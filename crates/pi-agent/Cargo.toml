@@ -1,0 +1,9 @@
+[package]
+name = "pi-agent"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+pi-ai.workspace = true
+pi-tools.workspace = true
+anyhow.workspace = true

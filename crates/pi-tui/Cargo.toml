@@ -1,0 +1,12 @@
+[package]
+name = "pi-tui"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+pi-agent.workspace = true
+pi-ai.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+futures-util.workspace = true
+anyhow.workspace = true

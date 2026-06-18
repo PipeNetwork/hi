@@ -1,0 +1,3 @@
+name = "greet-sh"
+prompt = "greet.sh should print a greeting of the exact form 'Hello, NAME!' for the name given as its first argument (so `bash greet.sh World` prints `Hello, World!`). It currently prints the wrong format. Fix greet.sh. Edit only greet.sh."
+verify = '''test "$(bash greet.sh World)" = "Hello, World!"'''

@@ -1,0 +1,19 @@
+[package]
+name = "hi"
+edition.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "hi"
+path = "src/main.rs"
+
+[dependencies]
+pi-ai.workspace = true
+pi-agent.workspace = true
+pi-tui.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true

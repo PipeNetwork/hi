@@ -1,0 +1,5 @@
+# Trivial demo task: the agent must put 42 into answer.txt.
+# Real tasks ship a `fixture/` with a failing test and a `verify` that runs it.
+name = "answer-42"
+prompt = "Write the number 42 to a file named answer.txt in the current directory."
+verify = "grep -qx 42 answer.txt"
