@@ -1,0 +1,3 @@
+name = "clamp"
+prompt = "Implement clamp(x, lo, hi) in solution.py: constrain x to the range bounded by lo and hi (e.g. clamp(5, 0, 10) == 5, clamp(-3, 0, 10) == 0). The tests pin down what happens when lo and hi are passed in the wrong order. It currently raises NotImplementedError. Edit only solution.py."
+verify = '''python3 -c "import solution as s; cases=[(5,0,10,5),(-3,0,10,0),(15,0,10,10),(5,10,0,5),(20,30,10,20),(5,30,10,10)]; fails=[f'clamp({x},{lo},{hi}) returned {s.clamp(x,lo,hi)}, expected {e}' for x,lo,hi,e in cases if s.clamp(x,lo,hi)!=e]; assert not fails, chr(10).join(fails)"'''

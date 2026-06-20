@@ -1,0 +1,21 @@
+[package]
+name = "hi"
+edition.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "hi"
+path = "src/main.rs"
+
+[dependencies]
+hi-ai.workspace = true
+hi-agent.workspace = true
+hi-tools.workspace = true
+hi-tui.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+rustyline.workspace = true

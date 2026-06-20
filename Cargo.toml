@@ -1,14 +1,14 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
-default-members = ["crates/pi-cli"]
+default-members = ["crates/hi-cli"]
 
 [workspace.package]
 edition = "2024"
 version = "0.1.0"
 
 [workspace.dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "io-std", "io-util", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "io-std", "io-util", "time", "signal"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 futures-util = "0.3"
 eventsource-stream = "0.2"
@@ -18,10 +18,11 @@ anyhow = "1"
 async-trait = "0.1"
 clap = { version = "4", features = ["derive", "env"] }
 toml = "0.8"
+rustyline = "14"
 ratatui = "0.29"
 crossterm = { version = "0.28", features = ["event-stream"] }
 
-pi-ai = { path = "crates/pi-ai" }
-pi-tools = { path = "crates/pi-tools" }
-pi-agent = { path = "crates/pi-agent" }
-pi-tui = { path = "crates/pi-tui" }
+hi-ai = { path = "crates/hi-ai" }
+hi-tools = { path = "crates/hi-tools" }
+hi-agent = { path = "crates/hi-agent" }
+hi-tui = { path = "crates/hi-tui" }

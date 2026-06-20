@@ -1,0 +1,3 @@
+name = "remainder-c"
+prompt = "Implement remainder_c(a, b) in solution.py: the remainder when dividing integer a by integer b (b is never 0). For example remainder_c(7, 3) == 1. The tests pin down the sign of the remainder when the operands are negative. It currently raises NotImplementedError. Edit only solution.py."
+verify = '''python3 -c "import solution as s; cases=[(7,3,1),(-7,3,-1),(7,-3,1),(-7,-3,-1),(8,4,0),(-8,3,-2),(9,5,4),(-9,5,-4)]; fails=[f'remainder_c({a},{b}) returned {s.remainder_c(a,b)}, expected {e}' for a,b,e in cases if s.remainder_c(a,b)!=e]; assert not fails, chr(10).join(fails)"'''

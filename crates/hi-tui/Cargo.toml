@@ -1,0 +1,15 @@
+[package]
+name = "hi-tui"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+hi-agent.workspace = true
+hi-ai.workspace = true
+hi-tools.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+futures-util.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+ansi-to-tui = "7"

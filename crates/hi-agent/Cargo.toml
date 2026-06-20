@@ -1,0 +1,13 @@
+[package]
+name = "hi-agent"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+hi-ai.workspace = true
+hi-tools.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }
+async-trait = { workspace = true }

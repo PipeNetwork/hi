@@ -1,0 +1,179 @@
+//! A [`Provider`] that tries a chain of backends in order, moving to the next
+//! when one errors or returns nothing — so a single dead or overloaded provider
+//! (e.g. a coding endpoint that streams only keep-alive heartbeats) doesn't kill
+//! the turn.
+
+use anyhow::Result;
+use async_trait::async_trait;
+
+use crate::provider::Provider;
+use crate::types::{ChatRequest, Completion, StreamEvent};
+
+/// One link in the fallback chain: a built provider plus the model id to request
+/// from it (each backend names its models differently).
+pub struct Backend {
+    pub provider: Box<dyn Provider>,
+    pub model: String,
+    /// A short human label for status messages, e.g. "ollama/qwen2.5:7b".
+    pub label: String,
+}
+
+/// Tries each [`Backend`] in turn. A backend "fails" if it returns an error or a
+/// completion with no content (no text and no tool calls) — the symptom of an
+/// overloaded model. The first backend that produces real output wins; if all
+/// fail, the last result (error or empty) is returned so the caller still sees a
+/// definitive outcome.
+pub struct FallbackProvider {
+    chain: Vec<Backend>,
+}
+
+impl FallbackProvider {
+    /// Build from a non-empty chain. With a single backend it's a thin pass-through.
+    pub fn new(chain: Vec<Backend>) -> Self {
+        debug_assert!(!chain.is_empty(), "fallback chain must not be empty");
+        Self { chain }
+    }
+}
+
+#[async_trait]
+impl Provider for FallbackProvider {
+    async fn stream(
+        &self,
+        request: ChatRequest,
+        sink: &mut (dyn FnMut(StreamEvent) + Send),
+    ) -> Result<Completion> {
+        let last = self.chain.len().saturating_sub(1);
+        for (i, backend) in self.chain.iter().enumerate() {
+            let is_last = i == last;
+            let mut req = request.clone();
+            req.model = backend.model.clone();
+
+            match backend.provider.stream(req, sink).await {
+                Ok(completion) if !completion.content.is_empty() || is_last => {
+                    return Ok(completion);
+                }
+                Ok(_empty) => {
+                    let next = &self.chain[i + 1];
+                    sink(StreamEvent::Status(format!(
+                        "{} returned nothing — falling back to {}",
+                        backend.label, next.label
+                    )));
+                }
+                Err(err) if is_last => return Err(err),
+                Err(err) => {
+                    let next = &self.chain[i + 1];
+                    sink(StreamEvent::Status(format!(
+                        "{} failed ({err}) — falling back to {}",
+                        backend.label, next.label
+                    )));
+                }
+            }
+        }
+        // The loop always returns on the last backend; this is unreachable.
+        unreachable!("fallback chain exhausted without returning")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{Completion, Content, Usage};
+    use std::sync::Mutex;
+
+    /// Returns one canned completion per call, in order.
+    struct Canned(Mutex<Vec<Result<Completion>>>);
+
+    #[async_trait]
+    impl Provider for Canned {
+        async fn stream(
+            &self,
+            _req: ChatRequest,
+            _sink: &mut (dyn FnMut(StreamEvent) + Send),
+        ) -> Result<Completion> {
+            self.0.lock().unwrap().remove(0)
+        }
+    }
+
+    fn empty() -> Completion {
+        Completion::default()
+    }
+
+    fn text(s: &str) -> Completion {
+        Completion {
+            content: vec![Content::Text(s.into())],
+            usage: Usage::default(),
+            stop_reason: None,
+        }
+    }
+
+    fn first_text(c: &Completion) -> &str {
+        match c.content.first() {
+            Some(Content::Text(t)) => t,
+            _ => "",
+        }
+    }
+
+    fn backend(label: &str, results: Vec<Result<Completion>>) -> Backend {
+        Backend {
+            provider: Box::new(Canned(Mutex::new(results))),
+            model: "m".into(),
+            label: label.into(),
+        }
+    }
+
+    fn req() -> ChatRequest {
+        ChatRequest {
+            model: "primary".into(),
+            messages: vec![],
+            tools: vec![],
+            max_tokens: 16,
+            temperature: None,
+            thinking_budget: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn falls_back_past_empty_and_errored_backends() {
+        let mut statuses = Vec::new();
+        let mut sink = |e: StreamEvent| {
+            if let StreamEvent::Status(s) = e {
+                statuses.push(s);
+            }
+        };
+        let fp = FallbackProvider::new(vec![
+            backend("primary", vec![Ok(empty())]), // returns nothing
+            backend("mid", vec![Err(anyhow::anyhow!("503"))]), // errors
+            backend("local", vec![Ok(text("hello from local"))]), // wins
+        ]);
+        let out = fp.stream(req(), &mut sink).await.unwrap();
+        assert_eq!(out.content.len(), 1);
+        assert_eq!(first_text(&out), "hello from local");
+        // Two fallbacks announced.
+        assert_eq!(statuses.len(), 2, "statuses: {statuses:?}");
+        assert!(statuses[0].contains("falling back to mid"));
+        assert!(statuses[1].contains("falling back to local"));
+    }
+
+    #[tokio::test]
+    async fn first_healthy_backend_wins_without_fallback() {
+        let mut sink = |_e: StreamEvent| {};
+        let fp = FallbackProvider::new(vec![
+            backend("primary", vec![Ok(text("direct"))]),
+            backend("local", vec![Ok(text("unused"))]),
+        ]);
+        let out = fp.stream(req(), &mut sink).await.unwrap();
+        assert_eq!(first_text(&out), "direct");
+    }
+
+    #[tokio::test]
+    async fn returns_last_result_when_all_fail() {
+        let mut sink = |_e: StreamEvent| {};
+        let fp = FallbackProvider::new(vec![
+            backend("primary", vec![Ok(empty())]),
+            backend("local", vec![Ok(empty())]),
+        ]);
+        // All empty → the last (empty) completion is returned, not an error.
+        let out = fp.stream(req(), &mut sink).await.unwrap();
+        assert!(out.content.is_empty());
+    }
+}

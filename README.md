@@ -17,14 +17,44 @@ cargo build --release           # binary at target/release/hi
 # OpenRouter (default endpoint)
 HI_API_KEY=sk-or-... hi -m anthropic/claude-sonnet-4 "add a --json flag to the CLI"
 
-# A local model (Ollama / llama.cpp / LM Studio / vLLM — all OpenAI-compatible)
-hi --base-url http://localhost:11434/v1 --api-key local -m qwen2.5-coder "..."
+# terminaili.com (OpenAI-compatible coding endpoint; defaults to ipop/coder-balanced)
+TERMINAILI_API_KEY=... hi --provider terminaili "add a --json flag to the CLI"
+
+# A local Ollama model (no API key needed)
+hi --provider ollama -m qwen2.5-coder "..."
 
 # Native Anthropic
 HI_API_KEY=sk-ant-... hi --provider anthropic -m claude-sonnet-4-20250514 "..."
 ```
 
-Run with no prompt for an interactive session; pass a prompt for one-shot.
+`--provider` accepts `openai` (any OpenAI-compatible URL), `anthropic`, `terminaili`, and `ollama`. The latter two are presets: they set the right base URL, key env var (`TERMINAILI_API_KEY`), and — for terminaili — a default model, so they work with no extra flags.
+
+### Fallback chain
+
+A single dead or overloaded provider shouldn't kill your session. Give a profile a `fallback` list (or pass `--fallback <profile>`, repeatable); if the primary errors or returns nothing, `hi` announces the switch and retries the next one:
+
+```toml
+default_profile = "cloud"
+
+[profiles.cloud]
+provider = "terminaili"
+api_key = "..."
+fallback = ["local"]      # → falls back to the `local` profile
+
+[profiles.local]
+provider = "ollama"
+model = "qwen2.5-coder"
+```
+
+A model that streams only keep-alive heartbeats with no output is treated as failed after `HI_STREAM_TIMEOUT` seconds (default 120; set lower to fail over faster). `HI_DEBUG_STREAM=1` dumps raw provider bytes for diagnosing one that returns nothing.
+
+Run with no prompt for an interactive session; pass a prompt for one-shot. Piped stdin is folded into a one-shot prompt as context, so `hi` composes with other tools:
+
+```bash
+cargo test 2>&1 | hi --auto-verify "fix the failing tests"
+cat error.log | hi "what's going wrong here?"
+cat data.json | hi -q "extract every email address" | sort -u   # -q: text only, no chatter
+```
 
 ## Models & providers
 
@@ -94,11 +124,25 @@ hi --no-save "..."                 # don't persist
 
 ## In-session commands & context
 
-Slash commands (interactive or TUI): `/help`, `/model [id]`, `/tokens`, `/clear`, `/exit`.
+Slash commands (TUI or plain REPL):
+
+| command | does |
+|---|---|
+| `/help` | list commands |
+| `/model [id]` | show or switch the model mid-session |
+| `/verify [cmd\|off]` | show, set, or clear the test command turns iterate against — turn the verify-loop on without restarting |
+| `/diff` | show what files have changed this session (`git diff` + new files) |
+| `/compact` | summarize the conversation and reset context to the summary (reclaims room on long sessions) |
+| `/retry` | re-run your last message (drops the previous attempt — pairs with `/model`) |
+| `/tokens` | cumulative token usage |
+| `/clear` | start a fresh conversation |
+| `/exit` | quit |
 
 Drop an `HI.md` or `AGENTS.md` in your project and its contents are appended to the system prompt — per-project conventions, for free.
 
-A `--tui` flag enables an experimental ratatui interface (transcript in scrollback + a live input/status region).
+Long sessions **auto-compact**: when the context window passes ~80% full, `hi` summarizes the conversation and resets to that summary before the next turn, so you don't overflow the model mid-task (disable with `--no-auto-compact`; trigger manually any time with `/compact`).
+
+Interactive sessions open a **full-screen TUI** by default (ratatui): a bordered, scrollable transcript with a title bar showing live token/cost, and an input box that turns into a working spinner (with elapsed seconds) while a turn runs. **Keep typing while it works to queue the next command(s)** — they're listed under the prompt and run in order as each turn finishes. Ctrl-C interrupts the current turn (and drops the queue), PgUp/PgDn scrolls, Up/Down recalls history, `/exit` quits. Pass `--plain` (or pipe input) for the line-based REPL.
 
 ## Architecture
 
@@ -106,29 +150,29 @@ A cargo workspace:
 
 | crate | role |
 |---|---|
-| `pi-ai` | provider-neutral types, the `Provider` trait, OpenAI + Anthropic adapters, retry, models.dev registry |
-| `pi-tools` | the `read` / `write` / `edit` / `bash` tools |
-| `pi-agent` | the agent loop, verify-loop, sessions, the `Ui` trait |
-| `pi-tui` | inline terminal UI |
-| `pi-cli` | the `hi` binary: config, sessions, best-of-N, slash commands |
-| `pi-eval` | the benchmark runner (see below) |
+| `hi-ai` | provider-neutral types, the `Provider` trait, OpenAI + Anthropic adapters, retry, models.dev registry |
+| `hi-tools` | the `read` / `write` / `edit` / `bash` / `list` / `grep` tools |
+| `hi-agent` | the agent loop, verify-loop, sessions, the `Ui` trait |
+| `hi-tui` | full-screen terminal UI (transcript, spinner, queue, slash commands) |
+| `hi-cli` | the `hi` binary: config, sessions, best-of-N, slash commands |
+| `hi-eval` | the benchmark runner (see below) |
 
 Richer capabilities come from **subprocess CLI tools** the model invokes via `bash` (pi's philosophy) rather than a plugin runtime.
 
-## Benchmarks (`pi-eval`)
+## Benchmarks (`hi-eval`)
 
-`bench/` measures whether the levers actually beat a baseline — including a real backend like [OpenRouter Fusion](https://openrouter.ai/blog/announcements/fusion-beats-frontier/). Each task ships a buggy `fixture/` and a `verify` command (the spec; the agent can't game it). `pi-eval` runs each task under three configs — `baseline`, `verify`, `best-of-3` — in isolated copies and scores pass/fail by ground truth.
+`bench/` measures whether the levers actually beat a baseline — including a real backend like [OpenRouter Fusion](https://openrouter.ai/blog/announcements/fusion-beats-frontier/). Each task ships a buggy `fixture/` and a `verify` command (the spec; the agent can't game it). `hi-eval` runs each task under three configs — `baseline`, `verify`, `best-of-3` — in isolated copies and scores pass/fail by ground truth.
 
 ```bash
-cargo run -p pi-eval -- --validate bench/spec     # check tasks are well-formed (no model)
+cargo run -p hi-eval -- --validate bench/spec     # check tasks are well-formed (no model)
 
 # Compare configs against any model (env flows through to hi):
 HI_MODEL=anthropic/claude-sonnet-4 HI_API_KEY=$OPENROUTER_API_KEY \
-  cargo run -p pi-eval -- bench/spec
+  cargo run -p hi-eval -- bench/spec
 
 # The raw-Fusion line to beat:
 HI_MODEL=openrouter/fusion HI_API_KEY=$OPENROUTER_API_KEY \
-  cargo run -p pi-eval -- bench/spec
+  cargo run -p hi-eval -- bench/spec
 ```
 
 Three task tiers: `bench/tasks` (easy bugs), `bench/hard` (edge-case algorithms), `bench/spec` (behavior pinned by the test, not the prompt). See `bench/README.md` to add tasks.
@@ -139,4 +183,4 @@ On a local 30B coder, easy and hard tiers saturate at 6/6 baseline — a capable
 
 ## Status
 
-Early but functional. The multi-provider core, sessions, verify-loop, best-of-N, and eval harness are built and tested; `cargo test` / `cargo clippy --workspace` are clean. The TUI is experimental (its interactive rendering needs a real terminal). No published releases yet.
+Early but functional. The multi-provider core, full-screen TUI, sessions, verify-loop, best-of-N, and eval harness are built and tested (26 tests; `cargo fmt`/`clippy`/`test` enforced in CI). The TUI's rendering is verified via ratatui's TestBackend; its live key/scroll behavior is best confirmed in a real terminal. No published releases yet.

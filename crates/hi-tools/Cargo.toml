@@ -1,0 +1,12 @@
+[package]
+name = "hi-tools"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+hi-ai.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+similar = "2"

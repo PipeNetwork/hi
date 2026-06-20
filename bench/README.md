@@ -6,12 +6,12 @@ baseline, including a real backend like `openrouter/fusion`. Without numbers,
 
 ## How it works
 
-`pi-eval` runs every task under every config in an isolated copy of the task's
+`hi-eval` runs every task under every config in an isolated copy of the task's
 `fixture/`, then scores pass/fail with the task's own `verify` command (ground
 truth — the compiler/tests, not a judge model). It reports pass-rate, cost, and
 tokens per config.
 
-Configs (in `crates/pi-eval/src/main.rs`):
+Configs (in `crates/hi-eval/src/main.rs`):
 - `baseline` — `hi` runs the prompt once, no verification.
 - `verify` — `hi --verify <task.verify>`, so the agent iterates until green.
 
@@ -35,7 +35,7 @@ smoke task.
 ### Validate tasks (no model needed)
 
 ```bash
-cargo run -p pi-eval -- --validate bench/tasks
+cargo run -p hi-eval -- --validate bench/tasks
 ```
 
 Confirms every task is well-formed: `verify` fails on the raw `fixture/` and
@@ -53,11 +53,11 @@ cargo build -p hi
 
 # A single frontier model through hi
 HI_MODEL=anthropic/claude-sonnet-4 HI_API_KEY=$OPENROUTER_API_KEY \
-  cargo run -p pi-eval -- bench/tasks
+  cargo run -p hi-eval -- bench/tasks
 
 # OpenRouter Fusion as the backend — the thing to beat
 HI_MODEL=openrouter/fusion HI_API_KEY=$OPENROUTER_API_KEY \
-  cargo run -p pi-eval -- bench/tasks
+  cargo run -p hi-eval -- bench/tasks
 ```
 
 Both default to OpenRouter's base URL. The win condition: the `verify` config
