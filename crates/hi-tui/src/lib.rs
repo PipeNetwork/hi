@@ -232,7 +232,8 @@ pub async fn run(
                             registry.model_ids()
                         }
                     };
-                    app.picker = Some(ModelPicker::new(models));
+                    let current = app.model.clone();
+                    app.picker = Some(ModelPicker::new(models, &current));
                     continue;
                 }
                 other => {
@@ -607,7 +608,8 @@ impl App {
             Command::Model(id) => {
                 if id.is_empty() {
                     // Open the interactive picker (filter + arrow-select).
-                    self.picker = Some(ModelPicker::new(registry.model_ids()));
+                    let current = self.model.clone();
+                    self.picker = Some(ModelPicker::new(registry.model_ids(), &current));
                 } else {
                     let (price, context_window) = registry.metadata(&id);
                     agent.set_model(id.clone(), price, context_window);
@@ -779,15 +781,22 @@ impl App {
                 plines.push(Line::styled("  (no matches)".to_string(), dim()));
             }
             for (id, selected) in visible {
+                let tag = if id == p.current { " (current)" } else { "" };
                 if selected {
-                    plines.push(Line::styled(
-                        format!("▶ {id}"),
-                        Style::default()
-                            .fg(Color::Cyan)
-                            .add_modifier(Modifier::BOLD),
-                    ));
+                    plines.push(Line::from(vec![
+                        Span::styled(
+                            format!("▶ {id}"),
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(tag.to_string(), dim()),
+                    ]));
                 } else {
-                    plines.push(Line::from(format!("  {id}")));
+                    plines.push(Line::from(vec![
+                        Span::raw(format!("  {id}")),
+                        Span::styled(tag.to_string(), dim()),
+                    ]));
                 }
             }
             frame.render_widget(Paragraph::new(plines).block(block), rows[1]);
@@ -870,6 +879,8 @@ fn wrapped_height(lines: &[Line], width: u16) -> u16 {
 /// Interactive `/model` picker: a filterable, arrow-navigable list of model ids.
 struct ModelPicker {
     all: Vec<String>,
+    /// The model in use when the picker opened — pre-selected and marked.
+    current: String,
     filter: String,
     /// Indices into `all` matching the current filter.
     matches: Vec<usize>,
@@ -878,13 +889,16 @@ struct ModelPicker {
 }
 
 impl ModelPicker {
-    fn new(all: Vec<String>) -> Self {
-        let matches = (0..all.len()).collect();
+    fn new(all: Vec<String>, current: &str) -> Self {
+        let matches: Vec<usize> = (0..all.len()).collect();
+        // Open with the current model highlighted (and scrolled into view).
+        let selected = all.iter().position(|id| id == current).unwrap_or(0);
         Self {
             all,
+            current: current.to_string(),
             filter: String::new(),
             matches,
-            selected: 0,
+            selected,
         }
     }
 
@@ -1207,12 +1221,17 @@ mod tests {
 
     #[test]
     fn model_picker_filters_and_navigates() {
-        let mut p = ModelPicker::new(vec![
-            "anthropic/claude-sonnet-4".into(),
-            "openai/gpt-4o".into(),
-            "openai/gpt-4o-mini".into(),
-            "google/gemini".into(),
-        ]);
+        let mut p = ModelPicker::new(
+            vec![
+                "anthropic/claude-sonnet-4".into(),
+                "openai/gpt-4o".into(),
+                "openai/gpt-4o-mini".into(),
+                "google/gemini".into(),
+            ],
+            "google/gemini",
+        );
+        // Opens with the current model pre-selected.
+        assert_eq!(p.current(), Some("google/gemini"));
         assert_eq!(p.matches.len(), 4);
         for c in "gpt".chars() {
             p.insert(c);
@@ -1247,11 +1266,11 @@ mod tests {
 
     #[test]
     fn renders_model_picker() {
-        let mut app = App::new("openai", "gpt-4o");
-        app.picker = Some(ModelPicker::new(vec![
-            "anthropic/claude-sonnet-4".into(),
-            "openai/gpt-4o".into(),
-        ]));
+        let mut app = App::new("openai", "openai/gpt-4o");
+        app.picker = Some(ModelPicker::new(
+            vec!["anthropic/claude-sonnet-4".into(), "openai/gpt-4o".into()],
+            "openai/gpt-4o",
+        ));
         let mut term = Terminal::new(TestBackend::new(60, 14)).unwrap();
         term.draw(|f| app.render(f)).unwrap();
         let screen = dump(&term);
@@ -1259,6 +1278,11 @@ mod tests {
         assert!(screen.contains("filter:"), "filter line: {screen}");
         assert!(screen.contains("claude-sonnet-4"), "lists models: {screen}");
         assert!(screen.contains("▶"), "highlights a selection: {screen}");
+        // The active model is marked and pre-selected.
+        assert!(
+            screen.contains("(current)"),
+            "marks current model: {screen}"
+        );
     }
 
     #[test]
