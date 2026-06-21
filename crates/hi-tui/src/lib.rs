@@ -421,8 +421,13 @@ impl App {
                 self.push(Line::styled(s, Style::default().fg(Color::Blue)));
             }
             UiEvent::TurnEnd(summary) => {
-                // Surface tokens/cost in the status bar rather than the transcript.
+                self.flush_pending();
+                // Tokens/cost go to the status bar; a dim marker in the transcript
+                // makes the end of a turn unmistakable (so a long run doesn't just
+                // trail off with no clear "done").
                 self.status = summary.trim_matches(['[', ']']).to_string();
+                self.push(Line::styled(format!("✓ done · {}", self.status), dim()));
+                self.follow();
             }
         }
     }
@@ -825,11 +830,19 @@ mod tests {
     }
 
     #[test]
-    fn turn_end_summary_goes_to_status_not_transcript() {
+    fn turn_end_sets_status_and_marks_transcript_done() {
         let mut app = App::new("openai", "gpt-4o");
         app.apply(UiEvent::TurnEnd("[10 in · 2 out · 12 total]".into()));
+        // Usage in the title bar...
         assert!(app.status.contains("12 total"));
-        assert!(app.transcript.is_empty());
+        // ...and a clear "done" marker in the transcript so the turn's end shows.
+        assert_eq!(app.transcript.len(), 1);
+        let line: String = app.transcript[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(line.contains("✓ done"), "got: {line}");
     }
 
     #[test]

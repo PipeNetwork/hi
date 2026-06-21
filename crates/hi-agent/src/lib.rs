@@ -19,8 +19,13 @@ const AUTO_COMPACT_PERCENT: u64 = 80;
 const SYSTEM_PROMPT: &str = "\
 You are hi, a coding agent running in the user's terminal, in their current \
 working directory. You can read, write, and edit files and run shell commands \
-via your tools. Work directly on the user's project. Prefer making the change \
-over describing it. Keep responses concise. When the task is done, stop.";
+via your tools. Work in the current directory and the existing project: if a \
+build or package file (Cargo.toml, package.json, go.mod, pyproject.toml, …) is \
+already present, modify it and its sources in place — do NOT scaffold a new \
+nested sub-project or subdirectory for your work unless the user explicitly \
+asks. Prefer making the change over describing it. Keep responses concise. When \
+the task is done, stop, and end with one short line stating what you changed and \
+the exact command to run or test it.";
 
 /// The system message, optionally with project context appended.
 fn build_system(project_context: Option<&str>) -> Message {
