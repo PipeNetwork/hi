@@ -72,6 +72,14 @@ impl Registry {
         }
     }
 
+    /// All known model ids, sorted and deduped — for the `/model` picker.
+    pub fn model_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self.models.iter().map(|m| m.id.clone()).collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
     /// Best-effort lookup, tolerating provider prefixes and `.`/`-` differences
     /// between naming conventions (e.g. `anthropic/claude-3.5-sonnet`).
     pub fn lookup(&self, model: &str) -> Option<&ModelInfo> {

@@ -436,7 +436,13 @@ fn handle_command(agent: &mut Agent, command: hi_agent::Command, registry: &Regi
         }
         Command::Model(id) => {
             if id.is_empty() {
-                println!("model: {}", agent.model());
+                // The line REPL can't do an arrow-select picker; show the current
+                // model + how to switch (the full-screen TUI has a live picker).
+                println!(
+                    "model: {}\n\x1b[2m{} models known — `/model <id>` to switch (the TUI's /model opens an interactive picker)\x1b[0m",
+                    agent.model(),
+                    registry.model_ids().len()
+                );
             } else {
                 let (price, context_window) = registry.metadata(&id);
                 agent.set_model(id.clone(), price, context_window);

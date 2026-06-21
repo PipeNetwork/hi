@@ -129,7 +129,7 @@ Slash commands (TUI or plain REPL):
 | command | does |
 |---|---|
 | `/help` | list commands |
-| `/model [id]` | show or switch the model mid-session |
+| `/model [id]` | switch model by id, or — with no id — open an interactive picker (type to filter, ↑/↓ to move, Enter to select) |
 | `/verify [cmd\|off]` | show, set, or clear the test command turns iterate against — turn the verify-loop on without restarting |
 | `/diff` | show what files have changed this session (`git diff` + new files) |
 | `/compact` | summarize the conversation and reset context to the summary (reclaims room on long sessions) |

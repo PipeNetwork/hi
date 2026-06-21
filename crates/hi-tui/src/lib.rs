@@ -32,6 +32,8 @@ use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
 use tokio::sync::mpsc;
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// How many model rows the `/model` picker shows at once.
+const PICKER_ROWS: usize = 12;
 const TICK: Duration = Duration::from_millis(120);
 
 /// Run the full-screen TUI until the user quits. `history_path`, if given, is
@@ -84,6 +86,30 @@ pub async fn run(
                             // A paste arrives as one event — insert it literally
                             // (newlines and all) instead of submitting each line.
                             Some(Ok(Event::Paste(text))) => app.input.insert_str(&text),
+                            // While the model picker is open, keys drive it.
+                            Some(Ok(Event::Key(key)))
+                                if key.kind == KeyEventKind::Press && app.picker.is_some() =>
+                            {
+                                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                                match key.code {
+                                    KeyCode::Enter => app.pick_model(agent, registry),
+                                    KeyCode::Esc => app.picker = None,
+                                    KeyCode::Char('c') if ctrl => app.picker = None,
+                                    // Navigation/filter: a fresh borrow, no app-level action.
+                                    code => {
+                                        let picker = app.picker.as_mut().unwrap();
+                                        match code {
+                                            KeyCode::Up => picker.up(),
+                                            KeyCode::Down => picker.down(),
+                                            KeyCode::PageUp => picker.page_up(),
+                                            KeyCode::PageDown => picker.page_down(),
+                                            KeyCode::Backspace => picker.backspace(),
+                                            KeyCode::Char(c) if !ctrl => picker.insert(c),
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
                             Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
                                 let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                                 match key.code {
@@ -314,6 +340,8 @@ struct App {
     /// Message-history length just before the last turn started, so `/retry`
     /// can drop that turn before re-running.
     last_turn_start: usize,
+    /// Active model picker (`/model` with no argument), if any.
+    picker: Option<ModelPicker>,
     status: String,
 }
 
@@ -332,8 +360,24 @@ impl App {
             queue: VecDeque::new(),
             last_prompt: None,
             last_turn_start: 0,
+            picker: None,
             status: String::new(),
         }
+    }
+
+    /// Apply the picker's current selection as the model, then close it.
+    fn pick_model(&mut self, agent: &mut Agent, registry: &hi_ai::Registry) {
+        if let Some(picker) = &self.picker
+            && let Some(id) = picker.current()
+        {
+            let id = id.to_string();
+            let (price, context_window) = registry.metadata(&id);
+            agent.set_model(id.clone(), price, context_window);
+            self.model = id.clone();
+            self.push(Line::styled(format!("model set to {id}"), dim()));
+        }
+        self.picker = None;
+        self.follow();
     }
 
     /// Mark the turn as running (or done), stamping the start time so the
@@ -486,7 +530,8 @@ impl App {
             }
             Command::Model(id) => {
                 if id.is_empty() {
-                    self.push(Line::styled(format!("model: {}", self.model), dim()));
+                    // Open the interactive picker (filter + arrow-select).
+                    self.picker = Some(ModelPicker::new(registry.model_ids()));
                 } else {
                     let (price, context_window) = registry.metadata(&id);
                     agent.set_model(id.clone(), price, context_window);
@@ -581,7 +626,13 @@ impl App {
         let queued_shown = self.queue.len().min(3);
         let queue_extra = usize::from(self.queue.len() > 3);
         let (input_lines, cursor_row, cursor_col) = self.input_view();
-        let input_h = (status_lines + input_lines.len() + queued_shown + queue_extra + 2) as u16;
+        let input_h = if let Some(p) = &self.picker {
+            // filter line + visible model rows + borders, bounded by the screen.
+            let rows = p.matches.len().clamp(1, PICKER_ROWS) as u16;
+            (rows + 3).min(area.height.saturating_sub(3))
+        } else {
+            (status_lines + input_lines.len() + queued_shown + queue_extra + 2) as u16
+        };
         let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(input_h)]).split(area);
 
         // --- Transcript ---
@@ -612,51 +663,90 @@ impl App {
             .scroll((scroll, 0));
         frame.render_widget(para, rows[0]);
 
-        // --- Input bar. While a turn runs the border turns cyan and the top
-        // inner line becomes a bold spinner + elapsed seconds; the prompt stays
-        // editable so you can type the next command, which queues (listed
-        // below) and runs when the current turn finishes. ---
-        let input_block = Block::bordered()
-            .border_type(BorderType::Rounded)
-            .border_style(if self.working {
-                Style::default().fg(Color::Cyan)
-            } else {
-                dim()
-            });
-
-        let mut ilines: Vec<Line> = Vec::new();
-        if self.working {
-            let frame_ch = SPINNER[self.spinner % SPINNER.len()];
-            let secs = self.started.map(|t| t.elapsed().as_secs()).unwrap_or(0);
-            ilines.push(Line::from(vec![
+        // --- Bottom region: the model picker (if `/model` is open) or the
+        // input bar. ---
+        if let Some(p) = &self.picker {
+            let block = Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(" select a model ")
+                .title_top(
+                    Line::from(format!(" {}/{} ", p.selected + 1, p.matches.len().max(1)))
+                        .right_aligned(),
+                );
+            let mut plines: Vec<Line> = vec![Line::from(vec![
+                Span::raw(format!("filter: {}", p.filter)),
                 Span::styled(
-                    format!("{frame_ch} working… {secs}s"),
-                    Style::default()
-                        .fg(Color::Cyan)
-                        .add_modifier(Modifier::BOLD),
+                    "   ↑↓ move · type to filter · Enter select · Esc cancel",
+                    dim(),
                 ),
-                Span::styled("   Ctrl-C to interrupt", dim()),
-            ]));
-        }
-        ilines.extend(input_lines);
-        for q in self.queue.iter().take(3) {
-            ilines.push(Line::styled(format!("⏳ {q}"), dim()));
-        }
-        if self.queue.len() > 3 {
-            ilines.push(Line::styled(
-                format!("   … +{} more queued", self.queue.len() - 3),
-                dim(),
+            ])];
+            let (_, visible) = p.visible();
+            if visible.is_empty() {
+                plines.push(Line::styled("  (no matches)".to_string(), dim()));
+            }
+            for (id, selected) in visible {
+                if selected {
+                    plines.push(Line::styled(
+                        format!("▶ {id}"),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                } else {
+                    plines.push(Line::from(format!("  {id}")));
+                }
+            }
+            frame.render_widget(Paragraph::new(plines).block(block), rows[1]);
+            // Cursor on the filter line, just after "filter: <text>".
+            let cx = rows[1].x + 1 + 8 + p.filter.chars().count() as u16;
+            frame.set_cursor_position((cx.min(rows[1].right().saturating_sub(2)), rows[1].y + 1));
+        } else {
+            // The border turns cyan and the top inner line becomes a bold
+            // spinner + elapsed seconds while a turn runs; the prompt stays
+            // editable so you can type the next command (it queues below).
+            let input_block = Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(if self.working {
+                    Style::default().fg(Color::Cyan)
+                } else {
+                    dim()
+                });
+
+            let mut ilines: Vec<Line> = Vec::new();
+            if self.working {
+                let frame_ch = SPINNER[self.spinner % SPINNER.len()];
+                let secs = self.started.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+                ilines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{frame_ch} working… {secs}s"),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled("   Ctrl-C to interrupt", dim()),
+                ]));
+            }
+            ilines.extend(input_lines);
+            for q in self.queue.iter().take(3) {
+                ilines.push(Line::styled(format!("⏳ {q}"), dim()));
+            }
+            if self.queue.len() > 3 {
+                ilines.push(Line::styled(
+                    format!("   … +{} more queued", self.queue.len() - 3),
+                    dim(),
+                ));
+            }
+            frame.render_widget(Paragraph::new(ilines).block(input_block), rows[1]);
+
+            // Cursor sits within the editable input (below the spinner, if shown).
+            let cx = rows[1].x + 1 + cursor_col;
+            let cy = rows[1].y + 1 + status_lines as u16 + cursor_row;
+            frame.set_cursor_position((
+                cx.min(rows[1].right().saturating_sub(2)),
+                cy.min(rows[1].bottom().saturating_sub(2)),
             ));
         }
-        frame.render_widget(Paragraph::new(ilines).block(input_block), rows[1]);
-
-        // Cursor sits within the editable input (below the spinner line, if shown).
-        let cx = rows[1].x + 1 + cursor_col;
-        let cy = rows[1].y + 1 + status_lines as u16 + cursor_row;
-        frame.set_cursor_position((
-            cx.min(rows[1].right().saturating_sub(2)),
-            cy.min(rows[1].bottom().saturating_sub(2)),
-        ));
     }
 }
 
@@ -682,6 +772,84 @@ fn wrapped_height(lines: &[Line], width: u16) -> u16 {
             }
         })
         .sum()
+}
+
+/// Interactive `/model` picker: a filterable, arrow-navigable list of model ids.
+struct ModelPicker {
+    all: Vec<String>,
+    filter: String,
+    /// Indices into `all` matching the current filter.
+    matches: Vec<usize>,
+    /// Index into `matches` of the highlighted row.
+    selected: usize,
+}
+
+impl ModelPicker {
+    fn new(all: Vec<String>) -> Self {
+        let matches = (0..all.len()).collect();
+        Self {
+            all,
+            filter: String::new(),
+            matches,
+            selected: 0,
+        }
+    }
+
+    /// Recompute matches (case-insensitive substring) after the filter changes.
+    fn refilter(&mut self) {
+        let needle = self.filter.to_lowercase();
+        self.matches = self
+            .all
+            .iter()
+            .enumerate()
+            .filter(|(_, id)| needle.is_empty() || id.to_lowercase().contains(&needle))
+            .map(|(i, _)| i)
+            .collect();
+        self.selected = 0;
+    }
+
+    fn insert(&mut self, c: char) {
+        self.filter.push(c);
+        self.refilter();
+    }
+    fn backspace(&mut self) {
+        self.filter.pop();
+        self.refilter();
+    }
+    fn down(&mut self) {
+        if self.selected + 1 < self.matches.len() {
+            self.selected += 1;
+        }
+    }
+    fn up(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+    fn page_down(&mut self) {
+        self.selected = (self.selected + PICKER_ROWS).min(self.matches.len().saturating_sub(1));
+    }
+    fn page_up(&mut self) {
+        self.selected = self.selected.saturating_sub(PICKER_ROWS);
+    }
+    fn current(&self) -> Option<&str> {
+        self.matches
+            .get(self.selected)
+            .map(|&i| self.all[i].as_str())
+    }
+
+    /// The visible window of (id, is_selected) rows, scrolled to keep the
+    /// selection in view.
+    fn visible(&self) -> (usize, Vec<(&str, bool)>) {
+        let offset = if self.selected >= PICKER_ROWS {
+            self.selected + 1 - PICKER_ROWS
+        } else {
+            0
+        };
+        let end = (offset + PICKER_ROWS).min(self.matches.len());
+        let rows = (offset..end)
+            .map(|vi| (self.all[self.matches[vi]].as_str(), vi == self.selected))
+            .collect();
+        (offset, rows)
+    }
 }
 
 /// Terminal-free input line: text + cursor + history. Unit-tested below.
@@ -942,6 +1110,48 @@ mod tests {
         let mut input = InputLine::default();
         input.insert_str("a\r\nb\rc");
         assert_eq!(input.text(), "a\nb\nc");
+    }
+
+    #[test]
+    fn model_picker_filters_and_navigates() {
+        let mut p = ModelPicker::new(vec![
+            "anthropic/claude-sonnet-4".into(),
+            "openai/gpt-4o".into(),
+            "openai/gpt-4o-mini".into(),
+            "google/gemini".into(),
+        ]);
+        assert_eq!(p.matches.len(), 4);
+        for c in "gpt".chars() {
+            p.insert(c);
+        }
+        assert_eq!(p.matches.len(), 2, "only gpt-* match");
+        assert_eq!(p.current(), Some("openai/gpt-4o"));
+        p.down();
+        assert_eq!(p.current(), Some("openai/gpt-4o-mini"));
+        p.down(); // clamped at the end
+        assert_eq!(p.current(), Some("openai/gpt-4o-mini"));
+        p.up();
+        assert_eq!(p.current(), Some("openai/gpt-4o"));
+        p.backspace(); // "gp"
+        p.backspace(); // "g" → matches both gpt-* and google
+        assert_eq!(p.filter, "g");
+        assert_eq!(p.matches.len(), 3);
+    }
+
+    #[test]
+    fn renders_model_picker() {
+        let mut app = App::new("openai", "gpt-4o");
+        app.picker = Some(ModelPicker::new(vec![
+            "anthropic/claude-sonnet-4".into(),
+            "openai/gpt-4o".into(),
+        ]));
+        let mut term = Terminal::new(TestBackend::new(60, 14)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let screen = dump(&term);
+        assert!(screen.contains("select a model"), "title: {screen}");
+        assert!(screen.contains("filter:"), "filter line: {screen}");
+        assert!(screen.contains("claude-sonnet-4"), "lists models: {screen}");
+        assert!(screen.contains("▶"), "highlights a selection: {screen}");
     }
 
     #[test]
