@@ -1,0 +1,3 @@
+name = "initials"
+prompt = "Implement initials(name) in solution.py: return the uppercase first letter of each whitespace-separated word, concatenated. Collapse runs of whitespace; an empty string yields an empty string. The tests pin the exact rules. It currently raises NotImplementedError. Edit only solution.py."
+verify = '''python3 -c "import solution as s; cases=[('john smith','JS'),('  multiple   spaces  ','MS'),('Alan Mathison Turing','AMT'),('',''),('a','A'),('mary-jane watson','MW')]; fails=[f'initials({i!r}) returned {s.initials(i)!r}, expected {e!r}' for i,e in cases if s.initials(i)!=e]; assert not fails, chr(10).join(fails)"'''

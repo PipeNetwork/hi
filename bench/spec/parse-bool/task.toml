@@ -1,0 +1,9 @@
+name = "parse-bool"
+prompt = "Implement parse_bool(s) in solution.py: parse a string to a bool. Accept (case-insensitively, ignoring surrounding whitespace) 'true'/'false', 'yes'/'no', '1'/'0', 'on'/'off'. Raise ValueError for anything else. The tests pin the exact rules. It currently raises NotImplementedError. Edit only solution.py."
+verify = '''python3 -c "import solution as s
+def r(x):
+ try: return s.parse_bool(x)
+ except ValueError: return 'ERR'
+got=[r(x) for x in ['true','TRUE',' Yes ','1','on','false','NO','0',' off ','maybe','2','']]
+exp=[True,True,True,True,True,False,False,False,False,'ERR','ERR','ERR']
+assert got==exp, f'{got} != {exp}'"'''

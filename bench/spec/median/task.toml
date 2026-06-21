@@ -1,0 +1,3 @@
+name = "median"
+prompt = "Implement median(nums) in solution.py: return the median of a non-empty list of numbers. The tests pin how to handle even-length lists and unsorted input. It currently raises NotImplementedError. Edit only solution.py."
+verify = '''python3 -c "import solution as s; cases=[([3,1,2],2),([1,2,3,4],2.5),([5],5),([2,1],1.5),([7,1,3,9,5],5),([10,2,8,4],6.0)]; fails=[f'median({xs!r}) returned {s.median(xs)!r}, expected {e!r}' for xs,e in cases if s.median(xs)!=e]; assert not fails, chr(10).join(fails)"'''

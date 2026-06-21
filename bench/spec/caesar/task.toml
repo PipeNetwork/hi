@@ -1,0 +1,3 @@
+name = "caesar"
+prompt = "Implement caesar(text, shift) in solution.py: a Caesar cipher that shifts each ASCII letter by `shift` positions, wrapping within its own case and leaving non-letters unchanged. `shift` may be negative or greater than 25. The tests pin the exact rules. It currently raises NotImplementedError. Edit only solution.py."
+verify = '''python3 -c "import solution as s; cases=[('abc',1,'bcd'),('xyz',3,'abc'),('Hello, World!',13,'Uryyb, Jbeyq!'),('abc',-1,'zab'),('abc',27,'bcd'),('abc',0,'abc')]; fails=[f'caesar({t!r},{k}) returned {s.caesar(t,k)!r}, expected {e!r}' for t,k,e in cases if s.caesar(t,k)!=e]; assert not fails, chr(10).join(fails)"'''
