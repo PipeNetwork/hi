@@ -142,6 +142,11 @@ impl Provider for OpenAiProvider {
         }
         Ok(completion)
     }
+
+    async fn list_models(&self) -> Result<Vec<String>> {
+        let url = format!("{}/models", self.base_url);
+        crate::http::fetch_model_ids(self.http.get(&url).bearer_auth(&self.api_key)).await
+    }
 }
 
 fn build_body(request: &ChatRequest) -> Value {

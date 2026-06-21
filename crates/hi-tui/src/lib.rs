@@ -162,6 +162,68 @@ pub async fn run(
                         continue;
                     }
                 },
+                // Open the picker on the provider's *live* model list (what this
+                // endpoint actually serves), falling back to the static catalog.
+                // The fetch runs behind a spinner so the UI stays responsive and
+                // Esc/Ctrl-C can cancel a slow or hung endpoint.
+                Command::Model(id) if id.is_empty() => {
+                    app.fetching = Some(Instant::now());
+                    let mut fetched: Option<Result<Vec<String>>> = None;
+                    let mut cancelled = false;
+                    {
+                        let fut = agent.list_models();
+                        tokio::pin!(fut);
+                        loop {
+                            terminal.draw(|f| app.render(f))?;
+                            tokio::select! {
+                                result = &mut fut => { fetched = Some(result); break; }
+                                _ = ticker.tick() => app.spinner = app.spinner.wrapping_add(1),
+                                maybe = events.next() => {
+                                    if let Some(Ok(Event::Key(key))) = maybe
+                                        && key.kind == KeyEventKind::Press
+                                    {
+                                        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                                        if matches!(key.code, KeyCode::Esc)
+                                            || (ctrl && matches!(key.code, KeyCode::Char('c')))
+                                        {
+                                            cancelled = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    app.fetching = None;
+                    if cancelled {
+                        continue;
+                    }
+                    let models = match fetched {
+                        Some(Ok(mut m)) if !m.is_empty() => {
+                            m.sort();
+                            m
+                        }
+                        Some(Ok(_)) => {
+                            app.push(Line::styled(
+                                "provider listed no models; showing the catalog".to_string(),
+                                dim(),
+                            ));
+                            registry.model_ids()
+                        }
+                        _ => {
+                            let note = match fetched {
+                                Some(Err(err)) => {
+                                    format!("couldn't fetch models ({err:#}); showing the catalog")
+                                }
+                                _ => "showing the catalog".to_string(),
+                            };
+                            app.push(Line::styled(note, dim()));
+                            registry.model_ids()
+                        }
+                    };
+                    app.picker = Some(ModelPicker::new(models));
+                    continue;
+                }
                 other => {
                     app.handle_command(agent, other, registry);
                     continue;
@@ -342,6 +404,8 @@ struct App {
     last_turn_start: usize,
     /// Active model picker (`/model` with no argument), if any.
     picker: Option<ModelPicker>,
+    /// When set, a model-list fetch is in flight (start time, for the spinner).
+    fetching: Option<Instant>,
     status: String,
 }
 
@@ -361,6 +425,7 @@ impl App {
             last_prompt: None,
             last_turn_start: 0,
             picker: None,
+            fetching: None,
             status: String::new(),
         }
     }
@@ -626,7 +691,9 @@ impl App {
         let queued_shown = self.queue.len().min(3);
         let queue_extra = usize::from(self.queue.len() > 3);
         let (input_lines, cursor_row, cursor_col) = self.input_view();
-        let input_h = if let Some(p) = &self.picker {
+        let input_h = if self.fetching.is_some() {
+            3
+        } else if let Some(p) = &self.picker {
             // filter line + visible model rows + borders, bounded by the screen.
             let rows = p.matches.len().clamp(1, PICKER_ROWS) as u16;
             (rows + 3).min(area.height.saturating_sub(3))
@@ -663,9 +730,24 @@ impl App {
             .scroll((scroll, 0));
         frame.render_widget(para, rows[0]);
 
-        // --- Bottom region: the model picker (if `/model` is open) or the
-        // input bar. ---
-        if let Some(p) = &self.picker {
+        // --- Bottom region: a fetch spinner, the model picker, or the input bar. ---
+        if let Some(started) = self.fetching {
+            let frame_ch = SPINNER[self.spinner % SPINNER.len()];
+            let secs = started.elapsed().as_secs();
+            let block = Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Cyan));
+            let body = Line::from(vec![
+                Span::styled(
+                    format!("{frame_ch} fetching models from {}… {secs}s", self.provider),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("   Esc to cancel", dim()),
+            ]);
+            frame.render_widget(Paragraph::new(body).block(block), rows[1]);
+        } else if let Some(p) = &self.picker {
             let block = Block::bordered()
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(Color::Cyan))
@@ -1136,6 +1218,20 @@ mod tests {
         p.backspace(); // "g" → matches both gpt-* and google
         assert_eq!(p.filter, "g");
         assert_eq!(p.matches.len(), 3);
+    }
+
+    #[test]
+    fn renders_fetching_spinner() {
+        let mut app = App::new("terminaili", "ipop/coder-balanced");
+        app.fetching = Some(Instant::now());
+        let mut term = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let screen = dump(&term);
+        assert!(
+            screen.contains("fetching models from terminaili"),
+            "fetch spinner: {screen}"
+        );
+        assert!(screen.contains("Esc to cancel"), "cancel hint: {screen}");
     }
 
     #[test]

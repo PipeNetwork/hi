@@ -131,6 +131,17 @@ impl Provider for AnthropicProvider {
             .collect();
         Ok(completion)
     }
+
+    async fn list_models(&self) -> Result<Vec<String>> {
+        let url = format!("{}/v1/models", self.base_url);
+        crate::http::fetch_model_ids(
+            self.http
+                .get(&url)
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", API_VERSION),
+        )
+        .await
+    }
 }
 
 fn build_body(request: &ChatRequest) -> Value {

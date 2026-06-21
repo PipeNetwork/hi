@@ -167,6 +167,12 @@ impl Agent {
         self.config.verify_command.as_deref()
     }
 
+    /// The model ids the current provider/endpoint actually serves (via its
+    /// `/models` route) — for the `/model` picker. Empty if unsupported.
+    pub async fn list_models(&self) -> Result<Vec<String>> {
+        self.provider.list_models().await
+    }
+
     /// Set or clear the verify command applied to subsequent turns.
     pub fn set_verify_command(&mut self, cmd: Option<String>) {
         self.config.verify_command = cmd;

@@ -7,12 +7,42 @@
 
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use futures_util::{Stream, StreamExt};
 use reqwest::{RequestBuilder, Response, StatusCode};
+use serde::Deserialize;
 
 const MAX_RETRIES: u32 = 3;
 const BASE_DELAY_MS: u64 = 250;
+
+#[derive(Deserialize)]
+struct ModelsList {
+    data: Vec<ModelEntry>,
+}
+#[derive(Deserialize)]
+struct ModelEntry {
+    id: String,
+}
+
+/// GET an OpenAI/Anthropic-style `/models` list from an already-authenticated
+/// request and return the served model ids — what the *current endpoint*
+/// actually offers, as opposed to the static models.dev catalog. Bounded by a
+/// short timeout so a hung endpoint (e.g. a flaky provider) can't wedge the
+/// caller; on timeout the caller falls back to the catalog.
+pub async fn fetch_model_ids(builder: RequestBuilder) -> Result<Vec<String>> {
+    let fetch = async {
+        let resp = send_with_retry(builder).await?;
+        if !resp.status().is_success() {
+            bail!("models endpoint returned {}", resp.status());
+        }
+        let list: ModelsList = resp.json().await.context("parsing models list")?;
+        Ok(list.data.into_iter().map(|m| m.id).collect())
+    };
+    match tokio::time::timeout(Duration::from_secs(6), fetch).await {
+        Ok(result) => result,
+        Err(_) => bail!("models request timed out after 6s"),
+    }
+}
 
 /// Give up on a stream if the model produces no output — content, reasoning, or
 /// tool tokens — for this long (default 120s, override with `HI_STREAM_TIMEOUT`
@@ -90,4 +120,21 @@ fn is_retryable_error(err: &reqwest::Error) -> bool {
 async fn backoff(attempt: u32) {
     let delay = BASE_DELAY_MS * 2u64.pow(attempt - 1);
     tokio::time::sleep(Duration::from_millis(delay)).await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_openai_style_models_list() {
+        // Extra fields (object, created, …) are ignored; only `data[].id` matters.
+        let json = r#"{"object":"list","data":[
+            {"id":"ipop/coder-balanced","object":"model","created":1},
+            {"id":"another-model"}
+        ]}"#;
+        let list: ModelsList = serde_json::from_str(json).unwrap();
+        let ids: Vec<String> = list.data.into_iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec!["ipop/coder-balanced", "another-model"]);
+    }
 }

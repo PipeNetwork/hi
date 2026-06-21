@@ -72,6 +72,13 @@ impl Provider for FallbackProvider {
         // The loop always returns on the last backend; this is unreachable.
         unreachable!("fallback chain exhausted without returning")
     }
+
+    async fn list_models(&self) -> Result<Vec<String>> {
+        match self.chain.first() {
+            Some(backend) => backend.provider.list_models().await,
+            None => Ok(Vec::new()),
+        }
+    }
 }
 
 #[cfg(test)]

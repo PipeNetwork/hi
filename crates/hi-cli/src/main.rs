@@ -336,6 +336,30 @@ async fn repl(agent: &mut Agent, settings: &Settings, registry: &Registry) -> Re
                                 continue;
                             }
                         },
+                        // `/model` with no id: list what the provider actually serves.
+                        Command::Model(id) if id.is_empty() => {
+                            match agent.list_models().await {
+                                Ok(mut models) if !models.is_empty() => {
+                                    models.sort();
+                                    println!(
+                                        "\x1b[2mmodels served by this endpoint (current: {}):\x1b[0m",
+                                        agent.model()
+                                    );
+                                    for m in &models {
+                                        let mark = if *m == agent.model() { "▶" } else { " " };
+                                        println!("  {mark} {m}");
+                                    }
+                                    println!("\x1b[2m/model <id> to switch\x1b[0m");
+                                }
+                                _ => {
+                                    println!(
+                                        "model: {}\n\x1b[2m(couldn't list endpoint models; /model <id> to switch)\x1b[0m",
+                                        agent.model()
+                                    );
+                                }
+                            }
+                            continue;
+                        }
                         other => {
                             handle_command(agent, other, registry);
                             continue;

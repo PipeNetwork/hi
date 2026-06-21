@@ -18,4 +18,10 @@ pub trait Provider: Send + Sync {
         request: ChatRequest,
         sink: &mut (dyn FnMut(StreamEvent) + Send),
     ) -> Result<Completion>;
+
+    /// The model ids this endpoint actually serves (via its `/models` route).
+    /// Default: empty, so callers fall back to the static models.dev catalog.
+    async fn list_models(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
 }
