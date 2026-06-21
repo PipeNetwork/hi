@@ -63,6 +63,8 @@ const CONFIGS: &[Config] = &[
 
 struct RunResult {
     config: &'static str,
+    task: String,
+    trial: usize,
     passed: bool,
     candidates: usize,
     cost_usd: f64,
@@ -103,6 +105,15 @@ fn main() -> Result<()> {
         bail!("no configs match --configs; known: baseline, verify, best-of-3");
     }
 
+    // --trials=N repeats the whole matrix N times so the summary can report a
+    // mean ± spread and pass@k (single runs are too noisy to trust).
+    let trials: usize = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--trials="))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1)
+        .max(1);
+
     let tasks = discover_tasks(Path::new(&tasks_dir))?;
     if tasks.is_empty() {
         bail!("no tasks (with task.toml) found under {tasks_dir}");
@@ -115,32 +126,39 @@ fn main() -> Result<()> {
     let hi = find_hi()?;
     let model = std::env::var("HI_MODEL").unwrap_or_else(|_| "(unset)".into());
     eprintln!(
-        "hi-eval: {} task(s) × {} config(s) · model={model} · hi={}",
+        "hi-eval: {} task(s) × {} config(s) × {trials} trial(s) · model={model} · hi={}",
         tasks.len(),
         active.len(),
         hi.display()
     );
 
     let mut results = Vec::new();
-    for (dir, task) in &tasks {
-        let label = task.name.clone().unwrap_or_else(|| dir_name(dir));
-        for config in &active {
-            let result = run_config(&hi, dir, task, config)
-                .with_context(|| format!("running task '{label}' [{}]", config.name))?;
-            eprintln!(
-                "  {:10} {:4} {label}  ({} cand, {} tok, ${:.4}, {:.1}s)",
-                config.name,
-                if result.passed { "PASS" } else { "FAIL" },
-                result.candidates,
-                result.tokens,
-                result.cost_usd,
-                result.seconds
-            );
-            results.push(result);
+    for trial in 0..trials {
+        if trials > 1 {
+            eprintln!("--- trial {}/{trials} ---", trial + 1);
+        }
+        for (dir, task) in &tasks {
+            let label = task.name.clone().unwrap_or_else(|| dir_name(dir));
+            for config in &active {
+                let mut result = run_config(&hi, dir, task, config)
+                    .with_context(|| format!("running task '{label}' [{}]", config.name))?;
+                result.task = label.clone();
+                result.trial = trial;
+                eprintln!(
+                    "  {:10} {:4} {label}  ({} cand, {} tok, ${:.4}, {:.1}s)",
+                    config.name,
+                    if result.passed { "PASS" } else { "FAIL" },
+                    result.candidates,
+                    result.tokens,
+                    result.cost_usd,
+                    result.seconds
+                );
+                results.push(result);
+            }
         }
     }
 
-    print_summary(&results, tasks.len(), &active);
+    print_summary(&results, tasks.len(), &active, trials);
     Ok(())
 }
 
@@ -211,6 +229,8 @@ fn verify_in(dir: &Path, cmd: &str) -> bool {
 fn run_config(hi: &Path, task_dir: &Path, task: &Task, config: &Config) -> Result<RunResult> {
     let mut result = RunResult {
         config: config.name,
+        task: String::new(),
+        trial: 0,
         passed: false,
         candidates: config.temperatures.len(),
         cost_usd: 0.0,
@@ -285,24 +305,53 @@ fn run_candidate(
     })
 }
 
-fn print_summary(results: &[RunResult], task_count: usize, active: &[&Config]) {
-    println!("\n=== Results ({task_count} tasks) ===");
+fn print_summary(results: &[RunResult], task_count: usize, active: &[&Config], trials: usize) {
+    println!("\n=== Results ({task_count} tasks × {trials} trial(s)) ===");
     println!(
-        "{:<10} {:>8} {:>6} {:>10} {:>10}",
-        "config", "pass", "cand", "cost", "tokens"
+        "{:<10} {:>14} {:>8} {:>6} {:>11} {:>10}",
+        "config", "pass@1", "pass@k", "cand", "tok/trial", "$/trial"
     );
     for config in active {
         let rows: Vec<&RunResult> = results.iter().filter(|r| r.config == config.name).collect();
-        let passed = rows.iter().filter(|r| r.passed).count();
-        let cost: f64 = rows.iter().map(|r| r.cost_usd).sum();
-        let tokens: u64 = rows.iter().map(|r| r.tokens).sum();
+
+        // Tasks passed per trial → mean ± spread (pass@1, with error bars).
+        let mut per_trial = vec![0usize; trials];
+        for r in &rows {
+            if r.passed {
+                per_trial[r.trial] += 1;
+            }
+        }
+        let mean = per_trial.iter().sum::<usize>() as f64 / trials as f64;
+        let std = (per_trial
+            .iter()
+            .map(|&c| (c as f64 - mean).powi(2))
+            .sum::<f64>()
+            / trials as f64)
+            .sqrt();
+        let pass1 = if trials == 1 {
+            format!("{}/{task_count}", per_trial[0])
+        } else {
+            format!("{mean:.1}±{std:.1}/{task_count}")
+        };
+
+        // pass@k: tasks solved by at least one trial (the capability ceiling).
+        let mut solved: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for r in &rows {
+            if r.passed {
+                solved.insert(r.task.as_str());
+            }
+        }
+
+        let tokens: u64 = rows.iter().map(|r| r.tokens).sum::<u64>() / trials as u64;
+        let cost: f64 = rows.iter().map(|r| r.cost_usd).sum::<f64>() / trials as f64;
         println!(
-            "{:<10} {:>8} {:>6} {:>10} {:>10}",
+            "{:<10} {:>14} {:>8} {:>6} {:>11} {:>10}",
             config.name,
-            format!("{passed}/{}", rows.len()),
+            pass1,
+            format!("{}/{task_count}", solved.len()),
             config.temperatures.len(),
-            format!("${cost:.4}"),
-            tokens
+            tokens,
+            format!("${cost:.4}")
         );
     }
 }
