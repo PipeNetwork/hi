@@ -13,7 +13,7 @@ use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-use hi_agent::{Agent, AgentConfig};
+use hi_agent::{Agent, AgentConfig, CompactionKind};
 use hi_ai::{
     AnthropicProvider, Backend, FallbackProvider, Message, OpenAiProvider, Provider, Registry,
 };
@@ -110,6 +110,13 @@ async fn main() -> Result<()> {
         max_verify_iterations: cli.max_verify,
         max_steps: cli.max_steps,
         auto_compact: !cli.no_auto_compact,
+        compaction: cli
+            .compaction
+            .as_deref()
+            .and_then(CompactionKind::from_arg)
+            .unwrap_or(CompactionKind::Hybrid {
+                keep_recent: hi_agent::DEFAULT_KEEP_RECENT,
+            }),
     };
     let mut agent = match history {
         Some(history) => Agent::resume(provider, agent_config, history),
@@ -319,10 +326,14 @@ async fn repl(agent: &mut Agent, settings: &Settings, registry: &Registry) -> Re
                 let input = if let Some(command) = hi_agent::command::parse(&line) {
                     match command {
                         Command::Quit => break,
-                        Command::Compact => {
+                        Command::Compact(arg) => {
+                            let kind = CompactionKind::from_arg(&arg)
+                                .unwrap_or_else(|| agent.compaction_kind());
                             let progress = Arc::new(AtomicBool::new(false));
                             let mut plain = PlainUi::with_progress(progress.clone());
-                            let _ = drive_with_spinner(agent.compact(&mut plain), &progress).await;
+                            let _ =
+                                drive_with_spinner(agent.compact_with(kind, &mut plain), &progress)
+                                    .await;
                             continue;
                         }
                         Command::Retry => match last_prompt.clone() {
@@ -508,7 +519,7 @@ fn handle_command(agent: &mut Agent, command: hi_agent::Command, registry: &Regi
         },
         Command::Diff => println!("{}", hi_tools::working_tree_diff()),
         // Handled in the repl loop (async / runs a turn); never reach here.
-        Command::Compact | Command::Retry | Command::Undo => {}
+        Command::Compact(_) | Command::Retry | Command::Undo => {}
         Command::Unknown(name) => {
             eprintln!("\x1b[33munknown command /{name}; try /help\x1b[0m");
         }

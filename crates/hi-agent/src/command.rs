@@ -15,8 +15,9 @@ pub enum Command {
     Verify(String),
     /// Show what's changed in the working tree (git diff).
     Diff,
-    /// Summarize the conversation so far and reset the live context to it.
-    Compact,
+    /// Reclaim context. Empty arg = configured strategy; `full`/`hybrid`/`elide`
+    /// pick one explicitly.
+    Compact(String),
     /// Re-run the last user message (after truncating its previous attempt).
     Retry,
     /// Revert the file changes the last turn made (from its git checkpoint).
@@ -41,7 +42,7 @@ pub fn parse(line: &str) -> Option<Command> {
         "tokens" | "usage" | "cost" => Command::Tokens,
         "verify" | "test" => Command::Verify(arg),
         "diff" | "changes" => Command::Diff,
-        "compact" => Command::Compact,
+        "compact" => Command::Compact(arg),
         "retry" | "redo" => Command::Retry,
         "undo" | "revert" => Command::Undo,
         "exit" | "quit" | "q" => Command::Quit,
@@ -56,7 +57,7 @@ commands:
   /model [id]        show or switch the model
   /verify [cmd|off]  show/set/clear the test command turns iterate against
   /diff              show what files have changed (git diff)
-  /compact           summarize the conversation to reclaim context
+  /compact [kind]    reclaim context (kind: hybrid, full, or elide)
   /retry             re-run your last message
   /undo              revert the file changes from the last turn
   /tokens            cumulative token usage this session
@@ -83,7 +84,11 @@ mod tests {
         );
         assert_eq!(parse("/verify"), Some(Command::Verify(String::new())));
         assert_eq!(parse("/diff"), Some(Command::Diff));
-        assert_eq!(parse("/compact"), Some(Command::Compact));
+        assert_eq!(parse("/compact"), Some(Command::Compact(String::new())));
+        assert_eq!(
+            parse("/compact hybrid"),
+            Some(Command::Compact("hybrid".into()))
+        );
         assert_eq!(parse("/redo"), Some(Command::Retry));
         assert_eq!(parse("/undo"), Some(Command::Undo));
         assert_eq!(parse("/bogus"), Some(Command::Unknown("bogus".into())));

@@ -196,6 +196,13 @@ impl ToolOutput {
     }
 }
 
+/// Whether a tool only observes state, with no side effects — so several can
+/// run concurrently within one round. The mutating/effecting tools (`write`,
+/// `edit`, `bash`) are excluded, since order and isolation matter for them.
+pub fn is_read_only(name: &str) -> bool {
+    matches!(name, "read" | "list" | "grep")
+}
+
 /// Execute a tool by name. Tool failures are returned as content (not errors)
 /// so the model sees them and can recover, rather than aborting the turn.
 pub async fn execute(name: &str, arguments: &str) -> ToolOutput {
@@ -298,23 +305,37 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// A compact colored diff (changed lines only) for UI display.
+/// A compact colored diff (changed lines only) for UI display, led by a bold
+/// one-line summary of how many lines were added and removed — so a write/edit
+/// shows what happened at a glance instead of trailing off into raw diff lines.
 fn diff(before: &str, after: &str) -> String {
     use similar::{ChangeTag, TextDiff};
-    let mut out = String::new();
+    let mut body = String::new();
+    let (mut adds, mut dels) = (0usize, 0usize);
     for change in TextDiff::from_lines(before, after).iter_all_changes() {
         let (sign, color) = match change.tag() {
-            ChangeTag::Delete => ("-", "\x1b[31m"),
-            ChangeTag::Insert => ("+", "\x1b[32m"),
+            ChangeTag::Delete => {
+                dels += 1;
+                ("-", "\x1b[31m")
+            }
+            ChangeTag::Insert => {
+                adds += 1;
+                ("+", "\x1b[32m")
+            }
             ChangeTag::Equal => continue,
         };
         let line = change.value().trim_end_matches('\n');
-        out.push_str(&format!("{color}{sign} {line}\x1b[0m\n"));
+        body.push_str(&format!("{color}{sign} {line}\x1b[0m\n"));
     }
-    if out.is_empty() {
-        out.push_str("(no changes)");
+    if adds == 0 && dels == 0 {
+        return "(no changes)".to_string();
     }
-    out
+    let plural = |n: usize| if n == 1 { "" } else { "s" };
+    format!(
+        "\x1b[1m{adds} addition{}, {dels} deletion{}\x1b[0m\n{body}",
+        plural(adds),
+        plural(dels)
+    )
 }
 
 /// Replace `old` with `new` in `text`, tolerating the whitespace differences
@@ -525,7 +546,35 @@ struct BashArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::apply_edit;
+    use super::{apply_edit, diff};
+
+    #[test]
+    fn diff_leads_with_a_change_summary() {
+        // The diff a write/edit shows the user must say what changed up front,
+        // not just trail off into raw +/- lines.
+        let out = diff("one\ntwo\n", "one\nTWO\nthree\n");
+        let first = out.lines().next().unwrap();
+        assert!(first.contains("2 additions"), "summary: {first:?}");
+        assert!(first.contains("1 deletion"), "summary: {first:?}");
+        // Singular form when exactly one line changes.
+        let single = diff("a\n", "a\nb\n");
+        assert!(
+            single.lines().next().unwrap().contains("1 addition,"),
+            "singular: {single:?}"
+        );
+        assert_eq!(diff("same\n", "same\n"), "(no changes)");
+    }
+
+    #[test]
+    fn read_only_tools_are_classified() {
+        assert!(super::is_read_only("read"));
+        assert!(super::is_read_only("list"));
+        assert!(super::is_read_only("grep"));
+        // Mutating / effecting tools are not safe to run concurrently.
+        assert!(!super::is_read_only("write"));
+        assert!(!super::is_read_only("edit"));
+        assert!(!super::is_read_only("bash"));
+    }
 
     #[test]
     fn sh_quote_escapes_single_quotes() {

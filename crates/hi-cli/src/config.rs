@@ -84,9 +84,13 @@ pub struct Cli {
     #[arg(long)]
     pub plain: bool,
 
-    /// Disable auto-compaction (summarize-and-reset when the context fills).
+    /// Disable auto-compaction (reclaim context when the window fills).
     #[arg(long)]
     pub no_auto_compact: bool,
+
+    /// Compaction strategy: hybrid (default), full, or elide.
+    #[arg(long, value_name = "KIND")]
+    pub compaction: Option<String>,
 
     /// Verification command run after each turn; on failure the model iterates.
     #[arg(long, value_name = "CMD")]

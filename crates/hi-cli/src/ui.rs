@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use hi_agent::Ui;
-use hi_agent::preview_args;
+use hi_agent::tool_label;
 
 pub struct PlainUi {
     /// Set true on the first real output; the REPL's spinner watches it and
@@ -53,7 +53,7 @@ impl Ui for PlainUi {
 
     fn tool_call(&mut self, name: &str, arguments: &str) {
         self.begin_output();
-        println!("\x1b[36m⏺ {name}({})\x1b[0m", preview_args(arguments));
+        println!("\x1b[36m⏺ {}\x1b[0m", tool_label(name, arguments));
     }
 
     fn tool_result(&mut self, result: &str) {

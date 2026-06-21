@@ -21,8 +21,8 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use futures_util::StreamExt;
-use hi_agent::ui::preview_args;
-use hi_agent::{Agent, Command, Ui, command};
+use hi_agent::ui::tool_label;
+use hi_agent::{Agent, Command, CompactionKind, Ui, command};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
@@ -56,6 +56,9 @@ pub async fn run(
         Terminal::new(CrosstermBackend::new(io::stdout())).context("creating terminal")?;
 
     let mut app = App::new(provider, model);
+    // Seed the context-fill gauge with the model's window so it reads 0% before
+    // the first turn (it refreshes from real usage after each round).
+    app.context_window = registry.metadata(model).1;
     if let Some(path) = &history_path
         && let Ok(text) = std::fs::read_to_string(path)
     {
@@ -70,7 +73,25 @@ pub async fn run(
          Ctrl-C interrupts, /exit quits.",
         dim(),
     ));
-    let mut events = EventStream::new();
+    // Read terminal events in a dedicated task and forward them over a channel.
+    // A channel receiver is fully cancel-safe, so the per-tick redraws in the
+    // loops below can't drop or delay a keystroke — which repeatedly cancelling
+    // an `EventStream::next()` future inside `select!` can.
+    let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Event>();
+    tokio::spawn(async move {
+        let mut events = EventStream::new();
+        loop {
+            match events.next().await {
+                Some(Ok(event)) => {
+                    if input_tx.send(event).is_err() {
+                        break; // main loop gone — stop reading
+                    }
+                }
+                Some(Err(_)) => continue, // skip a malformed event, keep reading
+                None => break,            // stdin closed
+            }
+        }
+    });
     let mut ticker = tokio::time::interval(TICK);
 
     'session: loop {
@@ -80,54 +101,52 @@ pub async fn run(
             Some(queued) => queued,
             None => 'input: loop {
                 terminal.draw(|f| app.render(f))?;
-                tokio::select! {
-                    maybe = events.next() => {
-                        match maybe {
-                            // A paste arrives as one event — insert it literally
-                            // (newlines and all) instead of submitting each line.
-                            Some(Ok(Event::Paste(text))) => app.input.insert_str(&text),
-                            // While the model picker is open, keys drive it.
-                            Some(Ok(Event::Key(key)))
-                                if key.kind == KeyEventKind::Press && app.picker.is_some() =>
-                            {
-                                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                                match key.code {
-                                    KeyCode::Enter => app.pick_model(agent, registry),
-                                    KeyCode::Esc => app.picker = None,
-                                    KeyCode::Char('c') if ctrl => app.picker = None,
-                                    // Navigation/filter: a fresh borrow, no app-level action.
-                                    code => {
-                                        let picker = app.picker.as_mut().unwrap();
-                                        match code {
-                                            KeyCode::Up => picker.up(),
-                                            KeyCode::Down => picker.down(),
-                                            KeyCode::PageUp => picker.page_up(),
-                                            KeyCode::PageDown => picker.page_down(),
-                                            KeyCode::Backspace => picker.backspace(),
-                                            KeyCode::Char(c) if !ctrl => picker.insert(c),
-                                            _ => {}
-                                        }
-                                    }
+                // Block on the next event. Nothing animates while idle, so there's
+                // no tick to race — every keystroke is handled the instant it lands.
+                let Some(event) = input_rx.recv().await else {
+                    break 'session; // input channel closed (stdin gone)
+                };
+                match event {
+                    // A paste arrives as one event — insert it literally
+                    // (newlines and all) instead of submitting each line.
+                    Event::Paste(text) => app.input.insert_str(&text),
+                    // While the model picker is open, keys drive it.
+                    Event::Key(key) if key.kind == KeyEventKind::Press && app.picker.is_some() => {
+                        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                        match key.code {
+                            KeyCode::Enter => app.pick_model(agent, registry),
+                            KeyCode::Esc => app.picker = None,
+                            KeyCode::Char('c') if ctrl => app.picker = None,
+                            // Navigation/filter: a fresh borrow, no app-level action.
+                            code => {
+                                let picker = app.picker.as_mut().unwrap();
+                                match code {
+                                    KeyCode::Up => picker.up(),
+                                    KeyCode::Down => picker.down(),
+                                    KeyCode::PageUp => picker.page_up(),
+                                    KeyCode::PageDown => picker.page_down(),
+                                    KeyCode::Backspace => picker.backspace(),
+                                    KeyCode::Char(c) if !ctrl => picker.insert(c),
+                                    _ => {}
                                 }
                             }
-                            Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                                match key.code {
-                                    KeyCode::Char('d') if ctrl && app.input.is_empty() => break 'session,
-                                    KeyCode::Char('c') if ctrl => app.input.clear(),
-                                    KeyCode::Esc if app.input.is_empty() => break 'session,
-                                    KeyCode::Esc => app.input.clear(),
-                                    _ => {
-                                        if let Some(line) = app.edit_key(&key) {
-                                            break 'input line;
-                                        }
-                                    }
-                                }
-                            }
-                            _ => {}
                         }
                     }
-                    _ = ticker.tick() => {}
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                        match key.code {
+                            KeyCode::Char('d') if ctrl && app.input.is_empty() => break 'session,
+                            KeyCode::Char('c') if ctrl => app.input.clear(),
+                            KeyCode::Esc if app.input.is_empty() => break 'session,
+                            KeyCode::Esc => app.input.clear(),
+                            _ => {
+                                if let Some(line) = app.edit_key(&key) {
+                                    break 'input line;
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
             },
         };
@@ -138,14 +157,16 @@ pub async fn run(
         let run_line = if let Some(cmd) = command::parse(&line) {
             match cmd {
                 Command::Quit => break,
-                Command::Compact => {
+                Command::Compact(arg) => {
+                    let kind =
+                        CompactionKind::from_arg(&arg).unwrap_or_else(|| agent.compaction_kind());
                     app.set_working(true);
                     app.follow();
                     let (tx, rx) = mpsc::unbounded_channel();
                     let mut sink = ChannelUi { tx };
                     {
-                        let fut = agent.compact(&mut sink);
-                        drive(&mut terminal, &mut events, &mut ticker, &mut app, rx, fut).await?;
+                        let fut = agent.compact_with(kind, &mut sink);
+                        drive(&mut terminal, &mut input_rx, &mut ticker, &mut app, rx, fut).await?;
                     }
                     app.set_working(false);
                     app.follow();
@@ -189,8 +210,8 @@ pub async fn run(
                             tokio::select! {
                                 result = &mut fut => { fetched = Some(result); break; }
                                 _ = ticker.tick() => app.spinner = app.spinner.wrapping_add(1),
-                                maybe = events.next() => {
-                                    if let Some(Ok(Event::Key(key))) = maybe
+                                maybe = input_rx.recv() => {
+                                    if let Some(Event::Key(key)) = maybe
                                         && key.kind == KeyEventKind::Press
                                     {
                                         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -259,7 +280,7 @@ pub async fn run(
         let mut sink = ChannelUi { tx };
         let cancelled = {
             let fut = agent.run_turn(&run_line, &mut sink);
-            drive(&mut terminal, &mut events, &mut ticker, &mut app, rx, fut).await?
+            drive(&mut terminal, &mut input_rx, &mut ticker, &mut app, rx, fut).await?
         };
 
         if cancelled {
@@ -293,7 +314,7 @@ pub async fn run(
 /// user scroll/queue/cancel. Returns whether the user cancelled with Ctrl-C.
 async fn drive(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    events: &mut EventStream,
+    input: &mut mpsc::UnboundedReceiver<Event>,
     ticker: &mut tokio::time::Interval,
     app: &mut App,
     mut rx: mpsc::UnboundedReceiver<UiEvent>,
@@ -316,17 +337,23 @@ async fn drive(
             }
             Some(event) = rx.recv() => app.apply(event),
             _ = ticker.tick() => app.spinner = app.spinner.wrapping_add(1),
-            maybe = events.next() => {
+            maybe = input.recv() => {
                 match maybe {
-                    Some(Ok(Event::Paste(text))) => app.input.insert_str(&text),
-                    Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                    Some(Event::Paste(text)) => app.input.insert_str(&text),
+                    Some(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                         match key.code {
                             KeyCode::Char('c') if ctrl => { cancelled = true; break; }
                             KeyCode::Esc => app.input.clear(),
-                            // Typing while a turn runs queues the next command.
-                            _ => if let Some(queued) = app.edit_key(&key) {
-                                app.queue.push_back(queued);
+                            // Typing while a turn runs queues the next command —
+                            // except `/tokens`, which reads the live counter and
+                            // runs in sync so you can watch usage climb mid-turn.
+                            _ => if let Some(submitted) = app.edit_key(&key) {
+                                if matches!(command::parse(&submitted), Some(Command::Tokens)) {
+                                    app.report_tokens();
+                                } else {
+                                    app.queue.push_back(submitted);
+                                }
                             }
                         }
                     }
@@ -355,6 +382,12 @@ enum UiEvent {
     ToolCall(String, String),
     ToolResult(String),
     Status(String),
+    Usage {
+        input: u64,
+        output: u64,
+        ctx_used: u64,
+        ctx_window: Option<u32>,
+    },
     TurnEnd(String),
 }
 
@@ -389,6 +422,20 @@ impl Ui for ChannelUi {
     fn status(&mut self, text: &str) {
         self.send(UiEvent::Status(text.to_string()));
     }
+    fn usage(
+        &mut self,
+        input_tokens: u64,
+        output_tokens: u64,
+        context_used: u64,
+        context_window: Option<u32>,
+    ) {
+        self.send(UiEvent::Usage {
+            input: input_tokens,
+            output: output_tokens,
+            ctx_used: context_used,
+            ctx_window: context_window,
+        });
+    }
     fn turn_end(&mut self, summary: &str) {
         self.send(UiEvent::TurnEnd(summary.to_string()));
     }
@@ -398,8 +445,12 @@ struct App {
     provider: String,
     model: String,
     transcript: Vec<Line<'static>>,
-    /// The in-progress streamed line: (style, text). Committed on newline/end.
-    pending: Option<(Style, String)>,
+    /// The in-progress streamed line: (style, markdown?, text). Committed on
+    /// newline/end. `markdown` is set for assistant prose so it's rendered with
+    /// light markdown styling; reasoning and other streams stay literal.
+    pending: Option<(Style, bool, String)>,
+    /// Whether the streamed assistant text is currently inside a ``` fence.
+    in_code_block: bool,
     input: InputLine,
     /// Lines scrolled up from the bottom (0 = following the latest output).
     scroll_up: u16,
@@ -419,6 +470,13 @@ struct App {
     /// When set, a model-list fetch is in flight (start time, for the spinner).
     fetching: Option<Instant>,
     status: String,
+    /// Cumulative session token usage (input, output), mirrored from the agent
+    /// so the working line and `/tokens` can show it live while a turn runs.
+    usage: (u64, u64),
+    /// Current context occupancy (tokens of the last request) and the model's
+    /// window, for the live context-fill gauge.
+    context_used: u64,
+    context_window: Option<u32>,
 }
 
 impl App {
@@ -428,6 +486,7 @@ impl App {
             model: model.to_string(),
             transcript: Vec::new(),
             pending: None,
+            in_code_block: false,
             input: InputLine::default(),
             scroll_up: 0,
             working: false,
@@ -439,7 +498,16 @@ impl App {
             picker: None,
             fetching: None,
             status: String::new(),
+            usage: (0, 0),
+            context_used: 0,
+            context_window: None,
         }
+    }
+
+    /// Percent of the context window currently occupied, when the window is known.
+    fn context_pct(&self) -> Option<u64> {
+        let window = u64::from(self.context_window?);
+        (window > 0).then(|| (self.context_used * 100 / window).min(100))
     }
 
     /// Apply the picker's current selection as the model, then close it.
@@ -451,6 +519,7 @@ impl App {
             let (price, context_window) = registry.metadata(&id);
             agent.set_model(id.clone(), price, context_window);
             self.model = id.clone();
+            self.context_window = context_window;
             self.push(Line::styled(format!("model set to {id}"), dim()));
         }
         self.picker = None;
@@ -502,6 +571,22 @@ impl App {
         self.scroll_up = 0;
     }
 
+    /// Push the cumulative-usage line from the live counters. Works mid-turn —
+    /// when the agent itself is borrowed by the running turn — because it reads
+    /// the mirrored `usage` rather than the agent.
+    fn report_tokens(&mut self) {
+        let (input, output) = self.usage;
+        let mut line = format!(
+            "cumulative: {input} in · {output} out · {} total",
+            input + output
+        );
+        if let Some(pct) = self.context_pct() {
+            line.push_str(&format!("  ·  context {pct}% full"));
+        }
+        self.push(Line::styled(line, dim()));
+        self.follow();
+    }
+
     fn scroll_up(&mut self, n: u16) {
         self.scroll_up = self.scroll_up.saturating_add(n);
     }
@@ -512,38 +597,57 @@ impl App {
 
     /// Commit the in-progress streamed line, if any.
     fn flush_pending(&mut self) {
-        if let Some((style, text)) = self.pending.take() {
-            self.transcript.push(Line::styled(text, style));
+        if let Some((style, markdown, text)) = self.pending.take() {
+            let line = if markdown {
+                markdown_line(&text, &mut self.in_code_block)
+            } else {
+                Line::styled(text, style)
+            };
+            self.transcript.push(line);
         }
     }
 
-    /// Append streamed text under `style`, committing complete lines.
-    fn stream(&mut self, style: Style, chunk: &str) {
-        // A style change ends the current line.
-        if let Some((prev, _)) = &self.pending
-            && *prev != style
+    /// Append streamed text under `style`, committing complete lines. When
+    /// `markdown` is set, committed lines are rendered with light markdown
+    /// styling (headings, bullets, code fences, inline emphasis).
+    fn stream(&mut self, style: Style, markdown: bool, chunk: &str) {
+        // A style/kind change ends the current line.
+        if let Some((prev, prev_md, _)) = &self.pending
+            && (*prev != style || *prev_md != markdown)
         {
             self.flush_pending();
         }
-        let (_, buf) = self.pending.get_or_insert_with(|| (style, String::new()));
+        let (_, _, buf) = self
+            .pending
+            .get_or_insert_with(|| (style, markdown, String::new()));
         buf.push_str(chunk);
         while let Some(idx) = buf.find('\n') {
             let committed: String = buf[..idx].to_string();
             buf.drain(..=idx);
-            self.transcript.push(Line::styled(committed, style));
+            let line = if markdown {
+                markdown_line(&committed, &mut self.in_code_block)
+            } else {
+                Line::styled(committed, style)
+            };
+            self.transcript.push(line);
         }
         self.follow();
     }
 
     fn apply(&mut self, event: UiEvent) {
         match event {
-            UiEvent::Text(t) => self.stream(Style::default(), &t),
-            UiEvent::Reasoning(t) => self.stream(dim(), &t),
-            UiEvent::AssistantEnd => self.flush_pending(),
+            UiEvent::Text(t) => self.stream(Style::default(), true, &t),
+            UiEvent::Reasoning(t) => self.stream(dim(), false, &t),
+            UiEvent::AssistantEnd => {
+                self.flush_pending();
+                // Fences don't span messages; reset so a stray ``` can't bleed
+                // code styling into the next response.
+                self.in_code_block = false;
+            }
             UiEvent::ToolCall(name, args) => {
                 self.flush_pending();
                 self.push(Line::styled(
-                    format!("⏺ {name}({})", preview_args(&args)),
+                    format!("⏺ {}", tool_label(&name, &args)),
                     Style::default().fg(Color::Cyan),
                 ));
             }
@@ -554,6 +658,17 @@ impl App {
             UiEvent::Status(s) => {
                 self.flush_pending();
                 self.push(Line::styled(s, Style::default().fg(Color::Blue)));
+            }
+            // Live counters only — no transcript line; the working/title bars read them.
+            UiEvent::Usage {
+                input,
+                output,
+                ctx_used,
+                ctx_window,
+            } => {
+                self.usage = (input, output);
+                self.context_used = ctx_used;
+                self.context_window = ctx_window;
             }
             UiEvent::TurnEnd(summary) => {
                 self.flush_pending();
@@ -594,16 +709,10 @@ impl App {
                 }
             }
             Command::Tokens => {
+                // Sync the live counter from the authoritative totals, then show it.
                 let t = agent.totals();
-                self.push(Line::styled(
-                    format!(
-                        "cumulative: {} in · {} out · {} total",
-                        t.input_tokens,
-                        t.output_tokens,
-                        t.total()
-                    ),
-                    dim(),
-                ));
+                self.usage = (t.input_tokens, t.output_tokens);
+                self.report_tokens();
             }
             Command::Model(id) => {
                 if id.is_empty() {
@@ -614,6 +723,7 @@ impl App {
                     let (price, context_window) = registry.metadata(&id);
                     agent.set_model(id.clone(), price, context_window);
                     self.model = id.clone();
+                    self.context_window = context_window;
                     self.push(Line::styled(format!("model set to {id}"), dim()));
                 }
             }
@@ -621,6 +731,7 @@ impl App {
                 agent.clear_history();
                 self.transcript.clear();
                 self.pending = None;
+                self.in_code_block = false;
                 self.status.clear();
                 self.push(Line::styled("conversation cleared", dim()));
             }
@@ -651,7 +762,7 @@ impl App {
                 }
             }
             // Handled in the event loop (async / runs a turn); never reach here.
-            Command::Compact | Command::Retry | Command::Undo => {}
+            Command::Compact(_) | Command::Retry | Command::Undo => {}
             Command::Unknown(name) => {
                 self.push(Line::styled(
                     format!("unknown command /{name}; try /help"),
@@ -717,10 +828,18 @@ impl App {
 
         // --- Transcript ---
         let title = format!(" hi · {} · {} ", self.provider, self.model);
-        let info = if self.status.is_empty() {
+        // Right-aligned: a persistent context-fill gauge, then the last status.
+        let mut info_parts: Vec<String> = Vec::new();
+        if let Some(pct) = self.context_pct() {
+            info_parts.push(format!("{pct}% ctx"));
+        }
+        if !self.status.is_empty() {
+            info_parts.push(self.status.clone());
+        }
+        let info = if info_parts.is_empty() {
             String::new()
         } else {
-            format!(" {} ", self.status)
+            format!(" {} ", info_parts.join(" · "))
         };
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
@@ -729,7 +848,9 @@ impl App {
             .title_top(Line::from(info).right_aligned());
 
         let mut lines = self.transcript.clone();
-        if let Some((style, text)) = &self.pending {
+        if let Some((style, _markdown, text)) = &self.pending {
+            // The in-progress line shows literally; markdown styling is applied
+            // once the line is committed on its newline.
             lines.push(Line::styled(text.clone(), *style));
         }
         let inner_w = rows[0].width.saturating_sub(2);
@@ -819,9 +940,18 @@ impl App {
             if self.working {
                 let frame_ch = SPINNER[self.spinner % SPINNER.len()];
                 let secs = self.started.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+                let (input, output) = self.usage;
+                // Show the running token total once the first round reports it.
+                let mut stats = String::new();
+                if input + output > 0 {
+                    stats.push_str(&format!(" · ↑{} ↓{}", fmt_count(input), fmt_count(output)));
+                }
+                if let Some(pct) = self.context_pct() {
+                    stats.push_str(&format!(" · {pct}% ctx"));
+                }
                 ilines.push(Line::from(vec![
                     Span::styled(
-                        format!("{frame_ch} working… {secs}s"),
+                        format!("{frame_ch} working… {secs}s{stats}"),
                         Style::default()
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
@@ -854,6 +984,209 @@ impl App {
 
 fn dim() -> Style {
     Style::default().add_modifier(Modifier::DIM)
+}
+
+/// Compact token count for the working line: `1234` → `1.2k`, `45000` → `45k`.
+fn fmt_count(n: u64) -> String {
+    match n {
+        0..=999 => n.to_string(),
+        1000..=9999 => format!("{:.1}k", n as f64 / 1000.0),
+        _ => format!("{}k", n / 1000),
+    }
+}
+
+/// The style for code — inline spans and fenced blocks.
+fn code_style() -> Style {
+    Style::default().fg(Color::Cyan)
+}
+
+/// Render one committed line of assistant markdown into a styled [`Line`].
+/// Block-level constructs (headings, lists, fences, rules, quotes) are detected
+/// per line; `in_code_block` carries the ``` fence state across calls so code
+/// interiors render verbatim. Anything else gets inline emphasis/code styling.
+fn markdown_line(text: &str, in_code_block: &mut bool) -> Line<'static> {
+    let trimmed = text.trim_start();
+
+    // Fenced code: ``` toggles the block; the fence line becomes a dim gutter
+    // (with the language as a caption when opening), interiors show verbatim.
+    if trimmed.starts_with("```") {
+        let opening = !*in_code_block;
+        *in_code_block = !*in_code_block;
+        let lang = trimmed.trim_start_matches('`').trim();
+        let caption = if opening { lang } else { "" };
+        return Line::from(vec![
+            Span::styled("▏ ", dim()),
+            Span::styled(caption.to_string(), dim().add_modifier(Modifier::ITALIC)),
+        ]);
+    }
+    if *in_code_block {
+        return Line::from(vec![Span::styled("▏ ", dim()), Span::raw(text.to_string())]);
+    }
+
+    // Horizontal rule.
+    if is_hr(trimmed) {
+        return Line::styled("─".repeat(40), dim());
+    }
+
+    // Headings: # … ###### → bold, markers stripped.
+    if let Some(rest) = heading_text(trimmed) {
+        return Line::from(inline_spans(
+            rest,
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    // Blockquote.
+    if let Some(rest) = trimmed
+        .strip_prefix("> ")
+        .or_else(|| trimmed.strip_prefix('>'))
+    {
+        let mut spans = vec![Span::styled("▏ ", dim())];
+        spans.extend(inline_spans(rest, dim()));
+        return Line::from(spans);
+    }
+
+    // List items keep their original indentation.
+    let indent = &text[..text.len() - trimmed.len()];
+    if let Some(rest) = bullet_text(trimmed) {
+        let mut spans = vec![Span::raw(format!("{indent}• "))];
+        spans.extend(inline_spans(rest, Style::default()));
+        return Line::from(spans);
+    }
+    if let Some((num, rest)) = numbered_text(trimmed) {
+        let mut spans = vec![Span::styled(
+            format!("{indent}{num}. "),
+            Style::default().add_modifier(Modifier::BOLD),
+        )];
+        spans.extend(inline_spans(rest, Style::default()));
+        return Line::from(spans);
+    }
+
+    // Plain paragraph (keep leading whitespace) with inline formatting.
+    Line::from(inline_spans(text, Style::default()))
+}
+
+/// `---`, `***`, or `___` (3+ of one char) — a horizontal rule.
+fn is_hr(s: &str) -> bool {
+    let s = s.trim_end();
+    s.len() >= 3 && ['-', '*', '_'].iter().any(|&m| s.chars().all(|c| c == m))
+}
+
+/// Strip a leading `#`..`###### `, returning the heading text.
+fn heading_text(s: &str) -> Option<&str> {
+    let hashes = s.len() - s.trim_start_matches('#').len();
+    if (1..=6).contains(&hashes) {
+        return s[hashes..].strip_prefix(' ').map(str::trim_end);
+    }
+    None
+}
+
+/// Strip a leading `- `, `* `, or `+ ` bullet marker.
+fn bullet_text(s: &str) -> Option<&str> {
+    ['-', '*', '+']
+        .iter()
+        .find_map(|&m| s.strip_prefix(m)?.strip_prefix(' '))
+}
+
+/// Split a leading `N. ` / `N) ` ordered-list marker into (number, rest).
+fn numbered_text(s: &str) -> Option<(&str, &str)> {
+    let end = s.find(|c: char| !c.is_ascii_digit())?;
+    if end == 0 {
+        return None;
+    }
+    let rest = s[end..]
+        .strip_prefix(". ")
+        .or_else(|| s[end..].strip_prefix(") "))?;
+    Some((&s[..end], rest))
+}
+
+/// Parse inline `**bold**`, `*italic*`/`_italic_`, and `` `code` `` into styled
+/// spans over `base`. Unmatched markers fall through as literal text.
+fn inline_spans(text: &str, base: Style) -> Vec<Span<'static>> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut plain = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        // `code`
+        if c == '`'
+            && let Some(close) = find_char(&chars, i + 1, '`')
+        {
+            flush_plain(&mut spans, &mut plain, base);
+            spans.push(Span::styled(slice(&chars, i + 1, close), code_style()));
+            i = close + 1;
+            continue;
+        }
+        // **bold**
+        if c == '*'
+            && chars.get(i + 1) == Some(&'*')
+            && let Some(close) = find_double_star(&chars, i + 2)
+        {
+            flush_plain(&mut spans, &mut plain, base);
+            spans.push(Span::styled(
+                slice(&chars, i + 2, close),
+                base.add_modifier(Modifier::BOLD),
+            ));
+            i = close + 2;
+            continue;
+        }
+        // *italic* (not ** and not an empty/space-led run)
+        if c == '*'
+            && chars.get(i + 1) != Some(&'*')
+            && chars.get(i + 1) != Some(&' ')
+            && let Some(close) = find_char(&chars, i + 1, '*')
+            && close > i + 1
+        {
+            flush_plain(&mut spans, &mut plain, base);
+            spans.push(Span::styled(
+                slice(&chars, i + 1, close),
+                base.add_modifier(Modifier::ITALIC),
+            ));
+            i = close + 1;
+            continue;
+        }
+        // _italic_ — word-boundary guarded so snake_case is left alone.
+        if c == '_'
+            && (i == 0 || !chars[i - 1].is_alphanumeric())
+            && let Some(close) = find_char(&chars, i + 1, '_')
+            && close > i + 1
+            && chars.get(close + 1).is_none_or(|c| !c.is_alphanumeric())
+        {
+            flush_plain(&mut spans, &mut plain, base);
+            spans.push(Span::styled(
+                slice(&chars, i + 1, close),
+                base.add_modifier(Modifier::ITALIC),
+            ));
+            i = close + 1;
+            continue;
+        }
+        plain.push(c);
+        i += 1;
+    }
+    flush_plain(&mut spans, &mut plain, base);
+    if spans.is_empty() {
+        spans.push(Span::styled(String::new(), base));
+    }
+    spans
+}
+
+fn slice(chars: &[char], from: usize, to: usize) -> String {
+    chars[from..to].iter().collect()
+}
+
+fn flush_plain(spans: &mut Vec<Span<'static>>, plain: &mut String, base: Style) {
+    if !plain.is_empty() {
+        spans.push(Span::styled(std::mem::take(plain), base));
+    }
+}
+
+fn find_char(chars: &[char], from: usize, target: char) -> Option<usize> {
+    (from..chars.len()).find(|&j| chars[j] == target)
+}
+
+fn find_double_star(chars: &[char], from: usize) -> Option<usize> {
+    (from..chars.len().saturating_sub(1)).find(|&j| chars[j] == '*' && chars[j + 1] == '*')
 }
 
 /// Approximate the number of terminal rows `lines` occupy when wrapped to
@@ -1080,7 +1413,7 @@ mod tests {
         let mut app = App::new("openai", "gpt-4o");
         app.apply(UiEvent::ToolCall(
             "edit".into(),
-            "{\"path\":\"src/cli.rs\"}".into(),
+            "{\"path\":\"src/cli.rs\",\"old_string\":\"a\",\"new_string\":\"b\"}".into(),
         ));
         // ANSI-colored diff line (from the edit tool) must render as text.
         app.apply(UiEvent::ToolResult(
@@ -1094,7 +1427,12 @@ mod tests {
         term.draw(|f| app.render(f)).unwrap();
         let screen = dump(&term);
 
-        assert!(screen.contains("⏺ edit"), "tool call line");
+        // The header reads as "edit <path>", not a raw JSON dump.
+        assert!(screen.contains("⏺ edit src/cli.rs"), "readable tool header");
+        assert!(
+            !screen.contains("old_string"),
+            "header must not dump JSON args"
+        );
         assert!(
             screen.contains("pub json: bool"),
             "ANSI diff rendered as text"
@@ -1108,6 +1446,58 @@ mod tests {
             screen.contains("Ctrl-C to interrupt"),
             "prompt bar shows the interrupt hint while working"
         );
+    }
+
+    #[test]
+    fn fmt_count_humanizes() {
+        assert_eq!(fmt_count(0), "0");
+        assert_eq!(fmt_count(999), "999");
+        assert_eq!(fmt_count(1234), "1.2k");
+        assert_eq!(fmt_count(45000), "45k");
+    }
+
+    #[test]
+    fn usage_event_updates_live_counter_and_working_line() {
+        let mut app = App::new("openai", "gpt-4o");
+        app.set_working(true);
+        app.apply(UiEvent::Usage {
+            input: 1234,
+            output: 340,
+            ctx_used: 64_000,
+            ctx_window: Some(128_000),
+        });
+        assert_eq!(app.usage, (1234, 340));
+        assert_eq!(app.context_pct(), Some(50));
+
+        let mut term = Terminal::new(TestBackend::new(72, 8)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let screen = dump(&term);
+        assert!(screen.contains("working…"), "spinner: {screen}");
+        assert!(screen.contains("↑1.2k"), "live input tokens: {screen}");
+        assert!(screen.contains("↓340"), "live output tokens: {screen}");
+        assert!(screen.contains("50% ctx"), "live context fill: {screen}");
+    }
+
+    #[test]
+    fn report_tokens_pushes_cumulative_line() {
+        // `/tokens` mid-turn reads the mirrored counter (the agent is borrowed).
+        let mut app = App::new("openai", "gpt-4o");
+        app.apply(UiEvent::Usage {
+            input: 1000,
+            output: 250,
+            ctx_used: 0,
+            ctx_window: None,
+        });
+        app.report_tokens();
+        let line: String = app
+            .transcript
+            .last()
+            .unwrap()
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(line, "cumulative: 1000 in · 250 out · 1250 total");
     }
 
     #[test]
@@ -1282,6 +1672,83 @@ mod tests {
         assert!(
             screen.contains("(current)"),
             "marks current model: {screen}"
+        );
+    }
+
+    /// Concatenated text of a rendered line.
+    fn line_text(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// True if any span carrying `needle` has the given modifier.
+    fn span_has(line: &Line, needle: &str, m: Modifier) -> bool {
+        line.spans
+            .iter()
+            .any(|s| s.content.contains(needle) && s.style.add_modifier.contains(m))
+    }
+
+    #[test]
+    fn markdown_headings_bullets_and_rules() {
+        let mut code = false;
+        let h = markdown_line("#### 5. visited reset", &mut code);
+        assert_eq!(
+            line_text(&h),
+            "5. visited reset",
+            "heading markers stripped"
+        );
+        assert!(span_has(&h, "visited", Modifier::BOLD), "heading is bold");
+
+        let b = markdown_line("- Threefold repetition", &mut code);
+        assert_eq!(line_text(&b), "• Threefold repetition", "bullet rewritten");
+
+        let n = markdown_line("7. parse_move accepts", &mut code);
+        assert_eq!(line_text(&n), "7. parse_move accepts", "numbered list kept");
+
+        assert_eq!(line_text(&markdown_line("---", &mut code)), "─".repeat(40));
+    }
+
+    #[test]
+    fn markdown_code_fence_renders_interior_verbatim() {
+        let mut code = false;
+        let open = markdown_line("```rust", &mut code);
+        assert!(code, "fence opens a code block");
+        assert!(line_text(&open).contains("rust"), "lang caption shown");
+
+        // Markdown markers inside a fence are NOT interpreted.
+        let inner = markdown_line("visited[tr][tc] = **true**;", &mut code);
+        assert!(
+            line_text(&inner).contains("**true**"),
+            "code interior is verbatim: {:?}",
+            line_text(&inner)
+        );
+
+        markdown_line("```", &mut code);
+        assert!(!code, "closing fence ends the block");
+    }
+
+    #[test]
+    fn markdown_inline_emphasis_and_code() {
+        let mut code = false;
+        let line = markdown_line("Use **mut** and `Vec` not _that_", &mut code);
+        assert_eq!(
+            line_text(&line),
+            "Use mut and Vec not that",
+            "markers consumed"
+        );
+        assert!(span_has(&line, "mut", Modifier::BOLD), "**bold**");
+        assert!(span_has(&line, "that", Modifier::ITALIC), "_italic_");
+        assert!(
+            line.spans
+                .iter()
+                .any(|s| s.content == "Vec" && s.style.fg == Some(Color::Cyan)),
+            "`code` styled"
+        );
+        // A bare underscore in an identifier must not start italics.
+        let id = markdown_line("call is_empty here", &mut code);
+        assert_eq!(line_text(&id), "call is_empty here");
+        assert!(
+            !span_has(&id, "is_empty", Modifier::ITALIC),
+            "snake_case spared"
         );
     }
 
