@@ -4,6 +4,7 @@
 //! `bash` — not a plugin runtime — so this set stays intentionally small.
 
 pub mod checkpoint;
+pub mod guard;
 
 use std::path::Path;
 use std::time::Duration;
@@ -438,6 +439,14 @@ fn reindent(new: &str, old_indent: &str, file_indent: &str) -> String {
 }
 
 async fn run_bash(command: &str) -> Result<String> {
+    // Refuse the handful of irreversible operations a checkpoint can't undo.
+    if let Some(reason) = guard::catastrophic_op(command) {
+        return Ok(format!(
+            "⚠ refused: this command {reason}. It's blocked as irreversible — the per-turn \
+             checkpoint can't undo it. If it's genuinely needed, ask the user to run it \
+             themselves (they can also set HI_ALLOW_DANGEROUS=1 to disable this guard)."
+        ));
+    }
     let future = Command::new("sh").arg("-c").arg(command).output();
     let output = match tokio::time::timeout(BASH_TIMEOUT, future).await {
         Ok(result) => result.context("failed to spawn command")?,
@@ -535,6 +544,14 @@ mod tests {
     async fn list_includes_source_files() {
         let out = super::execute("list", "{}").await;
         assert!(out.content.contains("lib.rs"), "list: {}", out.content);
+    }
+
+    #[tokio::test]
+    async fn bash_refuses_catastrophic_but_runs_safe() {
+        let refused = super::execute("bash", r#"{"command":"rm -rf /"}"#).await;
+        assert!(refused.content.contains("refused"), "{}", refused.content);
+        let ok = super::execute("bash", r#"{"command":"echo hello-guard"}"#).await;
+        assert!(ok.content.contains("hello-guard"), "{}", ok.content);
     }
 
     #[test]
