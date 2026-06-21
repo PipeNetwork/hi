@@ -184,7 +184,19 @@ Three task tiers: `bench/tasks` (easy bugs), `bench/hard` (edge-case algorithms)
 
 ### What we've measured
 
-On a local 30B coder, easy and hard tiers saturate at 6/6 baseline — a capable model self-verifies via `bash` and aces well-specified tasks. The `bench/spec` tier (unstated conventions the model can't self-test for) is where the loop earns its keep: **baseline 0/3 → verify 2/3.** That gap is the mechanism by which `hi` overperforms a single-shot ensemble like Fusion: ground-truth iteration it can't do. The headline Fusion comparison needs an OpenRouter key and is not yet run.
+`--trials=3` on the 20-task `bench/spec` tier with a local **`qwen2.5:7b`** (Ollama), scored by ground truth — `pass@1` = mean ± std tasks passed per trial; `pass@k` = tasks solved by at least one of the three trials:
+
+| config | pass@1 | pass@k |
+|---|---|---|
+| baseline | 1.3 ± 0.5 / 20 | 2 / 20 |
+| **verify** | **3.0 ± 0.8 / 20** | **5 / 20** |
+
+Verification-in-the-loop more than doubles the local pass rate (the ±std bands don't overlap) and lifts the ceiling from 2 → 5 distinct tasks — ground-truth iteration a single-shot endpoint structurally can't do. That gap is the mechanism by which `hi` aims to overperform an ensemble like Fusion. Two caveats from the same harness, kept honest:
+
+- **Capability gates the payoff.** A coder-tuned `qwen2.5-coder:7b` scored **0/20** — coder-tuning broke its tool-use (it stops emitting edits), a *worse* agent than the general 7b. A larger general `qwen2.5:32b` *is* a competent agent and the lift replicates (it converts `leap-year` baseline-fail → verify-pass), but it's slow (~2–6 min per verify task) and still can't crack the hardest hidden edges (`gcd`, `roman-to-int`).
+- **A tweak that failed its own measurement.** A "reflect-then-fix + don't-repeat" feedback rewrite *lowered* the local verify score (3.0 → 2.0) and was reverted; the simple, direct "compare expected vs actual and fix" feedback wins on a weak model.
+
+The headline Fusion comparison needs an OpenRouter key and is not yet run.
 
 ## Status
 
