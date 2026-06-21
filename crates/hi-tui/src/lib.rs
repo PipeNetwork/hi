@@ -12,7 +12,10 @@ use std::time::{Duration, Instant};
 
 use ansi_to_tui::IntoText;
 use anyhow::{Context, Result};
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEvent,
+    KeyEventKind, KeyModifiers,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -43,6 +46,9 @@ pub async fn run(
 ) -> Result<()> {
     enable_raw_mode().context("entering raw mode")?;
     execute!(io::stdout(), EnterAlternateScreen).context("entering alternate screen")?;
+    // Bracketed paste: the terminal wraps a paste so it arrives as one
+    // Event::Paste instead of per-line Enter keys (which would submit each line).
+    let _ = execute!(io::stdout(), EnableBracketedPaste);
     let _restore = Restore;
     let mut terminal =
         Terminal::new(CrosstermBackend::new(io::stdout())).context("creating terminal")?;
@@ -74,19 +80,25 @@ pub async fn run(
                 terminal.draw(|f| app.render(f))?;
                 tokio::select! {
                     maybe = events.next() => {
-                        let Some(Ok(Event::Key(key))) = maybe else { continue };
-                        if key.kind != KeyEventKind::Press { continue; }
-                        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                        match key.code {
-                            KeyCode::Char('d') if ctrl && app.input.is_empty() => break 'session,
-                            KeyCode::Char('c') if ctrl => app.input.clear(),
-                            KeyCode::Esc if app.input.is_empty() => break 'session,
-                            KeyCode::Esc => app.input.clear(),
-                            _ => {
-                                if let Some(line) = app.edit_key(&key) {
-                                    break 'input line;
+                        match maybe {
+                            // A paste arrives as one event — insert it literally
+                            // (newlines and all) instead of submitting each line.
+                            Some(Ok(Event::Paste(text))) => app.input.insert_str(&text),
+                            Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                                match key.code {
+                                    KeyCode::Char('d') if ctrl && app.input.is_empty() => break 'session,
+                                    KeyCode::Char('c') if ctrl => app.input.clear(),
+                                    KeyCode::Esc if app.input.is_empty() => break 'session,
+                                    KeyCode::Esc => app.input.clear(),
+                                    _ => {
+                                        if let Some(line) = app.edit_key(&key) {
+                                            break 'input line;
+                                        }
+                                    }
                                 }
                             }
+                            _ => {}
                         }
                     }
                     _ = ticker.tick() => {}
@@ -205,18 +217,20 @@ async fn drive(
             Some(event) = rx.recv() => app.apply(event),
             _ = ticker.tick() => app.spinner = app.spinner.wrapping_add(1),
             maybe = events.next() => {
-                if let Some(Ok(Event::Key(key))) = maybe
-                    && key.kind == KeyEventKind::Press
-                {
-                    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                    match key.code {
-                        KeyCode::Char('c') if ctrl => { cancelled = true; break; }
-                        KeyCode::Esc => app.input.clear(),
-                        // Typing while a turn runs queues the next command.
-                        _ => if let Some(queued) = app.edit_key(&key) {
-                            app.queue.push_back(queued);
+                match maybe {
+                    Some(Ok(Event::Paste(text))) => app.input.insert_str(&text),
+                    Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
+                        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                        match key.code {
+                            KeyCode::Char('c') if ctrl => { cancelled = true; break; }
+                            KeyCode::Esc => app.input.clear(),
+                            // Typing while a turn runs queues the next command.
+                            _ => if let Some(queued) = app.edit_key(&key) {
+                                app.queue.push_back(queued);
+                            }
                         }
                     }
+                    _ => {}
                 }
             }
         }
@@ -229,7 +243,7 @@ struct Restore;
 impl Drop for Restore {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
     }
 }
 
@@ -525,14 +539,49 @@ impl App {
         self.follow();
     }
 
+    /// The editable input rendered as one or more lines (the prompt may hold a
+    /// pasted multi-line block), plus the cursor's (row, col) within them. Long
+    /// inputs show only their last [`MAX_INPUT_ROWS`] lines with a "… more above"
+    /// note so they can't swallow the screen.
+    fn input_view(&self) -> (Vec<Line<'static>>, u16, u16) {
+        const MAX_INPUT_ROWS: usize = 10;
+        let text = self.input.text();
+        let before: String = text.chars().take(self.input.cursor()).collect();
+        let cursor_row_full = before.matches('\n').count();
+        let cursor_col = before.chars().rev().take_while(|&c| c != '\n').count() as u16;
+
+        let all: Vec<&str> = text.split('\n').collect();
+        let truncated = all.len() > MAX_INPUT_ROWS;
+        let start = if truncated {
+            all.len() - MAX_INPUT_ROWS
+        } else {
+            0
+        };
+
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        if truncated {
+            lines.push(Line::styled(
+                format!("  ⋮ {start} more line(s) above"),
+                dim(),
+            ));
+        }
+        for (i, seg) in all[start..].iter().enumerate() {
+            let prefix = if i == 0 && !truncated { "› " } else { "  " };
+            lines.push(Line::from(format!("{prefix}{seg}")));
+        }
+        let cursor_row = u16::from(truncated) + cursor_row_full.saturating_sub(start) as u16;
+        (lines, cursor_row, 2 + cursor_col)
+    }
+
     fn render(&self, frame: &mut ratatui::Frame) {
         let area = frame.area();
-        // The input box grows to fit a spinner status line (while working) and
-        // up to three queued commands (plus a "+N more" line).
+        // The input box grows to fit a spinner status line (while working), the
+        // (possibly multi-line) input, and up to three queued commands.
         let status_lines = usize::from(self.working);
         let queued_shown = self.queue.len().min(3);
         let queue_extra = usize::from(self.queue.len() > 3);
-        let input_h = (status_lines + 1 + queued_shown + queue_extra + 2) as u16;
+        let (input_lines, cursor_row, cursor_col) = self.input_view();
+        let input_h = (status_lines + input_lines.len() + queued_shown + queue_extra + 2) as u16;
         let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(input_h)]).split(area);
 
         // --- Transcript ---
@@ -589,7 +638,7 @@ impl App {
                 Span::styled("   Ctrl-C to interrupt", dim()),
             ]));
         }
-        ilines.push(Line::from(format!("› {}", self.input.text())));
+        ilines.extend(input_lines);
         for q in self.queue.iter().take(3) {
             ilines.push(Line::styled(format!("⏳ {q}"), dim()));
         }
@@ -601,10 +650,13 @@ impl App {
         }
         frame.render_widget(Paragraph::new(ilines).block(input_block), rows[1]);
 
-        // Cursor sits on the editable prompt line (below the spinner line, if shown).
-        let cx = rows[1].x + 1 + 2 + self.input.cursor() as u16;
-        let cy = rows[1].y + 1 + status_lines as u16;
-        frame.set_cursor_position((cx.min(rows[1].right().saturating_sub(2)), cy));
+        // Cursor sits within the editable input (below the spinner line, if shown).
+        let cx = rows[1].x + 1 + cursor_col;
+        let cy = rows[1].y + 1 + status_lines as u16 + cursor_row;
+        frame.set_cursor_position((
+            cx.min(rows[1].right().saturating_sub(2)),
+            cy.min(rows[1].bottom().saturating_sub(2)),
+        ));
     }
 }
 
@@ -654,6 +706,16 @@ impl InputLine {
     fn insert(&mut self, c: char) {
         self.chars.insert(self.cursor, c);
         self.cursor += 1;
+    }
+    /// Insert a (possibly multi-line) string at the cursor — used for pastes.
+    /// Line endings are normalized to `\n` so the text submits as one prompt.
+    fn insert_str(&mut self, s: &str) {
+        let normalized = s.replace("\r\n", "\n").replace('\r', "\n");
+        let chars: Vec<char> = normalized.chars().collect();
+        let n = chars.len();
+        self.chars.splice(self.cursor..self.cursor, chars);
+        self.cursor += n;
+        self.history_pos = None;
     }
     fn backspace(&mut self) {
         if self.cursor > 0 {
@@ -863,5 +925,37 @@ mod tests {
         assert_eq!(input.text(), "two");
         input.history_prev();
         assert_eq!(input.text(), "hello");
+    }
+
+    #[test]
+    fn paste_inserts_multiline_as_one_prompt() {
+        // The bug: a pasted block used to submit each line. It must instead
+        // become one multi-line input that submits whole on Enter.
+        let mut input = InputLine::default();
+        input.insert_str("line one\nline two\nline three");
+        assert_eq!(input.text(), "line one\nline two\nline three");
+        assert_eq!(input.submit(), "line one\nline two\nline three");
+    }
+
+    #[test]
+    fn paste_normalizes_crlf() {
+        let mut input = InputLine::default();
+        input.insert_str("a\r\nb\rc");
+        assert_eq!(input.text(), "a\nb\nc");
+    }
+
+    #[test]
+    fn renders_multiline_input() {
+        let mut app = App::new("openai", "gpt-4o");
+        app.input.insert_str("first\nsecond\nthird");
+        let mut term = Terminal::new(TestBackend::new(40, 14)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let screen = dump(&term);
+        assert!(
+            screen.contains("› first"),
+            "first line with prompt: {screen}"
+        );
+        assert!(screen.contains("second"), "second line: {screen}");
+        assert!(screen.contains("third"), "third line: {screen}");
     }
 }
