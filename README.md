@@ -134,6 +134,7 @@ Slash commands (TUI or plain REPL):
 | `/diff` | show what files have changed this session (`git diff` + new files) |
 | `/compact` | summarize the conversation and reset context to the summary (reclaims room on long sessions) |
 | `/retry` | re-run your last message (drops the previous attempt — pairs with `/model`) |
+| `/undo` | revert the file changes the last turn made (restores its git checkpoint) |
 | `/tokens` | cumulative token usage |
 | `/clear` | start a fresh conversation |
 | `/exit` | quit |
@@ -141,6 +142,8 @@ Slash commands (TUI or plain REPL):
 Drop an `HI.md` or `AGENTS.md` in your project and its contents are appended to the system prompt — per-project conventions, for free.
 
 Long sessions **auto-compact**: when the context window passes ~80% full, `hi` summarizes the conversation and resets to that summary before the next turn, so you don't overflow the model mid-task (disable with `--no-auto-compact`; trigger manually any time with `/compact`).
+
+**Undo.** In a git repo, `hi` snapshots the working tree before every turn into a *dangling* commit — built in a throwaway index, so it never touches your branch, staging area, or history. `/undo` restores the latest snapshot, reverting every file the turn created, modified, or deleted in one step. That's what makes running without confirmation prompts safe: anything the agent does to your files is one command away from being undone. (Covers non-ignored files; it can't undo non-file side effects.)
 
 Interactive sessions open a **full-screen TUI** by default (ratatui): a bordered, scrollable transcript with a title bar showing live token/cost, and an input box that turns into a working spinner (with elapsed seconds) while a turn runs. **Keep typing while it works to queue the next command(s)** — they're listed under the prompt and run in order as each turn finishes. Ctrl-C interrupts the current turn (and drops the queue), PgUp/PgDn scrolls, Up/Down recalls history, `/exit` quits. Pass `--plain` (or pipe input) for the line-based REPL.
 

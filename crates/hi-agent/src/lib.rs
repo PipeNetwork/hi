@@ -76,6 +76,8 @@ pub struct Agent {
     /// Input tokens of the most recent model call — a proxy for how full the
     /// context window is, used to decide when to auto-compact.
     context_used: u64,
+    /// Per-turn git checkpoints (working-tree snapshots), for `/undo`.
+    checkpoints: Vec<String>,
 }
 
 impl Agent {
@@ -108,7 +110,19 @@ impl Agent {
             totals: Usage::default(),
             last_verify: None,
             context_used: 0,
+            checkpoints: Vec::new(),
         }
+    }
+
+    /// Revert the file changes the most recent turn made, restoring its git
+    /// checkpoint. Returns `None` if there's nothing to undo, else the number of
+    /// files restored or removed.
+    pub async fn undo(&mut self) -> Result<Option<usize>> {
+        let Some(target) = self.checkpoints.pop() else {
+            return Ok(None);
+        };
+        let n = hi_tools::checkpoint::restore(std::path::Path::new("."), &target).await?;
+        Ok(Some(n))
     }
 
     /// Attach a sink that records messages produced from here on.
@@ -254,6 +268,12 @@ impl Agent {
     /// run; if it fails, its output is fed back and the model iterates, up to
     /// `max_verify_iterations` rounds.
     pub async fn run_turn(&mut self, input: &str, ui: &mut dyn Ui) -> Result<()> {
+        // Snapshot the working tree before this turn touches anything, so `/undo`
+        // can revert it. Best-effort: no-op outside a git repo.
+        if let Some(sha) = hi_tools::checkpoint::create(std::path::Path::new(".")).await {
+            self.checkpoints.push(sha);
+        }
+
         // If the context window is filling up, summarize-and-reset before adding
         // more, so the session keeps going instead of overflowing. Best-effort:
         // a failed compaction just leaves the history as-is.

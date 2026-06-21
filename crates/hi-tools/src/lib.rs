@@ -3,6 +3,8 @@
 //! Richer capabilities come from subprocess CLI tools the model invokes via
 //! `bash` — not a plugin runtime — so this set stays intentionally small.
 
+pub mod checkpoint;
+
 use std::path::Path;
 use std::time::Duration;
 

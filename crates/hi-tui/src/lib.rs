@@ -162,6 +162,17 @@ pub async fn run(
                         continue;
                     }
                 },
+                Command::Undo => {
+                    let msg = match agent.undo().await {
+                        Ok(Some(0)) => "nothing changed to undo".to_string(),
+                        Ok(Some(n)) => format!("↩ undid the last turn — restored {n} file(s)"),
+                        Ok(None) => "nothing to undo".to_string(),
+                        Err(err) => format!("undo failed: {err:#}"),
+                    };
+                    app.push(Line::styled(msg, dim()));
+                    app.follow();
+                    continue;
+                }
                 // Open the picker on the provider's *live* model list (what this
                 // endpoint actually serves), falling back to the static catalog.
                 // The fetch runs behind a spinner so the UI stays responsive and
@@ -638,7 +649,7 @@ impl App {
                 }
             }
             // Handled in the event loop (async / runs a turn); never reach here.
-            Command::Compact | Command::Retry => {}
+            Command::Compact | Command::Retry | Command::Undo => {}
             Command::Unknown(name) => {
                 self.push(Line::styled(
                     format!("unknown command /{name}; try /help"),

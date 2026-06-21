@@ -336,6 +336,19 @@ async fn repl(agent: &mut Agent, settings: &Settings, registry: &Registry) -> Re
                                 continue;
                             }
                         },
+                        Command::Undo => {
+                            match agent.undo().await {
+                                Ok(Some(0)) => println!("\x1b[2mnothing changed to undo\x1b[0m"),
+                                Ok(Some(n)) => {
+                                    println!(
+                                        "\x1b[2m↩ undid the last turn — restored {n} file(s)\x1b[0m"
+                                    )
+                                }
+                                Ok(None) => println!("\x1b[2mnothing to undo\x1b[0m"),
+                                Err(err) => eprintln!("\x1b[33mundo failed: {err:#}\x1b[0m"),
+                            }
+                            continue;
+                        }
                         // `/model` with no id: list what the provider actually serves.
                         Command::Model(id) if id.is_empty() => {
                             match agent.list_models().await {
@@ -495,7 +508,7 @@ fn handle_command(agent: &mut Agent, command: hi_agent::Command, registry: &Regi
         },
         Command::Diff => println!("{}", hi_tools::working_tree_diff()),
         // Handled in the repl loop (async / runs a turn); never reach here.
-        Command::Compact | Command::Retry => {}
+        Command::Compact | Command::Retry | Command::Undo => {}
         Command::Unknown(name) => {
             eprintln!("\x1b[33munknown command /{name}; try /help\x1b[0m");
         }

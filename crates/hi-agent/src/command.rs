@@ -19,6 +19,8 @@ pub enum Command {
     Compact,
     /// Re-run the last user message (after truncating its previous attempt).
     Retry,
+    /// Revert the file changes the last turn made (from its git checkpoint).
+    Undo,
     Quit,
     /// A `/word` that isn't recognized.
     Unknown(String),
@@ -41,6 +43,7 @@ pub fn parse(line: &str) -> Option<Command> {
         "diff" | "changes" => Command::Diff,
         "compact" => Command::Compact,
         "retry" | "redo" => Command::Retry,
+        "undo" | "revert" => Command::Undo,
         "exit" | "quit" | "q" => Command::Quit,
         other => Command::Unknown(other.to_string()),
     })
@@ -55,6 +58,7 @@ commands:
   /diff              show what files have changed (git diff)
   /compact           summarize the conversation to reclaim context
   /retry             re-run your last message
+  /undo              revert the file changes from the last turn
   /tokens            cumulative token usage this session
   /clear             start a fresh conversation
   /exit              quit";
@@ -81,6 +85,7 @@ mod tests {
         assert_eq!(parse("/diff"), Some(Command::Diff));
         assert_eq!(parse("/compact"), Some(Command::Compact));
         assert_eq!(parse("/redo"), Some(Command::Retry));
+        assert_eq!(parse("/undo"), Some(Command::Undo));
         assert_eq!(parse("/bogus"), Some(Command::Unknown("bogus".into())));
     }
 }
