@@ -50,5 +50,5 @@ fn main() {
     println!("budget: {budget} chars\n");
     row("original", &log);
     row("head+tail", &head_tail(&log, budget));
-    row("condensed", &hi_tools::condense_test_output(&log, budget));
+    row("condensed", &hi_tools::condense_diagnostics(&log, budget));
 }

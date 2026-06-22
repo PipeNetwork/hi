@@ -624,39 +624,69 @@ fn truncate(s: &str) -> String {
 
 /// Condense output to the configured budget (test/diagnostic-aware).
 fn condense(s: &str) -> String {
-    condense_test_output(s, *MAX_OUTPUT_CHARS)
+    condense_diagnostics(s, *MAX_OUTPUT_CHARS)
 }
 
-/// Condense test-runner / compiler output: keep the head, every failure/error
-/// line (with a little surrounding context), and the summary, while dropping the
-/// long runs of passing `... ok` noise — so a 4,000-line green run with three
-/// failures collapses to those three failures plus the count. Output that
-/// doesn't look like a test/diagnostic run falls back to plain head+tail
+/// Condense test-runner and compiler output: keep the head, the summary, and
+/// every failure — test failures with a little surrounding context, and whole
+/// compiler-diagnostic blocks (the `error[...]` line plus its `-->` location,
+/// code frame, and notes) — while dropping the long runs of passing `... ok`
+/// noise. A 4,000-line green run with three failures collapses to those three
+/// failures plus the count. Output that doesn't look like a test/diagnostic run,
+/// or that has nothing of interest in its body, falls back to plain head+tail
 /// [`truncate_to`] (don't mangle a file dump).
 ///
 /// Deliberately biased to *over*-keep: a stray noise line surviving is harmless,
 /// but dropping a real failure would send the model after the wrong thing. This
 /// is the "Tier 0" deterministic extractor — no model call, reproducible on the
 /// eval harness.
-pub fn condense_test_output(s: &str, max: usize) -> String {
-    if !looks_like_test_output(s) {
+pub fn condense_diagnostics(s: &str, max: usize) -> String {
+    if !looks_like_diagnostics(s) {
         return truncate_to(s, max);
     }
     let lines: Vec<&str> = s.lines().collect();
     let n = lines.len();
     const HEAD: usize = 4; // the "running N tests" / session preamble
     const TAIL: usize = 6; // the summary line(s) live at the very end
-    const CONTEXT: usize = 2; // lines kept on each side of a signal line
+    const CONTEXT: usize = 2; // lines kept on each side of a test-failure line
+    const MAX_BLOCK: usize = 40; // cap on a single compiler-diagnostic block
 
     let mut keep = vec![false; n];
-    for (i, line) in lines.iter().enumerate() {
-        if i < HEAD || i + TAIL >= n || is_signal_line(line) {
+    // Whether anything in the *body* (past the head, before the tail) was worth
+    // keeping. If not, detection was a false positive — clip normally instead of
+    // emitting a misleading "everything omitted" digest.
+    let mut matched = false;
+    for i in 0..n {
+        let line = lines[i];
+        if starts_diagnostic_block(line) {
+            // Keep the whole multi-line block: rustc/gcc/clang print the location,
+            // code frame, and notes under the `error:` line, ending at a blank
+            // line. Bounded so a pathological block can't run away.
+            matched = true;
+            let end = (i + MAX_BLOCK).min(n);
+            for (off, l) in lines[i..end].iter().enumerate() {
+                if off > 0 && l.trim().is_empty() {
+                    break;
+                }
+                keep[i + off] = true;
+            }
+        } else if is_signal_line(line) {
+            matched = true;
             let lo = i.saturating_sub(CONTEXT);
             let hi = (i + CONTEXT + 1).min(n);
             for slot in keep.iter_mut().take(hi).skip(lo) {
                 *slot = true;
             }
         }
+        // Always keep the head preamble and the trailing summary, wherever the
+        // failures fall — but signals are detected everywhere, so errors sitting
+        // in the tail still mark this as real diagnostics (not a false positive).
+        if i < HEAD || i + TAIL >= n {
+            keep[i] = true;
+        }
+    }
+    if !matched {
+        return truncate_to(s, max);
     }
     // When almost everything is a signal (a wall of failures), there's no green
     // noise to drop — head+tail clip the original rather than pepper it with
@@ -678,7 +708,17 @@ pub fn condense_test_output(s: &str, max: usize) -> String {
             while i < n && !keep[i] {
                 i += 1;
             }
-            out.push_str(&format!("… {} lines omitted …\n", i - start));
+            // A tiny gap (e.g. a blank line between two error blocks) is cheaper
+            // to show than to announce, and keeps the output readable.
+            let gap = i - start;
+            if gap <= 2 {
+                for l in &lines[start..i] {
+                    out.push_str(l);
+                    out.push('\n');
+                }
+            } else {
+                out.push_str(&format!("… {gap} lines omitted …\n"));
+            }
         }
     }
     // Even the condensed view honours the char budget.
@@ -688,20 +728,37 @@ pub fn condense_test_output(s: &str, max: usize) -> String {
 /// Whether output looks like a test run or compiler diagnostics, and so is worth
 /// condensing rather than blind-clipping. Specific markers keep this from firing
 /// on an ordinary command dump.
-fn looks_like_test_output(s: &str) -> bool {
+fn looks_like_diagnostics(s: &str) -> bool {
     let l = s.to_ascii_lowercase();
-    l.contains("test result:")                            // rust libtest summary
-        || l.contains("=== failures ===")                 // pytest
-        || l.contains("short test summary")               // pytest
-        || l.contains("collected ")                       // pytest "collected N items"
+    // Test runners.
+    l.contains("test result:")                             // rust libtest summary
+        || l.contains("=== failures ===")                  // pytest
+        || l.contains("short test summary")                // pytest
+        || l.contains("collected ")                        // pytest "collected N items"
         || (l.contains("running ") && l.contains(" test")) // libtest "running N tests"
-        || l.contains("error[e")                          // rustc errors in a cargo run
-        || l.contains("could not compile")
         || (l.contains(" passed") && (l.contains(" failed") || l.contains(" error")))
+        // Compilers.
+        || l.contains("error[")            // rustc, with an error code
+        || l.contains("could not compile") // cargo
+        || l.contains("error ts")          // tsc: "error TS2322"
+        || l.contains(": error:")          // gcc/clang/go: file:line:col: error:
+        || l.contains(": warning:")
 }
 
-/// Whether a line carries failure/error/summary signal worth keeping. Broad on
-/// purpose — see [`condense_test_output`]'s over-keep bias.
+/// Whether a line *begins* a multi-line compiler diagnostic whose whole block
+/// (location, code frame, notes) should be kept together.
+fn starts_diagnostic_block(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with("error[")          // rustc:  error[E0308]: mismatched types
+        || t.starts_with("error:")   // rustc/cargo:  error: cannot find value …
+        || t.starts_with("warning:") // rustc:  warning: unused variable …
+        || line.contains(": error:") // gcc/clang/go:  src/x.c:4:9: error: …
+        || line.contains(": warning:")
+        || line.contains("error TS") // tsc:  x.ts(1,2): error TS2322: …
+}
+
+/// Whether a line carries failure/summary signal worth keeping (test-runner
+/// output). Broad on purpose — see [`condense_diagnostics`]'s over-keep bias.
 fn is_signal_line(line: &str) -> bool {
     // pytest prints assertion detail on lines that start with `E ` but may carry
     // no keyword of their own.
@@ -881,7 +938,7 @@ struct BashArgs {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_edit, condense_test_output, diff, edit_not_found_help, format_read, truncate_to,
+        apply_edit, condense_diagnostics, diff, edit_not_found_help, format_read, truncate_to,
     };
 
     /// A realistic libtest run: a `header`, `passing` "... ok" lines, an injected
@@ -907,7 +964,7 @@ mod tests {
     #[test]
     fn condense_keeps_cargo_failure_and_summary_drops_green() {
         let log = cargo_log(400, 200);
-        let out = condense_test_output(&log, 50_000);
+        let out = condense_diagnostics(&log, 50_000);
         // The failure, its panic detail, and the summary all survive…
         assert!(out.contains("middle_case ... FAILED"), "keeps the failing test");
         assert!(out.contains("left: 3"), "keeps the assertion detail");
@@ -933,7 +990,7 @@ mod tests {
             "head+tail drops the middle failure"
         );
         assert!(
-            condense_test_output(&log, budget).contains("middle_case ... FAILED"),
+            condense_diagnostics(&log, budget).contains("middle_case ... FAILED"),
             "condense preserves it"
         );
     }
@@ -958,7 +1015,7 @@ tests/test_b.py:12: AssertionError
 FAILED tests/test_b.py::test_parsing - assert 2 == 3
 ========================= 1 failed, 49 passed in 0.42s =========================
 ";
-        let out = condense_test_output(log, 50_000);
+        let out = condense_diagnostics(log, 50_000);
         assert!(out.contains("test_parsing"), "keeps the failing test name");
         assert!(out.contains("assert 2 == 3"), "keeps the assertion (E line)");
         assert!(out.contains("1 failed, 49 passed"), "keeps the summary");
@@ -969,7 +1026,55 @@ FAILED tests/test_b.py::test_parsing - assert 2 == 3
         // A plain file/command dump (no test markers) is left untouched when it
         // fits — condense must not mangle ordinary output.
         let dump = "fn main() {\n    println!(\"hello\");\n}\n";
-        assert_eq!(condense_test_output(dump, 50_000), dump);
+        assert_eq!(condense_diagnostics(dump, 50_000), dump);
+    }
+
+    #[test]
+    fn condense_keeps_whole_rustc_error_block() {
+        // A `cargo build` run: a wall of "Compiling …" noise, one multi-line
+        // rustc diagnostic (location + code frame + note), then the summary.
+        let mut log = String::new();
+        for i in 0..40 {
+            log.push_str(&format!("   Compiling crate_{i} v0.1.0 (/tmp/crate_{i})\n"));
+        }
+        log.push_str(
+            "error[E0308]: mismatched types\n  \
+             --> src/lib.rs:42:18\n   |\n\
+             42 |     let x: u32 = \"hi\";\n   \
+             |            ---   ^^^^ expected `u32`, found `&str`\n   |\n   \
+             = note: expected type `u32`\n\n\
+             error: could not compile `app` (lib) due to 1 previous error\n",
+        );
+        let out = condense_diagnostics(&log, 50_000);
+        // The entire diagnostic block survives — code, the caret line, the note…
+        assert!(out.contains("error[E0308]"), "keeps the error line");
+        assert!(out.contains("--> src/lib.rs:42:18"), "keeps the location");
+        assert!(
+            out.contains("expected `u32`, found `&str`"),
+            "keeps the code frame / caret line"
+        );
+        assert!(out.contains("= note: expected type"), "keeps the note");
+        assert!(out.contains("could not compile"), "keeps the summary");
+        // …while the "Compiling …" noise is dropped.
+        assert!(out.contains("lines omitted"), "drops the compile noise: {out}");
+    }
+
+    #[test]
+    fn condense_keeps_tsc_errors() {
+        let mut log = String::from("> tsc --noEmit\n\n");
+        for i in 0..40 {
+            log.push_str(&format!("  checking module_{i:02}.ts\n"));
+        }
+        log.push_str(
+            "src/index.ts(10,7): error TS2322: Type 'string' is not assignable to type 'number'.\n\
+             src/index.ts(15,3): error TS2554: Expected 1 arguments, but got 0.\n\n\
+             Found 2 errors in the same file, starting at: src/index.ts:10\n",
+        );
+        let out = condense_diagnostics(&log, 50_000);
+        assert!(out.contains("error TS2322"), "keeps the first tsc error");
+        assert!(out.contains("error TS2554"), "keeps the second tsc error");
+        assert!(out.contains("Found 2 errors"), "keeps the summary");
+        assert!(out.contains("lines omitted"), "drops the checking noise");
     }
 
     #[test]
