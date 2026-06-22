@@ -59,12 +59,18 @@ impl Provider for OpenAiProvider {
         let stream = crate::http::debug_tap(resp.bytes_stream())
             .eventsource()
             .map(|res| res.map(|event| event.data).context("error reading stream"));
-        collect_completion(Box::pin(stream), crate::http::stream_idle_timeout(), sink).await
+        collect_completion(
+            Box::pin(stream),
+            crate::http::stream_idle_timeout(),
+            crate::http::stream_stall_timeout(),
+            sink,
+        )
+        .await
     }
 
-    async fn list_models(&self) -> Result<Vec<String>> {
+    async fn list_models(&self) -> Result<Vec<crate::provider::ServedModel>> {
         let url = format!("{}/models", self.base_url);
-        crate::http::fetch_model_ids(self.http.get(&url).bearer_auth(&self.api_key)).await
+        crate::http::fetch_models(self.http.get(&url).bearer_auth(&self.api_key)).await
     }
 }
 
@@ -78,14 +84,21 @@ const FINISH_GRACE: Duration = Duration::from_secs(3);
 /// Drain an OpenAI SSE stream (already reduced to `data` strings) into a
 /// [`Completion`], forwarding text/reasoning/tool tokens to `sink`.
 ///
-/// Two deadlines bound the wait. Before the model finishes, the per-token idle
-/// timeout trips if no real output (content/reasoning/tool tokens) arrives for
-/// `idle` — keep-alive heartbeats carry no token, so they don't reset it. After
-/// a `finish_reason` arrives, a short [`FINISH_GRACE`] catches any trailing
-/// usage chunk, then the loop stops even if `[DONE]` never comes.
+/// Three deadlines bound the wait, all measured from the last real token
+/// (content/reasoning/tool — keep-alive heartbeats carry none, so they don't
+/// reset the clock):
+/// - **cold start** (no output yet): wait up to `idle` — a request can be
+///   legitimately queued before the first token.
+/// - **stall** (output flowed, then stopped without a finish signal): end after
+///   the shorter `stall`, returning what we have. A multi-second gap *between*
+///   tokens means the stream has effectively ended; this stops a provider that
+///   streams a full answer then holds the socket open from hanging the turn.
+/// - **finish** (`finish_reason` seen): a short [`FINISH_GRACE`] catches any
+///   trailing usage chunk, then stop even if `[DONE]` never comes.
 async fn collect_completion<S>(
     mut stream: S,
     idle: Duration,
+    stall: Duration,
     sink: &mut (dyn FnMut(StreamEvent) + Send),
 ) -> Result<Completion>
 where
@@ -96,10 +109,12 @@ where
     let mut completion = Completion::default();
     let mut last_progress = Instant::now();
     let mut finished: Option<Instant> = None;
+    let mut progressed = false;
 
     loop {
         let budget = match finished {
             Some(at) => FINISH_GRACE.saturating_sub(at.elapsed()),
+            None if progressed => stall.saturating_sub(last_progress.elapsed()),
             None => idle.saturating_sub(last_progress.elapsed()),
         };
         let data = match tokio::time::timeout(budget, stream.next()).await {
@@ -108,6 +123,9 @@ where
             // Past finish_reason the answer is complete; don't let a provider that
             // omits `[DONE]` (or never closes the socket) hang a finished turn.
             Err(_) if finished.is_some() => break,
+            // Output flowed then stalled with no finish signal: treat what we have
+            // as the response rather than waiting out the full cold-start timeout.
+            Err(_) if progressed => break,
             Err(_) => bail!(
                 "model produced no output for {}s — the provider streamed only \
                  keep-alive heartbeats. It may be overloaded or the model unavailable; \
@@ -135,6 +153,7 @@ where
             {
                 sink(StreamEvent::Reasoning(reasoning));
                 last_progress = Instant::now();
+                progressed = true;
             }
             if let Some(content) = delta.content
                 && !content.is_empty()
@@ -142,9 +161,11 @@ where
                 text.push_str(&content);
                 sink(StreamEvent::Text(content));
                 last_progress = Instant::now();
+                progressed = true;
             }
             if let Some(deltas) = delta.tool_calls {
                 last_progress = Instant::now();
+                progressed = true;
                 for tcd in deltas {
                     if tool_calls.len() <= tcd.index {
                         tool_calls.resize_with(tcd.index + 1, ToolCallBuilder::default);
@@ -373,6 +394,9 @@ mod tests {
         stream::iter(items).chain(stream::pending())
     }
 
+    const STALL: Duration = Duration::from_secs(15);
+    const IDLE: Duration = Duration::from_secs(120);
+
     #[tokio::test(start_paused = true)]
     async fn stops_after_finish_reason_without_done() {
         // The bug: terminaili sends `finish_reason` then neither `[DONE]` nor a
@@ -383,7 +407,7 @@ mod tests {
             r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
         ]);
         let mut sink = |_: StreamEvent| {};
-        let completion = collect_completion(stream, Duration::from_secs(120), &mut sink)
+        let completion = collect_completion(stream, IDLE, STALL, &mut sink)
             .await
             .unwrap();
         assert_eq!(completion.stop_reason.as_deref(), Some("stop"));
@@ -403,7 +427,7 @@ mod tests {
             r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2}}"#,
         ]);
         let mut sink = |_: StreamEvent| {};
-        let completion = collect_completion(stream, Duration::from_secs(120), &mut sink)
+        let completion = collect_completion(stream, IDLE, STALL, &mut sink)
             .await
             .unwrap();
         assert_eq!(completion.usage.input_tokens, 10);
@@ -411,11 +435,30 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn bails_when_idle_before_any_finish() {
-        // No finish_reason and the stream stalls → the idle timeout still trips.
-        let stream = never_ending(vec![r#"{"choices":[{"delta":{"content":"partial"}}]}"#]);
+    async fn returns_partial_when_stream_stalls_after_content() {
+        // The reported bug: the model streams a full answer, then the provider
+        // sends no finish_reason / [DONE] and holds the socket open. Once output
+        // has flowed, the short stall window ends the turn with what we have,
+        // instead of spinning out the full cold-start idle timeout.
+        let stream = never_ending(vec![r#"{"choices":[{"delta":{"content":"the answer"}}]}"#]);
         let mut sink = |_: StreamEvent| {};
-        let err = collect_completion(stream, Duration::from_secs(120), &mut sink)
+        let completion = collect_completion(stream, IDLE, STALL, &mut sink)
+            .await
+            .unwrap();
+        assert!(
+            matches!(completion.content.first(), Some(Content::Text(t)) if t == "the answer"),
+            "the streamed answer is returned: {:?}",
+            completion.content
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bails_when_no_output_at_all() {
+        // Nothing ever streamed (cold-start): the long idle timeout trips and we
+        // surface the "no output" error rather than returning an empty success.
+        let stream = never_ending(vec![]);
+        let mut sink = |_: StreamEvent| {};
+        let err = collect_completion(stream, IDLE, STALL, &mut sink)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("no output"), "got: {err}");

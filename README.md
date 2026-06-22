@@ -132,6 +132,8 @@ Slash commands (TUI or plain REPL):
 | `/model [id]` | switch by id, or — with no id — open an interactive picker over the models **your provider actually serves** (live `/v1/models`; type to filter, ↑/↓, Enter). Falls back to the models.dev catalog if the endpoint can't list them. |
 | `/verify [cmd\|off]` | show, set, or clear the test command turns iterate against — turn the verify-loop on without restarting |
 | `/diff` | show what files have changed this session (`git diff` + new files) |
+| `/copy [all]` | copy the last assistant response to the terminal clipboard; `all` copies the transcript |
+| `/goal [text\|clear]` | show, set, or clear the current session goal injected into future turns |
 | `/compact` | summarize the conversation and reset context to the summary (reclaims room on long sessions) |
 | `/retry` | re-run your last message (drops the previous attempt — pairs with `/model`) |
 | `/undo` | revert the file changes the last turn made (restores its git checkpoint) |

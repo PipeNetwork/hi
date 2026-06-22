@@ -48,14 +48,34 @@ asks. Prefer making the change over describing it. Keep responses concise. When 
 the task is done, stop, and end with one short line stating what you changed and \
 the exact command to run or test it.";
 
-/// The system message, optionally with project context appended.
-fn build_system(project_context: Option<&str>) -> Message {
-    match project_context {
-        Some(context) if !context.trim().is_empty() => {
-            Message::system(format!("{SYSTEM_PROMPT}\n\n{}", context.trim()))
-        }
-        _ => Message::system(SYSTEM_PROMPT),
+/// The system message, optionally with project context and a session goal appended.
+fn build_system(project_context: Option<&str>, goal: Option<&str>) -> Message {
+    let mut text = SYSTEM_PROMPT.to_string();
+    // Ground the model in its real location so it doesn't guess paths (a wrong
+    // `/home/user`, scaffolding under `/tmp`, copying from directories that don't
+    // exist) and wander out of the project. Each shell command runs from here in
+    // a fresh shell, so `cd` never persists — say so explicitly.
+    if let Ok(cwd) = std::env::current_dir() {
+        text.push_str(&format!(
+            "\n\nYour working directory is `{}` — work here. Every shell command runs from \
+             this directory in a fresh shell, so `cd` does NOT persist between commands. Use \
+             paths relative to it; do not `cd` into, copy from, or create directories elsewhere.",
+            cwd.display()
+        ));
     }
+    if let Some(context) = project_context
+        && !context.trim().is_empty()
+    {
+        text.push_str("\n\n");
+        text.push_str(context.trim());
+    }
+    if let Some(goal) = goal
+        && !goal.trim().is_empty()
+    {
+        text.push_str("\n\n[Current session goal]\n");
+        text.push_str(goal.trim());
+    }
+    Message::system(text)
 }
 
 /// Per-session configuration the agent applies to every request.
@@ -102,12 +122,14 @@ pub struct Agent {
     context_used: u64,
     /// Per-turn git checkpoints (working-tree snapshots), for `/undo`.
     checkpoints: Vec<String>,
+    /// Optional transient goal injected into the system prompt for future turns.
+    goal: Option<String>,
 }
 
 impl Agent {
     /// Start a fresh session seeded with the system prompt.
     pub fn new(provider: Box<dyn Provider>, config: AgentConfig) -> Self {
-        let system = build_system(config.project_context.as_deref());
+        let system = build_system(config.project_context.as_deref(), None);
         Self::with_messages(provider, config, vec![system], 0)
     }
 
@@ -135,6 +157,7 @@ impl Agent {
             last_verify: None,
             context_used: 0,
             checkpoints: Vec::new(),
+            goal: None,
         }
     }
 
@@ -170,6 +193,10 @@ impl Agent {
         &self.totals
     }
 
+    pub fn checkpoint_count(&self) -> usize {
+        self.checkpoints.len()
+    }
+
     pub fn model(&self) -> &str {
         &self.config.model
     }
@@ -191,8 +218,35 @@ impl Agent {
     /// doesn't rewrite the session file, and the reset point isn't persisted, so
     /// resuming replays the full log.
     pub fn clear_history(&mut self) {
-        self.messages = vec![build_system(self.config.project_context.as_deref())];
+        self.messages = vec![self.system_message()];
         self.persisted = self.messages.len();
+    }
+
+    fn system_message(&self) -> Message {
+        build_system(self.config.project_context.as_deref(), self.goal.as_deref())
+    }
+
+    fn refresh_system_message(&mut self) {
+        let system = self.system_message();
+        if let Some(first) = self.messages.first_mut() {
+            *first = system;
+        } else {
+            self.messages.push(system);
+        }
+    }
+
+    /// Current transient session goal, if any.
+    pub fn goal(&self) -> Option<&str> {
+        self.goal.as_deref()
+    }
+
+    /// Set or clear the transient session goal and inject it into the system prompt.
+    pub fn set_goal(&mut self, goal: Option<String>) {
+        self.goal = goal.and_then(|g| {
+            let g = g.trim().to_string();
+            (!g.is_empty()).then_some(g)
+        });
+        self.refresh_system_message();
     }
 
     /// Whether the most recent turn's verification passed (None if not run).
@@ -205,9 +259,10 @@ impl Agent {
         self.config.verify_command.as_deref()
     }
 
-    /// The model ids the current provider/endpoint actually serves (via its
-    /// `/models` route) — for the `/model` picker. Empty if unsupported.
-    pub async fn list_models(&self) -> Result<Vec<String>> {
+    /// The models the current provider/endpoint actually serves (via its
+    /// `/models` route), with any live metadata — for the `/model` picker and
+    /// the live context/price/health wiring. Empty if unsupported.
+    pub async fn list_models(&self) -> Result<Vec<hi_ai::ServedModel>> {
         self.provider.list_models().await
     }
 
@@ -253,7 +308,7 @@ impl Agent {
             ui.status("compaction produced no summary; keeping history");
             return Ok(());
         };
-        let system = build_system(self.config.project_context.as_deref());
+        let system = self.system_message();
         self.messages = vec![
             system,
             Message::user(format!("[Summary of the conversation so far]\n\n{summary}")),
@@ -279,7 +334,7 @@ impl Agent {
             return Ok(());
         };
 
-        let system = build_system(self.config.project_context.as_deref());
+        let system = self.system_message();
         let mut recent = self.messages[split..].to_vec();
         let head = recent[0].text();
         recent[0] = Message::user(format!(
@@ -321,7 +376,7 @@ impl Agent {
         ui.status("compacting the conversation…");
 
         let mut messages = Vec::with_capacity(slice.len() + 2);
-        messages.push(build_system(self.config.project_context.as_deref()));
+        messages.push(self.system_message());
         messages.extend_from_slice(slice);
         messages.push(Message::user(SUMMARIZE_PROMPT));
 
@@ -680,6 +735,52 @@ mod tests {
         Agent::new(Box::new(Canned(Mutex::new(responses))), cfg)
     }
 
+    #[test]
+    fn system_prompt_grounds_the_working_directory() {
+        // The model must be told where it actually is, so it doesn't invent paths
+        // (e.g. /home/user), cd elsewhere, or scaffold a new project.
+        let sys = build_system(None, None);
+        let text = sys.text();
+        let cwd = std::env::current_dir().unwrap().display().to_string();
+        assert!(text.contains(&cwd), "names the working directory: {text}");
+        assert!(text.contains("does NOT persist"), "warns that cd doesn't persist");
+    }
+
+    #[test]
+    fn goal_updates_system_prompt_and_clear_history_keeps_it() {
+        let mut agent = agent(vec![], config());
+        agent.set_goal(Some("ship a stable TUI".into()));
+
+        assert_eq!(agent.goal(), Some("ship a stable TUI"));
+        assert!(
+            agent.messages()[0]
+                .text()
+                .contains("[Current session goal]"),
+            "goal marker included"
+        );
+        assert!(
+            agent.messages()[0].text().contains("ship a stable TUI"),
+            "goal text included"
+        );
+
+        agent.messages.push(Message::user("noise"));
+        agent.clear_history();
+        assert_eq!(agent.messages().len(), 1);
+        assert!(
+            agent.messages()[0].text().contains("ship a stable TUI"),
+            "goal survives clear-history"
+        );
+
+        agent.set_goal(None);
+        assert_eq!(agent.goal(), None);
+        assert!(
+            !agent.messages()[0]
+                .text()
+                .contains("[Current session goal]"),
+            "goal marker removed"
+        );
+    }
+
     #[tokio::test]
     async fn runs_a_tool_then_finishes() {
         let responses = vec![
@@ -1025,7 +1126,7 @@ mod tests {
         // First round comes back content-less; the silent retry succeeds. The
         // dead round is dropped from history, so the retry sees the same context.
         let responses = vec![
-            completion(vec![], 0, 0),                                   // empty → retry
+            completion(vec![], 0, 0), // empty → retry
             completion(vec![Content::Text("here's the review".into())], 5, 3), // succeeds
         ];
         let mut agent = agent(responses, config());

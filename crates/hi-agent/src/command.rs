@@ -10,11 +10,19 @@ pub enum Command {
     Model(String),
     /// Show cumulative token usage.
     Tokens,
+    /// Show current session/runtime status.
+    Status,
+    /// Write a debug/event log for the current session.
+    Log,
     /// Show, set, or clear the verify command turns iterate against. Empty =
     /// show; `off`/`none`/`clear` = disable; anything else = set.
     Verify(String),
     /// Show what's changed in the working tree (git diff).
     Diff,
+    /// Copy the last assistant response, or `all` for the transcript.
+    Copy(String),
+    /// Show, set, or clear the current session goal.
+    Goal(String),
     /// Reclaim context. Empty arg = configured strategy; `full`/`hybrid`/`elide`
     /// pick one explicitly.
     Compact(String),
@@ -40,8 +48,12 @@ pub fn parse(line: &str) -> Option<Command> {
         "clear" | "new" => Command::Clear,
         "model" | "m" => Command::Model(arg),
         "tokens" | "usage" | "cost" => Command::Tokens,
+        "status" | "st" => Command::Status,
+        "log" | "debug" => Command::Log,
         "verify" | "test" => Command::Verify(arg),
         "diff" | "changes" => Command::Diff,
+        "copy" | "cp" => Command::Copy(arg),
+        "goal" => Command::Goal(arg),
         "compact" => Command::Compact(arg),
         "retry" | "redo" => Command::Retry,
         "undo" | "revert" => Command::Undo,
@@ -57,9 +69,13 @@ commands:
   /model [id]        show or switch the model
   /verify [cmd|off]  show/set/clear the test command turns iterate against
   /diff              show what files have changed (git diff)
+  /copy [all]        copy the last assistant response (or transcript) to clipboard
+  /goal [text|clear] show, set, or clear the current session goal
   /compact [kind]    reclaim context (kind: hybrid, full, or elide)
   /retry             re-run your last message
   /undo              revert the file changes from the last turn
+  /status            show provider, model, queue, context, and last turn state
+  /log               write a local debug log for this session
   /tokens            cumulative token usage this session
   /clear             start a fresh conversation
   /exit              quit";
@@ -83,7 +99,16 @@ mod tests {
             Some(Command::Verify("cargo test".into()))
         );
         assert_eq!(parse("/verify"), Some(Command::Verify(String::new())));
+        assert_eq!(parse("/status"), Some(Command::Status));
+        assert_eq!(parse("/log"), Some(Command::Log));
         assert_eq!(parse("/diff"), Some(Command::Diff));
+        assert_eq!(parse("/copy"), Some(Command::Copy(String::new())));
+        assert_eq!(parse("/copy all"), Some(Command::Copy("all".into())));
+        assert_eq!(parse("/goal"), Some(Command::Goal(String::new())));
+        assert_eq!(
+            parse("/goal ship it"),
+            Some(Command::Goal("ship it".into()))
+        );
         assert_eq!(parse("/compact"), Some(Command::Compact(String::new())));
         assert_eq!(
             parse("/compact hybrid"),

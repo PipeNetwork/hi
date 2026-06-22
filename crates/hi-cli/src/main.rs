@@ -364,14 +364,18 @@ async fn repl(agent: &mut Agent, settings: &Settings, registry: &Registry) -> Re
                         Command::Model(id) if id.is_empty() => {
                             match agent.list_models().await {
                                 Ok(mut models) if !models.is_empty() => {
-                                    models.sort();
+                                    models.sort_by(|a, b| a.id.cmp(&b.id));
                                     println!(
                                         "\x1b[2mmodels served by this endpoint (current: {}):\x1b[0m",
                                         agent.model()
                                     );
                                     for m in &models {
-                                        let mark = if *m == agent.model() { "▶" } else { " " };
-                                        println!("  {mark} {m}");
+                                        let mark = if m.id == agent.model() { "▶" } else { " " };
+                                        let tag = m
+                                            .health()
+                                            .map(|h| format!("  ({h})"))
+                                            .unwrap_or_default();
+                                        println!("  {mark} {}{tag}", m.id);
                                     }
                                     println!("\x1b[2m/model <id> to switch\x1b[0m");
                                 }
@@ -482,6 +486,36 @@ fn handle_command(agent: &mut Agent, command: hi_agent::Command, registry: &Regi
                 t.total()
             );
         }
+        Command::Status => {
+            let t = agent.totals();
+            println!(
+                "\x1b[2mstatus: ready\nmodel: {}\nusage: {} in · {} out · {} total\nmodel health: unknown\ngoal: {}\nverify: {}\nlast error: none\ncheckpoints: {}\x1b[0m",
+                agent.model(),
+                t.input_tokens,
+                t.output_tokens,
+                t.total(),
+                agent.goal().unwrap_or("off"),
+                agent.verify_command().unwrap_or("off"),
+                agent.checkpoint_count(),
+            );
+        }
+        Command::Log => {
+            let t = agent.totals();
+            let body = format!(
+                "# hi debug log\n\nmodel: {}\nusage: {} in · {} out · {} total\ngoal: {}\nverify: {}\nlast_error: none\ncheckpoints: {}\n",
+                agent.model(),
+                t.input_tokens,
+                t.output_tokens,
+                t.total(),
+                agent.goal().unwrap_or("off"),
+                agent.verify_command().unwrap_or("off"),
+                agent.checkpoint_count(),
+            );
+            match std::fs::write(".hi-debug.log", body) {
+                Ok(()) => println!("\x1b[2mwrote debug log: .hi-debug.log\x1b[0m"),
+                Err(err) => eprintln!("\x1b[33mlog failed: {err}\x1b[0m"),
+            }
+        }
         Command::Model(id) => {
             if id.is_empty() {
                 // The line REPL can't do an arrow-select picker; show the current
@@ -518,6 +552,23 @@ fn handle_command(agent: &mut Agent, command: hi_agent::Command, registry: &Regi
             }
         },
         Command::Diff => println!("{}", hi_tools::working_tree_diff()),
+        Command::Copy(_) => {
+            println!("\x1b[33m/copy is only available in the full-screen TUI\x1b[0m");
+        }
+        Command::Goal(arg) => match arg.trim() {
+            "" => match agent.goal() {
+                Some(goal) => println!("\x1b[2mgoal: {goal}\x1b[0m"),
+                None => println!("\x1b[2mgoal: off (set one with /goal <text>)\x1b[0m"),
+            },
+            "clear" | "off" | "none" => {
+                agent.set_goal(None);
+                println!("\x1b[2mgoal cleared\x1b[0m");
+            }
+            goal => {
+                agent.set_goal(Some(goal.to_string()));
+                println!("\x1b[2mgoal set: {goal}\x1b[0m");
+            }
+        },
         // Handled in the repl loop (async / runs a turn); never reach here.
         Command::Compact(_) | Command::Retry | Command::Undo => {}
         Command::Unknown(name) => {

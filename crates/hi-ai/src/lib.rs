@@ -12,7 +12,7 @@ pub mod types;
 pub use anthropic::AnthropicProvider;
 pub use fallback::{Backend, FallbackProvider};
 pub use openai::OpenAiProvider;
-pub use provider::Provider;
+pub use provider::{Provider, ServedModel};
 pub use registry::{ModelInfo, Registry};
 pub use types::{
     ChatRequest, Completion, Content, Message, Role, StreamEvent, ToolCall, ToolSpec, Usage,

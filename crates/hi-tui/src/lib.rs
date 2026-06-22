@@ -6,8 +6,8 @@
 //! the event loop can keep redrawing — spinner, streaming output, scrolling —
 //! while a turn is in flight, and can cancel it with Ctrl-C.
 
-use std::collections::VecDeque;
-use std::io::{self};
+use std::collections::{HashMap, VecDeque};
+use std::io::{self, Write};
 use std::time::{Duration, Instant};
 
 use ansi_to_tui::IntoText;
@@ -35,6 +35,8 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 /// How many model rows the `/model` picker shows at once.
 const PICKER_ROWS: usize = 12;
 const TICK: Duration = Duration::from_millis(120);
+const WATCHDOG_NOTICE: Duration = Duration::from_secs(20);
+const WATCHDOG_STUCK: Duration = Duration::from_secs(60);
 
 /// Run the full-screen TUI until the user quits. `history_path`, if given, is
 /// the file used to persist input history across sessions (shared with the
@@ -93,6 +95,7 @@ pub async fn run(
         }
     });
     let mut ticker = tokio::time::interval(TICK);
+    let mut startup_check = app.context_window.is_none();
 
     'session: loop {
         // Run a queued command first (typed while the previous turn ran);
@@ -101,10 +104,50 @@ pub async fn run(
             Some(queued) => queued,
             None => 'input: loop {
                 terminal.draw(|f| app.render(f))?;
-                // Block on the next event. Nothing animates while idle, so there's
-                // no tick to race — every keystroke is handled the instant it lands.
-                let Some(event) = input_rx.recv().await else {
-                    break 'session; // input channel closed (stdin gone)
+                // Block on input, with a one-shot startup metadata check racing
+                // in the background. Input always wins immediately; the check is
+                // best-effort and never delays typing into the prompt.
+                let event = if startup_check {
+                    enum StartupRace {
+                        Metadata(Result<Vec<hi_ai::ServedModel>>),
+                        Input(Option<Event>),
+                    }
+                    let race = {
+                        let fut = agent.list_models();
+                        tokio::pin!(fut);
+                        tokio::select! {
+                            result = &mut fut => StartupRace::Metadata(result),
+                            maybe = input_rx.recv() => StartupRace::Input(maybe),
+                        }
+                    };
+                    startup_check = false;
+                    match race {
+                        StartupRace::Metadata(Ok(served)) if !served.is_empty() => {
+                            app.served = served.into_iter().map(|m| (m.id.clone(), m)).collect();
+                            let model_id = app.model.clone();
+                            if let Some(health) = app.apply_model(agent, registry, &model_id) {
+                                app.warn_degraded(&model_id, &health);
+                            }
+                            continue;
+                        }
+                        StartupRace::Metadata(Ok(_)) => {
+                            app.startup_notice =
+                                Some("provider metadata unavailable; using catalog".to_string());
+                            continue;
+                        }
+                        StartupRace::Metadata(Err(err)) => {
+                            app.startup_notice =
+                                Some(format!("provider metadata check failed: {err:#}"));
+                            continue;
+                        }
+                        StartupRace::Input(Some(event)) => event,
+                        StartupRace::Input(None) => break 'session,
+                    }
+                } else {
+                    let Some(event) = input_rx.recv().await else {
+                        break 'session; // input channel closed (stdin gone)
+                    };
+                    event
                 };
                 match event {
                     // A paste arrives as one event — insert it literally
@@ -166,7 +209,16 @@ pub async fn run(
                     let mut sink = ChannelUi { tx };
                     {
                         let fut = agent.compact_with(kind, &mut sink);
-                        drive(&mut terminal, &mut input_rx, &mut ticker, &mut app, rx, fut).await?;
+                        drive(
+                            &mut terminal,
+                            &mut input_rx,
+                            &mut ticker,
+                            &mut app,
+                            rx,
+                            fut,
+                            false,
+                        )
+                        .await?;
                     }
                     app.set_working(false);
                     app.follow();
@@ -175,6 +227,20 @@ pub async fn run(
                 Command::Retry => match app.last_prompt.clone() {
                     Some(prompt) => {
                         agent.truncate_messages(app.last_turn_start);
+                        let note = match app.last_turn_state {
+                            TurnState::Warning(_) => {
+                                if app.last_turn_had_file_edits {
+                                    "retrying from the last safe message checkpoint; file edits already made stay in the working tree and may be replayed if the model repeats them"
+                                } else {
+                                    "retrying from the last safe message checkpoint; no file edits were recorded in the last turn"
+                                }
+                            }
+                            TurnState::Failed(_) => {
+                                "retrying after failure from the last safe message checkpoint"
+                            }
+                            _ => "retrying from the last safe message checkpoint",
+                        };
+                        app.push(Line::styled(note.to_string(), dim()));
                         app.push(Line::styled(format!("retrying: {prompt}"), dim()));
                         prompt
                     }
@@ -184,6 +250,15 @@ pub async fn run(
                     }
                 },
                 Command::Undo => {
+                    let checkpoints = agent.checkpoint_count();
+                    if checkpoints > 0 {
+                        app.push(Line::styled(
+                            format!(
+                                "undo: restoring latest checkpoint ({checkpoints} available); non-file side effects cannot be reverted"
+                            ),
+                            dim(),
+                        ));
+                    }
                     let msg = match agent.undo().await {
                         Ok(Some(0)) => "nothing changed to undo".to_string(),
                         Ok(Some(n)) => format!("↩ undid the last turn — restored {n} file(s)"),
@@ -200,7 +275,7 @@ pub async fn run(
                 // Esc/Ctrl-C can cancel a slow or hung endpoint.
                 Command::Model(id) if id.is_empty() => {
                     app.fetching = Some(Instant::now());
-                    let mut fetched: Option<Result<Vec<String>>> = None;
+                    let mut fetched: Option<Result<Vec<hi_ai::ServedModel>>> = None;
                     let mut cancelled = false;
                     {
                         let fut = agent.list_models();
@@ -230,10 +305,14 @@ pub async fn run(
                     if cancelled {
                         continue;
                     }
-                    let models = match fetched {
-                        Some(Ok(mut m)) if !m.is_empty() => {
-                            m.sort();
-                            m
+                    let ids = match fetched {
+                        Some(Ok(served)) if !served.is_empty() => {
+                            // Remember the live metadata (window/price/health) so
+                            // selecting a model can apply it and tag its health.
+                            app.served = served.into_iter().map(|m| (m.id.clone(), m)).collect();
+                            let mut ids: Vec<String> = app.served.keys().cloned().collect();
+                            ids.sort();
+                            ids
                         }
                         Some(Ok(_)) => {
                             app.push(Line::styled(
@@ -254,7 +333,8 @@ pub async fn run(
                         }
                     };
                     let current = app.model.clone();
-                    app.picker = Some(ModelPicker::new(models, &current));
+                    let tags = app.served_tags();
+                    app.picker = Some(ModelPicker::new(ids, &current, tags));
                     continue;
                 }
                 other => {
@@ -280,11 +360,21 @@ pub async fn run(
         let mut sink = ChannelUi { tx };
         let cancelled = {
             let fut = agent.run_turn(&run_line, &mut sink);
-            drive(&mut terminal, &mut input_rx, &mut ticker, &mut app, rx, fut).await?
+            drive(
+                &mut terminal,
+                &mut input_rx,
+                &mut ticker,
+                &mut app,
+                rx,
+                fut,
+                true,
+            )
+            .await?
         };
 
         if cancelled {
             agent.truncate_messages(checkpoint);
+            app.last_turn_state = TurnState::Cancelled;
             let dropped = app.queue.len();
             app.queue.clear();
             let msg = if dropped > 0 {
@@ -319,24 +409,61 @@ async fn drive(
     app: &mut App,
     mut rx: mpsc::UnboundedReceiver<UiEvent>,
     fut: impl std::future::Future<Output = Result<()>>,
+    expect_turn_end: bool,
 ) -> Result<bool> {
     tokio::pin!(fut);
     let mut cancelled = false;
+    let mut saw_turn_end = false;
+    let mut last_activity = Instant::now();
+    let mut watchdog_notice = false;
+    let mut watchdog_stuck = false;
     loop {
         terminal.draw(|f| app.render(f))?;
         tokio::select! {
             result = &mut fut => {
-                while let Ok(event) = rx.try_recv() { app.apply(event); }
+                while let Ok(event) = rx.try_recv() {
+                    if matches!(event, UiEvent::TurnEnd(_)) {
+                        saw_turn_end = true;
+                    }
+                    app.apply(event);
+                }
                 if let Err(err) = result {
-                    app.push(Line::styled(
-                        format!("error: {err:#}"),
-                        Style::default().fg(Color::Red),
-                    ));
+                    app.note_turn_failed(&format!("{err:#}"));
+                    app.record_model_issue();
+                } else if expect_turn_end && !cancelled && !saw_turn_end {
+                    app.note_turn_completed_without_summary();
                 }
                 break;
             }
-            Some(event) = rx.recv() => app.apply(event),
-            _ = ticker.tick() => app.spinner = app.spinner.wrapping_add(1),
+            Some(event) = rx.recv() => {
+                if matches!(event, UiEvent::TurnEnd(_)) {
+                    saw_turn_end = true;
+                }
+                last_activity = Instant::now();
+                app.apply(event);
+            }
+            _ = ticker.tick() => {
+                app.spinner = app.spinner.wrapping_add(1);
+                let idle = last_activity.elapsed();
+                app.waiting_for = Some(idle);
+                if expect_turn_end && !watchdog_notice && idle >= WATCHDOG_NOTICE {
+                    watchdog_notice = true;
+                    app.push(Line::styled(
+                        "still waiting for the model/provider; Ctrl-C cancels, /retry can rerun after it returns",
+                        Style::default().fg(Color::Yellow),
+                    ));
+                    app.follow();
+                }
+                if expect_turn_end && !watchdog_stuck && idle >= WATCHDOG_STUCK {
+                    watchdog_stuck = true;
+                    app.push(Line::styled(
+                        "⚠ no activity for 60s; provider may be stuck. Ctrl-C to cancel, then try /model or /retry",
+                        Style::default().fg(Color::Yellow),
+                    ));
+                    app.follow();
+                    app.record_model_issue();
+                }
+            },
             maybe = input.recv() => {
                 match maybe {
                     Some(Event::Paste(text)) => app.input.insert_str(&text),
@@ -349,10 +476,10 @@ async fn drive(
                             // except `/tokens`, which reads the live counter and
                             // runs in sync so you can watch usage climb mid-turn.
                             _ => if let Some(submitted) = app.edit_key(&key) {
-                                if matches!(command::parse(&submitted), Some(Command::Tokens)) {
-                                    app.report_tokens();
-                                } else {
-                                    app.queue.push_back(submitted);
+                                match command::parse(&submitted) {
+                                    Some(Command::Tokens) => app.report_tokens(),
+                                    Some(Command::Copy(arg)) => app.copy(&arg),
+                                    _ => app.queue.push_back(submitted),
                                 }
                             }
                         }
@@ -362,6 +489,7 @@ async fn drive(
             }
         }
     }
+    app.waiting_for = None;
     Ok(cancelled)
 }
 
@@ -477,6 +605,60 @@ struct App {
     /// window, for the live context-fill gauge.
     context_used: u64,
     context_window: Option<u32>,
+    /// Live per-model metadata (window/price/health) learned from the endpoint's
+    /// `/models`, keyed by id — used to apply a model's settings and flag health.
+    served: HashMap<String, hi_ai::ServedModel>,
+    /// Assistant prose currently streaming. Tool output is intentionally not
+    /// included; `/copy` copies the assistant's answer, not command logs.
+    current_assistant: String,
+    /// Last completed assistant prose, copied by `/copy`.
+    last_assistant: String,
+    /// Last event type applied during the active turn, for better fallback
+    /// diagnostics when the provider stops without a final turn-end event.
+    last_turn_event: Option<TurnEventKind>,
+    /// Whether the current/last turn invoked file-editing tools.
+    last_turn_had_file_edits: bool,
+    waiting_for: Option<Duration>,
+    last_turn_state: TurnState,
+    last_error: Option<String>,
+    event_log: Vec<String>,
+    model_issues: HashMap<String, u32>,
+    startup_notice: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TurnEventKind {
+    Assistant,
+    AssistantEnd,
+    ToolCall,
+    ToolResult,
+    Status,
+    Usage,
+    TurnEnd,
+}
+
+impl TurnEventKind {
+    fn label(self) -> &'static str {
+        match self {
+            TurnEventKind::Assistant => "assistant",
+            TurnEventKind::AssistantEnd => "assistant end",
+            TurnEventKind::ToolCall => "tool call",
+            TurnEventKind::ToolResult => "tool result",
+            TurnEventKind::Status => "status",
+            TurnEventKind::Usage => "usage",
+            TurnEventKind::TurnEnd => "turn end",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum TurnState {
+    Idle,
+    Running,
+    Done(String),
+    Warning(String),
+    Failed(String),
+    Cancelled,
 }
 
 impl App {
@@ -501,7 +683,71 @@ impl App {
             usage: (0, 0),
             context_used: 0,
             context_window: None,
+            served: HashMap::new(),
+            current_assistant: String::new(),
+            last_assistant: String::new(),
+            last_turn_event: None,
+            last_turn_had_file_edits: false,
+            waiting_for: None,
+            last_turn_state: TurnState::Idle,
+            last_error: None,
+            event_log: Vec::new(),
+            model_issues: HashMap::new(),
+            startup_notice: None,
         }
+    }
+
+    /// Health tags (id → label) for the models we have live metadata on, for the
+    /// `/model` picker. Healthy models are omitted.
+    fn served_tags(&self) -> HashMap<String, String> {
+        self.served
+            .iter()
+            .map(|(id, m)| {
+                let tag = match (
+                    m.health().map(str::to_string),
+                    self.model_issues.get(id).copied().unwrap_or(0),
+                ) {
+                    (Some(endpoint), issues) if issues > 0 => {
+                        format!("{endpoint}; degraded in-session")
+                    }
+                    (Some(endpoint), _) => endpoint,
+                    (None, issues) if issues > 0 => "degraded in-session".to_string(),
+                    (None, _) => String::new(),
+                };
+                (id.clone(), tag)
+            })
+            .filter_map(|(id, tag)| (!tag.is_empty()).then_some((id, tag)))
+            .collect()
+    }
+
+    /// Apply `id` as the model: prefer live endpoint metadata (window/price) when
+    /// we have it, else the catalog. Updates the agent and the gauge. Returns the
+    /// model's health label if the endpoint flags it as not fully available.
+    fn apply_model(
+        &mut self,
+        agent: &mut Agent,
+        registry: &hi_ai::Registry,
+        id: &str,
+    ) -> Option<String> {
+        let (cat_price, cat_window) = registry.metadata(id);
+        let served = self.served.get(id);
+        let price = served.and_then(|m| m.price).or(cat_price);
+        let window = served.and_then(|m| m.context_window).or(cat_window);
+        agent.set_model(id.to_string(), price, window);
+        self.model = id.to_string();
+        self.context_window = window;
+        served.and_then(|m| m.health()).map(str::to_string)
+    }
+
+    /// Push a yellow line warning that `id` is in a non-healthy state.
+    fn warn_degraded(&mut self, id: &str, health: &str) {
+        self.push(Line::styled(
+            format!(
+                "⚠ {id} is reported {health} on this endpoint — responses may be slow or flaky; \
+                 /model to pick another"
+            ),
+            Style::default().fg(Color::Yellow),
+        ));
     }
 
     /// Percent of the context window currently occupied, when the window is known.
@@ -512,15 +758,17 @@ impl App {
 
     /// Apply the picker's current selection as the model, then close it.
     fn pick_model(&mut self, agent: &mut Agent, registry: &hi_ai::Registry) {
-        if let Some(picker) = &self.picker
-            && let Some(id) = picker.current()
-        {
-            let id = id.to_string();
-            let (price, context_window) = registry.metadata(&id);
-            agent.set_model(id.clone(), price, context_window);
-            self.model = id.clone();
-            self.context_window = context_window;
+        let id = self
+            .picker
+            .as_ref()
+            .and_then(|p| p.current())
+            .map(str::to_string);
+        if let Some(id) = id {
+            let health = self.apply_model(agent, registry, &id);
             self.push(Line::styled(format!("model set to {id}"), dim()));
+            if let Some(h) = health {
+                self.warn_degraded(&id, &h);
+            }
         }
         self.picker = None;
         self.follow();
@@ -531,6 +779,15 @@ impl App {
     fn set_working(&mut self, working: bool) {
         self.working = working;
         self.started = working.then(Instant::now);
+        if working {
+            self.last_turn_event = None;
+            self.last_turn_had_file_edits = false;
+            self.waiting_for = Some(Duration::ZERO);
+            self.last_turn_state = TurnState::Running;
+        } else if matches!(self.last_turn_state, TurnState::Running) {
+            self.last_turn_state = TurnState::Idle;
+            self.waiting_for = None;
+        }
     }
 
     /// Apply a pure editing/navigation key to the input line, shared by the
@@ -567,6 +824,67 @@ impl App {
         self.transcript.push(line);
     }
 
+    fn note_turn_completed_without_summary(&mut self) {
+        match self.last_turn_event {
+            Some(TurnEventKind::ToolCall | TurnEventKind::ToolResult) => {
+                self.status = "stopped after tool output".to_string();
+                self.last_turn_state = TurnState::Warning("stopped after tool output".to_string());
+                self.last_error = Some("turn stopped after tool output".to_string());
+                self.push(Line::styled(
+                    "⚠ turn stopped after tool output without a final assistant response; try /retry",
+                    Style::default().fg(Color::Yellow),
+                ));
+                self.record_model_issue();
+            }
+            _ => {
+                self.status = "done · no usage reported".to_string();
+                self.last_turn_state = TurnState::Done("no usage reported".to_string());
+                self.push(Line::styled("✓ done · no usage reported", dim()));
+            }
+        }
+        self.follow();
+    }
+
+    fn note_turn_failed(&mut self, error: &str) {
+        self.status = "failed".to_string();
+        self.last_turn_state = TurnState::Failed(error.to_string());
+        self.last_error = Some(error.to_string());
+        self.push(Line::styled(
+            format!("✗ failed · {error}"),
+            Style::default().fg(Color::Red),
+        ));
+        self.follow();
+    }
+
+    fn record_model_issue(&mut self) {
+        let count = {
+            let entry = self.model_issues.entry(self.model.clone()).or_insert(0);
+            *entry += 1;
+            *entry
+        };
+        self.last_error = Some(format!(
+            "reliability issue count for {} = {count}",
+            self.model
+        ));
+        if count == 1 {
+            self.push(Line::styled(
+                format!(
+                    "⚠ {} returned an incomplete turn; it is now marked degraded in-session. Consider /model",
+                    self.model
+                ),
+                Style::default().fg(Color::Yellow),
+            ));
+        } else if count >= 2 {
+            self.push(Line::styled(
+                format!(
+                    "⚠ {} has had {count} reliability issue(s) this session and is degraded; consider /model",
+                    self.model
+                ),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+    }
+
     fn follow(&mut self) {
         self.scroll_up = 0;
     }
@@ -585,6 +903,137 @@ impl App {
         }
         self.push(Line::styled(line, dim()));
         self.follow();
+    }
+
+    fn report_status(&mut self, agent: &Agent) {
+        let (input, output) = self.usage;
+        let state = match &self.last_turn_state {
+            TurnState::Idle => "idle".to_string(),
+            TurnState::Running => "running".to_string(),
+            TurnState::Done(s) => format!("done ({s})"),
+            TurnState::Warning(s) => format!("warning ({s})"),
+            TurnState::Failed(s) => format!("failed ({s})"),
+            TurnState::Cancelled => "cancelled".to_string(),
+        };
+        let ctx = self
+            .context_pct()
+            .map(|p| format!("{p}%"))
+            .unwrap_or_else(|| "unknown".to_string());
+        let goal = agent.goal().unwrap_or("off");
+        let verify = agent.verify_command().unwrap_or("off");
+        let error = self.last_error.as_deref().unwrap_or("none");
+        let model_issues = self.model_issues.get(&self.model).copied().unwrap_or(0);
+        let model_health = if model_issues >= 2 {
+            format!("degraded ({model_issues} issue(s))")
+        } else if model_issues == 1 {
+            "degraded (1 issue)".to_string()
+        } else {
+            "ok".to_string()
+        };
+        for line in [
+            format!("status: {state}"),
+            format!("provider/model: {} · {}", self.provider, self.model),
+            format!(
+                "context: {ctx}; usage: {input} in · {output} out · {} total",
+                input + output
+            ),
+            format!("model health: {model_health}"),
+            format!("goal: {goal}"),
+            format!("verify: {verify}"),
+            format!("last error: {error}"),
+            format!(
+                "startup notice: {}",
+                self.startup_notice.as_deref().unwrap_or("none")
+            ),
+            format!(
+                "queued: {}; checkpoints: {}",
+                self.queue.len(),
+                agent.checkpoint_count()
+            ),
+        ] {
+            self.push(Line::styled(line, dim()));
+        }
+        self.follow();
+    }
+
+    fn write_debug_log(&mut self) {
+        let path = std::path::Path::new(".hi-debug.log");
+        let mut body = String::new();
+        body.push_str("# hi debug log\n\n");
+        body.push_str("## status\n");
+        body.push_str(&format!(
+            "provider: {}\nmodel: {}\n",
+            self.provider, self.model
+        ));
+        body.push_str(&format!("status: {}\n\n", self.status));
+        body.push_str(&format!(
+            "last_error: {}\nwaiting_for: {:?}\nstartup_notice: {}\nlast_turn_file_edits: {}\n\n",
+            self.last_error.as_deref().unwrap_or("none"),
+            self.waiting_for,
+            self.startup_notice.as_deref().unwrap_or("none"),
+            self.last_turn_had_file_edits
+        ));
+        body.push_str("## events\n");
+        for event in &self.event_log {
+            body.push_str(event);
+            body.push('\n');
+        }
+        body.push_str("\n## transcript\n");
+        body.push_str(&self.transcript_text());
+        match std::fs::write(path, body) {
+            Ok(()) => self.push(Line::styled("wrote debug log: .hi-debug.log", dim())),
+            Err(err) => self.push(Line::styled(
+                format!("log failed: {err}"),
+                Style::default().fg(Color::Yellow),
+            )),
+        }
+        self.follow();
+    }
+
+    fn copy(&mut self, arg: &str) {
+        let text = match arg.trim() {
+            "all" | "transcript" => self.transcript_text(),
+            _ => self.last_assistant.trim().to_string(),
+        };
+        if text.is_empty() {
+            self.push(Line::styled("nothing to copy yet", dim()));
+        } else {
+            match copy_to_clipboard(&text) {
+                Ok(()) => self.push(Line::styled(format!("copied {} chars", text.len()), dim())),
+                Err(err) => self.push(Line::styled(
+                    format!("copy failed: {err}"),
+                    Style::default().fg(Color::Yellow),
+                )),
+            }
+        }
+        self.follow();
+    }
+
+    fn handle_goal(&mut self, agent: &mut Agent, arg: &str) {
+        let msg = match arg.trim() {
+            "" => match agent.goal() {
+                Some(goal) => format!("goal: {goal}"),
+                None => "goal: off (set one with /goal <text>)".to_string(),
+            },
+            "clear" | "off" | "none" => {
+                agent.set_goal(None);
+                "goal cleared".to_string()
+            }
+            goal => {
+                agent.set_goal(Some(goal.to_string()));
+                format!("goal set: {goal}")
+            }
+        };
+        self.push(Line::styled(msg, dim()));
+        self.follow();
+    }
+
+    fn transcript_text(&self) -> String {
+        self.transcript
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     fn scroll_up(&mut self, n: u16) {
@@ -636,15 +1085,37 @@ impl App {
 
     fn apply(&mut self, event: UiEvent) {
         match event {
-            UiEvent::Text(t) => self.stream(Style::default(), true, &t),
-            UiEvent::Reasoning(t) => self.stream(dim(), false, &t),
+            UiEvent::Text(t) => {
+                self.event_log
+                    .push(format!("assistant_text {} chars", t.len()));
+                self.last_turn_event = Some(TurnEventKind::Assistant);
+                self.current_assistant.push_str(&t);
+                self.stream(Style::default(), true, &t);
+            }
+            UiEvent::Reasoning(t) => {
+                self.event_log.push(format!("reasoning {} chars", t.len()));
+                self.last_turn_event = Some(TurnEventKind::Assistant);
+                self.stream(dim(), false, &t);
+            }
             UiEvent::AssistantEnd => {
+                self.event_log.push("assistant_end".to_string());
+                self.last_turn_event = Some(TurnEventKind::AssistantEnd);
                 self.flush_pending();
+                if !self.current_assistant.trim().is_empty() {
+                    self.last_assistant = self.current_assistant.trim().to_string();
+                }
+                self.current_assistant.clear();
                 // Fences don't span messages; reset so a stray ``` can't bleed
                 // code styling into the next response.
                 self.in_code_block = false;
             }
             UiEvent::ToolCall(name, args) => {
+                self.event_log
+                    .push(format!("tool_call {}", tool_label(&name, &args)));
+                self.last_turn_event = Some(TurnEventKind::ToolCall);
+                if matches!(name.as_str(), "write" | "edit") {
+                    self.last_turn_had_file_edits = true;
+                }
                 self.flush_pending();
                 self.push(Line::styled(
                     format!("⏺ {}", tool_label(&name, &args)),
@@ -652,10 +1123,15 @@ impl App {
                 ));
             }
             UiEvent::ToolResult(result) => {
+                self.event_log
+                    .push(format!("tool_result {} chars", result.len()));
+                self.last_turn_event = Some(TurnEventKind::ToolResult);
                 self.flush_pending();
                 self.push_result(&result);
             }
             UiEvent::Status(s) => {
+                self.event_log.push(format!("status {s}"));
+                self.last_turn_event = Some(TurnEventKind::Status);
                 self.flush_pending();
                 self.push(Line::styled(s, Style::default().fg(Color::Blue)));
             }
@@ -666,31 +1142,48 @@ impl App {
                 ctx_used,
                 ctx_window,
             } => {
+                self.event_log
+                    .push(format!("usage {input} in {output} out"));
+                self.last_turn_event = Some(TurnEventKind::Usage);
                 self.usage = (input, output);
                 self.context_used = ctx_used;
                 self.context_window = ctx_window;
             }
             UiEvent::TurnEnd(summary) => {
+                self.event_log.push(format!("turn_end {summary}"));
+                self.last_turn_event = Some(TurnEventKind::TurnEnd);
                 self.flush_pending();
                 // Tokens/cost go to the status bar; a dim marker in the transcript
                 // makes the end of a turn unmistakable (so a long run doesn't just
                 // trail off with no clear "done").
                 self.status = summary.trim_matches(['[', ']']).to_string();
+                self.last_turn_state = TurnState::Done(self.status.clone());
                 self.push(Line::styled(format!("✓ done · {}", self.status), dim()));
                 self.follow();
             }
         }
     }
 
-    /// Render a tool result, preserving any ANSI colors (e.g. edit diffs),
-    /// clipped to a handful of lines and indented.
+    /// Render a tool result, clipped to a handful of lines and indented.
+    /// Preserves any ANSI colors (e.g. edit/write diffs); for *plain* unified
+    /// diff output from a shell command (`git diff`, `diff -u`) — which CLIs
+    /// emit without color when piped — adds diff coloring so it's readable.
     fn push_result(&mut self, result: &str) {
         const MAX: usize = 14;
+        if result.trim().is_empty() {
+            self.push(Line::styled("  (no output)", dim()));
+            return;
+        }
         let body: String = result.lines().take(MAX).collect::<Vec<_>>().join("\n");
-        let text: Text = body
-            .into_text()
-            .unwrap_or_else(|_| Text::from(body.clone()));
-        for mut line in text.lines {
+        let lines: Vec<Line<'static>> = if !body.contains('\u{1b}') && looks_like_diff(result) {
+            body.lines().map(diff_line).collect()
+        } else {
+            // ANSI (already-colored) or non-diff text: parse escapes as before.
+            body.into_text()
+                .unwrap_or_else(|_| Text::from(body.clone()))
+                .lines
+        };
+        for mut line in lines {
             line.spans.insert(0, "  ".into());
             self.transcript.push(line);
         }
@@ -714,17 +1207,20 @@ impl App {
                 self.usage = (t.input_tokens, t.output_tokens);
                 self.report_tokens();
             }
+            Command::Status => self.report_status(agent),
+            Command::Log => self.write_debug_log(),
             Command::Model(id) => {
                 if id.is_empty() {
                     // Open the interactive picker (filter + arrow-select).
                     let current = self.model.clone();
-                    self.picker = Some(ModelPicker::new(registry.model_ids(), &current));
+                    let tags = self.served_tags();
+                    self.picker = Some(ModelPicker::new(registry.model_ids(), &current, tags));
                 } else {
-                    let (price, context_window) = registry.metadata(&id);
-                    agent.set_model(id.clone(), price, context_window);
-                    self.model = id.clone();
-                    self.context_window = context_window;
+                    let health = self.apply_model(agent, registry, &id);
                     self.push(Line::styled(format!("model set to {id}"), dim()));
+                    if let Some(h) = health {
+                        self.warn_degraded(&id, &h);
+                    }
                 }
             }
             Command::Clear => {
@@ -732,7 +1228,10 @@ impl App {
                 self.transcript.clear();
                 self.pending = None;
                 self.in_code_block = false;
+                self.current_assistant.clear();
+                self.last_assistant.clear();
                 self.status.clear();
+                self.last_turn_state = TurnState::Idle;
                 self.push(Line::styled("conversation cleared", dim()));
             }
             Command::Verify(arg) => {
@@ -761,6 +1260,8 @@ impl App {
                     self.push(line);
                 }
             }
+            Command::Copy(arg) => self.copy(&arg),
+            Command::Goal(arg) => self.handle_goal(agent, &arg),
             // Handled in the event loop (async / runs a turn); never reach here.
             Command::Compact(_) | Command::Retry | Command::Undo => {}
             Command::Unknown(name) => {
@@ -811,7 +1312,7 @@ impl App {
         let area = frame.area();
         // The input box grows to fit a spinner status line (while working), the
         // (possibly multi-line) input, and up to three queued commands.
-        let status_lines = usize::from(self.working);
+        let status_lines = 1usize;
         let queued_shown = self.queue.len().min(3);
         let queue_extra = usize::from(self.queue.len() > 3);
         let (input_lines, cursor_row, cursor_col) = self.input_view();
@@ -902,7 +1403,13 @@ impl App {
                 plines.push(Line::styled("  (no matches)".to_string(), dim()));
             }
             for (id, selected) in visible {
-                let tag = if id == p.current { " (current)" } else { "" };
+                let mut tag = String::new();
+                if id == p.current {
+                    tag.push_str(" (current)");
+                }
+                if let Some(health) = p.tags.get(id) {
+                    tag.push_str(&format!(" [{health}]"));
+                }
                 if selected {
                     plines.push(Line::from(vec![
                         Span::styled(
@@ -911,12 +1418,12 @@ impl App {
                                 .fg(Color::Cyan)
                                 .add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(tag.to_string(), dim()),
+                        Span::styled(tag, dim()),
                     ]));
                 } else {
                     plines.push(Line::from(vec![
                         Span::raw(format!("  {id}")),
-                        Span::styled(tag.to_string(), dim()),
+                        Span::styled(tag, dim()),
                     ]));
                 }
             }
@@ -937,6 +1444,12 @@ impl App {
                 });
 
             let mut ilines: Vec<Line> = Vec::new();
+            if let Some(notice) = &self.startup_notice {
+                ilines.push(Line::styled(
+                    notice.clone(),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
             if self.working {
                 let frame_ch = SPINNER[self.spinner % SPINNER.len()];
                 let secs = self.started.map(|t| t.elapsed().as_secs()).unwrap_or(0);
@@ -949,6 +1462,14 @@ impl App {
                 if let Some(pct) = self.context_pct() {
                     stats.push_str(&format!(" · {pct}% ctx"));
                 }
+                if let Some(event) = self.last_turn_event {
+                    stats.push_str(&format!(" · last: {}", event.label()));
+                }
+                if let Some(waiting) = self.waiting_for
+                    && waiting >= WATCHDOG_NOTICE
+                {
+                    stats.push_str(&format!(" · waiting {}s", waiting.as_secs()));
+                }
                 ilines.push(Line::from(vec![
                     Span::styled(
                         format!("{frame_ch} working… {secs}s{stats}"),
@@ -958,6 +1479,16 @@ impl App {
                     ),
                     Span::styled("   Ctrl-C to interrupt", dim()),
                 ]));
+            } else {
+                let line = match &self.last_turn_state {
+                    TurnState::Idle => "ready".to_string(),
+                    TurnState::Running => "working".to_string(),
+                    TurnState::Done(s) => format!("ready · last: done ({s})"),
+                    TurnState::Warning(s) => format!("ready · last: warning ({s})"),
+                    TurnState::Failed(_) => "ready · last: failed".to_string(),
+                    TurnState::Cancelled => "ready · last: cancelled".to_string(),
+                };
+                ilines.push(Line::styled(line, dim()));
             }
             ilines.extend(input_lines);
             for q in self.queue.iter().take(3) {
@@ -984,6 +1515,72 @@ impl App {
 
 fn dim() -> Style {
     Style::default().add_modifier(Modifier::DIM)
+}
+
+fn line_text(line: &Line) -> String {
+    line.spans.iter().map(|s| s.content.as_ref()).collect()
+}
+
+fn copy_to_clipboard(text: &str) -> io::Result<()> {
+    let encoded = base64_encode(text.as_bytes());
+    let mut out = io::stdout().lock();
+    write!(out, "\x1b]52;c;{encoded}\x07")?;
+    out.flush()
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = *chunk.get(1).unwrap_or(&0);
+        let b2 = *chunk.get(2).unwrap_or(&0);
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0b0000_0011) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[(((b1 & 0b0000_1111) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(b2 & 0b0011_1111) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+/// Whether `s` looks like unified-diff output (a hunk header, a git header, or
+/// a `---`/`+++` file-header pair) — so we can colorize plain `git diff` /
+/// `diff -u` output the model runs via the shell.
+fn looks_like_diff(s: &str) -> bool {
+    let (mut minus, mut plus) = (false, false);
+    for line in s.lines() {
+        if line.starts_with("@@") || line.starts_with("diff --git ") {
+            return true;
+        }
+        minus |= line.starts_with("--- ");
+        plus |= line.starts_with("+++ ");
+    }
+    minus && plus
+}
+
+/// Style one line of a unified diff: additions green, removals red, hunk headers
+/// cyan, file headers bold, context muted.
+fn diff_line(line: &str) -> Line<'static> {
+    let style = if line.starts_with("+++") || line.starts_with("---") {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else if line.starts_with("@@") {
+        Style::default().fg(Color::Cyan)
+    } else if line.starts_with('+') {
+        Style::default().fg(Color::Green)
+    } else if line.starts_with('-') {
+        Style::default().fg(Color::Red)
+    } else {
+        dim()
+    };
+    Line::from(Span::styled(line.to_string(), style))
 }
 
 /// Compact token count for the working line: `1234` → `1.2k`, `45000` → `45k`.
@@ -1214,6 +1811,8 @@ struct ModelPicker {
     all: Vec<String>,
     /// The model in use when the picker opened — pre-selected and marked.
     current: String,
+    /// Health label per id (e.g. "degraded"), when the endpoint reported one.
+    tags: HashMap<String, String>,
     filter: String,
     /// Indices into `all` matching the current filter.
     matches: Vec<usize>,
@@ -1222,13 +1821,14 @@ struct ModelPicker {
 }
 
 impl ModelPicker {
-    fn new(all: Vec<String>, current: &str) -> Self {
+    fn new(all: Vec<String>, current: &str, tags: HashMap<String, String>) -> Self {
         let matches: Vec<usize> = (0..all.len()).collect();
         // Open with the current model highlighted (and scrolled into view).
         let selected = all.iter().position(|id| id == current).unwrap_or(0);
         Self {
             all,
             current: current.to_string(),
+            tags,
             filter: String::new(),
             matches,
             selected,
@@ -1449,6 +2049,61 @@ mod tests {
     }
 
     #[test]
+    fn looks_like_diff_detects_unified_and_ignores_lists() {
+        assert!(looks_like_diff("@@ -1,2 +1,2 @@\n-a\n+b"));
+        assert!(looks_like_diff("--- a/x\n+++ b/x\n context"));
+        assert!(looks_like_diff("diff --git a/x b/x\n..."));
+        // A bullet list or a flag line must not be mistaken for a diff.
+        assert!(!looks_like_diff("- one\n- two\n+ three"));
+        assert!(!looks_like_diff("plain output\nno diff here"));
+    }
+
+    #[test]
+    fn colorizes_plain_diff_tool_output() {
+        let mut app = App::new("openai", "gpt-4o");
+        let diff = "--- a/x.rs\n+++ b/x.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n ctx\n";
+        app.apply(UiEvent::ToolResult(diff.into()));
+        // The content span (after the "  " indent) carries the diff color.
+        let colored: Vec<(String, Option<Color>)> = app
+            .transcript
+            .iter()
+            .map(|l| {
+                let text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+                (text, l.spans.last().map(|s| s.style.fg).unwrap_or(None))
+            })
+            .collect();
+        assert!(
+            colored
+                .iter()
+                .any(|(t, fg)| t.contains("+new") && *fg == Some(Color::Green)),
+            "added line is green: {colored:?}"
+        );
+        assert!(
+            colored
+                .iter()
+                .any(|(t, fg)| t.contains("-old") && *fg == Some(Color::Red)),
+            "removed line is red"
+        );
+        assert!(
+            colored
+                .iter()
+                .any(|(t, fg)| t.contains("@@") && *fg == Some(Color::Cyan)),
+            "hunk header is cyan"
+        );
+    }
+
+    #[test]
+    fn non_diff_tool_output_is_not_colorized() {
+        let mut app = App::new("openai", "gpt-4o");
+        app.apply(UiEvent::ToolResult("- item one\n- item two\n".into()));
+        let any_red = app
+            .transcript
+            .iter()
+            .any(|l| l.spans.last().map(|s| s.style.fg) == Some(Some(Color::Red)));
+        assert!(!any_red, "a plain list must not be colorized as a diff");
+    }
+
+    #[test]
     fn fmt_count_humanizes() {
         assert_eq!(fmt_count(0), "0");
         assert_eq!(fmt_count(999), "999");
@@ -1573,6 +2228,102 @@ mod tests {
     }
 
     #[test]
+    fn assistant_text_becomes_copy_target() {
+        let mut app = App::new("openai", "gpt-4o");
+        app.apply(UiEvent::Text("first ".into()));
+        app.apply(UiEvent::Text("answer\n".into()));
+        app.apply(UiEvent::AssistantEnd);
+        assert_eq!(app.last_assistant, "first answer");
+
+        app.apply(UiEvent::ToolCall(
+            "bash".into(),
+            r#"{"command":"echo noisy"}"#.into(),
+        ));
+        app.apply(UiEvent::ToolResult("noisy output".into()));
+        assert_eq!(
+            app.last_assistant, "first answer",
+            "tool logs are not copied as the assistant response"
+        );
+    }
+
+    #[test]
+    fn transcript_text_serializes_lines() {
+        let mut app = App::new("openai", "gpt-4o");
+        app.push(Line::raw("one"));
+        app.push(Line::from(vec![Span::raw("t"), Span::raw("wo")]));
+        assert_eq!(app.transcript_text(), "one\ntwo");
+    }
+
+    #[test]
+    fn base64_encoder_handles_padding() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+    }
+
+    #[test]
+    fn completed_turn_without_summary_is_visible() {
+        let mut app = App::new("openai", "gpt-4o");
+        app.note_turn_completed_without_summary();
+        let line = line_text(app.transcript.last().unwrap());
+        assert!(line.contains("✓ done"), "got: {line}");
+        assert!(line.contains("no usage reported"), "got: {line}");
+        assert_eq!(app.status, "done · no usage reported");
+    }
+
+    #[test]
+    fn stopped_after_tool_output_without_turn_end_is_visible() {
+        let mut app = App::new("openai", "gpt-4o");
+        app.apply(UiEvent::ToolCall(
+            "edit".into(),
+            r#"{"path":"src/main.rs"}"#.into(),
+        ));
+        app.apply(UiEvent::ToolResult("19 additions, 3 deletions".into()));
+        app.note_turn_completed_without_summary();
+
+        let lines: Vec<String> = app.transcript.iter().map(line_text).collect();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("stopped after tool output")),
+            "transcript: {lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("degraded in-session")),
+            "transcript: {lines:?}"
+        );
+        assert_eq!(app.status, "stopped after tool output");
+    }
+
+    #[test]
+    fn failed_turn_is_visible() {
+        let mut app = App::new("openai", "gpt-4o");
+        app.note_turn_failed("provider disconnected");
+        let line = line_text(app.transcript.last().unwrap());
+        assert!(line.contains("✗ failed"), "got: {line}");
+        assert!(line.contains("provider disconnected"), "got: {line}");
+        assert_eq!(app.status, "failed");
+    }
+
+    #[test]
+    fn empty_tool_result_is_visible() {
+        let mut app = App::new("openai", "gpt-4o");
+        app.apply(UiEvent::ToolCall(
+            "bash".into(),
+            r#"{"command":"true"}"#.into(),
+        ));
+        app.apply(UiEvent::ToolResult(String::new()));
+        let rendered: Vec<String> = app.transcript.iter().map(line_text).collect();
+        assert!(
+            rendered.iter().any(|line| line.contains("(no output)")),
+            "transcript: {rendered:?}"
+        );
+    }
+
+    #[test]
     fn input_editing_and_history() {
         let mut input = InputLine::default();
         for c in "helo".chars() {
@@ -1619,6 +2370,7 @@ mod tests {
                 "google/gemini".into(),
             ],
             "google/gemini",
+            HashMap::new(),
         );
         // Opens with the current model pre-selected.
         assert_eq!(p.current(), Some("google/gemini"));
@@ -1660,6 +2412,7 @@ mod tests {
         app.picker = Some(ModelPicker::new(
             vec!["anthropic/claude-sonnet-4".into(), "openai/gpt-4o".into()],
             "openai/gpt-4o",
+            HashMap::new(),
         ));
         let mut term = Terminal::new(TestBackend::new(60, 14)).unwrap();
         term.draw(|f| app.render(f)).unwrap();
@@ -1672,6 +2425,24 @@ mod tests {
         assert!(
             screen.contains("(current)"),
             "marks current model: {screen}"
+        );
+    }
+
+    #[test]
+    fn picker_shows_health_tag() {
+        let mut app = App::new("terminaili", "ipop/coder-balanced");
+        let tags = HashMap::from([("claude-sonnet-4.6".to_string(), "degraded".to_string())]);
+        app.picker = Some(ModelPicker::new(
+            vec!["claude-sonnet-4.6".into(), "ipop/coder-balanced".into()],
+            "ipop/coder-balanced",
+            tags,
+        ));
+        let mut term = Terminal::new(TestBackend::new(60, 14)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let screen = dump(&term);
+        assert!(
+            screen.contains("[degraded]"),
+            "degraded tag shown: {screen}"
         );
     }
 

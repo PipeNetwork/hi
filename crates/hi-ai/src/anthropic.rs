@@ -132,9 +132,9 @@ impl Provider for AnthropicProvider {
         Ok(completion)
     }
 
-    async fn list_models(&self) -> Result<Vec<String>> {
+    async fn list_models(&self) -> Result<Vec<crate::provider::ServedModel>> {
         let url = format!("{}/v1/models", self.base_url);
-        crate::http::fetch_model_ids(
+        crate::http::fetch_models(
             self.http
                 .get(&url)
                 .header("x-api-key", &self.api_key)

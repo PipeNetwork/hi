@@ -6,7 +6,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::provider::Provider;
+use crate::provider::{Provider, ServedModel};
 use crate::types::{ChatRequest, Completion, StreamEvent};
 
 /// One link in the fallback chain: a built provider plus the model id to request
@@ -73,7 +73,7 @@ impl Provider for FallbackProvider {
         unreachable!("fallback chain exhausted without returning")
     }
 
-    async fn list_models(&self) -> Result<Vec<String>> {
+    async fn list_models(&self) -> Result<Vec<ServedModel>> {
         match self.chain.first() {
             Some(backend) => backend.provider.list_models().await,
             None => Ok(Vec::new()),
