@@ -67,6 +67,43 @@ HI_MODEL=openrouter/fusion HI_API_KEY=$OPENROUTER_API_KEY \
 Both default to OpenRouter's base URL. The win condition: the `verify` config
 beats raw Fusion on pass-rate, and beats Fusion-as-a-model on $/solved-task.
 
+### A/B the tool-output condenser
+
+`hi` condenses test/compiler output (drops passing-test noise, keeps failures)
+before it re-enters context. To measure what that's worth, run the same matrix
+twice — toggling it with `HI_CONDENSE` — and compare the `tok/task` column (mean
+tokens to attempt one task):
+
+```bash
+HI_MODEL=… HI_API_KEY=… \
+  cargo run -p hi-eval -- bench/tasks                 # condense on (default)
+HI_CONDENSE=0 HI_MODEL=… HI_API_KEY=… \
+  cargo run -p hi-eval -- bench/tasks                 # condense off
+```
+
+The toggle is inherited by the `hi` subprocess; the run header and every
+artifact record `condense=on|off`, so `runs.jsonl` rows are self-labeled for
+offline analysis. The bet: `tok/task` drops with condensing on while `pass@1` /
+`pass@k` hold — fewer tokens for the same solve rate.
+
+### A/B recovery sampling
+
+When a round comes back empty/garbled, `hi` resamples hotter (temperature +
+nucleus + frequency penalty) on the retry to escape the stuck state.
+`HI_RECOVERY_SAMPLING=0` disables it (the retry just re-runs at the configured
+sampling); the header/artifacts record `recovery=on|off`.
+
+Unlike the condenser, this **won't move `tok/task`** — it only fires on a stall,
+which healthy models rarely produce. Its value shows up in **`pass@1` and the
+`error` failure bucket**: on a flaky local model, recovery on should convert some
+`error` cells (model returned nothing → gave up) into solves. On a model that
+never stalls, both sides are identical — which is the honest result, not a bug.
+
+```bash
+HI_MODEL=… cargo run -p hi-eval -- bench/tasks                    # recovery on (default)
+HI_RECOVERY_SAMPLING=0 HI_MODEL=… cargo run -p hi-eval -- bench/tasks  # recovery off
+```
+
 ### Manual terminaili runs
 
 Live provider evals are explicit and should not run in default CI. The

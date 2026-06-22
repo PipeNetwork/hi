@@ -54,6 +54,38 @@ user, in past tense, covering only what you actually did:\n\
 If something is incomplete or a check couldn't run, say so honestly. Output only the summary — \
 no preamble, and don't take any further action.";
 
+/// Whether recovery sampling (a hotter resample on an empty/garbled retry) is on.
+/// Off (`HI_RECOVERY_SAMPLING=0/off/false/no`) re-runs the retry at the configured
+/// sampling — the knob for A/B-ing recovery on the eval harness. Read once.
+static RECOVERY_SAMPLING: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    !matches!(
+        std::env::var("HI_RECOVERY_SAMPLING").ok().as_deref(),
+        Some("0" | "off" | "false" | "no")
+    )
+});
+
+/// Sampling for a model round, escalating with the count of consecutive
+/// content-less rounds (`retries`; 0 = the normal first attempt). Returns
+/// `(temperature, top_p, frequency_penalty)`. On a normal round — or when recovery
+/// sampling is disabled — it passes the configured temperature through and leaves
+/// `top_p`/`frequency_penalty` at the provider default (`None`). On a retry it
+/// climbs the temperature from a ≥0.7 floor toward 1.0 and adds nucleus sampling
+/// plus a growing frequency penalty, so a repetition/garble loop is actively
+/// discouraged rather than just reheated.
+fn recovery_sampling(
+    retries: u32,
+    base_temperature: Option<f32>,
+    enabled: bool,
+) -> (Option<f32>, Option<f32>, Option<f32>) {
+    if !enabled || retries == 0 {
+        return (base_temperature, None, None);
+    }
+    let r = retries as f32;
+    let temperature = (base_temperature.unwrap_or(0.7).max(0.7) + 0.15 * r).min(1.0);
+    let frequency_penalty = (0.2 * r).min(0.6);
+    (Some(temperature), Some(0.95), Some(frequency_penalty))
+}
+
 /// Instruction appended to a slice of history to summarize it for compaction.
 const SUMMARIZE_PROMPT: &str = "Summarize our conversation so far into a concise but \
 complete handoff brief: the task and goal, key decisions and constraints, files created \
@@ -511,6 +543,8 @@ impl Agent {
             tools: Vec::new(), // summarizing — no tool use
             max_tokens: self.config.max_tokens,
             temperature: self.config.temperature,
+            top_p: None,
+            frequency_penalty: None,
             thinking_budget: None,
             profile: RequestProfile {
                 compat: self.config.compat,
@@ -639,19 +673,18 @@ impl Agent {
                 }
                 steps += 1;
 
-                // After a content-less round, resample hotter on the retry to
-                // break out of the low-entropy/garbled attractor that produced it
-                // (cf. minion's recovery sampling). Bounded, and only while
-                // consecutively stalling — `empty_retries` resets on real output,
-                // so a normal round always runs at the configured temperature.
-                // Temperature is the portable lever here; repeat-penalty/DRY
-                // aren't plumbed through every provider.
-                let temperature = if empty_retries == 0 {
-                    self.config.temperature
-                } else {
-                    let base = self.config.temperature.unwrap_or(0.7).max(0.7);
-                    Some((base + 0.15 * empty_retries as f32).min(1.0))
-                };
+                // After a content-less/garbled round, resample hotter and with
+                // nucleus + frequency penalty on the retry to break out of the
+                // low-entropy attractor that produced it (cf. minion's recovery
+                // sampling). Bounded, and only while consecutively stalling —
+                // `empty_retries` resets on real output, so a normal round runs at
+                // the configured sampling. Toggleable via HI_RECOVERY_SAMPLING for
+                // A/B-ing on the eval harness.
+                let (temperature, top_p, frequency_penalty) = recovery_sampling(
+                    empty_retries,
+                    self.config.temperature,
+                    *RECOVERY_SAMPLING,
+                );
 
                 let request = ChatRequest {
                     model: self.config.model.clone(),
@@ -659,6 +692,8 @@ impl Agent {
                     tools: self.request_tools(),
                     max_tokens: self.config.max_tokens,
                     temperature,
+                    top_p,
+                    frequency_penalty,
                     thinking_budget: self.config.thinking_budget,
                     profile: RequestProfile {
                         compat: self.config.compat,
@@ -934,6 +969,8 @@ impl Agent {
             tools: Vec::new(), // recap only — no tool use
             max_tokens: self.config.max_tokens,
             temperature: self.config.temperature,
+            top_p: None,
+            frequency_penalty: None,
             thinking_budget: None,
             profile: RequestProfile {
                 compat: self.config.compat,
@@ -1220,11 +1257,13 @@ mod tests {
         }
     }
 
-    /// Like [`Canned`], but records the temperature of each request (shared via
-    /// an `Arc` so the test can inspect it after the provider is moved in).
+    /// Like [`Canned`], but records each request's sampling tuple
+    /// `(temperature, top_p, frequency_penalty)` (shared via an `Arc` so the test
+    /// can inspect it after the provider is moved in).
+    type Sample = (Option<f32>, Option<f32>, Option<f32>);
     struct RecordTemps {
         responses: Mutex<Vec<Completion>>,
-        temps: std::sync::Arc<Mutex<Vec<Option<f32>>>>,
+        samples: std::sync::Arc<Mutex<Vec<Sample>>>,
     }
 
     #[async_trait]
@@ -1234,7 +1273,11 @@ mod tests {
             request: ChatRequest,
             _sink: &mut (dyn FnMut(StreamEvent) + Send),
         ) -> Result<Completion> {
-            self.temps.lock().unwrap().push(request.temperature);
+            self.samples.lock().unwrap().push((
+                request.temperature,
+                request.top_p,
+                request.frequency_penalty,
+            ));
             Ok(self.responses.lock().unwrap().remove(0))
         }
     }
@@ -1933,28 +1976,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retry_resamples_at_a_higher_temperature() {
+    async fn retry_uses_recovery_sampling() {
         // A content-less first round triggers the silent retry, which must
-        // resample hotter to escape the attractor; the configured temperature is
-        // used for the initial (non-retry) call.
-        let temps = std::sync::Arc::new(Mutex::new(Vec::new()));
+        // resample hotter and with nucleus + frequency penalty to escape the
+        // attractor; the initial (non-retry) call uses the plain configured temp.
+        let samples = std::sync::Arc::new(Mutex::new(Vec::new()));
         let provider = RecordTemps {
             responses: Mutex::new(vec![
                 completion(vec![], 0, 0), // empty → retry
                 completion(vec![Content::Text("recovered".into())], 5, 3),
             ]),
-            temps: temps.clone(),
+            samples: samples.clone(),
         };
         let mut cfg = config();
         cfg.temperature = Some(0.2);
         let mut agent = Agent::new(Box::new(provider), cfg);
         agent.run_turn("go", &mut NullUi).await.unwrap();
 
-        let temps = temps.lock().unwrap();
-        assert_eq!(temps.len(), 2, "initial call + one retry, got {:?}", *temps);
-        assert_eq!(temps[0], Some(0.2), "first call uses the configured temp");
-        let retry = temps[1].expect("retry has a temperature");
-        assert!(retry > 0.2, "retry resamples hotter, got {retry}");
+        let samples = samples.lock().unwrap();
+        assert_eq!(samples.len(), 2, "initial call + one retry, got {:?}", *samples);
+        assert_eq!(
+            samples[0],
+            (Some(0.2), None, None),
+            "first call: configured temp, no recovery overrides"
+        );
+        let (temp, top_p, freq) = samples[1];
+        assert!(temp.unwrap() > 0.2, "retry resamples hotter, got {temp:?}");
+        assert_eq!(top_p, Some(0.95), "retry adds nucleus sampling");
+        assert!(
+            freq.is_some_and(|f| f > 0.0),
+            "retry adds a frequency penalty, got {freq:?}"
+        );
+    }
+
+    #[test]
+    fn recovery_sampling_escalates_and_toggles() {
+        // Normal round: pass the configured temperature through, no overrides.
+        assert_eq!(
+            recovery_sampling(0, Some(0.2), true),
+            (Some(0.2), None, None)
+        );
+        // First retry: hotter, with nucleus and a frequency penalty.
+        let (t1, p1, f1) = recovery_sampling(1, Some(0.2), true);
+        assert_eq!((p1, f1), (Some(0.95), Some(0.2)));
+        assert!(t1.unwrap() > 0.2 && t1.unwrap() <= 1.0, "temp climbs: {t1:?}");
+        // Second retry climbs further; temperature and penalty stay bounded.
+        let (t2, _, f2) = recovery_sampling(2, Some(0.2), true);
+        assert!(t2.unwrap() > t1.unwrap(), "temp keeps climbing");
+        assert!(f2.unwrap() > f1.unwrap(), "penalty grows");
+        assert!(t2.unwrap() <= 1.0 && f2.unwrap() <= 0.6, "both bounded");
+        // Disabled: a retry behaves like a normal round (no overrides).
+        assert_eq!(
+            recovery_sampling(2, Some(0.2), false),
+            (Some(0.2), None, None)
+        );
     }
 
     #[tokio::test]

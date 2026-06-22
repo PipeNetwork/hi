@@ -135,6 +135,8 @@ mod tests {
             tools: vec![],
             max_tokens: 16,
             temperature: None,
+            top_p: None,
+            frequency_penalty: None,
             thinking_budget: None,
             profile: Default::default(),
         }

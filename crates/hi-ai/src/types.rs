@@ -145,6 +145,13 @@ pub struct ChatRequest {
     pub tools: Vec<ToolSpec>,
     pub max_tokens: u32,
     pub temperature: Option<f32>,
+    /// Nucleus-sampling cutoff. Mainly used by recovery sampling (bumped on a
+    /// retry after a content-less round). `None` leaves the provider default.
+    pub top_p: Option<f32>,
+    /// Penalty on already-seen tokens (OpenAI-compatible providers only;
+    /// Anthropic has no equivalent and ignores it). Used by recovery sampling to
+    /// break a repetition/garbled loop. `None` leaves the provider default.
+    pub frequency_penalty: Option<f32>,
     /// When set, asks the provider to emit reasoning with this token budget
     /// (Anthropic extended thinking). Ignored by providers that don't support it.
     pub thinking_budget: Option<u32>,

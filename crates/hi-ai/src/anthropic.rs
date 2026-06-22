@@ -195,9 +195,15 @@ fn build_body(request: &ChatRequest) -> Value {
     }
     if let Some(budget) = request.thinking_budget {
         body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
-        // Extended thinking requires the default temperature, so don't set it.
-    } else if let Some(temperature) = request.temperature {
-        body["temperature"] = json!(temperature);
+        // Extended thinking requires default sampling, so set neither temperature
+        // nor top_p. (Anthropic has no frequency_penalty; it's ignored either way.)
+    } else {
+        if let Some(temperature) = request.temperature {
+            body["temperature"] = json!(temperature);
+        }
+        if let Some(top_p) = request.top_p {
+            body["top_p"] = json!(top_p);
+        }
     }
     body
 }

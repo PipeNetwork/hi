@@ -369,6 +369,12 @@ fn build_body(request: &ChatRequest, attempt: RequestAttempt) -> Value {
     if let Some(temperature) = request.temperature {
         body["temperature"] = json!(temperature);
     }
+    if let Some(top_p) = request.top_p {
+        body["top_p"] = json!(top_p);
+    }
+    if let Some(frequency_penalty) = request.frequency_penalty {
+        body["frequency_penalty"] = json!(frequency_penalty);
+    }
     body
 }
 
@@ -658,6 +664,8 @@ mod tests {
             tools: vec![],
             max_tokens: 16,
             temperature: None,
+            top_p: None,
+            frequency_penalty: None,
             thinking_budget: None,
             profile: Default::default(),
         };
@@ -668,6 +676,40 @@ mod tests {
         let fallback = build_body(&req, request_attempts(&req)[1]);
         assert!(fallback.get("stream_options").is_none());
         assert_eq!(fallback["stream"], true);
+    }
+
+    #[test]
+    fn request_body_carries_recovery_sampling() {
+        // top_p/frequency_penalty (set by recovery sampling on a retry) reach the
+        // wire; absent fields stay absent so the provider default applies.
+        let mut req = crate::types::ChatRequest {
+            model: "m".into(),
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            max_tokens: 16,
+            temperature: None,
+            top_p: None,
+            frequency_penalty: None,
+            thinking_budget: None,
+            profile: Default::default(),
+        };
+        let plain = build_body(&req, request_attempts(&req)[0]);
+        assert!(plain.get("top_p").is_none(), "omitted when unset");
+        assert!(plain.get("frequency_penalty").is_none());
+
+        req.temperature = Some(0.9);
+        req.top_p = Some(0.95);
+        req.frequency_penalty = Some(0.4);
+        let hot = build_body(&req, request_attempts(&req)[0]);
+        // f32 → JSON f64 isn't exact (0.9f32 ≈ 0.89999996), so compare with tolerance.
+        let near = |v: &serde_json::Value, want: f64| (v.as_f64().unwrap() - want).abs() < 1e-6;
+        assert!(near(&hot["temperature"], 0.9), "temperature: {}", hot["temperature"]);
+        assert!(near(&hot["top_p"], 0.95), "top_p: {}", hot["top_p"]);
+        assert!(
+            near(&hot["frequency_penalty"], 0.4),
+            "frequency_penalty: {}",
+            hot["frequency_penalty"]
+        );
     }
 
     #[tokio::test]
@@ -844,6 +886,8 @@ mod tests {
             tools,
             max_tokens: 16,
             temperature: None,
+            top_p: None,
+            frequency_penalty: None,
             thinking_budget: None,
             profile,
         }

@@ -160,6 +160,10 @@ struct RunArtifact {
     config: String,
     trial: usize,
     profile: String,
+    /// Whether the tool-output condenser was on for this run (for the A/B).
+    condense: bool,
+    /// Whether recovery sampling was on for this run (for the A/B).
+    recovery: bool,
     passed: bool,
     failure_bucket: Option<String>,
     failure_confidence: Option<&'static str>,
@@ -335,11 +339,23 @@ fn main() -> Result<()> {
 
     let hi = find_hi()?;
     let model = std::env::var("HI_MODEL").unwrap_or_else(|_| "(unset)".into());
+    // Mirror hi's env toggles so the run header and artifacts label which side of
+    // each A/B this run is: `HI_CONDENSE=0` / `HI_RECOVERY_SAMPLING=0` to disable.
+    let env_on = |name: &str| {
+        !matches!(
+            std::env::var(name).ok().as_deref(),
+            Some("0" | "off" | "false" | "no")
+        )
+    };
+    let condense_on = env_on("HI_CONDENSE");
+    let recovery_on = env_on("HI_RECOVERY_SAMPLING");
     eprintln!(
-        "hi-eval: {} task(s) × {} config(s) × {trials} trial(s) · model={model} · profile={} · hi={} · artifacts={}",
+        "hi-eval: {} task(s) × {} config(s) × {trials} trial(s) · model={model} · profile={} · condense={} · recovery={} · hi={} · artifacts={}",
         tasks.len(),
         active.len(),
         profile.label(),
+        if condense_on { "on" } else { "off" },
+        if recovery_on { "on" } else { "off" },
         hi.display(),
         artifacts_dir.display()
     );
@@ -356,7 +372,7 @@ fn main() -> Result<()> {
                     .with_context(|| format!("running task '{label}' [{}]", config.name))?;
                 result.task = label.clone();
                 result.trial = trial;
-                write_artifact(&artifacts_dir, profile, &result)?;
+                write_artifact(&artifacts_dir, profile, condense_on, recovery_on, &result)?;
                 eprintln!(
                     "  {:10} {:4} {label}  ({} cand, {} tok, ${:.4}, {:.1}s)",
                     config.name,
@@ -591,12 +607,20 @@ fn run_candidate(
     })
 }
 
-fn write_artifact(dir: &Path, profile: EvalProfile, result: &RunResult) -> Result<()> {
+fn write_artifact(
+    dir: &Path,
+    profile: EvalProfile,
+    condense: bool,
+    recovery: bool,
+    result: &RunResult,
+) -> Result<()> {
     let artifact = RunArtifact {
         task: result.task.clone(),
         config: result.config.to_string(),
         trial: result.trial,
         profile: profile.label().to_string(),
+        condense,
+        recovery,
         passed: result.passed,
         failure_bucket: result.fail.map(|f| f.label().to_string()),
         failure_confidence: result.failure_confidence,
@@ -671,8 +695,8 @@ fn default_artifacts_dir() -> PathBuf {
 fn print_summary(results: &[RunResult], task_count: usize, active: &[&Config], trials: usize) {
     println!("\n=== Results ({task_count} tasks × {trials} trial(s)) ===");
     println!(
-        "{:<10} {:>14} {:>8} {:>6} {:>11} {:>10}",
-        "config", "pass@1", "pass@k", "cand", "tok/trial", "$/trial"
+        "{:<10} {:>14} {:>8} {:>6} {:>11} {:>10} {:>10}",
+        "config", "pass@1", "pass@k", "cand", "tok/trial", "tok/task", "$/trial"
     );
     for config in active {
         let rows: Vec<&RunResult> = results.iter().filter(|r| r.config == config.name).collect();
@@ -706,14 +730,18 @@ fn print_summary(results: &[RunResult], task_count: usize, active: &[&Config], t
         }
 
         let tokens: u64 = rows.iter().map(|r| r.tokens).sum::<u64>() / trials as u64;
+        // The headline A/B number: mean tokens to attempt one task (summed across
+        // a config's candidates). Compare it across condense on/off runs.
+        let tok_per_task = tokens / task_count.max(1) as u64;
         let cost: f64 = rows.iter().map(|r| r.cost_usd).sum::<f64>() / trials as f64;
         println!(
-            "{:<10} {:>14} {:>8} {:>6} {:>11} {:>10}",
+            "{:<10} {:>14} {:>8} {:>6} {:>11} {:>10} {:>10}",
             config.name,
             pass1,
             format!("{}/{task_count}", solved.len()),
             config.temperatures.len(),
             tokens,
+            tok_per_task,
             format!("${cost:.4}")
         );
 

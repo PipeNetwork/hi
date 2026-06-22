@@ -622,9 +622,25 @@ fn truncate(s: &str) -> String {
     truncate_to(s, *MAX_OUTPUT_CHARS)
 }
 
-/// Condense output to the configured budget (test/diagnostic-aware).
+/// Whether the diagnostic condenser is enabled. Off falls back to plain head+tail
+/// truncation — the knob that lets the eval harness A/B the condenser's value.
+/// Read once, at first use.
+static CONDENSE_ENABLED: LazyLock<bool> =
+    LazyLock::new(|| condense_enabled(std::env::var("HI_CONDENSE").ok().as_deref()));
+
+/// Parse the `HI_CONDENSE` toggle: on by default; `0`/`off`/`false`/`no` disable.
+fn condense_enabled(var: Option<&str>) -> bool {
+    !matches!(var, Some("0" | "off" | "false" | "no"))
+}
+
+/// Condense output to the configured budget (test/diagnostic-aware), unless the
+/// condenser is disabled — then just head+tail clip.
 fn condense(s: &str) -> String {
-    condense_diagnostics(s, *MAX_OUTPUT_CHARS)
+    if *CONDENSE_ENABLED {
+        condense_diagnostics(s, *MAX_OUTPUT_CHARS)
+    } else {
+        truncate(s)
+    }
 }
 
 /// Condense test-runner and compiler output: keep the head, the summary, and
@@ -938,8 +954,19 @@ struct BashArgs {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_edit, condense_diagnostics, diff, edit_not_found_help, format_read, truncate_to,
+        apply_edit, condense_diagnostics, condense_enabled, diff, edit_not_found_help, format_read,
+        truncate_to,
     };
+
+    #[test]
+    fn condense_toggle_defaults_on_and_parses_off_values() {
+        assert!(condense_enabled(None), "default on when unset");
+        assert!(condense_enabled(Some("1")), "any other value is on");
+        assert!(condense_enabled(Some("on")));
+        for off in ["0", "off", "false", "no"] {
+            assert!(!condense_enabled(Some(off)), "{off} disables");
+        }
+    }
 
     /// A realistic libtest run: a `header`, `passing` "... ok" lines, an injected
     /// failure block somewhere in the middle, and the final summary.
