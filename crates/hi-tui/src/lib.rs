@@ -437,7 +437,9 @@ pub async fn run(
             app.maybe_notify_done();
         }
         app.set_working(false);
-        app.follow();
+        // No follow() at turn end: if the user scrolled up to read mid-turn, leave
+        // them there (the "↓ N new" hint shows the summary is below). A new turn
+        // re-pins to the bottom.
     }
 
     // Persist input history for next time.
@@ -523,6 +525,10 @@ async fn drive(
                         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                         match key.code {
                             KeyCode::Char('c') if ctrl => { cancelled = true; break; }
+                            // Esc clears a half-typed queued command, or — when the
+                            // input is empty — interrupts the running turn (a second
+                            // way out besides Ctrl-C).
+                            KeyCode::Esc if app.input.is_empty() => { cancelled = true; break; }
                             KeyCode::Esc => app.input.clear(),
                             // Typing while a turn runs queues the next command —
                             // except `/tokens`, which reads the live counter and
@@ -641,12 +647,28 @@ struct App {
     /// Carries across streamed lines so code interiors highlight consistently.
     code_lang: Option<String>,
     input: InputLine,
-    /// Lines scrolled up from the bottom (0 = following the latest output).
-    scroll_up: u16,
+    /// Transcript scroll state. `following` pins the view to the latest output
+    /// (the default); scrolling up unpins it and `scroll` holds the absolute
+    /// offset (wrapped lines hidden above the viewport). It re-pins once scrolled
+    /// back to the bottom, so streaming output never yanks a reader downward.
+    following: bool,
+    scroll: u16,
+    /// Cached each render so scroll events (which fire outside render and don't
+    /// know the wrapped height) can clamp and detect the bottom.
+    view_max_scroll: u16,
+    view_total: u16,
+    /// Wrapped-line total at the moment the view last left the bottom — drives
+    /// the "↓ N new" indicator while scrolled up.
+    total_when_unpinned: u16,
     working: bool,
     spinner: usize,
     /// When the current turn started, for the elapsed-time readout.
     started: Option<Instant>,
+    /// The tool currently executing (its display label) and when it started, so
+    /// the working line can name the in-flight action with its own timer. `None`
+    /// while the model — not a tool — is the active party.
+    current_tool: Option<String>,
+    current_tool_started: Option<Instant>,
     /// Lines typed while a turn was running, to run once it finishes (FIFO).
     queue: VecDeque<String>,
     /// The last message actually sent to the model, for `/retry`.
@@ -707,6 +729,7 @@ struct CompletionState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TurnEventKind {
     Assistant,
+    Reasoning,
     AssistantEnd,
     ToolCall,
     ToolResult,
@@ -715,19 +738,6 @@ enum TurnEventKind {
     TurnEnd,
 }
 
-impl TurnEventKind {
-    fn label(self) -> &'static str {
-        match self {
-            TurnEventKind::Assistant => "assistant",
-            TurnEventKind::AssistantEnd => "assistant end",
-            TurnEventKind::ToolCall => "tool call",
-            TurnEventKind::ToolResult => "tool result",
-            TurnEventKind::Status => "status",
-            TurnEventKind::Usage => "usage",
-            TurnEventKind::TurnEnd => "turn end",
-        }
-    }
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum TurnState {
@@ -748,10 +758,16 @@ impl App {
             pending: None,
             code_lang: None,
             input: InputLine::default(),
-            scroll_up: 0,
+            following: true,
+            scroll: 0,
+            view_max_scroll: 0,
+            view_total: 0,
+            total_when_unpinned: 0,
             working: false,
             spinner: 0,
             started: None,
+            current_tool: None,
+            current_tool_started: None,
             queue: VecDeque::new(),
             last_prompt: None,
             last_turn_start: 0,
@@ -946,6 +962,8 @@ impl App {
     fn set_working(&mut self, working: bool) {
         self.working = working;
         self.started = working.then(Instant::now);
+        self.current_tool = None;
+        self.current_tool_started = None;
         if working {
             self.last_turn_event = None;
             self.last_turn_had_file_edits = false;
@@ -955,6 +973,24 @@ impl App {
             self.last_turn_state = TurnState::Idle;
             self.waiting_for = None;
         }
+    }
+
+    /// The live "what's happening now" lead for the working line: the in-flight
+    /// tool named with its own elapsed timer, otherwise the model phase —
+    /// `thinking…` (reasoning), `responding…` (streaming text), or `waiting for
+    /// the model…` (the round's model call is in flight but nothing's streamed
+    /// yet). Lets you tell a slow tool from a slow model at a glance.
+    fn activity_line(&self) -> String {
+        if let (Some(tool), Some(started)) = (&self.current_tool, self.current_tool_started) {
+            return format!("running {tool} · {}s", started.elapsed().as_secs());
+        }
+        let secs = self.started.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+        let verb = match self.last_turn_event {
+            Some(TurnEventKind::Reasoning) => "thinking",
+            Some(TurnEventKind::Assistant) => "responding",
+            _ => "waiting for the model",
+        };
+        format!("{verb}… {secs}s")
     }
 
     /// Apply a pure editing/navigation key to the input line, shared by the
@@ -979,6 +1015,8 @@ impl App {
             KeyCode::Char('u') if ctrl => self.input.kill_to_start(),
             KeyCode::Char('a') if ctrl => self.input.home(),
             KeyCode::Char('e') if ctrl => self.input.end(),
+            KeyCode::Home => self.input.home(),
+            KeyCode::End => self.input.end(),
             KeyCode::Char(c) if !ctrl => self.input.insert(c),
             KeyCode::Backspace => self.input.backspace(),
             KeyCode::Left => self.input.left(),
@@ -1056,8 +1094,11 @@ impl App {
         }
     }
 
+    /// Re-pin the view to the latest output. Called on explicit user actions (a
+    /// new turn, a command's output) — not on streaming appends, so a reader who
+    /// scrolled up stays put.
     fn follow(&mut self) {
-        self.scroll_up = 0;
+        self.following = true;
     }
 
     /// Push the cumulative-usage line from the live counters. Works mid-turn —
@@ -1208,11 +1249,34 @@ impl App {
     }
 
     fn scroll_up(&mut self, n: u16) {
-        self.scroll_up = self.scroll_up.saturating_add(n);
+        self.scroll_by(-(n as i32));
     }
 
     fn scroll_down(&mut self, n: u16) {
-        self.scroll_up = self.scroll_up.saturating_sub(n);
+        self.scroll_by(n as i32);
+    }
+
+    /// Move the viewport by `delta` wrapped lines (negative = toward older
+    /// output). Re-pins to the bottom when scrolled all the way down; snapshots
+    /// the line count when first leaving the bottom (for the "↓ N new" hint).
+    /// Uses the metrics cached by the last render.
+    fn scroll_by(&mut self, delta: i32) {
+        let max = self.view_max_scroll as i32;
+        let cur = if self.following {
+            max
+        } else {
+            (self.scroll as i32).min(max)
+        };
+        let next = (cur + delta).clamp(0, max);
+        if next >= max {
+            self.following = true;
+        } else {
+            if self.following {
+                self.total_when_unpinned = self.view_total;
+            }
+            self.following = false;
+            self.scroll = next as u16;
+        }
     }
 
     /// Commit the in-progress streamed line, if any.
@@ -1251,7 +1315,8 @@ impl App {
             };
             self.transcript.push(line);
         }
-        self.follow();
+        // No follow() here: streaming must not yank a reader who scrolled up.
+        // While following, the view already tracks the growing bottom.
     }
 
     fn apply(&mut self, event: UiEvent) {
@@ -1265,7 +1330,7 @@ impl App {
             }
             UiEvent::Reasoning(t) => {
                 self.event_log.push(format!("reasoning {} chars", t.len()));
-                self.last_turn_event = Some(TurnEventKind::Assistant);
+                self.last_turn_event = Some(TurnEventKind::Reasoning);
                 self.stream(dim(), false, &t);
             }
             UiEvent::AssistantEnd => {
@@ -1281,15 +1346,19 @@ impl App {
                 self.code_lang = None;
             }
             UiEvent::ToolCall(name, args) => {
-                self.event_log
-                    .push(format!("tool_call {}", tool_label(&name, &args)));
+                let label = tool_label(&name, &args);
+                self.event_log.push(format!("tool_call {label}"));
                 self.last_turn_event = Some(TurnEventKind::ToolCall);
                 if matches!(name.as_str(), "write" | "edit") {
                     self.last_turn_had_file_edits = true;
                 }
+                // Mark this tool as the active party so the working line can name
+                // it with its own timer until the result lands.
+                self.current_tool = Some(label.clone());
+                self.current_tool_started = Some(Instant::now());
                 self.flush_pending();
                 self.push(Line::styled(
-                    format!("⏺ {}", tool_label(&name, &args)),
+                    format!("⏺ {label}"),
                     Style::default().fg(Color::Cyan),
                 ));
             }
@@ -1297,6 +1366,9 @@ impl App {
                 self.event_log
                     .push(format!("tool_result {} chars", result.len()));
                 self.last_turn_event = Some(TurnEventKind::ToolResult);
+                // The tool finished — back to the model being the active party.
+                self.current_tool = None;
+                self.current_tool_started = None;
                 self.flush_pending();
                 self.push_result(&result);
             }
@@ -1330,7 +1402,8 @@ impl App {
                 self.status = summary.trim_matches(['[', ']']).to_string();
                 self.last_turn_state = TurnState::Done(self.status.clone());
                 self.push(Line::styled(format!("✓ done · {}", self.status), dim()));
-                self.follow();
+                // No follow(): respect a reader who scrolled up — the "↓ N new"
+                // hint tells them the summary landed below.
             }
         }
     }
@@ -1513,12 +1586,6 @@ impl App {
         } else {
             format!(" {} ", info_parts.join(" · "))
         };
-        let block = Block::bordered()
-            .border_type(BorderType::Rounded)
-            .border_style(dim())
-            .title(title)
-            .title_top(Line::from(info).right_aligned());
-
         let mut lines = self.transcript.clone();
         if let Some((style, _markdown, text)) = &self.pending {
             // The in-progress line shows literally; markdown styling is applied
@@ -1529,10 +1596,41 @@ impl App {
         let inner_h = rows[0].height.saturating_sub(2);
         let total = wrapped_height(&lines, inner_w);
         let max_scroll = total.saturating_sub(inner_h);
-        // Clamp here, where the content/viewport heights are known, so scrolling
-        // past the top can't bank offset you'd have to scroll back down through.
-        self.scroll_up = self.scroll_up.min(max_scroll);
-        let scroll = max_scroll.saturating_sub(self.scroll_up);
+        // Cache the geometry so scroll events (which fire outside render) can clamp
+        // and detect the bottom.
+        self.view_max_scroll = max_scroll;
+        self.view_total = total;
+        // Pinned to the bottom while following; otherwise hold the user's absolute
+        // offset, re-pinning if the content shrank back to within one screen.
+        let scroll = if self.following || self.scroll >= max_scroll {
+            self.following = true;
+            max_scroll
+        } else {
+            self.scroll
+        };
+
+        let mut block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(dim())
+            .title(title)
+            .title_top(Line::from(info).right_aligned());
+        // While scrolled up, a bottom-right hint shows how much is below — new
+        // lines that arrived since you left the bottom, else how far down it is.
+        if !self.following {
+            let new = total.saturating_sub(self.total_when_unpinned);
+            let label = if new > 0 {
+                format!(" ↓ {new} new ")
+            } else {
+                format!(" ↓ {} below ", max_scroll.saturating_sub(scroll))
+            };
+            block = block.title_bottom(
+                Line::from(Span::styled(
+                    label,
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                ))
+                .right_aligned(),
+            );
+        }
         let para = Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .block(block)
@@ -1626,7 +1724,6 @@ impl App {
             }
             if self.working {
                 let frame_ch = SPINNER[self.spinner % SPINNER.len()];
-                let secs = self.started.map(|t| t.elapsed().as_secs()).unwrap_or(0);
                 let (input, output) = self.usage;
                 // Show the running token total once the first round reports it.
                 let mut stats = String::new();
@@ -1636,17 +1733,12 @@ impl App {
                 if let Some(pct) = self.context_pct() {
                     stats.push_str(&format!(" · {pct}% ctx"));
                 }
-                if let Some(event) = self.last_turn_event {
-                    stats.push_str(&format!(" · last: {}", event.label()));
-                }
-                if let Some(waiting) = self.waiting_for
-                    && waiting >= WATCHDOG_NOTICE
-                {
-                    stats.push_str(&format!(" · waiting {}s", waiting.as_secs()));
-                }
+                // The activity lead (named tool + timer, or thinking/responding)
+                // replaces the old coarse "working… · last: <event>"; its own timer
+                // and the watchdog notices cover the "is it stalled?" signal.
                 ilines.push(Line::from(vec![
                     Span::styled(
-                        format!("{frame_ch} working… {secs}s{stats}"),
+                        format!("{frame_ch} {}{stats}", self.activity_line()),
                         Style::default()
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
@@ -2369,6 +2461,65 @@ mod tests {
     }
 
     #[test]
+    fn sticky_scroll_unpins_on_scroll_up_and_repins_at_bottom() {
+        let mut app = App::new("openai", "gpt-4o");
+        // Simulate what render() caches for a transcript taller than the viewport.
+        app.view_max_scroll = 100;
+        app.view_total = 120;
+        assert!(app.following, "starts pinned to the bottom");
+
+        // Scrolling up unpins, holds an absolute offset, and snapshots the count.
+        app.scroll_up(10);
+        assert!(!app.following, "scroll up unpins");
+        assert_eq!(app.scroll, 90, "offset = max_scroll - 10");
+        assert_eq!(app.total_when_unpinned, 120);
+
+        // Streaming output below must NOT yank a scrolled-up reader back down.
+        app.apply(UiEvent::Text("a fresh streamed line\n".into()));
+        assert!(!app.following, "new output leaves the scrolled-up reader put");
+
+        // Scrolling back past the bottom re-pins so output follows again.
+        app.scroll_down(1000);
+        assert!(app.following, "reaching the bottom re-pins");
+    }
+
+    #[test]
+    fn working_line_names_the_inflight_tool_and_model_phase() {
+        let mut app = App::new("openai", "gpt-4o");
+        app.set_working(true);
+        // Model phase: reasoning then text stream distinctly.
+        app.apply(UiEvent::Reasoning("hmm".into()));
+        assert!(
+            app.activity_line().starts_with("thinking…"),
+            "{}",
+            app.activity_line()
+        );
+        app.apply(UiEvent::Text("here".into()));
+        assert!(
+            app.activity_line().starts_with("responding…"),
+            "{}",
+            app.activity_line()
+        );
+        // A tool starts → the line names it (with its own timer)…
+        app.apply(UiEvent::ToolCall(
+            "bash".into(),
+            "{\"command\":\"cargo test\"}".into(),
+        ));
+        assert!(
+            app.activity_line().starts_with("running bash cargo test"),
+            "{}",
+            app.activity_line()
+        );
+        // …and clears back to the model once the result lands.
+        app.apply(UiEvent::ToolResult("ok".into()));
+        assert!(
+            app.activity_line().starts_with("waiting for the model"),
+            "{}",
+            app.activity_line()
+        );
+    }
+
+    #[test]
     fn renders_tool_call_diff_and_spinner() {
         let mut app = App::new("openai", "gpt-4o");
         app.apply(UiEvent::ToolCall(
@@ -2399,8 +2550,8 @@ mod tests {
         );
         assert!(screen.contains("1290 total"), "status bar shows usage");
         assert!(
-            screen.contains("working… 0s"),
-            "prompt bar shows spinner + elapsed while working"
+            screen.contains(SPINNER[2]) && screen.contains("0s"),
+            "prompt bar shows the spinner + an elapsed timer while working: {screen}"
         );
         assert!(
             screen.contains("Ctrl-C to interrupt"),
@@ -2487,7 +2638,7 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(72, 8)).unwrap();
         term.draw(|f| app.render(f)).unwrap();
         let screen = dump(&term);
-        assert!(screen.contains("working…"), "spinner: {screen}");
+        assert!(screen.contains(SPINNER[0]), "spinner shown: {screen}");
         assert!(screen.contains("↑1.2k"), "live input tokens: {screen}");
         assert!(screen.contains("↓340"), "live output tokens: {screen}");
         assert!(screen.contains("50% ctx"), "live context fill: {screen}");
@@ -2527,7 +2678,7 @@ mod tests {
         term.draw(|f| app.render(f)).unwrap();
         let screen = dump(&term);
 
-        assert!(screen.contains("working…"), "spinner shown while working");
+        assert!(screen.contains(SPINNER[0]), "spinner shown while working");
         assert!(
             screen.contains("run the tests"),
             "first queued command shown"
