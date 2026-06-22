@@ -23,6 +23,8 @@ pub enum Command {
     Copy(String),
     /// Show, set, or clear the current session goal.
     Goal(String),
+    /// Explore the repo and write a project-context file (runs as a turn).
+    Init,
     /// Reclaim context. Empty arg = configured strategy; `full`/`hybrid`/`elide`
     /// pick one explicitly.
     Compact(String),
@@ -54,6 +56,7 @@ pub fn parse(line: &str) -> Option<Command> {
         "diff" | "changes" => Command::Diff,
         "copy" | "cp" => Command::Copy(arg),
         "goal" => Command::Goal(arg),
+        "init" => Command::Init,
         "compact" => Command::Compact(arg),
         "retry" | "redo" => Command::Retry,
         "undo" | "revert" => Command::Undo,
@@ -90,6 +93,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec { name: "diff", args: "", help: "show what files have changed (git diff)" },
     CommandSpec { name: "copy", args: "[all]", help: "copy the last response (or transcript) to the clipboard" },
     CommandSpec { name: "goal", args: "[text|clear]", help: "show, set, or clear the current session goal" },
+    CommandSpec { name: "init", args: "", help: "scan the repo and write an HI.md project guide" },
     CommandSpec { name: "compact", args: "[kind]", help: "reclaim context (kind: hybrid, full, or elide)" },
     CommandSpec { name: "retry", args: "", help: "re-run your last message" },
     CommandSpec { name: "undo", args: "", help: "revert the file changes from the last turn" },
@@ -99,6 +103,15 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec { name: "clear", args: "", help: "start a fresh conversation" },
     CommandSpec { name: "exit", args: "", help: "quit" },
 ];
+
+/// The message `/init` runs as a turn: explore the project and write a concise
+/// `HI.md` guide that future sessions load as context.
+pub const INIT_PROMPT: &str = "Explore this project (use the list and read tools) and write a \
+file named HI.md at the repository root — a concise guide for a coding agent working here. \
+Cover: what the project is and does; the main directories and files and their roles; the exact \
+build, test, lint, and run commands; and any conventions or constraints worth knowing. Be \
+factual and tight — this file is loaded as context for future sessions. Create HI.md with the \
+write tool, then end with a one-line summary of what you captured.";
 
 /// Commands whose canonical name starts with `prefix` (case-insensitive), in
 /// display order — drives the `/`-completion menu. An empty prefix lists all.

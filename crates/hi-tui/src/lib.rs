@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use ansi_to_tui::IntoText;
 use anyhow::{Context, Result};
 use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, Event, EventStream, KeyCode, KeyEvent,
-    KeyEventKind, KeyModifiers,
+    DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange, Event,
+    EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -37,6 +37,9 @@ const PICKER_ROWS: usize = 12;
 const TICK: Duration = Duration::from_millis(120);
 const WATCHDOG_NOTICE: Duration = Duration::from_secs(20);
 const WATCHDOG_STUCK: Duration = Duration::from_secs(60);
+/// On terminals that don't report focus, notify after a turn at least this long
+/// (a proxy for "you probably stepped away").
+const NOTIFY_THRESHOLD: Duration = Duration::from_secs(30);
 
 /// Run the full-screen TUI until the user quits. `history_path`, if given, is
 /// the file used to persist input history across sessions (shared with the
@@ -53,6 +56,9 @@ pub async fn run(
     // Bracketed paste: the terminal wraps a paste so it arrives as one
     // Event::Paste instead of per-line Enter keys (which would submit each line).
     let _ = execute!(io::stdout(), EnableBracketedPaste);
+    // Focus reporting: lets us tell when you've switched away, so a finished turn
+    // can ping you only when you're not looking. Harmless if unsupported.
+    let _ = execute!(io::stdout(), EnableFocusChange);
     let _restore = Restore;
     let mut terminal =
         Terminal::new(CrosstermBackend::new(io::stdout())).context("creating terminal")?;
@@ -217,6 +223,8 @@ pub async fn run(
                             }
                         }
                     }
+                    Event::FocusGained => app.set_focus(true),
+                    Event::FocusLost => app.set_focus(false),
                     _ => {}
                 }
             },
@@ -279,6 +287,13 @@ pub async fn run(
                         continue;
                     }
                 },
+                Command::Init => {
+                    app.push(Line::styled(
+                        "scanning the project to write HI.md…".to_string(),
+                        dim(),
+                    ));
+                    command::INIT_PROMPT.to_string()
+                }
                 Command::Undo => {
                     let checkpoints = agent.checkpoint_count();
                     if checkpoints > 0 {
@@ -413,6 +428,9 @@ pub async fn run(
                 "^C interrupted; turn discarded".to_string()
             };
             app.push(Line::styled(msg, Style::default().fg(Color::Yellow)));
+        } else {
+            // Turn finished on its own — ping if you've likely stepped away.
+            app.maybe_notify_done();
         }
         app.set_working(false);
         app.follow();
@@ -514,6 +532,8 @@ async fn drive(
                             }
                         }
                     }
+                    Some(Event::FocusGained) => app.set_focus(true),
+                    Some(Event::FocusLost) => app.set_focus(false),
                     _ => {}
                 }
             }
@@ -528,7 +548,12 @@ struct Restore;
 impl Drop for Restore {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            DisableFocusChange,
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        );
     }
 }
 
@@ -607,8 +632,10 @@ struct App {
     /// newline/end. `markdown` is set for assistant prose so it's rendered with
     /// light markdown styling; reasoning and other streams stay literal.
     pending: Option<(Style, bool, String)>,
-    /// Whether the streamed assistant text is currently inside a ``` fence.
-    in_code_block: bool,
+    /// The language of the ``` fence the streamed assistant text is currently
+    /// inside (empty string if the fence gave none); `None` when not in a fence.
+    /// Carries across streamed lines so code interiors highlight consistently.
+    code_lang: Option<String>,
     input: InputLine,
     /// Lines scrolled up from the bottom (0 = following the latest output).
     scroll_up: u16,
@@ -657,6 +684,12 @@ struct App {
     /// Active `/`-command completion menu: the query it's synced to and the
     /// highlighted row. `None` when the input isn't a slash-command prefix.
     completion: Option<CompletionState>,
+    /// Whether the terminal currently has focus (best-effort, via focus-change
+    /// reporting). Stays `true` on terminals that don't report it.
+    focused: bool,
+    /// Set once we've seen any focus event — i.e. the terminal reports focus, so
+    /// `focused` is trustworthy.
+    focus_known: bool,
 }
 
 /// State of the slash-command completion menu.
@@ -709,7 +742,7 @@ impl App {
             model: model.to_string(),
             transcript: Vec::new(),
             pending: None,
-            in_code_block: false,
+            code_lang: None,
             input: InputLine::default(),
             scroll_up: 0,
             working: false,
@@ -736,6 +769,29 @@ impl App {
             model_issues: HashMap::new(),
             startup_notice: None,
             completion: None,
+            focused: true,
+            focus_known: false,
+        }
+    }
+
+    /// Record a focus-change report from the terminal (and that it reports them).
+    fn set_focus(&mut self, focused: bool) {
+        self.focused = focused;
+        self.focus_known = true;
+    }
+
+    /// Ping the terminal when a turn finishes and you're likely away: when the
+    /// terminal reports it's unfocused, or — on terminals that don't report
+    /// focus — when the turn ran long enough that you probably stepped away.
+    fn maybe_notify_done(&self) {
+        let elapsed = self.started.map(|t| t.elapsed()).unwrap_or_default();
+        let away = if self.focus_known {
+            !self.focused
+        } else {
+            elapsed >= NOTIFY_THRESHOLD
+        };
+        if away {
+            notify_done();
         }
     }
 
@@ -901,7 +957,12 @@ impl App {
     /// by the caller, not here.
     fn edit_key(&mut self, key: &KeyEvent) -> Option<String> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
+            // Alt+Enter inserts a newline (multi-line prompt without pasting); so
+            // does a trailing backslash, for terminals that can't send Alt+Enter.
+            KeyCode::Enter if alt => self.input.insert('\n'),
+            KeyCode::Enter if self.input.continue_line() => {}
             KeyCode::Enter => {
                 let line = self.input.submit();
                 if !line.trim().is_empty() {
@@ -1152,7 +1213,7 @@ impl App {
     fn flush_pending(&mut self) {
         if let Some((style, markdown, text)) = self.pending.take() {
             let line = if markdown {
-                markdown_line(&text, &mut self.in_code_block)
+                markdown_line(&text, &mut self.code_lang)
             } else {
                 Line::styled(text, style)
             };
@@ -1178,7 +1239,7 @@ impl App {
             let committed: String = buf[..idx].to_string();
             buf.drain(..=idx);
             let line = if markdown {
-                markdown_line(&committed, &mut self.in_code_block)
+                markdown_line(&committed, &mut self.code_lang)
             } else {
                 Line::styled(committed, style)
             };
@@ -1211,7 +1272,7 @@ impl App {
                 self.current_assistant.clear();
                 // Fences don't span messages; reset so a stray ``` can't bleed
                 // code styling into the next response.
-                self.in_code_block = false;
+                self.code_lang = None;
             }
             UiEvent::ToolCall(name, args) => {
                 self.event_log
@@ -1280,7 +1341,7 @@ impl App {
         }
         let body: String = result.lines().take(MAX).collect::<Vec<_>>().join("\n");
         let lines: Vec<Line<'static>> = if !body.contains('\u{1b}') && looks_like_diff(result) {
-            body.lines().map(diff_line).collect()
+            diff_lines(&body)
         } else {
             // ANSI (already-colored) or non-diff text: parse escapes as before.
             body.into_text()
@@ -1331,7 +1392,7 @@ impl App {
                 agent.clear_history();
                 self.transcript.clear();
                 self.pending = None;
-                self.in_code_block = false;
+                self.code_lang = None;
                 self.current_assistant.clear();
                 self.last_assistant.clear();
                 self.status.clear();
@@ -1367,7 +1428,7 @@ impl App {
             Command::Copy(arg) => self.copy(&arg),
             Command::Goal(arg) => self.handle_goal(agent, &arg),
             // Handled in the event loop (async / runs a turn); never reach here.
-            Command::Compact(_) | Command::Retry | Command::Undo => {}
+            Command::Compact(_) | Command::Retry | Command::Undo | Command::Init => {}
             Command::Unknown(name) => {
                 self.push(Line::styled(
                     format!("unknown command /{name}; try /help"),
@@ -1652,6 +1713,17 @@ fn line_text(line: &Line) -> String {
     line.spans.iter().map(|s| s.content.as_ref()).collect()
 }
 
+/// Nudge the terminal that a turn finished: the BEL (which most terminals turn
+/// into a dock bounce / taskbar flash / audible ping when unfocused) plus an
+/// OSC 9 desktop notification for terminals that support it (iTerm2, WezTerm, …).
+/// Written straight to the tty; both are non-printing, so they don't disturb the
+/// ratatui frame.
+fn notify_done() {
+    let mut out = io::stdout().lock();
+    let _ = write!(out, "\x07\x1b]9;hi — turn complete\x07");
+    let _ = out.flush();
+}
+
 fn copy_to_clipboard(text: &str) -> io::Result<()> {
     let encoded = base64_encode(text.as_bytes());
     let mut out = io::stdout().lock();
@@ -1697,21 +1769,121 @@ fn looks_like_diff(s: &str) -> bool {
     minus && plus
 }
 
-/// Style one line of a unified diff: additions green, removals red, hunk headers
-/// cyan, file headers bold, context muted.
-fn diff_line(line: &str) -> Line<'static> {
-    let style = if line.starts_with("+++") || line.starts_with("---") {
-        Style::default().add_modifier(Modifier::BOLD)
-    } else if line.starts_with("@@") {
-        Style::default().fg(Color::Cyan)
-    } else if line.starts_with('+') {
-        Style::default().fg(Color::Green)
-    } else if line.starts_with('-') {
-        Style::default().fg(Color::Red)
-    } else {
-        dim()
-    };
-    Line::from(Span::styled(line.to_string(), style))
+/// Render a unified diff with coloring and a new-file line-number gutter:
+/// additions green, removals red, hunk headers cyan, file headers bold, context
+/// muted. The line number (tracked from each `@@` header) is shown for context
+/// and added lines; removed lines and headers get a blank gutter.
+fn diff_lines(body: &str) -> Vec<Line<'static>> {
+    let mut out = Vec::new();
+    let mut new_line: Option<u32> = None;
+    for line in body.lines() {
+        let (style, gutter, advance) = if line.starts_with("+++") || line.starts_with("---") {
+            (Style::default().add_modifier(Modifier::BOLD), None, false)
+        } else if line.starts_with("@@") {
+            new_line = parse_hunk_new_start(line);
+            (Style::default().fg(Color::Cyan), None, false)
+        } else if line.starts_with('+') {
+            (Style::default().fg(Color::Green), new_line, true)
+        } else if line.starts_with('-') {
+            (Style::default().fg(Color::Red), None, false)
+        } else {
+            (dim(), new_line, true)
+        };
+        let num = match gutter {
+            Some(n) => format!("{n:>4} "),
+            None => "     ".to_string(),
+        };
+        out.push(Line::from(vec![
+            Span::styled(num, dim()),
+            Span::styled(line.to_string(), style),
+        ]));
+        if advance && let Some(n) = new_line.as_mut() {
+            *n += 1;
+        }
+    }
+    out
+}
+
+/// Parse the new-file start line from a unified-diff hunk header
+/// `@@ -old,n +new,m @@` → `new`.
+fn parse_hunk_new_start(header: &str) -> Option<u32> {
+    let plus = header.split('+').nth(1)?;
+    let num: String = plus.chars().take_while(|c| c.is_ascii_digit()).collect();
+    num.parse().ok()
+}
+
+/// Light syntax highlighting for one line of fenced code: whole-line comments
+/// (by the fence language) are dimmed and string literals are greened; the rest
+/// stays in the default color. Deliberately minimal — no keyword tables — so it
+/// reads as intentional on every language and never mis-colors an unknown one.
+fn highlight_code(line: &str, lang: &str) -> Vec<Span<'static>> {
+    if let Some(marker) = line_comment_marker(lang)
+        && line.trim_start().starts_with(marker)
+    {
+        return vec![Span::styled(line.to_string(), dim())];
+    }
+    highlight_strings(line)
+}
+
+/// The line-comment marker for a fence language, if we know it. Unknown
+/// languages return `None` (no comment dimming) rather than guess.
+fn line_comment_marker(lang: &str) -> Option<&'static str> {
+    match lang.to_lowercase().as_str() {
+        "rust" | "rs" | "c" | "cpp" | "c++" | "h" | "hpp" | "js" | "javascript" | "jsx" | "ts"
+        | "typescript" | "tsx" | "go" | "java" | "kotlin" | "kt" | "swift" | "scala" | "zig"
+        | "dart" | "php" => Some("//"),
+        "python" | "py" | "sh" | "bash" | "shell" | "zsh" | "fish" | "ruby" | "rb" | "yaml"
+        | "yml" | "toml" | "ini" | "conf" | "r" | "perl" | "pl" | "makefile" | "make"
+        | "dockerfile" | "elixir" | "ex" => Some("#"),
+        "sql" | "lua" | "haskell" | "hs" => Some("--"),
+        _ => None,
+    }
+}
+
+/// Split a code line into spans, greening `"…"` / `'…'` string literals (honoring
+/// `\` escapes) and leaving everything else in the default style.
+fn highlight_strings(line: &str) -> Vec<Span<'static>> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut plain = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '"' || c == '\'' {
+            // Find the matching close on this line, skipping escaped quotes.
+            let mut j = i + 1;
+            let mut closed = false;
+            while j < chars.len() {
+                if chars[j] == '\\' {
+                    j += 2;
+                    continue;
+                }
+                if chars[j] == c {
+                    closed = true;
+                    break;
+                }
+                j += 1;
+            }
+            if closed {
+                if !plain.is_empty() {
+                    spans.push(Span::raw(std::mem::take(&mut plain)));
+                }
+                let s: String = chars[i..=j].iter().collect();
+                spans.push(Span::styled(s, Style::default().fg(Color::Green)));
+                i = j + 1;
+                continue;
+            }
+        }
+        plain.push(c);
+        i += 1;
+    }
+    if !plain.is_empty() {
+        spans.push(Span::raw(plain));
+    }
+    if spans.is_empty() {
+        spans.push(Span::raw(String::new()));
+    }
+    spans
 }
 
 /// If `input` is a slash command whose *name* is still being typed (starts with
@@ -1742,25 +1914,31 @@ fn code_style() -> Style {
 
 /// Render one committed line of assistant markdown into a styled [`Line`].
 /// Block-level constructs (headings, lists, fences, rules, quotes) are detected
-/// per line; `in_code_block` carries the ``` fence state across calls so code
-/// interiors render verbatim. Anything else gets inline emphasis/code styling.
-fn markdown_line(text: &str, in_code_block: &mut bool) -> Line<'static> {
+/// per line; `code_lang` carries the ``` fence state across calls (`Some(lang)`
+/// while inside a fence) so code interiors are highlighted for that language.
+/// Anything else gets inline emphasis/code styling.
+fn markdown_line(text: &str, code_lang: &mut Option<String>) -> Line<'static> {
     let trimmed = text.trim_start();
 
     // Fenced code: ``` toggles the block; the fence line becomes a dim gutter
-    // (with the language as a caption when opening), interiors show verbatim.
+    // (with the language as a caption when opening).
     if trimmed.starts_with("```") {
-        let opening = !*in_code_block;
-        *in_code_block = !*in_code_block;
         let lang = trimmed.trim_start_matches('`').trim();
-        let caption = if opening { lang } else { "" };
+        let caption = if code_lang.is_none() { lang } else { "" };
+        *code_lang = if code_lang.is_none() {
+            Some(lang.to_string())
+        } else {
+            None
+        };
         return Line::from(vec![
             Span::styled("▏ ", dim()),
             Span::styled(caption.to_string(), dim().add_modifier(Modifier::ITALIC)),
         ]);
     }
-    if *in_code_block {
-        return Line::from(vec![Span::styled("▏ ", dim()), Span::raw(text.to_string())]);
+    if let Some(lang) = code_lang.as_deref() {
+        let mut spans = vec![Span::styled("▏ ", dim())];
+        spans.extend(highlight_code(text, lang));
+        return Line::from(spans);
     }
 
     // Horizontal rule.
@@ -2057,6 +2235,17 @@ impl InputLine {
     fn insert(&mut self, c: char) {
         self.chars.insert(self.cursor, c);
         self.cursor += 1;
+    }
+    /// If the character just before the cursor is a backslash, replace it with a
+    /// newline and report `true` — so a line ending in `\` continues instead of
+    /// submitting (a universal fallback for terminals without Alt+Enter).
+    fn continue_line(&mut self) -> bool {
+        if self.cursor > 0 && self.chars[self.cursor - 1] == '\\' {
+            self.chars[self.cursor - 1] = '\n';
+            true
+        } else {
+            false
+        }
     }
     /// Insert a (possibly multi-line) string at the cursor — used for pastes.
     /// Line endings are normalized to `\n` so the text submits as one prompt.
@@ -2603,7 +2792,7 @@ mod tests {
 
     #[test]
     fn markdown_headings_bullets_and_rules() {
-        let mut code = false;
+        let mut code: Option<String> = None;
         let h = markdown_line("#### 5. visited reset", &mut code);
         assert_eq!(
             line_text(&h),
@@ -2623,9 +2812,9 @@ mod tests {
 
     #[test]
     fn markdown_code_fence_renders_interior_verbatim() {
-        let mut code = false;
+        let mut code: Option<String> = None;
         let open = markdown_line("```rust", &mut code);
-        assert!(code, "fence opens a code block");
+        assert!(code.is_some(), "fence opens a code block");
         assert!(line_text(&open).contains("rust"), "lang caption shown");
 
         // Markdown markers inside a fence are NOT interpreted.
@@ -2637,12 +2826,12 @@ mod tests {
         );
 
         markdown_line("```", &mut code);
-        assert!(!code, "closing fence ends the block");
+        assert!(code.is_none(), "closing fence ends the block");
     }
 
     #[test]
     fn markdown_inline_emphasis_and_code() {
-        let mut code = false;
+        let mut code: Option<String> = None;
         let line = markdown_line("Use **mut** and `Vec` not _that_", &mut code);
         assert_eq!(
             line_text(&line),
@@ -2679,6 +2868,67 @@ mod tests {
         );
         assert!(screen.contains("second"), "second line: {screen}");
         assert!(screen.contains("third"), "third line: {screen}");
+    }
+
+    #[test]
+    fn code_block_highlights_strings_and_comments() {
+        let mut code: Option<String> = None;
+        markdown_line("```rust", &mut code);
+        // A whole-line comment is dimmed.
+        let c = markdown_line("    // a note", &mut code);
+        assert!(
+            c.spans.iter().any(|s| s.content.contains("// a note")
+                && s.style.add_modifier.contains(Modifier::DIM)),
+            "comment dimmed"
+        );
+        // A string literal is greened; the rest is not.
+        let s = markdown_line("let x = \"hi\";", &mut code);
+        assert!(
+            s.spans.iter().any(|sp| sp.content == "\"hi\"" && sp.style.fg == Some(Color::Green)),
+            "string greened: {:?}",
+            s.spans.iter().map(|sp| (sp.content.as_ref(), sp.style.fg)).collect::<Vec<_>>()
+        );
+        // Unknown language → no comment marker, so a `#`-line isn't dimmed away.
+        let mut code2 = Some(String::new());
+        let u = markdown_line("# this is a heading-ish line", &mut code2);
+        assert!(
+            !u.spans.iter().skip(1).all(|s| s.style.add_modifier.contains(Modifier::DIM)),
+            "unknown lang doesn't treat # as a comment"
+        );
+    }
+
+    #[test]
+    fn diff_lines_number_the_new_file() {
+        let body = "--- a/x\n+++ b/x\n@@ -10,3 +10,4 @@\n ctx\n-old\n+new\n+more\n";
+        let lines = diff_lines(body);
+        let text: Vec<String> = lines.iter().map(line_text).collect();
+        // Context line is numbered from the hunk's new-file start (10).
+        assert!(text.iter().any(|t| t.contains("10") && t.contains("ctx")), "{text:?}");
+        // Additions continue the new-file numbering (11, 12); removals don't advance it.
+        assert!(text.iter().any(|t| t.contains("11") && t.contains("+new")), "{text:?}");
+        assert!(text.iter().any(|t| t.contains("12") && t.contains("+more")), "{text:?}");
+        // The removed line carries no number (blank gutter before the '-').
+        let removed = text.iter().find(|t| t.contains("-old")).unwrap();
+        assert!(!removed.chars().any(|c| c.is_ascii_digit()), "removed line has no number: {removed:?}");
+    }
+
+    #[test]
+    fn alt_enter_and_backslash_insert_newline_instead_of_submitting() {
+        let mut app = App::new("openai", "gpt-4o");
+        app.input.set("line one");
+        let alt_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
+        assert_eq!(app.edit_key(&alt_enter), None, "alt+enter does not submit");
+        assert_eq!(app.input.text(), "line one\n");
+
+        // Trailing backslash + Enter continues the line (universal fallback).
+        app.input.set("a\\");
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(app.edit_key(&enter), None, "backslash continues");
+        assert_eq!(app.input.text(), "a\n");
+
+        // A normal Enter still submits.
+        app.input.set("go");
+        assert_eq!(app.edit_key(&enter).as_deref(), Some("go"));
     }
 
     #[test]

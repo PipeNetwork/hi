@@ -347,6 +347,10 @@ async fn repl(agent: &mut Agent, settings: &Settings, registry: &Registry) -> Re
                                 continue;
                             }
                         },
+                        Command::Init => {
+                            println!("\x1b[2mscanning the project to write HI.md…\x1b[0m");
+                            hi_agent::command::INIT_PROMPT.to_string()
+                        }
                         Command::Undo => {
                             match agent.undo().await {
                                 Ok(Some(0)) => println!("\x1b[2mnothing changed to undo\x1b[0m"),
@@ -570,7 +574,7 @@ fn handle_command(agent: &mut Agent, command: hi_agent::Command, registry: &Regi
             }
         },
         // Handled in the repl loop (async / runs a turn); never reach here.
-        Command::Compact(_) | Command::Retry | Command::Undo => {}
+        Command::Compact(_) | Command::Retry | Command::Undo | Command::Init => {}
         Command::Unknown(name) => {
             eprintln!("\x1b[33munknown command /{name}; try /help\x1b[0m");
         }
