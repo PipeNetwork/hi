@@ -46,7 +46,7 @@ pub async fn run_check(command: &str) -> (bool, String) {
                 }
                 text.push_str(&stderr);
             }
-            (output.status.success(), truncate(&text))
+            (output.status.success(), condense(&text))
         }
         Ok(Err(err)) => (false, format!("failed to run verification: {err}")),
         Err(_) => (
@@ -324,7 +324,7 @@ async fn run(name: &str, arguments: &str) -> Result<ToolOutput> {
         }
         "bash" => {
             let args: BashArgs = parse(arguments)?;
-            Ok(ToolOutput::plain(truncate(&run_bash(&args.command).await?)))
+            Ok(ToolOutput::plain(condense(&run_bash(&args.command).await?)))
         }
         "list" => {
             let args: ListArgs = parse(arguments)?;
@@ -622,6 +622,112 @@ fn truncate(s: &str) -> String {
     truncate_to(s, *MAX_OUTPUT_CHARS)
 }
 
+/// Condense output to the configured budget (test/diagnostic-aware).
+fn condense(s: &str) -> String {
+    condense_test_output(s, *MAX_OUTPUT_CHARS)
+}
+
+/// Condense test-runner / compiler output: keep the head, every failure/error
+/// line (with a little surrounding context), and the summary, while dropping the
+/// long runs of passing `... ok` noise — so a 4,000-line green run with three
+/// failures collapses to those three failures plus the count. Output that
+/// doesn't look like a test/diagnostic run falls back to plain head+tail
+/// [`truncate_to`] (don't mangle a file dump).
+///
+/// Deliberately biased to *over*-keep: a stray noise line surviving is harmless,
+/// but dropping a real failure would send the model after the wrong thing. This
+/// is the "Tier 0" deterministic extractor — no model call, reproducible on the
+/// eval harness.
+pub fn condense_test_output(s: &str, max: usize) -> String {
+    if !looks_like_test_output(s) {
+        return truncate_to(s, max);
+    }
+    let lines: Vec<&str> = s.lines().collect();
+    let n = lines.len();
+    const HEAD: usize = 4; // the "running N tests" / session preamble
+    const TAIL: usize = 6; // the summary line(s) live at the very end
+    const CONTEXT: usize = 2; // lines kept on each side of a signal line
+
+    let mut keep = vec![false; n];
+    for (i, line) in lines.iter().enumerate() {
+        if i < HEAD || i + TAIL >= n || is_signal_line(line) {
+            let lo = i.saturating_sub(CONTEXT);
+            let hi = (i + CONTEXT + 1).min(n);
+            for slot in keep.iter_mut().take(hi).skip(lo) {
+                *slot = true;
+            }
+        }
+    }
+    // When almost everything is a signal (a wall of failures), there's no green
+    // noise to drop — head+tail clip the original rather than pepper it with
+    // omission markers.
+    let kept = keep.iter().filter(|&&k| k).count();
+    if kept * 10 >= n * 9 {
+        return truncate_to(s, max);
+    }
+
+    let mut out = String::new();
+    let mut i = 0;
+    while i < n {
+        if keep[i] {
+            out.push_str(lines[i]);
+            out.push('\n');
+            i += 1;
+        } else {
+            let start = i;
+            while i < n && !keep[i] {
+                i += 1;
+            }
+            out.push_str(&format!("… {} lines omitted …\n", i - start));
+        }
+    }
+    // Even the condensed view honours the char budget.
+    truncate_to(out.trim_end(), max)
+}
+
+/// Whether output looks like a test run or compiler diagnostics, and so is worth
+/// condensing rather than blind-clipping. Specific markers keep this from firing
+/// on an ordinary command dump.
+fn looks_like_test_output(s: &str) -> bool {
+    let l = s.to_ascii_lowercase();
+    l.contains("test result:")                            // rust libtest summary
+        || l.contains("=== failures ===")                 // pytest
+        || l.contains("short test summary")               // pytest
+        || l.contains("collected ")                       // pytest "collected N items"
+        || (l.contains("running ") && l.contains(" test")) // libtest "running N tests"
+        || l.contains("error[e")                          // rustc errors in a cargo run
+        || l.contains("could not compile")
+        || (l.contains(" passed") && (l.contains(" failed") || l.contains(" error")))
+}
+
+/// Whether a line carries failure/error/summary signal worth keeping. Broad on
+/// purpose — see [`condense_test_output`]'s over-keep bias.
+fn is_signal_line(line: &str) -> bool {
+    // pytest prints assertion detail on lines that start with `E ` but may carry
+    // no keyword of their own.
+    if line.starts_with("E ") {
+        return true;
+    }
+    let l = line.to_ascii_lowercase();
+    const SIGNALS: [&str; 14] = [
+        "fail",             // "test x ... FAILED", "failures:", "N failed"
+        "error",            // "error[E..]", "error:", pytest "ERROR"
+        "panic",            // rust panic
+        "assert",           // assertion failed / pytest assert
+        "thread '",         // rust panic location
+        "left:",            // assert_eq! diff
+        "right:",
+        "exception",        // python
+        "traceback",        // python
+        "expected",         // assertions
+        "could not compile",
+        "test result:",     // libtest summary
+        "short test summary",
+        "=====",            // pytest section rules (FAILURES / summary)
+    ];
+    SIGNALS.iter().any(|p| l.contains(p))
+}
+
 /// Clip to `max` chars keeping *both* ends. For command and test output the tail
 /// — failures, summaries, `error[...]` lines — is usually the most useful part,
 /// so head-only truncation drops the signal. Splits the budget ~60% head / ~40%
@@ -774,7 +880,97 @@ struct BashArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_edit, diff, edit_not_found_help, format_read, truncate_to};
+    use super::{
+        apply_edit, condense_test_output, diff, edit_not_found_help, format_read, truncate_to,
+    };
+
+    /// A realistic libtest run: a `header`, `passing` "... ok" lines, an injected
+    /// failure block somewhere in the middle, and the final summary.
+    fn cargo_log(passing: usize, fail_at: usize) -> String {
+        let mut out = format!("\nrunning {} tests\n", passing + 1);
+        for i in 0..passing {
+            if i == fail_at {
+                out.push_str("test mod::middle_case ... FAILED\n");
+            }
+            out.push_str(&format!("test mod::case_{i:04} ... ok\n"));
+        }
+        out.push_str(
+            "\nfailures:\n\n---- mod::middle_case stdout ----\n\
+             thread 'mod::middle_case' panicked at src/lib.rs:42:5:\n\
+             assertion `left == right` failed\n  left: 3\n right: 4\n\n\
+             failures:\n    mod::middle_case\n\n\
+             test result: FAILED. {passing} passed; 1 failed; 0 ignored\n",
+        );
+        out
+    }
+
+    #[test]
+    fn condense_keeps_cargo_failure_and_summary_drops_green() {
+        let log = cargo_log(400, 200);
+        let out = condense_test_output(&log, 50_000);
+        // The failure, its panic detail, and the summary all survive…
+        assert!(out.contains("middle_case ... FAILED"), "keeps the failing test");
+        assert!(out.contains("left: 3"), "keeps the assertion detail");
+        assert!(out.contains("test result: FAILED"), "keeps the summary");
+        // …while the green noise is collapsed.
+        assert!(out.contains("lines omitted"), "drops passing lines: {out}");
+        assert!(
+            out.len() < log.len() / 3,
+            "much smaller: {} vs {}",
+            out.len(),
+            log.len()
+        );
+    }
+
+    #[test]
+    fn condense_beats_head_tail_when_failure_is_in_the_middle() {
+        // The money case: one failure buried in the middle of a long green run,
+        // with a budget tight enough that blind head+tail would clip it out.
+        let log = cargo_log(1000, 500);
+        let budget = 8_000;
+        assert!(
+            !truncate_to(&log, budget).contains("middle_case ... FAILED"),
+            "head+tail drops the middle failure"
+        );
+        assert!(
+            condense_test_output(&log, budget).contains("middle_case ... FAILED"),
+            "condense preserves it"
+        );
+    }
+
+    #[test]
+    fn condense_keeps_pytest_failures() {
+        let log = "\
+collected 50 items
+
+tests/test_a.py ..........................................         [ 96%]
+tests/test_b.py F                                                  [100%]
+
+=================================== FAILURES ===================================
+________________________________ test_parsing _________________________________
+
+    def test_parsing():
+>       assert parse('1+1') == 3
+E       assert 2 == 3
+
+tests/test_b.py:12: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_b.py::test_parsing - assert 2 == 3
+========================= 1 failed, 49 passed in 0.42s =========================
+";
+        let out = condense_test_output(log, 50_000);
+        assert!(out.contains("test_parsing"), "keeps the failing test name");
+        assert!(out.contains("assert 2 == 3"), "keeps the assertion (E line)");
+        assert!(out.contains("1 failed, 49 passed"), "keeps the summary");
+    }
+
+    #[test]
+    fn condense_passes_through_non_test_output() {
+        // A plain file/command dump (no test markers) is left untouched when it
+        // fits — condense must not mangle ordinary output.
+        let dump = "fn main() {\n    println!(\"hello\");\n}\n";
+        assert_eq!(condense_test_output(dump, 50_000), dump);
+    }
 
     #[test]
     fn truncate_keeps_head_and_tail() {
