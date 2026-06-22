@@ -13,9 +13,8 @@ use std::time::{Duration, Instant};
 use ansi_to_tui::IntoText;
 use anyhow::{Context, Result};
 use crossterm::event::{
-    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
-    EnableFocusChange, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseEventKind,
+    DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange, Event,
+    EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -60,10 +59,10 @@ pub async fn run(
     // Focus reporting: lets us tell when you've switched away, so a finished turn
     // can ping you only when you're not looking. Harmless if unsupported.
     let _ = execute!(io::stdout(), EnableFocusChange);
-    // Mouse capture: delivers wheel/trackpad scroll as Event::Mouse so the
-    // transcript scrolls. Tradeoff: the terminal's own click-drag text selection
-    // stops working while captured — use Shift+drag (most terminals) or `/copy`.
-    let _ = execute!(io::stdout(), EnableMouseCapture);
+    // Deliberately NOT capturing the mouse: capture would route wheel events to
+    // us (enabling in-app scroll) but the terminal would then stop doing native
+    // click-drag selection, breaking copy/paste. Native selection wins; scroll
+    // with PageUp/PageDown.
     let _restore = Restore;
     let mut terminal =
         Terminal::new(CrosstermBackend::new(io::stdout())).context("creating terminal")?;
@@ -228,13 +227,6 @@ pub async fn run(
                             }
                         }
                     }
-                    // Wheel/trackpad scroll moves the transcript, mirroring
-                    // PageUp/PageDown, regardless of any open menu.
-                    Event::Mouse(mouse) => match mouse.kind {
-                        MouseEventKind::ScrollUp => app.scroll_up(3),
-                        MouseEventKind::ScrollDown => app.scroll_down(3),
-                        _ => {}
-                    },
                     Event::FocusGained => app.set_focus(true),
                     Event::FocusLost => app.set_focus(false),
                     _ => {}
@@ -544,11 +536,6 @@ async fn drive(
                             }
                         }
                     }
-                    Some(Event::Mouse(mouse)) => match mouse.kind {
-                        MouseEventKind::ScrollUp => app.scroll_up(3),
-                        MouseEventKind::ScrollDown => app.scroll_down(3),
-                        _ => {}
-                    },
                     Some(Event::FocusGained) => app.set_focus(true),
                     Some(Event::FocusLost) => app.set_focus(false),
                     _ => {}
@@ -567,7 +554,6 @@ impl Drop for Restore {
         let _ = disable_raw_mode();
         let _ = execute!(
             io::stdout(),
-            DisableMouseCapture,
             DisableFocusChange,
             DisableBracketedPaste,
             LeaveAlternateScreen
