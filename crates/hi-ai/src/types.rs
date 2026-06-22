@@ -9,6 +9,41 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ToolMode {
+    #[default]
+    Auto,
+    Required,
+    ChatOnly,
+    ReadOnly,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CompatMode {
+    #[default]
+    Auto,
+    Strict,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestProfile {
+    pub compat: CompatMode,
+    pub tool_mode: ToolMode,
+    pub stream_usage: Option<bool>,
+}
+
+impl Default for RequestProfile {
+    fn default() -> Self {
+        Self {
+            compat: CompatMode::Auto,
+            tool_mode: ToolMode::Auto,
+            stream_usage: None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
     System,
@@ -113,6 +148,7 @@ pub struct ChatRequest {
     /// When set, asks the provider to emit reasoning with this token budget
     /// (Anthropic extended thinking). Ignored by providers that don't support it.
     pub thinking_budget: Option<u32>,
+    pub profile: RequestProfile,
 }
 
 /// Incremental output streamed to the caller as it arrives.

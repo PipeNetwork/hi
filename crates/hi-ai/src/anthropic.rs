@@ -13,7 +13,7 @@ use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use serde_json::{Value, json};
 
-use crate::provider::Provider;
+use crate::provider::{Provider, ProviderError, ProviderErrorKind};
 use crate::types::{ChatRequest, Completion, Content, Message, Role, StreamEvent};
 
 const API_VERSION: &str = "2023-06-01";
@@ -57,7 +57,11 @@ impl Provider for AnthropicProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            bail!("API error {status}: {text}");
+            return Err(ProviderError::new(
+                classify_http_error(status),
+                format!("API error {status}: {text}"),
+            )
+            .into());
         }
 
         // `debug_tap` optionally echoes the raw wire bytes when HI_DEBUG_STREAM
@@ -75,12 +79,18 @@ impl Provider for AnthropicProvider {
             let event = match tokio::time::timeout(budget, stream.next()).await {
                 Ok(Some(event)) => event.context("error reading stream")?,
                 Ok(None) => break,
-                Err(_) => bail!(
-                    "model produced no output for {}s — the provider streamed only \
-                     keep-alive heartbeats. It may be overloaded or the model unavailable; \
-                     try again, or switch with /model.",
-                    idle.as_secs()
-                ),
+                Err(_) => {
+                    return Err(ProviderError::new(
+                        ProviderErrorKind::StreamTimeout,
+                        format!(
+                            "model produced no output for {}s — the provider streamed only \
+                             keep-alive heartbeats. It may be overloaded or the model unavailable; \
+                             try again, or switch with /model.",
+                            idle.as_secs()
+                        ),
+                    )
+                    .into());
+                }
             };
             let Ok(data) = serde_json::from_str::<Value>(&event.data) else {
                 continue;
@@ -141,6 +151,20 @@ impl Provider for AnthropicProvider {
                 .header("anthropic-version", API_VERSION),
         )
         .await
+    }
+}
+
+fn classify_http_error(status: reqwest::StatusCode) -> ProviderErrorKind {
+    match status {
+        reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN => {
+            ProviderErrorKind::Auth
+        }
+        reqwest::StatusCode::TOO_MANY_REQUESTS => ProviderErrorKind::RateLimit,
+        s if s.is_server_error() => ProviderErrorKind::Outage,
+        reqwest::StatusCode::BAD_REQUEST | reqwest::StatusCode::UNPROCESSABLE_ENTITY => {
+            ProviderErrorKind::UnsupportedRequestShape
+        }
+        _ => ProviderErrorKind::Other,
     }
 }
 

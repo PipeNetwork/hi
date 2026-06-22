@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, ValueEnum};
 use hi_agent::VerifyStage;
-use hi_ai::Registry;
+use hi_ai::{CompatMode, Registry, ToolMode};
 use serde::Deserialize;
 
 /// A minimal agentic coding tool. Works with any OpenAI-compatible endpoint
@@ -57,6 +57,14 @@ pub struct Cli {
     #[arg(long, value_name = "BUDGET")]
     pub thinking: Option<u32>,
 
+    /// Tool calling mode: auto, required, chat-only, or read-only.
+    #[arg(long, value_enum)]
+    pub tool_mode: Option<CliToolMode>,
+
+    /// Provider compatibility policy: auto retries simpler request shapes; strict sends one shape.
+    #[arg(long, value_enum)]
+    pub compat: Option<CliCompatMode>,
+
     /// Path to a config file (default: ./hi.toml or ~/.config/hi/config.toml).
     #[arg(long)]
     pub config: Option<PathBuf>,
@@ -88,6 +96,11 @@ pub struct Cli {
     /// Disable auto-compaction (reclaim context when the window fills).
     #[arg(long)]
     pub no_auto_compact: bool,
+
+    /// Disable the end-of-turn finalization call that writes a structured recap
+    /// after a turn changes files (saves one model call per such turn).
+    #[arg(long)]
+    pub no_finalize: bool,
 
     /// Compaction strategy: hybrid (default), full, or elide.
     #[arg(long, value_name = "KIND")]
@@ -137,6 +150,40 @@ pub enum ProviderName {
     Terminaili,
     /// A local Ollama server (OpenAI-compatible).
     Ollama,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum CliToolMode {
+    Auto,
+    Required,
+    ChatOnly,
+    ReadOnly,
+}
+
+impl From<CliToolMode> for ToolMode {
+    fn from(value: CliToolMode) -> Self {
+        match value {
+            CliToolMode::Auto => Self::Auto,
+            CliToolMode::Required => Self::Required,
+            CliToolMode::ChatOnly => Self::ChatOnly,
+            CliToolMode::ReadOnly => Self::ReadOnly,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum CliCompatMode {
+    Auto,
+    Strict,
+}
+
+impl From<CliCompatMode> for CompatMode {
+    fn from(value: CliCompatMode) -> Self {
+        match value {
+            CliCompatMode::Auto => Self::Auto,
+            CliCompatMode::Strict => Self::Strict,
+        }
+    }
 }
 
 impl ProviderName {
@@ -202,6 +249,10 @@ pub struct Profile {
     pub api_key_env: Option<String>,
     pub max_tokens: Option<u32>,
     pub thinking_budget: Option<u32>,
+    #[serde(default)]
+    pub tool_mode: Option<ToolMode>,
+    #[serde(default)]
+    pub compat: Option<CompatMode>,
     /// Other profile names to fall back to, in order, when this one returns
     /// nothing or errors.
     pub fallback: Option<Vec<String>>,
@@ -216,6 +267,8 @@ pub struct Settings {
     pub api_key: String,
     pub max_tokens: u32,
     pub thinking_budget: Option<u32>,
+    pub tool_mode: ToolMode,
+    pub compat: CompatMode,
 }
 
 pub fn load_config(explicit: Option<&Path>) -> Result<Config> {
@@ -302,6 +355,16 @@ pub fn resolve(cli: &Cli, config: &Config, registry: &Registry) -> Result<Settin
     }
 
     let thinking_budget = cli.thinking.or(profile.and_then(|p| p.thinking_budget));
+    let tool_mode = cli
+        .tool_mode
+        .map(ToolMode::from)
+        .or_else(|| profile.and_then(|p| p.tool_mode))
+        .unwrap_or_default();
+    let compat = cli
+        .compat
+        .map(CompatMode::from)
+        .or_else(|| profile.and_then(|p| p.compat))
+        .unwrap_or_default();
 
     Ok(Settings {
         provider,
@@ -310,6 +373,8 @@ pub fn resolve(cli: &Cli, config: &Config, registry: &Registry) -> Result<Settin
         api_key,
         max_tokens,
         thinking_budget,
+        tool_mode,
+        compat,
     })
 }
 
@@ -358,9 +423,7 @@ pub fn build_repo_map(dir: &Path) -> Option<String> {
         }
         files_shown += 1;
     }
-    (files_shown > 0).then(|| {
-        format!("# Repo map (heuristic — top declarations per file)\n{body}")
-    })
+    (files_shown > 0).then(|| format!("# Repo map (heuristic — top declarations per file)\n{body}"))
 }
 
 /// Git-tracked source files (by extension), sorted. `None` outside a git repo.
@@ -396,8 +459,17 @@ fn git_source_files(dir: &Path) -> Option<Vec<String>> {
 fn looks_like_signature(line: &str) -> bool {
     let mut t = line.trim();
     for kw in [
-        "pub", "export", "default", "async", "static", "final", "public", "private", "protected",
-        "unsafe", "abstract",
+        "pub",
+        "export",
+        "default",
+        "async",
+        "static",
+        "final",
+        "public",
+        "private",
+        "protected",
+        "unsafe",
+        "abstract",
     ] {
         if let Some(rest) = t.strip_prefix(kw)
             && rest.starts_with(char::is_whitespace)
@@ -406,8 +478,20 @@ fn looks_like_signature(line: &str) -> bool {
         }
     }
     const DECL: &[&str] = &[
-        "fn ", "func ", "def ", "struct ", "enum ", "trait ", "impl ", "impl<", "class ",
-        "interface ", "type ", "mod ", "module ", "function ",
+        "fn ",
+        "func ",
+        "def ",
+        "struct ",
+        "enum ",
+        "trait ",
+        "impl ",
+        "impl<",
+        "class ",
+        "interface ",
+        "type ",
+        "mod ",
+        "module ",
+        "function ",
     ];
     DECL.iter().any(|d| t.starts_with(d))
 }
@@ -609,6 +693,8 @@ fn resolve_named_profile(config: &Config, name: &str, registry: &Registry) -> Re
         api_key,
         max_tokens,
         thinking_budget: profile.thinking_budget,
+        tool_mode: profile.tool_mode.unwrap_or_default(),
+        compat: profile.compat.unwrap_or_default(),
     })
 }
 
@@ -635,7 +721,10 @@ mod tests {
     fn detects_layered_pipeline_by_marker() {
         // (marker, expected stage commands in order)
         let cases: [(&str, Vec<&str>); 6] = [
-            ("Cargo.toml", vec!["cargo check --quiet", "cargo test --quiet"]),
+            (
+                "Cargo.toml",
+                vec!["cargo check --quiet", "cargo test --quiet"],
+            ),
             ("go.mod", vec!["go build ./...", "go test ./..."]),
             ("pyproject.toml", vec!["pytest -q"]),
             ("package.json", vec!["npm test --silent"]),
@@ -674,7 +763,11 @@ mod tests {
         let map = build_repo_map(std::path::Path::new(".."))
             .or_else(|| build_repo_map(std::path::Path::new(".")));
         if let Some(map) = map {
-            assert!(map.contains("Repo map"), "has a header: {}", &map[..map.len().min(80)]);
+            assert!(
+                map.contains("Repo map"),
+                "has a header: {}",
+                &map[..map.len().min(80)]
+            );
             assert!(map.contains("fn "), "lists function signatures");
         }
         // (No panic / sane output is the assertion; outside git it returns None.)

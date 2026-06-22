@@ -9,11 +9,14 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures_util::{Stream, StreamExt};
+use reqwest::StatusCode;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::provider::Provider;
-use crate::types::{ChatRequest, Completion, Content, Message, Role, StreamEvent, Usage};
+use crate::provider::{Provider, ProviderError, ProviderErrorKind};
+use crate::types::{
+    ChatRequest, CompatMode, Completion, Content, Message, Role, StreamEvent, ToolMode, Usage,
+};
 
 pub struct OpenAiProvider {
     http: reqwest::Client,
@@ -39,19 +42,43 @@ impl Provider for OpenAiProvider {
         sink: &mut (dyn FnMut(StreamEvent) + Send),
     ) -> Result<Completion> {
         let url = format!("{}/chat/completions", self.base_url);
-        let body = build_body(&request);
+        let attempts = request_attempts(&request);
+        let mut last_error: Option<ProviderError> = None;
+        let mut resp = None;
+        for attempt in attempts {
+            let body = build_body(&request, attempt);
+            let response = crate::http::send_with_retry(
+                self.http.post(&url).bearer_auth(&self.api_key).json(&body),
+            )
+            .await
+            .context("request to model endpoint failed")?;
 
-        let resp = crate::http::send_with_retry(
-            self.http.post(&url).bearer_auth(&self.api_key).json(&body),
-        )
-        .await
-        .context("request to model endpoint failed")?;
+            if response.status().is_success() {
+                if let Some(status) = attempt.status {
+                    sink(StreamEvent::Status(status.into()));
+                }
+                resp = Some(response);
+                break;
+            }
 
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            bail!("API error {status}: {text}");
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            let kind = classify_http_error(status, &text);
+            last_error = Some(ProviderError::new(
+                kind,
+                format!("API error {status}: {text}"),
+            ));
+            if request.profile.compat == CompatMode::Strict || !attempt.can_fallback(kind, &text) {
+                break;
+            }
         }
+        let Some(resp) = resp else {
+            return Err(last_error
+                .unwrap_or_else(|| {
+                    ProviderError::new(ProviderErrorKind::Other, "request failed before streaming")
+                })
+                .into());
+        };
 
         // `debug_tap` optionally echoes the raw wire bytes when HI_DEBUG_STREAM
         // is set. Reduce the stream to its SSE `data` strings so the collection
@@ -59,19 +86,40 @@ impl Provider for OpenAiProvider {
         let stream = crate::http::debug_tap(resp.bytes_stream())
             .eventsource()
             .map(|res| res.map(|event| event.data).context("error reading stream"));
-        collect_completion(
+        let completion = collect_completion(
             Box::pin(stream),
             crate::http::stream_idle_timeout(),
             crate::http::stream_stall_timeout(),
             sink,
         )
         .await
+        .map_err(classify_stream_error)?;
+        if completion.content.is_empty() {
+            return Err(ProviderError::new(
+                ProviderErrorKind::EmptyCompletion,
+                "model returned an empty completion",
+            )
+            .into());
+        }
+        Ok(completion)
     }
 
     async fn list_models(&self) -> Result<Vec<crate::provider::ServedModel>> {
         let url = format!("{}/models", self.base_url);
         crate::http::fetch_models(self.http.get(&url).bearer_auth(&self.api_key)).await
     }
+}
+
+fn classify_stream_error(err: anyhow::Error) -> anyhow::Error {
+    let text = err.to_string();
+    let kind = if text.contains("no output") {
+        ProviderErrorKind::StreamTimeout
+    } else if text.contains("error reading stream") || text.contains("malformed SSE JSON chunk") {
+        ProviderErrorKind::MalformedStream
+    } else {
+        ProviderErrorKind::Other
+    };
+    ProviderError::new(kind, text).into()
 }
 
 /// Once the model reports a `finish_reason`, it has stopped generating; we wait
@@ -136,9 +184,12 @@ where
         if data == "[DONE]" {
             break;
         }
-        let Ok(chunk) = serde_json::from_str::<ChatChunk>(&data) else {
-            continue;
-        };
+        let chunk = serde_json::from_str::<ChatChunk>(&data).with_context(|| {
+            format!(
+                "malformed SSE JSON chunk: {}",
+                data.chars().take(160).collect::<String>()
+            )
+        })?;
 
         if let Some(usage) = chunk.usage {
             completion.usage = Usage {
@@ -204,15 +255,98 @@ where
     Ok(completion)
 }
 
-fn build_body(request: &ChatRequest) -> Value {
+#[derive(Clone, Copy)]
+struct RequestAttempt {
+    include_usage: bool,
+    include_tools: bool,
+    status: Option<&'static str>,
+}
+
+impl RequestAttempt {
+    fn can_fallback(self, kind: ProviderErrorKind, text: &str) -> bool {
+        matches!(kind, ProviderErrorKind::Outage)
+            || (self.include_usage && mentions(text, &["stream_options", "include_usage"]))
+            || (self.include_tools
+                && matches!(
+                    kind,
+                    ProviderErrorKind::UnsupportedTools
+                        | ProviderErrorKind::UnsupportedRequestShape
+                ))
+    }
+}
+
+fn request_attempts(request: &ChatRequest) -> Vec<RequestAttempt> {
+    let include_usage = request.profile.stream_usage.unwrap_or(true);
+    let include_tools =
+        !request.tools.is_empty() && request.profile.tool_mode != ToolMode::ChatOnly;
+    let mut attempts = vec![RequestAttempt {
+        include_usage,
+        include_tools,
+        status: None,
+    }];
+    if request.profile.compat == CompatMode::Strict {
+        return attempts;
+    }
+    if include_usage {
+        attempts.push(RequestAttempt {
+            include_usage: false,
+            include_tools,
+            status: Some(
+                "compat: provider rejected stream_options; retried without usage streaming",
+            ),
+        });
+    }
+    if include_tools && request.profile.tool_mode != ToolMode::Required {
+        attempts.push(RequestAttempt {
+            include_usage: false,
+            include_tools: false,
+            status: Some(
+                "compat: provider rejected tool calling; degraded to chat-only for this request",
+            ),
+        });
+    }
+    attempts
+}
+
+fn classify_http_error(status: StatusCode, text: &str) -> ProviderErrorKind {
+    match status {
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => ProviderErrorKind::Auth,
+        StatusCode::TOO_MANY_REQUESTS => ProviderErrorKind::RateLimit,
+        s if s.is_server_error() => ProviderErrorKind::Outage,
+        StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
+            if mentions(text, &["tool", "function_call", "function"]) {
+                ProviderErrorKind::UnsupportedTools
+            } else {
+                ProviderErrorKind::UnsupportedRequestShape
+            }
+        }
+        _ => ProviderErrorKind::Other,
+    }
+}
+
+fn mentions(text: &str, needles: &[&str]) -> bool {
+    let lower = text.to_ascii_lowercase();
+    needles.iter().any(|needle| lower.contains(needle))
+}
+
+fn build_body(request: &ChatRequest, attempt: RequestAttempt) -> Value {
+    let mut messages = to_openai_messages(&request.messages);
+    if !attempt.include_tools && !request.tools.is_empty() {
+        messages.push(json!({
+            "role": "user",
+            "content": "Tool calling is unavailable for this request because the provider rejected the tool schema. If the user asked for file edits, shell commands, or other workspace changes, say that this cannot be completed with the current provider/tool mode instead of claiming changes were made.",
+        }));
+    }
     let mut body = json!({
         "model": request.model,
-        "messages": to_openai_messages(&request.messages),
+        "messages": messages,
         "stream": true,
-        "stream_options": { "include_usage": true },
         "max_tokens": request.max_tokens,
     });
-    if !request.tools.is_empty() {
+    if attempt.include_usage {
+        body["stream_options"] = json!({ "include_usage": true });
+    }
+    if attempt.include_tools {
         let tools: Vec<Value> = request
             .tools
             .iter()
@@ -228,6 +362,9 @@ fn build_body(request: &ChatRequest) -> Value {
             })
             .collect();
         body["tools"] = json!(tools);
+        if request.profile.tool_mode == ToolMode::Required {
+            body["tool_choice"] = json!("required");
+        }
     }
     if let Some(temperature) = request.temperature {
         body["temperature"] = json!(temperature);
@@ -384,8 +521,12 @@ mod tests {
 
     use futures_util::{StreamExt, stream};
 
-    use super::{Result, collect_completion, to_openai_messages};
-    use crate::types::{Content, Message, StreamEvent};
+    use super::{Result, build_body, collect_completion, request_attempts, to_openai_messages};
+    use crate::provider::{Provider, ProviderErrorKind, provider_error_kind};
+    use crate::test_support::{FakeOpenAiServer, Response, sse_text};
+    use crate::types::{
+        ChatRequest, Content, Message, RequestProfile, StreamEvent, ToolMode, ToolSpec,
+    };
 
     /// A stream of SSE `data` strings that never ends (no `[DONE]`, socket stays
     /// open) — `pending()` models a provider that just stops talking.
@@ -507,5 +648,218 @@ mod tests {
         assert_eq!(out[0]["role"], "tool");
         assert_eq!(out[0]["tool_call_id"], "call_1");
         assert_eq!(out[0]["content"], "the output");
+    }
+
+    #[test]
+    fn request_body_can_omit_stream_options() {
+        let req = crate::types::ChatRequest {
+            model: "m".into(),
+            messages: vec![Message::user("hi")],
+            tools: vec![],
+            max_tokens: 16,
+            temperature: None,
+            thinking_budget: None,
+            profile: Default::default(),
+        };
+
+        let normal = build_body(&req, request_attempts(&req)[0]);
+        assert_eq!(normal["stream_options"]["include_usage"], true);
+
+        let fallback = build_body(&req, request_attempts(&req)[1]);
+        assert!(fallback.get("stream_options").is_none());
+        assert_eq!(fallback["stream"], true);
+    }
+
+    #[tokio::test]
+    async fn fake_server_rejects_stream_options_then_succeeds() {
+        let Some(server) = FakeOpenAiServer::new(vec![
+            Response::json(400, r#"{"error":"stream_options unsupported"}"#),
+            Response::sse(sse_text("ok")),
+        ]) else {
+            return;
+        };
+        let provider = super::OpenAiProvider::new(server.url().to_string(), "test".into());
+        let request = request(vec![], Default::default());
+        let mut statuses = Vec::new();
+        let mut sink = |event| {
+            if let StreamEvent::Status(status) = event {
+                statuses.push(status);
+            }
+        };
+        let completion = provider.stream(request, &mut sink).await.unwrap();
+        assert!(matches!(completion.content.first(), Some(Content::Text(t)) if t == "ok"));
+        assert!(
+            statuses.iter().any(|s| s.contains("stream_options")),
+            "{statuses:?}"
+        );
+        let bodies = server.bodies();
+        assert!(bodies[0].contains("stream_options"));
+        assert!(!bodies[1].contains("stream_options"));
+    }
+
+    #[tokio::test]
+    async fn fake_server_rejects_tools_then_degrades_to_chat_only() {
+        let Some(server) = FakeOpenAiServer::new(vec![
+            Response::json(400, r#"{"error":"tools unsupported"}"#),
+            Response::sse(sse_text("cannot edit without tools")),
+        ]) else {
+            return;
+        };
+        let provider = super::OpenAiProvider::new(server.url().to_string(), "test".into());
+        let mut statuses = Vec::new();
+        let mut sink = |event| {
+            if let StreamEvent::Status(status) = event {
+                statuses.push(status);
+            }
+        };
+        let completion = provider
+            .stream(request(vec![tool()], Default::default()), &mut sink)
+            .await
+            .unwrap();
+        assert!(
+            matches!(completion.content.first(), Some(Content::Text(t)) if t.contains("without tools"))
+        );
+        assert!(
+            statuses.iter().any(|s| s.contains("tool calling")),
+            "{statuses:?}"
+        );
+        let bodies = server.bodies();
+        assert!(bodies[0].contains("\"tools\""));
+        assert!(!bodies[1].contains("\"tools\""));
+        assert!(bodies[1].contains("Tool calling is unavailable"));
+    }
+
+    #[tokio::test]
+    async fn required_tool_mode_does_not_degrade() {
+        let Some(server) = FakeOpenAiServer::new(vec![Response::json(
+            400,
+            r#"{"error":"tools unsupported"}"#,
+        )]) else {
+            return;
+        };
+        let provider = super::OpenAiProvider::new(server.url().to_string(), "test".into());
+        let profile = RequestProfile {
+            tool_mode: ToolMode::Required,
+            ..Default::default()
+        };
+        let err = provider
+            .stream(request(vec![tool()], profile), &mut |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(
+            provider_error_kind(&err),
+            Some(ProviderErrorKind::UnsupportedTools)
+        );
+        assert_eq!(server.bodies().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn auth_rate_limit_and_malformed_stream_are_classified() {
+        for (status, kind) in [
+            (401, ProviderErrorKind::Auth),
+            (403, ProviderErrorKind::Auth),
+            (429, ProviderErrorKind::RateLimit),
+        ] {
+            let Some(server) =
+                FakeOpenAiServer::new(vec![Response::json(status, r#"{"error":"nope"}"#)])
+            else {
+                return;
+            };
+            let provider = super::OpenAiProvider::new(server.url().to_string(), "test".into());
+            let err = provider
+                .stream(request(vec![], Default::default()), &mut |_| {})
+                .await
+                .unwrap_err();
+            assert_eq!(provider_error_kind(&err), Some(kind), "status {status}");
+        }
+
+        let Some(server) = FakeOpenAiServer::new(vec![Response::sse("data: {not-json}\n\n")])
+        else {
+            return;
+        };
+        let provider = super::OpenAiProvider::new(server.url().to_string(), "test".into());
+        let err = provider
+            .stream(request(vec![], Default::default()), &mut |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(
+            provider_error_kind(&err),
+            Some(ProviderErrorKind::MalformedStream)
+        );
+    }
+
+    #[tokio::test]
+    async fn server_error_retries_then_succeeds() {
+        let Some(server) = FakeOpenAiServer::new(vec![
+            Response::json(500, r#"{"error":"temporary outage"}"#),
+            Response::sse(sse_text("recovered")),
+        ]) else {
+            return;
+        };
+        let provider = super::OpenAiProvider::new(server.url().to_string(), "test".into());
+        let completion = provider
+            .stream(request(vec![], Default::default()), &mut |_| {})
+            .await
+            .unwrap();
+        assert!(matches!(completion.content.first(), Some(Content::Text(t)) if t == "recovered"));
+        assert_eq!(server.bodies().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn fake_server_stream_can_finish_without_done() {
+        let Some(server) = FakeOpenAiServer::new(vec![Response::sse(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n",
+        )]) else {
+            return;
+        };
+        let provider = super::OpenAiProvider::new(server.url().to_string(), "test".into());
+        let completion = provider
+            .stream(request(vec![], Default::default()), &mut |_| {})
+            .await
+            .unwrap();
+        assert!(matches!(completion.content.first(), Some(Content::Text(t)) if t == "done"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fragmented_tool_calls_are_reassembled() {
+        let stream = never_ending(vec![
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"ba","arguments":"{\"com"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"sh","arguments":"mand\":\"echo hi\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+        ]);
+        let mut sink = |_: StreamEvent| {};
+        let completion = collect_completion(stream, IDLE, STALL, &mut sink)
+            .await
+            .unwrap();
+        let calls = completion.tool_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].name, "bash");
+        assert_eq!(calls[0].arguments, r#"{"command":"echo hi"}"#);
+    }
+
+    fn request(tools: Vec<ToolSpec>, profile: RequestProfile) -> ChatRequest {
+        ChatRequest {
+            model: "m".into(),
+            messages: vec![Message::user("hi")],
+            tools,
+            max_tokens: 16,
+            temperature: None,
+            thinking_budget: None,
+            profile,
+        }
+    }
+
+    fn tool() -> ToolSpec {
+        ToolSpec {
+            name: "bash".into(),
+            description: "Run shell command".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "command": { "type": "string" }
+                },
+                "required": ["command"]
+            }),
+        }
     }
 }

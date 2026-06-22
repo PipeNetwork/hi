@@ -9,11 +9,15 @@ baseline, including a real backend like `openrouter/fusion`. Without numbers,
 `hi-eval` runs every task under every config in an isolated copy of the task's
 `fixture/`, then scores pass/fail with the task's own `verify` command (ground
 truth — the compiler/tests, not a judge model). It reports pass-rate, cost, and
-tokens per config.
+tokens per config, and writes machine-readable artifacts for each task/config
+cell. By default artifacts go under `target/hi-eval/runs/<timestamp>-<pid>/`
+as one JSON file per run plus an append-only `runs.jsonl`.
 
 Configs (in `crates/hi-eval/src/main.rs`):
 - `baseline` — `hi` runs the prompt once, no verification.
 - `verify` — `hi --verify <task.verify>`, so the agent iterates until green.
+- `best-of-3` — three verified candidates at different temperatures; the config
+  passes if any candidate passes.
 
 ## Tasks
 
@@ -62,3 +66,19 @@ HI_MODEL=openrouter/fusion HI_API_KEY=$OPENROUTER_API_KEY \
 
 Both default to OpenRouter's base URL. The win condition: the `verify` config
 beats raw Fusion on pass-rate, and beats Fusion-as-a-model on $/solved-task.
+
+### Manual terminaili runs
+
+Live provider evals are explicit and should not run in default CI. The
+terminaili profile passes `--provider terminaili --compat auto --tool-mode auto`
+to `hi` and requires `TERMINAILI_API_KEY` (or `HI_API_KEY`):
+
+```bash
+TERMINAILI_API_KEY=... \
+  cargo run -p hi-eval -- --profile=terminaili --configs=baseline,verify bench/tasks
+```
+
+Use the tiers in order: `bench/tasks` smoke first, then `bench/spec`, then
+selected `bench/hard`. Compare `baseline`, `verify`, and `best-of-3`; treat
+artifact rows with `provider_error_kind` separately from model behavior buckets
+like `no-edits`, `compile`, and `logic`.

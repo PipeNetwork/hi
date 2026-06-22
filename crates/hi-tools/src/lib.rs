@@ -448,7 +448,11 @@ fn edit_not_found_help(text: &str, old: &str) -> String {
          (Do not include the line-number gutter from `read` in old_string.) ",
     );
     let lines: Vec<&str> = text.lines().collect();
-    let needle = old.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    let needle = old
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .trim();
     if needle.is_empty() {
         msg.push_str("Re-read the file and copy the exact text to replace.");
         return msg;
@@ -758,9 +762,18 @@ mod tests {
         assert!(all.contains("   4\tdelta"), "{all}");
         // A window keeps absolute line numbers and notes there's more below.
         let win = format_read(body, Some(2), Some(2));
-        assert!(win.contains("   2\tbravo") && win.contains("   3\tcharlie"), "{win}");
-        assert!(!win.contains("alpha") && !win.contains("delta"), "windowed: {win}");
-        assert!(win.contains("lines 2-3 of 4") && win.contains("offset 4"), "footer: {win}");
+        assert!(
+            win.contains("   2\tbravo") && win.contains("   3\tcharlie"),
+            "{win}"
+        );
+        assert!(
+            !win.contains("alpha") && !win.contains("delta"),
+            "windowed: {win}"
+        );
+        assert!(
+            win.contains("lines 2-3 of 4") && win.contains("offset 4"),
+            "footer: {win}"
+        );
         // Empty + past-end are handled.
         assert_eq!(format_read("", None, None), "(empty file)");
         assert!(format_read(body, Some(99), None).contains("past the end"));
@@ -772,7 +785,10 @@ mod tests {
         let help = edit_not_found_help(file, "fn target() {\n    do_OTHER();");
         assert!(help.contains("not found"), "{help}");
         // It surfaces the real nearby line with its number so the model can copy it.
-        assert!(help.contains("fn target() {"), "shows the candidate: {help}");
+        assert!(
+            help.contains("fn target() {"),
+            "shows the candidate: {help}"
+        );
         assert!(help.contains("2\t"), "with a line number: {help}");
     }
 
@@ -797,7 +813,11 @@ mod tests {
             r#"{{"path":"{p}","edits":[{{"old_string":"1","new_string":"X"}},{{"old_string":"nope","new_string":"Y"}}]}}"#
         );
         let out = super::execute("multi_edit", &bad).await;
-        assert!(out.content.contains("Error"), "should fail: {}", out.content);
+        assert!(
+            out.content.contains("Error"),
+            "should fail: {}",
+            out.content
+        );
         assert_eq!(
             std::fs::read_to_string(&path).unwrap(),
             "1\ntwo\n3\n",

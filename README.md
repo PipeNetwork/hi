@@ -13,6 +13,7 @@ hi --auto-verify "the tests in test_parser.py are failing — fix the parser"
 
 ```bash
 cargo build --release           # binary at target/release/hi
+cargo install --path crates/hi-cli --locked
 
 # OpenRouter (default endpoint)
 HI_API_KEY=sk-or-... hi -m anthropic/claude-sonnet-4 "add a --json flag to the CLI"
@@ -27,7 +28,7 @@ hi --provider ollama -m qwen2.5-coder "..."
 HI_API_KEY=sk-ant-... hi --provider anthropic -m claude-sonnet-4-20250514 "..."
 ```
 
-`--provider` accepts `openai` (any OpenAI-compatible URL), `anthropic`, `terminaili`, and `ollama`. The latter two are presets: they set the right base URL, key env var (`TERMINAILI_API_KEY`), and — for terminaili — a default model, so they work with no extra flags.
+`--provider` accepts `openai` (any OpenAI-compatible URL), `anthropic`, `terminaili`, and `ollama`. The latter two are presets: they set the right base URL, key env var (`TERMINAILI_API_KEY`), and — for terminaili — a default model, so they work with no extra flags. `hi --version` prints the Cargo package version.
 
 ### Fallback chain
 
@@ -48,6 +49,8 @@ model = "qwen2.5-coder"
 
 A model that streams only keep-alive heartbeats with no output is treated as failed after `HI_STREAM_TIMEOUT` seconds (default 120; set lower to fail over faster). `HI_DEBUG_STREAM=1` dumps raw provider bytes for diagnosing one that returns nothing.
 
+OpenAI-compatible endpoints vary in how much of Chat Completions they implement. The default `--compat auto` retries common simpler shapes: first without streamed usage metadata, then without tool calling when the provider rejects tools. Use `--compat strict` to send only the initial request shape. Tool availability is controlled separately with `--tool-mode auto|required|chat-only|read-only`; `required` fails instead of degrading when tools are rejected, `chat-only` advertises no tools, and `read-only` only advertises safe inspection tools.
+
 Run with no prompt for an interactive session; pass a prompt for one-shot. Piped stdin is folded into a one-shot prompt as context, so `hi` composes with other tools:
 
 ```bash
@@ -67,6 +70,8 @@ Settings resolve in this order: **CLI flags → profile → environment → defa
 | Model | `-m, --model` | `HI_MODEL` | — (required) |
 | Base URL | `--base-url` | `HI_BASE_URL` | OpenRouter / `api.anthropic.com` |
 | API key | `--api-key` | `HI_API_KEY`, then `OPENROUTER_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | — (required) |
+| Tool mode | `--tool-mode` | — | `auto` |
+| Compatibility | `--compat` | — | `auto` |
 
 ### Config profiles
 
@@ -84,11 +89,15 @@ api_key_env = "ANTHROPIC_API_KEY"
 provider = "openai"
 base_url = "http://localhost:11434/v1"
 model = "qwen2.5-coder"
+tool_mode = "read-only"   # auto|required|chat-only|read-only
+compat = "auto"           # auto|strict
 ```
 
 ### Model registry
 
 `hi --refresh-models` pulls the [models.dev](https://models.dev) catalog into a local cache (~2700 models). It powers the per-turn cost/context display, caps `--max-tokens` to a model's limit, and warns when a model isn't known to support tool calling.
+
+One-shot automation can write a JSON report with `--report path.json`. Reports include token/cost totals, `verify_passed`, `provider_error_kind`, `compat_fallbacks_used`, `tool_mode_effective`, and `changed_files`.
 
 ## Verification-in-the-loop
 
@@ -168,7 +177,7 @@ Richer capabilities come from **subprocess CLI tools** the model invokes via `ba
 
 ## Benchmarks (`hi-eval`)
 
-`bench/` measures whether the levers actually beat a baseline — including a real backend like [OpenRouter Fusion](https://openrouter.ai/blog/announcements/fusion-beats-frontier/). Each task ships a buggy `fixture/` and a `verify` command (the spec; the agent can't game it). `hi-eval` runs each task under three configs — `baseline`, `verify`, `best-of-3` — in isolated copies and scores pass/fail by ground truth.
+`bench/` measures whether the levers actually beat a baseline — including a real backend like [OpenRouter Fusion](https://openrouter.ai/blog/announcements/fusion-beats-frontier/). Each task ships a buggy `fixture/` and a `verify` command (the spec; the agent can't game it). `hi-eval` runs each task under three configs — `baseline`, `verify`, `best-of-3` — in isolated copies and scores pass/fail by ground truth. It separates provider failures from model behavior, records changed files, preserves verify output for compile-vs-logic bucketing, reports request-shape fallbacks, and writes per-run JSON plus `runs.jsonl` artifacts under `target/hi-eval/runs/...` by default.
 
 ```bash
 cargo run -p hi-eval -- --validate bench/spec     # check tasks are well-formed (no model)
@@ -180,6 +189,15 @@ HI_MODEL=anthropic/claude-sonnet-4 HI_API_KEY=$OPENROUTER_API_KEY \
 # The raw-Fusion line to beat:
 HI_MODEL=openrouter/fusion HI_API_KEY=$OPENROUTER_API_KEY \
   cargo run -p hi-eval -- bench/spec
+
+# Manual terminaili smoke (never part of default CI):
+TERMINAILI_API_KEY=... \
+  cargo run -p hi-eval -- --profile=terminaili --configs=baseline,verify bench/tasks
+
+# After the smoke is stable, compare in this order:
+cargo run -p hi-eval -- --profile=terminaili bench/tasks
+cargo run -p hi-eval -- --profile=terminaili bench/spec
+cargo run -p hi-eval -- --profile=terminaili bench/hard
 ```
 
 Three task tiers: `bench/tasks` (easy bugs), `bench/hard` (edge-case algorithms), `bench/spec` (behavior pinned by the test, not the prompt). See `bench/README.md` to add tasks.
@@ -200,6 +218,14 @@ Verification-in-the-loop more than doubles the local pass rate (the ±std bands 
 
 The headline Fusion comparison needs an OpenRouter key and is not yet run.
 
+## Release checklist
+
+- `cargo fmt --all`
+- `cargo test --workspace`
+- `cargo install --path crates/hi-cli --locked`
+- Smoke an OpenAI-compatible endpoint with `--compat auto` and `--tool-mode auto`
+- Validate eval tasks with `cargo run -p hi-eval -- --validate bench/spec`
+
 ## Status
 
-Early but functional. The multi-provider core, full-screen TUI, sessions, verify-loop, best-of-N, and eval harness are built and tested (26 tests; `cargo fmt`/`clippy`/`test` enforced in CI). The TUI's rendering is verified via ratatui's TestBackend; its live key/scroll behavior is best confirmed in a real terminal. No published releases yet.
+Early but functional. The multi-provider core, full-screen TUI, sessions, verify-loop, best-of-N, compatibility fallbacks, changed-file reporting, and eval harness are built and tested (`cargo fmt --all` and `cargo test --workspace`). The TUI's rendering is verified via ratatui's TestBackend; its live key/scroll behavior is best confirmed in a real terminal. Cargo install is the first release target; binary archives and Homebrew can follow later.

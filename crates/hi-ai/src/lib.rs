@@ -7,13 +7,16 @@ mod http;
 pub mod openai;
 pub mod provider;
 pub mod registry;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod types;
 
 pub use anthropic::AnthropicProvider;
 pub use fallback::{Backend, FallbackProvider};
 pub use openai::OpenAiProvider;
-pub use provider::{Provider, ServedModel};
+pub use provider::{Provider, ProviderError, ProviderErrorKind, ServedModel, provider_error_kind};
 pub use registry::{ModelInfo, Registry};
 pub use types::{
-    ChatRequest, Completion, Content, Message, Role, StreamEvent, ToolCall, ToolSpec, Usage,
+    ChatRequest, CompatMode, Completion, Content, Message, RequestProfile, Role, StreamEvent,
+    ToolCall, ToolMode, ToolSpec, Usage,
 };

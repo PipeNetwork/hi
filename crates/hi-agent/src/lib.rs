@@ -8,7 +8,10 @@ pub mod ui;
 
 use anyhow::Result;
 use futures_util::StreamExt;
-use hi_ai::{ChatRequest, Content, Message, Provider, StreamEvent, ToolSpec, Usage};
+use hi_ai::{
+    ChatRequest, CompatMode, Content, Message, Provider, RequestProfile, StreamEvent, ToolMode,
+    ToolSpec, Usage,
+};
 use hi_tools::{execute, tool_specs};
 
 pub use command::Command;
@@ -30,6 +33,26 @@ const MAX_EMPTY_RETRIES: u32 = 2;
 /// Max read-only tool calls to run concurrently within one round, bounding the
 /// open file handles / subprocesses a single batched response can spawn.
 const MAX_PARALLEL_TOOLS: usize = 8;
+/// Max times one turn will nudge a model that stopped after *describing* a next
+/// step without performing it. Bounds the "narrate-then-stall" recovery;
+/// `max_steps` is the hard backstop.
+const MAX_CONTINUE_NUDGES: u32 = 2;
+/// Sent when the model announces a next step but emits no tool call, to get it to
+/// actually do the work instead of ending the turn on a false "done".
+const CONTINUE_NUDGE: &str = "You described a next step but didn't run it. Continue now, \
+using your tools, to actually make that change. If the task is genuinely already complete, \
+stop and give your final recap: what you changed (by file) and the exact command to run or test it.";
+
+/// Asked of the model in a dedicated, tool-free call after a turn that changed
+/// files, to guarantee a structured recap even from a model that wouldn't
+/// produce one on its own. Kept terse and concrete so weak models still comply.
+const FINALIZE_PROMPT: &str = "The work for this turn is done. Write the final summary for the \
+user, in past tense, covering only what you actually did:\n\
+- One headline line stating what you accomplished.\n\
+- A short bullet list of the key changes, grouped by file.\n\
+- The exact command(s) to run or test it.\n\
+If something is incomplete or a check couldn't run, say so honestly. Output only the summary — \
+no preamble, and don't take any further action.";
 
 /// Instruction appended to a slice of history to summarize it for compaction.
 const SUMMARIZE_PROMPT: &str = "Summarize our conversation so far into a concise but \
@@ -48,12 +71,32 @@ asks. Prefer making the change over describing it. Keep responses concise. \
 For a non-trivial change, first take one line to state your plan (which files, \
 what edits). Before finishing, re-read the regions you changed and verify they \
 satisfy the request and are internally consistent — fix what you missed rather \
-than declaring done prematurely. When the task is done, stop, and end with one \
-short line stating what you changed and the exact command to run or test it.";
+than declaring done prematurely.";
 
-/// The system message, optionally with project context and a session goal appended.
-fn build_system(project_context: Option<&str>, goal: Option<&str>) -> Message {
+/// Ending instruction when no separate finalization step runs: the model itself
+/// must produce the closing recap.
+const SELF_RECAP_INSTRUCTION: &str = " When the task is done, stop and end with a short recap so \
+the user has the full picture: a one-line headline of what you accomplished, then — for any \
+non-trivial change — a brief bullet list of the key edits (grouped by file) and the exact \
+command(s) to run or test it. Write it in past tense, covering only what you actually did; don't \
+restate the plan or pad it. For a trivial change or a plain question, a single line is enough.";
+
+/// Ending instruction when a finalization step will write the recap: the model
+/// shouldn't duplicate it, just confirm completion.
+const DEFERRED_RECAP_INSTRUCTION: &str = " When the task is done, stop. A separate step will write \
+the final summary for the user, so you don't need to compose a full recap yourself — just make \
+sure the work is actually complete and finish with at most a one-line note.";
+
+/// The system message, optionally with project context and a session goal
+/// appended. `finalize` selects the ending instruction: when a separate
+/// finalization step will write the recap, the model is told not to duplicate it.
+fn build_system(project_context: Option<&str>, goal: Option<&str>, finalize: bool) -> Message {
     let mut text = SYSTEM_PROMPT.to_string();
+    text.push_str(if finalize {
+        DEFERRED_RECAP_INSTRUCTION
+    } else {
+        SELF_RECAP_INSTRUCTION
+    });
     // Ground the model in its real location so it doesn't guess paths (a wrong
     // `/home/user`, scaffolding under `/tmp`, copying from directories that don't
     // exist) and wander out of the project. Each shell command runs from here in
@@ -113,6 +156,8 @@ pub struct AgentConfig {
     pub max_tokens: u32,
     pub temperature: Option<f32>,
     pub thinking_budget: Option<u32>,
+    pub tool_mode: ToolMode,
+    pub compat: CompatMode,
     /// USD per 1M (input, output) tokens, when known — used for cost display.
     pub price: Option<(f64, f64)>,
     /// Model context window, when known — used to show how full it is.
@@ -134,6 +179,10 @@ pub struct AgentConfig {
     /// Strategy used by `/compact` (no arg) and the summarizing tier of
     /// auto-compaction.
     pub compaction: CompactionKind,
+    /// After a turn that changed files, make one dedicated tool-free model call
+    /// to produce a structured recap — so even a model that won't summarize on
+    /// its own ends with one. Costs one extra call per file-changing turn.
+    pub finalize: bool,
 }
 
 pub struct Agent {
@@ -153,6 +202,9 @@ pub struct Agent {
     context_used: u64,
     /// Per-turn git checkpoints (working-tree snapshots), for `/undo`.
     checkpoints: Vec<String>,
+    /// Files whose content or presence changed in the most recent turn.
+    last_changed_files: Vec<String>,
+    last_compat_fallbacks: Vec<String>,
     /// Optional transient goal injected into the system prompt for future turns.
     goal: Option<String>,
 }
@@ -160,7 +212,7 @@ pub struct Agent {
 impl Agent {
     /// Start a fresh session seeded with the system prompt.
     pub fn new(provider: Box<dyn Provider>, config: AgentConfig) -> Self {
-        let system = build_system(config.project_context.as_deref(), None);
+        let system = build_system(config.project_context.as_deref(), None, config.finalize);
         Self::with_messages(provider, config, vec![system], 0)
     }
 
@@ -188,6 +240,8 @@ impl Agent {
             last_verify: None,
             context_used: 0,
             checkpoints: Vec::new(),
+            last_changed_files: Vec::new(),
+            last_compat_fallbacks: Vec::new(),
             goal: None,
         }
     }
@@ -254,7 +308,11 @@ impl Agent {
     }
 
     fn system_message(&self) -> Message {
-        build_system(self.config.project_context.as_deref(), self.goal.as_deref())
+        build_system(
+            self.config.project_context.as_deref(),
+            self.goal.as_deref(),
+            self.config.finalize,
+        )
     }
 
     fn refresh_system_message(&mut self) {
@@ -283,6 +341,18 @@ impl Agent {
     /// Whether the most recent turn's verification passed (None if not run).
     pub fn last_verify(&self) -> Option<bool> {
         self.last_verify
+    }
+
+    pub fn last_changed_files(&self) -> &[String] {
+        &self.last_changed_files
+    }
+
+    pub fn last_compat_fallbacks(&self) -> &[String] {
+        &self.last_compat_fallbacks
+    }
+
+    pub fn tool_mode(&self) -> ToolMode {
+        self.config.tool_mode
     }
 
     /// Whether any verification stage is configured.
@@ -442,6 +512,11 @@ impl Agent {
             max_tokens: self.config.max_tokens,
             temperature: self.config.temperature,
             thinking_budget: None,
+            profile: RequestProfile {
+                compat: self.config.compat,
+                tool_mode: ToolMode::ChatOnly,
+                stream_usage: None,
+            },
         };
 
         let mut summary = String::new();
@@ -482,6 +557,20 @@ impl Agent {
     /// run; if it fails, its output is fed back and the model iterates, up to
     /// `max_verify_iterations` rounds.
     pub async fn run_turn(&mut self, input: &str, ui: &mut dyn Ui) -> Result<()> {
+        if self.tools_unavailable_for(input) {
+            ui.status(&format!(
+                "tool mode {} does not allow file edits or shell commands for this turn",
+                tool_mode_label(self.config.tool_mode)
+            ));
+            self.messages.push(Message::user(input));
+            self.messages.push(Message::assistant(vec![Content::Text(format!(
+                "I cannot perform coding actions in {} mode because file-edit and shell tools are unavailable. Switch to `--tool-mode auto` or `--tool-mode required` to let me modify the workspace.",
+                tool_mode_label(self.config.tool_mode)
+            ))]));
+            ui.turn_end(&self.usage_summary(&self.totals));
+            self.persist()?;
+            return Ok(());
+        }
         // Snapshot the working tree before this turn touches anything, so `/undo`
         // can revert it. Best-effort: no-op outside a git repo.
         if let Some(sha) = hi_tools::checkpoint::create(std::path::Path::new(".")).await {
@@ -517,6 +606,9 @@ impl Agent {
 
         self.messages.push(Message::user(input));
         self.last_verify = None;
+        self.last_changed_files.clear();
+        self.last_compat_fallbacks.clear();
+        let mut compat_fallbacks = Vec::new();
 
         let verify = self.config.verify.clone();
         let max_verify = self.config.max_verify_iterations;
@@ -524,6 +616,19 @@ impl Agent {
         let mut verify_round = 0u32;
         let mut steps = 0u32;
         let mut empty_retries = 0u32;
+        let mut continue_nudges = 0u32;
+        // Whether the model has run a tool this turn (so a later text-only stop is
+        // eligible for a continue-nudge) and whether the turn ended on an
+        // announced-but-unperformed step (drives the incomplete notice).
+        let mut made_tool_call = false;
+        let mut stalled_unfinished = false;
+        // Whether the turn was cut short by the per-turn step cap, so the
+        // finalization recap is skipped (the work may be incomplete).
+        let mut ended_at_cap = false;
+        // Snapshot the turn baseline so verification only runs when the
+        // workspace ends up changed. This catches `bash` edits too, while
+        // skipping verify when a turn makes no net file changes.
+        let turn_snapshot = workspace_snapshot(std::path::Path::new("."));
 
         'turn: loop {
             // Inner loop: model + tools until the model stops calling tools, or
@@ -537,16 +642,26 @@ impl Agent {
                 let request = ChatRequest {
                     model: self.config.model.clone(),
                     messages: self.messages.clone(),
-                    tools: self.tools.clone(),
+                    tools: self.request_tools(),
                     max_tokens: self.config.max_tokens,
                     temperature: self.config.temperature,
                     thinking_budget: self.config.thinking_budget,
+                    profile: RequestProfile {
+                        compat: self.config.compat,
+                        tool_mode: self.config.tool_mode,
+                        stream_usage: None,
+                    },
                 };
 
                 let mut sink = |event: StreamEvent| match event {
                     StreamEvent::Text(text) => ui.assistant_text(&text),
                     StreamEvent::Reasoning(text) => ui.assistant_reasoning(&text),
-                    StreamEvent::Status(text) => ui.status(&text),
+                    StreamEvent::Status(text) => {
+                        if let Some(fallback) = text.strip_prefix("compat: ") {
+                            compat_fallbacks.push(fallback.to_string());
+                        }
+                        ui.status(&text);
+                    }
                 };
                 let completion = self.provider.stream(request, &mut sink).await?;
                 ui.assistant_end();
@@ -577,13 +692,20 @@ impl Agent {
                     })
                     .collect();
 
-                // Did this round produce any usable assistant text? (A reasoning
-                // model can come back with only reasoning tokens, or whitespace,
-                // and no real message.) Captured before the content is moved.
-                let has_text = completion
+                // This round's assistant text, joined and captured before the
+                // content is moved into history. Used both to detect a content-less
+                // response (a reasoning model can return only reasoning tokens or
+                // whitespace) and to spot an announced-but-unperformed next step.
+                let assistant_text: String = completion
                     .content
                     .iter()
-                    .any(|c| matches!(c, Content::Text(t) if !t.trim().is_empty()));
+                    .filter_map(|c| match c {
+                        Content::Text(t) => Some(t.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let has_text = !assistant_text.trim().is_empty();
 
                 // Auto-recover from a content-less response — no tool calls and no
                 // text, i.e. a flaky provider returning only reasoning or an empty
@@ -607,8 +729,32 @@ impl Agent {
 
                 self.messages.push(Message::assistant(completion.content));
                 if calls.is_empty() {
+                    // Text but no tool call (the content-less case was handled
+                    // above). If the model was actively working this turn and its
+                    // last line reads like an announced-but-unperformed next step
+                    // ("Now let me rewrite main.rs:"), nudge it to actually do it —
+                    // bounded — rather than ending the turn on a false "done".
+                    if made_tool_call
+                        && continue_nudges < MAX_CONTINUE_NUDGES
+                        && looks_like_unfinished_step(&assistant_text)
+                    {
+                        continue_nudges += 1;
+                        stalled_unfinished = true;
+                        ui.status(&format!(
+                            "the model described a next step but didn't run it — \
+                             nudging it to continue ({continue_nudges}/{MAX_CONTINUE_NUDGES})"
+                        ));
+                        self.messages
+                            .push(Message::user(CONTINUE_NUDGE.to_string()));
+                        continue;
+                    }
                     break false;
                 }
+                // The model requested tool calls — it's actively working, so a
+                // later text-only stop is eligible for a nudge, and any pending
+                // "incomplete" state is cleared (it got back to work).
+                made_tool_call = true;
+                stalled_unfinished = false;
                 // When the model batches several read-only calls (e.g. reading
                 // many files to review them), run them concurrently — they have
                 // no side effects and can't race. Any write/edit/bash in the
@@ -647,6 +793,7 @@ impl Agent {
 
             if hit_cap {
                 ui.status(&format!("reached step limit ({max_steps}); stopping turn"));
+                ended_at_cap = true;
                 break 'turn;
             }
 
@@ -654,6 +801,20 @@ impl Agent {
             // first, then lint, then tests); the first to fail stops the turn and
             // its output is fed back. A passing pipeline ends the turn.
             if verify.is_empty() || verify_round >= max_verify {
+                break 'turn;
+            }
+            // Baseline-aware: only verify turns that changed files. A turn that
+            // edited nothing can't have introduced a failure, so verifying would
+            // only surface pre-existing/unrelated failures and pull the model
+            // into fixing things the user didn't ask about.
+            let changed_files = changed_files_between(
+                &turn_snapshot,
+                &workspace_snapshot(std::path::Path::new(".")),
+            );
+            if changed_files.is_empty() {
+                if verify_round == 0 {
+                    ui.status("verification skipped — no files changed this turn");
+                }
                 break 'turn;
             }
             verify_round += 1;
@@ -698,11 +859,115 @@ impl Agent {
             }
         }
 
+        self.last_changed_files = changed_files_between(
+            &turn_snapshot,
+            &workspace_snapshot(std::path::Path::new(".")),
+        );
+        self.last_compat_fallbacks = compat_fallbacks;
+
+        // The model kept announcing steps it never ran, through the whole nudge
+        // budget — don't let the turn read as a clean success.
+        if stalled_unfinished {
+            ui.status(
+                "⚠ the model kept describing steps without running them — the task \
+                 may be incomplete. /retry, or send 'continue'.",
+            );
+        }
+
+        // Finalization: after a turn where the model used its tools to change
+        // files, make one dedicated tool-free call so the user always gets a
+        // structured recap, even from a model that wouldn't summarize on its
+        // own. Requiring `made_tool_call` keeps a plain Q&A turn (whose answer is
+        // already the response) from triggering it. Skipped when the turn
+        // stalled or hit the step cap (the work may be incomplete, and a tidy
+        // summary would misrepresent it) — the notices above stand instead.
+        if self.config.finalize
+            && made_tool_call
+            && !ended_at_cap
+            && !stalled_unfinished
+            && !self.last_changed_files.is_empty()
+        {
+            self.finalize_turn(ui).await;
+        }
+
         // Report cumulative session usage — the same number the live working
         // line and `/tokens` show, so the three never disagree.
         ui.turn_end(&self.usage_summary(&self.totals));
         self.persist()?;
         Ok(())
+    }
+
+    /// Make one dedicated, tool-free model call asking for a structured recap of
+    /// the turn, and append it to the conversation as the closing assistant
+    /// message. Best-effort: a provider error here doesn't fail the turn (the
+    /// work is already done), it just leaves the turn without the extra summary.
+    ///
+    /// The synthetic request prompt is folded into history as a user turn so the
+    /// roles stay alternating (some providers reject two assistant messages in a
+    /// row) and the recap is part of the saved session.
+    async fn finalize_turn(&mut self, ui: &mut dyn Ui) {
+        let mut messages = self.messages.clone();
+        messages.push(Message::user(FINALIZE_PROMPT));
+
+        let request = ChatRequest {
+            model: self.config.model.clone(),
+            messages,
+            tools: Vec::new(), // recap only — no tool use
+            max_tokens: self.config.max_tokens,
+            temperature: self.config.temperature,
+            thinking_budget: None,
+            profile: RequestProfile {
+                compat: self.config.compat,
+                tool_mode: ToolMode::ChatOnly,
+                stream_usage: None,
+            },
+        };
+
+        let mut recap = String::new();
+        let mut sink = |event: StreamEvent| match event {
+            StreamEvent::Text(text) => {
+                recap.push_str(&text);
+                ui.assistant_text(&text);
+            }
+            StreamEvent::Status(text) => ui.status(&text),
+            StreamEvent::Reasoning(_) => {}
+        };
+        let completion = match self.provider.stream(request, &mut sink).await {
+            Ok(completion) => completion,
+            Err(err) => {
+                ui.status(&format!("(couldn't generate the final summary: {err})"));
+                return;
+            }
+        };
+        ui.assistant_end();
+
+        self.totals.input_tokens += completion.usage.input_tokens;
+        self.totals.output_tokens += completion.usage.output_tokens;
+        if completion.usage.input_tokens > 0 {
+            self.context_used = completion.usage.input_tokens;
+        }
+        ui.usage(
+            self.totals.input_tokens,
+            self.totals.output_tokens,
+            self.context_used,
+            self.config.context_window,
+        );
+
+        // Fall back to the final content if the provider didn't stream text.
+        if recap.trim().is_empty() {
+            for c in &completion.content {
+                if let Content::Text(t) = c {
+                    recap.push_str(t);
+                }
+            }
+        }
+        if recap.trim().is_empty() {
+            return; // nothing to record
+        }
+        // Record both the synthetic request and the recap so roles alternate.
+        self.messages.push(Message::user(FINALIZE_PROMPT));
+        self.messages
+            .push(Message::assistant(vec![Content::Text(recap)]));
     }
 
     /// Format a usage line. `usage` carries the cumulative in/out/total/cost;
@@ -736,6 +1001,26 @@ impl Agent {
         summary
     }
 
+    fn request_tools(&self) -> Vec<ToolSpec> {
+        match self.config.tool_mode {
+            ToolMode::ChatOnly => Vec::new(),
+            ToolMode::ReadOnly => self
+                .tools
+                .iter()
+                .filter(|tool| hi_tools::is_read_only(&tool.name))
+                .cloned()
+                .collect(),
+            ToolMode::Auto | ToolMode::Required => self.tools.clone(),
+        }
+    }
+
+    fn tools_unavailable_for(&self, input: &str) -> bool {
+        matches!(
+            self.config.tool_mode,
+            ToolMode::ChatOnly | ToolMode::ReadOnly
+        ) && looks_mutating(input)
+    }
+
     fn persist(&mut self) -> Result<()> {
         if let Some(session) = self.session.as_mut() {
             session.record(&self.messages[self.persisted..])?;
@@ -745,12 +1030,162 @@ impl Agent {
     }
 }
 
+fn tool_mode_label(mode: ToolMode) -> &'static str {
+    match mode {
+        ToolMode::Auto => "auto",
+        ToolMode::Required => "required",
+        ToolMode::ChatOnly => "chat-only",
+        ToolMode::ReadOnly => "read-only",
+    }
+}
+
+fn looks_mutating(input: &str) -> bool {
+    let s = input.to_ascii_lowercase();
+    [
+        "edit",
+        "fix",
+        "change",
+        "update",
+        "write",
+        "create",
+        "delete",
+        "remove",
+        "rename",
+        "implement",
+        "add ",
+        "modify",
+        "refactor",
+        "format",
+        "run ",
+    ]
+    .iter()
+    .any(|needle| s.contains(needle))
+}
+
+/// Heuristic: does the model's final text read like an *announced but unperformed*
+/// next step — e.g. "Now let me rewrite main.rs:" or a "Here's my plan:" followed
+/// by a numbered to-do list — rather than a finished answer or a past-tense recap?
+///
+/// It judges the trailing non-empty line, with one twist: when the message trails
+/// off into a plan/to-do list, the intent lives in the line that *introduces* the
+/// list ("Here's my plan:"), not the last bullet — so it judges that lead-in
+/// instead, and only when the lead-in looks forward. That way a proper codex-style
+/// recap that ends in a bullet list ("Key changes:\n- …") doesn't read as a stall,
+/// while a model that announces a plan and quits without doing it does.
+fn looks_like_unfinished_step(text: &str) -> bool {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let Some(&last) = lines.last() else {
+        return false;
+    };
+    if is_list_item(last) {
+        // Trailing plan/to-do list: unfinished only if the line introducing it
+        // looks forward ("Here's my plan:"). A past-tense recap list is done.
+        let lead = lines
+            .iter()
+            .rev()
+            .find(|l| !is_list_item(l))
+            .copied()
+            .unwrap_or(last);
+        return is_forward_intent(lead);
+    }
+    // Otherwise judge the trailing line: a dangling colon ("Now let me rewrite
+    // main.rs:") or a forward-looking phrase means work was announced, not done.
+    last.ends_with(':') || is_forward_intent(last)
+}
+
+/// Whether a line expresses *intent to act next* rather than a finished result.
+fn is_forward_intent(line: &str) -> bool {
+    let lower = line.to_lowercase();
+    const FORWARD_INTENT: [&str; 12] = [
+        "let me ",
+        "let's ",
+        "i'll ",
+        "i will ",
+        "i'm going to",
+        "i am going to",
+        "proceed to ",
+        "here's my plan",
+        "here is my plan",
+        "my plan",
+        "i need to ",
+        "next, i",
+    ];
+    FORWARD_INTENT.iter().any(|phrase| lower.contains(phrase))
+}
+
+/// Whether a line is a markdown list item — a bullet (`- `, `* `, `• `) or a
+/// numbered item (`1.`, `2)`) — used to spot a trailing plan/to-do list.
+fn is_list_item(line: &str) -> bool {
+    let l = line.trim_start();
+    if l.starts_with("- ") || l.starts_with("* ") || l.starts_with("• ") {
+        return true;
+    }
+    let digits = l.chars().take_while(|c| c.is_ascii_digit()).count();
+    digits > 0 && l[digits..].starts_with(['.', ')'])
+}
+
+fn workspace_snapshot(dir: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
+    fn walk(
+        base: &std::path::Path,
+        dir: &std::path::Path,
+        out: &mut std::collections::BTreeMap<String, Vec<u8>>,
+    ) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if matches!(
+                name.as_ref(),
+                ".git" | "target" | "node_modules" | ".next" | "dist" | "build" | "__pycache__"
+            ) {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                walk(base, &path, out);
+            } else if let Ok(bytes) = std::fs::read(&path)
+                && let Ok(rel) = path.strip_prefix(base)
+            {
+                out.insert(rel.to_string_lossy().into_owned(), bytes);
+            }
+        }
+    }
+
+    let mut out = std::collections::BTreeMap::new();
+    walk(dir, dir, &mut out);
+    out
+}
+
+fn changed_files_between(
+    before: &std::collections::BTreeMap<String, Vec<u8>>,
+    after: &std::collections::BTreeMap<String, Vec<u8>>,
+) -> Vec<String> {
+    let mut files = std::collections::BTreeSet::new();
+    for path in before.keys() {
+        if before.get(path) != after.get(path) {
+            files.insert(path.clone());
+        }
+    }
+    for path in after.keys() {
+        if before.get(path) != after.get(path) {
+            files.insert(path.clone());
+        }
+    }
+    files.into_iter().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use async_trait::async_trait;
     use hi_ai::{ChatRequest, Completion, Content, Provider, Role, StreamEvent, Usage};
-    use std::sync::Mutex;
+    use std::sync::{LazyLock, Mutex};
 
     /// A provider that returns canned completions in order.
     struct Canned(Mutex<Vec<Completion>>);
@@ -783,6 +1218,8 @@ mod tests {
             max_tokens: 100,
             temperature: None,
             thinking_budget: None,
+            tool_mode: ToolMode::Auto,
+            compat: CompatMode::Auto,
             price: None,
             context_window: None,
             project_context: None,
@@ -793,6 +1230,9 @@ mod tests {
             // Default to summarize so the existing summarize/auto tests are
             // unaffected; hybrid/elide get dedicated tests.
             compaction: CompactionKind::Summarize,
+            // Off by default so the canned-provider tests don't need an extra
+            // completion for the recap; the finalization tests opt in.
+            finalize: false,
         }
     }
 
@@ -811,15 +1251,42 @@ mod tests {
         Agent::new(Box::new(Canned(Mutex::new(responses))), cfg)
     }
 
+    static VERIFY_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+        LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    /// A completion that writes a throwaway file — marks the turn as having
+    /// edited, so the (edit-gated) verification pipeline runs.
+    fn write_completion(path: &str) -> Completion {
+        completion(
+            vec![Content::ToolCall {
+                id: "w".into(),
+                name: "write".into(),
+                arguments: format!("{{\"path\":{path:?},\"content\":\"x\"}}"),
+            }],
+            1,
+            1,
+        )
+    }
+
+    /// A unique throwaway file path under the current workspace.
+    fn temp_file(tag: &str) -> std::path::PathBuf {
+        std::env::current_dir()
+            .unwrap()
+            .join(format!(".hi-verify-{tag}-{}", std::process::id()))
+    }
+
     #[test]
     fn system_prompt_grounds_the_working_directory() {
         // The model must be told where it actually is, so it doesn't invent paths
         // (e.g. /home/user), cd elsewhere, or scaffold a new project.
-        let sys = build_system(None, None);
+        let sys = build_system(None, None, false);
         let text = sys.text();
         let cwd = std::env::current_dir().unwrap().display().to_string();
         assert!(text.contains(&cwd), "names the working directory: {text}");
-        assert!(text.contains("does NOT persist"), "warns that cd doesn't persist");
+        assert!(
+            text.contains("does NOT persist"),
+            "warns that cd doesn't persist"
+        );
     }
 
     #[test]
@@ -1092,9 +1559,12 @@ mod tests {
         statuses: Vec<String>,
         usages: Vec<(u64, u64)>,
         turn_end: Option<String>,
+        assistant: String,
     }
     impl Ui for RecUi {
-        fn assistant_text(&mut self, _: &str) {}
+        fn assistant_text(&mut self, t: &str) {
+            self.assistant.push_str(t);
+        }
         fn assistant_reasoning(&mut self, _: &str) {}
         fn assistant_end(&mut self) {}
         fn tool_call(&mut self, _: &str, _: &str) {}
@@ -1113,6 +1583,231 @@ mod tests {
         }
         fn turn_end(&mut self, summary: &str) {
             self.turn_end = Some(summary.to_string());
+        }
+    }
+
+    /// A harmless tool-call round (runs `echo`), marking the turn as actively
+    /// working so a later text-only stop is nudge-eligible.
+    fn echo_call() -> Completion {
+        completion(
+            vec![Content::ToolCall {
+                id: "t".into(),
+                name: "bash".into(),
+                arguments: "{\"command\":\"echo hi\"}".into(),
+            }],
+            1,
+            1,
+        )
+    }
+
+    #[tokio::test]
+    async fn nudges_once_when_model_stalls_mid_step() {
+        // Edited, then announced a next step without doing it, then — after the
+        // nudge — actually did it and finished. One nudge, no incomplete notice.
+        let responses = vec![
+            echo_call(),
+            completion(
+                vec![Content::Text("Now let me rewrite main.rs:".into())],
+                1,
+                1,
+            ),
+            echo_call(),
+            completion(vec![Content::Text("Done. Run cargo build.".into())], 1, 1),
+        ];
+        let mut agent = agent(responses, config());
+        let mut ui = RecUi::default();
+        agent.run_turn("add a thing", &mut ui).await.unwrap();
+        assert_eq!(
+            ui.statuses.iter().filter(|s| s.contains("nudging")).count(),
+            1,
+            "exactly one nudge, got: {:?}",
+            ui.statuses
+        );
+        assert!(
+            !ui.statuses.iter().any(|s| s.contains("may be incomplete")),
+            "no incomplete notice once it resumed, got: {:?}",
+            ui.statuses
+        );
+        assert!(ui.turn_end.is_some(), "turn completed");
+    }
+
+    #[tokio::test]
+    async fn nudges_when_model_stalls_on_a_plan_list() {
+        // Edited, then announced a multi-step plan as a numbered list without
+        // doing it (the trailing line is a list item, which the old line-only
+        // heuristic missed — the turn used to end here "without context"), then,
+        // after the nudge, finished. One nudge, no incomplete notice.
+        let responses = vec![
+            echo_call(),
+            completion(
+                vec![Content::Text(
+                    "Now let me make the fixes. Here's my plan:\n\n\
+                     1. Remove unused deps\n2. Fix the gitignore duplicate"
+                        .into(),
+                )],
+                1,
+                1,
+            ),
+            echo_call(),
+            completion(vec![Content::Text("Done. Run cargo test.".into())], 1, 1),
+        ];
+        let mut agent = agent(responses, config());
+        let mut ui = RecUi::default();
+        agent.run_turn("clean it up", &mut ui).await.unwrap();
+        assert_eq!(
+            ui.statuses.iter().filter(|s| s.contains("nudging")).count(),
+            1,
+            "exactly one nudge, got: {:?}",
+            ui.statuses
+        );
+        assert!(
+            !ui.statuses.iter().any(|s| s.contains("may be incomplete")),
+            "no incomplete notice once it resumed, got: {:?}",
+            ui.statuses
+        );
+        assert!(ui.turn_end.is_some(), "turn completed");
+    }
+
+    #[tokio::test]
+    async fn gives_up_with_notice_after_cap() {
+        // Worked once, then narrated a next step every round without doing it:
+        // bounded to MAX_CONTINUE_NUDGES nudges, then an honest incomplete notice.
+        let mut responses = vec![echo_call()];
+        for _ in 0..(MAX_CONTINUE_NUDGES + 1) {
+            responses.push(completion(
+                vec![Content::Text("Now let me rewrite main.rs:".into())],
+                1,
+                1,
+            ));
+        }
+        let mut agent = agent(responses, config());
+        let mut ui = RecUi::default();
+        agent.run_turn("add a thing", &mut ui).await.unwrap();
+        assert_eq!(
+            ui.statuses.iter().filter(|s| s.contains("nudging")).count(),
+            MAX_CONTINUE_NUDGES as usize,
+            "nudges are bounded, got: {:?}",
+            ui.statuses
+        );
+        assert!(
+            ui.statuses.iter().any(|s| s.contains("may be incomplete")),
+            "incomplete notice after the cap, got: {:?}",
+            ui.statuses
+        );
+    }
+
+    #[tokio::test]
+    async fn does_not_nudge_a_plain_answer() {
+        // No tool call this turn (a Q&A-style reply) — never nudge, never warn,
+        // even though the text isn't an action.
+        let responses = vec![completion(
+            vec![Content::Text("The answer is 42.".into())],
+            1,
+            1,
+        )];
+        let mut agent = agent(responses, config());
+        let mut ui = RecUi::default();
+        agent.run_turn("what is 6*7?", &mut ui).await.unwrap();
+        assert!(
+            !ui.statuses
+                .iter()
+                .any(|s| s.contains("nudging") || s.contains("incomplete")),
+            "plain answer is left alone, got: {:?}",
+            ui.statuses
+        );
+        assert!(ui.turn_end.is_some(), "turn completed");
+    }
+
+    #[tokio::test]
+    async fn finalizes_with_a_recap_when_files_changed() {
+        // A turn that changes a file ends with a dedicated recap call, recorded
+        // as the closing assistant message (preceded by the synthetic request so
+        // roles alternate), with its usage counted.
+        // Holds the workspace lock: this test writes a temp file, which would
+        // otherwise perturb the file-change detection of the verify tests.
+        let _guard = VERIFY_TEST_LOCK.lock().await;
+        let mut cfg = config();
+        cfg.finalize = true;
+        let tmp = temp_file("finalize");
+        let p = tmp.to_string_lossy().to_string();
+        let responses = vec![
+            write_completion(&p),
+            completion(vec![Content::Text("done".into())], 1, 1),
+            completion(
+                vec![Content::Text(
+                    "## Summary\n- Created the file.\n\nRun `cargo test`.".into(),
+                )],
+                3,
+                4,
+            ),
+        ];
+        let mut agent = agent(responses, cfg);
+        let mut ui = RecUi::default();
+        agent.run_turn("make a file", &mut ui).await.unwrap();
+        let _ = std::fs::remove_file(&tmp);
+
+        let m = agent.messages();
+        assert_eq!(m.last().unwrap().role, Role::Assistant);
+        assert!(
+            m.last().unwrap().text().contains("## Summary"),
+            "recap is the closing message: {}",
+            m.last().unwrap().text()
+        );
+        assert_eq!(m[m.len() - 2].role, Role::User, "request precedes the recap");
+        // Roles alternate (no two assistants in a row → provider-safe next turn).
+        assert!(
+            m.windows(2).all(|w| w[0].role != w[1].role),
+            "roles must alternate"
+        );
+        // The recap call's usage (3/4) is folded into the running totals.
+        assert_eq!(agent.totals().input_tokens, 1 + 1 + 3);
+        assert_eq!(agent.totals().output_tokens, 1 + 1 + 4);
+    }
+
+    #[tokio::test]
+    async fn does_not_finalize_a_plain_answer() {
+        // Finalization on, but the turn changed no files (a Q&A reply) — no extra
+        // recap call fires. (The canned provider has exactly one completion; a
+        // stray finalization call would panic trying to pop a second.)
+        let mut cfg = config();
+        cfg.finalize = true;
+        let mut agent = agent(
+            vec![completion(vec![Content::Text("The answer is 42.".into())], 1, 1)],
+            cfg,
+        );
+        let mut ui = RecUi::default();
+        agent.run_turn("what is 6*7?", &mut ui).await.unwrap();
+        let assistants = agent
+            .messages()
+            .iter()
+            .filter(|m| m.role == Role::Assistant)
+            .count();
+        assert_eq!(assistants, 1, "no extra recap message");
+        assert_eq!(agent.totals().output_tokens, 1, "no extra recap call");
+    }
+
+    #[test]
+    fn unfinished_step_heuristic() {
+        for t in [
+            "Now let me rewrite main.rs:",
+            "I'll add the struct",
+            "Here is the plan:",
+            // A "plan:" lead-in followed by a numbered to-do list — the trailing
+            // line is a list item, so the lead-in is what's judged. (This is the
+            // case the old line-only heuristic missed, ending the turn mid-plan.)
+            "Now let me make the fixes. Here's my plan:\n\n1. Remove deps\n2. Fix gitignore\n3. Drop dead code",
+        ] {
+            assert!(looks_like_unfinished_step(t), "should flag: {t:?}");
+        }
+        for t in [
+            "Done. Run `cargo build`.",
+            "The answer is 42.",
+            "I changed foo.rs and bar.rs.",
+            // A past-tense recap that ends in a bullet list is finished, not a
+            // stall — the lead-in ("Key changes:") looks back, not forward.
+            "Key changes:\n- Added GOP support in encoder.rs\n- Updated the CLI in main.rs",
+        ] {
+            assert!(!looks_like_unfinished_step(t), "should not flag: {t:?}");
         }
     }
 
@@ -1269,6 +1964,7 @@ mod tests {
 
     #[tokio::test]
     async fn layered_verify_stops_at_first_failing_stage() {
+        let _guard = VERIFY_TEST_LOCK.lock().await;
         // The compile gate fails, so the later (passing) test stage must NOT run
         // — and the feedback should be the compile-error guidance, not the test one.
         let mut cfg = config();
@@ -1277,10 +1973,13 @@ mod tests {
             VerifyStage::new("test", "true"),   // would pass, must be skipped
         ];
         cfg.max_verify_iterations = 1;
-        // A turn re-prompts the model once after a failing verify, so two
-        // completions are consumed (model → verify-fail → model → cap reached).
+        // The model edits (so verification runs), then stops; after the failing
+        // verify it re-prompts once more before the cap is reached.
+        let tmp = temp_file("stop");
+        let p = tmp.to_string_lossy().to_string();
         let mut agent = agent(
             vec![
+                write_completion(&p),
                 completion(vec![Content::Text("attempt 1".into())], 1, 1),
                 completion(vec![Content::Text("attempt 2".into())], 1, 1),
             ],
@@ -1288,10 +1987,13 @@ mod tests {
         );
         let mut ui = RecUi::default();
         agent.run_turn("x", &mut ui).await.unwrap();
+        let _ = std::fs::remove_file(&tmp);
         assert_eq!(agent.last_verify(), Some(false));
         // The failing stage is named…
         assert!(
-            ui.statuses.iter().any(|s| s.contains("check") && s.contains("failed")),
+            ui.statuses
+                .iter()
+                .any(|s| s.contains("check") && s.contains("failed")),
             "names the failing stage: {:?}",
             ui.statuses
         );
@@ -1311,26 +2013,99 @@ mod tests {
 
     #[tokio::test]
     async fn layered_verify_passes_when_all_stages_pass() {
+        let _guard = VERIFY_TEST_LOCK.lock().await;
         let mut cfg = config();
-        cfg.verify = vec![VerifyStage::new("check", "true"), VerifyStage::new("test", "true")];
-        let mut agent = agent(vec![completion(vec![Content::Text("done".into())], 1, 1)], cfg);
+        cfg.verify = vec![
+            VerifyStage::new("check", "true"),
+            VerifyStage::new("test", "true"),
+        ];
+        let tmp = temp_file("pass");
+        let p = tmp.to_string_lossy().to_string();
+        let mut agent = agent(
+            vec![
+                write_completion(&p),
+                completion(vec![Content::Text("done".into())], 1, 1),
+            ],
+            cfg,
+        );
         agent.run_turn("x", &mut NullUi).await.unwrap();
+        let _ = std::fs::remove_file(&tmp);
         assert_eq!(agent.last_verify(), Some(true));
     }
 
     #[tokio::test]
     async fn verify_failure_exhausts_retries() {
+        let _guard = VERIFY_TEST_LOCK.lock().await;
         let mut cfg = config();
         cfg.verify = vec![VerifyStage::new("test", "false")]; // always fails
         cfg.max_verify_iterations = 2;
-        // Each round the model "finishes" (no tool calls), so verify runs.
+        // The model edits once (so verify runs), then keeps finishing without
+        // tool calls; verify fails each round until the cap.
+        let tmp = temp_file("exhaust");
+        let p = tmp.to_string_lossy().to_string();
         let responses = vec![
+            write_completion(&p),
             completion(vec![Content::Text("attempt 1".into())], 1, 1),
             completion(vec![Content::Text("attempt 2".into())], 1, 1),
             completion(vec![Content::Text("attempt 3".into())], 1, 1),
         ];
         let mut agent = agent(responses, cfg);
         agent.run_turn("x", &mut NullUi).await.unwrap();
+        let _ = std::fs::remove_file(&tmp);
         assert_eq!(agent.last_verify(), Some(false));
+    }
+
+    #[tokio::test]
+    async fn verify_skipped_when_no_files_changed() {
+        let _guard = VERIFY_TEST_LOCK.lock().await;
+        // A turn that only answers (no edits) must not run verification, even
+        // when configured — so a red test suite can't hijack a question.
+        let mut cfg = config();
+        cfg.verify = vec![VerifyStage::new("test", "false")];
+        let mut agent = agent(
+            vec![completion(
+                vec![Content::Text("just answering".into())],
+                1,
+                1,
+            )],
+            cfg,
+        );
+        let mut ui = RecUi::default();
+        agent.run_turn("what does this do?", &mut ui).await.unwrap();
+        assert_eq!(agent.last_verify(), None, "verify must not have run");
+        assert!(
+            ui.statuses
+                .iter()
+                .any(|s| s.contains("skipped — no files changed")),
+            "skip is surfaced: {:?}",
+            ui.statuses
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_runs_when_bash_changes_files() {
+        let _guard = VERIFY_TEST_LOCK.lock().await;
+        let tmp = temp_file("bash");
+        let p = tmp.to_string_lossy().to_string();
+        let mut cfg = config();
+        cfg.verify = vec![VerifyStage::new("test", "true")];
+        let mut agent = agent(
+            vec![
+                completion(
+                    vec![Content::ToolCall {
+                        id: "b".into(),
+                        name: "bash".into(),
+                        arguments: format!("{{\"command\":\"printf x > '{}'\"}}", p),
+                    }],
+                    1,
+                    1,
+                ),
+                completion(vec![Content::Text("done".into())], 1, 1),
+            ],
+            cfg,
+        );
+        agent.run_turn("x", &mut NullUi).await.unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        assert_eq!(agent.last_verify(), Some(true));
     }
 }

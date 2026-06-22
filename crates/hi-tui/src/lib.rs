@@ -13,8 +13,9 @@ use std::time::{Duration, Instant};
 use ansi_to_tui::IntoText;
 use anyhow::{Context, Result};
 use crossterm::event::{
-    DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange, Event,
-    EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -59,6 +60,10 @@ pub async fn run(
     // Focus reporting: lets us tell when you've switched away, so a finished turn
     // can ping you only when you're not looking. Harmless if unsupported.
     let _ = execute!(io::stdout(), EnableFocusChange);
+    // Mouse capture: delivers wheel/trackpad scroll as Event::Mouse so the
+    // transcript scrolls. Tradeoff: the terminal's own click-drag text selection
+    // stops working while captured — use Shift+drag (most terminals) or `/copy`.
+    let _ = execute!(io::stdout(), EnableMouseCapture);
     let _restore = Restore;
     let mut terminal =
         Terminal::new(CrosstermBackend::new(io::stdout())).context("creating terminal")?;
@@ -223,6 +228,13 @@ pub async fn run(
                             }
                         }
                     }
+                    // Wheel/trackpad scroll moves the transcript, mirroring
+                    // PageUp/PageDown, regardless of any open menu.
+                    Event::Mouse(mouse) => match mouse.kind {
+                        MouseEventKind::ScrollUp => app.scroll_up(3),
+                        MouseEventKind::ScrollDown => app.scroll_down(3),
+                        _ => {}
+                    },
                     Event::FocusGained => app.set_focus(true),
                     Event::FocusLost => app.set_focus(false),
                     _ => {}
@@ -532,6 +544,11 @@ async fn drive(
                             }
                         }
                     }
+                    Some(Event::Mouse(mouse)) => match mouse.kind {
+                        MouseEventKind::ScrollUp => app.scroll_up(3),
+                        MouseEventKind::ScrollDown => app.scroll_down(3),
+                        _ => {}
+                    },
                     Some(Event::FocusGained) => app.set_focus(true),
                     Some(Event::FocusLost) => app.set_focus(false),
                     _ => {}
@@ -550,6 +567,7 @@ impl Drop for Restore {
         let _ = disable_raw_mode();
         let _ = execute!(
             io::stdout(),
+            DisableMouseCapture,
             DisableFocusChange,
             DisableBracketedPaste,
             LeaveAlternateScreen
@@ -813,7 +831,10 @@ impl App {
                 // Reset the highlight only when the query actually changed, so
                 // navigation survives unrelated redraws.
                 if self.completion.as_ref().map(|c| &c.query) != Some(&q) {
-                    self.completion = Some(CompletionState { query: q, selected: 0 });
+                    self.completion = Some(CompletionState {
+                        query: q,
+                        selected: 0,
+                    });
                 }
             }
             _ => self.completion = None,
@@ -1470,7 +1491,7 @@ impl App {
         (lines, cursor_row, 2 + cursor_col)
     }
 
-    fn render(&self, frame: &mut ratatui::Frame) {
+    fn render(&mut self, frame: &mut ratatui::Frame) {
         let area = frame.area();
         // The input box grows to fit a spinner status line (while working), the
         // (possibly multi-line) input, and up to three queued commands.
@@ -1522,6 +1543,9 @@ impl App {
         let inner_h = rows[0].height.saturating_sub(2);
         let total = wrapped_height(&lines, inner_w);
         let max_scroll = total.saturating_sub(inner_h);
+        // Clamp here, where the content/viewport heights are known, so scrolling
+        // past the top can't bank offset you'd have to scroll back down through.
+        self.scroll_up = self.scroll_up.min(max_scroll);
         let scroll = max_scroll.saturating_sub(self.scroll_up);
         let para = Paragraph::new(lines)
             .wrap(Wrap { trim: false })
@@ -1652,7 +1676,10 @@ impl App {
                     // Show the failure reason inline so you don't have to scroll
                     // the transcript to learn what went wrong.
                     TurnState::Failed(s) => {
-                        format!("ready · last: failed — {} · /retry to rerun", clip_reason(s))
+                        format!(
+                            "ready · last: failed — {} · /retry to rerun",
+                            clip_reason(s)
+                        )
                     }
                     TurnState::Cancelled => "ready · last: cancelled".to_string(),
                 };
@@ -1668,7 +1695,9 @@ impl App {
                     ilines.push(Line::from(vec![
                         Span::styled(
                             format!("▶ {name}"),
-                            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
                         ),
                         Span::styled(format!("  {}", spec.help), dim()),
                     ]));
@@ -2890,22 +2919,32 @@ mod tests {
         // A whole-line comment is dimmed.
         let c = markdown_line("    // a note", &mut code);
         assert!(
-            c.spans.iter().any(|s| s.content.contains("// a note")
-                && s.style.add_modifier.contains(Modifier::DIM)),
+            c.spans
+                .iter()
+                .any(|s| s.content.contains("// a note")
+                    && s.style.add_modifier.contains(Modifier::DIM)),
             "comment dimmed"
         );
         // A string literal is greened; the rest is not.
         let s = markdown_line("let x = \"hi\";", &mut code);
         assert!(
-            s.spans.iter().any(|sp| sp.content == "\"hi\"" && sp.style.fg == Some(Color::Green)),
+            s.spans
+                .iter()
+                .any(|sp| sp.content == "\"hi\"" && sp.style.fg == Some(Color::Green)),
             "string greened: {:?}",
-            s.spans.iter().map(|sp| (sp.content.as_ref(), sp.style.fg)).collect::<Vec<_>>()
+            s.spans
+                .iter()
+                .map(|sp| (sp.content.as_ref(), sp.style.fg))
+                .collect::<Vec<_>>()
         );
         // Unknown language → no comment marker, so a `#`-line isn't dimmed away.
         let mut code2 = Some(String::new());
         let u = markdown_line("# this is a heading-ish line", &mut code2);
         assert!(
-            !u.spans.iter().skip(1).all(|s| s.style.add_modifier.contains(Modifier::DIM)),
+            !u.spans
+                .iter()
+                .skip(1)
+                .all(|s| s.style.add_modifier.contains(Modifier::DIM)),
             "unknown lang doesn't treat # as a comment"
         );
     }
@@ -2916,13 +2955,25 @@ mod tests {
         let lines = diff_lines(body);
         let text: Vec<String> = lines.iter().map(line_text).collect();
         // Context line is numbered from the hunk's new-file start (10).
-        assert!(text.iter().any(|t| t.contains("10") && t.contains("ctx")), "{text:?}");
+        assert!(
+            text.iter().any(|t| t.contains("10") && t.contains("ctx")),
+            "{text:?}"
+        );
         // Additions continue the new-file numbering (11, 12); removals don't advance it.
-        assert!(text.iter().any(|t| t.contains("11") && t.contains("+new")), "{text:?}");
-        assert!(text.iter().any(|t| t.contains("12") && t.contains("+more")), "{text:?}");
+        assert!(
+            text.iter().any(|t| t.contains("11") && t.contains("+new")),
+            "{text:?}"
+        );
+        assert!(
+            text.iter().any(|t| t.contains("12") && t.contains("+more")),
+            "{text:?}"
+        );
         // The removed line carries no number (blank gutter before the '-').
         let removed = text.iter().find(|t| t.contains("-old")).unwrap();
-        assert!(!removed.chars().any(|c| c.is_ascii_digit()), "removed line has no number: {removed:?}");
+        assert!(
+            !removed.chars().any(|c| c.is_ascii_digit()),
+            "removed line has no number: {removed:?}"
+        );
     }
 
     #[test]
@@ -2960,7 +3011,10 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(80, 8)).unwrap();
         term.draw(|f| app.render(f)).unwrap();
         let screen = dump(&term);
-        assert!(screen.contains("last: failed — API error 401"), "reason inline: {screen}");
+        assert!(
+            screen.contains("last: failed — API error 401"),
+            "reason inline: {screen}"
+        );
         assert!(screen.contains("/retry"), "recovery hint: {screen}");
     }
 
@@ -2995,7 +3049,10 @@ mod tests {
         app.input.set("/co");
         app.sync_completion();
         let names: Vec<&str> = app.completion_matches().iter().map(|c| c.name).collect();
-        assert!(names.contains(&"copy") && names.contains(&"compact"), "got {names:?}");
+        assert!(
+            names.contains(&"copy") && names.contains(&"compact"),
+            "got {names:?}"
+        );
         assert!(names.iter().all(|n| n.starts_with("co")));
         // A space moves to arguments → menu closes.
         app.input.set("/copy ");
@@ -3016,7 +3073,11 @@ mod tests {
         // Arg-taking command: accept leaves a trailing space, does not submit.
         app.input.set("/mod");
         app.sync_completion();
-        assert_eq!(app.accept_completion(true), None, "arg command waits for input");
+        assert_eq!(
+            app.accept_completion(true),
+            None,
+            "arg command waits for input"
+        );
         assert_eq!(app.input.text(), "/model ");
 
         // Tab never submits, even for a no-arg command.

@@ -5,6 +5,62 @@ use async_trait::async_trait;
 
 use crate::types::{ChatRequest, Completion, StreamEvent};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderErrorKind {
+    Auth,
+    RateLimit,
+    Outage,
+    UnsupportedRequestShape,
+    UnsupportedTools,
+    StreamTimeout,
+    MalformedStream,
+    EmptyCompletion,
+    Other,
+}
+
+impl ProviderErrorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auth => "auth",
+            Self::RateLimit => "rate_limit",
+            Self::Outage => "outage",
+            Self::UnsupportedRequestShape => "unsupported_request_shape",
+            Self::UnsupportedTools => "unsupported_tools",
+            Self::StreamTimeout => "stream_timeout",
+            Self::MalformedStream => "malformed_stream",
+            Self::EmptyCompletion => "empty_completion",
+            Self::Other => "other",
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ProviderError {
+    pub kind: ProviderErrorKind,
+    pub message: String,
+}
+
+impl ProviderError {
+    pub fn new(kind: ProviderErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ProviderError {}
+
+pub fn provider_error_kind(err: &anyhow::Error) -> Option<ProviderErrorKind> {
+    err.downcast_ref::<ProviderError>().map(|e| e.kind)
+}
+
 /// A model the endpoint serves, with whatever live metadata it reports via its
 /// `/models` route. Everything past `id` is best-effort — most endpoints report
 /// only the id (then these stay `None`), but some (e.g. terminaili) also report

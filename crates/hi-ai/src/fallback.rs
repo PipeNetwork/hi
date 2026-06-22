@@ -136,6 +136,7 @@ mod tests {
             max_tokens: 16,
             temperature: None,
             thinking_budget: None,
+            profile: Default::default(),
         }
     }
 

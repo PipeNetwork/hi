@@ -103,6 +103,8 @@ async fn main() -> Result<()> {
         max_tokens: settings.max_tokens,
         temperature: cli.temperature,
         thinking_budget: settings.thinking_budget,
+        tool_mode: settings.tool_mode,
+        compat: settings.compat,
         price,
         context_window,
         project_context: load_project_context(),
@@ -117,6 +119,7 @@ async fn main() -> Result<()> {
             .unwrap_or(CompactionKind::Hybrid {
                 keep_recent: hi_agent::DEFAULT_KEEP_RECENT,
             }),
+        finalize: !cli.no_finalize,
     };
     let mut agent = match history {
         Some(history) => Agent::resume(provider, agent_config, history),
@@ -132,7 +135,13 @@ async fn main() -> Result<()> {
         let view: &mut dyn hi_agent::Ui = if cli.quiet { &mut quiet } else { &mut plain };
         let result = agent.run_turn(&prompt, view).await;
         if let Some(path) = &cli.report {
-            write_report(path, &agent, &registry, &settings.model)?;
+            write_report(
+                path,
+                &agent,
+                &registry,
+                &settings.model,
+                result.as_ref().err(),
+            )?;
         }
         return result;
     }
@@ -248,6 +257,7 @@ fn write_report(
     agent: &Agent,
     registry: &Registry,
     model: &str,
+    error: Option<&anyhow::Error>,
 ) -> Result<()> {
     let totals = agent.totals();
     let (price, _) = registry.metadata(model);
@@ -261,10 +271,23 @@ fn write_report(
         "total_tokens": totals.total(),
         "cost_usd": cost,
         "verify_passed": agent.last_verify(),
+        "provider_error_kind": error.and_then(hi_ai::provider_error_kind).map(|k| k.as_str()),
+        "compat_fallbacks_used": agent.last_compat_fallbacks(),
+        "tool_mode_effective": tool_mode_label(agent.tool_mode()),
+        "changed_files": agent.last_changed_files(),
     });
     std::fs::write(path, serde_json::to_string_pretty(&report)?)
         .with_context(|| format!("writing report {}", path.display()))?;
     Ok(())
+}
+
+fn tool_mode_label(mode: hi_ai::ToolMode) -> &'static str {
+    match mode {
+        hi_ai::ToolMode::Auto => "auto",
+        hi_ai::ToolMode::Required => "required",
+        hi_ai::ToolMode::ChatOnly => "chat-only",
+        hi_ai::ToolMode::ReadOnly => "read-only",
+    }
 }
 
 /// Load project context files from the working directory (pi-style). Combines
@@ -566,7 +589,9 @@ fn handle_command(agent: &mut Agent, command: hi_agent::Command, registry: &Regi
             println!("\x1b[2mconversation cleared\x1b[0m");
         }
         Command::Verify(arg) => match arg.trim() {
-            "" if agent.verify_is_on() => println!("\x1b[2mverify: {}\x1b[0m", agent.verify_summary()),
+            "" if agent.verify_is_on() => {
+                println!("\x1b[2mverify: {}\x1b[0m", agent.verify_summary())
+            }
             "" => println!("\x1b[2mverify: off (set one with /verify <cmd>)\x1b[0m"),
             "off" | "none" | "clear" | "disable" => {
                 agent.set_verify_command(None);

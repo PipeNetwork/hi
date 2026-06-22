@@ -87,21 +87,81 @@ impl CommandSpec {
 /// Every slash command, in display order. Each `name` must be parseable by
 /// [`parse`] (guarded by a test).
 pub const COMMANDS: &[CommandSpec] = &[
-    CommandSpec { name: "help", args: "", help: "show this help" },
-    CommandSpec { name: "model", args: "[id]", help: "show or switch the model (no id opens a picker)" },
-    CommandSpec { name: "verify", args: "[cmd|off]", help: "show/set/clear the test command turns iterate against" },
-    CommandSpec { name: "diff", args: "", help: "show what files have changed (git diff)" },
-    CommandSpec { name: "copy", args: "[all]", help: "copy the last response (or transcript) to the clipboard" },
-    CommandSpec { name: "goal", args: "[text|clear]", help: "show, set, or clear the current session goal" },
-    CommandSpec { name: "init", args: "", help: "scan the repo and write an HI.md project guide" },
-    CommandSpec { name: "compact", args: "[kind]", help: "reclaim context (kind: hybrid, full, or elide)" },
-    CommandSpec { name: "retry", args: "", help: "re-run your last message" },
-    CommandSpec { name: "undo", args: "", help: "revert the file changes from the last turn" },
-    CommandSpec { name: "status", args: "", help: "show provider, model, queue, context, and last turn state" },
-    CommandSpec { name: "log", args: "", help: "write a local debug log for this session" },
-    CommandSpec { name: "tokens", args: "", help: "cumulative token usage this session" },
-    CommandSpec { name: "clear", args: "", help: "start a fresh conversation" },
-    CommandSpec { name: "exit", args: "", help: "quit" },
+    CommandSpec {
+        name: "help",
+        args: "",
+        help: "show this help",
+    },
+    CommandSpec {
+        name: "model",
+        args: "[id]",
+        help: "show or switch the model (no id opens a picker)",
+    },
+    CommandSpec {
+        name: "verify",
+        args: "[cmd|off]",
+        help: "show/set/clear the test command turns iterate against",
+    },
+    CommandSpec {
+        name: "diff",
+        args: "",
+        help: "show what files have changed (git diff)",
+    },
+    CommandSpec {
+        name: "copy",
+        args: "[all]",
+        help: "copy the last response (or transcript) to the clipboard",
+    },
+    CommandSpec {
+        name: "goal",
+        args: "[text|clear]",
+        help: "show, set, or clear the current session goal",
+    },
+    CommandSpec {
+        name: "init",
+        args: "",
+        help: "scan the repo and write an HI.md project guide",
+    },
+    CommandSpec {
+        name: "compact",
+        args: "[kind]",
+        help: "reclaim context (kind: hybrid, full, or elide)",
+    },
+    CommandSpec {
+        name: "retry",
+        args: "",
+        help: "re-run your last message",
+    },
+    CommandSpec {
+        name: "undo",
+        args: "",
+        help: "revert the file changes from the last turn",
+    },
+    CommandSpec {
+        name: "status",
+        args: "",
+        help: "show provider, model, queue, context, and last turn state",
+    },
+    CommandSpec {
+        name: "log",
+        args: "",
+        help: "write a local debug log for this session",
+    },
+    CommandSpec {
+        name: "tokens",
+        args: "",
+        help: "cumulative token usage this session",
+    },
+    CommandSpec {
+        name: "clear",
+        args: "",
+        help: "start a fresh conversation",
+    },
+    CommandSpec {
+        name: "exit",
+        args: "",
+        help: "quit",
+    },
 ];
 
 /// The message `/init` runs as a turn: explore the project and write a concise

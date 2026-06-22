@@ -69,6 +69,8 @@ pub fn run() -> Result<Settings> {
         api_key,
         max_tokens: 4096,
         thinking_budget: None,
+        tool_mode: hi_ai::ToolMode::Auto,
+        compat: hi_ai::CompatMode::Auto,
     })
 }
 
