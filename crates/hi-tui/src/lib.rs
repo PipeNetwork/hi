@@ -1027,10 +1027,9 @@ impl App {
             *entry += 1;
             *entry
         };
-        self.last_error = Some(format!(
-            "reliability issue count for {} = {count}",
-            self.model
-        ));
+        // Note: don't touch `last_error` here — it holds the actual failure
+        // reason set by the caller; the per-model count lives in `model_issues`
+        // and surfaces via `/status` model health.
         if count == 1 {
             self.push(Line::styled(
                 format!(
@@ -1085,7 +1084,7 @@ impl App {
             .map(|p| format!("{p}%"))
             .unwrap_or_else(|| "unknown".to_string());
         let goal = agent.goal().unwrap_or("off");
-        let verify = agent.verify_command().unwrap_or("off");
+        let verify = agent.verify_summary();
         let error = self.last_error.as_deref().unwrap_or("none");
         let model_issues = self.model_issues.get(&self.model).copied().unwrap_or(0);
         let model_health = if model_issues >= 2 {
@@ -1401,10 +1400,8 @@ impl App {
             }
             Command::Verify(arg) => {
                 let msg = match arg.trim() {
-                    "" => match agent.verify_command() {
-                        Some(c) => format!("verify: `{c}`"),
-                        None => "verify: off (set one with /verify <cmd>)".to_string(),
-                    },
+                    "" if agent.verify_is_on() => format!("verify: {}", agent.verify_summary()),
+                    "" => "verify: off (set one with /verify <cmd>)".to_string(),
                     "off" | "none" | "clear" | "disable" => {
                         agent.set_verify_command(None);
                         "verification disabled".to_string()
@@ -1652,7 +1649,11 @@ impl App {
                     TurnState::Running => "working".to_string(),
                     TurnState::Done(s) => format!("ready · last: done ({s})"),
                     TurnState::Warning(s) => format!("ready · last: warning ({s})"),
-                    TurnState::Failed(_) => "ready · last: failed".to_string(),
+                    // Show the failure reason inline so you don't have to scroll
+                    // the transcript to learn what went wrong.
+                    TurnState::Failed(s) => {
+                        format!("ready · last: failed — {} · /retry to rerun", clip_reason(s))
+                    }
                     TurnState::Cancelled => "ready · last: cancelled".to_string(),
                 };
                 ilines.push(Line::styled(line, dim()));
@@ -1896,6 +1897,18 @@ fn slash_query(input: &str) -> Option<String> {
         return None;
     }
     Some(rest.to_lowercase())
+}
+
+/// One-line, length-capped form of an error message for the status bar:
+/// whitespace/newlines collapsed, clipped with an ellipsis.
+fn clip_reason(s: &str) -> String {
+    let one_line = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    const MAX: usize = 60;
+    if one_line.chars().count() > MAX {
+        format!("{}…", one_line.chars().take(MAX).collect::<String>())
+    } else {
+        one_line
+    }
 }
 
 /// Compact token count for the working line: `1234` → `1.2k`, `45000` → `45k`.
@@ -2929,6 +2942,32 @@ mod tests {
         // A normal Enter still submits.
         app.input.set("go");
         assert_eq!(app.edit_key(&enter).as_deref(), Some("go"));
+    }
+
+    #[test]
+    fn failed_turn_shows_reason_and_keeps_error() {
+        let mut app = App::new("openai", "gpt-4o");
+        app.note_turn_failed("API error 401: invalid or expired session");
+        // record_model_issue runs next in the real flow; it must NOT clobber the
+        // real error with a reliability-count message.
+        app.record_model_issue();
+        assert_eq!(
+            app.last_error.as_deref(),
+            Some("API error 401: invalid or expired session"),
+            "the real error is preserved for /status and /log"
+        );
+        // The bottom bar shows the reason inline, not a bare "failed".
+        let mut term = Terminal::new(TestBackend::new(80, 8)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let screen = dump(&term);
+        assert!(screen.contains("last: failed — API error 401"), "reason inline: {screen}");
+        assert!(screen.contains("/retry"), "recovery hint: {screen}");
+    }
+
+    #[test]
+    fn clip_reason_collapses_and_truncates() {
+        assert_eq!(clip_reason("a\n  b   c"), "a b c");
+        assert!(clip_reason(&"x".repeat(200)).ends_with('…'));
     }
 
     #[test]

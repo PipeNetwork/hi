@@ -44,9 +44,12 @@ via your tools. Work in the current directory and the existing project: if a \
 build or package file (Cargo.toml, package.json, go.mod, pyproject.toml, …) is \
 already present, modify it and its sources in place — do NOT scaffold a new \
 nested sub-project or subdirectory for your work unless the user explicitly \
-asks. Prefer making the change over describing it. Keep responses concise. When \
-the task is done, stop, and end with one short line stating what you changed and \
-the exact command to run or test it.";
+asks. Prefer making the change over describing it. Keep responses concise. \
+For a non-trivial change, first take one line to state your plan (which files, \
+what edits). Before finishing, re-read the regions you changed and verify they \
+satisfy the request and are internally consistent — fix what you missed rather \
+than declaring done prematurely. When the task is done, stop, and end with one \
+short line stating what you changed and the exact command to run or test it.";
 
 /// The system message, optionally with project context and a session goal appended.
 fn build_system(project_context: Option<&str>, goal: Option<&str>) -> Message {
@@ -78,6 +81,32 @@ fn build_system(project_context: Option<&str>, goal: Option<&str>) -> Message {
     Message::system(text)
 }
 
+/// One stage of layered verification: a short label and the shell command to
+/// run. Stages run in order; the first to fail stops the turn and its output is
+/// fed back to the model. A cheap compile/typecheck stage before tests yields
+/// fast, localizable errors.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifyStage {
+    pub name: String,
+    pub command: String,
+}
+
+impl VerifyStage {
+    pub fn new(name: impl Into<String>, command: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            command: command.into(),
+        }
+    }
+
+    /// Whether this stage runs tests (vs. a compile/lint/typecheck gate) — used
+    /// to tailor the failure guidance fed back to the model.
+    fn is_test(&self) -> bool {
+        let n = self.name.to_lowercase();
+        n.contains("test") || n.contains("spec")
+    }
+}
+
 /// Per-session configuration the agent applies to every request.
 pub struct AgentConfig {
     pub model: String,
@@ -90,9 +119,11 @@ pub struct AgentConfig {
     pub context_window: Option<u32>,
     /// Project context (e.g. from HI.md/AGENTS.md) appended to the system prompt.
     pub project_context: Option<String>,
-    /// Shell command run after the model stops, to check the work. On failure
-    /// its output is fed back and the model iterates (verification-in-the-loop).
-    pub verify_command: Option<String>,
+    /// Ordered verification stages run after the model stops — a cheap
+    /// compile/typecheck first, then lint, then tests. The first stage to fail
+    /// stops the turn and its output is fed back so the model iterates
+    /// (verification-in-the-loop). Empty = verification off.
+    pub verify: Vec<VerifyStage>,
     /// Cap on verification retry rounds.
     pub max_verify_iterations: u32,
     /// Safety cap on model calls per turn, to stop runaway tool loops.
@@ -254,9 +285,24 @@ impl Agent {
         self.last_verify
     }
 
-    /// The verify command turns iterate against, if any.
-    pub fn verify_command(&self) -> Option<&str> {
-        self.config.verify_command.as_deref()
+    /// Whether any verification stage is configured.
+    pub fn verify_is_on(&self) -> bool {
+        !self.config.verify.is_empty()
+    }
+
+    /// A one-line summary of the verification pipeline (`"off"` when none) —
+    /// e.g. `"cargo check → cargo test"`.
+    pub fn verify_summary(&self) -> String {
+        if self.config.verify.is_empty() {
+            "off".to_string()
+        } else {
+            self.config
+                .verify
+                .iter()
+                .map(|s| s.command.as_str())
+                .collect::<Vec<_>>()
+                .join(" → ")
+        }
     }
 
     /// The models the current provider/endpoint actually serves (via its
@@ -266,9 +312,18 @@ impl Agent {
         self.provider.list_models().await
     }
 
-    /// Set or clear the verify command applied to subsequent turns.
+    /// Set or clear a single custom verify command (from `/verify <cmd>`),
+    /// replacing any configured pipeline with one stage (or clearing it).
     pub fn set_verify_command(&mut self, cmd: Option<String>) {
-        self.config.verify_command = cmd;
+        self.config.verify = match cmd {
+            Some(c) => vec![VerifyStage::new("verify", c)],
+            None => Vec::new(),
+        };
+    }
+
+    /// Replace the verification pipeline (from auto-detection).
+    pub fn set_verify_pipeline(&mut self, stages: Vec<VerifyStage>) {
+        self.config.verify = stages;
     }
 
     /// The compaction strategy configured for this session.
@@ -463,7 +518,7 @@ impl Agent {
         self.messages.push(Message::user(input));
         self.last_verify = None;
 
-        let verify = self.config.verify_command.clone();
+        let verify = self.config.verify.clone();
         let max_verify = self.config.max_verify_iterations;
         let max_steps = self.config.max_steps;
         let mut verify_round = 0u32;
@@ -595,30 +650,51 @@ impl Agent {
                 break 'turn;
             }
 
-            // Verification gate.
-            match &verify {
-                Some(cmd) if verify_round < max_verify => {
-                    verify_round += 1;
-                    ui.status(&format!(
-                        "running verification ({verify_round}/{max_verify}): {cmd}"
-                    ));
-                    let (passed, output) = hi_tools::run_check(cmd).await;
-                    if passed {
-                        ui.status("✓ verification passed");
-                        self.last_verify = Some(true);
-                        break 'turn;
-                    }
-                    ui.status("✗ verification failed; iterating");
+            // Verification gate: run the stages in order (cheap compile/typecheck
+            // first, then lint, then tests); the first to fail stops the turn and
+            // its output is fed back. A passing pipeline ends the turn.
+            if verify.is_empty() || verify_round >= max_verify {
+                break 'turn;
+            }
+            verify_round += 1;
+            let mut failure = None;
+            for stage in &verify {
+                ui.status(&format!(
+                    "verifying ({verify_round}/{max_verify}) · {}: {}",
+                    stage.name, stage.command
+                ));
+                let (passed, output) = hi_tools::run_check(&stage.command).await;
+                if !passed {
+                    failure = Some((stage, output));
+                    break;
+                }
+            }
+            match failure {
+                None => {
+                    ui.status("✓ verification passed");
+                    self.last_verify = Some(true);
+                    break 'turn;
+                }
+                Some((stage, output)) => {
+                    ui.status(&format!("✗ {} failed; iterating", stage.name));
                     self.last_verify = Some(false);
+                    // Compile/lint errors point at a cause; test failures imply a
+                    // rule. Tailor the nudge so the model fixes the right thing.
+                    let guidance = if stage.is_test() {
+                        "These checks define the exact required behavior. Compare the expected \
+                         and actual values to infer the precise rule — including edge cases and \
+                         tie-breaking — then make the smallest edit that satisfies every case."
+                    } else {
+                        "Read the error above and fix its root cause (a type, name, or syntax \
+                         problem) before anything else — the later stages can't run until this \
+                         passes."
+                    };
                     self.messages.push(Message::user(format!(
-                        "Verification failed. Command: `{cmd}`\n\nOutput:\n{output}\n\n\
-                         The tests define the exact required behavior. Compare the expected \
-                         and actual values above to work out the precise rule — including \
-                         edge cases and tie-breaking — then edit the code so every check passes."
+                        "Verification stage `{}` failed (`{}`).\n\nOutput:\n{}\n\n{} If a previous \
+                         fix didn't work, reconsider rather than repeat it.",
+                        stage.name, stage.command, output, guidance
                     )));
                 }
-                // No verification, or retries exhausted: end the turn.
-                _ => break 'turn,
             }
         }
 
@@ -710,7 +786,7 @@ mod tests {
             price: None,
             context_window: None,
             project_context: None,
-            verify_command: None,
+            verify: Vec::new(),
             max_verify_iterations: 2,
             max_steps: 50,
             auto_compact: false,
@@ -1192,9 +1268,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn layered_verify_stops_at_first_failing_stage() {
+        // The compile gate fails, so the later (passing) test stage must NOT run
+        // — and the feedback should be the compile-error guidance, not the test one.
+        let mut cfg = config();
+        cfg.verify = vec![
+            VerifyStage::new("check", "false"), // "compile" fails
+            VerifyStage::new("test", "true"),   // would pass, must be skipped
+        ];
+        cfg.max_verify_iterations = 1;
+        // A turn re-prompts the model once after a failing verify, so two
+        // completions are consumed (model → verify-fail → model → cap reached).
+        let mut agent = agent(
+            vec![
+                completion(vec![Content::Text("attempt 1".into())], 1, 1),
+                completion(vec![Content::Text("attempt 2".into())], 1, 1),
+            ],
+            cfg,
+        );
+        let mut ui = RecUi::default();
+        agent.run_turn("x", &mut ui).await.unwrap();
+        assert_eq!(agent.last_verify(), Some(false));
+        // The failing stage is named…
+        assert!(
+            ui.statuses.iter().any(|s| s.contains("check") && s.contains("failed")),
+            "names the failing stage: {:?}",
+            ui.statuses
+        );
+        // …and the later test stage never ran (no status line for it).
+        assert!(
+            !ui.statuses.iter().any(|s| s.contains("· test:")),
+            "test stage must be skipped after the gate fails: {:?}",
+            ui.statuses
+        );
+        // …and the feedback to the model is the compile-error nudge.
+        let fed_back = agent
+            .messages()
+            .iter()
+            .any(|m| m.role == Role::User && m.text().contains("fix its root cause"));
+        assert!(fed_back, "compile-stage guidance fed back");
+    }
+
+    #[tokio::test]
+    async fn layered_verify_passes_when_all_stages_pass() {
+        let mut cfg = config();
+        cfg.verify = vec![VerifyStage::new("check", "true"), VerifyStage::new("test", "true")];
+        let mut agent = agent(vec![completion(vec![Content::Text("done".into())], 1, 1)], cfg);
+        agent.run_turn("x", &mut NullUi).await.unwrap();
+        assert_eq!(agent.last_verify(), Some(true));
+    }
+
+    #[tokio::test]
     async fn verify_failure_exhausts_retries() {
         let mut cfg = config();
-        cfg.verify_command = Some("false".into()); // always fails
+        cfg.verify = vec![VerifyStage::new("test", "false")]; // always fails
         cfg.max_verify_iterations = 2;
         // Each round the model "finishes" (no tool calls), so verify runs.
         let responses = vec![

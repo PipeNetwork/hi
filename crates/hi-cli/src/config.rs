@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, ValueEnum};
+use hi_agent::VerifyStage;
 use hi_ai::Registry;
 use serde::Deserialize;
 
@@ -312,22 +313,156 @@ pub fn resolve(cli: &Cli, config: &Config, registry: &Registry) -> Result<Settin
     })
 }
 
-/// Guess the project's test command from marker files in `dir`. Used by
-/// `--auto-verify` so the proven verify-loop is zero-config.
-pub fn detect_verify_command_in(dir: &Path) -> Option<String> {
-    let has = |name: &str| dir.join(name).exists();
-    if has("Cargo.toml") {
-        Some("cargo test".into())
-    } else if has("go.mod") {
-        Some("go test ./...".into())
-    } else if has("pyproject.toml") || has("setup.py") || has("pytest.ini") || has("tox.ini") {
-        Some("pytest -q".into())
-    } else if has("package.json") {
-        Some("npm test".into())
-    } else if has("Makefile") || has("makefile") {
-        Some("make test".into())
+/// Bounds on the session-start repo map, to keep it useful without flooding the
+/// context window every turn.
+const MAP_MAX_FILES: usize = 40;
+const MAP_MAX_PER_FILE: usize = 12;
+const MAP_MAX_LINES: usize = 150;
+
+/// A heuristic "repo map" for the system prompt: each source file followed by
+/// its top-level declarations (functions, types, classes…), so the model can
+/// navigate without reading everything first. Signature-only and bounded; this
+/// is a cheap stand-in for a tree-sitter map, and returns `None` outside a git
+/// repo or when nothing is found.
+pub fn build_repo_map(dir: &Path) -> Option<String> {
+    let files = git_source_files(dir)?;
+    let mut body = String::new();
+    let mut lines_used = 0;
+    let mut files_shown = 0;
+    for file in files.iter().take(MAP_MAX_FILES) {
+        if lines_used >= MAP_MAX_LINES {
+            break;
+        }
+        let Ok(content) = std::fs::read_to_string(dir.join(file)) else {
+            continue;
+        };
+        let sigs: Vec<String> = content
+            .lines()
+            .filter(|l| looks_like_signature(l))
+            .take(MAP_MAX_PER_FILE)
+            .map(|l| clip_line(l.trim()))
+            .collect();
+        if sigs.is_empty() {
+            continue;
+        }
+        body.push_str(file);
+        body.push('\n');
+        for s in sigs {
+            if lines_used >= MAP_MAX_LINES {
+                break;
+            }
+            body.push_str("  ");
+            body.push_str(&s);
+            body.push('\n');
+            lines_used += 1;
+        }
+        files_shown += 1;
+    }
+    (files_shown > 0).then(|| {
+        format!("# Repo map (heuristic — top declarations per file)\n{body}")
+    })
+}
+
+/// Git-tracked source files (by extension), sorted. `None` outside a git repo.
+fn git_source_files(dir: &Path) -> Option<Vec<String>> {
+    const EXTS: &[&str] = &[
+        "rs", "go", "py", "js", "jsx", "ts", "tsx", "java", "kt", "c", "cc", "cpp", "h", "hpp",
+        "rb", "swift", "scala", "cs", "php",
+    ];
+    let out = std::process::Command::new("git")
+        .arg("ls-files")
+        .current_dir(dir)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let mut files: Vec<String> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|f| {
+            Path::new(f)
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| EXTS.contains(&e))
+        })
+        .map(str::to_string)
+        .collect();
+    files.sort();
+    (!files.is_empty()).then_some(files)
+}
+
+/// Whether a line declares something worth mapping (a fn/type/class/etc.),
+/// after stripping leading visibility/async modifiers.
+fn looks_like_signature(line: &str) -> bool {
+    let mut t = line.trim();
+    for kw in [
+        "pub", "export", "default", "async", "static", "final", "public", "private", "protected",
+        "unsafe", "abstract",
+    ] {
+        if let Some(rest) = t.strip_prefix(kw)
+            && rest.starts_with(char::is_whitespace)
+        {
+            t = rest.trim_start();
+        }
+    }
+    const DECL: &[&str] = &[
+        "fn ", "func ", "def ", "struct ", "enum ", "trait ", "impl ", "impl<", "class ",
+        "interface ", "type ", "mod ", "module ", "function ",
+    ];
+    DECL.iter().any(|d| t.starts_with(d))
+}
+
+/// Trim a signature line for the map: drop a trailing `{` and clip length.
+fn clip_line(s: &str) -> String {
+    let s = s.trim_end().trim_end_matches('{').trim_end();
+    if s.chars().count() > 100 {
+        format!("{}…", s.chars().take(100).collect::<String>())
     } else {
-        None
+        s.to_string()
+    }
+}
+
+/// Guess a *layered* verification pipeline from marker files in `dir`: a cheap
+/// compile/typecheck (and lint, when obviously configured) before tests, so the
+/// model gets fast, localizable errors before the slower test stage. Used by
+/// `--auto-verify` so the proven verify-loop is zero-config. Empty = unknown
+/// project.
+pub fn detect_verify_pipeline(dir: &Path) -> Vec<VerifyStage> {
+    let has = |name: &str| dir.join(name).exists();
+    let stage = |name: &str, cmd: &str| VerifyStage::new(name, cmd);
+    if has("Cargo.toml") {
+        // `cargo check` fails faster and reports cleaner compiler errors than
+        // compiling the test harness; `cargo test` then covers behavior.
+        vec![
+            stage("check", "cargo check --quiet"),
+            stage("test", "cargo test --quiet"),
+        ]
+    } else if has("go.mod") {
+        vec![
+            stage("build", "go build ./..."),
+            stage("test", "go test ./..."),
+        ]
+    } else if has("package.json") {
+        // Type-check first when a tsconfig is present (catches what jest won't).
+        let mut v = Vec::new();
+        if has("tsconfig.json") {
+            v.push(stage("typecheck", "npx --no-install tsc --noEmit"));
+        }
+        v.push(stage("test", "npm test --silent"));
+        v
+    } else if has("pyproject.toml") || has("setup.py") || has("pytest.ini") || has("tox.ini") {
+        // Add a ruff lint gate only when ruff is clearly configured, to avoid
+        // false failures on projects that don't use it.
+        let mut v = Vec::new();
+        if has("ruff.toml") || has(".ruff.toml") {
+            v.push(stage("lint", "ruff check ."));
+        }
+        v.push(stage("test", "pytest -q"));
+        v
+    } else if has("Makefile") || has("makefile") {
+        vec![stage("test", "make test")]
+    } else {
+        Vec::new()
     }
 }
 
@@ -479,7 +614,7 @@ fn resolve_named_profile(config: &Config, name: &str, registry: &Registry) -> Re
 
 #[cfg(test)]
 mod tests {
-    use super::detect_verify_command_in;
+    use super::detect_verify_pipeline;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     fn temp_dir_with(marker: &str) -> std::path::PathBuf {
@@ -497,20 +632,62 @@ mod tests {
     }
 
     #[test]
-    fn detects_test_commands_by_marker() {
-        let cases = [
-            ("Cargo.toml", Some("cargo test")),
-            ("go.mod", Some("go test ./...")),
-            ("pyproject.toml", Some("pytest -q")),
-            ("package.json", Some("npm test")),
-            ("Makefile", Some("make test")),
-            ("", None),
+    fn detects_layered_pipeline_by_marker() {
+        // (marker, expected stage commands in order)
+        let cases: [(&str, Vec<&str>); 6] = [
+            ("Cargo.toml", vec!["cargo check --quiet", "cargo test --quiet"]),
+            ("go.mod", vec!["go build ./...", "go test ./..."]),
+            ("pyproject.toml", vec!["pytest -q"]),
+            ("package.json", vec!["npm test --silent"]),
+            ("Makefile", vec!["make test"]),
+            ("", vec![]),
         ];
         for (marker, expected) in cases {
             let dir = temp_dir_with(marker);
-            let got = detect_verify_command_in(&dir);
-            assert_eq!(got.as_deref(), expected, "marker={marker:?}");
+            let got: Vec<String> = detect_verify_pipeline(&dir)
+                .into_iter()
+                .map(|s| s.command)
+                .collect();
+            assert_eq!(got, expected, "marker={marker:?}");
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    #[test]
+    fn signature_detection_skips_non_decls() {
+        use super::looks_like_signature;
+        assert!(looks_like_signature("pub fn run() {"));
+        assert!(looks_like_signature("    async fn helper(x: u8) -> u8 {"));
+        assert!(looks_like_signature("struct App {"));
+        assert!(looks_like_signature("def parse(s):"));
+        assert!(looks_like_signature("export function main() {"));
+        // Not declarations.
+        assert!(!looks_like_signature("    let x = 1;"));
+        assert!(!looks_like_signature("// a comment"));
+        assert!(!looks_like_signature("return fn_result;"));
+    }
+
+    #[test]
+    fn repo_map_lists_signatures_for_a_git_repo() {
+        use super::build_repo_map;
+        // The hi repo itself is a git repo with Rust sources.
+        let map = build_repo_map(std::path::Path::new(".."))
+            .or_else(|| build_repo_map(std::path::Path::new(".")));
+        if let Some(map) = map {
+            assert!(map.contains("Repo map"), "has a header: {}", &map[..map.len().min(80)]);
+            assert!(map.contains("fn "), "lists function signatures");
+        }
+        // (No panic / sane output is the assertion; outside git it returns None.)
+    }
+
+    #[test]
+    fn cargo_pipeline_runs_compile_gate_before_tests() {
+        let dir = temp_dir_with("Cargo.toml");
+        let stages = detect_verify_pipeline(&dir);
+        // The cheap compile gate must come first so errors localize fast.
+        assert_eq!(stages[0].name, "check");
+        assert!(stages[0].command.contains("cargo check"));
+        assert!(stages.last().unwrap().command.contains("cargo test"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

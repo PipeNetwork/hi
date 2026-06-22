@@ -13,7 +13,7 @@ use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-use hi_agent::{Agent, AgentConfig, CompactionKind};
+use hi_agent::{Agent, AgentConfig, CompactionKind, VerifyStage};
 use hi_ai::{
     AnthropicProvider, Backend, FallbackProvider, Message, OpenAiProvider, Provider, Registry,
 };
@@ -76,7 +76,7 @@ async fn main() -> Result<()> {
         let prompt = prompt_input
             .as_deref()
             .ok_or_else(|| anyhow!("--best-of requires a one-shot prompt"))?;
-        let verify = resolve_verify(&cli)
+        let verify = pipeline_command(&resolve_verify(&cli))
             .ok_or_else(|| anyhow!("--best-of requires --verify or --auto-verify"))?;
         let exe = std::env::current_exe().context("locating the hi executable")?;
         return bestof::run(&bestof::BestOf {
@@ -106,7 +106,7 @@ async fn main() -> Result<()> {
         price,
         context_window,
         project_context: load_project_context(),
-        verify_command: resolve_verify(&cli),
+        verify: resolve_verify(&cli),
         max_verify_iterations: cli.max_verify,
         max_steps: cli.max_steps,
         auto_compact: !cli.no_auto_compact,
@@ -202,21 +202,43 @@ fn effective_prompt(cli: &Cli) -> Result<Option<String>> {
     Ok(Some(format!("{prompt}\n\nstdin:\n```\n{piped}\n```")))
 }
 
-/// The verification command: explicit `--verify` wins; otherwise `--auto-verify`
-/// detects the project's test command from the working directory.
-fn resolve_verify(cli: &Cli) -> Option<String> {
-    if cli.verify.is_some() {
-        return cli.verify.clone();
+/// The verification pipeline: an explicit `--verify` wins (one stage); otherwise
+/// `--auto-verify` detects a layered pipeline from the working directory. Empty
+/// = verification off.
+fn resolve_verify(cli: &Cli) -> Vec<VerifyStage> {
+    if let Some(cmd) = &cli.verify {
+        return vec![VerifyStage::new("verify", cmd.clone())];
     }
     if cli.auto_verify {
-        let detected = config::detect_verify_command_in(std::path::Path::new("."));
-        match &detected {
-            Some(cmd) => eprintln!("\x1b[2mauto-verify: using `{cmd}`\x1b[0m"),
-            None => eprintln!("\x1b[33mauto-verify: no test command detected\x1b[0m"),
+        let detected = config::detect_verify_pipeline(std::path::Path::new("."));
+        if detected.is_empty() {
+            eprintln!("\x1b[33mauto-verify: no test command detected\x1b[0m");
+        } else {
+            let summary = detected
+                .iter()
+                .map(|s| s.command.as_str())
+                .collect::<Vec<_>>()
+                .join(" → ");
+            eprintln!("\x1b[2mauto-verify: {summary}\x1b[0m");
         }
         return detected;
     }
-    None
+    Vec::new()
+}
+
+/// Flatten a verify pipeline to a single `&&`-chained shell command, for callers
+/// that need one pass/fail command (e.g. best-of selection). `None` when empty.
+fn pipeline_command(stages: &[VerifyStage]) -> Option<String> {
+    if stages.is_empty() {
+        return None;
+    }
+    Some(
+        stages
+            .iter()
+            .map(|s| s.command.as_str())
+            .collect::<Vec<_>>()
+            .join(" && "),
+    )
 }
 
 /// Write a machine-readable run report (tokens, cost, verify outcome) for the
@@ -257,6 +279,10 @@ fn load_project_context() -> Option<String> {
                 parts.push(format!("# Project context (from {name})\n{text}"));
             }
         }
+    }
+    // A heuristic repo map so the model can navigate without reading everything.
+    if let Some(map) = config::build_repo_map(std::path::Path::new(".")) {
+        parts.push(map);
     }
     (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
@@ -499,7 +525,7 @@ fn handle_command(agent: &mut Agent, command: hi_agent::Command, registry: &Regi
                 t.output_tokens,
                 t.total(),
                 agent.goal().unwrap_or("off"),
-                agent.verify_command().unwrap_or("off"),
+                agent.verify_summary(),
                 agent.checkpoint_count(),
             );
         }
@@ -512,7 +538,7 @@ fn handle_command(agent: &mut Agent, command: hi_agent::Command, registry: &Regi
                 t.output_tokens,
                 t.total(),
                 agent.goal().unwrap_or("off"),
-                agent.verify_command().unwrap_or("off"),
+                agent.verify_summary(),
                 agent.checkpoint_count(),
             );
             match std::fs::write(".hi-debug.log", body) {
@@ -540,10 +566,8 @@ fn handle_command(agent: &mut Agent, command: hi_agent::Command, registry: &Regi
             println!("\x1b[2mconversation cleared\x1b[0m");
         }
         Command::Verify(arg) => match arg.trim() {
-            "" => match agent.verify_command() {
-                Some(c) => println!("\x1b[2mverify: {c}\x1b[0m"),
-                None => println!("\x1b[2mverify: off (set one with /verify <cmd>)\x1b[0m"),
-            },
+            "" if agent.verify_is_on() => println!("\x1b[2mverify: {}\x1b[0m", agent.verify_summary()),
+            "" => println!("\x1b[2mverify: off (set one with /verify <cmd>)\x1b[0m"),
             "off" | "none" | "clear" | "disable" => {
                 agent.set_verify_command(None);
                 println!("\x1b[2mverification disabled\x1b[0m");

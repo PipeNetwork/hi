@@ -102,11 +102,13 @@ pub fn tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "read".into(),
-            description: "Read a UTF-8 text file and return its contents.".into(),
+            description: "Read a UTF-8 text file. Lines are returned numbered (`<n>\\t<text>`). For large files, page with offset/limit instead of assuming you saw everything.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Path to the file to read." }
+                    "path": { "type": "string", "description": "Path to the file to read." },
+                    "offset": { "type": "integer", "description": "1-based line to start at (default: first line)." },
+                    "limit": { "type": "integer", "description": "Maximum number of lines to return (default: to end of file)." }
                 },
                 "required": ["path"]
             }),
@@ -125,15 +127,38 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "edit".into(),
-            description: "Replace a unique block of text in a file. old_string must occur once; whitespace and indentation differences are tolerated.".into(),
+            description: "Replace a unique block of text in a file. old_string must occur once and be the file's literal text WITHOUT the `read` line-number gutter; whitespace and indentation differences are tolerated.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "Path to the file to edit." },
-                    "old_string": { "type": "string", "description": "Exact text to replace; must be unique in the file." },
+                    "old_string": { "type": "string", "description": "Exact text to replace; must be unique in the file. Do not include line numbers." },
                     "new_string": { "type": "string", "description": "Replacement text." }
                 },
                 "required": ["path", "old_string", "new_string"]
+            }),
+        },
+        ToolSpec {
+            name: "multi_edit".into(),
+            description: "Apply several edits to one file atomically, in order. Each edit replaces a unique block (same rules as `edit`); if any fails, none are applied. Prefer this over multiple `edit` calls on the same file.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Path to the file to edit." },
+                    "edits": {
+                        "type": "array",
+                        "description": "Edits applied in sequence to the file's evolving content.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old_string": { "type": "string", "description": "Exact text to replace; unique at the time this edit applies. No line numbers." },
+                                "new_string": { "type": "string", "description": "Replacement text." }
+                            },
+                            "required": ["old_string", "new_string"]
+                        }
+                    }
+                },
+                "required": ["path", "edits"]
             }),
         },
         ToolSpec {
@@ -219,7 +244,11 @@ async fn run(name: &str, arguments: &str) -> Result<ToolOutput> {
             let content = tokio::fs::read_to_string(&args.path)
                 .await
                 .with_context(|| format!("reading {}", args.path))?;
-            Ok(ToolOutput::plain(truncate(&content)))
+            Ok(ToolOutput::plain(truncate(&format_read(
+                &content,
+                args.offset,
+                args.limit,
+            ))))
         }
         "write" => {
             let args: WriteArgs = parse(arguments)?;
@@ -236,9 +265,10 @@ async fn run(name: &str, arguments: &str) -> Result<ToolOutput> {
             tokio::fs::write(&args.path, &args.content)
                 .await
                 .with_context(|| format!("writing {}", args.path))?;
+            let after = maybe_format(&args.path, args.content).await;
             Ok(ToolOutput::shown(
-                format!("Wrote {} bytes to {}", args.content.len(), args.path),
-                diff(&before, &args.content),
+                format!("Wrote {} bytes to {}", after.len(), args.path),
+                diff(&before, &after),
             ))
         }
         "edit" => {
@@ -251,8 +281,33 @@ async fn run(name: &str, arguments: &str) -> Result<ToolOutput> {
             tokio::fs::write(&args.path, &after)
                 .await
                 .with_context(|| format!("writing {}", args.path))?;
+            let after = maybe_format(&args.path, after).await;
             Ok(ToolOutput::shown(
                 format!("Edited {}", args.path),
+                diff(&before, &after),
+            ))
+        }
+        "multi_edit" => {
+            let args: MultiEditArgs = parse(arguments)?;
+            if args.edits.is_empty() {
+                bail!("no edits provided");
+            }
+            let before = tokio::fs::read_to_string(&args.path)
+                .await
+                .with_context(|| format!("reading {}", args.path))?;
+            // Apply edits in order against the evolving content; abort (writing
+            // nothing) if any fails, so a partial multi-edit never lands.
+            let mut after = before.clone();
+            for (i, e) in args.edits.iter().enumerate() {
+                after = apply_edit(&after, &e.old_string, &e.new_string)
+                    .with_context(|| format!("editing {} (edit #{})", args.path, i + 1))?;
+            }
+            tokio::fs::write(&args.path, &after)
+                .await
+                .with_context(|| format!("writing {}", args.path))?;
+            let after = maybe_format(&args.path, after).await;
+            Ok(ToolOutput::shown(
+                format!("Applied {} edits to {}", args.edits.len(), args.path),
                 diff(&before, &after),
             ))
         }
@@ -381,10 +436,59 @@ fn apply_edit(text: &str, old: &str, new: &str) -> Result<String> {
         return Ok(splice(text, start, end, reindented));
     }
 
-    bail!(
-        "old_string not found, even allowing for whitespace differences; \
-         re-read the file and copy the exact text to replace"
-    )
+    bail!("{}", edit_not_found_help(text, old));
+}
+
+/// Build a helpful error when `old_string` doesn't match: point the model at the
+/// nearest similar lines (with numbers) so it can copy the exact text, rather
+/// than blindly retrying the same string.
+fn edit_not_found_help(text: &str, old: &str) -> String {
+    let mut msg = String::from(
+        "old_string not found, even allowing for whitespace differences. \
+         (Do not include the line-number gutter from `read` in old_string.) ",
+    );
+    let lines: Vec<&str> = text.lines().collect();
+    let needle = old.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    if needle.is_empty() {
+        msg.push_str("Re-read the file and copy the exact text to replace.");
+        return msg;
+    }
+    // Lines equal (ignoring indentation) or containing the first old line.
+    let hits: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.trim() == needle || l.contains(needle))
+        .map(|(i, _)| i)
+        .take(3)
+        .collect();
+    if hits.is_empty() {
+        msg.push_str(&format!(
+            "No line resembling `{}` is in the {}-line file; re-read it to get the current text.",
+            clip(needle, 60),
+            lines.len()
+        ));
+        return msg;
+    }
+    msg.push_str("The closest matching lines in the file are:\n");
+    for i in hits {
+        let lo = i.saturating_sub(1);
+        let hi = (i + 2).min(lines.len());
+        for (off, line) in lines[lo..hi].iter().enumerate() {
+            msg.push_str(&format!("{:>6}\t{}\n", lo + off + 1, line));
+        }
+        msg.push_str("  ---\n");
+    }
+    msg.push_str("Copy old_string verbatim from one of these regions.");
+    msg
+}
+
+/// Truncate to `max` chars with an ellipsis (single-line error context).
+fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(max).collect::<String>())
+    }
 }
 
 /// Byte offset and trailing-newline-stripped content of each line in `text`.
@@ -508,9 +612,106 @@ fn truncate(s: &str) -> String {
     format!("{kept}\n… [truncated {dropped} characters]")
 }
 
+/// Render a file for the `read` tool: each line prefixed with its 1-based number
+/// and a tab (so the model can cite and edit precisely), optionally restricted
+/// to `[offset, offset+limit)`. A footer notes when lines were omitted so the
+/// model knows to page a large file with `offset`/`limit` rather than assume it
+/// saw everything.
+fn format_read(content: &str, offset: Option<usize>, limit: Option<usize>) -> String {
+    if content.is_empty() {
+        return "(empty file)".to_string();
+    }
+    let lines: Vec<&str> = content.lines().collect();
+    let total = lines.len();
+    let start = offset.unwrap_or(1).max(1);
+    if start > total {
+        return format!("(file has {total} line(s); offset {start} is past the end)");
+    }
+    let end = match limit {
+        Some(n) => start.saturating_add(n).saturating_sub(1).min(total),
+        None => total,
+    };
+    let width = end.to_string().len().max(4);
+    let mut out = String::new();
+    for (i, line) in lines[start - 1..end].iter().enumerate() {
+        let n = start + i;
+        out.push_str(&format!("{n:>width$}\t{line}\n"));
+    }
+    if start > 1 || end < total {
+        out.push_str(&format!("… showing lines {start}-{end} of {total}"));
+        if end < total {
+            out.push_str(&format!(" — read more with offset {}", end + 1));
+        }
+    }
+    out
+}
+
+/// Best-effort: run a file-scoped formatter if one is installed for this file
+/// type, then return the file's final content (for the diff shown to the user).
+/// Never fails the edit — a missing formatter, or a formatter that errors on
+/// not-yet-valid code, just leaves the file exactly as written.
+async fn maybe_format(path: &str, written: String) -> String {
+    // Opt-out: some repos aren't formatter-clean, so reformatting on edit would
+    // churn unrelated lines. `HI_NO_FORMAT=1` disables it.
+    if std::env::var_os("HI_NO_FORMAT").is_some() {
+        return written;
+    }
+    let Some((probe, command)) = formatter_for(path) else {
+        return written;
+    };
+    if !tool_available(probe).await {
+        return written;
+    }
+    let _ = run_bash(&format!("{command} {}", sh_quote(path))).await;
+    tokio::fs::read_to_string(path).await.unwrap_or(written)
+}
+
+/// The (probe binary, command prefix) of a file-scoped formatter for `path`'s
+/// extension, if we support one. The command is run as `<prefix> <file>`.
+fn formatter_for(path: &str) -> Option<(&'static str, &'static str)> {
+    match Path::new(path).extension()?.to_str()? {
+        "rs" => Some(("rustfmt", "rustfmt")),
+        "go" => Some(("gofmt", "gofmt -w")),
+        "py" => Some(("ruff", "ruff format -q")),
+        "js" | "jsx" | "ts" | "tsx" | "json" | "css" | "scss" | "md" | "html" | "yaml" | "yml" => {
+            Some(("prettier", "prettier --write --log-level warn"))
+        }
+        _ => None,
+    }
+}
+
+/// Whether `prog` is on PATH (so we only invoke formatters that exist).
+async fn tool_available(prog: &str) -> bool {
+    Command::new("sh")
+        .arg("-c")
+        .arg(format!("command -v {}", sh_quote(prog)))
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
 #[derive(Deserialize)]
 struct ReadArgs {
     path: String,
+    /// 1-based first line to return (default: start of file).
+    #[serde(default)]
+    offset: Option<usize>,
+    /// Max number of lines to return (default: to end of file).
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct MultiEditArgs {
+    path: String,
+    edits: Vec<EditOp>,
+}
+
+#[derive(Deserialize)]
+struct EditOp {
+    old_string: String,
+    new_string: String,
 }
 
 #[derive(Deserialize)]
@@ -546,7 +747,64 @@ struct BashArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_edit, diff};
+    use super::{apply_edit, diff, edit_not_found_help, format_read};
+
+    #[test]
+    fn read_numbers_lines_and_pages() {
+        let body = "alpha\nbravo\ncharlie\ndelta\n";
+        // Whole file: every line numbered from 1.
+        let all = format_read(body, None, None);
+        assert!(all.contains("   1\talpha"), "{all}");
+        assert!(all.contains("   4\tdelta"), "{all}");
+        // A window keeps absolute line numbers and notes there's more below.
+        let win = format_read(body, Some(2), Some(2));
+        assert!(win.contains("   2\tbravo") && win.contains("   3\tcharlie"), "{win}");
+        assert!(!win.contains("alpha") && !win.contains("delta"), "windowed: {win}");
+        assert!(win.contains("lines 2-3 of 4") && win.contains("offset 4"), "footer: {win}");
+        // Empty + past-end are handled.
+        assert_eq!(format_read("", None, None), "(empty file)");
+        assert!(format_read(body, Some(99), None).contains("past the end"));
+    }
+
+    #[test]
+    fn edit_not_found_points_at_similar_lines() {
+        let file = "fn a() {}\nfn target() {\n    do_thing();\n}\nfn b() {}\n";
+        let help = edit_not_found_help(file, "fn target() {\n    do_OTHER();");
+        assert!(help.contains("not found"), "{help}");
+        // It surfaces the real nearby line with its number so the model can copy it.
+        assert!(help.contains("fn target() {"), "shows the candidate: {help}");
+        assert!(help.contains("2\t"), "with a line number: {help}");
+    }
+
+    #[tokio::test]
+    async fn multi_edit_applies_in_order_and_is_atomic() {
+        let dir = std::env::temp_dir().join(format!("hi-medit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("x.txt");
+        std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+        let p = path.to_string_lossy();
+
+        // Two edits in one atomic call.
+        let args = format!(
+            r#"{{"path":"{p}","edits":[{{"old_string":"one","new_string":"1"}},{{"old_string":"three","new_string":"3"}}]}}"#
+        );
+        let out = super::execute("multi_edit", &args).await;
+        assert!(out.content.contains("Applied 2 edits"), "{}", out.content);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "1\ntwo\n3\n");
+
+        // A failing edit in the batch leaves the file untouched (atomic).
+        let bad = format!(
+            r#"{{"path":"{p}","edits":[{{"old_string":"1","new_string":"X"}},{{"old_string":"nope","new_string":"Y"}}]}}"#
+        );
+        let out = super::execute("multi_edit", &bad).await;
+        assert!(out.content.contains("Error"), "should fail: {}", out.content);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "1\ntwo\n3\n",
+            "file unchanged after a failed batch"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn diff_leads_with_a_change_summary() {
