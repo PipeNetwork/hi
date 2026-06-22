@@ -145,10 +145,29 @@ pub fn list_sessions() -> Result<()> {
             .duration_since(modified)
             .map(|d| humanize(d.as_secs()))
             .unwrap_or_else(|_| "?".into());
-        let first = first_user_message(&path).unwrap_or_default();
-        println!("{id}  {age:>6} ago  {}", hi_agent::ui::clip(&first, 70));
+        let title = first_user_message(&path)
+            .map(|m| session_title(&m))
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| "(no prompt yet)".to_string());
+        println!("{id}  {age:>6} ago  {}", hi_agent::ui::clip(&title, 70));
     }
     Ok(())
+}
+
+/// Derive a concise, single-line title from a session's first user message:
+/// drop any folded stdin/code block (a piped-in `hi "fix this" < log` lands as a
+/// fenced `stdin:` section) and collapse whitespace, so the listing shows the
+/// human instruction rather than a wall of pasted output. Deterministic — no
+/// model call, unlike minion's generated titles.
+fn session_title(first_user: &str) -> String {
+    let head = first_user
+        .split("stdin:")
+        .next()
+        .unwrap_or(first_user)
+        .split("```")
+        .next()
+        .unwrap_or(first_user);
+    head.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn first_user_message(path: &Path) -> Option<String> {
@@ -170,5 +189,29 @@ fn humanize(secs: u64) -> String {
         s if s < 3600 => format!("{}m", s / 60),
         s if s < 86_400 => format!("{}h", s / 3600),
         s => format!("{}d", s / 86_400),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::session_title;
+
+    #[test]
+    fn title_strips_folded_stdin_and_collapses_whitespace() {
+        assert_eq!(
+            session_title("fix the   failing\n test"),
+            "fix the failing test"
+        );
+        // Piped stdin is folded in as a fenced `stdin:` block — keep only the prose.
+        assert_eq!(
+            session_title("fix the failures\n\nstdin:\n```\nerror: boom\n```"),
+            "fix the failures"
+        );
+        // A leading code fence is dropped too.
+        assert_eq!(
+            session_title("explain this\n```rust\nfn main() {}\n```"),
+            "explain this"
+        );
+        assert_eq!(session_title("   "), "");
     }
 }

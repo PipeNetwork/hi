@@ -639,12 +639,26 @@ impl Agent {
                 }
                 steps += 1;
 
+                // After a content-less round, resample hotter on the retry to
+                // break out of the low-entropy/garbled attractor that produced it
+                // (cf. minion's recovery sampling). Bounded, and only while
+                // consecutively stalling — `empty_retries` resets on real output,
+                // so a normal round always runs at the configured temperature.
+                // Temperature is the portable lever here; repeat-penalty/DRY
+                // aren't plumbed through every provider.
+                let temperature = if empty_retries == 0 {
+                    self.config.temperature
+                } else {
+                    let base = self.config.temperature.unwrap_or(0.7).max(0.7);
+                    Some((base + 0.15 * empty_retries as f32).min(1.0))
+                };
+
                 let request = ChatRequest {
                     model: self.config.model.clone(),
                     messages: self.messages.clone(),
                     tools: self.request_tools(),
                     max_tokens: self.config.max_tokens,
-                    temperature: self.config.temperature,
+                    temperature,
                     thinking_budget: self.config.thinking_budget,
                     profile: RequestProfile {
                         compat: self.config.compat,
@@ -709,9 +723,10 @@ impl Agent {
 
                 // Auto-recover from a content-less response — no tool calls and no
                 // text, i.e. a flaky provider returning only reasoning or an empty
-                // message. Silently re-run the same request a few times before
-                // giving up. The dead round isn't recorded, so each retry re-runs
-                // with the original context.
+                // message. Silently re-run a few times before giving up, each
+                // retry resampling hotter (see the temperature bump above). The
+                // dead round isn't recorded, so each retry re-runs with the
+                // original context.
                 if calls.is_empty() && !has_text {
                     if empty_retries < MAX_EMPTY_RETRIES {
                         empty_retries += 1;
@@ -726,6 +741,10 @@ impl Agent {
                     );
                     break false;
                 }
+                // Real output this round — clear the retry counter so the
+                // temperature bump is transient: a later, unrelated stall gets
+                // its own budget rather than inheriting this one's elevation.
+                empty_retries = 0;
 
                 self.messages.push(Message::assistant(completion.content));
                 if calls.is_empty() {
@@ -1201,6 +1220,25 @@ mod tests {
         }
     }
 
+    /// Like [`Canned`], but records the temperature of each request (shared via
+    /// an `Arc` so the test can inspect it after the provider is moved in).
+    struct RecordTemps {
+        responses: Mutex<Vec<Completion>>,
+        temps: std::sync::Arc<Mutex<Vec<Option<f32>>>>,
+    }
+
+    #[async_trait]
+    impl Provider for RecordTemps {
+        async fn stream(
+            &self,
+            request: ChatRequest,
+            _sink: &mut (dyn FnMut(StreamEvent) + Send),
+        ) -> Result<Completion> {
+            self.temps.lock().unwrap().push(request.temperature);
+            Ok(self.responses.lock().unwrap().remove(0))
+        }
+    }
+
     struct NullUi;
     impl Ui for NullUi {
         fn assistant_text(&mut self, _: &str) {}
@@ -1400,7 +1438,9 @@ mod tests {
             "first result is Cargo.toml"
         );
         assert!(
-            outputs[1].contains("fn run_turn"),
+            // The file's top-of-module doc comment — stable in the kept head even
+            // after the per-result cap clips this (large) file's middle.
+            outputs[1].contains("The agent loop"),
             "second result is lib.rs"
         );
     }
@@ -1890,6 +1930,31 @@ mod tests {
             "history should be replaced by the summary"
         );
         assert_eq!(agent.messages().last().unwrap().text(), "ans2");
+    }
+
+    #[tokio::test]
+    async fn retry_resamples_at_a_higher_temperature() {
+        // A content-less first round triggers the silent retry, which must
+        // resample hotter to escape the attractor; the configured temperature is
+        // used for the initial (non-retry) call.
+        let temps = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let provider = RecordTemps {
+            responses: Mutex::new(vec![
+                completion(vec![], 0, 0), // empty → retry
+                completion(vec![Content::Text("recovered".into())], 5, 3),
+            ]),
+            temps: temps.clone(),
+        };
+        let mut cfg = config();
+        cfg.temperature = Some(0.2);
+        let mut agent = Agent::new(Box::new(provider), cfg);
+        agent.run_turn("go", &mut NullUi).await.unwrap();
+
+        let temps = temps.lock().unwrap();
+        assert_eq!(temps.len(), 2, "initial call + one retry, got {:?}", *temps);
+        assert_eq!(temps[0], Some(0.2), "first call uses the configured temp");
+        let retry = temps[1].expect("retry has a temperature");
+        assert!(retry > 0.2, "retry resamples hotter, got {retry}");
     }
 
     #[tokio::test]

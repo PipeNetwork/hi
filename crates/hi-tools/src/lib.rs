@@ -7,6 +7,7 @@ pub mod checkpoint;
 pub mod guard;
 
 use std::path::Path;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -15,8 +16,18 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::process::Command;
 
-/// Cap tool output so a single read or noisy command can't blow the context.
-const MAX_OUTPUT_CHARS: usize = 50_000;
+/// Per-result character budget so a single read or noisy command can't blow the
+/// context. Overridable via `HI_TOOL_RESULT_CHARS` — lower it for a tight local
+/// window, raise it when the model has room. Read once, at first use. The
+/// default is conservative on purpose: ~24k chars is ~6k tokens, and a single
+/// `cargo test` dump shouldn't swallow a small context.
+static MAX_OUTPUT_CHARS: LazyLock<usize> = LazyLock::new(|| {
+    std::env::var("HI_TOOL_RESULT_CHARS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 1_000)
+        .unwrap_or(24_000)
+});
 const BASH_TIMEOUT: Duration = Duration::from_secs(120);
 const CHECK_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -606,14 +617,26 @@ fn parse<T: for<'de> Deserialize<'de>>(arguments: &str) -> Result<T> {
     serde_json::from_str(arguments).context("invalid tool arguments")
 }
 
-/// Truncate output to a character budget, noting how much was dropped.
+/// Clip output to the configured character budget ([`MAX_OUTPUT_CHARS`]).
 fn truncate(s: &str) -> String {
-    if s.chars().count() <= MAX_OUTPUT_CHARS {
+    truncate_to(s, *MAX_OUTPUT_CHARS)
+}
+
+/// Clip to `max` chars keeping *both* ends. For command and test output the tail
+/// — failures, summaries, `error[...]` lines — is usually the most useful part,
+/// so head-only truncation drops the signal. Splits the budget ~60% head / ~40%
+/// tail and notes how much of the middle went. Split out so tests can set `max`.
+fn truncate_to(s: &str, max: usize) -> String {
+    let total = s.chars().count();
+    if total <= max {
         return s.to_string();
     }
-    let kept: String = s.chars().take(MAX_OUTPUT_CHARS).collect();
-    let dropped = s.chars().count() - MAX_OUTPUT_CHARS;
-    format!("{kept}\n… [truncated {dropped} characters]")
+    let head_budget = max * 6 / 10;
+    let tail_budget = max - head_budget;
+    let head: String = s.chars().take(head_budget).collect();
+    let tail: String = s.chars().skip(total - tail_budget).collect();
+    let dropped = total - head_budget - tail_budget;
+    format!("{head}\n… [truncated {dropped} characters] …\n{tail}")
 }
 
 /// Render a file for the `read` tool: each line prefixed with its 1-based number
@@ -751,7 +774,23 @@ struct BashArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_edit, diff, edit_not_found_help, format_read};
+    use super::{apply_edit, diff, edit_not_found_help, format_read, truncate_to};
+
+    #[test]
+    fn truncate_keeps_head_and_tail() {
+        // 300 chars, budget 100 → keep 60 head + 40 tail, drop the 200 middle.
+        let s = format!("{}{}{}", "A".repeat(100), "M".repeat(100), "Z".repeat(100));
+        let out = truncate_to(&s, 100);
+        assert!(out.starts_with(&"A".repeat(60)), "keeps the head");
+        assert!(out.trim_end().ends_with(&"Z".repeat(40)), "keeps the tail");
+        assert!(!out.contains('M'), "drops the middle");
+        assert!(
+            out.contains("truncated 200 characters"),
+            "notes the gap: {out}"
+        );
+        // Under budget passes through untouched.
+        assert_eq!(truncate_to("short", 100), "short");
+    }
 
     #[test]
     fn read_numbers_lines_and_pages() {
