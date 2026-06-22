@@ -175,6 +175,33 @@ pub async fn run(
                             }
                         }
                     }
+                    // When the `/`-command menu is open, navigation/accept keys
+                    // drive it; anything else edits the input and re-syncs it.
+                    Event::Key(key)
+                        if key.kind == KeyEventKind::Press && app.completion.is_some() =>
+                    {
+                        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                        match key.code {
+                            KeyCode::Char('c') if ctrl => app.input.clear(),
+                            KeyCode::Esc => app.completion = None,
+                            KeyCode::Up => app.completion_move(-1),
+                            KeyCode::Down => app.completion_move(1),
+                            KeyCode::Tab => {
+                                app.accept_completion(false);
+                            }
+                            KeyCode::Enter => {
+                                if let Some(line) = app.accept_completion(true) {
+                                    break 'input line;
+                                }
+                            }
+                            _ => {
+                                if let Some(line) = app.edit_key(&key) {
+                                    break 'input line;
+                                }
+                                app.sync_completion();
+                            }
+                        }
+                    }
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                         match key.code {
@@ -186,6 +213,7 @@ pub async fn run(
                                 if let Some(line) = app.edit_key(&key) {
                                     break 'input line;
                                 }
+                                app.sync_completion();
                             }
                         }
                     }
@@ -193,6 +221,8 @@ pub async fn run(
                 }
             },
         };
+        // A line is committed — drop any lingering completion menu state.
+        app.completion = None;
 
         // Slash commands. Most are handled inline; `/compact` runs a model call
         // (driven like a turn so the spinner shows); `/retry` yields the prompt
@@ -624,6 +654,17 @@ struct App {
     event_log: Vec<String>,
     model_issues: HashMap<String, u32>,
     startup_notice: Option<String>,
+    /// Active `/`-command completion menu: the query it's synced to and the
+    /// highlighted row. `None` when the input isn't a slash-command prefix.
+    completion: Option<CompletionState>,
+}
+
+/// State of the slash-command completion menu.
+struct CompletionState {
+    /// The command-name prefix the menu is filtered to (lowercased, no slash).
+    query: String,
+    /// Index of the highlighted match.
+    selected: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -694,6 +735,69 @@ impl App {
             event_log: Vec::new(),
             model_issues: HashMap::new(),
             startup_notice: None,
+            completion: None,
+        }
+    }
+
+    /// The commands the completion menu currently offers (empty when closed).
+    fn completion_matches(&self) -> Vec<&'static command::CommandSpec> {
+        match &self.completion {
+            Some(c) => command::matching(&c.query),
+            None => Vec::new(),
+        }
+    }
+
+    /// Re-sync the completion menu to the current input: open/refresh it when the
+    /// input is a slash-command name being typed (`/`, `/mo`, …) with matches,
+    /// otherwise close it. Called after every edit to the input line.
+    fn sync_completion(&mut self) {
+        let query = slash_query(&self.input.text());
+        match query {
+            Some(q) if !command::matching(&q).is_empty() => {
+                // Reset the highlight only when the query actually changed, so
+                // navigation survives unrelated redraws.
+                if self.completion.as_ref().map(|c| &c.query) != Some(&q) {
+                    self.completion = Some(CompletionState { query: q, selected: 0 });
+                }
+            }
+            _ => self.completion = None,
+        }
+    }
+
+    /// Move the completion highlight by `delta`, clamped to the match list.
+    fn completion_move(&mut self, delta: isize) {
+        let len = self.completion_matches().len();
+        if let Some(c) = &mut self.completion
+            && len > 0
+        {
+            let last = len - 1;
+            c.selected = match delta {
+                d if d < 0 => c.selected.saturating_sub(1),
+                _ => (c.selected + 1).min(last),
+            };
+        }
+    }
+
+    /// Accept the highlighted completion: replace the input with `/<name>` (plus
+    /// a trailing space when the command takes arguments) and close the menu.
+    /// When `submit` is set and the command takes no arguments, return the line
+    /// to run immediately; otherwise leave it in the input for further editing.
+    fn accept_completion(&mut self, submit: bool) -> Option<String> {
+        let matches = self.completion_matches();
+        let c = self.completion.as_ref()?;
+        let spec = matches.get(c.selected)?;
+        let takes_args = spec.takes_args();
+        let filled = if takes_args {
+            format!("/{} ", spec.name)
+        } else {
+            format!("/{}", spec.name)
+        };
+        self.input.set(&filled);
+        self.completion = None;
+        if submit && !takes_args {
+            Some(self.input.submit())
+        } else {
+            None
         }
     }
 
@@ -1197,7 +1301,7 @@ impl App {
         match command {
             Command::Quit => {}
             Command::Help => {
-                for line in command::HELP.lines() {
+                for line in command::help_text().lines() {
                     self.push(Line::styled(line.to_string(), dim()));
                 }
             }
@@ -1316,6 +1420,7 @@ impl App {
         let queued_shown = self.queue.len().min(3);
         let queue_extra = usize::from(self.queue.len() > 3);
         let (input_lines, cursor_row, cursor_col) = self.input_view();
+        let completion_rows = self.completion_matches().len();
         let input_h = if self.fetching.is_some() {
             3
         } else if let Some(p) = &self.picker {
@@ -1323,7 +1428,8 @@ impl App {
             let rows = p.matches.len().clamp(1, PICKER_ROWS) as u16;
             (rows + 3).min(area.height.saturating_sub(3))
         } else {
-            (status_lines + input_lines.len() + queued_shown + queue_extra + 2) as u16
+            (status_lines + completion_rows + input_lines.len() + queued_shown + queue_extra + 2)
+                as u16
         };
         let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(input_h)]).split(area);
 
@@ -1490,6 +1596,27 @@ impl App {
                 };
                 ilines.push(Line::styled(line, dim()));
             }
+            // The `/`-command completion menu sits just above the input line.
+            let matches = self.completion_matches();
+            let selected = self.completion.as_ref().map(|c| c.selected).unwrap_or(0);
+            let name_w = matches.iter().map(|c| c.name.len()).max().unwrap_or(0);
+            for (i, spec) in matches.iter().enumerate() {
+                let name = format!("/{:<width$}", spec.name, width = name_w);
+                if i == selected {
+                    ilines.push(Line::from(vec![
+                        Span::styled(
+                            format!("▶ {name}"),
+                            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(format!("  {}", spec.help), dim()),
+                    ]));
+                } else {
+                    ilines.push(Line::from(vec![
+                        Span::raw(format!("  {name}")),
+                        Span::styled(format!("  {}", spec.help), dim()),
+                    ]));
+                }
+            }
             ilines.extend(input_lines);
             for q in self.queue.iter().take(3) {
                 ilines.push(Line::styled(format!("⏳ {q}"), dim()));
@@ -1502,9 +1629,13 @@ impl App {
             }
             frame.render_widget(Paragraph::new(ilines).block(input_block), rows[1]);
 
-            // Cursor sits within the editable input (below the spinner, if shown).
+            // Cursor sits within the editable input — below the optional startup
+            // notice, the status line, and the completion menu.
+            let above = usize::from(self.startup_notice.is_some())
+                + status_lines
+                + self.completion_matches().len();
             let cx = rows[1].x + 1 + cursor_col;
-            let cy = rows[1].y + 1 + status_lines as u16 + cursor_row;
+            let cy = rows[1].y + 1 + above as u16 + cursor_row;
             frame.set_cursor_position((
                 cx.min(rows[1].right().saturating_sub(2)),
                 cy.min(rows[1].bottom().saturating_sub(2)),
@@ -1581,6 +1712,18 @@ fn diff_line(line: &str) -> Line<'static> {
         dim()
     };
     Line::from(Span::styled(line.to_string(), style))
+}
+
+/// If `input` is a slash command whose *name* is still being typed (starts with
+/// `/`, no whitespace yet), return the lowercased name prefix (without the
+/// slash) — the filter for the completion menu. Returns `None` once a space is
+/// typed (the user has moved on to arguments) or the input isn't a slash command.
+fn slash_query(input: &str) -> Option<String> {
+    let rest = input.strip_prefix('/')?;
+    if rest.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(rest.to_lowercase())
 }
 
 /// Compact token count for the working line: `1234` → `1.2k`, `45000` → `45k`.
@@ -2536,5 +2679,87 @@ mod tests {
         );
         assert!(screen.contains("second"), "second line: {screen}");
         assert!(screen.contains("third"), "third line: {screen}");
+    }
+
+    #[test]
+    fn slash_query_tracks_command_name_being_typed() {
+        assert_eq!(slash_query("/"), Some(String::new()));
+        assert_eq!(slash_query("/mo"), Some("mo".to_string()));
+        assert_eq!(slash_query("/MODEL"), Some("model".to_string()));
+        // Once a space is typed, we're on arguments — no menu.
+        assert_eq!(slash_query("/model "), None);
+        assert_eq!(slash_query("/model gpt"), None);
+        // Not a slash command at all.
+        assert_eq!(slash_query("hello"), None);
+    }
+
+    #[test]
+    fn completion_opens_filters_and_closes() {
+        let mut app = App::new("openai", "gpt-4o");
+        app.input.set("/");
+        app.sync_completion();
+        assert_eq!(
+            app.completion_matches().len(),
+            hi_agent::command::COMMANDS.len(),
+            "bare slash lists every command"
+        );
+        app.input.set("/co");
+        app.sync_completion();
+        let names: Vec<&str> = app.completion_matches().iter().map(|c| c.name).collect();
+        assert!(names.contains(&"copy") && names.contains(&"compact"), "got {names:?}");
+        assert!(names.iter().all(|n| n.starts_with("co")));
+        // A space moves to arguments → menu closes.
+        app.input.set("/copy ");
+        app.sync_completion();
+        assert!(app.completion.is_none());
+    }
+
+    #[test]
+    fn completion_navigation_and_accept() {
+        let mut app = App::new("openai", "gpt-4o");
+        // No-arg command: Enter accepts and submits immediately.
+        app.input.set("/hel");
+        app.sync_completion();
+        let line = app.accept_completion(true);
+        assert_eq!(line.as_deref(), Some("/help"));
+        assert!(app.completion.is_none(), "menu closes after accept");
+
+        // Arg-taking command: accept leaves a trailing space, does not submit.
+        app.input.set("/mod");
+        app.sync_completion();
+        assert_eq!(app.accept_completion(true), None, "arg command waits for input");
+        assert_eq!(app.input.text(), "/model ");
+
+        // Tab never submits, even for a no-arg command.
+        app.input.set("/dif");
+        app.sync_completion();
+        assert_eq!(app.accept_completion(false), None);
+        assert_eq!(app.input.text(), "/diff");
+    }
+
+    #[test]
+    fn completion_move_clamps() {
+        let mut app = App::new("openai", "gpt-4o");
+        app.input.set("/co"); // [copy, compact]
+        app.sync_completion();
+        app.completion_move(-1); // already at 0, stays
+        assert_eq!(app.completion.as_ref().unwrap().selected, 0);
+        app.completion_move(1);
+        assert_eq!(app.completion.as_ref().unwrap().selected, 1);
+        app.completion_move(1); // clamp at last
+        assert_eq!(app.completion.as_ref().unwrap().selected, 1);
+    }
+
+    #[test]
+    fn renders_completion_menu() {
+        let mut app = App::new("openai", "gpt-4o");
+        app.input.set("/");
+        app.sync_completion();
+        let mut term = Terminal::new(TestBackend::new(72, 20)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let screen = dump(&term);
+        assert!(screen.contains("/help"), "lists help: {screen}");
+        assert!(screen.contains("/model"), "lists model: {screen}");
+        assert!(screen.contains("▶"), "highlights a row: {screen}");
     }
 }

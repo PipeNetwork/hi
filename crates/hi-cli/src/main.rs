@@ -476,7 +476,7 @@ fn handle_command(agent: &mut Agent, command: hi_agent::Command, registry: &Regi
     use hi_agent::Command;
     match command {
         Command::Quit => return true,
-        Command::Help => println!("{}", hi_agent::command::HELP),
+        Command::Help => println!("{}", hi_agent::command::help_text()),
         Command::Tokens => {
             let t = agent.totals();
             println!(

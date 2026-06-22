@@ -62,27 +62,98 @@ pub fn parse(line: &str) -> Option<Command> {
     })
 }
 
-/// Help text listing the available commands.
-pub const HELP: &str = "\
-commands:
-  /help              show this help
-  /model [id]        show or switch the model
-  /verify [cmd|off]  show/set/clear the test command turns iterate against
-  /diff              show what files have changed (git diff)
-  /copy [all]        copy the last assistant response (or transcript) to clipboard
-  /goal [text|clear] show, set, or clear the current session goal
-  /compact [kind]    reclaim context (kind: hybrid, full, or elide)
-  /retry             re-run your last message
-  /undo              revert the file changes from the last turn
-  /status            show provider, model, queue, context, and last turn state
-  /log               write a local debug log for this session
-  /tokens            cumulative token usage this session
-  /clear             start a fresh conversation
-  /exit              quit";
+/// One user-facing slash command — the single source of truth for `/help` and
+/// the interactive completion menu, so they can't drift from each other.
+pub struct CommandSpec {
+    /// Canonical name without the leading slash (what completion inserts).
+    pub name: &'static str,
+    /// Argument hint, e.g. `[id]`; empty when the command takes no arguments.
+    pub args: &'static str,
+    /// One-line description.
+    pub help: &'static str,
+}
+
+impl CommandSpec {
+    /// Whether the command accepts arguments (so completion leaves a trailing
+    /// space for the user to type them, rather than submitting immediately).
+    pub fn takes_args(&self) -> bool {
+        !self.args.is_empty()
+    }
+}
+
+/// Every slash command, in display order. Each `name` must be parseable by
+/// [`parse`] (guarded by a test).
+pub const COMMANDS: &[CommandSpec] = &[
+    CommandSpec { name: "help", args: "", help: "show this help" },
+    CommandSpec { name: "model", args: "[id]", help: "show or switch the model (no id opens a picker)" },
+    CommandSpec { name: "verify", args: "[cmd|off]", help: "show/set/clear the test command turns iterate against" },
+    CommandSpec { name: "diff", args: "", help: "show what files have changed (git diff)" },
+    CommandSpec { name: "copy", args: "[all]", help: "copy the last response (or transcript) to the clipboard" },
+    CommandSpec { name: "goal", args: "[text|clear]", help: "show, set, or clear the current session goal" },
+    CommandSpec { name: "compact", args: "[kind]", help: "reclaim context (kind: hybrid, full, or elide)" },
+    CommandSpec { name: "retry", args: "", help: "re-run your last message" },
+    CommandSpec { name: "undo", args: "", help: "revert the file changes from the last turn" },
+    CommandSpec { name: "status", args: "", help: "show provider, model, queue, context, and last turn state" },
+    CommandSpec { name: "log", args: "", help: "write a local debug log for this session" },
+    CommandSpec { name: "tokens", args: "", help: "cumulative token usage this session" },
+    CommandSpec { name: "clear", args: "", help: "start a fresh conversation" },
+    CommandSpec { name: "exit", args: "", help: "quit" },
+];
+
+/// Commands whose canonical name starts with `prefix` (case-insensitive), in
+/// display order — drives the `/`-completion menu. An empty prefix lists all.
+pub fn matching(prefix: &str) -> Vec<&'static CommandSpec> {
+    let needle = prefix.to_lowercase();
+    COMMANDS
+        .iter()
+        .filter(|c| c.name.starts_with(&needle))
+        .collect()
+}
+
+/// Help text, generated from [`COMMANDS`] so it always lists exactly what
+/// exists.
+pub fn help_text() -> String {
+    let mut out = String::from("commands:\n");
+    for c in COMMANDS {
+        let left = if c.args.is_empty() {
+            format!("/{}", c.name)
+        } else {
+            format!("/{} {}", c.name, c.args)
+        };
+        out.push_str(&format!("  {left:<18} {}\n", c.help));
+    }
+    out.push_str("\naliases: /m /st /cp /redo /revert /new /changes /usage /debug /h /?");
+    out
+}
 
 #[cfg(test)]
 mod tests {
-    use super::{Command, parse};
+    use super::{COMMANDS, Command, matching, parse};
+
+    #[test]
+    fn every_listed_command_parses_to_a_real_command() {
+        // Guards against the menu/help listing a command no frontend can run.
+        for spec in COMMANDS {
+            let line = format!("/{}", spec.name);
+            match parse(&line) {
+                Some(Command::Unknown(_)) | None => {
+                    panic!("listed command {line} does not parse")
+                }
+                Some(_) => {}
+            }
+        }
+    }
+
+    #[test]
+    fn matching_filters_by_prefix() {
+        // Empty prefix → everything; a prefix narrows; no match → empty.
+        assert_eq!(matching("").len(), COMMANDS.len());
+        let m = matching("co");
+        assert!(m.iter().any(|c| c.name == "compact"));
+        assert!(m.iter().any(|c| c.name == "copy"));
+        assert!(m.iter().all(|c| c.name.starts_with("co")));
+        assert!(matching("zzz").is_empty());
+    }
 
     #[test]
     fn parses_commands_and_ignores_plain_input() {
