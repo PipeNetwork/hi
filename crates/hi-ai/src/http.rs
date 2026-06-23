@@ -16,8 +16,7 @@ use serde::Deserialize;
 
 use crate::provider::ServedModel;
 
-/// Default retry budget for transient failures (429 throttling, connection /
-/// timeout errors): brief, then surface.
+/// Retry budget for transient connection/timeout errors: brief, then surface.
 const MAX_RETRIES: u32 = 3;
 /// Wider budget for a transient *server outage* (5xx): ~6 attempts with the
 /// capped backoff below span ~12s — enough to silently ride out a quick provider
@@ -168,13 +167,12 @@ pub async fn send_with_retry(builder: RequestBuilder) -> Result<Response> {
 }
 
 /// How many times a given response status is worth retrying: a wide budget for a
-/// transient 5xx outage (ride out a deploy), the brief default for 429
-/// throttling, none otherwise.
+/// transient 5xx outage (ride out a deploy), none otherwise. A 429 throttle (and
+/// every other 4xx) surfaces immediately — retrying a rate limit just stalls the
+/// turn and can deepen the throttle; the caller backs off deliberately instead.
 fn retry_limit(status: StatusCode) -> u32 {
     if status.is_server_error() {
         OUTAGE_RETRIES
-    } else if status == StatusCode::TOO_MANY_REQUESTS {
-        MAX_RETRIES
     } else {
         0
     }
@@ -200,15 +198,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn server_errors_retry_longer_than_rate_limits() {
+    fn only_server_outages_are_retried() {
         // 5xx (transient outage / deploy) rides out the wider budget…
         assert_eq!(retry_limit(StatusCode::BAD_GATEWAY), OUTAGE_RETRIES);
         assert_eq!(retry_limit(StatusCode::SERVICE_UNAVAILABLE), OUTAGE_RETRIES);
         assert_eq!(retry_limit(StatusCode::GATEWAY_TIMEOUT), OUTAGE_RETRIES);
-        assert!(OUTAGE_RETRIES > MAX_RETRIES, "5xx rides out longer than 429");
-        // …429 only the brief default before surfacing the throttle…
-        assert_eq!(retry_limit(StatusCode::TOO_MANY_REQUESTS), MAX_RETRIES);
-        // …and client errors / success aren't retried at all.
+        assert!(OUTAGE_RETRIES > 0);
+        // …everything else surfaces immediately: a 429 throttle, auth, client errors.
+        assert_eq!(retry_limit(StatusCode::TOO_MANY_REQUESTS), 0);
         assert_eq!(retry_limit(StatusCode::BAD_REQUEST), 0);
         assert_eq!(retry_limit(StatusCode::UNAUTHORIZED), 0);
         assert_eq!(retry_limit(StatusCode::OK), 0);

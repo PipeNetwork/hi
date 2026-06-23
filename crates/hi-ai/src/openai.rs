@@ -45,7 +45,9 @@ impl Provider for OpenAiProvider {
         let attempts = request_attempts(&request);
         let mut last_error: Option<ProviderError> = None;
         let mut resp = None;
-        for attempt in attempts {
+        let mut idx = 0;
+        while idx < attempts.len() {
+            let attempt = attempts[idx];
             let body = build_body(&request, attempt);
             let response = crate::http::send_with_retry(
                 self.http.post(&url).bearer_auth(&self.api_key).json(&body),
@@ -68,8 +70,15 @@ impl Provider for OpenAiProvider {
                 kind,
                 format!("API error {status}: {text}"),
             ));
-            if request.profile.compat == CompatMode::Strict || !attempt.can_fallback(kind, &text) {
+            if request.profile.compat == CompatMode::Strict {
                 break;
+            }
+            // Degrade toward the attempt that actually addresses this error — a
+            // tool rejection jumps straight to chat-only rather than first dropping
+            // usage streaming. `None` means nothing more will help: surface it.
+            match next_degraded_attempt(&attempts, idx, kind, &text) {
+                Some(next) => idx = next,
+                None => break,
             }
         }
         let Some(resp) = resp else {
@@ -262,17 +271,44 @@ struct RequestAttempt {
     status: Option<&'static str>,
 }
 
-impl RequestAttempt {
-    fn can_fallback(self, kind: ProviderErrorKind, text: &str) -> bool {
-        matches!(kind, ProviderErrorKind::Outage)
-            || (self.include_usage && mentions(text, &["stream_options", "include_usage"]))
-            || (self.include_tools
-                && matches!(
-                    kind,
-                    ProviderErrorKind::UnsupportedTools
-                        | ProviderErrorKind::UnsupportedRequestShape
-                ))
+/// Given the attempt that just failed (at `current`) and its error, the index of
+/// the next attempt to try — the one whose degradation actually addresses this
+/// error — or `None` to stop and surface the error. A tool rejection jumps
+/// straight to the chat-only attempt instead of first dropping usage streaming;
+/// in Required tool mode there is no chat-only attempt, so the error surfaces.
+fn next_degraded_attempt(
+    attempts: &[RequestAttempt],
+    current: usize,
+    kind: ProviderErrorKind,
+    text: &str,
+) -> Option<usize> {
+    let cur = attempts[current];
+    let after = current + 1;
+    // Usage streaming rejected → retry without it (keeping tools).
+    if cur.include_usage && mentions(text, &["stream_options", "include_usage"]) {
+        return attempts[after..]
+            .iter()
+            .position(|a| !a.include_usage)
+            .map(|i| after + i);
     }
+    // Tool schema rejected → drop to chat-only.
+    if cur.include_tools
+        && matches!(
+            kind,
+            ProviderErrorKind::UnsupportedTools | ProviderErrorKind::UnsupportedRequestShape
+        )
+    {
+        return attempts[after..]
+            .iter()
+            .position(|a| !a.include_tools)
+            .map(|i| after + i);
+    }
+    // A persistent outage that already survived transport retries: try the next
+    // (degraded) shape in case the 5xx was really a request-shape problem.
+    if matches!(kind, ProviderErrorKind::Outage) && after < attempts.len() {
+        return Some(after);
+    }
+    None
 }
 
 fn request_attempts(request: &ChatRequest) -> Vec<RequestAttempt> {
