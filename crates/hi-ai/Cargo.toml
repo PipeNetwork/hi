@@ -3,6 +3,11 @@ name = "hi-ai"
 edition.workspace = true
 version.workspace = true
 
+[features]
+# Exposes `test_support` (a fake OpenAI server) publicly so other crates' tests
+# can drive the real binary against canned responses. Off in normal builds.
+test-support = []
+
 [dependencies]
 tokio.workspace = true
 reqwest.workspace = true

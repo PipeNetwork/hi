@@ -102,6 +102,11 @@ pub struct Cli {
     #[arg(long)]
     pub no_finalize: bool,
 
+    /// Disable auto-memory: at the end of an interactive session, distill durable
+    /// lessons into `.hi/memory.md` (loaded as context next session).
+    #[arg(long)]
+    pub no_memory: bool,
+
     /// Compaction strategy: hybrid (default), full, or elide.
     #[arg(long, value_name = "KIND")]
     pub compaction: Option<String>,

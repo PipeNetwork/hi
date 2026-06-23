@@ -52,6 +52,7 @@ pub async fn run(
     model: &str,
     registry: &hi_ai::Registry,
     history_path: Option<std::path::PathBuf>,
+    auto_memory: bool,
 ) -> Result<()> {
     enable_raw_mode().context("entering raw mode")?;
     execute!(io::stdout(), EnterAlternateScreen).context("entering alternate screen")?;
@@ -442,6 +443,32 @@ pub async fn run(
         // No follow() at turn end: if the user scrolled up to read mid-turn, leave
         // them there (the "↓ N new" hint shows the summary is below). A new turn
         // re-pins to the bottom.
+    }
+
+    // Session ending: distill durable lessons into .hi/memory.md (loaded next
+    // session), shown live so the user sees what's saved. Only if work happened.
+    if hi_agent::should_distill_memory(auto_memory, agent.totals().output_tokens) {
+        app.set_working(true);
+        app.follow();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut sink = ChannelUi { tx };
+        {
+            let fut = async {
+                agent.update_memory(&mut sink).await;
+                Ok::<(), anyhow::Error>(())
+            };
+            let _ = drive(
+                &mut terminal,
+                &mut input_rx,
+                &mut ticker,
+                &mut app,
+                rx,
+                fut,
+                false,
+            )
+            .await;
+        }
+        app.set_working(false);
     }
 
     // Persist input history for next time.

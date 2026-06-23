@@ -613,6 +613,87 @@ impl Agent {
         Ok((!summary.is_empty()).then(|| summary.to_string()))
     }
 
+    /// Distill durable, reusable lessons from this session into the project memory
+    /// file (`.hi/memory.md`), then load it as context next session. Re-derives the
+    /// *whole* capped list from the current memory + this session, so stale or wrong
+    /// facts fall out instead of accreting (self-correcting against poisoning).
+    ///
+    /// One chat-only model call. Best-effort: a provider/IO error is surfaced as a
+    /// status, never fatal (it runs at quit). Like [`summarize`](Self::summarize) it
+    /// builds a throwaway message vec and does NOT record into the session history.
+    pub async fn update_memory(&mut self, ui: &mut dyn Ui) {
+        self.update_memory_at(memory_file(), ui).await;
+    }
+
+    /// See [`update_memory`](Self::update_memory); the path is a parameter so tests
+    /// can redirect the write to a temp file (no global env/cwd state).
+    async fn update_memory_at(&mut self, path: std::path::PathBuf, ui: &mut dyn Ui) {
+        let existing = std::fs::read_to_string(&path).unwrap_or_default();
+
+        ui.status("distilling session memory…");
+        let mut messages = Vec::with_capacity(self.messages.len() + 1);
+        messages.push(self.system_message());
+        messages.extend_from_slice(&self.messages[1..]);
+        messages.push(Message::user(memory_prompt(existing.trim())));
+
+        let request = ChatRequest {
+            model: self.config.model.clone(),
+            messages,
+            tools: Vec::new(), // distilling — no tool use
+            max_tokens: self.config.max_tokens,
+            temperature: self.config.temperature,
+            top_p: None,
+            frequency_penalty: None,
+            thinking_budget: None,
+            profile: RequestProfile {
+                compat: self.config.compat,
+                tool_mode: ToolMode::ChatOnly,
+                stream_usage: None,
+            },
+        };
+
+        let mut memory = String::new();
+        let mut sink = |event: StreamEvent| match event {
+            StreamEvent::Text(text) => {
+                memory.push_str(&text);
+                ui.assistant_text(&text);
+            }
+            StreamEvent::Status(text) => ui.status(&text),
+            StreamEvent::Reasoning(_) => {}
+        };
+        let completion = match self.provider.stream(request, &mut sink).await {
+            Ok(completion) => completion,
+            Err(err) => {
+                ui.status(&format!("(couldn't update memory: {err})"));
+                return;
+            }
+        };
+        ui.assistant_end();
+        self.totals.input_tokens += completion.usage.input_tokens;
+        self.totals.output_tokens += completion.usage.output_tokens;
+
+        // Fall back to the final content if the provider didn't stream text.
+        if memory.trim().is_empty() {
+            for c in &completion.content {
+                if let Content::Text(t) = c {
+                    memory.push_str(t);
+                }
+            }
+        }
+        let memory = cap_memory(&memory);
+        if memory.is_empty() {
+            return; // nothing durable to save
+        }
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let notes = memory.lines().filter(|l| !l.trim().is_empty()).count();
+        match std::fs::write(&path, format!("{memory}\n")) {
+            Ok(()) => ui.status(&format!("✓ saved {notes} memory note(s) to {}", path.display())),
+            Err(err) => ui.status(&format!("(couldn't write memory: {err})")),
+        }
+    }
+
     /// Run one user turn to completion, emitting output through `ui`.
     ///
     /// After the model stops calling tools, an optional verification command is
@@ -1157,6 +1238,72 @@ impl Agent {
     }
 }
 
+/// Backstop cap on the distilled memory file. The prompt does the real shaping
+/// (≤ ~20 short bullets); this just stops a runaway response from bloating the
+/// file — and thus every future session's context.
+const MEMORY_MAX_CHARS: usize = 2_000;
+
+/// Where the project memory lives — `.hi/memory.md` under the working directory,
+/// overridable via `HI_MEMORY_FILE` (which also makes the file IO testable). The
+/// frontend reads the same path to load it as context.
+pub fn memory_file() -> std::path::PathBuf {
+    std::env::var_os("HI_MEMORY_FILE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::Path::new(".hi").join("memory.md"))
+}
+
+/// The session-end distillation prompt, folding in the current memory so the
+/// model revises it (merge / de-dupe / drop-stale) instead of appending.
+fn memory_prompt(existing: &str) -> String {
+    let existing = if existing.trim().is_empty() {
+        "(empty)"
+    } else {
+        existing.trim()
+    };
+    format!(
+        "This coding session is ending. Maintain a small, durable memory for future work \
+         in this project — reusable notes, not a transcript.\n\nCurrent saved memory:\n\
+         ---\n{existing}\n---\n\nRevise it using only what THIS session actually \
+         established: keep facts that save time next time — project conventions, key \
+         decisions and constraints, non-obvious gotchas, important file locations, and \
+         the exact build/test/run commands that matter. Drop anything transient, already \
+         obvious from the code or HI.md, or now outdated. Merge and de-duplicate. Output \
+         ONLY the updated memory as at most ~20 short bullet points (a few words to one \
+         line each), no preamble. If nothing durable is worth keeping, output the current \
+         memory unchanged (or nothing if it was empty)."
+    )
+}
+
+/// Trim and cap the distilled memory at [`MEMORY_MAX_CHARS`], cutting back to the
+/// last whole line so a bullet isn't sliced mid-word. Empty in → empty out.
+fn cap_memory(s: &str) -> String {
+    let s = s.trim();
+    if s.chars().count() <= MEMORY_MAX_CHARS {
+        return s.to_string();
+    }
+    let kept: String = s.chars().take(MEMORY_MAX_CHARS).collect();
+    let kept = kept.rsplit_once('\n').map(|(head, _)| head).unwrap_or(&kept);
+    format!("{}\n… (memory truncated)", kept.trim_end())
+}
+
+/// Whether to distill session memory at quit: only when enabled *and* the model
+/// actually produced output this session, so an empty or command-only session
+/// writes nothing. Shared by both frontends so the rule can't drift between them.
+pub fn should_distill_memory(enabled: bool, output_tokens: u64) -> bool {
+    enabled && output_tokens > 0
+}
+
+/// Humanize a token count compactly and consistently: `991`, `1.2k`, `22k`, `1.0M`.
+/// Shared by the live working line and the settled usage summary so they agree.
+pub fn humanize_count(n: u64) -> String {
+    match n {
+        0..=999 => n.to_string(),
+        1_000..=9_999 => format!("{:.1}k", n as f64 / 1000.0),
+        10_000..=999_999 => format!("{}k", n / 1000),
+        _ => format!("{:.1}M", n as f64 / 1_000_000.0),
+    }
+}
+
 fn tool_mode_label(mode: ToolMode) -> &'static str {
     match mode {
         ToolMode::Auto => "auto",
@@ -1641,6 +1788,75 @@ mod tests {
             1,
             "a terminal error is not retried"
         );
+    }
+
+    #[test]
+    fn cap_memory_trims_and_backstops() {
+        assert_eq!(cap_memory("  - a\n- b  "), "- a\n- b"); // trimmed, under budget
+        assert_eq!(cap_memory("   "), ""); // empty in → empty out
+        let big = "- a durable note\n".repeat(1000); // ≫ MEMORY_MAX_CHARS
+        let capped = cap_memory(&big);
+        assert!(capped.chars().count() <= MEMORY_MAX_CHARS + 40, "backstopped");
+        assert!(capped.ends_with("(memory truncated)"));
+    }
+
+    #[test]
+    fn memory_prompt_folds_in_existing_memory() {
+        let p = memory_prompt("- 4-space indent");
+        assert!(p.contains("- 4-space indent"), "includes current memory");
+        assert!(p.contains("Current saved memory"));
+        assert!(memory_prompt("   ").contains("(empty)"), "blank → (empty)");
+    }
+
+    #[tokio::test]
+    async fn update_memory_writes_file_without_polluting_history() {
+        let path = std::env::temp_dir().join(format!("hi-mem-{}-write.md", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        // The model returns a distilled bullet list.
+        let mut agent = agent(
+            vec![completion(
+                vec![Content::Text("- always run cargo fmt\n- tests live in tests/".into())],
+                7,
+                4,
+            )],
+            config(),
+        );
+        let before = agent.messages().len();
+        agent.update_memory_at(path.clone(), &mut NullUi).await;
+
+        let written = std::fs::read_to_string(&path).expect("memory file written");
+        let _ = std::fs::remove_file(&path);
+        assert!(written.contains("always run cargo fmt"), "distilled: {written}");
+        assert_eq!(agent.messages().len(), before, "session history not polluted");
+        assert_eq!(agent.totals().output_tokens, 4, "usage counted");
+    }
+
+    #[tokio::test]
+    async fn update_memory_is_best_effort_on_error() {
+        // A provider error at quit must not panic or leave a file behind.
+        let path = std::env::temp_dir().join(format!("hi-mem-{}-err.md", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let (mut agent, _requests) =
+            scripted_agent(vec![ProviderStep::Error(ProviderErrorKind::Outage)], config());
+        agent.update_memory_at(path.clone(), &mut NullUi).await;
+        assert!(!path.exists(), "nothing written when distillation fails");
+    }
+
+    #[test]
+    fn should_distill_memory_gates_on_enabled_and_work() {
+        assert!(should_distill_memory(true, 1), "enabled + work → distill");
+        assert!(!should_distill_memory(true, 0), "no model output → skip");
+        assert!(!should_distill_memory(false, 100), "disabled → skip");
+    }
+
+    #[test]
+    fn humanize_count_abbreviates_consistently() {
+        assert_eq!(humanize_count(0), "0");
+        assert_eq!(humanize_count(991), "991");
+        assert_eq!(humanize_count(1234), "1.2k");
+        assert_eq!(humanize_count(22864), "22k"); // the reported "22864 in"
+        assert_eq!(humanize_count(12000), "12k"); // the reported "12k" ctx
+        assert_eq!(humanize_count(1_000_000), "1.0M"); // a 1M window
     }
 
     #[test]

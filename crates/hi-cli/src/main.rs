@@ -146,6 +146,11 @@ async fn main() -> Result<()> {
         return result;
     }
 
+    // Auto-memory at the end of an interactive session (TUI or REPL), unless
+    // disabled or the session isn't being saved (memory is a form of persistence).
+    // One-shot prompts return above, so scripted/piped/eval runs never write it.
+    let auto_memory = auto_memory_enabled(cli.no_memory, cli.no_save);
+
     // The full-screen TUI is the default interactive experience; fall back to
     // the plain REPL when not on a TTY, when --plain is set, or if it errors.
     if !cli.plain && std::io::stdout().is_terminal() {
@@ -155,6 +160,7 @@ async fn main() -> Result<()> {
             &settings.model,
             &registry,
             session::history_path(),
+            auto_memory,
         )
         .await
         {
@@ -163,7 +169,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    repl(&mut agent, &settings, &registry).await
+    repl(&mut agent, &settings, &registry, auto_memory).await
 }
 
 fn provider_label(provider: ProviderName) -> &'static str {
@@ -303,11 +309,30 @@ fn load_project_context() -> Option<String> {
             }
         }
     }
+    // Memory distilled from past sessions (auto-maintained at session end).
+    if let Ok(text) = std::fs::read_to_string(hi_agent::memory_file())
+        && let Some(section) = memory_context(&text)
+    {
+        parts.push(section);
+    }
     // A heuristic repo map so the model can navigate without reading everything.
     if let Some(map) = config::build_repo_map(std::path::Path::new(".")) {
         parts.push(map);
     }
     (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
+/// Whether auto-memory is active for this session: on unless `--no-memory`, and
+/// off when the session isn't saved (`--no-save`) since memory is persistence.
+fn auto_memory_enabled(no_memory: bool, no_save: bool) -> bool {
+    !no_memory && !no_save
+}
+
+/// Build the `# Memory` context section from the saved memory file's contents,
+/// or `None` when it's empty/whitespace (so a blank file adds nothing).
+fn memory_context(text: &str) -> Option<String> {
+    let text = text.trim();
+    (!text.is_empty()).then(|| format!("# Memory (from past sessions)\n{text}"))
 }
 
 fn build_provider(settings: &Settings) -> Box<dyn Provider> {
@@ -339,7 +364,12 @@ fn build_chain(primary: &Settings, fallbacks: Vec<Settings>) -> Box<dyn Provider
     Box::new(FallbackProvider::new(chain))
 }
 
-async fn repl(agent: &mut Agent, settings: &Settings, registry: &Registry) -> Result<()> {
+async fn repl(
+    agent: &mut Agent,
+    settings: &Settings,
+    registry: &Registry,
+    auto_memory: bool,
+) -> Result<()> {
     use hi_agent::Command;
     use rustyline::DefaultEditor;
     use rustyline::error::ReadlineError;
@@ -472,6 +502,18 @@ async fn repl(agent: &mut Agent, settings: &Settings, registry: &Registry) -> Re
                 break;
             }
         }
+    }
+
+    // Session ending: distill durable lessons into .hi/memory.md (loaded next
+    // session). Skip an empty session — only if the model actually did work.
+    if hi_agent::should_distill_memory(auto_memory, agent.totals().output_tokens) {
+        let progress = Arc::new(AtomicBool::new(false));
+        let mut plain = PlainUi::with_progress(progress.clone());
+        let memory = async {
+            agent.update_memory(&mut plain).await;
+            Ok::<(), anyhow::Error>(())
+        };
+        let _ = drive_with_spinner(memory, &progress).await;
     }
 
     if let Some(path) = &history {
@@ -629,4 +671,24 @@ fn handle_command(agent: &mut Agent, command: hi_agent::Command, registry: &Regi
         }
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{auto_memory_enabled, memory_context};
+
+    #[test]
+    fn auto_memory_off_when_disabled_or_unsaved() {
+        assert!(auto_memory_enabled(false, false), "default on");
+        assert!(!auto_memory_enabled(true, false), "--no-memory disables");
+        assert!(!auto_memory_enabled(false, true), "--no-save disables");
+    }
+
+    #[test]
+    fn memory_context_wraps_nonempty_and_skips_blank() {
+        let section = memory_context("- run cargo fmt before commits").unwrap();
+        assert!(section.starts_with("# Memory (from past sessions)"));
+        assert!(section.contains("- run cargo fmt before commits"));
+        assert!(memory_context("   \n  ").is_none(), "blank → no section");
+    }
 }

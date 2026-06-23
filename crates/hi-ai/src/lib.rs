@@ -7,8 +7,8 @@ mod http;
 pub mod openai;
 pub mod provider;
 pub mod registry;
-#[cfg(test)]
-pub(crate) mod test_support;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 pub mod types;
 
 pub use anthropic::AnthropicProvider;
