@@ -314,7 +314,19 @@ fn classify_http_error(status: StatusCode, text: &str) -> ProviderErrorKind {
         StatusCode::TOO_MANY_REQUESTS => ProviderErrorKind::RateLimit,
         s if s.is_server_error() => ProviderErrorKind::Outage,
         StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
-            if mentions(text, &["tool", "function_call", "function"]) {
+            if mentions(
+                text,
+                &[
+                    "maximum allowed size",
+                    "input exceeds",
+                    "context length",
+                    "context_length_exceeded",
+                    "too many tokens",
+                    "request too large",
+                ],
+            ) {
+                ProviderErrorKind::RequestTooLarge
+            } else if mentions(text, &["tool", "function_call", "function"]) {
                 ProviderErrorKind::UnsupportedTools
             } else {
                 ProviderErrorKind::UnsupportedRequestShape
@@ -703,7 +715,11 @@ mod tests {
         let hot = build_body(&req, request_attempts(&req)[0]);
         // f32 → JSON f64 isn't exact (0.9f32 ≈ 0.89999996), so compare with tolerance.
         let near = |v: &serde_json::Value, want: f64| (v.as_f64().unwrap() - want).abs() < 1e-6;
-        assert!(near(&hot["temperature"], 0.9), "temperature: {}", hot["temperature"]);
+        assert!(
+            near(&hot["temperature"], 0.9),
+            "temperature: {}",
+            hot["temperature"]
+        );
         assert!(near(&hot["top_p"], 0.95), "top_p: {}", hot["top_p"]);
         assert!(
             near(&hot["frequency_penalty"], 0.4),
@@ -827,6 +843,25 @@ mod tests {
         assert_eq!(
             provider_error_kind(&err),
             Some(ProviderErrorKind::MalformedStream)
+        );
+    }
+
+    #[tokio::test]
+    async fn request_too_large_400_is_classified() {
+        let Some(server) = FakeOpenAiServer::new(vec![Response::json(
+            400,
+            r#"{"error":"chat input exceeds the maximum allowed size of 131072 bytes","error_type":"invalid_request_error"}"#,
+        )]) else {
+            return;
+        };
+        let provider = super::OpenAiProvider::new(server.url().to_string(), "test".into());
+        let err = provider
+            .stream(request(vec![], Default::default()), &mut |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(
+            provider_error_kind(&err),
+            Some(ProviderErrorKind::RequestTooLarge)
         );
     }
 
