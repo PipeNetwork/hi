@@ -1183,11 +1183,13 @@ impl Agent {
     /// size), since cumulative input sums re-sent context across rounds and so
     /// isn't a measure of how full the window is.
     fn usage_summary(&self, usage: &hi_ai::Usage) -> String {
+        // Cumulative session tokens, ↑ sent / ↓ received — these drive cost and
+        // match the live working line. Abbreviated in the same units as the
+        // context gauge below so the two never read as raw-vs-rounded.
         let mut summary = format!(
-            "[{} in · {} out · {} total",
-            usage.input_tokens,
-            usage.output_tokens,
-            usage.total()
+            "[↑{} ↓{}",
+            humanize_count(usage.input_tokens),
+            humanize_count(usage.output_tokens),
         );
         if let Some((input_price, output_price)) = self.config.price {
             let cost = (usage.input_tokens as f64 * input_price
@@ -1195,14 +1197,16 @@ impl Agent {
                 / 1_000_000.0;
             summary.push_str(&format!(" · ${cost:.4}"));
         }
+        // The context gauge is a *point-in-time* measure (the last request's
+        // size), not cumulative input — so it is correctly smaller than ↑.
         if let Some(window) = self.config.context_window
             && window > 0
         {
             let pct = (self.context_used * 100 / u64::from(window)).min(100);
             summary.push_str(&format!(
-                " · {pct}% ctx ({}k/{}k)",
-                self.context_used / 1000,
-                window / 1000
+                " · ctx {pct}% ({}/{})",
+                humanize_count(self.context_used),
+                humanize_count(u64::from(window)),
             ));
         }
         summary.push(']');
@@ -2426,9 +2430,55 @@ mod tests {
         let mut ui = RecUi::default();
         agent.run_turn("go", &mut ui).await.unwrap();
         let summary = ui.turn_end.expect("turn_end emitted");
+        // Cumulative session totals (↑11 ↓3), matching the live counter — not just
+        // the last round (↑6 ↓2).
         assert!(
-            summary.contains("11 in · 3 out · 14 total"),
+            summary.contains("↑11 ↓3"),
             "cumulative totals, got: {summary}"
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_line_separates_cumulative_spend_from_context_fill() {
+        // The regression guard: with a window + price set, the done line shows
+        // cumulative ↑/↓ session spend (abbreviated, matching the live line), the
+        // cost, and a context gauge that is the *last request's* size — distinct
+        // from cumulative input and humanized the same way. Pins against mixing
+        // raw/abbreviated units, rendering a count two ways, or conflating the two.
+        let mut cfg = config();
+        cfg.context_window = Some(1_000_000);
+        cfg.price = Some((5.0, 15.0)); // $/1M (in, out)
+        let responses = vec![
+            completion(
+                vec![Content::ToolCall {
+                    id: "1".into(),
+                    name: "bash".into(),
+                    arguments: "{\"command\":\"echo hi\"}".into(),
+                }],
+                8_000,
+                100,
+            ),
+            completion(vec![Content::Text("done".into())], 12_000, 200),
+        ];
+        let mut agent = agent(responses, cfg);
+        let mut ui = RecUi::default();
+        agent.run_turn("go", &mut ui).await.unwrap();
+        let line = ui.turn_end.expect("turn_end emitted");
+
+        // Cumulative session spend, arrowed + abbreviated (same shape as the live line).
+        assert!(line.contains("↑20k"), "cumulative input ↑ (8k+12k): {line}");
+        assert!(line.contains("↓300"), "cumulative output ↓ (100+200): {line}");
+        // The context gauge is the LAST request (12k) over the window — NOT the
+        // cumulative input (20k), and abbreviated, not raw.
+        assert!(line.contains("ctx 1% (12k/1.0M)"), "point-in-time context: {line}");
+        // The old, mixed-unit, misleading format is gone.
+        assert!(
+            !line.contains(" in ·") && !line.contains("total"),
+            "no raw in/out/total wording: {line}"
+        );
+        assert!(
+            !line.contains("20000") && !line.contains("12000"),
+            "no raw token counts: {line}"
         );
     }
 

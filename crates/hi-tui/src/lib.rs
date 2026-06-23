@@ -1010,7 +1010,7 @@ impl App {
     /// yet). Lets you tell a slow tool from a slow model at a glance.
     fn activity_line(&self) -> String {
         if let (Some(tool), Some(started)) = (&self.current_tool, self.current_tool_started) {
-            return format!("running {tool} · {}s", started.elapsed().as_secs());
+            return format!("running {tool} · {}", fmt_elapsed(started.elapsed().as_secs()));
         }
         let secs = self.started.map(|t| t.elapsed().as_secs()).unwrap_or(0);
         let verb = match self.last_turn_event {
@@ -1018,7 +1018,7 @@ impl App {
             Some(TurnEventKind::Assistant) => "responding",
             _ => "waiting for the model",
         };
-        format!("{verb}… {secs}s")
+        format!("{verb}… {}", fmt_elapsed(secs))
     }
 
     /// Apply a pure editing/navigation key to the input line, shared by the
@@ -1668,13 +1668,13 @@ impl App {
         // --- Bottom region: a fetch spinner, the model picker, or the input bar. ---
         if let Some(started) = self.fetching {
             let frame_ch = SPINNER[self.spinner % SPINNER.len()];
-            let secs = started.elapsed().as_secs();
+            let elapsed = fmt_elapsed(started.elapsed().as_secs());
             let block = Block::bordered()
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(Color::Cyan));
             let body = Line::from(vec![
                 Span::styled(
-                    format!("{frame_ch} fetching models from {}… {secs}s", self.provider),
+                    format!("{frame_ch} fetching models from {}… {elapsed}", self.provider),
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
@@ -2047,11 +2047,21 @@ fn clip_reason(s: &str) -> String {
 }
 
 /// Compact token count for the working line: `1234` → `1.2k`, `45000` → `45k`.
+/// The live working line and the settled usage summary share one humanizer (in
+/// `hi-agent`), so the same count never renders two different ways.
 fn fmt_count(n: u64) -> String {
-    match n {
-        0..=999 => n.to_string(),
-        1000..=9999 => format!("{:.1}k", n as f64 / 1000.0),
-        _ => format!("{}k", n / 1000),
+    hi_agent::humanize_count(n)
+}
+
+/// Format an elapsed-seconds count compactly: `45s`, `14m 28s`, `1h 02m`.
+fn fmt_elapsed(secs: u64) -> String {
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if h > 0 {
+        format!("{h}h {m:02}m")
+    } else if m > 0 {
+        format!("{m}m {s:02}s")
+    } else {
+        format!("{s}s")
     }
 }
 
@@ -2648,6 +2658,26 @@ mod tests {
         assert_eq!(fmt_count(999), "999");
         assert_eq!(fmt_count(1234), "1.2k");
         assert_eq!(fmt_count(45000), "45k");
+    }
+
+    #[test]
+    fn working_and_summary_share_one_humanizer() {
+        // The live working line (fmt_count) and the settled usage summary
+        // (hi_agent::humanize_count) must format a count identically — else the
+        // same number renders two ways as a turn finishes (the regression fixed).
+        for n in [0u64, 999, 1234, 22_864, 12_000, 1_000_000, 1_500_000] {
+            assert_eq!(fmt_count(n), hi_agent::humanize_count(n), "diverged at {n}");
+        }
+    }
+
+    #[test]
+    fn fmt_elapsed_shows_minutes_and_seconds() {
+        assert_eq!(fmt_elapsed(0), "0s");
+        assert_eq!(fmt_elapsed(45), "45s");
+        assert_eq!(fmt_elapsed(60), "1m 00s");
+        assert_eq!(fmt_elapsed(868), "14m 28s"); // the reported "868s"
+        assert_eq!(fmt_elapsed(3600), "1h 00m");
+        assert_eq!(fmt_elapsed(3661), "1h 01m");
     }
 
     #[test]
