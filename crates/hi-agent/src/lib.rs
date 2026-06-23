@@ -9,8 +9,8 @@ pub mod ui;
 use anyhow::Result;
 use futures_util::StreamExt;
 use hi_ai::{
-    ChatRequest, CompatMode, Content, Message, Provider, RequestProfile, StreamEvent, ToolMode,
-    ToolSpec, Usage,
+    ChatRequest, CompatMode, Content, Message, Provider, ProviderErrorKind, RequestProfile,
+    StreamEvent, ToolMode, ToolSpec, Usage, provider_error_kind,
 };
 use hi_tools::{execute, tool_specs};
 
@@ -26,9 +26,10 @@ const AUTO_COMPACT_PERCENT: u64 = 80;
 const COMPACT_TARGET_PERCENT: u64 = 50;
 /// User turns auto-compaction keeps verbatim.
 const AUTO_KEEP_RECENT: usize = 3;
-/// How many times to silently re-run a round that came back with no tool calls
-/// and no text (a flaky provider returning only reasoning or an empty message)
-/// before giving up and surfacing it.
+/// How many times to silently re-run a round that produced no usable output —
+/// either a content-less response (only reasoning, or empty) or a transient
+/// malformed/empty *stream error* — each retry resampling hotter, before giving
+/// up and surfacing it.
 const MAX_EMPTY_RETRIES: u32 = 2;
 /// Max read-only tool calls to run concurrently within one round, bounding the
 /// open file handles / subprocesses a single batched response can spawn.
@@ -69,9 +70,9 @@ static RECOVERY_SAMPLING: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|
 /// `(temperature, top_p, frequency_penalty)`. On a normal round — or when recovery
 /// sampling is disabled — it passes the configured temperature through and leaves
 /// `top_p`/`frequency_penalty` at the provider default (`None`). On a retry it
-/// climbs the temperature from a ≥0.7 floor toward 1.0 and adds nucleus sampling
-/// plus a growing frequency penalty, so a repetition/garble loop is actively
-/// discouraged rather than just reheated.
+/// leads with anti-repetition — nucleus sampling plus a growing frequency penalty
+/// — and only gently raises temperature from a ≥0.5 floor, so a repetition/garble
+/// loop is broken with less coding-quality risk than a big temperature jump.
 fn recovery_sampling(
     retries: u32,
     base_temperature: Option<f32>,
@@ -81,8 +82,8 @@ fn recovery_sampling(
         return (base_temperature, None, None);
     }
     let r = retries as f32;
-    let temperature = (base_temperature.unwrap_or(0.7).max(0.7) + 0.15 * r).min(1.0);
-    let frequency_penalty = (0.2 * r).min(0.6);
+    let temperature = (base_temperature.unwrap_or(0.7).max(0.5) + 0.15 * r).min(1.0);
+    let frequency_penalty = (0.3 * r).min(0.6);
     (Some(temperature), Some(0.95), Some(frequency_penalty))
 }
 
@@ -452,6 +453,33 @@ impl Agent {
         }
     }
 
+    /// Provider byte/request caps can be lower than the model catalog's token
+    /// window, so a request can be rejected before usage is reported and before
+    /// the normal auto-compaction trigger fires. Keep the latest user request,
+    /// drop earlier in-memory context once, and let the loop retry immediately.
+    fn retry_after_request_too_large(
+        &mut self,
+        input: &str,
+        turn_start: usize,
+        ui: &mut dyn Ui,
+    ) -> bool {
+        if turn_start <= 1 {
+            return false;
+        }
+
+        self.truncate_messages(1);
+        self.messages.push(Message::user(format!(
+            "[Earlier conversation context was omitted because the provider rejected the request \
+             as too large. Continue from this latest user request; ask for missing details if the \
+             omitted context is required.]\n\n{input}"
+        )));
+        self.context_used = 0;
+        ui.status(
+            "provider rejected the request as too large; dropped prior conversation context and retrying",
+        );
+        true
+    }
+
     /// Summarize the whole conversation and reset to system + summary.
     async fn compact_summarize(&mut self, ui: &mut dyn Ui) -> Result<()> {
         // Need at least one exchange beyond the system prompt to summarize.
@@ -638,6 +666,7 @@ impl Agent {
             self.context_used = 0;
         }
 
+        let turn_start = self.messages.len();
         self.messages.push(Message::user(input));
         self.last_verify = None;
         self.last_changed_files.clear();
@@ -651,6 +680,7 @@ impl Agent {
         let mut steps = 0u32;
         let mut empty_retries = 0u32;
         let mut continue_nudges = 0u32;
+        let mut request_too_large_retried = false;
         // Whether the model has run a tool this turn (so a later text-only stop is
         // eligible for a continue-nudge) and whether the turn ended on an
         // announced-but-unperformed step (drives the incomplete notice).
@@ -680,11 +710,8 @@ impl Agent {
                 // `empty_retries` resets on real output, so a normal round runs at
                 // the configured sampling. Toggleable via HI_RECOVERY_SAMPLING for
                 // A/B-ing on the eval harness.
-                let (temperature, top_p, frequency_penalty) = recovery_sampling(
-                    empty_retries,
-                    self.config.temperature,
-                    *RECOVERY_SAMPLING,
-                );
+                let (temperature, top_p, frequency_penalty) =
+                    recovery_sampling(empty_retries, self.config.temperature, *RECOVERY_SAMPLING);
 
                 let request = ChatRequest {
                     model: self.config.model.clone(),
@@ -712,7 +739,51 @@ impl Agent {
                         ui.status(&text);
                     }
                 };
-                let completion = self.provider.stream(request, &mut sink).await?;
+                let completion = match self.provider.stream(request, &mut sink).await {
+                    Ok(completion) => completion,
+                    Err(err)
+                        if provider_error_kind(&err)
+                            == Some(ProviderErrorKind::RequestTooLarge) =>
+                    {
+                        if !request_too_large_retried
+                            && self.retry_after_request_too_large(input, turn_start, ui)
+                        {
+                            request_too_large_retried = true;
+                            continue;
+                        }
+                        self.truncate_messages(turn_start);
+                        ui.status(
+                            "request still exceeds the provider limit with prior context removed; \
+                             shorten the prompt or attached input, then retry",
+                        );
+                        return Err(err);
+                    }
+                    // A transient generation flake — a malformed/garbled stream or
+                    // an empty completion. Treat it like a content-less response:
+                    // flush, then silently re-run with hotter recovery sampling (a
+                    // fresh request, with its own transport retries) up to the same
+                    // budget, instead of failing the turn. Terminal errors (auth,
+                    // outage, …) fall through to the abort below.
+                    Err(err)
+                        if empty_retries < MAX_EMPTY_RETRIES
+                            && matches!(
+                                provider_error_kind(&err),
+                                Some(
+                                    ProviderErrorKind::MalformedStream
+                                        | ProviderErrorKind::EmptyCompletion
+                                )
+                            ) =>
+                    {
+                        ui.assistant_end();
+                        empty_retries += 1;
+                        ui.status(&format!(
+                            "⚠ the model's response didn't come through cleanly — \
+                             retrying ({empty_retries}/{MAX_EMPTY_RETRIES})"
+                        ));
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                };
                 ui.assistant_end();
 
                 self.totals.input_tokens += completion.usage.input_tokens;
@@ -1240,7 +1311,10 @@ fn changed_files_between(
 mod tests {
     use super::*;
     use async_trait::async_trait;
-    use hi_ai::{ChatRequest, Completion, Content, Provider, Role, StreamEvent, Usage};
+    use hi_ai::{
+        ChatRequest, Completion, Content, Provider, ProviderError, ProviderErrorKind, Role,
+        StreamEvent, Usage,
+    };
     use std::sync::{LazyLock, Mutex};
 
     /// A provider that returns canned completions in order.
@@ -1282,6 +1356,40 @@ mod tests {
         }
     }
 
+    enum ProviderStep {
+        Completion(Completion),
+        RequestTooLarge,
+        /// Fail this round with a provider error of the given kind.
+        Error(ProviderErrorKind),
+    }
+
+    struct ScriptedProvider {
+        steps: Mutex<Vec<ProviderStep>>,
+        requests: std::sync::Arc<Mutex<Vec<Vec<Message>>>>,
+    }
+
+    #[async_trait]
+    impl Provider for ScriptedProvider {
+        async fn stream(
+            &self,
+            request: ChatRequest,
+            _sink: &mut (dyn FnMut(StreamEvent) + Send),
+        ) -> Result<Completion> {
+            self.requests.lock().unwrap().push(request.messages);
+            match self.steps.lock().unwrap().remove(0) {
+                ProviderStep::Completion(completion) => Ok(completion),
+                ProviderStep::RequestTooLarge => Err(ProviderError::new(
+                    ProviderErrorKind::RequestTooLarge,
+                    "API error 400 Bad Request: chat input exceeds the maximum allowed size",
+                )
+                .into()),
+                ProviderStep::Error(kind) => {
+                    Err(ProviderError::new(kind, "scripted provider error").into())
+                }
+            }
+        }
+    }
+
     struct NullUi;
     impl Ui for NullUi {
         fn assistant_text(&mut self, _: &str) {}
@@ -1291,6 +1399,26 @@ mod tests {
         fn tool_result(&mut self, _: &str) {}
         fn status(&mut self, _: &str) {}
         fn turn_end(&mut self, _: &str) {}
+    }
+
+    #[derive(Default)]
+    struct RecordingUi {
+        statuses: Vec<String>,
+        turn_ends: Vec<String>,
+    }
+
+    impl Ui for RecordingUi {
+        fn assistant_text(&mut self, _: &str) {}
+        fn assistant_reasoning(&mut self, _: &str) {}
+        fn assistant_end(&mut self) {}
+        fn tool_call(&mut self, _: &str, _: &str) {}
+        fn tool_result(&mut self, _: &str) {}
+        fn status(&mut self, s: &str) {
+            self.statuses.push(s.to_string());
+        }
+        fn turn_end(&mut self, s: &str) {
+            self.turn_ends.push(s.to_string());
+        }
     }
 
     fn config() -> AgentConfig {
@@ -1332,6 +1460,18 @@ mod tests {
         Agent::new(Box::new(Canned(Mutex::new(responses))), cfg)
     }
 
+    fn scripted_agent(
+        steps: Vec<ProviderStep>,
+        cfg: AgentConfig,
+    ) -> (Agent, std::sync::Arc<Mutex<Vec<Vec<Message>>>>) {
+        let requests = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let provider = ScriptedProvider {
+            steps: Mutex::new(steps),
+            requests: requests.clone(),
+        };
+        (Agent::new(Box::new(provider), cfg), requests)
+    }
+
     static VERIFY_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
         LazyLock::new(|| tokio::sync::Mutex::new(()));
 
@@ -1354,6 +1494,153 @@ mod tests {
         std::env::current_dir()
             .unwrap()
             .join(format!(".hi-verify-{tag}-{}", std::process::id()))
+    }
+
+    #[tokio::test]
+    async fn request_too_large_drops_prior_context_and_retries_latest_prompt() {
+        let (mut agent, requests) = scripted_agent(
+            vec![
+                ProviderStep::RequestTooLarge,
+                ProviderStep::Completion(completion(vec![Content::Text("ok".into())], 12, 3)),
+            ],
+            config(),
+        );
+        let huge_old_output = "old tool output ".repeat(20_000);
+        agent.messages.push(Message::user("previous task"));
+        agent
+            .messages
+            .push(Message::assistant(vec![Content::ToolCall {
+                id: "read-1".into(),
+                name: "read".into(),
+                arguments: r#"{"path":"LICENSE"}"#.into(),
+            }]));
+        agent
+            .messages
+            .push(Message::tool_result("read-1", huge_old_output.clone()));
+
+        let mut ui = RecordingUi::default();
+        agent
+            .run_turn("fix the current bug", &mut ui)
+            .await
+            .unwrap();
+
+        let requests = requests.lock().unwrap();
+        let contains = |messages: &[Message], needle: &str| {
+            messages.iter().flat_map(|m| &m.content).any(|c| match c {
+                Content::Text(t) => t.contains(needle),
+                Content::Thinking { text, .. } => text.contains(needle),
+                Content::ToolCall {
+                    name, arguments, ..
+                } => name.contains(needle) || arguments.contains(needle),
+                Content::ToolResult { output, .. } => output.contains(needle),
+            })
+        };
+        assert_eq!(requests.len(), 2);
+        assert!(
+            contains(&requests[0], &huge_old_output),
+            "first request includes existing context"
+        );
+        assert!(
+            !contains(&requests[1], &huge_old_output),
+            "retry omits oversized prior context"
+        );
+        assert!(
+            requests[1]
+                .iter()
+                .any(|m| m.text().contains("fix the current bug")),
+            "latest user request is preserved"
+        );
+        assert!(
+            ui.statuses
+                .iter()
+                .any(|s| s.contains("dropped prior conversation context")),
+            "user sees recovery status: {:?}",
+            ui.statuses
+        );
+        assert_eq!(agent.messages().last().unwrap().text(), "ok");
+    }
+
+    #[tokio::test]
+    async fn request_too_large_latest_prompt_is_removed_after_failed_retry() {
+        let (mut agent, _requests) = scripted_agent(vec![ProviderStep::RequestTooLarge], config());
+        let start_len = agent.messages().len();
+        let mut ui = RecordingUi::default();
+
+        let err = agent
+            .run_turn(&"single huge prompt ".repeat(20_000), &mut ui)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            hi_ai::provider_error_kind(&err),
+            Some(ProviderErrorKind::RequestTooLarge)
+        );
+        assert_eq!(
+            agent.messages().len(),
+            start_len,
+            "failed oversized prompt is not left in live history"
+        );
+        assert!(
+            ui.statuses.iter().any(|s| s.contains("shorten the prompt")),
+            "user gets actionable status: {:?}",
+            ui.statuses
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_stream_retries_and_recovers() {
+        // A garbled stream on the first call is silently re-run (with recovery
+        // sampling) rather than failing the turn — then it recovers.
+        let (mut agent, requests) = scripted_agent(
+            vec![
+                ProviderStep::Error(ProviderErrorKind::MalformedStream),
+                ProviderStep::Completion(completion(vec![Content::Text("recovered".into())], 5, 3)),
+            ],
+            config(),
+        );
+        let mut ui = RecordingUi::default();
+        agent.run_turn("go", &mut ui).await.unwrap();
+
+        assert_eq!(agent.messages().last().unwrap().text(), "recovered");
+        assert_eq!(requests.lock().unwrap().len(), 2, "retried once after the garble");
+        assert!(
+            ui.statuses.iter().any(|s| s.contains("retrying")),
+            "shows a retry, got: {:?}",
+            ui.statuses
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_completion_error_is_resampled_too() {
+        // The same path catches a provider's empty-completion *error*, not just a
+        // content-less Ok response.
+        let (mut agent, requests) = scripted_agent(
+            vec![
+                ProviderStep::Error(ProviderErrorKind::EmptyCompletion),
+                ProviderStep::Completion(completion(vec![Content::Text("recovered".into())], 5, 3)),
+            ],
+            config(),
+        );
+        agent.run_turn("go", &mut NullUi).await.unwrap();
+        assert_eq!(agent.messages().last().unwrap().text(), "recovered");
+        assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn terminal_error_aborts_without_retry() {
+        // A non-resamplable error (auth) fails the turn immediately — no retry.
+        let (mut agent, requests) =
+            scripted_agent(vec![ProviderStep::Error(ProviderErrorKind::Auth)], config());
+        let err = agent.run_turn("go", &mut NullUi).await.unwrap_err();
+        assert_eq!(
+            hi_ai::provider_error_kind(&err),
+            Some(ProviderErrorKind::Auth)
+        );
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            1,
+            "a terminal error is not retried"
+        );
     }
 
     #[test]
@@ -1836,7 +2123,11 @@ mod tests {
             "recap is the closing message: {}",
             m.last().unwrap().text()
         );
-        assert_eq!(m[m.len() - 2].role, Role::User, "request precedes the recap");
+        assert_eq!(
+            m[m.len() - 2].role,
+            Role::User,
+            "request precedes the recap"
+        );
         // Roles alternate (no two assistants in a row → provider-safe next turn).
         assert!(
             m.windows(2).all(|w| w[0].role != w[1].role),
@@ -1855,7 +2146,11 @@ mod tests {
         let mut cfg = config();
         cfg.finalize = true;
         let mut agent = agent(
-            vec![completion(vec![Content::Text("The answer is 42.".into())], 1, 1)],
+            vec![completion(
+                vec![Content::Text("The answer is 42.".into())],
+                1,
+                1,
+            )],
             cfg,
         );
         let mut ui = RecUi::default();
@@ -1994,7 +2289,12 @@ mod tests {
         agent.run_turn("go", &mut NullUi).await.unwrap();
 
         let samples = samples.lock().unwrap();
-        assert_eq!(samples.len(), 2, "initial call + one retry, got {:?}", *samples);
+        assert_eq!(
+            samples.len(),
+            2,
+            "initial call + one retry, got {:?}",
+            *samples
+        );
         assert_eq!(
             samples[0],
             (Some(0.2), None, None),
@@ -2016,10 +2316,14 @@ mod tests {
             recovery_sampling(0, Some(0.2), true),
             (Some(0.2), None, None)
         );
-        // First retry: hotter, with nucleus and a frequency penalty.
+        // First retry: nucleus + frequency penalty lead; temperature rises only
+        // gently from the 0.5 floor (to ~0.65, well under the old 0.85).
         let (t1, p1, f1) = recovery_sampling(1, Some(0.2), true);
-        assert_eq!((p1, f1), (Some(0.95), Some(0.2)));
-        assert!(t1.unwrap() > 0.2 && t1.unwrap() <= 1.0, "temp climbs: {t1:?}");
+        assert_eq!((p1, f1), (Some(0.95), Some(0.3)));
+        assert!(
+            t1.unwrap() > 0.2 && t1.unwrap() < 0.7,
+            "temp climbs gently: {t1:?}"
+        );
         // Second retry climbs further; temperature and penalty stay bounded.
         let (t2, _, f2) = recovery_sampling(2, Some(0.2), true);
         assert!(t2.unwrap() > t1.unwrap(), "temp keeps climbing");

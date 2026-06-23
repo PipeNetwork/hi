@@ -35,7 +35,9 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 /// How many model rows the `/model` picker shows at once.
 const PICKER_ROWS: usize = 12;
 const TICK: Duration = Duration::from_millis(120);
-const WATCHDOG_NOTICE: Duration = Duration::from_secs(20);
+/// Only flag a possibly-stuck provider after a long, genuinely silent wait — the
+/// working line already shows the live elapsed time, so an earlier notice just
+/// reads as alarming when the model/provider is merely slow.
 const WATCHDOG_STUCK: Duration = Duration::from_secs(60);
 /// On terminals that don't report focus, notify after a turn at least this long
 /// (a proxy for "you probably stepped away").
@@ -469,7 +471,6 @@ async fn drive(
     let mut cancelled = false;
     let mut saw_turn_end = false;
     let mut last_activity = Instant::now();
-    let mut watchdog_notice = false;
     let mut watchdog_stuck = false;
     loop {
         terminal.draw(|f| app.render(f))?;
@@ -500,18 +501,18 @@ async fn drive(
                 app.spinner = app.spinner.wrapping_add(1);
                 let idle = last_activity.elapsed();
                 app.waiting_for = Some(idle);
-                if expect_turn_end && !watchdog_notice && idle >= WATCHDOG_NOTICE {
-                    watchdog_notice = true;
-                    app.push(Line::styled(
-                        "still waiting for the model/provider; Ctrl-C cancels, /retry can rerun after it returns",
-                        Style::default().fg(Color::Yellow),
-                    ));
-                    app.follow();
-                }
-                if expect_turn_end && !watchdog_stuck && idle >= WATCHDOG_STUCK {
+                // Only warn about a stuck *model/provider* — not while a tool is
+                // legitimately running (its own timer shows in the working line),
+                // which would otherwise fire a false alarm and mark the model
+                // degraded for what is really a slow `cargo test`.
+                if expect_turn_end
+                    && !watchdog_stuck
+                    && app.current_tool.is_none()
+                    && idle >= WATCHDOG_STUCK
+                {
                     watchdog_stuck = true;
                     app.push(Line::styled(
-                        "⚠ no activity for 60s; provider may be stuck. Ctrl-C to cancel, then try /model or /retry",
+                        "⚠ no response for 60s; the model/provider may be stuck. Ctrl-C to cancel, then try /model or /retry",
                         Style::default().fg(Color::Yellow),
                     ));
                     app.follow();

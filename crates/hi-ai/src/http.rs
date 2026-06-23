@@ -1,9 +1,11 @@
 //! Shared HTTP send-with-retry used by every adapter.
 //!
 //! Retries the *initial* request (before streaming begins) on transient
-//! failures — connection/timeout errors and 429 / 5xx responses — with
-//! exponential backoff. Mid-stream failures are not retried (they'd duplicate
-//! already-emitted output).
+//! failures — connection/timeout errors and 429 / 5xx responses — with capped
+//! exponential backoff. The budget is wide enough to ride out a brief backend
+//! blip silently (e.g. a 502 while the provider rolls out an update) rather than
+//! surfacing it as a turn failure. Mid-stream failures are not retried (they'd
+//! duplicate already-emitted output).
 
 use std::time::Duration;
 
@@ -14,8 +16,19 @@ use serde::Deserialize;
 
 use crate::provider::ServedModel;
 
+/// Default retry budget for transient failures (429 throttling, connection /
+/// timeout errors): brief, then surface.
 const MAX_RETRIES: u32 = 3;
+/// Wider budget for a transient *server outage* (5xx): ~6 attempts with the
+/// capped backoff below span ~12s — enough to silently ride out a quick provider
+/// restart/deploy (a 502 while it rolls out an update) instead of failing the
+/// turn. Scoped to the status path; a 502 arrives as a fast HTTP response, so the
+/// cost is just the backoff sleeps, not stacked connection timeouts.
+const OUTAGE_RETRIES: u32 = 6;
 const BASE_DELAY_MS: u64 = 250;
+/// Cap on a single backoff so the wider budget stays bounded (a few seconds per
+/// wait) instead of exploding exponentially.
+const MAX_DELAY_MS: u64 = 4_000;
 
 #[derive(Deserialize)]
 struct ModelsList {
@@ -135,7 +148,7 @@ pub async fn send_with_retry(builder: RequestBuilder) -> Result<Response> {
 
         match attempt_builder.send().await {
             Ok(response) => {
-                if attempt < MAX_RETRIES && is_retryable_status(response.status()) {
+                if attempt < retry_limit(response.status()) {
                     attempt += 1;
                     backoff(attempt).await;
                     continue;
@@ -154,8 +167,17 @@ pub async fn send_with_retry(builder: RequestBuilder) -> Result<Response> {
     }
 }
 
-fn is_retryable_status(status: StatusCode) -> bool {
-    status == StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+/// How many times a given response status is worth retrying: a wide budget for a
+/// transient 5xx outage (ride out a deploy), the brief default for 429
+/// throttling, none otherwise.
+fn retry_limit(status: StatusCode) -> u32 {
+    if status.is_server_error() {
+        OUTAGE_RETRIES
+    } else if status == StatusCode::TOO_MANY_REQUESTS {
+        MAX_RETRIES
+    } else {
+        0
+    }
 }
 
 fn is_retryable_error(err: &reqwest::Error) -> bool {
@@ -163,13 +185,46 @@ fn is_retryable_error(err: &reqwest::Error) -> bool {
 }
 
 async fn backoff(attempt: u32) {
-    let delay = BASE_DELAY_MS * 2u64.pow(attempt - 1);
-    tokio::time::sleep(Duration::from_millis(delay)).await;
+    tokio::time::sleep(Duration::from_millis(backoff_delay(attempt))).await;
+}
+
+/// Backoff for `attempt` (1-based): exponential from [`BASE_DELAY_MS`], capped at
+/// [`MAX_DELAY_MS`]. Split out from the sleep so it's unit-testable.
+fn backoff_delay(attempt: u32) -> u64 {
+    let exp = BASE_DELAY_MS.saturating_mul(2u64.saturating_pow(attempt - 1));
+    exp.min(MAX_DELAY_MS)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn server_errors_retry_longer_than_rate_limits() {
+        // 5xx (transient outage / deploy) rides out the wider budget…
+        assert_eq!(retry_limit(StatusCode::BAD_GATEWAY), OUTAGE_RETRIES);
+        assert_eq!(retry_limit(StatusCode::SERVICE_UNAVAILABLE), OUTAGE_RETRIES);
+        assert_eq!(retry_limit(StatusCode::GATEWAY_TIMEOUT), OUTAGE_RETRIES);
+        assert!(OUTAGE_RETRIES > MAX_RETRIES, "5xx rides out longer than 429");
+        // …429 only the brief default before surfacing the throttle…
+        assert_eq!(retry_limit(StatusCode::TOO_MANY_REQUESTS), MAX_RETRIES);
+        // …and client errors / success aren't retried at all.
+        assert_eq!(retry_limit(StatusCode::BAD_REQUEST), 0);
+        assert_eq!(retry_limit(StatusCode::UNAUTHORIZED), 0);
+        assert_eq!(retry_limit(StatusCode::OK), 0);
+    }
+
+    #[test]
+    fn backoff_is_exponential_then_capped() {
+        assert_eq!(backoff_delay(1), 250);
+        assert_eq!(backoff_delay(2), 500);
+        assert_eq!(backoff_delay(3), 1000);
+        assert_eq!(backoff_delay(4), 2000);
+        // 250 * 2^4 = 4000 hits the cap; later attempts stay there (no overflow).
+        assert_eq!(backoff_delay(5), MAX_DELAY_MS);
+        assert_eq!(backoff_delay(6), MAX_DELAY_MS);
+        assert_eq!(backoff_delay(64), MAX_DELAY_MS);
+    }
 
     #[test]
     fn parses_openai_style_models_list() {
