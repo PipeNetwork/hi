@@ -74,6 +74,9 @@ pub async fn run(
     // Seed the context-fill gauge with the model's window so it reads 0% before
     // the first turn (it refreshes from real usage after each round).
     app.context_window = registry.metadata(model).1;
+    // The catalog, for inline `/model <id>` completion (the picker fetches the
+    // live list on demand; this is the synchronous type-ahead source).
+    app.model_ids = registry.model_ids();
     if let Some(path) = &history_path
         && let Ok(text) = std::fs::read_to_string(path)
     {
@@ -200,7 +203,10 @@ pub async fn run(
                             KeyCode::Up => app.completion_move(-1),
                             KeyCode::Down => app.completion_move(1),
                             KeyCode::Tab => {
+                                // Completing a command that takes arguments fills
+                                // `/name ` — re-sync so its value menu opens next.
                                 app.accept_completion(false);
+                                app.sync_completion();
                             }
                             KeyCode::Enter => {
                                 if let Some(line) = app.accept_completion(true) {
@@ -719,6 +725,8 @@ struct App {
     /// Live per-model metadata (window/price/health) learned from the endpoint's
     /// `/models`, keyed by id — used to apply a model's settings and flag health.
     served: HashMap<String, hi_ai::ServedModel>,
+    /// The model catalog (ids), for inline `/model <id>` type-ahead completion.
+    model_ids: Vec<String>,
     /// Assistant prose currently streaming. Tool output is intentionally not
     /// included; `/copy` copies the assistant's answer, not command logs.
     current_assistant: String,
@@ -748,10 +756,36 @@ struct App {
 
 /// State of the slash-command completion menu.
 struct CompletionState {
-    /// The command-name prefix the menu is filtered to (lowercased, no slash).
-    query: String,
+    /// What the menu is completing — a command name, or the argument of a known
+    /// command — and the prefix it's filtered to.
+    ctx: CompletionContext,
     /// Index of the highlighted match.
     selected: usize,
+}
+
+/// What the completion menu is offering, derived from the input line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CompletionContext {
+    /// Typing the command name itself (`/`, `/co`) — the lowercased prefix.
+    Command(String),
+    /// Typing the argument of a command that has enumerable values (`/compact `,
+    /// `/compact hy`) — the canonical command name and the lowercased value prefix.
+    Arg { cmd: &'static str, prefix: String },
+}
+
+/// One row in the completion menu — a command name or an argument value, already
+/// resolved to what shows and what gets inserted.
+struct CompletionItem {
+    /// Left column: `/compact` for a command, `hybrid` for an argument value.
+    label: String,
+    /// Right-column hint.
+    help: String,
+    /// Text the input becomes when this row is accepted.
+    insert: String,
+    /// Whether accepting with Enter submits the line. Command names that take
+    /// arguments fill `/name ` and wait; everything else (no-arg commands, fully
+    /// chosen argument values) is a complete line that runs.
+    submit_on_enter: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -806,6 +840,7 @@ impl App {
             context_used: 0,
             context_window: None,
             served: HashMap::new(),
+            model_ids: Vec::new(),
             current_assistant: String::new(),
             last_assistant: String::new(),
             last_turn_event: None,
@@ -843,28 +878,52 @@ impl App {
         }
     }
 
-    /// The commands the completion menu currently offers (empty when closed).
-    fn completion_matches(&self) -> Vec<&'static command::CommandSpec> {
+    /// Rows for a completion context — model ids from the live catalog, every
+    /// other command's values from the static table.
+    fn items_for_ctx(&self, ctx: &CompletionContext) -> Vec<CompletionItem> {
+        if let CompletionContext::Arg { cmd, prefix } = ctx
+            && *cmd == MODEL_CMD
+        {
+            return self.model_completion_items(prefix);
+        }
+        completion_items_for(ctx)
+    }
+
+    /// Up to [`MODEL_COMPLETION_MAX`] catalog ids starting with `prefix` (already
+    /// lowercased), as `/model <id>` rows — inline type-ahead for `/model`.
+    fn model_completion_items(&self, prefix: &str) -> Vec<CompletionItem> {
+        self.model_ids
+            .iter()
+            .filter(|id| id.to_lowercase().starts_with(prefix))
+            .take(MODEL_COMPLETION_MAX)
+            .map(|id| CompletionItem {
+                label: id.clone(),
+                help: String::new(),
+                insert: format!("/{MODEL_CMD} {id}"),
+                submit_on_enter: true,
+            })
+            .collect()
+    }
+
+    /// The rows the completion menu currently offers (empty when closed).
+    fn completion_items(&self) -> Vec<CompletionItem> {
         match &self.completion {
-            Some(c) => command::matching(&c.query),
+            Some(c) => self.items_for_ctx(&c.ctx),
             None => Vec::new(),
         }
     }
 
     /// Re-sync the completion menu to the current input: open/refresh it when the
-    /// input is a slash-command name being typed (`/`, `/mo`, …) with matches,
-    /// otherwise close it. Called after every edit to the input line.
+    /// input is a slash-command name being typed (`/`, `/mo`, …) or the argument
+    /// of a command with enumerable values (`/compact `, `/model gp`), with
+    /// matches; otherwise close it. Called after every edit to the input line.
     fn sync_completion(&mut self) {
-        let query = slash_query(&self.input.text());
-        match query {
-            Some(q) if !command::matching(&q).is_empty() => {
-                // Reset the highlight only when the query actually changed, so
+        match completion_context(&self.input.text()) {
+            Some(ctx) if !self.items_for_ctx(&ctx).is_empty() => {
+                // Reset the highlight only when the context actually changed, so
                 // navigation survives unrelated redraws.
-                if self.completion.as_ref().map(|c| &c.query) != Some(&q) {
-                    self.completion = Some(CompletionState {
-                        query: q,
-                        selected: 0,
-                    });
+                if self.completion.as_ref().map(|c| &c.ctx) != Some(&ctx) {
+                    self.completion = Some(CompletionState { ctx, selected: 0 });
                 }
             }
             _ => self.completion = None,
@@ -873,7 +932,7 @@ impl App {
 
     /// Move the completion highlight by `delta`, clamped to the match list.
     fn completion_move(&mut self, delta: isize) {
-        let len = self.completion_matches().len();
+        let len = self.completion_items().len();
         if let Some(c) = &mut self.completion
             && len > 0
         {
@@ -885,23 +944,18 @@ impl App {
         }
     }
 
-    /// Accept the highlighted completion: replace the input with `/<name>` (plus
-    /// a trailing space when the command takes arguments) and close the menu.
-    /// When `submit` is set and the command takes no arguments, return the line
-    /// to run immediately; otherwise leave it in the input for further editing.
+    /// Accept the highlighted completion: replace the input with the row's
+    /// insertion (`/name`, `/name ` for an arg-taking command, or `/cmd value`)
+    /// and close the menu. When `submit` is set and the row is a complete line,
+    /// return it to run immediately; otherwise leave it in the input.
     fn accept_completion(&mut self, submit: bool) -> Option<String> {
-        let matches = self.completion_matches();
+        let items = self.completion_items();
         let c = self.completion.as_ref()?;
-        let spec = matches.get(c.selected)?;
-        let takes_args = spec.takes_args();
-        let filled = if takes_args {
-            format!("/{} ", spec.name)
-        } else {
-            format!("/{}", spec.name)
-        };
-        self.input.set(&filled);
+        let item = items.get(c.selected)?;
+        let submit_on_enter = item.submit_on_enter;
+        self.input.set(&item.insert);
         self.completion = None;
-        if submit && !takes_args {
+        if submit && submit_on_enter {
             Some(self.input.submit())
         } else {
             None
@@ -1250,21 +1304,21 @@ impl App {
     }
 
     fn handle_goal(&mut self, agent: &mut Agent, arg: &str) {
-        let msg = match arg.trim() {
-            "" => match agent.goal() {
-                Some(goal) => format!("goal: {goal}"),
-                None => "goal: off (set one with /goal <text>)".to_string(),
-            },
-            "clear" | "off" | "none" => {
-                agent.set_goal(None);
-                "goal cleared".to_string()
-            }
-            goal => {
-                agent.set_goal(Some(goal.to_string()));
-                format!("goal set: {goal}")
-            }
+        // Apply the change first, then describe the resulting state.
+        match arg.trim() {
+            "" => {} // no argument — just report the current goal
+            "clear" | "off" | "none" => agent.set_goal(None),
+            goal => agent.set_goal(Some(goal.to_string())),
+        }
+        let (msg, prominent) = goal_feedback(arg, agent.goal());
+        // A set/clear is an applied change — show it plainly (green ✓), not dim,
+        // so it's obvious it took effect. A bare `/goal` is just a read-out.
+        let style = if prominent {
+            Style::default().fg(Color::Green)
+        } else {
+            dim()
         };
-        self.push(Line::styled(msg, dim()));
+        self.push(Line::styled(msg, style));
         self.follow();
     }
 
@@ -1586,7 +1640,7 @@ impl App {
         let queued_shown = self.queue.len().min(3);
         let queue_extra = usize::from(self.queue.len() > 3);
         let (input_lines, cursor_row, cursor_col) = self.input_view();
-        let completion_rows = self.completion_matches().len();
+        let completion_rows = self.completion_items().len();
         let input_h = if self.fetching.is_some() {
             3
         } else if let Some(p) = &self.picker {
@@ -1791,26 +1845,28 @@ impl App {
                 };
                 ilines.push(Line::styled(line, dim()));
             }
-            // The `/`-command completion menu sits just above the input line.
-            let matches = self.completion_matches();
+            // The `/`-command completion menu sits just above the input line. Rows
+            // are command names (`/compact`) or, past the name, argument values
+            // (`hybrid`, `full`, `elide`).
+            let items = self.completion_items();
             let selected = self.completion.as_ref().map(|c| c.selected).unwrap_or(0);
-            let name_w = matches.iter().map(|c| c.name.len()).max().unwrap_or(0);
-            for (i, spec) in matches.iter().enumerate() {
-                let name = format!("/{:<width$}", spec.name, width = name_w);
+            let label_w = items.iter().map(|i| i.label.len()).max().unwrap_or(0);
+            for (i, item) in items.iter().enumerate() {
+                let label = format!("{:<width$}", item.label, width = label_w);
                 if i == selected {
                     ilines.push(Line::from(vec![
                         Span::styled(
-                            format!("▶ {name}"),
+                            format!("▶ {label}"),
                             Style::default()
                                 .fg(Color::Cyan)
                                 .add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(format!("  {}", spec.help), dim()),
+                        Span::styled(format!("  {}", item.help), dim()),
                     ]));
                 } else {
                     ilines.push(Line::from(vec![
-                        Span::raw(format!("  {name}")),
-                        Span::styled(format!("  {}", spec.help), dim()),
+                        Span::raw(format!("  {label}")),
+                        Span::styled(format!("  {}", item.help), dim()),
                     ]));
                 }
             }
@@ -1830,7 +1886,7 @@ impl App {
             // notice, the status line, and the completion menu.
             let above = usize::from(self.startup_notice.is_some())
                 + status_lines
-                + self.completion_matches().len();
+                + self.completion_items().len();
             let cx = rows[1].x + 1 + cursor_col;
             let cy = rows[1].y + 1 + above as u16 + cursor_row;
             frame.set_cursor_position((
@@ -1843,6 +1899,27 @@ impl App {
 
 fn dim() -> Style {
     Style::default().add_modifier(Modifier::DIM)
+}
+
+/// The `/goal` feedback line, and whether it's a prominent applied-change
+/// confirmation (set/clear) versus a dim status read-out (a bare `/goal`).
+/// `goal` is the agent's goal *after* the action, so a set echoes exactly what's
+/// stored. Pure, so the wording is unit-testable without an agent.
+fn goal_feedback(arg: &str, goal: Option<&str>) -> (String, bool) {
+    match arg.trim() {
+        "" => match goal {
+            Some(g) => (format!("goal: {g}"), false),
+            None => ("goal: off (set one with /goal <text>)".to_string(), false),
+        },
+        "clear" | "off" | "none" => ("✓ goal cleared".to_string(), true),
+        _ => (
+            format!(
+                "✓ goal set — steers every turn until cleared: \"{}\"",
+                goal.unwrap_or_default()
+            ),
+            true,
+        ),
+    }
 }
 
 fn line_text(line: &Line) -> String {
@@ -2022,16 +2099,77 @@ fn highlight_strings(line: &str) -> Vec<Span<'static>> {
     spans
 }
 
-/// If `input` is a slash command whose *name* is still being typed (starts with
-/// `/`, no whitespace yet), return the lowercased name prefix (without the
-/// slash) — the filter for the completion menu. Returns `None` once a space is
-/// typed (the user has moved on to arguments) or the input isn't a slash command.
-fn slash_query(input: &str) -> Option<String> {
+/// What the completion menu should offer for `input`, or `None` to close it:
+/// the command name while it's being typed (`/`, `/co`), or — once past the name
+/// — the argument of a command that has enumerable values (`/compact `,
+/// `/compact hy`). A freeform-argument command (`/model <id>`) or a second arg
+/// token closes the menu, as does any non-slash input.
+/// The one command whose argument values come from live state (the model
+/// catalog) rather than the static table.
+const MODEL_CMD: &str = "model";
+/// Cap on inline `/model` id completions, so a large catalog can't flood the menu.
+const MODEL_COMPLETION_MAX: usize = 8;
+
+fn completion_context(input: &str) -> Option<CompletionContext> {
     let rest = input.strip_prefix('/')?;
-    if rest.contains(char::is_whitespace) {
-        return None;
+    match rest.split_once(char::is_whitespace) {
+        // No space yet → still choosing the command name.
+        None => Some(CompletionContext::Command(rest.to_lowercase())),
+        // Past the name, on the first argument token.
+        Some((name, arg)) => {
+            if arg.contains(char::is_whitespace) {
+                return None; // a second token — past the single argument
+            }
+            let spec = command::COMMANDS
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(name))?;
+            let prefix = arg.to_lowercase();
+            if !spec.arg_values.is_empty() {
+                // A static enumerable set (compact, copy, verify, goal).
+                if spec.arg_values.iter().any(|(v, _)| *v == prefix) {
+                    return None; // a full valid value is typed — nothing left to pick
+                }
+                return Some(CompletionContext::Arg { cmd: spec.name, prefix });
+            }
+            if spec.name == MODEL_CMD {
+                // Model ids are dynamic — the catalog is filtered at render time,
+                // so emptiness is resolved there, not here.
+                return Some(CompletionContext::Arg { cmd: spec.name, prefix });
+            }
+            None // freeform or no argument — nothing to enumerate
+        }
     }
-    Some(rest.to_lowercase())
+}
+
+/// Resolve a completion context to the menu rows it offers.
+fn completion_items_for(ctx: &CompletionContext) -> Vec<CompletionItem> {
+    match ctx {
+        CompletionContext::Command(prefix) => command::matching(prefix)
+            .into_iter()
+            .map(|spec| {
+                let takes_args = spec.takes_args();
+                CompletionItem {
+                    label: format!("/{}", spec.name),
+                    help: spec.help.to_string(),
+                    insert: if takes_args {
+                        format!("/{} ", spec.name)
+                    } else {
+                        format!("/{}", spec.name)
+                    },
+                    submit_on_enter: !takes_args,
+                }
+            })
+            .collect(),
+        CompletionContext::Arg { cmd, prefix } => command::arg_matching(cmd, prefix)
+            .into_iter()
+            .map(|(value, hint)| CompletionItem {
+                label: value.to_string(),
+                help: hint.to_string(),
+                insert: format!("/{cmd} {value}"),
+                submit_on_enter: true,
+            })
+            .collect(),
+    }
 }
 
 /// One-line, length-capped form of an error message for the status bar:
@@ -3220,15 +3358,39 @@ mod tests {
     }
 
     #[test]
-    fn slash_query_tracks_command_name_being_typed() {
-        assert_eq!(slash_query("/"), Some(String::new()));
-        assert_eq!(slash_query("/mo"), Some("mo".to_string()));
-        assert_eq!(slash_query("/MODEL"), Some("model".to_string()));
-        // Once a space is typed, we're on arguments — no menu.
-        assert_eq!(slash_query("/model "), None);
-        assert_eq!(slash_query("/model gpt"), None);
+    fn completion_context_tracks_name_then_argument() {
+        use CompletionContext::{Arg, Command};
+        // The command name, until a space is typed.
+        assert_eq!(completion_context("/"), Some(Command(String::new())));
+        assert_eq!(completion_context("/mo"), Some(Command("mo".to_string())));
+        assert_eq!(completion_context("/MODEL"), Some(Command("model".to_string())));
+        // Past the name, on the argument of a command with enumerable values.
+        assert_eq!(
+            completion_context("/compact "),
+            Some(Arg { cmd: "compact", prefix: String::new() })
+        );
+        assert_eq!(
+            completion_context("/compact hy"),
+            Some(Arg { cmd: "compact", prefix: "hy".to_string() })
+        );
+        // The single-keyword commands and the dynamic model command, too.
+        assert_eq!(
+            completion_context("/verify "),
+            Some(Arg { cmd: "verify", prefix: String::new() })
+        );
+        assert_eq!(
+            completion_context("/model gp"),
+            Some(Arg { cmd: "model", prefix: "gp".to_string() })
+        );
+        // A fully-typed valid static value has nothing left to complete → no menu.
+        assert_eq!(completion_context("/compact hybrid"), None);
+        assert_eq!(completion_context("/verify off"), None);
+        // A command that takes no argument, with a trailing space → no menu.
+        assert_eq!(completion_context("/diff "), None);
+        // A second argument token is past the single arg → no menu.
+        assert_eq!(completion_context("/compact hybrid x"), None);
         // Not a slash command at all.
-        assert_eq!(slash_query("hello"), None);
+        assert_eq!(completion_context("hello"), None);
     }
 
     #[test]
@@ -3237,22 +3399,110 @@ mod tests {
         app.input.set("/");
         app.sync_completion();
         assert_eq!(
-            app.completion_matches().len(),
+            app.completion_items().len(),
             hi_agent::command::COMMANDS.len(),
             "bare slash lists every command"
         );
         app.input.set("/co");
         app.sync_completion();
-        let names: Vec<&str> = app.completion_matches().iter().map(|c| c.name).collect();
+        let labels: Vec<String> = app.completion_items().iter().map(|i| i.label.clone()).collect();
         assert!(
-            names.contains(&"copy") && names.contains(&"compact"),
-            "got {names:?}"
+            labels.contains(&"/copy".to_string()) && labels.contains(&"/compact".to_string()),
+            "got {labels:?}"
         );
-        assert!(names.iter().all(|n| n.starts_with("co")));
-        // A space moves to arguments → menu closes.
-        app.input.set("/copy ");
+        assert!(labels.iter().all(|n| n.starts_with("/co")));
+        // A space after a command that takes no argument closes the menu.
+        app.input.set("/diff ");
         app.sync_completion();
         assert!(app.completion.is_none());
+    }
+
+    #[test]
+    fn goal_feedback_is_prominent_on_change_quiet_on_read() {
+        // Setting echoes the stored goal as a prominent ✓ confirmation that says
+        // it persists — the visibility fix for "/goal seemed to do nothing".
+        let (msg, prominent) = goal_feedback("ship it", Some("ship it"));
+        assert!(prominent, "a set is an applied change, shown plainly");
+        assert!(msg.starts_with("✓ goal set"), "got: {msg}");
+        assert!(
+            msg.contains("ship it") && msg.contains("until cleared"),
+            "echoes the goal and that it persists: {msg}"
+        );
+        // Clearing is also a prominent ✓.
+        assert_eq!(
+            goal_feedback("clear", None),
+            ("✓ goal cleared".to_string(), true)
+        );
+        // A bare /goal is a quiet read-out, not a ✓ confirmation.
+        let (read, prominent) = goal_feedback("", Some("ship it"));
+        assert_eq!((read.as_str(), prominent), ("goal: ship it", false));
+        assert!(!goal_feedback("", None).1, "the off read-out stays dim too");
+    }
+
+    #[test]
+    fn completion_offers_verify_and_goal_keywords() {
+        let mut app = App::new("openai", "gpt-4o");
+        app.input.set("/verify ");
+        app.sync_completion();
+        let labels: Vec<String> = app.completion_items().iter().map(|i| i.label.clone()).collect();
+        assert_eq!(labels, vec!["off"], "verify offers its disable keyword");
+        app.input.set("/goal cl");
+        app.sync_completion();
+        let labels: Vec<String> = app.completion_items().iter().map(|i| i.label.clone()).collect();
+        assert_eq!(labels, vec!["clear"], "goal offers its clear keyword");
+        assert_eq!(app.accept_completion(true).as_deref(), Some("/goal clear"));
+    }
+
+    #[test]
+    fn completion_offers_live_model_ids() {
+        let mut app = App::new("openai", "gpt-4o");
+        app.model_ids = vec!["gpt-4o".into(), "gpt-4o-mini".into(), "claude-opus".into()];
+        app.input.set("/model gp");
+        app.sync_completion();
+        let labels: Vec<String> = app.completion_items().iter().map(|i| i.label.clone()).collect();
+        assert_eq!(labels, vec!["gpt-4o", "gpt-4o-mini"], "filters the catalog by prefix");
+        // Accepting a row runs the full command.
+        app.completion.as_mut().unwrap().selected = 1;
+        assert_eq!(app.accept_completion(true).as_deref(), Some("/model gpt-4o-mini"));
+
+        // With no catalog loaded, there's no inline menu — the picker still
+        // handles `/model` (so the feature degrades, it doesn't break).
+        let mut bare = App::new("openai", "gpt-4o");
+        bare.input.set("/model gp");
+        bare.sync_completion();
+        assert!(bare.completion.is_none());
+    }
+
+    #[test]
+    fn completion_offers_then_fills_compact_kinds() {
+        let mut app = App::new("openai", "gpt-4o");
+        // The space that used to kill the menu now offers the kinds.
+        app.input.set("/compact ");
+        app.sync_completion();
+        let labels: Vec<String> = app.completion_items().iter().map(|i| i.label.clone()).collect();
+        assert_eq!(labels, vec!["hybrid", "full", "elide"], "offers every kind");
+        // Typing narrows by prefix.
+        app.input.set("/compact e");
+        app.sync_completion();
+        let labels: Vec<String> = app.completion_items().iter().map(|i| i.label.clone()).collect();
+        assert_eq!(labels, vec!["elide"]);
+        // Accepting a kind fills the whole command and runs it on Enter.
+        assert_eq!(app.accept_completion(true).as_deref(), Some("/compact elide"));
+        assert!(app.completion.is_none(), "menu closes after accept");
+    }
+
+    #[test]
+    fn completing_compact_name_opens_its_kind_menu() {
+        let mut app = App::new("openai", "gpt-4o");
+        app.input.set("/compact");
+        app.sync_completion();
+        // Tab accepts the command name, leaving `/compact `…
+        app.accept_completion(false);
+        assert_eq!(app.input.text(), "/compact ");
+        // …and the re-sync the Tab handler performs opens the kind menu.
+        app.sync_completion();
+        let labels: Vec<String> = app.completion_items().iter().map(|i| i.label.clone()).collect();
+        assert!(labels.contains(&"hybrid".to_string()), "got {labels:?}");
     }
 
     #[test]

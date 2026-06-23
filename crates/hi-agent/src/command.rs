@@ -74,6 +74,10 @@ pub struct CommandSpec {
     pub args: &'static str,
     /// One-line description.
     pub help: &'static str,
+    /// Enumerable values the argument can take, each with a one-line hint, for
+    /// the completion menu (e.g. `/compact ` → hybrid/full/elide). Empty when the
+    /// argument is freeform (`/model <id>`, `/goal <text>`) or absent.
+    pub arg_values: &'static [(&'static str, &'static str)],
 }
 
 impl CommandSpec {
@@ -91,76 +95,95 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "help",
         args: "",
         help: "show this help",
+        arg_values: &[],
     },
     CommandSpec {
         name: "model",
         args: "[id]",
         help: "show or switch the model (no id opens a picker)",
+        arg_values: &[],
     },
     CommandSpec {
         name: "verify",
         args: "[cmd|off]",
         help: "show/set/clear the test command turns iterate against",
+        arg_values: &[("off", "disable the verify command")],
     },
     CommandSpec {
         name: "diff",
         args: "",
         help: "show what files have changed (git diff)",
+        arg_values: &[],
     },
     CommandSpec {
         name: "copy",
         args: "[all]",
         help: "copy the last response (or transcript) to the clipboard",
+        arg_values: &[("all", "copy the whole transcript, not just the last reply")],
     },
     CommandSpec {
         name: "goal",
         args: "[text|clear]",
         help: "show, set, or clear the current session goal",
+        arg_values: &[("clear", "clear the current goal")],
     },
     CommandSpec {
         name: "init",
         args: "",
         help: "scan the repo and write an HI.md project guide",
+        arg_values: &[],
     },
     CommandSpec {
         name: "compact",
         args: "[kind]",
         help: "reclaim context (kind: hybrid, full, or elide)",
+        arg_values: &[
+            ("hybrid", "summarize old turns, keep the recent ones verbatim"),
+            ("full", "summarize the whole conversation into a brief"),
+            ("elide", "drop old tool output, no model call"),
+        ],
     },
     CommandSpec {
         name: "retry",
         args: "",
         help: "re-run your last message",
+        arg_values: &[],
     },
     CommandSpec {
         name: "undo",
         args: "",
         help: "revert the file changes from the last turn",
+        arg_values: &[],
     },
     CommandSpec {
         name: "status",
         args: "",
         help: "show provider, model, queue, context, and last turn state",
+        arg_values: &[],
     },
     CommandSpec {
         name: "log",
         args: "",
         help: "write a local debug log for this session",
+        arg_values: &[],
     },
     CommandSpec {
         name: "tokens",
         args: "",
         help: "cumulative token usage this session",
+        arg_values: &[],
     },
     CommandSpec {
         name: "clear",
         args: "",
         help: "start a fresh conversation",
+        arg_values: &[],
     },
     CommandSpec {
         name: "exit",
         args: "",
         help: "quit",
+        arg_values: &[],
     },
 ];
 
@@ -181,6 +204,25 @@ pub fn matching(prefix: &str) -> Vec<&'static CommandSpec> {
         .iter()
         .filter(|c| c.name.starts_with(&needle))
         .collect()
+}
+
+/// Enumerable argument values (value, hint) for command `name` whose value
+/// starts with `prefix` (case-insensitive) — drives argument completion in the
+/// `/`-menu (e.g. `/compact ` → hybrid/full/elide). Empty when the command is
+/// unknown, takes a freeform argument, or nothing matches.
+pub fn arg_matching(name: &str, prefix: &str) -> Vec<(&'static str, &'static str)> {
+    let needle = prefix.to_lowercase();
+    COMMANDS
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(name))
+        .map(|c| {
+            c.arg_values
+                .iter()
+                .filter(|(v, _)| v.starts_with(&needle))
+                .copied()
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Help text, generated from [`COMMANDS`] so it always lists exactly what
@@ -226,6 +268,36 @@ mod tests {
         assert!(m.iter().any(|c| c.name == "copy"));
         assert!(m.iter().all(|c| c.name.starts_with("co")));
         assert!(matching("zzz").is_empty());
+    }
+
+    #[test]
+    fn arg_matching_filters_enumerable_values() {
+        use super::arg_matching;
+        fn names(v: Vec<(&'static str, &'static str)>) -> Vec<&'static str> {
+            v.into_iter().map(|(n, _)| n).collect()
+        }
+        // Empty prefix → all of the command's values, in order.
+        assert_eq!(names(arg_matching("compact", "")), ["hybrid", "full", "elide"]);
+        // A prefix narrows; case-insensitive.
+        assert_eq!(names(arg_matching("compact", "h")), ["hybrid"]);
+        assert_eq!(names(arg_matching("compact", "E")), ["elide"]);
+        // No match, freeform-arg command, and unknown command all → empty.
+        assert!(arg_matching("compact", "z").is_empty());
+        assert!(arg_matching("model", "").is_empty());
+        assert!(arg_matching("nope", "").is_empty());
+    }
+
+    #[test]
+    fn every_compact_kind_value_parses() {
+        // The menu's compact values must stay in lockstep with the parser, or the
+        // menu would offer a kind /compact can't actually run.
+        let compact = COMMANDS.iter().find(|c| c.name == "compact").unwrap();
+        for (value, _) in compact.arg_values {
+            assert!(
+                crate::CompactionKind::from_arg(value).is_some(),
+                "compact kind {value:?} listed in the menu must parse"
+            );
+        }
     }
 
     #[test]

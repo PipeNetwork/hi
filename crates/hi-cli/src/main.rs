@@ -657,11 +657,11 @@ fn handle_command(agent: &mut Agent, command: hi_agent::Command, registry: &Regi
             },
             "clear" | "off" | "none" => {
                 agent.set_goal(None);
-                println!("\x1b[2mgoal cleared\x1b[0m");
+                println!("\x1b[32m✓ goal cleared\x1b[0m");
             }
             goal => {
                 agent.set_goal(Some(goal.to_string()));
-                println!("\x1b[2mgoal set: {goal}\x1b[0m");
+                println!("\x1b[32m✓ goal set — steers every turn until cleared: {goal}\x1b[0m");
             }
         },
         // Handled in the repl loop (async / runs a turn); never reach here.
