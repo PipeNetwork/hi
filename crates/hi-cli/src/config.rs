@@ -583,7 +583,7 @@ const ONBOARDING: &str = "no model configured. Get started with one of:
   Anthropic:        ANTHROPIC_API_KEY=...   hi --provider anthropic \"...\"
 
 Or set HI_MODEL, or add a profile in ~/.config/hi/config.toml (see README).
-Tip: run with --tui for a full-screen interface.";
+Tip: interactive sessions use the full-screen interface by default; pass --plain for the line REPL.";
 
 /// Infer a provider + model from API keys present in the environment.
 fn auto_select() -> Option<(ProviderName, String)> {
@@ -787,5 +787,17 @@ mod tests {
         assert!(stages[0].command.contains("cargo check"));
         assert!(stages.last().unwrap().command.contains("cargo test"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn onboarding_mentions_real_interactive_flags() {
+        assert!(
+            !super::ONBOARDING.contains("--tui"),
+            "there is no --tui flag; the TUI is the default"
+        );
+        assert!(
+            super::ONBOARDING.contains("--plain"),
+            "onboarding should point to the actual opt-out flag"
+        );
     }
 }

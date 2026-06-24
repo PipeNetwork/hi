@@ -92,7 +92,12 @@ fn memory_distills_at_quit_and_reloads_next_session() {
     let Some(server2) = FakeOpenAiServer::new(vec![Response::sse(sse_with_usage("ok"))]) else {
         return;
     };
-    run_hi(tmp.path(), server2.url(), &["--no-memory"], "do something\n");
+    run_hi(
+        tmp.path(),
+        server2.url(),
+        &["--no-memory"],
+        "do something\n",
+    );
 
     let body = server2
         .bodies()

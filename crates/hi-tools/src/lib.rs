@@ -783,20 +783,20 @@ fn is_signal_line(line: &str) -> bool {
     }
     let l = line.to_ascii_lowercase();
     const SIGNALS: [&str; 14] = [
-        "fail",             // "test x ... FAILED", "failures:", "N failed"
-        "error",            // "error[E..]", "error:", pytest "ERROR"
-        "panic",            // rust panic
-        "assert",           // assertion failed / pytest assert
-        "thread '",         // rust panic location
-        "left:",            // assert_eq! diff
+        "fail",     // "test x ... FAILED", "failures:", "N failed"
+        "error",    // "error[E..]", "error:", pytest "ERROR"
+        "panic",    // rust panic
+        "assert",   // assertion failed / pytest assert
+        "thread '", // rust panic location
+        "left:",    // assert_eq! diff
         "right:",
-        "exception",        // python
-        "traceback",        // python
-        "expected",         // assertions
+        "exception", // python
+        "traceback", // python
+        "expected",  // assertions
         "could not compile",
-        "test result:",     // libtest summary
+        "test result:", // libtest summary
         "short test summary",
-        "=====",            // pytest section rules (FAILURES / summary)
+        "=====", // pytest section rules (FAILURES / summary)
     ];
     SIGNALS.iter().any(|p| l.contains(p))
 }
@@ -993,7 +993,10 @@ mod tests {
         let log = cargo_log(400, 200);
         let out = condense_diagnostics(&log, 50_000);
         // The failure, its panic detail, and the summary all survive…
-        assert!(out.contains("middle_case ... FAILED"), "keeps the failing test");
+        assert!(
+            out.contains("middle_case ... FAILED"),
+            "keeps the failing test"
+        );
         assert!(out.contains("left: 3"), "keeps the assertion detail");
         assert!(out.contains("test result: FAILED"), "keeps the summary");
         // …while the green noise is collapsed.
@@ -1044,7 +1047,10 @@ FAILED tests/test_b.py::test_parsing - assert 2 == 3
 ";
         let out = condense_diagnostics(log, 50_000);
         assert!(out.contains("test_parsing"), "keeps the failing test name");
-        assert!(out.contains("assert 2 == 3"), "keeps the assertion (E line)");
+        assert!(
+            out.contains("assert 2 == 3"),
+            "keeps the assertion (E line)"
+        );
         assert!(out.contains("1 failed, 49 passed"), "keeps the summary");
     }
 
@@ -1083,7 +1089,10 @@ FAILED tests/test_b.py::test_parsing - assert 2 == 3
         assert!(out.contains("= note: expected type"), "keeps the note");
         assert!(out.contains("could not compile"), "keeps the summary");
         // …while the "Compiling …" noise is dropped.
-        assert!(out.contains("lines omitted"), "drops the compile noise: {out}");
+        assert!(
+            out.contains("lines omitted"),
+            "drops the compile noise: {out}"
+        );
     }
 
     #[test]

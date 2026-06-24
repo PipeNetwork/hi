@@ -138,7 +138,10 @@ pub const COMMANDS: &[CommandSpec] = &[
         args: "[kind]",
         help: "reclaim context (kind: hybrid, full, or elide)",
         arg_values: &[
-            ("hybrid", "summarize old turns, keep the recent ones verbatim"),
+            (
+                "hybrid",
+                "summarize old turns, keep the recent ones verbatim",
+            ),
             ("full", "summarize the whole conversation into a brief"),
             ("elide", "drop old tool output, no model call"),
         ],
@@ -277,7 +280,10 @@ mod tests {
             v.into_iter().map(|(n, _)| n).collect()
         }
         // Empty prefix → all of the command's values, in order.
-        assert_eq!(names(arg_matching("compact", "")), ["hybrid", "full", "elide"]);
+        assert_eq!(
+            names(arg_matching("compact", "")),
+            ["hybrid", "full", "elide"]
+        );
         // A prefix narrows; case-insensitive.
         assert_eq!(names(arg_matching("compact", "h")), ["hybrid"]);
         assert_eq!(names(arg_matching("compact", "E")), ["elide"]);

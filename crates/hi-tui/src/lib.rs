@@ -800,7 +800,6 @@ enum TurnEventKind {
     TurnEnd,
 }
 
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum TurnState {
     Idle,
@@ -1064,7 +1063,10 @@ impl App {
     /// yet). Lets you tell a slow tool from a slow model at a glance.
     fn activity_line(&self) -> String {
         if let (Some(tool), Some(started)) = (&self.current_tool, self.current_tool_started) {
-            return format!("running {tool} · {}", fmt_elapsed(started.elapsed().as_secs()));
+            return format!(
+                "running {tool} · {}",
+                fmt_elapsed(started.elapsed().as_secs())
+            );
         }
         let secs = self.started.map(|t| t.elapsed().as_secs()).unwrap_or(0);
         let verb = match self.last_turn_event {
@@ -1723,7 +1725,9 @@ impl App {
             block = block.title_bottom(
                 Line::from(Span::styled(
                     label,
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ))
                 .right_aligned(),
             );
@@ -1743,7 +1747,10 @@ impl App {
                 .border_style(Style::default().fg(Color::Cyan));
             let body = Line::from(vec![
                 Span::styled(
-                    format!("{frame_ch} fetching models from {}… {elapsed}", self.provider),
+                    format!(
+                        "{frame_ch} fetching models from {}… {elapsed}",
+                        self.provider
+                    ),
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),
@@ -2144,12 +2151,18 @@ fn completion_context(input: &str) -> Option<CompletionContext> {
                 if spec.arg_values.iter().any(|(v, _)| *v == prefix) {
                     return None; // a full valid value is typed — nothing left to pick
                 }
-                return Some(CompletionContext::Arg { cmd: spec.name, prefix });
+                return Some(CompletionContext::Arg {
+                    cmd: spec.name,
+                    prefix,
+                });
             }
             if spec.name == MODEL_CMD {
                 // Model ids are dynamic — the catalog is filtered at render time,
                 // so emptiness is resolved there, not here.
-                return Some(CompletionContext::Arg { cmd: spec.name, prefix });
+                return Some(CompletionContext::Arg {
+                    cmd: spec.name,
+                    prefix,
+                });
             }
             None // freeform or no argument — nothing to enumerate
         }
@@ -2673,7 +2686,10 @@ mod tests {
 
         // Streaming output below must NOT yank a scrolled-up reader back down.
         app.apply(UiEvent::Text("a fresh streamed line\n".into()));
-        assert!(!app.following, "new output leaves the scrolled-up reader put");
+        assert!(
+            !app.following,
+            "new output leaves the scrolled-up reader put"
+        );
 
         // Scrolling back past the bottom re-pins so output follows again.
         app.scroll_down(1000);
@@ -2688,7 +2704,11 @@ mod tests {
         for i in 0..(MAX_TRANSCRIPT_LINES + 5_000) {
             app.push(Line::raw(format!("l{i}")));
         }
-        assert_eq!(app.transcript.len(), MAX_TRANSCRIPT_LINES, "bounded while following");
+        assert_eq!(
+            app.transcript.len(),
+            MAX_TRANSCRIPT_LINES,
+            "bounded while following"
+        );
         assert_eq!(
             line_text(app.transcript.last().unwrap()),
             format!("l{}", MAX_TRANSCRIPT_LINES + 5_000 - 1),
@@ -2719,7 +2739,10 @@ mod tests {
         // scrolling (the "scrolling is broken" report on a huge session).
         let lines: Vec<Line> = (0..70_000).map(|_| Line::raw("x")).collect();
         let h = wrapped_height(&lines, 80);
-        assert!(h >= 60_000, "tall transcript reports a large height, got {h}");
+        assert!(
+            h >= 60_000,
+            "tall transcript reports a large height, got {h}"
+        );
     }
 
     #[test]
@@ -2732,23 +2755,38 @@ mod tests {
         // Following: the bottom is visible, the top is not.
         term.draw(|f| app.render(f)).unwrap();
         let screen = dump(&term);
-        assert!(screen.contains("line 099"), "bottom visible when following:\n{screen}");
-        assert!(!screen.contains("line 000"), "top hidden when following:\n{screen}");
+        assert!(
+            screen.contains("line 099"),
+            "bottom visible when following:\n{screen}"
+        );
+        assert!(
+            !screen.contains("line 000"),
+            "top hidden when following:\n{screen}"
+        );
 
         // Scroll up: earlier lines appear, the bottom leaves the viewport.
         app.scroll_up(40);
         term.draw(|f| app.render(f)).unwrap();
         let screen = dump(&term);
         assert!(!app.following, "scroll up unpins");
-        assert!(!screen.contains("line 099"), "bottom gone after scroll up:\n{screen}");
-        assert!(screen.contains("line 0"), "older lines now visible:\n{screen}");
+        assert!(
+            !screen.contains("line 099"),
+            "bottom gone after scroll up:\n{screen}"
+        );
+        assert!(
+            screen.contains("line 0"),
+            "older lines now visible:\n{screen}"
+        );
 
         // Scroll back down past the end: re-pins and shows the bottom again.
         app.scroll_down(1000);
         term.draw(|f| app.render(f)).unwrap();
         let screen = dump(&term);
         assert!(app.following, "re-pinned at the bottom");
-        assert!(screen.contains("line 099"), "bottom visible again:\n{screen}");
+        assert!(
+            screen.contains("line 099"),
+            "bottom visible again:\n{screen}"
+        );
     }
 
     #[test]
@@ -3455,24 +3493,39 @@ mod tests {
         // The command name, until a space is typed.
         assert_eq!(completion_context("/"), Some(Command(String::new())));
         assert_eq!(completion_context("/mo"), Some(Command("mo".to_string())));
-        assert_eq!(completion_context("/MODEL"), Some(Command("model".to_string())));
+        assert_eq!(
+            completion_context("/MODEL"),
+            Some(Command("model".to_string()))
+        );
         // Past the name, on the argument of a command with enumerable values.
         assert_eq!(
             completion_context("/compact "),
-            Some(Arg { cmd: "compact", prefix: String::new() })
+            Some(Arg {
+                cmd: "compact",
+                prefix: String::new()
+            })
         );
         assert_eq!(
             completion_context("/compact hy"),
-            Some(Arg { cmd: "compact", prefix: "hy".to_string() })
+            Some(Arg {
+                cmd: "compact",
+                prefix: "hy".to_string()
+            })
         );
         // The single-keyword commands and the dynamic model command, too.
         assert_eq!(
             completion_context("/verify "),
-            Some(Arg { cmd: "verify", prefix: String::new() })
+            Some(Arg {
+                cmd: "verify",
+                prefix: String::new()
+            })
         );
         assert_eq!(
             completion_context("/model gp"),
-            Some(Arg { cmd: "model", prefix: "gp".to_string() })
+            Some(Arg {
+                cmd: "model",
+                prefix: "gp".to_string()
+            })
         );
         // A fully-typed valid static value has nothing left to complete → no menu.
         assert_eq!(completion_context("/compact hybrid"), None);
@@ -3497,7 +3550,11 @@ mod tests {
         );
         app.input.set("/co");
         app.sync_completion();
-        let labels: Vec<String> = app.completion_items().iter().map(|i| i.label.clone()).collect();
+        let labels: Vec<String> = app
+            .completion_items()
+            .iter()
+            .map(|i| i.label.clone())
+            .collect();
         assert!(
             labels.contains(&"/copy".to_string()) && labels.contains(&"/compact".to_string()),
             "got {labels:?}"
@@ -3536,11 +3593,19 @@ mod tests {
         let mut app = App::new("openai", "gpt-4o");
         app.input.set("/verify ");
         app.sync_completion();
-        let labels: Vec<String> = app.completion_items().iter().map(|i| i.label.clone()).collect();
+        let labels: Vec<String> = app
+            .completion_items()
+            .iter()
+            .map(|i| i.label.clone())
+            .collect();
         assert_eq!(labels, vec!["off"], "verify offers its disable keyword");
         app.input.set("/goal cl");
         app.sync_completion();
-        let labels: Vec<String> = app.completion_items().iter().map(|i| i.label.clone()).collect();
+        let labels: Vec<String> = app
+            .completion_items()
+            .iter()
+            .map(|i| i.label.clone())
+            .collect();
         assert_eq!(labels, vec!["clear"], "goal offers its clear keyword");
         assert_eq!(app.accept_completion(true).as_deref(), Some("/goal clear"));
     }
@@ -3551,11 +3616,22 @@ mod tests {
         app.model_ids = vec!["gpt-4o".into(), "gpt-4o-mini".into(), "claude-opus".into()];
         app.input.set("/model gp");
         app.sync_completion();
-        let labels: Vec<String> = app.completion_items().iter().map(|i| i.label.clone()).collect();
-        assert_eq!(labels, vec!["gpt-4o", "gpt-4o-mini"], "filters the catalog by prefix");
+        let labels: Vec<String> = app
+            .completion_items()
+            .iter()
+            .map(|i| i.label.clone())
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["gpt-4o", "gpt-4o-mini"],
+            "filters the catalog by prefix"
+        );
         // Accepting a row runs the full command.
         app.completion.as_mut().unwrap().selected = 1;
-        assert_eq!(app.accept_completion(true).as_deref(), Some("/model gpt-4o-mini"));
+        assert_eq!(
+            app.accept_completion(true).as_deref(),
+            Some("/model gpt-4o-mini")
+        );
 
         // With no catalog loaded, there's no inline menu — the picker still
         // handles `/model` (so the feature degrades, it doesn't break).
@@ -3571,15 +3647,26 @@ mod tests {
         // The space that used to kill the menu now offers the kinds.
         app.input.set("/compact ");
         app.sync_completion();
-        let labels: Vec<String> = app.completion_items().iter().map(|i| i.label.clone()).collect();
+        let labels: Vec<String> = app
+            .completion_items()
+            .iter()
+            .map(|i| i.label.clone())
+            .collect();
         assert_eq!(labels, vec!["hybrid", "full", "elide"], "offers every kind");
         // Typing narrows by prefix.
         app.input.set("/compact e");
         app.sync_completion();
-        let labels: Vec<String> = app.completion_items().iter().map(|i| i.label.clone()).collect();
+        let labels: Vec<String> = app
+            .completion_items()
+            .iter()
+            .map(|i| i.label.clone())
+            .collect();
         assert_eq!(labels, vec!["elide"]);
         // Accepting a kind fills the whole command and runs it on Enter.
-        assert_eq!(app.accept_completion(true).as_deref(), Some("/compact elide"));
+        assert_eq!(
+            app.accept_completion(true).as_deref(),
+            Some("/compact elide")
+        );
         assert!(app.completion.is_none(), "menu closes after accept");
     }
 
@@ -3593,7 +3680,11 @@ mod tests {
         assert_eq!(app.input.text(), "/compact ");
         // …and the re-sync the Tab handler performs opens the kind menu.
         app.sync_completion();
-        let labels: Vec<String> = app.completion_items().iter().map(|i| i.label.clone()).collect();
+        let labels: Vec<String> = app
+            .completion_items()
+            .iter()
+            .map(|i| i.label.clone())
+            .collect();
         assert!(labels.contains(&"hybrid".to_string()), "got {labels:?}");
     }
 

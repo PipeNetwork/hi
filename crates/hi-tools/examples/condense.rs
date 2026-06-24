@@ -27,10 +27,16 @@ fn head_tail(s: &str, max: usize) -> String {
 }
 
 fn signal_hits(s: &str) -> usize {
-    ["FAILED", "panicked", "error[", "could not compile", "test result: FAILED"]
-        .iter()
-        .map(|m| s.matches(m).count())
-        .sum()
+    [
+        "FAILED",
+        "panicked",
+        "error[",
+        "could not compile",
+        "test result: FAILED",
+    ]
+    .iter()
+    .map(|m| s.matches(m).count())
+    .sum()
 }
 
 fn row(label: &str, s: &str) {

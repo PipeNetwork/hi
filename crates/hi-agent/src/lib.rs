@@ -689,7 +689,10 @@ impl Agent {
         }
         let notes = memory.lines().filter(|l| !l.trim().is_empty()).count();
         match std::fs::write(&path, format!("{memory}\n")) {
-            Ok(()) => ui.status(&format!("✓ saved {notes} memory note(s) to {}", path.display())),
+            Ok(()) => ui.status(&format!(
+                "✓ saved {notes} memory note(s) to {}",
+                path.display()
+            )),
             Err(err) => ui.status(&format!("(couldn't write memory: {err})")),
         }
     }
@@ -1286,7 +1289,10 @@ fn cap_memory(s: &str) -> String {
         return s.to_string();
     }
     let kept: String = s.chars().take(MEMORY_MAX_CHARS).collect();
-    let kept = kept.rsplit_once('\n').map(|(head, _)| head).unwrap_or(&kept);
+    let kept = kept
+        .rsplit_once('\n')
+        .map(|(head, _)| head)
+        .unwrap_or(&kept);
     format!("{}\n… (memory truncated)", kept.trim_end())
 }
 
@@ -1767,7 +1773,11 @@ mod tests {
         agent.run_turn("go", &mut ui).await.unwrap();
 
         assert_eq!(agent.messages().last().unwrap().text(), "recovered");
-        assert_eq!(requests.lock().unwrap().len(), 2, "retried once after the garble");
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            2,
+            "retried once after the garble"
+        );
         assert!(
             ui.statuses.iter().any(|s| s.contains("retrying")),
             "shows a retry, got: {:?}",
@@ -1814,7 +1824,10 @@ mod tests {
         assert_eq!(cap_memory("   "), ""); // empty in → empty out
         let big = "- a durable note\n".repeat(1000); // ≫ MEMORY_MAX_CHARS
         let capped = cap_memory(&big);
-        assert!(capped.chars().count() <= MEMORY_MAX_CHARS + 40, "backstopped");
+        assert!(
+            capped.chars().count() <= MEMORY_MAX_CHARS + 40,
+            "backstopped"
+        );
         assert!(capped.ends_with("(memory truncated)"));
     }
 
@@ -1833,7 +1846,9 @@ mod tests {
         // The model returns a distilled bullet list.
         let mut agent = agent(
             vec![completion(
-                vec![Content::Text("- always run cargo fmt\n- tests live in tests/".into())],
+                vec![Content::Text(
+                    "- always run cargo fmt\n- tests live in tests/".into(),
+                )],
                 7,
                 4,
             )],
@@ -1844,8 +1859,15 @@ mod tests {
 
         let written = std::fs::read_to_string(&path).expect("memory file written");
         let _ = std::fs::remove_file(&path);
-        assert!(written.contains("always run cargo fmt"), "distilled: {written}");
-        assert_eq!(agent.messages().len(), before, "session history not polluted");
+        assert!(
+            written.contains("always run cargo fmt"),
+            "distilled: {written}"
+        );
+        assert_eq!(
+            agent.messages().len(),
+            before,
+            "session history not polluted"
+        );
         assert_eq!(agent.totals().output_tokens, 4, "usage counted");
     }
 
@@ -1854,8 +1876,10 @@ mod tests {
         // A provider error at quit must not panic or leave a file behind.
         let path = std::env::temp_dir().join(format!("hi-mem-{}-err.md", std::process::id()));
         let _ = std::fs::remove_file(&path);
-        let (mut agent, _requests) =
-            scripted_agent(vec![ProviderStep::Error(ProviderErrorKind::Outage)], config());
+        let (mut agent, _requests) = scripted_agent(
+            vec![ProviderStep::Error(ProviderErrorKind::Outage)],
+            config(),
+        );
         agent.update_memory_at(path.clone(), &mut NullUi).await;
         assert!(!path.exists(), "nothing written when distillation fails");
     }
@@ -2491,10 +2515,16 @@ mod tests {
 
         // Cumulative session spend, arrowed + abbreviated (same shape as the live line).
         assert!(line.contains("↑20k"), "cumulative input ↑ (8k+12k): {line}");
-        assert!(line.contains("↓300"), "cumulative output ↓ (100+200): {line}");
+        assert!(
+            line.contains("↓300"),
+            "cumulative output ↓ (100+200): {line}"
+        );
         // The context gauge is the LAST request (12k) over the window — NOT the
         // cumulative input (20k), and abbreviated, not raw.
-        assert!(line.contains("ctx 1% (12k/1.0M)"), "point-in-time context: {line}");
+        assert!(
+            line.contains("ctx 1% (12k/1.0M)"),
+            "point-in-time context: {line}"
+        );
         // The old, mixed-unit, misleading format is gone.
         assert!(
             !line.contains(" in ·") && !line.contains("total"),

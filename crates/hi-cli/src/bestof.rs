@@ -52,7 +52,13 @@ pub fn run(opts: &BestOf) -> Result<()> {
             i + 1,
             opts.candidates
         );
-        run_candidate(opts, &worktree, temperature)?;
+        if !run_candidate(opts, &worktree, temperature)? {
+            println!(
+                "\x1b[33m✗ candidate {} exited with an error; skipping verification\x1b[0m",
+                i + 1
+            );
+            continue;
+        }
 
         if verify_passes(&worktree, opts.verify) {
             println!("\x1b[32m✓ candidate {} passed verification\x1b[0m", i + 1);
@@ -84,8 +90,9 @@ pub fn run(opts: &BestOf) -> Result<()> {
     result
 }
 
-/// Run one candidate `hi` in its worktree, with its own verify-loop.
-fn run_candidate(opts: &BestOf, worktree: &Path, temperature: f32) -> Result<()> {
+/// Run one candidate `hi` in its worktree, with its own verify-loop. Returns
+/// whether the candidate process itself completed successfully.
+fn run_candidate(opts: &BestOf, worktree: &Path, temperature: f32) -> Result<bool> {
     let status = Command::new(opts.exe)
         .current_dir(worktree)
         .env("HI_API_KEY", opts.api_key)
@@ -109,8 +116,7 @@ fn run_candidate(opts: &BestOf, worktree: &Path, temperature: f32) -> Result<()>
         ])
         .status()
         .context("failed to launch candidate hi")?;
-    let _ = status;
-    Ok(())
+    Ok(status.success())
 }
 
 /// Spread candidate temperatures across [0.2, 1.0] for diversity.
@@ -224,5 +230,35 @@ fn cleanup(worktrees: &[PathBuf]) {
             .args(["worktree", "remove", "--force"])
             .arg(path)
             .output();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_candidate_reports_nonzero_exit() {
+        let exe = Path::new("/bin/false");
+        if !exe.exists() {
+            return;
+        }
+        let opts = BestOf {
+            exe,
+            provider: "openai",
+            model: "test-model",
+            base_url: "http://127.0.0.1:9/v1",
+            api_key: "test-key",
+            verify: "true",
+            prompt: "do the thing",
+            candidates: 1,
+            max_steps: 1,
+            max_verify: 1,
+        };
+
+        assert!(
+            !run_candidate(&opts, Path::new("."), 0.2).expect("candidate command launches"),
+            "a failing candidate process must not be considered eligible to win"
+        );
     }
 }
