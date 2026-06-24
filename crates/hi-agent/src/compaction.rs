@@ -117,6 +117,49 @@ pub(crate) fn elide_tool_outputs(messages: &mut [Message], up_to: usize) -> usiz
     freed
 }
 
+/// Replace bulky tool-result outputs anywhere in the conversation except the
+/// newest `keep_recent_results` tool results. This is used inside a single long
+/// turn, where there may be no old user-turn boundary yet but repeated model
+/// rounds would otherwise resend every previous tool payload.
+pub(crate) fn elide_tool_outputs_except_recent(
+    messages: &mut [Message],
+    keep_recent_results: usize,
+) -> usize {
+    if messages.len() <= 1 {
+        return 0;
+    }
+
+    let names = tool_names(messages);
+    let mut seen = 0usize;
+    for message in messages.iter().rev() {
+        for block in message.content.iter().rev() {
+            if matches!(block, Content::ToolResult { .. }) {
+                seen += 1;
+            }
+        }
+    }
+
+    let mut eligible = seen.saturating_sub(keep_recent_results);
+    let mut freed = 0usize;
+    for message in &mut messages[1..] {
+        for block in &mut message.content {
+            if let Content::ToolResult { call_id, output } = block {
+                if eligible == 0 {
+                    return freed;
+                }
+                eligible -= 1;
+                if output.len() > ELIDE_MIN_CHARS && !output.starts_with(ELIDED_MARK) {
+                    let lines = output.lines().count();
+                    let name = names.get(call_id).map_or("tool", String::as_str);
+                    freed += output.len();
+                    *output = format!("{ELIDED_MARK} {name} output — was {lines} lines]");
+                }
+            }
+        }
+    }
+    freed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,6 +259,40 @@ mod tests {
         // No recent split (one turn) → caller passes len; small output untouched.
         let len = m.len();
         assert_eq!(elide_tool_outputs(&mut m, len), 0);
+    }
+
+    #[test]
+    fn in_turn_elide_keeps_newest_tool_results() {
+        let mut m = vec![Message::system("sys"), Message::user("q")];
+        for i in 1..=4 {
+            let id = format!("c{i}");
+            m.push(Message::assistant(vec![Content::ToolCall {
+                id: id.clone(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            }]));
+            m.push(Message::tool_result(
+                &id,
+                format!("{i}\n{}", "x".repeat(500)),
+            ));
+        }
+
+        let freed = elide_tool_outputs_except_recent(&mut m, 2);
+        assert!(freed >= 1000, "reclaimed old tool outputs: {freed}");
+
+        let outputs: Vec<String> = m
+            .iter()
+            .flat_map(|msg| &msg.content)
+            .filter_map(|c| match c {
+                Content::ToolResult { output, .. } => Some(output.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(outputs[0].starts_with(ELIDED_MARK), "{outputs:?}");
+        assert!(outputs[1].starts_with(ELIDED_MARK), "{outputs:?}");
+        assert!(outputs[2].starts_with("3\n"), "{outputs:?}");
+        assert!(outputs[3].starts_with("4\n"), "{outputs:?}");
+        assert_eq!(elide_tool_outputs_except_recent(&mut m, 2), 0);
     }
 
     #[test]

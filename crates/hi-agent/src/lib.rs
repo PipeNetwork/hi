@@ -24,6 +24,12 @@ const AUTO_COMPACT_PERCENT: u64 = 80;
 /// After triggering, compact until the local estimate is at or below this
 /// percent of the window (so there's headroom before the next compaction).
 const COMPACT_TARGET_PERCENT: u64 = 50;
+/// During one long tool loop, begin dropping old bulky tool payloads before the
+/// next model call. This keeps repeated requests from multiplying token spend.
+const IN_TURN_ELIDE_PERCENT: u64 = 45;
+/// Keep the newest tool results verbatim when trimming inside a turn; these are
+/// usually the files/errors the model is actively using.
+const IN_TURN_KEEP_TOOL_RESULTS: usize = 6;
 /// User turns auto-compaction keeps verbatim.
 const AUTO_KEEP_RECENT: usize = 3;
 /// How many times to silently re-run a round that produced no usable output —
@@ -598,6 +604,37 @@ impl Agent {
         }
     }
 
+    fn elide_in_turn_context_if_needed(&mut self, ui: &mut dyn Ui) {
+        if !self.config.auto_compact {
+            return;
+        }
+        let Some(window) = self.config.context_window else {
+            return;
+        };
+        if window == 0 {
+            return;
+        }
+
+        let used = compaction::estimate_tokens(&self.messages);
+        if used * 100 < u64::from(window) * IN_TURN_ELIDE_PERCENT {
+            return;
+        }
+
+        let freed = compaction::elide_tool_outputs_except_recent(
+            &mut self.messages,
+            IN_TURN_KEEP_TOOL_RESULTS,
+        );
+        if freed == 0 {
+            return;
+        }
+
+        ui.status(&format!(
+            "context ~{}% full — elided old tool output before continuing",
+            used * 100 / u64::from(window)
+        ));
+        self.context_used = 0;
+    }
+
     /// Run the summarization model call over `slice`, returning the summary text
     /// (trimmed), or `None` if the model produced nothing. Shared by the
     /// Summarize and Hybrid strategies.
@@ -849,6 +886,8 @@ impl Agent {
                 // A/B-ing on the eval harness.
                 let (temperature, top_p, frequency_penalty) =
                     recovery_sampling(empty_retries, self.config.temperature, *RECOVERY_SAMPLING);
+
+                self.elide_in_turn_context_if_needed(ui);
 
                 let request = ChatRequest {
                     model: self.config.model.clone(),
@@ -2783,6 +2822,58 @@ mod tests {
             "history should be replaced by the summary"
         );
         assert_eq!(agent.messages().last().unwrap().text(), "ans2");
+    }
+
+    #[tokio::test]
+    async fn elides_old_tool_outputs_before_model_request() {
+        let mut cfg = config();
+        cfg.auto_compact = true;
+        cfg.context_window = Some(100);
+        let (mut agent, requests) = scripted_agent(
+            vec![ProviderStep::Completion(completion(
+                vec![Content::Text("done".into())],
+                5,
+                1,
+            ))],
+            cfg,
+        );
+        agent.messages.push(Message::user("existing long turn"));
+        for i in 1..=8 {
+            let id = format!("c{i}");
+            agent
+                .messages
+                .push(Message::assistant(vec![Content::ToolCall {
+                    id: id.clone(),
+                    name: "read".into(),
+                    arguments: "{}".into(),
+                }]));
+            agent.messages.push(Message::tool_result(
+                &id,
+                format!("{i}\n{}", "x".repeat(500)),
+            ));
+        }
+
+        let mut ui = RecordingUi::default();
+        agent.run_turn("continue", &mut ui).await.unwrap();
+
+        let requests = requests.lock().unwrap();
+        let outputs: Vec<String> = requests[0]
+            .iter()
+            .flat_map(|msg| &msg.content)
+            .filter_map(|c| match c {
+                Content::ToolResult { output, .. } => Some(output.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(outputs[0].starts_with("[elided"), "{outputs:?}");
+        assert!(outputs[1].starts_with("[elided"), "{outputs:?}");
+        assert!(outputs[2].starts_with("3\n"), "{outputs:?}");
+        assert!(outputs[7].starts_with("8\n"), "{outputs:?}");
+        assert!(
+            ui.statuses.iter().any(|s| s.contains("elided old tool")),
+            "expected elision status, got {:?}",
+            ui.statuses
+        );
     }
 
     #[tokio::test]

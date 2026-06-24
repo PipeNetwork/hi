@@ -19,15 +19,16 @@ use tokio::process::Command;
 /// Per-result character budget so a single read or noisy command can't blow the
 /// context. Overridable via `HI_TOOL_RESULT_CHARS` — lower it for a tight local
 /// window, raise it when the model has room. Read once, at first use. The
-/// default is conservative on purpose: ~24k chars is ~6k tokens, and a single
-/// `cargo test` dump shouldn't swallow a small context.
+/// default is intentionally tight for remote agent loops: ~8k chars is ~2k
+/// tokens, and repeated tool rounds resend this history.
 static MAX_OUTPUT_CHARS: LazyLock<usize> = LazyLock::new(|| {
     std::env::var("HI_TOOL_RESULT_CHARS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n >= 1_000)
-        .unwrap_or(24_000)
+        .unwrap_or(8_000)
 });
+const DEFAULT_READ_LIMIT: usize = 240;
 const BASH_TIMEOUT: Duration = Duration::from_secs(120);
 const CHECK_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -113,13 +114,13 @@ pub fn tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "read".into(),
-            description: "Read a UTF-8 text file. Lines are returned numbered (`<n>\\t<text>`). For large files, page with offset/limit instead of assuming you saw everything.".into(),
+            description: "Read a UTF-8 text file. Lines are returned numbered (`<n>\\t<text>`). Returns at most 240 lines by default; page with offset/limit instead of assuming you saw everything.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "Path to the file to read." },
                     "offset": { "type": "integer", "description": "1-based line to start at (default: first line)." },
-                    "limit": { "type": "integer", "description": "Maximum number of lines to return (default: to end of file)." }
+                    "limit": { "type": "integer", "description": "Maximum number of lines to return (default: 240)." }
                 },
                 "required": ["path"]
             }),
@@ -820,9 +821,9 @@ fn truncate_to(s: &str, max: usize) -> String {
 
 /// Render a file for the `read` tool: each line prefixed with its 1-based number
 /// and a tab (so the model can cite and edit precisely), optionally restricted
-/// to `[offset, offset+limit)`. A footer notes when lines were omitted so the
-/// model knows to page a large file with `offset`/`limit` rather than assume it
-/// saw everything.
+/// to `[offset, offset+limit)`. When no limit is provided, return a bounded
+/// page. A footer notes when lines were omitted so the model knows to page a
+/// large file with `offset`/`limit` rather than assume it saw everything.
 fn format_read(content: &str, offset: Option<usize>, limit: Option<usize>) -> String {
     if content.is_empty() {
         return "(empty file)".to_string();
@@ -833,10 +834,8 @@ fn format_read(content: &str, offset: Option<usize>, limit: Option<usize>) -> St
     if start > total {
         return format!("(file has {total} line(s); offset {start} is past the end)");
     }
-    let end = match limit {
-        Some(n) => start.saturating_add(n).saturating_sub(1).min(total),
-        None => total,
-    };
+    let limit = limit.unwrap_or(DEFAULT_READ_LIMIT);
+    let end = start.saturating_add(limit).saturating_sub(1).min(total);
     let width = end.to_string().len().max(4);
     let mut out = String::new();
     for (i, line) in lines[start - 1..end].iter().enumerate() {
@@ -954,8 +953,8 @@ struct BashArgs {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_edit, condense_diagnostics, condense_enabled, diff, edit_not_found_help, format_read,
-        truncate_to,
+        DEFAULT_READ_LIMIT, apply_edit, condense_diagnostics, condense_enabled, diff,
+        edit_not_found_help, format_read, truncate_to,
     };
 
     #[test]
@@ -1149,6 +1148,29 @@ FAILED tests/test_b.py::test_parsing - assert 2 == 3
         assert!(
             win.contains("lines 2-3 of 4") && win.contains("offset 4"),
             "footer: {win}"
+        );
+        let large = (1..=DEFAULT_READ_LIMIT + 2)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let page = format_read(&large, None, None);
+        assert!(page.contains("   1\tline 1"), "{page}");
+        assert!(
+            page.contains(&format!(
+                "{DEFAULT_READ_LIMIT:>4}\tline {DEFAULT_READ_LIMIT}"
+            )),
+            "{page}"
+        );
+        assert!(
+            !page.contains(&format!("line {}", DEFAULT_READ_LIMIT + 1)),
+            "{page}"
+        );
+        assert!(
+            page.contains(&format!(
+                "lines 1-{DEFAULT_READ_LIMIT} of {}",
+                DEFAULT_READ_LIMIT + 2
+            )) && page.contains(&format!("offset {}", DEFAULT_READ_LIMIT + 1)),
+            "footer: {page}"
         );
         // Empty + past-end are handled.
         assert_eq!(format_read("", None, None), "(empty file)");

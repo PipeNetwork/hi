@@ -152,7 +152,7 @@ Slash commands (TUI or plain REPL):
 
 Drop an `HI.md` or `AGENTS.md` in your project and its contents are appended to the system prompt — per-project conventions, for free.
 
-Long sessions **auto-compact**: when the context window passes ~80% full, `hi` summarizes the conversation and resets to that summary before the next turn, so you don't overflow the model mid-task (disable with `--no-auto-compact`; trigger manually any time with `/compact`).
+Long sessions **auto-compact**: during long tool loops, `hi` elides older bulky tool results once the local context estimate passes ~45% full, keeping the newest tool results verbatim. Before a new turn, if the previous request used ~80% of the context window, it summarizes the conversation and resets to that summary. Disable with `--no-auto-compact`; trigger manually any time with `/compact`. Tool payloads are also bounded by default: `read` returns 240 lines unless paged with `offset`/`limit`, and `HI_TOOL_RESULT_CHARS` controls the per-result character cap.
 
 **Undo.** In a git repo, `hi` snapshots the working tree before every turn into a *dangling* commit — built in a throwaway index, so it never touches your branch, staging area, or history. `/undo` restores the latest snapshot, reverting every file the turn created, modified, or deleted in one step. That's what makes running without confirmation prompts safe: anything the agent does to your files is one command away from being undone. (Covers non-ignored files; it can't undo non-file side effects.)
 
