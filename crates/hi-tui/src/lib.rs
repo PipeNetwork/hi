@@ -1114,6 +1114,19 @@ impl App {
 
     fn push(&mut self, line: Line<'static>) {
         self.transcript.push(line);
+        self.cap_transcript();
+    }
+
+    /// Bound the transcript so a very long session can't overflow the u16 scroll
+    /// range, slow the per-frame render clone, or grow memory without limit. Older
+    /// lines scroll off the top (the full session is still in the JSONL log). Only
+    /// trims while pinned to the bottom, so a reader scrolled up isn't yanked by
+    /// the offsets shifting underneath them.
+    fn cap_transcript(&mut self) {
+        if self.following && self.transcript.len() > MAX_TRANSCRIPT_LINES {
+            let excess = self.transcript.len() - MAX_TRANSCRIPT_LINES;
+            self.transcript.drain(..excess);
+        }
     }
 
     fn note_turn_completed_without_summary(&mut self) {
@@ -1370,6 +1383,7 @@ impl App {
                 Line::styled(text, style)
             };
             self.transcript.push(line);
+            self.cap_transcript();
         }
     }
 
@@ -1397,6 +1411,7 @@ impl App {
             };
             self.transcript.push(line);
         }
+        self.cap_transcript();
         // No follow() here: streaming must not yank a reader who scrolled up.
         // While following, the view already tracks the growing bottom.
     }
@@ -2403,24 +2418,30 @@ fn find_double_star(chars: &[char], from: usize) -> Option<usize> {
     (from..chars.len().saturating_sub(1)).find(|&j| chars[j] == '*' && chars[j + 1] == '*')
 }
 
+/// Max transcript lines kept for display and scrolling. Older lines scroll off
+/// the top (the full session is still in the JSONL log). Bounds the u16 scroll
+/// range, the per-frame render clone, and memory on very long sessions.
+const MAX_TRANSCRIPT_LINES: usize = 10_000;
+
 /// Approximate the number of terminal rows `lines` occupy when wrapped to
 /// `width` — used to keep the transcript scrolled to the bottom.
 fn wrapped_height(lines: &[Line], width: u16) -> u16 {
-    if width == 0 {
-        return lines.len() as u16;
-    }
-    let width = width as usize;
-    lines
-        .iter()
-        .map(|line| {
-            let len: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
-            if len == 0 {
-                1
-            } else {
-                len.div_ceil(width) as u16
-            }
-        })
-        .sum()
+    // Sum in usize and saturate to u16. A long transcript can exceed u16 rows, and
+    // a u16 sum (or `as u16` per line) would wrap to a tiny value — zeroing
+    // max_scroll and freezing scrolling. u16::MAX is also ratatui's scroll ceiling.
+    let total: usize = if width == 0 {
+        lines.len()
+    } else {
+        let width = width as usize;
+        lines
+            .iter()
+            .map(|line| {
+                let len: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
+                if len == 0 { 1 } else { len.div_ceil(width) }
+            })
+            .sum()
+    };
+    total.min(u16::MAX as usize) as u16
 }
 
 /// Interactive `/model` picker: a filterable, arrow-navigable list of model ids.
@@ -2657,6 +2678,77 @@ mod tests {
         // Scrolling back past the bottom re-pins so output follows again.
         app.scroll_down(1000);
         assert!(app.following, "reaching the bottom re-pins");
+    }
+
+    #[test]
+    fn transcript_is_capped_while_following_but_not_while_scrolled_up() {
+        let mut app = App::new("openai", "gpt-4o");
+        // Following (the default): pushing far past the cap keeps it bounded, and
+        // keeps the newest lines (the oldest scroll off the top).
+        for i in 0..(MAX_TRANSCRIPT_LINES + 5_000) {
+            app.push(Line::raw(format!("l{i}")));
+        }
+        assert_eq!(app.transcript.len(), MAX_TRANSCRIPT_LINES, "bounded while following");
+        assert_eq!(
+            line_text(app.transcript.last().unwrap()),
+            format!("l{}", MAX_TRANSCRIPT_LINES + 5_000 - 1),
+            "newest line kept"
+        );
+
+        // Scrolled up: pushes are NOT trimmed, or the offsets would shift under a
+        // reader. (render caches the geometry scroll_up needs.)
+        app.view_max_scroll = 50;
+        app.view_total = 60;
+        app.scroll_up(5);
+        assert!(!app.following, "scrolled up");
+        let before = app.transcript.len();
+        for i in 0..1_000 {
+            app.push(Line::raw(format!("m{i}")));
+        }
+        assert_eq!(
+            app.transcript.len(),
+            before + 1_000,
+            "grows while scrolled up, no trim"
+        );
+    }
+
+    #[test]
+    fn wrapped_height_does_not_overflow_on_a_tall_transcript() {
+        // A long session can exceed u16 rows. The height must saturate, not wrap
+        // around to a tiny value — which would zero out max_scroll and freeze
+        // scrolling (the "scrolling is broken" report on a huge session).
+        let lines: Vec<Line> = (0..70_000).map(|_| Line::raw("x")).collect();
+        let h = wrapped_height(&lines, 80);
+        assert!(h >= 60_000, "tall transcript reports a large height, got {h}");
+    }
+
+    #[test]
+    fn scrolling_moves_the_viewport_through_render_and_repins() {
+        let mut app = App::new("openai", "gpt-4o");
+        for i in 0..100 {
+            app.push(Line::raw(format!("line {i:03}")));
+        }
+        let mut term = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        // Following: the bottom is visible, the top is not.
+        term.draw(|f| app.render(f)).unwrap();
+        let screen = dump(&term);
+        assert!(screen.contains("line 099"), "bottom visible when following:\n{screen}");
+        assert!(!screen.contains("line 000"), "top hidden when following:\n{screen}");
+
+        // Scroll up: earlier lines appear, the bottom leaves the viewport.
+        app.scroll_up(40);
+        term.draw(|f| app.render(f)).unwrap();
+        let screen = dump(&term);
+        assert!(!app.following, "scroll up unpins");
+        assert!(!screen.contains("line 099"), "bottom gone after scroll up:\n{screen}");
+        assert!(screen.contains("line 0"), "older lines now visible:\n{screen}");
+
+        // Scroll back down past the end: re-pins and shows the bottom again.
+        app.scroll_down(1000);
+        term.draw(|f| app.render(f)).unwrap();
+        let screen = dump(&term);
+        assert!(app.following, "re-pinned at the bottom");
+        assert!(screen.contains("line 099"), "bottom visible again:\n{screen}");
     }
 
     #[test]

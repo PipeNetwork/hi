@@ -203,7 +203,9 @@ mod tests {
         assert_eq!(retry_limit(StatusCode::BAD_GATEWAY), OUTAGE_RETRIES);
         assert_eq!(retry_limit(StatusCode::SERVICE_UNAVAILABLE), OUTAGE_RETRIES);
         assert_eq!(retry_limit(StatusCode::GATEWAY_TIMEOUT), OUTAGE_RETRIES);
-        assert!(OUTAGE_RETRIES > 0);
+        // The outage budget is non-zero — a compile-time invariant, asserted in a
+        // const block so clippy doesn't flag it as a constant-condition assertion.
+        const _: () = assert!(OUTAGE_RETRIES > 0);
         // …everything else surfaces immediately: a 429 throttle, auth, client errors.
         assert_eq!(retry_limit(StatusCode::TOO_MANY_REQUESTS), 0);
         assert_eq!(retry_limit(StatusCode::BAD_REQUEST), 0);

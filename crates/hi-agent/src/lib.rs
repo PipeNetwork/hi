@@ -1378,6 +1378,20 @@ fn looks_like_unfinished_step(text: &str) -> bool {
 /// Whether a line expresses *intent to act next* rather than a finished result.
 fn is_forward_intent(line: &str) -> bool {
     let lower = line.to_lowercase();
+    // Courtesy closings address the *user* ("let me know if…", "I'll be happy
+    // to…", "I'll let you know…") — they read like forward phrases but mean the
+    // turn is finished, not stalled. Vetoed first so they don't trigger a nudge.
+    const CLOSINGS: [&str; 6] = [
+        "let me know",
+        "i'll be happy",
+        "i'll let you",
+        "i'll wait",
+        "i'm happy to",
+        "feel free",
+    ];
+    if CLOSINGS.iter().any(|c| lower.contains(c)) {
+        return false;
+    }
     const FORWARD_INTENT: [&str; 12] = [
         "let me ",
         "let's ",
@@ -1860,7 +1874,11 @@ mod tests {
         assert_eq!(humanize_count(1234), "1.2k");
         assert_eq!(humanize_count(22864), "22k"); // the reported "22864 in"
         assert_eq!(humanize_count(12000), "12k"); // the reported "12k" ctx
+        assert_eq!(humanize_count(999_999), "999k"); // last "k" before switching
         assert_eq!(humanize_count(1_000_000), "1.0M"); // a 1M window
+        // A long session's cumulative input must read as millions, never a
+        // 5-digit "15528k" (the pre-fix formatter that prompted this).
+        assert_eq!(humanize_count(15_528_000), "15.5M");
     }
 
     #[test]
@@ -2404,6 +2422,12 @@ mod tests {
             // A past-tense recap that ends in a bullet list is finished, not a
             // stall — the lead-in ("Key changes:") looks back, not forward.
             "Key changes:\n- Added GOP support in encoder.rs\n- Updated the CLI in main.rs",
+            // Courtesy closings address the user — a finished turn, not a stall —
+            // even though they contain "let me"/"I'll". These used to false-nudge.
+            "All done. Let me know if you'd like any changes.",
+            "I'll be happy to help with anything else.",
+            "Implemented and tested. I'll let you know if I spot any issues.",
+            "Fixed it — feel free to ask if you want more detail.",
         ] {
             assert!(!looks_like_unfinished_step(t), "should not flag: {t:?}");
         }
