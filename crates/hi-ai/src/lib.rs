@@ -14,9 +14,13 @@ pub mod types;
 pub use anthropic::AnthropicProvider;
 pub use fallback::{Backend, FallbackProvider};
 pub use openai::OpenAiProvider;
-pub use provider::{Provider, ProviderError, ProviderErrorKind, ServedModel, provider_error_kind};
+pub use provider::{
+    Provider, ProviderError, ProviderErrorKind, ServedModel, provider_error_kind,
+    provider_error_usage,
+};
 pub use registry::{ModelInfo, Registry};
 pub use types::{
     ChatRequest, CompatMode, Completion, Content, Message, RequestProfile, Role, StreamEvent,
-    ToolCall, ToolMode, ToolSpec, Usage,
+    ToolCall, ToolMode, ToolSpec, Usage, estimate_completion_output_tokens,
+    estimate_content_tokens, estimate_messages_tokens, estimate_text_tokens,
 };

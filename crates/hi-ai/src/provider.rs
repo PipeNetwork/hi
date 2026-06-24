@@ -3,7 +3,7 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::types::{ChatRequest, Completion, StreamEvent};
+use crate::types::{ChatRequest, Completion, StreamEvent, Usage};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderErrorKind {
@@ -40,6 +40,7 @@ impl ProviderErrorKind {
 pub struct ProviderError {
     pub kind: ProviderErrorKind,
     pub message: String,
+    pub usage: Usage,
 }
 
 impl ProviderError {
@@ -47,7 +48,13 @@ impl ProviderError {
         Self {
             kind,
             message: message.into(),
+            usage: Usage::default(),
         }
+    }
+
+    pub fn with_usage(mut self, usage: Usage) -> Self {
+        self.usage = usage;
+        self
     }
 }
 
@@ -61,6 +68,12 @@ impl std::error::Error for ProviderError {}
 
 pub fn provider_error_kind(err: &anyhow::Error) -> Option<ProviderErrorKind> {
     err.downcast_ref::<ProviderError>().map(|e| e.kind)
+}
+
+pub fn provider_error_usage(err: &anyhow::Error) -> Usage {
+    err.downcast_ref::<ProviderError>()
+        .map(|e| e.usage)
+        .unwrap_or_default()
 }
 
 /// A model the endpoint serves, with whatever live metadata it reports via its

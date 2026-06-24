@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 use crate::provider::{Provider, ProviderError, ProviderErrorKind};
 use crate::types::{
     ChatRequest, CompatMode, Completion, Content, Message, Role, StreamEvent, ToolMode, Usage,
+    estimate_messages_tokens,
 };
 
 pub struct OpenAiProvider {
@@ -95,19 +96,26 @@ impl Provider for OpenAiProvider {
         let stream = crate::http::debug_tap(resp.bytes_stream())
             .eventsource()
             .map(|res| res.map(|event| event.data).context("error reading stream"));
-        let completion = collect_completion(
+        let mut completion = collect_completion(
             Box::pin(stream),
             crate::http::stream_idle_timeout(),
             crate::http::stream_stall_timeout(),
             sink,
         )
         .await
-        .map_err(classify_stream_error)?;
+        .map_err(|err| {
+            classify_stream_error(err).with_usage(Usage {
+                input_tokens: estimate_messages_tokens(&request.messages),
+                output_tokens: request.max_tokens as u64,
+            })
+        })?;
+        backfill_missing_usage(&mut completion, &request);
         if completion.content.is_empty() {
             return Err(ProviderError::new(
                 ProviderErrorKind::EmptyCompletion,
                 "model returned an empty completion",
             )
+            .with_usage(completion.usage)
             .into());
         }
         Ok(completion)
@@ -119,7 +127,7 @@ impl Provider for OpenAiProvider {
     }
 }
 
-fn classify_stream_error(err: anyhow::Error) -> anyhow::Error {
+fn classify_stream_error(err: anyhow::Error) -> ProviderError {
     let text = err.to_string();
     let kind = if text.contains("no output") {
         ProviderErrorKind::StreamTimeout
@@ -128,7 +136,17 @@ fn classify_stream_error(err: anyhow::Error) -> anyhow::Error {
     } else {
         ProviderErrorKind::Other
     };
-    ProviderError::new(kind, text).into()
+    ProviderError::new(kind, text)
+}
+
+fn backfill_missing_usage(completion: &mut Completion, request: &ChatRequest) {
+    if completion.usage.input_tokens == 0 {
+        completion.usage.input_tokens = estimate_messages_tokens(&request.messages);
+    }
+    if completion.usage.output_tokens == 0 {
+        completion.usage.output_tokens =
+            crate::types::estimate_completion_output_tokens(&completion.content);
+    }
 }
 
 /// Once the model reports a `finish_reason`, it has stopped generating; we wait
@@ -167,6 +185,7 @@ where
     let mut last_progress = Instant::now();
     let mut finished: Option<Instant> = None;
     let mut progressed = false;
+    let mut output_chars = 0usize;
 
     loop {
         let budget = match finished {
@@ -211,6 +230,7 @@ where
             if let Some(reasoning) = delta.reasoning.or(delta.reasoning_content)
                 && !reasoning.is_empty()
             {
+                output_chars += reasoning.len();
                 sink(StreamEvent::Reasoning(reasoning));
                 last_progress = Instant::now();
                 progressed = true;
@@ -218,6 +238,7 @@ where
             if let Some(content) = delta.content
                 && !content.is_empty()
             {
+                output_chars += content.len();
                 text.push_str(&content);
                 sink(StreamEvent::Text(content));
                 last_progress = Instant::now();
@@ -238,9 +259,11 @@ where
                     }
                     if let Some(func) = tcd.function {
                         if let Some(name) = func.name {
+                            output_chars += name.len();
                             builder.name.push_str(&name);
                         }
                         if let Some(args) = func.arguments {
+                            output_chars += args.len();
                             builder.arguments.push_str(&args);
                         }
                     }
@@ -260,6 +283,9 @@ where
         if !builder.name.is_empty() {
             completion.content.push(builder.finish());
         }
+    }
+    if completion.usage.output_tokens == 0 && output_chars > 0 {
+        completion.usage.output_tokens = output_chars.div_ceil(4) as u64;
     }
     Ok(completion)
 }
@@ -783,6 +809,16 @@ mod tests {
         let completion = provider.stream(request, &mut sink).await.unwrap();
         assert!(matches!(completion.content.first(), Some(Content::Text(t)) if t == "ok"));
         assert!(
+            completion.usage.input_tokens > 0,
+            "fallback request gets estimated input usage: {:?}",
+            completion.usage
+        );
+        assert!(
+            completion.usage.output_tokens > 0,
+            "fallback request gets estimated output usage: {:?}",
+            completion.usage
+        );
+        assert!(
             statuses.iter().any(|s| s.contains("stream_options")),
             "{statuses:?}"
         );
@@ -916,6 +952,26 @@ mod tests {
             .unwrap();
         assert!(matches!(completion.content.first(), Some(Content::Text(t)) if t == "recovered"));
         assert_eq!(server.bodies().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn empty_completion_error_carries_usage() {
+        let Some(server) = FakeOpenAiServer::new(vec![Response::sse(
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":42,\"completion_tokens\":3}}\n\n",
+        )]) else {
+            return;
+        };
+        let provider = super::OpenAiProvider::new(server.url().to_string(), "test".into());
+        let err = provider
+            .stream(request(vec![], Default::default()), &mut |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(
+            provider_error_kind(&err),
+            Some(ProviderErrorKind::EmptyCompletion)
+        );
+        assert_eq!(crate::provider::provider_error_usage(&err).input_tokens, 42);
+        assert_eq!(crate::provider::provider_error_usage(&err).output_tokens, 3);
     }
 
     #[tokio::test]

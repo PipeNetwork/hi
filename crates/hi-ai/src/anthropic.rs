@@ -14,7 +14,10 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 
 use crate::provider::{Provider, ProviderError, ProviderErrorKind};
-use crate::types::{ChatRequest, Completion, Content, Message, Role, StreamEvent};
+use crate::types::{
+    ChatRequest, Completion, Content, Message, Role, StreamEvent, Usage,
+    estimate_completion_output_tokens, estimate_messages_tokens,
+};
 
 const API_VERSION: &str = "2023-06-01";
 
@@ -89,6 +92,10 @@ impl Provider for AnthropicProvider {
                             idle.as_secs()
                         ),
                     )
+                    .with_usage(Usage {
+                        input_tokens: estimate_messages_tokens(&request.messages),
+                        output_tokens: 0,
+                    })
                     .into());
                 }
             };
@@ -139,6 +146,12 @@ impl Provider for AnthropicProvider {
             .flatten()
             .filter_map(BlockBuilder::finish)
             .collect();
+        if completion.usage.input_tokens == 0 {
+            completion.usage.input_tokens = estimate_messages_tokens(&request.messages);
+        }
+        if completion.usage.output_tokens == 0 {
+            completion.usage.output_tokens = estimate_completion_output_tokens(&completion.content);
+        }
         Ok(completion)
     }
 

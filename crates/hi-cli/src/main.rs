@@ -16,6 +16,7 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 use hi_agent::{Agent, AgentConfig, CompactionKind, VerifyStage};
 use hi_ai::{
     AnthropicProvider, Backend, FallbackProvider, Message, OpenAiProvider, Provider, Registry,
+    Usage,
 };
 
 use config::{Cli, ProviderName, Settings};
@@ -94,10 +95,19 @@ async fn main() -> Result<()> {
     }
 
     // Resolve which session file to use and any history to resume.
-    let (session_path, history) = resolve_session(&cli)?;
+    let (session_path, loaded) = resolve_session(&cli)?;
 
-    let provider = build_chain(&settings, config::resolve_fallbacks(&cli, &file, &registry));
-    let (price, context_window) = registry.metadata(&settings.model);
+    let fallbacks = config::resolve_fallbacks(&cli, &file, &registry);
+    let has_fallbacks = !fallbacks.is_empty();
+    let provider = build_chain(&settings, fallbacks);
+    let (mut price, context_window) = if settings.provider == ProviderName::Terminaili {
+        resolve_live_model_metadata(provider.as_ref(), &registry, &settings.model).await
+    } else {
+        registry.metadata(&settings.model)
+    };
+    if has_fallbacks {
+        price = None;
+    }
     let agent_config = AgentConfig {
         model: settings.model.clone(),
         max_tokens: settings.max_tokens,
@@ -121,8 +131,14 @@ async fn main() -> Result<()> {
             }),
         finalize: !cli.no_finalize,
     };
-    let mut agent = match history {
-        Some(history) => Agent::resume(provider, agent_config, history),
+    let mut agent = match loaded {
+        Some(loaded) => Agent::resume(
+            provider,
+            agent_config,
+            loaded.messages,
+            loaded.usage,
+            loaded.cost_usd,
+        ),
         None => Agent::new(provider, agent_config),
     };
     if !cli.no_save {
@@ -182,16 +198,36 @@ fn provider_label(provider: ProviderName) -> &'static str {
 }
 
 /// Decide the session file and whether to preload history.
-fn resolve_session(cli: &Cli) -> Result<(std::path::PathBuf, Option<Vec<Message>>)> {
+struct LoadedAgentSession {
+    messages: Vec<Message>,
+    usage: Usage,
+    cost_usd: Option<f64>,
+}
+
+fn resolve_session(cli: &Cli) -> Result<(std::path::PathBuf, Option<LoadedAgentSession>)> {
     if let Some(id) = &cli.resume {
         let path = session::session_path(id)?;
-        let history = session::load_history(&path)?;
-        return Ok((path, Some(history)));
+        let loaded = session::load_history(&path)?;
+        return Ok((
+            path,
+            Some(LoadedAgentSession {
+                messages: loaded.messages,
+                usage: loaded.usage,
+                cost_usd: loaded.cost_usd,
+            }),
+        ));
     }
     if cli.cont {
         if let Some(path) = session::latest_session() {
-            let history = session::load_history(&path)?;
-            return Ok((path, Some(history)));
+            let loaded = session::load_history(&path)?;
+            return Ok((
+                path,
+                Some(LoadedAgentSession {
+                    messages: loaded.messages,
+                    usage: loaded.usage,
+                    cost_usd: loaded.cost_usd,
+                }),
+            ));
         }
         eprintln!("\x1b[33mno previous session; starting a new one\x1b[0m");
     }
@@ -261,21 +297,17 @@ fn pipeline_command(stages: &[VerifyStage]) -> Option<String> {
 fn write_report(
     path: &std::path::Path,
     agent: &Agent,
-    registry: &Registry,
+    _registry: &Registry,
     model: &str,
     error: Option<&anyhow::Error>,
 ) -> Result<()> {
     let totals = agent.totals();
-    let (price, _) = registry.metadata(model);
-    let cost = price.map(|(input, output)| {
-        (totals.input_tokens as f64 * input + totals.output_tokens as f64 * output) / 1_000_000.0
-    });
     let report = serde_json::json!({
         "model": model,
         "input_tokens": totals.input_tokens,
         "output_tokens": totals.output_tokens,
         "total_tokens": totals.total(),
-        "cost_usd": cost,
+        "cost_usd": agent.cost_usd(),
         "verify_passed": agent.last_verify(),
         "provider_error_kind": error.and_then(hi_ai::provider_error_kind).map(|k| k.as_str()),
         "compat_fallbacks_used": agent.last_compat_fallbacks(),
@@ -362,6 +394,27 @@ fn build_chain(primary: &Settings, fallbacks: Vec<Settings>) -> Box<dyn Provider
     let mut chain = vec![build_backend(primary)];
     chain.extend(fallbacks.iter().map(build_backend));
     Box::new(FallbackProvider::new(chain))
+}
+
+async fn resolve_live_model_metadata(
+    provider: &dyn Provider,
+    registry: &Registry,
+    model: &str,
+) -> (Option<(f64, f64)>, Option<u32>) {
+    let (catalog_price, catalog_window) = registry.metadata(model);
+    match provider.list_models().await {
+        Ok(served) => served
+            .into_iter()
+            .find(|m| m.id == model)
+            .map(|m| {
+                (
+                    m.price.or(catalog_price),
+                    m.context_window.or(catalog_window),
+                )
+            })
+            .unwrap_or((catalog_price, catalog_window)),
+        Err(_) => (catalog_price, catalog_window),
+    }
 }
 
 async fn repl(

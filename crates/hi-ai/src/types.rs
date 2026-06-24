@@ -168,7 +168,7 @@ pub enum StreamEvent {
     Status(String),
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -177,6 +177,15 @@ pub struct Usage {
 impl Usage {
     pub fn total(&self) -> u64 {
         self.input_tokens + self.output_tokens
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.input_tokens == 0 && self.output_tokens == 0
+    }
+
+    pub fn add(&mut self, other: Usage) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
     }
 }
 
@@ -207,6 +216,39 @@ impl Completion {
             })
             .collect()
     }
+}
+
+const CHARS_PER_TOKEN: usize = 4;
+
+pub fn estimate_text_tokens(text: &str) -> u64 {
+    if text.is_empty() {
+        0
+    } else {
+        text.len().div_ceil(CHARS_PER_TOKEN) as u64
+    }
+}
+
+pub fn estimate_messages_tokens(messages: &[Message]) -> u64 {
+    messages
+        .iter()
+        .flat_map(|m| &m.content)
+        .map(estimate_content_tokens)
+        .sum()
+}
+
+pub fn estimate_content_tokens(content: &Content) -> u64 {
+    match content {
+        Content::Text(t) => estimate_text_tokens(t),
+        Content::Thinking { text, .. } => estimate_text_tokens(text),
+        Content::ToolCall {
+            name, arguments, ..
+        } => estimate_text_tokens(name) + estimate_text_tokens(arguments),
+        Content::ToolResult { output, .. } => estimate_text_tokens(output),
+    }
+}
+
+pub fn estimate_completion_output_tokens(content: &[Content]) -> u64 {
+    content.iter().map(estimate_content_tokens).sum()
 }
 
 /// A borrowed view of a requested tool call.

@@ -11,7 +11,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use hi_agent::SessionSink;
-use hi_ai::{Message, Role};
+use hi_ai::{Message, Role, Usage};
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum SessionMeta {
+    Usage {
+        input_tokens: u64,
+        output_tokens: u64,
+        #[serde(default)]
+        cost_usd: Option<f64>,
+    },
+}
 
 /// Appends messages to a session's JSONL file.
 pub struct JsonlSession {
@@ -25,8 +37,8 @@ impl JsonlSession {
 }
 
 impl SessionSink for JsonlSession {
-    fn record(&mut self, messages: &[Message]) -> Result<()> {
-        if messages.is_empty() {
+    fn record(&mut self, messages: &[Message], usage: Usage, cost_usd: Option<f64>) -> Result<()> {
+        if messages.is_empty() && usage.is_zero() {
             return Ok(());
         }
         if let Some(parent) = self.path.parent() {
@@ -42,9 +54,21 @@ impl SessionSink for JsonlSession {
             let line = serde_json::to_string(message)?;
             writeln!(writer, "{line}")?;
         }
+        let line = serde_json::to_string(&SessionMeta::Usage {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cost_usd,
+        })?;
+        writeln!(writer, "{line}")?;
         writer.flush()?;
         Ok(())
     }
+}
+
+pub struct LoadedSession {
+    pub messages: Vec<Message>,
+    pub usage: Usage,
+    pub cost_usd: Option<f64>,
 }
 
 /// Directory holding all session files (may not exist yet).
@@ -98,19 +122,41 @@ pub fn latest_session() -> Option<PathBuf> {
 }
 
 /// Load a session's messages back into conversation history.
-pub fn load_history(path: &Path) -> Result<Vec<Message>> {
+pub fn load_history(path: &Path) -> Result<LoadedSession> {
     let text =
         fs::read_to_string(path).with_context(|| format!("reading session {}", path.display()))?;
     let mut messages = Vec::new();
+    let mut usage = Usage::default();
+    let mut cost_usd = Some(0.0);
     for (i, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(meta) = serde_json::from_str::<SessionMeta>(line) {
+            match meta {
+                SessionMeta::Usage {
+                    input_tokens,
+                    output_tokens,
+                    cost_usd: saved_cost,
+                } => {
+                    usage = Usage {
+                        input_tokens,
+                        output_tokens,
+                    };
+                    cost_usd = saved_cost;
+                }
+            }
             continue;
         }
         let message: Message = serde_json::from_str(line)
             .with_context(|| format!("parsing {} line {}", path.display(), i + 1))?;
         messages.push(message);
     }
-    Ok(messages)
+    Ok(LoadedSession {
+        messages,
+        usage,
+        cost_usd,
+    })
 }
 
 /// Print a summary of saved sessions (id, age, first user message).
@@ -194,7 +240,9 @@ fn humanize(secs: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::session_title;
+    use super::{JsonlSession, load_history, session_title};
+    use hi_agent::SessionSink;
+    use hi_ai::{Message, Usage};
 
     #[test]
     fn title_strips_folded_stdin_and_collapses_whitespace() {
@@ -213,5 +261,37 @@ mod tests {
             "explain this"
         );
         assert_eq!(session_title("   "), "");
+    }
+
+    #[test]
+    fn jsonl_session_round_trips_usage_metadata() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "hi-session-usage-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut session = JsonlSession::new(path.clone());
+        session
+            .record(
+                &[Message::system("sys"), Message::user("hello")],
+                Usage {
+                    input_tokens: 123,
+                    output_tokens: 45,
+                },
+                Some(0.1234),
+            )
+            .unwrap();
+
+        let loaded = load_history(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(loaded.messages.len(), 2);
+        assert_eq!(loaded.usage.input_tokens, 123);
+        assert_eq!(loaded.usage.output_tokens, 45);
+        assert_eq!(loaded.cost_usd, Some(0.1234));
     }
 }

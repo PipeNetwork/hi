@@ -10,7 +10,7 @@ use anyhow::Result;
 use futures_util::StreamExt;
 use hi_ai::{
     ChatRequest, CompatMode, Content, Message, Provider, ProviderErrorKind, RequestProfile,
-    StreamEvent, ToolMode, ToolSpec, Usage, provider_error_kind,
+    StreamEvent, ToolMode, ToolSpec, Usage, provider_error_kind, provider_error_usage,
 };
 use hi_tools::{execute, tool_specs};
 
@@ -228,6 +228,9 @@ pub struct Agent {
     persisted: usize,
     /// Running total of tokens across the session.
     totals: Usage,
+    /// Running USD cost. `None` means some usage was recorded while pricing was
+    /// unknown, so showing a precise total would be misleading.
+    cost_usd: Option<f64>,
     /// Whether the most recent turn's verification passed (None if not run).
     last_verify: Option<bool>,
     /// Input tokens of the most recent model call — a proxy for how full the
@@ -251,9 +254,18 @@ impl Agent {
 
     /// Resume from previously-saved history (which already includes the system
     /// prompt). The loaded messages are treated as already persisted.
-    pub fn resume(provider: Box<dyn Provider>, config: AgentConfig, history: Vec<Message>) -> Self {
+    pub fn resume(
+        provider: Box<dyn Provider>,
+        config: AgentConfig,
+        history: Vec<Message>,
+        usage: Usage,
+        cost_usd: Option<f64>,
+    ) -> Self {
         let persisted = history.len();
-        Self::with_messages(provider, config, history, persisted)
+        let mut agent = Self::with_messages(provider, config, history, persisted);
+        agent.totals = usage;
+        agent.cost_usd = cost_usd;
+        agent
     }
 
     fn with_messages(
@@ -270,6 +282,7 @@ impl Agent {
             session: None,
             persisted,
             totals: Usage::default(),
+            cost_usd: Some(0.0),
             last_verify: None,
             context_used: 0,
             checkpoints: Vec::new(),
@@ -309,6 +322,37 @@ impl Agent {
     /// Cumulative token usage across the session.
     pub fn totals(&self) -> &Usage {
         &self.totals
+    }
+
+    pub fn cost_usd(&self) -> Option<f64> {
+        self.cost_usd
+    }
+
+    fn add_usage(&mut self, usage: Usage) {
+        if !usage.is_zero() {
+            match (self.cost_usd, self.config.price) {
+                (Some(total), Some((input_price, output_price))) => {
+                    self.cost_usd = Some(
+                        total
+                            + (usage.input_tokens as f64 * input_price
+                                + usage.output_tokens as f64 * output_price)
+                                / 1_000_000.0,
+                    );
+                }
+                (_, None) => {
+                    self.cost_usd = None;
+                }
+                (None, Some(_)) => {}
+            }
+        }
+        self.totals.add(usage);
+        if usage.input_tokens > 0 {
+            self.context_used = usage.input_tokens;
+        }
+    }
+
+    fn add_error_usage(&mut self, err: &anyhow::Error) {
+        self.add_usage(provider_error_usage(err));
     }
 
     pub fn checkpoint_count(&self) -> usize {
@@ -590,10 +634,17 @@ impl Agent {
             StreamEvent::Status(text) => ui.status(&text),
             StreamEvent::Reasoning(_) => {}
         };
-        let completion = self.provider.stream(request, &mut sink).await?;
+        let completion = match self.provider.stream(request, &mut sink).await {
+            Ok(completion) => completion,
+            Err(err) => {
+                self.add_error_usage(&err);
+                let _ = self.persist();
+                return Err(err);
+            }
+        };
         ui.assistant_end();
-        self.totals.input_tokens += completion.usage.input_tokens;
-        self.totals.output_tokens += completion.usage.output_tokens;
+        self.add_usage(completion.usage);
+        let _ = self.persist();
         ui.usage(
             self.totals.input_tokens,
             self.totals.output_tokens,
@@ -664,13 +715,15 @@ impl Agent {
         let completion = match self.provider.stream(request, &mut sink).await {
             Ok(completion) => completion,
             Err(err) => {
+                self.add_error_usage(&err);
+                let _ = self.persist();
                 ui.status(&format!("(couldn't update memory: {err})"));
                 return;
             }
         };
         ui.assistant_end();
-        self.totals.input_tokens += completion.usage.input_tokens;
-        self.totals.output_tokens += completion.usage.output_tokens;
+        self.add_usage(completion.usage);
+        let _ = self.persist();
 
         // Fall back to the final content if the provider didn't stream text.
         if memory.trim().is_empty() {
@@ -840,6 +893,8 @@ impl Agent {
                             "request still exceeds the provider limit with prior context removed; \
                              shorten the prompt or attached input, then retry",
                         );
+                        self.add_error_usage(&err);
+                        let _ = self.persist();
                         return Err(err);
                     }
                     // A transient generation flake — a malformed/garbled stream or
@@ -859,6 +914,7 @@ impl Agent {
                             ) =>
                     {
                         ui.assistant_end();
+                        self.add_error_usage(&err);
                         empty_retries += 1;
                         ui.status(&format!(
                             "⚠ the model's response didn't come through cleanly — \
@@ -866,16 +922,15 @@ impl Agent {
                         ));
                         continue;
                     }
-                    Err(err) => return Err(err),
+                    Err(err) => {
+                        self.add_error_usage(&err);
+                        let _ = self.persist();
+                        return Err(err);
+                    }
                 };
                 ui.assistant_end();
 
-                self.totals.input_tokens += completion.usage.input_tokens;
-                self.totals.output_tokens += completion.usage.output_tokens;
-                // Latest context fill, for the auto-compaction decision next turn.
-                if completion.usage.input_tokens > 0 {
-                    self.context_used = completion.usage.input_tokens;
-                }
+                self.add_usage(completion.usage);
                 // Let the frontend show the running total climb mid-turn.
                 ui.usage(
                     self.totals.input_tokens,
@@ -1146,17 +1201,14 @@ impl Agent {
         let completion = match self.provider.stream(request, &mut sink).await {
             Ok(completion) => completion,
             Err(err) => {
+                self.add_error_usage(&err);
                 ui.status(&format!("(couldn't generate the final summary: {err})"));
                 return;
             }
         };
         ui.assistant_end();
 
-        self.totals.input_tokens += completion.usage.input_tokens;
-        self.totals.output_tokens += completion.usage.output_tokens;
-        if completion.usage.input_tokens > 0 {
-            self.context_used = completion.usage.input_tokens;
-        }
+        self.add_usage(completion.usage);
         ui.usage(
             self.totals.input_tokens,
             self.totals.output_tokens,
@@ -1194,10 +1246,7 @@ impl Agent {
             humanize_count(usage.input_tokens),
             humanize_count(usage.output_tokens),
         );
-        if let Some((input_price, output_price)) = self.config.price {
-            let cost = (usage.input_tokens as f64 * input_price
-                + usage.output_tokens as f64 * output_price)
-                / 1_000_000.0;
+        if let Some(cost) = self.cost_usd {
             summary.push_str(&format!(" · ${cost:.4}"));
         }
         // The context gauge is a *point-in-time* measure (the last request's
@@ -1238,7 +1287,7 @@ impl Agent {
 
     fn persist(&mut self) -> Result<()> {
         if let Some(session) = self.session.as_mut() {
-            session.record(&self.messages[self.persisted..])?;
+            session.record(&self.messages[self.persisted..], self.totals, self.cost_usd)?;
             self.persisted = self.messages.len();
         }
         Ok(())
@@ -1532,6 +1581,7 @@ mod tests {
         RequestTooLarge,
         /// Fail this round with a provider error of the given kind.
         Error(ProviderErrorKind),
+        ErrorWithUsage(ProviderErrorKind, Usage),
     }
 
     struct ScriptedProvider {
@@ -1557,6 +1607,11 @@ mod tests {
                 ProviderStep::Error(kind) => {
                     Err(ProviderError::new(kind, "scripted provider error").into())
                 }
+                ProviderStep::ErrorWithUsage(kind, usage) => {
+                    Err(ProviderError::new(kind, "scripted provider error")
+                        .with_usage(usage)
+                        .into())
+                }
             }
         }
     }
@@ -1570,6 +1625,22 @@ mod tests {
         fn tool_result(&mut self, _: &str) {}
         fn status(&mut self, _: &str) {}
         fn turn_end(&mut self, _: &str) {}
+    }
+
+    struct RecordingSession {
+        records: std::sync::Arc<Mutex<Vec<(Usage, Option<f64>)>>>,
+    }
+
+    impl SessionSink for RecordingSession {
+        fn record(
+            &mut self,
+            _messages: &[Message],
+            usage: Usage,
+            cost_usd: Option<f64>,
+        ) -> Result<()> {
+            self.records.lock().unwrap().push((usage, cost_usd));
+            Ok(())
+        }
     }
 
     #[derive(Default)]
@@ -1786,6 +1857,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retry_counts_usage_from_failed_attempt() {
+        let (mut agent, _requests) = scripted_agent(
+            vec![
+                ProviderStep::ErrorWithUsage(
+                    ProviderErrorKind::MalformedStream,
+                    Usage {
+                        input_tokens: 7,
+                        output_tokens: 100,
+                    },
+                ),
+                ProviderStep::Completion(completion(vec![Content::Text("recovered".into())], 5, 3)),
+            ],
+            config(),
+        );
+
+        agent.run_turn("go", &mut NullUi).await.unwrap();
+
+        assert_eq!(agent.totals().input_tokens, 12);
+        assert_eq!(agent.totals().output_tokens, 103);
+    }
+
+    #[tokio::test]
     async fn empty_completion_error_is_resampled_too() {
         // The same path catches a provider's empty-completion *error*, not just a
         // content-less Ok response.
@@ -1815,6 +1908,41 @@ mod tests {
             requests.lock().unwrap().len(),
             1,
             "a terminal error is not retried"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_error_persists_usage_before_returning() {
+        let records = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let (mut agent, _requests) = scripted_agent(
+            vec![ProviderStep::ErrorWithUsage(
+                ProviderErrorKind::Outage,
+                Usage {
+                    input_tokens: 11,
+                    output_tokens: 100,
+                },
+            )],
+            config(),
+        );
+        agent.set_session(Box::new(RecordingSession {
+            records: records.clone(),
+        }));
+
+        let err = agent.run_turn("go", &mut NullUi).await.unwrap_err();
+
+        assert_eq!(
+            hi_ai::provider_error_kind(&err),
+            Some(ProviderErrorKind::Outage)
+        );
+        assert_eq!(
+            *records.lock().unwrap(),
+            vec![(
+                Usage {
+                    input_tokens: 11,
+                    output_tokens: 100,
+                },
+                None,
+            )]
         );
     }
 
@@ -1869,6 +1997,41 @@ mod tests {
             "session history not polluted"
         );
         assert_eq!(agent.totals().output_tokens, 4, "usage counted");
+    }
+
+    #[tokio::test]
+    async fn update_memory_persists_usage_without_new_messages() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "hi-memory-persist-{}-{}.md",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let records = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let mut agent = agent(
+            vec![completion(vec![Content::Text("- note".into())], 10, 5)],
+            config(),
+        );
+        agent.set_session(Box::new(RecordingSession {
+            records: records.clone(),
+        }));
+
+        agent.update_memory_at(path.clone(), &mut NullUi).await;
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(
+            *records.lock().unwrap(),
+            vec![(
+                Usage {
+                    input_tokens: 10,
+                    output_tokens: 5,
+                },
+                None,
+            )]
+        );
     }
 
     #[tokio::test]
@@ -2039,6 +2202,7 @@ mod tests {
 
     #[tokio::test]
     async fn compact_replaces_history_with_summary() {
+        let records = std::sync::Arc::new(Mutex::new(Vec::new()));
         let responses = vec![completion(
             vec![Content::Text(
                 "BRIEF: ported the parser; tests green".into(),
@@ -2047,6 +2211,9 @@ mod tests {
             5,
         )];
         let mut agent = agent(responses, config());
+        agent.set_session(Box::new(RecordingSession {
+            records: records.clone(),
+        }));
         // Some history to compact.
         agent.messages.push(Message::user("hello"));
         agent
@@ -2066,6 +2233,17 @@ mod tests {
         );
         // The summarization call's usage is counted.
         assert_eq!(agent.totals().output_tokens, 5);
+        assert_eq!(
+            *records.lock().unwrap(),
+            vec![(
+                Usage {
+                    input_tokens: 7,
+                    output_tokens: 5,
+                },
+                None,
+            )],
+            "manual compaction persists usage even though compacted messages are transient"
+        );
     }
 
     #[tokio::test]
@@ -2534,6 +2712,23 @@ mod tests {
             !line.contains("20000") && !line.contains("12000"),
             "no raw token counts: {line}"
         );
+    }
+
+    #[tokio::test]
+    async fn cost_accumulates_at_price_active_for_each_call() {
+        let mut cfg = config();
+        cfg.price = Some((1.0, 10.0));
+        let responses = vec![
+            completion(vec![Content::Text("first".into())], 1_000, 100),
+            completion(vec![Content::Text("second".into())], 1_000, 100),
+        ];
+        let mut agent = agent(responses, cfg);
+
+        agent.run_turn("first", &mut NullUi).await.unwrap();
+        agent.set_model("m2".into(), Some((2.0, 20.0)), None);
+        agent.run_turn("second", &mut NullUi).await.unwrap();
+
+        assert_eq!(agent.cost_usd(), Some(0.006));
     }
 
     #[tokio::test]

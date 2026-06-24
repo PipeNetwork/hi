@@ -14,8 +14,6 @@ use hi_ai::{Content, Message, Role};
 /// User turns kept verbatim by `Hybrid`/`ElideToolOutput` by default.
 pub const DEFAULT_KEEP_RECENT: usize = 3;
 
-/// Rough characters-per-token ratio for the local size estimate.
-const CHARS_PER_TOKEN: usize = 4;
 /// Tool outputs shorter than this aren't worth eliding.
 const ELIDE_MIN_CHARS: usize = 200;
 /// Marker an elided output starts with, so elision is idempotent.
@@ -78,19 +76,7 @@ pub(crate) fn recent_split(messages: &[Message], keep_recent: usize) -> Option<u
 /// A rough token estimate (~4 chars/token) across all message content — used to
 /// decide whether deterministic elision freed enough to skip a summary call.
 pub(crate) fn estimate_tokens(messages: &[Message]) -> u64 {
-    let chars: usize = messages
-        .iter()
-        .flat_map(|m| &m.content)
-        .map(|c| match c {
-            Content::Text(t) => t.len(),
-            Content::Thinking { text, .. } => text.len(),
-            Content::ToolCall {
-                arguments, name, ..
-            } => arguments.len() + name.len(),
-            Content::ToolResult { output, .. } => output.len(),
-        })
-        .sum();
-    (chars / CHARS_PER_TOKEN) as u64
+    hi_ai::estimate_messages_tokens(messages)
 }
 
 /// `call_id` → tool name, from the assistant's ToolCall blocks, so an elision

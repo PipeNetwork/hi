@@ -6,8 +6,10 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::provider::{Provider, ServedModel};
-use crate::types::{ChatRequest, Completion, StreamEvent};
+use crate::provider::{
+    Provider, ProviderError, ServedModel, provider_error_kind, provider_error_usage,
+};
+use crate::types::{ChatRequest, Completion, StreamEvent, Usage};
 
 /// One link in the fallback chain: a built provider plus the model id to request
 /// from it (each backend names its models differently).
@@ -43,24 +45,41 @@ impl Provider for FallbackProvider {
         sink: &mut (dyn FnMut(StreamEvent) + Send),
     ) -> Result<Completion> {
         let last = self.chain.len().saturating_sub(1);
+        let mut prior_usage = Usage::default();
         for (i, backend) in self.chain.iter().enumerate() {
             let is_last = i == last;
             let mut req = request.clone();
             req.model = backend.model.clone();
 
             match backend.provider.stream(req, sink).await {
-                Ok(completion) if !completion.content.is_empty() || is_last => {
+                Ok(mut completion) if !completion.content.is_empty() || is_last => {
+                    if !prior_usage.is_zero() {
+                        completion.usage.input_tokens += prior_usage.input_tokens;
+                        completion.usage.output_tokens += prior_usage.output_tokens;
+                    }
                     return Ok(completion);
                 }
-                Ok(_empty) => {
+                Ok(empty) => {
+                    prior_usage.add(empty.usage);
                     let next = &self.chain[i + 1];
                     sink(StreamEvent::Status(format!(
                         "{} returned nothing — falling back to {}",
                         backend.label, next.label
                     )));
                 }
-                Err(err) if is_last => return Err(err),
+                Err(err) if is_last => {
+                    prior_usage.add(provider_error_usage(&err));
+                    if prior_usage.is_zero() {
+                        return Err(err);
+                    }
+                    let kind = provider_error_kind(&err)
+                        .unwrap_or(crate::provider::ProviderErrorKind::Other);
+                    return Err(ProviderError::new(kind, err.to_string())
+                        .with_usage(prior_usage)
+                        .into());
+                }
                 Err(err) => {
+                    prior_usage.add(provider_error_usage(&err));
                     let next = &self.chain[i + 1];
                     sink(StreamEvent::Status(format!(
                         "{} failed ({err}) — falling back to {}",
@@ -105,12 +124,30 @@ mod tests {
         Completion::default()
     }
 
-    fn text(s: &str) -> Completion {
+    fn empty_with_usage(input: u64, output: u64) -> Completion {
         Completion {
-            content: vec![Content::Text(s.into())],
-            usage: Usage::default(),
+            content: Vec::new(),
+            usage: Usage {
+                input_tokens: input,
+                output_tokens: output,
+            },
             stop_reason: None,
         }
+    }
+
+    fn text_with_usage(s: &str, input: u64, output: u64) -> Completion {
+        Completion {
+            content: vec![Content::Text(s.into())],
+            usage: Usage {
+                input_tokens: input,
+                output_tokens: output,
+            },
+            stop_reason: None,
+        }
+    }
+
+    fn text(s: &str) -> Completion {
+        text_with_usage(s, 0, 0)
     }
 
     fn first_text(c: &Completion) -> &str {
@@ -162,6 +199,19 @@ mod tests {
         assert_eq!(statuses.len(), 2, "statuses: {statuses:?}");
         assert!(statuses[0].contains("falling back to mid"));
         assert!(statuses[1].contains("falling back to local"));
+    }
+
+    #[tokio::test]
+    async fn fallback_preserves_usage_from_prior_attempts() {
+        let mut sink = |_e: StreamEvent| {};
+        let fp = FallbackProvider::new(vec![
+            backend("primary", vec![Ok(empty_with_usage(10, 2))]),
+            backend("local", vec![Ok(text_with_usage("winner", 3, 4))]),
+        ]);
+        let out = fp.stream(req(), &mut sink).await.unwrap();
+        assert_eq!(first_text(&out), "winner");
+        assert_eq!(out.usage.input_tokens, 13);
+        assert_eq!(out.usage.output_tokens, 6);
     }
 
     #[tokio::test]
