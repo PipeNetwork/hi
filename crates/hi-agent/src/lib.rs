@@ -34,7 +34,7 @@ pub use ui::{Ui, tool_label};
 
 use heuristics::{
     emit_tool_output, looks_like_unfinished_step, looks_mutating, recovery_sampling,
-    recovery_telemetry, tool_mode_label, StallMode, RECOVERY_SAMPLING,
+    recovery_telemetry, respects_deps, tool_deps, tool_mode_label, StallMode, RECOVERY_SAMPLING,
 };
 use memory::{cap_memory, memory_prompt};
 use prompt::SystemPrompt;
@@ -1325,6 +1325,19 @@ impl Agent {
                 // "incomplete" state is cleared (it got back to work).
                 made_tool_call = true;
                 stalled_unfinished = false;
+                // Infer within-batch dependencies (a read of a file a mutating
+                // call earlier in the batch targeted must observe that mutation;
+                // mutating calls serialize). The current scheduler runs calls in
+                // emission order, which by construction respects these deps
+                // (deps only point backward) — but computing them here and
+                // asserting the order respects them documents the invariant and
+                // guards a future scheduler change from regressing the
+                // "read-after-write observes the write" property.
+                let deps = tool_deps(&calls);
+                debug_assert!(
+                    respects_deps(&deps, &(0..calls.len()).collect::<Vec<_>>()),
+                    "emission-order execution must respect inferred tool deps"
+                );
                 // Execute the calls in the order the model emitted them, so a
                 // batch like "edit, then read" reads the post-edit state. Within
                 // that order, contiguous runs of read-only calls (which have no

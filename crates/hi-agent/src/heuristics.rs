@@ -16,6 +16,82 @@ pub(crate) fn emit_tool_output(ui: &mut dyn Ui, output: &ToolOutput) {
     }
 }
 
+/// Infer within-batch tool-call dependencies so the executor can honor the
+/// model's intent rather than relying on emission-order coincidence. Returns,
+/// for each call index, the set of earlier call indices it must run *after*.
+///
+/// Rules (conservative — over-serializing is safe, under-serializing is a bug):
+/// - A mutating call (`write`/`edit`/`multi_edit`/`bash`/`apply_patch`) depends
+///   on every earlier mutating call, so side effects apply in emission order.
+///   (Two independent writes still serialize — file edits aren't commutative
+///   and a later write may depend on an earlier write's content.)
+/// - A read-only call depends on any earlier mutating call whose inferred
+///   target path matches the read's target path — so "write a.rs, then read
+///   a.rs" reads the post-write state even if a scheduler reorders independent
+///   reads. Reads with no path overlap with earlier mutations have no deps and
+///   may parallelize freely.
+///
+/// `calls` is `(id, name, arguments)` per the executor's shape. A call with an
+/// unparseable target path is treated as dependent on all earlier mutations
+/// (the safe fallback — `target_path` returns `None` for `bash`, so a `bash`
+/// edit followed by a read serializes).
+pub(crate) fn tool_deps(calls: &[(String, String, String)]) -> Vec<Vec<usize>> {
+    let n = calls.len();
+    let mut deps = vec![Vec::new(); n];
+    // Track, for each prior index, whether it was mutating and its target path.
+    let mut prior: Vec<(bool, Option<String>)> = Vec::with_capacity(n);
+    for (i, (_, name, arguments)) in calls.iter().enumerate() {
+        let mutating = !hi_tools::is_read_only(name);
+        let my_path = hi_tools::target_path(name, arguments);
+        for (j, (was_mut, their_path)) in prior.iter().enumerate() {
+            let must_wait = if mutating {
+                // Mutating calls serialize after all earlier mutations.
+                *was_mut
+            } else {
+                // Reads wait for an earlier mutation on the same path. If
+                // either side has no parseable path, be safe and serialize
+                // (covers `bash` edits, which have no path).
+                *was_mut
+                    && paths_overlap(their_path.as_deref(), my_path.as_deref())
+            };
+            if must_wait {
+                deps[i].push(j);
+            }
+        }
+        prior.push((mutating, my_path));
+    }
+    deps
+}
+
+/// Whether two (possibly-unknown) target paths refer to the same file. `None`
+/// on either side means "unknown" — treat as overlapping (the safe choice:
+/// serialize rather than risk a read observing a pre-mutation state).
+fn paths_overlap(a: Option<&str>, b: Option<&str>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a == b,
+        // Unknown on either side → conservatively overlap.
+        _ => true,
+    }
+}
+
+/// Whether an execution `order` (a permutation of `0..n`) respects the
+/// dependency graph from [`tool_deps`]: every call appears after all of its
+/// dependencies. Used as a debug assertion / property-test oracle so a future
+/// scheduler change can't regress the "read-after-write observes the write"
+/// invariant.
+pub(crate) fn respects_deps(deps: &[Vec<usize>], order: &[usize]) -> bool {
+    let pos = |idx: usize| order.iter().position(|&o| o == idx).unwrap();
+    for (i, ds) in deps.iter().enumerate() {
+        let my_pos = pos(i);
+        for &d in ds {
+            if pos(d) > my_pos {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Humanize a token count compactly and consistently: `991`, `1.2k`, `22k`, `1.0M`.
 /// Shared by the live working line and the settled usage summary so they agree.
 pub fn humanize_count(n: u64) -> String {
@@ -358,6 +434,83 @@ mod tests {
             recovery_telemetry(StallMode::Empty, 2, 2, Some(0.2), None, None, false),
             None,
             "disabled recovery should not emit"
+        );
+    }
+
+    #[test]
+    fn tool_deps_serializes_read_after_write_on_same_path() {
+        // write a.rs, read a.rs, read b.rs: the read of a.rs depends on the
+        // write; the read of b.rs does not (different path) — independent.
+        let calls = vec![
+            ("w".into(), "write".into(), r#"{"path":"a.rs","content":"x"}"#.into()),
+            ("r1".into(), "read".into(), r#"{"path":"a.rs"}"#.into()),
+            ("r2".into(), "read".into(), r#"{"path":"b.rs"}"#.into()),
+        ];
+        let deps = tool_deps(&calls);
+        // write (0) has no deps.
+        assert!(deps[0].is_empty(), "write has no deps: {deps:?}");
+        // read a.rs (1) depends on the write (0).
+        assert!(deps[1].contains(&0), "read a.rs depends on write: {deps:?}");
+        // read b.rs (2) is independent of the write on a.rs.
+        assert!(
+            !deps[2].contains(&0),
+            "read b.rs independent of write a.rs: {deps:?}"
+        );
+    }
+
+    #[test]
+    fn tool_deps_serializes_mutating_calls_in_emission_order() {
+        // Two writes: the second depends on the first (edits aren't commutative).
+        let calls = vec![
+            ("w1".into(), "write".into(), r#"{"path":"a.rs","content":"1"}"#.into()),
+            ("w2".into(), "edit".into(), r#"{"path":"a.rs","old_string":"1","new_string":"2"}"#.into()),
+        ];
+        let deps = tool_deps(&calls);
+        assert!(deps[0].is_empty());
+        assert!(deps[1].contains(&0), "second write depends on first: {deps:?}");
+    }
+
+    #[test]
+    fn tool_deps_bash_edit_serializes_following_read() {
+        // A bash edit has no parseable path, so a following read is conservatively
+        // serialized after it (the safe fallback — the read might observe the
+        // bash edit's effect).
+        let calls = vec![
+            ("b".into(), "bash".into(), r#"{"command":"echo x > a.rs"}"#.into()),
+            ("r".into(), "read".into(), r#"{"path":"a.rs"}"#.into()),
+        ];
+        let deps = tool_deps(&calls);
+        assert!(deps[1].contains(&0), "read after bash edit serializes: {deps:?}");
+    }
+
+    #[test]
+    fn respects_deps_validates_ordering() {
+        // deps: call 1 depends on 0; call 2 depends on 0.
+        let deps = vec![vec![], vec![0], vec![0]];
+        // Emission order respects deps.
+        assert!(respects_deps(&deps, &[0, 1, 2]));
+        // Reordering 0 after 1 violates (1 depends on 0).
+        assert!(!respects_deps(&deps, &[1, 0, 2]));
+        // 2 before 1 is fine (2 doesn't depend on 1).
+        assert!(respects_deps(&deps, &[0, 2, 1]));
+    }
+
+    #[test]
+    fn emission_order_respects_inferred_deps_for_a_realistic_batch() {
+        // The property the executor pins: for a realistic mixed batch, the
+        // emission order [0,1,2,...] always respects the inferred deps (since
+        // deps only point backward). This is the regression guard.
+        let calls = vec![
+            ("r0".into(), "read".into(), r#"{"path":"a.rs"}"#.into()),
+            ("w".into(), "write".into(), r#"{"path":"a.rs","content":"x"}"#.into()),
+            ("r1".into(), "read".into(), r#"{"path":"a.rs"}"#.into()),
+            ("r2".into(), "read".into(), r#"{"path":"b.rs"}"#.into()),
+        ];
+        let deps = tool_deps(&calls);
+        let order: Vec<usize> = (0..calls.len()).collect();
+        assert!(
+            respects_deps(&deps, &order),
+            "emission order respects inferred deps: {deps:?}"
         );
     }
 }

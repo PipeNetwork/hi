@@ -380,6 +380,31 @@ pub fn is_read_only(name: &str) -> bool {
     // parallel batch — order and isolation matter.
 }
 
+/// Best-effort extraction of the primary target path from a tool call's JSON
+/// arguments — the `path` field for read/write/edit/list, the `path`/`glob` for
+/// grep. Returns `None` for tools without a meaningful single path (e.g.
+/// `bash`, or a `grep` with only a pattern). Used by the agent to infer
+/// within-batch dependencies: a read of a file a mutating call earlier in the
+/// same batch targeted should observe that mutation, so it's serialized after.
+/// Tolerant — a failed parse yields `None`, which the caller treats as "no
+/// dependency inferred" (safe fallback to emission order).
+pub fn target_path(name: &str, arguments: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    match name {
+        // read/write/edit/multi_edit carry an explicit `path`.
+        "read" | "write" | "edit" | "multi_edit" => {
+            value.get("path")?.as_str().map(str::to_string)
+        }
+        // list's path is optional (defaults to ".").
+        "list" => value.get("path")?.as_str().map(str::to_string),
+        // grep: prefer an explicit `path`; fall back to `glob` only as a hint
+        // (a glob isn't a single file, so return None to avoid over-serializing).
+        "grep" => value.get("path")?.as_str().map(str::to_string),
+        // diff/glob/bash: no single meaningful target path for dep inference.
+        _ => None,
+    }
+}
+
 /// Execute a tool by name. Tool failures are returned as content (not errors)
 /// so the model sees them and can recover, rather than aborting the turn.
 pub async fn execute(name: &str, arguments: &str) -> ToolOutput {
@@ -698,7 +723,7 @@ pub(crate) struct BashArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::is_read_only;
+    use super::{is_read_only, target_path};
     use crate::edit::sh_quote;
 
     #[test]
@@ -717,5 +742,27 @@ mod tests {
     fn sh_quote_escapes_single_quotes() {
         assert_eq!(sh_quote("a b"), "'a b'");
         assert_eq!(sh_quote("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn target_path_extracts_path_field() {
+        assert_eq!(
+            target_path("read", r#"{"path":"src/a.rs"}"#),
+            Some("src/a.rs".into())
+        );
+        assert_eq!(
+            target_path("write", r#"{"path":"b.rs","content":"x"}"#),
+            Some("b.rs".into())
+        );
+        // list's path is optional → None when absent.
+        assert_eq!(target_path("list", r#"{}"#), None);
+        assert_eq!(
+            target_path("list", r#"{"path":"sub"}"#),
+            Some("sub".into())
+        );
+        // bash has no path → None (the safe-fallback case for dep inference).
+        assert_eq!(target_path("bash", r#"{"command":"echo hi"}"#), None);
+        // Malformed JSON → None (tolerant).
+        assert_eq!(target_path("read", "not json"), None);
     }
 }

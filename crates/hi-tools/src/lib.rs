@@ -17,8 +17,8 @@ mod tools;
 pub use condense::condense_diagnostics;
 pub use paths::clear_read_cache;
 pub use tools::{
-    TOOL_SPECS, commit, execute, execute_streaming, is_read_only, run_check, tool_specs,
-    working_tree_diff, working_tree_diff_plain,
+    TOOL_SPECS, commit, execute, execute_streaming, is_read_only, run_check, target_path,
+    tool_specs, working_tree_diff, working_tree_diff_plain,
 };
 
 pub use attribution::{parse_attributions, AttrKind, Attribution};
