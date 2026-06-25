@@ -16,6 +16,15 @@ pub struct Trajectory {
     pub stalled_unfinished: bool,
     pub stalled_repeating: bool,
     pub verify_attributions: Vec<TrajectoryAttribution>,
+    /// Scheduler parallelism: total tool calls this turn.
+    #[serde(default)]
+    pub tool_calls: u32,
+    /// Largest concurrent ready-batch (1 = all serial).
+    #[serde(default)]
+    pub max_concurrent_batch: u32,
+    /// Calls that ran serially (bash or a lone ready call).
+    #[serde(default)]
+    pub serial_runs: u32,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

@@ -361,6 +361,9 @@ fn write_report(
             "stalled_unfinished": tel.stalled_unfinished,
             "stalled_repeating": tel.stalled_repeating,
             "verify_attributions": tel.verify_attributions,
+            "tool_calls": tel.tool_calls,
+            "max_concurrent_batch": tel.max_concurrent_batch,
+            "serial_runs": tel.serial_runs,
         },
     });
     std::fs::write(path, serde_json::to_string_pretty(&report)?)

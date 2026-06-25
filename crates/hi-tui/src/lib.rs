@@ -1797,7 +1797,7 @@ impl App {
         };
         let changed_h = usize::from(!self.last_changed_files.is_empty() && !self.working);
         // The Ctrl-? observability panel: header + 3 diagnostic lines.
-        let debug_h = if self.show_debug { 4 } else { 0 };
+        let debug_h = if self.show_debug { 5 } else { 0 };
         let input_h = if self.fetching.is_some() {
             3
         } else if let Some(p) = &self.picker {
@@ -2046,6 +2046,22 @@ impl App {
                     "telemetry: (no turn yet)".to_string()
                 };
                 ilines.push(Line::styled(tel, dim()));
+                // Scheduler parallelism: max concurrent batch and serial share.
+                let sched = if let Some(t) = self.last_telemetry.as_ref() {
+                    if t.tool_calls > 0 {
+                        format!(
+                            "scheduler: {} calls · max batch {} · {} serial",
+                            t.tool_calls, t.max_concurrent_batch, t.serial_runs,
+                        )
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
+                if !sched.is_empty() {
+                    ilines.push(Line::styled(sched, dim()));
+                }
                 ilines.push(Line::styled(
                     format!("tool calls this turn: {}", self.turn_tool_calls),
                     dim(),
@@ -2577,6 +2593,9 @@ mod tests {
             stalled_unfinished: false,
             stalled_repeating: false,
             verify_attributions: Vec::new(),
+            tool_calls: 7,
+            max_concurrent_batch: 3,
+            serial_runs: 2,
         });
         app.turn_tool_calls = 7;
         let mut term = Terminal::new(TestBackend::new(60, 16)).unwrap();

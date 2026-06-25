@@ -76,6 +76,17 @@ pub struct TurnTelemetry {
     /// verify passed, was skipped, or produced nothing parseable). Points at
     /// the file/line/symbol the model was steered toward.
     pub verify_attributions: Vec<TurnAttribution>,
+    /// Scheduler parallelism this turn: total tool calls executed.
+    pub tool_calls: u32,
+    /// Largest number of calls that ran concurrently in a single ready-batch
+    /// (1 = everything serialized; higher = the dep-aware scheduler overlapped
+    /// independent calls). Measures whether the scheduler's concurrency
+    /// actually helped.
+    pub max_concurrent_batch: u32,
+    /// How many calls ran serially (bash, or a lone ready call in a batch).
+    /// `tool_calls - serial_runs` is the count that ran as part of a parallel
+    /// batch; the parallelism ratio is `(tool_calls - serial_runs) / tool_calls`.
+    pub serial_runs: u32,
 }
 
 /// A serializable view of one parsed verify-failure location, for the telemetry
@@ -1220,6 +1231,13 @@ impl Agent {
         let mut empty_retries = 0u32;
         let mut continue_nudges = 0u32;
         let mut repeat_nudges = 0u32;
+        // Scheduler parallelism counters: how many calls ran this turn, the
+        // largest concurrent ready-batch, and how many ran serially (bash or a
+        // lone ready call). Flushed into telemetry so the dep-aware scheduler's
+        // concurrency is measurable, not shipped on faith.
+        let mut sched_tool_calls = 0u32;
+        let mut sched_max_concurrent = 0u32;
+        let mut sched_serial_runs = 0u32;
         // Signature (name, arguments) of the previous round's tool calls, to
         // spot a model re-issuing the exact same call and looping on it.
         let mut prev_call_sig: Option<Vec<(String, String)>> = None;
@@ -1587,12 +1605,17 @@ impl Agent {
                         completed[i] = true;
                         completion_order.push(i);
                         done += 1;
+                        // Bash runs alone → a serial run and a batch of size 1.
+                        sched_tool_calls += 1;
+                        sched_serial_runs += 1;
+                        sched_max_concurrent = sched_max_concurrent.max(1);
                         continue;
                     }
                     // Run all ready non-bash calls concurrently. Record the
                     // completion order as the ready order (within a concurrent
                     // batch, relative order doesn't matter — none depend on
                     // each other, or they wouldn't all be ready).
+                    let batch_size = ready.len() as u32;
                     for &i in &ready {
                         ui.tool_call(&calls[i].1, &calls[i].2);
                     }
@@ -1604,6 +1627,13 @@ impl Agent {
                     .buffered(self.config.max_parallel_tools)
                     .collect()
                     .await;
+                    // Scheduler telemetry: this batch ran `batch_size` calls
+                    // concurrently; a batch of 1 is a serial run.
+                    sched_tool_calls += batch_size;
+                    sched_max_concurrent = sched_max_concurrent.max(batch_size);
+                    if batch_size == 1 {
+                        sched_serial_runs += 1;
+                    }
                     for (&i, output) in ready.iter().zip(outputs) {
                         emit_tool_output(&mut *ui, &output);
                         results[i] = Some((calls[i].0.clone(), output.content));
@@ -1795,6 +1825,9 @@ impl Agent {
                 .iter()
                 .map(TurnAttribution::from)
                 .collect(),
+            tool_calls: sched_tool_calls,
+            max_concurrent_batch: sched_max_concurrent,
+            serial_runs: sched_serial_runs,
         };
 
         // Long-horizon driver: when a structured goal is set and long_horizon
@@ -3113,6 +3146,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scheduler_parallelism_counts_concurrent_batches() {
+        // A batch of independent reads (different paths, no deps) should run
+        // concurrently — telemetry reports max_concurrent_batch > 1 and a
+        // sub-100% serial share. Pins that the dep-aware scheduler's
+        // concurrency is measured, not just shipped on faith.
+        let mut cfg = config();
+        let responses = vec![completion(
+            vec![
+                Content::ToolCall {
+                    id: "r1".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"a.rs"}"#.into(),
+                },
+                Content::ToolCall {
+                    id: "r2".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"b.rs"}"#.into(),
+                },
+                Content::ToolCall {
+                    id: "r3".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"c.rs"}"#.into(),
+                },
+            ],
+            1,
+            1,
+        ),
+        completion(vec![Content::Text("done".into())], 1, 1),
+        completion(vec![Content::Text("done".into())], 1, 1)];
+        let mut agent = agent(responses, cfg);
+        let mut ui = RecUi::default();
+        agent.run_turn("read them", &mut ui).await.unwrap();
+        let tel = agent.last_turn_telemetry();
+        assert_eq!(tel.tool_calls, 3, "three reads ran: {:?}", tel);
+        assert!(
+            tel.max_concurrent_batch >= 2,
+            "independent reads overlapped: {:?}",
+            tel
+        );
+        assert!(
+            tel.serial_runs < tel.tool_calls,
+            "not all serial: {:?}",
+            tel
+        );
+    }
+
+    #[tokio::test]
     async fn hybrid_falls_back_to_summarize_when_too_few_turns() {
         let mut agent = agent(
             vec![completion(
@@ -3619,6 +3699,9 @@ mod tests {
             stalled_unfinished: false,
             stalled_repeating: false,
             verify_attributions: Vec::new(),
+            tool_calls: 0,
+            max_concurrent_batch: 0,
+            serial_runs: 0,
         };
         let steer = a.turn_steer().expect("noisy turn has a steer line");
         assert!(
@@ -3640,6 +3723,9 @@ mod tests {
             stalled_unfinished: true,
             stalled_repeating: false,
             verify_attributions: Vec::new(),
+            tool_calls: 0,
+            max_concurrent_batch: 0,
+            serial_runs: 0,
         };
         let steer = a.turn_steer().expect("stall has a steer line");
         assert!(steer.contains("stalled"), "stall flagged: {steer}");

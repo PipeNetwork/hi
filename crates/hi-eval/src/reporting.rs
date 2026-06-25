@@ -99,5 +99,31 @@ pub fn print_summary(results: &[RunResult], task_count: usize, active: &[&Config
                 rows.len()
             );
         }
+        // Scheduler parallelism: average over cells with tool calls — the max
+        // concurrent batch size and the share of calls that ran serially. A
+        // config whose batches are mostly serial (max_concurrent ≈ 1, most runs
+        // serial) isn't benefiting from the dep-aware scheduler; one with high
+        // max_concurrent and a low serial share is. Skipped when no cell used
+        // tools.
+        let tool_rows: Vec<&RunResult> =
+            rows.iter().filter(|r| r.trajectory.tool_calls > 0).copied().collect();
+        if !tool_rows.is_empty() {
+            let avg_max: f64 = tool_rows
+                .iter()
+                .map(|r| r.trajectory.max_concurrent_batch as f64)
+                .sum::<f64>()
+                / tool_rows.len() as f64;
+            let total_calls: u64 = tool_rows.iter().map(|r| r.trajectory.tool_calls as u64).sum();
+            let total_serial: u64 =
+                tool_rows.iter().map(|r| r.trajectory.serial_runs as u64).sum();
+            let serial_pct = if total_calls > 0 {
+                100 * total_serial / total_calls
+            } else {
+                0
+            };
+            println!(
+                "           parallel: {avg_max:.1} max concurrent batch · {serial_pct}% of {total_calls} calls serial",
+            );
+        }
     }
 }

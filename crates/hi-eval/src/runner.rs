@@ -321,6 +321,9 @@ fn read_report(path: &Path) -> ReportInfo {
                     .collect()
             })
             .unwrap_or_default(),
+        tool_calls: tel["tool_calls"].as_u64().unwrap_or(0) as u32,
+        max_concurrent_batch: tel["max_concurrent_batch"].as_u64().unwrap_or(0) as u32,
+        serial_runs: tel["serial_runs"].as_u64().unwrap_or(0) as u32,
     };
     ReportInfo {
         tokens: value["total_tokens"].as_u64().unwrap_or(0),
