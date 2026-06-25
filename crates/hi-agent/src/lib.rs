@@ -1259,9 +1259,43 @@ impl Agent {
                     ui.status(&format!("✗ {} failed; iterating", stage.name));
                     self.last_verify = Some(false);
                     let guidance = stage_guidance(&stage);
+                    // Attribution: parse the (already-condensed) failure output
+                    // into structured file/line/symbol hints and prepend a
+                    // "Likely cause" section so the model is pointed at the
+                    // right region first. Enrich-only — the raw `Output:` block
+                    // stays unchanged, so nothing the model could see before is
+                    // hidden. Empty when nothing parseable is found (the nudge
+                    // then keeps its original shape).
+                    let causes = hi_tools::parse_attributions(&output, 3);
+                    let cause_section = if causes.is_empty() {
+                        String::new()
+                    } else {
+                        let lines: Vec<String> = causes
+                            .iter()
+                            .map(|a| {
+                                let kind = match a.kind {
+                                    hi_tools::AttrKind::Compile => "compile",
+                                    hi_tools::AttrKind::Test => "test",
+                                    hi_tools::AttrKind::Lint => "lint",
+                                    hi_tools::AttrKind::Other => "other",
+                                };
+                                let loc = match (a.line, a.column) {
+                                    (Some(l), Some(c)) => format!("{}:{}:{}", a.path, l, c),
+                                    (Some(l), None) => format!("{}:{}", a.path, l),
+                                    _ => a.path.clone(),
+                                };
+                                if loc.is_empty() {
+                                    format!("- [{kind}] {}", a.message)
+                                } else {
+                                    format!("- [{kind}] {loc} — {}", a.message)
+                                }
+                            })
+                            .collect();
+                        format!("Likely cause (verify and fix first):\n{}\n\n", lines.join("\n"))
+                    };
                     let nudge_body = format!(
-                        "Verification stage `{}` failed (`{}`).\n\nOutput:\n{}\n\n{} If a previous \
-                         fix didn't work, reconsider rather than repeat it.",
+                        "{cause_section}Verification stage `{}` failed (`{}`).\n\nOutput:\n{}\n\n{} \
+                         If a previous fix didn't work, reconsider rather than repeat it.",
                         stage.name, stage.command, output, guidance
                     );
                     // Replace the previous verify nudge instead of accumulating.
@@ -2947,6 +2981,17 @@ mod tests {
             .iter()
             .any(|m| m.role == Role::User && m.text().contains("fix its root cause"));
         assert!(fed_back, "compile-stage guidance fed back");
+        // The `false` command's output isn't a parseable diagnostic, so the
+        // attribution layer adds no "Likely cause" section — the nudge keeps
+        // its original shape (enrich-only contract).
+        let has_cause = agent
+            .messages()
+            .iter()
+            .any(|m| m.role == Role::User && m.text().contains("Likely cause"));
+        assert!(
+            !has_cause,
+            "no attribution section for unparseable output"
+        );
     }
 
     #[tokio::test]
@@ -2991,6 +3036,61 @@ mod tests {
         agent.run_turn("x", &mut NullUi).await.unwrap();
         let _ = std::fs::remove_file(&tmp);
         assert_eq!(agent.last_verify(), Some(false));
+    }
+
+    #[tokio::test]
+    async fn verify_failure_nudge_carries_attribution() {
+        let _guard = VERIFY_TEST_LOCK.lock().await;
+        // A verify stage that emits a real rustc-style diagnostic should yield a
+        // "Likely cause" section in the nudge pointing at the parsed file:line,
+        // while the raw `Output:` block is preserved (enrich-only).
+        let mut cfg = config();
+        cfg.verify = vec![VerifyStage::new(
+            "check",
+            "printf 'error[E0308]: mismatched types\\n  --> src/lib.rs:42:18\\n' >&2; exit 1",
+        )];
+        cfg.max_verify_iterations = 1;
+        let tmp = temp_file("attr");
+        let p = tmp.to_string_lossy().to_string();
+        let mut agent = agent(
+            vec![
+                write_completion(&p),
+                completion(vec![Content::Text("attempt 1".into())], 1, 1),
+                completion(vec![Content::Text("attempt 2".into())], 1, 1),
+            ],
+            cfg,
+        );
+        let mut ui = RecUi::default();
+        agent.run_turn("x", &mut ui).await.unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        // The attribution section is present and points at the parsed location.
+        let nudge = agent
+            .messages()
+            .iter()
+            .find(|m| m.role == Role::User && m.text().contains("Likely cause"))
+            .expect("attribution section present");
+        let body = nudge.text();
+        assert!(
+            body.contains("Likely cause (verify and fix first)"),
+            "section header: {body}"
+        );
+        assert!(
+            body.contains("src/lib.rs:42:18"),
+            "parsed location in attribution: {body}"
+        );
+        assert!(
+            body.contains("[compile]"),
+            "compile kind label: {body}"
+        );
+        // Enrich-only: the raw output block is still there alongside it.
+        assert!(
+            body.contains("Output:\n"),
+            "raw Output block preserved: {body}"
+        );
+        assert!(
+            body.contains("mismatched types"),
+            "raw error message preserved in Output block: {body}"
+        );
     }
 
     #[tokio::test]

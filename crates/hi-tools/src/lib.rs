@@ -6,6 +6,7 @@
 pub mod checkpoint;
 pub mod guard;
 
+mod attribution;
 mod condense;
 mod edit;
 mod paths;
@@ -19,6 +20,8 @@ pub use tools::{
     TOOL_SPECS, commit, execute, execute_streaming, is_read_only, run_check, tool_specs,
     working_tree_diff, working_tree_diff_plain,
 };
+
+pub use attribution::{parse_attributions, AttrKind, Attribution};
 
 // `ToolOutput`'s constructors (`plain`/`shown`/`planned`) are crate-private and
 // used by `tools`/`read`; they live here because the type is part of the public
