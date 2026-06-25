@@ -20,7 +20,7 @@ pub use provider::{
 };
 pub use registry::{ModelInfo, Registry};
 pub use types::{
-    ChatRequest, CompatMode, Completion, Content, Message, RequestProfile, Role, StreamEvent,
-    ToolCall, ToolMode, ToolSpec, Usage, estimate_completion_output_tokens,
+    BillableBreakdown, ChatRequest, CompatMode, Completion, Content, Message, RequestProfile,
+    Role, StreamEvent, ToolCall, ToolMode, ToolSpec, Usage, estimate_completion_output_tokens,
     estimate_content_tokens, estimate_messages_tokens, estimate_text_tokens,
 };

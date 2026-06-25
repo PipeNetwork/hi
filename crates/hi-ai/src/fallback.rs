@@ -134,6 +134,7 @@ mod tests {
                 cache_creation_tokens: 0,
                 input_includes_cache: false,
                 context_occupancy: input,
+                billable: None,
             },
             stop_reason: None,
         }
@@ -149,6 +150,7 @@ mod tests {
                 cache_creation_tokens: 0,
                 input_includes_cache: false,
                 context_occupancy: input,
+                billable: None,
             },
             stop_reason: None,
         }

@@ -111,7 +111,7 @@ impl Default for AgentConfig {
             max_verify_iterations: 2,
             max_steps: 500,
             auto_compact: true,
-            compaction: CompactionKind::Hybrid {
+            compaction: CompactionKind::ElideThenSummarizeTail {
                 keep_recent: DEFAULT_KEEP_RECENT,
             },
             finalize: true,

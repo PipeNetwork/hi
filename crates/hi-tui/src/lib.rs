@@ -49,6 +49,30 @@ use util::{clip_reason, copy_to_clipboard, fmt_count, fmt_elapsed, goal_feedback
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 /// How many model rows the `/model` picker shows at once.
 pub(crate) const PICKER_ROWS: usize = 12;
+
+/// A synchronous, plain (uncolored) `git diff` of the working tree, for the
+/// `Ctrl-D` diff panel. The TUI applies its own highlighting via `diff_lines`,
+/// so we want the raw diff without ANSI codes. Returns empty when not a git
+/// repo or there are no changes. Synchronous because the key handler isn't
+/// async and `git diff` is fast/user-initiated.
+fn working_tree_diff_sync() -> String {
+    let out = std::process::Command::new("git")
+        .args(["--no-pager", "diff", "--no-color", "HEAD"])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
+        // Not a git repo / no HEAD: fall back to an untracked+unstaged diff.
+        Ok(_) => {
+            let untracked = std::process::Command::new("git")
+                .args(["--no-pager", "diff", "--no-color"])
+                .output();
+            untracked
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .unwrap_or_default()
+        }
+        Err(_) => String::new(),
+    }
+}
 const TICK: Duration = Duration::from_millis(120);
 /// Only flag a possibly-stuck provider after a long, genuinely silent wait — the
 /// working line already shows the live elapsed time, so an earlier notice just
@@ -470,6 +494,12 @@ pub async fn run(
         } else {
             // Turn finished on its own — ping if you've likely stepped away.
             app.maybe_notify_done();
+            // Capture which files this turn changed, so the "changed: …" line
+            // above the input reflects the latest turn. The agent already
+            // computed this for verify gating; reuse it rather than re-walking.
+            app.last_changed_files = agent.last_changed_files().to_vec();
+            // A new turn's edits supersede any open diff panel's snapshot.
+            app.diff_text = None;
         }
         app.set_working(false);
         // No follow() at turn end: if the user scrolled up to read mid-turn, leave
@@ -686,6 +716,16 @@ struct App {
     last_turn_event: Option<TurnEventKind>,
     /// Whether the current/last turn invoked file-editing tools.
     last_turn_had_file_edits: bool,
+    /// Files the last turn changed (from `agent.last_changed_files()`), shown
+    /// as a compact "changed: …" line above the input so the user always sees
+    /// what a turn touched without scrolling the transcript.
+    last_changed_files: Vec<String>,
+    /// Whether the `Ctrl-D` diff panel is open (a full working-tree diff pinned
+    /// above the input, rendered with the same highlighting as tool-output diffs).
+    show_diff: bool,
+    /// Cached working-tree diff text for the open diff panel, refreshed when the
+    /// panel is toggled on so it reflects the current tree, not a stale snapshot.
+    diff_text: Option<String>,
     waiting_for: Option<Duration>,
     last_turn_state: TurnState,
     last_error: Option<String>,
@@ -760,6 +800,9 @@ impl App {
             last_assistant: String::new(),
             last_turn_event: None,
             last_turn_had_file_edits: false,
+            last_changed_files: Vec::new(),
+            show_diff: false,
+            diff_text: None,
             waiting_for: None,
             last_turn_state: TurnState::Idle,
             last_error: None,
@@ -1015,6 +1058,18 @@ impl App {
             KeyCode::Char('u') if ctrl => self.input.kill_to_start(),
             KeyCode::Char('a') if ctrl => self.input.home(),
             KeyCode::Char('e') if ctrl => self.input.end(),
+            // Toggle the working-tree diff panel. Refreshed when opened so it
+            // reflects the current tree, not a stale snapshot. Fetched
+            // synchronously (a `git diff` is fast and user-initiated) since the
+            // key handler isn't async.
+            KeyCode::Char('d') if ctrl => {
+                self.show_diff = !self.show_diff;
+                if self.show_diff {
+                    self.diff_text = Some(working_tree_diff_sync());
+                } else {
+                    self.diff_text = None;
+                }
+            }
             KeyCode::Home => self.input.home(),
             KeyCode::End => self.input.end(),
             KeyCode::Char(c) if !ctrl => self.input.insert(c),
@@ -1670,6 +1725,15 @@ impl App {
         // The live plan checklist, pinned just above the input (input-bar state only).
         let plan_block = self.plan_lines();
         let plan_h = plan_block.len();
+        // The optional Ctrl-D diff panel height (header + up to 20 diff lines +
+        // optional "more" line) and the compact changed-files summary line.
+        let diff_h = if self.show_diff && self.diff_text.is_some() {
+            let n = self.diff_text.as_deref().map(|t| t.trim().lines().count()).unwrap_or(0);
+            1 + n.min(20) + usize::from(n > 20)
+        } else {
+            0
+        };
+        let changed_h = usize::from(!self.last_changed_files.is_empty() && !self.working);
         let input_h = if self.fetching.is_some() {
             3
         } else if let Some(p) = &self.picker {
@@ -1677,7 +1741,9 @@ impl App {
             let rows = p.matches.len().clamp(1, PICKER_ROWS) as u16;
             (rows + 3).min(area.height.saturating_sub(3))
         } else {
-            (plan_h + status_lines + completion_rows + input_lines.len() + queued_shown
+            (plan_h + diff_h + changed_h + status_lines + completion_rows
+                + input_lines.len()
+                + queued_shown
                 + queue_extra
                 + 2) as u16
         };
@@ -1842,6 +1908,53 @@ impl App {
             let mut ilines: Vec<Line> = Vec::new();
             // Pinned plan checklist at the very top of the input box.
             ilines.extend(plan_block);
+            // The `Ctrl-D` working-tree diff panel: a compact view of what's
+            // changed in the tree, rendered with the same highlighting as
+            // tool-output diffs. Sits above the changed-files summary line.
+            if self.show_diff
+                && let Some(text) = &self.diff_text
+            {
+                ilines.push(Line::styled(
+                    "diff (Ctrl-D to close)".to_string(),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    ilines.push(Line::styled("(no changes in the working tree)", dim()));
+                } else {
+                    // `diff_lines` parses the whole body (tracking `@@` line
+                    // numbers) into highlighted lines; cap the result so a huge
+                    // diff can't swallow the input box. The full diff is one
+                    // `git diff` away.
+                    let rendered = diff_lines(trimmed);
+                    let total = rendered.len();
+                    for line in rendered.into_iter().take(20) {
+                        ilines.push(line);
+                    }
+                    if total > 20 {
+                        ilines.push(Line::styled(
+                            format!("  … +{} more (see `git diff`)", total - 20),
+                            dim(),
+                        ));
+                    }
+                }
+            }
+            // A compact "changed: …" line so the user always sees what the last
+            // turn touched, without opening the diff panel or scrolling.
+            if !self.last_changed_files.is_empty() && !self.working {
+                let summary = self
+                    .last_changed_files
+                    .iter()
+                    .map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                ilines.push(Line::styled(
+                    format!("changed: {summary}  (Ctrl-D for diff)"),
+                    dim(),
+                ));
+            }
             if let Some(notice) = &self.startup_notice {
                 ilines.push(Line::styled(
                     notice.clone(),
@@ -1929,6 +2042,8 @@ impl App {
             // Cursor sits within the editable input — below the optional startup
             // notice, the status line, and the completion menu.
             let above = plan_h
+                + diff_h
+                + changed_h
                 + usize::from(self.startup_notice.is_some())
                 + status_lines
                 + self.completion_items().len();
@@ -2297,6 +2412,47 @@ mod tests {
     }
 
     #[test]
+    fn changed_files_line_shows_what_last_turn_touched() {
+        // After a turn that changed files, a compact "changed: …" line sits
+        // above the input so the user sees what was touched without scrolling.
+        let mut app = App::new("openai", "gpt-4o");
+        app.last_changed_files = vec!["src/a.rs".into(), "src/b.rs".into()];
+        let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let screen = dump(&term);
+        assert!(
+            screen.contains("changed: src/a.rs, src/b.rs"),
+            "changed-files line: {screen}"
+        );
+        assert!(
+            screen.contains("Ctrl-D for diff"),
+            "diff toggle hint: {screen}"
+        );
+    }
+
+    #[test]
+    fn ctrl_d_toggles_the_diff_panel() {
+        // Toggling Ctrl-D opens the panel with the cached diff text and a
+        // header; toggling again closes it. We set diff_text directly to avoid
+        // a real git call in the unit test.
+        let mut app = App::new("openai", "gpt-4o");
+        app.show_diff = true;
+        app.diff_text = Some("--- a/x\n+++ b/x\n@@ -1,1 +1,1 @@\n-old\n+new\n".into());
+        let mut term = Terminal::new(TestBackend::new(60, 14)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let screen = dump(&term);
+        assert!(screen.contains("diff (Ctrl-D to close)"), "panel header: {screen}");
+        assert!(screen.contains("+new"), "diff content rendered: {screen}");
+
+        // Closing drops the panel.
+        app.show_diff = false;
+        app.diff_text = None;
+        term.draw(|f| app.render(f)).unwrap();
+        let screen2 = dump(&term);
+        assert!(!screen2.contains("diff (Ctrl-D to close)"), "panel closed: {screen2}");
+    }
+
+    #[test]
     fn in_progress_line_is_styled_live() {
         // A heading still streaming (no trailing newline yet) renders styled with
         // its markers stripped — not literally as "## …" until the line commits.
@@ -2362,6 +2518,27 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect();
         assert!(line.contains("✓ done"), "got: {line}");
+    }
+
+    #[test]
+    fn turn_end_renders_the_steer_suffix_from_the_summary() {
+        // The agent appends a "steer" suffix to the usage summary for noisy
+        // turns; the TUI renders that string verbatim, so the suffix surfaces
+        // in both the status bar and the done marker with no TUI-specific code.
+        let mut app = App::new("openai", "gpt-4o");
+        let noisy = "[↑10 ↓2 · ctx 5% (500/10k) · steer: 2 verify · 1 retry]";
+        app.apply(UiEvent::TurnEnd(noisy.into()));
+        assert!(
+            app.status.contains("steer: 2 verify"),
+            "steer in status bar: {}",
+            app.status
+        );
+        let line: String = app.transcript[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(line.contains("steer"), "steer in done marker: {line}");
     }
 
     #[test]

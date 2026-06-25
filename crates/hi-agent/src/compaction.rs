@@ -30,6 +30,16 @@ pub enum CompactionKind {
     /// Deterministic, no model call: replace the output of tool results older
     /// than `keep_recent` turns with a short stub.
     ElideToolOutput { keep_recent: usize },
+    /// Elide-first, summarize-only-the-conversational-tail. Keep the last
+    /// `keep_recent` user turns verbatim (with their tool results elided, not
+    /// summarized, so the call/result skeleton stays). For turns older than the
+    /// recent window: elide the ones that carry tool results (their *shape* —
+    /// which tool, which file — stays; only bulky output is stubbed), and
+    /// summarize only the tool-free Q&A turns into a brief folded into the
+    /// first kept turn. This is the right default for tool-heavy coding
+    /// sessions, where the recent tool results matter most and a summary of
+    /// them would be lossy in exactly the wrong way.
+    ElideThenSummarizeTail { keep_recent: usize },
 }
 
 impl CompactionKind {
@@ -42,6 +52,9 @@ impl CompactionKind {
                 keep_recent: DEFAULT_KEEP_RECENT,
             }),
             "elide" | "tools" | "tool" => Some(Self::ElideToolOutput {
+                keep_recent: DEFAULT_KEEP_RECENT,
+            }),
+            "tail" | "default" => Some(Self::ElideThenSummarizeTail {
                 keep_recent: DEFAULT_KEEP_RECENT,
             }),
             _ => None,
@@ -71,6 +84,53 @@ pub(crate) fn recent_split(messages: &[Message], keep_recent: usize) -> Option<u
     }
     let starts = user_turn_starts(messages);
     (starts.len() > keep_recent).then(|| starts[starts.len() - keep_recent])
+}
+
+/// Whether the slice `[1..split)` contains any tool results. Used by the
+/// elide-then-summarize-tail strategy to decide whether the "old" region is
+/// tool-heavy (elide it, keep the skeleton) or conversational (summarize it).
+pub(crate) fn has_tool_results(messages: &[Message], split: usize) -> bool {
+    let up_to = split.min(messages.len());
+    messages[1..up_to]
+        .iter()
+        .flat_map(|m| &m.content)
+        .any(|c| matches!(c, Content::ToolResult { .. }))
+}
+
+/// The "old" conversational tail (pure Q&A user turns) that the
+/// elide-then-summarize-tail strategy summarizes. A user turn counts as
+/// conversational iff the assistant reply that follows it made **no tool
+/// calls** — a user turn that triggered tool use is part of a tool-bearing
+/// turn and gets elided (skeleton kept), not summarized. Returns the messages
+/// of those conversational old turns (in `[1..split)`) in order, so the
+/// summarizer sees the actual Q&A exchange, not just the prompts.
+pub(crate) fn conversational_tail(messages: &[Message], split: usize) -> Vec<Message> {
+    let up_to = split.min(messages.len());
+    let starts = user_turn_starts(messages);
+    let mut out = Vec::new();
+    for (idx, &start) in starts.iter().enumerate() {
+        if start >= up_to {
+            break;
+        }
+        let end = if idx + 1 < starts.len() {
+            starts[idx + 1].min(up_to)
+        } else {
+            up_to
+        };
+        // Was the assistant reply in [start..end) tool-free? If there was no
+        // assistant message, treat the turn as conversational (a bare user
+        // turn, e.g. the last partial turn).
+        let has_tool_call = messages[start..end].iter().any(|m| {
+            m.role == Role::Assistant
+                && m.content
+                    .iter()
+                    .any(|c| matches!(c, Content::ToolCall { .. }))
+        });
+        if !has_tool_call {
+            out.extend_from_slice(&messages[start..end]);
+        }
+    }
+    out
 }
 
 /// A rough token estimate (~4 chars/token) across all message content — used to
@@ -305,5 +365,32 @@ mod tests {
             Message::tool_result("c", "b".repeat(40)), // 10 tokens
         ];
         assert_eq!(estimate_tokens(&m), 20);
+    }
+
+    #[test]
+    fn has_tool_results_and_conversational_tail_partition_the_old_region() {
+        let m = convo(); // system, q1, read call, big result, q2, answer
+        let split = recent_split(&m, 1).unwrap(); // q2 onward is recent → split at q2
+        // The old region [1..split) is turn one: q1 + read call + big result.
+        assert!(has_tool_results(&m, split), "old region has the read result");
+        // Turn one's assistant reply made a tool call, so it's NOT part of the
+        // conversational tail — the tail is empty for this conversation.
+        let tail = conversational_tail(&m, split);
+        assert!(tail.is_empty(), "tool turn excluded from Q&A tail: {tail:?}");
+
+        // A conversation with a real Q&A turn: system, q1 + text answer (Q&A),
+        // q2 + tool turn (recent).
+        let m2 = vec![
+            Message::system("sys"),
+            Message::user("q1"),
+            Message::assistant(vec![Content::Text("a1".into())]), // no tool call → Q&A
+            Message::user("q2"),
+            Message::assistant(vec![Content::Text("a2".into())]),
+        ];
+        let split2 = recent_split(&m2, 1).unwrap(); // q2 is recent
+        let tail2 = conversational_tail(&m2, split2);
+        assert_eq!(tail2.len(), 2, "q1 + a1 form the Q&A tail: {tail2:?}");
+        assert_eq!(tail2[0].role, Role::User);
+        assert_eq!(tail2[1].role, Role::Assistant);
     }
 }

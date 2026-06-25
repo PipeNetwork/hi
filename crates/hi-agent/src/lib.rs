@@ -361,25 +361,29 @@ impl Agent {
         if !usage.is_zero() {
             match (self.cost_usd, self.config.price) {
                 (Some(total), Some((input_price, output_price))) => {
-                    // Provider token semantics differ:
-                    // - Anthropic: input_tokens EXCLUDES cache tokens, which are
-                    //   reported separately in cache_read/cache_creation.
-                    // - OpenAI: prompt_tokens INCLUDES cached tokens (already in
-                    //   input_tokens), and cache_read_tokens is the subset that
-                    //   was cached.
-                    // We don't know the provider here, but both cases converge
-                    // if we treat input_tokens as the non-cached portion and add
-                    // the discounted cache portions. For OpenAI the cached tokens
-                    // are double-counted at most at full price (conservative).
-                    let regular_input = usage.input_tokens.saturating_sub(usage.cache_read_tokens);
-                    self.cost_usd = Some(
-                        total
-                            + (regular_input as f64 * input_price
-                                + usage.cache_read_tokens as f64 * input_price * 0.5
-                                + usage.cache_creation_tokens as f64 * input_price * 1.25
-                                + usage.output_tokens as f64 * output_price)
-                            / 1_000_000.0,
-                    );
+                    // Prefer the provider-computed normalized breakdown when
+                    // available — it correctly decomposes tokens into priced
+                    // buckets regardless of provider (OpenAI's prompt_tokens
+                    // includes cached; Anthropic reports cache separately), so
+                    // a session that switches models mid-run still accrues cost
+                    // coherently. Fall back to the input-excludes-cache
+                    // heuristic for legacy/error paths that don't set `billable`.
+                    let cost = if let Some(b) = usage.billable {
+                        (b.regular_input as f64 * input_price
+                            + b.cached_input as f64 * input_price * 0.5
+                            + b.cache_creation as f64 * input_price * 1.25
+                            + b.output as f64 * output_price)
+                            / 1_000_000.0
+                    } else {
+                        let regular_input =
+                            usage.input_tokens.saturating_sub(usage.cache_read_tokens);
+                        (regular_input as f64 * input_price
+                            + usage.cache_read_tokens as f64 * input_price * 0.5
+                            + usage.cache_creation_tokens as f64 * input_price * 1.25
+                            + usage.output_tokens as f64 * output_price)
+                            / 1_000_000.0
+                    };
+                    self.cost_usd = Some(total + cost);
                 }
                 (_, None) => {
                     self.cost_usd = None;
@@ -555,6 +559,9 @@ impl Agent {
                 self.compact_elide(keep_recent, ui);
                 Ok(())
             }
+            CompactionKind::ElideThenSummarizeTail { keep_recent } => {
+                self.compact_elide_then_summarize_tail(keep_recent, ui).await
+            }
         }
     }
 
@@ -644,6 +651,83 @@ impl Agent {
             let _ = session.record_compaction(&self.messages.arc());
         }
         ui.status("✓ compacted — kept recent turns, summarized the rest");
+        Ok(())
+    }
+
+    /// Elide-first, summarize-only-the-conversational-tail. Keep the recent
+    /// `keep_recent` turns verbatim (their tool results elided, skeleton kept).
+    /// For old turns: **keep** the tool-bearing ones in history with their bulky
+    /// output elided (the call/result skeleton stays, so the model remembers
+    /// "I read file X" — just without the verbatim output), and summarize only
+    /// the tool-free Q&A turns into a brief folded into the first kept turn. A
+    /// pure tool-heavy session with no old Q&A makes no model call at all — just
+    /// the deterministic elision.
+    async fn compact_elide_then_summarize_tail(
+        &mut self,
+        keep_recent: usize,
+        ui: &mut dyn Ui,
+    ) -> Result<()> {
+        let Some(split) = compaction::recent_split(self.messages.as_slice(), keep_recent) else {
+            // Nothing older than the recent window — fall back to summarizing
+            // everything so a triggered compaction still makes progress.
+            return self.compact_summarize(ui).await;
+        };
+        // Elide bulky tool output everywhere older than the recent window. The
+        // tool-bearing messages themselves stay (skeleton kept); only their
+        // output is stubbed.
+        compaction::elide_tool_outputs(self.messages.mutate_slice(), split);
+
+        // Summarize only the conversational (tool-free) old tail. The tool-bearing
+        // old turns are NOT summarized — they stay in history, elided.
+        let convo = compaction::conversational_tail(self.messages.as_slice(), split);
+        let summary = if convo.is_empty() {
+            None
+        } else {
+            self.summarize(&convo, ui).await?
+        };
+
+        // Rebuild: system + old tool-bearing turns (elided, kept) + recent turns
+        // (with the Q&A summary folded into the first recent turn). The old
+        // Q&A-only messages are dropped (replaced by the summary).
+        let system = self.system_message();
+        let old = self.messages.as_slice()[1..split]
+            .iter()
+            .filter(|m| {
+                m.content
+                    .iter()
+                    .any(|c| matches!(c, Content::ToolCall { .. } | Content::ToolResult { .. }))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut recent = self.messages.as_slice()[split..].to_vec();
+        let had_summary = summary.is_some();
+        if let Some(summary) = summary {
+            // Fold the brief into the first kept turn (avoids two consecutive
+            // user messages, which some providers reject) — same shape as
+            // `compact_hybrid`. If the old tool-bearing region is non-empty, the
+            // summary sits between it and the recent turns as a user message —
+            // which is fine as long as it doesn't create two consecutive users.
+            // The last old message is a ToolResult (tool-bearing), so a user
+            // summary after it alternates correctly.
+            let head = recent[0].text();
+            recent[0] = Message::user(format!(
+                "[Summary of earlier conversation]\n\n{summary}\n\n---\n\n{head}"
+            ));
+        }
+        let mut next = Vec::with_capacity(1 + old.len() + recent.len());
+        next.push(system);
+        next.extend(old);
+        next.extend(recent);
+        self.messages.replace_all(next);
+        self.persisted = self.messages.len();
+        if let Some(session) = self.session.as_mut() {
+            let _ = session.record_compaction(&self.messages.arc());
+        }
+        if had_summary {
+            ui.status("✓ compacted — elided old tool output, summarized the Q&A tail");
+        } else {
+            ui.status("✓ compacted — elided old tool output (no Q&A tail to summarize)");
+        }
         Ok(())
     }
 
@@ -907,6 +991,12 @@ impl Agent {
         // deterministic elision of old tool output first; then, only if still
         // heavy, the configured summarizing strategy. Best-effort — a failed
         // model call just leaves the (already elided) history as-is.
+        //
+        // The outer trigger uses the provider-reported `context_used` (the last
+        // request's occupancy — the most accurate signal, and only meaningful
+        // once a real request has happened, so a fresh session isn't
+        // over-eagerly compacted). Tier 2 below gates on a local token estimate
+        // instead, because `context_used` is stale by then.
         if self.config.auto_compact
             && let Some(window) = self.config.context_window
             && window > 0
@@ -917,7 +1007,8 @@ impl Agent {
                 self.context_used * 100 / u64::from(window)
             ));
             // Tier 1: deterministic, no model call. Only old turns are eligible.
-            if let Some(split) = compaction::recent_split(self.messages.as_slice(), AUTO_KEEP_RECENT)
+            if let Some(split) =
+                compaction::recent_split(self.messages.as_slice(), AUTO_KEEP_RECENT)
             {
                 compaction::elide_tool_outputs(self.messages.mutate_slice(), split);
             }
@@ -1560,8 +1651,43 @@ impl Agent {
                 humanize_count(u64::from(window)),
             ));
         }
+        // Per-turn trajectory: a terse "steer" suffix when the turn needed
+        // more than one shot, so a noisy success reads differently from a clean
+        // one. Clean turns (no verify rounds, no recovery retries, no nudges,
+        // no stalls) add nothing. See `TurnTelemetry`.
+        if let Some(steer) = self.turn_steer() {
+            summary.push_str(&format!(" · {steer}"));
+        }
         summary.push(']');
         summary
+    }
+
+    /// A terse per-turn steering summary for the usage line, or `None` when the
+    /// turn was clean (no extra rounds of any kind, no stall). Format:
+    /// `steer: 2 verify · 1 retry · stalled` — components omitted when zero.
+    fn turn_steer(&self) -> Option<String> {
+        let t = &self.last_turn_telemetry;
+        let mut parts: Vec<String> = Vec::new();
+        if t.verify_rounds > 0 {
+            parts.push(format!("{} verify", t.verify_rounds));
+        }
+        if t.recovery_retries > 0 {
+            parts.push(format!("{} retry", t.recovery_retries));
+        }
+        if t.repeat_nudges > 0 {
+            parts.push(format!("{} repeat", t.repeat_nudges));
+        }
+        if t.continue_nudges > 0 {
+            parts.push(format!("{} continue", t.continue_nudges));
+        }
+        if t.stalled_unfinished || t.stalled_repeating {
+            parts.push("stalled".to_string());
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(format!("steer: {}", parts.join(" · ")))
+        }
     }
 
     fn request_tools(&self) -> Arc<[ToolSpec]> {
@@ -2325,6 +2451,131 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn elide_then_summarize_tail_elides_tool_turns_summarizes_qa() {
+        // A session with: an old tool-bearing turn (q1 + read + big result), an
+        // old Q&A turn (q2 + text), and a recent turn (q3). The new default
+        // strategy should elide the old tool result (keep the call/result
+        // skeleton) and summarize only the old Q&A tail, folding the summary
+        // into the first kept turn. The recent turn stays verbatim.
+        let mut agent = agent(
+            vec![completion(vec![Content::Text("QA SUMMARY".into())], 1, 1)],
+            config(),
+        );
+        // Old tool-bearing turn.
+        agent.messages_mut().push(Message::user("q1"));
+        agent.messages_mut().push(Message::assistant(vec![Content::ToolCall {
+            id: "c1".into(),
+            name: "read".into(),
+            arguments: "{}".into(),
+        }]));
+        agent
+            .messages_mut()
+            .push(Message::tool_result("c1", "x".repeat(500)));
+        // Old Q&A turn (no tool results) — this is the conversational tail.
+        agent.messages_mut().push(Message::user("q2"));
+        agent
+            .messages_mut()
+            .push(Message::assistant(vec![Content::Text("a2".into())]));
+        // Recent turn.
+        agent.messages_mut().push(Message::user("q3"));
+        agent
+            .messages_mut()
+            .push(Message::assistant(vec![Content::Text("a3".into())]));
+
+        agent
+            .compact_with(
+                CompactionKind::ElideThenSummarizeTail { keep_recent: 1 },
+                &mut NullUi,
+            )
+            .await
+            .unwrap();
+
+        let m = agent.messages();
+        // The old tool result must be elided (skeleton kept, not wiped).
+        let tool_results: Vec<&str> = m
+            .iter()
+            .flat_map(|msg| &msg.content)
+            .filter_map(|c| match c {
+                Content::ToolResult { output, .. } => Some(output.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            tool_results.iter().any(|o| o.starts_with("[elided")),
+            "old tool result elided (skeleton kept): {tool_results:?}"
+        );
+        assert!(
+            !tool_results.iter().any(|o| o.contains(&"x".repeat(100))),
+            "old tool output content gone: {tool_results:?}"
+        );
+        // The Q&A summary is folded into the first kept turn (q3), and q3 stays.
+        let user_texts: Vec<String> = m
+            .iter()
+            .filter(|msg| msg.role == Role::User)
+            .map(|msg| msg.text())
+            .collect();
+        assert!(
+            user_texts.iter().any(|t| t.contains("QA SUMMARY")),
+            "Q&A tail summarized and folded: {user_texts:?}"
+        );
+        assert!(
+            user_texts.iter().any(|t| t.contains("q3")),
+            "recent turn kept: {user_texts:?}"
+        );
+        // Provider-safe: roles alternate.
+        assert!(
+            m.windows(2).all(|w| w[0].role != w[1].role),
+            "roles must alternate: {:?}",
+            m.iter().map(|x| x.role).collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn elide_then_summarize_tail_skips_model_call_when_no_qa_tail() {
+        // A pure tool-heavy session (no old Q&A turns): the strategy should
+        // elide and NOT make a summarizing model call. Provide no canned
+        // completion — if it tried to summarize, the provider would panic on
+        // an empty response list.
+        let mut agent = agent(vec![], config());
+        agent.messages_mut().push(Message::user("q1"));
+        agent.messages_mut().push(Message::assistant(vec![Content::ToolCall {
+            id: "c1".into(),
+            name: "read".into(),
+            arguments: "{}".into(),
+        }]));
+        agent
+            .messages_mut()
+            .push(Message::tool_result("c1", "x".repeat(500)));
+        agent.messages_mut().push(Message::user("q2"));
+        agent
+            .messages_mut()
+            .push(Message::assistant(vec![Content::Text("a2".into())]));
+
+        // keep_recent = 1 → q2 is recent; q1's tool result is old and gets
+        // elided. No Q&A tail older than q2 → no model call.
+        agent
+            .compact_with(
+                CompactionKind::ElideThenSummarizeTail { keep_recent: 1 },
+                &mut NullUi,
+            )
+            .await
+            .unwrap();
+        let m = agent.messages();
+        let tool_results: Vec<&str> = m
+            .iter()
+            .flat_map(|msg| &msg.content)
+            .filter_map(|c| match c {
+                Content::ToolResult { output, .. } => Some(output.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            tool_results.iter().any(|o| o.starts_with("[elided")),
+            "old tool result elided: {tool_results:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn hybrid_falls_back_to_summarize_when_too_few_turns() {
         let mut agent = agent(
             vec![completion(
@@ -2807,6 +3058,54 @@ mod tests {
             !line.contains("20000") && !line.contains("12000"),
             "no raw token counts: {line}"
         );
+        // A clean turn (one tool call, no verify/retry/nudge) shows no steer
+        // suffix — the trajectory surface is additive, only for noisy turns.
+        assert!(
+            !line.contains("steer"),
+            "clean turn has no steer suffix: {line}"
+        );
+    }
+
+    #[test]
+    fn turn_steer_summarizes_trajectory() {
+        // Clean turn → None.
+        let mut a = agent(vec![], config());
+        assert_eq!(a.turn_steer(), None);
+
+        // Noisy turn → a steer line listing each non-zero component.
+        a.last_turn_telemetry = TurnTelemetry {
+            verify_rounds: 2,
+            recovery_retries: 1,
+            repeat_nudges: 0,
+            continue_nudges: 0,
+            hit_step_cap: false,
+            stalled_unfinished: false,
+            stalled_repeating: false,
+            verify_attributions: Vec::new(),
+        };
+        let steer = a.turn_steer().expect("noisy turn has a steer line");
+        assert!(
+            steer.contains("2 verify") && steer.contains("1 retry"),
+            "lists non-zero components: {steer}"
+        );
+        assert!(
+            !steer.contains("repeat") && !steer.contains("continue"),
+            "omits zero components: {steer}"
+        );
+
+        // A stall is surfaced even with no rounds.
+        a.last_turn_telemetry = TurnTelemetry {
+            verify_rounds: 0,
+            recovery_retries: 0,
+            repeat_nudges: 0,
+            continue_nudges: 0,
+            hit_step_cap: false,
+            stalled_unfinished: true,
+            stalled_repeating: false,
+            verify_attributions: Vec::new(),
+        };
+        let steer = a.turn_steer().expect("stall has a steer line");
+        assert!(steer.contains("stalled"), "stall flagged: {steer}");
     }
 
     #[tokio::test]
@@ -2824,6 +3123,69 @@ mod tests {
         agent.run_turn("second", &mut NullUi).await.unwrap();
 
         assert_eq!(agent.cost_usd(), Some(0.006));
+    }
+
+    #[test]
+    fn add_usage_uses_normalized_billable_across_provider_semantics() {
+        // A session that switches providers mid-run must accrue cost coherently.
+        // The `billable` breakdown is provider-computed, so the agent's cost
+        // math doesn't have to know whether `input_tokens` includes cached
+        // tokens (OpenAI) or excludes them (Anthropic). Pin: an OpenAI-style
+        // usage where input_tokens already includes the cached subset must NOT
+        // double-count the cached tokens, and an Anthropic-style usage where
+        // input excludes cache must still bill the cache portion at a discount.
+        let mut cfg = config();
+        cfg.price = Some((1.0, 10.0)); // $/1M in, out
+        let mut a = agent(vec![], cfg);
+
+        // OpenAI-style: prompt_tokens=1000 includes 400 cached. The normalized
+        // breakdown separates them: 600 regular + 400 cached. Cost must bill
+        // 600 at full price + 400 at 0.5x — NOT 1000 + 400 (double-count).
+        a.add_usage(Usage {
+            input_tokens: 1000,
+            output_tokens: 0,
+            cache_read_tokens: 400,
+            cache_creation_tokens: 0,
+            input_includes_cache: true,
+            context_occupancy: 1000,
+            billable: Some(hi_ai::BillableBreakdown {
+                regular_input: 600,
+                cached_input: 400,
+                cache_creation: 0,
+                output: 0,
+            }),
+        });
+        let openai_cost = a.cost_usd().unwrap();
+        // 600*1 + 400*0.5 = 800 token-units -> $0.0008
+        assert!(
+            (openai_cost - 0.0008).abs() < 1e-9,
+            "openai no double-count: {openai_cost}"
+        );
+
+        // Anthropic-style: input_tokens=600 excludes 400 cache_read + 100
+        // cache_creation. The breakdown bills 600 regular + 400 at 0.5x + 100
+        // at 1.25x. The agent must NOT re-derive (which would wrongly subtract
+        // cache_read from input_tokens).
+        a.add_usage(Usage {
+            input_tokens: 600,
+            output_tokens: 50,
+            cache_read_tokens: 400,
+            cache_creation_tokens: 100,
+            input_includes_cache: false,
+            context_occupancy: 1100,
+            billable: Some(hi_ai::BillableBreakdown {
+                regular_input: 600,
+                cached_input: 400,
+                cache_creation: 100,
+                output: 50,
+            }),
+        });
+        let total = a.cost_usd().unwrap();
+        // anthropic increment: 600*1 + 400*0.5 + 100*1.25 + 50*10 = 600+200+125+500 = 1425 -> $0.001425
+        assert!(
+            (total - (0.0008 + 0.001425)).abs() < 1e-9,
+            "coherent cumulative across providers: {total}"
+        );
     }
 
     #[tokio::test]

@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 
 use crate::provider::{Provider, ProviderError, ProviderErrorKind};
 use crate::types::{
-    ChatRequest, Completion, Content, Message, Role, StreamEvent, Usage,
+    BillableBreakdown, ChatRequest, Completion, Content, Message, Role, StreamEvent, Usage,
     estimate_completion_output_tokens, estimate_messages_tokens,
 };
 
@@ -130,6 +130,7 @@ impl Provider for AnthropicProvider {
                         cache_creation_tokens: 0,
                         input_includes_cache: false,
                         context_occupancy: estimate_messages_tokens(&request.messages),
+                        billable: None,
                     })
                     .into());
                 }
@@ -155,6 +156,15 @@ impl Provider for AnthropicProvider {
                     completion.usage.context_occupancy = completion.usage.input_tokens
                         + completion.usage.cache_read_tokens
                         + completion.usage.cache_creation_tokens;
+                    // Normalized billable breakdown: Anthropic's `input_tokens`
+                    // already excludes cache, so regular input is exactly
+                    // `input_tokens`. Output is filled later from `message_delta`.
+                    completion.usage.billable = Some(BillableBreakdown {
+                        regular_input: completion.usage.input_tokens,
+                        cached_input: completion.usage.cache_read_tokens,
+                        cache_creation: completion.usage.cache_creation_tokens,
+                        output: completion.usage.output_tokens,
+                    });
                 }
                 "content_block_start" => {
                     let index = data["index"].as_u64().unwrap_or(0) as usize;
@@ -178,6 +188,11 @@ impl Provider for AnthropicProvider {
                     }
                     if let Some(tokens) = data["usage"]["output_tokens"].as_u64() {
                         completion.usage.output_tokens = tokens;
+                        // Keep the billable breakdown's output in sync — it was
+                        // seeded from `output_tokens` (0) at `message_start`.
+                        if let Some(b) = completion.usage.billable.as_mut() {
+                            b.output = tokens;
+                        }
                     }
                 }
                 "error" => {
