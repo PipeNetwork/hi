@@ -87,15 +87,17 @@ pub async fn run(
             .collect();
     }
     {
+        // A one-line usage hint as the first transcript line. The provider and
+        // model already appear in the border title (top of the box), so we don't
+        // repeat them here — that would render as a duplicate header line.
         let ctx = registry
             .metadata(model)
             .1
-            .map(|w| format!(" · {}k ctx", w / 1000))
+            .map(|w| format!(" · {w} token window"))
             .unwrap_or_default();
         app.push(Line::styled(
             format!(
-                "hi · {provider} · {model}{ctx} — Enter to send, type ahead to queue, \
-                 Ctrl-C interrupts, /help for commands.",
+                "Enter to send, type ahead to queue, Ctrl-C interrupts, /help for commands{ctx}.",
             ),
             dim(),
         ));
