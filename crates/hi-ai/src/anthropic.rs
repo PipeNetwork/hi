@@ -129,6 +129,7 @@ impl Provider for AnthropicProvider {
                         cache_read_tokens: 0,
                         cache_creation_tokens: 0,
                         input_includes_cache: false,
+                        context_occupancy: estimate_messages_tokens(&request.messages),
                     })
                     .into());
                 }
@@ -148,6 +149,12 @@ impl Provider for AnthropicProvider {
                     if let Some(tokens) = data["message"]["usage"]["cache_creation_input_tokens"].as_u64() {
                         completion.usage.cache_creation_tokens = tokens;
                     }
+                    // Anthropic reports cache tokens separately from
+                    // `input_tokens`, so the full context window occupancy is
+                    // the sum of all three.
+                    completion.usage.context_occupancy = completion.usage.input_tokens
+                        + completion.usage.cache_read_tokens
+                        + completion.usage.cache_creation_tokens;
                 }
                 "content_block_start" => {
                     let index = data["index"].as_u64().unwrap_or(0) as usize;

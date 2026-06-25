@@ -133,6 +133,7 @@ mod tests {
                 cache_read_tokens: 0,
                 cache_creation_tokens: 0,
                 input_includes_cache: false,
+                context_occupancy: input,
             },
             stop_reason: None,
         }
@@ -147,6 +148,7 @@ mod tests {
                 cache_read_tokens: 0,
                 cache_creation_tokens: 0,
                 input_includes_cache: false,
+                context_occupancy: input,
             },
             stop_reason: None,
         }

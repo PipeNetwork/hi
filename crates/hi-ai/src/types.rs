@@ -215,10 +215,23 @@ pub struct Usage {
     /// `cache_creation_tokens`). True for OpenAI-compatible providers, where
     /// `prompt_tokens` is the total and `cached_tokens` is a subset; false for
     /// Anthropic, where `input_tokens` excludes the separately-reported cache
-    /// tokens. Determines how `context_used` is computed so it isn't
-    /// double-counted.
+    /// tokens.
+    ///
+    /// Deprecated: prefer [`Usage::context_occupancy`], which is computed at the
+    /// provider adapter where the semantics are known, so the agent layer no
+    /// longer needs to branch on provider. Kept for now because call sites
+    /// still construct `Usage` literals with it; will be removed once migration
+    /// completes.
     #[serde(default)]
     pub input_includes_cache: bool,
+    /// The total input tokens occupying the context window for this request, as
+    /// the provider defines it. Computed at the provider adapter, where whether
+    /// cache tokens are included in `input_tokens` (OpenAI) or reported
+    /// separately (Anthropic) is known — so this is already the right number
+    /// with no double-counting. The agent reads this directly instead of
+    /// re-deriving occupancy from the other fields.
+    #[serde(default)]
+    pub context_occupancy: u64,
 }
 
 impl Usage {
@@ -240,10 +253,9 @@ impl Usage {
         self.cache_creation_tokens += other.cache_creation_tokens;
     }
 
-    /// The effective number of input tokens occupying the context window for
-    /// this request. On providers where `input_tokens` already includes the
-    /// cached subset (OpenAI), that subset is not added again; on providers
-    /// where cache tokens are reported separately (Anthropic), it is.
+    /// Deprecated: prefer [`Usage::context_occupancy`], which is set by the
+    /// provider adapter and avoids re-deriving occupancy here. Kept callable so
+    /// existing call sites continue to work during the migration.
     pub fn effective_input_tokens(&self) -> u64 {
         if self.input_includes_cache {
             self.input_tokens

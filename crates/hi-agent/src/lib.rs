@@ -3,7 +3,14 @@
 
 pub mod command;
 pub mod compaction;
-pub mod session;
+mod config;
+mod heuristics;
+mod memory;
+mod prompt;
+mod session;
+mod snapshot;
+mod transcript;
+mod verify;
 pub mod ui;
 
 use std::sync::Arc;
@@ -11,27 +18,29 @@ use std::sync::Arc;
 use anyhow::Result;
 use futures_util::StreamExt;
 use hi_ai::{
-    ChatRequest, CompatMode, Content, Message, Provider, ProviderErrorKind, RequestProfile,
+    ChatRequest, Content, Message, Provider, ProviderErrorKind, RequestProfile,
     StreamEvent, ToolMode, ToolSpec, Usage, provider_error_kind, provider_error_usage,
 };
 use hi_tools::{TOOL_SPECS, execute, execute_streaming};
 
 pub use command::Command;
 pub use compaction::{CompactionKind, DEFAULT_KEEP_RECENT};
+pub use config::{AgentConfig, VerifyStage};
+pub use heuristics::humanize_count;
 pub use hi_tools::{PlanStatus, PlanStep};
+pub use memory::{memory_file, should_distill_memory};
 pub use session::SessionSink;
 pub use ui::{Ui, tool_label};
 
-/// Route a tool's output to the right UI surface: a plan update drives the live
-/// tracker (in place), everything else renders as a tool result — its richer
-/// `display` if present, else the model-facing `content`.
-fn emit_tool_output(ui: &mut dyn Ui, output: &hi_tools::ToolOutput) {
-    if let Some(plan) = output.plan.as_deref() {
-        ui.plan(plan);
-    } else {
-        ui.tool_result(output.display.as_deref().unwrap_or(&output.content));
-    }
-}
+use heuristics::{
+    emit_tool_output, looks_like_unfinished_step, looks_mutating, recovery_sampling,
+    recovery_telemetry, tool_mode_label, StallMode, RECOVERY_SAMPLING,
+};
+use memory::{cap_memory, memory_prompt};
+use prompt::SystemPrompt;
+use snapshot::{changed_files_between, FileFingerprint, SnapshotCache};
+use transcript::{NudgeKind, Transcript};
+use verify::{stage_guidance, Verifier, VerifyOutcome, Snapshot};
 
 /// Crate version (from Cargo.toml).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -93,38 +102,6 @@ user, in past tense, covering only what you actually did:\n\
 If something is incomplete or a check couldn't run, say so honestly. Output only the summary — \
 no preamble, and don't take any further action.";
 
-/// Whether recovery sampling (a hotter resample on an empty/garbled retry) is on.
-/// Off (`HI_RECOVERY_SAMPLING=0/off/false/no`) re-runs the retry at the configured
-/// sampling — the knob for A/B-ing recovery on the eval harness. Read once.
-static RECOVERY_SAMPLING: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    !matches!(
-        std::env::var("HI_RECOVERY_SAMPLING").ok().as_deref(),
-        Some("0" | "off" | "false" | "no")
-    )
-});
-
-/// Sampling for a model round, escalating with the count of consecutive
-/// content-less rounds (`retries`; 0 = the normal first attempt). Returns
-/// `(temperature, top_p, frequency_penalty)`. On a normal round — or when recovery
-/// sampling is disabled — it passes the configured temperature through and leaves
-/// `top_p`/`frequency_penalty` at the provider default (`None`). On a retry it
-/// leads with anti-repetition — nucleus sampling plus a growing frequency penalty
-/// — and only gently raises temperature from a ≥0.5 floor, so a repetition/garble
-/// loop is broken with less coding-quality risk than a big temperature jump.
-fn recovery_sampling(
-    retries: u32,
-    base_temperature: Option<f32>,
-    enabled: bool,
-) -> (Option<f32>, Option<f32>, Option<f32>) {
-    if !enabled || retries == 0 {
-        return (base_temperature, None, None);
-    }
-    let r = retries as f32;
-    let temperature = (base_temperature.unwrap_or(0.7).max(0.5) + 0.15 * r).min(1.0);
-    let frequency_penalty = (0.3 * r).min(0.6);
-    (Some(temperature), Some(0.95), Some(frequency_penalty))
-}
-
 /// Instruction appended to a slice of history to summarize it for compaction.
 const SUMMARIZE_PROMPT: &str = "Summarize our conversation so far into a concise but \
 complete handoff brief: the task and goal, key decisions and constraints, files created \
@@ -141,218 +118,14 @@ go — always with the complete list — marking the current step `active` and \
 finished ones `done`. Skip the plan for simple one-step changes. Verify your \
 edits before finishing.";
 
-/// Ending instruction when no separate finalization step runs: the model itself
-/// must produce the closing recap.
-const SELF_RECAP_INSTRUCTION: &str = " When the task is done, stop and end with a short recap so \
-the user has the full picture: a one-line headline of what you accomplished, then — for any \
-non-trivial change — a brief bullet list of the key edits (grouped by file) and the exact \
-command(s) to run or test it. Write it in past tense, covering only what you actually did; don't \
-restate the plan or pad it. For a trivial change or a plain question, a single line is enough.";
-
-/// Ending instruction when a finalization step will write the recap: the model
-/// shouldn't duplicate it, just confirm completion.
-const DEFERRED_RECAP_INSTRUCTION: &str = " When the task is done, stop. A separate step will write \
-the final summary for the user, so you don't need to compose a full recap yourself — just make \
-sure the work is actually complete and finish with at most a one-line note.";
-
-/// Builds a system message by composing optional sections.
-///
-/// Usage:
-/// ```ignore
-/// SystemPrompt::new()
-///     .with_project_context(ctx)
-///     .with_goal(goal)
-///     .with_finalize(true)
-///     .build()
-/// ```
-struct SystemPrompt {
-    project_context: Option<String>,
-    goal: Option<String>,
-    finalize: bool,
-}
-
-impl SystemPrompt {
-    fn new() -> Self {
-        Self {
-            project_context: None,
-            goal: None,
-            finalize: false,
-        }
-    }
-
-    fn with_project_context(mut self, context: Option<&str>) -> Self {
-        self.project_context = context
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
-        self
-    }
-
-    fn with_goal(mut self, goal: Option<&str>) -> Self {
-        self.goal = goal.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-        self
-    }
-
-    fn with_finalize(mut self, finalize: bool) -> Self {
-        self.finalize = finalize;
-        self
-    }
-
-    fn build(self) -> Message {
-        let mut text = SYSTEM_PROMPT.to_string();
-        text.push_str(if self.finalize {
-            DEFERRED_RECAP_INSTRUCTION
-        } else {
-            SELF_RECAP_INSTRUCTION
-        });
-        // Ground the model in its real location so it doesn't guess paths (a wrong
-        // `/home/user`, scaffolding under `/tmp`, copying from directories that don't
-        // exist) and wander out of the project. Each shell command runs from here in
-        // a fresh shell, so `cd` never persists — say so explicitly.
-        if let Ok(cwd) = std::env::current_dir() {
-            text.push_str(&format!(
-                "\n\nYour working directory is `{}` — work here. Every shell command runs from \
-                 this directory in a fresh shell, so `cd` does NOT persist between commands. Use \
-                 paths relative to it; do not `cd` into, copy from, or create directories elsewhere.",
-                cwd.display()
-            ));
-        }
-        if let Some(context) = self.project_context {
-            text.push_str("\n\n");
-            text.push_str(&context);
-        }
-        if let Some(goal) = self.goal {
-            text.push_str("\n\n[Current session goal]\n");
-            text.push_str(&goal);
-        }
-        Message::system(text)
-    }
-}
-
-/// One stage of layered verification: a short label and the shell command to
-/// run. Stages run in order; the first to fail stops the turn and its output is
-/// fed back to the model. A cheap compile/typecheck stage before tests yields
-/// fast, localizable errors.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct VerifyStage {
-    pub name: String,
-    pub command: String,
-}
-
-impl VerifyStage {
-    pub fn new(name: impl Into<String>, command: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-            command: command.into(),
-        }
-    }
-
-    /// Whether this stage runs tests (vs. a compile/lint/typecheck gate) — used
-    /// to tailor the failure guidance fed back to the model.
-    fn is_test(&self) -> bool {
-        let n = self.name.to_lowercase();
-        n.contains("test") || n.contains("spec")
-    }
-}
-
-/// Per-session configuration the agent applies to every request.
-pub struct AgentConfig {
-    pub model: String,
-    pub max_tokens: u32,
-    pub temperature: Option<f32>,
-    pub thinking_budget: Option<u32>,
-    pub tool_mode: ToolMode,
-    pub compat: CompatMode,
-    /// USD per 1M (input, output) tokens, when known — used for cost display.
-    pub price: Option<(f64, f64)>,
-    /// Model context window, when known — used to show how full it is.
-    pub context_window: Option<u32>,
-    /// Project context (e.g. from HI.md/AGENTS.md) appended to the system prompt.
-    pub project_context: Option<String>,
-    /// Ordered verification stages run after the model stops — a cheap
-    /// compile/typecheck first, then lint, then tests. The first stage to fail
-    /// stops the turn and its output is fed back so the model iterates
-    /// (verification-in-the-loop). Empty = verification off.
-    pub verify: Vec<VerifyStage>,
-    /// Cap on verification retry rounds.
-    pub max_verify_iterations: u32,
-    /// Safety cap on model calls per turn, to stop runaway tool loops.
-    pub max_steps: u32,
-    /// When the context window fills past a threshold, summarize-and-reset
-    /// before the next turn so a long session doesn't overflow the model.
-    pub auto_compact: bool,
-    /// Strategy used by `/compact` (no arg) and the summarizing tier of
-    /// auto-compaction.
-    pub compaction: CompactionKind,
-    /// After a turn that changed files, make one dedicated tool-free model call
-    /// to produce a structured recap — so even a model that won't summarize on
-    /// its own ends with one. Costs one extra call per file-changing turn.
-    pub finalize: bool,
-    /// Max times one turn will nudge a model that stopped after *describing* a
-    /// next step without performing it. Default: [`MAX_CONTINUE_NUDGES`].
-    pub max_continue_nudges: u32,
-    /// Max times one turn will nudge a model that re-issues the exact same tool
-    /// call as the previous round (a repetition loop). Default:
-    /// [`MAX_REPEAT_NUDGES`].
-    pub max_repeat_nudges: u32,
-    /// How many times to silently re-run a round that produced no usable output.
-    /// Default: [`MAX_EMPTY_RETRIES`].
-    pub max_empty_retries: u32,
-    /// Max read-only tool calls to run concurrently within one round.
-    /// Default: [`MAX_PARALLEL_TOOLS`].
-    pub max_parallel_tools: usize,
-    /// Auto-compact once the context window is at least this percent full.
-    /// Default: [`AUTO_COMPACT_PERCENT`].
-    pub auto_compact_percent: u64,
-    /// After triggering, compact until the local estimate is at or below this
-    /// percent of the window. Default: [`COMPACT_TARGET_PERCENT`].
-    pub compact_target_percent: u64,
-    /// During one long tool loop, begin dropping old bulky tool payloads before
-    /// the next model call. Default: [`IN_TURN_ELIDE_PERCENT`].
-    pub in_turn_elide_percent: u64,
-    /// Keep the newest tool results verbatim when trimming inside a turn.
-    /// Default: [`IN_TURN_KEEP_TOOL_RESULTS`].
-    pub in_turn_keep_tool_results: usize,
-}
-
-impl Default for AgentConfig {
-    fn default() -> Self {
-        Self {
-            model: String::new(),
-            max_tokens: 4096,
-            temperature: None,
-            thinking_budget: None,
-            tool_mode: ToolMode::Auto,
-            compat: CompatMode::Auto,
-            price: None,
-            context_window: None,
-            project_context: None,
-            verify: Vec::new(),
-            max_verify_iterations: 2,
-            max_steps: 500,
-            auto_compact: true,
-            compaction: CompactionKind::Hybrid {
-                keep_recent: DEFAULT_KEEP_RECENT,
-            },
-            finalize: true,
-            max_continue_nudges: MAX_CONTINUE_NUDGES,
-            max_repeat_nudges: MAX_REPEAT_NUDGES,
-            max_empty_retries: MAX_EMPTY_RETRIES,
-            max_parallel_tools: MAX_PARALLEL_TOOLS,
-            auto_compact_percent: AUTO_COMPACT_PERCENT,
-            compact_target_percent: COMPACT_TARGET_PERCENT,
-            in_turn_elide_percent: IN_TURN_ELIDE_PERCENT,
-            in_turn_keep_tool_results: IN_TURN_KEEP_TOOL_RESULTS,
-        }
-    }
-}
-
 pub struct Agent {
     provider: Box<dyn Provider>,
     config: AgentConfig,
-    /// Conversation history, shared with in-flight `ChatRequest`s via `Arc`.
-    /// `Arc::make_mut` clones only when a request is in flight (refcount > 1),
-    /// so repeated tool rounds without a model call avoid copying the history.
-    messages: Arc<Vec<Message>>,
+    /// Conversation history, shared with in-flight `ChatRequest`s via the
+    /// `Arc` inside [`Transcript`]. Mutations go through the `Transcript` API
+    /// so provider-safety invariants (every `tool_use` has a matching
+    /// `tool_result`; typed synthetic nudges) are enforced by construction.
+    messages: Transcript,
     tools: Arc<[ToolSpec]>,
     session: Option<Box<dyn SessionSink>>,
     /// How many messages have already been handed to the session sink.
@@ -376,8 +149,8 @@ pub struct Agent {
     goal: Option<String>,
     /// Cached workspace snapshot — avoids re-walking the tree on every
     /// verify/turn-end check when no files changed. Invalidated by any
-    /// write/edit/bash tool call in the current turn.
-    snapshot_cache: Option<std::collections::BTreeMap<String, FileFingerprint>>,
+    /// write/edit/bash tool call in the current turn, and by `/undo`.
+    snapshot_cache: SnapshotCache,
 }
 
 impl Agent {
@@ -415,7 +188,7 @@ impl Agent {
         Self {
             provider,
             config,
-            messages: Arc::new(messages),
+            messages: Transcript::new(messages),
             tools: TOOL_SPECS.clone().into(),
             session: None,
             persisted,
@@ -427,7 +200,7 @@ impl Agent {
             last_changed_files: Vec::new(),
             last_compat_fallbacks: Vec::new(),
             goal: None,
-            snapshot_cache: None,
+            snapshot_cache: SnapshotCache::default(),
         }
     }
 
@@ -453,13 +226,14 @@ impl Agent {
 
     /// The current conversation history (including the system prompt).
     pub fn messages(&self) -> &[Message] {
-        &self.messages
+        self.messages.as_slice()
     }
 
     /// Discard messages back to `len` — used to drop an interrupted turn so the
-    /// conversation stays consistent (no dangling user message).
+    /// conversation stays consistent (no dangling user message, no orphan
+    /// tool_use from a round cut off mid-execution).
     pub fn truncate_messages(&mut self, len: usize) {
-        Arc::make_mut(&mut self.messages).truncate(len);
+        self.messages.rewind_to(len);
         self.persisted = self.persisted.min(self.messages.len());
     }
 
@@ -489,7 +263,7 @@ impl Agent {
         out.push_str("# hi session transcript
 
 ");
-        for msg in self.messages.iter() {
+        for msg in self.messages.as_slice().iter() {
             match msg.role {
                 hi_ai::Role::System => {} // skip system prompt
                 hi_ai::Role::User => {
@@ -584,7 +358,7 @@ impl Agent {
     /// doesn't rewrite the session file, and the reset point isn't persisted, so
     /// resuming replays the full log.
     pub fn clear_history(&mut self) {
-        self.messages = Arc::new(vec![self.system_message()]);
+        self.messages.replace_all(vec![self.system_message()]);
         self.persisted = self.messages.len();
     }
 
@@ -607,12 +381,7 @@ impl Agent {
 
     fn refresh_system_message(&mut self) {
         let system = self.system_message();
-        let messages = Arc::make_mut(&mut self.messages);
-        if let Some(first) = messages.first_mut() {
-            *first = system;
-        } else {
-            messages.push(system);
-        }
+        self.messages.replace_system(system);
     }
 
     /// Current transient session goal, if any.
@@ -729,11 +498,11 @@ impl Agent {
         }
 
         self.truncate_messages(1);
-        Arc::make_mut(&mut self.messages).push(Message::user(format!(
+        self.messages.push_user(format!(
             "[Earlier conversation context was omitted because the provider rejected the request \
              as too large. Continue from this latest user request; ask for missing details if the \
              omitted context is required.]\n\n{input}"
-        )));
+        ));
         self.context_used = 0;
         ui.status(
             "provider rejected the request as too large; dropped prior conversation context and retrying",
@@ -749,20 +518,20 @@ impl Agent {
             return Ok(());
         }
         // Own the slice so it doesn't borrow `self` across the `&mut self` call.
-        let slice = self.messages[1..].to_vec();
+        let slice = self.messages.as_slice()[1..].to_vec();
         let Some(summary) = self.summarize(&slice, ui).await? else {
             ui.status("compaction produced no summary; keeping history");
             return Ok(());
         };
         let system = self.system_message();
-        self.messages = Arc::new(vec![
+        self.messages.replace_all(vec![
             system,
             Message::user(format!("[Summary of the conversation so far]\n\n{summary}")),
         ]);
         self.persisted = self.messages.len();
         // Persist the compaction so it survives session resume.
         if let Some(session) = self.session.as_mut() {
-            let _ = session.record_compaction(&self.messages);
+            let _ = session.record_compaction(&self.messages.arc());
         }
         ui.status("✓ compacted — context reset to the summary");
         Ok(())
@@ -773,19 +542,19 @@ impl Agent {
     /// inserting a separate summary message) avoids two consecutive user
     /// messages, which some providers reject.
     async fn compact_hybrid(&mut self, keep_recent: usize, ui: &mut dyn Ui) -> Result<()> {
-        let Some(split) = compaction::recent_split(&self.messages, keep_recent) else {
+        let Some(split) = compaction::recent_split(self.messages.as_slice(), keep_recent) else {
             // Nothing older than the recent window — summarize everything so a
             // triggered compaction still makes progress.
             return self.compact_summarize(ui).await;
         };
-        let old = self.messages[1..split].to_vec();
+        let old = self.messages.as_slice()[1..split].to_vec();
         let Some(summary) = self.summarize(&old, ui).await? else {
             ui.status("compaction produced no summary; keeping history");
             return Ok(());
         };
 
         let system = self.system_message();
-        let mut recent = self.messages[split..].to_vec();
+        let mut recent = self.messages.as_slice()[split..].to_vec();
         let head = recent[0].text();
         recent[0] = Message::user(format!(
             "[Summary of earlier conversation]\n\n{summary}\n\n---\n\n{head}"
@@ -793,11 +562,11 @@ impl Agent {
         let mut next = Vec::with_capacity(recent.len() + 1);
         next.push(system);
         next.extend(recent);
-        self.messages = Arc::new(next);
+        self.messages.replace_all(next);
         self.persisted = self.messages.len();
         // Persist the compaction so it survives session resume.
         if let Some(session) = self.session.as_mut() {
-            let _ = session.record_compaction(&self.messages);
+            let _ = session.record_compaction(&self.messages.arc());
         }
         ui.status("✓ compacted — kept recent turns, summarized the rest");
         Ok(())
@@ -809,8 +578,8 @@ impl Agent {
     fn compact_elide(&mut self, keep_recent: usize, ui: &mut dyn Ui) {
         // Only turns older than the recent window are eligible; if everything is
         // recent there's nothing to elide.
-        let freed = match compaction::recent_split(&self.messages, keep_recent) {
-            Some(split) => compaction::elide_tool_outputs(Arc::make_mut(&mut self.messages), split),
+        let freed = match compaction::recent_split(self.messages.as_slice(), keep_recent) {
+            Some(split) => compaction::elide_tool_outputs(self.messages.mutate_slice(), split),
             None => 0,
         };
         if freed > 0 {
@@ -834,13 +603,13 @@ impl Agent {
             return;
         }
 
-        let used = compaction::estimate_tokens(&self.messages);
+        let used = compaction::estimate_tokens(self.messages.as_slice());
         if used * 100 < u64::from(window) * self.config.in_turn_elide_percent {
             return;
         }
 
         let freed = compaction::elide_tool_outputs_except_recent(
-            Arc::make_mut(&mut self.messages),
+            self.messages.mutate_slice(),
             self.config.in_turn_keep_tool_results,
         );
         if freed == 0 {
@@ -949,7 +718,7 @@ impl Agent {
         // Elide bulky tool outputs — the memory distillation only needs to
         // understand what was done, not re-read command output verbatim.
         let start = self.messages.len().min(1);
-        let mut history: Vec<Message> = self.messages[start..].to_vec();
+        let mut history: Vec<Message> = self.messages.as_slice()[start..].to_vec();
         let len = history.len();
         compaction::elide_tool_outputs(&mut history, len);
 
@@ -1024,17 +793,12 @@ impl Agent {
     /// Get the workspace snapshot, using the cached version when available.
     /// The cache is valid until invalidated by [`invalidate_snapshot`].
     async fn snapshot_cached(&mut self) -> std::collections::BTreeMap<String, FileFingerprint> {
-        if let Some(cache) = &self.snapshot_cache {
-            return cache.clone();
-        }
-        let snap = workspace_snapshot(std::path::Path::new(".")).await;
-        self.snapshot_cache = Some(snap.clone());
-        snap
+        self.snapshot_cache.get().await
     }
 
     /// Invalidate the snapshot cache — called after any mutating tool.
     fn invalidate_snapshot(&mut self) {
-        self.snapshot_cache = None;
+        self.snapshot_cache.invalidate();
     }
 
     /// Run one user turn to completion, emitting output through `ui`.
@@ -1048,11 +812,11 @@ impl Agent {
                 "tool mode {} does not allow file edits or shell commands for this turn",
                 tool_mode_label(self.config.tool_mode)
             ));
-            Arc::make_mut(&mut self.messages).push(Message::user(input));
-            Arc::make_mut(&mut self.messages).push(Message::assistant(vec![Content::Text(format!(
+            self.messages.push_user(input);
+            self.messages.push_assistant(vec![Content::Text(format!(
                 "I cannot perform coding actions in {} mode because file-edit and shell tools are unavailable. Switch to `--tool-mode auto` or `--tool-mode required` to let me modify the workspace.",
                 tool_mode_label(self.config.tool_mode)
-            ))]));
+            ))]);
             ui.turn_end(&self.usage_summary(&self.totals));
             self.persist()?;
             return Ok(());
@@ -1078,29 +842,28 @@ impl Agent {
                 self.context_used * 100 / u64::from(window)
             ));
             // Tier 1: deterministic, no model call. Only old turns are eligible.
-            if let Some(split) = compaction::recent_split(&self.messages, AUTO_KEEP_RECENT) {
-                compaction::elide_tool_outputs(Arc::make_mut(&mut self.messages), split);
+            if let Some(split) = compaction::recent_split(self.messages.as_slice(), AUTO_KEEP_RECENT)
+            {
+                compaction::elide_tool_outputs(self.messages.mutate_slice(), split);
             }
             // Tier 2: only if still heavy. `context_used` reflects the
             // pre-elision request and is now stale, so gate on a local estimate.
             let target = u64::from(window) * self.config.compact_target_percent / 100;
-            if compaction::estimate_tokens(&self.messages) > target {
+            if compaction::estimate_tokens(self.messages.as_slice()) > target {
                 let _ = self.compact(ui).await;
             }
             self.context_used = 0;
         }
 
         let turn_start = self.messages.len();
-        Arc::make_mut(&mut self.messages).push(Message::user(input));
+        self.messages.push_user_or_fold(input);
         self.last_verify = None;
         self.last_changed_files.clear();
         self.last_compat_fallbacks.clear();
         let mut compat_fallbacks = Vec::new();
 
-        let verify = self.config.verify.clone();
-        let max_verify = self.config.max_verify_iterations;
+        let mut verifier = Verifier::new(self.config.verify.clone(), self.config.max_verify_iterations);
         let max_steps = self.config.max_steps;
-        let mut verify_round = 0u32;
         let mut steps = 0u32;
         let mut empty_retries = 0u32;
         let mut continue_nudges = 0u32;
@@ -1124,12 +887,10 @@ impl Agent {
         // Snapshot the turn baseline so verification only runs when the
         // workspace ends up changed. This catches `bash` edits too, while
         // skipping verify when a turn makes no net file changes.
-        let turn_snapshot = self.snapshot_cached().await;
+        let turn_snapshot: Snapshot = self.snapshot_cached().await;
         // Snapshot from the most recent verify check. Reused at turn end to
         // avoid a second full tree walk when verify already took one.
-        let mut verify_snapshot: Option<
-            std::collections::BTreeMap<String, FileFingerprint>,
-        > = None;
+        let mut verify_snapshot: Option<Snapshot> = None;
 
         'turn: loop {
             // Inner loop: model + tools until the model stops calling tools, or
@@ -1150,11 +911,37 @@ impl Agent {
                 let (temperature, top_p, frequency_penalty) =
                     recovery_sampling(empty_retries, self.config.temperature, *RECOVERY_SAMPLING);
 
+                // Telemetry for the recovery-sampling A/B: emit a concise debug
+                // line only when sampling is actually being changed (recovery on
+                // and this is a retry), so ordinary runs stay quiet. The empty
+                // path is the only mode that escalates sampling today; repeat and
+                // continue nudges re-run at the configured sampling.
+                if let Some(line) = recovery_telemetry(
+                    StallMode::Empty,
+                    empty_retries,
+                    self.config.max_empty_retries,
+                    temperature,
+                    top_p,
+                    frequency_penalty,
+                    *RECOVERY_SAMPLING,
+                ) {
+                    ui.status(&line);
+                }
+
                 self.elide_in_turn_context_if_needed(ui);
+
+                // Debug-mode invariant check: the transcript we're about to send
+                // must be provider-safe (every tool_use answered, no consecutive
+                // user messages). Cheap in release builds; in debug it catches
+                // the orphan-tool_use class of bug at the source.
+                debug_assert!(
+                    self.messages.validate_for_provider().is_ok(),
+                    "transcript invariant violated before provider send"
+                );
 
                 let request = ChatRequest {
                     model: self.config.model.clone(),
-                    messages: Arc::clone(&self.messages),
+                    messages: self.messages.arc(),
                     tools: self.request_tools(),
                     max_tokens: self.config.max_tokens,
                     temperature,
@@ -1178,7 +965,7 @@ impl Agent {
                         ui.status(&text);
                     }
                 };
-                let completion = match self.provider.stream(request, &mut sink).await {
+                let mut completion = match self.provider.stream(request, &mut sink).await {
                     Ok(completion) => completion,
                     Err(err)
                         if provider_error_kind(&err)
@@ -1270,15 +1057,11 @@ impl Agent {
                     // something) before nudging, so the history stays coherent.
                     // We deliberately do NOT execute the repeated tool calls, so
                     // strip their `ToolCall` blocks from the recorded message:
-                    // leaving `tool_use` blocks without matching `tool_result`
-                    // blocks puts the transcript in a state most providers reject
-                    // on the next request.
-                    let text_only: Vec<Content> = completion
-                        .content
-                        .into_iter()
-                        .filter(|c| !matches!(c, Content::ToolCall { .. }))
-                        .collect();
-                    Arc::make_mut(&mut self.messages).push(Message::assistant(text_only));
+                    // `push_assistant_text_only` is the intentional "calls
+                    // skipped, not executed" path — leaving `tool_use` blocks
+                    // without matching `tool_result` blocks puts the transcript
+                    // in a state most providers reject on the next request.
+                    self.messages.push_assistant_text_only(std::mem::take(&mut completion.content));
                     if repeat_nudges < self.config.max_repeat_nudges {
                         repeat_nudges += 1;
                         stalled_repeating = true;
@@ -1287,8 +1070,7 @@ impl Agent {
                              nudging it to act on it ({repeat_nudges}/{})",
                             self.config.max_repeat_nudges
                         ));
-                        Arc::make_mut(&mut self.messages)
-                            .push(Message::user(REPEAT_NUDGE.to_string()));
+                        self.messages.push_nudge(NudgeKind::Repeat, REPEAT_NUDGE);
                         // Keep prev_call_sig as-is so a further repeat is still
                         // detected against the same signature.
                         continue;
@@ -1345,13 +1127,14 @@ impl Agent {
                 // its own budget rather than inheriting this one's elevation.
                 empty_retries = 0;
 
-                Arc::make_mut(&mut self.messages).push(Message::assistant(completion.content));
                 if calls.is_empty() {
                     // Text but no tool call (the content-less case was handled
-                    // above). If the model was actively working this turn and its
+                    // above): no tool_use blocks, so the safe text-only append
+                    // applies. If the model was actively working this turn and its
                     // last line reads like an announced-but-unperformed next step
                     // ("Now let me rewrite main.rs:"), nudge it to actually do it —
                     // bounded — rather than ending the turn on a false "done".
+                    self.messages.push_assistant(std::mem::take(&mut completion.content));
                     if made_tool_call
                         && continue_nudges < self.config.max_continue_nudges
                         && looks_like_unfinished_step(&assistant_text)
@@ -1363,8 +1146,7 @@ impl Agent {
                              nudging it to continue ({continue_nudges}/{})",
                             self.config.max_continue_nudges
                         ));
-                        Arc::make_mut(&mut self.messages)
-                            .push(Message::user(CONTINUE_NUDGE.to_string()));
+                        self.messages.push_nudge(NudgeKind::Continue, CONTINUE_NUDGE);
                         continue;
                     }
                     break false;
@@ -1381,6 +1163,12 @@ impl Agent {
                 // the parallelism benefit for all-read batches and read clusters
                 // around a mutating call, without reordering reads past a
                 // mutating call that precedes them.
+                //
+                // Results are collected and the assistant message + all matching
+                // tool results are recorded together via `push_assistant_with_results`,
+                // so the transcript never carries an orphan tool_use. UI streaming
+                // and snapshot invalidation still happen during execution.
+                let mut results: Vec<(String, String)> = Vec::with_capacity(calls.len());
                 let mut i = 0;
                 while i < calls.len() {
                     if hi_tools::is_read_only(&calls[i].1) {
@@ -1399,8 +1187,7 @@ impl Agent {
                         .await;
                         for ((id, _, _), output) in batch.iter().zip(outputs) {
                             emit_tool_output(&mut *ui, &output);
-                            Arc::make_mut(&mut self.messages)
-                                .push(Message::tool_result(id, output.content));
+                            results.push((id.clone(), output.content));
                         }
                         i = j;
                     } else {
@@ -1416,14 +1203,15 @@ impl Agent {
                             execute(name, arguments).await
                         };
                         emit_tool_output(&mut *ui, &output);
-                        Arc::make_mut(&mut self.messages)
-                            .push(Message::tool_result(id, output.content));
+                        results.push((id.clone(), output.content));
                         // A mutating tool may have changed files — invalidate the
                         // workspace snapshot cache so the next check re-walks.
                         self.invalidate_snapshot();
                         i += 1;
                     }
                 }
+                self.messages
+                    .push_assistant_with_results(std::mem::take(&mut completion.content), results);
             };
 
             if hit_cap {
@@ -1434,94 +1222,57 @@ impl Agent {
 
             // Verification gate: run the stages in order (cheap compile/typecheck
             // first, then lint, then tests); the first to fail stops the turn and
-            // its output is fed back. A passing pipeline ends the turn.
-            if verify.is_empty() || verify_round >= max_verify {
-                break 'turn;
-            }
-            // Baseline-aware: only verify turns that changed files. A turn that
-            // edited nothing can't have introduced a failure, so verifying would
-            // only surface pre-existing/unrelated failures and pull the model
-            // into fixing things the user didn't ask about.
-            let current = self.snapshot_cached().await;
-            verify_snapshot = Some(current.clone());
-            let changed_files = changed_files_between(&turn_snapshot, &current);
-            if changed_files.is_empty() {
-                if verify_round == 0 {
-                    ui.status("verification skipped — no files changed this turn");
-                }
-                break 'turn;
-            }
-            verify_round += 1;
-            let mut failure = None;
-            for stage in &verify {
-                ui.status(&format!(
-                    "verifying ({verify_round}/{max_verify}) · {}: {}",
-                    stage.name, stage.command
-                ));
-                let (passed, output) = hi_tools::run_check(&stage.command).await;
-                if !passed {
-                    failure = Some((stage, output));
-                    break;
+            // its output is fed back. A passing pipeline ends the turn. The state
+            // machine (round counter, change gating, stage execution) lives in the
+            // `Verifier`; this loop just reacts to its outcome.
+            let outcome = verifier
+                .check(&turn_snapshot, &mut self.snapshot_cache, ui)
+                .await;
+            // Capture the verify snapshot for turn-end reuse whenever the
+            // verifier actually walked the tree (i.e. it didn't bail before
+            // snapshotting). On a failure we drop it: the model is about to edit
+            // again, so it's no longer current.
+            if matches!(outcome, VerifyOutcome::Passed | VerifyOutcome::Failed { .. }) {
+                verify_snapshot = Some(self.snapshot_cached().await);
+                if matches!(outcome, VerifyOutcome::Failed { .. }) {
+                    verify_snapshot = None;
                 }
             }
-            match failure {
-                None => {
+            match outcome {
+                VerifyOutcome::NotRun => break 'turn,
+                VerifyOutcome::SkippedNoChanges { first } => {
+                    if first {
+                        ui.status("verification skipped — no files changed this turn");
+                    }
+                    break 'turn;
+                }
+                VerifyOutcome::Passed => {
                     ui.status("✓ verification passed");
                     self.last_verify = Some(true);
                     break 'turn;
                 }
-                Some((stage, output)) => {
+                VerifyOutcome::Failed {
+                    stage,
+                    output,
+                    round,
+                } => {
                     ui.status(&format!("✗ {} failed; iterating", stage.name));
                     self.last_verify = Some(false);
-                    // Invalidate the cached snapshot — the model is about to do
-                    // more work, so the verify snapshot is no longer current.
-                    verify_snapshot = None;
-                    // Compile/lint errors point at a cause; test failures imply a
-                    // rule. Tailor the nudge so the model fixes the right thing.
-                    let guidance = if stage.is_test() {
-                        "These checks define the exact required behavior. Compare the expected \
-                         and actual values to infer the precise rule — including edge cases and \
-                         tie-breaking — then make the smallest edit that satisfies every case."
-                    } else {
-                        "Read the error above and fix its root cause (a type, name, or syntax \
-                         problem) before anything else — the later stages can't run until this \
-                         passes."
-                    };
-                    let nudge = Message::user(format!(
+                    let guidance = stage_guidance(&stage);
+                    let nudge_body = format!(
                         "Verification stage `{}` failed (`{}`).\n\nOutput:\n{}\n\n{} If a previous \
                          fix didn't work, reconsider rather than repeat it.",
                         stage.name, stage.command, output, guidance
-                    ));
+                    );
                     // Replace the previous verify nudge instead of accumulating.
                     // Only the latest verification output belongs in context.
-                    let msgs = Arc::make_mut(&mut self.messages);
-                    if verify_round > 1 {
-                        // Remove everything back to (and including) the previous
-                        // verify nudge: the nudge itself, any trailing assistant
-                        // response, and the tool messages it produced. Stopping at
-                        // the first tool message would leave the earlier nudge in
-                        // place, so multiple verify prompts accumulate.
-                        while let Some(last) = msgs.last() {
-                            if last.role == hi_ai::Role::User
-                                && last.content.iter().any(|c| {
-                                    matches!(c, Content::Text(t) if t.contains("Verification stage"))
-                                })
-                            {
-                                msgs.pop();
-                                break;
-                            }
-                            // Pop trailing tool and assistant messages that
-                            // belong to the prior verify cycle, so we reach the
-                            // earlier verify nudge.
-                            match last.role {
-                                hi_ai::Role::Tool | hi_ai::Role::Assistant => {
-                                    msgs.pop();
-                                }
-                                _ => break,
-                            }
-                        }
-                    }
-                    msgs.push(nudge);
+                    // `replace_last_nudge` pops trailing tool/assistant messages
+                    // from the prior verify cycle and the prior nudge itself
+                    // (located by typed kind, not string-matching), then pushes
+                    // the new one. On the first round there's no prior nudge, so
+                    // nothing is popped — the model's just-finished turn stays.
+                    self.messages
+                        .replace_last_nudge(NudgeKind::Verify { round }, nudge_body);
                 }
             }
         }
@@ -1581,7 +1332,7 @@ impl Agent {
         // context), not the entire session history. The recap only needs to
         // know what happened *this turn* — sending 40K tokens of old context
         // to produce a 200-token summary is pure waste.
-        let turn = &self.messages[turn_start..];
+        let turn = &self.messages.as_slice()[turn_start..];
         let mut messages = Vec::with_capacity(turn.len() + 2);
         messages.push(self.minimal_system_message());
         messages.extend_from_slice(turn);
@@ -1642,8 +1393,9 @@ impl Agent {
             return; // nothing to record
         }
         // Record both the synthetic request and the recap so roles alternate.
-        Arc::make_mut(&mut self.messages).push(Message::user(FINALIZE_PROMPT));
-        Arc::make_mut(&mut self.messages).push(Message::assistant(vec![Content::Text(recap)]));
+        // The recap is a text-only assistant message (no tool calls).
+        self.messages.push_nudge(NudgeKind::Finalize, FINALIZE_PROMPT);
+        self.messages.push_assistant(vec![Content::Text(recap)]);
     }
 
     /// Format a usage line. `usage` carries the cumulative in/out/total/cost;
@@ -1704,279 +1456,24 @@ impl Agent {
 
     fn persist(&mut self) -> Result<()> {
         if let Some(session) = self.session.as_mut() {
-            session.record(&self.messages[self.persisted..], self.totals, self.cost_usd)?;
+            session.record(
+                &self.messages.as_slice()[self.persisted..],
+                self.totals,
+                self.cost_usd,
+            )?;
             self.persisted = self.messages.len();
         }
         Ok(())
     }
-}
 
-/// Backstop cap on the distilled memory file. The prompt does the real shaping
-/// (≤ ~20 short bullets); this just stops a runaway response from bloating the
-/// file — and thus every future session's context.
-const MEMORY_MAX_CHARS: usize = 2_000;
-
-/// Where the project memory lives — `.hi/memory.md` under the working directory,
-/// overridable via `HI_MEMORY_FILE` (which also makes the file IO testable). The
-/// frontend reads the same path to load it as context.
-pub fn memory_file() -> std::path::PathBuf {
-    std::env::var_os("HI_MEMORY_FILE")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::Path::new(".hi").join("memory.md"))
-}
-
-/// The session-end distillation prompt, folding in the current memory so the
-/// model revises it (merge / de-dupe / drop-stale) instead of appending.
-fn memory_prompt(existing: &str) -> String {
-    let existing = if existing.trim().is_empty() {
-        "(empty)"
-    } else {
-        existing.trim()
-    };
-    format!(
-        "This coding session is ending. Maintain a small, durable memory for future work \
-         in this project — reusable notes, not a transcript.\n\nCurrent saved memory:\n\
-         ---\n{existing}\n---\n\nRevise it using only what THIS session actually \
-         established: keep facts that save time next time — project conventions, key \
-         decisions and constraints, non-obvious gotchas, important file locations, and \
-         the exact build/test/run commands that matter. Drop anything transient, already \
-         obvious from the code or HI.md, or now outdated. Merge and de-duplicate. Output \
-         ONLY the updated memory as at most ~20 short bullet points (a few words to one \
-         line each), no preamble. If nothing durable is worth keeping, output the current \
-         memory unchanged (or nothing if it was empty)."
-    )
-}
-
-/// Trim and cap the distilled memory at [`MEMORY_MAX_CHARS`], cutting back to the
-/// last whole line so a bullet isn't sliced mid-word. Empty in → empty out.
-fn cap_memory(s: &str) -> String {
-    let s = s.trim();
-    if s.chars().count() <= MEMORY_MAX_CHARS {
-        return s.to_string();
+    /// Test-only direct access to the backing message vec, so tests can set up
+    /// transcripts (prior turns, tool calls + results) without going through a
+    /// model call. Goes through [`Transcript::mutate_slice`] so the same
+    /// shared-`Arc` optimization applies.
+    #[cfg(test)]
+    pub(crate) fn messages_mut(&mut self) -> &mut Vec<Message> {
+        self.messages.mutate_slice()
     }
-    let kept: String = s.chars().take(MEMORY_MAX_CHARS).collect();
-    let kept = kept
-        .rsplit_once('\n')
-        .map(|(head, _)| head)
-        .unwrap_or(&kept);
-    format!("{}\n… (memory truncated)", kept.trim_end())
-}
-
-/// Whether to distill session memory at quit: only when enabled *and* the model
-/// actually produced output this session, so an empty or command-only session
-/// writes nothing. Shared by both frontends so the rule can't drift between them.
-pub fn should_distill_memory(enabled: bool, output_tokens: u64) -> bool {
-    enabled && output_tokens > 0
-}
-
-/// Humanize a token count compactly and consistently: `991`, `1.2k`, `22k`, `1.0M`.
-/// Shared by the live working line and the settled usage summary so they agree.
-pub fn humanize_count(n: u64) -> String {
-    match n {
-        0..=999 => n.to_string(),
-        1_000..=9_999 => format!("{:.1}k", n as f64 / 1000.0),
-        10_000..=999_999 => format!("{}k", n / 1000),
-        _ => format!("{:.1}M", n as f64 / 1_000_000.0),
-    }
-}
-
-fn tool_mode_label(mode: ToolMode) -> &'static str {
-    match mode {
-        ToolMode::Auto => "auto",
-        ToolMode::Required => "required",
-        ToolMode::ChatOnly => "chat-only",
-        ToolMode::ReadOnly => "read-only",
-    }
-}
-
-fn looks_mutating(input: &str) -> bool {
-    let s = input.to_ascii_lowercase();
-    [
-        "edit",
-        "fix",
-        "change",
-        "update",
-        "write",
-        "create",
-        "delete",
-        "remove",
-        "rename",
-        "implement",
-        "add ",
-        "modify",
-        "refactor",
-        "format",
-        "run ",
-    ]
-    .iter()
-    .any(|needle| s.contains(needle))
-}
-
-/// Heuristic: does the model's final text read like an *announced but unperformed*
-/// next step — e.g. "Now let me rewrite main.rs:" or a "Here's my plan:" followed
-/// by a numbered to-do list — rather than a finished answer or a past-tense recap?
-///
-/// It judges the trailing non-empty line, with one twist: when the message trails
-/// off into a plan/to-do list, the intent lives in the line that *introduces* the
-/// list ("Here's my plan:"), not the last bullet — so it judges that lead-in
-/// instead, and only when the lead-in looks forward. That way a proper codex-style
-/// recap that ends in a bullet list ("Key changes:\n- …") doesn't read as a stall,
-/// while a model that announces a plan and quits without doing it does.
-fn looks_like_unfinished_step(text: &str) -> bool {
-    let lines: Vec<&str> = text
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
-    let Some(&last) = lines.last() else {
-        return false;
-    };
-    if is_list_item(last) {
-        // Trailing plan/to-do list: unfinished only if the line introducing it
-        // looks forward ("Here's my plan:"). A past-tense recap list is done.
-        let lead = lines
-            .iter()
-            .rev()
-            .find(|l| !is_list_item(l))
-            .copied()
-            .unwrap_or(last);
-        return is_forward_intent(lead);
-    }
-    // Otherwise judge the trailing line: a dangling colon ("Now let me rewrite
-    // main.rs:") or a forward-looking phrase means work was announced, not done.
-    last.ends_with(':') || is_forward_intent(last)
-}
-
-/// Whether a line expresses *intent to act next* rather than a finished result.
-fn is_forward_intent(line: &str) -> bool {
-    let lower = line.to_lowercase();
-    // Courtesy closings address the *user* ("let me know if…", "I'll be happy
-    // to…", "I'll let you know…") — they read like forward phrases but mean the
-    // turn is finished, not stalled. Vetoed first so they don't trigger a nudge.
-    const CLOSINGS: [&str; 6] = [
-        "let me know",
-        "i'll be happy",
-        "i'll let you",
-        "i'll wait",
-        "i'm happy to",
-        "feel free",
-    ];
-    if CLOSINGS.iter().any(|c| lower.contains(c)) {
-        return false;
-    }
-    const FORWARD_INTENT: [&str; 12] = [
-        "let me ",
-        "let's ",
-        "i'll ",
-        "i will ",
-        "i'm going to",
-        "i am going to",
-        "proceed to ",
-        "here's my plan",
-        "here is my plan",
-        "my plan",
-        "i need to ",
-        "next, i",
-    ];
-    FORWARD_INTENT.iter().any(|phrase| lower.contains(phrase))
-}
-
-/// Whether a line is a markdown list item — a bullet (`- `, `* `, `• `) or a
-/// numbered item (`1.`, `2)`) — used to spot a trailing plan/to-do list.
-fn is_list_item(line: &str) -> bool {
-    let l = line.trim_start();
-    if l.starts_with("- ") || l.starts_with("* ") || l.starts_with("• ") {
-        return true;
-    }
-    let digits = l.chars().take_while(|c| c.is_ascii_digit()).count();
-    digits > 0 && l[digits..].starts_with(['.', ')'])
-}
-
-/// A lightweight file fingerprint: mtime (seconds) + size in bytes. Two
-/// snapshots of the same file compare equal iff the file hasn't been touched.
-/// Much cheaper than reading every file's content on every turn.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct FileFingerprint {
-    mtime_secs: i64,
-    len: u64,
-}
-
-async fn workspace_snapshot(
-    dir: &std::path::Path,
-) -> std::collections::BTreeMap<String, FileFingerprint> {
-    // Use the `ignore` crate (same as the list/grep tools) to respect
-    // .gitignore, global gitignore, and parent .gitignore files. This avoids
-    // walking node_modules, .venv, target, vendor, Pods, etc. — a massive win
-    // for repos with large dependency trees. The walk is synchronous but fast
-    // (no per-entry async overhead); we run it on a blocking-pool thread.
-    let dir = dir.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        let mut out = std::collections::BTreeMap::new();
-        for entry in ignore::WalkBuilder::new(&dir)
-            .hidden(false)
-            .git_ignore(true)
-            .git_global(true)
-            .git_exclude(true)
-            .ignore(true)
-            .parents(true)
-            // Prune VCS metadata (.git/.hg/.svn/.jj): walking it would flag
-            // every commit/index write as a "changed file" and balloon the
-            // snapshot. We walk hidden files so real dotfiles are tracked.
-            .filter_entry(|e| {
-                !matches!(
-                    e.file_name().to_str(),
-                    Some(".git" | ".hg" | ".svn" | ".jj")
-                )
-            })
-            .build()
-            .filter_map(|e| e.ok())
-        {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let Ok(rel) = path.strip_prefix(&dir) else {
-                continue;
-            };
-            let Ok(meta) = std::fs::metadata(path) else {
-                continue;
-            };
-            let mtime_secs = meta
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            out.insert(
-                rel.to_string_lossy().into_owned(),
-                FileFingerprint {
-                    mtime_secs,
-                    len: meta.len(),
-                },
-            );
-        }
-        out
-    })
-    .await
-    .unwrap_or_default()
-}
-
-fn changed_files_between(
-    before: &std::collections::BTreeMap<String, FileFingerprint>,
-    after: &std::collections::BTreeMap<String, FileFingerprint>,
-) -> Vec<String> {
-    let mut files = std::collections::BTreeSet::new();
-    for path in before.keys() {
-        if before.get(path) != after.get(path) {
-            files.insert(path.clone());
-        }
-    }
-    for path in after.keys() {
-        if before.get(path) != after.get(path) {
-            files.insert(path.clone());
-        }
-    }
-    files.into_iter().collect()
 }
 
 #[cfg(test)]
@@ -2202,13 +1699,13 @@ mod tests {
             config(),
         );
         let huge_old_output = "old tool output ".repeat(20_000);
-        Arc::make_mut(&mut agent.messages).push(Message::user("previous task"));
-        Arc::make_mut(&mut agent.messages).push(Message::assistant(vec![Content::ToolCall {
+        agent.messages_mut().push(Message::user("previous task"));
+        agent.messages_mut().push(Message::assistant(vec![Content::ToolCall {
             id: "read-1".into(),
             name: "read".into(),
             arguments: r#"{"path":"LICENSE"}"#.into(),
         }]));
-        Arc::make_mut(&mut agent.messages)
+        agent.messages_mut()
             .push(Message::tool_result("read-1", huge_old_output.clone()));
 
         let mut ui = RecordingUi::default();
@@ -2401,27 +1898,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cap_memory_trims_and_backstops() {
-        assert_eq!(cap_memory("  - a\n- b  "), "- a\n- b"); // trimmed, under budget
-        assert_eq!(cap_memory("   "), ""); // empty in → empty out
-        let big = "- a durable note\n".repeat(1000); // ≫ MEMORY_MAX_CHARS
-        let capped = cap_memory(&big);
-        assert!(
-            capped.chars().count() <= MEMORY_MAX_CHARS + 40,
-            "backstopped"
-        );
-        assert!(capped.ends_with("(memory truncated)"));
-    }
-
-    #[test]
-    fn memory_prompt_folds_in_existing_memory() {
-        let p = memory_prompt("- 4-space indent");
-        assert!(p.contains("- 4-space indent"), "includes current memory");
-        assert!(p.contains("Current saved memory"));
-        assert!(memory_prompt("   ").contains("(empty)"), "blank → (empty)");
-    }
-
     #[tokio::test]
     async fn update_memory_writes_file_without_polluting_history() {
         let path = std::env::temp_dir().join(format!("hi-mem-{}-write.md", std::process::id()));
@@ -2504,41 +1980,6 @@ mod tests {
     }
 
     #[test]
-    fn should_distill_memory_gates_on_enabled_and_work() {
-        assert!(should_distill_memory(true, 1), "enabled + work → distill");
-        assert!(!should_distill_memory(true, 0), "no model output → skip");
-        assert!(!should_distill_memory(false, 100), "disabled → skip");
-    }
-
-    #[test]
-    fn humanize_count_abbreviates_consistently() {
-        assert_eq!(humanize_count(0), "0");
-        assert_eq!(humanize_count(991), "991");
-        assert_eq!(humanize_count(1234), "1.2k");
-        assert_eq!(humanize_count(22864), "22k"); // the reported "22864 in"
-        assert_eq!(humanize_count(12000), "12k"); // the reported "12k" ctx
-        assert_eq!(humanize_count(999_999), "999k"); // last "k" before switching
-        assert_eq!(humanize_count(1_000_000), "1.0M"); // a 1M window
-        // A long session's cumulative input must read as millions, never a
-        // 5-digit "15528k" (the pre-fix formatter that prompted this).
-        assert_eq!(humanize_count(15_528_000), "15.5M");
-    }
-
-    #[test]
-    fn system_prompt_grounds_the_working_directory() {
-        // The model must be told where it actually is, so it doesn't invent paths
-        // (e.g. /home/user), cd elsewhere, or scaffold a new project.
-        let sys = SystemPrompt::new().build();
-        let text = sys.text();
-        let cwd = std::env::current_dir().unwrap().display().to_string();
-        assert!(text.contains(&cwd), "names the working directory: {text}");
-        assert!(
-            text.contains("does NOT persist"),
-            "warns that cd doesn't persist"
-        );
-    }
-
-    #[test]
     fn goal_updates_system_prompt_and_clear_history_keeps_it() {
         let mut agent = agent(vec![], config());
         agent.set_goal(Some("ship a stable TUI".into()));
@@ -2555,7 +1996,7 @@ mod tests {
             "goal text included"
         );
 
-        Arc::make_mut(&mut agent.messages).push(Message::user("noise"));
+        agent.messages_mut().push(Message::user("noise"));
         agent.clear_history();
         assert_eq!(agent.messages().len(), 1);
         assert!(
@@ -2671,8 +2112,8 @@ mod tests {
             records: records.clone(),
         }));
         // Some history to compact.
-        Arc::make_mut(&mut agent.messages).push(Message::user("hello"));
-        Arc::make_mut(&mut agent.messages)
+        agent.messages_mut().push(Message::user("hello"));
+        agent.messages_mut()
             .push(Message::assistant(vec![Content::Text("hi".into())]));
 
         agent.compact(&mut NullUi).await.unwrap();
@@ -2709,11 +2150,11 @@ mod tests {
             config(),
         );
         // Two user turns; keep_recent = 1 summarizes the first, keeps the second.
-        Arc::make_mut(&mut agent.messages).push(Message::user("q1"));
-        Arc::make_mut(&mut agent.messages)
+        agent.messages_mut().push(Message::user("q1"));
+        agent.messages_mut()
             .push(Message::assistant(vec![Content::Text("a1".into())]));
-        Arc::make_mut(&mut agent.messages).push(Message::user("q2"));
-        Arc::make_mut(&mut agent.messages)
+        agent.messages_mut().push(Message::user("q2"));
+        agent.messages_mut()
             .push(Message::assistant(vec![Content::Text("a2".into())]));
 
         agent
@@ -2754,8 +2195,8 @@ mod tests {
             )],
             config(),
         );
-        Arc::make_mut(&mut agent.messages).push(Message::user("only turn"));
-        Arc::make_mut(&mut agent.messages)
+        agent.messages_mut().push(Message::user("only turn"));
+        agent.messages_mut()
             .push(Message::assistant(vec![Content::Text("a".into())]));
         // keep_recent = 3 but only one turn → no recent window → summarize all.
         agent
@@ -2773,20 +2214,20 @@ mod tests {
         // Empty provider: if elision tried to call the model, this would panic.
         let mut agent = agent(vec![], config());
         let big = "x".repeat(500);
-        Arc::make_mut(&mut agent.messages).push(Message::user("read a"));
-        Arc::make_mut(&mut agent.messages).push(Message::assistant(vec![Content::ToolCall {
+        agent.messages_mut().push(Message::user("read a"));
+        agent.messages_mut().push(Message::assistant(vec![Content::ToolCall {
             id: "c1".into(),
             name: "read".into(),
             arguments: "{}".into(),
         }]));
-        Arc::make_mut(&mut agent.messages).push(Message::tool_result("c1", big.clone()));
-        Arc::make_mut(&mut agent.messages).push(Message::user("read b")); // recent turn
-        Arc::make_mut(&mut agent.messages).push(Message::assistant(vec![Content::ToolCall {
+        agent.messages_mut().push(Message::tool_result("c1", big.clone()));
+        agent.messages_mut().push(Message::user("read b")); // recent turn
+        agent.messages_mut().push(Message::assistant(vec![Content::ToolCall {
             id: "c2".into(),
             name: "read".into(),
             arguments: "{}".into(),
         }]));
-        Arc::make_mut(&mut agent.messages).push(Message::tool_result("c2", big.clone()));
+        agent.messages_mut().push(Message::tool_result("c2", big.clone()));
 
         agent
             .compact_with(
@@ -3150,37 +2591,6 @@ mod tests {
         assert_eq!(agent.totals().output_tokens, 1, "no extra recap call");
     }
 
-    #[test]
-    fn unfinished_step_heuristic() {
-        for t in [
-            "Now let me rewrite main.rs:",
-            "I'll add the struct",
-            "Here is the plan:",
-            // A "plan:" lead-in followed by a numbered to-do list — the trailing
-            // line is a list item, so the lead-in is what's judged. (This is the
-            // case the old line-only heuristic missed, ending the turn mid-plan.)
-            "Now let me make the fixes. Here's my plan:\n\n1. Remove deps\n2. Fix gitignore\n3. Drop dead code",
-        ] {
-            assert!(looks_like_unfinished_step(t), "should flag: {t:?}");
-        }
-        for t in [
-            "Done. Run `cargo build`.",
-            "The answer is 42.",
-            "I changed foo.rs and bar.rs.",
-            // A past-tense recap that ends in a bullet list is finished, not a
-            // stall — the lead-in ("Key changes:") looks back, not forward.
-            "Key changes:\n- Added GOP support in encoder.rs\n- Updated the CLI in main.rs",
-            // Courtesy closings address the user — a finished turn, not a stall —
-            // even though they contain "let me"/"I'll". These used to false-nudge.
-            "All done. Let me know if you'd like any changes.",
-            "I'll be happy to help with anything else.",
-            "Implemented and tested. I'll let you know if I spot any issues.",
-            "Fixed it — feel free to ask if you want more detail.",
-        ] {
-            assert!(!looks_like_unfinished_step(t), "should not flag: {t:?}");
-        }
-    }
-
     #[tokio::test]
     async fn turn_end_reports_cumulative_not_last_round() {
         // Two rounds (5/1 then 6/2). The done line must show the cumulative
@@ -3344,15 +2754,15 @@ mod tests {
             ))],
             cfg,
         );
-        Arc::make_mut(&mut agent.messages).push(Message::user("existing long turn"));
+        agent.messages_mut().push(Message::user("existing long turn"));
         for i in 1..=8 {
             let id = format!("c{i}");
-            Arc::make_mut(&mut agent.messages).push(Message::assistant(vec![Content::ToolCall {
+            agent.messages_mut().push(Message::assistant(vec![Content::ToolCall {
                 id: id.clone(),
                 name: "read".into(),
                 arguments: "{}".into(),
             }]));
-            Arc::make_mut(&mut agent.messages).push(Message::tool_result(
+            agent.messages_mut().push(Message::tool_result(
                 &id,
                 format!("{i}\n{}", "x".repeat(500)),
             ));
@@ -3417,33 +2827,6 @@ mod tests {
         assert!(
             freq.is_some_and(|f| f > 0.0),
             "retry adds a frequency penalty, got {freq:?}"
-        );
-    }
-
-    #[test]
-    fn recovery_sampling_escalates_and_toggles() {
-        // Normal round: pass the configured temperature through, no overrides.
-        assert_eq!(
-            recovery_sampling(0, Some(0.2), true),
-            (Some(0.2), None, None)
-        );
-        // First retry: nucleus + frequency penalty lead; temperature rises only
-        // gently from the 0.5 floor (to ~0.65, well under the old 0.85).
-        let (t1, p1, f1) = recovery_sampling(1, Some(0.2), true);
-        assert_eq!((p1, f1), (Some(0.95), Some(0.3)));
-        assert!(
-            t1.unwrap() > 0.2 && t1.unwrap() < 0.7,
-            "temp climbs gently: {t1:?}"
-        );
-        // Second retry climbs further; temperature and penalty stay bounded.
-        let (t2, _, f2) = recovery_sampling(2, Some(0.2), true);
-        assert!(t2.unwrap() > t1.unwrap(), "temp keeps climbing");
-        assert!(f2.unwrap() > f1.unwrap(), "penalty grows");
-        assert!(t2.unwrap() <= 1.0 && f2.unwrap() <= 0.6, "both bounded");
-        // Disabled: a retry behaves like a normal round (no overrides).
-        assert_eq!(
-            recovery_sampling(2, Some(0.2), false),
-            (Some(0.2), None, None)
         );
     }
 

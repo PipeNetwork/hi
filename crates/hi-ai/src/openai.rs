@@ -110,6 +110,7 @@ impl Provider for OpenAiProvider {
                 cache_read_tokens: 0,
                 cache_creation_tokens: 0,
                 input_includes_cache: true,
+                context_occupancy: estimate_messages_tokens(&request.messages),
             })
         })?;
         backfill_missing_usage(&mut completion, &request);
@@ -233,9 +234,10 @@ where
                 cache_read_tokens: cached,
                 cache_creation_tokens: 0,
                 // OpenAI's `prompt_tokens` already includes the cached subset
-                // reported in `cached_tokens`, so do not add cache_read_tokens
-                // again when computing context occupancy.
+                // reported in `cached_tokens`, so the context window occupancy
+                // is exactly `prompt_tokens` — not `prompt_tokens + cached`.
                 input_includes_cache: true,
+                context_occupancy: usage.prompt_tokens,
             };
         }
         for choice in chunk.choices {
@@ -1060,6 +1062,28 @@ mod tests {
         assert_eq!(calls[0].id, "call_1");
         assert_eq!(calls[0].name, "bash");
         assert_eq!(calls[0].arguments, r#"{"command":"echo hi"}"#);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cached_tokens_do_not_double_count_context_occupancy() {
+        // OpenAI's `prompt_tokens` already includes the cached subset reported
+        // in `cached_tokens`, so context_occupancy must equal prompt_tokens —
+        // not prompt_tokens + cached_tokens (the double-counting bug this field
+        // replaces).
+        let stream = never_ending(vec![
+            r#"{"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}"#,
+            r#"{"choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":400}}}"#,
+        ]);
+        let mut sink = |_: StreamEvent| {};
+        let completion = collect_completion(stream, IDLE, STALL, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(completion.usage.input_tokens, 1000);
+        assert_eq!(completion.usage.cache_read_tokens, 400);
+        assert_eq!(
+            completion.usage.context_occupancy, 1000,
+            "context_occupancy == prompt_tokens, not prompt_tokens + cached"
+        );
     }
 
     fn request(tools: Vec<ToolSpec>, profile: RequestProfile) -> ChatRequest {

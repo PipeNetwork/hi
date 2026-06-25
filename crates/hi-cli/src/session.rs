@@ -220,6 +220,7 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
                         cache_read_tokens: 0,
                         cache_creation_tokens: 0,
                         input_includes_cache: false,
+                        context_occupancy: input_tokens,
                     };
                     cost_usd = saved_cost;
                 }
@@ -370,6 +371,7 @@ mod tests {
                     cache_read_tokens: 0,
                     cache_creation_tokens: 0,
                     input_includes_cache: false,
+                    context_occupancy: 123,
                 },
                 Some(0.1234),
             )
