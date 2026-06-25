@@ -572,6 +572,7 @@ dependencies = [
  "hi-ai",
  "hi-tools",
  "ignore",
+ "serde",
  "serde_json",
  "tokio",
 ]

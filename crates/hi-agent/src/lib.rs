@@ -45,6 +45,67 @@ use verify::{stage_guidance, Verifier, VerifyOutcome, Snapshot};
 /// Crate version (from Cargo.toml).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Per-turn telemetry: the trajectory of one `run_turn`, captured so callers
+/// (the `--report` writer, the eval harness) can diagnose *how* a turn went,
+/// not just whether it passed. The counters here are locals inside `run_turn`
+/// that would otherwise be discarded on return; flushing them to this struct
+/// makes the verify/recovery/nudge story queryable.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TurnTelemetry {
+    /// How many verify rounds ran this turn (0 = verify off or skipped).
+    pub verify_rounds: u32,
+    /// Times a content-less / malformed response was silently re-sampled
+    /// (recovery sampling). 0 on a clean turn.
+    pub recovery_retries: u32,
+    /// Times the repeat guard nudged the model for re-issuing identical calls.
+    pub repeat_nudges: u32,
+    /// Times the continue nudge fired for an announced-but-unperformed step.
+    pub continue_nudges: u32,
+    /// Whether the turn hit the per-turn step cap (`max_steps`).
+    pub hit_step_cap: bool,
+    /// Whether the turn ended stalled on announced-but-unrun steps.
+    pub stalled_unfinished: bool,
+    /// Whether the turn ended stalled repeating the same tool call.
+    pub stalled_repeating: bool,
+    /// Attributions parsed from the last verify failure's output (empty if
+    /// verify passed, was skipped, or produced nothing parseable). Points at
+    /// the file/line/symbol the model was steered toward.
+    pub verify_attributions: Vec<TurnAttribution>,
+}
+
+/// A serializable view of one parsed verify-failure location, for the telemetry
+/// report. Mirrors `hi_tools::Attribution` but owned and plain-old-data so it
+/// derives `Serialize`/`Deserialize` cleanly without leaking the parser type
+/// across the crate boundary.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TurnAttribution {
+    pub path: String,
+    pub line: Option<u32>,
+    pub column: Option<u32>,
+    pub message: String,
+    /// `"compile"`, `"test"`, `"lint"`, or `"other"`.
+    pub kind: String,
+}
+
+impl From<&hi_tools::Attribution> for TurnAttribution {
+    fn from(a: &hi_tools::Attribution) -> Self {
+        let kind = match a.kind {
+            hi_tools::AttrKind::Compile => "compile",
+            hi_tools::AttrKind::Test => "test",
+            hi_tools::AttrKind::Lint => "lint",
+            hi_tools::AttrKind::Other => "other",
+        };
+        Self {
+            path: a.path.clone(),
+            line: a.line,
+            column: a.column,
+            message: a.message.clone(),
+            kind: kind.to_string(),
+        }
+    }
+}
+
+
 /// Auto-compact once the context window is at least this percent full.
 pub const AUTO_COMPACT_PERCENT: u64 = 80;
 /// After triggering, compact until the local estimate is at or below this
@@ -145,6 +206,11 @@ pub struct Agent {
     /// Files whose content or presence changed in the most recent turn.
     last_changed_files: Vec<String>,
     last_compat_fallbacks: Vec<String>,
+    /// Telemetry from the most recent `run_turn` (verify rounds, recovery
+    /// retries, nudges fired, last verify attributions). Flushed at turn end
+    /// from locals that would otherwise be discarded; exposed for `--report`
+    /// and the eval harness so they can diagnose *how* a turn went.
+    last_turn_telemetry: TurnTelemetry,
     /// Optional transient goal injected into the system prompt for future turns.
     goal: Option<String>,
     /// Cached workspace snapshot — avoids re-walking the tree on every
@@ -199,6 +265,7 @@ impl Agent {
             checkpoints: Vec::new(),
             last_changed_files: Vec::new(),
             last_compat_fallbacks: Vec::new(),
+            last_turn_telemetry: TurnTelemetry::default(),
             goal: None,
             snapshot_cache: SnapshotCache::default(),
         }
@@ -411,6 +478,14 @@ impl Agent {
     /// Compatibility fallbacks that were triggered in the most recent turn.
     pub fn last_compat_fallbacks(&self) -> &[String] {
         &self.last_compat_fallbacks
+    }
+
+    /// Telemetry from the most recent turn: verify rounds, recovery retries,
+    /// nudges fired, stall flags, and the attributions parsed from the last
+    /// verify failure. Lets callers diagnose *how* a turn went, not just
+    /// whether it passed.
+    pub fn last_turn_telemetry(&self) -> &TurnTelemetry {
+        &self.last_turn_telemetry
     }
 
     /// The tool mode currently configured for this session.
@@ -884,6 +959,9 @@ impl Agent {
         // Whether the turn was cut short by the per-turn step cap, so the
         // finalization recap is skipped (the work may be incomplete).
         let mut ended_at_cap = false;
+        // Attributions parsed from the most recent verify failure — captured
+        // here so they survive to turn end and can be flushed into telemetry.
+        let mut last_verify_attributions: Vec<hi_tools::Attribution> = Vec::new();
         // Snapshot the turn baseline so verification only runs when the
         // workspace ends up changed. This catches `bash` edits too, while
         // skipping verify when a turn makes no net file changes.
@@ -1267,6 +1345,8 @@ impl Agent {
                     // hidden. Empty when nothing parseable is found (the nudge
                     // then keeps its original shape).
                     let causes = hi_tools::parse_attributions(&output, 3);
+                    // Capture for telemetry (flushed to the Agent at turn end).
+                    last_verify_attributions = causes.clone();
                     let cause_section = if causes.is_empty() {
                         String::new()
                     } else {
@@ -1319,6 +1399,23 @@ impl Agent {
         };
         self.last_changed_files = changed_files_between(&turn_snapshot, &end_snapshot);
         self.last_compat_fallbacks = compat_fallbacks;
+        // Flush the per-turn counters (otherwise discarded locals) into
+        // telemetry so `--report` / the eval harness can diagnose the turn's
+        // trajectory: how many verify rounds, recovery retries, nudges fired,
+        // and where the last verify failure pointed.
+        self.last_turn_telemetry = TurnTelemetry {
+            verify_rounds: verifier.round(),
+            recovery_retries: empty_retries,
+            repeat_nudges,
+            continue_nudges,
+            hit_step_cap: ended_at_cap,
+            stalled_unfinished,
+            stalled_repeating,
+            verify_attributions: last_verify_attributions
+                .iter()
+                .map(TurnAttribution::from)
+                .collect(),
+        };
 
         // The model kept announcing steps it never ran, through the whole nudge
         // budget — don't let the turn read as a clean success.
@@ -1716,11 +1813,19 @@ mod tests {
         )
     }
 
-    /// A unique throwaway file path under the current workspace.
+    /// A unique throwaway file path under the current workspace. The name is
+    /// unique per *call* (not just per process), so concurrent test runs and
+    /// repeated calls within one process never collide — and a file left
+    /// behind by a test that panicked before cleanup doesn't get clobbered
+    /// or mistaken for another test's artifact. The file lives in the
+    /// workspace (cwd) on purpose: the verify snapshot walks `.` to detect
+    /// changes, so the temp file must be inside it for verify to notice.
     fn temp_file(tag: &str) -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         std::env::current_dir()
             .unwrap()
-            .join(format!(".hi-verify-{tag}-{}", std::process::id()))
+            .join(format!(".hi-verify-{tag}-{}-{n}", std::process::id()))
     }
 
     #[tokio::test]

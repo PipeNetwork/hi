@@ -7,6 +7,7 @@ version.workspace = true
 hi-ai.workspace = true
 hi-tools.workspace = true
 anyhow.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 futures-util.workspace = true
 tokio = { workspace = true }
