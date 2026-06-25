@@ -4,6 +4,8 @@
 # Track it (git add -f .hi/memory.md) if you'd rather share project memory with the team.
 /.hi/
 
-# Test artifacts: temp files created by hi-agent tests (temp_file helper) that
-# leak into the workspace when tests don't clean up. Never commit these.
+# Test artifacts: temp files created by hi-agent tests that leaked into the
+# workspace. The current temp_file helper uses hi-test-* names (not gitignored,
+# so the workspace snapshot can see them for change detection). These are
+# cleaned up by the tests; this pattern catches any that leak from older tests.
 .hi-verify-*

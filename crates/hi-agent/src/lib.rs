@@ -591,23 +591,52 @@ impl Agent {
             return; // Already done or failed — nothing to drive.
         }
         let max_retries = DEFAULT_SUBGOAL_RETRIES;
-        // A turn that verified clean (or had no verify and didn't stall)
-        // completes the active sub-goal → advance.
+        // A turn that verified clean (or had no verify but made edits without
+        // stalling) completes the active sub-goal → advance.
         let verified_clean = matches!(self.last_verify, Some(true));
         let no_verify_clean = self.last_verify.is_none()
             && !stalled_repeating
             && !hit_step_cap
             && !self.last_changed_files.is_empty();
+        // A clean read-only turn (investigation, Q&A — no edits, no verify,
+        // no stall) is neutral: neither advance nor record failure. The sub-goal
+        // stays active for the next turn, which should do the actual work.
+        let no_edit_neutral = self.last_verify.is_none()
+            && !stalled_repeating
+            && !hit_step_cap
+            && self.last_changed_files.is_empty();
+        if no_edit_neutral {
+            return;
+        }
         if verified_clean || no_verify_clean {
             // Only advance if the active sub-goal isn't already Done —
             // `apply_plan_to_goal` (from the model's `update_plan` call) may
             // have already marked it done and advanced to the next. Calling
             // `advance()` again here would skip that next sub-goal.
-            let needs_advance = goal
-                .active_sub_goal()
-                .map(|sg| sg.status != GoalStatus::Done)
-                .unwrap_or(false);
-            if needs_advance {
+            //
+            // After apply_plan_to_goal advances, the *new* active sub-goal is
+            // Active (not Done), so checking "is the active sub-goal Done?"
+            // would still call advance() and skip it. Instead, track whether
+            // apply_plan_to_goal already advanced during this turn by checking
+            // if any sub-goal after the first Active one is also Active or
+            // Done (meaning the plan already progressed past the original
+            // active step). Simpler and correct: only advance if NO sub-goal
+            // was marked Done by apply_plan_to_goal this turn — i.e., the
+            // model didn't use update_plan to mark progress. We detect this
+            // by checking whether the first non-Pending sub-goal from the top
+            // is the active one (no Done step before it was handled by the
+            // plan update). If apply_plan_to_goal ran, the first Done sub-goal
+            // is already marked, and the active one is past it — so advance()
+            // would skip. The safe check: don't advance if any sub-goal before
+            // the active index is Done AND the active sub-goal itself is not
+            // Done (apply_plan_to_goal already advanced to it).
+            let active_idx = goal.active_index();
+            let plan_already_advanced = active_idx.map(|i| {
+                // If any sub-goal before the active one is Done, the plan
+                // already progressed — don't advance again.
+                i > 0 && goal.sub_goals[..i].iter().any(|sg| sg.status == GoalStatus::Done)
+            }).unwrap_or(false);
+            if !plan_already_advanced {
                 let i = goal.active_index();
                 goal.advance();
                 if let Some(i) = i {
@@ -1531,6 +1560,15 @@ impl Agent {
                         self.messages.push_nudge(NudgeKind::Continue, SILENT_CONTINUE_NUDGE);
                         continue;
                     }
+                    // If we exhausted the silent-continue budget on a turn that
+                    // looked unfinished, let the user know — the model kept
+                    // narrating without acting, and the agent stopped pushing.
+                    if looks_unfinished && silent_continues >= self.config.max_silent_continues {
+                        ui.status(
+                            "⚠ the model kept narrating without acting — the task may be \
+                             incomplete. /retry, or send 'continue'.",
+                        );
+                    }
                     break false;
                 }
                 // The model requested tool calls — it's actively working.
@@ -2290,7 +2328,7 @@ mod tests {
         let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         std::env::current_dir()
             .unwrap()
-            .join(format!(".hi-verify-{tag}-{}-{n}", std::process::id()))
+            .join(format!("hi-test-{tag}-{}-{n}", std::process::id()))
     }
 
     #[tokio::test]
@@ -3446,10 +3484,11 @@ mod tests {
         agent.run_turn("review the code", &mut ui).await.unwrap();
         // The turn completed (didn't run out of completions).
         assert!(ui.turn_end.is_some(), "turn completed");
-        // No "nudging" or "continue" status line was emitted — it was silent.
+        // No "nudging" status line was emitted during the silent continues.
+        // (The exhaustion warning after the budget is fine — it's expected.)
         assert!(
-            !ui.statuses.iter().any(|s| s.contains("nudging") || s.contains("continue")),
-            "silent — no visible nudge status: {:?}",
+            !ui.statuses.iter().any(|s| s.contains("nudging")),
+            "silent — no visible nudge status during continues: {:?}",
             ui.statuses
         );
     }
