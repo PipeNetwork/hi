@@ -4,6 +4,7 @@
 pub mod command;
 pub mod compaction;
 mod config;
+mod decision;
 mod heuristics;
 mod memory;
 mod prompt;
@@ -41,6 +42,8 @@ use prompt::SystemPrompt;
 use snapshot::{changed_files_between, FileFingerprint, SnapshotCache};
 use transcript::{NudgeKind, Transcript};
 use verify::{stage_guidance, Verifier, VerifyOutcome, Snapshot};
+
+pub use decision::{Decision, DecisionLog};
 
 /// Crate version (from Cargo.toml).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -213,6 +216,11 @@ pub struct Agent {
     last_turn_telemetry: TurnTelemetry,
     /// Optional transient goal injected into the system prompt for future turns.
     goal: Option<String>,
+    /// Durable intra-session decision log — recorded via the `record_decision`
+    /// tool and injected into the system prompt each turn, so the model stays
+    /// consistent across compaction (which would otherwise summarize away the
+    /// reasoning behind earlier decisions).
+    decisions: DecisionLog,
     /// Cached workspace snapshot — avoids re-walking the tree on every
     /// verify/turn-end check when no files changed. Invalidated by any
     /// write/edit/bash tool call in the current turn, and by `/undo`.
@@ -267,6 +275,7 @@ impl Agent {
             last_compat_fallbacks: Vec::new(),
             last_turn_telemetry: TurnTelemetry::default(),
             goal: None,
+            decisions: DecisionLog::default(),
             snapshot_cache: SnapshotCache::default(),
         }
     }
@@ -437,6 +446,7 @@ impl Agent {
         SystemPrompt::new()
             .with_project_context(self.config.project_context.as_deref())
             .with_goal(self.goal.as_deref())
+            .with_decisions(self.decisions.prompt_section().as_deref())
             .with_finalize(self.config.finalize)
             .build()
     }
@@ -460,6 +470,12 @@ impl Agent {
         self.goal.as_deref()
     }
 
+    /// The durable intra-session decision log (recorded via `record_decision`),
+    /// injected into the system prompt each turn and preserved across compaction.
+    pub fn decisions(&self) -> &DecisionLog {
+        &self.decisions
+    }
+
     /// Set or clear the transient session goal and inject it into the system prompt.
     pub fn set_goal(&mut self, goal: Option<String>) {
         self.goal = goal.and_then(|g| {
@@ -467,6 +483,38 @@ impl Agent {
             (!g.is_empty()).then_some(g)
         });
         self.refresh_system_message();
+    }
+
+    /// Handle a `record_decision` tool call: parse the args, append to the
+    /// durable decision log (which feeds the system prompt), and return a
+    /// terse confirmation for the model. Malformed args yield an error string
+    /// (the model sees it and can retry), not a panic.
+    fn handle_record_decision(&mut self, arguments: &str) -> String {
+        #[derive(serde::Deserialize)]
+        struct DecisionArgs {
+            summary: String,
+            rationale: String,
+            #[serde(default)]
+            files: Vec<String>,
+        }
+        match serde_json::from_str::<DecisionArgs>(arguments) {
+            Ok(args) => {
+                let summary = args.summary.trim().to_string();
+                if summary.is_empty() {
+                    return "Error: record_decision needs a non-empty summary".to_string();
+                }
+                self.decisions.record(Decision {
+                    summary,
+                    rationale: args.rationale.trim().to_string(),
+                    files: args.files,
+                });
+                // Refresh the system prompt so the decision is injected on the
+                // next turn (and visible to the model immediately in history).
+                self.refresh_system_message();
+                "Decision recorded — it will persist across compaction.".to_string()
+            }
+            Err(err) => format!("Error: bad record_decision arguments: {err}"),
+        }
     }
 
     /// Whether the most recent turn's verification passed (None if not run).
@@ -1327,71 +1375,112 @@ impl Agent {
                 stalled_unfinished = false;
                 // Infer within-batch dependencies (a read of a file a mutating
                 // call earlier in the batch targeted must observe that mutation;
-                // mutating calls serialize). The current scheduler runs calls in
-                // emission order, which by construction respects these deps
-                // (deps only point backward) — but computing them here and
-                // asserting the order respects them documents the invariant and
-                // guards a future scheduler change from regressing the
-                // "read-after-write observes the write" property.
+                // mutating calls serialize). The scheduler below runs ready
+                // calls concurrently respecting this graph, so independent reads
+                // can overlap with an independent later write — while a read
+                // whose path matches an earlier write waits for it.
                 let deps = tool_deps(&calls);
-                debug_assert!(
-                    respects_deps(&deps, &(0..calls.len()).collect::<Vec<_>>()),
-                    "emission-order execution must respect inferred tool deps"
-                );
-                // Execute the calls in the order the model emitted them, so a
-                // batch like "edit, then read" reads the post-edit state. Within
-                // that order, contiguous runs of read-only calls (which have no
-                // side effects and can't race) are run concurrently — preserving
-                // the parallelism benefit for all-read batches and read clusters
-                // around a mutating call, without reordering reads past a
-                // mutating call that precedes them.
-                //
-                // Results are collected and the assistant message + all matching
-                // tool results are recorded together via `push_assistant_with_results`,
-                // so the transcript never carries an orphan tool_use. UI streaming
-                // and snapshot invalidation still happen during execution.
-                let mut results: Vec<(String, String)> = Vec::with_capacity(calls.len());
-                let mut i = 0;
-                while i < calls.len() {
-                    if hi_tools::is_read_only(&calls[i].1) {
-                        // Gather the contiguous read-only run starting at i.
-                        let mut j = i;
-                        while j < calls.len() && hi_tools::is_read_only(&calls[j].1) {
-                            ui.tool_call(&calls[j].1, &calls[j].2);
-                            j += 1;
-                        }
-                        let batch = &calls[i..j];
-                        let outputs: Vec<_> = futures_util::stream::iter(
-                            batch.iter().map(|(_, name, arguments)| execute(name, arguments)),
-                        )
-                        .buffered(self.config.max_parallel_tools)
-                        .collect()
-                        .await;
-                        for ((id, _, _), output) in batch.iter().zip(outputs) {
-                            emit_tool_output(&mut *ui, &output);
-                            results.push((id.clone(), output.content));
-                        }
-                        i = j;
-                    } else {
+                // Execute via a ready-queue scheduler over the dep graph. A call
+                // is ready when all its deps are complete. Ready non-bash calls
+                // run concurrently; bash runs alone this round (its line-by-line
+                // UI streaming can't be reordered, and `tool_deps` already makes
+                // it depend on all prior calls via the unknown-path fallback, so
+                // it's never ready alongside a dependent). Results are collected
+                // and recorded together via `push_assistant_with_results` so the
+                // transcript never carries an orphan tool_use; results are
+                // ordered by emission index so the transcript reads in model
+                // order. UI streaming and snapshot invalidation still happen
+                // during execution.
+                let mut results: Vec<Option<(String, String)>> = vec![None; calls.len()];
+                let mut completed = vec![false; calls.len()];
+                let mut completion_order: Vec<usize> = Vec::with_capacity(calls.len());
+                // Pre-pass: handle `record_decision` calls serially. They mutate
+                // agent state (`self.decisions`) and aren't real tool dispatches,
+                // so they can't run in the parallel `execute` stream (no `&mut
+                // self` there). They're instantaneous and have no deps that
+                // matter, so handling them up front is safe.
+                for (i, (id, name, arguments)) in calls.iter().enumerate() {
+                    if name != "record_decision" {
+                        continue;
+                    }
+                    ui.tool_call(name, arguments);
+                    let content = self.handle_record_decision(arguments);
+                    ui.tool_result(&content);
+                    results[i] = Some((id.clone(), content));
+                    completed[i] = true;
+                    completion_order.push(i);
+                }
+                let mut done = completion_order.len();
+                while done < calls.len() {
+                    // Ready: deps all complete.
+                    let ready: Vec<usize> = (0..calls.len())
+                        .filter(|&i| !completed[i] && deps[i].iter().all(|&d| completed[d]))
+                        .collect();
+                    if ready.is_empty() {
+                        // Shouldn't happen (deps point backward) — break to
+                        // avoid spinning if the graph were somehow cyclic.
+                        break;
+                    }
+                    // If any ready call is bash, run it alone (streaming UI).
+                    let bash_idx = ready
+                        .iter()
+                        .copied()
+                        .find(|&i| calls[i].1 == "bash");
+                    if let Some(i) = bash_idx {
                         let (id, name, arguments) = &calls[i];
                         ui.tool_call(name, arguments);
-                        let output = if name == "bash" {
-                            let ui_ref: &mut dyn Ui = &mut *ui;
-                            execute_streaming(name, arguments, &mut |line: &str| {
-                                ui_ref.tool_result(line);
-                            })
-                            .await
-                        } else {
-                            execute(name, arguments).await
-                        };
+                        let ui_ref: &mut dyn Ui = &mut *ui;
+                        let output = execute_streaming(name, arguments, &mut |line: &str| {
+                            ui_ref.tool_result(line);
+                        })
+                        .await;
                         emit_tool_output(&mut *ui, &output);
-                        results.push((id.clone(), output.content));
-                        // A mutating tool may have changed files — invalidate the
-                        // workspace snapshot cache so the next check re-walks.
+                        results[i] = Some((id.clone(), output.content));
                         self.invalidate_snapshot();
-                        i += 1;
+                        completed[i] = true;
+                        completion_order.push(i);
+                        done += 1;
+                        continue;
+                    }
+                    // Run all ready non-bash calls concurrently. Record the
+                    // completion order as the ready order (within a concurrent
+                    // batch, relative order doesn't matter — none depend on
+                    // each other, or they wouldn't all be ready).
+                    for &i in &ready {
+                        ui.tool_call(&calls[i].1, &calls[i].2);
+                    }
+                    let outputs: Vec<_> = futures_util::stream::iter(
+                        ready
+                            .iter()
+                            .map(|&i| execute(&calls[i].1, &calls[i].2)),
+                    )
+                    .buffered(self.config.max_parallel_tools)
+                    .collect()
+                    .await;
+                    for (&i, output) in ready.iter().zip(outputs) {
+                        emit_tool_output(&mut *ui, &output);
+                        results[i] = Some((calls[i].0.clone(), output.content));
+                        // A mutating tool may have changed files — invalidate
+                        // the snapshot cache so a dependent read (guaranteed to
+                        // run after by the dep graph) re-walks.
+                        if !hi_tools::is_read_only(&calls[i].1) {
+                            self.invalidate_snapshot();
+                        }
+                        completed[i] = true;
+                        completion_order.push(i);
+                        done += 1;
                     }
                 }
+                // The completion order must respect the dep graph — a real
+                // guarantee now (the scheduler only runs a call after its deps),
+                // not just an emission-order coincidence.
+                debug_assert!(
+                    respects_deps(&deps, &completion_order),
+                    "scheduler completion must respect inferred tool deps: {:?} vs {:?}",
+                    deps,
+                    completion_order
+                );
+                let results: Vec<(String, String)> = results.into_iter().flatten().collect();
                 self.messages
                     .push_assistant_with_results(std::mem::take(&mut completion.content), results);
             };
@@ -2585,6 +2674,49 @@ mod tests {
         assert!(
             tool_results.iter().any(|o| o.starts_with("[elided")),
             "old tool result elided: {tool_results:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_decision_persists_across_compaction_in_system_prompt() {
+        // A decision recorded via the tool survives a compaction in the system
+        // prompt (the log is injected into the system message, which compaction
+        // preserves verbatim — not summarized away).
+        let responses = vec![
+            completion(
+                vec![Content::ToolCall {
+                    id: "d1".into(),
+                    name: "record_decision".into(),
+                    arguments: r#"{"summary":"use BTreeMap","rationale":"ordered iteration","files":["src/m.rs"]}"#.into(),
+                }],
+                1,
+                1,
+            ),
+            completion(vec![Content::Text("done".into())], 1, 1),
+            completion(vec![Content::Text("done".into())], 1, 1),
+        ];
+        let mut agent = agent(responses, config());
+        agent.run_turn("refactor", &mut NullUi).await.unwrap();
+        assert_eq!(agent.decisions().entries().len(), 1);
+        assert_eq!(agent.decisions().entries()[0].summary, "use BTreeMap");
+
+        // The system prompt contains the decision.
+        let sys = agent.messages()[0].text();
+        assert!(
+            sys.contains("use BTreeMap") && sys.contains("ordered iteration"),
+            "decision in system prompt: {sys}"
+        );
+
+        // A compaction that summarizes the Q&A tail must NOT remove the
+        // decision from the system prompt.
+        agent
+            .compact_with(CompactionKind::Summarize, &mut NullUi)
+            .await
+            .unwrap();
+        let sys_after = agent.messages()[0].text();
+        assert!(
+            sys_after.contains("use BTreeMap"),
+            "decision survives compaction: {sys_after}"
         );
     }
 

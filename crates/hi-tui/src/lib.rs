@@ -464,6 +464,8 @@ pub async fn run(
         let checkpoint = agent.messages().len();
         app.last_turn_start = checkpoint;
         app.last_prompt = Some(run_line.clone());
+        // Reset the per-turn tool-call counter for the observability panel.
+        app.turn_tool_calls = 0;
         let (tx, rx) = mpsc::unbounded_channel();
         let mut sink = ChannelUi { tx };
         let cancelled = {
@@ -498,6 +500,9 @@ pub async fn run(
             // above the input reflects the latest turn. The agent already
             // computed this for verify gating; reuse it rather than re-walking.
             app.last_changed_files = agent.last_changed_files().to_vec();
+            // Capture the turn's trajectory telemetry for the observability
+            // panel (verify rounds, recovery retries, nudges, stalls).
+            app.last_telemetry = Some(agent.last_turn_telemetry().clone());
             // A new turn's edits supersede any open diff panel's snapshot.
             app.diff_text = None;
         }
@@ -726,6 +731,16 @@ struct App {
     /// Cached working-tree diff text for the open diff panel, refreshed when the
     /// panel is toggled on so it reflects the current tree, not a stale snapshot.
     diff_text: Option<String>,
+    /// Whether the `Ctrl-?` agent-observability panel is open: telemetry
+    /// counters, per-turn tool-call count, and context composition.
+    show_debug: bool,
+    /// Telemetry from the last turn (verify rounds, recovery retries, nudges,
+    /// stalls), captured post-turn from `agent.last_turn_telemetry()` for the
+    /// observability panel.
+    last_telemetry: Option<hi_agent::TurnTelemetry>,
+    /// Tool calls seen this turn (incremented on each `UiEvent::ToolCall`),
+    /// for the observability panel's "tool calls this turn" line.
+    turn_tool_calls: u32,
     waiting_for: Option<Duration>,
     last_turn_state: TurnState,
     last_error: Option<String>,
@@ -803,6 +818,9 @@ impl App {
             last_changed_files: Vec::new(),
             show_diff: false,
             diff_text: None,
+            show_debug: false,
+            last_telemetry: None,
+            turn_tool_calls: 0,
             waiting_for: None,
             last_turn_state: TurnState::Idle,
             last_error: None,
@@ -1069,6 +1087,13 @@ impl App {
                 } else {
                     self.diff_text = None;
                 }
+            }
+            // Toggle the agent-observability panel (Ctrl-? = Ctrl-Shift-/).
+            // Shows the last turn's trajectory telemetry, tool-call count, and
+            // context composition — read-only diagnostics for the agent's own
+            // behavior.
+            KeyCode::Char('?') if ctrl => {
+                self.show_debug = !self.show_debug;
             }
             KeyCode::Home => self.input.home(),
             KeyCode::End => self.input.end(),
@@ -1425,6 +1450,7 @@ impl App {
                 let label = tool_label(&name, &args);
                 self.event_log.push(format!("tool_call {label}"));
                 self.last_turn_event = Some(TurnEventKind::ToolCall);
+                self.turn_tool_calls = self.turn_tool_calls.saturating_add(1);
                 if matches!(name.as_str(), "write" | "edit") {
                     self.last_turn_had_file_edits = true;
                 }
@@ -1734,6 +1760,8 @@ impl App {
             0
         };
         let changed_h = usize::from(!self.last_changed_files.is_empty() && !self.working);
+        // The Ctrl-? observability panel: header + 3 diagnostic lines.
+        let debug_h = if self.show_debug { 4 } else { 0 };
         let input_h = if self.fetching.is_some() {
             3
         } else if let Some(p) = &self.picker {
@@ -1741,7 +1769,7 @@ impl App {
             let rows = p.matches.len().clamp(1, PICKER_ROWS) as u16;
             (rows + 3).min(area.height.saturating_sub(3))
         } else {
-            (plan_h + diff_h + changed_h + status_lines + completion_rows
+            (plan_h + diff_h + changed_h + debug_h + status_lines + completion_rows
                 + input_lines.len()
                 + queued_shown
                 + queue_extra
@@ -1955,6 +1983,51 @@ impl App {
                     dim(),
                 ));
             }
+            // The Ctrl-? agent-observability panel: trajectory telemetry, tool
+            // calls this turn, and context composition. Read-only diagnostics.
+            if self.show_debug {
+                ilines.push(Line::styled(
+                    "agent (Ctrl-? to close)".to_string(),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                let t = self.last_telemetry.as_ref();
+                let tel = if let Some(t) = t {
+                    format!(
+                        "telemetry: {} verify · {} retry · {} repeat · {} continue{}",
+                        t.verify_rounds,
+                        t.recovery_retries,
+                        t.repeat_nudges,
+                        t.continue_nudges,
+                        if t.stalled_unfinished || t.stalled_repeating {
+                            " · stalled"
+                        } else {
+                            ""
+                        }
+                    )
+                } else {
+                    "telemetry: (no turn yet)".to_string()
+                };
+                ilines.push(Line::styled(tel, dim()));
+                ilines.push(Line::styled(
+                    format!("tool calls this turn: {}", self.turn_tool_calls),
+                    dim(),
+                ));
+                // Context composition: occupancy vs. window, and cumulative
+                // session tokens (the same numbers the usage line shows, but
+                // gathered here for a single diagnostics view).
+                let (input, output) = self.usage;
+                let ctx = if let Some(pct) = self.context_pct() {
+                    format!(" · ctx {pct}%")
+                } else {
+                    String::new()
+                };
+                ilines.push(Line::styled(
+                    format!("session: ↑{} ↓{}{ctx}", fmt_count(input), fmt_count(output)),
+                    dim(),
+                ));
+            }
             if let Some(notice) = &self.startup_notice {
                 ilines.push(Line::styled(
                     notice.clone(),
@@ -2044,6 +2117,7 @@ impl App {
             let above = plan_h
                 + diff_h
                 + changed_h
+                + debug_h
                 + usize::from(self.startup_notice.is_some())
                 + status_lines
                 + self.completion_items().len();
@@ -2450,6 +2524,43 @@ mod tests {
         term.draw(|f| app.render(f)).unwrap();
         let screen2 = dump(&term);
         assert!(!screen2.contains("diff (Ctrl-D to close)"), "panel closed: {screen2}");
+    }
+
+    #[test]
+    fn ctrl_question_toggles_the_observability_panel() {
+        // The Ctrl-? agent-observability panel renders the last turn's telemetry
+        // counters, the per-turn tool-call count, and session/context numbers.
+        let mut app = App::new("openai", "gpt-4o");
+        app.show_debug = true;
+        app.last_telemetry = Some(hi_agent::TurnTelemetry {
+            verify_rounds: 2,
+            recovery_retries: 1,
+            repeat_nudges: 0,
+            continue_nudges: 1,
+            hit_step_cap: false,
+            stalled_unfinished: false,
+            stalled_repeating: false,
+            verify_attributions: Vec::new(),
+        });
+        app.turn_tool_calls = 7;
+        let mut term = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let screen = dump(&term);
+        assert!(screen.contains("agent (Ctrl-? to close)"), "panel header: {screen}");
+        assert!(
+            screen.contains("2 verify") && screen.contains("1 retry") && screen.contains("1 continue"),
+            "telemetry counters: {screen}"
+        );
+        assert!(
+            screen.contains("tool calls this turn: 7"),
+            "tool-call count: {screen}"
+        );
+
+        // Closing drops the panel.
+        app.show_debug = false;
+        term.draw(|f| app.render(f)).unwrap();
+        let screen2 = dump(&term);
+        assert!(!screen2.contains("agent (Ctrl-? to close)"), "panel closed: {screen2}");
     }
 
     #[test]

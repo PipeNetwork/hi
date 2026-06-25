@@ -238,6 +238,23 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             }),
         },
         ToolSpec {
+            name: "record_decision".into(),
+            description: "Record a key design decision so it persists across context compaction and keeps later turns consistent. Call this when you commit to an approach, a convention, or a non-obvious tradeoff (e.g. 'using a BTreeMap for ordered iteration', 'skipping Windows support for now'). Kept verbatim in the system prompt — NOT summarized away — so a long refactor doesn't drift from its own rationale. Use sparingly: only for decisions that matter later.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "summary": { "type": "string", "description": "A short title of the decision (one line)." },
+                    "rationale": { "type": "string", "description": "Why this choice — the constraint or tradeoff that drove it." },
+                    "files": {
+                        "type": "array",
+                        "description": "Files the decision most affects (may be empty).",
+                        "items": { "type": "string" }
+                    }
+                },
+                "required": ["summary", "rationale"]
+            }),
+        },
+        ToolSpec {
             name: "read".into(),
             description: "Read a UTF-8 text file. Lines are returned numbered (`<n>\\t<text>`). Returns at most 240 lines by default; page with offset/limit instead of assuming you saw everything.".into(),
             parameters: json!({

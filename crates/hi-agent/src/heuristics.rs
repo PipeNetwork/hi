@@ -513,4 +513,46 @@ mod tests {
             "emission order respects inferred deps: {deps:?}"
         );
     }
+
+    #[test]
+    fn scheduler_allows_independent_read_to_overlap_later_write() {
+        // The capability the dep-aware scheduler unlocks: [read a.rs, write b.rs,
+        // read c.rs] — none overlap on a path, so the scheduler may complete
+        // read c.rs before write b.rs. The dep graph permits any order where
+        // each call follows its (here, empty) deps. Pin that such an order
+        // respects_deps, while an order that runs a dependent read before its
+        // write does not.
+        let calls = vec![
+            ("r0".into(), "read".into(), r#"{"path":"a.rs"}"#.into()),
+            ("w".into(), "write".into(), r#"{"path":"b.rs","content":"x"}"#.into()),
+            ("r2".into(), "read".into(), r#"{"path":"c.rs"}"#.into()),
+        ];
+        let deps = tool_deps(&calls);
+        // No path overlaps → no deps between them → any order respects deps,
+        // including overlapping read c.rs ahead of write b.rs.
+        assert!(
+            deps.iter().all(|d| d.is_empty()),
+            "independent batch has no deps: {deps:?}"
+        );
+        assert!(
+            respects_deps(&deps, &[0, 2, 1]),
+            "read c.rs may complete before write b.rs: {deps:?}"
+        );
+
+        // Contrast: a dependent read (same path as the write) must NOT complete
+        // before the write.
+        let dep_calls = vec![
+            ("w".into(), "write".into(), r#"{"path":"a.rs","content":"x"}"#.into()),
+            ("r".into(), "read".into(), r#"{"path":"a.rs"}"#.into()),
+        ];
+        let dep = tool_deps(&dep_calls);
+        assert!(
+            !respects_deps(&dep, &[1, 0]),
+            "dependent read before write violates deps: {dep:?}"
+        );
+        assert!(
+            respects_deps(&dep, &[0, 1]),
+            "write before dependent read respects deps: {dep:?}"
+        );
+    }
 }
