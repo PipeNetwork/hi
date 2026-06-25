@@ -5,8 +5,7 @@ use hi_ai::{CompatMode, ToolMode};
 use crate::compaction::{CompactionKind, DEFAULT_KEEP_RECENT};
 use crate::{
     AUTO_COMPACT_PERCENT, COMPACT_TARGET_PERCENT, IN_TURN_ELIDE_PERCENT,
-    IN_TURN_KEEP_TOOL_RESULTS, MAX_CONTINUE_NUDGES, MAX_EMPTY_RETRIES, MAX_PARALLEL_TOOLS,
-    MAX_REPEAT_NUDGES,
+    IN_TURN_KEEP_TOOL_RESULTS, MAX_EMPTY_RETRIES, MAX_PARALLEL_TOOLS, MAX_REPEAT_NUDGES,
 };
 
 /// One stage of layered verification: a short label and the shell command to
@@ -68,9 +67,6 @@ pub struct AgentConfig {
     /// to produce a structured recap — so even a model that won't summarize on
     /// its own ends with one. Costs one extra call per file-changing turn.
     pub finalize: bool,
-    /// Max times one turn will nudge a model that stopped after *describing* a
-    /// next step without performing it. Default: [`MAX_CONTINUE_NUDGES`].
-    pub max_continue_nudges: u32,
     /// Max times one turn will nudge a model that re-issues the exact same tool
     /// call as the previous round (a repetition loop). Default:
     /// [`MAX_REPEAT_NUDGES`].
@@ -125,7 +121,6 @@ impl Default for AgentConfig {
                 keep_recent: DEFAULT_KEEP_RECENT,
             },
             finalize: true,
-            max_continue_nudges: MAX_CONTINUE_NUDGES,
             max_repeat_nudges: MAX_REPEAT_NUDGES,
             max_empty_retries: MAX_EMPTY_RETRIES,
             max_parallel_tools: MAX_PARALLEL_TOOLS,

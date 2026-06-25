@@ -38,6 +38,9 @@ pub(crate) enum NudgeKind {
     /// round; tells it to act on the output it already has.
     Repeat,
     /// Sent when the model described a next step but emitted no tool call.
+    /// (The continue-nudge mechanism was removed — the model now just ends the
+    /// turn when it stops with text. Kept for the typed enum's completeness.)
+    #[allow(dead_code)]
     Continue,
     /// A verification stage failure fed back to the model for another attempt.
     /// Carries the verify round (1-based) so the replace logic can tell a prior

@@ -89,6 +89,7 @@ pub(crate) fn recent_split(messages: &[Message], keep_recent: usize) -> Option<u
 /// Whether the slice `[1..split)` contains any tool results. Used by the
 /// elide-then-summarize-tail strategy to decide whether the "old" region is
 /// tool-heavy (elide it, keep the skeleton) or conversational (summarize it).
+#[allow(dead_code)]
 pub(crate) fn has_tool_results(messages: &[Message], split: usize) -> bool {
     let up_to = split.min(messages.len());
     messages[1..up_to]

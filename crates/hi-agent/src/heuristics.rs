@@ -145,6 +145,7 @@ pub(crate) fn looks_mutating(input: &str) -> bool {
 /// instead, and only when the lead-in looks forward. That way a proper codex-style
 /// recap that ends in a bullet list ("Key changes:\n- …") doesn't read as a stall,
 /// while a model that announces a plan and quits without doing it does.
+#[allow(dead_code)]
 pub(crate) fn looks_like_unfinished_step(text: &str) -> bool {
     let lines: Vec<&str> = text
         .lines()
@@ -171,6 +172,7 @@ pub(crate) fn looks_like_unfinished_step(text: &str) -> bool {
 }
 
 /// Whether a line expresses *intent to act next* rather than a finished result.
+#[allow(dead_code)]
 pub(crate) fn is_forward_intent(line: &str) -> bool {
     let lower = line.to_lowercase();
     // Courtesy closings address the *user* ("let me know if…", "I'll be happy
@@ -206,6 +208,7 @@ pub(crate) fn is_forward_intent(line: &str) -> bool {
 
 /// Whether a line is a markdown list item — a bullet (`- `, `* `, `• `) or a
 /// numbered item (`1.`, `2)`) — used to spot a trailing plan/to-do list.
+#[allow(dead_code)]
 pub(crate) fn is_list_item(line: &str) -> bool {
     let l = line.trim_start();
     if l.starts_with("- ") || l.starts_with("* ") || l.starts_with("• ") {

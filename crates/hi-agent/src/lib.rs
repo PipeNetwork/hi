@@ -35,8 +35,8 @@ pub use session::SessionSink;
 pub use ui::{Ui, tool_label};
 
 use heuristics::{
-    emit_tool_output, looks_like_unfinished_step, looks_mutating, recovery_sampling,
-    recovery_telemetry, respects_deps, tool_deps, tool_mode_label, StallMode, RECOVERY_SAMPLING,
+    emit_tool_output, looks_mutating, recovery_sampling, recovery_telemetry, respects_deps,
+    tool_deps, tool_mode_label, StallMode, RECOVERY_SAMPLING,
 };
 use memory::{cap_memory, memory_prompt};
 use prompt::SystemPrompt;
@@ -143,22 +143,12 @@ pub const MAX_EMPTY_RETRIES: u32 = 2;
 /// Max read-only tool calls to run concurrently within one round, bounding the
 /// open file handles / subprocesses a single batched response can spawn.
 pub const MAX_PARALLEL_TOOLS: usize = 8;
-/// Max times one turn will nudge a model that stopped after *describing* a next
-/// step without performing it. Bounds the "narrate-then-stall" recovery;
-/// `max_steps` is the hard backstop.
-pub const MAX_CONTINUE_NUDGES: u32 = 2;
 /// Max times one turn will nudge a model that re-issues the *exact same* tool
 /// call as the previous round — a repetition loop where the model re-runs an
 /// identical command, gets the same output, and re-emits it again. Bounds the
 /// recovery before the turn ends with an honest "stuck repeating" notice;
 /// `max_steps` is the hard backstop.
 pub const MAX_REPEAT_NUDGES: u32 = 2;
-/// Sent when the model announces a next step but emits no tool call, to get it to
-/// actually do the work instead of ending the turn on a false "done".
-const CONTINUE_NUDGE: &str = "You described a next step but didn't run it. Continue now, \
-using your tools, to actually make that change. If the task is genuinely already complete, \
-stop and give your final recap: what you changed (by file) and the exact command to run or test it.";
-
 /// Sent when the model re-issues the exact same tool call as the previous
 /// round. The command already ran and its output is in the history just above —
 /// re-running it will only produce the same result. This nudges the model to act
@@ -572,7 +562,7 @@ impl Agent {
     /// goal-level progression once the turn settles.
     fn goal_turn_end(
         &mut self,
-        stalled_unfinished: bool,
+        _stalled_unfinished: bool,
         stalled_repeating: bool,
         hit_step_cap: bool,
         ui: &mut dyn Ui,
@@ -590,7 +580,8 @@ impl Agent {
         // A turn that verified clean (or had no verify and didn't stall)
         // completes the active sub-goal → advance.
         let verified_clean = matches!(self.last_verify, Some(true));
-        let no_verify_clean = self.last_verify.is_none() && !stalled_unfinished && !stalled_repeating && !hit_step_cap;
+        let no_verify_clean =
+            self.last_verify.is_none() && !stalled_repeating && !hit_step_cap;
         if verified_clean || no_verify_clean {
             let i = goal.active_index();
             goal.advance();
@@ -613,8 +604,6 @@ impl Agent {
         // the budget is exhausted, the sub-goal (and goal) is marked Failed.
         let reason = if hit_step_cap {
             "hit the per-turn step cap"
-        } else if stalled_unfinished {
-            "stalled announcing steps without running them"
         } else if stalled_repeating {
             "stalled repeating the same tool call"
         } else {
@@ -1229,7 +1218,6 @@ impl Agent {
         let max_steps = self.config.max_steps;
         let mut steps = 0u32;
         let mut empty_retries = 0u32;
-        let mut continue_nudges = 0u32;
         let mut repeat_nudges = 0u32;
         // Scheduler parallelism counters: how many calls ran this turn, the
         // largest concurrent ready-batch, and how many ran serially (bash or a
@@ -1242,11 +1230,9 @@ impl Agent {
         // spot a model re-issuing the exact same call and looping on it.
         let mut prev_call_sig: Option<Vec<(String, String)>> = None;
         let mut request_too_large_retried = false;
-        // Whether the model has run a tool this turn (so a later text-only stop is
-        // eligible for a continue-nudge) and whether the turn ended on an
-        // announced-but-unperformed step (drives the incomplete notice).
+        // Whether the model has run a tool this turn (kept for finalization
+        // gating — a plain Q&A turn doesn't need a recap).
         let mut made_tool_call = false;
-        let mut stalled_unfinished = false;
         // Whether the turn ended because the model kept re-issuing the exact
         // same tool call through the whole repeat-nudge budget (drives the
         // incomplete notice and skips the finalization recap).
@@ -1502,33 +1488,17 @@ impl Agent {
 
                 if calls.is_empty() {
                     // Text but no tool call (the content-less case was handled
-                    // above): no tool_use blocks, so the safe text-only append
-                    // applies. If the model was actively working this turn and its
-                    // last line reads like an announced-but-unperformed next step
-                    // ("Now let me rewrite main.rs:"), nudge it to actually do it —
-                    // bounded — rather than ending the turn on a false "done".
+                    // above): the turn is done. No continue-nudge — the model
+                    // has the tools and the system-prompt instruction to act;
+                    // if it stops with text, it's finished, and a heuristic
+                    // guessing "stalled" from phrasing ("Let me…") produced too
+                    // many false positives. The user sends the next message if
+                    // they want more.
                     self.messages.push_assistant(std::mem::take(&mut completion.content));
-                    if made_tool_call
-                        && continue_nudges < self.config.max_continue_nudges
-                        && looks_like_unfinished_step(&assistant_text)
-                    {
-                        continue_nudges += 1;
-                        stalled_unfinished = true;
-                        ui.status(&format!(
-                            "the model described a next step but didn't run it — \
-                             nudging it to continue ({continue_nudges}/{})",
-                            self.config.max_continue_nudges
-                        ));
-                        self.messages.push_nudge(NudgeKind::Continue, CONTINUE_NUDGE);
-                        continue;
-                    }
                     break false;
                 }
-                // The model requested tool calls — it's actively working, so a
-                // later text-only stop is eligible for a nudge, and any pending
-                // "incomplete" state is cleared (it got back to work).
+                // The model requested tool calls — it's actively working.
                 made_tool_call = true;
-                stalled_unfinished = false;
                 // Infer within-batch dependencies (a read of a file a mutating
                 // call earlier in the batch targeted must observe that mutation;
                 // mutating calls serialize). The scheduler below runs ready
@@ -1817,9 +1787,9 @@ impl Agent {
             verify_rounds: verifier.round(),
             recovery_retries: empty_retries,
             repeat_nudges,
-            continue_nudges,
+            continue_nudges: 0,
             hit_step_cap: ended_at_cap,
-            stalled_unfinished,
+            stalled_unfinished: false,
             stalled_repeating,
             verify_attributions: last_verify_attributions
                 .iter()
@@ -1834,28 +1804,17 @@ impl Agent {
         // is on, advance or retry the active sub-goal based on this turn's
         // outcome — so the next turn resumes coherently at the right sub-goal
         // (and with prior-attempt notes if it stalled). See `goal_turn_end`.
-        self.goal_turn_end(stalled_unfinished, stalled_repeating, ended_at_cap, ui);
-
-        // The model kept announcing steps it never ran, through the whole nudge
-        // budget — don't let the turn read as a clean success.
-        if stalled_unfinished {
-            ui.status(
-                "⚠ the model kept describing steps without running them — the task \
-                 may be incomplete. /retry, or send 'continue'.",
-            );
-        }
+        self.goal_turn_end(false, stalled_repeating, ended_at_cap, ui);
 
         // Finalization: after a turn where the model used its tools to change
         // files, make one dedicated tool-free call so the user always gets a
         // structured recap, even from a model that wouldn't summarize on its
         // own. Requiring `made_tool_call` keeps a plain Q&A turn (whose answer is
         // already the response) from triggering it. Skipped when the turn
-        // stalled or hit the step cap (the work may be incomplete, and a tidy
-        // summary would misrepresent it) — the notices above stand instead.
+        // hit the step cap or stalled repeating (the work may be incomplete).
         if self.config.finalize
             && made_tool_call
             && !ended_at_cap
-            && !stalled_unfinished
             && !stalled_repeating
             && !self.last_changed_files.is_empty()
         {
@@ -3305,102 +3264,6 @@ mod tests {
             1,
             1,
         )
-    }
-
-    #[tokio::test]
-    async fn nudges_once_when_model_stalls_mid_step() {
-        // Edited, then announced a next step without doing it, then — after the
-        // nudge — actually did it and finished. One nudge, no incomplete notice.
-        let responses = vec![
-            echo_call(),
-            completion(
-                vec![Content::Text("Now let me rewrite main.rs:".into())],
-                1,
-                1,
-            ),
-            echo_call(),
-            completion(vec![Content::Text("Done. Run cargo build.".into())], 1, 1),
-        ];
-        let mut agent = agent(responses, config());
-        let mut ui = RecUi::default();
-        agent.run_turn("add a thing", &mut ui).await.unwrap();
-        assert_eq!(
-            ui.statuses.iter().filter(|s| s.contains("nudging")).count(),
-            1,
-            "exactly one nudge, got: {:?}",
-            ui.statuses
-        );
-        assert!(
-            !ui.statuses.iter().any(|s| s.contains("may be incomplete")),
-            "no incomplete notice once it resumed, got: {:?}",
-            ui.statuses
-        );
-        assert!(ui.turn_end.is_some(), "turn completed");
-    }
-
-    #[tokio::test]
-    async fn nudges_when_model_stalls_on_a_plan_list() {
-        // Edited, then announced a multi-step plan as a numbered list without
-        // doing it (the trailing line is a list item, which the old line-only
-        // heuristic missed — the turn used to end here "without context"), then,
-        // after the nudge, finished. One nudge, no incomplete notice.
-        let responses = vec![
-            echo_call(),
-            completion(
-                vec![Content::Text(
-                    "Now let me make the fixes. Here's my plan:\n\n\
-                     1. Remove unused deps\n2. Fix the gitignore duplicate"
-                        .into(),
-                )],
-                1,
-                1,
-            ),
-            echo_call(),
-            completion(vec![Content::Text("Done. Run cargo test.".into())], 1, 1),
-        ];
-        let mut agent = agent(responses, config());
-        let mut ui = RecUi::default();
-        agent.run_turn("clean it up", &mut ui).await.unwrap();
-        assert_eq!(
-            ui.statuses.iter().filter(|s| s.contains("nudging")).count(),
-            1,
-            "exactly one nudge, got: {:?}",
-            ui.statuses
-        );
-        assert!(
-            !ui.statuses.iter().any(|s| s.contains("may be incomplete")),
-            "no incomplete notice once it resumed, got: {:?}",
-            ui.statuses
-        );
-        assert!(ui.turn_end.is_some(), "turn completed");
-    }
-
-    #[tokio::test]
-    async fn gives_up_with_notice_after_cap() {
-        // Worked once, then narrated a next step every round without doing it:
-        // bounded to max_continue_nudges nudges, then an honest incomplete notice.
-        let mut responses = vec![echo_call()];
-        for _ in 0..(config().max_continue_nudges + 1) {
-            responses.push(completion(
-                vec![Content::Text("Now let me rewrite main.rs:".into())],
-                1,
-                1,
-            ));
-        }
-        let mut agent = agent(responses, config());
-        let mut ui = RecUi::default();
-        agent.run_turn("add a thing", &mut ui).await.unwrap();
-        assert_eq!(
-            ui.statuses.iter().filter(|s| s.contains("nudging")).count(),
-            config().max_continue_nudges as usize,
-            "nudges are bounded, got: {:?}",
-            ui.statuses
-        );
-        assert!(
-            ui.statuses.iter().any(|s| s.contains("may be incomplete")),
-            "incomplete notice after the cap, got: {:?}",
-            ui.statuses
-        );
     }
 
     #[tokio::test]
