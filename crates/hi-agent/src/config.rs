@@ -6,6 +6,7 @@ use crate::compaction::{CompactionKind, DEFAULT_KEEP_RECENT};
 use crate::{
     AUTO_COMPACT_PERCENT, COMPACT_TARGET_PERCENT, IN_TURN_ELIDE_PERCENT,
     IN_TURN_KEEP_TOOL_RESULTS, MAX_EMPTY_RETRIES, MAX_PARALLEL_TOOLS, MAX_REPEAT_NUDGES,
+    MAX_SILENT_CONTINUES,
 };
 
 /// One stage of layered verification: a short label and the shell command to
@@ -71,6 +72,11 @@ pub struct AgentConfig {
     /// call as the previous round (a repetition loop). Default:
     /// [`MAX_REPEAT_NUDGES`].
     pub max_repeat_nudges: u32,
+    /// Max times a turn will silently re-prompt the model to continue after it
+    /// stops with text but no tool calls (when it was actively working earlier
+    /// in the turn). Keeps the agent going without user intervention. Default:
+    /// [`MAX_SILENT_CONTINUES`].
+    pub max_silent_continues: u32,
     /// How many times to silently re-run a round that produced no usable output.
     /// Default: [`MAX_EMPTY_RETRIES`].
     pub max_empty_retries: u32,
@@ -122,6 +128,7 @@ impl Default for AgentConfig {
             },
             finalize: true,
             max_repeat_nudges: MAX_REPEAT_NUDGES,
+            max_silent_continues: MAX_SILENT_CONTINUES,
             max_empty_retries: MAX_EMPTY_RETRIES,
             max_parallel_tools: MAX_PARALLEL_TOOLS,
             auto_compact_percent: AUTO_COMPACT_PERCENT,

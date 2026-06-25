@@ -149,6 +149,16 @@ pub const MAX_PARALLEL_TOOLS: usize = 8;
 /// recovery before the turn ends with an honest "stuck repeating" notice;
 /// `max_steps` is the hard backstop.
 pub const MAX_REPEAT_NUDGES: u32 = 2;
+/// Max times a turn will silently re-prompt the model to continue after it
+/// stops with text but no tool calls (when it was actively working). Keeps the
+/// agent going without user intervention, bounded so it can't loop forever.
+pub const MAX_SILENT_CONTINUES: u32 = 3;
+/// Sent silently (no status line, no steer counter) when the model stops with
+/// text after having made tool calls earlier in the turn. The system prompt
+/// tells the model not to narrate without acting, but when it still does, this
+/// keeps the turn going so the user doesn't have to type "continue".
+const SILENT_CONTINUE_NUDGE: &str = "Continue now — use your tools to do the work you just \
+described. Don't narrate; act. If the task is genuinely complete, stop and give your final recap.";
 /// Sent when the model re-issues the exact same tool call as the previous
 /// round. The command already ran and its output is in the history just above —
 /// re-running it will only produce the same result. This nudges the model to act
@@ -183,7 +193,11 @@ your plan in one line first. For a task that takes several steps, track it with 
 the `update_plan` tool: post the step list up front, then call it again as you \
 go — always with the complete list — marking the current step `active` and \
 finished ones `done`. Skip the plan for simple one-step changes. Verify your \
-edits before finishing.";
+edits before finishing. \
+\
+Never describe a next step without doing it — if you say 'let me read X', call \
+the read tool in the same response. Do not narrate intent; act on it. Keep \
+working until the task is complete, then stop and give your recap.";
 
 /// Parse an `update_plan` arguments JSON and apply its step statuses to a
 /// structured goal's sub-goals (mapping by position). Tolerant — a malformed
@@ -1218,6 +1232,7 @@ impl Agent {
         let max_steps = self.config.max_steps;
         let mut steps = 0u32;
         let mut empty_retries = 0u32;
+        let mut silent_continues = 0u32;
         let mut repeat_nudges = 0u32;
         // Scheduler parallelism counters: how many calls ran this turn, the
         // largest concurrent ready-batch, and how many ran serially (bash or a
@@ -1488,13 +1503,20 @@ impl Agent {
 
                 if calls.is_empty() {
                     // Text but no tool call (the content-less case was handled
-                    // above): the turn is done. No continue-nudge — the model
-                    // has the tools and the system-prompt instruction to act;
-                    // if it stops with text, it's finished, and a heuristic
-                    // guessing "stalled" from phrasing ("Let me…") produced too
-                    // many false positives. The user sends the next message if
-                    // they want more.
+                    // above). If the model was actively working this turn (it
+                    // made tool calls earlier), silently re-prompt it to
+                    // continue — no status line, no steer counter, no visible
+                    // nudge. The system prompt tells the model not to narrate
+                    // without acting, but when it still does, this keeps the
+                    // turn going automatically so the user doesn't have to type
+                    // "continue". Bounded so it can't loop forever; past the
+                    // budget the turn ends honestly.
                     self.messages.push_assistant(std::mem::take(&mut completion.content));
+                    if made_tool_call && silent_continues < self.config.max_silent_continues {
+                        silent_continues += 1;
+                        self.messages.push_nudge(NudgeKind::Continue, SILENT_CONTINUE_NUDGE);
+                        continue;
+                    }
                     break false;
                 }
                 // The model requested tool calls — it's actively working.
@@ -2190,6 +2212,9 @@ mod tests {
             // Off by default so the canned-provider tests don't need an extra
             // completion for the recap; the finalization tests opt in.
             finalize: false,
+            // Off so canned-provider tests don't need extra completions for the
+            // silent auto-continue; tests that exercise it opt in.
+            max_silent_continues: 0,
             ..AgentConfig::default()
         }
     }
@@ -3361,6 +3386,58 @@ mod tests {
             ui.statuses
         );
         assert!(ui.turn_end.is_some(), "turn completed");
+    }
+
+    #[tokio::test]
+    async fn silent_auto_continue_keeps_turn_going_without_status() {
+        // The model made a tool call, then stopped with text (no tool call).
+        // With max_silent_continues > 0, the agent silently re-prompts it to
+        // continue — no status line, no visible nudge. The model then does
+        // another tool call and finishes.
+        let mut cfg = config();
+        cfg.max_silent_continues = 3;
+        let responses = vec![
+            // Round 1: model makes a tool call (actively working).
+            completion(
+                vec![Content::ToolCall {
+                    id: "r1".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"x"}"#.into(),
+                }],
+                1,
+                1,
+            ),
+            // Round 2: model stops with text, no tool call.
+            completion(vec![Content::Text("Now let me check the tests.".into())], 1, 1),
+            // Round 3: silently re-prompted, model makes another tool call.
+            completion(
+                vec![Content::ToolCall {
+                    id: "r2".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"y"}"#.into(),
+                }],
+                1,
+                1,
+            ),
+            // Round 4: model finishes with text.
+            completion(vec![Content::Text("Done.".into())], 1, 1),
+            // Round 5: silently re-prompted again.
+            completion(vec![Content::Text("Done.".into())], 1, 1),
+            // Round 6: silently re-prompted a 3rd time; budget (3) now
+            // exhausted → turn ends.
+            completion(vec![Content::Text("Done.".into())], 1, 1),
+        ];
+        let mut agent = agent(responses, cfg);
+        let mut ui = RecUi::default();
+        agent.run_turn("review the code", &mut ui).await.unwrap();
+        // The turn completed (didn't run out of completions).
+        assert!(ui.turn_end.is_some(), "turn completed");
+        // No "nudging" or "continue" status line was emitted — it was silent.
+        assert!(
+            !ui.statuses.iter().any(|s| s.contains("nudging") || s.contains("continue")),
+            "silent — no visible nudge status: {:?}",
+            ui.statuses
+        );
     }
 
     #[tokio::test]
