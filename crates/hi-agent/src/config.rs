@@ -98,6 +98,11 @@ pub struct AgentConfig {
     /// only at turn-end verify. Off by default; only fires for languages with a
     /// genuinely per-file fast check (see `hi_tools::fast_check_for`).
     pub proactive_verify: bool,
+    /// Whether long-horizon agency is on: a structured `Goal` the agent
+    /// decomposes into sub-goals, drives across turns, retries on failure, and
+    /// resumes across sessions. Off by default while it stabilizes; when off,
+    /// the agent behaves as the single-turn loop.
+    pub long_horizon: bool,
 }
 
 impl Default for AgentConfig {
@@ -129,6 +134,7 @@ impl Default for AgentConfig {
             in_turn_elide_percent: IN_TURN_ELIDE_PERCENT,
             in_turn_keep_tool_results: IN_TURN_KEEP_TOOL_RESULTS,
             proactive_verify: false,
+            long_horizon: false,
         }
     }
 }

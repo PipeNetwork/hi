@@ -29,6 +29,7 @@ sure the work is actually complete and finish with at most a one-line note.";
 pub(crate) struct SystemPrompt {
     project_context: Option<String>,
     goal: Option<String>,
+    goal_state: Option<String>,
     decisions: Option<String>,
     finalize: bool,
 }
@@ -38,6 +39,7 @@ impl SystemPrompt {
         Self {
             project_context: None,
             goal: None,
+            goal_state: None,
             decisions: None,
             finalize: false,
         }
@@ -52,6 +54,14 @@ impl SystemPrompt {
 
     pub(crate) fn with_goal(mut self, goal: Option<&str>) -> Self {
         self.goal = goal.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        self
+    }
+
+    /// Inject the long-horizon goal state (already rendered, including its own
+    /// header) — the objective, the sub-goal checklist with statuses, and any
+    /// retry notes on the active sub-goal. Survives compaction (system message).
+    pub(crate) fn with_goal_state(mut self, section: Option<&str>) -> Self {
+        self.goal_state = section.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
         self
     }
 
@@ -94,6 +104,9 @@ impl SystemPrompt {
         if let Some(goal) = self.goal {
             text.push_str("\n\n[Current session goal]\n");
             text.push_str(&goal);
+        }
+        if let Some(goal_state) = self.goal_state {
+            text.push_str(&goal_state);
         }
         if let Some(decisions) = self.decisions {
             text.push_str(&decisions);

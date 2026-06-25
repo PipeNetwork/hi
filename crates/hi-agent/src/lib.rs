@@ -5,6 +5,7 @@ pub mod command;
 pub mod compaction;
 mod config;
 mod decision;
+mod goal;
 mod heuristics;
 mod memory;
 mod prompt;
@@ -44,6 +45,7 @@ use transcript::{NudgeKind, Transcript};
 use verify::{stage_guidance, Verifier, VerifyOutcome, Snapshot};
 
 pub use decision::{Decision, DecisionLog};
+pub use goal::{Goal, GoalStatus, SubGoal, DEFAULT_SUBGOAL_RETRIES};
 
 /// Crate version (from Cargo.toml).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -216,6 +218,11 @@ pub struct Agent {
     last_turn_telemetry: TurnTelemetry,
     /// Optional transient goal injected into the system prompt for future turns.
     goal: Option<String>,
+    /// A structured, multi-step long-horizon goal (decomposed into sub-goals)
+    /// used when `config.long_horizon` is on. Persisted across sessions and
+    /// injected into the system prompt each turn so the agent resumes the
+    /// active sub-goal coherently. Distinct from the transient `goal` string.
+    structured_goal: Option<Goal>,
     /// Durable intra-session decision log — recorded via the `record_decision`
     /// tool and injected into the system prompt each turn, so the model stays
     /// consistent across compaction (which would otherwise summarize away the
@@ -275,6 +282,7 @@ impl Agent {
             last_compat_fallbacks: Vec::new(),
             last_turn_telemetry: TurnTelemetry::default(),
             goal: None,
+            structured_goal: None,
             decisions: DecisionLog::default(),
             snapshot_cache: SnapshotCache::default(),
         }
@@ -443,9 +451,14 @@ impl Agent {
     }
 
     fn system_message(&self) -> Message {
+        let goal_section = self
+            .structured_goal
+            .as_ref()
+            .and_then(|g| g.prompt_section());
         SystemPrompt::new()
             .with_project_context(self.config.project_context.as_deref())
             .with_goal(self.goal.as_deref())
+            .with_goal_state(goal_section.as_deref())
             .with_decisions(self.decisions.prompt_section().as_deref())
             .with_finalize(self.config.finalize)
             .build()
@@ -483,6 +496,24 @@ impl Agent {
             (!g.is_empty()).then_some(g)
         });
         self.refresh_system_message();
+    }
+
+    /// Set or clear a structured long-horizon goal (decomposed into sub-goals).
+    /// Only takes effect when `config.long_horizon` is on; when set, the goal's
+    /// state is injected into the system prompt each turn so the agent resumes
+    /// the active sub-goal. Returns whether it was accepted.
+    pub fn set_structured_goal(&mut self, goal: Option<Goal>) -> bool {
+        if !self.config.long_horizon && goal.is_some() {
+            return false;
+        }
+        self.structured_goal = goal;
+        self.refresh_system_message();
+        true
+    }
+
+    /// The structured long-horizon goal, if any (for persistence/observability).
+    pub fn structured_goal(&self) -> Option<&Goal> {
+        self.structured_goal.as_ref()
     }
 
     /// Handle a `record_decision` tool call: parse the args, append to the
@@ -2812,6 +2843,53 @@ mod tests {
             "proactive failure surfaced: {:?}",
             ui.statuses
         );
+    }
+
+    #[tokio::test]
+    async fn structured_goal_state_injected_into_system_prompt_when_long_horizon_on() {
+        // With long_horizon on, a structured goal's state (objective + sub-goal
+        // checklist + retry notes) is injected into the system prompt so the
+        // agent resumes the active sub-goal coherently each turn.
+        let mut cfg = config();
+        cfg.long_horizon = true;
+        let mut agent = agent(vec![completion(vec![Content::Text("ok".into())], 1, 1)], cfg);
+        let mut goal = Goal::new(
+            "refactor the parser",
+            vec!["write tests".into(), "rewrite parser".into()],
+        );
+        // Record a failed attempt so the prompt surfaces "don't repeat" notes.
+        goal.record_failure("approach A didn't compile", DEFAULT_SUBGOAL_RETRIES);
+        assert!(agent.set_structured_goal(Some(goal)), "accepted when long_horizon on");
+
+        let sys = agent.messages()[0].text();
+        assert!(sys.contains("Long-horizon goal"), "header: {sys}");
+        assert!(sys.contains("refactor the parser"), "objective: {sys}");
+        assert!(sys.contains("write tests"), "sub-goal: {sys}");
+        assert!(
+            sys.contains("don't repeat these"),
+            "retry notes surfaced: {sys}"
+        );
+
+        // Clearing the goal removes the section.
+        agent.set_structured_goal(None);
+        let sys_after = agent.messages()[0].text();
+        assert!(
+            !sys_after.contains("Long-horizon goal"),
+            "goal section cleared: {sys_after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn structured_goal_rejected_when_long_horizon_off() {
+        // Default config has long_horizon off — setting a structured goal is
+        // rejected (the single-turn loop is unchanged), so the system prompt
+        // gains no goal section.
+        let mut agent = agent(vec![completion(vec![Content::Text("ok".into())], 1, 1)], config());
+        let goal = Goal::new("do a thing", vec!["step one".into()]);
+        assert!(!agent.set_structured_goal(Some(goal)), "rejected when off");
+        assert!(agent.structured_goal().is_none());
+        let sys = agent.messages()[0].text();
+        assert!(!sys.contains("Long-horizon goal"), "no goal section when off: {sys}");
     }
 
     #[tokio::test]
