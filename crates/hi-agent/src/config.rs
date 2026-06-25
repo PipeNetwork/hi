@@ -93,6 +93,11 @@ pub struct AgentConfig {
     /// Keep the newest tool results verbatim when trimming inside a turn.
     /// Default: [`IN_TURN_KEEP_TOOL_RESULTS`].
     pub in_turn_keep_tool_results: usize,
+    /// Whether to run a per-file fast check (syntax/lint) in the background
+    /// right after a write/edit, so errors surface during the turn instead of
+    /// only at turn-end verify. Off by default; only fires for languages with a
+    /// genuinely per-file fast check (see `hi_tools::fast_check_for`).
+    pub proactive_verify: bool,
 }
 
 impl Default for AgentConfig {
@@ -123,6 +128,7 @@ impl Default for AgentConfig {
             compact_target_percent: COMPACT_TARGET_PERCENT,
             in_turn_elide_percent: IN_TURN_ELIDE_PERCENT,
             in_turn_keep_tool_results: IN_TURN_KEEP_TOOL_RESULTS,
+            proactive_verify: false,
         }
     }
 }

@@ -1411,6 +1411,15 @@ impl Agent {
                     completion_order.push(i);
                 }
                 let mut done = completion_order.len();
+                // Proactive per-edit checks: kicked off in the background as
+                // mutating calls complete, awaited after the batch so any
+                // syntax/lint error surfaces during the turn (before turn-end
+                // verify) while the edit is still the model's focus. Each entry
+                // is (path, join handle of the check).
+                let mut pending_checks: Vec<(
+                    String,
+                    tokio::task::JoinHandle<(bool, String)>,
+                )> = Vec::new();
                 while done < calls.len() {
                     // Ready: deps all complete.
                     let ready: Vec<usize> = (0..calls.len())
@@ -1465,6 +1474,20 @@ impl Agent {
                         // run after by the dep graph) re-walks.
                         if !hi_tools::is_read_only(&calls[i].1) {
                             self.invalidate_snapshot();
+                            // Proactive per-edit verify: kick off a background
+                            // fast check for the edited file so a syntax/lint
+                            // error surfaces during the turn. The check is
+                            // awaited after the batch; failures are non-fatal.
+                            if self.config.proactive_verify
+                                && let Some(path) = hi_tools::target_path(&calls[i].1, &calls[i].2)
+                                && let Some(cmd) = hi_tools::fast_check_for(&path)
+                            {
+                                let cmd = format!("{cmd} {path}");
+                                pending_checks.push((
+                                    path,
+                                    tokio::spawn(async move { hi_tools::run_check(&cmd).await }),
+                                ));
+                            }
                         }
                         completed[i] = true;
                         completion_order.push(i);
@@ -1483,6 +1506,21 @@ impl Agent {
                 let results: Vec<(String, String)> = results.into_iter().flatten().collect();
                 self.messages
                     .push_assistant_with_results(std::mem::take(&mut completion.content), results);
+                // Await the proactive per-edit checks kicked off during the
+                // batch and surface each as a status line — a syntax/lint error
+                // appears here, during the turn, before turn-end verify. A pass
+                // is silent (no need to noise a clean edit); a failure names the
+                // file and shows the check output so the model can fix it now.
+                for (path, handle) in pending_checks {
+                    if let Ok((passed, output)) = handle.await {
+                        if passed {
+                            continue;
+                        }
+                        ui.status(&format!(
+                            "⚠ proactive check failed for {path}:\n{output}"
+                        ));
+                    }
+                }
             };
 
             if hit_cap {
@@ -2717,6 +2755,62 @@ mod tests {
         assert!(
             sys_after.contains("use BTreeMap"),
             "decision survives compaction: {sys_after}"
+        );
+    }
+
+    #[tokio::test]
+    async fn proactive_verify_surfaces_a_per_edit_check_failure() {
+        // With proactive_verify on, a write to a .py file with a syntax error
+        // triggers a background `python3 -m py_compile` whose failure surfaces
+        // as a status line during the turn (before turn-end verify). Skipped if
+        // python3 isn't on PATH (the check just won't run).
+        if std::process::Command::new("sh")
+            .arg("-c")
+            .arg("command -v python3")
+            .output()
+            .map(|o| !o.status.success())
+            .unwrap_or(true)
+        {
+            eprintln!("skipping: python3 not on PATH");
+            return;
+        }
+        let _guard = VERIFY_TEST_LOCK.lock().await;
+        let mut cfg = config();
+        cfg.proactive_verify = true;
+        let tmp = temp_file("proactive");
+        let py = tmp.with_extension("py");
+        let p = py.to_string_lossy().to_string();
+        // Write invalid Python so py_compile fails.
+        let responses = vec![
+            Completion {
+                content: vec![Content::ToolCall {
+                    id: "w".into(),
+                    name: "write".into(),
+                    arguments: format!(
+                        r#"{{"path":{p:?},"content":"def (\n"}}"#
+                    ),
+                }],
+                usage: Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    context_occupancy: 1,
+                    ..Default::default()
+                },
+                stop_reason: None,
+            },
+            completion(vec![Content::Text("done".into())], 1, 1),
+        ];
+        let mut agent = agent(responses, cfg);
+        let mut ui = RecUi::default();
+        agent.run_turn("write it", &mut ui).await.unwrap();
+        let _ = std::fs::remove_file(&py);
+        // A proactive-check failure status line names the file.
+        assert!(
+            ui.statuses
+                .iter()
+                .any(|s| s.contains("proactive check failed") && s.contains(&p)),
+            "proactive failure surfaced: {:?}",
+            ui.statuses
         );
     }
 

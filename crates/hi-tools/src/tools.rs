@@ -43,6 +43,35 @@ pub async fn run_check(command: &str) -> (bool, String) {
     }
 }
 
+/// A per-file "fast check" command for `path`'s language — a quick, file-scoped
+/// syntax/lint check that can run in the background right after an edit, so a
+/// type/syntax error surfaces while the edit is still the model's focus rather
+/// than at turn-end verify. Returns `None` for languages without a genuinely
+/// per-file fast check (e.g. Rust, whose `cargo check` is project-wide and is
+/// already the turn-end verify) or for unrecognized extensions. The command is
+/// run via `sh -c` with the file path appended; callers should only run it when
+/// the relevant tool is on PATH (probe with [`tool_available`] in
+/// `read.rs`). Failures are non-fatal — no early signal is better than a wrong
+/// one, so unknown/missing tools yield `None`.
+pub fn fast_check_for(path: &str) -> Option<&'static str> {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())?;
+    match ext {
+        // Python: py_compile catches syntax errors per-file, fast.
+        "py" => Some("python3 -m py_compile"),
+        // Go: gofmt -l lists files that aren't formatted / have syntax issues.
+        "go" => Some("gofmt -l"),
+        // TypeScript/JavaScript: tsc --noEmit is project-wide but fast enough
+        // and the best signal available; only useful when a tsconfig is present
+        // (the caller running it is fine even without — it just no-ops).
+        "ts" | "tsx" | "js" | "jsx" => Some("npx --no-install tsc --noEmit"),
+        // Rust, C/C++, and others: no reliable per-file fast check — rely on
+        // the turn-end verify (e.g. `cargo check`).
+        _ => None,
+    }
+}
+
 /// A human-readable, ANSI-colored summary of what's changed in the working
 /// tree versus the last commit — the body of the `/diff` command. Tracked
 /// changes come from `git diff HEAD`; new files the agent created are listed by
@@ -740,7 +769,7 @@ pub(crate) struct BashArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_read_only, target_path};
+    use super::{fast_check_for, is_read_only, target_path};
     use crate::edit::sh_quote;
 
     #[test]
@@ -781,5 +810,21 @@ mod tests {
         assert_eq!(target_path("bash", r#"{"command":"echo hi"}"#), None);
         // Malformed JSON → None (tolerant).
         assert_eq!(target_path("read", "not json"), None);
+    }
+
+    #[test]
+    fn fast_check_for_targets_per_file_languages() {
+        // Python and Go have genuinely per-file fast checks.
+        assert!(fast_check_for("src/a.py").is_some());
+        assert!(fast_check_for("main.go").is_some());
+        // TS/JS get a project-wide tsc (best available).
+        assert!(fast_check_for("x.ts").is_some());
+        assert!(fast_check_for("x.jsx").is_some());
+        // Rust has no reliable per-file fast check (cargo check is project-wide
+        // and already the turn-end verify) → None.
+        assert!(fast_check_for("src/lib.rs").is_none());
+        // Unknown extension → None.
+        assert!(fast_check_for("README.md").is_none());
+        assert!(fast_check_for("noext").is_none());
     }
 }
