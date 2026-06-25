@@ -6,23 +6,28 @@
 //! the event loop can keep redrawing — spinner, streaming output, scrolling —
 //! while a turn is in flight, and can cancel it with Ctrl-C.
 
+mod completion;
+mod event;
+mod input;
+mod model_picker;
+mod render;
+mod util;
+
 use std::collections::{HashMap, VecDeque};
-use std::io::{self, Write};
+use std::io;
 use std::time::{Duration, Instant};
 
 use ansi_to_tui::IntoText;
 use anyhow::{Context, Result};
 use crossterm::event::{
-    DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange, Event,
-    EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    EnableBracketedPaste, EnableFocusChange, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
 };
 use crossterm::execute;
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
+use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
 use futures_util::StreamExt;
 use hi_agent::ui::tool_label;
-use hi_agent::{Agent, Command, CompactionKind, PlanStatus, Ui, command};
+use hi_agent::{Agent, Command, CompactionKind, PlanStatus, command};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
@@ -31,9 +36,19 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
 use tokio::sync::mpsc;
 
+use completion::{
+    CompletionContext, CompletionItem, CompletionState, MODEL_CMD, MODEL_COMPLETION_MAX,
+    completion_context, completion_items_for,
+};
+use event::{ChannelUi, Restore, UiEvent};
+use input::InputLine;
+use model_picker::ModelPicker;
+use render::{diff_lines, dim, line_text, looks_like_diff, markdown_line, wrapped_height};
+use util::{clip_reason, copy_to_clipboard, fmt_count, fmt_elapsed, goal_feedback, notify_done};
+
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 /// How many model rows the `/model` picker shows at once.
-const PICKER_ROWS: usize = 12;
+pub(crate) const PICKER_ROWS: usize = 12;
 const TICK: Duration = Duration::from_millis(120);
 /// Only flag a possibly-stuck provider after a long, genuinely silent wait — the
 /// working line already shows the live elapsed time, so an earlier notice just
@@ -598,91 +613,6 @@ async fn drive(
     Ok(cancelled)
 }
 
-/// Restores the terminal on drop (covers early returns and panics).
-struct Restore;
-impl Drop for Restore {
-    fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(
-            io::stdout(),
-            DisableFocusChange,
-            DisableBracketedPaste,
-            LeaveAlternateScreen
-        );
-    }
-}
-
-/// Events the agent emits; drained by the event loop into [`App`].
-enum UiEvent {
-    Text(String),
-    Reasoning(String),
-    AssistantEnd,
-    ToolCall(String, String),
-    ToolResult(String),
-    Status(String),
-    Plan(Vec<hi_agent::PlanStep>),
-    Usage {
-        input: u64,
-        output: u64,
-        ctx_used: u64,
-        ctx_window: Option<u32>,
-    },
-    TurnEnd(String),
-}
-
-/// The [`Ui`] handed to the agent: forwards everything over a channel so the
-/// turn never borrows the live [`App`].
-struct ChannelUi {
-    tx: mpsc::UnboundedSender<UiEvent>,
-}
-
-impl ChannelUi {
-    fn send(&self, event: UiEvent) {
-        let _ = self.tx.send(event);
-    }
-}
-
-impl Ui for ChannelUi {
-    fn assistant_text(&mut self, text: &str) {
-        self.send(UiEvent::Text(text.to_string()));
-    }
-    fn assistant_reasoning(&mut self, text: &str) {
-        self.send(UiEvent::Reasoning(text.to_string()));
-    }
-    fn assistant_end(&mut self) {
-        self.send(UiEvent::AssistantEnd);
-    }
-    fn tool_call(&mut self, name: &str, arguments: &str) {
-        self.send(UiEvent::ToolCall(name.to_string(), arguments.to_string()));
-    }
-    fn tool_result(&mut self, result: &str) {
-        self.send(UiEvent::ToolResult(result.to_string()));
-    }
-    fn status(&mut self, text: &str) {
-        self.send(UiEvent::Status(text.to_string()));
-    }
-    fn plan(&mut self, steps: &[hi_agent::PlanStep]) {
-        self.send(UiEvent::Plan(steps.to_vec()));
-    }
-    fn usage(
-        &mut self,
-        input_tokens: u64,
-        output_tokens: u64,
-        context_used: u64,
-        context_window: Option<u32>,
-    ) {
-        self.send(UiEvent::Usage {
-            input: input_tokens,
-            output: output_tokens,
-            ctx_used: context_used,
-            ctx_window: context_window,
-        });
-    }
-    fn turn_end(&mut self, summary: &str) {
-        self.send(UiEvent::TurnEnd(summary.to_string()));
-    }
-}
-
 struct App {
     provider: String,
     model: String,
@@ -771,40 +701,6 @@ struct App {
     /// Set once we've seen any focus event — i.e. the terminal reports focus, so
     /// `focused` is trustworthy.
     focus_known: bool,
-}
-
-/// State of the slash-command completion menu.
-struct CompletionState {
-    /// What the menu is completing — a command name, or the argument of a known
-    /// command — and the prefix it's filtered to.
-    ctx: CompletionContext,
-    /// Index of the highlighted match.
-    selected: usize,
-}
-
-/// What the completion menu is offering, derived from the input line.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum CompletionContext {
-    /// Typing the command name itself (`/`, `/co`) — the lowercased prefix.
-    Command(String),
-    /// Typing the argument of a command that has enumerable values (`/compact `,
-    /// `/compact hy`) — the canonical command name and the lowercased value prefix.
-    Arg { cmd: &'static str, prefix: String },
-}
-
-/// One row in the completion menu — a command name or an argument value, already
-/// resolved to what shows and what gets inserted.
-struct CompletionItem {
-    /// Left column: `/compact` for a command, `hybrid` for an argument value.
-    label: String,
-    /// Right-column hint.
-    help: String,
-    /// Text the input becomes when this row is accepted.
-    insert: String,
-    /// Whether accepting with Enter submits the line. Command names that take
-    /// arguments fill `/name ` and wait; everything else (no-arg commands, fully
-    /// chosen argument values) is a complete line that runs.
-    submit_on_enter: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2046,739 +1942,10 @@ impl App {
     }
 }
 
-fn dim() -> Style {
-    Style::default().add_modifier(Modifier::DIM)
-}
-
-/// The `/goal` feedback line, and whether it's a prominent applied-change
-/// confirmation (set/clear) versus a dim status read-out (a bare `/goal`).
-/// `goal` is the agent's goal *after* the action, so a set echoes exactly what's
-/// stored. Pure, so the wording is unit-testable without an agent.
-fn goal_feedback(arg: &str, goal: Option<&str>) -> (String, bool) {
-    match arg.trim() {
-        "" => match goal {
-            Some(g) => (format!("goal: {g}"), false),
-            None => ("goal: off (set one with /goal <text>)".to_string(), false),
-        },
-        "clear" | "off" | "none" => ("✓ goal cleared".to_string(), true),
-        _ => (
-            format!(
-                "✓ goal set — steers every turn until cleared: \"{}\"",
-                goal.unwrap_or_default()
-            ),
-            true,
-        ),
-    }
-}
-
-fn line_text(line: &Line) -> String {
-    line.spans.iter().map(|s| s.content.as_ref()).collect()
-}
-
-/// Nudge the terminal that a turn finished: the BEL (which most terminals turn
-/// into a dock bounce / taskbar flash / audible ping when unfocused) plus an
-/// OSC 9 desktop notification for terminals that support it (iTerm2, WezTerm, …).
-/// Written straight to the tty; both are non-printing, so they don't disturb the
-/// ratatui frame.
-fn notify_done() {
-    let mut out = io::stdout().lock();
-    let _ = write!(out, "\x07\x1b]9;hi — turn complete\x07");
-    let _ = out.flush();
-}
-
-fn copy_to_clipboard(text: &str) -> io::Result<()> {
-    let encoded = base64_encode(text.as_bytes());
-    let mut out = io::stdout().lock();
-    write!(out, "\x1b]52;c;{encoded}\x07")?;
-    out.flush()
-}
-
-fn base64_encode(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0];
-        let b1 = *chunk.get(1).unwrap_or(&0);
-        let b2 = *chunk.get(2).unwrap_or(&0);
-        out.push(TABLE[(b0 >> 2) as usize] as char);
-        out.push(TABLE[(((b0 & 0b0000_0011) << 4) | (b1 >> 4)) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(TABLE[(((b1 & 0b0000_1111) << 2) | (b2 >> 6)) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        if chunk.len() > 2 {
-            out.push(TABLE[(b2 & 0b0011_1111) as usize] as char);
-        } else {
-            out.push('=');
-        }
-    }
-    out
-}
-
-/// Whether `s` looks like unified-diff output (a hunk header, a git header, or
-/// a `---`/`+++` file-header pair) — so we can colorize plain `git diff` /
-/// `diff -u` output the model runs via the shell.
-fn looks_like_diff(s: &str) -> bool {
-    let (mut minus, mut plus) = (false, false);
-    for line in s.lines() {
-        if line.starts_with("@@") || line.starts_with("diff --git ") {
-            return true;
-        }
-        minus |= line.starts_with("--- ");
-        plus |= line.starts_with("+++ ");
-    }
-    minus && plus
-}
-
-/// Render a unified diff with coloring and a new-file line-number gutter:
-/// additions green, removals red, hunk headers cyan, file headers bold, context
-/// muted. The line number (tracked from each `@@` header) is shown for context
-/// and added lines; removed lines and headers get a blank gutter.
-fn diff_lines(body: &str) -> Vec<Line<'static>> {
-    let mut out = Vec::new();
-    let mut new_line: Option<u32> = None;
-    for line in body.lines() {
-        let (style, gutter, advance) = if line.starts_with("+++") || line.starts_with("---") {
-            (Style::default().add_modifier(Modifier::BOLD), None, false)
-        } else if line.starts_with("@@") {
-            new_line = parse_hunk_new_start(line);
-            (Style::default().fg(Color::Cyan), None, false)
-        } else if line.starts_with('+') {
-            (Style::default().fg(Color::Green), new_line, true)
-        } else if line.starts_with('-') {
-            (Style::default().fg(Color::Red), None, false)
-        } else {
-            (dim(), new_line, true)
-        };
-        let num = match gutter {
-            Some(n) => format!("{n:>4} "),
-            None => "     ".to_string(),
-        };
-        out.push(Line::from(vec![
-            Span::styled(num, dim()),
-            Span::styled(line.to_string(), style),
-        ]));
-        if advance && let Some(n) = new_line.as_mut() {
-            *n += 1;
-        }
-    }
-    out
-}
-
-/// Parse the new-file start line from a unified-diff hunk header
-/// `@@ -old,n +new,m @@` → `new`.
-fn parse_hunk_new_start(header: &str) -> Option<u32> {
-    let plus = header.split('+').nth(1)?;
-    let num: String = plus.chars().take_while(|c| c.is_ascii_digit()).collect();
-    num.parse().ok()
-}
-
-/// Light syntax highlighting for one line of fenced code: whole-line comments
-/// (by the fence language) are dimmed and string literals are greened; the rest
-/// stays in the default color. Deliberately minimal — no keyword tables — so it
-/// reads as intentional on every language and never mis-colors an unknown one.
-fn highlight_code(line: &str, lang: &str) -> Vec<Span<'static>> {
-    if let Some(marker) = line_comment_marker(lang)
-        && line.trim_start().starts_with(marker)
-    {
-        return vec![Span::styled(line.to_string(), dim())];
-    }
-    highlight_strings(line)
-}
-
-/// The line-comment marker for a fence language, if we know it. Unknown
-/// languages return `None` (no comment dimming) rather than guess.
-fn line_comment_marker(lang: &str) -> Option<&'static str> {
-    match lang.to_lowercase().as_str() {
-        "rust" | "rs" | "c" | "cpp" | "c++" | "h" | "hpp" | "js" | "javascript" | "jsx" | "ts"
-        | "typescript" | "tsx" | "go" | "java" | "kotlin" | "kt" | "swift" | "scala" | "zig"
-        | "dart" | "php" => Some("//"),
-        "python" | "py" | "sh" | "bash" | "shell" | "zsh" | "fish" | "ruby" | "rb" | "yaml"
-        | "yml" | "toml" | "ini" | "conf" | "r" | "perl" | "pl" | "makefile" | "make"
-        | "dockerfile" | "elixir" | "ex" => Some("#"),
-        "sql" | "lua" | "haskell" | "hs" => Some("--"),
-        _ => None,
-    }
-}
-
-/// Split a code line into spans, greening `"…"` / `'…'` string literals (honoring
-/// `\` escapes) and leaving everything else in the default style.
-fn highlight_strings(line: &str) -> Vec<Span<'static>> {
-    let chars: Vec<char> = line.chars().collect();
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut plain = String::new();
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        if c == '"' || c == '\'' {
-            // Find the matching close on this line, skipping escaped quotes.
-            let mut j = i + 1;
-            let mut closed = false;
-            while j < chars.len() {
-                if chars[j] == '\\' {
-                    j += 2;
-                    continue;
-                }
-                if chars[j] == c {
-                    closed = true;
-                    break;
-                }
-                j += 1;
-            }
-            if closed {
-                if !plain.is_empty() {
-                    spans.push(Span::raw(std::mem::take(&mut plain)));
-                }
-                let s: String = chars[i..=j].iter().collect();
-                spans.push(Span::styled(s, Style::default().fg(Color::Green)));
-                i = j + 1;
-                continue;
-            }
-        }
-        plain.push(c);
-        i += 1;
-    }
-    if !plain.is_empty() {
-        spans.push(Span::raw(plain));
-    }
-    if spans.is_empty() {
-        spans.push(Span::raw(String::new()));
-    }
-    spans
-}
-
-/// What the completion menu should offer for `input`, or `None` to close it:
-/// the command name while it's being typed (`/`, `/co`), or — once past the name
-/// — the argument of a command that has enumerable values (`/compact `,
-/// `/compact hy`). A freeform-argument command (`/model <id>`) or a second arg
-/// token closes the menu, as does any non-slash input.
-/// The one command whose argument values come from live state (the model
-/// catalog) rather than the static table.
-const MODEL_CMD: &str = "model";
-/// Cap on inline `/model` id completions, so a large catalog can't flood the menu.
-const MODEL_COMPLETION_MAX: usize = 8;
-
-fn completion_context(input: &str) -> Option<CompletionContext> {
-    let rest = input.strip_prefix('/')?;
-    match rest.split_once(char::is_whitespace) {
-        // No space yet → still choosing the command name.
-        None => Some(CompletionContext::Command(rest.to_lowercase())),
-        // Past the name, on the first argument token.
-        Some((name, arg)) => {
-            if arg.contains(char::is_whitespace) {
-                return None; // a second token — past the single argument
-            }
-            let spec = command::COMMANDS
-                .iter()
-                .find(|c| c.name.eq_ignore_ascii_case(name))?;
-            let prefix = arg.to_lowercase();
-            if !spec.arg_values.is_empty() {
-                // A static enumerable set (compact, copy, verify, goal).
-                if spec.arg_values.iter().any(|(v, _)| *v == prefix) {
-                    return None; // a full valid value is typed — nothing left to pick
-                }
-                return Some(CompletionContext::Arg {
-                    cmd: spec.name,
-                    prefix,
-                });
-            }
-            if spec.name == MODEL_CMD {
-                // Model ids are dynamic — the catalog is filtered at render time,
-                // so emptiness is resolved there, not here.
-                return Some(CompletionContext::Arg {
-                    cmd: spec.name,
-                    prefix,
-                });
-            }
-            None // freeform or no argument — nothing to enumerate
-        }
-    }
-}
-
-/// Resolve a completion context to the menu rows it offers.
-fn completion_items_for(ctx: &CompletionContext) -> Vec<CompletionItem> {
-    match ctx {
-        CompletionContext::Command(prefix) => command::matching(prefix)
-            .into_iter()
-            .map(|spec| {
-                let takes_args = spec.takes_args();
-                CompletionItem {
-                    label: format!("/{}", spec.name),
-                    help: spec.help.to_string(),
-                    insert: if takes_args {
-                        format!("/{} ", spec.name)
-                    } else {
-                        format!("/{}", spec.name)
-                    },
-                    submit_on_enter: !takes_args,
-                }
-            })
-            .collect(),
-        CompletionContext::Arg { cmd, prefix } => command::arg_matching(cmd, prefix)
-            .into_iter()
-            .map(|(value, hint)| CompletionItem {
-                label: value.to_string(),
-                help: hint.to_string(),
-                insert: format!("/{cmd} {value}"),
-                submit_on_enter: true,
-            })
-            .collect(),
-    }
-}
-
-/// One-line, length-capped form of an error message for the status bar:
-/// whitespace/newlines collapsed, clipped with an ellipsis.
-fn clip_reason(s: &str) -> String {
-    let one_line = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    const MAX: usize = 60;
-    if one_line.chars().count() > MAX {
-        format!("{}…", one_line.chars().take(MAX).collect::<String>())
-    } else {
-        one_line
-    }
-}
-
-/// Compact token count for the working line: `1234` → `1.2k`, `45000` → `45k`.
-/// The live working line and the settled usage summary share one humanizer (in
-/// `hi-agent`), so the same count never renders two different ways.
-fn fmt_count(n: u64) -> String {
-    hi_agent::humanize_count(n)
-}
-
-/// Format an elapsed-seconds count compactly: `45s`, `14m 28s`, `1h 02m`.
-fn fmt_elapsed(secs: u64) -> String {
-    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
-    if h > 0 {
-        format!("{h}h {m:02}m")
-    } else if m > 0 {
-        format!("{m}m {s:02}s")
-    } else {
-        format!("{s}s")
-    }
-}
-
-/// The style for code — inline spans and fenced blocks.
-fn code_style() -> Style {
-    Style::default().fg(Color::Cyan)
-}
-
-/// Render one committed line of assistant markdown into a styled [`Line`].
-/// Block-level constructs (headings, lists, fences, rules, quotes) are detected
-/// per line; `code_lang` carries the ``` fence state across calls (`Some(lang)`
-/// while inside a fence) so code interiors are highlighted for that language.
-/// Anything else gets inline emphasis/code styling.
-fn markdown_line(text: &str, code_lang: &mut Option<String>) -> Line<'static> {
-    let trimmed = text.trim_start();
-
-    // Fenced code: ``` toggles the block; the fence line becomes a dim gutter
-    // (with the language as a caption when opening).
-    if trimmed.starts_with("```") {
-        let lang = trimmed.trim_start_matches('`').trim();
-        let caption = if code_lang.is_none() { lang } else { "" };
-        *code_lang = if code_lang.is_none() {
-            Some(lang.to_string())
-        } else {
-            None
-        };
-        return Line::from(vec![
-            Span::styled("▏ ", dim()),
-            Span::styled(caption.to_string(), dim().add_modifier(Modifier::ITALIC)),
-        ]);
-    }
-    if let Some(lang) = code_lang.as_deref() {
-        let mut spans = vec![Span::styled("▏ ", dim())];
-        spans.extend(highlight_code(text, lang));
-        return Line::from(spans);
-    }
-
-    // Horizontal rule.
-    if is_hr(trimmed) {
-        return Line::styled("─".repeat(40), dim());
-    }
-
-    // Headings: # … ###### → bold, markers stripped.
-    if let Some(rest) = heading_text(trimmed) {
-        return Line::from(inline_spans(
-            rest,
-            Style::default().add_modifier(Modifier::BOLD),
-        ));
-    }
-
-    // Blockquote.
-    if let Some(rest) = trimmed
-        .strip_prefix("> ")
-        .or_else(|| trimmed.strip_prefix('>'))
-    {
-        let mut spans = vec![Span::styled("▏ ", dim())];
-        spans.extend(inline_spans(rest, dim()));
-        return Line::from(spans);
-    }
-
-    // List items keep their original indentation.
-    let indent = &text[..text.len() - trimmed.len()];
-    if let Some(rest) = bullet_text(trimmed) {
-        let mut spans = vec![Span::raw(format!("{indent}• "))];
-        spans.extend(inline_spans(rest, Style::default()));
-        return Line::from(spans);
-    }
-    if let Some((num, rest)) = numbered_text(trimmed) {
-        let mut spans = vec![Span::styled(
-            format!("{indent}{num}. "),
-            Style::default().add_modifier(Modifier::BOLD),
-        )];
-        spans.extend(inline_spans(rest, Style::default()));
-        return Line::from(spans);
-    }
-
-    // Plain paragraph (keep leading whitespace) with inline formatting.
-    Line::from(inline_spans(text, Style::default()))
-}
-
-/// `---`, `***`, or `___` (3+ of one char) — a horizontal rule.
-fn is_hr(s: &str) -> bool {
-    let s = s.trim_end();
-    s.len() >= 3 && ['-', '*', '_'].iter().any(|&m| s.chars().all(|c| c == m))
-}
-
-/// Strip a leading `#`..`###### `, returning the heading text.
-fn heading_text(s: &str) -> Option<&str> {
-    let hashes = s.len() - s.trim_start_matches('#').len();
-    if (1..=6).contains(&hashes) {
-        return s[hashes..].strip_prefix(' ').map(str::trim_end);
-    }
-    None
-}
-
-/// Strip a leading `- `, `* `, or `+ ` bullet marker.
-fn bullet_text(s: &str) -> Option<&str> {
-    ['-', '*', '+']
-        .iter()
-        .find_map(|&m| s.strip_prefix(m)?.strip_prefix(' '))
-}
-
-/// Split a leading `N. ` / `N) ` ordered-list marker into (number, rest).
-fn numbered_text(s: &str) -> Option<(&str, &str)> {
-    let end = s.find(|c: char| !c.is_ascii_digit())?;
-    if end == 0 {
-        return None;
-    }
-    let rest = s[end..]
-        .strip_prefix(". ")
-        .or_else(|| s[end..].strip_prefix(") "))?;
-    Some((&s[..end], rest))
-}
-
-/// Parse inline `**bold**`, `*italic*`/`_italic_`, and `` `code` `` into styled
-/// spans over `base`. Unmatched markers fall through as literal text.
-fn inline_spans(text: &str, base: Style) -> Vec<Span<'static>> {
-    let chars: Vec<char> = text.chars().collect();
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut plain = String::new();
-    let mut i = 0;
-    while i < chars.len() {
-        let c = chars[i];
-        // `code`
-        if c == '`'
-            && let Some(close) = find_char(&chars, i + 1, '`')
-        {
-            flush_plain(&mut spans, &mut plain, base);
-            spans.push(Span::styled(slice(&chars, i + 1, close), code_style()));
-            i = close + 1;
-            continue;
-        }
-        // **bold**
-        if c == '*'
-            && chars.get(i + 1) == Some(&'*')
-            && let Some(close) = find_double_star(&chars, i + 2)
-        {
-            flush_plain(&mut spans, &mut plain, base);
-            spans.push(Span::styled(
-                slice(&chars, i + 2, close),
-                base.add_modifier(Modifier::BOLD),
-            ));
-            i = close + 2;
-            continue;
-        }
-        // *italic* (not ** and not an empty/space-led run)
-        if c == '*'
-            && chars.get(i + 1) != Some(&'*')
-            && chars.get(i + 1) != Some(&' ')
-            && let Some(close) = find_char(&chars, i + 1, '*')
-            && close > i + 1
-        {
-            flush_plain(&mut spans, &mut plain, base);
-            spans.push(Span::styled(
-                slice(&chars, i + 1, close),
-                base.add_modifier(Modifier::ITALIC),
-            ));
-            i = close + 1;
-            continue;
-        }
-        // _italic_ — word-boundary guarded so snake_case is left alone.
-        if c == '_'
-            && (i == 0 || !chars[i - 1].is_alphanumeric())
-            && let Some(close) = find_char(&chars, i + 1, '_')
-            && close > i + 1
-            && chars.get(close + 1).is_none_or(|c| !c.is_alphanumeric())
-        {
-            flush_plain(&mut spans, &mut plain, base);
-            spans.push(Span::styled(
-                slice(&chars, i + 1, close),
-                base.add_modifier(Modifier::ITALIC),
-            ));
-            i = close + 1;
-            continue;
-        }
-        plain.push(c);
-        i += 1;
-    }
-    flush_plain(&mut spans, &mut plain, base);
-    if spans.is_empty() {
-        spans.push(Span::styled(String::new(), base));
-    }
-    spans
-}
-
-fn slice(chars: &[char], from: usize, to: usize) -> String {
-    chars[from..to].iter().collect()
-}
-
-fn flush_plain(spans: &mut Vec<Span<'static>>, plain: &mut String, base: Style) {
-    if !plain.is_empty() {
-        spans.push(Span::styled(std::mem::take(plain), base));
-    }
-}
-
-fn find_char(chars: &[char], from: usize, target: char) -> Option<usize> {
-    (from..chars.len()).find(|&j| chars[j] == target)
-}
-
-fn find_double_star(chars: &[char], from: usize) -> Option<usize> {
-    (from..chars.len().saturating_sub(1)).find(|&j| chars[j] == '*' && chars[j + 1] == '*')
-}
-
 /// Max transcript lines kept for display and scrolling. Older lines scroll off
 /// the top (the full session is still in the JSONL log). Bounds the u16 scroll
 /// range, the per-frame render clone, and memory on very long sessions.
 const MAX_TRANSCRIPT_LINES: usize = 10_000;
-
-/// Approximate the number of terminal rows `lines` occupy when wrapped to
-/// `width` — used to keep the transcript scrolled to the bottom.
-fn wrapped_height(lines: &[Line], width: u16) -> u16 {
-    // Sum in usize and saturate to u16. A long transcript can exceed u16 rows, and
-    // a u16 sum (or `as u16` per line) would wrap to a tiny value — zeroing
-    // max_scroll and freezing scrolling. u16::MAX is also ratatui's scroll ceiling.
-    let total: usize = if width == 0 {
-        lines.len()
-    } else {
-        let width = width as usize;
-        lines
-            .iter()
-            .map(|line| {
-                let len: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
-                if len == 0 { 1 } else { len.div_ceil(width) }
-            })
-            .sum()
-    };
-    total.min(u16::MAX as usize) as u16
-}
-
-/// Interactive `/model` picker: a filterable, arrow-navigable list of model ids.
-struct ModelPicker {
-    all: Vec<String>,
-    /// The model in use when the picker opened — pre-selected and marked.
-    current: String,
-    /// Health label per id (e.g. "degraded"), when the endpoint reported one.
-    tags: HashMap<String, String>,
-    filter: String,
-    /// Indices into `all` matching the current filter.
-    matches: Vec<usize>,
-    /// Index into `matches` of the highlighted row.
-    selected: usize,
-}
-
-impl ModelPicker {
-    fn new(all: Vec<String>, current: &str, tags: HashMap<String, String>) -> Self {
-        let matches: Vec<usize> = (0..all.len()).collect();
-        // Open with the current model highlighted (and scrolled into view).
-        let selected = all.iter().position(|id| id == current).unwrap_or(0);
-        Self {
-            all,
-            current: current.to_string(),
-            tags,
-            filter: String::new(),
-            matches,
-            selected,
-        }
-    }
-
-    /// Recompute matches (case-insensitive substring) after the filter changes.
-    fn refilter(&mut self) {
-        let needle = self.filter.to_lowercase();
-        self.matches = self
-            .all
-            .iter()
-            .enumerate()
-            .filter(|(_, id)| needle.is_empty() || id.to_lowercase().contains(&needle))
-            .map(|(i, _)| i)
-            .collect();
-        self.selected = 0;
-    }
-
-    fn insert(&mut self, c: char) {
-        self.filter.push(c);
-        self.refilter();
-    }
-    fn backspace(&mut self) {
-        self.filter.pop();
-        self.refilter();
-    }
-    fn down(&mut self) {
-        if self.selected + 1 < self.matches.len() {
-            self.selected += 1;
-        }
-    }
-    fn up(&mut self) {
-        self.selected = self.selected.saturating_sub(1);
-    }
-    fn page_down(&mut self) {
-        self.selected = (self.selected + PICKER_ROWS).min(self.matches.len().saturating_sub(1));
-    }
-    fn page_up(&mut self) {
-        self.selected = self.selected.saturating_sub(PICKER_ROWS);
-    }
-    fn current(&self) -> Option<&str> {
-        self.matches
-            .get(self.selected)
-            .map(|&i| self.all[i].as_str())
-    }
-
-    /// The visible window of (id, is_selected) rows, scrolled to keep the
-    /// selection in view.
-    fn visible(&self) -> (usize, Vec<(&str, bool)>) {
-        let offset = if self.selected >= PICKER_ROWS {
-            self.selected + 1 - PICKER_ROWS
-        } else {
-            0
-        };
-        let end = (offset + PICKER_ROWS).min(self.matches.len());
-        let rows = (offset..end)
-            .map(|vi| (self.all[self.matches[vi]].as_str(), vi == self.selected))
-            .collect();
-        (offset, rows)
-    }
-}
-
-/// Terminal-free input line: text + cursor + history. Unit-tested below.
-#[derive(Default)]
-struct InputLine {
-    chars: Vec<char>,
-    cursor: usize,
-    history: Vec<String>,
-    history_pos: Option<usize>,
-}
-
-impl InputLine {
-    fn text(&self) -> String {
-        self.chars.iter().collect()
-    }
-    fn cursor(&self) -> usize {
-        self.cursor
-    }
-    fn is_empty(&self) -> bool {
-        self.chars.is_empty()
-    }
-    fn insert(&mut self, c: char) {
-        self.chars.insert(self.cursor, c);
-        self.cursor += 1;
-    }
-    /// If the character just before the cursor is a backslash, replace it with a
-    /// newline and report `true` — so a line ending in `\` continues instead of
-    /// submitting (a universal fallback for terminals without Alt+Enter).
-    fn continue_line(&mut self) -> bool {
-        if self.cursor > 0 && self.chars[self.cursor - 1] == '\\' {
-            self.chars[self.cursor - 1] = '\n';
-            true
-        } else {
-            false
-        }
-    }
-    /// Insert a (possibly multi-line) string at the cursor — used for pastes.
-    /// Line endings are normalized to `\n` so the text submits as one prompt.
-    fn insert_str(&mut self, s: &str) {
-        let normalized = s.replace("\r\n", "\n").replace('\r', "\n");
-        let chars: Vec<char> = normalized.chars().collect();
-        let n = chars.len();
-        self.chars.splice(self.cursor..self.cursor, chars);
-        self.cursor += n;
-        self.history_pos = None;
-    }
-    fn backspace(&mut self) {
-        if self.cursor > 0 {
-            self.chars.remove(self.cursor - 1);
-            self.cursor -= 1;
-        }
-    }
-    fn kill_to_start(&mut self) {
-        self.chars.drain(..self.cursor);
-        self.cursor = 0;
-    }
-    fn left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
-    }
-    fn right(&mut self) {
-        self.cursor = (self.cursor + 1).min(self.chars.len());
-    }
-    fn home(&mut self) {
-        self.cursor = 0;
-    }
-    fn end(&mut self) {
-        self.cursor = self.chars.len();
-    }
-    fn clear(&mut self) {
-        self.chars.clear();
-        self.cursor = 0;
-        self.history_pos = None;
-    }
-    fn submit(&mut self) -> String {
-        let line = self.text();
-        self.clear();
-        if !line.trim().is_empty() && self.history.last() != Some(&line) {
-            self.history.push(line.clone());
-        }
-        line
-    }
-    fn set(&mut self, text: &str) {
-        self.chars = text.chars().collect();
-        self.cursor = self.chars.len();
-    }
-    fn history_prev(&mut self) {
-        if self.history.is_empty() {
-            return;
-        }
-        let pos = match self.history_pos {
-            Some(0) => 0,
-            Some(p) => p - 1,
-            None => self.history.len() - 1,
-        };
-        self.history_pos = Some(pos);
-        self.set(&self.history[pos].clone());
-    }
-    fn history_next(&mut self) {
-        match self.history_pos {
-            Some(p) if p + 1 < self.history.len() => {
-                self.history_pos = Some(p + 1);
-                self.set(&self.history[p + 1].clone());
-            }
-            Some(_) => {
-                self.history_pos = None;
-                self.set("");
-            }
-            None => {}
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -2856,19 +2023,6 @@ mod tests {
             app.transcript.len(),
             before + 1_000,
             "grows while scrolled up, no trim"
-        );
-    }
-
-    #[test]
-    fn wrapped_height_does_not_overflow_on_a_tall_transcript() {
-        // A long session can exceed u16 rows. The height must saturate, not wrap
-        // around to a tiny value — which would zero out max_scroll and freeze
-        // scrolling (the "scrolling is broken" report on a huge session).
-        let lines: Vec<Line> = (0..70_000).map(|_| Line::raw("x")).collect();
-        let h = wrapped_height(&lines, 80);
-        assert!(
-            h >= 60_000,
-            "tall transcript reports a large height, got {h}"
         );
     }
 
@@ -2993,16 +2147,6 @@ mod tests {
     }
 
     #[test]
-    fn looks_like_diff_detects_unified_and_ignores_lists() {
-        assert!(looks_like_diff("@@ -1,2 +1,2 @@\n-a\n+b"));
-        assert!(looks_like_diff("--- a/x\n+++ b/x\n context"));
-        assert!(looks_like_diff("diff --git a/x b/x\n..."));
-        // A bullet list or a flag line must not be mistaken for a diff.
-        assert!(!looks_like_diff("- one\n- two\n+ three"));
-        assert!(!looks_like_diff("plain output\nno diff here"));
-    }
-
-    #[test]
     fn colorizes_plain_diff_tool_output() {
         let mut app = App::new("openai", "gpt-4o");
         let diff = "--- a/x.rs\n+++ b/x.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n ctx\n";
@@ -3045,34 +2189,6 @@ mod tests {
             .iter()
             .any(|l| l.spans.last().map(|s| s.style.fg) == Some(Some(Color::Red)));
         assert!(!any_red, "a plain list must not be colorized as a diff");
-    }
-
-    #[test]
-    fn fmt_count_humanizes() {
-        assert_eq!(fmt_count(0), "0");
-        assert_eq!(fmt_count(999), "999");
-        assert_eq!(fmt_count(1234), "1.2k");
-        assert_eq!(fmt_count(45000), "45k");
-    }
-
-    #[test]
-    fn working_and_summary_share_one_humanizer() {
-        // The live working line (fmt_count) and the settled usage summary
-        // (hi_agent::humanize_count) must format a count identically — else the
-        // same number renders two ways as a turn finishes (the regression fixed).
-        for n in [0u64, 999, 1234, 22_864, 12_000, 1_000_000, 1_500_000] {
-            assert_eq!(fmt_count(n), hi_agent::humanize_count(n), "diverged at {n}");
-        }
-    }
-
-    #[test]
-    fn fmt_elapsed_shows_minutes_and_seconds() {
-        assert_eq!(fmt_elapsed(0), "0s");
-        assert_eq!(fmt_elapsed(45), "45s");
-        assert_eq!(fmt_elapsed(60), "1m 00s");
-        assert_eq!(fmt_elapsed(868), "14m 28s"); // the reported "868s"
-        assert_eq!(fmt_elapsed(3600), "1h 00m");
-        assert_eq!(fmt_elapsed(3661), "1h 01m");
     }
 
     #[test]
@@ -3276,14 +2392,6 @@ mod tests {
     }
 
     #[test]
-    fn base64_encoder_handles_padding() {
-        assert_eq!(base64_encode(b""), "");
-        assert_eq!(base64_encode(b"f"), "Zg==");
-        assert_eq!(base64_encode(b"fo"), "Zm8=");
-        assert_eq!(base64_encode(b"foo"), "Zm9v");
-    }
-
-    #[test]
     fn completed_turn_without_summary_is_visible() {
         let mut app = App::new("openai", "gpt-4o");
         app.note_turn_completed_without_summary();
@@ -3345,75 +2453,6 @@ mod tests {
     }
 
     #[test]
-    fn input_editing_and_history() {
-        let mut input = InputLine::default();
-        for c in "helo".chars() {
-            input.insert(c);
-        }
-        input.left();
-        input.insert('l');
-        assert_eq!(input.text(), "hello");
-        input.submit();
-        for c in "two".chars() {
-            input.insert(c);
-        }
-        input.submit();
-        input.history_prev();
-        assert_eq!(input.text(), "two");
-        input.history_prev();
-        assert_eq!(input.text(), "hello");
-    }
-
-    #[test]
-    fn paste_inserts_multiline_as_one_prompt() {
-        // The bug: a pasted block used to submit each line. It must instead
-        // become one multi-line input that submits whole on Enter.
-        let mut input = InputLine::default();
-        input.insert_str("line one\nline two\nline three");
-        assert_eq!(input.text(), "line one\nline two\nline three");
-        assert_eq!(input.submit(), "line one\nline two\nline three");
-    }
-
-    #[test]
-    fn paste_normalizes_crlf() {
-        let mut input = InputLine::default();
-        input.insert_str("a\r\nb\rc");
-        assert_eq!(input.text(), "a\nb\nc");
-    }
-
-    #[test]
-    fn model_picker_filters_and_navigates() {
-        let mut p = ModelPicker::new(
-            vec![
-                "anthropic/claude-sonnet-4".into(),
-                "openai/gpt-4o".into(),
-                "openai/gpt-4o-mini".into(),
-                "google/gemini".into(),
-            ],
-            "google/gemini",
-            HashMap::new(),
-        );
-        // Opens with the current model pre-selected.
-        assert_eq!(p.current(), Some("google/gemini"));
-        assert_eq!(p.matches.len(), 4);
-        for c in "gpt".chars() {
-            p.insert(c);
-        }
-        assert_eq!(p.matches.len(), 2, "only gpt-* match");
-        assert_eq!(p.current(), Some("openai/gpt-4o"));
-        p.down();
-        assert_eq!(p.current(), Some("openai/gpt-4o-mini"));
-        p.down(); // clamped at the end
-        assert_eq!(p.current(), Some("openai/gpt-4o-mini"));
-        p.up();
-        assert_eq!(p.current(), Some("openai/gpt-4o"));
-        p.backspace(); // "gp"
-        p.backspace(); // "g" → matches both gpt-* and google
-        assert_eq!(p.filter, "g");
-        assert_eq!(p.matches.len(), 3);
-    }
-
-    #[test]
     fn renders_fetching_spinner() {
         let mut app = App::new("terminaili", "ipop/coder-balanced");
         app.fetching = Some(Instant::now());
@@ -3467,83 +2506,6 @@ mod tests {
         );
     }
 
-    /// Concatenated text of a rendered line.
-    fn line_text(line: &Line) -> String {
-        line.spans.iter().map(|s| s.content.as_ref()).collect()
-    }
-
-    /// True if any span carrying `needle` has the given modifier.
-    fn span_has(line: &Line, needle: &str, m: Modifier) -> bool {
-        line.spans
-            .iter()
-            .any(|s| s.content.contains(needle) && s.style.add_modifier.contains(m))
-    }
-
-    #[test]
-    fn markdown_headings_bullets_and_rules() {
-        let mut code: Option<String> = None;
-        let h = markdown_line("#### 5. visited reset", &mut code);
-        assert_eq!(
-            line_text(&h),
-            "5. visited reset",
-            "heading markers stripped"
-        );
-        assert!(span_has(&h, "visited", Modifier::BOLD), "heading is bold");
-
-        let b = markdown_line("- Threefold repetition", &mut code);
-        assert_eq!(line_text(&b), "• Threefold repetition", "bullet rewritten");
-
-        let n = markdown_line("7. parse_move accepts", &mut code);
-        assert_eq!(line_text(&n), "7. parse_move accepts", "numbered list kept");
-
-        assert_eq!(line_text(&markdown_line("---", &mut code)), "─".repeat(40));
-    }
-
-    #[test]
-    fn markdown_code_fence_renders_interior_verbatim() {
-        let mut code: Option<String> = None;
-        let open = markdown_line("```rust", &mut code);
-        assert!(code.is_some(), "fence opens a code block");
-        assert!(line_text(&open).contains("rust"), "lang caption shown");
-
-        // Markdown markers inside a fence are NOT interpreted.
-        let inner = markdown_line("visited[tr][tc] = **true**;", &mut code);
-        assert!(
-            line_text(&inner).contains("**true**"),
-            "code interior is verbatim: {:?}",
-            line_text(&inner)
-        );
-
-        markdown_line("```", &mut code);
-        assert!(code.is_none(), "closing fence ends the block");
-    }
-
-    #[test]
-    fn markdown_inline_emphasis_and_code() {
-        let mut code: Option<String> = None;
-        let line = markdown_line("Use **mut** and `Vec` not _that_", &mut code);
-        assert_eq!(
-            line_text(&line),
-            "Use mut and Vec not that",
-            "markers consumed"
-        );
-        assert!(span_has(&line, "mut", Modifier::BOLD), "**bold**");
-        assert!(span_has(&line, "that", Modifier::ITALIC), "_italic_");
-        assert!(
-            line.spans
-                .iter()
-                .any(|s| s.content == "Vec" && s.style.fg == Some(Color::Cyan)),
-            "`code` styled"
-        );
-        // A bare underscore in an identifier must not start italics.
-        let id = markdown_line("call is_empty here", &mut code);
-        assert_eq!(line_text(&id), "call is_empty here");
-        assert!(
-            !span_has(&id, "is_empty", Modifier::ITALIC),
-            "snake_case spared"
-        );
-    }
-
     #[test]
     fn renders_multiline_input() {
         let mut app = App::new("openai", "gpt-4o");
@@ -3557,70 +2519,6 @@ mod tests {
         );
         assert!(screen.contains("second"), "second line: {screen}");
         assert!(screen.contains("third"), "third line: {screen}");
-    }
-
-    #[test]
-    fn code_block_highlights_strings_and_comments() {
-        let mut code: Option<String> = None;
-        markdown_line("```rust", &mut code);
-        // A whole-line comment is dimmed.
-        let c = markdown_line("    // a note", &mut code);
-        assert!(
-            c.spans
-                .iter()
-                .any(|s| s.content.contains("// a note")
-                    && s.style.add_modifier.contains(Modifier::DIM)),
-            "comment dimmed"
-        );
-        // A string literal is greened; the rest is not.
-        let s = markdown_line("let x = \"hi\";", &mut code);
-        assert!(
-            s.spans
-                .iter()
-                .any(|sp| sp.content == "\"hi\"" && sp.style.fg == Some(Color::Green)),
-            "string greened: {:?}",
-            s.spans
-                .iter()
-                .map(|sp| (sp.content.as_ref(), sp.style.fg))
-                .collect::<Vec<_>>()
-        );
-        // Unknown language → no comment marker, so a `#`-line isn't dimmed away.
-        let mut code2 = Some(String::new());
-        let u = markdown_line("# this is a heading-ish line", &mut code2);
-        assert!(
-            !u.spans
-                .iter()
-                .skip(1)
-                .all(|s| s.style.add_modifier.contains(Modifier::DIM)),
-            "unknown lang doesn't treat # as a comment"
-        );
-    }
-
-    #[test]
-    fn diff_lines_number_the_new_file() {
-        let body = "--- a/x\n+++ b/x\n@@ -10,3 +10,4 @@\n ctx\n-old\n+new\n+more\n";
-        let lines = diff_lines(body);
-        let text: Vec<String> = lines.iter().map(line_text).collect();
-        // Context line is numbered from the hunk's new-file start (10).
-        assert!(
-            text.iter().any(|t| t.contains("10") && t.contains("ctx")),
-            "{text:?}"
-        );
-        // Additions continue the new-file numbering (11, 12); removals don't advance it.
-        assert!(
-            text.iter().any(|t| t.contains("11") && t.contains("+new")),
-            "{text:?}"
-        );
-        assert!(
-            text.iter().any(|t| t.contains("12") && t.contains("+more")),
-            "{text:?}"
-        );
-        // The removed line carries no number (blank gutter before the '-').
-        let removed = text.iter().find(|t| t.contains("-old")).unwrap();
-        assert!(
-            !removed.chars().any(|c| c.is_ascii_digit()),
-            "removed line has no number: {removed:?}"
-        );
     }
 
     #[test]
@@ -3666,63 +2564,6 @@ mod tests {
     }
 
     #[test]
-    fn clip_reason_collapses_and_truncates() {
-        assert_eq!(clip_reason("a\n  b   c"), "a b c");
-        assert!(clip_reason(&"x".repeat(200)).ends_with('…'));
-    }
-
-    #[test]
-    fn completion_context_tracks_name_then_argument() {
-        use CompletionContext::{Arg, Command};
-        // The command name, until a space is typed.
-        assert_eq!(completion_context("/"), Some(Command(String::new())));
-        assert_eq!(completion_context("/mo"), Some(Command("mo".to_string())));
-        assert_eq!(
-            completion_context("/MODEL"),
-            Some(Command("model".to_string()))
-        );
-        // Past the name, on the argument of a command with enumerable values.
-        assert_eq!(
-            completion_context("/compact "),
-            Some(Arg {
-                cmd: "compact",
-                prefix: String::new()
-            })
-        );
-        assert_eq!(
-            completion_context("/compact hy"),
-            Some(Arg {
-                cmd: "compact",
-                prefix: "hy".to_string()
-            })
-        );
-        // The single-keyword commands and the dynamic model command, too.
-        assert_eq!(
-            completion_context("/verify "),
-            Some(Arg {
-                cmd: "verify",
-                prefix: String::new()
-            })
-        );
-        assert_eq!(
-            completion_context("/model gp"),
-            Some(Arg {
-                cmd: "model",
-                prefix: "gp".to_string()
-            })
-        );
-        // A fully-typed valid static value has nothing left to complete → no menu.
-        assert_eq!(completion_context("/compact hybrid"), None);
-        assert_eq!(completion_context("/verify off"), None);
-        // A command that takes no argument, with a trailing space → no menu.
-        assert_eq!(completion_context("/diff "), None);
-        // A second argument token is past the single arg → no menu.
-        assert_eq!(completion_context("/compact hybrid x"), None);
-        // Not a slash command at all.
-        assert_eq!(completion_context("hello"), None);
-    }
-
-    #[test]
     fn completion_opens_filters_and_closes() {
         let mut app = App::new("openai", "gpt-4o");
         app.input.set("/");
@@ -3748,28 +2589,6 @@ mod tests {
         app.input.set("/diff ");
         app.sync_completion();
         assert!(app.completion.is_none());
-    }
-
-    #[test]
-    fn goal_feedback_is_prominent_on_change_quiet_on_read() {
-        // Setting echoes the stored goal as a prominent ✓ confirmation that says
-        // it persists — the visibility fix for "/goal seemed to do nothing".
-        let (msg, prominent) = goal_feedback("ship it", Some("ship it"));
-        assert!(prominent, "a set is an applied change, shown plainly");
-        assert!(msg.starts_with("✓ goal set"), "got: {msg}");
-        assert!(
-            msg.contains("ship it") && msg.contains("until cleared"),
-            "echoes the goal and that it persists: {msg}"
-        );
-        // Clearing is also a prominent ✓.
-        assert_eq!(
-            goal_feedback("clear", None),
-            ("✓ goal cleared".to_string(), true)
-        );
-        // A bare /goal is a quiet read-out, not a ✓ confirmation.
-        let (read, prominent) = goal_feedback("", Some("ship it"));
-        assert_eq!((read.as_str(), prominent), ("goal: ship it", false));
-        assert!(!goal_feedback("", None).1, "the off read-out stays dim too");
     }
 
     #[test]
