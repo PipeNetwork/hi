@@ -70,9 +70,15 @@ fn run_hi(dir: &Path, server_url: &str, extra_args: &[&str], stdin_script: &str)
 #[test]
 fn memory_distills_at_quit_and_reloads_next_session() {
     // Round 1: one turn (with usage, so work is registered) + the quit-time
-    // distillation — two canned responses.
+    // distillation. The turn response "Done — fixed it." is text-only with no
+    // tool calls, so the silent auto-continue fires up to 3 times (production
+    // default) before the turn ends — provide those extra responses, then the
+    // distillation response.
     let Some(server1) = FakeOpenAiServer::new(vec![
         Response::sse(sse_with_usage("Done — fixed it.")),
+        Response::sse(sse_text("Done.")),
+        Response::sse(sse_text("Done.")),
+        Response::sse(sse_text("Done.")),
         Response::sse(sse_text("- always run cargo fmt before commits")),
     ]) else {
         return; // sandbox can't bind a socket → skip
@@ -89,7 +95,12 @@ fn memory_distills_at_quit_and_reloads_next_session() {
 
     // Round 2 (same dir): the saved memory must load into the system prompt.
     // `--no-memory` so this run doesn't re-distill — one turn, one request to inspect.
-    let Some(server2) = FakeOpenAiServer::new(vec![Response::sse(sse_with_usage("ok"))]) else {
+    let Some(server2) = FakeOpenAiServer::new(vec![
+        Response::sse(sse_with_usage("ok")),
+        Response::sse(sse_text("ok")),
+        Response::sse(sse_text("ok")),
+        Response::sse(sse_text("ok")),
+    ]) else {
         return;
     };
     run_hi(

@@ -1503,16 +1503,18 @@ impl Agent {
 
                 if calls.is_empty() {
                     // Text but no tool call (the content-less case was handled
-                    // above). If the model was actively working this turn (it
-                    // made tool calls earlier), silently re-prompt it to
-                    // continue — no status line, no steer counter, no visible
-                    // nudge. The system prompt tells the model not to narrate
-                    // without acting, but when it still does, this keeps the
-                    // turn going automatically so the user doesn't have to type
-                    // "continue". Bounded so it can't loop forever; past the
-                    // budget the turn ends honestly.
+                    // above). Silently re-prompt the model to continue — no
+                    // status line, no steer counter, no visible nudge. This
+                    // fires whether or not the model made tool calls earlier in
+                    // the turn: the system prompt tells the model not to narrate
+                    // without acting, but when it still does (even on the first
+                    // round — "I'll review the codebase. Let me start by…"
+                    // without calling a tool), this keeps the turn going
+                    // automatically so the user doesn't have to type "continue".
+                    // Bounded so it can't loop forever; past the budget the turn
+                    // ends honestly.
                     self.messages.push_assistant(std::mem::take(&mut completion.content));
-                    if made_tool_call && silent_continues < self.config.max_silent_continues {
+                    if silent_continues < self.config.max_silent_continues {
                         silent_continues += 1;
                         self.messages.push_nudge(NudgeKind::Continue, SILENT_CONTINUE_NUDGE);
                         continue;
