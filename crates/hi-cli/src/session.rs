@@ -32,6 +32,12 @@ enum SessionMeta {
     Compaction {
         messages: Vec<Message>,
     },
+    /// A long-horizon goal's authoritative state, so a `/resume` picks up the
+    /// in-progress goal at its active sub-goal. Last write wins (the goal is
+    /// replaced wholesale, like `Compaction`).
+    Goal {
+        goal: hi_agent::Goal,
+    },
 }
 
 /// Appends messages to a session's JSONL file.
@@ -113,6 +119,24 @@ impl SessionSink for JsonlSession {
         writer.flush()?;
         Ok(())
     }
+
+    fn record_goal(&mut self, goal: &hi_agent::Goal) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .with_context(|| format!("opening {}", self.path.display()))?;
+        let mut writer = BufWriter::new(file);
+        let line = serde_json::to_string(&SessionMeta::Goal {
+            goal: goal.clone(),
+        })?;
+        writeln!(writer, "{line}")?;
+        writer.flush()?;
+        Ok(())
+    }
 }
 
 pub struct LoadedSession {
@@ -120,6 +144,8 @@ pub struct LoadedSession {
     pub usage: Usage,
     pub cost_usd: Option<f64>,
     pub checkpoint_refs: Vec<String>,
+    /// A long-horizon goal persisted across sessions, if any (last write wins).
+    pub goal: Option<hi_agent::Goal>,
 }
 
 /// One-line summary shown when a session is resumed: message count, cost, and
@@ -203,6 +229,7 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
     let mut usage = Usage::default();
     let mut cost_usd: Option<f64> = None;
     let mut checkpoint_refs = Vec::new();
+    let mut loaded_goal: Option<hi_agent::Goal> = None;
     for (i, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
@@ -232,6 +259,9 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
                     // Replace all prior messages with the compacted set.
                     messages = compacted;
                 }
+                SessionMeta::Goal { goal } => {
+                    loaded_goal = Some(goal);
+                }
             }
             continue;
         }
@@ -244,6 +274,7 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
         usage,
         cost_usd,
         checkpoint_refs,
+        goal: loaded_goal,
     })
 }
 
@@ -386,5 +417,50 @@ mod tests {
         assert_eq!(loaded.usage.input_tokens, 123);
         assert_eq!(loaded.usage.output_tokens, 45);
         assert_eq!(loaded.cost_usd, Some(0.1234));
+    }
+
+    #[test]
+    fn jsonl_session_round_trips_a_structured_goal() {
+        // A long-horizon goal persisted via record_goal survives a load so a
+        // /resume picks it up at its active sub-goal.
+        use hi_agent::{Goal, GoalStatus};
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "hi-session-goal-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut session = JsonlSession::new(path.clone());
+        session
+            .record(
+                &[Message::system("sys"), Message::user("go")],
+                Usage {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                    input_includes_cache: false,
+                    context_occupancy: 1,
+                    billable: None,
+                },
+                None,
+            )
+            .unwrap();
+        // A goal mid-progress: sub-goal 1 done, sub-goal 2 active.
+        let mut goal = Goal::new("refactor the parser", vec!["write tests".into(), "rewrite parser".into()]);
+        goal.advance(); // mark step 1 done, step 2 active
+        session.record_goal(&goal).unwrap();
+
+        let loaded = load_history(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let loaded_goal = loaded.goal.expect("goal persisted across load");
+        assert_eq!(loaded_goal.objective, "refactor the parser");
+        assert_eq!(loaded_goal.sub_goals.len(), 2);
+        assert_eq!(loaded_goal.sub_goals[0].status, GoalStatus::Done);
+        assert_eq!(loaded_goal.active_index(), Some(1), "resumes at the active sub-goal");
     }
 }

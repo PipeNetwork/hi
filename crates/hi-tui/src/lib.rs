@@ -1321,13 +1321,49 @@ impl App {
     }
 
     fn handle_goal(&mut self, agent: &mut Agent, arg: &str) {
-        // Apply the change first, then describe the resulting state.
+        // Apply the change first, then describe the resulting state. When
+        // long-horizon agency is on, setting a goal creates a structured `Goal`
+        // (a single sub-goal equal to the objective, which the model decomposes
+        // as it works via `update_plan`); clearing drops both views.
         match arg.trim() {
             "" => {} // no argument — just report the current goal
-            "clear" | "off" | "none" => agent.set_goal(None),
-            goal => agent.set_goal(Some(goal.to_string())),
+            "clear" | "off" | "none" => {
+                agent.set_goal(None);
+                agent.set_structured_goal(None);
+            }
+            goal => {
+                if agent.long_horizon() {
+                    let accepted = agent.set_structured_goal(Some(hi_agent::Goal::new(
+                        goal.to_string(),
+                        vec![goal.to_string()],
+                    )));
+                    if !accepted {
+                        agent.set_goal(Some(goal.to_string()));
+                    }
+                } else {
+                    agent.set_goal(Some(goal.to_string()));
+                }
+            }
         }
-        let (msg, prominent) = goal_feedback(arg, agent.goal());
+        // Report whichever view is active.
+        let (msg, prominent) = if let Some(g) = agent.structured_goal() {
+            let done = g
+                .sub_goals
+                .iter()
+                .filter(|s| s.status == hi_agent::GoalStatus::Done)
+                .count();
+            (
+                format!(
+                    "goal: {} — {}/{} sub-goals done",
+                    g.objective,
+                    done,
+                    g.sub_goals.len()
+                ),
+                true,
+            )
+        } else {
+            goal_feedback(arg, agent.goal())
+        };
         // A set/clear is an applied change — show it plainly (green ✓), not dim,
         // so it's obvious it took effect. A bare `/goal` is just a read-out.
         let style = if prominent {

@@ -115,17 +115,52 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command, regi
             println!("\x1b[33m/copy is only available in the full-screen TUI\x1b[0m");
         }
         Command::Goal(arg) => match arg.trim() {
-            "" => match agent.goal() {
-                Some(goal) => println!("\x1b[2mgoal: {goal}\x1b[0m"),
-                None => println!("\x1b[2mgoal: off (set one with /goal <text>)\x1b[0m"),
-            },
+            "" => {
+                // Report whichever goal view is active: the structured
+                // long-horizon goal when long_horizon is on, else the
+                // transient goal string.
+                if let Some(g) = agent.structured_goal() {
+                    println!(
+                        "\x1b[2mgoal: {} — {}/{} sub-goals done\x1b[0m",
+                        g.objective,
+                        g.sub_goals.iter().filter(|s| s.status == hi_agent::GoalStatus::Done).count(),
+                        g.sub_goals.len()
+                    );
+                } else {
+                    match agent.goal() {
+                        Some(goal) => println!("\x1b[2mgoal: {goal}\x1b[0m"),
+                        None => println!("\x1b[2mgoal: off (set one with /goal <text>)\x1b[0m"),
+                    }
+                }
+            }
             "clear" | "off" | "none" => {
                 agent.set_goal(None);
+                agent.set_structured_goal(None);
                 println!("\x1b[32m✓ goal cleared\x1b[0m");
             }
             goal => {
-                agent.set_goal(Some(goal.to_string()));
-                println!("\x1b[32m✓ goal set — steers every turn until cleared: {goal}\x1b[0m");
+                // When long-horizon agency is on, set a structured goal — a
+                // single sub-goal equal to the objective, which the model
+                // decomposes as it works (its `update_plan` calls map back to
+                // sub-goal statuses). Otherwise fall back to the transient
+                // prompt-injected goal string.
+                if agent.long_horizon() {
+                    let accepted = agent.set_structured_goal(Some(hi_agent::Goal::new(
+                        goal.to_string(),
+                        vec![goal.to_string()],
+                    )));
+                    if accepted {
+                        println!(
+                            "\x1b[32m✓ long-horizon goal set — drives sub-goals across turns: {goal}\x1b[0m"
+                        );
+                    } else {
+                        agent.set_goal(Some(goal.to_string()));
+                        println!("\x1b[32m✓ goal set — steers every turn until cleared: {goal}\x1b[0m");
+                    }
+                } else {
+                    agent.set_goal(Some(goal.to_string()));
+                    println!("\x1b[32m✓ goal set — steers every turn until cleared: {goal}\x1b[0m");
+                }
             }
         },
         // Handled in the repl loop (async / runs a turn); never reach here.

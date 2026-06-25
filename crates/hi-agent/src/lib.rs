@@ -184,6 +184,27 @@ go — always with the complete list — marking the current step `active` and \
 finished ones `done`. Skip the plan for simple one-step changes. Verify your \
 edits before finishing.";
 
+/// Parse an `update_plan` arguments JSON and apply its step statuses to a
+/// structured goal's sub-goals (mapping by position). Tolerant — a malformed
+/// payload or count mismatch just applies what it can. Used when `long_horizon`
+/// is on so the model's stated plan progress drives the goal.
+fn apply_plan_to_goal(goal: &mut Goal, arguments: &str) {
+    #[derive(serde::Deserialize)]
+    struct StepArg {
+        #[serde(default)]
+        status: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct PlanArgs {
+        #[serde(default)]
+        steps: Vec<StepArg>,
+    }
+    if let Ok(args) = serde_json::from_str::<PlanArgs>(arguments) {
+        let statuses: Vec<&str> = args.steps.iter().map(|s| s.status.as_str()).collect();
+        goal.apply_plan_statuses(&statuses);
+    }
+}
+
 pub struct Agent {
     provider: Box<dyn Provider>,
     config: AgentConfig,
@@ -508,12 +529,98 @@ impl Agent {
         }
         self.structured_goal = goal;
         self.refresh_system_message();
+        // Persist the change so a /resume picks it up. Best-effort: no UI here
+        // (callers can surface failures), so swallow — the goal lives in-memory
+        // for this session regardless.
+        if let Some(session) = self.session.as_mut()
+            && let Some(g) = &self.structured_goal
+        {
+            let _ = session.record_goal(g);
+        }
         true
     }
 
     /// The structured long-horizon goal, if any (for persistence/observability).
     pub fn structured_goal(&self) -> Option<&Goal> {
         self.structured_goal.as_ref()
+    }
+
+    /// Whether long-horizon agency is on (the `long_horizon` config flag), so
+    /// frontends can branch `/goal` between the structured goal and the
+    /// transient goal string.
+    pub fn long_horizon(&self) -> bool {
+        self.config.long_horizon
+    }
+
+    /// Long-horizon driver — called at turn end. When a structured goal is set
+    /// and `long_horizon` is on, advance or retry the active sub-goal based on
+    /// the turn's outcome, so the next turn resumes at the right sub-goal (with
+    /// prior-attempt notes if it stalled, so the model doesn't repeat a failed
+    /// approach). The verify retry itself happens *within* the turn (the 'turn
+    /// loop re-runs the model on a verify failure); this hook handles the
+    /// goal-level progression once the turn settles.
+    fn goal_turn_end(
+        &mut self,
+        stalled_unfinished: bool,
+        stalled_repeating: bool,
+        hit_step_cap: bool,
+        ui: &mut dyn Ui,
+    ) {
+        if !self.config.long_horizon {
+            return;
+        }
+        let Some(goal) = self.structured_goal.as_mut() else {
+            return;
+        };
+        if goal.status != GoalStatus::Active {
+            return; // Already done or failed — nothing to drive.
+        }
+        let max_retries = DEFAULT_SUBGOAL_RETRIES;
+        // A turn that verified clean (or had no verify and didn't stall)
+        // completes the active sub-goal → advance.
+        let verified_clean = matches!(self.last_verify, Some(true));
+        let no_verify_clean = self.last_verify.is_none() && !stalled_unfinished && !stalled_repeating && !hit_step_cap;
+        if verified_clean || no_verify_clean {
+            let i = goal.active_index();
+            goal.advance();
+            if let Some(i) = i {
+                ui.status(&format!(
+                    "✓ sub-goal {}/{} done — advancing",
+                    i + 1,
+                    goal.sub_goals.len().max(i + 1)
+                ));
+            }
+            if goal.status == GoalStatus::Done {
+                ui.status("✓ long-horizon goal complete");
+            }
+            self.refresh_system_message();
+            self.persist_goal(ui);
+            return;
+        }
+        // A stalled or cap-hit turn, or a verify failure that ended the turn,
+        // records a sub-goal attempt so the next turn sees the prior note. If
+        // the budget is exhausted, the sub-goal (and goal) is marked Failed.
+        let reason = if hit_step_cap {
+            "hit the per-turn step cap"
+        } else if stalled_unfinished {
+            "stalled announcing steps without running them"
+        } else if stalled_repeating {
+            "stalled repeating the same tool call"
+        } else {
+            "verification failed and the turn ended without fixing it"
+        };
+        let can_retry = goal.record_failure(reason, max_retries);
+        if can_retry {
+            ui.status(&format!(
+                "↻ sub-goal failed this turn ({reason}) — will retry next turn, don't repeat the same approach"
+            ));
+        } else {
+            ui.status(&format!(
+                "✗ sub-goal exhausted its retry budget ({reason}) — marked failed; /goal to revise or continue past it"
+            ));
+        }
+        self.refresh_system_message();
+        self.persist_goal(ui);
     }
 
     /// Handle a `record_decision` tool call: parse the args, append to the
@@ -1500,6 +1607,17 @@ impl Agent {
                     for (&i, output) in ready.iter().zip(outputs) {
                         emit_tool_output(&mut *ui, &output);
                         results[i] = Some((calls[i].0.clone(), output.content));
+                        // Long-horizon: the model's `update_plan` statuses map
+                        // onto the structured goal's sub-goals, so the agent
+                        // advances/skips in lockstep with the model's stated
+                        // progress. Only when long_horizon is on and a goal is
+                        // set; the plan UI still renders via the ToolOutput.
+                        if self.config.long_horizon
+                            && calls[i].1 == "update_plan"
+                            && let Some(goal) = self.structured_goal.as_mut()
+                        {
+                            apply_plan_to_goal(goal, &calls[i].2);
+                        }
                         // A mutating tool may have changed files — invalidate
                         // the snapshot cache so a dependent read (guaranteed to
                         // run after by the dep graph) re-walks.
@@ -1678,6 +1796,12 @@ impl Agent {
                 .map(TurnAttribution::from)
                 .collect(),
         };
+
+        // Long-horizon driver: when a structured goal is set and long_horizon
+        // is on, advance or retry the active sub-goal based on this turn's
+        // outcome — so the next turn resumes coherently at the right sub-goal
+        // (and with prior-attempt notes if it stalled). See `goal_turn_end`.
+        self.goal_turn_end(stalled_unfinished, stalled_repeating, ended_at_cap, ui);
 
         // The model kept announcing steps it never ran, through the whole nudge
         // budget — don't let the turn read as a clean success.
@@ -1892,6 +2016,19 @@ impl Agent {
             self.persisted = self.messages.len();
         }
         Ok(())
+    }
+
+    /// Persist the current structured goal (if any) so a `/resume` picks it up
+    /// at its active sub-goal. Best-effort: a failure is logged to the UI but
+    /// doesn't fail the turn (the goal still lives in-memory for this session).
+    fn persist_goal(&mut self, ui: &mut dyn Ui) {
+        if let Some(session) = self.session.as_mut()
+            && let Some(goal) = &self.structured_goal
+        {
+            if let Err(err) = session.record_goal(goal) {
+                ui.status(&format!("(couldn't persist goal: {err})"));
+            }
+        }
     }
 
     /// Test-only direct access to the backing message vec, so tests can set up
@@ -2890,6 +3027,89 @@ mod tests {
         assert!(agent.structured_goal().is_none());
         let sys = agent.messages()[0].text();
         assert!(!sys.contains("Long-horizon goal"), "no goal section when off: {sys}");
+    }
+
+    #[tokio::test]
+    async fn long_horizon_driver_advances_on_clean_turn() {
+        // With long_horizon on and a structured goal set, a turn that verifies
+        // clean (or has no verify and doesn't stall) advances the active
+        // sub-goal, and the system prompt reflects the new active sub-goal.
+        let mut cfg = config();
+        cfg.long_horizon = true;
+        // One turn: model writes a file (tool), then a clean text finish. No
+        // verify configured → a non-stalling turn with no verify is "clean".
+        let tmp = temp_file("lh1");
+        let p = tmp.to_string_lossy().to_string();
+        let responses = vec![
+            write_completion(&p),
+            completion(vec![Content::Text("done".into())], 1, 1),
+            completion(vec![Content::Text("done".into())], 1, 1),
+        ];
+        let mut agent = agent(responses, cfg);
+        agent.set_structured_goal(Some(Goal::new(
+            "refactor",
+            vec!["step one".into(), "step two".into()],
+        )));
+        let mut ui = RecUi::default();
+        agent.run_turn("go", &mut ui).await.unwrap();
+        let _ = std::fs::remove_file(&tmp);
+        let goal = agent.structured_goal().expect("goal still set");
+        assert_eq!(goal.sub_goals[0].status, GoalStatus::Done, "advanced past step 1");
+        assert_eq!(goal.active_index(), Some(1), "step 2 now active");
+        // The system prompt reflects the new active sub-goal.
+        assert!(
+            agent.messages()[0].text().contains("step two"),
+            "system prompt shows new active sub-goal"
+        );
+    }
+
+    #[tokio::test]
+    async fn long_horizon_driver_records_failure_on_stall() {
+        // A turn that stalls (repeat guard exhausts) records a sub-goal attempt
+        // so the next turn sees the prior note (and doesn't repeat the approach).
+        let mut cfg = config();
+        cfg.long_horizon = true;
+        cfg.max_repeat_nudges = 1;
+        // Model re-issues the same tool call → repeat guard stalls the turn
+        // after exhausting the (1) nudge budget. Three identical writes: the
+        // second triggers a nudge, the third exhausts the budget and breaks
+        // stalled.
+        let responses = vec![
+            write_completion("lhstall"),
+            write_completion("lhstall"),
+            write_completion("lhstall"),
+        ];
+        let mut agent = agent(responses, cfg);
+        agent.set_structured_goal(Some(Goal::new(
+            "refactor",
+            vec!["step one".into(), "step two".into()],
+        )));
+        let mut ui = RecUi::default();
+        agent.run_turn("go", &mut ui).await.unwrap();
+        let _ = std::fs::remove_file("lhstall");
+        let goal = agent.structured_goal().expect("goal still set");
+        assert_eq!(goal.active_index(), Some(0), "didn't advance (stalled)");
+        assert!(
+            goal.sub_goals[0].attempts > 0,
+            "recorded a failure attempt: {:?}",
+            goal.sub_goals[0]
+        );
+        assert!(
+            goal.sub_goals[0]
+                .notes
+                .iter()
+                .any(|n| n.contains("stalled")),
+            "stall reason recorded as a note: {:?}",
+            goal.sub_goals[0].notes
+        );
+        // The system prompt surfaces the "don't repeat" notes on the active
+        // sub-goal, so the next turn doesn't repeat the failed approach.
+        assert!(
+            agent.messages()[0]
+                .text()
+                .contains("don't repeat these"),
+            "retry notes in system prompt"
+        );
     }
 
     #[tokio::test]

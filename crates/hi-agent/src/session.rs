@@ -12,4 +12,11 @@ pub trait SessionSink: Send {
     /// Persist a compaction boundary: the compacted messages replace all prior
     /// messages in storage, so a resumed session starts from the compacted state.
     fn record_compaction(&mut self, messages: &[Message]) -> Result<()>;
+
+    /// Persist a long-horizon goal's state so a resumed session picks it up at
+    /// its active sub-goal. Last write wins (the goal is replaced wholesale).
+    /// Default no-op so existing mock sinks don't need to implement it.
+    fn record_goal(&mut self, _goal: &crate::Goal) -> Result<()> {
+        Ok(())
+    }
 }
