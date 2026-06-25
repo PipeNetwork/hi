@@ -579,6 +579,7 @@ impl Agent {
         _stalled_unfinished: bool,
         stalled_repeating: bool,
         hit_step_cap: bool,
+        plan_updated_goal: bool,
         ui: &mut dyn Ui,
     ) {
         if !self.config.long_horizon {
@@ -609,34 +610,11 @@ impl Agent {
             return;
         }
         if verified_clean || no_verify_clean {
-            // Only advance if the active sub-goal isn't already Done —
-            // `apply_plan_to_goal` (from the model's `update_plan` call) may
-            // have already marked it done and advanced to the next. Calling
-            // `advance()` again here would skip that next sub-goal.
-            //
-            // After apply_plan_to_goal advances, the *new* active sub-goal is
-            // Active (not Done), so checking "is the active sub-goal Done?"
-            // would still call advance() and skip it. Instead, track whether
-            // apply_plan_to_goal already advanced during this turn by checking
-            // if any sub-goal after the first Active one is also Active or
-            // Done (meaning the plan already progressed past the original
-            // active step). Simpler and correct: only advance if NO sub-goal
-            // was marked Done by apply_plan_to_goal this turn — i.e., the
-            // model didn't use update_plan to mark progress. We detect this
-            // by checking whether the first non-Pending sub-goal from the top
-            // is the active one (no Done step before it was handled by the
-            // plan update). If apply_plan_to_goal ran, the first Done sub-goal
-            // is already marked, and the active one is past it — so advance()
-            // would skip. The safe check: don't advance if any sub-goal before
-            // the active index is Done AND the active sub-goal itself is not
-            // Done (apply_plan_to_goal already advanced to it).
-            let active_idx = goal.active_index();
-            let plan_already_advanced = active_idx.map(|i| {
-                // If any sub-goal before the active one is Done, the plan
-                // already progressed — don't advance again.
-                i > 0 && goal.sub_goals[..i].iter().any(|sg| sg.status == GoalStatus::Done)
-            }).unwrap_or(false);
-            if !plan_already_advanced {
+            // If the model's update_plan already advanced the goal during this
+            // turn (apply_plan_to_goal marked the active sub-goal done and
+            // activated the next), don't advance again — that would skip the
+            // newly-activated sub-goal. Otherwise, advance normally.
+            if !plan_updated_goal {
                 let i = goal.active_index();
                 goal.advance();
                 if let Some(i) = i {
@@ -1275,6 +1253,10 @@ impl Agent {
         let mut empty_retries = 0u32;
         let mut silent_continues = 0u32;
         let mut repeat_nudges = 0u32;
+        // Whether the model's update_plan call already advanced the structured
+        // goal during this turn (so goal_turn_end doesn't advance again and
+        // skip the next sub-goal).
+        let mut plan_updated_goal = false;
         // Scheduler parallelism counters: how many calls ran this turn, the
         // largest concurrent ready-batch, and how many ran serially (bash or a
         // lone ready call). Flushed into telemetry so the dep-aware scheduler's
@@ -1560,10 +1542,11 @@ impl Agent {
                         self.messages.push_nudge(NudgeKind::Continue, SILENT_CONTINUE_NUDGE);
                         continue;
                     }
-                    // If we exhausted the silent-continue budget on a turn that
-                    // looked unfinished, let the user know — the model kept
-                    // narrating without acting, and the agent stopped pushing.
-                    if looks_unfinished && silent_continues >= self.config.max_silent_continues {
+                    // If we exhausted the silent-continue budget (at least one
+                    // continue was attempted) on a turn that looked unfinished,
+                    // let the user know. Don't warn when max_silent_continues
+                    // is 0 (no continue was attempted — the feature is off).
+                    if looks_unfinished && silent_continues > 0 {
                         ui.status(
                             "⚠ the model kept narrating without acting — the task may be \
                              incomplete. /retry, or send 'continue'.",
@@ -1691,6 +1674,7 @@ impl Agent {
                             && let Some(goal) = self.structured_goal.as_mut()
                         {
                             apply_plan_to_goal(goal, &calls[i].2);
+                            plan_updated_goal = true;
                         }
                         // A mutating tool may have changed files — invalidate
                         // the snapshot cache so a dependent read (guaranteed to
@@ -1878,7 +1862,7 @@ impl Agent {
         // is on, advance or retry the active sub-goal based on this turn's
         // outcome — so the next turn resumes coherently at the right sub-goal
         // (and with prior-attempt notes if it stalled). See `goal_turn_end`.
-        self.goal_turn_end(false, stalled_repeating, ended_at_cap, ui);
+        self.goal_turn_end(false, stalled_repeating, ended_at_cap, plan_updated_goal, ui);
 
         // Finalization: after a turn where the model used its tools to change
         // files, make one dedicated tool-free call so the user always gets a
