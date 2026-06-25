@@ -3,3 +3,7 @@
 # Auto-generated, re-derived every session — local working state, not curated docs.
 # Track it (git add -f .hi/memory.md) if you'd rather share project memory with the team.
 /.hi/
+
+# Test artifacts: temp files created by hi-agent tests (temp_file helper) that
+# leak into the workspace when tests don't clean up. Never commit these.
+.hi-verify-*

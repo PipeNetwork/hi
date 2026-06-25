@@ -145,7 +145,6 @@ pub(crate) fn looks_mutating(input: &str) -> bool {
 /// instead, and only when the lead-in looks forward. That way a proper codex-style
 /// recap that ends in a bullet list ("Key changes:\n- …") doesn't read as a stall,
 /// while a model that announces a plan and quits without doing it does.
-#[allow(dead_code)]
 pub(crate) fn looks_like_unfinished_step(text: &str) -> bool {
     let lines: Vec<&str> = text
         .lines()

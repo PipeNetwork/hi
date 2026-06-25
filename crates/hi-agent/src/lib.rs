@@ -35,8 +35,8 @@ pub use session::SessionSink;
 pub use ui::{Ui, tool_label};
 
 use heuristics::{
-    emit_tool_output, looks_mutating, recovery_sampling, recovery_telemetry, respects_deps,
-    tool_deps, tool_mode_label, StallMode, RECOVERY_SAMPLING,
+    emit_tool_output, looks_like_unfinished_step, looks_mutating, recovery_sampling,
+    recovery_telemetry, respects_deps, tool_deps, tool_mode_label, StallMode, RECOVERY_SAMPLING,
 };
 use memory::{cap_memory, memory_prompt};
 use prompt::SystemPrompt;
@@ -594,17 +594,29 @@ impl Agent {
         // A turn that verified clean (or had no verify and didn't stall)
         // completes the active sub-goal → advance.
         let verified_clean = matches!(self.last_verify, Some(true));
-        let no_verify_clean =
-            self.last_verify.is_none() && !stalled_repeating && !hit_step_cap;
+        let no_verify_clean = self.last_verify.is_none()
+            && !stalled_repeating
+            && !hit_step_cap
+            && !self.last_changed_files.is_empty();
         if verified_clean || no_verify_clean {
-            let i = goal.active_index();
-            goal.advance();
-            if let Some(i) = i {
-                ui.status(&format!(
-                    "✓ sub-goal {}/{} done — advancing",
-                    i + 1,
-                    goal.sub_goals.len().max(i + 1)
-                ));
+            // Only advance if the active sub-goal isn't already Done —
+            // `apply_plan_to_goal` (from the model's `update_plan` call) may
+            // have already marked it done and advanced to the next. Calling
+            // `advance()` again here would skip that next sub-goal.
+            let needs_advance = goal
+                .active_sub_goal()
+                .map(|sg| sg.status != GoalStatus::Done)
+                .unwrap_or(false);
+            if needs_advance {
+                let i = goal.active_index();
+                goal.advance();
+                if let Some(i) = i {
+                    ui.status(&format!(
+                        "✓ sub-goal {}/{} done — advancing",
+                        i + 1,
+                        goal.sub_goals.len().max(i + 1)
+                    ));
+                }
             }
             if goal.status == GoalStatus::Done {
                 ui.status("✓ long-horizon goal complete");
@@ -1504,17 +1516,17 @@ impl Agent {
                 if calls.is_empty() {
                     // Text but no tool call (the content-less case was handled
                     // above). Silently re-prompt the model to continue — no
-                    // status line, no steer counter, no visible nudge. This
-                    // fires whether or not the model made tool calls earlier in
-                    // the turn: the system prompt tells the model not to narrate
-                    // without acting, but when it still does (even on the first
-                    // round — "I'll review the codebase. Let me start by…"
-                    // without calling a tool), this keeps the turn going
-                    // automatically so the user doesn't have to type "continue".
-                    // Bounded so it can't loop forever; past the budget the turn
-                    // ends honestly.
+                    // status line, no steer counter, no visible nudge.
+                    //
+                    // Fires when the model was actively working this turn (it
+                    // made tool calls earlier) OR when the text looks like an
+                    // announced-but-unperformed next step ("Let me start by…"
+                    // on the first round, without calling a tool). Genuine
+                    // Q&A answers ("The answer is 42.") end the turn — no
+                    // wasted model calls. Bounded so it can't loop forever.
                     self.messages.push_assistant(std::mem::take(&mut completion.content));
-                    if silent_continues < self.config.max_silent_continues {
+                    let looks_unfinished = made_tool_call || looks_like_unfinished_step(&assistant_text);
+                    if looks_unfinished && silent_continues < self.config.max_silent_continues {
                         silent_continues += 1;
                         self.messages.push_nudge(NudgeKind::Continue, SILENT_CONTINUE_NUDGE);
                         continue;
