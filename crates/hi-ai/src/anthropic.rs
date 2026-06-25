@@ -5,9 +5,9 @@
 //! an event-typed SSE stream. Extended thinking is surfaced as `thinking`
 //! blocks whose `signature` must be echoed back on the next turn.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
@@ -30,7 +30,7 @@ pub struct AnthropicProvider {
 impl AnthropicProvider {
     pub fn new(base_url: String, api_key: String) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http::agent_http_client(),
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
         }
@@ -75,13 +75,44 @@ impl Provider for AnthropicProvider {
         let mut blocks: Vec<Option<BlockBuilder>> = Vec::new();
         let mut completion = Completion::default();
         let idle = crate::http::stream_idle_timeout();
+        let stall = crate::http::stream_stall_timeout();
+        // FINISH_GRACE: once Anthropic sends a `message_delta` carrying a
+        // `stop_reason`, generation is over; we wait only this long for any
+        // trailing usage chunk before ending the turn. Without it, a provider
+        // that emits the final `message_delta` but never closes the socket
+        // would wedge the turn until the much longer idle timeout expires.
+        const FINISH_GRACE: Duration = Duration::from_secs(3);
         let mut last_progress = Instant::now();
+        let mut progressed = false;
+        let mut finished: Option<Instant> = None;
 
         loop {
-            let budget = idle.saturating_sub(last_progress.elapsed());
+            // Three deadlines bound the wait, all measured from the last real
+            // output token (`content_block_delta`); keep-alive `ping`
+            // heartbeats and metadata events carry no output, so they don't
+            // reset the clock:
+            // - **finish** (`stop_reason` seen): a short FINISH_GRACE catches
+            //   any trailing usage chunk, then stop even if the socket never
+            //   closes.
+            // - **stall** (output flowed, then stopped without finish): end
+            //   after the shorter `stall`, returning what we have.
+            // - **cold start** (no output yet): wait up to `idle` — a request
+            //   can be legitimately queued before the first token.
+            let budget = match finished {
+                Some(at) => FINISH_GRACE.saturating_sub(at.elapsed()),
+                None if progressed => stall.saturating_sub(last_progress.elapsed()),
+                None => idle.saturating_sub(last_progress.elapsed()),
+            };
             let event = match tokio::time::timeout(budget, stream.next()).await {
                 Ok(Some(event)) => event.context("error reading stream")?,
                 Ok(None) => break,
+                // Past stop_reason the answer is complete; don't let a provider
+                // that never closes the socket hang a finished turn.
+                Err(_) if finished.is_some() => break,
+                // Output flowed then stalled with no finish signal: treat what
+                // we have as the response rather than waiting out the full
+                // cold-start timeout.
+                Err(_) if progressed => break,
                 Err(_) => {
                     return Err(ProviderError::new(
                         ProviderErrorKind::StreamTimeout,
@@ -95,6 +126,9 @@ impl Provider for AnthropicProvider {
                     .with_usage(Usage {
                         input_tokens: estimate_messages_tokens(&request.messages),
                         output_tokens: 0,
+                        cache_read_tokens: 0,
+                        cache_creation_tokens: 0,
+                        input_includes_cache: false,
                     })
                     .into());
                 }
@@ -102,14 +136,17 @@ impl Provider for AnthropicProvider {
             let Ok(data) = serde_json::from_str::<Value>(&event.data) else {
                 continue;
             };
-            if event.event != "ping" {
-                last_progress = Instant::now();
-            }
 
             match event.event.as_str() {
                 "message_start" => {
                     if let Some(tokens) = data["message"]["usage"]["input_tokens"].as_u64() {
                         completion.usage.input_tokens = tokens;
+                    }
+                    if let Some(tokens) = data["message"]["usage"]["cache_read_input_tokens"].as_u64() {
+                        completion.usage.cache_read_tokens = tokens;
+                    }
+                    if let Some(tokens) = data["message"]["usage"]["cache_creation_input_tokens"].as_u64() {
+                        completion.usage.cache_creation_tokens = tokens;
                     }
                 }
                 "content_block_start" => {
@@ -120,6 +157,8 @@ impl Provider for AnthropicProvider {
                     blocks[index] = Some(BlockBuilder::start(&data["content_block"]));
                 }
                 "content_block_delta" => {
+                    progressed = true;
+                    last_progress = Instant::now();
                     let index = data["index"].as_u64().unwrap_or(0) as usize;
                     if let Some(Some(builder)) = blocks.get_mut(index) {
                         builder.apply_delta(&data["delta"], sink);
@@ -128,6 +167,7 @@ impl Provider for AnthropicProvider {
                 "message_delta" => {
                     if let Some(reason) = data["delta"]["stop_reason"].as_str() {
                         completion.stop_reason = Some(reason.to_string());
+                        finished.get_or_insert_with(Instant::now);
                     }
                     if let Some(tokens) = data["usage"]["output_tokens"].as_u64() {
                         completion.usage.output_tokens = tokens;
@@ -135,7 +175,19 @@ impl Provider for AnthropicProvider {
                 }
                 "error" => {
                     let message = data["error"]["message"].as_str().unwrap_or("unknown error");
-                    bail!("Anthropic stream error: {message}");
+                    let error_type = data["error"]["type"].as_str().unwrap_or("");
+                    let kind = match error_type {
+                        "overloaded_error" | "rate_limit_error" => ProviderErrorKind::RateLimit,
+                        "authentication_error" => ProviderErrorKind::Auth,
+                        "invalid_request_error" => ProviderErrorKind::UnsupportedRequestShape,
+                        _ => ProviderErrorKind::Other,
+                    };
+                    return Err(ProviderError::new(
+                        kind,
+                        format!("Anthropic stream error: {message}"),
+                    )
+                    .with_usage(completion.usage)
+                    .into());
                 }
                 _ => {}
             }
@@ -190,18 +242,34 @@ fn build_body(request: &ChatRequest) -> Value {
         "stream": true,
     });
     if !system.is_empty() {
-        body["system"] = json!(system);
+        // Use the array form with cache_control so the system prompt is cached
+        // on the provider side. After the first request in a session, this ~500-
+        // token block is served from cache at ~10% of normal input cost.
+        body["system"] = json!([
+            {
+                "type": "text",
+                "text": system,
+                "cache_control": { "type": "ephemeral" },
+            }
+        ]);
     }
     if !request.tools.is_empty() {
         let tools: Vec<Value> = request
             .tools
             .iter()
-            .map(|t| {
-                json!({
+            .enumerate()
+            .map(|(i, t)| {
+                let mut tool = json!({
                     "name": t.name,
                     "description": t.description,
                     "input_schema": t.parameters,
-                })
+                });
+                // Cache the tool definitions (they never change within a
+                // session). cache_control goes on the last tool.
+                if i == request.tools.len() - 1 {
+                    tool["cache_control"] = json!({ "type": "ephemeral" });
+                }
+                tool
             })
             .collect();
         body["tools"] = json!(tools);
@@ -240,10 +308,27 @@ fn to_anthropic_messages(messages: &[Message]) -> (String, Vec<Value>) {
                 i += 1;
             }
             Role::User => {
-                out.push(json!({
-                    "role": "user",
-                    "content": [{ "type": "text", "text": message.text() }],
-                }));
+                let mut content = Vec::new();
+                for block in &message.content {
+                    match block {
+                        Content::Image { data, media_type } => content.push(json!({
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": data,
+                            },
+                        })),
+                        Content::Text(text) if !text.is_empty() => {
+                            content.push(json!({ "type": "text", "text": text }));
+                        }
+                        _ => {}
+                    }
+                }
+                if content.is_empty() {
+                    content.push(json!({ "type": "text", "text": message.text() }));
+                }
+                out.push(json!({ "role": "user", "content": content }));
                 i += 1;
             }
             Role::Assistant => {

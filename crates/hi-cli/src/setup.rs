@@ -89,16 +89,42 @@ fn save_config(provider: ProviderName, model: &str, api_key: &str) -> Result<std
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let contents = format!(
-        "default_profile = \"default\"\n\n\
-         [profiles.default]\n\
-         provider = \"{}\"\n\
-         model = \"{}\"\n\
-         api_key = \"{}\"\n",
-        provider.as_str(),
-        model,
-        api_key,
-    );
+    let contents = match provider.key_envs().first() {
+        Some(env_name) if !matches!(provider, ProviderName::Ollama) => {
+            // Print the export command for the user, with the key masked
+            // so it doesn't linger in the terminal scrollback.
+            let masked = if api_key.len() > 8 {
+                format!("{}…{}", &api_key[..4], &api_key[api_key.len()-4..])
+            } else {
+                "***".to_string()
+            };
+            println!("Add this to your shell profile (~/.bashrc, ~/.zshrc, etc.):");
+            println!("  export {env_name}={masked}");
+            println!("(Use the full key — shown masked here for safety.)");
+            format!(
+                "default_profile = \"default\"\n\n\
+                 [profiles.default]\n\
+                 provider = \"{}\"\n\
+                 model = \"{}\"\n\
+                 api_key_env = \"{}\"\n",
+                provider.as_str(),
+                model,
+                env_name,
+            )
+        }
+        _ => {
+            format!(
+                "default_profile = \"default\"\n\n\
+                 [profiles.default]\n\
+                 provider = \"{}\"\n\
+                 model = \"{}\"\n\
+                 api_key = \"{}\"\n",
+                provider.as_str(),
+                model,
+                api_key,
+            )
+        }
+    };
     std::fs::write(&path, contents).with_context(|| format!("writing {}", path.display()))?;
     #[cfg(unix)]
     {

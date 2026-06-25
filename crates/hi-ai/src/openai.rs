@@ -28,7 +28,7 @@ pub struct OpenAiProvider {
 impl OpenAiProvider {
     pub fn new(base_url: String, api_key: String) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: crate::http::agent_http_client(),
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
         }
@@ -104,9 +104,12 @@ impl Provider for OpenAiProvider {
         )
         .await
         .map_err(|err| {
-            classify_stream_error(err).with_usage(Usage {
+            classify_stream_error(err)            .with_usage(Usage {
                 input_tokens: estimate_messages_tokens(&request.messages),
                 output_tokens: request.max_tokens as u64,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                input_includes_cache: true,
             })
         })?;
         backfill_missing_usage(&mut completion, &request);
@@ -220,9 +223,19 @@ where
         })?;
 
         if let Some(usage) = chunk.usage {
+            let cached = usage
+                .prompt_tokens_details
+                .map(|d| d.cached_tokens)
+                .unwrap_or(0);
             completion.usage = Usage {
                 input_tokens: usage.prompt_tokens,
                 output_tokens: usage.completion_tokens,
+                cache_read_tokens: cached,
+                cache_creation_tokens: 0,
+                // OpenAI's `prompt_tokens` already includes the cached subset
+                // reported in `cached_tokens`, so do not add cache_read_tokens
+                // again when computing context occupancy.
+                input_includes_cache: true,
             };
         }
         for choice in chunk.choices {
@@ -459,7 +472,39 @@ fn to_openai_messages(messages: &[Message]) -> Vec<Value> {
     for message in messages {
         match message.role {
             Role::System => out.push(json!({ "role": "system", "content": message.text() })),
-            Role::User => out.push(json!({ "role": "user", "content": message.text() })),
+            Role::User => {
+                // If the message carries any image blocks, emit OpenAI's
+                // multipart `content` array (text + image_url). Otherwise fall
+                // back to the plain string form, which is cheaper and more
+                // broadly compatible.
+                let has_image = message
+                    .content
+                    .iter()
+                    .any(|b| matches!(b, Content::Image { .. }));
+                if has_image {
+                    let mut parts = Vec::new();
+                    for block in &message.content {
+                        match block {
+                            Content::Image { data, media_type } => parts.push(json!({
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": format!("data:{media_type};base64,{data}"),
+                                },
+                            })),
+                            Content::Text(t) if !t.is_empty() => {
+                                parts.push(json!({ "type": "text", "text": t }));
+                            }
+                            _ => {}
+                        }
+                    }
+                    if parts.is_empty() {
+                        parts.push(json!({ "type": "text", "text": message.text() }));
+                    }
+                    out.push(json!({ "role": "user", "content": parts }));
+                } else {
+                    out.push(json!({ "role": "user", "content": message.text() }));
+                }
+            }
             Role::Assistant => {
                 let mut thinking = String::new();
                 let mut text = String::new();
@@ -481,6 +526,8 @@ fn to_openai_messages(messages: &[Message]) -> Vec<Value> {
                             "function": { "name": name, "arguments": arguments },
                         })),
                         Content::ToolResult { .. } => {}
+                        // Images don't appear in assistant turns; ignore them.
+                        Content::Image { .. } => {}
                     }
                 }
                 let mut content = String::new();
@@ -555,6 +602,15 @@ struct OpenAiUsage {
     prompt_tokens: u64,
     #[serde(default)]
     completion_tokens: u64,
+    /// OpenAI reports automatic prefix-cache hits here.
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokenDetails>,
+}
+
+#[derive(Deserialize)]
+struct PromptTokenDetails {
+    #[serde(default)]
+    cached_tokens: u64,
 }
 
 #[derive(Deserialize)]
@@ -734,8 +790,8 @@ mod tests {
     fn request_body_can_omit_stream_options() {
         let req = crate::types::ChatRequest {
             model: "m".into(),
-            messages: vec![Message::user("hi")],
-            tools: vec![],
+            messages: vec![Message::user("hi")].into(),
+            tools: vec![].into(),
             max_tokens: 16,
             temperature: None,
             top_p: None,
@@ -758,8 +814,8 @@ mod tests {
         // wire; absent fields stay absent so the provider default applies.
         let mut req = crate::types::ChatRequest {
             model: "m".into(),
-            messages: vec![Message::user("hi")],
-            tools: vec![],
+            messages: vec![Message::user("hi")].into(),
+            tools: vec![].into(),
             max_tokens: 16,
             temperature: None,
             top_p: None,
@@ -1009,8 +1065,8 @@ mod tests {
     fn request(tools: Vec<ToolSpec>, profile: RequestProfile) -> ChatRequest {
         ChatRequest {
             model: "m".into(),
-            messages: vec![Message::user("hi")],
-            tools,
+            messages: vec![Message::user("hi")].into(),
+            tools: tools.into(),
             max_tokens: 16,
             temperature: None,
             top_p: None,

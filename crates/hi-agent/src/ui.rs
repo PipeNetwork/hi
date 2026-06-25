@@ -21,6 +21,11 @@ pub trait Ui: Send {
     fn tool_result(&mut self, result: &str);
     /// A status note (e.g. verification progress).
     fn status(&mut self, text: &str);
+    /// The task plan was created or updated (via the `update_plan` tool). The
+    /// full step list is passed each time; a frontend shows it as a live,
+    /// in-place checklist rather than a scrolling transcript echo. Defaults to
+    /// ignoring it — only interactive frontends render a tracker.
+    fn plan(&mut self, _steps: &[crate::PlanStep]) {}
     /// Token usage after a model round: cumulative session
     /// `input_tokens`/`output_tokens`, plus the current context occupancy
     /// (`context_used` tokens against the model's `context_window`, when known)
@@ -64,6 +69,10 @@ fn salient_arg(name: &str, arguments: &str) -> Option<String> {
             }
         }
         "bash" => collapse_ws(str_field("command")?),
+        "update_plan" => {
+            let n = value.get("steps").and_then(|v| v.as_array()).map_or(0, |a| a.len());
+            format!("{n} step{}", if n == 1 { "" } else { "s" })
+        }
         _ => return None,
     };
     Some(clip(&label, 80))

@@ -18,12 +18,23 @@ pub fn catastrophic_op(command: &str) -> Option<&'static str> {
         return None;
     }
 
-    let segments: Vec<&str> = command
+    // Expand command substitution so `$(rm -rf /)` and backtick-wrapped commands
+    // are visible to the segment scanner. We replace `$(` … `)` and `` ` … ` ``
+    // with their inner text + a separator so the inner command becomes its own
+    // segment.
+    let expanded = expand_command_substitution(command);
+    let segments: Vec<&str> = expanded
         .split([';', '\n', '|', '&'])
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect();
     let programs: Vec<&str> = segments.iter().map(|s| program(s)).collect();
+
+    // Also build a flat token list — needed for a few cases where a dangerous
+    // program appears as an argument to a wrapper (e.g. `xargs rm -rf /`). We
+    // don't use this for privilege-escalation detection (sudo/doas) because
+    // "echo sudo make me a sandwich" would false-positive.
+    let all_tokens: Vec<&str> = expanded.split_whitespace().collect();
 
     if programs.iter().any(|p| *p == "sudo" || *p == "doas") {
         return Some("runs with root privileges (sudo/doas)");
@@ -50,15 +61,17 @@ pub fn catastrophic_op(command: &str) -> Option<&'static str> {
     }
 
     // Raw writes to a disk device.
-    if programs.contains(&"dd") && command.contains("of=/dev/") && !command.contains("of=/dev/null")
+    if (programs.contains(&"dd") || all_tokens.contains(&"dd"))
+        && expanded.contains("of=/dev/")
+        && !expanded.contains("of=/dev/null")
     {
         return Some("writes raw data to a device (dd of=/dev/…)");
     }
-    if writes_to_disk_device(command) {
+    if writes_to_disk_device(&expanded) {
         return Some("redirects output onto a raw disk device");
     }
 
-    if command.replace([' ', '\t'], "").contains(":(){:|:&};:") {
+    if expanded.replace([' ', '\t'], "").contains(":(){:|:&};:") {
         return Some("is a fork bomb");
     }
 
@@ -74,6 +87,44 @@ pub fn catastrophic_op(command: &str) -> Option<&'static str> {
     }
 
     catastrophic_rm(&segments)
+}
+
+/// Replace `$(...)` and `` `...` `` command substitutions with their inner
+/// text, so the segment scanner sees the embedded command. Quotes are stripped
+/// from the inner text for simplicity — this is heuristic, not a full shell
+/// parser, but catches the common obfuscation patterns.
+fn expand_command_substitution(command: &str) -> String {
+    let mut result = command.to_string();
+    // Replace `$( ... )` — handle nested parens by finding the matching close.
+    while let Some(start) = result.find("$(") {
+        let mut depth = 1;
+        let mut end = start + 2;
+        let bytes = result.as_bytes();
+        while end < bytes.len() && depth > 0 {
+            match bytes[end] {
+                b'(' => depth += 1,
+                b')' => depth -= 1,
+                _ => {}
+            }
+            end += 1;
+        }
+        if depth == 0 {
+            let inner = &result[start + 2..end - 1];
+            result = format!("{} ; {} {}", &result[..start], inner, &result[end..]);
+        } else {
+            break; // unbalanced — leave as-is
+        }
+    }
+    // Replace `` `...` `` backtick substitution.
+    while let (Some(start), Some(end)) = (result.find('`'), result.rfind('`')) {
+        if start < end {
+            let inner = &result[start + 1..end];
+            result = format!("{} ; {} {}", &result[..start], inner, &result[end + 1..]);
+        } else {
+            break;
+        }
+    }
+    result
 }
 
 /// The program a segment runs, skipping leading `VAR=value` env assignments.

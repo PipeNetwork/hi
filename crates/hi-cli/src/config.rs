@@ -73,6 +73,10 @@ pub struct Cli {
     #[arg(long)]
     pub refresh_models: bool,
 
+    /// Print the resolved configuration (provider, model, base URL, etc.) and exit.
+    #[arg(long)]
+    pub show_config: bool,
+
     /// Resume the most recent session.
     #[arg(short = 'c', long = "continue")]
     pub cont: bool,
@@ -120,11 +124,11 @@ pub struct Cli {
     pub auto_verify: bool,
 
     /// Max verification retry rounds.
-    #[arg(long, default_value_t = 3)]
+    #[arg(long, default_value_t = 2)]
     pub max_verify: u32,
 
     /// Safety cap on model calls per turn (stops runaway tool loops).
-    #[arg(long, default_value_t = 50)]
+    #[arg(long, default_value_t = 500)]
     pub max_steps: u32,
 
     /// Run N candidate attempts in isolated git worktrees and keep the first
@@ -226,7 +230,7 @@ impl ProviderName {
     }
 
     /// Env vars checked for the API key, in order.
-    fn key_envs(self) -> &'static [&'static str] {
+    pub fn key_envs(self) -> &'static [&'static str] {
         match self {
             ProviderName::Anthropic => &["HI_API_KEY", "ANTHROPIC_API_KEY"],
             ProviderName::Terminaili => &["HI_API_KEY", "TERMINAILI_API_KEY", "OPENAI_API_KEY"],
@@ -384,10 +388,11 @@ pub fn resolve(cli: &Cli, config: &Config, registry: &Registry) -> Result<Settin
 }
 
 /// Bounds on the session-start repo map, to keep it useful without flooding the
-/// context window every turn.
-const MAP_MAX_FILES: usize = 40;
-const MAP_MAX_PER_FILE: usize = 12;
-const MAP_MAX_LINES: usize = 150;
+/// context window every turn. Kept tight since the system prompt is resent
+/// on every model call — each line costs tokens × rounds.
+const MAP_MAX_FILES: usize = 25;
+const MAP_MAX_PER_FILE: usize = 8;
+const MAP_MAX_LINES: usize = 80;
 
 /// A heuristic "repo map" for the system prompt: each source file followed by
 /// its top-level declarations (functions, types, classes…), so the model can
@@ -626,7 +631,13 @@ fn resolve_api_key_for(profile: Option<&Profile>, provider: ProviderName) -> Res
     if matches!(provider, ProviderName::Ollama) {
         return Ok("ollama".into());
     }
-    bail!("no API key: pass --api-key or set one of {candidates:?}");
+    let names: Vec<String> = candidates.iter().map(|s| s.to_string()).collect();
+    let hint = match names.len() {
+        0 => "an API key env var".to_string(),
+        1 => names[0].clone(),
+        _ => format!("{} or {}", names[..names.len() - 1].join(", "), names[names.len() - 1]),
+    };
+    bail!("no API key: pass --api-key or set {hint}");
 }
 
 /// The fallback chain (excluding the primary) — `--fallback` flags first, then

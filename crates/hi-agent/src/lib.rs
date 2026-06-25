@@ -6,49 +6,81 @@ pub mod compaction;
 pub mod session;
 pub mod ui;
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use futures_util::StreamExt;
 use hi_ai::{
     ChatRequest, CompatMode, Content, Message, Provider, ProviderErrorKind, RequestProfile,
     StreamEvent, ToolMode, ToolSpec, Usage, provider_error_kind, provider_error_usage,
 };
-use hi_tools::{execute, tool_specs};
+use hi_tools::{TOOL_SPECS, execute, execute_streaming};
 
 pub use command::Command;
 pub use compaction::{CompactionKind, DEFAULT_KEEP_RECENT};
+pub use hi_tools::{PlanStatus, PlanStep};
 pub use session::SessionSink;
 pub use ui::{Ui, tool_label};
 
+/// Route a tool's output to the right UI surface: a plan update drives the live
+/// tracker (in place), everything else renders as a tool result — its richer
+/// `display` if present, else the model-facing `content`.
+fn emit_tool_output(ui: &mut dyn Ui, output: &hi_tools::ToolOutput) {
+    if let Some(plan) = output.plan.as_deref() {
+        ui.plan(plan);
+    } else {
+        ui.tool_result(output.display.as_deref().unwrap_or(&output.content));
+    }
+}
+
+/// Crate version (from Cargo.toml).
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Auto-compact once the context window is at least this percent full.
-const AUTO_COMPACT_PERCENT: u64 = 80;
+pub const AUTO_COMPACT_PERCENT: u64 = 80;
 /// After triggering, compact until the local estimate is at or below this
 /// percent of the window (so there's headroom before the next compaction).
-const COMPACT_TARGET_PERCENT: u64 = 50;
+pub const COMPACT_TARGET_PERCENT: u64 = 50;
 /// During one long tool loop, begin dropping old bulky tool payloads before the
 /// next model call. This keeps repeated requests from multiplying token spend.
-const IN_TURN_ELIDE_PERCENT: u64 = 45;
+pub const IN_TURN_ELIDE_PERCENT: u64 = 45;
 /// Keep the newest tool results verbatim when trimming inside a turn; these are
 /// usually the files/errors the model is actively using.
-const IN_TURN_KEEP_TOOL_RESULTS: usize = 6;
+pub const IN_TURN_KEEP_TOOL_RESULTS: usize = 6;
 /// User turns auto-compaction keeps verbatim.
-const AUTO_KEEP_RECENT: usize = 3;
+pub const AUTO_KEEP_RECENT: usize = 3;
 /// How many times to silently re-run a round that produced no usable output —
 /// either a content-less response (only reasoning, or empty) or a transient
 /// malformed/empty *stream error* — each retry resampling hotter, before giving
 /// up and surfacing it.
-const MAX_EMPTY_RETRIES: u32 = 2;
+pub const MAX_EMPTY_RETRIES: u32 = 2;
 /// Max read-only tool calls to run concurrently within one round, bounding the
 /// open file handles / subprocesses a single batched response can spawn.
-const MAX_PARALLEL_TOOLS: usize = 8;
+pub const MAX_PARALLEL_TOOLS: usize = 8;
 /// Max times one turn will nudge a model that stopped after *describing* a next
 /// step without performing it. Bounds the "narrate-then-stall" recovery;
 /// `max_steps` is the hard backstop.
-const MAX_CONTINUE_NUDGES: u32 = 2;
+pub const MAX_CONTINUE_NUDGES: u32 = 2;
+/// Max times one turn will nudge a model that re-issues the *exact same* tool
+/// call as the previous round — a repetition loop where the model re-runs an
+/// identical command, gets the same output, and re-emits it again. Bounds the
+/// recovery before the turn ends with an honest "stuck repeating" notice;
+/// `max_steps` is the hard backstop.
+pub const MAX_REPEAT_NUDGES: u32 = 2;
 /// Sent when the model announces a next step but emits no tool call, to get it to
 /// actually do the work instead of ending the turn on a false "done".
 const CONTINUE_NUDGE: &str = "You described a next step but didn't run it. Continue now, \
 using your tools, to actually make that change. If the task is genuinely already complete, \
 stop and give your final recap: what you changed (by file) and the exact command to run or test it.";
+
+/// Sent when the model re-issues the exact same tool call as the previous
+/// round. The command already ran and its output is in the history just above —
+/// re-running it will only produce the same result. This nudges the model to act
+/// on that output (edit the code, move on, or finish) instead of looping.
+const REPEAT_NUDGE: &str = "You just ran that exact command last round and its output is already \
+in the conversation above — running it again will only repeat the same result. Act on that output \
+now: make the edit it points to, move to the next step, or if the task is already complete, stop \
+and give your final recap. Do not re-run the same command.";
 
 /// Asked of the model in a dedicated, tool-free call after a turn that changed
 /// files, to guarantee a structured recap even from a model that wouldn't
@@ -100,17 +132,14 @@ or changed, commands that matter, and any open or next steps. This summary will 
 the history, so include everything needed to continue seamlessly. Output only the summary.";
 
 const SYSTEM_PROMPT: &str = "\
-You are hi, a coding agent running in the user's terminal, in their current \
-working directory. You can read, write, and edit files and run shell commands \
-via your tools. Work in the current directory and the existing project: if a \
-build or package file (Cargo.toml, package.json, go.mod, pyproject.toml, …) is \
-already present, modify it and its sources in place — do NOT scaffold a new \
-nested sub-project or subdirectory for your work unless the user explicitly \
-asks. Prefer making the change over describing it. Keep responses concise. \
-For a non-trivial change, first take one line to state your plan (which files, \
-what edits). Before finishing, re-read the regions you changed and verify they \
-satisfy the request and are internally consistent — fix what you missed rather \
-than declaring done prematurely.";
+You are hi, a coding agent running in the user's terminal. Work in the current \
+project — modify existing files in place, don't scaffold sub-projects. Prefer \
+action over description. Keep responses concise. For non-trivial changes, state \
+your plan in one line first. For a task that takes several steps, track it with \
+the `update_plan` tool: post the step list up front, then call it again as you \
+go — always with the complete list — marking the current step `active` and \
+finished ones `done`. Skip the plan for simple one-step changes. Verify your \
+edits before finishing.";
 
 /// Ending instruction when no separate finalization step runs: the model itself
 /// must produce the closing recap.
@@ -126,41 +155,77 @@ const DEFERRED_RECAP_INSTRUCTION: &str = " When the task is done, stop. A separa
 the final summary for the user, so you don't need to compose a full recap yourself — just make \
 sure the work is actually complete and finish with at most a one-line note.";
 
-/// The system message, optionally with project context and a session goal
-/// appended. `finalize` selects the ending instruction: when a separate
-/// finalization step will write the recap, the model is told not to duplicate it.
-fn build_system(project_context: Option<&str>, goal: Option<&str>, finalize: bool) -> Message {
-    let mut text = SYSTEM_PROMPT.to_string();
-    text.push_str(if finalize {
-        DEFERRED_RECAP_INSTRUCTION
-    } else {
-        SELF_RECAP_INSTRUCTION
-    });
-    // Ground the model in its real location so it doesn't guess paths (a wrong
-    // `/home/user`, scaffolding under `/tmp`, copying from directories that don't
-    // exist) and wander out of the project. Each shell command runs from here in
-    // a fresh shell, so `cd` never persists — say so explicitly.
-    if let Ok(cwd) = std::env::current_dir() {
-        text.push_str(&format!(
-            "\n\nYour working directory is `{}` — work here. Every shell command runs from \
-             this directory in a fresh shell, so `cd` does NOT persist between commands. Use \
-             paths relative to it; do not `cd` into, copy from, or create directories elsewhere.",
-            cwd.display()
-        ));
+/// Builds a system message by composing optional sections.
+///
+/// Usage:
+/// ```ignore
+/// SystemPrompt::new()
+///     .with_project_context(ctx)
+///     .with_goal(goal)
+///     .with_finalize(true)
+///     .build()
+/// ```
+struct SystemPrompt {
+    project_context: Option<String>,
+    goal: Option<String>,
+    finalize: bool,
+}
+
+impl SystemPrompt {
+    fn new() -> Self {
+        Self {
+            project_context: None,
+            goal: None,
+            finalize: false,
+        }
     }
-    if let Some(context) = project_context
-        && !context.trim().is_empty()
-    {
-        text.push_str("\n\n");
-        text.push_str(context.trim());
+
+    fn with_project_context(mut self, context: Option<&str>) -> Self {
+        self.project_context = context
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        self
     }
-    if let Some(goal) = goal
-        && !goal.trim().is_empty()
-    {
-        text.push_str("\n\n[Current session goal]\n");
-        text.push_str(goal.trim());
+
+    fn with_goal(mut self, goal: Option<&str>) -> Self {
+        self.goal = goal.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        self
     }
-    Message::system(text)
+
+    fn with_finalize(mut self, finalize: bool) -> Self {
+        self.finalize = finalize;
+        self
+    }
+
+    fn build(self) -> Message {
+        let mut text = SYSTEM_PROMPT.to_string();
+        text.push_str(if self.finalize {
+            DEFERRED_RECAP_INSTRUCTION
+        } else {
+            SELF_RECAP_INSTRUCTION
+        });
+        // Ground the model in its real location so it doesn't guess paths (a wrong
+        // `/home/user`, scaffolding under `/tmp`, copying from directories that don't
+        // exist) and wander out of the project. Each shell command runs from here in
+        // a fresh shell, so `cd` never persists — say so explicitly.
+        if let Ok(cwd) = std::env::current_dir() {
+            text.push_str(&format!(
+                "\n\nYour working directory is `{}` — work here. Every shell command runs from \
+                 this directory in a fresh shell, so `cd` does NOT persist between commands. Use \
+                 paths relative to it; do not `cd` into, copy from, or create directories elsewhere.",
+                cwd.display()
+            ));
+        }
+        if let Some(context) = self.project_context {
+            text.push_str("\n\n");
+            text.push_str(&context);
+        }
+        if let Some(goal) = self.goal {
+            text.push_str("\n\n[Current session goal]\n");
+            text.push_str(&goal);
+        }
+        Message::system(text)
+    }
 }
 
 /// One stage of layered verification: a short label and the shell command to
@@ -222,13 +287,73 @@ pub struct AgentConfig {
     /// to produce a structured recap — so even a model that won't summarize on
     /// its own ends with one. Costs one extra call per file-changing turn.
     pub finalize: bool,
+    /// Max times one turn will nudge a model that stopped after *describing* a
+    /// next step without performing it. Default: [`MAX_CONTINUE_NUDGES`].
+    pub max_continue_nudges: u32,
+    /// Max times one turn will nudge a model that re-issues the exact same tool
+    /// call as the previous round (a repetition loop). Default:
+    /// [`MAX_REPEAT_NUDGES`].
+    pub max_repeat_nudges: u32,
+    /// How many times to silently re-run a round that produced no usable output.
+    /// Default: [`MAX_EMPTY_RETRIES`].
+    pub max_empty_retries: u32,
+    /// Max read-only tool calls to run concurrently within one round.
+    /// Default: [`MAX_PARALLEL_TOOLS`].
+    pub max_parallel_tools: usize,
+    /// Auto-compact once the context window is at least this percent full.
+    /// Default: [`AUTO_COMPACT_PERCENT`].
+    pub auto_compact_percent: u64,
+    /// After triggering, compact until the local estimate is at or below this
+    /// percent of the window. Default: [`COMPACT_TARGET_PERCENT`].
+    pub compact_target_percent: u64,
+    /// During one long tool loop, begin dropping old bulky tool payloads before
+    /// the next model call. Default: [`IN_TURN_ELIDE_PERCENT`].
+    pub in_turn_elide_percent: u64,
+    /// Keep the newest tool results verbatim when trimming inside a turn.
+    /// Default: [`IN_TURN_KEEP_TOOL_RESULTS`].
+    pub in_turn_keep_tool_results: usize,
+}
+
+impl Default for AgentConfig {
+    fn default() -> Self {
+        Self {
+            model: String::new(),
+            max_tokens: 4096,
+            temperature: None,
+            thinking_budget: None,
+            tool_mode: ToolMode::Auto,
+            compat: CompatMode::Auto,
+            price: None,
+            context_window: None,
+            project_context: None,
+            verify: Vec::new(),
+            max_verify_iterations: 2,
+            max_steps: 500,
+            auto_compact: true,
+            compaction: CompactionKind::Hybrid {
+                keep_recent: DEFAULT_KEEP_RECENT,
+            },
+            finalize: true,
+            max_continue_nudges: MAX_CONTINUE_NUDGES,
+            max_repeat_nudges: MAX_REPEAT_NUDGES,
+            max_empty_retries: MAX_EMPTY_RETRIES,
+            max_parallel_tools: MAX_PARALLEL_TOOLS,
+            auto_compact_percent: AUTO_COMPACT_PERCENT,
+            compact_target_percent: COMPACT_TARGET_PERCENT,
+            in_turn_elide_percent: IN_TURN_ELIDE_PERCENT,
+            in_turn_keep_tool_results: IN_TURN_KEEP_TOOL_RESULTS,
+        }
+    }
 }
 
 pub struct Agent {
     provider: Box<dyn Provider>,
     config: AgentConfig,
-    messages: Vec<Message>,
-    tools: Vec<ToolSpec>,
+    /// Conversation history, shared with in-flight `ChatRequest`s via `Arc`.
+    /// `Arc::make_mut` clones only when a request is in flight (refcount > 1),
+    /// so repeated tool rounds without a model call avoid copying the history.
+    messages: Arc<Vec<Message>>,
+    tools: Arc<[ToolSpec]>,
     session: Option<Box<dyn SessionSink>>,
     /// How many messages have already been handed to the session sink.
     persisted: usize,
@@ -249,12 +374,19 @@ pub struct Agent {
     last_compat_fallbacks: Vec<String>,
     /// Optional transient goal injected into the system prompt for future turns.
     goal: Option<String>,
+    /// Cached workspace snapshot — avoids re-walking the tree on every
+    /// verify/turn-end check when no files changed. Invalidated by any
+    /// write/edit/bash tool call in the current turn.
+    snapshot_cache: Option<std::collections::BTreeMap<String, FileFingerprint>>,
 }
 
 impl Agent {
     /// Start a fresh session seeded with the system prompt.
     pub fn new(provider: Box<dyn Provider>, config: AgentConfig) -> Self {
-        let system = build_system(config.project_context.as_deref(), None, config.finalize);
+        let system = SystemPrompt::new()
+            .with_project_context(config.project_context.as_deref())
+            .with_finalize(config.finalize)
+            .build();
         Self::with_messages(provider, config, vec![system], 0)
     }
 
@@ -283,8 +415,8 @@ impl Agent {
         Self {
             provider,
             config,
-            messages,
-            tools: tool_specs(),
+            messages: Arc::new(messages),
+            tools: TOOL_SPECS.clone().into(),
             session: None,
             persisted,
             totals: Usage::default(),
@@ -295,6 +427,7 @@ impl Agent {
             last_changed_files: Vec::new(),
             last_compat_fallbacks: Vec::new(),
             goal: None,
+            snapshot_cache: None,
         }
     }
 
@@ -306,14 +439,19 @@ impl Agent {
             return Ok(None);
         };
         let n = hi_tools::checkpoint::restore(std::path::Path::new("."), &target).await?;
+        // The working tree just changed under us, so any cached snapshot is now
+        // stale. Without this, the next turn reuses pre-undo fingerprints and
+        // change detection / verify gating / last_changed_files can be wrong.
+        self.invalidate_snapshot();
         Ok(Some(n))
     }
 
-    /// Attach a sink that records messages produced from here on.
+    /// Attach a session sink that records messages produced from here on.
     pub fn set_session(&mut self, session: Box<dyn SessionSink>) {
         self.session = Some(session);
     }
 
+    /// The current conversation history (including the system prompt).
     pub fn messages(&self) -> &[Message] {
         &self.messages
     }
@@ -321,7 +459,7 @@ impl Agent {
     /// Discard messages back to `len` — used to drop an interrupted turn so the
     /// conversation stays consistent (no dangling user message).
     pub fn truncate_messages(&mut self, len: usize) {
-        self.messages.truncate(len);
+        Arc::make_mut(&mut self.messages).truncate(len);
         self.persisted = self.persisted.min(self.messages.len());
     }
 
@@ -330,19 +468,76 @@ impl Agent {
         &self.totals
     }
 
+    /// Cumulative USD cost across the session, if pricing is known.
     pub fn cost_usd(&self) -> Option<f64> {
         self.cost_usd
+    }
+
+    /// The context-window occupancy, as last reported by the provider.
+    pub fn context_used(&self) -> u64 {
+        self.context_used
+    }
+
+    /// The configured context window, if known.
+    pub fn context_window(&self) -> Option<u32> {
+        self.config.context_window
+    }
+
+    /// Render the conversation as Markdown for /export.
+    pub fn export_markdown(&self) -> String {
+        let mut out = String::new();
+        out.push_str("# hi session transcript
+
+");
+        for msg in self.messages.iter() {
+            match msg.role {
+                hi_ai::Role::System => {} // skip system prompt
+                hi_ai::Role::User => {
+                    out.push_str("**user:**
+
+");
+                    out.push_str(&msg.text());
+                    out.push_str("
+
+");
+                }
+                hi_ai::Role::Assistant => {
+                    out.push_str("**assistant:**\n\n");
+                    out.push_str(&msg.text());
+                    out.push_str("\n\n");
+                }
+                hi_ai::Role::Tool => {
+                    out.push_str("**tool:**\n\n");
+                    out.push_str(&msg.text());
+                    out.push_str("\n\n");
+                }
+            }
+        }
+        out
     }
 
     fn add_usage(&mut self, usage: Usage) {
         if !usage.is_zero() {
             match (self.cost_usd, self.config.price) {
                 (Some(total), Some((input_price, output_price))) => {
+                    // Provider token semantics differ:
+                    // - Anthropic: input_tokens EXCLUDES cache tokens, which are
+                    //   reported separately in cache_read/cache_creation.
+                    // - OpenAI: prompt_tokens INCLUDES cached tokens (already in
+                    //   input_tokens), and cache_read_tokens is the subset that
+                    //   was cached.
+                    // We don't know the provider here, but both cases converge
+                    // if we treat input_tokens as the non-cached portion and add
+                    // the discounted cache portions. For OpenAI the cached tokens
+                    // are double-counted at most at full price (conservative).
+                    let regular_input = usage.input_tokens.saturating_sub(usage.cache_read_tokens);
                     self.cost_usd = Some(
                         total
-                            + (usage.input_tokens as f64 * input_price
+                            + (regular_input as f64 * input_price
+                                + usage.cache_read_tokens as f64 * input_price * 0.5
+                                + usage.cache_creation_tokens as f64 * input_price * 1.25
                                 + usage.output_tokens as f64 * output_price)
-                                / 1_000_000.0,
+                            / 1_000_000.0,
                     );
                 }
                 (_, None) => {
@@ -352,8 +547,9 @@ impl Agent {
             }
         }
         self.totals.add(usage);
-        if usage.input_tokens > 0 {
-            self.context_used = usage.input_tokens;
+        let effective_input = usage.effective_input_tokens();
+        if effective_input > 0 {
+            self.context_used = effective_input;
         }
     }
 
@@ -361,10 +557,12 @@ impl Agent {
         self.add_usage(provider_error_usage(err));
     }
 
+    /// Number of git checkpoints created so far (for `/undo`).
     pub fn checkpoint_count(&self) -> usize {
         self.checkpoints.len()
     }
 
+    /// The model id currently configured for this session.
     pub fn model(&self) -> &str {
         &self.config.model
     }
@@ -386,24 +584,34 @@ impl Agent {
     /// doesn't rewrite the session file, and the reset point isn't persisted, so
     /// resuming replays the full log.
     pub fn clear_history(&mut self) {
-        self.messages = vec![self.system_message()];
+        self.messages = Arc::new(vec![self.system_message()]);
         self.persisted = self.messages.len();
     }
 
     fn system_message(&self) -> Message {
-        build_system(
-            self.config.project_context.as_deref(),
-            self.goal.as_deref(),
-            self.config.finalize,
-        )
+        SystemPrompt::new()
+            .with_project_context(self.config.project_context.as_deref())
+            .with_goal(self.goal.as_deref())
+            .with_finalize(self.config.finalize)
+            .build()
+    }
+
+    /// Minimal system message for throwaway model calls (finalize_turn,
+    /// summarize, update_memory) — no project_context, no goal, no finalize
+    /// instruction. These calls don't need the repo map or session goal; sending
+    /// them wastes ~1.5-3K input tokens per call and bloats the uncached portion
+    /// of the request.
+    fn minimal_system_message(&self) -> Message {
+        SystemPrompt::new().build()
     }
 
     fn refresh_system_message(&mut self) {
         let system = self.system_message();
-        if let Some(first) = self.messages.first_mut() {
+        let messages = Arc::make_mut(&mut self.messages);
+        if let Some(first) = messages.first_mut() {
             *first = system;
         } else {
-            self.messages.push(system);
+            messages.push(system);
         }
     }
 
@@ -426,14 +634,17 @@ impl Agent {
         self.last_verify
     }
 
+    /// Files whose content or presence changed in the most recent turn.
     pub fn last_changed_files(&self) -> &[String] {
         &self.last_changed_files
     }
 
+    /// Compatibility fallbacks that were triggered in the most recent turn.
     pub fn last_compat_fallbacks(&self) -> &[String] {
         &self.last_compat_fallbacks
     }
 
+    /// The tool mode currently configured for this session.
     pub fn tool_mode(&self) -> ToolMode {
         self.config.tool_mode
     }
@@ -518,7 +729,7 @@ impl Agent {
         }
 
         self.truncate_messages(1);
-        self.messages.push(Message::user(format!(
+        Arc::make_mut(&mut self.messages).push(Message::user(format!(
             "[Earlier conversation context was omitted because the provider rejected the request \
              as too large. Continue from this latest user request; ask for missing details if the \
              omitted context is required.]\n\n{input}"
@@ -544,11 +755,15 @@ impl Agent {
             return Ok(());
         };
         let system = self.system_message();
-        self.messages = vec![
+        self.messages = Arc::new(vec![
             system,
             Message::user(format!("[Summary of the conversation so far]\n\n{summary}")),
-        ];
+        ]);
         self.persisted = self.messages.len();
+        // Persist the compaction so it survives session resume.
+        if let Some(session) = self.session.as_mut() {
+            let _ = session.record_compaction(&self.messages);
+        }
         ui.status("✓ compacted — context reset to the summary");
         Ok(())
     }
@@ -578,8 +793,12 @@ impl Agent {
         let mut next = Vec::with_capacity(recent.len() + 1);
         next.push(system);
         next.extend(recent);
-        self.messages = next;
+        self.messages = Arc::new(next);
         self.persisted = self.messages.len();
+        // Persist the compaction so it survives session resume.
+        if let Some(session) = self.session.as_mut() {
+            let _ = session.record_compaction(&self.messages);
+        }
         ui.status("✓ compacted — kept recent turns, summarized the rest");
         Ok(())
     }
@@ -591,7 +810,7 @@ impl Agent {
         // Only turns older than the recent window are eligible; if everything is
         // recent there's nothing to elide.
         let freed = match compaction::recent_split(&self.messages, keep_recent) {
-            Some(split) => compaction::elide_tool_outputs(&mut self.messages, split),
+            Some(split) => compaction::elide_tool_outputs(Arc::make_mut(&mut self.messages), split),
             None => 0,
         };
         if freed > 0 {
@@ -616,13 +835,13 @@ impl Agent {
         }
 
         let used = compaction::estimate_tokens(&self.messages);
-        if used * 100 < u64::from(window) * IN_TURN_ELIDE_PERCENT {
+        if used * 100 < u64::from(window) * self.config.in_turn_elide_percent {
             return;
         }
 
         let freed = compaction::elide_tool_outputs_except_recent(
-            &mut self.messages,
-            IN_TURN_KEEP_TOOL_RESULTS,
+            Arc::make_mut(&mut self.messages),
+            self.config.in_turn_keep_tool_results,
         );
         if freed == 0 {
             return;
@@ -641,16 +860,23 @@ impl Agent {
     async fn summarize(&mut self, slice: &[Message], ui: &mut dyn Ui) -> Result<Option<String>> {
         ui.status("compacting the conversation…");
 
-        let mut messages = Vec::with_capacity(slice.len() + 2);
-        messages.push(self.system_message());
-        messages.extend_from_slice(slice);
+        // Elide bulky tool outputs before sending to the model — the summary
+        // doesn't need verbatim command output, just the conversation shape.
+        // This can cut input tokens by 50-80% on tool-heavy sessions.
+        let mut slice_owned: Vec<Message> = slice.to_vec();
+        let len = slice_owned.len();
+        compaction::elide_tool_outputs(&mut slice_owned, len);
+
+        let mut messages = Vec::with_capacity(slice_owned.len() + 2);
+        messages.push(self.minimal_system_message());
+        messages.extend_from_slice(&slice_owned);
         messages.push(Message::user(SUMMARIZE_PROMPT));
 
         let request = ChatRequest {
             model: self.config.model.clone(),
-            messages,
-            tools: Vec::new(), // summarizing — no tool use
-            max_tokens: self.config.max_tokens,
+            messages: Arc::from(messages),
+            tools: Arc::new([]), // summarizing — no tool use
+            max_tokens: 1024, // throwaway call — summaries are short
             temperature: self.config.temperature,
             top_p: None,
             frequency_penalty: None,
@@ -719,16 +945,24 @@ impl Agent {
         let existing = std::fs::read_to_string(&path).unwrap_or_default();
 
         ui.status("distilling session memory…");
-        let mut messages = Vec::with_capacity(self.messages.len() + 1);
-        messages.push(self.system_message());
-        messages.extend_from_slice(&self.messages[1..]);
+
+        // Elide bulky tool outputs — the memory distillation only needs to
+        // understand what was done, not re-read command output verbatim.
+        let start = self.messages.len().min(1);
+        let mut history: Vec<Message> = self.messages[start..].to_vec();
+        let len = history.len();
+        compaction::elide_tool_outputs(&mut history, len);
+
+        let mut messages = Vec::with_capacity(history.len() + 2);
+        messages.push(self.minimal_system_message());
+        messages.extend_from_slice(&history);
         messages.push(Message::user(memory_prompt(existing.trim())));
 
         let request = ChatRequest {
             model: self.config.model.clone(),
-            messages,
-            tools: Vec::new(), // distilling — no tool use
-            max_tokens: self.config.max_tokens,
+            messages: Arc::from(messages),
+            tools: Arc::new([]), // distilling — no tool use
+            max_tokens: 1024, // throwaway call — memory notes are short
             temperature: self.config.temperature,
             top_p: None,
             frequency_penalty: None,
@@ -787,6 +1021,22 @@ impl Agent {
         }
     }
 
+    /// Get the workspace snapshot, using the cached version when available.
+    /// The cache is valid until invalidated by [`invalidate_snapshot`].
+    async fn snapshot_cached(&mut self) -> std::collections::BTreeMap<String, FileFingerprint> {
+        if let Some(cache) = &self.snapshot_cache {
+            return cache.clone();
+        }
+        let snap = workspace_snapshot(std::path::Path::new(".")).await;
+        self.snapshot_cache = Some(snap.clone());
+        snap
+    }
+
+    /// Invalidate the snapshot cache — called after any mutating tool.
+    fn invalidate_snapshot(&mut self) {
+        self.snapshot_cache = None;
+    }
+
     /// Run one user turn to completion, emitting output through `ui`.
     ///
     /// After the model stops calling tools, an optional verification command is
@@ -798,8 +1048,8 @@ impl Agent {
                 "tool mode {} does not allow file edits or shell commands for this turn",
                 tool_mode_label(self.config.tool_mode)
             ));
-            self.messages.push(Message::user(input));
-            self.messages.push(Message::assistant(vec![Content::Text(format!(
+            Arc::make_mut(&mut self.messages).push(Message::user(input));
+            Arc::make_mut(&mut self.messages).push(Message::assistant(vec![Content::Text(format!(
                 "I cannot perform coding actions in {} mode because file-edit and shell tools are unavailable. Switch to `--tool-mode auto` or `--tool-mode required` to let me modify the workspace.",
                 tool_mode_label(self.config.tool_mode)
             ))]));
@@ -821,7 +1071,7 @@ impl Agent {
         if self.config.auto_compact
             && let Some(window) = self.config.context_window
             && window > 0
-            && self.context_used * 100 >= u64::from(window) * AUTO_COMPACT_PERCENT
+            && self.context_used * 100 >= u64::from(window) * self.config.auto_compact_percent
         {
             ui.status(&format!(
                 "context ~{}% full — compacting to free room",
@@ -829,11 +1079,11 @@ impl Agent {
             ));
             // Tier 1: deterministic, no model call. Only old turns are eligible.
             if let Some(split) = compaction::recent_split(&self.messages, AUTO_KEEP_RECENT) {
-                compaction::elide_tool_outputs(&mut self.messages, split);
+                compaction::elide_tool_outputs(Arc::make_mut(&mut self.messages), split);
             }
             // Tier 2: only if still heavy. `context_used` reflects the
             // pre-elision request and is now stale, so gate on a local estimate.
-            let target = u64::from(window) * COMPACT_TARGET_PERCENT / 100;
+            let target = u64::from(window) * self.config.compact_target_percent / 100;
             if compaction::estimate_tokens(&self.messages) > target {
                 let _ = self.compact(ui).await;
             }
@@ -841,7 +1091,7 @@ impl Agent {
         }
 
         let turn_start = self.messages.len();
-        self.messages.push(Message::user(input));
+        Arc::make_mut(&mut self.messages).push(Message::user(input));
         self.last_verify = None;
         self.last_changed_files.clear();
         self.last_compat_fallbacks.clear();
@@ -854,19 +1104,32 @@ impl Agent {
         let mut steps = 0u32;
         let mut empty_retries = 0u32;
         let mut continue_nudges = 0u32;
+        let mut repeat_nudges = 0u32;
+        // Signature (name, arguments) of the previous round's tool calls, to
+        // spot a model re-issuing the exact same call and looping on it.
+        let mut prev_call_sig: Option<Vec<(String, String)>> = None;
         let mut request_too_large_retried = false;
         // Whether the model has run a tool this turn (so a later text-only stop is
         // eligible for a continue-nudge) and whether the turn ended on an
         // announced-but-unperformed step (drives the incomplete notice).
         let mut made_tool_call = false;
         let mut stalled_unfinished = false;
+        // Whether the turn ended because the model kept re-issuing the exact
+        // same tool call through the whole repeat-nudge budget (drives the
+        // incomplete notice and skips the finalization recap).
+        let mut stalled_repeating = false;
         // Whether the turn was cut short by the per-turn step cap, so the
         // finalization recap is skipped (the work may be incomplete).
         let mut ended_at_cap = false;
         // Snapshot the turn baseline so verification only runs when the
         // workspace ends up changed. This catches `bash` edits too, while
         // skipping verify when a turn makes no net file changes.
-        let turn_snapshot = workspace_snapshot(std::path::Path::new("."));
+        let turn_snapshot = self.snapshot_cached().await;
+        // Snapshot from the most recent verify check. Reused at turn end to
+        // avoid a second full tree walk when verify already took one.
+        let mut verify_snapshot: Option<
+            std::collections::BTreeMap<String, FileFingerprint>,
+        > = None;
 
         'turn: loop {
             // Inner loop: model + tools until the model stops calling tools, or
@@ -891,7 +1154,7 @@ impl Agent {
 
                 let request = ChatRequest {
                     model: self.config.model.clone(),
-                    messages: self.messages.clone(),
+                    messages: Arc::clone(&self.messages),
                     tools: self.request_tools(),
                     max_tokens: self.config.max_tokens,
                     temperature,
@@ -943,7 +1206,7 @@ impl Agent {
                     // budget, instead of failing the turn. Terminal errors (auth,
                     // outage, …) fall through to the abort below.
                     Err(err)
-                        if empty_retries < MAX_EMPTY_RETRIES
+                        if empty_retries < self.config.max_empty_retries
                             && matches!(
                                 provider_error_kind(&err),
                                 Some(
@@ -957,7 +1220,8 @@ impl Agent {
                         empty_retries += 1;
                         ui.status(&format!(
                             "⚠ the model's response didn't come through cleanly — \
-                             retrying ({empty_retries}/{MAX_EMPTY_RETRIES})"
+                             retrying ({empty_retries}/{})",
+                            self.config.max_empty_retries
                         ));
                         continue;
                     }
@@ -990,6 +1254,56 @@ impl Agent {
                     })
                     .collect();
 
+                // Repetition guard: the model re-issued the exact same tool
+                // calls (same names, same arguments, same order) as the previous
+                // round. Re-running them can only reproduce the same output, so
+                // don't execute — nudge the model to act on the output it already
+                // has. Bounded; past the budget the turn ends with an honest
+                // "stuck repeating" notice rather than looping until `max_steps`.
+                let call_sig: Vec<(String, String)> = calls
+                    .iter()
+                    .map(|(_, name, args)| (name.clone(), args.clone()))
+                    .collect();
+                let is_repeat = !calls.is_empty() && prev_call_sig.as_ref() == Some(&call_sig);
+                if is_repeat {
+                    // Record this round's assistant text (the model did emit
+                    // something) before nudging, so the history stays coherent.
+                    // We deliberately do NOT execute the repeated tool calls, so
+                    // strip their `ToolCall` blocks from the recorded message:
+                    // leaving `tool_use` blocks without matching `tool_result`
+                    // blocks puts the transcript in a state most providers reject
+                    // on the next request.
+                    let text_only: Vec<Content> = completion
+                        .content
+                        .into_iter()
+                        .filter(|c| !matches!(c, Content::ToolCall { .. }))
+                        .collect();
+                    Arc::make_mut(&mut self.messages).push(Message::assistant(text_only));
+                    if repeat_nudges < self.config.max_repeat_nudges {
+                        repeat_nudges += 1;
+                        stalled_repeating = true;
+                        ui.status(&format!(
+                            "the model re-ran the same command — its output is already above; \
+                             nudging it to act on it ({repeat_nudges}/{})",
+                            self.config.max_repeat_nudges
+                        ));
+                        Arc::make_mut(&mut self.messages)
+                            .push(Message::user(REPEAT_NUDGE.to_string()));
+                        // Keep prev_call_sig as-is so a further repeat is still
+                        // detected against the same signature.
+                        continue;
+                    }
+                    ui.status(
+                        "⚠ the model kept re-running the same command without acting on the \
+                         result — the task may be incomplete. /retry, or send 'continue'.",
+                    );
+                    break false;
+                }
+                // A different set of calls (or none) this round — the model moved
+                // on, so clear any pending repeat-stall state.
+                stalled_repeating = false;
+                prev_call_sig = Some(call_sig);
+
                 // This round's assistant text, joined and captured before the
                 // content is moved into history. Used both to detect a content-less
                 // response (a reasoning model can return only reasoning tokens or
@@ -1012,10 +1326,11 @@ impl Agent {
                 // dead round isn't recorded, so each retry re-runs with the
                 // original context.
                 if calls.is_empty() && !has_text {
-                    if empty_retries < MAX_EMPTY_RETRIES {
+                    if empty_retries < self.config.max_empty_retries {
                         empty_retries += 1;
                         ui.status(&format!(
-                            "⚠ the model returned no response — retrying ({empty_retries}/{MAX_EMPTY_RETRIES})"
+                            "⚠ the model returned no response — retrying ({empty_retries}/{})",
+                            self.config.max_empty_retries
                         ));
                         continue;
                     }
@@ -1030,7 +1345,7 @@ impl Agent {
                 // its own budget rather than inheriting this one's elevation.
                 empty_retries = 0;
 
-                self.messages.push(Message::assistant(completion.content));
+                Arc::make_mut(&mut self.messages).push(Message::assistant(completion.content));
                 if calls.is_empty() {
                     // Text but no tool call (the content-less case was handled
                     // above). If the model was actively working this turn and its
@@ -1038,16 +1353,17 @@ impl Agent {
                     // ("Now let me rewrite main.rs:"), nudge it to actually do it —
                     // bounded — rather than ending the turn on a false "done".
                     if made_tool_call
-                        && continue_nudges < MAX_CONTINUE_NUDGES
+                        && continue_nudges < self.config.max_continue_nudges
                         && looks_like_unfinished_step(&assistant_text)
                     {
                         continue_nudges += 1;
                         stalled_unfinished = true;
                         ui.status(&format!(
                             "the model described a next step but didn't run it — \
-                             nudging it to continue ({continue_nudges}/{MAX_CONTINUE_NUDGES})"
+                             nudging it to continue ({continue_nudges}/{})",
+                            self.config.max_continue_nudges
                         ));
-                        self.messages
+                        Arc::make_mut(&mut self.messages)
                             .push(Message::user(CONTINUE_NUDGE.to_string()));
                         continue;
                     }
@@ -1058,38 +1374,54 @@ impl Agent {
                 // "incomplete" state is cleared (it got back to work).
                 made_tool_call = true;
                 stalled_unfinished = false;
-                // When the model batches several read-only calls (e.g. reading
-                // many files to review them), run them concurrently — they have
-                // no side effects and can't race. Any write/edit/bash in the
-                // batch falls back to ordered, sequential execution so effects
-                // stay isolated and in the order the model intended. Results are
-                // recorded in call order either way.
-                if calls.len() > 1
-                    && calls
-                        .iter()
-                        .all(|(_, name, _)| hi_tools::is_read_only(name))
-                {
-                    for (_, name, arguments) in &calls {
+                // Execute the calls in the order the model emitted them, so a
+                // batch like "edit, then read" reads the post-edit state. Within
+                // that order, contiguous runs of read-only calls (which have no
+                // side effects and can't race) are run concurrently — preserving
+                // the parallelism benefit for all-read batches and read clusters
+                // around a mutating call, without reordering reads past a
+                // mutating call that precedes them.
+                let mut i = 0;
+                while i < calls.len() {
+                    if hi_tools::is_read_only(&calls[i].1) {
+                        // Gather the contiguous read-only run starting at i.
+                        let mut j = i;
+                        while j < calls.len() && hi_tools::is_read_only(&calls[j].1) {
+                            ui.tool_call(&calls[j].1, &calls[j].2);
+                            j += 1;
+                        }
+                        let batch = &calls[i..j];
+                        let outputs: Vec<_> = futures_util::stream::iter(
+                            batch.iter().map(|(_, name, arguments)| execute(name, arguments)),
+                        )
+                        .buffered(self.config.max_parallel_tools)
+                        .collect()
+                        .await;
+                        for ((id, _, _), output) in batch.iter().zip(outputs) {
+                            emit_tool_output(&mut *ui, &output);
+                            Arc::make_mut(&mut self.messages)
+                                .push(Message::tool_result(id, output.content));
+                        }
+                        i = j;
+                    } else {
+                        let (id, name, arguments) = &calls[i];
                         ui.tool_call(name, arguments);
-                    }
-                    let outputs: Vec<_> = futures_util::stream::iter(
-                        calls
-                            .iter()
-                            .map(|(_, name, arguments)| execute(name, arguments)),
-                    )
-                    .buffered(MAX_PARALLEL_TOOLS)
-                    .collect()
-                    .await;
-                    for ((id, _, _), output) in calls.into_iter().zip(outputs) {
-                        ui.tool_result(output.display.as_deref().unwrap_or(&output.content));
-                        self.messages.push(Message::tool_result(id, output.content));
-                    }
-                } else {
-                    for (id, name, arguments) in calls {
-                        ui.tool_call(&name, &arguments);
-                        let output = execute(&name, &arguments).await;
-                        ui.tool_result(output.display.as_deref().unwrap_or(&output.content));
-                        self.messages.push(Message::tool_result(id, output.content));
+                        let output = if name == "bash" {
+                            let ui_ref: &mut dyn Ui = &mut *ui;
+                            execute_streaming(name, arguments, &mut |line: &str| {
+                                ui_ref.tool_result(line);
+                            })
+                            .await
+                        } else {
+                            execute(name, arguments).await
+                        };
+                        emit_tool_output(&mut *ui, &output);
+                        Arc::make_mut(&mut self.messages)
+                            .push(Message::tool_result(id, output.content));
+                        // A mutating tool may have changed files — invalidate the
+                        // workspace snapshot cache so the next check re-walks.
+                        self.invalidate_snapshot();
+                        i += 1;
                     }
                 }
             };
@@ -1110,10 +1442,9 @@ impl Agent {
             // edited nothing can't have introduced a failure, so verifying would
             // only surface pre-existing/unrelated failures and pull the model
             // into fixing things the user didn't ask about.
-            let changed_files = changed_files_between(
-                &turn_snapshot,
-                &workspace_snapshot(std::path::Path::new(".")),
-            );
+            let current = self.snapshot_cached().await;
+            verify_snapshot = Some(current.clone());
+            let changed_files = changed_files_between(&turn_snapshot, &current);
             if changed_files.is_empty() {
                 if verify_round == 0 {
                     ui.status("verification skipped — no files changed this turn");
@@ -1142,6 +1473,9 @@ impl Agent {
                 Some((stage, output)) => {
                     ui.status(&format!("✗ {} failed; iterating", stage.name));
                     self.last_verify = Some(false);
+                    // Invalidate the cached snapshot — the model is about to do
+                    // more work, so the verify snapshot is no longer current.
+                    verify_snapshot = None;
                     // Compile/lint errors point at a cause; test failures imply a
                     // rule. Tailor the nudge so the model fixes the right thing.
                     let guidance = if stage.is_test() {
@@ -1153,19 +1487,52 @@ impl Agent {
                          problem) before anything else — the later stages can't run until this \
                          passes."
                     };
-                    self.messages.push(Message::user(format!(
+                    let nudge = Message::user(format!(
                         "Verification stage `{}` failed (`{}`).\n\nOutput:\n{}\n\n{} If a previous \
                          fix didn't work, reconsider rather than repeat it.",
                         stage.name, stage.command, output, guidance
-                    )));
+                    ));
+                    // Replace the previous verify nudge instead of accumulating.
+                    // Only the latest verification output belongs in context.
+                    let msgs = Arc::make_mut(&mut self.messages);
+                    if verify_round > 1 {
+                        // Remove everything back to (and including) the previous
+                        // verify nudge: the nudge itself, any trailing assistant
+                        // response, and the tool messages it produced. Stopping at
+                        // the first tool message would leave the earlier nudge in
+                        // place, so multiple verify prompts accumulate.
+                        while let Some(last) = msgs.last() {
+                            if last.role == hi_ai::Role::User
+                                && last.content.iter().any(|c| {
+                                    matches!(c, Content::Text(t) if t.contains("Verification stage"))
+                                })
+                            {
+                                msgs.pop();
+                                break;
+                            }
+                            // Pop trailing tool and assistant messages that
+                            // belong to the prior verify cycle, so we reach the
+                            // earlier verify nudge.
+                            match last.role {
+                                hi_ai::Role::Tool | hi_ai::Role::Assistant => {
+                                    msgs.pop();
+                                }
+                                _ => break,
+                            }
+                        }
+                    }
+                    msgs.push(nudge);
                 }
             }
         }
 
-        self.last_changed_files = changed_files_between(
-            &turn_snapshot,
-            &workspace_snapshot(std::path::Path::new(".")),
-        );
+        // Reuse the verify snapshot when available (verify passed or found no
+        // changes — no model work happened since). Otherwise take a fresh one.
+        let end_snapshot = match verify_snapshot.take() {
+            Some(s) => s,
+            None => self.snapshot_cached().await,
+        };
+        self.last_changed_files = changed_files_between(&turn_snapshot, &end_snapshot);
         self.last_compat_fallbacks = compat_fallbacks;
 
         // The model kept announcing steps it never ran, through the whole nudge
@@ -1188,9 +1555,10 @@ impl Agent {
             && made_tool_call
             && !ended_at_cap
             && !stalled_unfinished
+            && !stalled_repeating
             && !self.last_changed_files.is_empty()
         {
-            self.finalize_turn(ui).await;
+            self.finalize_turn(turn_start, ui).await;
         }
 
         // Report cumulative session usage — the same number the live working
@@ -1208,15 +1576,22 @@ impl Agent {
     /// The synthetic request prompt is folded into history as a user turn so the
     /// roles stay alternating (some providers reject two assistant messages in a
     /// row) and the recap is part of the saved session.
-    async fn finalize_turn(&mut self, ui: &mut dyn Ui) {
-        let mut messages = self.messages.clone();
+    async fn finalize_turn(&mut self, turn_start: usize, ui: &mut dyn Ui) {
+        // Only send the current turn's messages (plus the system prompt for
+        // context), not the entire session history. The recap only needs to
+        // know what happened *this turn* — sending 40K tokens of old context
+        // to produce a 200-token summary is pure waste.
+        let turn = &self.messages[turn_start..];
+        let mut messages = Vec::with_capacity(turn.len() + 2);
+        messages.push(self.minimal_system_message());
+        messages.extend_from_slice(turn);
         messages.push(Message::user(FINALIZE_PROMPT));
 
         let request = ChatRequest {
             model: self.config.model.clone(),
-            messages,
-            tools: Vec::new(), // recap only — no tool use
-            max_tokens: self.config.max_tokens,
+            messages: Arc::from(messages),
+            tools: Arc::new([]), // recap only — no tool use
+            max_tokens: 1024, // throwaway call — recaps are short
             temperature: self.config.temperature,
             top_p: None,
             frequency_penalty: None,
@@ -1267,9 +1642,8 @@ impl Agent {
             return; // nothing to record
         }
         // Record both the synthetic request and the recap so roles alternate.
-        self.messages.push(Message::user(FINALIZE_PROMPT));
-        self.messages
-            .push(Message::assistant(vec![Content::Text(recap)]));
+        Arc::make_mut(&mut self.messages).push(Message::user(FINALIZE_PROMPT));
+        Arc::make_mut(&mut self.messages).push(Message::assistant(vec![Content::Text(recap)]));
     }
 
     /// Format a usage line. `usage` carries the cumulative in/out/total/cost;
@@ -1285,6 +1659,9 @@ impl Agent {
             humanize_count(usage.input_tokens),
             humanize_count(usage.output_tokens),
         );
+        if usage.cache_read_tokens > 0 {
+            summary.push_str(&format!(" ⟲{}", humanize_count(usage.cache_read_tokens)));
+        }
         if let Some(cost) = self.cost_usd {
             summary.push_str(&format!(" · ${cost:.4}"));
         }
@@ -1304,16 +1681,17 @@ impl Agent {
         summary
     }
 
-    fn request_tools(&self) -> Vec<ToolSpec> {
+    fn request_tools(&self) -> Arc<[ToolSpec]> {
         match self.config.tool_mode {
-            ToolMode::ChatOnly => Vec::new(),
+            ToolMode::ChatOnly => Arc::new([]),
             ToolMode::ReadOnly => self
                 .tools
                 .iter()
                 .filter(|tool| hi_tools::is_read_only(&tool.name))
                 .cloned()
-                .collect(),
-            ToolMode::Auto | ToolMode::Required => self.tools.clone(),
+                .collect::<Vec<_>>()
+                .into(),
+            ToolMode::Auto | ToolMode::Required => self.tools.clone().into(),
         }
     }
 
@@ -1514,43 +1892,78 @@ fn is_list_item(line: &str) -> bool {
     digits > 0 && l[digits..].starts_with(['.', ')'])
 }
 
-fn workspace_snapshot(dir: &std::path::Path) -> std::collections::BTreeMap<String, Vec<u8>> {
-    fn walk(
-        base: &std::path::Path,
-        dir: &std::path::Path,
-        out: &mut std::collections::BTreeMap<String, Vec<u8>>,
-    ) {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if matches!(
-                name.as_ref(),
-                ".git" | "target" | "node_modules" | ".next" | "dist" | "build" | "__pycache__"
-            ) {
+/// A lightweight file fingerprint: mtime (seconds) + size in bytes. Two
+/// snapshots of the same file compare equal iff the file hasn't been touched.
+/// Much cheaper than reading every file's content on every turn.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct FileFingerprint {
+    mtime_secs: i64,
+    len: u64,
+}
+
+async fn workspace_snapshot(
+    dir: &std::path::Path,
+) -> std::collections::BTreeMap<String, FileFingerprint> {
+    // Use the `ignore` crate (same as the list/grep tools) to respect
+    // .gitignore, global gitignore, and parent .gitignore files. This avoids
+    // walking node_modules, .venv, target, vendor, Pods, etc. — a massive win
+    // for repos with large dependency trees. The walk is synchronous but fast
+    // (no per-entry async overhead); we run it on a blocking-pool thread.
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut out = std::collections::BTreeMap::new();
+        for entry in ignore::WalkBuilder::new(&dir)
+            .hidden(false)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true)
+            .ignore(true)
+            .parents(true)
+            // Prune VCS metadata (.git/.hg/.svn/.jj): walking it would flag
+            // every commit/index write as a "changed file" and balloon the
+            // snapshot. We walk hidden files so real dotfiles are tracked.
+            .filter_entry(|e| {
+                !matches!(
+                    e.file_name().to_str(),
+                    Some(".git" | ".hg" | ".svn" | ".jj")
+                )
+            })
+            .build()
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            if !path.is_file() {
                 continue;
             }
-            let path = entry.path();
-            if path.is_dir() {
-                walk(base, &path, out);
-            } else if let Ok(bytes) = std::fs::read(&path)
-                && let Ok(rel) = path.strip_prefix(base)
-            {
-                out.insert(rel.to_string_lossy().into_owned(), bytes);
-            }
+            let Ok(rel) = path.strip_prefix(&dir) else {
+                continue;
+            };
+            let Ok(meta) = std::fs::metadata(path) else {
+                continue;
+            };
+            let mtime_secs = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            out.insert(
+                rel.to_string_lossy().into_owned(),
+                FileFingerprint {
+                    mtime_secs,
+                    len: meta.len(),
+                },
+            );
         }
-    }
-
-    let mut out = std::collections::BTreeMap::new();
-    walk(dir, dir, &mut out);
-    out
+        out
+    })
+    .await
+    .unwrap_or_default()
 }
 
 fn changed_files_between(
-    before: &std::collections::BTreeMap<String, Vec<u8>>,
-    after: &std::collections::BTreeMap<String, Vec<u8>>,
+    before: &std::collections::BTreeMap<String, FileFingerprint>,
+    after: &std::collections::BTreeMap<String, FileFingerprint>,
 ) -> Vec<String> {
     let mut files = std::collections::BTreeSet::new();
     for path in before.keys() {
@@ -1635,7 +2048,10 @@ mod tests {
             request: ChatRequest,
             _sink: &mut (dyn FnMut(StreamEvent) + Send),
         ) -> Result<Completion> {
-            self.requests.lock().unwrap().push(request.messages);
+            self.requests
+                .lock()
+                .unwrap()
+                .push(request.messages.to_vec());
             match self.steps.lock().unwrap().remove(0) {
                 ProviderStep::Completion(completion) => Ok(completion),
                 ProviderStep::RequestTooLarge => Err(ProviderError::new(
@@ -1666,8 +2082,10 @@ mod tests {
         fn turn_end(&mut self, _: &str) {}
     }
 
+    type UsageRecords = std::sync::Arc<Mutex<Vec<(Usage, Option<f64>)>>>;
+
     struct RecordingSession {
-        records: std::sync::Arc<Mutex<Vec<(Usage, Option<f64>)>>>,
+        records: UsageRecords,
     }
 
     impl SessionSink for RecordingSession {
@@ -1678,6 +2096,10 @@ mod tests {
             cost_usd: Option<f64>,
         ) -> Result<()> {
             self.records.lock().unwrap().push((usage, cost_usd));
+            Ok(())
+        }
+
+        fn record_compaction(&mut self, _messages: &[Message]) -> Result<()> {
             Ok(())
         }
     }
@@ -1706,16 +2128,7 @@ mod tests {
         AgentConfig {
             model: "m".into(),
             max_tokens: 100,
-            temperature: None,
-            thinking_budget: None,
-            tool_mode: ToolMode::Auto,
-            compat: CompatMode::Auto,
-            price: None,
-            context_window: None,
-            project_context: None,
-            verify: Vec::new(),
             max_verify_iterations: 2,
-            max_steps: 50,
             auto_compact: false,
             // Default to summarize so the existing summarize/auto tests are
             // unaffected; hybrid/elide get dedicated tests.
@@ -1723,6 +2136,7 @@ mod tests {
             // Off by default so the canned-provider tests don't need an extra
             // completion for the recap; the finalization tests opt in.
             finalize: false,
+            ..AgentConfig::default()
         }
     }
 
@@ -1732,6 +2146,7 @@ mod tests {
             usage: Usage {
                 input_tokens: input,
                 output_tokens: output,
+                ..Default::default()
             },
             stop_reason: None,
         }
@@ -1787,16 +2202,13 @@ mod tests {
             config(),
         );
         let huge_old_output = "old tool output ".repeat(20_000);
-        agent.messages.push(Message::user("previous task"));
-        agent
-            .messages
-            .push(Message::assistant(vec![Content::ToolCall {
-                id: "read-1".into(),
-                name: "read".into(),
-                arguments: r#"{"path":"LICENSE"}"#.into(),
-            }]));
-        agent
-            .messages
+        Arc::make_mut(&mut agent.messages).push(Message::user("previous task"));
+        Arc::make_mut(&mut agent.messages).push(Message::assistant(vec![Content::ToolCall {
+            id: "read-1".into(),
+            name: "read".into(),
+            arguments: r#"{"path":"LICENSE"}"#.into(),
+        }]));
+        Arc::make_mut(&mut agent.messages)
             .push(Message::tool_result("read-1", huge_old_output.clone()));
 
         let mut ui = RecordingUi::default();
@@ -1814,6 +2226,7 @@ mod tests {
                     name, arguments, ..
                 } => name.contains(needle) || arguments.contains(needle),
                 Content::ToolResult { output, .. } => output.contains(needle),
+                _ => false,
             })
         };
         assert_eq!(requests.len(), 2);
@@ -1904,6 +2317,7 @@ mod tests {
                     Usage {
                         input_tokens: 7,
                         output_tokens: 100,
+                        ..Default::default()
                     },
                 ),
                 ProviderStep::Completion(completion(vec![Content::Text("recovered".into())], 5, 3)),
@@ -1959,6 +2373,7 @@ mod tests {
                 Usage {
                     input_tokens: 11,
                     output_tokens: 100,
+                    ..Default::default()
                 },
             )],
             config(),
@@ -1979,6 +2394,7 @@ mod tests {
                 Usage {
                     input_tokens: 11,
                     output_tokens: 100,
+                    ..Default::default()
                 },
                 None,
             )]
@@ -2067,6 +2483,7 @@ mod tests {
                 Usage {
                     input_tokens: 10,
                     output_tokens: 5,
+                    ..Default::default()
                 },
                 None,
             )]
@@ -2111,7 +2528,7 @@ mod tests {
     fn system_prompt_grounds_the_working_directory() {
         // The model must be told where it actually is, so it doesn't invent paths
         // (e.g. /home/user), cd elsewhere, or scaffold a new project.
-        let sys = build_system(None, None, false);
+        let sys = SystemPrompt::new().build();
         let text = sys.text();
         let cwd = std::env::current_dir().unwrap().display().to_string();
         assert!(text.contains(&cwd), "names the working directory: {text}");
@@ -2138,7 +2555,7 @@ mod tests {
             "goal text included"
         );
 
-        agent.messages.push(Message::user("noise"));
+        Arc::make_mut(&mut agent.messages).push(Message::user("noise"));
         agent.clear_history();
         assert_eq!(agent.messages().len(), 1);
         assert!(
@@ -2254,9 +2671,8 @@ mod tests {
             records: records.clone(),
         }));
         // Some history to compact.
-        agent.messages.push(Message::user("hello"));
-        agent
-            .messages
+        Arc::make_mut(&mut agent.messages).push(Message::user("hello"));
+        Arc::make_mut(&mut agent.messages)
             .push(Message::assistant(vec![Content::Text("hi".into())]));
 
         agent.compact(&mut NullUi).await.unwrap();
@@ -2278,6 +2694,7 @@ mod tests {
                 Usage {
                     input_tokens: 7,
                     output_tokens: 5,
+                    ..Default::default()
                 },
                 None,
             )],
@@ -2292,13 +2709,11 @@ mod tests {
             config(),
         );
         // Two user turns; keep_recent = 1 summarizes the first, keeps the second.
-        agent.messages.push(Message::user("q1"));
-        agent
-            .messages
+        Arc::make_mut(&mut agent.messages).push(Message::user("q1"));
+        Arc::make_mut(&mut agent.messages)
             .push(Message::assistant(vec![Content::Text("a1".into())]));
-        agent.messages.push(Message::user("q2"));
-        agent
-            .messages
+        Arc::make_mut(&mut agent.messages).push(Message::user("q2"));
+        Arc::make_mut(&mut agent.messages)
             .push(Message::assistant(vec![Content::Text("a2".into())]));
 
         agent
@@ -2339,9 +2754,8 @@ mod tests {
             )],
             config(),
         );
-        agent.messages.push(Message::user("only turn"));
-        agent
-            .messages
+        Arc::make_mut(&mut agent.messages).push(Message::user("only turn"));
+        Arc::make_mut(&mut agent.messages)
             .push(Message::assistant(vec![Content::Text("a".into())]));
         // keep_recent = 3 but only one turn → no recent window → summarize all.
         agent
@@ -2359,24 +2773,20 @@ mod tests {
         // Empty provider: if elision tried to call the model, this would panic.
         let mut agent = agent(vec![], config());
         let big = "x".repeat(500);
-        agent.messages.push(Message::user("read a"));
-        agent
-            .messages
-            .push(Message::assistant(vec![Content::ToolCall {
-                id: "c1".into(),
-                name: "read".into(),
-                arguments: "{}".into(),
-            }]));
-        agent.messages.push(Message::tool_result("c1", big.clone()));
-        agent.messages.push(Message::user("read b")); // recent turn
-        agent
-            .messages
-            .push(Message::assistant(vec![Content::ToolCall {
-                id: "c2".into(),
-                name: "read".into(),
-                arguments: "{}".into(),
-            }]));
-        agent.messages.push(Message::tool_result("c2", big.clone()));
+        Arc::make_mut(&mut agent.messages).push(Message::user("read a"));
+        Arc::make_mut(&mut agent.messages).push(Message::assistant(vec![Content::ToolCall {
+            id: "c1".into(),
+            name: "read".into(),
+            arguments: "{}".into(),
+        }]));
+        Arc::make_mut(&mut agent.messages).push(Message::tool_result("c1", big.clone()));
+        Arc::make_mut(&mut agent.messages).push(Message::user("read b")); // recent turn
+        Arc::make_mut(&mut agent.messages).push(Message::assistant(vec![Content::ToolCall {
+            id: "c2".into(),
+            name: "read".into(),
+            arguments: "{}".into(),
+        }]));
+        Arc::make_mut(&mut agent.messages).push(Message::tool_result("c2", big.clone()));
 
         agent
             .compact_with(
@@ -2520,9 +2930,9 @@ mod tests {
     #[tokio::test]
     async fn gives_up_with_notice_after_cap() {
         // Worked once, then narrated a next step every round without doing it:
-        // bounded to MAX_CONTINUE_NUDGES nudges, then an honest incomplete notice.
+        // bounded to max_continue_nudges nudges, then an honest incomplete notice.
         let mut responses = vec![echo_call()];
-        for _ in 0..(MAX_CONTINUE_NUDGES + 1) {
+        for _ in 0..(config().max_continue_nudges + 1) {
             responses.push(completion(
                 vec![Content::Text("Now let me rewrite main.rs:".into())],
                 1,
@@ -2534,7 +2944,7 @@ mod tests {
         agent.run_turn("add a thing", &mut ui).await.unwrap();
         assert_eq!(
             ui.statuses.iter().filter(|s| s.contains("nudging")).count(),
-            MAX_CONTINUE_NUDGES as usize,
+            config().max_continue_nudges as usize,
             "nudges are bounded, got: {:?}",
             ui.statuses
         );
@@ -2543,6 +2953,103 @@ mod tests {
             "incomplete notice after the cap, got: {:?}",
             ui.statuses
         );
+    }
+
+    #[tokio::test]
+    async fn nudges_when_model_repeats_the_same_command() {
+        // The model runs a command, then re-issues the *exact same* call next
+        // round. The repetition guard nudges it to act on the output instead of
+        // re-running, and the model then finishes. One repeat-nudge, no
+        // "stuck repeating" notice.
+        let responses = vec![
+            echo_call(),
+            echo_call(), // exact repeat → nudged
+            completion(vec![Content::Text("Done. Run cargo test.".into())], 1, 1),
+        ];
+        let mut agent = agent(responses, config());
+        let mut ui = RecUi::default();
+        agent.run_turn("check it", &mut ui).await.unwrap();
+        assert_eq!(
+            ui.statuses
+                .iter()
+                .filter(|s| s.contains("re-ran the same command"))
+                .count(),
+            1,
+            "exactly one repeat-nudge, got: {:?}",
+            ui.statuses
+        );
+        assert!(
+            !ui.statuses.iter().any(|s| s.contains("kept re-running")),
+            "no stuck-repeating notice once it moved on, got: {:?}",
+            ui.statuses
+        );
+        assert!(ui.turn_end.is_some(), "turn completed");
+    }
+
+    #[tokio::test]
+    async fn gives_up_with_notice_after_repeat_cap() {
+        // The model re-issues the exact same command every round, through the
+        // whole repeat-nudge budget: bounded nudges, then an honest
+        // "stuck repeating" notice.
+        let mut responses = vec![echo_call()];
+        for _ in 0..(config().max_repeat_nudges + 1) {
+            responses.push(echo_call()); // exact repeat each round
+        }
+        let mut agent = agent(responses, config());
+        let mut ui = RecUi::default();
+        agent.run_turn("check it", &mut ui).await.unwrap();
+        assert_eq!(
+            ui.statuses
+                .iter()
+                .filter(|s| s.contains("re-ran the same command"))
+                .count(),
+            config().max_repeat_nudges as usize,
+            "repeat-nudges are bounded, got: {:?}",
+            ui.statuses
+        );
+        assert!(
+            ui.statuses.iter().any(|s| s.contains("kept re-running")),
+            "stuck-repeating notice after the cap, got: {:?}",
+            ui.statuses
+        );
+    }
+
+    #[tokio::test]
+    async fn does_not_nudge_a_different_command() {
+        // Two consecutive tool calls with different arguments are not a repeat —
+        // both execute, no repeat-nudge.
+        let responses = vec![
+            completion(
+                vec![Content::ToolCall {
+                    id: "t".into(),
+                    name: "bash".into(),
+                    arguments: "{\"command\":\"echo one\"}".into(),
+                }],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::ToolCall {
+                    id: "t".into(),
+                    name: "bash".into(),
+                    arguments: "{\"command\":\"echo two\"}".into(),
+                }],
+                1,
+                1,
+            ),
+            completion(vec![Content::Text("Done.".into())], 1, 1),
+        ];
+        let mut agent = agent(responses, config());
+        let mut ui = RecUi::default();
+        agent.run_turn("run them", &mut ui).await.unwrap();
+        assert!(
+            !ui.statuses
+                .iter()
+                .any(|s| s.contains("re-ran the same command")),
+            "different commands are not a repeat, got: {:?}",
+            ui.statuses
+        );
+        assert!(ui.turn_end.is_some(), "turn completed");
     }
 
     #[tokio::test]
@@ -2837,17 +3344,15 @@ mod tests {
             ))],
             cfg,
         );
-        agent.messages.push(Message::user("existing long turn"));
+        Arc::make_mut(&mut agent.messages).push(Message::user("existing long turn"));
         for i in 1..=8 {
             let id = format!("c{i}");
-            agent
-                .messages
-                .push(Message::assistant(vec![Content::ToolCall {
-                    id: id.clone(),
-                    name: "read".into(),
-                    arguments: "{}".into(),
-                }]));
-            agent.messages.push(Message::tool_result(
+            Arc::make_mut(&mut agent.messages).push(Message::assistant(vec![Content::ToolCall {
+                id: id.clone(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            }]));
+            Arc::make_mut(&mut agent.messages).push(Message::tool_result(
                 &id,
                 format!("{i}\n{}", "x".repeat(500)),
             ));

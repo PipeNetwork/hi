@@ -18,11 +18,13 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 
 /// A benchmark task: a prompt to run and a command that decides success.
 #[derive(Deserialize)]
@@ -63,7 +65,7 @@ const CONFIGS: &[Config] = &[
 ];
 
 struct RunResult {
-    config: &'static str,
+    config: String,
     task: String,
     trial: usize,
     passed: bool,
@@ -285,6 +287,11 @@ fn dir_snapshot(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
 }
 
 fn main() -> Result<()> {
+    let rt = tokio::runtime::Runtime::new().context("creating tokio runtime")?;
+    rt.block_on(async_main())
+}
+
+async fn async_main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let validate = args.iter().any(|a| a == "--validate");
     let tasks_dir = args
@@ -361,28 +368,77 @@ fn main() -> Result<()> {
     );
 
     let mut results = Vec::new();
+    // Cap concurrent candidates to avoid overwhelming the provider with parallel
+    // requests. Each candidate is a subprocess that makes its own HTTP calls, so
+    // the real limit is the provider's rate limit, not local CPU.
+    let semaphore = Arc::new(Semaphore::new(
+        std::env::var("HI_EVAL_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4),
+    ));
+
     for trial in 0..trials {
         if trials > 1 {
             eprintln!("--- trial {}/{trials} ---", trial + 1);
         }
+        // Run all (task, config) pairs for this trial concurrently.
+        let mut futs = Vec::new();
         for (dir, task) in &tasks {
             let label = task.name.clone().unwrap_or_else(|| dir_name(dir));
             for config in &active {
-                let mut result = run_config(&hi, dir, task, config, profile)
-                    .with_context(|| format!("running task '{label}' [{}]", config.name))?;
-                result.task = label.clone();
-                result.trial = trial;
-                write_artifact(&artifacts_dir, profile, condense_on, recovery_on, &result)?;
-                eprintln!(
-                    "  {:10} {:4} {label}  ({} cand, {} tok, ${:.4}, {:.1}s)",
-                    config.name,
-                    if result.passed { "PASS" } else { "FAIL" },
-                    result.candidates,
-                    result.tokens,
-                    result.cost_usd,
-                    result.seconds
-                );
-                results.push(result);
+                let hi = hi.clone();
+                let dir = dir.clone();
+                let task_prompt = task.prompt.clone();
+                let task_verify = task.verify.clone();
+                let config_name = config.name.to_string();
+                let use_verify = config.use_verify;
+                let temperatures = config.temperatures.to_vec();
+                let sem = semaphore.clone();
+                let artifacts_dir = artifacts_dir.clone();
+                let label2 = label.clone();
+                futs.push(tokio::spawn(async move {
+                    let _permit = sem.acquire().await;
+                    let task = Task {
+                        name: Some(label2.clone()),
+                        prompt: task_prompt,
+                        verify: task_verify,
+                    };
+                    let mut result = run_config(
+                        &hi,
+                        &dir,
+                        &task,
+                        &config_name,
+                        use_verify,
+                        &temperatures,
+                        profile,
+                    )
+                    .await
+                    .with_context(|| format!("running task '{}' [{}]", label2, config_name))?;
+                    result.task = label2.clone();
+                    result.trial = trial;
+                    write_artifact(&artifacts_dir, profile, condense_on, recovery_on, &result)?;
+                    eprintln!(
+                        "  {:10} {:4} {}  ({} cand, {} tok, ${:.4}, {:.1}s)",
+                        config_name,
+                        if result.passed { "PASS" } else { "FAIL" },
+                        label2,
+                        result.candidates,
+                        result.tokens,
+                        result.cost_usd,
+                        result.seconds
+                    );
+                    Ok::<_, anyhow::Error>(result)
+                }));
+            }
+        }
+        for fut in futs {
+            match fut.await.context("joining eval task")? {
+                Ok(result) => results.push(result),
+                Err(err) => {
+                    eprintln!("  eval error: {err:#}");
+                    return Err(err);
+                }
             }
         }
     }
@@ -453,17 +509,20 @@ fn verify_in(dir: &Path, cmd: &str) -> bool {
 }
 
 /// Run all of a config's candidates; the config solves the task if any passes.
-/// Cost and tokens are summed (in production the N candidates run in parallel,
-/// so wall-clock would be the max, but cost is still the sum).
+/// Cost and tokens are summed. Candidates run in parallel since each gets its own
+/// isolated workdir — wall-clock is the max, not the sum.
 fn run_config(
     hi: &Path,
     task_dir: &Path,
     task: &Task,
-    config: &Config,
+    config_name: &str,
+    use_verify: bool,
+    temperatures: &[f32],
     profile: EvalProfile,
-) -> Result<RunResult> {
+) -> impl std::future::Future<Output = Result<RunResult>> {
+    async move {
     let mut result = RunResult {
-        config: config.name,
+        config: config_name.to_string(),
         task: String::new(),
         trial: 0,
         passed: false,
@@ -473,15 +532,50 @@ fn run_config(
         changed_files: Vec::new(),
         verify_output_summary: String::new(),
         failure_confidence: None,
-        candidates: config.temperatures.len(),
+        candidates: temperatures.len(),
         cost_usd: 0.0,
         tokens: 0,
         seconds: 0.0,
     };
+
+    // Run candidates in parallel — each gets its own temp workdir.
+    // `run_config` is already executing on the eval runtime (called from
+    // `async_main` via `tokio::spawn`), so we must not create a second Tokio
+    // runtime here and `block_on` from within it — nesting runtimes panics.
+    // Just await the candidate futures directly on this runtime.
+    let candidates: Vec<Candidate> = async {
+        let mut futs = Vec::new();
+        for &temperature in temperatures {
+            let hi = hi.to_path_buf();
+            let task_dir = task_dir.to_path_buf();
+            let prompt = task.prompt.clone();
+            let verify = task.verify.clone();
+            futs.push(tokio::task::spawn_blocking(move || {
+                run_candidate(
+                    &hi,
+                    &task_dir,
+                    &Task {
+                        name: None,
+                        prompt,
+                        verify,
+                    },
+                    use_verify,
+                    temperature,
+                    profile,
+                )
+            }));
+        }
+        let mut out = Vec::with_capacity(futs.len());
+        for fut in futs {
+            out.push(fut.await.context("joining candidate task")??);
+        }
+        Ok::<_, anyhow::Error>(out)
+    }
+    .await?;
+
     let mut fails: Vec<FailKind> = Vec::new();
     let mut summaries = Vec::new();
-    for &temperature in config.temperatures {
-        let candidate = run_candidate(hi, task_dir, task, config.use_verify, temperature, profile)?;
+    for candidate in candidates {
         result.passed |= candidate.passed;
         if let Some(k) = candidate.fail {
             fails.push(k);
@@ -512,6 +606,7 @@ fn run_config(
     result.compat_fallbacks_used.dedup();
     result.verify_output_summary = summaries.join("\n--- candidate ---\n");
     Ok(result)
+    }
 }
 
 /// One independent attempt in an isolated copy of the fixture.
@@ -636,7 +731,7 @@ fn write_artifact(
     let name = format!(
         "trial-{:03}-{}-{}.json",
         result.trial + 1,
-        sanitize_name(result.config),
+        sanitize_name(&result.config),
         sanitize_name(&result.task)
     );
     let json = serde_json::to_string_pretty(&artifact)?;

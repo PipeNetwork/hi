@@ -57,7 +57,9 @@ impl Ui for PlainUi {
     }
 
     fn tool_result(&mut self, result: &str) {
-        const MAX_LINES: usize = 12;
+        // Enough to show a small edit's diff with its context inline; larger
+        // results truncate with a footer (use `/diff` for the full diff).
+        const MAX_LINES: usize = 16;
         let lines: Vec<&str> = result.lines().collect();
         for line in lines.iter().take(MAX_LINES) {
             println!("\x1b[2m  {}\x1b[0m", hi_agent::ui::clip(line, 200));
@@ -72,9 +74,49 @@ impl Ui for PlainUi {
         println!("\x1b[34m{text}\x1b[0m");
     }
 
+    fn plan(&mut self, steps: &[hi_agent::PlanStep]) {
+        use hi_agent::PlanStatus;
+        self.begin_output();
+        let done = steps
+            .iter()
+            .filter(|s| s.status == PlanStatus::Done)
+            .count();
+        println!("\x1b[1m⏺ plan · {done}/{}\x1b[0m", steps.len());
+        for s in steps {
+            let (glyph, color) = match s.status {
+                PlanStatus::Done => ('✓', "\x1b[32m"),
+                PlanStatus::Active => ('▸', "\x1b[36m"),
+                PlanStatus::Pending => ('☐', "\x1b[2m"),
+            };
+            println!("{color}  {glyph} {}\x1b[0m", s.title);
+        }
+    }
+
     fn turn_end(&mut self, summary: &str) {
         self.begin_output();
         println!("\x1b[2m{summary}\x1b[0m");
+    }
+
+    fn usage(
+        &mut self,
+        _input_tokens: u64,
+        _output_tokens: u64,
+        context_used: u64,
+        context_window: Option<u32>,
+    ) {
+        // Show a context-fill percentage when the window is known,
+        // so the user can see when auto-compaction is approaching.
+        if let Some(window) = context_window
+            && window > 0
+        {
+            let pct = (context_used * 100 / window as u64).min(100);
+            if pct >= 60 {
+                self.begin_output();
+                let bar = "█".repeat((pct / 5) as usize);
+                let pad = "░".repeat(20 - (pct / 5) as usize);
+                println!("\x1b[2m  ctx [{bar}{pad}] {pct}%\x1b[0m");
+            }
+        }
     }
 }
 

@@ -130,6 +130,9 @@ mod tests {
             usage: Usage {
                 input_tokens: input,
                 output_tokens: output,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                input_includes_cache: false,
             },
             stop_reason: None,
         }
@@ -141,6 +144,9 @@ mod tests {
             usage: Usage {
                 input_tokens: input,
                 output_tokens: output,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                input_includes_cache: false,
             },
             stop_reason: None,
         }
@@ -168,8 +174,8 @@ mod tests {
     fn req() -> ChatRequest {
         ChatRequest {
             model: "primary".into(),
-            messages: vec![],
-            tools: vec![],
+            messages: vec![].into(),
+            tools: vec![].into(),
             max_tokens: 16,
             temperature: None,
             top_p: None,

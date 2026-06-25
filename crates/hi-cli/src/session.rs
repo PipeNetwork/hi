@@ -23,6 +23,15 @@ enum SessionMeta {
         #[serde(default)]
         cost_usd: Option<f64>,
     },
+    Checkpoints {
+        refs: Vec<String>,
+    },
+    /// A compaction boundary: all messages before this line are superseded by
+    /// the compacted messages stored here. On resume, replace prior messages
+    /// with these so the compaction survives across sessions.
+    Compaction {
+        messages: Vec<Message>,
+    },
 }
 
 /// Appends messages to a session's JSONL file.
@@ -33,6 +42,29 @@ pub struct JsonlSession {
 impl JsonlSession {
     pub fn new(path: PathBuf) -> Self {
         Self { path }
+    }
+
+    /// Persist checkpoint refs so a resumed session knows where it branched.
+    pub fn record_checkpoints(&mut self, refs: &[String]) -> Result<()> {
+        if refs.is_empty() {
+            return Ok(());
+        }
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .with_context(|| format!("opening {}", self.path.display()))?;
+        let mut writer = BufWriter::new(file);
+        let line = serde_json::to_string(&SessionMeta::Checkpoints {
+            refs: refs.to_vec(),
+        })?;
+        writeln!(writer, "{line}")?;
+        writer.flush()?;
+        Ok(())
     }
 }
 
@@ -63,12 +95,54 @@ impl SessionSink for JsonlSession {
         writer.flush()?;
         Ok(())
     }
+
+    fn record_compaction(&mut self, messages: &[Message]) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .with_context(|| format!("opening {}", self.path.display()))?;
+        let mut writer = BufWriter::new(file);
+        let line = serde_json::to_string(&SessionMeta::Compaction {
+            messages: messages.to_vec(),
+        })?;
+        writeln!(writer, "{line}")?;
+        writer.flush()?;
+        Ok(())
+    }
 }
 
 pub struct LoadedSession {
     pub messages: Vec<Message>,
     pub usage: Usage,
     pub cost_usd: Option<f64>,
+    pub checkpoint_refs: Vec<String>,
+}
+
+/// One-line summary shown when a session is resumed: message count, cost, and
+/// the last user instruction (clipped), so the user knows what they're walking
+/// back into.
+pub fn resume_summary(loaded: &LoadedSession) -> String {
+    let n = loaded
+        .messages
+        .iter()
+        .filter(|m| m.role != Role::System)
+        .count();
+    let cost = loaded
+        .cost_usd
+        .map(|c| format!("${c:.2}"))
+        .unwrap_or_else(|| "unknown cost".into());
+    let last = loaded
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == Role::User)
+        .map(|m| hi_agent::ui::clip(&m.text(), 60))
+        .unwrap_or_default();
+    format!("Resumed: {n} messages, {cost}, last: '{last}'")
 }
 
 /// Directory holding all session files (may not exist yet).
@@ -127,7 +201,8 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
         fs::read_to_string(path).with_context(|| format!("reading session {}", path.display()))?;
     let mut messages = Vec::new();
     let mut usage = Usage::default();
-    let mut cost_usd = Some(0.0);
+    let mut cost_usd: Option<f64> = None;
+    let mut checkpoint_refs = Vec::new();
     for (i, line) in text.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
@@ -142,8 +217,18 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
                     usage = Usage {
                         input_tokens,
                         output_tokens,
+                        cache_read_tokens: 0,
+                        cache_creation_tokens: 0,
+                        input_includes_cache: false,
                     };
                     cost_usd = saved_cost;
+                }
+                SessionMeta::Checkpoints { refs } => {
+                    checkpoint_refs.extend(refs);
+                }
+                SessionMeta::Compaction { messages: compacted } => {
+                    // Replace all prior messages with the compacted set.
+                    messages = compacted;
                 }
             }
             continue;
@@ -156,6 +241,7 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
         messages,
         usage,
         cost_usd,
+        checkpoint_refs,
     })
 }
 
@@ -281,6 +367,9 @@ mod tests {
                 Usage {
                     input_tokens: 123,
                     output_tokens: 45,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                    input_includes_cache: false,
                 },
                 Some(0.1234),
             )

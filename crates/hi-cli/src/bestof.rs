@@ -34,43 +34,108 @@ pub fn run(opts: &BestOf) -> Result<()> {
         );
     }
 
-    let mut created: Vec<PathBuf> = Vec::new();
-    let mut winner: Option<(u32, PathBuf)> = None;
-
+    // Create all worktrees up front so a failure here aborts before spawning.
+    let mut worktrees: Vec<(u32, PathBuf, f32)> = Vec::new();
     for i in 0..opts.candidates {
         let temperature = temperature_for(i, opts.candidates);
         let worktree = worktree_path(i);
-
         if let Err(err) = add_worktree(&worktree) {
-            cleanup(&created);
+            cleanup(&worktrees.iter().map(|(_, wt, _)| wt.clone()).collect::<Vec<_>>());
             return Err(err);
         }
-        created.push(worktree.clone());
+        worktrees.push((i, worktree, temperature));
+    }
 
-        println!(
-            "\x1b[36m── candidate {}/{} (temp {temperature:.1}) ─────────────────\x1b[0m",
-            i + 1,
-            opts.candidates
-        );
-        if !run_candidate(opts, &worktree, temperature)? {
+    println!(
+        "\x1b[36m── running {} candidates in parallel ──────────────────\x1b[0m",
+        opts.candidates
+    );
+
+    // Spawn all candidate threads at once so they run concurrently. Each thread
+    // owns copies of the scalar settings (the borrowed `BestOf` can't cross the
+    // thread boundary) and builds its own `BestOf` view over those locals.
+    let handles: Vec<std::thread::JoinHandle<(u32, PathBuf, bool)>> = worktrees
+        .into_iter()
+        .map(|(i, worktree, temperature)| {
+            let exe = opts.exe.to_path_buf();
+            let provider = opts.provider.to_string();
+            let model = opts.model.to_string();
+            let base_url = opts.base_url.to_string();
+            let api_key = opts.api_key.to_string();
+            let verify = opts.verify.to_string();
+            let prompt = opts.prompt.to_string();
+            let max_steps = opts.max_steps;
+            let max_verify = opts.max_verify;
+            std::thread::spawn(move || {
+                let thread_opts = BestOf {
+                    exe: &exe,
+                    provider: &provider,
+                    model: &model,
+                    base_url: &base_url,
+                    api_key: &api_key,
+                    verify: &verify,
+                    prompt: &prompt,
+                    candidates: 0, // unused by run_candidate
+                    max_steps,
+                    max_verify,
+                };
+                let success =
+                    run_candidate(&thread_opts, &worktree, temperature).unwrap_or(false);
+                println!(
+                    "\x1b[36m── candidate {}/{} (temp {temperature:.1}) finished ─────────────────\x1b[0m",
+                    i + 1,
+                    // count isn't available here; print as marker only
+                    i + 1
+                );
+                (i, worktree, success)
+            })
+        })
+        .collect();
+
+    // Join all threads and collect results.
+    let mut results: Vec<(u32, PathBuf, bool)> = Vec::new();
+    for handle in handles {
+        results.push(handle.join().expect("candidate thread panicked"));
+    }
+
+    // Deterministic order: by candidate index.
+    results.sort_by_key(|r| r.0);
+
+    // Find the first passing candidate (in index order): ran successfully AND
+    // passes the verify command. Worktrees are independent, so checking each is
+    // safe regardless of the others.
+    let mut winner: Option<(u32, PathBuf)> = None;
+    let total = opts.candidates;
+    for (i, worktree, success) in &results {
+        let idx = *i;
+        if !success {
             println!(
-                "\x1b[33m✗ candidate {} exited with an error; skipping verification\x1b[0m",
-                i + 1
+                "\x1b[33m✗ candidate {}/{} exited with an error; skipping verification\x1b[0m",
+                idx + 1,
+                total
             );
             continue;
         }
-
-        if verify_passes(&worktree, opts.verify) {
-            println!("\x1b[32m✓ candidate {} passed verification\x1b[0m", i + 1);
-            winner = Some((i, worktree));
+        if verify_passes(worktree, opts.verify) {
+            println!(
+                "\x1b[32m✓ candidate {}/{} passed verification\x1b[0m",
+                idx + 1,
+                total
+            );
+            winner = Some((idx, worktree.clone()));
             break;
         }
-        println!("\x1b[33m✗ candidate {} failed verification\x1b[0m", i + 1);
+        println!(
+            "\x1b[33m✗ candidate {}/{} failed verification\x1b[0m",
+            idx + 1,
+            total
+        );
     }
 
     let result = match &winner {
         Some((i, worktree)) => {
-            apply_changes(worktree).with_context(|| "applying the winning candidate's changes")?;
+            apply_changes(worktree)
+                .with_context(|| "applying the winning candidate's changes")?;
             println!(
                 "\x1b[32m✓ applied candidate {} to the working tree\x1b[0m",
                 i + 1
@@ -80,13 +145,15 @@ pub fn run(opts: &BestOf) -> Result<()> {
         None => {
             println!(
                 "\x1b[31m✗ no candidate passed verification (tried {})\x1b[0m",
-                opts.candidates
+                total
             );
             Ok(())
         }
     };
 
-    cleanup(&created);
+    // Clean up every worktree we created.
+    let all_paths: Vec<PathBuf> = results.iter().map(|(_, wt, _)| wt.clone()).collect();
+    cleanup(&all_paths);
     result
 }
 

@@ -97,10 +97,13 @@ fn tool_names(messages: &[Message]) -> HashMap<String, String> {
 /// [`ELIDE_MIN_CHARS`] with a short stub, keeping the call/result skeleton (and
 /// `call_id`) intact so tool pairing stays valid. Idempotent — already-elided
 /// outputs are skipped. Returns the number of characters reclaimed.
-pub(crate) fn elide_tool_outputs(messages: &mut [Message], up_to: usize) -> usize {
+pub(crate) fn elide_tool_outputs(messages: &mut Vec<Message>, up_to: usize) -> usize {
     let names = tool_names(messages);
     let mut freed = 0;
     let up_to = up_to.min(messages.len());
+    if up_to <= 1 {
+        return 0;
+    }
     for message in &mut messages[1..up_to] {
         for block in &mut message.content {
             if let Content::ToolResult { call_id, output } = block
@@ -122,7 +125,7 @@ pub(crate) fn elide_tool_outputs(messages: &mut [Message], up_to: usize) -> usiz
 /// turn, where there may be no old user-turn boundary yet but repeated model
 /// rounds would otherwise resend every previous tool payload.
 pub(crate) fn elide_tool_outputs_except_recent(
-    messages: &mut [Message],
+    messages: &mut Vec<Message>,
     keep_recent_results: usize,
 ) -> usize {
     if messages.len() <= 1 {

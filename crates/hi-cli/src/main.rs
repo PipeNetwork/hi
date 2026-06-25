@@ -27,6 +27,43 @@ use ui::PlainUi;
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    if cli.show_config {
+        let registry = Registry::load();
+        let file = config::load_config(cli.config.as_deref())?;
+        match config::resolve(&cli, &file, &registry) {
+            Ok(settings) => {
+                println!("provider:   {}", provider_label(settings.provider));
+                println!("model:      {}", settings.model);
+                println!("base_url:   {}", settings.base_url);
+                println!("max_tokens: {}", settings.max_tokens);
+                println!(
+                    "thinking:   {}",
+                    settings
+                        .thinking_budget
+                        .map(|b| b.to_string())
+                        .unwrap_or_else(|| "off".into())
+                );
+                println!("tool_mode:  {:?}", settings.tool_mode);
+                println!("compat:     {:?}", settings.compat);
+                let api_key_display = if settings.api_key.len() > 8 {
+                    format!(
+                        "{}...{}",
+                        &settings.api_key[..4],
+                        &settings.api_key[settings.api_key.len() - 4..]
+                    )
+                } else {
+                    "***".to_string()
+                };
+                println!("api_key:    {}", api_key_display);
+                return Ok(());
+            }
+            Err(err) => {
+                eprintln!("{err}");
+                std::process::exit(2);
+            }
+        }
+    }
+
     if cli.refresh_models {
         let count = hi_ai::registry::refresh().await?;
         let location = hi_ai::registry::cache_path()
@@ -130,6 +167,7 @@ async fn main() -> Result<()> {
                 keep_recent: hi_agent::DEFAULT_KEEP_RECENT,
             }),
         finalize: !cli.no_finalize,
+        ..AgentConfig::default()
     };
     let mut agent = match loaded {
         Some(loaded) => Agent::resume(
@@ -427,10 +465,14 @@ async fn repl(
     use rustyline::DefaultEditor;
     use rustyline::error::ReadlineError;
 
+    let window = registry.metadata(&settings.model).1
+        .map(|w| format!(" · {}k ctx", w / 1000))
+        .unwrap_or_default();
     println!(
-        "hi · {} · {} — /help for commands, Ctrl-D to quit.",
+        "hi · {} · {}{} — /help for commands, Ctrl-D to quit.",
         provider_label(settings.provider),
-        settings.model
+        settings.model,
+        window,
     );
 
     let mut editor = DefaultEditor::new().context("initializing line editor")?;
@@ -482,6 +524,31 @@ async fn repl(
                         Command::Init => {
                             println!("\x1b[2mscanning the project to write HI.md…\x1b[0m");
                             hi_agent::command::INIT_PROMPT.to_string()
+                        }
+                        Command::Diff => {
+                            let diff = hi_tools::working_tree_diff().await;
+                            println!("{diff}");
+                            continue;
+                        }
+                        Command::Commit => {
+                            let diff = hi_tools::working_tree_diff_plain().await;
+                            if diff.trim() == "(no changes)" || diff.trim().is_empty() {
+                                println!("\x1b[2mnothing to commit — no changes\x1b[0m");
+                                continue;
+                            }
+                            // Show a preview of what will be committed.
+                            let preview: String = diff.lines().take(20).collect::<Vec<_>>().join("\n");
+                            let total = diff.lines().count();
+                            println!("\x1b[2m--- committing {total} line(s) of changes ---\x1b[0m");
+                            println!("{preview}");
+                            if total > 20 {
+                                println!("\x1b[2m  … {} more line(s)\x1b[0m", total - 20);
+                            }
+                            let out = hi_tools::commit().await;
+                            for line in out.lines() {
+                                println!("\x1b[2m── {line} ──\x1b[0m");
+                            }
+                            continue;
                         }
                         Command::Undo => {
                             match agent.undo().await {
@@ -579,8 +646,8 @@ async fn repl(
 }
 
 /// Drive a model future (a turn or a compaction) to completion, showing an
-/// animated `working… Ns` spinner until the first output and letting Ctrl-C
-/// cancel it. Returns whether it was cancelled.
+/// animated spinner until the first output and letting Ctrl-C cancel it.
+/// Returns whether it was cancelled.
 async fn drive_with_spinner(
     fut: impl std::future::Future<Output = Result<()>>,
     progress: &AtomicBool,
@@ -594,7 +661,17 @@ async fn drive_with_spinner(
         tokio::select! {
             result = &mut fut => {
                 if let Err(err) = result {
-                    eprintln!("\r\x1b[K\x1b[31merror: {err:#}\x1b[0m");
+                    let category = hi_ai::provider_error_kind(&err)
+                        .map(|k| k.as_str())
+                        .unwrap_or("error");
+                    let hint = match category {
+                        "auth" => " — check your API key (run `hi --show-config`)",
+                        "rate_limit" => " — rate limited; wait a moment and /retry",
+                        "server_error" => " — provider is having issues; try /retry",
+                        "network" => " — can't reach the endpoint; check your connection",
+                        _ => "",
+                    };
+                    eprintln!("\r\x1b[K\x1b[31m{category}: {err:#}{hint}\x1b[0m");
                 }
                 break;
             }
@@ -627,21 +704,43 @@ fn handle_command(agent: &mut Agent, command: hi_agent::Command, registry: &Regi
         Command::Help => println!("{}", hi_agent::command::help_text()),
         Command::Tokens => {
             let t = agent.totals();
+            let cost = agent.cost_usd()
+                .map(|c| format!(" · ${c:.4}"))
+                .unwrap_or_default();
+            let ctx = agent.context_window()
+                .map(|w| {
+                    let pct = if w > 0 { agent.context_used() * 100 / w as u64 } else { 0 };
+                    format!(" · context: {pct}%")
+                })
+                .unwrap_or_default();
             println!(
-                "\x1b[2mcumulative: {} in · {} out · {} total\x1b[0m",
+                "\x1b[2mcumulative: {} in · {} out · {} total{}{}\x1b[0m",
                 t.input_tokens,
                 t.output_tokens,
-                t.total()
+                t.total(),
+                cost,
+                ctx,
             );
         }
         Command::Status => {
             let t = agent.totals();
+            let cost = agent.cost_usd()
+                .map(|c| format!("${c:.4}"))
+                .unwrap_or_else(|| "unknown".into());
+            let ctx = agent.context_window()
+                .map(|w| {
+                    let pct = if w > 0 { agent.context_used() * 100 / w as u64 } else { 0 };
+                    format!("{pct}% of {}k", w / 1000)
+                })
+                .unwrap_or_else(|| "unknown".into());
             println!(
-                "\x1b[2mstatus: ready\nmodel: {}\nusage: {} in · {} out · {} total\nmodel health: unknown\ngoal: {}\nverify: {}\nlast error: none\ncheckpoints: {}\x1b[0m",
+                "\x1b[2mstatus: ready\nmodel: {}\nusage: {} in · {} out · {} total\ncost: {}\ncontext: {}\ngoal: {}\nverify: {}\ncheckpoints: {}\x1b[0m",
                 agent.model(),
                 t.input_tokens,
                 t.output_tokens,
                 t.total(),
+                cost,
+                ctx,
                 agent.goal().unwrap_or("off"),
                 agent.verify_summary(),
                 agent.checkpoint_count(),
@@ -680,8 +779,9 @@ fn handle_command(agent: &mut Agent, command: hi_agent::Command, registry: &Regi
             }
         }
         Command::Clear => {
+            let count = agent.messages().iter().filter(|m| m.role != hi_ai::Role::System).count();
             agent.clear_history();
-            println!("\x1b[2mconversation cleared\x1b[0m");
+            println!("\x1b[2mcleared {count} messages — starting fresh\x1b[0m");
         }
         Command::Verify(arg) => match arg.trim() {
             "" if agent.verify_is_on() => {
@@ -699,7 +799,7 @@ fn handle_command(agent: &mut Agent, command: hi_agent::Command, registry: &Regi
                 );
             }
         },
-        Command::Diff => println!("{}", hi_tools::working_tree_diff()),
+        // Diff and Commit are handled in the async repl loop.
         Command::Copy(_) => {
             println!("\x1b[33m/copy is only available in the full-screen TUI\x1b[0m");
         }
@@ -718,7 +818,20 @@ fn handle_command(agent: &mut Agent, command: hi_agent::Command, registry: &Regi
             }
         },
         // Handled in the repl loop (async / runs a turn); never reach here.
-        Command::Compact(_) | Command::Retry | Command::Undo | Command::Init => {}
+        Command::Compact(_) | Command::Retry | Command::Undo | Command::Init
+        | Command::Diff | Command::Commit => {}
+        Command::Version => {
+            println!("hi {}", hi_agent::VERSION);
+        }
+        Command::Export(arg) => {
+            let path = if arg.trim().is_empty() { "transcript.md" } else { arg.trim() };
+            let content = agent.export_markdown();
+            match std::fs::write(path, &content) {
+                Ok(()) => println!("\x1b[2mexported {} messages to {path}\x1b[0m",
+                    agent.messages().iter().filter(|m| m.role != hi_ai::Role::System).count()),
+                Err(err) => eprintln!("\x1b[33mexport failed: {err}\x1b[0m"),
+            }
+        }
         Command::Unknown(name) => {
             eprintln!("\x1b[33munknown command /{name}; try /help\x1b[0m");
         }

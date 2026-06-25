@@ -6,6 +6,8 @@
 //! that round-trips both APIs cleanly — including reasoning/thinking, which the
 //! flat OpenAI message shape can't represent on its own.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -75,6 +77,24 @@ impl Message {
         }
     }
 
+    /// Create a user message with text and an image.
+    pub fn user_with_image(
+        text: impl Into<String>,
+        data: impl Into<String>,
+        media_type: impl Into<String>,
+    ) -> Self {
+        Self {
+            role: Role::User,
+            content: vec![
+                Content::Image {
+                    data: data.into(),
+                    media_type: media_type.into(),
+                },
+                Content::Text(text.into()),
+            ],
+        }
+    }
+
     pub fn assistant(content: Vec<Content>) -> Self {
         Self {
             role: Role::Assistant,
@@ -127,6 +147,13 @@ pub enum Content {
         call_id: String,
         output: String,
     },
+    /// An image block (for vision models). Data is base64-encoded.
+    Image {
+        /// Base64-encoded image data (no data: prefix).
+        data: String,
+        /// MIME type: "image/png", "image/jpeg", "image/gif", "image/webp".
+        media_type: String,
+    },
 }
 
 /// A tool advertised to the model. `parameters` is a JSON Schema object.
@@ -141,8 +168,10 @@ pub struct ToolSpec {
 #[derive(Clone, Debug)]
 pub struct ChatRequest {
     pub model: String,
-    pub messages: Vec<Message>,
-    pub tools: Vec<ToolSpec>,
+    /// Shared conversation history — `Arc` so the agent can clone the request
+    /// cheaply (ref-count bump) instead of copying every message on every round.
+    pub messages: Arc<Vec<Message>>,
+    pub tools: Arc<[ToolSpec]>,
     pub max_tokens: u32,
     pub temperature: Option<f32>,
     /// Nucleus-sampling cutoff. Mainly used by recovery sampling (bumped on a
@@ -172,6 +201,24 @@ pub enum StreamEvent {
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Tokens served from a provider-side prompt cache (Anthropic cache_read).
+    /// Billed at a discount to the normal input price (50% for OpenAI, ~10%
+    /// for Anthropic); tracked separately so cost calculations can apply the
+    /// discount.
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    /// Tokens written to the provider-side prompt cache this request (Anthropic
+    /// cache_creation). Billed at ~125% of normal input price.
+    #[serde(default)]
+    pub cache_creation_tokens: u64,
+    /// Whether `input_tokens` already includes `cache_read_tokens` (and any
+    /// `cache_creation_tokens`). True for OpenAI-compatible providers, where
+    /// `prompt_tokens` is the total and `cached_tokens` is a subset; false for
+    /// Anthropic, where `input_tokens` excludes the separately-reported cache
+    /// tokens. Determines how `context_used` is computed so it isn't
+    /// double-counted.
+    #[serde(default)]
+    pub input_includes_cache: bool,
 }
 
 impl Usage {
@@ -180,12 +227,29 @@ impl Usage {
     }
 
     pub fn is_zero(&self) -> bool {
-        self.input_tokens == 0 && self.output_tokens == 0
+        self.input_tokens == 0
+            && self.output_tokens == 0
+            && self.cache_read_tokens == 0
+            && self.cache_creation_tokens == 0
     }
 
     pub fn add(&mut self, other: Usage) {
         self.input_tokens += other.input_tokens;
         self.output_tokens += other.output_tokens;
+        self.cache_read_tokens += other.cache_read_tokens;
+        self.cache_creation_tokens += other.cache_creation_tokens;
+    }
+
+    /// The effective number of input tokens occupying the context window for
+    /// this request. On providers where `input_tokens` already includes the
+    /// cached subset (OpenAI), that subset is not added again; on providers
+    /// where cache tokens are reported separately (Anthropic), it is.
+    pub fn effective_input_tokens(&self) -> u64 {
+        if self.input_includes_cache {
+            self.input_tokens
+        } else {
+            self.input_tokens + self.cache_read_tokens + self.cache_creation_tokens
+        }
     }
 }
 
@@ -244,6 +308,8 @@ pub fn estimate_content_tokens(content: &Content) -> u64 {
             name, arguments, ..
         } => estimate_text_tokens(name) + estimate_text_tokens(arguments),
         Content::ToolResult { output, .. } => estimate_text_tokens(output),
+        // Base64 image data: a rough token estimate from the encoded length.
+        Content::Image { data, .. } => estimate_text_tokens(data),
     }
 }
 

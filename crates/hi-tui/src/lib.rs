@@ -22,7 +22,7 @@ use crossterm::terminal::{
 };
 use futures_util::StreamExt;
 use hi_agent::ui::tool_label;
-use hi_agent::{Agent, Command, CompactionKind, Ui, command};
+use hi_agent::{Agent, Command, CompactionKind, PlanStatus, Ui, command};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout};
@@ -86,11 +86,20 @@ pub async fn run(
             .filter(|l| !l.trim().is_empty())
             .collect();
     }
-    app.push(Line::styled(
-        "Welcome to hi. Enter to send; keep typing while it works to queue the next; \
-         Ctrl-C interrupts, /exit quits.",
-        dim(),
-    ));
+    {
+        let ctx = registry
+            .metadata(model)
+            .1
+            .map(|w| format!(" · {}k ctx", w / 1000))
+            .unwrap_or_default();
+        app.push(Line::styled(
+            format!(
+                "hi · {provider} · {model}{ctx} — Enter to send, type ahead to queue, \
+                 Ctrl-C interrupts, /help for commands.",
+            ),
+            dim(),
+        ));
+    }
     // Read terminal events in a dedicated task and forward them over a channel.
     // A channel receiver is fully cancel-safe, so the per-tick redraws in the
     // loops below can't drop or delay a keystroke — which repeatedly cancelling
@@ -609,6 +618,7 @@ enum UiEvent {
     ToolCall(String, String),
     ToolResult(String),
     Status(String),
+    Plan(Vec<hi_agent::PlanStep>),
     Usage {
         input: u64,
         output: u64,
@@ -648,6 +658,9 @@ impl Ui for ChannelUi {
     }
     fn status(&mut self, text: &str) {
         self.send(UiEvent::Status(text.to_string()));
+    }
+    fn plan(&mut self, steps: &[hi_agent::PlanStep]) {
+        self.send(UiEvent::Plan(steps.to_vec()));
     }
     fn usage(
         &mut self,
@@ -715,6 +728,10 @@ struct App {
     /// When set, a model-list fetch is in flight (start time, for the spinner).
     fetching: Option<Instant>,
     status: String,
+    /// The latest task plan from the `update_plan` tool, pinned above the input
+    /// as a live checklist. Empty until the model posts a plan; replaced wholesale
+    /// on each update so it never drifts.
+    plan: Vec<hi_agent::PlanStep>,
     /// Cumulative session token usage (input, output), mirrored from the agent
     /// so the working line and `/tokens` can show it live while a turn runs.
     usage: (u64, u64),
@@ -835,6 +852,7 @@ impl App {
             picker: None,
             fetching: None,
             status: String::new(),
+            plan: Vec::new(),
             usage: (0, 0),
             context_used: 0,
             context_window: None,
@@ -1246,6 +1264,12 @@ impl App {
                 "context: {ctx}; usage: {input} in · {output} out · {} total",
                 input + output
             ),
+            format!(
+                "cost: {}",
+                agent.cost_usd()
+                    .map(|c| format!("${c:.4}"))
+                    .unwrap_or_else(|| "unknown".into())
+            ),
             format!("model health: {model_health}"),
             format!("goal: {goal}"),
             format!("verify: {verify}"),
@@ -1477,6 +1501,12 @@ impl App {
                 self.flush_pending();
                 self.push(Line::styled(s, Style::default().fg(Color::Blue)));
             }
+            // Plan updates replace the pinned checklist in place — no transcript
+            // line, so progress reads as one updating block rather than a scroll.
+            UiEvent::Plan(steps) => {
+                self.event_log.push(format!("plan {} steps", steps.len()));
+                self.plan = steps;
+            }
             // Live counters only — no transcript line; the working/title bars read them.
             UiEvent::Usage {
                 input,
@@ -1512,7 +1542,9 @@ impl App {
     /// diff output from a shell command (`git diff`, `diff -u`) — which CLIs
     /// emit without color when piped — adds diff coloring so it's readable.
     fn push_result(&mut self, result: &str) {
-        const MAX: usize = 14;
+        // Enough to show a small edit's diff with its context inline; larger
+        // results truncate with a footer (use `/diff` for the full diff).
+        const MAX: usize = 16;
         if result.trim().is_empty() {
             self.push(Line::styled("  (no output)", dim()));
             return;
@@ -1545,10 +1577,18 @@ impl App {
                 }
             }
             Command::Tokens => {
-                // Sync the live counter from the authoritative totals, then show it.
                 let t = agent.totals();
                 self.usage = (t.input_tokens, t.output_tokens);
-                self.report_tokens();
+                let cost = agent.cost_usd()
+                    .map(|c| format!(" · ${c:.4}"))
+                    .unwrap_or_default();
+                self.push(Line::styled(
+                    format!(
+                        "cumulative: {} in · {} out · {} total{}",
+                        t.input_tokens, t.output_tokens, t.total(), cost,
+                    ),
+                    dim(),
+                ));
             }
             Command::Status => self.report_status(agent),
             Command::Log => self.write_debug_log(),
@@ -1567,6 +1607,7 @@ impl App {
                 }
             }
             Command::Clear => {
+                let count = agent.messages().iter().filter(|m| m.role != hi_ai::Role::System).count();
                 agent.clear_history();
                 self.transcript.clear();
                 self.pending = None;
@@ -1575,7 +1616,7 @@ impl App {
                 self.last_assistant.clear();
                 self.status.clear();
                 self.last_turn_state = TurnState::Idle;
-                self.push(Line::styled("conversation cleared", dim()));
+                self.push(Line::styled(format!("cleared {count} messages — starting fresh"), dim()));
             }
             Command::Verify(arg) => {
                 let msg = match arg.trim() {
@@ -1595,16 +1636,40 @@ impl App {
                 self.push(Line::styled(msg, dim()));
             }
             Command::Diff => {
-                let out = hi_tools::working_tree_diff();
+                let handle = tokio::runtime::Handle::current();
+                let out = handle.block_on(hi_tools::working_tree_diff());
                 let text = out.into_text().unwrap_or_else(|_| Text::from(out.clone()));
                 for line in text.lines {
                     self.push(line);
+                }
+            }
+            Command::Commit => {
+                let handle = tokio::runtime::Handle::current();
+                let out = handle.block_on(hi_tools::commit());
+                for line in out.lines() {
+                    self.push(Line::styled(format!("── {line} ──"), dim()));
                 }
             }
             Command::Copy(arg) => self.copy(&arg),
             Command::Goal(arg) => self.handle_goal(agent, &arg),
             // Handled in the event loop (async / runs a turn); never reach here.
             Command::Compact(_) | Command::Retry | Command::Undo | Command::Init => {}
+            Command::Version => {
+                self.push(Line::styled(format!("hi {}", hi_agent::VERSION), dim()));
+            }
+            Command::Export(arg) => {
+                let path = if arg.trim().is_empty() { "transcript.md" } else { arg.trim() };
+                let content = agent.export_markdown();
+                let count = agent.messages().iter().filter(|m| m.role != hi_ai::Role::System).count();
+                match std::fs::write(path, &content) {
+                    Ok(()) => self.push(Line::styled(
+                        format!("exported {count} messages to {path}"), dim(),
+                    )),
+                    Err(err) => self.push(Line::styled(
+                        format!("export failed: {err}"), Style::default().fg(Color::Yellow),
+                    )),
+                }
+            }
             Command::Unknown(name) => {
                 self.push(Line::styled(
                     format!("unknown command /{name}; try /help"),
@@ -1649,6 +1714,52 @@ impl App {
         (lines, cursor_row, 2 + cursor_col)
     }
 
+    /// The pinned plan checklist shown just above the input, or empty when no
+    /// plan has been posted. Done steps dim out; the active step is bold cyan.
+    /// Capped so a long plan can't swallow the input area.
+    fn plan_lines(&self) -> Vec<Line<'static>> {
+        if self.plan.is_empty() {
+            return Vec::new();
+        }
+        const MAX_STEPS: usize = 8;
+        let total = self.plan.len();
+        let done = self
+            .plan
+            .iter()
+            .filter(|s| s.status == PlanStatus::Done)
+            .count();
+        let mut out = vec![Line::styled(
+            format!("plan · {done}/{total}"),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )];
+        for s in self.plan.iter().take(MAX_STEPS) {
+            let (glyph, glyph_style, title_style) = match s.status {
+                PlanStatus::Done => ('✓', Style::default().fg(Color::Green), dim()),
+                PlanStatus::Active => (
+                    '▸',
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                PlanStatus::Pending => ('☐', dim(), Style::default()),
+            };
+            out.push(Line::from(vec![
+                Span::styled(format!("  {glyph} "), glyph_style),
+                Span::styled(s.title.clone(), title_style),
+            ]));
+        }
+        if total > MAX_STEPS {
+            out.push(Line::styled(
+                format!("  … +{} more", total - MAX_STEPS),
+                dim(),
+            ));
+        }
+        out
+    }
+
     fn render(&mut self, frame: &mut ratatui::Frame) {
         let area = frame.area();
         // The input box grows to fit a spinner status line (while working), the
@@ -1658,6 +1769,9 @@ impl App {
         let queue_extra = usize::from(self.queue.len() > 3);
         let (input_lines, cursor_row, cursor_col) = self.input_view();
         let completion_rows = self.completion_items().len();
+        // The live plan checklist, pinned just above the input (input-bar state only).
+        let plan_block = self.plan_lines();
+        let plan_h = plan_block.len();
         let input_h = if self.fetching.is_some() {
             3
         } else if let Some(p) = &self.picker {
@@ -1665,8 +1779,9 @@ impl App {
             let rows = p.matches.len().clamp(1, PICKER_ROWS) as u16;
             (rows + 3).min(area.height.saturating_sub(3))
         } else {
-            (status_lines + completion_rows + input_lines.len() + queued_shown + queue_extra + 2)
-                as u16
+            (plan_h + status_lines + completion_rows + input_lines.len() + queued_shown
+                + queue_extra
+                + 2) as u16
         };
         let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(input_h)]).split(area);
 
@@ -1686,10 +1801,17 @@ impl App {
             format!(" {} ", info_parts.join(" · "))
         };
         let mut lines = self.transcript.clone();
-        if let Some((style, _markdown, text)) = &self.pending {
-            // The in-progress line shows literally; markdown styling is applied
-            // once the line is committed on its newline.
-            lines.push(Line::styled(text.clone(), *style));
+        if let Some((style, markdown, text)) = &self.pending {
+            // Style the in-progress line live (headings, bold, code, …) so prose
+            // doesn't snap into formatting only when its newline lands. The line
+            // isn't committed yet, so apply markdown against a CLONE of the fence
+            // state — the real `code_lang` must only advance on a committed line.
+            let line = if *markdown {
+                markdown_line(text, &mut self.code_lang.clone())
+            } else {
+                Line::styled(text.clone(), *style)
+            };
+            lines.push(line);
         }
         let inner_w = rows[0].width.saturating_sub(2);
         let inner_h = rows[0].height.saturating_sub(2);
@@ -1820,6 +1942,8 @@ impl App {
                 });
 
             let mut ilines: Vec<Line> = Vec::new();
+            // Pinned plan checklist at the very top of the input box.
+            ilines.extend(plan_block);
             if let Some(notice) = &self.startup_notice {
                 ilines.push(Line::styled(
                     notice.clone(),
@@ -1906,7 +2030,8 @@ impl App {
 
             // Cursor sits within the editable input — below the optional startup
             // notice, the status line, and the completion menu.
-            let above = usize::from(self.startup_notice.is_some())
+            let above = plan_h
+                + usize::from(self.startup_notice.is_some())
                 + status_lines
                 + self.completion_items().len();
             let cx = rows[1].x + 1 + cursor_col;
@@ -3020,6 +3145,63 @@ mod tests {
     }
 
     #[test]
+    fn renders_pinned_plan_checklist() {
+        use hi_agent::PlanStep;
+        let mut app = App::new("openai", "gpt-4o");
+        app.apply(UiEvent::Plan(vec![
+            PlanStep { title: "find leak".into(), status: PlanStatus::Done },
+            PlanStep { title: "fix walkers".into(), status: PlanStatus::Active },
+            PlanStep { title: "add tests".into(), status: PlanStatus::Pending },
+        ]));
+
+        let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let screen = dump(&term);
+
+        assert!(screen.contains("plan · 1/3"), "plan header w/ progress:\n{screen}");
+        assert!(screen.contains("find leak"), "step titles shown:\n{screen}");
+        assert!(screen.contains("fix walkers"));
+        assert!(screen.contains("add tests"));
+        assert!(screen.contains('✓'), "done glyph:\n{screen}");
+        assert!(screen.contains('▸'), "active glyph:\n{screen}");
+
+        // A later update replaces the plan in place — progress advances and the
+        // checklist isn't duplicated into the transcript.
+        app.apply(UiEvent::Plan(vec![
+            PlanStep { title: "find leak".into(), status: PlanStatus::Done },
+            PlanStep { title: "fix walkers".into(), status: PlanStatus::Done },
+            PlanStep { title: "add tests".into(), status: PlanStatus::Active },
+        ]));
+        term.draw(|f| app.render(f)).unwrap();
+        let screen2 = dump(&term);
+        assert!(screen2.contains("plan · 2/3"), "progress advanced:\n{screen2}");
+        assert!(app.transcript.is_empty(), "plan must not echo into the transcript");
+    }
+
+    #[test]
+    fn in_progress_line_is_styled_live() {
+        // A heading still streaming (no trailing newline yet) renders styled with
+        // its markers stripped — not literally as "## …" until the line commits.
+        let mut app = App::new("openai", "gpt-4o");
+        app.apply(UiEvent::Text("## Hello world".into()));
+        let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let screen = dump(&term);
+        assert!(screen.contains("Hello world"), "heading text shown:\n{screen}");
+        assert!(!screen.contains("## Hello"), "marker stripped live:\n{screen}");
+
+        // Styling the preview must NOT advance the real fence state: a partial
+        // opening fence leaves code_lang untouched until its line commits.
+        let mut app2 = App::new("openai", "gpt-4o");
+        app2.apply(UiEvent::Text("```rust".into()));
+        term.draw(|f| app2.render(f)).unwrap();
+        assert!(
+            app2.code_lang.is_none(),
+            "live preview must not mutate the committed fence state"
+        );
+    }
+
+    #[test]
     fn edit_key_submits_on_enter_and_clears() {
         let mut app = App::new("openai", "gpt-4o");
         app.input.set("queue me");
@@ -3718,14 +3900,15 @@ mod tests {
     #[test]
     fn completion_move_clamps() {
         let mut app = App::new("openai", "gpt-4o");
-        app.input.set("/co"); // [copy, compact]
+        app.input.set("/co"); // [commit, compact, copy]
         app.sync_completion();
+        let last = app.completion_items().len().saturating_sub(1);
         app.completion_move(-1); // already at 0, stays
         assert_eq!(app.completion.as_ref().unwrap().selected, 0);
         app.completion_move(1);
         assert_eq!(app.completion.as_ref().unwrap().selected, 1);
         app.completion_move(1); // clamp at last
-        assert_eq!(app.completion.as_ref().unwrap().selected, 1);
+        assert_eq!(app.completion.as_ref().unwrap().selected, last);
     }
 
     #[test]

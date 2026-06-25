@@ -32,6 +32,13 @@ pub enum Command {
     Retry,
     /// Revert the file changes the last turn made (from its git checkpoint).
     Undo,
+    /// Stage all working-tree changes and commit them with an auto-generated
+    /// message summarizing the changed files (the `/commit` command).
+    Commit,
+    /// Print the version and exit.
+    Version,
+    /// Export the conversation to a file.
+    Export(String),
     Quit,
     /// A `/word` that isn't recognized.
     Unknown(String),
@@ -60,6 +67,9 @@ pub fn parse(line: &str) -> Option<Command> {
         "compact" => Command::Compact(arg),
         "retry" | "redo" => Command::Retry,
         "undo" | "revert" => Command::Undo,
+        "commit" => Command::Commit,
+        "version" | "ver" | "v" => Command::Version,
+        "export" => Command::Export(arg),
         "exit" | "quit" | "q" => Command::Quit,
         other => Command::Unknown(other.to_string()),
     })
@@ -156,6 +166,24 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "undo",
         args: "",
         help: "revert the file changes from the last turn",
+        arg_values: &[],
+    },
+    CommandSpec {
+        name: "commit",
+        args: "",
+        help: "stage all changes and commit them (git add -A && git commit)",
+        arg_values: &[],
+    },
+    CommandSpec {
+        name: "version",
+        args: "",
+        help: "show version",
+        arg_values: &[],
+    },
+    CommandSpec {
+        name: "export",
+        args: "[path]",
+        help: "export the conversation to a file (default: transcript.md)",
         arg_values: &[],
     },
     CommandSpec {

@@ -6,12 +6,14 @@
 pub mod checkpoint;
 pub mod guard;
 
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::LazyLock;
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use hi_ai::ToolSpec;
+use regex::Regex;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::process::Command;
@@ -19,18 +21,88 @@ use tokio::process::Command;
 /// Per-result character budget so a single read or noisy command can't blow the
 /// context. Overridable via `HI_TOOL_RESULT_CHARS` — lower it for a tight local
 /// window, raise it when the model has room. Read once, at first use. The
-/// default is intentionally tight for remote agent loops: ~8k chars is ~2k
+/// default is intentionally tight for remote agent loops: ~5k chars is ~1.3k
 /// tokens, and repeated tool rounds resend this history.
 static MAX_OUTPUT_CHARS: LazyLock<usize> = LazyLock::new(|| {
     std::env::var("HI_TOOL_RESULT_CHARS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n >= 1_000)
-        .unwrap_or(8_000)
+        .unwrap_or(5_000)
 });
 const DEFAULT_READ_LIMIT: usize = 240;
 const BASH_TIMEOUT: Duration = Duration::from_secs(120);
 const CHECK_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Validate that a path is inside the workspace root (cwd by default). Returns
+/// the canonicalized absolute path if safe, or an error explaining why not.
+/// Set `HI_NO_PATH_GUARD=1` to disable (not recommended — the model can then
+/// read/write any file on the system).
+fn validate_workspace_path(path: &str) -> Result<std::path::PathBuf> {
+    if std::env::var_os("HI_NO_PATH_GUARD").is_some() {
+        return Ok(Path::new(path).to_path_buf());
+    }
+    let cwd = std::env::current_dir().context("determining working directory")?;
+    let target = Path::new(path);
+    // If absolute, canonicalize and check containment. If relative, join to cwd.
+    let resolved = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        cwd.join(target)
+    };
+    // For paths that exist, canonicalize to resolve symlinks and `..`.
+    let canonical = resolved.canonicalize().unwrap_or(resolved.clone());
+    let canonical_cwd = cwd.canonicalize().unwrap_or(cwd.clone());
+    if canonical.starts_with(&canonical_cwd) {
+        return Ok(canonical);
+    }
+    // Allow /tmp and macOS /var/folders paths (scratch files, pipes). On macOS,
+    // /tmp symlinks to /private/tmp and /var/folders to /private/var/folders,
+    // so canonicalize() resolves them.
+    if canonical.starts_with("/tmp/")
+        || canonical.starts_with("/private/tmp/")
+        || canonical.starts_with("/var/folders/")
+        || canonical.starts_with("/private/var/folders/")
+    {
+        return Ok(canonical);
+    }
+    bail!(
+        "path '{}' is outside the workspace ({}). \
+         Set HI_NO_PATH_GUARD=1 to allow out-of-workspace paths.",
+        path,
+        canonical_cwd.display()
+    );
+}
+
+/// VCS metadata directories that must never reach the model. We walk with
+/// `hidden(false)` so the agent can see useful dotfiles (`.github/`,
+/// `.env.example`, `.cargo/config.toml`, …), but these internal directories are
+/// large, mostly binary, and leak repository internals (loose/packed objects,
+/// refs, reflogs, config). Used as a `WalkBuilder::filter_entry` predicate,
+/// which prunes the whole subtree so we never even descend into them.
+fn is_vcs_metadata_dir(entry: &ignore::DirEntry) -> bool {
+    matches!(
+        entry.file_name().to_str(),
+        Some(".git" | ".hg" | ".svn" | ".jj")
+    )
+}
+
+/// Maximum number of cached file reads. Beyond this, the cache is cleared
+/// entirely (cheap — it refills lazily on the next re-read).
+const READ_CACHE_MAX: usize = 50;
+
+/// Per-turn cache of file reads, so re-reading the same file (common when the
+/// model is orienting) hits memory instead of disk. Cleared between turns, and
+/// bounded to [`READ_CACHE_MAX`] entries to avoid unbounded memory growth.
+static READ_CACHE: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Clear the per-turn read cache. Call at the start of each turn.
+pub fn clear_read_cache() {
+    if let Ok(mut cache) = READ_CACHE.lock() {
+        cache.clear();
+    }
+}
 
 /// Run a verification command (e.g. a test suite) and report `(passed, output)`
 /// based on its exit status. Used by the agent's verification loop.
@@ -62,18 +134,34 @@ pub async fn run_check(command: &str) -> (bool, String) {
 /// changes come from `git diff HEAD`; new files the agent created are listed by
 /// name (their contents aren't in `git diff`). Returns a friendly message when
 /// the cwd isn't a git repo or there's nothing to show.
-pub fn working_tree_diff() -> String {
-    use std::process::Command as SyncCommand;
+pub async fn working_tree_diff() -> String {
+    working_tree_diff_impl(true).await
+}
 
-    let git = |args: &[&str]| SyncCommand::new("git").args(args).output();
+/// Same as [`working_tree_diff`] but without ANSI color codes — for the `diff`
+/// tool, so the model gets plain text it can parse.
+pub async fn working_tree_diff_plain() -> String {
+    working_tree_diff_impl(false).await
+}
 
-    let tracked = match git(&["--no-pager", "-c", "color.ui=always", "diff", "HEAD"]) {
+async fn working_tree_diff_impl(color: bool) -> String {
+    let git = |args: &'static [&'static str]| async move {
+        let mut cmd = Command::new("git");
+        cmd.args(args);
+        if color {
+            cmd.arg("-c").arg("color.ui=always");
+        }
+        cmd.output().await
+    };
+
+    let tracked = match git(&["--no-pager", "diff", "HEAD"]).await {
         Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
             // Fresh repo with no commits yet: diff against the empty tree instead.
             if stderr.contains("unknown revision") || stderr.contains("ambiguous argument") {
-                git(&["--no-pager", "-c", "color.ui=always", "diff"])
+                git(&["--no-pager", "diff"])
+                    .await
                     .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
                     .unwrap_or_default()
             } else {
@@ -87,6 +175,7 @@ pub fn working_tree_diff() -> String {
     };
 
     let untracked = git(&["ls-files", "--others", "--exclude-standard"])
+        .await
         .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
         .unwrap_or_default();
     let new_files: Vec<&str> = untracked.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -109,9 +198,131 @@ pub fn working_tree_diff() -> String {
     out
 }
 
+/// Stage all working-tree changes and commit them with an auto-generated
+/// message summarizing the changed files. This is the body of the `/commit`
+/// slash command. Returns a single human-readable progress line (the message
+/// used), or an error message when there's nothing to commit or this isn't a
+/// git repo. Phase order: `git add -A` → read the staged diff stat →
+/// `git commit -m "<message>"`.
+pub async fn commit() -> String {
+    // 1. Confirm we're inside a work tree before touching anything.
+    let in_tree = match Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .await
+    {
+        Ok(o) => {
+            o.status.success()
+                && String::from_utf8_lossy(&o.stdout).trim() == "true"
+        }
+        Err(err) => return format!("git not available: {err}"),
+    };
+    if !in_tree {
+        return "not a git repository".to_string();
+    }
+
+    // 2. Stage all changes (tracked modifications, deletions, untracked adds).
+    let add = match Command::new("git").args(["add", "-A"]).output().await {
+        Ok(o) => o,
+        Err(err) => return format!("git add failed: {err}"),
+    };
+    if !add.status.success() {
+        let stderr = String::from_utf8_lossy(&add.stderr);
+        return format!("git add failed: {}", stderr.trim());
+    }
+
+    // 3. Summarize the staged changes for the commit message. We list the
+    //    changed file names and count them for the "N files" phrasing.
+    let stat = match Command::new("git")
+        .args(["--no-pager", "diff", "--cached", "--name-only"])
+        .output()
+        .await
+    {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Err(err) => return format!("git diff failed: {err}"),
+    };
+    let files: Vec<&str> = stat.lines().filter(|l| !l.trim().is_empty()).collect();
+    if files.is_empty() {
+        return "nothing to commit (working tree clean)".to_string();
+    }
+
+    // Build a message from the file list: keep it to a single subject line plus
+    // a short body. Conventional-ish subject ("update N files") so it reads well
+    // in `git log` without depending on a model call.
+    let n = files.len();
+    let subject = if n == 1 {
+        format!("update {}", files[0])
+    } else {
+        format!("update {n} files")
+    };
+    // Body: list the files, trimmed to a reasonable cap so huge staging sets
+    // don't produce a multi-thousand-line commit message.
+    const MAX_FILES_IN_BODY: usize = 40;
+    let mut body = String::new();
+    for f in files.iter().take(MAX_FILES_IN_BODY) {
+        body.push_str("  - ");
+        body.push_str(f);
+        body.push('\n');
+    }
+    if n > MAX_FILES_IN_BODY {
+        body.push_str(&format!("  - … and {} more\n", n - MAX_FILES_IN_BODY));
+    }
+    let message = if body.trim().is_empty() {
+        subject.clone()
+    } else {
+        format!("{subject}\n\n{body}", body = body.trim_end())
+    };
+
+    // 4. Commit. We pass the message via `-m`; embedded newlines cover subject
+    //    + body in a single argument.
+    let commit = match Command::new("git")
+        .args(["commit", "-m", &message])
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(err) => return format!("git commit failed: {err}"),
+    };
+    if !commit.status.success() {
+        let stderr = String::from_utf8_lossy(&commit.stderr);
+        let stdout = String::from_utf8_lossy(&commit.stdout);
+        let detail = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        return format!("git commit failed: {detail}");
+    }
+
+    // Echo the summary the way the UI expects: `── … ──`.
+    format!("staged {n} file{}\ncommitted: \"{subject}\"", if n == 1 { "" } else { "s" })
+}
+
 /// The tools advertised to the model each turn.
 pub fn tool_specs() -> Vec<ToolSpec> {
     vec![
+        ToolSpec {
+            name: "update_plan".into(),
+            description: "Record or update a short task plan, shown to the user as a live checklist. Call it when starting a task that takes several steps — pass the full ordered list of steps — then call it again as you progress, ALWAYS passing the complete list with updated statuses (mark the step you're on `active`, finished steps `done`). Keep titles to a few words. Skip it for trivial one-step tasks.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "steps": {
+                        "type": "array",
+                        "description": "The full ordered list of plan steps, resubmitted in its entirety on every call.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "title": { "type": "string", "description": "Short description of the step (a few words)." },
+                                "status": { "type": "string", "enum": ["pending", "active", "done"], "description": "pending (not started), active (in progress now), or done." }
+                            },
+                            "required": ["title", "status"]
+                        }
+                    }
+                },
+                "required": ["steps"]
+            }),
+        },
         ToolSpec {
             name: "read".into(),
             description: "Read a UTF-8 text file. Lines are returned numbered (`<n>\\t<text>`). Returns at most 240 lines by default; page with offset/limit instead of assuming you saw everything.".into(),
@@ -139,13 +350,14 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "edit".into(),
-            description: "Replace a unique block of text in a file. old_string must occur once and be the file's literal text WITHOUT the `read` line-number gutter; whitespace and indentation differences are tolerated.".into(),
+            description: "Replace a unique block of text in a file. old_string must occur once and be the file's literal text WITHOUT the `read` line-number gutter; whitespace and indentation differences are tolerated. Set replace_all=true to replace every occurrence (use with care).".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "Path to the file to edit." },
-                    "old_string": { "type": "string", "description": "Exact text to replace; must be unique in the file. Do not include line numbers." },
-                    "new_string": { "type": "string", "description": "Replacement text." }
+                    "old_string": { "type": "string", "description": "Exact text to replace; must be unique in the file unless replace_all is set. Do not include line numbers." },
+                    "new_string": { "type": "string", "description": "Replacement text." },
+                    "replace_all": { "type": "boolean", "description": "If true, replace every occurrence of old_string (default: false, requires uniqueness)." }
                 },
                 "required": ["path", "old_string", "new_string"]
             }),
@@ -195,26 +407,64 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             }),
         },
         ToolSpec {
+            name: "diff".into(),
+            description: "Show what's changed in the working tree versus the last commit (tracked changes as a diff, plus a list of new untracked files). Use this to review your own edits before finishing.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {}
+            }),
+        },
+        ToolSpec {
             name: "grep".into(),
-            description: "Search file contents for a regular expression (ripgrep if available, else grep), respecting .gitignore. Returns matching `path:line: text`. Use this to find where something is defined or used.".into(),
+            description: "Search file contents for a regular expression (ripgrep if available, else grep), respecting .gitignore. Returns matching `path:line: text`. Use this to find where something is defined or used. Pass `context` to see surrounding lines. Pass `glob` to filter by file name pattern (e.g. `*.rs`).".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "pattern": { "type": "string", "description": "Regular expression to search for." },
-                    "path": { "type": "string", "description": "File or directory to search (default: the whole project)." }
+                    "path": { "type": "string", "description": "File or directory to search (default: the whole project)." },
+                    "context": { "type": "integer", "description": "Lines of context to show around each match (default: 0)." },
+                    "glob": { "type": "string", "description": "File name glob to filter (e.g. `*.rs`, `*.py`). Only files whose name matches are searched." }
                 },
                 "required": ["pattern"]
+            }),
+        },
+        ToolSpec {
+            name: "glob".into(),
+            description: "Find files by name pattern (e.g. `**/*.rs`, `src/*.py`). Respects .gitignore. Returns matching paths, up to 500 results.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "pattern": { "type": "string", "description": "Glob pattern to match file paths (e.g. `**/*.rs`, `*.py`)." },
+                    "path": { "type": "string", "description": "Directory to search in (default: the whole project)." }
+                },
+                "required": ["pattern"]
+            }),
+        },
+        ToolSpec {
+            name: "apply_patch".into(),
+            description: "Apply a multi-file patch. Use for coordinated edits across several files at once. Format: '*** Begin Patch\\n*** Update File: path\\n@@ context @\\n-old\\n+new\\n unchanged\\n*** End Patch'. Also supports '*** Add File: path' and '*** Delete File: path'.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "patch": { "type": "string", "description": "The patch text in Begin/End Patch format." }
+                },
+                "required": ["patch"]
             }),
         },
     ]
 }
 
+/// The tool specifications advertised to the model, cached once.
+pub static TOOL_SPECS: LazyLock<Vec<ToolSpec>> = LazyLock::new(tool_specs);
+
 /// The result of a tool call, split into `content` shown to the model and an
 /// optional richer `display` for the UI (e.g. a colored diff). This keeps
 /// edit/write feedback terse for the model while showing the user what changed.
+/// `plan`, when set, drives the live plan tracker instead of a transcript echo.
 pub struct ToolOutput {
     pub content: String,
     pub display: Option<String>,
+    pub plan: Option<Vec<PlanStep>>,
 }
 
 impl ToolOutput {
@@ -222,6 +472,7 @@ impl ToolOutput {
         Self {
             content,
             display: None,
+            plan: None,
         }
     }
 
@@ -229,6 +480,48 @@ impl ToolOutput {
         Self {
             content,
             display: Some(display),
+            plan: None,
+        }
+    }
+
+    /// A result that updates the user-facing plan checklist. The model sees only
+    /// `content` (a terse confirmation); the steps drive the pinned tracker.
+    fn planned(content: String, steps: Vec<PlanStep>) -> Self {
+        Self {
+            content,
+            display: None,
+            plan: Some(steps),
+        }
+    }
+}
+
+/// One line of the task plan/checklist surfaced by the `update_plan` tool. The
+/// model resubmits the whole list (with updated statuses) on every call, so
+/// there is no per-step index or state to drift out of sync.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanStep {
+    pub title: String,
+    pub status: PlanStatus,
+}
+
+/// The progress state of a single [`PlanStep`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanStatus {
+    Pending,
+    Active,
+    Done,
+}
+
+impl PlanStatus {
+    /// Map the model's free-form status string onto a state, tolerating the
+    /// common synonyms models reach for ("in_progress", "completed", "todo", …).
+    fn parse(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "done" | "complete" | "completed" | "finished" => PlanStatus::Done,
+            "active" | "in_progress" | "in-progress" | "doing" | "current" | "started" => {
+                PlanStatus::Active
+            }
+            _ => PlanStatus::Pending,
         }
     }
 }
@@ -237,7 +530,9 @@ impl ToolOutput {
 /// run concurrently within one round. The mutating/effecting tools (`write`,
 /// `edit`, `bash`) are excluded, since order and isolation matter for them.
 pub fn is_read_only(name: &str) -> bool {
-    matches!(name, "read" | "list" | "grep")
+    matches!(name, "read" | "list" | "grep" | "glob" | "diff")
+    // `apply_patch`, like `write`/`edit`, is effecting and never runs in a
+    // parallel batch — order and isolation matter.
 }
 
 /// Execute a tool by name. Tool failures are returned as content (not errors)
@@ -249,21 +544,113 @@ pub async fn execute(name: &str, arguments: &str) -> ToolOutput {
     }
 }
 
+/// Execute a tool by name, streaming `bash` output line-by-line through `on_line`
+/// so the UI can show progress in real time. Other tools behave identically to
+/// [`execute`] — `on_line` is only called for `bash`.
+pub async fn execute_streaming(
+    name: &str,
+    arguments: &str,
+    on_line: &mut (dyn FnMut(&str) + Send),
+) -> ToolOutput {
+    match run_streaming(name, arguments, on_line).await {
+        Ok(output) => output,
+        Err(err) => ToolOutput::plain(format!("Error: {err:#}")),
+    }
+}
+
+async fn run_streaming(
+    name: &str,
+    arguments: &str,
+    on_line: &mut (dyn FnMut(&str) + Send),
+) -> Result<ToolOutput> {
+    if name == "bash" {
+        let args: BashArgs = parse(arguments)?;
+        return Ok(ToolOutput::plain(condense(
+            &run_bash_streaming(&args.command, on_line).await?,
+        )));
+    }
+    // All other tools: delegate to the normal path (on_line unused).
+    run(name, arguments).await
+}
+
 async fn run(name: &str, arguments: &str) -> Result<ToolOutput> {
     match name {
         "read" => {
             let args: ReadArgs = parse(arguments)?;
-            let content = tokio::fs::read_to_string(&args.path)
-                .await
-                .with_context(|| format!("reading {}", args.path))?;
+            validate_workspace_path(&args.path)?;
+            // Check the per-turn cache first — models often re-read files.
+            let content = {
+                let cache = READ_CACHE.lock().unwrap();
+                if let Some(cached) = cache.get(&args.path) {
+                    cached.clone()
+                } else {
+                    drop(cache);
+                    // Read as bytes first so we can detect binary files and
+                    // give a clear message instead of an opaque UTF-8 error.
+                    let bytes = tokio::fs::read(&args.path)
+                        .await
+                        .with_context(|| format!("reading {}", args.path))?;
+                    if is_binary(&bytes) {
+                        bail!(
+                            "{} is a binary file ({} bytes) — the `read` tool is for text. \
+                             Use `bash` to inspect it (e.g. `file {}`, `xxd {} | head`).",
+                            args.path,
+                            bytes.len(),
+                            sh_quote(&args.path),
+                            sh_quote(&args.path)
+                        );
+                    }
+                    let content = String::from_utf8_lossy(&bytes).into_owned();
+                    if let Ok(mut cache) = READ_CACHE.lock() {
+                        if cache.len() >= READ_CACHE_MAX {
+                            cache.clear();
+                        }
+                        cache.insert(args.path.clone(), content.clone());
+                    }
+                    content
+                }
+            };
             Ok(ToolOutput::plain(truncate(&format_read(
                 &content,
                 args.offset,
                 args.limit,
             ))))
         }
+        "update_plan" => {
+            #[derive(Deserialize)]
+            struct StepArg {
+                title: String,
+                #[serde(default)]
+                status: String,
+            }
+            #[derive(Deserialize)]
+            struct PlanArgs {
+                steps: Vec<StepArg>,
+            }
+            let args: PlanArgs = parse(arguments)?;
+            if args.steps.is_empty() {
+                bail!("update_plan needs at least one step");
+            }
+            let steps: Vec<PlanStep> = args
+                .steps
+                .into_iter()
+                .map(|s| PlanStep {
+                    title: s.title,
+                    status: PlanStatus::parse(&s.status),
+                })
+                .collect();
+            let done = steps
+                .iter()
+                .filter(|s| s.status == PlanStatus::Done)
+                .count();
+            Ok(ToolOutput::planned(
+                format!("Plan recorded: {done}/{} done.", steps.len()),
+                steps,
+            ))
+        }
         "write" => {
             let args: WriteArgs = parse(arguments)?;
+            validate_workspace_path(&args.path)?;
             if let Some(parent) = Path::new(&args.path).parent()
                 && !parent.as_os_str().is_empty()
             {
@@ -277,6 +664,10 @@ async fn run(name: &str, arguments: &str) -> Result<ToolOutput> {
             tokio::fs::write(&args.path, &args.content)
                 .await
                 .with_context(|| format!("writing {}", args.path))?;
+            // Invalidate the read cache for this path after a write.
+            if let Ok(mut cache) = READ_CACHE.lock() {
+                cache.remove(&args.path);
+            }
             let after = maybe_format(&args.path, args.content).await;
             Ok(ToolOutput::shown(
                 format!("Wrote {} bytes to {}", after.len(), args.path),
@@ -285,22 +676,42 @@ async fn run(name: &str, arguments: &str) -> Result<ToolOutput> {
         }
         "edit" => {
             let args: EditArgs = parse(arguments)?;
+            validate_workspace_path(&args.path)?;
             let before = tokio::fs::read_to_string(&args.path)
                 .await
                 .with_context(|| format!("reading {}", args.path))?;
-            let after = apply_edit(&before, &args.old_string, &args.new_string)
-                .with_context(|| format!("editing {}", args.path))?;
+            let after = apply_edit(
+                &before,
+                &args.old_string,
+                &args.new_string,
+                args.replace_all,
+            )
+            .with_context(|| format!("editing {}", args.path))?;
             tokio::fs::write(&args.path, &after)
                 .await
                 .with_context(|| format!("writing {}", args.path))?;
+            // Invalidate the read cache for this path after an edit.
+            if let Ok(mut cache) = READ_CACHE.lock() {
+                cache.remove(&args.path);
+            }
             let after = maybe_format(&args.path, after).await;
+            let count = if args.replace_all {
+                before.matches(&args.old_string).count()
+            } else {
+                1
+            };
             Ok(ToolOutput::shown(
-                format!("Edited {}", args.path),
+                if args.replace_all && count > 1 {
+                    format!("Replaced {count} occurrences in {}", args.path)
+                } else {
+                    format!("Edited {}", args.path)
+                },
                 diff(&before, &after),
             ))
         }
         "multi_edit" => {
             let args: MultiEditArgs = parse(arguments)?;
+            validate_workspace_path(&args.path)?;
             if args.edits.is_empty() {
                 bail!("no edits provided");
             }
@@ -311,12 +722,16 @@ async fn run(name: &str, arguments: &str) -> Result<ToolOutput> {
             // nothing) if any fails, so a partial multi-edit never lands.
             let mut after = before.clone();
             for (i, e) in args.edits.iter().enumerate() {
-                after = apply_edit(&after, &e.old_string, &e.new_string)
+                after = apply_edit(&after, &e.old_string, &e.new_string, false)
                     .with_context(|| format!("editing {} (edit #{})", args.path, i + 1))?;
             }
             tokio::fs::write(&args.path, &after)
                 .await
                 .with_context(|| format!("writing {}", args.path))?;
+            // Invalidate the read cache for this path after a multi-edit.
+            if let Ok(mut cache) = READ_CACHE.lock() {
+                cache.remove(&args.path);
+            }
             let after = maybe_format(&args.path, after).await;
             Ok(ToolOutput::shown(
                 format!("Applied {} edits to {}", args.edits.len(), args.path),
@@ -329,17 +744,97 @@ async fn run(name: &str, arguments: &str) -> Result<ToolOutput> {
         }
         "list" => {
             let args: ListArgs = parse(arguments)?;
-            let path = sh_quote(args.path.as_deref().unwrap_or("."));
-            // git ls-files inside a repo (gitignore-aware); plain find otherwise.
-            let cmd = format!(
-                "if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then \
-                   git ls-files --cached --others --exclude-standard -- {path}; \
-                 else find {path} -type f -not -path '*/.git/*'; fi 2>/dev/null \
-                 | head -400"
-            );
-            let out = run_bash(&cmd).await?;
-            let out = if out.trim() == "[no output]" {
+            let path = args.path.as_deref().unwrap_or(".");
+            // Use the `ignore` crate for gitignore-aware directory walking, same
+            // semantics as `git ls-files` but without spawning a process.
+            let mut out = String::new();
+            let mut count = 0u32;
+            let walker = ignore::WalkBuilder::new(path)
+                .git_ignore(true)
+                .git_global(true)
+                .git_exclude(true)
+                .require_git(false) // fall back to all files outside a repo
+                .hidden(false)
+                .filter_entry(|e| !is_vcs_metadata_dir(e))
+                .build();
+            for entry in walker {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+                    continue;
+                }
+                let rel = entry.path().to_string_lossy();
+                out.push_str(&rel);
+                out.push('\n');
+                count += 1;
+                if count >= 1000 {
+                    out.push_str("… (truncated at 1000 entries)\n");
+                    break;
+                }
+            }
+            let out = if out.is_empty() {
                 "(no files found)".to_string()
+            } else {
+                out
+            };
+            Ok(ToolOutput::plain(truncate(&out)))
+        }
+        "diff" => {
+            // Reuse the working-tree diff summary, but return it as model content
+            // (plain text, no ANSI) so the model can review what changed.
+            Ok(ToolOutput::plain(working_tree_diff_plain().await))
+        }
+        "glob" => {
+            #[derive(Deserialize)]
+            struct GlobArgs {
+                pattern: String,
+                path: Option<String>,
+            }
+            let args: GlobArgs = parse(arguments)?;
+            let path = args.path.as_deref().unwrap_or(".");
+            let mut out = String::new();
+            let mut count = 0u32;
+            let mut builder = ignore::WalkBuilder::new(path);
+            builder
+                .git_ignore(true)
+                .git_global(true)
+                .git_exclude(true)
+                .require_git(false)
+                .hidden(false)
+                .filter_entry(|e| !is_vcs_metadata_dir(e));
+            let mut override_builder = ignore::overrides::OverrideBuilder::new(path);
+            if let Err(e) = override_builder.add(&args.pattern) {
+                return Ok(ToolOutput::plain(format!("invalid glob `{}`: {e}", args.pattern)));
+            }
+            match override_builder.build() {
+                Ok(ov) => {
+                    let walker = builder.overrides(ov).build();
+                    for entry in walker {
+                        let entry = match entry {
+                            Ok(e) => e,
+                            Err(_) => continue,
+                        };
+                        if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+                            continue;
+                        }
+                        let rel = entry.path().to_string_lossy();
+                        out.push_str(&rel);
+                        out.push('\n');
+                        count += 1;
+                        if count >= 500 {
+                            out.push_str("… (truncated at 500 entries)\n");
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    return Ok(ToolOutput::plain(format!("invalid glob `{}`: {e}", args.pattern)));
+                }
+            }
+            let out = if out.is_empty() {
+                format!("no files match `{}`", args.pattern)
             } else {
                 out
             };
@@ -347,24 +842,290 @@ async fn run(name: &str, arguments: &str) -> Result<ToolOutput> {
         }
         "grep" => {
             let args: GrepArgs = parse(arguments)?;
-            let pattern = sh_quote(&args.pattern);
-            let path = sh_quote(args.path.as_deref().unwrap_or("."));
-            // ripgrep (gitignore-aware) when present, else recursive grep.
-            let cmd = format!(
-                "if command -v rg >/dev/null 2>&1; then \
-                   rg -n --no-heading --color=never -e {pattern} -- {path}; \
-                 else grep -rnI -e {pattern} -- {path} 2>/dev/null; fi | head -200"
-            );
-            let out = run_bash(&cmd).await?;
-            let out = if out.trim() == "[no output]" {
+            let pattern = &args.pattern;
+            let path = args.path.as_deref().unwrap_or(".");
+            let context = args.context.unwrap_or(0);
+
+            // Fast path: shell out to ripgrep when available — 5-20x faster than
+            // the inline walker, with built-in .gitignore support and SIMD.
+            if tool_available("rg").await {
+                let mut cmd_args = vec![
+                    "--no-heading".to_string(),
+                    "--line-number".to_string(),
+                    "--color=never".to_string(),
+                    "--max-count=200".to_string(),
+                    // Never search VCS metadata, even if the user's ripgrep
+                    // config enables --hidden (which would otherwise descend
+                    // into .git and leak repository internals to the model).
+                    "--glob=!.git".to_string(),
+                    "--glob=!.hg".to_string(),
+                    "--glob=!.svn".to_string(),
+                    "--glob=!.jj".to_string(),
+                ];
+                if context > 0 {
+                    cmd_args.push(format!("--context={context}"));
+                }
+                if let Some(glob) = &args.glob {
+                    cmd_args.push("--glob".to_string());
+                    cmd_args.push(glob.clone());
+                }
+                cmd_args.push("--".to_string());
+                cmd_args.push(pattern.clone());
+                cmd_args.push(path.to_string());
+                let output = Command::new("rg")
+                    .args(&cmd_args)
+                    .output()
+                    .await;
+                match output {
+                    Ok(o) if o.status.success() || !o.stdout.is_empty() => {
+                        let text = String::from_utf8_lossy(&o.stdout);
+                        let out = if text.trim().is_empty() {
+                            format!("no matches for {}", args.pattern)
+                        } else {
+                            text.into_owned()
+                        };
+                        return Ok(ToolOutput::plain(truncate(&out)));
+                    }
+                    Ok(o) if o.status.code() == Some(1) => {
+                        // rg exit 1 = no matches (not an error)
+                        return Ok(ToolOutput::plain(
+                            format!("no matches for {}", args.pattern),
+                        ));
+                    }
+                    // Fall through to inline walker on other rg errors.
+                    _ => {}
+                }
+            }
+
+            // Fallback: inline walker with the `ignore` crate + `regex`.
+            let re = match Regex::new(pattern) {
+                Ok(re) => re,
+                Err(e) => {
+                    return Ok(ToolOutput::plain(format!("invalid regex: {e}")));
+                }
+            };
+            let mut builder = ignore::WalkBuilder::new(path);
+            builder
+                .git_ignore(true)
+                .git_global(true)
+                .git_exclude(true)
+                .require_git(false)
+                .hidden(false)
+                .filter_entry(|e| !is_vcs_metadata_dir(e));
+            if let Some(glob) = &args.glob {
+                match ignore::overrides::OverrideBuilder::new(path).add(glob) {
+                    Ok(ovb) => match ovb.build() {
+                        Ok(ov) => {
+                            builder.overrides(ov);
+                        }
+                        Err(e) => {
+                            return Ok(ToolOutput::plain(format!("invalid glob `{glob}`: {e}")));
+                        }
+                    },
+                    Err(e) => {
+                        return Ok(ToolOutput::plain(format!("invalid glob `{glob}`: {e}")));
+                    }
+                }
+            }
+            let mut out = String::new();
+            let mut count = 0u32;
+            let walker = builder.build();
+            for entry in walker {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(_) => continue,
+                };
+                if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+                    continue;
+                }
+                let file_path = entry.path();
+                let bytes = match tokio::fs::read(file_path).await {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                if is_binary(&bytes) {
+                    continue;
+                }
+                let content = String::from_utf8_lossy(&bytes);
+                let rel = file_path.to_string_lossy();
+                let lines: Vec<&str> = content.lines().collect();
+                for (i, line) in lines.iter().enumerate() {
+                    if re.is_match(line) {
+                        let line_no = i + 1;
+                        if context > 0 {
+                            let start = i.saturating_sub(context);
+                            let end = (i + context + 1).min(lines.len());
+                            for ctx_i in start..end {
+                                let marker = if ctx_i == i { ":" } else { "-" };
+                                out.push_str(&format!(
+                                    "{rel}{marker}{}: {}\n",
+                                    ctx_i + 1,
+                                    lines[ctx_i]
+                                ));
+                            }
+                            out.push_str("--\n");
+                        } else {
+                            out.push_str(&format!("{rel}:{line_no}: {line}\n"));
+                        }
+                        count += 1;
+                        if count >= 200 {
+                            out.push_str("… (truncated at 200 matches)\n");
+                            break;
+                        }
+                    }
+                }
+                if count >= 200 {
+                    break;
+                }
+            }
+            let out = if out.is_empty() {
                 format!("no matches for {}", args.pattern)
             } else {
                 out
             };
             Ok(ToolOutput::plain(truncate(&out)))
         }
+        "apply_patch" => {
+            #[derive(Deserialize)]
+            struct PatchArgs {
+                patch: String,
+            }
+            let args: PatchArgs = parse(arguments)?;
+            let result = apply_multi_patch(&args.patch)?;
+            Ok(ToolOutput::plain(result))
+        }
         other => bail!("unknown tool: {other}"),
     }
+}
+
+/// Apply a multi-file patch in Claude's `apply_patch` format. The envelope is
+/// `*** Begin Patch … *** End Patch`; inside, each `*** Update File:`,
+/// `*** Add File:`, or `*** Delete File:` header introduces a file operation.
+///
+/// For updates, each line is either context (no prefix), a removal (`-`), or an
+/// addition (`+`). The result file is rebuilt as the "after" state: context and
+/// added lines are emitted in order, removed lines are dropped, and `@@ … @@`
+/// hunk headers are skipped. This works because the model sends the full new
+/// region via context+added lines, with `-` marking only what was removed. We
+/// read the original only to verify the file exists and to diff against for the
+/// UI-friendly result.
+fn apply_multi_patch(patch: &str) -> Result<String> {
+    let mut results = Vec::new();
+    let lines: Vec<&str> = patch.lines().collect();
+
+    // Validate envelope. An empty body is also rejected so the model gets a
+    // clear message instead of a confusing "no operations" result.
+    if lines.is_empty() {
+        bail!("patch is empty");
+    }
+    if !lines[0].trim().starts_with("*** Begin Patch") {
+        bail!("patch must start with '*** Begin Patch'");
+    }
+    let mut i = 1;
+
+    while i < lines.len() {
+        let line = lines[i].trim();
+        if line.starts_with("*** End Patch") || line.is_empty() {
+            i += 1;
+            continue;
+        }
+
+        // Add File: every following line until the next `*** ` directive is the
+        // new file's content (verbatim, no +/- prefixes).
+        if let Some(path) = line.strip_prefix("*** Add File: ") {
+            let path = path.trim();
+            validate_workspace_path(path)?;
+            let mut content = String::new();
+            i += 1;
+            while i < lines.len() && !lines[i].trim().starts_with("*** ") {
+                content.push_str(lines[i]);
+                content.push('\n');
+                i += 1;
+            }
+            if let Some(parent) = Path::new(path).parent()
+                && !parent.as_os_str().is_empty()
+            {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+            std::fs::write(path, &content).with_context(|| format!("writing {path}"))?;
+            if let Ok(mut cache) = READ_CACHE.lock() {
+                cache.remove(path);
+            }
+            results.push(format!("+ added {path}"));
+            continue;
+        }
+
+        // Delete File: remove the file if it exists.
+        if let Some(path) = line.strip_prefix("*** Delete File: ") {
+            let path = path.trim();
+            validate_workspace_path(path)?;
+            std::fs::remove_file(path).with_context(|| format!("deleting {path}"))?;
+            if let Ok(mut cache) = READ_CACHE.lock() {
+                cache.remove(path);
+            }
+            results.push(format!("- deleted {path}"));
+            i += 1;
+            continue;
+        }
+
+        // Update File: rebuild from context + added lines, dropping removed ones.
+        if let Some(path) = line.strip_prefix("*** Update File: ") {
+            let path = path.trim();
+            validate_workspace_path(path)?;
+            // Read to verify the file exists (Update File can't create — use
+            // Add File for that). The content isn't needed: the rebuilt "after"
+            // text comes entirely from the patch's context + added lines.
+            std::fs::read_to_string(path)
+                .with_context(|| format!("reading {path} (use *** Add File: to create)"))?;
+            let mut after = String::new();
+            let mut changes = 0u32;
+            i += 1;
+
+            while i < lines.len() && !lines[i].trim().starts_with("*** ") {
+                let l = lines[i];
+                match l.chars().next() {
+                    Some('+') => {
+                        after.push_str(&l[1..]);
+                        after.push('\n');
+                        changes += 1;
+                        i += 1;
+                    }
+                    Some('-') => {
+                        // Skip removed line — it's dropped from the output.
+                        changes += 1;
+                        i += 1;
+                    }
+                    _ => {
+                        // Context line or `@@ … @@` hunk header. Include the
+                        // line as-is, except for the hunk header, which is just
+                        // a delimiter and not part of the file content.
+                        if !l.trim_start().starts_with("@@") {
+                            after.push_str(l);
+                            after.push('\n');
+                        }
+                        i += 1;
+                    }
+                }
+            }
+
+            if let Ok(mut cache) = READ_CACHE.lock() {
+                cache.remove(path);
+            }
+            std::fs::write(path, &after).with_context(|| format!("writing {path}"))?;
+            results.push(format!("~ updated {path} ({changes} change{})", if changes == 1 { "" } else { "s" }));
+            continue;
+        }
+
+        // Unknown directive — skip it rather than aborting the whole patch, so a
+        // minor format variation doesn't lose all the file operations.
+        i += 1;
+    }
+
+    if results.is_empty() {
+        bail!("patch contained no file operations");
+    }
+    Ok(results.join("\n"))
 }
 
 /// Single-quote a string for safe interpolation into an `sh -c` command.
@@ -372,31 +1133,55 @@ fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// A compact colored diff (changed lines only) for UI display, led by a bold
-/// one-line summary of how many lines were added and removed — so a write/edit
-/// shows what happened at a glance instead of trailing off into raw diff lines.
+/// A compact, readable diff for UI display: a bold one-line summary of how many
+/// lines changed, then each changed region shown with a few lines of unchanged
+/// context, gutter line numbers, and `±` signs. The context and line numbers let
+/// the reader see *where* an edit lands, not just what changed; non-adjacent
+/// regions are separated by a dim `⋯`. The model never sees this — it's the
+/// `display` half of an edit's [`ToolOutput`], so the extra context costs no
+/// tokens. (`/diff` shows the full working-tree diff.)
 fn diff(before: &str, after: &str) -> String {
     use similar::{ChangeTag, TextDiff};
-    let mut body = String::new();
+    /// Lines of unchanged context shown on each side of a changed region.
+    const CONTEXT: usize = 2;
+
+    let tdiff = TextDiff::from_lines(before, after);
     let (mut adds, mut dels) = (0usize, 0usize);
-    for change in TextDiff::from_lines(before, after).iter_all_changes() {
-        let (sign, color) = match change.tag() {
-            ChangeTag::Delete => {
-                dels += 1;
-                ("-", "\x1b[31m")
-            }
-            ChangeTag::Insert => {
-                adds += 1;
-                ("+", "\x1b[32m")
-            }
-            ChangeTag::Equal => continue,
-        };
-        let line = change.value().trim_end_matches('\n');
-        body.push_str(&format!("{color}{sign} {line}\x1b[0m\n"));
+    for change in tdiff.iter_all_changes() {
+        match change.tag() {
+            ChangeTag::Insert => adds += 1,
+            ChangeTag::Delete => dels += 1,
+            ChangeTag::Equal => {}
+        }
     }
     if adds == 0 && dels == 0 {
         return "(no changes)".to_string();
     }
+
+    let mut body = String::new();
+    for (hunk_idx, group) in tdiff.grouped_ops(CONTEXT).iter().enumerate() {
+        if hunk_idx > 0 {
+            body.push_str("\x1b[2m   ⋯\x1b[0m\n"); // gap between changed regions
+        }
+        for op in group {
+            for change in tdiff.iter_changes(op) {
+                // Number each line by its own side of the diff: removed lines by
+                // their old position, added/context lines by their new one.
+                let (idx, sign, color) = match change.tag() {
+                    ChangeTag::Delete => (change.old_index(), '-', "\x1b[31m"),
+                    ChangeTag::Insert => (change.new_index(), '+', "\x1b[32m"),
+                    ChangeTag::Equal => (change.new_index(), ' ', "\x1b[2m"),
+                };
+                let gutter = idx
+                    .map(|i| format!("{:>4}", i + 1))
+                    .unwrap_or_else(|| "    ".to_string());
+                let text = change.value();
+                let text = text.strip_suffix('\n').unwrap_or(text);
+                body.push_str(&format!("{color}{gutter} {sign} {text}\x1b[0m\n"));
+            }
+        }
+    }
+
     let plural = |n: usize| if n == 1 { "" } else { "s" };
     format!(
         "\x1b[1m{adds} addition{}, {dels} deletion{}\x1b[0m\n{body}",
@@ -407,20 +1192,28 @@ fn diff(before: &str, after: &str) -> String {
 
 /// Replace `old` with `new` in `text`, tolerating the whitespace differences
 /// that make models' exact-match edits fail. Strategies, in order:
-///   1. exact, unique match;
+///   1. exact match (unique, or all when `replace_all`);
 ///   2. line-based match ignoring trailing whitespace (also fixes CRLF);
 ///   3. line-based match ignoring all indentation, re-indenting `new` to fit.
 ///
-/// Each requires a unique match so an edit is never applied ambiguously.
-fn apply_edit(text: &str, old: &str, new: &str) -> Result<String> {
+/// Without `replace_all`, each strategy requires a unique match so an edit is
+/// never applied ambiguously. With `replace_all`, strategy 1 replaces every
+/// exact occurrence; the fuzzy strategies still require uniqueness (they can't
+/// safely disambiguate multiple fuzzy matches).
+fn apply_edit(text: &str, old: &str, new: &str, replace_all: bool) -> Result<String> {
     if old.is_empty() {
         bail!("old_string is empty");
     }
     // 1. Exact.
-    match text.matches(old).count() {
+    let count = text.matches(old).count();
+    if replace_all && count > 0 {
+        return Ok(text.replace(old, new));
+    }
+    match count {
         1 => return Ok(text.replacen(old, new, 1)),
         n if n > 1 => bail!(
-            "old_string is not unique ({n} matches); include more surrounding context to pick one"
+            "old_string is not unique ({n} matches); include more surrounding context to pick one, \
+             or set replace_all=true to replace every occurrence"
         ),
         _ => {}
     }
@@ -453,7 +1246,9 @@ fn apply_edit(text: &str, old: &str, new: &str) -> Result<String> {
 
 /// Build a helpful error when `old_string` doesn't match: point the model at the
 /// nearest similar lines (with numbers) so it can copy the exact text, rather
-/// than blindly retrying the same string.
+/// than blindly retrying the same string. Falls back to similarity scoring when
+/// no line contains the needle — so a model that got a line slightly wrong still
+/// gets pointed at the right region instead of "no line resembles".
 fn edit_not_found_help(text: &str, old: &str) -> String {
     let mut msg = String::from(
         "old_string not found, even allowing for whitespace differences. \
@@ -477,6 +1272,41 @@ fn edit_not_found_help(text: &str, old: &str) -> String {
         .map(|(i, _)| i)
         .take(3)
         .collect();
+    // If no direct hit, try similarity: score each line by how many words from
+    // the needle it shares, and show the top matches. This catches cases where
+    // the model misremembered a line (wrong variable name, typo, etc.) but is
+    // still close enough to find the right region.
+    let hits = if hits.is_empty() {
+        let needles: Vec<&str> = needle.split_whitespace().collect();
+        if needles.is_empty() {
+            return msg
+                + &format!(
+                    "No line resembling `{}` is in the {}-line file; re-read it to get the current text.",
+                    clip(needle, 60),
+                    lines.len()
+                );
+        }
+        let mut scored: Vec<(usize, usize)> = lines
+            .iter()
+            .enumerate()
+            .map(|(i, l)| {
+                let lower = l.to_lowercase();
+                let score = needles
+                    .iter()
+                    .filter(|w| {
+                        let w = w.to_lowercase();
+                        lower.contains(w.as_str())
+                    })
+                    .count();
+                (i, score)
+            })
+            .filter(|(_, s)| *s > 0)
+            .collect();
+        scored.sort_by_key(|(_, s)| std::cmp::Reverse(*s));
+        scored.into_iter().take(3).map(|(i, _)| i).collect()
+    } else {
+        hits
+    };
     if hits.is_empty() {
         msg.push_str(&format!(
             "No line resembling `{}` is in the {}-line file; re-read it to get the current text.",
@@ -487,8 +1317,8 @@ fn edit_not_found_help(text: &str, old: &str) -> String {
     }
     msg.push_str("The closest matching lines in the file are:\n");
     for i in hits {
-        let lo = i.saturating_sub(1);
-        let hi = (i + 2).min(lines.len());
+        let lo = i.saturating_sub(2);
+        let hi = (i + 3).min(lines.len());
         for (off, line) in lines[lo..hi].iter().enumerate() {
             msg.push_str(&format!("{:>6}\t{}\n", lo + off + 1, line));
         }
@@ -580,6 +1410,16 @@ fn reindent(new: &str, old_indent: &str, file_indent: &str) -> String {
 }
 
 async fn run_bash(command: &str) -> Result<String> {
+    run_bash_streaming(command, &mut |_| {}).await
+}
+
+/// Run a shell command, calling `on_line` for each line of output as it arrives
+/// (both stdout and stderr). The final assembled output is still returned for the
+/// model. Lines are delivered with a trailing newline.
+async fn run_bash_streaming(
+    command: &str,
+    on_line: &mut (dyn FnMut(&str) + Send),
+) -> Result<String> {
     // Refuse the handful of irreversible operations a checkpoint can't undo.
     if let Some(reason) = guard::catastrophic_op(command) {
         return Ok(format!(
@@ -588,22 +1428,45 @@ async fn run_bash(command: &str) -> Result<String> {
              themselves (they can also set HI_ALLOW_DANGEROUS=1 to disable this guard)."
         ));
     }
-    let future = Command::new("sh").arg("-c").arg(command).output();
-    let output = match tokio::time::timeout(BASH_TIMEOUT, future).await {
-        Ok(result) => result.context("failed to spawn command")?,
-        Err(_) => bail!("command timed out after {}s", BASH_TIMEOUT.as_secs()),
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(command)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("failed to spawn command")?;
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    // Use a shared Mutex<&mut dyn FnMut> so both stdout and stderr readers can
+    // call on_line without double-borrowing.
+    let cb: &std::sync::Mutex<&mut (dyn FnMut(&str) + Send)> = &std::sync::Mutex::new(on_line);
+    let (stdout_lines, stderr_lines): (Vec<String>, Vec<String>) =
+        tokio::join!(read_lines(stdout, cb), read_lines(stderr, cb),);
+
+    // Wait for the process to finish (with timeout for the remainder).
+    let status = match tokio::time::timeout(BASH_TIMEOUT, child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(err)) => bail!("command failed: {err}"),
+        Err(_) => {
+            let _ = child.kill().await;
+            bail!("command timed out after {}s", BASH_TIMEOUT.as_secs())
+        }
     };
 
     let mut out = String::new();
-    out.push_str(&String::from_utf8_lossy(&output.stdout));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if !stderr.is_empty() {
+    for line in &stdout_lines {
+        out.push_str(line);
+    }
+    for line in &stderr_lines {
         if !out.is_empty() && !out.ends_with('\n') {
             out.push('\n');
         }
-        out.push_str(&stderr);
+        out.push_str(line);
     }
-    if let Some(code) = output.status.code()
+    if let Some(code) = status.code()
         && code != 0
     {
         out.push_str(&format!("\n[exit code {code}]"));
@@ -612,6 +1475,29 @@ async fn run_bash(command: &str) -> Result<String> {
         out.push_str("[no output]");
     }
     Ok(out)
+}
+
+/// Read lines from an optional child-process pipe, calling `on_line` (behind a
+/// Mutex so stdout/stderr can share it) for each line, and collecting them.
+async fn read_lines<R: tokio::io::AsyncRead + Unpin>(
+    pipe: Option<R>,
+    on_line: &std::sync::Mutex<&mut (dyn FnMut(&str) + Send)>,
+) -> Vec<String> {
+    let Some(pipe) = pipe else {
+        return Vec::new();
+    };
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let mut lines = Vec::new();
+    let mut reader = BufReader::new(pipe).lines();
+    while let Ok(Some(line)) = reader.next_line().await {
+        let mut with_nl = line;
+        with_nl.push('\n');
+        if let Ok(mut cb) = on_line.lock() {
+            (*cb)(&with_nl);
+        }
+        lines.push(with_nl);
+    }
+    lines
 }
 
 fn parse<T: for<'de> Deserialize<'de>>(arguments: &str) -> Result<T> {
@@ -856,9 +1742,9 @@ fn format_read(content: &str, offset: Option<usize>, limit: Option<usize>) -> St
 /// Never fails the edit — a missing formatter, or a formatter that errors on
 /// not-yet-valid code, just leaves the file exactly as written.
 async fn maybe_format(path: &str, written: String) -> String {
-    // Opt-out: some repos aren't formatter-clean, so reformatting on edit would
-    // churn unrelated lines. `HI_NO_FORMAT=1` disables it.
-    if std::env::var_os("HI_NO_FORMAT").is_some() {
+    // Opt-in: formatters churn unrelated lines in repos that aren't
+    // formatter-clean. Disabled by default; set `HI_FORMAT=1` to enable.
+    if std::env::var_os("HI_FORMAT").is_none() {
         return written;
     }
     let Some((probe, command)) = formatter_for(path) else {
@@ -885,15 +1771,42 @@ fn formatter_for(path: &str) -> Option<(&'static str, &'static str)> {
     }
 }
 
+/// Cached results of `tool_available` probes — the answer never changes within
+/// a session, so we avoid a fork+exec per edit.
+static TOOL_AVAILABLE_CACHE: LazyLock<Mutex<HashMap<String, bool>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 /// Whether `prog` is on PATH (so we only invoke formatters that exist).
+/// Results are cached per-session: the probe is a fork+exec that takes
+/// ~5-20ms, and it's called on every write/edit. Cached after first call.
 async fn tool_available(prog: &str) -> bool {
-    Command::new("sh")
+    if let Some(&result) = TOOL_AVAILABLE_CACHE.lock().unwrap().get(prog) {
+        return result;
+    }
+    let result = Command::new("sh")
         .arg("-c")
         .arg(format!("command -v {}", sh_quote(prog)))
         .output()
         .await
         .map(|o| o.status.success())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    TOOL_AVAILABLE_CACHE
+        .lock()
+        .unwrap()
+        .insert(prog.to_string(), result);
+    result
+}
+
+/// Heuristic: does `bytes` look like a binary file? A NUL byte in the first 8 KB
+/// is the classic signal (ripgrep uses the same heuristic). Empty files are not
+/// binary. This lets `grep` and `read` skip/guard against non-text files instead
+/// of failing opaquely on `read_to_string`.
+fn is_binary(bytes: &[u8]) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+    let probe = &bytes[..bytes.len().min(8192)];
+    probe.contains(&0)
 }
 
 #[derive(Deserialize)]
@@ -930,6 +1843,9 @@ struct EditArgs {
     path: String,
     old_string: String,
     new_string: String,
+    /// If true, replace every occurrence of `old_string` (default: false).
+    #[serde(default)]
+    replace_all: bool,
 }
 
 #[derive(Deserialize)]
@@ -943,6 +1859,13 @@ struct GrepArgs {
     pattern: String,
     #[serde(default)]
     path: Option<String>,
+    /// Lines of context to show around each match (default: 0).
+    #[serde(default)]
+    context: Option<usize>,
+    /// File name glob to filter (e.g. `*.rs`). Only files whose name matches
+    /// are searched.
+    #[serde(default)]
+    glob: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -953,8 +1876,8 @@ struct BashArgs {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_READ_LIMIT, apply_edit, condense_diagnostics, condense_enabled, diff,
-        edit_not_found_help, format_read, truncate_to,
+        DEFAULT_READ_LIMIT, apply_edit, apply_multi_patch, condense_diagnostics,
+        condense_enabled, diff, edit_not_found_help, format_read, truncate_to,
     };
 
     #[test]
@@ -1198,6 +2121,10 @@ FAILED tests/test_b.py::test_parsing - assert 2 == 3
         std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
         let p = path.to_string_lossy();
 
+        // Bypass path guard — temp files live outside the project workspace.
+        let had_guard = std::env::var_os("HI_NO_PATH_GUARD");
+        unsafe { std::env::set_var("HI_NO_PATH_GUARD", "1"); }
+
         // Two edits in one atomic call.
         let args = format!(
             r#"{{"path":"{p}","edits":[{{"old_string":"one","new_string":"1"}},{{"old_string":"three","new_string":"3"}}]}}"#
@@ -1221,6 +2148,10 @@ FAILED tests/test_b.py::test_parsing - assert 2 == 3
             "1\ntwo\n3\n",
             "file unchanged after a failed batch"
         );
+        // Restore env.
+        unsafe {
+            if had_guard.is_none() { std::env::remove_var("HI_NO_PATH_GUARD"); }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1242,10 +2173,51 @@ FAILED tests/test_b.py::test_parsing - assert 2 == 3
     }
 
     #[test]
+    fn diff_shows_context_and_line_numbers() {
+        // A change deep in a file must show its surrounding context with gutter
+        // line numbers, so the reader can see *where* it lands — not just the
+        // changed line floating context-free.
+        let before = "a\nb\nc\nd\ne\nf\ng\n";
+        let after = "a\nb\nc\nD\ne\nf\ng\n";
+        let plain = strip_ansi(&diff(before, after));
+        // Summary still leads.
+        assert!(
+            plain.lines().next().unwrap().contains("1 addition"),
+            "summary: {plain}"
+        );
+        // Unchanged neighbours appear as context (proves we're not changed-only).
+        assert!(plain.contains(" c\n") || plain.contains(" c"), "context: {plain}");
+        // The change is on line 4, numbered, with both old and new sides shown.
+        assert!(plain.contains("4 - d"), "removed line w/ number: {plain}");
+        assert!(plain.contains("4 + D"), "added line w/ number: {plain}");
+        // Distant lines (line 1) are NOT shown — only context around the change.
+        assert!(!plain.contains("1   a") && !plain.contains("1 + a"), "far context elided: {plain}");
+    }
+
+    /// Strip ANSI SGR escapes (`\x1b[…m`) so tests can assert on plain text.
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for c2 in chars.by_ref() {
+                    if c2 == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    #[test]
     fn read_only_tools_are_classified() {
         assert!(super::is_read_only("read"));
         assert!(super::is_read_only("list"));
         assert!(super::is_read_only("grep"));
+        assert!(super::is_read_only("diff"));
         // Mutating / effecting tools are not safe to run concurrently.
         assert!(!super::is_read_only("write"));
         assert!(!super::is_read_only("edit"));
@@ -1266,8 +2238,182 @@ FAILED tests/test_b.py::test_parsing - assert 2 == 3
     }
 
     #[tokio::test]
+    async fn grep_glob_filters_by_extension() {
+        // `fn tool_specs` is in lib.rs but not in any .py file. With a `*.py`
+        // glob, grep should find no matches; without a glob it finds the .rs hit.
+        let py = super::execute("grep", r#"{"pattern":"fn tool_specs","glob":"*.py"}"#).await;
+        assert!(
+            py.content.contains("no matches"),
+            "glob *.py excludes the .rs hit: {}",
+            py.content
+        );
+        let rs = super::execute("grep", r#"{"pattern":"fn tool_specs","glob":"*.rs"}"#).await;
+        assert!(
+            rs.content.contains("tool_specs"),
+            "glob *.rs finds the hit: {}",
+            rs.content
+        );
+    }
+
+    #[tokio::test]
+    async fn grep_skips_binary_files() {
+        // A file with a NUL byte should be skipped, not error out.
+        let dir = std::env::temp_dir().join(format!("hi-grep-bin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "hello world\n").unwrap();
+        std::fs::write(dir.join("b.bin"), b"hello\x00world\n").unwrap();
+        let p = dir.to_string_lossy();
+        let out = super::execute("grep", &format!(r#"{{"pattern":"hello","path":"{p}"}}"#)).await;
+        // Should find the match in a.txt but not error on b.bin.
+        assert!(
+            out.content.contains("a.txt"),
+            "found text file: {}",
+            out.content
+        );
+        assert!(
+            !out.content.contains("Error"),
+            "no error on binary: {}",
+            out.content
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn update_plan_records_steps_and_statuses() {
+        let args = r#"{"steps":[
+            {"title":"find leak","status":"done"},
+            {"title":"fix walkers","status":"in_progress"},
+            {"title":"add tests","status":"pending"}
+        ]}"#;
+        let out = super::execute("update_plan", args).await;
+        let plan = out.plan.expect("plan is set");
+        assert_eq!(plan.len(), 3);
+        assert_eq!(plan[0].status, super::PlanStatus::Done);
+        // "in_progress" is a common model synonym for active.
+        assert_eq!(plan[1].status, super::PlanStatus::Active);
+        assert_eq!(plan[2].status, super::PlanStatus::Pending);
+        // Model-facing content is a terse confirmation; the steps drive the
+        // pinned tracker, so there's no transcript-echo display.
+        assert!(out.content.contains("1/3"), "content: {}", out.content);
+        assert!(out.display.is_none(), "plan should not echo to transcript");
+    }
+
+    #[tokio::test]
+    async fn update_plan_rejects_empty() {
+        let out = super::execute("update_plan", r#"{"steps":[]}"#).await;
+        assert!(out.content.contains("Error"), "{}", out.content);
+        assert!(out.plan.is_none());
+    }
+
+    #[tokio::test]
+    async fn list_excludes_git_metadata_but_keeps_dotfiles() {
+        // Regression: the model called `list` during a review and got flooded
+        // with `.git/objects/...` paths. We walk hidden files (so real dotfiles
+        // like `.github/` are visible) but must prune VCS metadata directories.
+        let dir = std::env::temp_dir().join(format!("hi-list-vcs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".git/objects/ab")).unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join(".github/workflows")).unwrap();
+        std::fs::write(dir.join(".git/config"), "[core]\n").unwrap();
+        std::fs::write(dir.join(".git/objects/ab/cdef"), b"\x00\x01obj").unwrap();
+        std::fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(dir.join(".github/workflows/ci.yml"), "name: ci\n").unwrap();
+
+        let p = dir.to_string_lossy();
+        let out = super::execute("list", &format!(r#"{{"path":"{p}"}}"#)).await;
+
+        assert!(
+            !out.content.contains("/.git/"),
+            ".git metadata must be pruned: {}",
+            out.content
+        );
+        assert!(
+            out.content.contains("main.rs"),
+            "normal files still listed: {}",
+            out.content
+        );
+        // Legit dotfiles must survive — we prune VCS dirs, not all hidden entries.
+        assert!(
+            out.content.contains(".github"),
+            "non-VCS dotfiles preserved: {}",
+            out.content
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn grep_excludes_git_metadata() {
+        // The same needle lives in a tracked file and in `.git` internals; grep
+        // must surface only the tracked hit (covers whichever path runs — the
+        // `rg` fast-path's exclusion globs or the inline walker's filter).
+        let dir = std::env::temp_dir().join(format!("hi-grep-vcs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "let UNIQNEEDLE = 1;\n").unwrap();
+        std::fs::write(dir.join(".git/config"), "UNIQNEEDLE\n").unwrap();
+
+        let p = dir.to_string_lossy();
+        let out =
+            super::execute("grep", &format!(r#"{{"pattern":"UNIQNEEDLE","path":"{p}"}}"#)).await;
+
+        assert!(
+            out.content.contains("lib.rs"),
+            "tracked hit found: {}",
+            out.content
+        );
+        assert!(
+            !out.content.contains(".git/config"),
+            ".git must not be searched: {}",
+            out.content
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn read_rejects_binary_with_a_clear_message() {
+        let dir = std::env::temp_dir().join(format!("hi-read-bin-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("blob.bin");
+        std::fs::write(&path, b"\x00\x01\x02binary\xff").unwrap();
+        let p = path.to_string_lossy();
+        // Bypass path guard — temp files live outside the project workspace.
+        let had_guard = std::env::var_os("HI_NO_PATH_GUARD");
+        unsafe { std::env::set_var("HI_NO_PATH_GUARD", "1"); }
+        let out = super::execute("read", &format!(r#"{{"path":"{p}"}}"#)).await;
+        unsafe {
+            if had_guard.is_none() { std::env::remove_var("HI_NO_PATH_GUARD"); }
+        }
+        assert!(
+            out.content.contains("binary file"),
+            "clear binary message: {}",
+            out.content
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn is_binary_detects_nul_bytes() {
+        assert!(!super::is_binary(b"plain text\n"), "text is not binary");
+        assert!(!super::is_binary(b""), "empty is not binary");
+        assert!(super::is_binary(b"text\x00more"), "NUL → binary");
+        // NUL beyond the 8 KB probe window is not detected (same as ripgrep).
+        let mut big = vec![b'x'; 9000];
+        big.push(0);
+        assert!(
+            !super::is_binary(&big),
+            "NUL past 8 KB probe is not detected"
+        );
+    }
+
+    #[tokio::test]
     async fn list_includes_source_files() {
-        let out = super::execute("list", "{}").await;
+        // Pass an explicit path instead of relying on the process cwd: other
+        // tests mutate the shared cwd via set_current_dir, which makes a
+        // default-path `.` listing racy under parallel execution.
+        let manifest = env!("CARGO_MANIFEST_DIR");
+        let out = super::execute("list", &format!(r#"{{"path":"{manifest}"}}"#)).await;
         assert!(out.content.contains("lib.rs"), "list: {}", out.content);
     }
 
@@ -1282,33 +2428,33 @@ FAILED tests/test_b.py::test_parsing - assert 2 == 3
     #[test]
     fn exact_unique_match() {
         assert_eq!(
-            apply_edit("let x = 1;\n", "let x = 1;", "let x = 2;").unwrap(),
+            apply_edit("let x = 1;\n", "let x = 1;", "let x = 2;", false).unwrap(),
             "let x = 2;\n"
         );
     }
 
     #[test]
     fn missing_old_string_errors() {
-        assert!(apply_edit("foo\n", "bar", "baz").is_err());
+        assert!(apply_edit("foo\n", "bar", "baz", false).is_err());
     }
 
     #[test]
     fn ambiguous_exact_match_errors() {
-        assert!(apply_edit("x = 1\nx = 1\n", "x = 1", "y").is_err());
+        assert!(apply_edit("x = 1\nx = 1\n", "x = 1", "y", false).is_err());
     }
 
     #[test]
     fn tolerates_trailing_whitespace() {
         // The file has a stray trailing space the model's old_string lacks.
         assert_eq!(
-            apply_edit("a\nb \nc\n", "a\nb\nc", "a\nB\nc").unwrap(),
+            apply_edit("a\nb \nc\n", "a\nb\nc", "a\nB\nc", false).unwrap(),
             "a\nB\nc\n"
         );
     }
 
     #[test]
     fn tolerates_crlf() {
-        let out = apply_edit("a\r\nb\r\n", "a\nb", "X\nY").unwrap();
+        let out = apply_edit("a\r\nb\r\n", "a\nb", "X\nY", false).unwrap();
         assert!(out.contains('X') && out.contains('Y'));
     }
 
@@ -1319,7 +2465,8 @@ FAILED tests/test_b.py::test_parsing - assert 2 == 3
             apply_edit(
                 "def f():\n        return 0\n",
                 "    return 0",
-                "    return 1"
+                "    return 1",
+                false
             )
             .unwrap(),
             "def f():\n        return 1\n"
@@ -1329,12 +2476,117 @@ FAILED tests/test_b.py::test_parsing - assert 2 == 3
     #[test]
     fn ambiguous_flexible_match_errors() {
         // Two lines match once indentation is ignored — refuse rather than guess.
-        assert!(apply_edit("  x\n  x\n", "x ", "y").is_err());
+        assert!(apply_edit("  x\n  x\n", "x ", "y", false).is_err());
     }
 
     #[test]
     fn preserves_trailing_newline() {
-        let out = apply_edit("first\nsecond\n", "second", "SECOND").unwrap();
+        let out = apply_edit("first\nsecond\n", "second", "SECOND", false).unwrap();
         assert_eq!(out, "first\nSECOND\n");
+    }
+
+    #[test]
+    fn replace_all_swaps_every_occurrence() {
+        let out = apply_edit("a\nb\na\nb\n", "a", "X", true).unwrap();
+        assert_eq!(out, "X\nb\nX\nb\n");
+    }
+
+    #[test]
+    fn replace_all_with_no_match_errors() {
+        assert!(apply_edit("a\nb\n", "z", "X", true).is_err());
+    }
+
+    #[test]
+    fn replace_all_unique_still_works() {
+        let out = apply_edit("only\n", "only", "once", true).unwrap();
+        assert_eq!(out, "once\n");
+    }
+
+    #[test]
+    fn edit_not_found_help_finds_similar_lines() {
+        // The needle has a typo ("funciton" vs "function") — no exact or
+        // substring hit, but the similarity fallback should still point at the
+        // right line by shared words.
+        let text = "fn funciton_add(a, b) {\n    a + b\n}\n";
+        let msg = edit_not_found_help(text, "fn function_add(a, b) {");
+        assert!(
+            msg.contains("funciton_add"),
+            "similarity fallback finds the typo'd line: {msg}"
+        );
+    }
+
+    #[test]
+    fn apply_multi_patch_adds_updates_and_deletes() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let orig_cwd = std::env::current_dir().unwrap();
+        let had_guard = std::env::var_os("HI_NO_PATH_GUARD");
+        let dir = std::env::temp_dir().join(format!(
+            "hi-patch-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        // Set HI_NO_PATH_GUARD so temp-dir paths aren't rejected.
+        // (unsafe: env mutation is unsafe in edition 2024.)
+        unsafe { std::env::set_var("HI_NO_PATH_GUARD", "1"); }
+
+        std::fs::write(dir.join("update.txt"), "line1\nline2\nline3\n").unwrap();
+        std::fs::write(dir.join("delete.txt"), "bye\n").unwrap();
+
+        let patch = "\
+*** Begin Patch
+*** Update File: update.txt
+@@ line1 @@
+ line1
+ line2
+-replaced
++line2b
+ line3
+*** Add File: created.txt
+new content
+*** Delete File: delete.txt
+*** End Patch";
+        let result = apply_multi_patch(patch).unwrap();
+
+        // Update: context + added lines become the new file; `-replaced` is
+        // dropped (it wasn't even in the file, but the format skips `-` lines).
+        let updated = std::fs::read_to_string(dir.join("update.txt")).unwrap();
+        assert!(updated.contains("line1"), "context kept");
+        assert!(updated.contains("line2b"), "added line present");
+        assert!(!updated.contains("replaced"), "removed line dropped");
+        assert!(updated.contains("line3"), "trailing context kept");
+
+        // Add: new file written with the given content.
+        let created = std::fs::read_to_string(dir.join("created.txt")).unwrap();
+        assert_eq!(created, "new content\n");
+
+        // Delete: file removed.
+        assert!(!dir.join("delete.txt").exists(), "deleted file is gone");
+
+        // Result summary mentions all three operations.
+        assert!(result.contains("updated"), "{result}");
+        assert!(result.contains("added"), "{result}");
+        assert!(result.contains("deleted"), "{result}");
+
+        // Restore environment for other tests.
+        unsafe {
+            if had_guard.is_some() {
+                std::env::set_var("HI_NO_PATH_GUARD", "1");
+            } else {
+                std::env::remove_var("HI_NO_PATH_GUARD");
+            }
+        }
+        std::env::set_current_dir(&orig_cwd).ok();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn apply_multi_patch_rejects_bad_envelope() {
+        unsafe { std::env::set_var("HI_NO_PATH_GUARD", "1"); }
+        assert!(apply_multi_patch("not a patch").is_err());
+        assert!(apply_multi_patch("").is_err());
+        unsafe { std::env::remove_var("HI_NO_PATH_GUARD"); }
     }
 }

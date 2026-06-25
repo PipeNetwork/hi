@@ -135,6 +135,22 @@ where
     })
 }
 
+/// Build a `reqwest::Client` with connection-pool and keep-alive tuned for an
+/// agent loop that makes many sequential requests to the same endpoint.
+/// Reusing connections avoids a TLS handshake on every model call — the
+/// default `Client::new()` does pool internally, but this sets explicit
+/// limits and keep-alive so long sessions reuse connections reliably.
+pub fn agent_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .pool_idle_timeout(Some(Duration::from_secs(90)))
+        .pool_max_idle_per_host(4)
+        .tcp_keepalive(Some(Duration::from_secs(60)))
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(300))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
 /// Send `builder`, retrying transient failures with exponential backoff.
 pub async fn send_with_retry(builder: RequestBuilder) -> Result<Response> {
     let mut attempt = 0;
