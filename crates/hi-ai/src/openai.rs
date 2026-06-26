@@ -318,6 +318,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streamed_error_payload_is_not_reported_as_empty_completion() {
+        let Some(server) = FakeOpenAiServer::new(vec![Response::sse(
+            "data: {\"error\":{\"message\":\"capacity temporarily unavailable\"}}\n\ndata: [DONE]\n\n",
+        )]) else {
+            return;
+        };
+        let provider = OpenAiProvider::new(server.url().to_string(), "test".into());
+        let err = provider
+            .stream(request(vec![], Default::default()), &mut |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(provider_error_kind(&err), Some(ProviderErrorKind::Outage));
+        assert!(
+            err.to_string().contains("capacity temporarily unavailable"),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
     async fn fake_server_stream_can_finish_without_done() {
         let Some(server) = FakeOpenAiServer::new(vec![Response::sse(
             "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n",

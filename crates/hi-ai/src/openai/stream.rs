@@ -6,9 +6,12 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, bail};
 use futures_util::{Stream, StreamExt};
 use serde::Deserialize;
+use serde_json::Value;
 
 use crate::provider::{ProviderError, ProviderErrorKind};
-use crate::types::{BillableBreakdown, Completion, Content, StreamEvent, Usage, estimate_messages_tokens};
+use crate::types::{
+    BillableBreakdown, Completion, Content, StreamEvent, Usage, estimate_messages_tokens,
+};
 
 /// Once the model reports a `finish_reason`, it has stopped generating; we wait
 /// only this long for the trailing usage chunk / `[DONE]` before ending the
@@ -94,6 +97,10 @@ where
                 data.chars().take(160).collect::<String>()
             )
         })?;
+        if let Some(error) = chunk.error {
+            let message = stream_error_message(&error);
+            return Err(ProviderError::new(classify_stream_api_error(&message), message).into());
+        }
 
         if let Some(usage) = chunk.usage {
             let cached = usage
@@ -187,6 +194,10 @@ where
 }
 
 pub(crate) fn classify_stream_error(err: anyhow::Error) -> ProviderError {
+    if let Some(provider) = err.downcast_ref::<ProviderError>() {
+        return ProviderError::new(provider.kind, provider.message.clone())
+            .with_usage(provider.usage.clone());
+    }
     let text = err.to_string();
     let kind = if text.contains("no output") {
         ProviderErrorKind::StreamTimeout
@@ -198,7 +209,44 @@ pub(crate) fn classify_stream_error(err: anyhow::Error) -> ProviderError {
     ProviderError::new(kind, text)
 }
 
-pub(crate) fn backfill_missing_usage(completion: &mut Completion, request: &crate::types::ChatRequest) {
+fn stream_error_message(error: &Value) -> String {
+    match error {
+        Value::String(message) => message.clone(),
+        Value::Object(object) => object
+            .get("message")
+            .and_then(Value::as_str)
+            .or_else(|| object.get("error").and_then(Value::as_str))
+            .or_else(|| object.get("code").and_then(Value::as_str))
+            .map(str::to_string)
+            .unwrap_or_else(|| error.to_string()),
+        _ => error.to_string(),
+    }
+}
+
+fn classify_stream_api_error(message: &str) -> ProviderErrorKind {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("rate limit") || lower.contains("too many requests") || lower.contains("429")
+    {
+        ProviderErrorKind::RateLimit
+    } else if lower.contains("capacity")
+        || lower.contains("temporarily unavailable")
+        || lower.contains("service unavailable")
+        || lower.contains("no route")
+        || lower.contains("overloaded")
+        || lower.contains("cooling down")
+        || lower.contains("first_token_stall")
+        || lower.contains("first token")
+    {
+        ProviderErrorKind::Outage
+    } else {
+        ProviderErrorKind::Other
+    }
+}
+
+pub(crate) fn backfill_missing_usage(
+    completion: &mut Completion,
+    request: &crate::types::ChatRequest,
+) {
     if completion.usage.input_tokens == 0 {
         completion.usage.input_tokens = estimate_messages_tokens(&request.messages);
     }
@@ -237,6 +285,8 @@ struct ChatChunk {
     choices: Vec<ChunkChoice>,
     #[serde(default)]
     usage: Option<OpenAiUsage>,
+    #[serde(default)]
+    error: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -315,7 +365,8 @@ mod tests {
     /// a provider that resets the connection (or sends a truncated frame)
     /// instead of closing cleanly or sending `[DONE]`.
     fn errors_after(events: Vec<&str>) -> impl futures_util::Stream<Item = Result<String>> + Unpin {
-        let mut items: Vec<Result<String>> = events.into_iter().map(|s| Ok(s.to_string())).collect();
+        let mut items: Vec<Result<String>> =
+            events.into_iter().map(|s| Ok(s.to_string())).collect();
         items.push(Err(anyhow::anyhow!("error reading stream")));
         stream::iter(items)
     }
