@@ -47,7 +47,7 @@ provider = "ollama"
 model = "qwen2.5-coder"
 ```
 
-A model that streams only keep-alive heartbeats with no output is treated as failed after `HI_STREAM_TIMEOUT` seconds (default 120; set lower to fail over faster). `HI_DEBUG_STREAM=1` dumps raw provider bytes for diagnosing one that returns nothing.
+A model that streams only keep-alive heartbeats with no output is treated as failed after `HI_STREAM_TIMEOUT` seconds (default 300; set lower to fail over faster). `HI_HTTP_TIMEOUT` controls the total HTTP request cap (default 900s), and `HI_TUI_WATCHDOG_SECS` controls the soft TUI “still waiting” notice (default 180s). The TUI notice does not mark the model degraded. `HI_DEBUG_STREAM=1` dumps raw provider bytes for diagnosing one that returns nothing.
 
 OpenAI-compatible endpoints vary in how much of Chat Completions they implement. The default `--compat auto` retries common simpler shapes, such as retrying without streamed usage metadata when a provider rejects `stream_options`. Tool calling is not silently downgraded: if a request advertises tools and the provider rejects them, the turn fails fast instead of continuing chat-only. Use `--compat strict` to send only the initial request shape. Tool availability is controlled separately with `--tool-mode auto|required|chat-only|read-only`; `auto` advertises tools without forcing a tool call, `required` asks the model to call a tool, `chat-only` advertises no tools, and `read-only` only advertises safe inspection tools.
 

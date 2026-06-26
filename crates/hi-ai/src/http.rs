@@ -28,6 +28,8 @@ const BASE_DELAY_MS: u64 = 250;
 /// Cap on a single backoff so the wider budget stays bounded (a few seconds per
 /// wait) instead of exploding exponentially.
 const MAX_DELAY_MS: u64 = 4_000;
+const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 300;
+const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 900;
 
 #[derive(Deserialize)]
 struct ModelsList {
@@ -87,16 +89,13 @@ pub async fn fetch_models(builder: RequestBuilder) -> Result<Vec<ServedModel>> {
 }
 
 /// Give up on a stream if the model produces no output — content, reasoning, or
-/// tool tokens — for this long (default 120s, override with `HI_STREAM_TIMEOUT`
+/// tool tokens — for this long (default 300s, override with `HI_STREAM_TIMEOUT`
 /// in seconds). Keep-alive heartbeats do NOT count as progress: a provider that
 /// only sends heartbeats is stalled, not working. (Adapters reset their deadline
 /// whenever they emit a real token.)
 pub fn stream_idle_timeout() -> Duration {
-    std::env::var("HI_STREAM_TIMEOUT")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(120))
+    let configured = std::env::var("HI_STREAM_TIMEOUT").ok();
+    timeout_from_env_value(configured.as_deref(), DEFAULT_STREAM_IDLE_TIMEOUT_SECS)
 }
 
 /// Once output *has* started flowing, end the stream this long after tokens stop
@@ -107,11 +106,21 @@ pub fn stream_idle_timeout() -> Duration {
 /// gap *between* tokens means the stream has effectively ended, whereas a slow
 /// time-to-first-token can be a legitimately queued request.
 pub fn stream_stall_timeout() -> Duration {
-    std::env::var("HI_STREAM_STALL")
-        .ok()
+    let configured = std::env::var("HI_STREAM_STALL").ok();
+    timeout_from_env_value(configured.as_deref(), 15)
+}
+
+fn agent_http_timeout() -> Duration {
+    let configured = std::env::var("HI_HTTP_TIMEOUT").ok();
+    timeout_from_env_value(configured.as_deref(), DEFAULT_HTTP_TIMEOUT_SECS)
+}
+
+fn timeout_from_env_value(value: Option<&str>, default_seconds: u64) -> Duration {
+    value
         .and_then(|v| v.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
         .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(15))
+        .unwrap_or(Duration::from_secs(default_seconds))
 }
 
 /// When `HI_DEBUG_STREAM` is set, echo every raw byte chunk (escaped, so SSE
@@ -146,7 +155,7 @@ pub fn agent_http_client() -> reqwest::Client {
         .pool_max_idle_per_host(4)
         .tcp_keepalive(Some(Duration::from_secs(60)))
         .connect_timeout(Duration::from_secs(15))
-        .timeout(Duration::from_secs(300))
+        .timeout(agent_http_timeout())
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 }
@@ -239,6 +248,30 @@ mod tests {
         assert_eq!(backoff_delay(5), MAX_DELAY_MS);
         assert_eq!(backoff_delay(6), MAX_DELAY_MS);
         assert_eq!(backoff_delay(64), MAX_DELAY_MS);
+    }
+
+    #[test]
+    fn timeout_defaults_are_long_enough_for_backend_retrying() {
+        assert_eq!(
+            timeout_from_env_value(None, DEFAULT_STREAM_IDLE_TIMEOUT_SECS),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            timeout_from_env_value(None, DEFAULT_HTTP_TIMEOUT_SECS),
+            Duration::from_secs(900)
+        );
+        assert_eq!(
+            timeout_from_env_value(Some("42"), DEFAULT_STREAM_IDLE_TIMEOUT_SECS),
+            Duration::from_secs(42)
+        );
+        assert_eq!(
+            timeout_from_env_value(Some("0"), DEFAULT_STREAM_IDLE_TIMEOUT_SECS),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            timeout_from_env_value(Some("not-a-number"), DEFAULT_HTTP_TIMEOUT_SECS),
+            Duration::from_secs(900)
+        );
     }
 
     #[test]

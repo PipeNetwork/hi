@@ -74,13 +74,29 @@ fn working_tree_diff_sync() -> String {
     }
 }
 const TICK: Duration = Duration::from_millis(120);
-/// Only flag a possibly-stuck provider after a long, genuinely silent wait — the
-/// working line already shows the live elapsed time, so an earlier notice just
-/// reads as alarming when the model/provider is merely slow.
-const WATCHDOG_STUCK: Duration = Duration::from_secs(60);
+/// Only show an informational notice after a long, genuinely silent wait. This
+/// is deliberately not a model-health signal: hosted APIs may buffer and retry
+/// on the backend without streaming visible tokens to the TUI.
+const DEFAULT_WATCHDOG_STUCK_SECS: u64 = 180;
+const MIN_WATCHDOG_STUCK_SECS: u64 = 30;
+const MAX_WATCHDOG_STUCK_SECS: u64 = 1_800;
 /// On terminals that don't report focus, notify after a turn at least this long
 /// (a proxy for "you probably stepped away").
 const NOTIFY_THRESHOLD: Duration = Duration::from_secs(30);
+
+fn watchdog_stuck_timeout() -> Duration {
+    let configured = std::env::var("HI_TUI_WATCHDOG_SECS").ok();
+    watchdog_stuck_timeout_from_value(configured.as_deref())
+}
+
+fn watchdog_stuck_timeout_from_value(value: Option<&str>) -> Duration {
+    let seconds = value
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .unwrap_or(DEFAULT_WATCHDOG_STUCK_SECS)
+        .clamp(MIN_WATCHDOG_STUCK_SECS, MAX_WATCHDOG_STUCK_SECS);
+    Duration::from_secs(seconds)
+}
 
 /// Run the full-screen TUI until the user quits. `history_path`, if given, is
 /// the file used to persist input history across sessions (shared with the
@@ -575,6 +591,7 @@ async fn drive(
     let mut saw_turn_end = false;
     let mut last_activity = Instant::now();
     let mut watchdog_stuck = false;
+    let watchdog_timeout = watchdog_stuck_timeout();
     loop {
         terminal.draw(|f| app.render(f))?;
         tokio::select! {
@@ -604,22 +621,15 @@ async fn drive(
                 app.spinner = app.spinner.wrapping_add(1);
                 let idle = last_activity.elapsed();
                 app.waiting_for = Some(idle);
-                // Only warn about a stuck *model/provider* — not while a tool is
-                // legitimately running (its own timer shows in the working line),
-                // which would otherwise fire a false alarm and mark the model
-                // degraded for what is really a slow `cargo test`.
+                // Only notify about a quiet backend while no tool is legitimately
+                // running. This is a soft notice, not a model health signal.
                 if expect_turn_end
                     && !watchdog_stuck
                     && app.current_tool.is_none()
-                    && idle >= WATCHDOG_STUCK
+                    && idle >= watchdog_timeout
                 {
                     watchdog_stuck = true;
-                    app.push(Line::styled(
-                        "⚠ no response for 60s; the model/provider may be stuck. Ctrl-C to cancel, then try /model or /retry",
-                        Style::default().fg(Color::Yellow),
-                    ));
-                    app.follow();
-                    app.record_model_issue();
+                    app.note_backend_waiting(idle, watchdog_timeout);
                 }
             },
             maybe = input.recv() => {
@@ -1345,6 +1355,17 @@ impl App {
         self.push(Line::styled(
             format!("✗ failed · {error}"),
             Style::default().fg(Color::Red),
+        ));
+        self.follow();
+    }
+
+    fn note_backend_waiting(&mut self, idle: Duration, threshold: Duration) {
+        self.push(Line::styled(
+            format!(
+                "⚠ still waiting for backend response after {}s; the API may be retrying or buffering. Ctrl-C cancels, or keep waiting",
+                idle.as_secs().max(threshold.as_secs())
+            ),
+            Style::default().fg(Color::Yellow),
         ));
         self.follow();
     }
@@ -3177,6 +3198,42 @@ mod tests {
             "reason inline: {screen}"
         );
         assert!(screen.contains("/retry"), "recovery hint: {screen}");
+    }
+
+    #[test]
+    fn backend_wait_notice_does_not_mark_model_degraded() {
+        let mut app = App::new("pipenetwork", "ipop/coder-balanced");
+        app.note_backend_waiting(Duration::from_secs(181), Duration::from_secs(180));
+
+        assert_eq!(app.model_issues.get("ipop/coder-balanced"), None);
+        assert_eq!(app.last_error, None);
+        let mut term = Terminal::new(TestBackend::new(100, 8)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let screen = dump(&term);
+        assert!(
+            screen.contains("still waiting for backend response after 181s"),
+            "soft wait notice shown: {screen}"
+        );
+        assert!(
+            !screen.contains("degraded in-session"),
+            "soft wait notice is not model health: {screen}"
+        );
+    }
+
+    #[test]
+    fn watchdog_timeout_default_is_longer_than_client_warning_window() {
+        assert_eq!(
+            watchdog_stuck_timeout_from_value(None),
+            Duration::from_secs(180)
+        );
+        assert_eq!(
+            watchdog_stuck_timeout_from_value(Some("5")),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            watchdog_stuck_timeout_from_value(Some("9999")),
+            Duration::from_secs(1_800)
+        );
     }
 
     #[test]
