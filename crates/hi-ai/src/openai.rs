@@ -75,9 +75,10 @@ impl Provider for OpenAiProvider {
             if request.profile.compat == CompatMode::Strict {
                 break;
             }
-            // Degrade toward the attempt that actually addresses this error — a
-            // tool rejection jumps straight to chat-only rather than first dropping
-            // usage streaming. `None` means nothing more will help: surface it.
+            // Degrade toward the attempt that actually addresses this error.
+            // Tool rejection is surfaced: an agent turn that advertised tools
+            // cannot safely continue chat-only because it would be unable to
+            // inspect or modify the workspace.
             match request::next_degraded_attempt(&attempts, idx, kind, &text) {
                 Some(next) => idx = next,
                 None => break,
@@ -105,7 +106,7 @@ impl Provider for OpenAiProvider {
         )
         .await
         .map_err(|err| {
-            stream::classify_stream_error(err)            .with_usage(Usage {
+            stream::classify_stream_error(err).with_usage(Usage {
                 input_tokens: estimate_messages_tokens(&request.messages),
                 output_tokens: request.max_tokens as u64,
                 cache_read_tokens: 0,
@@ -180,35 +181,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fake_server_rejects_tools_then_degrades_to_chat_only() {
-        let Some(server) = FakeOpenAiServer::new(vec![
-            Response::json(400, r#"{"error":"tools unsupported"}"#),
-            Response::sse(sse_text("cannot edit without tools")),
-        ]) else {
+    async fn fake_server_rejects_tools_fails_fast() {
+        let Some(server) = FakeOpenAiServer::new(vec![Response::json(
+            400,
+            r#"{"error":"tools unsupported"}"#,
+        )]) else {
             return;
         };
         let provider = OpenAiProvider::new(server.url().to_string(), "test".into());
-        let mut statuses = Vec::new();
-        let mut sink = |event| {
-            if let StreamEvent::Status(status) = event {
-                statuses.push(status);
-            }
-        };
-        let completion = provider
-            .stream(request(vec![tool()], Default::default()), &mut sink)
+        let err = provider
+            .stream(request(vec![tool()], Default::default()), &mut |_| {})
             .await
-            .unwrap();
-        assert!(
-            matches!(completion.content.first(), Some(Content::Text(t)) if t.contains("without tools"))
-        );
-        assert!(
-            statuses.iter().any(|s| s.contains("tool calling")),
-            "{statuses:?}"
+            .unwrap_err();
+        assert_eq!(
+            provider_error_kind(&err),
+            Some(ProviderErrorKind::UnsupportedTools)
         );
         let bodies = server.bodies();
+        assert_eq!(bodies.len(), 1);
         assert!(bodies[0].contains("\"tools\""));
-        assert!(!bodies[1].contains("\"tools\""));
-        assert!(bodies[1].contains("Tool calling is unavailable"));
     }
 
     #[tokio::test]

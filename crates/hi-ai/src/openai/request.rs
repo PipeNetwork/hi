@@ -8,7 +8,8 @@ use crate::provider::ProviderErrorKind;
 use crate::types::{ChatRequest, CompatMode, Message, Role, ToolMode};
 
 /// One shape the request is sent in. The provider tries the most capable shape
-/// first and degrades through this list when the server rejects a feature.
+/// first and degrades through this list when the server rejects a compatible
+/// optional feature.
 #[derive(Clone, Copy)]
 pub(crate) struct RequestAttempt {
     pub(crate) include_usage: bool,
@@ -18,9 +19,9 @@ pub(crate) struct RequestAttempt {
 
 /// Given the attempt that just failed (at `current`) and its error, the index of
 /// the next attempt to try — the one whose degradation actually addresses this
-/// error — or `None` to stop and surface the error. A tool rejection jumps
-/// straight to the chat-only attempt instead of first dropping usage streaming;
-/// in Required tool mode there is no chat-only attempt, so the error surfaces.
+/// error — or `None` to stop and surface the error. Tool rejection is never
+/// downgraded to chat-only: a coding-agent turn that advertised tools cannot
+/// reliably complete after losing workspace access.
 pub(crate) fn next_degraded_attempt(
     attempts: &[RequestAttempt],
     current: usize,
@@ -36,17 +37,15 @@ pub(crate) fn next_degraded_attempt(
             .position(|a| !a.include_usage)
             .map(|i| after + i);
     }
-    // Tool schema rejected → drop to chat-only.
+    // Tool schema rejected → fail fast. Use `--tool-mode chat-only` for an
+    // explicit no-tools request.
     if cur.include_tools
         && matches!(
             kind,
             ProviderErrorKind::UnsupportedTools | ProviderErrorKind::UnsupportedRequestShape
         )
     {
-        return attempts[after..]
-            .iter()
-            .position(|a| !a.include_tools)
-            .map(|i| after + i);
+        return None;
     }
     // A persistent outage that already survived transport retries: try the next
     // (degraded) shape in case the 5xx was really a request-shape problem.
@@ -74,15 +73,6 @@ pub(crate) fn request_attempts(request: &ChatRequest) -> Vec<RequestAttempt> {
             include_tools,
             status: Some(
                 "compat: provider rejected stream_options; retried without usage streaming",
-            ),
-        });
-    }
-    if include_tools && request.profile.tool_mode != ToolMode::Required {
-        attempts.push(RequestAttempt {
-            include_usage: false,
-            include_tools: false,
-            status: Some(
-                "compat: provider rejected tool calling; degraded to chat-only for this request",
             ),
         });
     }
@@ -123,13 +113,7 @@ fn mentions(text: &str, needles: &[&str]) -> bool {
 }
 
 pub(crate) fn build_body(request: &ChatRequest, attempt: RequestAttempt) -> Value {
-    let mut messages = to_openai_messages(&request.messages);
-    if !attempt.include_tools && !request.tools.is_empty() {
-        messages.push(json!({
-            "role": "user",
-            "content": "Tool calling is unavailable for this request because the provider rejected the tool schema. If the user asked for file edits, shell commands, or other workspace changes, say that this cannot be completed with the current provider/tool mode instead of claiming changes were made.",
-        }));
-    }
+    let messages = to_openai_messages(&request.messages);
     let mut body = json!({
         "model": request.model,
         "messages": messages,
@@ -191,12 +175,14 @@ pub(crate) fn to_openai_messages(messages: &[Message]) -> Vec<Value> {
                     let mut parts = Vec::new();
                     for block in &message.content {
                         match block {
-                            crate::types::Content::Image { data, media_type } => parts.push(json!({
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": format!("data:{media_type};base64,{data}"),
-                                },
-                            })),
+                            crate::types::Content::Image { data, media_type } => {
+                                parts.push(json!({
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": format!("data:{media_type};base64,{data}"),
+                                    },
+                                }))
+                            }
                             crate::types::Content::Text(t) if !t.is_empty() => {
                                 parts.push(json!({ "type": "text", "text": t }));
                             }
@@ -287,11 +273,12 @@ mod tests {
 
     #[test]
     fn assistant_tool_call_omits_content_rather_than_null() {
-        let out = to_openai_messages(&[Message::assistant(vec![crate::types::Content::ToolCall {
-            id: "1".into(),
-            name: "bash".into(),
-            arguments: "{}".into(),
-        }])]);
+        let out =
+            to_openai_messages(&[Message::assistant(vec![crate::types::Content::ToolCall {
+                id: "1".into(),
+                name: "bash".into(),
+                arguments: "{}".into(),
+            }])]);
         // Ollama rejects null content; we omit the key entirely.
         assert!(out[0].get("content").is_none());
         assert!(out[0]["tool_calls"].is_array());

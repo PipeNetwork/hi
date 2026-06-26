@@ -49,7 +49,7 @@ model = "qwen2.5-coder"
 
 A model that streams only keep-alive heartbeats with no output is treated as failed after `HI_STREAM_TIMEOUT` seconds (default 120; set lower to fail over faster). `HI_DEBUG_STREAM=1` dumps raw provider bytes for diagnosing one that returns nothing.
 
-OpenAI-compatible endpoints vary in how much of Chat Completions they implement. The default `--compat auto` retries common simpler shapes: first without streamed usage metadata, then without tool calling when the provider rejects tools. Use `--compat strict` to send only the initial request shape. Tool availability is controlled separately with `--tool-mode auto|required|chat-only|read-only`; `required` fails instead of degrading when tools are rejected, `chat-only` advertises no tools, and `read-only` only advertises safe inspection tools.
+OpenAI-compatible endpoints vary in how much of Chat Completions they implement. The default `--compat auto` retries common simpler shapes, such as retrying without streamed usage metadata when a provider rejects `stream_options`. Tool calling is not silently downgraded: if a request advertises tools and the provider rejects them, the turn fails fast instead of continuing chat-only. Use `--compat strict` to send only the initial request shape. Tool availability is controlled separately with `--tool-mode auto|required|chat-only|read-only`; `auto` advertises tools without forcing a tool call, `required` asks the model to call a tool, `chat-only` advertises no tools, and `read-only` only advertises safe inspection tools.
 
 Run with no prompt for an interactive session; pass a prompt for one-shot. Piped stdin is folded into a one-shot prompt as context, so `hi` composes with other tools:
 
