@@ -55,7 +55,22 @@ where
             None => idle.saturating_sub(last_progress.elapsed()),
         };
         let data = match tokio::time::timeout(budget, stream.next()).await {
-            Ok(Some(data)) => data?,
+            Ok(Some(Ok(data))) => data,
+            // A stream *read* error mid-flight: the provider reset the connection
+            // or sent a truncated frame instead of closing cleanly / sending
+            // `[DONE]`. If the answer already finished, or output has flowed,
+            // treat it as an unclean end of a complete response and return what
+            // we have — discarding a fully-streamed answer to force a retry is
+            // worse than tolerating the unclean close. (This guard mirrors the
+            // timeout branches below; without it a finished response was thrown
+            // away as a "malformed stream" whenever the socket RST'd after the
+            // last token.) With no output yet, it's a genuine failure: propagate.
+            Ok(Some(Err(err))) => {
+                if finished.is_some() || progressed {
+                    break;
+                }
+                return Err(err);
+            }
             Ok(None) => break,
             // Past finish_reason the answer is complete; don't let a provider that
             // omits `[DONE]` (or never closes the socket) hang a finished turn.
@@ -296,12 +311,21 @@ mod tests {
         stream::iter(items).chain(stream::pending())
     }
 
+    /// A stream that yields the given `data` strings, then a read error — models
+    /// a provider that resets the connection (or sends a truncated frame)
+    /// instead of closing cleanly or sending `[DONE]`.
+    fn errors_after(events: Vec<&str>) -> impl futures_util::Stream<Item = Result<String>> + Unpin {
+        let mut items: Vec<Result<String>> = events.into_iter().map(|s| Ok(s.to_string())).collect();
+        items.push(Err(anyhow::anyhow!("error reading stream")));
+        stream::iter(items)
+    }
+
     const STALL: Duration = Duration::from_secs(15);
     const IDLE: Duration = Duration::from_secs(120);
 
     #[tokio::test(start_paused = true)]
     async fn stops_after_finish_reason_without_done() {
-        // The bug: terminaili sends `finish_reason` then neither `[DONE]` nor a
+        // The bug: pipenetwork.ai sends `finish_reason` then neither `[DONE]` nor a
         // socket close, so a finished answer used to spin until the 120s idle
         // timeout. Now the short finish-grace ends the turn promptly.
         let stream = never_ending(vec![
@@ -351,6 +375,59 @@ mod tests {
             matches!(completion.content.first(), Some(Content::Text(t)) if t == "the answer"),
             "the streamed answer is returned: {:?}",
             completion.content
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn returns_content_when_stream_errors_after_finish() {
+        // The reported "the model's response didn't come through cleanly" bug:
+        // the model streams a full answer and `finish_reason`, then the provider
+        // resets the connection instead of a clean close / `[DONE]`. The complete
+        // answer must be returned, not discarded as a malformed stream and retried.
+        let stream = errors_after(vec![
+            r#"{"choices":[{"delta":{"content":"the answer"},"finish_reason":"stop"}]}"#,
+        ]);
+        let mut sink = |_: StreamEvent| {};
+        let completion = collect_completion(stream, IDLE, STALL, &mut sink)
+            .await
+            .unwrap();
+        assert_eq!(completion.stop_reason.as_deref(), Some("stop"));
+        assert!(
+            matches!(completion.content.first(), Some(Content::Text(t)) if t == "the answer"),
+            "the streamed answer survives an unclean close: {:?}",
+            completion.content
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn returns_content_when_stream_errors_after_content_without_finish() {
+        // Output flowed (no finish_reason yet), then the socket errored. We've
+        // received real content, so return it rather than discarding it — same
+        // policy as a post-content stall.
+        let stream = errors_after(vec![r#"{"choices":[{"delta":{"content":"partial"}}]}"#]);
+        let mut sink = |_: StreamEvent| {};
+        let completion = collect_completion(stream, IDLE, STALL, &mut sink)
+            .await
+            .unwrap();
+        assert!(
+            matches!(completion.content.first(), Some(Content::Text(t)) if t == "partial"),
+            "content received before the error is kept: {:?}",
+            completion.content
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn propagates_stream_error_before_any_output() {
+        // A read error before any token is a genuine failure with nothing to
+        // salvage — propagate it (the caller decides whether to retry).
+        let stream = errors_after(vec![]);
+        let mut sink = |_: StreamEvent| {};
+        let err = collect_completion(stream, IDLE, STALL, &mut sink)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("error reading stream"),
+            "got: {err}"
         );
     }
 

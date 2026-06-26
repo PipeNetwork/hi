@@ -1253,6 +1253,16 @@ impl Agent {
         let mut empty_retries = 0u32;
         let mut silent_continues = 0u32;
         let mut repeat_nudges = 0u32;
+        // Set after a silent-continue nudge: force the *next* round to call a
+        // tool (`tool_choice: required`) instead of letting the model narrate
+        // again or return an empty completion. Some models (e.g. weaker
+        // OpenAI-compat coders) intermittently emit text-only or empty responses
+        // when asked to continue; backing the "use your tools; act, don't
+        // narrate" nudge with a hard tool-choice makes them actually act. Stays
+        // set across empty-retries and re-nudges until the model emits a tool
+        // call, then clears (see the made_tool_call path). Only takes effect when
+        // tools are otherwise freely available (config tool_mode Auto).
+        let mut force_tools_next = false;
         // Whether the model's update_plan call already advanced the structured
         // goal during this turn (so goal_turn_end doesn't advance again and
         // skip the next sub-goal).
@@ -1336,6 +1346,15 @@ impl Agent {
                     "transcript invariant violated before provider send"
                 );
 
+                // After a continue-nudge, force this round to call a tool rather
+                // than narrate again or come back empty. Only when tools are
+                // freely available (Auto): never override an intentional
+                // ChatOnly/ReadOnly restriction, and Required already forces.
+                let tool_mode = if force_tools_next && self.config.tool_mode == ToolMode::Auto {
+                    ToolMode::Required
+                } else {
+                    self.config.tool_mode
+                };
                 let request = ChatRequest {
                     model: self.config.model.clone(),
                     messages: self.messages.arc(),
@@ -1347,7 +1366,7 @@ impl Agent {
                     thinking_budget: self.config.thinking_budget,
                     profile: RequestProfile {
                         compat: self.config.compat,
-                        tool_mode: self.config.tool_mode,
+                        tool_mode,
                         stream_usage: None,
                     },
                 };
@@ -1529,16 +1548,27 @@ impl Agent {
                     // above). Silently re-prompt the model to continue — no
                     // status line, no steer counter, no visible nudge.
                     //
-                    // Fires when the model was actively working this turn (it
-                    // made tool calls earlier) OR when the text looks like an
-                    // announced-but-unperformed next step ("Let me start by…"
-                    // on the first round, without calling a tool). Genuine
-                    // Q&A answers ("The answer is 42.") end the turn — no
-                    // wasted model calls. Bounded so it can't loop forever.
+                    // Fires only when the text looks like an announced-but-
+                    // unperformed next step ("Let me start by…", "Now I'll
+                    // rewrite main.rs:") — on the first round or after the model
+                    // has been working. A *finished* response ends the turn
+                    // cleanly: a final recap after a multi-step task ("I reviewed
+                    // the codebase; the architecture is clean.") or a plain Q&A
+                    // answer ("The answer is 42.") — no wasted model calls and no
+                    // false "incomplete" warning. Crucially, do NOT treat every
+                    // post-tool-use text as unfinished: a read-only task (review,
+                    // explain, summarize) legitimately ends with tools-then-recap,
+                    // and gating on `made_tool_call` would force it to churn the
+                    // whole budget and stop on a scary warning. Bounded so it
+                    // can't loop forever.
                     self.messages.push_assistant(std::mem::take(&mut completion.content));
-                    let looks_unfinished = made_tool_call || looks_like_unfinished_step(&assistant_text);
+                    let looks_unfinished = looks_like_unfinished_step(&assistant_text);
                     if looks_unfinished && silent_continues < self.config.max_silent_continues {
                         silent_continues += 1;
+                        // Force the next round to actually call a tool, so the
+                        // nudge can't be answered with yet another narration or an
+                        // empty completion.
+                        force_tools_next = true;
                         self.messages.push_nudge(NudgeKind::Continue, SILENT_CONTINUE_NUDGE);
                         continue;
                     }
@@ -1556,6 +1586,20 @@ impl Agent {
                 }
                 // The model requested tool calls — it's actively working.
                 made_tool_call = true;
+                // Real progress this round, so clear the silent-continue counter:
+                // the budget bounds *consecutive* narrate-without-acting stalls,
+                // not their total across the turn. A long, productive turn that
+                // reads many files but occasionally narrates a step without the
+                // tool call (a quirk of some models) recovers each time via the
+                // nudge — without this reset the counter would creep up across
+                // the whole turn and kill the turn mid-progress on the Nth stall
+                // even though the model acted between every one. Mirrors the
+                // `empty_retries = 0` reset above (a later stall gets its own
+                // budget rather than inheriting an earlier one's).
+                silent_continues = 0;
+                // The model acted, so drop the forced-tool-choice we may have set
+                // after a nudge — the next round is free to narrate or finish.
+                force_tools_next = false;
                 // Infer within-batch dependencies (a read of a file a mutating
                 // call earlier in the batch targeted must observe that mutation;
                 // mutating calls serialize). The scheduler below runs ready
@@ -2136,6 +2180,25 @@ mod tests {
                 request.top_p,
                 request.frequency_penalty,
             ));
+            Ok(self.responses.lock().unwrap().remove(0))
+        }
+    }
+
+    /// Like [`Canned`], but records each request's `tool_mode` so a test can
+    /// assert when the agent forces `tool_choice` (e.g. after a continue-nudge).
+    struct RecordToolModes {
+        responses: Mutex<Vec<Completion>>,
+        modes: std::sync::Arc<Mutex<Vec<ToolMode>>>,
+    }
+
+    #[async_trait]
+    impl Provider for RecordToolModes {
+        async fn stream(
+            &self,
+            request: ChatRequest,
+            _sink: &mut (dyn FnMut(StreamEvent) + Send),
+        ) -> Result<Completion> {
+            self.modes.lock().unwrap().push(request.profile.tool_mode);
             Ok(self.responses.lock().unwrap().remove(0))
         }
     }
@@ -3426,10 +3489,13 @@ mod tests {
 
     #[tokio::test]
     async fn silent_auto_continue_keeps_turn_going_without_status() {
-        // The model made a tool call, then stopped with text (no tool call).
-        // With max_silent_continues > 0, the agent silently re-prompts it to
-        // continue — no status line, no visible nudge. The model then does
-        // another tool call and finishes.
+        // The model narrates an announced-but-unperformed next step ("Now let me
+        // check the tests.") with no tool call. With max_silent_continues > 0 the
+        // agent silently re-prompts it to continue — no status line, no visible
+        // nudge — and the model then makes the next tool call and finishes with a
+        // recap. The recap ("Done.") is a *finished* answer, not a forward-looking
+        // step, so it ends the turn cleanly: no further nudge, no false
+        // "incomplete" warning.
         let mut cfg = config();
         cfg.max_silent_continues = 3;
         let responses = vec![
@@ -3443,9 +3509,9 @@ mod tests {
                 1,
                 1,
             ),
-            // Round 2: model stops with text, no tool call.
+            // Round 2: announced next step, no tool call → silent continue.
             completion(vec![Content::Text("Now let me check the tests.".into())], 1, 1),
-            // Round 3: silently re-prompted, model makes another tool call.
+            // Round 3: silently re-prompted, model makes the next tool call.
             completion(
                 vec![Content::ToolCall {
                     id: "r2".into(),
@@ -3455,25 +3521,185 @@ mod tests {
                 1,
                 1,
             ),
-            // Round 4: model finishes with text.
-            completion(vec![Content::Text("Done.".into())], 1, 1),
-            // Round 5: silently re-prompted again.
-            completion(vec![Content::Text("Done.".into())], 1, 1),
-            // Round 6: silently re-prompted a 3rd time; budget (3) now
-            // exhausted → turn ends.
+            // Round 4: model finishes with a recap → turn ends cleanly.
             completion(vec![Content::Text("Done.".into())], 1, 1),
         ];
         let mut agent = agent(responses, cfg);
         let mut ui = RecUi::default();
         agent.run_turn("review the code", &mut ui).await.unwrap();
-        // The turn completed (didn't run out of completions).
+        // The turn completed, consuming exactly the four canned responses — a
+        // spurious continue after the "Done." recap would have asked for a fifth
+        // and panicked on the empty queue.
         assert!(ui.turn_end.is_some(), "turn completed");
-        // No "nudging" status line was emitted during the silent continues.
-        // (The exhaustion warning after the budget is fine — it's expected.)
+        // No visible "nudging" status during the silent continue, and no false
+        // "incomplete" warning — the recap ended the turn cleanly.
         assert!(
-            !ui.statuses.iter().any(|s| s.contains("nudging")),
-            "silent — no visible nudge status during continues: {:?}",
+            !ui.statuses
+                .iter()
+                .any(|s| s.contains("nudging") || s.contains("incomplete")),
+            "silent continue then clean finish: {:?}",
             ui.statuses
+        );
+    }
+
+    #[tokio::test]
+    async fn finished_recap_after_tool_use_ends_without_incomplete_warning() {
+        // Repro of the reported "review codebase runs a bit, then stops without
+        // finishing" bug. A read-only task reads files (tool calls), then gives
+        // its final recap as text with no tool call. The recap is a *finished*
+        // answer (past tense), not an announced next step, so the turn must end
+        // cleanly — no silent-continue nudge, no false "the model kept narrating
+        // … may be incomplete" warning. Before the fix, `made_tool_call` alone
+        // forced a nudge on any post-tool text, so a finished review churned the
+        // whole silent-continue budget and stopped on the warning.
+        let mut cfg = config();
+        cfg.max_silent_continues = 3;
+        let responses = vec![
+            // Reads a file (actively working).
+            completion(
+                vec![Content::ToolCall {
+                    id: "r1".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"src/lib.rs"}"#.into(),
+                }],
+                1,
+                1,
+            ),
+            // Final recap — a finished answer, text only.
+            completion(
+                vec![Content::Text(
+                    "I reviewed the codebase. The architecture is clean and the tests pass.".into(),
+                )],
+                1,
+                1,
+            ),
+        ];
+        let mut agent = agent(responses, cfg);
+        let mut ui = RecUi::default();
+        agent.run_turn("review codebase", &mut ui).await.unwrap();
+        // The turn ended after exactly the two canned responses — a spurious
+        // continue would have asked for a third and panicked on the empty queue.
+        assert!(ui.turn_end.is_some(), "turn completed");
+        assert!(
+            !ui.statuses.iter().any(|s| s.contains("incomplete")),
+            "no false incomplete warning on a finished review: {:?}",
+            ui.statuses
+        );
+        // The recap is the closing message — the turn stopped there rather than
+        // churning past it with spurious continues.
+        let m = agent.messages();
+        assert!(
+            m.last().unwrap().text().contains("I reviewed the codebase"),
+            "the recap is the model's final response: {:?}",
+            m.last().unwrap().text()
+        );
+    }
+
+    #[tokio::test]
+    async fn silent_continue_budget_resets_after_tool_progress() {
+        // The actual "review codebase stops without finishing" bug. A long,
+        // productive turn that *intermittently* narrates a next step without the
+        // tool call (a quirk of some models), but reads a file after each nudge.
+        // The silent-continue budget bounds *consecutive* stalls, not their
+        // total across the turn: each tool call resets the counter, so the turn
+        // keeps going as long as the model makes progress between stalls — even
+        // when the number of stalls exceeds max_silent_continues. Before the
+        // reset the cumulative counter crept up across the whole turn (stall 1,
+        // act, stall 2, act, …) and ended it mid-review with a false "incomplete"
+        // warning once the Nth stall hit the budget, despite progress every time.
+        let mut cfg = config();
+        cfg.max_silent_continues = 1;
+        let read = |id: &str, path: &str| {
+            completion(
+                vec![Content::ToolCall {
+                    id: id.into(),
+                    name: "read".into(),
+                    arguments: format!(r#"{{"path":"{path}"}}"#),
+                }],
+                1,
+                1,
+            )
+        };
+        let responses = vec![
+            // Stall 1: narrates a next step, no tool call → nudge (budget is 1).
+            completion(vec![Content::Text("Let me read module a.".into())], 1, 1),
+            // Recovers: reads a file → must reset the silent-continue counter.
+            read("a", "src/a.rs"),
+            // Stall 2: narrates again. With the reset this is still within budget;
+            // without it the cumulative counter is already exhausted here.
+            completion(vec![Content::Text("Let me read module b.".into())], 1, 1),
+            // Recovers again.
+            read("b", "src/b.rs"),
+            // Finishes with a recap → clean end.
+            completion(
+                vec![Content::Text("Reviewed both modules. Done.".into())],
+                1,
+                1,
+            ),
+        ];
+        let mut agent = agent(responses, cfg);
+        let mut ui = RecUi::default();
+        agent.run_turn("review codebase", &mut ui).await.unwrap();
+        assert!(ui.turn_end.is_some(), "turn completed");
+        assert!(
+            !ui.statuses.iter().any(|s| s.contains("incomplete")),
+            "no false incomplete warning while making progress: {:?}",
+            ui.statuses
+        );
+        // Ran all the way to the recap rather than quitting at the second stall.
+        assert!(
+            agent.messages().last().unwrap().text().contains("Done."),
+            "turn ran to the recap: {:?}",
+            agent.messages().last().unwrap().text()
+        );
+    }
+
+    #[tokio::test]
+    async fn continue_nudge_forces_tool_choice_on_the_next_round() {
+        // When the model narrates instead of acting and gets a silent-continue
+        // nudge, the *next* request forces a tool call (tool_mode Required ->
+        // tool_choice "required") so the model can't answer the nudge with yet
+        // another narration or an empty completion (the observed failure mode of
+        // some OpenAI-compat coder models). Once the model acts, the force clears.
+        let mut cfg = config();
+        cfg.max_silent_continues = 1;
+        assert_eq!(cfg.tool_mode, ToolMode::Auto, "precondition: free tool use");
+        let responses = vec![
+            // R1: narrates a next step, no tool call → nudge + force next round.
+            completion(vec![Content::Text("Let me read the code.".into())], 1, 1),
+            // R2 (forced): the model calls a tool → force clears.
+            completion(
+                vec![Content::ToolCall {
+                    id: "r".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"x"}"#.into(),
+                }],
+                1,
+                1,
+            ),
+            // R3: finishes with a recap → turn ends.
+            completion(vec![Content::Text("Done.".into())], 1, 1),
+        ];
+        let modes = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let provider = RecordToolModes {
+            responses: Mutex::new(responses),
+            modes: modes.clone(),
+        };
+        let mut agent = Agent::new(Box::new(provider), cfg);
+        let mut ui = RecUi::default();
+        agent.run_turn("review", &mut ui).await.unwrap();
+        let modes = modes.lock().unwrap().clone();
+        assert_eq!(modes.len(), 3, "three model rounds: {modes:?}");
+        assert_eq!(modes[0], ToolMode::Auto, "first round is normal");
+        assert_eq!(
+            modes[1],
+            ToolMode::Required,
+            "the round after the nudge forces a tool call"
+        );
+        assert_eq!(
+            modes[2],
+            ToolMode::Auto,
+            "after the model acted, the force is cleared"
         );
     }
 

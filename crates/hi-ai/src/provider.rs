@@ -78,7 +78,7 @@ pub fn provider_error_usage(err: &anyhow::Error) -> Usage {
 
 /// A model the endpoint serves, with whatever live metadata it reports via its
 /// `/models` route. Everything past `id` is best-effort — most endpoints report
-/// only the id (then these stay `None`), but some (e.g. terminaili) also report
+/// only the id (then these stay `None`), but some (e.g. pipenetwork.ai) also report
 /// the context window, pricing, and a health status.
 #[derive(Clone, Debug)]
 pub struct ServedModel {

@@ -104,15 +104,15 @@ HI_MODEL=… cargo run -p hi-eval -- bench/tasks                    # recovery o
 HI_RECOVERY_SAMPLING=0 HI_MODEL=… cargo run -p hi-eval -- bench/tasks  # recovery off
 ```
 
-### Manual terminaili runs
+### Manual pipenetwork runs
 
 Live provider evals are explicit and should not run in default CI. The
-terminaili profile passes `--provider terminaili --compat auto --tool-mode auto`
-to `hi` and requires `TERMINAILI_API_KEY` (or `HI_API_KEY`):
+pipenetwork profile passes `--provider pipenetwork --compat auto --tool-mode auto`
+to `hi` and requires `PIPENETWORK_API_KEY` (or `HI_API_KEY`):
 
 ```bash
-TERMINAILI_API_KEY=... \
-  cargo run -p hi-eval -- --profile=terminaili --configs=baseline,verify bench/tasks
+PIPENETWORK_API_KEY=... \
+  cargo run -p hi-eval -- --profile=pipenetwork --configs=baseline,verify bench/tasks
 ```
 
 Use the tiers in order: `bench/tasks` smoke first, then `bench/spec`, then

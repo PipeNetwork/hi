@@ -1,6 +1,6 @@
 //! OpenAI Chat Completions adapter.
 //!
-//! Covers OpenRouter, terminaili.com, and local servers (Ollama, llama.cpp,
+//! Covers OpenRouter, pipenetwork.ai, and local servers (Ollama, llama.cpp,
 //! LM Studio, vLLM) — they differ only by base URL and API key.
 //!
 //! Request translation lives in [`request`], and SSE stream parsing in

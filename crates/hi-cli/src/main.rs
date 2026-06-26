@@ -137,7 +137,7 @@ async fn main() -> Result<()> {
     let fallbacks = config::resolve_fallbacks(&cli, &file, &registry);
     let has_fallbacks = !fallbacks.is_empty();
     let provider = build_chain(&settings, fallbacks);
-    let (mut price, context_window) = if settings.provider == ProviderName::Terminaili {
+    let (mut price, context_window) = if settings.provider == ProviderName::Pipenetwork {
         resolve_live_model_metadata(provider.as_ref(), &registry, &settings.model).await
     } else {
         registry.metadata(&settings.model)
@@ -230,7 +230,7 @@ pub(crate) fn provider_label(provider: ProviderName) -> &'static str {
     match provider {
         ProviderName::Openai => "openai",
         ProviderName::Anthropic => "anthropic",
-        ProviderName::Terminaili => "terminaili",
+        ProviderName::Pipenetwork => "pipenetwork",
         ProviderName::Ollama => "ollama",
     }
 }

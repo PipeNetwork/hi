@@ -9,6 +9,54 @@ pub(crate) struct InputLine {
     pub history_pos: Option<usize>,
 }
 
+/// A Ctrl-R reverse-incremental search over input history. Filters the history
+/// (most-recent-first) by case-insensitive substring; the match under the cursor
+/// is loaded into the input line so Enter submits it immediately.
+#[derive(Default)]
+pub(crate) struct HistorySearch {
+    pub query: String,
+    /// Indices into `InputLine::history` (most-recent-first) matching the query.
+    pub matches: Vec<usize>,
+    /// Index into `matches` of the highlighted result.
+    pub selected: usize,
+}
+
+impl HistorySearch {
+    /// Recompute matches from `query` against `history`, newest-first.
+    pub fn refilter(&mut self, history: &[String]) {
+        let needle = self.query.to_lowercase();
+        self.matches = history
+            .iter()
+            .rev()
+            .enumerate()
+            .filter(|(_, h)| needle.is_empty() || h.to_lowercase().contains(&needle))
+            .map(|(i, _)| history.len() - 1 - i)
+            .collect();
+        self.selected = 0;
+    }
+
+    pub fn insert(&mut self, c: char, history: &[String]) {
+        self.query.push(c);
+        self.refilter(history);
+    }
+    pub fn backspace(&mut self, history: &[String]) {
+        self.query.pop();
+        self.refilter(history);
+    }
+    pub fn next(&mut self) {
+        if self.selected + 1 < self.matches.len() {
+            self.selected += 1;
+        }
+    }
+    pub fn prev(&mut self) {
+        self.selected = self.selected.saturating_sub(1);
+    }
+    /// The history index of the currently highlighted match, if any.
+    pub fn current(&self) -> Option<usize> {
+        self.matches.get(self.selected).copied()
+    }
+}
+
 impl InputLine {
     pub fn text(&self) -> String {
         self.chars.iter().collect()

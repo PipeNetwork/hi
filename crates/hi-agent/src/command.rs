@@ -257,7 +257,7 @@ pub fn arg_matching(name: &str, prefix: &str) -> Vec<(&'static str, &'static str
 }
 
 /// Help text, generated from [`COMMANDS`] so it always lists exactly what
-/// exists.
+/// exists. Includes a keybindings section so Ctrl- shortcuts aren't secret.
 pub fn help_text() -> String {
     let mut out = String::from("commands:\n");
     for c in COMMANDS {
@@ -268,7 +268,19 @@ pub fn help_text() -> String {
         };
         out.push_str(&format!("  {left:<18} {}\n", c.help));
     }
-    out.push_str("\naliases: /m /st /cp /redo /revert /new /changes /usage /debug /h /?");
+    out.push_str("aliases: /m /st /cp /redo /revert /new /changes /usage /debug /h /?");
+    out.push_str("\n\nkeybindings (TUI):\n");
+    out.push_str("  Ctrl-T             toggle reasoning (thinking) collapse\n");
+    out.push_str("  Ctrl-D (idle)      quit\n");
+    out.push_str("  Ctrl-D (typing)    toggle the working-tree diff panel\n");
+    out.push_str("  Ctrl-?             toggle the agent observability panel\n");
+    out.push_str("  Ctrl-C             interrupt the running turn (or clear input)\n");
+    out.push_str("  Ctrl-R             fuzzy-search input history\n");
+    out.push_str("  Ctrl-A / Ctrl-E    move cursor to start / end of the line\n");
+    out.push_str("  Ctrl-U             clear the input line\n");
+    out.push_str("  Alt-Enter          insert a newline (multi-line prompt)\n");
+    out.push_str("  PageUp / PageDown  scroll the transcript\n");
+    out.push_str("  Esc                clear input, or quit when the line is empty\n");
     out
 }
 

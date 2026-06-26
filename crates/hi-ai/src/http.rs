@@ -33,7 +33,7 @@ const MAX_DELAY_MS: u64 = 4_000;
 struct ModelsList {
     data: Vec<ModelEntry>,
 }
-/// One `/models` entry. Only `id` is standard; the rest are terminaili-style
+/// One `/models` entry. Only `id` is standard; the rest are pipenetwork-style
 /// extensions that other endpoints simply omit (hence all optional).
 #[derive(Deserialize)]
 struct ModelEntry {
@@ -254,8 +254,8 @@ mod tests {
     }
 
     #[test]
-    fn parses_terminaili_model_metadata() {
-        // terminaili extends /models with window, per-token rates, and health.
+    fn parses_pipenetwork_model_metadata() {
+        // pipenetwork.ai extends /models with window, per-token rates, and health.
         let json = r#"{"data":[
             {"id":"ipop/coder-balanced","max_context_tokens":1000000,
              "input_token_rate":0.000001,"output_token_rate":0.000002,

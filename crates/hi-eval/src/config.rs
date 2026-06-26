@@ -42,31 +42,31 @@ pub const CONFIGS: &[Config] = &[
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EvalProfile {
     Default,
-    Terminaili,
+    Pipenetwork,
 }
 
 impl EvalProfile {
     pub fn parse(value: Option<&str>) -> Result<Self> {
         match value.unwrap_or("default") {
             "default" => Ok(Self::Default),
-            "terminaili" => Ok(Self::Terminaili),
-            other => bail!("unknown --profile={other}; known: default, terminaili"),
+            "pipenetwork" => Ok(Self::Pipenetwork),
+            other => bail!("unknown --profile={other}; known: default, pipenetwork"),
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
             Self::Default => "default",
-            Self::Terminaili => "terminaili",
+            Self::Pipenetwork => "pipenetwork",
         }
     }
 
     pub fn hi_args(self) -> &'static [&'static str] {
         match self {
             Self::Default => &[],
-            Self::Terminaili => &[
+            Self::Pipenetwork => &[
                 "--provider",
-                "terminaili",
+                "pipenetwork",
                 "--compat",
                 "auto",
                 "--tool-mode",
@@ -76,11 +76,11 @@ impl EvalProfile {
     }
 
     pub fn validate_env(self) -> Result<()> {
-        if matches!(self, Self::Terminaili)
-            && std::env::var("TERMINAILI_API_KEY").is_err()
+        if matches!(self, Self::Pipenetwork)
+            && std::env::var("PIPENETWORK_API_KEY").is_err()
             && std::env::var("HI_API_KEY").is_err()
         {
-            bail!("--profile=terminaili requires TERMINAILI_API_KEY or HI_API_KEY");
+            bail!("--profile=pipenetwork requires PIPENETWORK_API_KEY or HI_API_KEY");
         }
         Ok(())
     }

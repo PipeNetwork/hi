@@ -18,8 +18,8 @@ cargo install --path crates/hi-cli --locked
 # OpenRouter (default endpoint)
 HI_API_KEY=sk-or-... hi -m anthropic/claude-sonnet-4 "add a --json flag to the CLI"
 
-# terminaili.com (OpenAI-compatible coding endpoint; defaults to ipop/coder-balanced)
-TERMINAILI_API_KEY=... hi --provider terminaili "add a --json flag to the CLI"
+# pipenetwork.ai (OpenAI-compatible coding endpoint; defaults to ipop/coder-balanced)
+PIPENETWORK_API_KEY=... hi --provider pipenetwork "add a --json flag to the CLI"
 
 # A local Ollama model (no API key needed)
 hi --provider ollama -m qwen2.5-coder "..."
@@ -28,7 +28,7 @@ hi --provider ollama -m qwen2.5-coder "..."
 HI_API_KEY=sk-ant-... hi --provider anthropic -m claude-sonnet-4-20250514 "..."
 ```
 
-`--provider` accepts `openai` (any OpenAI-compatible URL), `anthropic`, `terminaili`, and `ollama`. The latter two are presets: they set the right base URL, key env var (`TERMINAILI_API_KEY`), and — for terminaili — a default model, so they work with no extra flags. `hi --version` prints the Cargo package version.
+`--provider` accepts `openai` (any OpenAI-compatible URL), `anthropic`, `pipenetwork`, and `ollama`. The latter two are presets: they set the right base URL, key env var (`PIPENETWORK_API_KEY`), and — for pipenetwork — a default model, so they work with no extra flags. `hi --version` prints the Cargo package version.
 
 ### Fallback chain
 
@@ -38,7 +38,7 @@ A single dead or overloaded provider shouldn't kill your session. Give a profile
 default_profile = "cloud"
 
 [profiles.cloud]
-provider = "terminaili"
+provider = "pipenetwork"
 api_key = "..."
 fallback = ["local"]      # → falls back to the `local` profile
 
@@ -61,7 +61,7 @@ cat data.json | hi -q "extract every email address" | sort -u   # -q: text only,
 
 ## Models & providers
 
-One OpenAI-compatible client covers **OpenRouter, terminaili.com, Ollama, llama.cpp, LM Studio, and vLLM** — they differ only by `--base-url` and `--api-key`. A native **Anthropic** adapter (`--provider anthropic`) adds extended thinking and tool-use blocks.
+One OpenAI-compatible client covers **OpenRouter, pipenetwork.ai, Ollama, llama.cpp, LM Studio, and vLLM** — they differ only by `--base-url` and `--api-key`. A native **Anthropic** adapter (`--provider anthropic`) adds extended thinking and tool-use blocks.
 
 Settings resolve in this order: **CLI flags → profile → environment → defaults.**
 
@@ -190,14 +190,14 @@ HI_MODEL=anthropic/claude-sonnet-4 HI_API_KEY=$OPENROUTER_API_KEY \
 HI_MODEL=openrouter/fusion HI_API_KEY=$OPENROUTER_API_KEY \
   cargo run -p hi-eval -- bench/spec
 
-# Manual terminaili smoke (never part of default CI):
-TERMINAILI_API_KEY=... \
-  cargo run -p hi-eval -- --profile=terminaili --configs=baseline,verify bench/tasks
+# Manual pipenetwork smoke (never part of default CI):
+PIPENETWORK_API_KEY=... \
+  cargo run -p hi-eval -- --profile=pipenetwork --configs=baseline,verify bench/tasks
 
 # After the smoke is stable, compare in this order:
-cargo run -p hi-eval -- --profile=terminaili bench/tasks
-cargo run -p hi-eval -- --profile=terminaili bench/spec
-cargo run -p hi-eval -- --profile=terminaili bench/hard
+cargo run -p hi-eval -- --profile=pipenetwork bench/tasks
+cargo run -p hi-eval -- --profile=pipenetwork bench/spec
+cargo run -p hi-eval -- --profile=pipenetwork bench/hard
 ```
 
 Three task tiers: `bench/tasks` (easy bugs), `bench/hard` (edge-case algorithms), `bench/spec` (behavior pinned by the test, not the prompt). See `bench/README.md` to add tasks.

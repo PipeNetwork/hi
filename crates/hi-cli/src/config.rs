@@ -15,7 +15,7 @@ use hi_ai::{CompatMode, Registry, ToolMode};
 use serde::Deserialize;
 
 /// A minimal agentic coding tool. Works with any OpenAI-compatible endpoint
-/// (OpenRouter, terminaili.com, Ollama, llama.cpp, vLLM) or the native
+/// (OpenRouter, pipenetwork.ai, Ollama, llama.cpp, vLLM) or the native
 /// Anthropic API.
 #[derive(Parser, Debug)]
 #[command(name = "hi", version, about)]
@@ -155,8 +155,8 @@ pub enum ProviderName {
     Openai,
     /// Native Anthropic Messages API.
     Anthropic,
-    /// terminaili.com — OpenAI-compatible coding-agent endpoint.
-    Terminaili,
+    /// pipenetwork.ai — OpenAI-compatible coding-agent endpoint.
+    Pipenetwork,
     /// A local Ollama server (OpenAI-compatible).
     Ollama,
 }
@@ -205,7 +205,7 @@ impl ProviderName {
         match self {
             ProviderName::Openai => "https://openrouter.ai/api/v1",
             ProviderName::Anthropic => "https://api.anthropic.com",
-            ProviderName::Terminaili => "https://api.terminaili.com/v1",
+            ProviderName::Pipenetwork => "https://api.pipenetwork.ai/v1",
             ProviderName::Ollama => "http://localhost:11434/v1",
         }
     }
@@ -213,7 +213,7 @@ impl ProviderName {
     /// A sensible default model for presets that have an obvious one.
     pub(crate) fn default_model(self) -> Option<&'static str> {
         match self {
-            ProviderName::Terminaili => Some("ipop/coder-balanced"),
+            ProviderName::Pipenetwork => Some("ipop/coder-balanced"),
             ProviderName::Anthropic => Some("claude-sonnet-4-20250514"),
             _ => None,
         }
@@ -224,7 +224,7 @@ impl ProviderName {
         match self {
             ProviderName::Openai => "openai",
             ProviderName::Anthropic => "anthropic",
-            ProviderName::Terminaili => "terminaili",
+            ProviderName::Pipenetwork => "pipenetwork",
             ProviderName::Ollama => "ollama",
         }
     }
@@ -233,7 +233,7 @@ impl ProviderName {
     pub fn key_envs(self) -> &'static [&'static str] {
         match self {
             ProviderName::Anthropic => &["HI_API_KEY", "ANTHROPIC_API_KEY"],
-            ProviderName::Terminaili => &["HI_API_KEY", "TERMINAILI_API_KEY", "OPENAI_API_KEY"],
+            ProviderName::Pipenetwork => &["HI_API_KEY", "PIPENETWORK_API_KEY", "OPENAI_API_KEY"],
             ProviderName::Ollama => &["HI_API_KEY", "OLLAMA_API_KEY"],
             ProviderName::Openai => &["HI_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY"],
         }
@@ -583,18 +583,19 @@ pub fn default_config_path() -> Option<PathBuf> {
 const ONBOARDING: &str = "no model configured. Get started with one of:
 
   Local (Ollama):   hi --provider ollama -m qwen2.5-coder \"...\"
-  terminaili.com:   TERMINAILI_API_KEY=...  hi --provider terminaili \"...\"
-  OpenRouter:       OPENROUTER_API_KEY=...  hi -m anthropic/claude-sonnet-4 \"...\"
   Anthropic:        ANTHROPIC_API_KEY=...   hi --provider anthropic \"...\"
+  OpenRouter:       OPENROUTER_API_KEY=...  hi -m anthropic/claude-sonnet-4 \"...\"
+  pipenetwork.ai:   PIPENETWORK_API_KEY=...  hi --provider pipenetwork \"...\"
 
+Or run `hi` on a real terminal for the interactive setup wizard.
 Or set HI_MODEL, or add a profile in ~/.config/hi/config.toml (see README).
 Tip: interactive sessions use the full-screen interface by default; pass --plain for the line REPL.";
 
 /// Infer a provider + model from API keys present in the environment.
 fn auto_select() -> Option<(ProviderName, String)> {
     let set = |name: &str| std::env::var(name).is_ok_and(|v| !v.is_empty());
-    if set("TERMINAILI_API_KEY") {
-        Some((ProviderName::Terminaili, "ipop/coder-balanced".into()))
+    if set("PIPENETWORK_API_KEY") {
+        Some((ProviderName::Pipenetwork, "ipop/coder-balanced".into()))
     } else if set("ANTHROPIC_API_KEY") {
         Some((ProviderName::Anthropic, "claude-sonnet-4-20250514".into()))
     } else {

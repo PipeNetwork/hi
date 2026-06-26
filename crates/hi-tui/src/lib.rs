@@ -41,8 +41,8 @@ use completion::{
     completion_context, completion_items_for,
 };
 use event::{ChannelUi, Restore, UiEvent};
-use input::InputLine;
-use model_picker::ModelPicker;
+use input::{HistorySearch, InputLine};
+use model_picker::{display_health, display_price, display_window, ModelPicker};
 use render::{diff_lines, dim, line_text, looks_like_diff, markdown_line, wrapped_height};
 use util::{clip_reason, copy_to_clipboard, fmt_count, fmt_elapsed, goal_feedback, notify_done};
 
@@ -136,7 +136,7 @@ pub async fn run(
             .unwrap_or_default();
         app.push(Line::styled(
             format!(
-                "Enter to send, type ahead to queue, Ctrl-C interrupts, /help for commands{ctx}.",
+                "Enter to send · Alt-Enter for a newline · Ctrl-C interrupts · Ctrl-T shows reasoning · Ctrl-D toggles diff · /help for all commands{ctx}.",
             ),
             dim(),
         ));
@@ -273,6 +273,13 @@ pub async fn run(
                     }
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                        // Ctrl-R opens reverse history search (when not already
+                        // in it and there's history to search).
+                        if ctrl && key.code == KeyCode::Char('r') && app.history_search.is_none() && !app.input.history.is_empty() {
+                            let mut search = HistorySearch::default();
+                            search.refilter(&app.input.history);
+                            app.history_search = Some(search);
+                        }
                         match key.code {
                             KeyCode::Char('d') if ctrl && app.input.is_empty() => break 'session,
                             KeyCode::Char('c') if ctrl => app.input.clear(),
@@ -442,7 +449,7 @@ pub async fn run(
                     };
                     let current = app.model.clone();
                     let tags = app.served_tags();
-                    app.picker = Some(ModelPicker::new(ids, &current, tags));
+                    app.picker = Some(ModelPicker::new(ids, &current, tags, &app.served));
                     continue;
                 }
                 other => {
@@ -503,6 +510,8 @@ pub async fn run(
             // Capture the turn's trajectory telemetry for the observability
             // panel (verify rounds, recovery retries, nudges, stalls).
             app.last_telemetry = Some(agent.last_turn_telemetry().clone());
+            // Sync cumulative cost for the title bar's persistent display.
+            app.cost_usd = agent.cost_usd();
             // A new turn's edits supersede any open diff panel's snapshot.
             app.diff_text = None;
         }
@@ -648,14 +657,85 @@ async fn drive(
     Ok(cancelled)
 }
 
+/// One entry in the display transcript. Most content is a plain styled line;
+/// reasoning (CoT) is stored specially so it can be collapsed by default and
+/// expanded on demand via Ctrl-T, rather than flooding the transcript inline.
+#[derive(Clone)]
+enum TranscriptEntry {
+    Line(Line<'static>),
+    /// Assistant reasoning/thinking, buffered until the reasoning phase ends.
+    /// Shown collapsed ("thought for Ns") unless `show_reasoning` is on.
+    Reasoning {
+        text: String,
+        elapsed: Duration,
+    },
+}
+
+impl TranscriptEntry {
+    /// Flatten this entry into display lines under the current `show_reasoning`
+    /// setting. A collapsed reasoning block is one dim summary line; expanded,
+    /// it's the full text indented and dimmed.
+    fn flatten(&self, show_reasoning: bool) -> Vec<Line<'static>> {
+        match self {
+            TranscriptEntry::Line(line) => vec![line.clone()],
+            TranscriptEntry::Reasoning { text, elapsed } => {
+                let secs = elapsed.as_secs();
+                let label = if secs >= 60 {
+                    format!("{}m {:02}s", secs / 60, secs % 60)
+                } else {
+                    format!("{secs}s")
+                };
+                if show_reasoning {
+                    let mut lines = vec![Line::styled(
+                        format!("⏺ thought for {label} (Ctrl-T to collapse)"),
+                        Style::default().fg(Color::DarkGray),
+                    )];
+                    for line in text.lines() {
+                        lines.push(Line::styled(
+                            format!("  {line}"),
+                            Style::default().fg(Color::DarkGray),
+                        ));
+                    }
+                    lines
+                } else {
+                    vec![Line::styled(
+                        format!("⏺ thought for {label}  (Ctrl-T to expand)",
+                    ),
+                        Style::default().fg(Color::DarkGray),
+                    )]
+                }
+            }
+        }
+    }
+
+    /// The plain text of this entry, for /copy and /export (always includes
+    /// reasoning text regardless of collapse state).
+    fn text(&self) -> String {
+        match self {
+            TranscriptEntry::Line(line) => line_text(line),
+            TranscriptEntry::Reasoning { text, .. } => text.clone(),
+        }
+    }
+}
+
 struct App {
     provider: String,
     model: String,
-    transcript: Vec<Line<'static>>,
+    transcript: Vec<TranscriptEntry>,
     /// The in-progress streamed line: (style, markdown?, text). Committed on
     /// newline/end. `markdown` is set for assistant prose so it's rendered with
     /// light markdown styling; reasoning and other streams stay literal.
     pending: Option<(Style, bool, String)>,
+    /// Buffer for assistant reasoning (CoT) chunks: accumulated until the
+    /// reasoning phase ends, then committed as a single collapsible
+    /// `TranscriptEntry::Reasoning` so it doesn't flood the transcript inline.
+    reasoning_buffer: String,
+    /// When the current reasoning phase started (for the "thought for Ns" label).
+    reasoning_started: Option<Instant>,
+    /// Whether reasoning (CoT) blocks are expanded inline. Off by default —
+    /// reasoning is collapsed to a one-line "thought for Ns" summary; Ctrl-T
+    /// toggles this to show/hide the full thinking text.
+    show_reasoning: bool,
     /// The language of the ``` fence the streamed assistant text is currently
     /// inside (empty string if the fence gave none); `None` when not in a fence.
     /// Carries across streamed lines so code interiors highlight consistently.
@@ -692,6 +772,9 @@ struct App {
     last_turn_start: usize,
     /// Active model picker (`/model` with no argument), if any.
     picker: Option<ModelPicker>,
+    /// Ctrl-R reverse-search over input history. When active, keystrokes go to
+    /// the search filter instead of the input line.
+    history_search: Option<HistorySearch>,
     /// When set, a model-list fetch is in flight (start time, for the spinner).
     fetching: Option<Instant>,
     status: String,
@@ -711,6 +794,12 @@ struct App {
     served: HashMap<String, hi_ai::ServedModel>,
     /// The model catalog (ids), for inline `/model <id>` type-ahead completion.
     model_ids: Vec<String>,
+    /// Cumulative session USD cost, mirrored from the agent for the title bar.
+    cost_usd: Option<f64>,
+    /// How many transcript lines have been trimmed from the top by
+    /// [`cap_transcript`]. When > 0, a "↑ N lines compacted" marker shows at
+    /// the top of the transcript so it's obvious older content scrolled off.
+    trimmed: u64,
     /// Assistant prose currently streaming. Tool output is intentionally not
     /// included; `/copy` copies the assistant's answer, not command logs.
     current_assistant: String,
@@ -787,6 +876,9 @@ impl App {
             model: model.to_string(),
             transcript: Vec::new(),
             pending: None,
+            reasoning_buffer: String::new(),
+            reasoning_started: None,
+            show_reasoning: false,
             code_lang: None,
             input: InputLine::default(),
             following: true,
@@ -803,6 +895,7 @@ impl App {
             last_prompt: None,
             last_turn_start: 0,
             picker: None,
+            history_search: None,
             fetching: None,
             status: String::new(),
             plan: Vec::new(),
@@ -811,6 +904,8 @@ impl App {
             context_window: None,
             served: HashMap::new(),
             model_ids: Vec::new(),
+            cost_usd: None,
+            trimmed: 0,
             current_assistant: String::new(),
             last_assistant: String::new(),
             last_turn_event: None,
@@ -1062,6 +1157,93 @@ impl App {
     fn edit_key(&mut self, key: &KeyEvent) -> Option<String> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        // --- Ctrl-R reverse history search mode ---
+        // When active, keystrokes go to the search filter, not the input line.
+        if let Some(search) = &mut self.history_search {
+            match key.code {
+                KeyCode::Enter => {
+                    // Load the highlighted match into the input and submit it.
+                    let idx = search.current();
+                    self.history_search = None;
+                    if let Some(i) = idx {
+                        if i < self.input.history.len() {
+                            self.input.set(&self.input.history[i].clone());
+                            let line = self.input.submit();
+                            if !line.trim().is_empty() {
+                                return Some(line);
+                            }
+                        }
+                    }
+                    return None;
+                }
+                KeyCode::Esc => {
+                    // On Esc, load the highlighted match for editing (don't submit).
+                    if let Some(i) = search.current() {
+                        if i < self.input.history.len() {
+                            self.input.set(&self.input.history[i].clone());
+                        }
+                    }
+                    self.history_search = None;
+                    return None;
+                }
+                KeyCode::Char('r') if ctrl => {
+                    // Cycle to the next match (like bash Ctrl-R).
+                    search.next();
+                    if let Some(i) = search.current() {
+                        if i < self.input.history.len() {
+                            self.input.set(&self.input.history[i].clone());
+                        }
+                    }
+                    return None;
+                }
+                KeyCode::Char('s') if ctrl => {
+                    search.prev();
+                    if let Some(i) = search.current() {
+                        if i < self.input.history.len() {
+                            self.input.set(&self.input.history[i].clone());
+                        }
+                    }
+                    return None;
+                }
+                KeyCode::Backspace => {
+                    search.backspace(&self.input.history);
+                    if let Some(i) = search.current() {
+                        if i < self.input.history.len() {
+                            self.input.set(&self.input.history[i].clone());
+                        }
+                    }
+                    return None;
+                }
+                KeyCode::Up => {
+                    search.prev();
+                    if let Some(i) = search.current() {
+                        if i < self.input.history.len() {
+                            self.input.set(&self.input.history[i].clone());
+                        }
+                    }
+                    return None;
+                }
+                KeyCode::Down => {
+                    search.next();
+                    if let Some(i) = search.current() {
+                        if i < self.input.history.len() {
+                            self.input.set(&self.input.history[i].clone());
+                        }
+                    }
+                    return None;
+                }
+                KeyCode::Char(c) if !ctrl => {
+                    search.insert(c, &self.input.history);
+                    if let Some(i) = search.current() {
+                        if i < self.input.history.len() {
+                            self.input.set(&self.input.history[i].clone());
+                        }
+                    }
+                    return None;
+                }
+                _ => return None,
+            }
+        }
         match key.code {
             // Alt+Enter inserts a newline (multi-line prompt without pasting); so
             // does a trailing backslash, for terminals that can't send Alt+Enter.
@@ -1095,6 +1277,12 @@ impl App {
             KeyCode::Char('?') if ctrl => {
                 self.show_debug = !self.show_debug;
             }
+            // Toggle reasoning (CoT) expansion: collapsed "thought for Ns"
+            // summaries vs. the full thinking text. Off by default so reasoning
+            // doesn't flood the transcript; Ctrl-T shows/hides all blocks.
+            KeyCode::Char('t') if ctrl => {
+                self.show_reasoning = !self.show_reasoning;
+            }
             KeyCode::Home => self.input.home(),
             KeyCode::End => self.input.end(),
             KeyCode::Char(c) if !ctrl => self.input.insert(c),
@@ -1111,7 +1299,7 @@ impl App {
     }
 
     fn push(&mut self, line: Line<'static>) {
-        self.transcript.push(line);
+        self.transcript.push(TranscriptEntry::Line(line));
         self.cap_transcript();
     }
 
@@ -1119,11 +1307,13 @@ impl App {
     /// range, slow the per-frame render clone, or grow memory without limit. Older
     /// lines scroll off the top (the full session is still in the JSONL log). Only
     /// trims while pinned to the bottom, so a reader scrolled up isn't yanked by
-    /// the offsets shifting underneath them.
+    /// the offsets shifting underneath them. Sets `trimmed` so the render shows a
+    /// "↑ N lines compacted" marker at the top of the transcript.
     fn cap_transcript(&mut self) {
         if self.following && self.transcript.len() > MAX_TRANSCRIPT_LINES {
             let excess = self.transcript.len() - MAX_TRANSCRIPT_LINES;
             self.transcript.drain(..excess);
+            self.trimmed = self.trimmed.saturating_add(excess as u64);
         }
     }
 
@@ -1378,7 +1568,7 @@ impl App {
     fn transcript_text(&self) -> String {
         self.transcript
             .iter()
-            .map(line_text)
+            .map(TranscriptEntry::text)
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -1422,9 +1612,28 @@ impl App {
             } else {
                 Line::styled(text, style)
             };
-            self.transcript.push(line);
+            self.transcript.push(TranscriptEntry::Line(line));
             self.cap_transcript();
         }
+    }
+
+    /// Commit any buffered reasoning as a single collapsible entry, then clear
+    /// the buffer. Called when the reasoning phase ends (first text arrives, or
+    /// the message ends) so the reasoning isn't flooded inline.
+    fn flush_reasoning(&mut self) {
+        if self.reasoning_buffer.is_empty() {
+            self.reasoning_started = None;
+            return;
+        }
+        let elapsed = self
+            .reasoning_started
+            .map(|t| t.elapsed())
+            .unwrap_or_default();
+        let text = std::mem::take(&mut self.reasoning_buffer);
+        self.transcript
+            .push(TranscriptEntry::Reasoning { text, elapsed });
+        self.reasoning_started = None;
+        self.cap_transcript();
     }
 
     /// Append streamed text under `style`, committing complete lines. When
@@ -1449,7 +1658,7 @@ impl App {
             } else {
                 Line::styled(committed, style)
             };
-            self.transcript.push(line);
+            self.transcript.push(TranscriptEntry::Line(line));
         }
         self.cap_transcript();
         // No follow() here: streaming must not yank a reader who scrolled up.
@@ -1462,17 +1671,27 @@ impl App {
                 self.event_log
                     .push(format!("assistant_text {} chars", t.len()));
                 self.last_turn_event = Some(TurnEventKind::Assistant);
+                // If reasoning preceded this text, commit it as a collapsible
+                // block before the answer starts.
+                self.flush_reasoning();
                 self.current_assistant.push_str(&t);
                 self.stream(Style::default(), true, &t);
             }
             UiEvent::Reasoning(t) => {
                 self.event_log.push(format!("reasoning {} chars", t.len()));
                 self.last_turn_event = Some(TurnEventKind::Reasoning);
-                self.stream(dim(), false, &t);
+                // Buffer reasoning instead of streaming it inline — it's
+                // committed as a single collapsible "thought for Ns" entry when
+                // the reasoning phase ends (first text or assistant_end).
+                if self.reasoning_started.is_none() {
+                    self.reasoning_started = Some(Instant::now());
+                }
+                self.reasoning_buffer.push_str(&t);
             }
             UiEvent::AssistantEnd => {
                 self.event_log.push("assistant_end".to_string());
                 self.last_turn_event = Some(TurnEventKind::AssistantEnd);
+                self.flush_reasoning();
                 self.flush_pending();
                 if !self.current_assistant.trim().is_empty() {
                     self.last_assistant = self.current_assistant.trim().to_string();
@@ -1494,6 +1713,7 @@ impl App {
                 // it with its own timer until the result lands.
                 self.current_tool = Some(label.clone());
                 self.current_tool_started = Some(Instant::now());
+                self.flush_reasoning();
                 self.flush_pending();
                 self.push(Line::styled(
                     format!("⏺ {label}"),
@@ -1575,7 +1795,7 @@ impl App {
         };
         for mut line in lines {
             line.spans.insert(0, "  ".into());
-            self.transcript.push(line);
+            self.transcript.push(TranscriptEntry::Line(line));
         }
         let extra = result.lines().count().saturating_sub(MAX);
         if extra > 0 {
@@ -1612,7 +1832,7 @@ impl App {
                     // Open the interactive picker (filter + arrow-select).
                     let current = self.model.clone();
                     let tags = self.served_tags();
-                    self.picker = Some(ModelPicker::new(registry.model_ids(), &current, tags));
+                    self.picker = Some(ModelPicker::new(registry.model_ids(), &current, tags, &self.served));
                 } else {
                     let health = self.apply_model(agent, registry, &id);
                     self.push(Line::styled(format!("model set to {id}"), dim()));
@@ -1815,8 +2035,20 @@ impl App {
 
         // --- Transcript ---
         let title = format!(" hi · {} · {} ", self.provider, self.model);
-        // Right-aligned: a persistent context-fill gauge, then the last status.
+        // Right-aligned: persistent cost + token totals, a context-fill gauge,
+        // then the last status — so spend is always visible without a command.
         let mut info_parts: Vec<String> = Vec::new();
+        let (input, output) = self.usage;
+        if input + output > 0 {
+            info_parts.push(format!(
+                "↑{} ↓{}",
+                fmt_count(input),
+                fmt_count(output)
+            ));
+        }
+        if let Some(cost) = self.cost_usd {
+            info_parts.push(format!("${cost:.4}"));
+        }
         if let Some(pct) = self.context_pct() {
             info_parts.push(format!("{pct}% ctx"));
         }
@@ -1828,7 +2060,21 @@ impl App {
         } else {
             format!(" {} ", info_parts.join(" · "))
         };
-        let mut lines = self.transcript.clone();
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        // If older transcript lines have been trimmed, show a marker at the top
+        // so the user knows earlier content scrolled off (it's still in the
+        // JSONL session log).
+        if self.trimmed > 0 {
+            lines.push(Line::styled(
+                format!("↑ {} lines compacted (see session log)", self.trimmed),
+                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+            ));
+        }
+        lines.extend(
+            self.transcript
+                .iter()
+                .flat_map(|e| e.flatten(self.show_reasoning)),
+        );
         if let Some((style, markdown, text)) = &self.pending {
             // Style the in-progress line live (headings, bold, code, …) so prose
             // doesn't snap into formatting only when its newline lands. The line
@@ -1928,27 +2174,38 @@ impl App {
             if visible.is_empty() {
                 plines.push(Line::styled("  (no matches)".to_string(), dim()));
             }
-            for (id, selected) in visible {
+            for row in visible {
                 let mut tag = String::new();
-                if id == p.current {
+                if row.id == p.current {
                     tag.push_str(" (current)");
                 }
-                if let Some(health) = p.tags.get(id) {
+                let health = display_health(row.meta);
+                if !health.is_empty() {
                     tag.push_str(&format!(" [{health}]"));
                 }
-                if selected {
+                // Price + window columns, right-aligned after the id.
+                let price = display_price(row.meta);
+                let window = display_window(row.meta);
+                let meta_col = if price.is_empty() && window.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {price:>8}  {window:>5}")
+                };
+                if row.selected {
                     plines.push(Line::from(vec![
                         Span::styled(
-                            format!("▶ {id}"),
+                            format!("▶ {}", row.id),
                             Style::default()
                                 .fg(Color::Cyan)
                                 .add_modifier(Modifier::BOLD),
                         ),
+                        Span::styled(meta_col, Style::default().fg(Color::Yellow)),
                         Span::styled(tag, dim()),
                     ]));
                 } else {
                     plines.push(Line::from(vec![
-                        Span::raw(format!("  {id}")),
+                        Span::raw(format!("  {}", row.id)),
+                        Span::styled(meta_col, Style::default().fg(Color::DarkGray)),
                         Span::styled(tag, dim()),
                     ]));
                 }
@@ -1972,6 +2229,33 @@ impl App {
             let mut ilines: Vec<Line> = Vec::new();
             // Pinned plan checklist at the very top of the input box.
             ilines.extend(plan_block);
+            // Ctrl-R reverse history search overlay: shows the query, the match
+            // count, and a few recent matches above the input line.
+            if let Some(search) = &self.history_search {
+                let count = search.matches.len();
+                let preview = search
+                    .current()
+                    .and_then(|i| self.input.history.get(i))
+                    .map(|s| s.replace('\n', " "))
+                    .unwrap_or_default();
+                let preview = if preview.len() > 60 {
+                    format!("{}…", &preview[..60])
+                } else {
+                    preview
+                };
+                ilines.push(Line::from(vec![
+                    Span::styled(
+                        "reverse-i-search: ",
+                        Style::default().fg(Color::Green),
+                    ),
+                    Span::styled(search.query.clone(), Style::default().add_modifier(Modifier::BOLD)),
+                    Span::styled(
+                        format!("  ({count} match{})", if count == 1 { "" } else { "es" }),
+                        dim(),
+                    ),
+                ]));
+                ilines.push(Line::styled(format!("  → {preview}"), dim()));
+            }
             // The `Ctrl-D` working-tree diff panel: a compact view of what's
             // changed in the tree, rendered with the same highlighting as
             // tool-output diffs. Sits above the changed-files summary line.
@@ -2245,7 +2529,7 @@ mod tests {
             "bounded while following"
         );
         assert_eq!(
-            line_text(app.transcript.last().unwrap()),
+            app.transcript.last().unwrap().text(),
             format!("l{}", MAX_TRANSCRIPT_LINES + 5_000 - 1),
             "newest line kept"
         );
@@ -2396,6 +2680,7 @@ mod tests {
         let colored: Vec<(String, Option<Color>)> = app
             .transcript
             .iter()
+            .flat_map(|e| e.flatten(false))
             .map(|l| {
                 let text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
                 (text, l.spans.last().map(|s| s.style.fg).unwrap_or(None))
@@ -2428,6 +2713,7 @@ mod tests {
         let any_red = app
             .transcript
             .iter()
+            .flat_map(|e| e.flatten(false))
             .any(|l| l.spans.last().map(|s| s.style.fg) == Some(Some(Color::Red)));
         assert!(!any_red, "a plain list must not be colorized as a diff");
     }
@@ -2465,14 +2751,7 @@ mod tests {
             ctx_window: None,
         });
         app.report_tokens();
-        let line: String = app
-            .transcript
-            .last()
-            .unwrap()
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect();
+        let line = app.transcript.last().unwrap().text();
         assert_eq!(line, "cumulative: 1000 in · 250 out · 1250 total");
     }
 
@@ -2678,11 +2957,7 @@ mod tests {
         assert!(app.status.contains("12 total"));
         // ...and a clear "done" marker in the transcript so the turn's end shows.
         assert_eq!(app.transcript.len(), 1);
-        let line: String = app.transcript[0]
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect();
+        let line = app.transcript[0].text();
         assert!(line.contains("✓ done"), "got: {line}");
     }
 
@@ -2699,11 +2974,7 @@ mod tests {
             "steer in status bar: {}",
             app.status
         );
-        let line: String = app.transcript[0]
-            .spans
-            .iter()
-            .map(|s| s.content.as_ref())
-            .collect();
+        let line = app.transcript[0].text();
         assert!(line.contains("steer"), "steer in done marker: {line}");
     }
 
@@ -2738,7 +3009,7 @@ mod tests {
     fn completed_turn_without_summary_is_visible() {
         let mut app = App::new("openai", "gpt-4o");
         app.note_turn_completed_without_summary();
-        let line = line_text(app.transcript.last().unwrap());
+        let line = app.transcript.last().unwrap().text();
         assert!(line.contains("✓ done"), "got: {line}");
         assert!(line.contains("no usage reported"), "got: {line}");
         assert_eq!(app.status, "done · no usage reported");
@@ -2754,7 +3025,7 @@ mod tests {
         app.apply(UiEvent::ToolResult("19 additions, 3 deletions".into()));
         app.note_turn_completed_without_summary();
 
-        let lines: Vec<String> = app.transcript.iter().map(line_text).collect();
+        let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
         assert!(
             lines
                 .iter()
@@ -2774,7 +3045,7 @@ mod tests {
     fn failed_turn_is_visible() {
         let mut app = App::new("openai", "gpt-4o");
         app.note_turn_failed("provider disconnected");
-        let line = line_text(app.transcript.last().unwrap());
+        let line = app.transcript.last().unwrap().text();
         assert!(line.contains("✗ failed"), "got: {line}");
         assert!(line.contains("provider disconnected"), "got: {line}");
         assert_eq!(app.status, "failed");
@@ -2788,7 +3059,7 @@ mod tests {
             r#"{"command":"true"}"#.into(),
         ));
         app.apply(UiEvent::ToolResult(String::new()));
-        let rendered: Vec<String> = app.transcript.iter().map(line_text).collect();
+        let rendered: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
         assert!(
             rendered.iter().any(|line| line.contains("(no output)")),
             "transcript: {rendered:?}"
@@ -2797,13 +3068,13 @@ mod tests {
 
     #[test]
     fn renders_fetching_spinner() {
-        let mut app = App::new("terminaili", "ipop/coder-balanced");
+        let mut app = App::new("pipenetwork", "ipop/coder-balanced");
         app.fetching = Some(Instant::now());
         let mut term = Terminal::new(TestBackend::new(60, 10)).unwrap();
         term.draw(|f| app.render(f)).unwrap();
         let screen = dump(&term);
         assert!(
-            screen.contains("fetching models from terminaili"),
+            screen.contains("fetching models from pipenetwork"),
             "fetch spinner: {screen}"
         );
         assert!(screen.contains("Esc to cancel"), "cancel hint: {screen}");
@@ -2816,6 +3087,7 @@ mod tests {
             vec!["anthropic/claude-sonnet-4".into(), "openai/gpt-4o".into()],
             "openai/gpt-4o",
             HashMap::new(),
+            &HashMap::new(),
         ));
         let mut term = Terminal::new(TestBackend::new(60, 14)).unwrap();
         term.draw(|f| app.render(f)).unwrap();
@@ -2833,12 +3105,13 @@ mod tests {
 
     #[test]
     fn picker_shows_health_tag() {
-        let mut app = App::new("terminaili", "ipop/coder-balanced");
+        let mut app = App::new("pipenetwork", "ipop/coder-balanced");
         let tags = HashMap::from([("claude-sonnet-4.6".to_string(), "degraded".to_string())]);
         app.picker = Some(ModelPicker::new(
             vec!["claude-sonnet-4.6".into(), "ipop/coder-balanced".into()],
             "ipop/coder-balanced",
             tags,
+            &HashMap::new(),
         ));
         let mut term = Terminal::new(TestBackend::new(60, 14)).unwrap();
         term.draw(|f| app.render(f)).unwrap();
