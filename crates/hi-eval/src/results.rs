@@ -12,6 +12,10 @@ pub struct Trajectory {
     pub recovery_retries: u32,
     pub repeat_nudges: u32,
     pub continue_nudges: u32,
+    /// Times the truncation recovery nudged the model to continue after hitting
+    /// the output token cap. 0 on a turn that never hit the limit.
+    #[serde(default)]
+    pub truncation_retries: u32,
     pub hit_step_cap: bool,
     pub stalled_unfinished: bool,
     pub stalled_repeating: bool,
@@ -57,7 +61,11 @@ impl Trajectory {
     /// clean one-shot: verify rounds + recovery retries + repeat/continue
     /// nudges. A clean turn is 0; higher means the model needed more steering.
     pub fn extra_rounds(&self) -> u32 {
-        self.verify_rounds + self.recovery_retries + self.repeat_nudges + self.continue_nudges
+        self.verify_rounds
+            + self.recovery_retries
+            + self.repeat_nudges
+            + self.continue_nudges
+            + self.truncation_retries
     }
 }
 
@@ -236,5 +244,20 @@ mod tests {
             "test result: FAILED. 1 passed; 1 failed"
         ));
         assert!(!looks_like_build_error("AssertionError: expected 4, got 5"));
+    }
+
+    #[test]
+    fn extra_rounds_includes_truncation_retries() {
+        use super::Trajectory;
+        let t = Trajectory {
+            truncation_retries: 3,
+            verify_rounds: 1,
+            recovery_retries: 1,
+            repeat_nudges: 0,
+            continue_nudges: 0,
+            ..Default::default()
+        };
+        // 1 verify + 1 recovery + 3 truncation = 5 total extra rounds.
+        assert_eq!(t.extra_rounds(), 5);
     }
 }

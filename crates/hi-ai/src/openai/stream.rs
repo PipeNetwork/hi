@@ -654,9 +654,9 @@ where
     if !text.is_empty() {
         completion.content.push(Content::Text(text));
     }
-    for builder in tool_calls {
+    for (i, builder) in tool_calls.into_iter().enumerate() {
         if !builder.name.is_empty() {
-            completion.content.push(builder.finish());
+            completion.content.push(builder.finish(i));
         }
     }
     if completion.usage.output_tokens == 0 && output_chars > 0 {
@@ -736,9 +736,19 @@ struct ToolCallBuilder {
 }
 
 impl ToolCallBuilder {
-    fn finish(self) -> Content {
+    fn finish(self, index: usize) -> Content {
+        // Some local OpenAI-compat servers (Ollama, llama.cpp) omit the tool-call
+        // `id` field, leaving it empty. Two calls with empty IDs would cross-match
+        // in the agent's result-pairing logic (find-by-id returns the first match),
+        // so the second call would get the first call's output. Synthesize a unique
+        // id when the provider didn't send one.
+        let id = if self.id.is_empty() {
+            format!("apicall_{index}")
+        } else {
+            self.id
+        };
         Content::ToolCall {
-            id: self.id,
+            id,
             name: self.name,
             arguments: if self.arguments.is_empty() {
                 "{}".into()
@@ -981,6 +991,31 @@ mod tests {
         assert_eq!(calls[0].id, "call_1");
         assert_eq!(calls[0].name, "bash");
         assert_eq!(calls[0].arguments, r#"{"command":"echo hi"}"#);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tool_calls_without_ids_get_synthesized_unique_ids() {
+        // Some local OpenAI-compat servers (Ollama, llama.cpp) omit the `id`
+        // field on tool-call deltas. Without synthesis, two calls would both get
+        // id="" and the agent's result-pairing would cross-match them. Each call
+        // must get a unique synthesized id (apicall_0, apicall_1, …).
+        let stream = never_ending(vec![
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"read","arguments":"{\"path\":\"a\"}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"name":"read","arguments":"{\"path\":\"b\"}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ]);
+        let mut sink = |_: StreamEvent| {};
+        let completion = collect_completion(stream, IDLE, STALL, &mut sink)
+            .await
+            .unwrap();
+        let calls = completion.tool_calls();
+        assert_eq!(calls.len(), 2);
+        // Each call gets a unique synthesized id, not both empty.
+        assert_ne!(calls[0].id, calls[1].id, "ids must be unique");
+        assert!(!calls[0].id.is_empty(), "first id synthesized");
+        assert!(!calls[1].id.is_empty(), "second id synthesized");
+        assert_eq!(calls[0].name, "read");
+        assert_eq!(calls[1].name, "read");
     }
 
     #[tokio::test(start_paused = true)]

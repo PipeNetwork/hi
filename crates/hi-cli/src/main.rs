@@ -498,6 +498,7 @@ fn write_report(
             "recovery_retries": tel.recovery_retries,
             "repeat_nudges": tel.repeat_nudges,
             "continue_nudges": tel.continue_nudges,
+            "truncation_retries": tel.truncation_retries,
             "hit_step_cap": tel.hit_step_cap,
             "stalled_unfinished": tel.stalled_unfinished,
             "stalled_repeating": tel.stalled_repeating,

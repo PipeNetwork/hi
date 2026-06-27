@@ -299,6 +299,7 @@ fn read_report(path: &Path) -> ReportInfo {
         recovery_retries: tel["recovery_retries"].as_u64().unwrap_or(0) as u32,
         repeat_nudges: tel["repeat_nudges"].as_u64().unwrap_or(0) as u32,
         continue_nudges: tel["continue_nudges"].as_u64().unwrap_or(0) as u32,
+        truncation_retries: tel["truncation_retries"].as_u64().unwrap_or(0) as u32,
         hit_step_cap: tel["hit_step_cap"].as_bool().unwrap_or(false),
         stalled_unfinished: tel["stalled_unfinished"].as_bool().unwrap_or(false),
         stalled_repeating: tel["stalled_repeating"].as_bool().unwrap_or(false),

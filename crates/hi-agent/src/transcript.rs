@@ -223,12 +223,19 @@ impl Transcript {
         // Record a result for each call id exactly once. If a result is
         // missing, synthesize a stub so we never leave an orphan tool_use —
         // providers reject that on the next request.
+        //
+        // When two calls share the same id (e.g. a provider that omits ids and
+        // the caller synthesized duplicates, or a malformed response), a plain
+        // `find` would give both calls the first matching result. Instead, drain
+        // results by id: each id consumes the first unused result with that id,
+        // so the second call gets the second result.
+        let mut remaining = results;
         for id in &call_ids {
-            let output = results
-                .iter()
-                .find(|(rid, _)| rid == id)
-                .map(|(_, o)| o.clone())
-                .unwrap_or_else(|| "[tool result missing]".to_string());
+            let pos = remaining.iter().position(|(rid, _)| rid == id);
+            let output = match pos {
+                Some(i) => remaining.remove(i).1,
+                None => "[tool result missing]".to_string(),
+            };
             msgs.push(Message::tool_result(id, output));
         }
     }
@@ -552,6 +559,46 @@ mod tests {
         // Still has a tool result (the stub), so validation passes.
         t.validate_for_provider().unwrap();
         assert_eq!(t.as_slice().last().unwrap().role, Role::Tool);
+    }
+
+    #[test]
+    fn push_assistant_with_results_pairs_duplicate_ids_by_position() {
+        // Two calls with the same id (e.g. a provider that omits ids and both
+        // got synthesized to the same value, or a malformed response). Each call
+        // must get its OWN result, not both getting the first match — the old
+        // `find` logic gave both calls "out-a", losing "out-b".
+        let mut t = Transcript::new(vec![user("do it")]);
+        t.push_assistant_with_results(
+            vec![
+                Content::ToolCall {
+                    id: "dup".into(),
+                    name: "read".into(),
+                    arguments: "{}".into(),
+                },
+                Content::ToolCall {
+                    id: "dup".into(),
+                    name: "read".into(),
+                    arguments: "{}".into(),
+                },
+            ],
+            vec![
+                ("dup".into(), "out-a".into()),
+                ("dup".into(), "out-b".into()),
+            ],
+        );
+        let msgs = t.as_slice();
+        // assistant + two tool results
+        assert_eq!(msgs.len(), 4);
+        // First result → out-a, second result → out-b (positional, not both out-a)
+        assert!(matches!(
+            &msgs[2].content[0],
+            Content::ToolResult { output, .. } if output == "out-a"
+        ));
+        assert!(matches!(
+            &msgs[3].content[0],
+            Content::ToolResult { output, .. } if output == "out-b"
+        ));
+        t.validate_for_provider().unwrap();
     }
 
     #[test]

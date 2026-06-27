@@ -192,6 +192,11 @@ pub const MAX_REPEAT_NUDGES: u32 = 2;
 /// they actually act — with 3, a single step's stall could exhaust the budget
 /// and end the turn mid-plan.
 pub const MAX_SILENT_CONTINUES: u32 = 5;
+/// Maximum number of per-turn git checkpoints retained for `/undo`. Each is a
+/// 40-char SHA, so the memory cost is negligible, but a very long session
+/// (thousands of turns) would grow the vec without bound. Older checkpoints
+/// beyond this cap are dropped — `/undo` only needs the most recent few.
+pub const MAX_CHECKPOINTS: usize = 50;
 /// Sent silently (no status line, no steer counter) when the model stops with
 /// text after having made tool calls earlier in the turn. The system prompt
 /// tells the model not to narrate without acting, but when it still does, this
@@ -1423,6 +1428,13 @@ impl Agent {
         // can revert it. Best-effort: no-op outside a git repo.
         if let Some(sha) = hi_tools::checkpoint::create(std::path::Path::new(".")).await {
             self.checkpoints.push(sha);
+            // Drop oldest checkpoints beyond the cap so the vec doesn't grow
+            // without bound over a very long session. `/undo` only needs the
+            // most recent few.
+            if self.checkpoints.len() > MAX_CHECKPOINTS {
+                self.checkpoints
+                    .drain(0..self.checkpoints.len() - MAX_CHECKPOINTS);
+            }
         }
 
         // If the context window is filling up, reclaim room before adding more,

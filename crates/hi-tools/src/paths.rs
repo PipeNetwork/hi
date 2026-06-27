@@ -22,12 +22,17 @@ pub(crate) fn validate_workspace_path(path: &str) -> Result<std::path::PathBuf> 
     };
     // For paths that exist, canonicalize to resolve symlinks and `..`. For
     // paths that don't exist yet (a new file being written), canonicalize()
-    // fails — so we fall back to *lexical* normalization (resolve `.`/`..`
-    // without touching the filesystem) so `..` segments can't escape the
-    // workspace via a not-yet-existing path.
+    // fails — so we canonicalize the *parent* directory (which usually exists)
+    // and re-join the filename. This resolves symlinks on the parent so a
+    // symlink inside the workspace pointing outside (e.g. `./external -> /etc`)
+    // can't be used to write `external/new_file` to `/etc/new_file` — the
+    // canonicalized parent would be `/etc`, which fails the containment check.
+    // If the parent also doesn't exist (nested new directories), fall back to
+    // *lexical* normalization (resolve `.`/`..` without touching the filesystem)
+    // so `..` segments can't escape the workspace via a not-yet-existing path.
     let canonical = resolved
         .canonicalize()
-        .unwrap_or_else(|_| lexical_abs(&resolved));
+        .unwrap_or_else(|_| canonicalize_via_parent(&resolved));
     let canonical_cwd = cwd.canonicalize().unwrap_or(cwd.clone());
     if canonical.starts_with(&canonical_cwd) {
         return Ok(canonical);
@@ -48,6 +53,22 @@ pub(crate) fn validate_workspace_path(path: &str) -> Result<std::path::PathBuf> 
         path,
         canonical_cwd.display()
     );
+}
+
+/// Canonicalize a not-yet-existing path by resolving its parent directory (if
+/// it exists) and re-joining the file name. This resolves symlinks on the
+/// parent so a symlink directory inside the workspace pointing outside can't
+/// be used to escape. Falls back to lexical normalization if the parent also
+/// doesn't exist.
+fn canonicalize_via_parent(path: &Path) -> std::path::PathBuf {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Ok(canonical_parent) = parent.canonicalize()
+        && let Some(filename) = path.file_name()
+    {
+        return canonical_parent.join(filename);
+    }
+    lexical_abs(path)
 }
 
 /// Lexically normalize a path to an absolute form with no `.` or `..` segments
@@ -303,5 +324,52 @@ mod tests {
         assert_eq!(k1, k3, "redundant ../ should not change the key");
         // The key is absolute (joined to cwd).
         assert!(k1.starts_with('/'), "cache key should be absolute");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonicalize_via_parent_resolves_symlink() {
+        // The fix for symlink escape: canonicalize_via_parent resolves the
+        // parent directory's symlinks so a symlink inside the workspace pointing
+        // outside can't be used to write a not-yet-existing file through it.
+        // The symlink target must NOT be under /tmp or /var/folders (those are
+        // allowlisted as scratch paths), so we use a temp dir under the user's
+        // home instead.
+        use super::canonicalize_via_parent;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::var("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let workspace = base.join(format!(".hi-symlink-ws-{stamp}"));
+        let outside = base.join(format!(".hi-symlink-out-{stamp}"));
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let link = workspace.join("escape");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        // A not-yet-existing file through the symlink: canonicalize_via_parent
+        // resolves the parent (the symlink → outside) and joins the filename.
+        let target = link.join("new_file.txt");
+        let resolved = canonicalize_via_parent(&target);
+
+        // The resolved path must be under `outside`, not under `workspace` —
+        // proving the symlink was resolved rather than lexically kept.
+        let canonical_outside = outside.canonicalize().unwrap();
+        assert!(
+            resolved.starts_with(&canonical_outside),
+            "symlink parent should resolve to outside ({}), got {}",
+            canonical_outside.display(),
+            resolved.display()
+        );
+        assert_eq!(
+            resolved.file_name(),
+            Some(std::ffi::OsStr::new("new_file.txt"))
+        );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 }

@@ -229,7 +229,7 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
     let mut cost_usd: Option<f64> = None;
     let mut checkpoint_refs = Vec::new();
     let mut loaded_goal: Option<hi_agent::Goal> = None;
-    for (i, line) in text.lines().enumerate() {
+    for line in text.lines() {
         if line.trim().is_empty() {
             continue;
         }
@@ -266,8 +266,16 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
             }
             continue;
         }
-        let message: Message = serde_json::from_str(line)
-            .with_context(|| format!("parsing {} line {}", path.display(), i + 1))?;
+        let message: Message = match serde_json::from_str(line) {
+            Ok(m) => m,
+            Err(_) => {
+                // Skip a corrupted/unparseable line (e.g. a partially-written
+                // last line from a crash mid-flush) rather than failing the
+                // entire resume. The session is still usable up to the last
+                // complete line; a truncated final line carries no real content.
+                continue;
+            }
+        };
         messages.push(message);
     }
     Ok(LoadedSession {
@@ -470,5 +478,36 @@ mod tests {
             Some(1),
             "resumes at the active sub-goal"
         );
+    }
+
+    #[test]
+    fn load_history_skips_corrupted_lines() {
+        // A partially-written last line (from a crash mid-flush) must not make
+        // the entire session unresumable. The good lines before it should load.
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "hi-session-corrupt-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // Write a valid message line, a valid usage line, then a corrupted line
+        // (truncated JSON — what a crash mid-write would leave).
+        let valid_msg = serde_json::to_string(&Message::user("hello world")).unwrap();
+        let valid_usage = r#"{"type":"usage","input_tokens":10,"output_tokens":5}"#;
+        let corrupted = r#"{"role":"user","content":[{"type":"text","text":"trun"#;
+        let content = format!("{valid_msg}\n{valid_usage}\n{corrupted}");
+        std::fs::write(&path, &content).unwrap();
+
+        let loaded = load_history(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        // The valid message loaded; the corrupted line was skipped.
+        assert_eq!(loaded.messages.len(), 1);
+        assert_eq!(loaded.messages[0].text(), "hello world");
+        // The valid usage line loaded too.
+        assert_eq!(loaded.usage.input_tokens, 10);
     }
 }
