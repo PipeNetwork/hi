@@ -56,6 +56,29 @@ impl Ui for PlainUi {
         println!("\x1b[36m⏺ {}\x1b[0m", tool_label(name, arguments));
     }
 
+    fn tool_stream(&mut self, _name: &str, line: &str) {
+        // Live bash output: print dimmed so it's distinguishable from the
+        // final result. No begin_output — the spinner was already cleared
+        // by the tool_call header.
+        println!("\x1b[2m  │ {line}\x1b[0m");
+    }
+
+    fn confirm_edit(&mut self, path: &str, diff: &str) -> bool {
+        use std::io::Write;
+        self.begin_output();
+        println!("\x1b[33m⏺ edit {} — apply? [y/N]\x1b[0m", path);
+        if !diff.is_empty() {
+            for line in diff.lines().take(20) {
+                println!("\x1b[2m  {line}\x1b[0m");
+            }
+        }
+        print!("\x1b[33m  › \x1b[0m");
+        let _ = std::io::stdout().flush();
+        let mut input = String::new();
+        let _ = std::io::stdin().read_line(&mut input);
+        input.trim().eq_ignore_ascii_case("y")
+    }
+
     fn tool_result(&mut self, name: &str, result: &str) {
         // Read-only exploration tools (read/list/grep) already named the file
         // or pattern in their `tool_call` header — blasting their full output
@@ -93,8 +116,21 @@ impl Ui for PlainUi {
             .iter()
             .filter(|s| s.status == PlanStatus::Done)
             .count();
-        println!("\x1b[1m⏺ plan · {done}/{}\x1b[0m", steps.len());
-        for s in steps {
+        let active = steps.iter().find(|s| s.status == PlanStatus::Active);
+        // Compact one-line summary with the active step, so a reader scanning
+        // the REPL output sees progress at a glance without reading every line.
+        if let Some(a) = active {
+            println!(
+                "\x1b[1m⏺ plan · {done}/{} · ▸ {}\x1b[0m",
+                steps.len(),
+                a.title
+            );
+        } else {
+            println!("\x1b[1m⏺ plan · {done}/{}\x1b[0m", steps.len());
+        }
+        // Show up to 8 steps; clip long plans so they don't flood the REPL.
+        const MAX_SHOWN: usize = 8;
+        for s in steps.iter().take(MAX_SHOWN) {
             let (glyph, color) = match s.status {
                 PlanStatus::Done => ('✓', "\x1b[32m"),
                 PlanStatus::Active => ('▸', "\x1b[36m"),
@@ -102,11 +138,35 @@ impl Ui for PlainUi {
             };
             println!("{color}  {glyph} {}\x1b[0m", s.title);
         }
+        if steps.len() > MAX_SHOWN {
+            println!("\x1b[2m  … {} more steps\x1b[0m", steps.len() - MAX_SHOWN);
+        }
     }
 
     fn turn_end(&mut self, summary: &str) {
         self.begin_output();
         println!("\x1b[2m{summary}\x1b[0m");
+    }
+
+    fn turn_error(&mut self, kind: &str, message: &str, guidance: &str) {
+        self.begin_output();
+        let suffix = if guidance.is_empty() {
+            String::new()
+        } else {
+            format!(" — {guidance}")
+        };
+        eprintln!("\x1b[31m{kind}: {message}{suffix}\x1b[0m");
+    }
+
+    fn changed_files(&mut self, files: &[String]) {
+        self.begin_output();
+        let label = if files.len() == 1 { "file" } else { "files" };
+        println!(
+            "\x1b[32m  ✎ {} {} changed: {}\x1b[0m",
+            files.len(),
+            label,
+            files.join(", ")
+        );
     }
 
     fn usage(

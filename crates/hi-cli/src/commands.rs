@@ -191,6 +191,7 @@ pub(crate) fn handle_command(
         // Handled in the repl loop (async / runs a turn); never reach here.
         Command::Compact(_)
         | Command::Retry
+        | Command::Edit
         | Command::Undo
         | Command::Init
         | Command::Diff
@@ -219,6 +220,9 @@ pub(crate) fn handle_command(
         }
         Command::Unknown(name) => {
             eprintln!("\x1b[33munknown command /{name}; try /help\x1b[0m");
+        }
+        Command::Context => {
+            print!("{}", agent.context_breakdown());
         }
         // `/provider` is handled inline by the REPL/TUI (it needs the Config
         // and a provider builder, which this synchronous handler doesn't have).

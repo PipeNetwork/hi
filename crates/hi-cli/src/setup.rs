@@ -7,7 +7,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::config::{ProviderName, Settings, default_config_path};
 
-pub fn run() -> Result<Settings> {
+pub async fn run() -> Result<Settings> {
     println!("Welcome to hi — let's set up a model provider.\n");
     println!("  1) Ollama (local)    run models on your machine — free, private, no key");
     println!("                      needs `ollama serve` running (install: ollama.com)");
@@ -55,6 +55,19 @@ pub fn run() -> Result<Settings> {
         key
     };
 
+    // Test the connection before saving, so the user discovers a bad key
+    // or unreachable server now — not on their first turn.
+    print!("\x1b[2m  testing connection…\x1b[0m\r");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let test_result = test_connection(provider, &model, &api_key).await;
+    match &test_result {
+        Ok(()) => println!("\x1b[2m  ✓ connection verified\x1b[0m"),
+        Err(err) => {
+            println!("\x1b[33m  ⚠ couldn't verify the connection: {err:#}\x1b[0m");
+            println!("\x1b[2m  You can continue — hi will retry on the first turn.\x1b[0m");
+        }
+    }
+
     let save = prompt("Save to ~/.config/hi/config.toml so you don't repeat this? [Y/n]: ")?;
     if !save.trim().eq_ignore_ascii_case("n") {
         match save_config(provider, &model, &api_key) {
@@ -74,6 +87,19 @@ pub fn run() -> Result<Settings> {
         tool_mode: hi_ai::ToolMode::Auto,
         compat: hi_ai::CompatMode::Auto,
     })
+}
+
+/// Test the connection by listing models from the endpoint. Returns `Ok(())`
+/// if the endpoint responded (even with an empty list), or an error if it
+/// couldn't be reached / the key was rejected.
+async fn test_connection(provider: ProviderName, _model: &str, api_key: &str) -> Result<()> {
+    use hi_ai::{OpenAiProvider, Provider};
+    let base_url = provider.default_base_url();
+    let p = OpenAiProvider::new(base_url.to_string(), api_key.to_string());
+    p.list_models()
+        .await
+        .map(|_| ())
+        .map_err(|err| anyhow::anyhow!("{err:#}"))
 }
 
 fn prompt(message: &str) -> Result<String> {

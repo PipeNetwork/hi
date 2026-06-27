@@ -22,6 +22,21 @@ pub trait Ui: Send {
     /// with its result, so a reader can tell which result belongs to which call.
     /// Defaults to no-op; only the live TUI needs it.
     fn tool_started(&mut self, _name: &str, _arguments: &str) {}
+    /// A line of live output from a running tool (e.g. `bash` stdout/stderr
+    /// streamed line-by-line). Emitted *during* execution, before the
+    /// matching [`tool_call`]/[`tool_result`] pair. Unlike [`tool_result`],
+    /// this is not a transcript line — it's a transient progress indicator
+    /// that an interactive frontend can show in a live "running" panel and
+    /// discard when the final result arrives. Defaults to no-op; only the
+    /// live TUI needs it.
+    fn tool_stream(&mut self, _name: &str, _line: &str) {}
+    /// Ask the user to confirm a file edit. `path` is the file being changed;
+    /// `diff` is a unified-diff preview. Returns `true` to approve, `false` to
+    /// skip. Defaults to auto-approve (non-interactive). Only interactive
+    /// frontends override this to actually prompt.
+    fn confirm_edit(&mut self, _path: &str, _diff: &str) -> bool {
+        true
+    }
     /// Emit the transcript header for a tool call, immediately followed by the
     /// matching [`tool_result`]. In a concurrent batch these are emitted in
     /// completion order, as (header, result) pairs, so the two never drift
@@ -53,6 +68,65 @@ pub trait Ui: Send {
     }
     /// End of the turn, with a prebuilt token/cost summary line.
     fn turn_end(&mut self, summary: &str);
+    /// The list of files changed during the turn (empty for a read-only or
+    /// Q&A turn). Emitted just before [`turn_end`] so a frontend can show a
+    /// compact "changed: a.rs, b.rs" line without needing `/diff`. Defaults
+    /// to no-op — only interactive frontends render it.
+    fn changed_files(&mut self, _files: &[String]) {}
+    /// The turn failed with a classified error. `kind` is a short slug
+    /// (`auth`, `rate_limit`, `outage`, …) so a frontend can tailor its
+    /// presentation; `message` is the raw error text; `guidance` is a
+    /// user-facing remediation hint. Defaults to ignoring — frontends
+    /// that already handle `turn_end` should override this for richer
+    /// error UX.
+    fn turn_error(&mut self, _kind: &str, _message: &str, _guidance: &str) {}
+}
+
+/// Classify a provider/agent error into a user-facing kind slug and
+/// remediation guidance. Returns `(kind, guidance)` where `kind` is a
+/// short lowercase slug and `guidance` is a one-line hint. Falls back to
+/// `("error", "")` for unclassified errors.
+pub fn classify_error(err: &anyhow::Error) -> (&'static str, &'static str) {
+    use hi_ai::ProviderErrorKind as K;
+    match hi_ai::provider_error_kind(err) {
+        Some(K::Auth) => (
+            "auth",
+            "your API key may be invalid or expired — try /provider to reconfigure, then /retry",
+        ),
+        Some(K::RateLimit) => (
+            "rate_limit",
+            "the endpoint is rate-limiting you — wait a moment, then /retry",
+        ),
+        Some(K::Outage) => (
+            "outage",
+            "the endpoint is unreachable or returning errors — check the provider's status page, or /provider to switch",
+        ),
+        Some(K::UnsupportedRequestShape) => (
+            "compat",
+            "the provider rejected the request shape — try --compat auto, or /model to switch to a model with better tool support",
+        ),
+        Some(K::UnsupportedTools) => (
+            "tools",
+            "this model doesn't support tool use — try /model to switch, or --tool-mode chat-only for a Q&A turn",
+        ),
+        Some(K::RequestTooLarge) => (
+            "context_full",
+            "the request exceeded the model's context window — try /compact to reclaim room, then /retry",
+        ),
+        Some(K::StreamTimeout) => (
+            "timeout",
+            "the response stream timed out — the endpoint may be slow or overloaded; /retry or /model to switch",
+        ),
+        Some(K::MalformedStream) => (
+            "malformed",
+            "the provider sent a malformed response — this is often a server-side bug; /retry, or /model to switch",
+        ),
+        Some(K::EmptyCompletion) => (
+            "empty",
+            "the model returned an empty response — /retry, or /model to switch to a more reliable model",
+        ),
+        Some(K::Other) | None => ("error", ""),
+    }
 }
 
 /// A short, human-readable label for a tool call: the tool name followed by its

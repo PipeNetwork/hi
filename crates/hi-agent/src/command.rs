@@ -30,6 +30,9 @@ pub enum Command {
     Copy(String),
     /// Show, set, or clear the current session goal.
     Goal(String),
+    /// Show a context-occupancy breakdown: system prompt, per-turn token
+    /// estimates, and what compaction would keep/elide.
+    Context,
     /// Explore the repo and write a project-context file (runs as a turn).
     Init,
     /// Reclaim context. Empty arg = configured strategy; `full`/`hybrid`/`elide`
@@ -37,6 +40,9 @@ pub enum Command {
     Compact(String),
     /// Re-run the last user message (after truncating its previous attempt).
     Retry,
+    /// Load the last user prompt into the input line for editing before
+    /// resending. Handled by the frontend (it manipulates the input line).
+    Edit,
     /// Revert the file changes the last turn made (from its git checkpoint).
     Undo,
     /// Stage all working-tree changes and commit them with an auto-generated
@@ -71,9 +77,11 @@ pub fn parse(line: &str) -> Option<Command> {
         "diff" | "changes" => Command::Diff,
         "copy" | "cp" => Command::Copy(arg),
         "goal" => Command::Goal(arg),
+        "context" | "ctx" => Command::Context,
         "init" => Command::Init,
         "compact" => Command::Compact(arg),
         "retry" | "redo" => Command::Retry,
+        "edit" => Command::Edit,
         "undo" | "revert" => Command::Undo,
         "commit" => Command::Commit,
         "version" | "ver" | "v" => Command::Version,
@@ -123,8 +131,8 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "provider",
-        args: "[name|add|edit]",
-        help: "switch profile, or add/edit a profile (no arg lists all)",
+        args: "[name|add|edit|remove]",
+        help: "switch profile, or add/edit/remove a profile (no arg lists all)",
         arg_values: &[],
     },
     CommandSpec {
@@ -152,6 +160,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         arg_values: &[("clear", "clear the current goal")],
     },
     CommandSpec {
+        name: "context",
+        args: "",
+        help: "show context-occupancy breakdown and compaction preview",
+        arg_values: &[],
+    },
+    CommandSpec {
         name: "init",
         args: "",
         help: "scan the repo and write an HI.md project guide",
@@ -174,6 +188,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "retry",
         args: "",
         help: "re-run your last message",
+        arg_values: &[],
+    },
+    CommandSpec {
+        name: "edit",
+        args: "",
+        help: "load your last message into the input line to edit and resend",
         arg_values: &[],
     },
     CommandSpec {
@@ -386,6 +406,14 @@ mod tests {
         assert_eq!(
             parse("/provider edit sonnet"),
             Some(Command::Provider("edit sonnet".into()))
+        );
+        assert_eq!(
+            parse("/provider remove local"),
+            Some(Command::Provider("remove local".into()))
+        );
+        assert_eq!(
+            parse("/provider rm local"),
+            Some(Command::Provider("rm local".into()))
         );
         assert_eq!(
             parse("/verify cargo test"),

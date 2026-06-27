@@ -17,6 +17,8 @@ pub(crate) enum UiEvent {
     ToolStarted(String, String),
     ToolCall(String, String),
     ToolResult(String, String),
+    /// A live line of output from a running tool (e.g. bash stdout).
+    ToolStream(String, String),
     Status(String),
     Plan(Vec<PlanStep>),
     Usage {
@@ -26,6 +28,10 @@ pub(crate) enum UiEvent {
         ctx_window: Option<u32>,
     },
     TurnEnd(String),
+    /// A classified turn failure: (kind slug, raw message, guidance hint).
+    TurnError(String, String, String),
+    /// Files changed during the turn.
+    ChangedFiles(Vec<String>),
 }
 
 /// The [`Ui`] handed to the agent: forwards everything over a channel so the
@@ -62,6 +68,14 @@ impl Ui for ChannelUi {
     fn tool_result(&mut self, name: &str, result: &str) {
         self.send(UiEvent::ToolResult(name.to_string(), result.to_string()));
     }
+    fn tool_stream(&mut self, name: &str, line: &str) {
+        self.send(UiEvent::ToolStream(name.to_string(), line.to_string()));
+    }
+    // confirm_edit: the TUI's ChannelUi is async-by-channel and can't
+    // synchronously wait for a user response. --confirm-edits is primarily
+    // a REPL/plain-mode feature. The TUI auto-approves (returns true via
+    // the default impl). A future improvement could add a confirmation
+    // overlay with a oneshot channel.
     fn status(&mut self, text: &str) {
         self.send(UiEvent::Status(text.to_string()));
     }
@@ -84,6 +98,16 @@ impl Ui for ChannelUi {
     }
     fn turn_end(&mut self, summary: &str) {
         self.send(UiEvent::TurnEnd(summary.to_string()));
+    }
+    fn turn_error(&mut self, kind: &str, message: &str, guidance: &str) {
+        self.send(UiEvent::TurnError(
+            kind.to_string(),
+            message.to_string(),
+            guidance.to_string(),
+        ));
+    }
+    fn changed_files(&mut self, files: &[String]) {
+        self.send(UiEvent::ChangedFiles(files.to_vec()));
     }
 }
 

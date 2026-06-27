@@ -1,5 +1,6 @@
 mod bestof;
 mod commands;
+mod complete;
 mod config;
 mod repl;
 mod session;
@@ -85,7 +86,7 @@ async fn main() -> Result<()> {
         && config::needs_setup(&cli, &file)
         && std::io::stdin().is_terminal()
     {
-        setup::run()?
+        setup::run().await?
     } else {
         // Otherwise print config/onboarding guidance plainly (no "Error:" prefix).
         match config::resolve(&cli, &file, &registry) {
@@ -167,8 +168,11 @@ async fn main() -> Result<()> {
                 keep_recent: hi_agent::DEFAULT_KEEP_RECENT,
             }),
         finalize: !cli.no_finalize,
+        max_cost_warn: cli.max_cost,
+        confirm_edits: cli.confirm_edits,
         ..AgentConfig::default()
     };
+    let resume_summary = loaded.as_ref().and_then(|l| l.resume_summary.clone());
     let mut agent = match loaded {
         Some(loaded) => Agent::resume(
             provider,
@@ -197,6 +201,15 @@ async fn main() -> Result<()> {
                 result.as_ref().err(),
             )?;
         }
+        if let Err(err) = &result {
+            let (kind, guidance) = hi_agent::classify_error(err);
+            let suffix = if guidance.is_empty() {
+                String::new()
+            } else {
+                format!(" — {guidance}")
+            };
+            eprintln!("\x1b[31m{kind}: {err:#}{suffix}\x1b[0m");
+        }
         // A one-shot turn may have started background processes; don't leak them.
         hi_tools::kill_background_processes();
         return result;
@@ -207,27 +220,18 @@ async fn main() -> Result<()> {
     // One-shot prompts return above, so scripted/piped/eval runs never write it.
     let auto_memory = auto_memory_enabled(cli.no_memory, cli.no_save);
 
+    // Show a resume summary when continuing a session, so the user knows what
+    // they're walking back into before the TUI takes over the screen.
+    if let Some(summary) = &resume_summary {
+        println!("\x1b[2m{summary}\x1b[0m");
+    }
+
     // The full-screen TUI is the default interactive experience; fall back to
     // the plain REPL when not on a TTY, when --plain is set, or if it errors.
     if !cli.plain && std::io::stdout().is_terminal() {
         // Build the profile list and resolver for `/provider` in the TUI.
-        let profiles: Vec<hi_tui::ProfileInfo> = config::profile_names(&file)
-            .into_iter()
-            .map(|name| {
-                let p = file.profiles.get(&name);
-                let provider = p
-                    .and_then(|p| p.provider)
-                    .map(provider_label)
-                    .unwrap_or("openai")
-                    .to_string();
-                let model = p.and_then(|p| p.model.clone());
-                hi_tui::ProfileInfo {
-                    name,
-                    provider,
-                    model,
-                }
-            })
-            .collect();
+        let profiles: Vec<hi_tui::ProfileInfo> = profile_infos(&file);
+        let active_profile = cli.profile.clone().or_else(|| file.default_profile.clone());
         let resolver: hi_tui::ProfileResolver = Box::new({
             let file = file.clone();
             let registry = registry.clone();
@@ -264,23 +268,7 @@ async fn main() -> Result<()> {
                 let mut file = file.lock().unwrap();
                 config::upsert_profile(&mut file, &data.name, profile, &path)?;
                 // Return the updated profile list.
-                Ok(config::profile_names(&file)
-                    .into_iter()
-                    .map(|name| {
-                        let p = file.profiles.get(&name);
-                        let prov = p
-                            .and_then(|p| p.provider)
-                            .map(provider_label)
-                            .unwrap_or("openai")
-                            .to_string();
-                        let model = p.and_then(|p| p.model.clone());
-                        hi_tui::ProfileInfo {
-                            name,
-                            provider: prov,
-                            model,
-                        }
-                    })
-                    .collect())
+                Ok(profile_infos(&file))
             }
         });
         let loader: hi_tui::ProfileLoader = Box::new({
@@ -301,6 +289,19 @@ async fn main() -> Result<()> {
                 })
             }
         });
+        let remover: hi_tui::ProfileRemover = Box::new({
+            let file = std::sync::Mutex::new(file.clone());
+            move |name: &str| {
+                let path = config::writable_config_path(None)
+                    .context("could not determine config path")?;
+                let mut file = file.lock().unwrap();
+                let existed = config::remove_profile(&mut file, name, &path)?;
+                if !existed {
+                    anyhow::bail!("no profile named '{name}'");
+                }
+                Ok(profile_infos(&file))
+            }
+        });
         match hi_tui::run(
             &mut agent,
             provider_label(settings.provider),
@@ -309,9 +310,12 @@ async fn main() -> Result<()> {
             session::history_path(),
             auto_memory,
             profiles,
+            active_profile,
             resolver,
             saver,
             loader,
+            remover,
+            resume_summary,
         )
         .await
         {
@@ -335,35 +339,72 @@ pub(crate) fn provider_label(provider: ProviderName) -> &'static str {
     }
 }
 
+/// Build the TUI profile list from a config. Shared by the initial list, the
+/// saver callback, and the remover callback so they all stay in sync. Only
+/// non-default base URLs are included (to keep the `/provider` list concise).
+fn profile_infos(config: &config::Config) -> Vec<hi_tui::ProfileInfo> {
+    config::profile_names(config)
+        .into_iter()
+        .map(|name| {
+            let p = config.profiles.get(&name);
+            let provider = p
+                .and_then(|p| p.provider)
+                .map(provider_label)
+                .unwrap_or("openai")
+                .to_string();
+            let model = p.and_then(|p| p.model.clone());
+            // Only show the base URL when it differs from the provider default.
+            let base_url = p.and_then(|p| {
+                p.base_url.clone().filter(|url| {
+                    let default = p.provider.map(|prov| prov.default_base_url()).unwrap_or("");
+                    url.trim_end_matches('/') != default.trim_end_matches('/')
+                })
+            });
+            hi_tui::ProfileInfo {
+                name,
+                provider,
+                model,
+                base_url,
+            }
+        })
+        .collect()
+}
+
 /// Decide the session file and whether to preload history.
 struct LoadedAgentSession {
     messages: Vec<Message>,
     usage: Usage,
     cost_usd: Option<f64>,
+    /// A one-line summary of the resumed session, shown to the user on startup.
+    resume_summary: Option<String>,
 }
 
 fn resolve_session(cli: &Cli) -> Result<(std::path::PathBuf, Option<LoadedAgentSession>)> {
     if let Some(id) = &cli.resume {
         let path = session::session_path(id)?;
         let loaded = session::load_history(&path)?;
+        let summary = session::resume_summary(&loaded);
         return Ok((
             path,
             Some(LoadedAgentSession {
                 messages: loaded.messages,
                 usage: loaded.usage,
                 cost_usd: loaded.cost_usd,
+                resume_summary: Some(summary),
             }),
         ));
     }
     if cli.cont {
         if let Some(path) = session::latest_session() {
             let loaded = session::load_history(&path)?;
+            let summary = session::resume_summary(&loaded);
             return Ok((
                 path,
                 Some(LoadedAgentSession {
                     messages: loaded.messages,
                     usage: loaded.usage,
                     cost_usd: loaded.cost_usd,
+                    resume_summary: Some(summary),
                 }),
             ));
         }

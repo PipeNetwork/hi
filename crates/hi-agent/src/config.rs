@@ -111,6 +111,13 @@ pub struct AgentConfig {
     /// resumes across sessions. Off by default while it stabilizes; when off,
     /// the agent behaves as the single-turn loop.
     pub long_horizon: bool,
+    /// When set, warn via `ui.status` after each turn if cumulative session
+    /// cost exceeds this USD amount. Does not interrupt the turn.
+    pub max_cost_warn: Option<f64>,
+    /// When true, ask the user to confirm each file edit (write/edit/multi_edit/
+    /// apply_patch) before applying it. The UI shows a diff preview and prompts
+    /// for y/n. In non-interactive mode, edits are auto-approved.
+    pub confirm_edits: bool,
 }
 
 impl Default for AgentConfig {
@@ -144,6 +151,8 @@ impl Default for AgentConfig {
             in_turn_keep_tool_results: IN_TURN_KEEP_TOOL_RESULTS,
             proactive_verify: false,
             long_horizon: false,
+            max_cost_warn: None,
+            confirm_edits: false,
         }
     }
 }

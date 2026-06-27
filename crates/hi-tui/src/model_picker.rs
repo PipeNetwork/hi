@@ -7,10 +7,11 @@ use hi_ai::ServedModel;
 use crate::PICKER_ROWS;
 
 /// A shared empty metadata instance used when a model id has no served info.
-const EMPTY_META: ModelMeta = ModelMeta {
+static EMPTY_META: ModelMeta = ModelMeta {
     window: None,
     price: None,
     health: None,
+    capabilities: Vec::new(),
 };
 
 /// One row of model metadata for display: the id plus whatever the endpoint
@@ -22,6 +23,8 @@ pub(crate) struct ModelMeta {
     pub window: Option<u32>,
     pub price: Option<(f64, f64)>,
     pub health: Option<String>,
+    /// Capability tags from the static catalog: "tools", "reasoning".
+    pub capabilities: Vec<&'static str>,
 }
 
 impl ModelMeta {
@@ -30,6 +33,7 @@ impl ModelMeta {
             window: sm.context_window,
             price: sm.price,
             health: sm.health().map(|h| h.to_string()),
+            capabilities: Vec::new(),
         }
     }
 }
@@ -88,6 +92,7 @@ impl ModelPicker {
         current: &str,
         tags: HashMap<String, String>,
         served: &HashMap<String, ServedModel>,
+        capabilities: &HashMap<String, Vec<&'static str>>,
     ) -> Self {
         let matches: Vec<usize> = (0..all.len()).collect();
         // Open with the current model highlighted (and scrolled into view).
@@ -104,10 +109,14 @@ impl ModelPicker {
                 // If served didn't report health but the legacy tags map has it,
                 // use that.
                 let mut m = m;
-                if m.health.is_none() {
-                    if let Some(h) = tags.get(id) {
-                        m.health = Some(h.clone());
-                    }
+                if m.health.is_none()
+                    && let Some(h) = tags.get(id)
+                {
+                    m.health = Some(h.clone());
+                }
+                // Attach capability tags from the static catalog when available.
+                if let Some(caps) = capabilities.get(id) {
+                    m.capabilities = caps.clone();
                 }
                 (id.clone(), m)
             })
@@ -164,7 +173,7 @@ impl ModelPicker {
     }
 
     /// The visible window of rows, scrolled to keep the selection in view.
-    pub fn visible(&self) -> (usize, Vec<PickerRow>) {
+    pub fn visible(&self) -> (usize, Vec<PickerRow<'_>>) {
         let offset = if self.selected >= PICKER_ROWS {
             self.selected + 1 - PICKER_ROWS
         } else {
@@ -205,6 +214,15 @@ pub(crate) fn display_health(meta: &ModelMeta) -> String {
     meta.health.clone().unwrap_or_default()
 }
 
+/// Format capability tags as a compact string: "tools·reasoning" or "".
+pub(crate) fn display_capabilities(meta: &ModelMeta) -> String {
+    if meta.capabilities.is_empty() {
+        String::new()
+    } else {
+        meta.capabilities.join("·")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -220,6 +238,7 @@ mod tests {
             ],
             "google/gemini",
             HashMap::new(),
+            &HashMap::new(),
             &HashMap::new(),
         );
         // Opens with the current model pre-selected.

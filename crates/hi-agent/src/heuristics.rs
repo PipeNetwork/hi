@@ -1,9 +1,203 @@
 //! Small heuristics and formatters used by the agent loop.
 
-use hi_ai::ToolMode;
+use hi_ai::{Content, ToolMode};
 use hi_tools::{PlanStatus, PlanStep, ToolOutput};
 
+use crate::transcript::Transcript;
 use crate::ui::Ui;
+
+/// The set of valid tool names, used to validate text-parsed tool calls so we
+/// don't act on hallucinated or garbage names.
+const VALID_TOOL_NAMES: &[&str] = &[
+    "update_plan",
+    "record_decision",
+    "read",
+    "write",
+    "edit",
+    "multi_edit",
+    "bash",
+    "bash_output",
+    "bash_kill",
+    "list",
+    "diff",
+    "grep",
+    "glob",
+    "apply_patch",
+];
+
+/// Whether a string is a known tool name.
+fn is_valid_tool_name(name: &str) -> bool {
+    VALID_TOOL_NAMES.contains(&name)
+}
+
+/// Parse a single tool-call JSON object from a substring starting at `{`.
+/// Returns `(name, arguments_json_string, end_index)` if the object is a
+/// valid tool call, or `None` if it's not. `end_index` is one past the
+/// closing `}`.
+fn try_parse_tool_call_json(s: &str, start: usize) -> Option<(String, String, usize)> {
+    // Walk forward to find the matching closing brace, respecting string
+    // literals and nested objects/arrays.
+    let bytes = s.as_bytes();
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escape = false;
+    let mut i = start;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+        } else if b == b'"' {
+            in_string = true;
+        } else if b == b'{' || b == b'[' {
+            depth += 1;
+        } else if b == b'}' || b == b']' {
+            depth -= 1;
+            if depth == 0 && b == b'}' {
+                break;
+            }
+        }
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return None; // No matching close brace
+    }
+    let json_str = &s[start..=i];
+    let value: serde_json::Value = serde_json::from_str(json_str).ok()?;
+    let obj = value.as_object()?;
+    // Accept {"name": "...", "arguments": {...}} or
+    // {"name": "...", "arguments": "..."} (string form).
+    let name = obj.get("name")?.as_str()?;
+    if !is_valid_tool_name(name) {
+        return None;
+    }
+    let arguments = match obj.get("arguments") {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(other) => other.to_string(),
+        None => "{}".to_string(),
+    };
+    Some((name.to_string(), arguments, i + 1))
+}
+
+/// Scan assistant text for tool-call-like JSON patterns and convert them into
+/// `Content::ToolCall` blocks. This is a fallback for local models (Ollama,
+/// llama.cpp, etc.) that emit tool calls as text instead of using the
+/// structured `tool_calls` API field.
+///
+/// Recognizes patterns like:
+/// - `{"name": "bash", "arguments": {"command": "ls"}}`
+/// - `{"name": "read", "arguments": "{\"path\": \"foo.rs\"}"}`
+///
+/// Returns the parsed tool calls (with generated IDs) and the text with the
+/// tool-call JSON removed, so the assistant message recorded in history
+/// contains only the prose, not the raw JSON.
+///
+/// `id_offset` is the number of `textcall_` IDs already present in the
+/// transcript — new IDs start at `textcall_{id_offset}` so they're globally
+/// unique across the whole conversation, not just this message. Without the
+/// offset, every assistant message reuses `textcall_0`, `textcall_1`, … and
+/// providers reject the duplicate IDs with a 400 on the next request (e.g.
+/// after switching from a local model to a hosted one mid-session).
+/// Returns the interleaved content blocks — prose `Text` segments and
+/// `ToolCall` blocks in their original emission order — so that trailing
+/// prose *after* a tool call stays after it in the recorded message, not
+/// merged before it. Each prose segment is trailing-trimmed (newlines left
+/// by the JSON sitting on its own line) but leading whitespace is preserved.
+/// An empty leading segment (tool call at the very start) is omitted.
+pub(crate) fn parse_text_tool_calls(text: &str, id_offset: usize) -> Vec<Content> {
+    // Strip ChatML special tokens (<|im_start|>, <|im_end|>, …) that some
+    // local models emit as raw text. The streaming layer already strips them,
+    // but this is a defense-in-depth for any text that arrives unstripped.
+    let text = strip_chatml_tokens(text);
+    let mut out = Vec::new();
+    let mut call_count = 0usize;
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    let mut search_from = 0;
+
+    while i < bytes.len() {
+        if bytes[i] == b'{'
+            && let Some((name, arguments, end)) = try_parse_tool_call_json(&text, i)
+        {
+            // Emit the prose before this tool call as a Text block.
+            let prose = text[search_from..i].trim_end();
+            if !prose.is_empty() {
+                out.push(Content::Text(prose.to_string()));
+            }
+            let id = format!("textcall_{}", id_offset + call_count);
+            out.push(Content::ToolCall {
+                id,
+                name,
+                arguments,
+            });
+            call_count += 1;
+            i = end;
+            search_from = end;
+            continue;
+        }
+        i += 1;
+    }
+    // Emit any trailing prose after the last tool call.
+    let trailing = text[search_from..].trim_end();
+    if !trailing.is_empty() {
+        out.push(Content::Text(trailing.to_string()));
+    }
+
+    out
+}
+
+/// Count how many `textcall_` tool-call IDs already exist in the transcript, so
+/// the next batch of text-parsed tool calls gets globally-unique IDs instead of
+/// restarting from `textcall_0` every message. Scans both assistant `ToolCall`
+/// blocks and tool `ToolResult` blocks (which carry the matching `call_id`).
+pub(crate) fn textcall_id_offset(messages: &Transcript) -> usize {
+    messages
+        .as_slice()
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .filter_map(|c| match c {
+            Content::ToolCall { id, .. } => Some(id.as_str()),
+            Content::ToolResult { call_id, .. } => Some(call_id.as_str()),
+            _ => None,
+        })
+        .filter_map(|id| id.strip_prefix("textcall_"))
+        .filter_map(|n| n.parse::<usize>().ok())
+        .max()
+        .map(|m| m + 1)
+        .unwrap_or(0)
+}
+
+/// Strip ChatML special tokens (`<|…|>`) from text. The token content must be
+/// alphanumeric/underscore — this avoids eating literal text like `<|foo bar|>`.
+fn strip_chatml_tokens(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'<'
+            && i + 1 < bytes.len()
+            && bytes[i + 1] == b'|'
+            && let Some(end) = text[i..].find("|>")
+        {
+            let inner = &text[i + 2..i + end];
+            if !inner.is_empty() && inner.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                out.push_str(&text[last..i]);
+                last = i + end + 2;
+                i = last;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out.push_str(&text[last..]);
+    out
+}
 
 /// Route a tool's output to the right UI surface: a plan update drives the live
 /// tracker (in place), everything else renders as a tool result — its richer
@@ -694,5 +888,253 @@ mod tests {
             respects_deps(&dep, &[0, 1]),
             "write before dependent read respects deps: {dep:?}"
         );
+    }
+
+    // ── parse_text_tool_calls ──
+
+    fn tool_call_names(content: &[Content]) -> Vec<String> {
+        content
+            .iter()
+            .filter_map(|c| match c {
+                Content::ToolCall { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Join all Text blocks in `content` into a single string, for assertions
+    /// that check prose preservation.
+    fn prose(content: &[Content]) -> String {
+        content
+            .iter()
+            .filter_map(|c| match c {
+                Content::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn parse_text_tool_calls_finds_raw_json() {
+        let text = r#"Let me check the files.
+
+{"name": "list", "arguments": {}}
+
+Now I'll read one."#;
+        let content = parse_text_tool_calls(text, 0);
+        assert_eq!(tool_call_names(&content), vec!["list"]);
+        let p = prose(&content);
+        assert!(!p.contains("name"), "JSON stripped from text: {p}");
+        assert!(p.contains("Let me check"), "prose preserved: {p}");
+    }
+
+    #[test]
+    fn parse_text_tool_calls_finds_json_with_object_arguments() {
+        let text = r#"{"name": "bash", "arguments": {"command": "echo hi"}}"#;
+        let content = parse_text_tool_calls(text, 0);
+        assert_eq!(tool_call_names(&content), vec!["bash"]);
+        assert!(prose(&content).is_empty(), "only JSON → no text blocks");
+        if let Content::ToolCall { arguments, .. } = &content[0] {
+            assert!(arguments.contains("echo hi"), "args preserved: {arguments}");
+        }
+    }
+
+    #[test]
+    fn parse_text_tool_calls_finds_json_with_string_arguments() {
+        let text = r#"{"name": "read", "arguments": "{\"path\": \"foo.rs\"}"}"#;
+        let content = parse_text_tool_calls(text, 0);
+        assert_eq!(tool_call_names(&content), vec!["read"]);
+        if let Content::ToolCall { arguments, .. } = &content[0] {
+            assert!(arguments.contains("foo.rs"), "args preserved: {arguments}");
+        }
+    }
+
+    #[test]
+    fn parse_text_tool_calls_finds_multiple_calls() {
+        let text = r#"Starting now.
+{"name": "read", "arguments": {"path": "a.rs"}}
+{"name": "read", "arguments": {"path": "b.rs"}}
+Done."#;
+        let content = parse_text_tool_calls(text, 0);
+        assert_eq!(tool_call_names(&content), vec!["read", "read"]);
+        let p = prose(&content);
+        assert!(p.contains("Starting now"), "prose before first call: {p}");
+        assert!(p.contains("Done"), "prose after last call: {p}");
+    }
+
+    #[test]
+    fn parse_text_tool_calls_ignores_non_tool_json() {
+        // Random JSON that isn't a tool call should not be touched.
+        let text = r#"The result is {"foo": 42} which is fine."#;
+        let content = parse_text_tool_calls(text, 0);
+        assert!(
+            tool_call_names(&content).is_empty(),
+            "no tool calls in random JSON"
+        );
+        assert_eq!(prose(&content), text, "text unchanged");
+    }
+
+    #[test]
+    fn parse_text_tool_calls_ignores_unknown_tool_name() {
+        let text = r#"{"name": "hack_the_planet", "arguments": {}}"#;
+        let content = parse_text_tool_calls(text, 0);
+        assert!(
+            tool_call_names(&content).is_empty(),
+            "unknown tool name rejected"
+        );
+    }
+
+    #[test]
+    fn parse_text_tool_calls_handles_nested_json_arguments() {
+        let text =
+            r#"{"name": "edit", "arguments": {"path": "a.rs", "old_string": "x\n{\"y\": 1}"}}"#;
+        let content = parse_text_tool_calls(text, 0);
+        assert_eq!(tool_call_names(&content), vec!["edit"]);
+    }
+
+    #[test]
+    fn parse_text_tool_calls_preserves_leading_whitespace() {
+        // A tool call at the very start leaves the trailing prose as the only
+        // text block. Leading whitespace there is the model's actual content
+        // (e.g. an indented code block) and must NOT be trimmed — only the
+        // trailing newline artifact is removed.
+        let text = "{\"name\": \"list\", \"arguments\": {}}\n    code line\n";
+        let content = parse_text_tool_calls(text, 0);
+        assert_eq!(tool_call_names(&content), vec!["list"]);
+        // The trailing prose is a Text block after the ToolCall.
+        let p = prose(&content);
+        assert!(
+            p.contains("    code line"),
+            "leading indent preserved: {p:?}"
+        );
+        assert!(!p.ends_with('\n'), "trailing newline trimmed: {p:?}");
+    }
+
+    #[test]
+    fn parse_text_tool_calls_interleaves_prose_and_calls() {
+        // Trailing prose after a tool call must be a separate Text block
+        // AFTER the ToolCall, not merged before it. This is the fix for the
+        // "end of the context comes through" bug: previously all prose was
+        // merged into one Text block placed before the tool calls, so the
+        // model's forward-looking narration ("Now I'll read the file.")
+        // appeared before the tool result in history, confusing the model
+        // on the next prompt.
+        let text =
+            "Let me check.\n{\"name\": \"list\", \"arguments\": {}}\nNow I'll read the file.";
+        let content = parse_text_tool_calls(text, 0);
+        // Expected order: [Text("Let me check."), ToolCall(list), Text("Now I'll read the file.")]
+        assert_eq!(content.len(), 3, "expected 3 blocks: {content:?}");
+        assert!(
+            matches!(content[0], Content::Text(_)),
+            "first block is text"
+        );
+        assert!(
+            matches!(content[1], Content::ToolCall { .. }),
+            "second block is tool call"
+        );
+        assert!(
+            matches!(content[2], Content::Text(_)),
+            "third block is trailing text"
+        );
+        if let Content::Text(t) = &content[2] {
+            assert!(
+                t.contains("Now I'll read the file"),
+                "trailing prose after call: {t}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_text_tool_calls_no_calls_returns_text_only() {
+        let text = "Just a normal message with no tool calls.";
+        let content = parse_text_tool_calls(text, 0);
+        assert!(tool_call_names(&content).is_empty());
+        assert_eq!(prose(&content), text);
+    }
+
+    #[test]
+    fn parse_text_tool_calls_strips_chatml_tokens() {
+        // Models that emit <|im_start|> / <|im_end|> as raw text should have
+        // them stripped, and any tool-call JSON between them should still be
+        // promoted to a real ToolCall.
+        let text = "Let me check.\n<|im_start|>\n{\"name\": \"list\", \"arguments\": {}}\n<|im_end|>\nDone.";
+        let content = parse_text_tool_calls(text, 0);
+        assert_eq!(tool_call_names(&content), vec!["list"]);
+        let p = prose(&content);
+        assert!(
+            !p.contains("<|im_start|>") && !p.contains("<|im_end|>"),
+            "special tokens stripped: {p}"
+        );
+        assert!(p.contains("Let me check"), "prose preserved: {p}");
+        assert!(p.contains("Done"), "trailing prose preserved: {p}");
+    }
+
+    #[test]
+    fn parse_text_tool_calls_ids_respect_offset() {
+        // With offset 0, IDs start at textcall_0.
+        let text = r#"{"name": "list", "arguments": {}}
+{"name": "read", "arguments": {"path": "a.rs"}}"#;
+        let content = parse_text_tool_calls(text, 0);
+        let ids: Vec<&str> = content
+            .iter()
+            .filter_map(|c| match c {
+                Content::ToolCall { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec!["textcall_0", "textcall_1"]);
+
+        // With offset 3 (as if 3 textcall_ IDs already exist in history), IDs
+        // start at textcall_3 — globally unique across the conversation.
+        let content = parse_text_tool_calls(text, 3);
+        let ids: Vec<&str> = content
+            .iter()
+            .filter_map(|c| match c {
+                Content::ToolCall { id, .. } => Some(id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec!["textcall_3", "textcall_4"]);
+    }
+
+    #[test]
+    fn textcall_id_offset_counts_existing_ids() {
+        use crate::transcript::Transcript;
+        use hi_ai::{Content, Message};
+
+        // Empty transcript → offset 0.
+        let t = Transcript::new(vec![]);
+        assert_eq!(textcall_id_offset(&t), 0);
+
+        // An assistant message with textcall_0 and textcall_2 → offset 3.
+        let t = Transcript::new(vec![
+            Message::system("sys"),
+            Message::user("hi"),
+            Message::assistant(vec![
+                Content::Text("thinking".into()),
+                Content::ToolCall {
+                    id: "textcall_0".into(),
+                    name: "list".into(),
+                    arguments: "{}".into(),
+                },
+                Content::ToolCall {
+                    id: "textcall_2".into(),
+                    name: "read".into(),
+                    arguments: "{}".into(),
+                },
+            ]),
+            Message::tool_result("textcall_0", "ok"),
+            Message::tool_result("textcall_2", "ok"),
+        ]);
+        assert_eq!(textcall_id_offset(&t), 3);
+
+        // Non-textcall IDs (e.g. from a hosted provider) are ignored.
+        let t = Transcript::new(vec![Message::assistant(vec![Content::ToolCall {
+            id: "call_abc".into(),
+            name: "list".into(),
+            arguments: "{}".into(),
+        }])]);
+        assert_eq!(textcall_id_offset(&t), 0);
     }
 }

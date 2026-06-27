@@ -1,5 +1,9 @@
 /target
 
+# Coverage artifacts (re-derived from test runs).
+/coverage.lcov
+/coverage_html/
+
 # Auto-generated, re-derived every session — local working state, not curated docs.
 # Track it (git add -f .hi/memory.md) if you'd rather share project memory with the team.
 /.hi/

@@ -81,6 +81,24 @@ impl Registry {
         ids
     }
 
+    /// Capability tags for a model id: "tools" if it supports tool use,
+    /// "reasoning" if it supports reasoning/thinking. Empty for unknown models.
+    pub fn capabilities(&self, model: &str) -> Vec<&'static str> {
+        match self.lookup(model) {
+            Some(info) => {
+                let mut caps = Vec::new();
+                if info.supports_tools {
+                    caps.push("tools");
+                }
+                if info.supports_reasoning {
+                    caps.push("reasoning");
+                }
+                caps
+            }
+            None => Vec::new(),
+        }
+    }
+
     /// Best-effort lookup, tolerating provider prefixes and `.`/`-` differences
     /// between naming conventions (e.g. `anthropic/claude-3.5-sonnet`).
     pub fn lookup(&self, model: &str) -> Option<&ModelInfo> {

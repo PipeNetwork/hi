@@ -16,6 +16,7 @@ mod util;
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ansi_to_tui::IntoText;
@@ -45,6 +46,8 @@ pub struct ProfileInfo {
     pub provider: String,
     /// The model configured on this profile, if any.
     pub model: Option<String>,
+    /// The base URL configured on this profile, if any (non-default only).
+    pub base_url: Option<String>,
 }
 
 /// The result of resolving a profile name at runtime: a built provider, the
@@ -85,13 +88,20 @@ pub type ProfileSaver = Box<dyn Fn(&ProfileFormData) -> Result<Vec<ProfileInfo>>
 /// A callback that loads an existing profile's form data for editing.
 pub type ProfileLoader = Box<dyn Fn(&str) -> Result<ProfileFormData> + Send + Sync>;
 
+/// A callback that removes a profile from the config file and returns the
+/// updated profile list. `hi-cli` supplies this; the TUI calls it for
+/// `/provider remove <name>`.
+pub type ProfileRemover = Box<dyn Fn(&str) -> Result<Vec<ProfileInfo>> + Send + Sync>;
+
 use completion::{
     CompletionContext, CompletionItem, CompletionState, MODEL_CMD, MODEL_COMPLETION_MAX,
-    completion_context, completion_items_for,
+    PROVIDER_CMD, completion_context, completion_items_for,
 };
 use event::{ChannelUi, Restore, UiEvent};
 use input::{HistorySearch, InputLine};
-use model_picker::{ModelPicker, display_health, display_price, display_window};
+use model_picker::{
+    ModelPicker, display_capabilities, display_health, display_price, display_window,
+};
 use render::{diff_lines, dim, line_text, looks_like_diff, markdown_line, wrapped_height};
 use util::{clip_reason, copy_to_clipboard, fmt_count, fmt_elapsed, goal_feedback, notify_done};
 
@@ -147,10 +157,20 @@ fn watchdog_stuck_timeout_from_value(value: Option<&str>) -> Duration {
     Duration::from_secs(seconds)
 }
 
+/// True if the provider label refers to a self-hosted/local server (Ollama,
+/// llama.cpp, LM Studio, vLLM, …). These serve their own model list from
+/// `/v1/models`; when that fetch fails the cloud catalog is not a useful
+/// fallback — it's a misleading "mess of models" — so the caller should
+/// surface the error instead.
+fn is_local_provider(label: &str) -> bool {
+    matches!(label, "ollama")
+}
+
 /// Run the full-screen TUI until the user quits. `history_path`, if given, is
 /// the file used to persist input history across sessions (shared with the
 /// plain REPL). `profiles` is the list of configured profiles (for `/provider`
 /// with no arg); `resolver` resolves a name to a built provider at runtime.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     agent: &mut Agent,
     provider: &str,
@@ -159,9 +179,12 @@ pub async fn run(
     history_path: Option<std::path::PathBuf>,
     auto_memory: bool,
     profiles: Vec<ProfileInfo>,
+    active_profile: Option<String>,
     resolver: ProfileResolver,
     saver: ProfileSaver,
     loader: ProfileLoader,
+    remover: ProfileRemover,
+    resume_summary: Option<String>,
 ) -> Result<()> {
     enable_raw_mode().context("entering raw mode")?;
     execute!(io::stdout(), EnterAlternateScreen).context("entering alternate screen")?;
@@ -179,7 +202,16 @@ pub async fn run(
     let mut terminal =
         Terminal::new(CrosstermBackend::new(io::stdout())).context("creating terminal")?;
 
-    let mut app = App::new(provider, model, profiles, resolver, saver, loader);
+    let mut app = App::new(
+        provider,
+        model,
+        profiles,
+        active_profile,
+        resolver,
+        saver,
+        loader,
+        remover,
+    );
     // Seed the context-fill gauge with the model's window so it reads 0% before
     // the first turn (it refreshes from real usage after each round).
     app.context_window = registry.metadata(model).1;
@@ -204,6 +236,10 @@ pub async fn run(
             .1
             .map(|w| format!(" · {w} token window"))
             .unwrap_or_default();
+        // When resuming, show what we're walking back into before the hint.
+        if let Some(summary) = &resume_summary {
+            app.push(Line::styled(summary.clone(), dim()));
+        }
         app.push(Line::styled(
             format!(
                 "Enter to send · Alt-Enter for a newline · Ctrl-C interrupts · Ctrl-T shows reasoning · Ctrl-D toggles diff · /help for all commands{ctx}.",
@@ -286,9 +322,17 @@ pub async fn run(
                     event
                 };
                 match event {
-                    // A paste arrives as one event — insert it literally
-                    // (newlines and all) instead of submitting each line.
-                    Event::Paste(text) => app.input.insert_str(&text),
+                    // A paste arrives as one event. Route it to whichever input
+                    // surface is active: the provider form (its current field),
+                    // or the main input line. Without this, a paste while the
+                    // form is open silently went into the hidden main input.
+                    Event::Paste(text) => {
+                        if let Some(form) = app.provider_form.as_mut() {
+                            form.insert_str(&text);
+                        } else {
+                            app.input.insert_str(&text);
+                        }
+                    }
                     // While the model picker is open, keys drive it.
                     Event::Key(key) if key.kind == KeyEventKind::Press && app.picker.is_some() => {
                         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -324,20 +368,34 @@ pub async fn run(
                                 // Submit the form.
                                 let form = app.provider_form.as_ref().unwrap();
                                 if let Some(data) = form.data() {
-                                    match (app.saver)(&data) {
-                                        Ok(updated) => {
-                                            app.profiles = updated;
-                                            app.push(Line::styled(
-                                                format!("saved profile '{}'", data.name),
-                                                dim(),
-                                            ));
-                                            app.provider_form = None;
-                                        }
-                                        Err(err) => {
-                                            app.push(Line::styled(
-                                                format!("save failed: {err:#}"),
-                                                Style::default().fg(Color::Yellow),
-                                            ));
+                                    // When adding (not editing), reject a name that
+                                    // already exists to prevent silent clobbering.
+                                    if !form.editing
+                                        && app.profiles.iter().any(|p| p.name == data.name)
+                                    {
+                                        app.push(Line::styled(
+                                            format!(
+                                                "a profile '{}' already exists — use /provider edit {} to modify it",
+                                                data.name, data.name
+                                            ),
+                                            Style::default().fg(Color::Yellow),
+                                        ));
+                                    } else {
+                                        match (app.saver)(&data) {
+                                            Ok(updated) => {
+                                                app.profiles = updated;
+                                                app.push(Line::styled(
+                                                    format!("saved profile '{}'", data.name),
+                                                    dim(),
+                                                ));
+                                                app.provider_form = None;
+                                            }
+                                            Err(err) => {
+                                                app.push(Line::styled(
+                                                    format!("save failed: {err:#}"),
+                                                    Style::default().fg(Color::Yellow),
+                                                ));
+                                            }
                                         }
                                     }
                                 } else {
@@ -502,6 +560,22 @@ pub async fn run(
                         continue;
                     }
                 },
+                Command::Edit => {
+                    // Load the last user prompt into the input line for editing.
+                    // Unlike /retry, this doesn't submit — the user edits and
+                    // presses Enter to send.
+                    match agent.last_user_message() {
+                        Some(prev) => {
+                            app.input.set(&prev);
+                            app.sync_completion();
+                            continue;
+                        }
+                        None => {
+                            app.push(Line::styled("nothing to edit yet".to_string(), dim()));
+                            continue;
+                        }
+                    }
+                }
                 Command::Init => {
                     app.push(Line::styled(
                         "scanning the project to write HI.md…".to_string(),
@@ -565,6 +639,11 @@ pub async fn run(
                     if cancelled {
                         continue;
                     }
+                    // Resolve the model list to show. For a local provider
+                    // (e.g. Ollama) a fetch failure or empty list means the
+                    // server is down or misconfigured — dumping the cloud
+                    // catalog would be a meaningless "mess of models," so we
+                    // surface the error and skip the picker instead.
                     let ids = match fetched {
                         Some(Ok(served)) if !served.is_empty() => {
                             // Remember the live metadata (window/price/health) so
@@ -574,27 +653,34 @@ pub async fn run(
                             ids.sort();
                             ids
                         }
-                        Some(Ok(_)) => {
-                            app.push(Line::styled(
-                                "provider listed no models; showing the catalog".to_string(),
-                                dim(),
-                            ));
-                            registry.model_ids()
-                        }
                         _ => {
-                            let note = match fetched {
-                                Some(Err(err)) => {
-                                    format!("couldn't fetch models ({err:#}); showing the catalog")
+                            let local = is_local_provider(&app.provider);
+                            let note = match (&fetched, local) {
+                                (Some(Ok(_)), true) => {
+                                    "provider listed no models — is the local server running?"
                                 }
-                                _ => "showing the catalog".to_string(),
+                                (Some(Ok(_)), false) => {
+                                    "provider listed no models; showing the catalog"
+                                }
+                                (Some(Err(err)), true) => &format!(
+                                    "couldn't reach the local server ({err:#}) — check it's running and the base_url is correct"
+                                ),
+                                (Some(Err(err)), false) => {
+                                    &format!("couldn't fetch models ({err:#}); showing the catalog")
+                                }
+                                (None, _) => "showing the catalog",
                             };
-                            app.push(Line::styled(note, dim()));
+                            app.push(Line::styled(note.to_string(), dim()));
+                            if local {
+                                continue;
+                            }
                             registry.model_ids()
                         }
                     };
                     let current = app.model.clone();
                     let tags = app.served_tags();
-                    app.picker = Some(ModelPicker::new(ids, &current, tags, &app.served));
+                    let caps = App::capabilities_map(registry, &ids);
+                    app.picker = Some(ModelPicker::new(ids, &current, tags, &app.served, &caps));
                     continue;
                 }
                 // `/provider` with no arg: list configured profiles.
@@ -643,29 +729,83 @@ pub async fn run(
                         }
                         continue;
                     }
+                    if let Some(rm_name) = arg
+                        .strip_prefix("remove")
+                        .or_else(|| arg.strip_prefix("rm"))
+                    {
+                        let rm_name = rm_name.trim();
+                        // If no name given, pick the first profile (or show a hint).
+                        let target = if rm_name.is_empty() {
+                            if app.profiles.is_empty() {
+                                app.push(Line::styled("no profiles to remove".to_string(), dim()));
+                                continue;
+                            }
+                            app.profiles[0].name.clone()
+                        } else {
+                            rm_name.to_string()
+                        };
+                        // Don't remove the active profile — the agent is using it.
+                        if app.active_profile.as_deref() == Some(&target) {
+                            app.push(Line::styled(
+                                format!("can't remove '{target}' — it's the active profile; switch first"),
+                                Style::default().fg(Color::Yellow),
+                            ));
+                            continue;
+                        }
+                        match (app.remover)(&target) {
+                            Ok(updated) => {
+                                app.profiles = updated;
+                                app.push(Line::styled(
+                                    format!("removed profile '{target}'"),
+                                    dim(),
+                                ));
+                            }
+                            Err(err) => {
+                                app.push(Line::styled(
+                                    format!("/provider remove failed: {err:#}"),
+                                    Style::default().fg(Color::Yellow),
+                                ));
+                            }
+                        }
+                        continue;
+                    }
                     // --- Switch / list ---
                     if arg.is_empty() {
                         if app.profiles.is_empty() {
                             app.push(Line::styled(
-                                "no profiles configured — add [profiles.<name>] to hi.toml"
+                                "no profiles configured — use /provider add, or add [profiles.<name>] to hi.toml"
                                     .to_string(),
                                 dim(),
                             ));
                         } else {
                             app.push(Line::styled("configured profiles:".to_string(), dim()));
-                            let rows: Vec<String> = app
+                            let active = app.active_profile.clone();
+                            let rows: Vec<(String, Style)> = app
                                 .profiles
                                 .iter()
                                 .map(|p| {
+                                    let is_active = active.as_deref() == Some(&p.name);
+                                    let mark = if is_active { "▶" } else { " " };
                                     let model = p.model.as_deref().unwrap_or("(pick via /model)");
-                                    format!("  {} — {} · {}", p.name, p.provider, model)
+                                    let mut row =
+                                        format!("  {mark} {} — {} · {}", p.name, p.provider, model);
+                                    if let Some(url) = &p.base_url {
+                                        row.push_str(&format!("  ·  {url}"));
+                                    }
+                                    let style = if is_active {
+                                        Style::default().fg(Color::Cyan)
+                                    } else {
+                                        dim()
+                                    };
+                                    (row, style)
                                 })
                                 .collect();
-                            for row in rows {
-                                app.push(Line::styled(row, dim()));
+                            for (row, style) in rows {
+                                app.push(Line::styled(row, style));
                             }
                             app.push(Line::styled(
-                                "/provider <name> to switch".to_string(),
+                                "/provider <name> to switch · /provider add · /provider edit [name] · /provider remove [name]"
+                                    .to_string(),
                                 dim(),
                             ));
                         }
@@ -682,6 +822,7 @@ pub async fn run(
                             agent.set_provider(switched.provider, model.clone(), price, window);
                             app.provider = label.clone();
                             app.model = model.clone();
+                            app.active_profile = Some(arg.clone());
                             app.context_window = window;
                             app.served.clear();
                             app.push(Line::styled(
@@ -731,36 +872,46 @@ pub async fn run(
                             }
                             let ids = match fetched {
                                 Some(Ok(served)) if !served.is_empty() => {
+                                    let count = served.len();
                                     app.served =
                                         served.into_iter().map(|m| (m.id.clone(), m)).collect();
                                     let mut ids: Vec<String> = app.served.keys().cloned().collect();
                                     ids.sort();
-                                    ids
-                                }
-                                Some(Ok(_)) => {
                                     app.push(Line::styled(
-                                        "provider listed no models; showing the catalog"
-                                            .to_string(),
+                                        format!("{count} models available — pick one"),
                                         dim(),
                                     ));
-                                    registry.model_ids()
+                                    ids
                                 }
                                 _ => {
-                                    let note = match fetched {
-                                        Some(Err(err)) => {
-                                            format!(
-                                                "couldn't fetch models ({err:#}); showing the catalog"
-                                            )
+                                    let local = is_local_provider(&app.provider);
+                                    let note = match (&fetched, local) {
+                                        (Some(Ok(_)), true) => {
+                                            "provider listed no models — is the local server running?"
                                         }
-                                        _ => "showing the catalog".to_string(),
+                                        (Some(Ok(_)), false) => {
+                                            "provider listed no models; showing the catalog"
+                                        }
+                                        (Some(Err(err)), true) => &format!(
+                                            "couldn't reach the local server ({err:#}) — check it's running and the base_url is correct"
+                                        ),
+                                        (Some(Err(err)), false) => &format!(
+                                            "couldn't fetch models ({err:#}); showing the catalog"
+                                        ),
+                                        (None, _) => "showing the catalog",
                                     };
-                                    app.push(Line::styled(note, dim()));
+                                    app.push(Line::styled(note.to_string(), dim()));
+                                    if local {
+                                        continue;
+                                    }
                                     registry.model_ids()
                                 }
                             };
                             let current = app.model.clone();
                             let tags = app.served_tags();
-                            app.picker = Some(ModelPicker::new(ids, &current, tags, &app.served));
+                            let caps = App::capabilities_map(registry, &ids);
+                            app.picker =
+                                Some(ModelPicker::new(ids, &current, tags, &app.served, &caps));
                         }
                         Err(err) => {
                             app.push(Line::styled(
@@ -792,6 +943,9 @@ pub async fn run(
         app.last_prompt = Some(run_line.clone());
         // Reset the per-turn tool-call counter for the observability panel.
         app.turn_tool_calls = 0;
+        app.turn_rounds = 0;
+        // Grab the interrupt handle so Esc during a tool call can signal it.
+        app.interrupt = Some(agent.interrupt_handle());
         let (tx, rx) = mpsc::unbounded_channel();
         let mut sink = ChannelUi { tx };
         let cancelled = {
@@ -906,7 +1060,8 @@ async fn drive(
                     app.apply(event);
                 }
                 if let Err(err) = result {
-                    app.note_turn_failed(&format!("{err:#}"));
+                    let (kind, guidance) = hi_agent::classify_error(&err);
+                    app.note_turn_failed(&format!("{err:#}"), kind, guidance);
                     app.record_model_issue();
                 } else if expect_turn_end && !cancelled && !saw_turn_end {
                     app.note_turn_completed_without_summary();
@@ -943,9 +1098,20 @@ async fn drive(
                         match key.code {
                             KeyCode::Char('c') if ctrl => { cancelled = true; break; }
                             // Esc clears a half-typed queued command, or — when the
-                            // input is empty — interrupts the running turn (a second
-                            // way out besides Ctrl-C).
-                            KeyCode::Esc if app.input.is_empty() => { cancelled = true; break; }
+                            // input is empty — interrupts the current tool call
+                            // (if one is running) or cancels the whole turn.
+                            KeyCode::Esc if app.input.is_empty() => {
+                                if app.current_tool.is_some() {
+                                    // A tool is running: signal interrupt to skip
+                                    // just this tool call, not the whole turn.
+                                    if let Some(flag) = &app.interrupt {
+                                        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                                    }
+                                } else {
+                                    cancelled = true;
+                                    break;
+                                }
+                            }
                             KeyCode::Esc => app.input.clear(),
                             // Typing while a turn runs queues the next command —
                             // except `/tokens`, which reads the live counter and
@@ -1033,6 +1199,13 @@ impl TranscriptEntry {
 struct App {
     provider: String,
     model: String,
+    /// A shared interrupt handle for the running turn. When the user presses
+    /// Esc during a tool call, this is set so the agent skips the current tool
+    /// and feeds "interrupted by user" back to the model.
+    interrupt: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// The name of the currently-active profile, if any (for marking it in the
+    /// `/provider` list). Updated when the user switches via `/provider <name>`.
+    active_profile: Option<String>,
     /// Configured profiles (for `/provider` with no arg).
     profiles: Vec<ProfileInfo>,
     /// Resolves a profile name to a built provider at runtime (for `/provider`).
@@ -1041,6 +1214,8 @@ struct App {
     saver: ProfileSaver,
     /// Loads an existing profile's form data (for `/provider edit`).
     loader: ProfileLoader,
+    /// Removes a profile from the config file (for `/provider remove`).
+    remover: ProfileRemover,
     transcript: Vec<TranscriptEntry>,
     /// The in-progress streamed line: (style, markdown?, text). Committed on
     /// newline/end. `markdown` is set for assistant prose so it's rendered with
@@ -1145,6 +1320,8 @@ struct App {
     /// Whether the `Ctrl-?` agent-observability panel is open: telemetry
     /// counters, per-turn tool-call count, and context composition.
     show_debug: bool,
+    /// Whether the keybindings help overlay is open (toggled by `?`).
+    show_help: bool,
     /// Telemetry from the last turn (verify rounds, recovery retries, nudges,
     /// stalls), captured post-turn from `agent.last_turn_telemetry()` for the
     /// observability panel.
@@ -1152,6 +1329,13 @@ struct App {
     /// Tool calls seen this turn (incremented on each `UiEvent::ToolCall`),
     /// for the observability panel's "tool calls this turn" line.
     turn_tool_calls: u32,
+    /// Model rounds seen this turn (incremented on each `UiEvent::AssistantEnd`),
+    /// so the activity line can show "round 3 · 5 tool calls" for multi-step turns.
+    turn_rounds: u32,
+    /// A tail of recent streamed tool output lines (e.g. bash stdout), shown
+    /// live in the working area while a tool runs. Cleared when the tool
+    /// finishes and its final result is pushed to the transcript.
+    tool_stream_tail: Vec<String>,
     waiting_for: Option<Duration>,
     last_turn_state: TurnState,
     last_error: Option<String>,
@@ -1192,21 +1376,27 @@ enum TurnState {
 }
 
 impl App {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         provider: &str,
         model: &str,
         profiles: Vec<ProfileInfo>,
+        active_profile: Option<String>,
         resolver: ProfileResolver,
         saver: ProfileSaver,
         loader: ProfileLoader,
+        remover: ProfileRemover,
     ) -> Self {
         Self {
             provider: provider.to_string(),
             model: model.to_string(),
+            interrupt: None,
+            active_profile,
             profiles,
             resolver,
             saver,
             loader,
+            remover,
             transcript: Vec::new(),
             pending: None,
             reasoning_buffer: String::new(),
@@ -1248,8 +1438,11 @@ impl App {
             show_diff: false,
             diff_text: None,
             show_debug: false,
+            show_help: false,
             last_telemetry: None,
             turn_tool_calls: 0,
+            turn_rounds: 0,
+            tool_stream_tail: Vec::new(),
             waiting_for: None,
             last_turn_state: TurnState::Idle,
             last_error: None,
@@ -1283,13 +1476,19 @@ impl App {
         }
     }
 
-    /// Rows for a completion context — model ids from the live catalog, every
-    /// other command's values from the static table.
+    /// Rows for a completion context — model ids from the live catalog, profile
+    /// names from the config, every other command's values from the static
+    /// table.
     fn items_for_ctx(&self, ctx: &CompletionContext) -> Vec<CompletionItem> {
         if let CompletionContext::Arg { cmd, prefix } = ctx
             && *cmd == MODEL_CMD
         {
             return self.model_completion_items(prefix);
+        }
+        if let CompletionContext::Arg { cmd, prefix } = ctx
+            && *cmd == PROVIDER_CMD
+        {
+            return self.provider_completion_items(prefix);
         }
         completion_items_for(ctx)
     }
@@ -1308,6 +1507,46 @@ impl App {
                 submit_on_enter: true,
             })
             .collect()
+    }
+
+    /// Profile names + `add`/`edit`/`remove` subcommands matching `prefix`, as
+    /// `/provider <name>` rows — inline type-ahead for `/provider`.
+    fn provider_completion_items(&self, prefix: &str) -> Vec<CompletionItem> {
+        let mut items: Vec<CompletionItem> = Vec::new();
+        // Subcommands first.
+        for sub in ["add", "edit", "remove"] {
+            if sub.starts_with(prefix) {
+                items.push(CompletionItem {
+                    label: sub.to_string(),
+                    help: match sub {
+                        "add" => "create a new profile",
+                        "edit" => "edit an existing profile",
+                        "remove" => "remove a profile",
+                        _ => "",
+                    }
+                    .to_string(),
+                    insert: format!("/{PROVIDER_CMD} {sub}"),
+                    submit_on_enter: true,
+                });
+            }
+        }
+        // Profile names.
+        for p in &self.profiles {
+            if p.name.starts_with(prefix) {
+                let help = format!(
+                    "{} · {}",
+                    p.provider,
+                    p.model.as_deref().unwrap_or("pick via /model")
+                );
+                items.push(CompletionItem {
+                    label: p.name.clone(),
+                    help,
+                    insert: format!("/{PROVIDER_CMD} {}", p.name),
+                    submit_on_enter: true,
+                });
+            }
+        }
+        items
     }
 
     /// The rows the completion menu currently offers (empty when closed).
@@ -1369,6 +1608,17 @@ impl App {
 
     /// Health tags (id → label) for the models we have live metadata on, for the
     /// `/model` picker. Healthy models are omitted.
+    /// Build a per-model-id capabilities map from the registry, for the model
+    /// picker's capability-tag column.
+    fn capabilities_map(
+        registry: &hi_ai::Registry,
+        ids: &[String],
+    ) -> HashMap<String, Vec<&'static str>> {
+        ids.iter()
+            .map(|id| (id.clone(), registry.capabilities(id)))
+            .collect()
+    }
+
     fn served_tags(&self) -> HashMap<String, String> {
         self.served
             .iter()
@@ -1468,9 +1718,22 @@ impl App {
     /// the model…` (the round's model call is in flight but nothing's streamed
     /// yet). Lets you tell a slow tool from a slow model at a glance.
     fn activity_line(&self) -> String {
+        // A compact progress suffix for multi-step turns: "round 3 · 5 calls".
+        // Suppressed on the first round with no tool calls (the common single-shot case).
+        let progress = if self.turn_rounds > 1 || (self.turn_rounds > 0 && self.turn_tool_calls > 0)
+        {
+            format!(
+                " · round {} · {} call{}",
+                self.turn_rounds,
+                self.turn_tool_calls,
+                if self.turn_tool_calls == 1 { "" } else { "s" }
+            )
+        } else {
+            String::new()
+        };
         if let (Some(tool), Some(started)) = (&self.current_tool, self.current_tool_started) {
             return format!(
-                "running {tool} · {}",
+                "running {tool} · {}{progress}",
                 fmt_elapsed(started.elapsed().as_secs())
             );
         }
@@ -1480,7 +1743,7 @@ impl App {
             Some(TurnEventKind::Assistant) => "responding",
             _ => "waiting for the model",
         };
-        format!("{verb}… {}", fmt_elapsed(secs))
+        format!("{verb}… {}{progress}", fmt_elapsed(secs))
     }
 
     /// Apply a pure editing/navigation key to the input line, shared by the
@@ -1499,23 +1762,23 @@ impl App {
                     // Load the highlighted match into the input and submit it.
                     let idx = search.current();
                     self.history_search = None;
-                    if let Some(i) = idx {
-                        if i < self.input.history.len() {
-                            self.input.set(&self.input.history[i].clone());
-                            let line = self.input.submit();
-                            if !line.trim().is_empty() {
-                                return Some(line);
-                            }
+                    if let Some(i) = idx
+                        && i < self.input.history.len()
+                    {
+                        self.input.set(&self.input.history[i].clone());
+                        let line = self.input.submit();
+                        if !line.trim().is_empty() {
+                            return Some(line);
                         }
                     }
                     return None;
                 }
                 KeyCode::Esc => {
                     // On Esc, load the highlighted match for editing (don't submit).
-                    if let Some(i) = search.current() {
-                        if i < self.input.history.len() {
-                            self.input.set(&self.input.history[i].clone());
-                        }
+                    if let Some(i) = search.current()
+                        && i < self.input.history.len()
+                    {
+                        self.input.set(&self.input.history[i].clone());
                     }
                     self.history_search = None;
                     return None;
@@ -1523,55 +1786,55 @@ impl App {
                 KeyCode::Char('r') if ctrl => {
                     // Cycle to the next match (like bash Ctrl-R).
                     search.next();
-                    if let Some(i) = search.current() {
-                        if i < self.input.history.len() {
-                            self.input.set(&self.input.history[i].clone());
-                        }
+                    if let Some(i) = search.current()
+                        && i < self.input.history.len()
+                    {
+                        self.input.set(&self.input.history[i].clone());
                     }
                     return None;
                 }
                 KeyCode::Char('s') if ctrl => {
                     search.prev();
-                    if let Some(i) = search.current() {
-                        if i < self.input.history.len() {
-                            self.input.set(&self.input.history[i].clone());
-                        }
+                    if let Some(i) = search.current()
+                        && i < self.input.history.len()
+                    {
+                        self.input.set(&self.input.history[i].clone());
                     }
                     return None;
                 }
                 KeyCode::Backspace => {
                     search.backspace(&self.input.history);
-                    if let Some(i) = search.current() {
-                        if i < self.input.history.len() {
-                            self.input.set(&self.input.history[i].clone());
-                        }
+                    if let Some(i) = search.current()
+                        && i < self.input.history.len()
+                    {
+                        self.input.set(&self.input.history[i].clone());
                     }
                     return None;
                 }
                 KeyCode::Up => {
                     search.prev();
-                    if let Some(i) = search.current() {
-                        if i < self.input.history.len() {
-                            self.input.set(&self.input.history[i].clone());
-                        }
+                    if let Some(i) = search.current()
+                        && i < self.input.history.len()
+                    {
+                        self.input.set(&self.input.history[i].clone());
                     }
                     return None;
                 }
                 KeyCode::Down => {
                     search.next();
-                    if let Some(i) = search.current() {
-                        if i < self.input.history.len() {
-                            self.input.set(&self.input.history[i].clone());
-                        }
+                    if let Some(i) = search.current()
+                        && i < self.input.history.len()
+                    {
+                        self.input.set(&self.input.history[i].clone());
                     }
                     return None;
                 }
                 KeyCode::Char(c) if !ctrl => {
                     search.insert(c, &self.input.history);
-                    if let Some(i) = search.current() {
-                        if i < self.input.history.len() {
-                            self.input.set(&self.input.history[i].clone());
-                        }
+                    if let Some(i) = search.current()
+                        && i < self.input.history.len()
+                    {
+                        self.input.set(&self.input.history[i].clone());
                     }
                     return None;
                 }
@@ -1619,6 +1882,11 @@ impl App {
             }
             KeyCode::Home => self.input.home(),
             KeyCode::End => self.input.end(),
+            // `?` on an empty input line toggles a keybindings help overlay;
+            // when there's text, it's a normal character.
+            KeyCode::Char('?') if !ctrl && self.input.is_empty() => {
+                self.show_help = !self.show_help;
+            }
             KeyCode::Char(c) if !ctrl => self.input.insert(c),
             KeyCode::Backspace => self.input.backspace(),
             KeyCode::Left => self.input.left(),
@@ -1672,12 +1940,17 @@ impl App {
         self.follow();
     }
 
-    fn note_turn_failed(&mut self, error: &str) {
-        self.status = "failed".to_string();
+    fn note_turn_failed(&mut self, error: &str, kind: &str, guidance: &str) {
+        self.status = format!("failed · {kind}").to_string();
         self.last_turn_state = TurnState::Failed(error.to_string());
         self.last_error = Some(error.to_string());
+        let guidance_line = if guidance.is_empty() {
+            String::new()
+        } else {
+            format!("\n  💡 {guidance}")
+        };
         self.push(Line::styled(
-            format!("✗ failed · {error}"),
+            format!("✗ failed · {kind}: {error}{guidance_line}"),
             Style::default().fg(Color::Red),
         ));
         self.follow();
@@ -2037,6 +2310,7 @@ impl App {
             UiEvent::AssistantEnd => {
                 self.event_log.push("assistant_end".to_string());
                 self.last_turn_event = Some(TurnEventKind::AssistantEnd);
+                self.turn_rounds = self.turn_rounds.saturating_add(1);
                 self.flush_reasoning();
                 self.flush_pending();
                 if !self.current_assistant.trim().is_empty() {
@@ -2055,6 +2329,8 @@ impl App {
                 // transcript line — the header is emitted with the result.
                 self.current_tool = Some(label);
                 self.current_tool_started = Some(Instant::now());
+                // Clear any previous stream tail when a new tool starts.
+                self.tool_stream_tail.clear();
             }
             UiEvent::ToolCall(name, args) => {
                 let label = tool_label(&name, &args);
@@ -2078,8 +2354,17 @@ impl App {
                 // The tool finished — back to the model being the active party.
                 self.current_tool = None;
                 self.current_tool_started = None;
+                self.tool_stream_tail.clear();
                 self.flush_pending();
                 self.push_result(&name, &result);
+            }
+            UiEvent::ToolStream(_name, line) => {
+                // Accumulate streamed lines for the live working-area display.
+                // Keep only the last few so the panel stays compact.
+                self.tool_stream_tail.push(line.to_string());
+                if self.tool_stream_tail.len() > 4 {
+                    self.tool_stream_tail.remove(0);
+                }
             }
             UiEvent::Status(s) => {
                 self.event_log.push(format!("status {s}"));
@@ -2119,6 +2404,25 @@ impl App {
                 self.push(Line::styled(format!("✓ done · {}", self.status), dim()));
                 // No follow(): respect a reader who scrolled up — the "↓ N new"
                 // hint tells them the summary landed below.
+            }
+            UiEvent::TurnError(kind, message, guidance) => {
+                self.event_log.push(format!("turn_error {kind} {message}"));
+                self.last_turn_event = Some(TurnEventKind::TurnEnd);
+                self.flush_pending();
+                self.note_turn_failed(&message, &kind, &guidance);
+            }
+            UiEvent::ChangedFiles(files) => {
+                self.event_log
+                    .push(format!("changed_files {}", files.len()));
+                self.flush_pending();
+                let label = if files.len() == 1 { "file" } else { "files" };
+                let list = files.join(", ");
+                let clipped = hi_agent::ui::clip(&list, 200);
+                self.push(Line::styled(
+                    format!("✎ {} {} changed: {}", files.len(), label, clipped),
+                    Style::default().fg(Color::Green),
+                ));
+                self.follow();
             }
         }
     }
@@ -2205,12 +2509,9 @@ impl App {
                     // Open the interactive picker (filter + arrow-select).
                     let current = self.model.clone();
                     let tags = self.served_tags();
-                    self.picker = Some(ModelPicker::new(
-                        registry.model_ids(),
-                        &current,
-                        tags,
-                        &self.served,
-                    ));
+                    let ids = registry.model_ids();
+                    let caps = App::capabilities_map(registry, &ids);
+                    self.picker = Some(ModelPicker::new(ids, &current, tags, &self.served, &caps));
                 } else {
                     let health = self.apply_model(agent, registry, &id);
                     self.push(Line::styled(format!("model set to {id}"), dim()));
@@ -2272,9 +2573,16 @@ impl App {
             }
             Command::Copy(arg) => self.copy(&arg),
             Command::Goal(arg) => self.handle_goal(agent, &arg),
+            Command::Context => {
+                let breakdown = agent.context_breakdown();
+                for line in breakdown.lines() {
+                    self.push(Line::styled(line.to_string(), dim()));
+                }
+            }
             // Handled in the event loop (async / runs a turn / needs config); never reach here.
             Command::Compact(_)
             | Command::Retry
+            | Command::Edit
             | Command::Undo
             | Command::Init
             | Command::Provider(_) => {}
@@ -2421,20 +2729,32 @@ impl App {
         let changed_h = usize::from(!self.last_changed_files.is_empty() && !self.working);
         // The Ctrl-? observability panel: header + 3 diagnostic lines.
         let debug_h = if self.show_debug { 5 } else { 0 };
+        // The `?` keybindings help overlay: header + 10 lines.
+        let help_h = if self.show_help { 12 } else { 0 };
+        // Live streamed tool output tail (e.g. bash stdout), shown while a tool runs.
+        let stream_h = if self.working && !self.tool_stream_tail.is_empty() {
+            self.tool_stream_tail.len()
+        } else {
+            0
+        };
         let input_h = if self.fetching.is_some() {
             3
         } else if let Some(p) = &self.picker {
             // filter line + visible model rows + borders, bounded by the screen.
             let rows = p.matches.len().clamp(1, PICKER_ROWS) as u16;
             (rows + 3).min(area.height.saturating_sub(3))
-        } else if self.provider_form.is_some() {
-            // Provider form: provider picker row + 4 text fields + borders.
-            8
+        } else if let Some(form) = &self.provider_form {
+            // Provider form: provider picker row + hint row + text fields +
+            // borders. The API-key field is hidden for Ollama, so subtract one.
+            let fields = if form.api_key_unneeded() { 3 } else { 4 };
+            (fields + 4) as u16
         } else {
             (plan_h
                 + diff_h
                 + changed_h
                 + debug_h
+                + help_h
+                + stream_h
                 + status_lines
                 + completion_rows
                 + input_lines.len()
@@ -2592,6 +2912,10 @@ impl App {
                 if !health.is_empty() {
                     tag.push_str(&format!(" [{health}]"));
                 }
+                let caps = display_capabilities(row.meta);
+                if !caps.is_empty() {
+                    tag.push_str(&format!(" {{{caps}}}"));
+                }
                 // Price + window columns, right-aligned after the id.
                 let price = display_price(row.meta);
                 let window = display_window(row.meta);
@@ -2639,7 +2963,7 @@ impl App {
 
             // Provider picker row.
             let mut prov_spans = vec![Span::raw("Provider: ")];
-            for (i, (id, label)) in choices.iter().enumerate() {
+            for (i, (_id, label)) in choices.iter().enumerate() {
                 if i == pidx {
                     prov_spans.push(Span::styled(
                         format!("▶ {label} "),
@@ -2658,9 +2982,17 @@ impl App {
             ));
 
             // Text fields.
-            for (label, placeholder, value, is_active) in form.field_labels() {
+            let unneeded = form.api_key_unneeded();
+            for (i, (label, placeholder, value, is_active)) in
+                form.field_labels().into_iter().enumerate()
+            {
+                // Skip rendering the API-key field entirely for Ollama — it
+                // would be a confusing, unusable field the user might try to fill.
+                if i == 1 && unneeded {
+                    continue;
+                }
                 let display = if value.is_empty() && !placeholder.is_empty() {
-                    placeholder.to_string()
+                    placeholder.clone()
                 } else {
                     value.clone()
                 };
@@ -2686,8 +3018,15 @@ impl App {
             // Cursor on the active text field.
             let form_fields = form.field_labels();
             let active_idx = form.active();
+            // Account for the hidden API-key field (index 1) when computing the
+            // display row: fields after it shift up by one.
+            let hidden_before = if form.api_key_unneeded() && active_idx > 1 {
+                1
+            } else {
+                0
+            };
             // +3 for border + provider row + hint row.
-            let cy = rows[1].y + 1 + 2 + active_idx as u16;
+            let cy = rows[1].y + 1 + 2 + (active_idx - hidden_before) as u16;
             let label = form_fields[active_idx].0;
             let prefix_len = 2 + label.len() + 2; // "▶ " + label + ": "
             let cx = rows[1].x + 1 + prefix_len as u16 + form.active_cursor() as u16;
@@ -2843,6 +3182,35 @@ impl App {
                     dim(),
                 ));
             }
+            // The `?` keybindings help overlay: a compact, contextual cheat
+            // sheet. Toggled by pressing `?` on an empty input line.
+            if self.show_help {
+                ilines.push(Line::styled(
+                    "keybindings (? to close)".to_string(),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                let bindings = [
+                    ("Enter", "send the prompt"),
+                    ("Alt-Enter / \\", "insert a newline (multi-line prompt)"),
+                    ("Ctrl-C", "interrupt the running turn"),
+                    ("Ctrl-D (idle)", "quit"),
+                    ("Ctrl-D (typing)", "toggle the working-tree diff panel"),
+                    ("Ctrl-T", "toggle reasoning (thinking) display"),
+                    ("Ctrl-?", "toggle agent observability panel"),
+                    ("Ctrl-R", "fuzzy-search input history"),
+                    ("PageUp/PageDown", "scroll the transcript"),
+                    ("Esc", "clear input, or quit when empty"),
+                    ("/help", "show all slash commands"),
+                ];
+                for (key, desc) in bindings {
+                    ilines.push(Line::from(vec![
+                        Span::styled(format!("  {key:<18}"), dim()),
+                        Span::raw(desc),
+                    ]));
+                }
+            }
             if let Some(notice) = &self.startup_notice {
                 ilines.push(Line::styled(
                     notice.clone(),
@@ -2872,6 +3240,14 @@ impl App {
                     ),
                     Span::styled("   Ctrl-C to interrupt", dim()),
                 ]));
+                // Show a tail of recent streamed tool output (e.g. bash stdout)
+                // so the user sees live progress during long-running commands.
+                for line in &self.tool_stream_tail {
+                    ilines.push(Line::styled(
+                        format!("  │ {}", clip_reason(line)),
+                        Style::default().fg(Color::DarkGray),
+                    ));
+                }
             } else {
                 let line = match &self.last_turn_state {
                     TurnState::Idle => "ready".to_string(),
@@ -2933,6 +3309,8 @@ impl App {
                 + diff_h
                 + changed_h
                 + debug_h
+                + help_h
+                + stream_h
                 + usize::from(self.startup_notice.is_some())
                 + status_lines
                 + self.completion_items().len();
@@ -2981,15 +3359,21 @@ mod tests {
         Box::new(|_name| anyhow::bail!("no profiles in tests"))
     }
 
+    fn test_remover() -> ProfileRemover {
+        Box::new(|_name| anyhow::bail!("no profiles in tests"))
+    }
+
     /// `App::new` with empty profiles and dummy callbacks, for tests.
     fn test_app(provider: &str, model: &str) -> App {
         App::new(
             provider,
             model,
             Vec::new(),
+            None,
             test_resolver(),
             test_saver(),
             test_loader(),
+            test_remover(),
         )
     }
 
@@ -3604,11 +3988,21 @@ mod tests {
     #[test]
     fn failed_turn_is_visible() {
         let mut app = test_app("openai", "gpt-4o");
-        app.note_turn_failed("provider disconnected");
+        app.note_turn_failed(
+            "provider disconnected",
+            "outage",
+            "check the provider's status page",
+        );
         let line = app.transcript.last().unwrap().text();
         assert!(line.contains("✗ failed"), "got: {line}");
         assert!(line.contains("provider disconnected"), "got: {line}");
-        assert_eq!(app.status, "failed");
+        assert!(line.contains("outage"), "got: {line}");
+        assert!(line.contains("💡"), "shows guidance: {line}");
+        assert!(
+            app.status.contains("outage"),
+            "status has kind: {}",
+            app.status
+        );
     }
 
     #[test]
@@ -3648,6 +4042,7 @@ mod tests {
             "openai/gpt-4o",
             HashMap::new(),
             &HashMap::new(),
+            &HashMap::new(),
         ));
         let mut term = Terminal::new(TestBackend::new(60, 14)).unwrap();
         term.draw(|f| app.render(f)).unwrap();
@@ -3671,6 +4066,7 @@ mod tests {
             vec!["claude-sonnet-4.6".into(), "ipop/coder-balanced".into()],
             "ipop/coder-balanced",
             tags,
+            &HashMap::new(),
             &HashMap::new(),
         ));
         let mut term = Terminal::new(TestBackend::new(60, 14)).unwrap();
@@ -3719,7 +4115,11 @@ mod tests {
     #[test]
     fn failed_turn_shows_reason_and_keeps_error() {
         let mut app = test_app("openai", "gpt-4o");
-        app.note_turn_failed("API error 401: invalid or expired session");
+        app.note_turn_failed(
+            "API error 401: invalid or expired session",
+            "auth",
+            "check your API key",
+        );
         // record_model_issue runs next in the real flow; it must NOT clobber the
         // real error with a reliability-count message.
         app.record_model_issue();
@@ -3933,14 +4333,17 @@ mod tests {
     #[test]
     fn completion_move_clamps() {
         let mut app = test_app("openai", "gpt-4o");
-        app.input.set("/co"); // [commit, compact, copy]
+        app.input.set("/co"); // [commit, compact, context, copy]
         app.sync_completion();
         let last = app.completion_items().len().saturating_sub(1);
         app.completion_move(-1); // already at 0, stays
         assert_eq!(app.completion.as_ref().unwrap().selected, 0);
         app.completion_move(1);
         assert_eq!(app.completion.as_ref().unwrap().selected, 1);
-        app.completion_move(1); // clamp at last
+        // Move past the end to verify clamping.
+        for _ in 0..last + 1 {
+            app.completion_move(1);
+        }
         assert_eq!(app.completion.as_ref().unwrap().selected, last);
     }
 

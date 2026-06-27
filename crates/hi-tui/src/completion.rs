@@ -47,6 +47,9 @@ pub(crate) struct CompletionItem {
 pub(crate) const MODEL_CMD: &str = "model";
 /// Cap on inline `/model` id completions, so a large catalog can't flood the menu.
 pub(crate) const MODEL_COMPLETION_MAX: usize = 8;
+/// The command whose argument values are profile names (live state from the
+/// config, plus the `add`/`edit`/`remove` subcommands).
+pub(crate) const PROVIDER_CMD: &str = "provider";
 
 pub(crate) fn completion_context(input: &str) -> Option<CompletionContext> {
     let rest = input.strip_prefix('/')?;
@@ -75,6 +78,14 @@ pub(crate) fn completion_context(input: &str) -> Option<CompletionContext> {
             if spec.name == MODEL_CMD {
                 // Model ids are dynamic — the catalog is filtered at render time,
                 // so emptiness is resolved there, not here.
+                return Some(CompletionContext::Arg {
+                    cmd: spec.name,
+                    prefix,
+                });
+            }
+            if spec.name == PROVIDER_CMD {
+                // Profile names + subcommands are dynamic — resolved at render
+                // time from the live profile list.
                 return Some(CompletionContext::Arg {
                     cmd: spec.name,
                     prefix,
@@ -165,6 +176,22 @@ mod tests {
         // A fully-typed valid static value has nothing left to complete → no menu.
         assert_eq!(completion_context("/compact hybrid"), None);
         assert_eq!(completion_context("/verify off"), None);
+        // The dynamic provider command offers completions (profile names +
+        // subcommands), resolved at render time.
+        assert_eq!(
+            completion_context("/provider "),
+            Some(Arg {
+                cmd: "provider",
+                prefix: String::new()
+            })
+        );
+        assert_eq!(
+            completion_context("/provider lo"),
+            Some(Arg {
+                cmd: "provider",
+                prefix: "lo".to_string()
+            })
+        );
         // A command that takes no argument, with a trailing space → no menu.
         assert_eq!(completion_context("/diff "), None);
         // A second argument token is past the single arg → no menu.

@@ -19,9 +19,6 @@ struct Field {
     input: InputLine,
     /// A short hint shown when the field is empty.
     placeholder: &'static str,
-    /// Whether this is the provider-type field (rendered as a picker, not
-    /// freeform text).
-    is_provider_picker: bool,
 }
 
 /// The form state: a list of fields, the active field index, and whether we're
@@ -44,25 +41,21 @@ impl ProviderForm {
                     label: "Name",
                     input: InputLine::default(),
                     placeholder: "e.g. sonnet, local, work",
-                    is_provider_picker: false,
                 },
                 Field {
                     label: "API key",
                     input: InputLine::default(),
                     placeholder: "paste key or env var name (e.g. ANTHROPIC_API_KEY)",
-                    is_provider_picker: false,
                 },
                 Field {
                     label: "Model",
                     input: InputLine::default(),
                     placeholder: "optional — blank to pick via /model",
-                    is_provider_picker: false,
                 },
                 Field {
                     label: "Base URL",
                     input: InputLine::default(),
                     placeholder: "blank for provider default",
-                    is_provider_picker: false,
                 },
             ],
             active: 0,
@@ -91,25 +84,21 @@ impl ProviderForm {
                     label: "Name",
                     input: InputLine::default(),
                     placeholder: "",
-                    is_provider_picker: false,
                 },
                 Field {
                     label: "API key",
                     input: InputLine::default(),
                     placeholder: "blank = keep current",
-                    is_provider_picker: false,
                 },
                 Field {
                     label: "Model",
                     input: InputLine::default(),
                     placeholder: "blank = keep current",
-                    is_provider_picker: false,
                 },
                 Field {
                     label: "Base URL",
                     input: InputLine::default(),
                     placeholder: "blank = keep current",
-                    is_provider_picker: false,
                 },
             ],
             active: 1, // Start on the API key field (name is read-only).
@@ -140,10 +129,44 @@ impl ProviderForm {
         self.provider_idx
     }
 
+    /// The provider id string for the currently-selected provider.
+    pub fn provider_id(&self) -> &'static str {
+        PROVIDER_CHOICES[self.provider_idx].0
+    }
+
+    /// True when the current provider doesn't need an API key (Ollama runs
+    /// locally without one). The form skips the API-key field for these.
+    pub fn api_key_unneeded(&self) -> bool {
+        self.provider_id() == "ollama"
+    }
+
+    /// The default base URL for the currently-selected provider, to show as the
+    /// placeholder when the Base URL field is empty.
+    pub fn default_base_url(&self) -> &'static str {
+        match self.provider_id() {
+            "ollama" => "http://localhost:11434/v1",
+            "pipenetwork" => "https://api.pipenetwork.ai/v1",
+            "anthropic" => "https://api.anthropic.com",
+            "openai" => "https://openrouter.ai/api/v1",
+            _ => "",
+        }
+    }
+
+    /// Advance `self.active` past any field that should be skipped (the API-key
+    /// field when the provider is Ollama). Called after provider cycling and
+    /// after Tab navigation.
+    fn skip_hidden(&mut self) {
+        if self.api_key_unneeded() && self.active == 1 {
+            // Skip forward past the API-key field.
+            self.active = 2;
+        }
+    }
+
     /// Move to the next field (Tab). Cycles to submit after the last field.
     pub fn next_field(&mut self) {
         if self.active < self.fields.len() - 1 {
             self.active += 1;
+            self.skip_hidden();
         }
     }
 
@@ -151,6 +174,10 @@ impl ProviderForm {
     pub fn prev_field(&mut self) {
         if self.active > 0 && !(self.editing && self.active == 1) {
             self.active -= 1;
+            // If we landed on the hidden API-key field, skip back past it.
+            if self.api_key_unneeded() && self.active == 1 {
+                self.active = 0;
+            }
         }
     }
 
@@ -159,6 +186,7 @@ impl ProviderForm {
     /// row, but we render it separately from the text fields).
     pub fn cycle_provider(&mut self) {
         self.provider_idx = (self.provider_idx + 1) % PROVIDER_CHOICES.len();
+        self.skip_hidden();
     }
 
     /// Cycle the provider picker to the previous choice.
@@ -168,12 +196,24 @@ impl ProviderForm {
         } else {
             self.provider_idx -= 1;
         }
+        self.skip_hidden();
     }
 
     /// Insert a character into the active text field.
     pub fn insert(&mut self, c: char) {
         if self.active < self.fields.len() {
             self.fields[self.active].input.insert(c);
+        }
+    }
+
+    /// Insert a (possibly multi-line) string into the active text field — used
+    /// for pastes. Newlines are stripped so a pasted key stays on one line.
+    pub fn insert_str(&mut self, s: &str) {
+        if self.active < self.fields.len() {
+            let single = s.replace("\r\n", "").replace(['\r', '\n'], "");
+            for c in single.chars() {
+                self.fields[self.active].input.insert(c);
+            }
         }
     }
 
@@ -188,15 +228,6 @@ impl ProviderForm {
     pub fn clear_field(&mut self) {
         if self.active < self.fields.len() {
             self.fields[self.active].input.clear();
-        }
-    }
-
-    /// The text in the active field.
-    pub fn active_text(&self) -> String {
-        if self.active < self.fields.len() {
-            self.fields[self.active].input.text()
-        } else {
-            String::new()
         }
     }
 
@@ -243,12 +274,30 @@ impl ProviderForm {
         PROVIDER_CHOICES
     }
 
-    /// The label and placeholder for each text field, for rendering.
-    pub fn field_labels(&self) -> Vec<(&'static str, &'static str, String, bool)> {
+    /// The label and placeholder for each text field, for rendering. The
+    /// placeholder is dynamic: the API-key field shows "(not needed for Ollama)"
+    /// when the provider is Ollama, and the Base URL field shows the provider's
+    /// default URL.
+    pub fn field_labels(&self) -> Vec<(&'static str, String, String, bool)> {
+        let unneeded = self.api_key_unneeded();
+        let default_url = self.default_base_url();
         self.fields
             .iter()
             .enumerate()
-            .map(|(i, f)| (f.label, f.placeholder, f.input.text(), i == self.active))
+            .map(|(i, f)| {
+                let placeholder = if i == 1 && unneeded {
+                    "(not needed for Ollama)".to_string()
+                } else if i == 3 {
+                    if default_url.is_empty() {
+                        f.placeholder.to_string()
+                    } else {
+                        format!("blank for {default_url}")
+                    }
+                } else {
+                    f.placeholder.to_string()
+                };
+                (f.label, placeholder, f.input.text(), i == self.active)
+            })
             .collect()
     }
 }

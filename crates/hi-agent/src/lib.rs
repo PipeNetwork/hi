@@ -20,7 +20,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use futures_util::StreamExt;
 use hi_ai::{
-    ChatRequest, Content, Message, Provider, ProviderErrorKind, RequestProfile, StreamEvent,
+    ChatRequest, Content, Message, Provider, ProviderErrorKind, RequestProfile, Role, StreamEvent,
     ToolMode, ToolSpec, Usage, provider_error_kind, provider_error_usage,
 };
 use hi_tools::{TOOL_SPECS, execute, execute_streaming};
@@ -32,12 +32,13 @@ pub use heuristics::humanize_count;
 pub use hi_tools::{PlanStatus, PlanStep};
 pub use memory::{memory_file, should_distill_memory};
 pub use session::SessionSink;
-pub use ui::{Ui, tool_label};
+pub use ui::{Ui, classify_error, tool_label};
 
 use heuristics::{
     RECOVERY_SAMPLING, StallMode, emit_tool_output, looks_like_continue,
-    looks_like_unfinished_step, looks_mutating, plan_has_pending_steps, recovery_sampling,
-    recovery_telemetry, respects_deps, tool_deps, tool_mode_label,
+    looks_like_unfinished_step, looks_mutating, parse_text_tool_calls, plan_has_pending_steps,
+    recovery_sampling, recovery_telemetry, respects_deps, textcall_id_offset, tool_deps,
+    tool_mode_label,
 };
 use memory::{cap_memory, memory_prompt};
 use prompt::SystemPrompt;
@@ -301,6 +302,11 @@ pub struct Agent {
     /// Files whose content or presence changed in the most recent turn.
     last_changed_files: Vec<String>,
     last_compat_fallbacks: Vec<String>,
+    /// A shared interrupt flag. When set (by the UI on a user action like
+    /// pressing Esc during a tool call), the agent skips the remaining tool
+    /// calls in the current batch and feeds a "interrupted by user" result
+    /// back to the model, so it can adapt without losing the turn.
+    interrupt: Arc<std::sync::atomic::AtomicBool>,
     /// Telemetry from the most recent `run_turn` (verify rounds, recovery
     /// retries, nudges fired, last verify attributions). Flushed at turn end
     /// from locals that would otherwise be discarded; exposed for `--report`
@@ -362,10 +368,20 @@ impl Agent {
         messages: Vec<Message>,
         persisted: usize,
     ) -> Self {
+        let mut messages = Transcript::new(messages);
+        // Clean up any stale synthetic nudges from a session saved by an older
+        // version (before strip_finalize_pair existed). This prevents a resumed
+        // session from carrying a FINALIZE_PROMPT ("don't take any further
+        // action") into the next turn's context.
+        messages.strip_finalize_pair();
+        messages.strip_trailing_nudges();
+        // Clamp persisted to the (possibly shorter) transcript length so the
+        // incremental session recorder doesn't slice past the end.
+        let persisted = persisted.min(messages.len());
         Self {
             provider,
             config,
-            messages: Transcript::new(messages),
+            messages,
             tools: TOOL_SPECS.clone().into(),
             session: None,
             persisted,
@@ -376,6 +392,7 @@ impl Agent {
             checkpoints: Vec::new(),
             last_changed_files: Vec::new(),
             last_compat_fallbacks: Vec::new(),
+            interrupt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_turn_telemetry: TurnTelemetry::default(),
             goal: None,
             structured_goal: None,
@@ -410,6 +427,17 @@ impl Agent {
         self.messages.as_slice()
     }
 
+    /// The text of the last user message in the conversation, or `None` if
+    /// there is none. Used by `/edit` to load it into the input line.
+    pub fn last_user_message(&self) -> Option<String> {
+        self.messages
+            .as_slice()
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User)
+            .map(|m| m.text())
+    }
+
     /// Discard messages back to `len` — used to drop an interrupted turn so the
     /// conversation stays consistent (no dangling user message, no orphan
     /// tool_use from a round cut off mid-execution).
@@ -436,6 +464,88 @@ impl Agent {
     /// The configured context window, if known.
     pub fn context_window(&self) -> Option<u32> {
         self.config.context_window
+    }
+
+    /// A human-readable context-occupancy breakdown for `/context`: the
+    /// system prompt size, per-message token estimates, total occupancy vs.
+    /// window, and what compaction would keep/elide.
+    pub fn context_breakdown(&self) -> String {
+        let messages = self.messages.as_slice();
+        let window = self.config.context_window;
+        let total_est = compaction::estimate_tokens(messages);
+        let mut out = String::new();
+        if let Some(w) = window
+            && w > 0
+        {
+            let pct = (self.context_used * 100 / u64::from(w)).min(100);
+            out.push_str(&format!(
+                "context: {} / {} tokens ({}% used)\n",
+                humanize_count(self.context_used),
+                humanize_count(u64::from(w)),
+                pct,
+            ));
+            out.push_str(&format!(
+                "  estimated history: {} tokens\n",
+                humanize_count(total_est),
+            ));
+            // How many turns until compaction triggers?
+            let threshold = u64::from(w) * self.config.auto_compact_percent / 100;
+            if self.context_used < threshold {
+                let headroom = threshold.saturating_sub(self.context_used);
+                out.push_str(&format!(
+                    "  headroom before auto-compact: {} tokens ({})\n",
+                    humanize_count(headroom),
+                    if headroom > 0 {
+                        "healthy"
+                    } else {
+                        "at threshold"
+                    },
+                ));
+            } else {
+                out.push_str(
+                    "  ⚠ at or past the auto-compact threshold — /compact to reclaim now\n",
+                );
+            }
+        } else {
+            out.push_str(&format!(
+                "context: {} tokens used (window unknown)\n",
+                humanize_count(self.context_used),
+            ));
+        }
+        // Per-message breakdown (system + up to 10 recent).
+        out.push_str("\n  message breakdown:\n");
+        for (i, msg) in messages.iter().enumerate().take(20) {
+            let role = match msg.role {
+                Role::System => "system",
+                Role::User => "user  ",
+                Role::Assistant => "asst  ",
+                Role::Tool => "tool  ",
+            };
+            let est = compaction::estimate_tokens(std::slice::from_ref(msg));
+            let preview = ui::clip(&msg.text().replace('\n', " "), 50);
+            out.push_str(&format!(
+                "    {i:>3} {role} ~{:<6} {preview}\n",
+                humanize_count(est)
+            ));
+        }
+        if messages.len() > 20 {
+            out.push_str(&format!("    … {} more messages\n", messages.len() - 20));
+        }
+        // Compaction preview.
+        out.push_str(&format!(
+            "\n  compaction strategy: {:?}\n",
+            self.config.compaction
+        ));
+        if let Some(split) = compaction::recent_split(messages, DEFAULT_KEEP_RECENT) {
+            let old = split - 1;
+            let recent = messages.len() - split;
+            out.push_str(&format!(
+                "  on compact: summarize {old} old, keep {recent} recent verbatim\n",
+            ));
+        } else {
+            out.push_str("  on compact: nothing older than the recent window to summarize\n");
+        }
+        out
     }
 
     /// Render the conversation as Markdown for /export.
@@ -525,6 +635,13 @@ impl Agent {
     /// Number of git checkpoints created so far (for `/undo`).
     pub fn checkpoint_count(&self) -> usize {
         self.checkpoints.len()
+    }
+
+    /// A shared interrupt handle the UI can set to skip the current tool call.
+    /// The agent checks it between tool executions; when set, the current tool's
+    /// result is replaced with "interrupted by user" and the flag is cleared.
+    pub fn interrupt_handle(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.interrupt.clone()
     }
 
     /// The model id currently configured for this session.
@@ -1139,11 +1256,12 @@ impl Agent {
             Ok(completion) => completion,
             Err(err) => {
                 self.add_error_usage(&err);
+                // Flush any partially-streamed summary text before returning.
+                ui.assistant_end();
                 let _ = self.persist();
                 return Err(err);
             }
         };
-        ui.assistant_end();
         self.add_usage(completion.usage);
         let _ = self.persist();
         ui.usage(
@@ -1154,13 +1272,18 @@ impl Agent {
         );
 
         // Fall back to the final content if the provider didn't stream text.
+        // Emit it through the UI before assistant_end so the user sees the
+        // summary even when the provider returned text only in the completion
+        // object (not via stream deltas).
         if summary.trim().is_empty() {
             for c in &completion.content {
                 if let Content::Text(t) = c {
                     summary.push_str(t);
+                    ui.assistant_text(t);
                 }
             }
         }
+        ui.assistant_end();
         let summary = summary.trim();
         Ok((!summary.is_empty()).then(|| summary.to_string()))
     }
@@ -1225,23 +1348,29 @@ impl Agent {
             Ok(completion) => completion,
             Err(err) => {
                 self.add_error_usage(&err);
+                // Flush any partially-streamed memory text before the status.
+                ui.assistant_end();
                 let _ = self.persist();
                 ui.status(&format!("(couldn't update memory: {err})"));
                 return;
             }
         };
-        ui.assistant_end();
         self.add_usage(completion.usage);
         let _ = self.persist();
 
         // Fall back to the final content if the provider didn't stream text.
+        // Emit it through the UI before assistant_end so the user sees the
+        // distilled memory even when the provider returned text only in the
+        // completion object (not via stream deltas).
         if memory.trim().is_empty() {
             for c in &completion.content {
                 if let Content::Text(t) = c {
                     memory.push_str(t);
+                    ui.assistant_text(t);
                 }
             }
         }
+        ui.assistant_end();
         let memory = cap_memory(&memory);
         if memory.is_empty() {
             return; // nothing durable to save
@@ -1507,6 +1636,8 @@ impl Agent {
                         );
                         self.add_error_usage(&err);
                         let _ = self.persist();
+                        let (kind, guidance) = crate::ui::classify_error(&err);
+                        ui.turn_error(kind, &err.to_string(), guidance);
                         return Err(err);
                     }
                     // A transient generation flake — a malformed/garbled stream or
@@ -1538,6 +1669,8 @@ impl Agent {
                     Err(err) => {
                         self.add_error_usage(&err);
                         let _ = self.persist();
+                        let (kind, guidance) = crate::ui::classify_error(&err);
+                        ui.turn_error(kind, &err.to_string(), guidance);
                         return Err(err);
                     }
                 };
@@ -1573,13 +1706,15 @@ impl Agent {
                         "⚠ the model hit the output token limit — continuing ({truncation_retries}/{})",
                         self.config.max_truncation_retries
                     ));
-                    // Strip any ToolCall blocks from the truncated content: a
-                    // truncated tool call has partial/malformed JSON arguments
-                    // and was never executed, so it has no matching tool_result.
-                    // Leaving it in would create an orphan tool_use that providers
-                    // reject on the next request — the turn would stall. Text and
-                    // thinking blocks are kept so the model can continue from
-                    // where it was cut off.
+                    // Clean text-embedded tool-call JSON (local models) from the
+                    // truncated content before recording. Complete tool calls are
+                    // extracted and stripped; partial JSON (cut off mid-generation)
+                    // stays as text so the model can continue from the cutoff.
+                    // Structured ToolCall blocks are stripped: a truncated tool call
+                    // has partial/malformed arguments and was never executed, so it
+                    // has no matching tool_result. Leaving it in would create an
+                    // orphan tool_use that providers reject on the next request.
+                    self.clean_text_tool_calls_from_content(&mut completion.content);
                     self.messages
                         .push_assistant_text_only(std::mem::take(&mut completion.content));
                     self.messages
@@ -1592,6 +1727,7 @@ impl Agent {
                 // user — the task may be incomplete. Don't silently end the turn
                 // on a half-finished output without surfacing what happened.
                 if truncated {
+                    self.clean_text_tool_calls_from_content(&mut completion.content);
                     self.messages
                         .push_assistant_text_only(std::mem::take(&mut completion.content));
                     ui.status(&format!(
@@ -1613,6 +1749,69 @@ impl Agent {
                         )
                     })
                     .collect();
+
+                // Fallback for local models (Ollama, llama.cpp, etc.) that emit
+                // tool calls as text — raw JSON like {"name":"bash","arguments":…}
+                // — instead of using the structured `tool_calls` API field. When
+                // the API returned no structured calls, scan the assistant text
+                // for tool-call JSON and promote any matches to real ToolCall
+                // blocks so they actually execute. The raw JSON is stripped from
+                // the recorded text so history stays clean.
+                let calls = if calls.is_empty() {
+                    let full_text: String = completion
+                        .content
+                        .iter()
+                        .filter_map(|c| match c {
+                            Content::Text(t) => Some(t.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let parsed =
+                        parse_text_tool_calls(&full_text, textcall_id_offset(&self.messages));
+                    if parsed.iter().any(|c| matches!(c, Content::ToolCall { .. })) {
+                        // Replace text blocks with the interleaved content
+                        // (prose segments + ToolCall blocks in emission order),
+                        // preserving any Thinking blocks from the original.
+                        let mut new_content = Vec::new();
+                        let mut parsed_iter = parsed.into_iter().peekable();
+                        for c in completion.content.iter() {
+                            match c {
+                                Content::Text(_) => {
+                                    // Drain the parsed content that corresponds to
+                                    // this text block (all of it — the original had
+                                    // one Text block with the full raw text).
+                                    for p in parsed_iter.by_ref() {
+                                        new_content.push(p);
+                                    }
+                                }
+                                Content::Thinking { .. } => new_content.push(c.clone()),
+                                _ => {}
+                            }
+                        }
+                        // If the original had no Text block (shouldn't happen for
+                        // the local-model path, but be safe), drain remaining.
+                        for p in parsed_iter {
+                            new_content.push(p);
+                        }
+                        completion.content = new_content;
+                        completion
+                            .tool_calls()
+                            .into_iter()
+                            .map(|c| {
+                                (
+                                    c.id.to_string(),
+                                    c.name.to_string(),
+                                    c.arguments.to_string(),
+                                )
+                            })
+                            .collect()
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    calls
+                };
 
                 // Repetition guard: the model re-issued the exact same tool
                 // calls (same names, same arguments, same order) as the previous
@@ -1816,6 +2015,28 @@ impl Agent {
                 let mut pending_checks: Vec<(String, tokio::task::JoinHandle<(bool, String)>)> =
                     Vec::new();
                 while done < calls.len() {
+                    // Check the interrupt flag: if the user pressed Esc to skip
+                    // the current tool, mark all uncompleted calls as interrupted
+                    // and break out of the execution loop so the model gets a
+                    // "interrupted by user" result and can adapt.
+                    if self
+                        .interrupt
+                        .swap(false, std::sync::atomic::Ordering::Relaxed)
+                    {
+                        for i in 0..calls.len() {
+                            if !completed[i] {
+                                let (id, name, _) = &calls[i];
+                                ui.tool_call(name, "[]");
+                                let msg = "Tool call interrupted by user.".to_string();
+                                ui.tool_result(name, &msg);
+                                results[i] = Some((id.clone(), msg));
+                                completed[i] = true;
+                                completion_order.push(i);
+                            }
+                        }
+                        ui.status("⚠ tool call interrupted by user — the model will adapt");
+                        break;
+                    }
                     // Ready: deps all complete.
                     let ready: Vec<usize> = (0..calls.len())
                         .filter(|&i| !completed[i] && deps[i].iter().all(|&d| completed[d]))
@@ -1829,13 +2050,16 @@ impl Agent {
                     let bash_idx = ready.iter().copied().find(|&i| calls[i].1 == "bash");
                     if let Some(i) = bash_idx {
                         let (id, name, arguments) = &calls[i];
+                        // Confirm edit if in --confirm-edits mode and this is a
+                        // mutating tool. Bash is mutating but we let it run
+                        // (the guard layer handles catastrophic ops).
                         ui.tool_started(name, arguments);
                         ui.tool_call(name, arguments);
                         let path = hi_tools::target_path(name, arguments).unwrap_or_default();
                         let started = std::time::Instant::now();
                         let ui_ref: &mut dyn Ui = &mut *ui;
                         let output = execute_streaming(name, arguments, &mut |line: &str| {
-                            ui_ref.tool_result(name, line);
+                            ui_ref.tool_stream(name, line);
                         })
                         .await;
                         let duration_ms = started.elapsed().as_millis() as u64;
@@ -1870,9 +2094,41 @@ impl Agent {
                     for &i in &ready {
                         ui.tool_started(&calls[i].1, &calls[i].2);
                     }
+                    // In --confirm-edits mode, check each mutating call with
+                    // the UI before executing. Denied calls get a "skipped"
+                    // result instead of running.
+                    let mut denied: Vec<usize> = Vec::new();
+                    if self.config.confirm_edits {
+                        for &i in &ready {
+                            let name = &calls[i].1;
+                            if matches!(
+                                name.as_str(),
+                                "write" | "edit" | "multi_edit" | "apply_patch"
+                            ) {
+                                let path = hi_tools::target_path(name, &calls[i].2)
+                                    .unwrap_or_else(|| "(unknown)".to_string());
+                                // Generate a diff preview for edit/multi_edit/apply_patch.
+                                let preview = match name.as_str() {
+                                    "edit" | "multi_edit" | "apply_patch" => {
+                                        "(diff preview unavailable in concurrent batch)".to_string()
+                                    }
+                                    _ => String::new(),
+                                };
+                                if !ui.confirm_edit(&path, &preview) {
+                                    denied.push(i);
+                                }
+                            }
+                        }
+                    }
                     let batch_started = std::time::Instant::now();
+                    // Split ready into approved and denied; only execute approved.
+                    let approved: Vec<usize> = ready
+                        .iter()
+                        .copied()
+                        .filter(|i| !denied.contains(i))
+                        .collect();
                     let outputs: Vec<_> = futures_util::stream::iter(
-                        ready.iter().map(|&i| execute(&calls[i].1, &calls[i].2)),
+                        approved.iter().map(|&i| execute(&calls[i].1, &calls[i].2)),
                     )
                     .buffered(self.config.max_parallel_tools)
                     .collect()
@@ -1885,7 +2141,26 @@ impl Agent {
                     if batch_size == 1 {
                         sched_serial_runs += 1;
                     }
-                    for (&i, output) in ready.iter().zip(outputs) {
+                    // Handle denied calls first: emit their headers and "skipped" results.
+                    for &i in &denied {
+                        let name = &calls[i].1;
+                        ui.tool_call(name, &calls[i].2);
+                        let skipped_msg = "Edit skipped by user (not applied).".to_string();
+                        emit_tool_output(
+                            &mut *ui,
+                            name,
+                            &hi_tools::ToolOutput {
+                                content: skipped_msg.clone(),
+                                display: None,
+                                plan: None,
+                            },
+                        );
+                        results[i] = Some((calls[i].0.clone(), skipped_msg));
+                        self.invalidate_snapshot();
+                        completed[i] = true;
+                        completion_order.push(i);
+                    }
+                    for (&i, output) in approved.iter().zip(outputs) {
                         let name = &calls[i].1;
                         // Emit the transcript header immediately before its
                         // result — in a concurrent batch this pairs each header
@@ -2123,6 +2398,14 @@ impl Agent {
             ui,
         );
 
+        // Surface the files this turn changed, so the user sees what was touched
+        // without needing /diff. Skipped for read-only/Q&A turns (empty list).
+        // Emitted BEFORE the finalize recap so the recap is the last text the
+        // user sees (the "✓ done" marker follows it).
+        if !self.last_changed_files.is_empty() {
+            ui.changed_files(&self.last_changed_files);
+        }
+
         // Finalization: after a turn where the model used its tools to change
         // files, make one dedicated tool-free call so the user always gets a
         // structured recap, even from a model that wouldn't summarize on its
@@ -2136,6 +2419,23 @@ impl Agent {
             && !self.last_changed_files.is_empty()
         {
             self.finalize_turn(turn_start, ui).await;
+            // finalize_turn appended a [user: finalize-nudge][assistant: recap]
+            // pair. Strip it from the persisted transcript so the FINALIZE_PROMPT
+            // ("don't take any further action") doesn't bleed into the next turn
+            // and make the model emit summary text instead of executing the new
+            // prompt. The recap was already shown to the user via the UI.
+            self.messages.strip_finalize_pair();
+        }
+
+        // Cost warning: if the session has exceeded the configured spending
+        // limit, surface a notice so the user can decide whether to continue.
+        if let Some(limit) = self.config.max_cost_warn
+            && let Some(cost) = self.cost_usd
+            && cost >= limit
+        {
+            ui.status(&format!(
+                "⚠ session cost ${cost:.4} has exceeded the --max-cost limit of ${limit:.2}"
+            ));
         }
 
         // Report cumulative session usage — the same number the live working
@@ -2174,7 +2474,7 @@ impl Agent {
             model: self.config.model.clone(),
             messages: Arc::from(messages),
             tools: Arc::new([]), // recap only — no tool use
-            max_tokens: 1024,    // throwaway call — recaps are short
+            max_tokens: 2048,    // throwaway call — recaps can be detailed
             temperature: self.config.temperature,
             top_p: None,
             frequency_penalty: None,
@@ -2199,11 +2499,13 @@ impl Agent {
             Ok(completion) => completion,
             Err(err) => {
                 self.add_error_usage(&err);
+                // Flush any partially-streamed recap text before the status
+                // line, so it isn't left dangling in the UI's pending buffer.
+                ui.assistant_end();
                 ui.status(&format!("(couldn't generate the final summary: {err})"));
                 return;
             }
         };
-        ui.assistant_end();
 
         self.add_usage(completion.usage);
         ui.usage(
@@ -2214,13 +2516,21 @@ impl Agent {
         );
 
         // Fall back to the final content if the provider didn't stream text.
+        // Emit it through the UI before assistant_end so the user actually sees
+        // the recap — without this, a provider that returns text only in the
+        // completion object (not via stream deltas) would have its summary
+        // recorded in history but never displayed, so the turn appears to end
+        // without its closing message.
         if recap.trim().is_empty() {
             for c in &completion.content {
                 if let Content::Text(t) = c {
                     recap.push_str(t);
+                    ui.assistant_text(t);
                 }
             }
         }
+        ui.assistant_end();
+
         if recap.trim().is_empty() {
             return; // nothing to record
         }
@@ -2314,7 +2624,7 @@ impl Agent {
                 .cloned()
                 .collect::<Vec<_>>()
                 .into(),
-            ToolMode::Auto | ToolMode::Required => self.tools.clone().into(),
+            ToolMode::Auto | ToolMode::Required => self.tools.clone(),
         }
     }
 
@@ -2323,6 +2633,37 @@ impl Agent {
             self.config.tool_mode,
             ToolMode::ChatOnly | ToolMode::ReadOnly
         ) && looks_mutating(input)
+    }
+
+    /// Clean text-embedded tool-call JSON from `Content::Text` blocks in
+    /// `content`. Used on the truncation path (before `parse_text_tool_calls`
+    /// would normally run) so raw tool-call JSON doesn't leak into recorded
+    /// history. Complete tool calls are extracted and stripped; partial JSON
+    /// stays as text. `ToolCall` blocks are left in place — the caller
+    /// (`push_assistant_text_only`) strips them.
+    fn clean_text_tool_calls_from_content(&self, content: &mut Vec<Content>) {
+        let mut new_content = Vec::new();
+        for c in content.drain(..) {
+            match c {
+                Content::Text(t) => {
+                    let parsed = parse_text_tool_calls(&t, textcall_id_offset(&self.messages));
+                    if parsed.iter().any(|p| matches!(p, Content::ToolCall { .. })) {
+                        // Tool calls found — keep only the Text blocks (drop
+                        // the extracted ToolCalls; they're partial/truncated
+                        // and have no matching results).
+                        new_content.extend(
+                            parsed.into_iter().filter(|p| {
+                                matches!(p, Content::Text(_) | Content::Thinking { .. })
+                            }),
+                        );
+                    } else {
+                        new_content.push(Content::Text(t));
+                    }
+                }
+                other => new_content.push(other),
+            }
+        }
+        *content = new_content;
     }
 
     fn persist(&mut self) -> Result<()> {
@@ -2343,10 +2684,9 @@ impl Agent {
     fn persist_goal(&mut self, ui: &mut dyn Ui) {
         if let Some(session) = self.session.as_mut()
             && let Some(goal) = &self.structured_goal
+            && let Err(err) = session.record_goal(goal)
         {
-            if let Err(err) = session.record_goal(goal) {
-                ui.status(&format!("(couldn't persist goal: {err})"));
-            }
+            ui.status(&format!("(couldn't persist goal: {err})"));
         }
     }
 
@@ -3481,7 +3821,7 @@ mod tests {
         // concurrently — telemetry reports max_concurrent_batch > 1 and a
         // sub-100% serial share. Pins that the dep-aware scheduler's
         // concurrency is measured, not just shipped on faith.
-        let mut cfg = config();
+        let cfg = config();
         let responses = vec![
             completion(
                 vec![
@@ -4807,9 +5147,11 @@ mod tests {
 
     #[tokio::test]
     async fn finalizes_with_a_recap_when_files_changed() {
-        // A turn that changes a file ends with a dedicated recap call, recorded
-        // as the closing assistant message (preceded by the synthetic request so
-        // roles alternate), with its usage counted.
+        // A turn that changes a file ends with a dedicated recap call. The recap
+        // is emitted to the UI (so the user sees it) and its usage is counted,
+        // but the [user: finalize-nudge][assistant: recap] pair is stripped from
+        // the persisted transcript at turn end — the FINALIZE_PROMPT's "don't
+        // take any further action" instruction must not bleed into the next turn.
         // Holds the workspace lock: this test writes a temp file, which would
         // otherwise perturb the file-change detection of the verify tests.
         let _guard = VERIFY_TEST_LOCK.lock().await;
@@ -4833,17 +5175,33 @@ mod tests {
         agent.run_turn("make a file", &mut ui).await.unwrap();
         let _ = std::fs::remove_file(&tmp);
 
-        let m = agent.messages();
-        assert_eq!(m.last().unwrap().role, Role::Assistant);
+        // The recap was emitted to the UI (the user sees it).
         assert!(
-            m.last().unwrap().text().contains("## Summary"),
-            "recap is the closing message: {}",
-            m.last().unwrap().text()
+            ui.assistant.contains("## Summary"),
+            "recap is emitted to the UI: {}",
+            ui.assistant
         );
-        assert_eq!(
-            m[m.len() - 2].role,
-            Role::User,
-            "request precedes the recap"
+
+        let m = agent.messages();
+        // The finalize nudge + recap are stripped from history. The last message
+        // is the assistant's "done" from the turn work, not the recap.
+        let last = m.last().expect("history is non-empty");
+        assert_eq!(last.role, Role::Assistant);
+        assert!(
+            !last.text().contains("[hi:nudge:finalize]"),
+            "no finalize nudge marker in history, got: {}",
+            last.text()
+        );
+        // No finalize nudge anywhere in the transcript.
+        assert!(
+            !m.iter().any(|msg| {
+                msg.role == Role::User
+                    && msg
+                        .content
+                        .iter()
+                        .any(|c| matches!(c, Content::Text(t) if t.contains("[hi:nudge:finalize]")))
+            }),
+            "finalize nudge should be stripped from history"
         );
         // Roles alternate (no two assistants in a row → provider-safe next turn).
         assert!(
@@ -4853,6 +5211,122 @@ mod tests {
         // The recap call's usage (3/4) is folded into the running totals.
         assert_eq!(agent.totals().input_tokens, 1 + 1 + 3);
         assert_eq!(agent.totals().output_tokens, 1 + 1 + 4);
+    }
+
+    #[tokio::test]
+    async fn finalize_recap_is_emitted_to_the_ui() {
+        // The Canned provider never calls the stream sink — it returns text
+        // only in the completion object. The finalize fallback must emit that
+        // text through ui.assistant_text so the user sees the recap, not just
+        // record it silently in history. (This is the "ending doesn't show"
+        // bug: the recap was recorded but never displayed.)
+        let _guard = VERIFY_TEST_LOCK.lock().await;
+        let mut cfg = config();
+        cfg.finalize = true;
+        let tmp = temp_file("finalize_ui");
+        let p = tmp.to_string_lossy().to_string();
+        let responses = vec![
+            write_completion(&p),
+            completion(vec![Content::Text("done".into())], 1, 1),
+            completion(
+                vec![Content::Text("## Summary\n- Created the file.".into())],
+                3,
+                4,
+            ),
+        ];
+        let mut agent = agent(responses, cfg);
+        let mut ui = RecUi::default();
+        agent.run_turn("make a file", &mut ui).await.unwrap();
+        let _ = std::fs::remove_file(&tmp);
+
+        // The recap text must have been emitted to the UI, not just recorded.
+        assert!(
+            ui.assistant.contains("## Summary"),
+            "recap text should be emitted to the UI, got assistant: {:?}",
+            ui.assistant
+        );
+    }
+
+    #[tokio::test]
+    async fn finalize_nudge_does_not_bleed_into_next_turn() {
+        // Regression: after a finalized turn, the FINALIZE_PROMPT ("don't take
+        // any further action") was left in history. On the next turn the model
+        // saw it above the new prompt and emitted more summary text instead of
+        // executing the request. The fix strips the [user: finalize-nudge]
+        // [assistant: recap] pair at turn end. This test verifies the nudge is
+        // gone from history before the second turn starts, so the model's
+        // context for turn 2 contains only real conversation.
+        let _guard = VERIFY_TEST_LOCK.lock().await;
+        let mut cfg = config();
+        cfg.finalize = true;
+        let tmp = temp_file("finalize_bleed");
+        let p = tmp.to_string_lossy().to_string();
+        let responses = vec![
+            // Turn 1: write a file, then a "done" text, then the recap.
+            write_completion(&p),
+            completion(vec![Content::Text("done".into())], 1, 1),
+            completion(
+                vec![Content::Text("## Summary\n- Created the file.".into())],
+                3,
+                4,
+            ),
+            // Turn 2: a clean text response to the second prompt.
+            completion(vec![Content::Text("ok second".into())], 1, 1),
+        ];
+        let mut agent = agent(responses, cfg);
+        let mut ui = RecUi::default();
+        agent.run_turn("make a file", &mut ui).await.unwrap();
+        let _ = std::fs::remove_file(&tmp);
+
+        // After turn 1: no finalize nudge or recap in history.
+        let msgs = agent.messages();
+        assert!(
+            !msgs.iter().any(|m| {
+                m.content.iter().any(|c| {
+                    matches!(
+                        c,
+                        Content::Text(t) if t.contains("[hi:nudge:finalize]")
+                    )
+                })
+            }),
+            "finalize nudge must be stripped from history after turn 1"
+        );
+        assert!(
+            !msgs.iter().any(|m| m.text().contains("## Summary")),
+            "recap must be stripped from history after turn 1"
+        );
+
+        // Turn 2: the model should see the new prompt without the stale
+        // "don't take any further action" instruction. We verify by checking
+        // the last user message is the real second prompt, not folded nudge text.
+        let mut ui2 = RecUi::default();
+        agent
+            .run_turn("now do something else", &mut ui2)
+            .await
+            .unwrap();
+
+        let msgs = agent.messages();
+        let last_user = msgs
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User)
+            .expect("there is a last user message");
+        let text = last_user
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                Content::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(
+            text.contains("now do something else"),
+            "second prompt is the real user message, got: {text}"
+        );
+        assert!(
+            !text.contains("don't take any further action"),
+            "stale finalize instruction must not be in the second prompt context, got: {text}"
+        );
     }
 
     #[tokio::test]

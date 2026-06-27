@@ -51,6 +51,7 @@ impl JsonlSession {
     }
 
     /// Persist checkpoint refs so a resumed session knows where it branched.
+    #[allow(dead_code)]
     pub fn record_checkpoints(&mut self, refs: &[String]) -> Result<()> {
         if refs.is_empty() {
             return Ok(());
@@ -136,6 +137,7 @@ impl SessionSink for JsonlSession {
     }
 }
 
+#[allow(dead_code)]
 pub struct LoadedSession {
     pub messages: Vec<Message>,
     pub usage: Usage,

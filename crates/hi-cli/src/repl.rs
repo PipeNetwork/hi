@@ -24,8 +24,11 @@ pub(crate) async fn repl(
 ) -> Result<()> {
     use hi_agent::Command;
     use hi_agent::CompactionKind;
-    use rustyline::DefaultEditor;
+    use rustyline::Editor;
     use rustyline::error::ReadlineError;
+    use rustyline::history::DefaultHistory;
+
+    use crate::complete::{ProfileNames, ReplHelper};
 
     let window = registry
         .metadata(&settings.model)
@@ -39,7 +42,15 @@ pub(crate) async fn repl(
         window,
     );
 
-    let mut editor = DefaultEditor::new().context("initializing line editor")?;
+    // Shared, mutable profile-name list the completer reads. We refresh it
+    // before each readline so add/edit changes are visible immediately.
+    let profiles: ProfileNames =
+        std::rc::Rc::new(std::cell::RefCell::new(config::profile_names(config)));
+    let helper = ReplHelper::new(hi_agent::command::COMMANDS, profiles.clone());
+    let mut editor =
+        Editor::<ReplHelper, DefaultHistory>::with_config(rustyline::Config::default())
+            .context("initializing line editor")?;
+    editor.set_helper(Some(helper));
     let history = session::history_path();
     if let Some(path) = &history {
         let _ = editor.load_history(path);
@@ -51,6 +62,8 @@ pub(crate) async fn repl(
     let mut last_turn_start = 0usize;
 
     loop {
+        // Refresh profile names for the completer (covers add/edit changes).
+        *profiles.borrow_mut() = config::profile_names(config);
         match editor.readline("› ") {
             Ok(line) => {
                 let line = line.trim().to_string();
@@ -85,6 +98,35 @@ pub(crate) async fn repl(
                                 continue;
                             }
                         },
+                        Command::Edit => {
+                            // Load the last user prompt into the line editor
+                            // for editing. We use rustyline's `set_line` via
+                            // a re-readline with a prefilled buffer.
+                            match agent.last_user_message() {
+                                Some(prev) => {
+                                    // Re-readline with the previous prompt
+                                    // pre-filled and the cursor at the end.
+                                    let edited = editor.readline_with_initial("› ", (&prev, ""));
+                                    match edited {
+                                        Ok(line) if line.trim().is_empty() => continue,
+                                        Ok(line) => {
+                                            let line = line.trim().to_string();
+                                            let _ = editor.add_history_entry(&line);
+                                            line
+                                        }
+                                        Err(ReadlineError::Interrupted) => continue,
+                                        Err(err) => {
+                                            eprintln!("input error: {err}");
+                                            continue;
+                                        }
+                                    }
+                                }
+                                None => {
+                                    println!("\x1b[2mnothing to edit yet\x1b[0m");
+                                    continue;
+                                }
+                            }
+                        }
                         Command::Init => {
                             println!("\x1b[2mscanning the project to write HI.md…\x1b[0m");
                             hi_agent::command::INIT_PROMPT.to_string()
@@ -166,7 +208,7 @@ pub(crate) async fn repl(
                             let arg = arg.trim();
                             // --- Subcommands ---
                             if arg == "add" {
-                                match provider_add_prompt(config) {
+                                match provider_add_prompt(config, &mut editor) {
                                     Ok(name) => {
                                         println!(
                                             "\x1b[2msaved profile '{name}' — /provider {name} to switch\x1b[0m"
@@ -180,7 +222,7 @@ pub(crate) async fn repl(
                             }
                             if let Some(edit_name) = arg.strip_prefix("edit") {
                                 let edit_name = edit_name.trim();
-                                match provider_edit_prompt(config, edit_name) {
+                                match provider_edit_prompt(config, edit_name, &mut editor) {
                                     Ok(name) => {
                                         println!("\x1b[2msaved profile '{name}'\x1b[0m");
                                     }
@@ -190,14 +232,57 @@ pub(crate) async fn repl(
                                 }
                                 continue;
                             }
+                            if let Some(rm_name) = arg
+                                .strip_prefix("remove")
+                                .or_else(|| arg.strip_prefix("rm"))
+                            {
+                                let rm_name = rm_name.trim();
+                                let target = if rm_name.is_empty() {
+                                    let names = config::profile_names(config);
+                                    if names.is_empty() {
+                                        eprintln!("\x1b[2mno profiles to remove\x1b[0m");
+                                        continue;
+                                    }
+                                    names[0].clone()
+                                } else {
+                                    rm_name.to_string()
+                                };
+                                let active = config.default_profile.as_ref();
+                                if active.map(|a| a.as_str()) == Some(&target) {
+                                    eprintln!(
+                                        "\x1b[33mcan't remove '{target}' — it's the active profile; switch first\x1b[0m"
+                                    );
+                                    continue;
+                                }
+                                let path = match config::writable_config_path(None) {
+                                    Some(p) => p,
+                                    None => {
+                                        eprintln!("\x1b[33mcould not determine config path\x1b[0m");
+                                        continue;
+                                    }
+                                };
+                                match config::remove_profile(config, &target, &path) {
+                                    Ok(true) => {
+                                        println!("\x1b[2mremoved profile '{target}'\x1b[0m");
+                                    }
+                                    Ok(false) => {
+                                        eprintln!("\x1b[33mno profile named '{target}'\x1b[0m");
+                                    }
+                                    Err(err) => {
+                                        eprintln!("\x1b[33m/provider remove failed: {err}\x1b[0m");
+                                    }
+                                }
+                                continue;
+                            }
                             // --- Switch / list ---
                             if arg.is_empty() {
                                 let names = config::profile_names(config);
                                 if names.is_empty() {
                                     println!(
-                                        "\x1b[2mno profiles configured — add [profiles.<name>] to hi.toml\x1b[0m"
+                                        "\x1b[2mno profiles configured — use /provider add, or add [profiles.<name>] to hi.toml\x1b[0m"
                                     );
                                 } else {
+                                    let active = config.default_profile.as_deref();
                                     println!("\x1b[2mconfigured profiles:\x1b[0m");
                                     for name in &names {
                                         let p = config.profiles.get(name);
@@ -208,9 +293,29 @@ pub(crate) async fn repl(
                                         let model = p
                                             .and_then(|p| p.model.as_deref())
                                             .unwrap_or("(pick via /model)");
-                                        println!("  {name} — {prov} · {model}");
+                                        let mark = if active == Some(name.as_str()) {
+                                            "▶"
+                                        } else {
+                                            " "
+                                        };
+                                        let mut row = format!("  {mark} {name} — {prov} · {model}");
+                                        if let Some(url) =
+                                            p.and_then(|p| p.base_url.as_deref()).filter(|url| {
+                                                let default = p
+                                                    .and_then(|p| p.provider)
+                                                    .map(|prov| prov.default_base_url())
+                                                    .unwrap_or("");
+                                                url.trim_end_matches('/')
+                                                    != default.trim_end_matches('/')
+                                            })
+                                        {
+                                            row.push_str(&format!("  ·  {url}"));
+                                        }
+                                        println!("\x1b[2m{row}\x1b[0m");
                                     }
-                                    println!("\x1b[2m/provider <name> to switch\x1b[0m");
+                                    println!(
+                                        "\x1b[2m/provider <name> to switch · /provider add · /provider edit [name] · /provider remove [name]\x1b[0m"
+                                    );
                                 }
                                 continue;
                             }
@@ -244,9 +349,19 @@ pub(crate) async fn repl(
                                             println!("\x1b[2m/model <id> to switch\x1b[0m");
                                         }
                                         _ => {
-                                            println!(
-                                                "\x1b[2m(couldn't list endpoint models; /model <id> to switch)\x1b[0m"
+                                            let local = matches!(
+                                                new_settings.provider,
+                                                config::ProviderName::Ollama
                                             );
+                                            if local {
+                                                println!(
+                                                    "\x1b[2m(couldn't reach the local server — is it running and is the base_url correct? /model <id> to switch)\x1b[0m"
+                                                );
+                                            } else {
+                                                println!(
+                                                    "\x1b[2m(couldn't list endpoint models; /model <id> to switch)\x1b[0m"
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -332,17 +447,13 @@ async fn drive_with_spinner(
         tokio::select! {
             result = &mut fut => {
                 if let Err(err) = result {
-                    let category = hi_ai::provider_error_kind(&err)
-                        .map(|k| k.as_str())
-                        .unwrap_or("error");
-                    let hint = match category {
-                        "auth" => " — check your API key (run `hi --show-config`)",
-                        "rate_limit" => " — rate limited; wait a moment and /retry",
-                        "server_error" => " — provider is having issues; try /retry",
-                        "network" => " — can't reach the endpoint; check your connection",
-                        _ => "",
+                    let (kind, guidance) = hi_agent::classify_error(&err);
+                    let suffix = if guidance.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" — {guidance}")
                     };
-                    eprintln!("\r\x1b[K\x1b[31m{category}: {err:#}{hint}\x1b[0m");
+                    eprintln!("\r\x1b[K\x1b[31m{kind}: {err:#}{suffix}\x1b[0m");
                 }
                 break;
             }
@@ -368,22 +479,23 @@ async fn drive_with_spinner(
 }
 
 /// Read a line from the user with a prompt, using rustyline for line editing.
-fn rl_prompt(editor: &mut rustyline::DefaultEditor, message: &str) -> Result<String> {
+fn rl_prompt(editor: &mut crate::complete::ReplEditor, message: &str) -> Result<String> {
     Ok(editor.readline(message)?.trim().to_string())
 }
 
 /// Interactively create a new profile via line prompts and save it to the
 /// config file. Returns the profile name.
-fn provider_add_prompt(config: &mut config::Config) -> Result<String> {
+fn provider_add_prompt(
+    config: &mut config::Config,
+    editor: &mut crate::complete::ReplEditor,
+) -> Result<String> {
     use config::{ProfileForm, ProviderName, upsert_profile, writable_config_path};
-
-    let mut editor = rustyline::DefaultEditor::new().context("initializing line editor")?;
 
     println!("\x1b[2m— add a provider profile —\x1b[0m");
 
     // Profile name.
     let name = loop {
-        let n = rl_prompt(&mut editor, "Profile name: ")?;
+        let n = rl_prompt(editor, "Profile name: ")?;
         if n.is_empty() {
             eprintln!("  name can't be empty");
             continue;
@@ -400,7 +512,7 @@ fn provider_add_prompt(config: &mut config::Config) -> Result<String> {
     // Provider type.
     println!("  1) Ollama (local)    2) pipenetwork.ai    3) Anthropic    4) OpenRouter");
     let provider = loop {
-        match rl_prompt(&mut editor, "Provider [1-4] (default 1): ")?.as_str() {
+        match rl_prompt(editor, "Provider [1-4] (default 1): ")?.as_str() {
             "" | "1" => break ProviderName::Ollama,
             "2" => break ProviderName::Pipenetwork,
             "3" => break ProviderName::Anthropic,
@@ -414,7 +526,7 @@ fn provider_add_prompt(config: &mut config::Config) -> Result<String> {
         (String::new(), false)
     } else {
         let key = rl_prompt(
-            &mut editor,
+            editor,
             &format!(
                 "API key (or env var name like {}_API_KEY): ",
                 provider.as_str().to_uppercase()
@@ -436,16 +548,9 @@ fn provider_add_prompt(config: &mut config::Config) -> Result<String> {
     // Model (optional — can pick via /model after switching).
     let default_model = provider.default_model().unwrap_or("");
     let model = if default_model.is_empty() {
-        rl_prompt(
-            &mut editor,
-            "Model id (optional — blank to pick via /model): ",
-        )?
+        rl_prompt(editor, "Model id (optional — blank to pick via /model): ")?
     } else {
-        rl_prompt(
-            &mut editor,
-            &format!("Model id (default {default_model}): "),
-        )?
-        .to_string()
+        rl_prompt(editor, &format!("Model id (default {default_model}): "))?.to_string()
     };
     let model = if model.is_empty() {
         default_model.to_string()
@@ -455,7 +560,7 @@ fn provider_add_prompt(config: &mut config::Config) -> Result<String> {
 
     // Base URL (optional — uses provider default if blank).
     let base_url = rl_prompt(
-        &mut editor,
+        editor,
         &format!("Base URL (blank for {}): ", provider.default_base_url()),
     )?;
 
@@ -475,10 +580,12 @@ fn provider_add_prompt(config: &mut config::Config) -> Result<String> {
 }
 
 /// Interactively edit an existing profile. `name` may be empty to prompt for it.
-fn provider_edit_prompt(config: &mut config::Config, name: &str) -> Result<String> {
+fn provider_edit_prompt(
+    config: &mut config::Config,
+    name: &str,
+    editor: &mut crate::complete::ReplEditor,
+) -> Result<String> {
     use config::{ProfileForm, ProviderName, upsert_profile, writable_config_path};
-
-    let mut editor = rustyline::DefaultEditor::new().context("initializing line editor")?;
 
     // Resolve which profile to edit.
     let name = if name.is_empty() {
@@ -491,7 +598,7 @@ fn provider_edit_prompt(config: &mut config::Config, name: &str) -> Result<Strin
             println!("  {n}");
         }
         loop {
-            let n = rl_prompt(&mut editor, "Profile to edit: ")?;
+            let n = rl_prompt(editor, "Profile to edit: ")?;
             if config.profiles.contains_key(&n) {
                 break n;
             }
@@ -514,7 +621,7 @@ fn provider_edit_prompt(config: &mut config::Config, name: &str) -> Result<Strin
         form.provider.as_str()
     );
     let provider = loop {
-        let input = rl_prompt(&mut editor, "Provider [1-4]: ")?;
+        let input = rl_prompt(editor, "Provider [1-4]: ")?;
         if input.is_empty() {
             break form.provider;
         }
@@ -542,7 +649,7 @@ fn provider_edit_prompt(config: &mut config::Config, name: &str) -> Result<Strin
         "***".to_string()
     };
     let new_key = rl_prompt(
-        &mut editor,
+        editor,
         &format!("API key/{key_label} (current: {masked}): "),
     )?;
     if !new_key.is_empty() {
@@ -555,16 +662,13 @@ fn provider_edit_prompt(config: &mut config::Config, name: &str) -> Result<Strin
     }
 
     // Model.
-    let new_model = rl_prompt(&mut editor, &format!("Model (current: {}): ", form.model))?;
+    let new_model = rl_prompt(editor, &format!("Model (current: {}): ", form.model))?;
     if !new_model.is_empty() {
         form.model = new_model;
     }
 
     // Base URL.
-    let new_url = rl_prompt(
-        &mut editor,
-        &format!("Base URL (current: {}): ", form.base_url),
-    )?;
+    let new_url = rl_prompt(editor, &format!("Base URL (current: {}): ", form.base_url))?;
     if !new_url.is_empty() {
         form.base_url = new_url;
     }

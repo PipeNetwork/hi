@@ -349,6 +349,41 @@ impl Transcript {
         }
     }
 
+    /// Remove a trailing `[user: finalize-nudge][assistant: recap]` pair if
+    /// present. Unlike [`strip_trailing_nudges`], this handles the finalize
+    /// case where the nudge is *not* the last message — it's followed by the
+    /// assistant recap, so the trailing-nudge scan above can't reach it.
+    ///
+    /// The FINALIZE_PROMPT tells the model "the work for this turn is done…
+    /// don't take any further action." If it stays in history, the next turn's
+    /// prompt arrives right after that instruction and some models comply with
+    /// the stale "don't act" directive instead of executing the new request —
+    /// emitting more summary text rather than doing the work. The recap itself
+    /// was already shown to the user via the UI, and the model can reconstruct
+    /// what it did from the tool-call history already in the transcript, so
+    /// dropping the pair loses no actionable context.
+    pub(crate) fn strip_finalize_pair(&mut self) {
+        let msgs = self.make_mut();
+        // Need at least two messages: [user: finalize-nudge][assistant: recap].
+        if msgs.len() < 2 {
+            return;
+        }
+        let recap_is_last = msgs
+            .last()
+            .map(|m| m.role == Role::Assistant)
+            .unwrap_or(false);
+        let finalize_before_recap = msgs[msgs.len() - 2]
+            .role == Role::User
+            && msgs[msgs.len() - 2]
+                .content
+                .iter()
+                .any(|c| matches!(c, Content::Text(t) if t.starts_with(nudge_marker(NudgeKind::Finalize))));
+        if recap_is_last && finalize_before_recap {
+            msgs.pop(); // assistant recap
+            msgs.pop(); // user finalize-nudge
+        }
+    }
+
     /// Discard messages back to `len` — used to drop an interrupted turn so the
     /// conversation stays consistent (no dangling user message, no orphan
     /// tool_use from a round that was cut off mid-execution).
@@ -474,9 +509,6 @@ mod tests {
             arguments: "{}".into(),
         }])
     }
-    fn tool_result(id: &str, out: &str) -> Message {
-        Message::tool_result(id, out)
-    }
 
     #[test]
     fn push_assistant_with_results_pairs_every_call() {
@@ -577,7 +609,7 @@ mod tests {
     fn validate_catches_orphan_tool_use() {
         // Simulate the bug class directly: an assistant tool_use with no
         // matching result. Bypass the safe API to construct the bad state.
-        let mut t = Transcript::new(vec![user("do it"), assistant_with_call("o", "bash")]);
+        let t = Transcript::new(vec![user("do it"), assistant_with_call("o", "bash")]);
         // No tool_result pushed.
         assert!(matches!(
             t.validate_for_provider(),
@@ -656,5 +688,42 @@ mod tests {
         let len = t.len();
         t.strip_trailing_nudges();
         assert_eq!(t.len(), len);
+    }
+
+    #[test]
+    fn strip_finalize_pair_removes_nudge_and_recap() {
+        // After finalize_turn the transcript is
+        //   [user: finalize-nudge][assistant: recap]
+        // as the last two messages. strip_finalize_pair should remove both,
+        // leaving the prior assistant message as the last entry.
+        let mut t = Transcript::new(vec![user("do it"), assistant_text("working")]);
+        t.push_nudge(NudgeKind::Finalize, "Write the final summary.");
+        t.push_assistant(vec![Content::Text("## Summary\n- did stuff".into())]);
+        assert_eq!(t.as_slice().last().unwrap().role, Role::Assistant);
+        assert_eq!(t.as_slice().len(), 4);
+        t.strip_finalize_pair();
+        assert_eq!(t.as_slice().len(), 2, "nudge + recap removed");
+        assert_eq!(
+            t.as_slice().last().unwrap().role,
+            Role::Assistant,
+            "prior assistant message is now last"
+        );
+        t.validate_for_provider().unwrap();
+    }
+
+    #[test]
+    fn strip_finalize_pair_noop_without_pair() {
+        // No trailing finalize pair → no-op, whatever the last message is.
+        let mut t = Transcript::new(vec![user("do it"), assistant_text("done")]);
+        let len = t.len();
+        t.strip_finalize_pair();
+        assert_eq!(t.len(), len);
+
+        // A trailing repeat-nudge (not finalize) is also a no-op for this method.
+        let mut t = Transcript::new(vec![user("do it"), assistant_text("done")]);
+        t.push_nudge(NudgeKind::Repeat, "Act on the output.");
+        let len = t.len();
+        t.strip_finalize_pair();
+        assert_eq!(t.len(), len, "repeat nudge is not a finalize pair");
     }
 }

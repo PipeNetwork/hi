@@ -111,6 +111,11 @@ pub struct Cli {
     #[arg(long)]
     pub no_memory: bool,
 
+    /// Confirm each file edit before applying it. Shows a diff preview and
+    /// asks for approval (y/n) before write/edit/multi_edit/apply_patch.
+    #[arg(long)]
+    pub confirm_edits: bool,
+
     /// Compaction strategy: hybrid (default), full, or elide.
     #[arg(long, value_name = "KIND")]
     pub compaction: Option<String>,
@@ -139,6 +144,11 @@ pub struct Cli {
     /// Write a JSON usage/outcome report to this path (for eval/automation).
     #[arg(long, value_name = "PATH")]
     pub report: Option<PathBuf>,
+
+    /// Warn when cumulative session cost exceeds this USD amount (e.g. 0.50).
+    /// The warning is shown after each turn; the turn is not interrupted.
+    #[arg(long, value_name = "USD")]
+    pub max_cost: Option<f64>,
 
     /// Quiet: print only the assistant's text (no tool chatter or usage line).
     #[arg(short = 'q', long)]
@@ -274,8 +284,7 @@ impl serde::Serialize for Config {
         }
         if !self.profiles.is_empty() {
             // BTreeMap serializes as a sorted map → stable, alphabetical output.
-            let sorted: BTreeMap<&String, &Profile> =
-                self.profiles.iter().map(|(k, v)| (k, v)).collect();
+            let sorted: BTreeMap<&String, &Profile> = self.profiles.iter().collect();
             s.serialize_field("profiles", &sorted)?;
         }
         s.end()
@@ -722,8 +731,10 @@ impl Default for ProfileForm {
 impl ProfileForm {
     /// Build a `Profile` from the form fields, leaving unused fields as `None`.
     pub fn to_profile(&self) -> Profile {
-        let mut p = Profile::default();
-        p.provider = Some(self.provider);
+        let mut p = Profile {
+            provider: Some(self.provider),
+            ..Default::default()
+        };
         if !self.model.is_empty() {
             p.model = Some(self.model.clone());
         }
@@ -764,8 +775,39 @@ pub fn upsert_profile(
     profile: Profile,
     config_path: &Path,
 ) -> Result<()> {
+    validate_profile(&profile)?;
     config.profiles.insert(name.to_string(), profile);
     save_config_to(config, config_path)
+}
+
+/// Remove a profile from the config and save it to disk. Returns `false` if the
+/// profile didn't exist (caller may treat that as an error or a no-op).
+pub fn remove_profile(config: &mut Config, name: &str, config_path: &Path) -> Result<bool> {
+    if config.profiles.remove(name).is_none() {
+        return Ok(false);
+    }
+    save_config_to(config, config_path)?;
+    Ok(true)
+}
+
+/// Sanity-check a profile before saving. Currently validates that the base URL
+/// doesn't include an endpoint path (the provider appends `/chat/completions`
+/// and `/models` itself — a common copy-paste mistake is to paste the full
+/// endpoint URL, which produces 404s).
+fn validate_profile(profile: &Profile) -> Result<()> {
+    if let Some(url) = &profile.base_url {
+        let trimmed = url.trim_end_matches('/');
+        for suffix in ["/chat/completions", "/completions", "/messages"] {
+            if trimmed.ends_with(suffix) {
+                bail!(
+                    "base_url looks like a full endpoint path (ends with '{suffix}'). \
+                     The provider appends the endpoint path itself — use just the base, \
+                     e.g. 'http://localhost:11434/v1' not 'http://localhost:11434/v1{suffix}'."
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Shown when `hi` is run with nothing configured. Actionable, not terse.
@@ -894,7 +936,7 @@ pub fn resolve_named_profile(config: &Config, name: &str, registry: &Registry) -
         .model
         .clone()
         .or_else(|| provider.default_model().map(String::from))
-        .unwrap_or_else(|| format!("__pick_via_model__"));
+        .unwrap_or_else(|| "__pick_via_model__".to_string());
     let base_url = profile
         .base_url
         .clone()
@@ -1021,8 +1063,10 @@ mod tests {
 
     #[test]
     fn config_round_trips_through_toml() {
-        let mut config = Config::default();
-        config.default_profile = Some("sonnet".into());
+        let mut config = Config {
+            default_profile: Some("sonnet".into()),
+            ..Default::default()
+        };
         config.profiles.insert(
             "sonnet".into(),
             Profile {
@@ -1076,5 +1120,42 @@ mod tests {
             Some(ProviderName::Ollama)
         );
         assert!(reloaded.profiles.get("local").unwrap().model.is_none());
+    }
+
+    #[test]
+    fn validate_profile_rejects_endpoint_paths_in_base_url() {
+        use super::validate_profile;
+        // A bare base URL is fine.
+        let ok = Profile {
+            provider: Some(ProviderName::Ollama),
+            base_url: Some("http://localhost:11434/v1".into()),
+            ..Default::default()
+        };
+        assert!(validate_profile(&ok).is_ok());
+
+        // Trailing slash is tolerated.
+        let ok_slash = Profile {
+            base_url: Some("http://localhost:11434/v1/".into()),
+            ..ok.clone()
+        };
+        assert!(validate_profile(&ok_slash).is_ok());
+
+        // Common mistake: full endpoint path appended.
+        for bad in [
+            "http://localhost:11434/v1/chat/completions",
+            "http://localhost:11434/v1/completions",
+            "https://api.anthropic.com/messages",
+        ] {
+            let p = Profile {
+                base_url: Some(bad.into()),
+                ..ok.clone()
+            };
+            let err = validate_profile(&p).unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("base_url looks like a full endpoint path"),
+                "expected rejection for {bad}, got: {msg}"
+            );
+        }
     }
 }
