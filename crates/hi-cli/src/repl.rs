@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use hi_agent::Agent;
 use hi_ai::Registry;
 
@@ -18,7 +18,7 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 pub(crate) async fn repl(
     agent: &mut Agent,
     settings: &Settings,
-    config: &config::Config,
+    config: &mut config::Config,
     registry: &Registry,
     auto_memory: bool,
 ) -> Result<()> {
@@ -160,8 +160,37 @@ pub(crate) async fn repl(
                         // `/provider <name>`: switch to that profile, then list
                         // the models the new endpoint serves so the user can
                         // `/model` to pick one.
+                        // `/provider add`: interactively create a new profile.
+                        // `/provider edit [name]`: edit an existing profile.
                         Command::Provider(arg) => {
                             let arg = arg.trim();
+                            // --- Subcommands ---
+                            if arg == "add" {
+                                match provider_add_prompt(config) {
+                                    Ok(name) => {
+                                        println!(
+                                            "\x1b[2msaved profile '{name}' — /provider {name} to switch\x1b[0m"
+                                        );
+                                    }
+                                    Err(err) => {
+                                        eprintln!("\x1b[33m/provider add failed: {err}\x1b[0m");
+                                    }
+                                }
+                                continue;
+                            }
+                            if let Some(edit_name) = arg.strip_prefix("edit") {
+                                let edit_name = edit_name.trim();
+                                match provider_edit_prompt(config, edit_name) {
+                                    Ok(name) => {
+                                        println!("\x1b[2msaved profile '{name}'\x1b[0m");
+                                    }
+                                    Err(err) => {
+                                        eprintln!("\x1b[33m/provider edit failed: {err}\x1b[0m");
+                                    }
+                                }
+                                continue;
+                            }
+                            // --- Switch / list ---
                             if arg.is_empty() {
                                 let names = config::profile_names(config);
                                 if names.is_empty() {
@@ -336,4 +365,212 @@ async fn drive_with_spinner(
         let _ = std::io::stdout().flush();
     }
     cancelled
+}
+
+/// Read a line from the user with a prompt, using rustyline for line editing.
+fn rl_prompt(editor: &mut rustyline::DefaultEditor, message: &str) -> Result<String> {
+    Ok(editor.readline(message)?.trim().to_string())
+}
+
+/// Interactively create a new profile via line prompts and save it to the
+/// config file. Returns the profile name.
+fn provider_add_prompt(config: &mut config::Config) -> Result<String> {
+    use config::{ProfileForm, ProviderName, upsert_profile, writable_config_path};
+
+    let mut editor = rustyline::DefaultEditor::new().context("initializing line editor")?;
+
+    println!("\x1b[2m— add a provider profile —\x1b[0m");
+
+    // Profile name.
+    let name = loop {
+        let n = rl_prompt(&mut editor, "Profile name: ")?;
+        if n.is_empty() {
+            eprintln!("  name can't be empty");
+            continue;
+        }
+        if config.profiles.contains_key(&n) {
+            eprintln!(
+                "  a profile named '{n}' already exists — use /provider edit {n} to modify it"
+            );
+            continue;
+        }
+        break n;
+    };
+
+    // Provider type.
+    println!("  1) Ollama (local)    2) pipenetwork.ai    3) Anthropic    4) OpenRouter");
+    let provider = loop {
+        match rl_prompt(&mut editor, "Provider [1-4] (default 1): ")?.as_str() {
+            "" | "1" => break ProviderName::Ollama,
+            "2" => break ProviderName::Pipenetwork,
+            "3" => break ProviderName::Anthropic,
+            "4" => break ProviderName::Openai,
+            other => eprintln!("  '{other}' isn't a choice — pick 1-4."),
+        }
+    };
+
+    // API key (skip for Ollama).
+    let (api_key, store_as_env) = if matches!(provider, ProviderName::Ollama) {
+        (String::new(), false)
+    } else {
+        let key = rl_prompt(
+            &mut editor,
+            &format!(
+                "API key (or env var name like {}_API_KEY): ",
+                provider.as_str().to_uppercase()
+            ),
+        )?;
+        if key.is_empty() {
+            (String::new(), false)
+        } else {
+            // Heuristic: if it looks like an env var name (all caps + underscores,
+            // no spaces), store as env var reference. Otherwise it's a literal key.
+            let looks_like_env = key
+                .chars()
+                .all(|c| c.is_uppercase() || c == '_' || c.is_ascii_digit())
+                && key.contains('_');
+            (key, looks_like_env)
+        }
+    };
+
+    // Model (optional — can pick via /model after switching).
+    let default_model = provider.default_model().unwrap_or("");
+    let model = if default_model.is_empty() {
+        rl_prompt(
+            &mut editor,
+            "Model id (optional — blank to pick via /model): ",
+        )?
+    } else {
+        rl_prompt(
+            &mut editor,
+            &format!("Model id (default {default_model}): "),
+        )?
+        .to_string()
+    };
+    let model = if model.is_empty() {
+        default_model.to_string()
+    } else {
+        model
+    };
+
+    // Base URL (optional — uses provider default if blank).
+    let base_url = rl_prompt(
+        &mut editor,
+        &format!("Base URL (blank for {}): ", provider.default_base_url()),
+    )?;
+
+    let form = ProfileForm {
+        name: name.clone(),
+        provider,
+        api_key,
+        store_as_env,
+        model,
+        base_url,
+    };
+    let profile = form.to_profile();
+
+    let path = writable_config_path(None).context("could not determine config path")?;
+    upsert_profile(config, &name, profile, &path)?;
+    Ok(name)
+}
+
+/// Interactively edit an existing profile. `name` may be empty to prompt for it.
+fn provider_edit_prompt(config: &mut config::Config, name: &str) -> Result<String> {
+    use config::{ProfileForm, ProviderName, upsert_profile, writable_config_path};
+
+    let mut editor = rustyline::DefaultEditor::new().context("initializing line editor")?;
+
+    // Resolve which profile to edit.
+    let name = if name.is_empty() {
+        let names = config::profile_names(config);
+        if names.is_empty() {
+            bail!("no profiles configured — use /provider add to create one");
+        }
+        println!("\x1b[2mconfigured profiles:\x1b[0m");
+        for n in &names {
+            println!("  {n}");
+        }
+        loop {
+            let n = rl_prompt(&mut editor, "Profile to edit: ")?;
+            if config.profiles.contains_key(&n) {
+                break n;
+            }
+            eprintln!("  no profile named '{n}'");
+        }
+    } else if !config.profiles.contains_key(name) {
+        bail!("no profile named '{name}'");
+    } else {
+        name.to_string()
+    };
+
+    let existing = config.profiles.get(&name).unwrap();
+    let mut form = ProfileForm::from_profile(&name, existing);
+
+    println!("\x1b[2m— editing profile '{name}' (blank = keep current) —\x1b[0m");
+
+    // Provider type.
+    println!(
+        "  current: {} (1=Ollama 2=pipenetwork 3=Anthropic 4=OpenRouter)",
+        form.provider.as_str()
+    );
+    let provider = loop {
+        let input = rl_prompt(&mut editor, "Provider [1-4]: ")?;
+        if input.is_empty() {
+            break form.provider;
+        }
+        match input.as_str() {
+            "1" => break ProviderName::Ollama,
+            "2" => break ProviderName::Pipenetwork,
+            "3" => break ProviderName::Anthropic,
+            "4" => break ProviderName::Openai,
+            _ => eprintln!("  pick 1-4"),
+        }
+    };
+    form.provider = provider;
+
+    // API key.
+    let key_label = if form.store_as_env { "env var" } else { "key" };
+    let masked = if form.api_key.len() > 8 {
+        format!(
+            "{}…{}",
+            &form.api_key[..4],
+            &form.api_key[form.api_key.len() - 4..]
+        )
+    } else if form.api_key.is_empty() {
+        "(none)".to_string()
+    } else {
+        "***".to_string()
+    };
+    let new_key = rl_prompt(
+        &mut editor,
+        &format!("API key/{key_label} (current: {masked}): "),
+    )?;
+    if !new_key.is_empty() {
+        let looks_like_env = new_key
+            .chars()
+            .all(|c| c.is_uppercase() || c == '_' || c.is_ascii_digit())
+            && new_key.contains('_');
+        form.api_key = new_key;
+        form.store_as_env = looks_like_env;
+    }
+
+    // Model.
+    let new_model = rl_prompt(&mut editor, &format!("Model (current: {}): ", form.model))?;
+    if !new_model.is_empty() {
+        form.model = new_model;
+    }
+
+    // Base URL.
+    let new_url = rl_prompt(
+        &mut editor,
+        &format!("Base URL (current: {}): ", form.base_url),
+    )?;
+    if !new_url.is_empty() {
+        form.base_url = new_url;
+    }
+
+    let profile = form.to_profile();
+    let path = writable_config_path(None).context("could not determine config path")?;
+    upsert_profile(config, &name, profile, &path)?;
+    Ok(name)
 }

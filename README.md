@@ -69,7 +69,7 @@ provider = "ollama"
 # no model field — /provider local then /model to pick from what Ollama serves
 ```
 
-`/provider <name>` swaps the endpoint (base URL, API key, wire format) mid-session, then opens the model picker so you pick a model from what the new endpoint actually serves. The `model` field is optional — if omitted, you pick via `/model` after switching.
+`/provider <name>` swaps the endpoint (base URL, API key, wire format) mid-session, then opens the model picker so you pick a model from what the new endpoint actually serves. The `model` field is optional — if omitted, you pick via `/model` after switching. `/provider add` creates a new profile interactively (in the TUI, a form with provider picker, API key, model, and base URL fields); `/provider edit [name]` modifies an existing one. Both write to your config file.
 
 ### Fallback chain
 
@@ -146,7 +146,7 @@ Slash commands (TUI or plain REPL):
 |---|---|
 | `/help` | list commands |
 | `/model [id]` | switch by id, or — with no id — open an interactive picker over the models **your provider actually serves** (live `/v1/models`; type to filter, ↑/↓, Enter). Falls back to the models.dev catalog if the endpoint can't list them. |
-| `/provider [name]` | switch to a configured profile (no name lists them). After switching, the model picker opens with what the new endpoint serves — pick a model with `/model`. |
+| `/provider [name\|add\|edit]` | switch to a configured profile (no name lists them), `add` to create a new profile interactively, `edit [name]` to modify one. After switching, the model picker opens with what the new endpoint serves. |
 | `/verify [cmd\|off]` | show, set, or clear the test command turns iterate against — turn the verify-loop on without restarting |
 | `/diff` | show what files have changed this session (`git diff` + new files) |
 | `/copy [all]` | copy the last assistant response to the terminal clipboard; `all` copies the transcript |

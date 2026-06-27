@@ -5,14 +5,14 @@
 //! (e.g. a cloud Anthropic profile and a local Ollama profile) and switch with
 //! `-p <name>`.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, ValueEnum};
 use hi_agent::VerifyStage;
 use hi_ai::{CompatMode, Registry, ToolMode};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// A minimal agentic coding tool. Works with any OpenAI-compatible endpoint
 /// (OpenRouter, pipenetwork.ai, Ollama, llama.cpp, vLLM) or the native
@@ -148,7 +148,7 @@ pub struct Cli {
     pub prompt: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderName {
     /// OpenAI-compatible Chat Completions (default base URL: OpenRouter).
@@ -240,6 +240,21 @@ impl ProviderName {
     }
 }
 
+impl std::str::FromStr for ProviderName {
+    type Err = String;
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "openai" => Ok(Self::Openai),
+            "anthropic" => Ok(Self::Anthropic),
+            "pipenetwork" => Ok(Self::Pipenetwork),
+            "ollama" => Ok(Self::Ollama),
+            other => Err(format!(
+                "unknown provider '{other}' (expected: openai, anthropic, pipenetwork, ollama)"
+            )),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct Config {
     pub default_profile: Option<String>,
@@ -247,7 +262,27 @@ pub struct Config {
     pub profiles: HashMap<String, Profile>,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+impl serde::Serialize for Config {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("Config", 2)?;
+        if let Some(v) = &self.default_profile {
+            s.serialize_field("default_profile", v)?;
+        }
+        if !self.profiles.is_empty() {
+            // BTreeMap serializes as a sorted map → stable, alphabetical output.
+            let sorted: BTreeMap<&String, &Profile> =
+                self.profiles.iter().map(|(k, v)| (k, v)).collect();
+            s.serialize_field("profiles", &sorted)?;
+        }
+        s.end()
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct Profile {
     pub provider: Option<ProviderName>,
     pub model: Option<String>,
@@ -265,6 +300,51 @@ pub struct Profile {
     /// Other profile names to fall back to, in order, when this one returns
     /// nothing or errors.
     pub fallback: Option<Vec<String>>,
+}
+
+// Serialize `Profile` with clean output: omit `None` fields so the TOML
+// doesn't fill with `model = ""` lines. We can't put `skip_serializing_if` on
+// each field above (it'd require repeating it 9 times), so we implement a
+// custom serializer that skips None values.
+impl serde::Serialize for Profile {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut s = serializer.serialize_struct("Profile", 9)?;
+        if let Some(v) = &self.provider {
+            s.serialize_field("provider", v)?;
+        }
+        if let Some(v) = &self.model {
+            s.serialize_field("model", v)?;
+        }
+        if let Some(v) = &self.base_url {
+            s.serialize_field("base_url", v)?;
+        }
+        if let Some(v) = &self.api_key {
+            s.serialize_field("api_key", v)?;
+        }
+        if let Some(v) = &self.api_key_env {
+            s.serialize_field("api_key_env", v)?;
+        }
+        if let Some(v) = &self.max_tokens {
+            s.serialize_field("max_tokens", v)?;
+        }
+        if let Some(v) = &self.thinking_budget {
+            s.serialize_field("thinking_budget", v)?;
+        }
+        if let Some(v) = &self.tool_mode {
+            s.serialize_field("tool_mode", v)?;
+        }
+        if let Some(v) = &self.compat {
+            s.serialize_field("compat", v)?;
+        }
+        if let Some(v) = &self.fallback {
+            s.serialize_field("fallback", v)?;
+        }
+        s.end()
+    }
 }
 
 /// Fully-resolved settings used to build a provider and run the agent.
@@ -579,6 +659,115 @@ pub fn default_config_path() -> Option<PathBuf> {
     Some(base.join("hi").join("config.toml"))
 }
 
+/// The path to write config to: an explicit `--config` path, a local `hi.toml`
+/// if it exists, or the default global path. Unlike [`config_path`], this
+/// returns a path even when the file doesn't exist yet (so we can create it).
+pub fn writable_config_path(explicit: Option<&Path>) -> Option<PathBuf> {
+    if let Some(path) = explicit {
+        return Some(path.to_path_buf());
+    }
+    let local = PathBuf::from("hi.toml");
+    if local.exists() {
+        return Some(local);
+    }
+    default_config_path()
+}
+
+/// Serialize `config` to TOML and write it to `path`, creating parent dirs.
+/// Sets 0600 permissions on Unix so API keys in the file aren't world-readable.
+pub fn save_config_to(config: &Config, path: &Path) -> Result<()> {
+    let toml = toml::to_string_pretty(config)
+        .with_context(|| format!("serializing config to {}", path.display()))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating config dir {}", parent.display()))?;
+    }
+    std::fs::write(path, toml).with_context(|| format!("writing {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+/// The fields needed to create or edit a profile, collected from the user.
+/// Used by both the plain REPL prompts and the TUI form.
+#[derive(Clone, Debug)]
+pub struct ProfileForm {
+    pub name: String,
+    pub provider: ProviderName,
+    pub api_key: String,
+    /// Whether to store the key as a literal (`api_key`) or an env var name
+    /// (`api_key_env`). The setup wizard uses env vars for cloud providers;
+    /// we match that convention.
+    pub store_as_env: bool,
+    pub model: String,
+    pub base_url: String,
+}
+
+impl Default for ProfileForm {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            provider: ProviderName::Openai,
+            api_key: String::new(),
+            store_as_env: false,
+            model: String::new(),
+            base_url: String::new(),
+        }
+    }
+}
+
+impl ProfileForm {
+    /// Build a `Profile` from the form fields, leaving unused fields as `None`.
+    pub fn to_profile(&self) -> Profile {
+        let mut p = Profile::default();
+        p.provider = Some(self.provider);
+        if !self.model.is_empty() {
+            p.model = Some(self.model.clone());
+        }
+        if !self.base_url.is_empty() {
+            p.base_url = Some(self.base_url.clone());
+        }
+        if !self.api_key.is_empty() {
+            if self.store_as_env {
+                p.api_key_env = Some(self.api_key.clone());
+            } else {
+                p.api_key = Some(self.api_key.clone());
+            }
+        }
+        p
+    }
+
+    /// Populate the form from an existing profile (for editing).
+    pub fn from_profile(name: &str, p: &Profile) -> Self {
+        Self {
+            name: name.to_string(),
+            provider: p.provider.unwrap_or(ProviderName::Openai),
+            api_key: p
+                .api_key_env
+                .clone()
+                .or_else(|| p.api_key.clone())
+                .unwrap_or_default(),
+            store_as_env: p.api_key_env.is_some(),
+            model: p.model.clone().unwrap_or_default(),
+            base_url: p.base_url.clone().unwrap_or_default(),
+        }
+    }
+}
+
+/// Add or replace a profile in the config and save it to disk.
+pub fn upsert_profile(
+    config: &mut Config,
+    name: &str,
+    profile: Profile,
+    config_path: &Path,
+) -> Result<()> {
+    config.profiles.insert(name.to_string(), profile);
+    save_config_to(config, config_path)
+}
+
 /// Shown when `hi` is run with nothing configured. Actionable, not terse.
 const ONBOARDING: &str = "no model configured. Get started with one of:
 
@@ -734,7 +923,7 @@ pub fn resolve_named_profile(config: &Config, name: &str, registry: &Registry) -
 
 #[cfg(test)]
 mod tests {
-    use super::detect_verify_pipeline;
+    use super::{Config, Profile, ProviderName, detect_verify_pipeline, save_config_to};
     use std::sync::atomic::{AtomicU32, Ordering};
 
     fn temp_dir_with(marker: &str) -> std::path::PathBuf {
@@ -828,5 +1017,64 @@ mod tests {
             super::ONBOARDING.contains("--plain"),
             "onboarding should point to the actual opt-out flag"
         );
+    }
+
+    #[test]
+    fn config_round_trips_through_toml() {
+        let mut config = Config::default();
+        config.default_profile = Some("sonnet".into());
+        config.profiles.insert(
+            "sonnet".into(),
+            Profile {
+                provider: Some(ProviderName::Anthropic),
+                model: Some("claude-sonnet-4-20250514".into()),
+                api_key_env: Some("ANTHROPIC_API_KEY".into()),
+                ..Default::default()
+            },
+        );
+        config.profiles.insert(
+            "local".into(),
+            Profile {
+                provider: Some(ProviderName::Ollama),
+                ..Default::default()
+            },
+        );
+
+        let dir = temp_dir_with("");
+        let path = dir.join("config.toml");
+        save_config_to(&config, &path).unwrap();
+
+        // Re-read and verify.
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[profiles.sonnet]"));
+        assert!(text.contains("[profiles.local]"));
+        assert!(text.contains("provider = \"anthropic\""));
+        assert!(text.contains("api_key_env = \"ANTHROPIC_API_KEY\""));
+        // Ollama profile has no model — it should be absent, not `model = ""`.
+        // Check just the local section (between [profiles.local] and the next
+        // [profiles...] or EOF).
+        let local_section = text
+            .split("[profiles.local]")
+            .nth(1)
+            .unwrap_or("")
+            .split('[')
+            .next()
+            .unwrap_or("");
+        assert!(
+            !local_section.contains("model ="),
+            "None fields should be omitted, got: {local_section}"
+        );
+
+        let reloaded: Config = toml::from_str(&text).unwrap();
+        assert_eq!(reloaded.default_profile.as_deref(), Some("sonnet"));
+        assert_eq!(
+            reloaded.profiles.get("sonnet").unwrap().provider,
+            Some(ProviderName::Anthropic)
+        );
+        assert_eq!(
+            reloaded.profiles.get("local").unwrap().provider,
+            Some(ProviderName::Ollama)
+        );
+        assert!(reloaded.profiles.get("local").unwrap().model.is_none());
     }
 }

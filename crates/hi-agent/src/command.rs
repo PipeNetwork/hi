@@ -11,6 +11,9 @@ pub enum Command {
     /// Switch the provider/profile for subsequent turns (empty = report current).
     /// Named profiles are resolved from the config; the model is then picked
     /// via `/model` from what the new endpoint serves.
+    ///
+    /// Subcommands: `add` (create a new profile interactively), `edit [name]`
+    /// (edit an existing profile). The frontend parses these from the arg.
     Provider(String),
     /// Show cumulative token usage.
     Tokens,
@@ -120,8 +123,8 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "provider",
-        args: "[name]",
-        help: "switch provider/profile (no name lists configured profiles)",
+        args: "[name|add|edit]",
+        help: "switch profile, or add/edit a profile (no arg lists all)",
         arg_values: &[],
     },
     CommandSpec {
@@ -375,6 +378,14 @@ mod tests {
         assert_eq!(
             parse("/prov local"),
             Some(Command::Provider("local".into()))
+        );
+        assert_eq!(
+            parse("/provider add"),
+            Some(Command::Provider("add".into()))
+        );
+        assert_eq!(
+            parse("/provider edit sonnet"),
+            Some(Command::Provider("edit sonnet".into()))
         );
         assert_eq!(
             parse("/verify cargo test"),

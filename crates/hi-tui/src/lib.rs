@@ -10,6 +10,7 @@ mod completion;
 mod event;
 mod input;
 mod model_picker;
+mod provider_form;
 mod render;
 mod util;
 
@@ -60,6 +61,29 @@ pub struct SwitchedProvider {
 /// it without needing to know about `Config`/`Settings` (which live in
 /// `hi-cli`).
 pub type ProfileResolver = Box<dyn Fn(&str) -> Result<SwitchedProvider> + Send + Sync>;
+
+/// Form data for creating or editing a profile, exchanged between the TUI
+/// (which collects it via a form) and `hi-cli` (which writes it to the config
+/// file). Mirrors `hi_cli::config::ProfileForm` but without the dependency.
+#[derive(Clone, Debug)]
+pub struct ProfileFormData {
+    pub name: String,
+    /// "ollama", "pipenetwork", "anthropic", or "openai".
+    pub provider: String,
+    pub api_key: String,
+    /// If true, `api_key` is an env var name (stored as `api_key_env`).
+    pub store_as_env: bool,
+    pub model: String,
+    pub base_url: String,
+}
+
+/// A callback that saves a profile (add or edit) to the config file and
+/// returns the updated profile list. `hi-cli` supplies this; the TUI calls it
+/// when the user submits the provider form.
+pub type ProfileSaver = Box<dyn Fn(&ProfileFormData) -> Result<Vec<ProfileInfo>> + Send + Sync>;
+
+/// A callback that loads an existing profile's form data for editing.
+pub type ProfileLoader = Box<dyn Fn(&str) -> Result<ProfileFormData> + Send + Sync>;
 
 use completion::{
     CompletionContext, CompletionItem, CompletionState, MODEL_CMD, MODEL_COMPLETION_MAX,
@@ -136,6 +160,8 @@ pub async fn run(
     auto_memory: bool,
     profiles: Vec<ProfileInfo>,
     resolver: ProfileResolver,
+    saver: ProfileSaver,
+    loader: ProfileLoader,
 ) -> Result<()> {
     enable_raw_mode().context("entering raw mode")?;
     execute!(io::stdout(), EnterAlternateScreen).context("entering alternate screen")?;
@@ -153,7 +179,7 @@ pub async fn run(
     let mut terminal =
         Terminal::new(CrosstermBackend::new(io::stdout())).context("creating terminal")?;
 
-    let mut app = App::new(provider, model, profiles, resolver);
+    let mut app = App::new(provider, model, profiles, resolver, saver, loader);
     // Seed the context-fill gauge with the model's window so it reads 0% before
     // the first turn (it refreshes from real usage after each round).
     app.context_window = registry.metadata(model).1;
@@ -283,6 +309,77 @@ pub async fn run(
                                     _ => {}
                                 }
                             }
+                        }
+                    }
+                    // Provider form: keystrokes go to the form, not the input.
+                    Event::Key(key)
+                        if key.kind == KeyEventKind::Press && app.provider_form.is_some() =>
+                    {
+                        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+                        match key.code {
+                            KeyCode::Esc => app.provider_form = None,
+                            KeyCode::Char('c') if ctrl => app.provider_form = None,
+                            KeyCode::Enter => {
+                                // Submit the form.
+                                let form = app.provider_form.as_ref().unwrap();
+                                if let Some(data) = form.data() {
+                                    match (app.saver)(&data) {
+                                        Ok(updated) => {
+                                            app.profiles = updated;
+                                            app.push(Line::styled(
+                                                format!("saved profile '{}'", data.name),
+                                                dim(),
+                                            ));
+                                            app.provider_form = None;
+                                        }
+                                        Err(err) => {
+                                            app.push(Line::styled(
+                                                format!("save failed: {err:#}"),
+                                                Style::default().fg(Color::Yellow),
+                                            ));
+                                        }
+                                    }
+                                } else {
+                                    app.push(Line::styled(
+                                        "name is required".to_string(),
+                                        Style::default().fg(Color::Yellow),
+                                    ));
+                                }
+                            }
+                            KeyCode::Tab => {
+                                let form = app.provider_form.as_mut().unwrap();
+                                form.next_field();
+                            }
+                            KeyCode::BackTab => {
+                                let form = app.provider_form.as_mut().unwrap();
+                                form.prev_field();
+                            }
+                            KeyCode::Left
+                                if app.provider_form.as_ref().unwrap().active() == 0 && !shift =>
+                            {
+                                // Left arrow on the provider picker row cycles.
+                                // (Only when on the "provider" pseudo-field, which
+                                // we represent as active==0 in edit mode or the
+                                // name field in add mode — but we always show the
+                                // provider picker at the top, so cycle on Left/Right
+                                // when the form's provider row is focused.)
+                                // For simplicity, Left/Right always cycle the provider.
+                                app.provider_form.as_mut().unwrap().cycle_provider_prev();
+                            }
+                            KeyCode::Right if !shift => {
+                                app.provider_form.as_mut().unwrap().cycle_provider();
+                            }
+                            KeyCode::Backspace => {
+                                app.provider_form.as_mut().unwrap().backspace();
+                            }
+                            KeyCode::Char('u') if ctrl => {
+                                app.provider_form.as_mut().unwrap().clear_field();
+                            }
+                            KeyCode::Char(c) if !ctrl => {
+                                app.provider_form.as_mut().unwrap().insert(c);
+                            }
+                            _ => {}
                         }
                     }
                     // When the `/`-command menu is open, navigation/accept keys
@@ -506,6 +603,47 @@ pub async fn run(
                 // user can pick a model immediately.
                 Command::Provider(arg) => {
                     let arg = arg.trim().to_string();
+                    // --- Subcommands ---
+                    if arg == "add" {
+                        app.provider_form = Some(provider_form::ProviderForm::new_add());
+                        continue;
+                    }
+                    if let Some(edit_name) = arg.strip_prefix("edit") {
+                        let edit_name = edit_name.trim();
+                        // If no name given, pick the first profile (or show a hint).
+                        let target = if edit_name.is_empty() {
+                            if app.profiles.is_empty() {
+                                app.push(Line::styled(
+                                    "no profiles to edit — use /provider add".to_string(),
+                                    dim(),
+                                ));
+                                continue;
+                            }
+                            app.profiles[0].name.clone()
+                        } else {
+                            edit_name.to_string()
+                        };
+                        // Load the profile's current values via the loader callback.
+                        match (app.loader)(&target) {
+                            Ok(data) => {
+                                app.provider_form = Some(provider_form::ProviderForm::new_edit(
+                                    &data.name,
+                                    &data.provider,
+                                    &data.api_key,
+                                    &data.model,
+                                    &data.base_url,
+                                ));
+                            }
+                            Err(err) => {
+                                app.push(Line::styled(
+                                    format!("/provider edit failed: {err:#}"),
+                                    Style::default().fg(Color::Yellow),
+                                ));
+                            }
+                        }
+                        continue;
+                    }
+                    // --- Switch / list ---
                     if arg.is_empty() {
                         if app.profiles.is_empty() {
                             app.push(Line::styled(
@@ -899,6 +1037,10 @@ struct App {
     profiles: Vec<ProfileInfo>,
     /// Resolves a profile name to a built provider at runtime (for `/provider`).
     resolver: ProfileResolver,
+    /// Saves a profile form to the config file (for `/provider add/edit`).
+    saver: ProfileSaver,
+    /// Loads an existing profile's form data (for `/provider edit`).
+    loader: ProfileLoader,
     transcript: Vec<TranscriptEntry>,
     /// The in-progress streamed line: (style, markdown?, text). Committed on
     /// newline/end. `markdown` is set for assistant prose so it's rendered with
@@ -950,6 +1092,8 @@ struct App {
     last_turn_start: usize,
     /// Active model picker (`/model` with no argument), if any.
     picker: Option<ModelPicker>,
+    /// Active provider form (`/provider add` or `/provider edit`), if any.
+    provider_form: Option<provider_form::ProviderForm>,
     /// Ctrl-R reverse-search over input history. When active, keystrokes go to
     /// the search filter instead of the input line.
     history_search: Option<HistorySearch>,
@@ -1053,12 +1197,16 @@ impl App {
         model: &str,
         profiles: Vec<ProfileInfo>,
         resolver: ProfileResolver,
+        saver: ProfileSaver,
+        loader: ProfileLoader,
     ) -> Self {
         Self {
             provider: provider.to_string(),
             model: model.to_string(),
             profiles,
             resolver,
+            saver,
+            loader,
             transcript: Vec::new(),
             pending: None,
             reasoning_buffer: String::new(),
@@ -1080,6 +1228,7 @@ impl App {
             last_prompt: None,
             last_turn_start: 0,
             picker: None,
+            provider_form: None,
             history_search: None,
             fetching: None,
             status: String::new(),
@@ -2278,6 +2427,9 @@ impl App {
             // filter line + visible model rows + borders, bounded by the screen.
             let rows = p.matches.len().clamp(1, PICKER_ROWS) as u16;
             (rows + 3).min(area.height.saturating_sub(3))
+        } else if self.provider_form.is_some() {
+            // Provider form: provider picker row + 4 text fields + borders.
+            8
         } else {
             (plan_h
                 + diff_h
@@ -2471,6 +2623,75 @@ impl App {
             // Cursor on the filter line, just after "filter: <text>".
             let cx = rows[1].x + 1 + 8 + p.filter.chars().count() as u16;
             frame.set_cursor_position((cx.min(rows[1].right().saturating_sub(2)), rows[1].y + 1));
+        } else if let Some(form) = &self.provider_form {
+            let title = if form.editing {
+                " edit provider "
+            } else {
+                " add provider "
+            };
+            let block = Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Cyan))
+                .title(title);
+            let choices = form.provider_choices();
+            let pidx = form.provider_idx();
+            let mut lines: Vec<Line> = Vec::new();
+
+            // Provider picker row.
+            let mut prov_spans = vec![Span::raw("Provider: ")];
+            for (i, (id, label)) in choices.iter().enumerate() {
+                if i == pidx {
+                    prov_spans.push(Span::styled(
+                        format!("▶ {label} "),
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                } else {
+                    prov_spans.push(Span::styled(format!("  {label} "), dim()));
+                }
+            }
+            lines.push(Line::from(prov_spans));
+            lines.push(Line::styled(
+                "  ←→ cycle · Tab next field · Enter save · Esc cancel".to_string(),
+                dim(),
+            ));
+
+            // Text fields.
+            for (label, placeholder, value, is_active) in form.field_labels() {
+                let display = if value.is_empty() && !placeholder.is_empty() {
+                    placeholder.to_string()
+                } else {
+                    value.clone()
+                };
+                let prefix = if is_active { "▶ " } else { "  " };
+                let val_span = if value.is_empty() && !placeholder.is_empty() {
+                    Span::styled(display, Style::default().fg(Color::DarkGray))
+                } else if is_active {
+                    Span::styled(display, Style::default().fg(Color::Cyan))
+                } else {
+                    Span::raw(display)
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{prefix}{label}: "),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    val_span,
+                ]));
+            }
+
+            frame.render_widget(Paragraph::new(lines).block(block), rows[1]);
+
+            // Cursor on the active text field.
+            let form_fields = form.field_labels();
+            let active_idx = form.active();
+            // +3 for border + provider row + hint row.
+            let cy = rows[1].y + 1 + 2 + active_idx as u16;
+            let label = form_fields[active_idx].0;
+            let prefix_len = 2 + label.len() + 2; // "▶ " + label + ": "
+            let cx = rows[1].x + 1 + prefix_len as u16 + form.active_cursor() as u16;
+            frame.set_cursor_position((cx.min(rows[1].right().saturating_sub(2)), cy));
         } else {
             // The border turns cyan and the top inner line becomes a bold
             // spinner + elapsed seconds while a turn runs; the prompt stays
@@ -2752,9 +2973,24 @@ mod tests {
         Box::new(|_name| anyhow::bail!("no profiles in tests"))
     }
 
-    /// `App::new` with empty profiles and a dummy resolver, for tests.
+    fn test_saver() -> ProfileSaver {
+        Box::new(|_form| anyhow::bail!("no profiles in tests"))
+    }
+
+    fn test_loader() -> ProfileLoader {
+        Box::new(|_name| anyhow::bail!("no profiles in tests"))
+    }
+
+    /// `App::new` with empty profiles and dummy callbacks, for tests.
     fn test_app(provider: &str, model: &str) -> App {
-        App::new(provider, model, Vec::new(), test_resolver())
+        App::new(
+            provider,
+            model,
+            Vec::new(),
+            test_resolver(),
+            test_saver(),
+            test_loader(),
+        )
     }
 
     #[test]

@@ -77,7 +77,7 @@ async fn main() -> Result<()> {
     }
 
     let registry = Registry::load();
-    let file = config::load_config(cli.config.as_deref())?;
+    let mut file = config::load_config(cli.config.as_deref())?;
 
     // First run on a real terminal with nothing configured: walk the user
     // through an interactive setup instead of erroring.
@@ -243,6 +243,64 @@ async fn main() -> Result<()> {
                 })
             }
         });
+        let saver: hi_tui::ProfileSaver = Box::new({
+            let file = std::sync::Mutex::new(file.clone());
+            move |data: &hi_tui::ProfileFormData| {
+                let provider = data
+                    .provider
+                    .parse::<ProviderName>()
+                    .map_err(|e| anyhow::anyhow!("invalid provider '{}': {e}", data.provider))?;
+                let form = config::ProfileForm {
+                    name: data.name.clone(),
+                    provider,
+                    api_key: data.api_key.clone(),
+                    store_as_env: data.store_as_env,
+                    model: data.model.clone(),
+                    base_url: data.base_url.clone(),
+                };
+                let profile = form.to_profile();
+                let path = config::writable_config_path(None)
+                    .context("could not determine config path")?;
+                let mut file = file.lock().unwrap();
+                config::upsert_profile(&mut file, &data.name, profile, &path)?;
+                // Return the updated profile list.
+                Ok(config::profile_names(&file)
+                    .into_iter()
+                    .map(|name| {
+                        let p = file.profiles.get(&name);
+                        let prov = p
+                            .and_then(|p| p.provider)
+                            .map(provider_label)
+                            .unwrap_or("openai")
+                            .to_string();
+                        let model = p.and_then(|p| p.model.clone());
+                        hi_tui::ProfileInfo {
+                            name,
+                            provider: prov,
+                            model,
+                        }
+                    })
+                    .collect())
+            }
+        });
+        let loader: hi_tui::ProfileLoader = Box::new({
+            let file = file.clone();
+            move |name: &str| {
+                let p = file
+                    .profiles
+                    .get(name)
+                    .ok_or_else(|| anyhow::anyhow!("no profile named '{name}'"))?;
+                let form = config::ProfileForm::from_profile(name, p);
+                Ok(hi_tui::ProfileFormData {
+                    name: form.name,
+                    provider: form.provider.as_str().to_string(),
+                    api_key: form.api_key,
+                    store_as_env: form.store_as_env,
+                    model: form.model,
+                    base_url: form.base_url,
+                })
+            }
+        });
         match hi_tui::run(
             &mut agent,
             provider_label(settings.provider),
@@ -252,6 +310,8 @@ async fn main() -> Result<()> {
             auto_memory,
             profiles,
             resolver,
+            saver,
+            loader,
         )
         .await
         {
@@ -263,7 +323,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    repl(&mut agent, &settings, &file, &registry, auto_memory).await
+    repl(&mut agent, &settings, &mut file, &registry, auto_memory).await
 }
 
 pub(crate) fn provider_label(provider: ProviderName) -> &'static str {
