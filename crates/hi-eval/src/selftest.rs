@@ -189,7 +189,11 @@ mod tests {
 
         assert_eq!(expected_candidates(baseline), 1);
         assert_eq!(expected_candidates(verify), 1);
-        assert_eq!(expected_candidates(best_of_3), 3, "best-of-3 must run 3 candidates");
+        assert_eq!(
+            expected_candidates(best_of_3),
+            3,
+            "best-of-3 must run 3 candidates"
+        );
 
         // The RunResult.candidates field is initialized to temperatures.len()
         // inside run_config; simulate that invariant here.
@@ -211,7 +215,10 @@ mod tests {
         assert!(dir.join("fixture").is_dir(), "fixture/ subdir must exist");
         // Nothing pre-existing under fixture/.
         assert!(
-            std::fs::read_dir(dir.join("fixture")).unwrap().next().is_none(),
+            std::fs::read_dir(dir.join("fixture"))
+                .unwrap()
+                .next()
+                .is_none(),
             "fixture/ must start empty"
         );
         let _ = std::fs::remove_dir_all(&dir);

@@ -144,10 +144,14 @@ impl Provider for AnthropicProvider {
                     if let Some(tokens) = data["message"]["usage"]["input_tokens"].as_u64() {
                         completion.usage.input_tokens = tokens;
                     }
-                    if let Some(tokens) = data["message"]["usage"]["cache_read_input_tokens"].as_u64() {
+                    if let Some(tokens) =
+                        data["message"]["usage"]["cache_read_input_tokens"].as_u64()
+                    {
                         completion.usage.cache_read_tokens = tokens;
                     }
-                    if let Some(tokens) = data["message"]["usage"]["cache_creation_input_tokens"].as_u64() {
+                    if let Some(tokens) =
+                        data["message"]["usage"]["cache_creation_input_tokens"].as_u64()
+                    {
                         completion.usage.cache_creation_tokens = tokens;
                     }
                     // Anthropic reports cache tokens separately from

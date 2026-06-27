@@ -609,6 +609,7 @@ dependencies = [
  "anyhow",
  "hi-ai",
  "ignore",
+ "libc",
  "regex",
  "serde",
  "serde_json",

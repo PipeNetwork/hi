@@ -4,9 +4,9 @@ use hi_ai::{CompatMode, ToolMode};
 
 use crate::compaction::{CompactionKind, DEFAULT_KEEP_RECENT};
 use crate::{
-    AUTO_COMPACT_PERCENT, COMPACT_TARGET_PERCENT, IN_TURN_ELIDE_PERCENT,
-    IN_TURN_KEEP_TOOL_RESULTS, MAX_EMPTY_RETRIES, MAX_PARALLEL_TOOLS, MAX_REPEAT_NUDGES,
-    MAX_SILENT_CONTINUES,
+    AUTO_COMPACT_PERCENT, COMPACT_TARGET_PERCENT, IN_TURN_ELIDE_PERCENT, IN_TURN_KEEP_TOOL_RESULTS,
+    MAX_EMPTY_RETRIES, MAX_PARALLEL_TOOLS, MAX_REPEAT_NUDGES, MAX_SILENT_CONTINUES,
+    MAX_TRUNCATION_RETRIES,
 };
 
 /// One stage of layered verification: a short label and the shell command to
@@ -80,6 +80,12 @@ pub struct AgentConfig {
     /// How many times to silently re-run a round that produced no usable output.
     /// Default: [`MAX_EMPTY_RETRIES`].
     pub max_empty_retries: u32,
+    /// Max times one turn will nudge the model to continue after its output was
+    /// truncated by the output token cap. Separate from `max_empty_retries`
+    /// because truncation is a different failure mode (valid output, just cut
+    /// off by the token limit) and needs a more generous budget for big tasks.
+    /// Default: [`MAX_TRUNCATION_RETRIES`].
+    pub max_truncation_retries: u32,
     /// Max read-only tool calls to run concurrently within one round.
     /// Default: [`MAX_PARALLEL_TOOLS`].
     pub max_parallel_tools: usize,
@@ -111,7 +117,7 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             model: String::new(),
-            max_tokens: 4096,
+            max_tokens: 8192,
             temperature: None,
             thinking_budget: None,
             tool_mode: ToolMode::Auto,
@@ -130,6 +136,7 @@ impl Default for AgentConfig {
             max_repeat_nudges: MAX_REPEAT_NUDGES,
             max_silent_continues: MAX_SILENT_CONTINUES,
             max_empty_retries: MAX_EMPTY_RETRIES,
+            max_truncation_retries: MAX_TRUNCATION_RETRIES,
             max_parallel_tools: MAX_PARALLEL_TOOLS,
             auto_compact_percent: AUTO_COMPACT_PERCENT,
             compact_target_percent: COMPACT_TARGET_PERCENT,

@@ -76,9 +76,15 @@ impl DecisionLog {
         if self.is_empty() {
             return None;
         }
-        let mut out = String::from("\n\n[Key decisions this session — stay consistent with these]\n");
+        let mut out =
+            String::from("\n\n[Key decisions this session — stay consistent with these]\n");
         for (i, d) in self.entries.iter().enumerate() {
-            out.push_str(&format!("{}. {}\n   why: {}\n", i + 1, d.summary, d.rationale));
+            out.push_str(&format!(
+                "{}. {}\n   why: {}\n",
+                i + 1,
+                d.summary,
+                d.rationale
+            ));
             if !d.files.is_empty() {
                 out.push_str(&format!("   files: {}\n", d.files.join(", ")));
             }
@@ -143,6 +149,9 @@ mod tests {
             files: vec!["src/config.rs".into(), "src/main.rs".into()],
         });
         let section = log.prompt_section().unwrap();
-        assert!(section.contains("src/config.rs, src/main.rs"), "files: {section}");
+        assert!(
+            section.contains("src/config.rs, src/main.rs"),
+            "files: {section}"
+        );
     }
 }

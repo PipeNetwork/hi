@@ -97,7 +97,10 @@ impl ModelPicker {
         let meta = all
             .iter()
             .map(|id| {
-                let m = served.get(id).map(ModelMeta::from_served).unwrap_or_default();
+                let m = served
+                    .get(id)
+                    .map(ModelMeta::from_served)
+                    .unwrap_or_default();
                 // If served didn't report health but the legacy tags map has it,
                 // use that.
                 let mut m = m;
@@ -174,7 +177,11 @@ impl ModelPicker {
                 let id = self.all[idx].as_str();
                 PickerRow {
                     id,
-                    meta: self.meta.get(id).map(|m| m as &ModelMeta).unwrap_or(&EMPTY_META),
+                    meta: self
+                        .meta
+                        .get(id)
+                        .map(|m| m as &ModelMeta)
+                        .unwrap_or(&EMPTY_META),
                     selected: vi == self.selected,
                 }
             })

@@ -14,7 +14,7 @@
 use hi_tools::run_check;
 
 use crate::config::VerifyStage;
-use crate::snapshot::{changed_files_between, FileFingerprint, SnapshotCache};
+use crate::snapshot::{FileFingerprint, SnapshotCache, changed_files_between};
 use crate::ui::Ui;
 
 /// The snapshot type the verifier compares against.

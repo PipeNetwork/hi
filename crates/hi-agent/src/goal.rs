@@ -96,12 +96,16 @@ impl Goal {
 
     /// The currently-active sub-goal, if any (the first `Active` one).
     pub fn active_sub_goal(&self) -> Option<&SubGoal> {
-        self.sub_goals.iter().find(|s| s.status == GoalStatus::Active)
+        self.sub_goals
+            .iter()
+            .find(|s| s.status == GoalStatus::Active)
     }
 
     /// The currently-active sub-goal index, if any.
     pub fn active_index(&self) -> Option<usize> {
-        self.sub_goals.iter().position(|s| s.status == GoalStatus::Active)
+        self.sub_goals
+            .iter()
+            .position(|s| s.status == GoalStatus::Active)
     }
 
     /// Mark the active sub-goal done and advance to the next (which becomes
@@ -161,7 +165,9 @@ impl Goal {
     /// semantics: "done"/"completed", "active"/"in_progress", else pending).
     pub fn apply_plan_statuses(&mut self, statuses: &[&str]) {
         for (i, raw) in statuses.iter().enumerate() {
-            let Some(sg) = self.sub_goals.get_mut(i) else { break };
+            let Some(sg) = self.sub_goals.get_mut(i) else {
+                break;
+            };
             let new = match raw.trim().to_ascii_lowercase().as_str() {
                 "done" | "complete" | "completed" | "finished" => GoalStatus::Done,
                 "active" | "in_progress" | "in-progress" | "doing" | "current" | "started" => {
@@ -179,7 +185,10 @@ impl Goal {
             return;
         }
         // Ensure the first not-done sub-goal is the active one (idempotent).
-        let any_failed = self.sub_goals.iter().any(|s| s.status == GoalStatus::Failed);
+        let any_failed = self
+            .sub_goals
+            .iter()
+            .any(|s| s.status == GoalStatus::Failed);
         for sg in &mut self.sub_goals {
             if sg.status == GoalStatus::Active {
                 break;
@@ -189,7 +198,12 @@ impl Goal {
                 break;
             }
         }
-        if any_failed && !self.sub_goals.iter().any(|s| s.status == GoalStatus::Active) {
+        if any_failed
+            && !self
+                .sub_goals
+                .iter()
+                .any(|s| s.status == GoalStatus::Active)
+        {
             self.status = GoalStatus::Failed;
         } else if self.status == GoalStatus::Done {
             self.status = GoalStatus::Active;
@@ -204,7 +218,8 @@ impl Goal {
         if self.sub_goals.is_empty() {
             return None;
         }
-        let mut out = String::from("\n\n[Long-horizon goal — work the active step, then advance]\n");
+        let mut out =
+            String::from("\n\n[Long-horizon goal — work the active step, then advance]\n");
         out.push_str(&format!("Objective: {}\n", self.objective));
         for (i, sg) in self.sub_goals.iter().enumerate() {
             let glyph = match sg.status {
@@ -232,7 +247,11 @@ mod tests {
     fn goal() -> Goal {
         Goal::new(
             "refactor the parser",
-            vec!["write tests".into(), "rewrite parser".into(), "update callers".into()],
+            vec![
+                "write tests".into(),
+                "rewrite parser".into(),
+                "update callers".into(),
+            ],
         )
     }
 
@@ -263,7 +282,10 @@ mod tests {
         // Budget 2: two failures still allow a retry; the third exhausts.
         assert!(g.record_failure("approach A didn't compile", 2));
         assert!(g.record_failure("approach B also failed", 2));
-        assert!(!g.record_failure("third strike", 2), "budget exhausted → Failed");
+        assert!(
+            !g.record_failure("third strike", 2),
+            "budget exhausted → Failed"
+        );
         assert_eq!(g.sub_goals[0].status, GoalStatus::Failed);
         assert_eq!(g.status, GoalStatus::Failed);
         assert_eq!(g.sub_goals[0].attempts, 3);
@@ -281,7 +303,11 @@ mod tests {
         g.skip_active("step 2 also blocked");
         assert_eq!(g.active_index(), Some(2), "advanced to last sub-goal");
         g.skip_active("last step blocked too");
-        assert_eq!(g.status, GoalStatus::Failed, "skipping the last sub-goal fails the goal");
+        assert_eq!(
+            g.status,
+            GoalStatus::Failed,
+            "skipping the last sub-goal fails the goal"
+        );
     }
 
     #[test]
@@ -312,7 +338,10 @@ mod tests {
         let mut g = goal();
         g.record_failure("approach A", 2);
         let section = g.prompt_section().expect("nonempty goal renders");
-        assert!(section.contains("refactor the parser"), "objective: {section}");
+        assert!(
+            section.contains("refactor the parser"),
+            "objective: {section}"
+        );
         assert!(section.contains("▸"), "active glyph: {section}");
         assert!(
             section.contains("don't repeat these"),

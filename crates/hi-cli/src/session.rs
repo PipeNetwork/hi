@@ -56,8 +56,7 @@ impl JsonlSession {
             return Ok(());
         }
         if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent)
-                .with_context(|| format!("creating {}", parent.display()))?;
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
         }
         let file = OpenOptions::new()
             .create(true)
@@ -130,9 +129,7 @@ impl SessionSink for JsonlSession {
             .open(&self.path)
             .with_context(|| format!("opening {}", self.path.display()))?;
         let mut writer = BufWriter::new(file);
-        let line = serde_json::to_string(&SessionMeta::Goal {
-            goal: goal.clone(),
-        })?;
+        let line = serde_json::to_string(&SessionMeta::Goal { goal: goal.clone() })?;
         writeln!(writer, "{line}")?;
         writer.flush()?;
         Ok(())
@@ -255,7 +252,9 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
                 SessionMeta::Checkpoints { refs } => {
                     checkpoint_refs.extend(refs);
                 }
-                SessionMeta::Compaction { messages: compacted } => {
+                SessionMeta::Compaction {
+                    messages: compacted,
+                } => {
                     // Replace all prior messages with the compacted set.
                     messages = compacted;
                 }
@@ -450,7 +449,10 @@ mod tests {
             )
             .unwrap();
         // A goal mid-progress: sub-goal 1 done, sub-goal 2 active.
-        let mut goal = Goal::new("refactor the parser", vec!["write tests".into(), "rewrite parser".into()]);
+        let mut goal = Goal::new(
+            "refactor the parser",
+            vec!["write tests".into(), "rewrite parser".into()],
+        );
         goal.advance(); // mark step 1 done, step 2 active
         session.record_goal(&goal).unwrap();
 
@@ -461,6 +463,10 @@ mod tests {
         assert_eq!(loaded_goal.objective, "refactor the parser");
         assert_eq!(loaded_goal.sub_goals.len(), 2);
         assert_eq!(loaded_goal.sub_goals[0].status, GoalStatus::Done);
-        assert_eq!(loaded_goal.active_index(), Some(1), "resumes at the active sub-goal");
+        assert_eq!(
+            loaded_goal.active_index(),
+            Some(1),
+            "resumes at the active sub-goal"
+        );
     }
 }

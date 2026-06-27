@@ -196,7 +196,7 @@ where
 pub(crate) fn classify_stream_error(err: anyhow::Error) -> ProviderError {
     if let Some(provider) = err.downcast_ref::<ProviderError>() {
         return ProviderError::new(provider.kind, provider.message.clone())
-            .with_usage(provider.usage.clone());
+            .with_usage(provider.usage);
     }
     let text = err.to_string();
     let kind = if text.contains("no output") {

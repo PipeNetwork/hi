@@ -25,6 +25,22 @@ pub struct Trajectory {
     /// Calls that ran serially (bash or a lone ready call).
     #[serde(default)]
     pub serial_runs: u32,
+    /// Per-tool-call timeline: name, path, duration (ms), error flag.
+    /// Ordered by execution completion. Empty when no tools ran.
+    #[serde(default)]
+    pub tool_timeline: Vec<TrajectoryToolCall>,
+}
+
+/// One entry in the per-turn tool-call timeline.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrajectoryToolCall {
+    pub tool: String,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub duration_ms: u64,
+    #[serde(default)]
+    pub error: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

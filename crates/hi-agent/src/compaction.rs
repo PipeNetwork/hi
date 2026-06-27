@@ -373,11 +373,17 @@ mod tests {
         let m = convo(); // system, q1, read call, big result, q2, answer
         let split = recent_split(&m, 1).unwrap(); // q2 onward is recent → split at q2
         // The old region [1..split) is turn one: q1 + read call + big result.
-        assert!(has_tool_results(&m, split), "old region has the read result");
+        assert!(
+            has_tool_results(&m, split),
+            "old region has the read result"
+        );
         // Turn one's assistant reply made a tool call, so it's NOT part of the
         // conversational tail — the tail is empty for this conversation.
         let tail = conversational_tail(&m, split);
-        assert!(tail.is_empty(), "tool turn excluded from Q&A tail: {tail:?}");
+        assert!(
+            tail.is_empty(),
+            "tool turn excluded from Q&A tail: {tail:?}"
+        );
 
         // A conversation with a real Q&A turn: system, q1 + text answer (Q&A),
         // q2 + tool turn (recent).

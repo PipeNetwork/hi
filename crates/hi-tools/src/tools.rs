@@ -11,12 +11,33 @@ use hi_ai::ToolSpec;
 
 use crate::condense::condense;
 use crate::edit::{apply_edit, apply_multi_patch, diff};
-use crate::paths::{READ_CACHE, validate_workspace_path};
+use crate::paths::{READ_CACHE, cache_key, validate_workspace_path};
 use crate::read::{run_glob, run_grep, run_list, run_read};
 use crate::{PlanStatus, PlanStep, ToolOutput};
 
-const BASH_TIMEOUT: Duration = Duration::from_secs(120);
+/// Default wall-clock limit for a single `bash` command, used when neither the
+/// caller nor `HI_BASH_TIMEOUT_SECS` overrides it. Generous enough for a real
+/// `cargo test`/build verify step, bounded so a genuine hang recovers on its own.
+const DEFAULT_BASH_TIMEOUT_SECS: u64 = 600;
+/// Hard ceiling on any per-command timeout (model- or env-supplied) so a bad
+/// value can't reintroduce an unbounded stall.
+const MAX_BASH_TIMEOUT_SECS: u64 = 3600;
 const CHECK_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Resolve the effective bash timeout: an explicit per-command request wins,
+/// else `HI_BASH_TIMEOUT_SECS`, else the default — always clamped to
+/// `[1, MAX_BASH_TIMEOUT_SECS]` so neither side can disable the guard.
+fn resolve_bash_timeout(requested: Option<u64>) -> Duration {
+    let secs = requested
+        .or_else(|| {
+            std::env::var("HI_BASH_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.trim().parse().ok())
+        })
+        .unwrap_or(DEFAULT_BASH_TIMEOUT_SECS)
+        .clamp(1, MAX_BASH_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
 
 /// Run a verification command (e.g. a test suite) and report `(passed, output)`
 /// based on its exit status. Used by the agent's verification loop.
@@ -66,6 +87,20 @@ pub fn fast_check_for(path: &str) -> Option<&'static str> {
         // and the best signal available; only useful when a tsconfig is present
         // (the caller running it is fine even without — it just no-ops).
         "ts" | "tsx" | "js" | "jsx" => Some("npx --no-install tsc --noEmit"),
+        // Ruby: `ruby -c` is a fast per-file syntax check.
+        "rb" => Some("ruby -c"),
+        // Shell: `shellcheck` catches syntax errors and common pitfalls
+        // per-file. Widely available; no-ops gracefully if absent. `--shell=bash`
+        // is required because the caller appends the file path as the next arg,
+        // and a bare `--shell` would consume that path as the shell name.
+        "sh" | "bash" => Some("shellcheck --shell=bash"),
+        // Lua: `luac -p` is a fast per-file syntax check.
+        "lua" => Some("luac -p"),
+        // Perl: `perl -c` is a fast per-file syntax check.
+        "pl" | "pm" | "t" => Some("perl -c"),
+        // PHP: `php -l` is a fast per-file syntax check
+        // (`-l` = lint, not list; available since PHP 5).
+        "php" => Some("php -l"),
         // Rust, C/C++, and others: no reliable per-file fast check — rely on
         // the turn-end verify (e.g. `cargo check`).
         _ => None,
@@ -154,10 +189,7 @@ pub async fn commit() -> String {
         .output()
         .await
     {
-        Ok(o) => {
-            o.status.success()
-                && String::from_utf8_lossy(&o.stdout).trim() == "true"
-        }
+        Ok(o) => o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true",
         Err(err) => return format!("git not available: {err}"),
     };
     if !in_tree {
@@ -238,11 +270,14 @@ pub async fn commit() -> String {
     }
 
     // Echo the summary the way the UI expects: `── … ──`.
-    format!("staged {n} file{}\ncommitted: \"{subject}\"", if n == 1 { "" } else { "s" })
+    format!(
+        "staged {n} file{}\ncommitted: \"{subject}\"",
+        if n == 1 { "" } else { "s" }
+    )
 }
 
 /// The tools advertised to the model each turn.
-pub fn tool_specs() -> Vec<ToolSpec> {
+fn build_tool_specs() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "update_plan".into(),
@@ -347,13 +382,37 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "bash".into(),
-            description: "Run a shell command via `sh -c` in the current working directory and return combined stdout/stderr.".into(),
+            description: "Run a shell command via `sh -c` in the current working directory and return combined stdout/stderr. stdin is closed, so commands never block on input. A foreground command that exceeds its timeout is killed (whole process tree) and reports what it printed so far. For a long-lived or blocking process (a dev server, a file watcher, `tail -f`), set run_in_background:true — it returns a handle id immediately; read its output with bash_output and stop it with bash_kill. For a slow but finite build or test suite, just raise `timeout` instead.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "command": { "type": "string", "description": "The command to run." }
+                    "command": { "type": "string", "description": "The command to run." },
+                    "timeout": { "type": "integer", "description": "Optional wall-clock limit in seconds (default 600, max 3600). Raise it for a slow test/build suite. Ignored when run_in_background is true." },
+                    "run_in_background": { "type": "boolean", "description": "Run detached and return a handle id immediately instead of waiting for the command to exit. Use for servers/watchers/long-lived processes." }
                 },
                 "required": ["command"]
+            }),
+        },
+        ToolSpec {
+            name: "bash_output".into(),
+            description: "Read new output (stdout+stderr) from a background process started by `bash` with run_in_background, since the last read. Also reports whether it is still running, exited (with code), or was killed. Returns immediately.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "The background process handle returned by bash (e.g. `bg_1`)." }
+                },
+                "required": ["id"]
+            }),
+        },
+        ToolSpec {
+            name: "bash_kill".into(),
+            description: "Stop a background process (and its whole process tree) started by `bash` with run_in_background. Idempotent.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "The background process handle to kill (e.g. `bg_1`)." }
+                },
+                "required": ["id"]
             }),
         },
         ToolSpec {
@@ -415,15 +474,31 @@ pub fn tool_specs() -> Vec<ToolSpec> {
 }
 
 /// The tool specifications advertised to the model, cached once.
-pub static TOOL_SPECS: LazyLock<Vec<ToolSpec>> = LazyLock::new(tool_specs);
+pub static TOOL_SPECS: LazyLock<Vec<ToolSpec>> = LazyLock::new(build_tool_specs);
 
 /// Whether a tool only observes state, with no side effects — so several can
-/// run concurrently within one round. The mutating/effecting tools (`write`,
-/// `edit`, `bash`) are excluded, since order and isolation matter for them.
+/// run concurrently within one round, and it's safe to offer in `ReadOnly`
+/// tool mode. Tools that mutate the filesystem (`write`, `edit`, `multi_edit`,
+/// `apply_patch`) or have ordering-sensitive external effects (`bash`,
+/// `bash_kill`) are excluded. `update_plan` and `record_decision` have no
+/// side effects beyond in-memory state, so they're read-only here.
+/// `bash_output` is a pure poll of an existing buffer.
 pub fn is_read_only(name: &str) -> bool {
-    matches!(name, "read" | "list" | "grep" | "glob" | "diff")
-    // `apply_patch`, like `write`/`edit`, is effecting and never runs in a
-    // parallel batch — order and isolation matter.
+    matches!(
+        name,
+        "read" | "list" | "grep" | "glob" | "diff" | "update_plan" | "record_decision"
+            | "bash_output"
+    )
+}
+
+/// Whether a tool mutates the working tree — so the agent should invalidate its
+/// snapshot cache and kick off a proactive fast-check after it runs. This is a
+/// narrower set than `!is_read_only`: `bash` can mutate files but is handled
+/// separately (it always runs alone), and `bash_kill`/`update_plan`/
+/// `record_decision` have no filesystem effect even though they're not
+/// read-only for parallelization purposes.
+pub fn is_filesystem_mutating(name: &str) -> bool {
+    matches!(name, "write" | "edit" | "multi_edit" | "apply_patch")
 }
 
 /// Best-effort extraction of the primary target path from a tool call's JSON
@@ -438,14 +513,26 @@ pub fn target_path(name: &str, arguments: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
     match name {
         // read/write/edit/multi_edit carry an explicit `path`.
-        "read" | "write" | "edit" | "multi_edit" => {
-            value.get("path")?.as_str().map(str::to_string)
-        }
+        "read" | "write" | "edit" | "multi_edit" => value.get("path")?.as_str().map(str::to_string),
         // list's path is optional (defaults to ".").
         "list" => value.get("path")?.as_str().map(str::to_string),
         // grep: prefer an explicit `path`; fall back to `glob` only as a hint
         // (a glob isn't a single file, so return None to avoid over-serializing).
         "grep" => value.get("path")?.as_str().map(str::to_string),
+        // apply_patch: the patch text contains `*** Update File: <path>` (or
+        // `*** Add File:`/`*** Delete File:`) directives. Return the first path
+        // so a read of that file after the patch serializes. Multi-file patches
+        // only expose the first path — the safe fallback (serialize after all
+        // earlier mutations) covers the rest.
+        "apply_patch" => {
+            let patch = value.get("patch")?.as_str()?;
+            patch.lines().find_map(|l| {
+                l.trim()
+                    .strip_prefix("*** Update File: ")
+                    .or_else(|| l.trim().strip_prefix("*** Add File: "))
+                    .map(|p| p.trim().to_string())
+            })
+        }
         // diff/glob/bash: no single meaningful target path for dep inference.
         _ => None,
     }
@@ -481,9 +568,7 @@ async fn run_streaming(
 ) -> Result<ToolOutput> {
     if name == "bash" {
         let args: BashArgs = parse(arguments)?;
-        return Ok(ToolOutput::plain(condense(
-            &run_bash_streaming(&args.command, on_line).await?,
-        )));
+        return run_bash_tool(args, on_line).await;
     }
     // All other tools: delegate to the normal path (on_line unused).
     run(name, arguments).await
@@ -542,20 +627,26 @@ async fn run(name: &str, arguments: &str) -> Result<ToolOutput> {
                 .with_context(|| format!("writing {}", args.path))?;
             // Invalidate the read cache for this path after a write.
             if let Ok(mut cache) = READ_CACHE.lock() {
-                cache.remove(&args.path);
+                cache.remove(&cache_key(&args.path));
             }
+            let written_len = args.content.len();
             let after = crate::read::maybe_format(&args.path, args.content).await;
-            Ok(ToolOutput::shown(
-                format!("Wrote {} bytes to {}", after.len(), args.path),
-                diff(&before, &after),
-            ))
+            let msg = if after.len() != written_len {
+                format!(
+                    "Wrote {} bytes to {} (formatter adjusted to {} bytes)",
+                    written_len,
+                    args.path,
+                    after.len()
+                )
+            } else {
+                format!("Wrote {} bytes to {}", written_len, args.path)
+            };
+            Ok(ToolOutput::shown(msg, diff(&before, &after)))
         }
         "edit" => {
             let args: EditArgs = parse(arguments)?;
             validate_workspace_path(&args.path)?;
-            let before = tokio::fs::read_to_string(&args.path)
-                .await
-                .with_context(|| format!("reading {}", args.path))?;
+            let before = crate::read::read_text_file(&args.path).await?;
             let after = apply_edit(
                 &before,
                 &args.old_string,
@@ -568,7 +659,7 @@ async fn run(name: &str, arguments: &str) -> Result<ToolOutput> {
                 .with_context(|| format!("writing {}", args.path))?;
             // Invalidate the read cache for this path after an edit.
             if let Ok(mut cache) = READ_CACHE.lock() {
-                cache.remove(&args.path);
+                cache.remove(&cache_key(&args.path));
             }
             let after = crate::read::maybe_format(&args.path, after).await;
             let count = if args.replace_all {
@@ -591,9 +682,7 @@ async fn run(name: &str, arguments: &str) -> Result<ToolOutput> {
             if args.edits.is_empty() {
                 bail!("no edits provided");
             }
-            let before = tokio::fs::read_to_string(&args.path)
-                .await
-                .with_context(|| format!("reading {}", args.path))?;
+            let before = crate::read::read_text_file(&args.path).await?;
             // Apply edits in order against the evolving content; abort (writing
             // nothing) if any fails, so a partial multi-edit never lands.
             let mut after = before.clone();
@@ -606,7 +695,7 @@ async fn run(name: &str, arguments: &str) -> Result<ToolOutput> {
                 .with_context(|| format!("writing {}", args.path))?;
             // Invalidate the read cache for this path after a multi-edit.
             if let Ok(mut cache) = READ_CACHE.lock() {
-                cache.remove(&args.path);
+                cache.remove(&cache_key(&args.path));
             }
             let after = crate::read::maybe_format(&args.path, after).await;
             Ok(ToolOutput::shown(
@@ -616,7 +705,25 @@ async fn run(name: &str, arguments: &str) -> Result<ToolOutput> {
         }
         "bash" => {
             let args: BashArgs = parse(arguments)?;
-            Ok(ToolOutput::plain(condense(&run_bash(&args.command).await?)))
+            run_bash_tool(args, &mut |_| {}).await
+        }
+        "bash_output" => {
+            #[derive(Deserialize)]
+            struct Args {
+                id: String,
+            }
+            let args: Args = parse(arguments)?;
+            Ok(ToolOutput::plain(condense(&crate::background::poll(
+                &args.id,
+            )?)))
+        }
+        "bash_kill" => {
+            #[derive(Deserialize)]
+            struct Args {
+                id: String,
+            }
+            let args: Args = parse(arguments)?;
+            Ok(ToolOutput::plain(crate::background::kill(&args.id)?))
         }
         "list" => run_list(arguments).await,
         "diff" => {
@@ -632,12 +739,55 @@ async fn run(name: &str, arguments: &str) -> Result<ToolOutput> {
                 patch: String,
             }
             let args: PatchArgs = parse(arguments)?;
-            let result = apply_multi_patch(&args.patch)?;
+            let result = apply_multi_patch(&args.patch).await?;
             Ok(ToolOutput::plain(result))
         }
         other => bail!("unknown tool: {other}"),
     }
 }
+
+/// Spawn `sh -c <command>` hardened for unattended use: stdin detached (so it
+/// never blocks on input), stdout/stderr piped, its own process group (so the
+/// whole tree can be killed), and kill-on-drop. Shared by the foreground and
+/// background bash paths so both behave identically.
+pub(crate) fn spawn_shell(command: &str) -> Result<tokio::process::Child> {
+    let mut cmd = Command::new("sh");
+    cmd.arg("-c")
+        .arg(command)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
+    cmd.spawn().context("failed to spawn command")
+}
+
+/// SIGKILL an entire process group by its id. We spawn with `process_group(0)`,
+/// so a process's group id equals its pid; signalling the negative pid reaches
+/// every descendant. No-op on non-Unix (where `child.kill()` is the best we have).
+#[cfg(unix)]
+pub(crate) fn kill_group(pgid: i32) {
+    // SAFETY: `kill(2)` with a negative pid targets the process group; it has no
+    // memory-safety implications and a stale pid simply errors out.
+    unsafe {
+        libc::kill(-pgid, libc::SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn kill_group(_pgid: i32) {}
+
+/// SIGKILL the child's whole process group, if it hasn't been reaped yet.
+#[cfg(unix)]
+fn kill_process_group(child: &tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        kill_group(pid as i32);
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_child: &tokio::process::Child) {}
 
 pub(crate) async fn run_bash(command: &str) -> Result<String> {
     run_bash_streaming(command, &mut |_| {}).await
@@ -650,6 +800,14 @@ pub(crate) async fn run_bash_streaming(
     command: &str,
     on_line: &mut (dyn FnMut(&str) + Send),
 ) -> Result<String> {
+    run_bash_streaming_with_timeout(command, on_line, resolve_bash_timeout(None)).await
+}
+
+async fn run_bash_streaming_with_timeout(
+    command: &str,
+    on_line: &mut (dyn FnMut(&str) + Send),
+    bash_timeout: Duration,
+) -> Result<String> {
     // Refuse the handful of irreversible operations a checkpoint can't undo.
     if let Some(reason) = crate::guard::catastrophic_op(command) {
         return Ok(format!(
@@ -658,14 +816,10 @@ pub(crate) async fn run_bash_streaming(
              themselves (they can also set HI_ALLOW_DANGEROUS=1 to disable this guard)."
         ));
     }
-    let mut child = Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-        .context("failed to spawn command")?;
+    // Hardened spawn (detached stdin, piped output, own process group) so a
+    // timeout can SIGKILL the *whole tree* — cargo, the test binary, any leaked
+    // daemon — not just the `sh` parent, and nothing blocks waiting on input.
+    let mut child = spawn_shell(command)?;
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -673,19 +827,38 @@ pub(crate) async fn run_bash_streaming(
     // Use a shared Mutex<&mut dyn FnMut> so both stdout and stderr readers can
     // call on_line without double-borrowing.
     let cb: &std::sync::Mutex<&mut (dyn FnMut(&str) + Send)> = &std::sync::Mutex::new(on_line);
-    let (stdout_lines, stderr_lines): (Vec<String>, Vec<String>) =
-        tokio::join!(read_lines(stdout, cb), read_lines(stderr, cb),);
+    // Accumulate lines in outer-scope buffers so partial output survives a
+    // timeout (the futures that fill them get dropped when the timeout fires).
+    let stdout_buf = std::sync::Mutex::new(Vec::<String>::new());
+    let stderr_buf = std::sync::Mutex::new(Vec::<String>::new());
 
-    // Wait for the process to finish (with timeout for the remainder).
-    let status = match tokio::time::timeout(BASH_TIMEOUT, child.wait()).await {
-        Ok(Ok(status)) => status,
+    // The timeout MUST wrap pipe-draining *and* the wait together: a process
+    // that hangs while holding its pipes open (a deadlocked test, something
+    // waiting on a socket/stdin, or a leaked child inheriting the stdout fd)
+    // never reaches EOF, so reading alone would block forever. Wrapping only
+    // `child.wait()` — reached after the pipes drain — would never arm at all.
+    let combined = async {
+        tokio::join!(
+            read_lines(stdout, cb, &stdout_buf),
+            read_lines(stderr, cb, &stderr_buf),
+        );
+        child.wait().await
+    };
+    let status = match tokio::time::timeout(bash_timeout, combined).await {
+        Ok(Ok(status)) => Some(status),
         Ok(Err(err)) => bail!("command failed: {err}"),
         Err(_) => {
+            // `combined` (holding the &mut child borrow) is dropped by `timeout`
+            // before it returns Err, so the child is free to kill here. Kill the
+            // whole group first (orphaned grandchildren), then reap `sh` itself.
+            kill_process_group(&child);
             let _ = child.kill().await;
-            bail!("command timed out after {}s", BASH_TIMEOUT.as_secs())
+            None
         }
     };
 
+    let stdout_lines = stdout_buf.into_inner().unwrap_or_default();
+    let stderr_lines = stderr_buf.into_inner().unwrap_or_default();
     let mut out = String::new();
     for line in &stdout_lines {
         out.push_str(line);
@@ -696,10 +869,23 @@ pub(crate) async fn run_bash_streaming(
         }
         out.push_str(line);
     }
-    if let Some(code) = status.code()
-        && code != 0
-    {
-        out.push_str(&format!("\n[exit code {code}]"));
+    match status {
+        Some(status) => {
+            if let Some(code) = status.code()
+                && code != 0
+            {
+                out.push_str(&format!("\n[exit code {code}]"));
+            }
+        }
+        None => {
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(&format!(
+                "[timed out after {}s — process killed]",
+                bash_timeout.as_secs()
+            ));
+        }
     }
     if out.is_empty() {
         out.push_str("[no output]");
@@ -708,16 +894,19 @@ pub(crate) async fn run_bash_streaming(
 }
 
 /// Read lines from an optional child-process pipe, calling `on_line` (behind a
-/// Mutex so stdout/stderr can share it) for each line, and collecting them.
+/// Mutex so stdout/stderr can share it) for each line and pushing each into
+/// `buf`. Writing into a shared, outer-scope `buf` (rather than returning a
+/// `Vec`) is what lets the caller recover partial output if a timeout drops
+/// this future mid-read.
 async fn read_lines<R: tokio::io::AsyncRead + Unpin>(
     pipe: Option<R>,
     on_line: &std::sync::Mutex<&mut (dyn FnMut(&str) + Send)>,
-) -> Vec<String> {
+    buf: &std::sync::Mutex<Vec<String>>,
+) {
     let Some(pipe) = pipe else {
-        return Vec::new();
+        return;
     };
     use tokio::io::{AsyncBufReadExt, BufReader};
-    let mut lines = Vec::new();
     let mut reader = BufReader::new(pipe).lines();
     while let Ok(Some(line)) = reader.next_line().await {
         let mut with_nl = line;
@@ -725,9 +914,10 @@ async fn read_lines<R: tokio::io::AsyncRead + Unpin>(
         if let Ok(mut cb) = on_line.lock() {
             (*cb)(&with_nl);
         }
-        lines.push(with_nl);
+        if let Ok(mut buf) = buf.lock() {
+            buf.push(with_nl);
+        }
     }
-    lines
 }
 
 pub(crate) fn parse<T: for<'de> Deserialize<'de>>(arguments: &str) -> Result<T> {
@@ -765,12 +955,156 @@ pub(crate) struct EditArgs {
 #[derive(Deserialize)]
 pub(crate) struct BashArgs {
     pub command: String,
+    /// Optional per-command wall-clock limit in seconds. Omitted → the default
+    /// (or `HI_BASH_TIMEOUT_SECS`). Clamped to `[1, MAX_BASH_TIMEOUT_SECS]`.
+    /// Ignored when `run_in_background` is set.
+    #[serde(default)]
+    pub timeout: Option<u64>,
+    /// Run detached: return a handle immediately instead of waiting for exit.
+    /// Poll it with `bash_output` and stop it with `bash_kill`.
+    #[serde(default)]
+    pub run_in_background: bool,
+}
+
+/// Shared `bash` dispatch for both the streaming and non-streaming entry points.
+/// `run_in_background` short-circuits to a detached process and returns its
+/// handle; otherwise it runs to completion (streaming output through `on_line`).
+async fn run_bash_tool(
+    args: BashArgs,
+    on_line: &mut (dyn FnMut(&str) + Send),
+) -> Result<ToolOutput> {
+    if args.run_in_background {
+        let id = crate::background::spawn(&args.command)?;
+        return Ok(ToolOutput::plain(format!(
+            "Started background process `{id}`: {}\n\
+             Check its output with bash_output {{\"id\":\"{id}\"}} and stop it with \
+             bash_kill {{\"id\":\"{id}\"}}.",
+            args.command
+        )));
+    }
+    let timeout = resolve_bash_timeout(args.timeout);
+    let out = run_bash_streaming_with_timeout(&args.command, on_line, timeout).await?;
+    Ok(ToolOutput::plain(condense(&out)))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{fast_check_for, is_read_only, target_path};
+    use super::{
+        fast_check_for, is_filesystem_mutating, is_read_only, run_bash_streaming_with_timeout,
+        target_path,
+    };
     use crate::edit::sh_quote;
+    use std::time::Duration;
+
+    // A command that keeps its stdout pipe open and never exits must still
+    // return via the timeout. Before the fix the timeout wrapped only
+    // `child.wait()`, reached after the pipes drained — so a process holding
+    // its pipes open blocked the reader forever and the timeout never armed.
+    #[tokio::test]
+    async fn bash_times_out_when_process_holds_pipe_open() {
+        let mut sink = |_: &str| {};
+        let out = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_bash_streaming_with_timeout("sleep 600", &mut sink, Duration::from_millis(200)),
+        )
+        .await
+        .expect("must not hang past the outer guard")
+        .expect("bash run returns Ok with a timeout notice");
+        assert!(out.contains("timed out"), "got: {out:?}");
+    }
+
+    // Output produced before a hang is preserved in the returned text.
+    #[tokio::test]
+    async fn bash_timeout_preserves_partial_output() {
+        let mut sink = |_: &str| {};
+        let out = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_bash_streaming_with_timeout(
+                "echo before-hang; sleep 600",
+                &mut sink,
+                Duration::from_millis(300),
+            ),
+        )
+        .await
+        .expect("must not hang past the outer guard")
+        .expect("bash run returns Ok");
+        assert!(out.contains("before-hang"), "got: {out:?}");
+        assert!(out.contains("timed out"), "got: {out:?}");
+    }
+
+    // The normal path is unchanged: a fast command returns its output and the
+    // exit code is appended on failure.
+    #[tokio::test]
+    async fn bash_normal_command_returns_output() {
+        let mut sink = |_: &str| {};
+        let out =
+            run_bash_streaming_with_timeout("echo hello", &mut sink, Duration::from_secs(10))
+                .await
+                .expect("ok");
+        assert!(out.contains("hello"), "got: {out:?}");
+        assert!(!out.contains("timed out"), "got: {out:?}");
+    }
+
+    // stdin is detached: a command reading stdin sees EOF immediately rather
+    // than blocking on the agent's terminal.
+    #[tokio::test]
+    async fn bash_stdin_is_closed_not_blocking() {
+        let mut sink = |_: &str| {};
+        let out = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_bash_streaming_with_timeout("cat", &mut sink, Duration::from_secs(10)),
+        )
+        .await
+        .expect("must not block on stdin")
+        .expect("ok");
+        assert!(!out.contains("timed out"), "got: {out:?}");
+    }
+
+    // A timeout kills the whole process tree: a child that outlives its `sh`
+    // parent (here, a backgrounded `sleep` holding the pipe) is reaped, so the
+    // call returns promptly instead of the pipe keeping the reader alive.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_timeout_kills_descendants_holding_pipe() {
+        let mut sink = |_: &str| {};
+        // `sleep 600 &` backgrounds a child that inherits stdout; the script
+        // then exits, but the pipe stays open via the grandchild. With group
+        // kill this still returns at the timeout rather than hanging on read.
+        let out = tokio::time::timeout(
+            Duration::from_secs(5),
+            run_bash_streaming_with_timeout(
+                "sleep 600 & echo started; wait",
+                &mut sink,
+                Duration::from_millis(300),
+            ),
+        )
+        .await
+        .expect("must not hang on the orphaned grandchild's pipe")
+        .expect("ok");
+        assert!(out.contains("started"), "got: {out:?}");
+        assert!(out.contains("timed out"), "got: {out:?}");
+    }
+
+    #[test]
+    fn bash_timeout_resolution_and_clamping() {
+        use super::{
+            resolve_bash_timeout, DEFAULT_BASH_TIMEOUT_SECS, MAX_BASH_TIMEOUT_SECS,
+        };
+        // Explicit request wins and is honored.
+        assert_eq!(resolve_bash_timeout(Some(42)).as_secs(), 42);
+        // Absurd values clamp to the ceiling, not unbounded.
+        assert_eq!(
+            resolve_bash_timeout(Some(u64::MAX)).as_secs(),
+            MAX_BASH_TIMEOUT_SECS
+        );
+        // Zero clamps up to 1 so the guard is never disabled.
+        assert_eq!(resolve_bash_timeout(Some(0)).as_secs(), 1);
+        // No request → the default (env not set in this test).
+        assert_eq!(
+            resolve_bash_timeout(None).as_secs(),
+            DEFAULT_BASH_TIMEOUT_SECS
+        );
+    }
 
     #[test]
     fn read_only_tools_are_classified() {
@@ -778,10 +1112,38 @@ mod tests {
         assert!(is_read_only("list"));
         assert!(is_read_only("grep"));
         assert!(is_read_only("diff"));
+        assert!(is_read_only("glob"));
+        // No filesystem side effects — safe to parallelize and offer in
+        // read-only mode.
+        assert!(is_read_only("update_plan"));
+        assert!(is_read_only("record_decision"));
+        assert!(is_read_only("bash_output"));
         // Mutating / effecting tools are not safe to run concurrently.
         assert!(!is_read_only("write"));
         assert!(!is_read_only("edit"));
+        assert!(!is_read_only("multi_edit"));
+        assert!(!is_read_only("apply_patch"));
         assert!(!is_read_only("bash"));
+        assert!(!is_read_only("bash_kill"));
+    }
+
+    #[test]
+    fn filesystem_mutating_tools_are_classified() {
+        // Only tools that write to the working tree.
+        assert!(is_filesystem_mutating("write"));
+        assert!(is_filesystem_mutating("edit"));
+        assert!(is_filesystem_mutating("multi_edit"));
+        assert!(is_filesystem_mutating("apply_patch"));
+        // Everything else — including non-read-only tools like bash — does not
+        // directly mutate via the tool layer (bash runs alone; bash_kill stops
+        // a process; update_plan/record_decision are in-memory only).
+        assert!(!is_filesystem_mutating("bash"));
+        assert!(!is_filesystem_mutating("bash_kill"));
+        assert!(!is_filesystem_mutating("bash_output"));
+        assert!(!is_filesystem_mutating("update_plan"));
+        assert!(!is_filesystem_mutating("record_decision"));
+        assert!(!is_filesystem_mutating("read"));
+        assert!(!is_filesystem_mutating("diff"));
     }
 
     #[test]
@@ -802,14 +1164,27 @@ mod tests {
         );
         // list's path is optional → None when absent.
         assert_eq!(target_path("list", r#"{}"#), None);
-        assert_eq!(
-            target_path("list", r#"{"path":"sub"}"#),
-            Some("sub".into())
-        );
+        assert_eq!(target_path("list", r#"{"path":"sub"}"#), Some("sub".into()));
         // bash has no path → None (the safe-fallback case for dep inference).
         assert_eq!(target_path("bash", r#"{"command":"echo hi"}"#), None);
         // Malformed JSON → None (tolerant).
         assert_eq!(target_path("read", "not json"), None);
+        // apply_patch: first Update/Add File directive's path is extracted.
+        let patch = r#"{"patch":"*** Begin Patch\n*** Update File: src/a.rs\n-old\n+new\n*** End Patch"}"#;
+        assert_eq!(
+            target_path("apply_patch", patch),
+            Some("src/a.rs".into())
+        );
+        let add_patch = r#"{"patch":"*** Begin Patch\n*** Add File: new.txt\nhello\n*** End Patch"}"#;
+        assert_eq!(
+            target_path("apply_patch", add_patch),
+            Some("new.txt".into())
+        );
+        // No file directives → None.
+        assert_eq!(
+            target_path("apply_patch", r#"{"patch":"*** Begin Patch\n*** End Patch"}"#),
+            None
+        );
     }
 
     #[test]
@@ -820,6 +1195,13 @@ mod tests {
         // TS/JS get a project-wide tsc (best available).
         assert!(fast_check_for("x.ts").is_some());
         assert!(fast_check_for("x.jsx").is_some());
+        // Ruby, Shell, Lua, Perl, PHP have per-file syntax checks
+        // (e.g. `ruby -c`, `shellcheck --shell`, `luac -p`, `perl -c`, `php -l`).
+        assert!(fast_check_for("app.rb").is_some());
+        assert!(fast_check_for("deploy.sh").is_some());
+        assert!(fast_check_for("init.lua").is_some());
+        assert!(fast_check_for("script.pl").is_some());
+        assert!(fast_check_for("page.php").is_some());
         // Rust has no reliable per-file fast check (cargo check is project-wide
         // and already the turn-end verify) → None.
         assert!(fast_check_for("src/lib.rs").is_none());

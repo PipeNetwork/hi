@@ -8,19 +8,29 @@ use hi_agent::Agent;
 use hi_ai::Registry;
 
 /// Act on a slash command. Returns true when the session should quit.
-pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command, registry: &Registry) -> bool {
+pub(crate) fn handle_command(
+    agent: &mut Agent,
+    command: hi_agent::Command,
+    registry: &Registry,
+) -> bool {
     use hi_agent::Command;
     match command {
         Command::Quit => return true,
         Command::Help => println!("{}", hi_agent::command::help_text()),
         Command::Tokens => {
             let t = agent.totals();
-            let cost = agent.cost_usd()
+            let cost = agent
+                .cost_usd()
                 .map(|c| format!(" · ${c:.4}"))
                 .unwrap_or_default();
-            let ctx = agent.context_window()
+            let ctx = agent
+                .context_window()
                 .map(|w| {
-                    let pct = if w > 0 { agent.context_used() * 100 / w as u64 } else { 0 };
+                    let pct = if w > 0 {
+                        agent.context_used() * 100 / w as u64
+                    } else {
+                        0
+                    };
                     format!(" · context: {pct}%")
                 })
                 .unwrap_or_default();
@@ -35,12 +45,18 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command, regi
         }
         Command::Status => {
             let t = agent.totals();
-            let cost = agent.cost_usd()
+            let cost = agent
+                .cost_usd()
                 .map(|c| format!("${c:.4}"))
                 .unwrap_or_else(|| "unknown".into());
-            let ctx = agent.context_window()
+            let ctx = agent
+                .context_window()
                 .map(|w| {
-                    let pct = if w > 0 { agent.context_used() * 100 / w as u64 } else { 0 };
+                    let pct = if w > 0 {
+                        agent.context_used() * 100 / w as u64
+                    } else {
+                        0
+                    };
                     format!("{pct}% of {}k", w / 1000)
                 })
                 .unwrap_or_else(|| "unknown".into());
@@ -90,7 +106,11 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command, regi
             }
         }
         Command::Clear => {
-            let count = agent.messages().iter().filter(|m| m.role != hi_ai::Role::System).count();
+            let count = agent
+                .messages()
+                .iter()
+                .filter(|m| m.role != hi_ai::Role::System)
+                .count();
             agent.clear_history();
             println!("\x1b[2mcleared {count} messages — starting fresh\x1b[0m");
         }
@@ -123,7 +143,10 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command, regi
                     println!(
                         "\x1b[2mgoal: {} — {}/{} sub-goals done\x1b[0m",
                         g.objective,
-                        g.sub_goals.iter().filter(|s| s.status == hi_agent::GoalStatus::Done).count(),
+                        g.sub_goals
+                            .iter()
+                            .filter(|s| s.status == hi_agent::GoalStatus::Done)
+                            .count(),
                         g.sub_goals.len()
                     );
                 } else {
@@ -155,7 +178,9 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command, regi
                         );
                     } else {
                         agent.set_goal(Some(goal.to_string()));
-                        println!("\x1b[32m✓ goal set — steers every turn until cleared: {goal}\x1b[0m");
+                        println!(
+                            "\x1b[32m✓ goal set — steers every turn until cleared: {goal}\x1b[0m"
+                        );
                     }
                 } else {
                     agent.set_goal(Some(goal.to_string()));
@@ -164,17 +189,31 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command, regi
             }
         },
         // Handled in the repl loop (async / runs a turn); never reach here.
-        Command::Compact(_) | Command::Retry | Command::Undo | Command::Init
-        | Command::Diff | Command::Commit => {}
+        Command::Compact(_)
+        | Command::Retry
+        | Command::Undo
+        | Command::Init
+        | Command::Diff
+        | Command::Commit => {}
         Command::Version => {
             println!("hi {}", hi_agent::VERSION);
         }
         Command::Export(arg) => {
-            let path = if arg.trim().is_empty() { "transcript.md" } else { arg.trim() };
+            let path = if arg.trim().is_empty() {
+                "transcript.md"
+            } else {
+                arg.trim()
+            };
             let content = agent.export_markdown();
             match std::fs::write(path, &content) {
-                Ok(()) => println!("\x1b[2mexported {} messages to {path}\x1b[0m",
-                    agent.messages().iter().filter(|m| m.role != hi_ai::Role::System).count()),
+                Ok(()) => println!(
+                    "\x1b[2mexported {} messages to {path}\x1b[0m",
+                    agent
+                        .messages()
+                        .iter()
+                        .filter(|m| m.role != hi_ai::Role::System)
+                        .count()
+                ),
                 Err(err) => eprintln!("\x1b[33mexport failed: {err}\x1b[0m"),
             }
         }

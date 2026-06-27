@@ -42,7 +42,7 @@ use completion::{
 };
 use event::{ChannelUi, Restore, UiEvent};
 use input::{HistorySearch, InputLine};
-use model_picker::{display_health, display_price, display_window, ModelPicker};
+use model_picker::{ModelPicker, display_health, display_price, display_window};
 use render::{diff_lines, dim, line_text, looks_like_diff, markdown_line, wrapped_height};
 use util::{clip_reason, copy_to_clipboard, fmt_count, fmt_elapsed, goal_feedback, notify_done};
 
@@ -291,7 +291,11 @@ pub async fn run(
                         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                         // Ctrl-R opens reverse history search (when not already
                         // in it and there's history to search).
-                        if ctrl && key.code == KeyCode::Char('r') && app.history_search.is_none() && !app.input.history.is_empty() {
+                        if ctrl
+                            && key.code == KeyCode::Char('r')
+                            && app.history_search.is_none()
+                            && !app.input.history.is_empty()
+                        {
                             let mut search = HistorySearch::default();
                             search.refilter(&app.input.history);
                             app.history_search = Some(search);
@@ -709,8 +713,7 @@ impl TranscriptEntry {
                     lines
                 } else {
                     vec![Line::styled(
-                        format!("⏺ thought for {label}  (Ctrl-T to expand)",
-                    ),
+                        format!("⏺ thought for {label}  (Ctrl-T to expand)",),
                         Style::default().fg(Color::DarkGray),
                     )]
                 }
@@ -1455,7 +1458,8 @@ impl App {
             ),
             format!(
                 "cost: {}",
-                agent.cost_usd()
+                agent
+                    .cost_usd()
                     .map(|c| format!("${c:.4}"))
                     .unwrap_or_else(|| "unknown".into())
             ),
@@ -1722,6 +1726,15 @@ impl App {
                 // code styling into the next response.
                 self.code_lang = None;
             }
+            UiEvent::ToolStarted(name, args) => {
+                let label = tool_label(&name, &args);
+                self.event_log.push(format!("tool_started {label}"));
+                // Mark this tool as the active party so the working line can
+                // name it with its own timer until the result lands. No
+                // transcript line — the header is emitted with the result.
+                self.current_tool = Some(label);
+                self.current_tool_started = Some(Instant::now());
+            }
             UiEvent::ToolCall(name, args) => {
                 let label = tool_label(&name, &args);
                 self.event_log.push(format!("tool_call {label}"));
@@ -1730,10 +1743,6 @@ impl App {
                 if matches!(name.as_str(), "write" | "edit") {
                     self.last_turn_had_file_edits = true;
                 }
-                // Mark this tool as the active party so the working line can name
-                // it with its own timer until the result lands.
-                self.current_tool = Some(label.clone());
-                self.current_tool_started = Some(Instant::now());
                 self.flush_reasoning();
                 self.flush_pending();
                 self.push(Line::styled(
@@ -1741,7 +1750,7 @@ impl App {
                     Style::default().fg(Color::Cyan),
                 ));
             }
-            UiEvent::ToolResult(result) => {
+            UiEvent::ToolResult(name, result) => {
                 self.event_log
                     .push(format!("tool_result {} chars", result.len()));
                 self.last_turn_event = Some(TurnEventKind::ToolResult);
@@ -1749,7 +1758,7 @@ impl App {
                 self.current_tool = None;
                 self.current_tool_started = None;
                 self.flush_pending();
-                self.push_result(&result);
+                self.push_result(&name, &result);
             }
             UiEvent::Status(s) => {
                 self.event_log.push(format!("status {s}"));
@@ -1797,7 +1806,25 @@ impl App {
     /// Preserves any ANSI colors (e.g. edit/write diffs); for *plain* unified
     /// diff output from a shell command (`git diff`, `diff -u`) — which CLIs
     /// emit without color when piped — adds diff coloring so it's readable.
-    fn push_result(&mut self, result: &str) {
+    ///
+    /// Read-only exploration tools (`read`/`list`/`grep`) already named the
+    /// file or pattern in their `tool_call` header line — dumping their full
+    /// output into the transcript is noise during a codebase review. Show a
+    /// compact line count instead, so the transcript reads as a list of files
+    /// consulted rather than a wall of their contents.
+    fn push_result(&mut self, name: &str, result: &str) {
+        if matches!(name, "read" | "list" | "grep") {
+            let n = result.lines().count();
+            if n == 0 {
+                self.push(Line::styled("  (no output)", dim()));
+            } else {
+                self.push(Line::styled(
+                    format!("  {n} line{}", if n == 1 { "" } else { "s" }),
+                    dim(),
+                ));
+            }
+            return;
+        }
         // Enough to show a small edit's diff with its context inline; larger
         // results truncate with a footer (use `/diff` for the full diff).
         const MAX: usize = 16;
@@ -1835,13 +1862,17 @@ impl App {
             Command::Tokens => {
                 let t = agent.totals();
                 self.usage = (t.input_tokens, t.output_tokens);
-                let cost = agent.cost_usd()
+                let cost = agent
+                    .cost_usd()
                     .map(|c| format!(" · ${c:.4}"))
                     .unwrap_or_default();
                 self.push(Line::styled(
                     format!(
                         "cumulative: {} in · {} out · {} total{}",
-                        t.input_tokens, t.output_tokens, t.total(), cost,
+                        t.input_tokens,
+                        t.output_tokens,
+                        t.total(),
+                        cost,
                     ),
                     dim(),
                 ));
@@ -1853,7 +1884,12 @@ impl App {
                     // Open the interactive picker (filter + arrow-select).
                     let current = self.model.clone();
                     let tags = self.served_tags();
-                    self.picker = Some(ModelPicker::new(registry.model_ids(), &current, tags, &self.served));
+                    self.picker = Some(ModelPicker::new(
+                        registry.model_ids(),
+                        &current,
+                        tags,
+                        &self.served,
+                    ));
                 } else {
                     let health = self.apply_model(agent, registry, &id);
                     self.push(Line::styled(format!("model set to {id}"), dim()));
@@ -1863,7 +1899,11 @@ impl App {
                 }
             }
             Command::Clear => {
-                let count = agent.messages().iter().filter(|m| m.role != hi_ai::Role::System).count();
+                let count = agent
+                    .messages()
+                    .iter()
+                    .filter(|m| m.role != hi_ai::Role::System)
+                    .count();
                 agent.clear_history();
                 self.transcript.clear();
                 self.pending = None;
@@ -1872,7 +1912,10 @@ impl App {
                 self.last_assistant.clear();
                 self.status.clear();
                 self.last_turn_state = TurnState::Idle;
-                self.push(Line::styled(format!("cleared {count} messages — starting fresh"), dim()));
+                self.push(Line::styled(
+                    format!("cleared {count} messages — starting fresh"),
+                    dim(),
+                ));
             }
             Command::Verify(arg) => {
                 let msg = match arg.trim() {
@@ -1914,15 +1957,25 @@ impl App {
                 self.push(Line::styled(format!("hi {}", hi_agent::VERSION), dim()));
             }
             Command::Export(arg) => {
-                let path = if arg.trim().is_empty() { "transcript.md" } else { arg.trim() };
+                let path = if arg.trim().is_empty() {
+                    "transcript.md"
+                } else {
+                    arg.trim()
+                };
                 let content = agent.export_markdown();
-                let count = agent.messages().iter().filter(|m| m.role != hi_ai::Role::System).count();
+                let count = agent
+                    .messages()
+                    .iter()
+                    .filter(|m| m.role != hi_ai::Role::System)
+                    .count();
                 match std::fs::write(path, &content) {
                     Ok(()) => self.push(Line::styled(
-                        format!("exported {count} messages to {path}"), dim(),
+                        format!("exported {count} messages to {path}"),
+                        dim(),
                     )),
                     Err(err) => self.push(Line::styled(
-                        format!("export failed: {err}"), Style::default().fg(Color::Yellow),
+                        format!("export failed: {err}"),
+                        Style::default().fg(Color::Yellow),
                     )),
                 }
             }
@@ -2031,7 +2084,11 @@ impl App {
         // The optional Ctrl-D diff panel height (header + up to 20 diff lines +
         // optional "more" line) and the compact changed-files summary line.
         let diff_h = if self.show_diff && self.diff_text.is_some() {
-            let n = self.diff_text.as_deref().map(|t| t.trim().lines().count()).unwrap_or(0);
+            let n = self
+                .diff_text
+                .as_deref()
+                .map(|t| t.trim().lines().count())
+                .unwrap_or(0);
             1 + n.min(20) + usize::from(n > 20)
         } else {
             0
@@ -2046,7 +2103,12 @@ impl App {
             let rows = p.matches.len().clamp(1, PICKER_ROWS) as u16;
             (rows + 3).min(area.height.saturating_sub(3))
         } else {
-            (plan_h + diff_h + changed_h + debug_h + status_lines + completion_rows
+            (plan_h
+                + diff_h
+                + changed_h
+                + debug_h
+                + status_lines
+                + completion_rows
                 + input_lines.len()
                 + queued_shown
                 + queue_extra
@@ -2061,11 +2123,7 @@ impl App {
         let mut info_parts: Vec<String> = Vec::new();
         let (input, output) = self.usage;
         if input + output > 0 {
-            info_parts.push(format!(
-                "↑{} ↓{}",
-                fmt_count(input),
-                fmt_count(output)
-            ));
+            info_parts.push(format!("↑{} ↓{}", fmt_count(input), fmt_count(output)));
         }
         if let Some(cost) = self.cost_usd {
             info_parts.push(format!("${cost:.4}"));
@@ -2088,7 +2146,9 @@ impl App {
         if self.trimmed > 0 {
             lines.push(Line::styled(
                 format!("↑ {} lines compacted (see session log)", self.trimmed),
-                Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC),
             ));
         }
         lines.extend(
@@ -2265,11 +2325,11 @@ impl App {
                     preview
                 };
                 ilines.push(Line::from(vec![
+                    Span::styled("reverse-i-search: ", Style::default().fg(Color::Green)),
                     Span::styled(
-                        "reverse-i-search: ",
-                        Style::default().fg(Color::Green),
+                        search.query.clone(),
+                        Style::default().add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(search.query.clone(), Style::default().add_modifier(Modifier::BOLD)),
                     Span::styled(
                         format!("  ({count} match{})", if count == 1 { "" } else { "es" }),
                         dim(),
@@ -2336,11 +2396,12 @@ impl App {
                 let t = self.last_telemetry.as_ref();
                 let tel = if let Some(t) = t {
                     format!(
-                        "telemetry: {} verify · {} retry · {} repeat · {} continue{}",
+                        "telemetry: {} verify · {} retry · {} repeat · {} continue · {} trunc{}",
                         t.verify_rounds,
                         t.recovery_retries,
                         t.repeat_nudges,
                         t.continue_nudges,
+                        t.truncation_retries,
                         if t.stalled_unfinished || t.stalled_repeating {
                             " · stalled"
                         } else {
@@ -2634,7 +2695,7 @@ mod tests {
             app.activity_line()
         );
         // A tool starts → the line names it (with its own timer)…
-        app.apply(UiEvent::ToolCall(
+        app.apply(UiEvent::ToolStarted(
             "bash".into(),
             "{\"command\":\"cargo test\"}".into(),
         ));
@@ -2644,7 +2705,7 @@ mod tests {
             app.activity_line()
         );
         // …and clears back to the model once the result lands.
-        app.apply(UiEvent::ToolResult("ok".into()));
+        app.apply(UiEvent::ToolResult("bash".into(), "ok".into()));
         assert!(
             app.activity_line().starts_with("waiting for the model"),
             "{}",
@@ -2661,6 +2722,7 @@ mod tests {
         ));
         // ANSI-colored diff line (from the edit tool) must render as text.
         app.apply(UiEvent::ToolResult(
+            "edit".into(),
             "\u{1b}[32m+ pub json: bool\u{1b}[0m".into(),
         ));
         app.apply(UiEvent::TurnEnd("[1234 in · 56 out · 1290 total]".into()));
@@ -2696,7 +2758,7 @@ mod tests {
     fn colorizes_plain_diff_tool_output() {
         let mut app = App::new("openai", "gpt-4o");
         let diff = "--- a/x.rs\n+++ b/x.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n ctx\n";
-        app.apply(UiEvent::ToolResult(diff.into()));
+        app.apply(UiEvent::ToolResult("bash".into(), diff.into()));
         // The content span (after the "  " indent) carries the diff color.
         let colored: Vec<(String, Option<Color>)> = app
             .transcript
@@ -2730,7 +2792,7 @@ mod tests {
     #[test]
     fn non_diff_tool_output_is_not_colorized() {
         let mut app = App::new("openai", "gpt-4o");
-        app.apply(UiEvent::ToolResult("- item one\n- item two\n".into()));
+        app.apply(UiEvent::ToolResult("bash".into(), "- item one\n- item two\n".into()));
         let any_red = app
             .transcript
             .iter()
@@ -2808,16 +2870,28 @@ mod tests {
         use hi_agent::PlanStep;
         let mut app = App::new("openai", "gpt-4o");
         app.apply(UiEvent::Plan(vec![
-            PlanStep { title: "find leak".into(), status: PlanStatus::Done },
-            PlanStep { title: "fix walkers".into(), status: PlanStatus::Active },
-            PlanStep { title: "add tests".into(), status: PlanStatus::Pending },
+            PlanStep {
+                title: "find leak".into(),
+                status: PlanStatus::Done,
+            },
+            PlanStep {
+                title: "fix walkers".into(),
+                status: PlanStatus::Active,
+            },
+            PlanStep {
+                title: "add tests".into(),
+                status: PlanStatus::Pending,
+            },
         ]));
 
         let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
         term.draw(|f| app.render(f)).unwrap();
         let screen = dump(&term);
 
-        assert!(screen.contains("plan · 1/3"), "plan header w/ progress:\n{screen}");
+        assert!(
+            screen.contains("plan · 1/3"),
+            "plan header w/ progress:\n{screen}"
+        );
         assert!(screen.contains("find leak"), "step titles shown:\n{screen}");
         assert!(screen.contains("fix walkers"));
         assert!(screen.contains("add tests"));
@@ -2827,14 +2901,29 @@ mod tests {
         // A later update replaces the plan in place — progress advances and the
         // checklist isn't duplicated into the transcript.
         app.apply(UiEvent::Plan(vec![
-            PlanStep { title: "find leak".into(), status: PlanStatus::Done },
-            PlanStep { title: "fix walkers".into(), status: PlanStatus::Done },
-            PlanStep { title: "add tests".into(), status: PlanStatus::Active },
+            PlanStep {
+                title: "find leak".into(),
+                status: PlanStatus::Done,
+            },
+            PlanStep {
+                title: "fix walkers".into(),
+                status: PlanStatus::Done,
+            },
+            PlanStep {
+                title: "add tests".into(),
+                status: PlanStatus::Active,
+            },
         ]));
         term.draw(|f| app.render(f)).unwrap();
         let screen2 = dump(&term);
-        assert!(screen2.contains("plan · 2/3"), "progress advanced:\n{screen2}");
-        assert!(app.transcript.is_empty(), "plan must not echo into the transcript");
+        assert!(
+            screen2.contains("plan · 2/3"),
+            "progress advanced:\n{screen2}"
+        );
+        assert!(
+            app.transcript.is_empty(),
+            "plan must not echo into the transcript"
+        );
     }
 
     #[test]
@@ -2867,7 +2956,10 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(60, 14)).unwrap();
         term.draw(|f| app.render(f)).unwrap();
         let screen = dump(&term);
-        assert!(screen.contains("diff (Ctrl-D to close)"), "panel header: {screen}");
+        assert!(
+            screen.contains("diff (Ctrl-D to close)"),
+            "panel header: {screen}"
+        );
         assert!(screen.contains("+new"), "diff content rendered: {screen}");
 
         // Closing drops the panel.
@@ -2875,7 +2967,10 @@ mod tests {
         app.diff_text = None;
         term.draw(|f| app.render(f)).unwrap();
         let screen2 = dump(&term);
-        assert!(!screen2.contains("diff (Ctrl-D to close)"), "panel closed: {screen2}");
+        assert!(
+            !screen2.contains("diff (Ctrl-D to close)"),
+            "panel closed: {screen2}"
+        );
     }
 
     #[test]
@@ -2889,6 +2984,7 @@ mod tests {
             recovery_retries: 1,
             repeat_nudges: 0,
             continue_nudges: 1,
+            truncation_retries: 0,
             hit_step_cap: false,
             stalled_unfinished: false,
             stalled_repeating: false,
@@ -2896,14 +2992,20 @@ mod tests {
             tool_calls: 7,
             max_concurrent_batch: 3,
             serial_runs: 2,
+            tool_timeline: Vec::new(),
         });
         app.turn_tool_calls = 7;
         let mut term = Terminal::new(TestBackend::new(60, 16)).unwrap();
         term.draw(|f| app.render(f)).unwrap();
         let screen = dump(&term);
-        assert!(screen.contains("agent (Ctrl-? to close)"), "panel header: {screen}");
         assert!(
-            screen.contains("2 verify") && screen.contains("1 retry") && screen.contains("1 continue"),
+            screen.contains("agent (Ctrl-? to close)"),
+            "panel header: {screen}"
+        );
+        assert!(
+            screen.contains("2 verify")
+                && screen.contains("1 retry")
+                && screen.contains("1 continue"),
             "telemetry counters: {screen}"
         );
         assert!(
@@ -2915,7 +3017,10 @@ mod tests {
         app.show_debug = false;
         term.draw(|f| app.render(f)).unwrap();
         let screen2 = dump(&term);
-        assert!(!screen2.contains("agent (Ctrl-? to close)"), "panel closed: {screen2}");
+        assert!(
+            !screen2.contains("agent (Ctrl-? to close)"),
+            "panel closed: {screen2}"
+        );
     }
 
     #[test]
@@ -2927,8 +3032,14 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
         term.draw(|f| app.render(f)).unwrap();
         let screen = dump(&term);
-        assert!(screen.contains("Hello world"), "heading text shown:\n{screen}");
-        assert!(!screen.contains("## Hello"), "marker stripped live:\n{screen}");
+        assert!(
+            screen.contains("Hello world"),
+            "heading text shown:\n{screen}"
+        );
+        assert!(
+            !screen.contains("## Hello"),
+            "marker stripped live:\n{screen}"
+        );
 
         // Styling the preview must NOT advance the real fence state: a partial
         // opening fence leaves code_lang untouched until its line commits.
@@ -3011,7 +3122,7 @@ mod tests {
             "bash".into(),
             r#"{"command":"echo noisy"}"#.into(),
         ));
-        app.apply(UiEvent::ToolResult("noisy output".into()));
+        app.apply(UiEvent::ToolResult("bash".into(), "noisy output".into()));
         assert_eq!(
             app.last_assistant, "first answer",
             "tool logs are not copied as the assistant response"
@@ -3043,7 +3154,7 @@ mod tests {
             "edit".into(),
             r#"{"path":"src/main.rs"}"#.into(),
         ));
-        app.apply(UiEvent::ToolResult("19 additions, 3 deletions".into()));
+        app.apply(UiEvent::ToolResult("edit".into(), "19 additions, 3 deletions".into()));
         app.note_turn_completed_without_summary();
 
         let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
@@ -3079,7 +3190,7 @@ mod tests {
             "bash".into(),
             r#"{"command":"true"}"#.into(),
         ));
-        app.apply(UiEvent::ToolResult(String::new()));
+        app.apply(UiEvent::ToolResult("bash".into(), String::new()));
         let rendered: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
         assert!(
             rendered.iter().any(|line| line.contains("(no output)")),

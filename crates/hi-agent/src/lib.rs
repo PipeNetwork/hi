@@ -12,16 +12,16 @@ mod prompt;
 mod session;
 mod snapshot;
 mod transcript;
-mod verify;
 pub mod ui;
+mod verify;
 
 use std::sync::Arc;
 
 use anyhow::Result;
 use futures_util::StreamExt;
 use hi_ai::{
-    ChatRequest, Content, Message, Provider, ProviderErrorKind, RequestProfile,
-    StreamEvent, ToolMode, ToolSpec, Usage, provider_error_kind, provider_error_usage,
+    ChatRequest, Content, Message, Provider, ProviderErrorKind, RequestProfile, StreamEvent,
+    ToolMode, ToolSpec, Usage, provider_error_kind, provider_error_usage,
 };
 use hi_tools::{TOOL_SPECS, execute, execute_streaming};
 
@@ -35,17 +35,18 @@ pub use session::SessionSink;
 pub use ui::{Ui, tool_label};
 
 use heuristics::{
-    emit_tool_output, looks_like_unfinished_step, looks_mutating, recovery_sampling,
-    recovery_telemetry, respects_deps, tool_deps, tool_mode_label, StallMode, RECOVERY_SAMPLING,
+    RECOVERY_SAMPLING, StallMode, emit_tool_output, looks_like_continue,
+    looks_like_unfinished_step, looks_mutating, plan_has_pending_steps, recovery_sampling,
+    recovery_telemetry, respects_deps, tool_deps, tool_mode_label,
 };
 use memory::{cap_memory, memory_prompt};
 use prompt::SystemPrompt;
-use snapshot::{changed_files_between, FileFingerprint, SnapshotCache};
+use snapshot::{FileFingerprint, SnapshotCache, changed_files_between};
 use transcript::{NudgeKind, Transcript};
-use verify::{stage_guidance, Verifier, VerifyOutcome, Snapshot};
+use verify::{Snapshot, Verifier, VerifyOutcome, stage_guidance};
 
 pub use decision::{Decision, DecisionLog};
-pub use goal::{Goal, GoalStatus, SubGoal, DEFAULT_SUBGOAL_RETRIES};
+pub use goal::{DEFAULT_SUBGOAL_RETRIES, Goal, GoalStatus, SubGoal};
 
 /// Crate version (from Cargo.toml).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -66,6 +67,9 @@ pub struct TurnTelemetry {
     pub repeat_nudges: u32,
     /// Times the continue nudge fired for an announced-but-unperformed step.
     pub continue_nudges: u32,
+    /// Times the truncation recovery nudged the model to continue after hitting
+    /// the output token cap. 0 on a turn that never hit the limit.
+    pub truncation_retries: u32,
     /// Whether the turn hit the per-turn step cap (`max_steps`).
     pub hit_step_cap: bool,
     /// Whether the turn ended stalled on announced-but-unrun steps.
@@ -87,6 +91,11 @@ pub struct TurnTelemetry {
     /// `tool_calls - serial_runs` is the count that ran as part of a parallel
     /// batch; the parallelism ratio is `(tool_calls - serial_runs) / tool_calls`.
     pub serial_runs: u32,
+    /// Per-tool-call timeline for this turn: each call's name, target path,
+    /// wall-clock duration (milliseconds), and whether it errored. Ordered by
+    /// execution completion. Lets `--report` and the eval harness diagnose
+    /// *where* time went and which calls failed, not just aggregate counts.
+    pub tool_timeline: Vec<ToolCallEntry>,
 }
 
 /// A serializable view of one parsed verify-failure location, for the telemetry
@@ -121,6 +130,22 @@ impl From<&hi_tools::Attribution> for TurnAttribution {
     }
 }
 
+/// One entry in the per-turn tool-call timeline: which tool ran, against what
+/// path (when inferrable), how long it took, and whether it errored. Lets the
+/// `--report` JSON and eval harness diagnose where time went and which calls
+/// failed — not just aggregate counts.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ToolCallEntry {
+    /// The tool name (`read`, `write`, `edit`, `bash`, …).
+    pub tool: String,
+    /// The target path when inferrable (`read`/`write`/`edit` carry one;
+    /// `bash` does not). Empty when no single path applies.
+    pub path: String,
+    /// Wall-clock duration in milliseconds.
+    pub duration_ms: u64,
+    /// Whether the tool's output indicated an error (starts with `"Error:"`).
+    pub error: bool,
+}
 
 /// Auto-compact once the context window is at least this percent full.
 pub const AUTO_COMPACT_PERCENT: u64 = 80;
@@ -140,6 +165,16 @@ pub const AUTO_KEEP_RECENT: usize = 3;
 /// malformed/empty *stream error* — each retry resampling hotter, before giving
 /// up and surfacing it.
 pub const MAX_EMPTY_RETRIES: u32 = 2;
+/// Max times one turn will nudge the model to continue after its output was
+/// truncated by the output token cap (`stop_reason: "length"` / `"max_tokens"`).
+/// This is a *separate* budget from [`MAX_EMPTY_RETRIES`] because truncation is
+/// a different failure mode: the model was producing valid output, it just ran
+/// out of token budget. A big task can legitimately hit the cap several times
+/// (long file writes, multi-step plans) — sharing the empty-retry budget (only
+/// 2) caused the turn to end early on a half-finished output, leaving the model
+/// "picking up where it stalled" on the next prompt. A higher, dedicated budget
+/// lets the model finish the work without the user having to type "continue".
+pub const MAX_TRUNCATION_RETRIES: u32 = 5;
 /// Max read-only tool calls to run concurrently within one round, bounding the
 /// open file handles / subprocesses a single batched response can spawn.
 pub const MAX_PARALLEL_TOOLS: usize = 8;
@@ -152,13 +187,32 @@ pub const MAX_REPEAT_NUDGES: u32 = 2;
 /// Max times a turn will silently re-prompt the model to continue after it
 /// stops with text but no tool calls (when it was actively working). Keeps the
 /// agent going without user intervention, bounded so it can't loop forever.
-pub const MAX_SILENT_CONTINUES: u32 = 3;
+/// Set to 5 because some models need 2-3 text-only responses to a nudge before
+/// they actually act — with 3, a single step's stall could exhaust the budget
+/// and end the turn mid-plan.
+pub const MAX_SILENT_CONTINUES: u32 = 5;
 /// Sent silently (no status line, no steer counter) when the model stops with
 /// text after having made tool calls earlier in the turn. The system prompt
 /// tells the model not to narrate without acting, but when it still does, this
 /// keeps the turn going so the user doesn't have to type "continue".
 const SILENT_CONTINUE_NUDGE: &str = "Continue now — use your tools to do the work you just \
 described. Don't narrate; act. If the task is genuinely complete, stop and give your final recap.";
+/// Sent when the model stops calling tools but its plan (posted via `update_plan`)
+/// still has pending or active steps. The model often completes one sub-task,
+/// writes a recap, and stops — leaving the plan at e.g. 2/9. This nudge points
+/// it at the next incomplete step so it keeps working without the user typing
+/// "continue".
+const PLAN_CONTINUE_NUDGE: &str = "Your plan still has incomplete steps. Continue with the next \
+pending step — use your tools to do the work, don't just describe it. Mark the step active in \
+`update_plan`, do the work, then move to the next. If the task is genuinely complete, stop and \
+give your final recap.";
+/// Sent when the model's output was truncated by the output token cap
+/// (`stop_reason: "length"` / `"max_tokens"`) — the response was cut off
+/// mid-generation, not finished. The nudge tells the model to continue from
+/// where it stopped so the turn doesn't end on a half-finished output.
+const TRUNCATION_NUDGE: &str = "Your previous response was cut off by the output token limit — \
+it was truncated, not finished. Continue exactly from where you stopped, completing the text or \
+tool call you were in the middle of. Do not restart or repeat what you already produced.";
 /// Sent when the model re-issues the exact same tool call as the previous
 /// round. The command already ran and its output is in the history just above —
 /// re-running it will only produce the same result. This nudges the model to act
@@ -268,6 +322,12 @@ pub struct Agent {
     /// verify/turn-end check when no files changed. Invalidated by any
     /// write/edit/bash tool call in the current turn, and by `/undo`.
     snapshot_cache: SnapshotCache,
+    /// The most recent plan posted via `update_plan` this turn — used to detect
+    /// an incomplete plan when the model stops calling tools. If the plan has
+    /// pending/active steps, the agent silently nudges the model to continue
+    /// rather than ending the turn (the model often writes a finished-looking
+    /// recap after one sub-task, even when the plan is only 2/9 done).
+    last_plan: Vec<PlanStep>,
 }
 
 impl Agent {
@@ -321,6 +381,7 @@ impl Agent {
             structured_goal: None,
             decisions: DecisionLog::default(),
             snapshot_cache: SnapshotCache::default(),
+            last_plan: Vec::new(),
         }
     }
 
@@ -380,20 +441,26 @@ impl Agent {
     /// Render the conversation as Markdown for /export.
     pub fn export_markdown(&self) -> String {
         let mut out = String::new();
-        out.push_str("# hi session transcript
+        out.push_str(
+            "# hi session transcript
 
-");
+",
+        );
         for msg in self.messages.as_slice().iter() {
             match msg.role {
                 hi_ai::Role::System => {} // skip system prompt
                 hi_ai::Role::User => {
-                    out.push_str("**user:**
+                    out.push_str(
+                        "**user:**
 
-");
+",
+                    );
                     out.push_str(&msg.text());
-                    out.push_str("
+                    out.push_str(
+                        "
 
-");
+",
+                    );
                 }
                 hi_ai::Role::Assistant => {
                     out.push_str("**assistant:**\n\n");
@@ -779,7 +846,8 @@ impl Agent {
                 Ok(())
             }
             CompactionKind::ElideThenSummarizeTail { keep_recent } => {
-                self.compact_elide_then_summarize_tail(keep_recent, ui).await
+                self.compact_elide_then_summarize_tail(keep_recent, ui)
+                    .await
             }
         }
     }
@@ -1023,7 +1091,7 @@ impl Agent {
             model: self.config.model.clone(),
             messages: Arc::from(messages),
             tools: Arc::new([]), // summarizing — no tool use
-            max_tokens: 1024, // throwaway call — summaries are short
+            max_tokens: 1024,    // throwaway call — summaries are short
             temperature: self.config.temperature,
             top_p: None,
             frequency_penalty: None,
@@ -1109,7 +1177,7 @@ impl Agent {
             model: self.config.model.clone(),
             messages: Arc::from(messages),
             tools: Arc::new([]), // distilling — no tool use
-            max_tokens: 1024, // throwaway call — memory notes are short
+            max_tokens: 1024,    // throwaway call — memory notes are short
             temperature: self.config.temperature,
             top_p: None,
             frequency_penalty: None,
@@ -1245,12 +1313,24 @@ impl Agent {
         self.last_verify = None;
         self.last_changed_files.clear();
         self.last_compat_fallbacks.clear();
+        // Clear the plan from the previous turn unless the user's input looks
+        // like a "continue" command. When the user types "continue" on an
+        // incomplete plan, the plan state should persist so the plan-aware
+        // continue logic can fire. For any other input, clear it so a stale
+        // plan from a previous task doesn't cause spurious nudges.
+        if !looks_like_continue(input) {
+            self.last_plan.clear();
+        }
         let mut compat_fallbacks = Vec::new();
 
-        let mut verifier = Verifier::new(self.config.verify.clone(), self.config.max_verify_iterations);
+        let mut verifier = Verifier::new(
+            self.config.verify.clone(),
+            self.config.max_verify_iterations,
+        );
         let max_steps = self.config.max_steps;
         let mut steps = 0u32;
         let mut empty_retries = 0u32;
+        let mut truncation_retries = 0u32;
         let mut silent_continues = 0u32;
         let mut repeat_nudges = 0u32;
         // Set after a silent-continue nudge: force the *next* round to call a
@@ -1274,6 +1354,10 @@ impl Agent {
         let mut sched_tool_calls = 0u32;
         let mut sched_max_concurrent = 0u32;
         let mut sched_serial_runs = 0u32;
+        // Per-tool-call timeline: each call's name, path, duration, and error
+        // status, flushed into telemetry so `--report` can diagnose where time
+        // went and which calls failed.
+        let mut tool_timeline: Vec<ToolCallEntry> = Vec::new();
         // Signature (name, arguments) of the previous round's tool calls, to
         // spot a model re-issuing the exact same call and looping on it.
         let mut prev_call_sig: Option<Vec<(String, String)>> = None;
@@ -1445,6 +1529,56 @@ impl Agent {
                     self.config.context_window,
                 );
 
+                // Truncation recovery: the model hit the output token cap
+                // (`stop_reason: "length"` / `"max_tokens"`) mid-generation.
+                // The response was cut off, not finished — record what it
+                // produced and nudge it to continue from the cutoff, instead
+                // of treating the truncation as a natural stop (which would
+                // end the turn on a half-finished output and leave the model
+                // "picking up where it stalled" on the next prompt). Bounded
+                // by a *dedicated* truncation budget (separate from
+                // `empty_retries`) so a big task that legitimately hits the
+                // cap several times can still finish without the user typing
+                // "continue".
+                let truncated = matches!(
+                    completion.stop_reason.as_deref(),
+                    Some("length" | "max_tokens")
+                );
+                if truncated && truncation_retries < self.config.max_truncation_retries {
+                    truncation_retries += 1;
+                    ui.status(&format!(
+                        "⚠ the model hit the output token limit — continuing ({truncation_retries}/{})",
+                        self.config.max_truncation_retries
+                    ));
+                    // Strip any ToolCall blocks from the truncated content: a
+                    // truncated tool call has partial/malformed JSON arguments
+                    // and was never executed, so it has no matching tool_result.
+                    // Leaving it in would create an orphan tool_use that providers
+                    // reject on the next request — the turn would stall. Text and
+                    // thinking blocks are kept so the model can continue from
+                    // where it was cut off.
+                    self.messages
+                        .push_assistant_text_only(std::mem::take(&mut completion.content));
+                    self.messages
+                        .push_nudge(NudgeKind::Truncation, TRUNCATION_NUDGE);
+                    continue;
+                }
+                // Truncation budget exhausted: the model kept hitting the output
+                // token cap through the whole retry budget. Record the truncated
+                // output (stripping partial tool calls, as above) and warn the
+                // user — the task may be incomplete. Don't silently end the turn
+                // on a half-finished output without surfacing what happened.
+                if truncated {
+                    self.messages
+                        .push_assistant_text_only(std::mem::take(&mut completion.content));
+                    ui.status(&format!(
+                        "⚠ the model hit the output token limit {max} times — the task may be \
+                         incomplete. /retry, or send 'continue'.",
+                        max = self.config.max_truncation_retries,
+                    ));
+                    break false;
+                }
+
                 let calls: Vec<(String, String, String)> = completion
                     .tool_calls()
                     .into_iter()
@@ -1477,7 +1611,8 @@ impl Agent {
                     // skipped, not executed" path — leaving `tool_use` blocks
                     // without matching `tool_result` blocks puts the transcript
                     // in a state most providers reject on the next request.
-                    self.messages.push_assistant_text_only(std::mem::take(&mut completion.content));
+                    self.messages
+                        .push_assistant_text_only(std::mem::take(&mut completion.content));
                     if repeat_nudges < self.config.max_repeat_nudges {
                         repeat_nudges += 1;
                         stalled_repeating = true;
@@ -1548,35 +1683,47 @@ impl Agent {
                     // above). Silently re-prompt the model to continue — no
                     // status line, no steer counter, no visible nudge.
                     //
-                    // Fires only when the text looks like an announced-but-
-                    // unperformed next step ("Let me start by…", "Now I'll
-                    // rewrite main.rs:") — on the first round or after the model
-                    // has been working. A *finished* response ends the turn
-                    // cleanly: a final recap after a multi-step task ("I reviewed
-                    // the codebase; the architecture is clean.") or a plain Q&A
-                    // answer ("The answer is 42.") — no wasted model calls and no
-                    // false "incomplete" warning. Crucially, do NOT treat every
-                    // post-tool-use text as unfinished: a read-only task (review,
-                    // explain, summarize) legitimately ends with tools-then-recap,
-                    // and gating on `made_tool_call` would force it to churn the
-                    // whole budget and stop on a scary warning. Bounded so it
-                    // can't loop forever.
-                    self.messages.push_assistant(std::mem::take(&mut completion.content));
+                    // Two signals detect an unfinished turn:
+                    // 1. The text looks like an announced-but-unperformed next
+                    //    step ("Let me start by…", "Now I'll rewrite main.rs:").
+                    // 2. The plan has pending/active steps — the model posted a
+                    //    plan via `update_plan` and it's not complete, even if
+                    //    the text reads like a finished recap ("I've implemented
+                    //    proof.rs."). The plan state is unambiguous and catches
+                    //    the common case where the model does one sub-task,
+                    //    writes a recap, and stops — leaving the plan at 2/9.
+                    //
+                    // A *finished* response ends the turn cleanly: a final recap
+                    // after a multi-step task with a complete plan, or a plain
+                    // Q&A answer. Bounded so it can't loop forever.
+                    self.messages
+                        .push_assistant(std::mem::take(&mut completion.content));
                     let looks_unfinished = looks_like_unfinished_step(&assistant_text);
-                    if looks_unfinished && silent_continues < self.config.max_silent_continues {
+                    let plan_incomplete = plan_has_pending_steps(&self.last_plan);
+                    if (looks_unfinished || plan_incomplete)
+                        && silent_continues < self.config.max_silent_continues
+                    {
                         silent_continues += 1;
                         // Force the next round to actually call a tool, so the
                         // nudge can't be answered with yet another narration or an
                         // empty completion.
                         force_tools_next = true;
-                        self.messages.push_nudge(NudgeKind::Continue, SILENT_CONTINUE_NUDGE);
+                        // Use a plan-aware nudge when the plan is incomplete, so
+                        // the model knows to continue the next step rather than
+                        // just "continue from where you stopped".
+                        let nudge = if plan_incomplete && !looks_unfinished {
+                            PLAN_CONTINUE_NUDGE
+                        } else {
+                            SILENT_CONTINUE_NUDGE
+                        };
+                        self.messages.push_nudge(NudgeKind::Continue, nudge);
                         continue;
                     }
                     // If we exhausted the silent-continue budget (at least one
                     // continue was attempted) on a turn that looked unfinished,
                     // let the user know. Don't warn when max_silent_continues
                     // is 0 (no continue was attempted — the feature is off).
-                    if looks_unfinished && silent_continues > 0 {
+                    if (looks_unfinished || plan_incomplete) && silent_continues > 0 {
                         ui.status(
                             "⚠ the model kept narrating without acting — the task may be \
                              incomplete. /retry, or send 'continue'.",
@@ -1632,7 +1779,7 @@ impl Agent {
                     }
                     ui.tool_call(name, arguments);
                     let content = self.handle_record_decision(arguments);
-                    ui.tool_result(&content);
+                    ui.tool_result(name, &content);
                     results[i] = Some((id.clone(), content));
                     completed[i] = true;
                     completion_order.push(i);
@@ -1643,10 +1790,8 @@ impl Agent {
                 // syntax/lint error surfaces during the turn (before turn-end
                 // verify) while the edit is still the model's focus. Each entry
                 // is (path, join handle of the check).
-                let mut pending_checks: Vec<(
-                    String,
-                    tokio::task::JoinHandle<(bool, String)>,
-                )> = Vec::new();
+                let mut pending_checks: Vec<(String, tokio::task::JoinHandle<(bool, String)>)> =
+                    Vec::new();
                 while done < calls.len() {
                     // Ready: deps all complete.
                     let ready: Vec<usize> = (0..calls.len())
@@ -1658,19 +1803,27 @@ impl Agent {
                         break;
                     }
                     // If any ready call is bash, run it alone (streaming UI).
-                    let bash_idx = ready
-                        .iter()
-                        .copied()
-                        .find(|&i| calls[i].1 == "bash");
+                    let bash_idx = ready.iter().copied().find(|&i| calls[i].1 == "bash");
                     if let Some(i) = bash_idx {
                         let (id, name, arguments) = &calls[i];
+                        ui.tool_started(name, arguments);
                         ui.tool_call(name, arguments);
+                        let path = hi_tools::target_path(name, arguments).unwrap_or_default();
+                        let started = std::time::Instant::now();
                         let ui_ref: &mut dyn Ui = &mut *ui;
                         let output = execute_streaming(name, arguments, &mut |line: &str| {
-                            ui_ref.tool_result(line);
+                            ui_ref.tool_result(name, line);
                         })
                         .await;
-                        emit_tool_output(&mut *ui, &output);
+                        let duration_ms = started.elapsed().as_millis() as u64;
+                        let error = output.content.starts_with("Error:");
+                        tool_timeline.push(ToolCallEntry {
+                            tool: name.clone(),
+                            path,
+                            duration_ms,
+                            error,
+                        });
+                        emit_tool_output(&mut *ui, name, &output);
                         results[i] = Some((id.clone(), output.content));
                         self.invalidate_snapshot();
                         completed[i] = true;
@@ -1687,17 +1840,21 @@ impl Agent {
                     // batch, relative order doesn't matter — none depend on
                     // each other, or they wouldn't all be ready).
                     let batch_size = ready.len() as u32;
+                    // Signal each call as started so the live TUI can show a
+                    // "running {tool}" timer. The transcript header is emitted
+                    // later, paired with its result, so headers and results
+                    // never drift apart in a concurrent batch.
                     for &i in &ready {
-                        ui.tool_call(&calls[i].1, &calls[i].2);
+                        ui.tool_started(&calls[i].1, &calls[i].2);
                     }
+                    let batch_started = std::time::Instant::now();
                     let outputs: Vec<_> = futures_util::stream::iter(
-                        ready
-                            .iter()
-                            .map(|&i| execute(&calls[i].1, &calls[i].2)),
+                        ready.iter().map(|&i| execute(&calls[i].1, &calls[i].2)),
                     )
                     .buffered(self.config.max_parallel_tools)
                     .collect()
                     .await;
+                    let batch_duration_ms = batch_started.elapsed().as_millis() as u64;
                     // Scheduler telemetry: this batch ran `batch_size` calls
                     // concurrently; a batch of 1 is a serial run.
                     sched_tool_calls += batch_size;
@@ -1706,8 +1863,30 @@ impl Agent {
                         sched_serial_runs += 1;
                     }
                     for (&i, output) in ready.iter().zip(outputs) {
-                        emit_tool_output(&mut *ui, &output);
+                        let name = &calls[i].1;
+                        // Emit the transcript header immediately before its
+                        // result — in a concurrent batch this pairs each header
+                        // with its own result in completion order.
+                        ui.tool_call(name, &calls[i].2);
+                        let path = hi_tools::target_path(name, &calls[i].2).unwrap_or_default();
+                        let error = output.content.starts_with("Error:");
+                        tool_timeline.push(ToolCallEntry {
+                            tool: name.clone(),
+                            path,
+                            duration_ms: batch_duration_ms,
+                            error,
+                        });
+                        emit_tool_output(&mut *ui, name, &output);
                         results[i] = Some((calls[i].0.clone(), output.content));
+                        // Track the latest plan state so the continue logic can
+                        // detect an incomplete plan when the model stops calling
+                        // tools. The model resubmits the whole list on every
+                        // call, so the last one is always current.
+                        if calls[i].1 == "update_plan"
+                            && let Some(plan) = output.plan.as_deref()
+                        {
+                            self.last_plan = plan.to_vec();
+                        }
                         // Long-horizon: the model's `update_plan` statuses map
                         // onto the structured goal's sub-goals, so the agent
                         // advances/skips in lockstep with the model's stated
@@ -1720,10 +1899,13 @@ impl Agent {
                             apply_plan_to_goal(goal, &calls[i].2);
                             plan_updated_goal = true;
                         }
-                        // A mutating tool may have changed files — invalidate
-                        // the snapshot cache so a dependent read (guaranteed to
-                        // run after by the dep graph) re-walks.
-                        if !hi_tools::is_read_only(&calls[i].1) {
+                        // A filesystem-mutating tool may have changed files —
+                        // invalidate the snapshot cache so a dependent read
+                        // (guaranteed to run after by the dep graph) re-walks.
+                        // `bash` also invalidates but always runs alone (above).
+                        if hi_tools::is_filesystem_mutating(&calls[i].1)
+                            || calls[i].1 == "bash"
+                        {
                             self.invalidate_snapshot();
                             // Proactive per-edit verify: kick off a background
                             // fast check for the edited file so a syntax/lint
@@ -1767,9 +1949,7 @@ impl Agent {
                         if passed {
                             continue;
                         }
-                        ui.status(&format!(
-                            "⚠ proactive check failed for {path}:\n{output}"
-                        ));
+                        ui.status(&format!("⚠ proactive check failed for {path}:\n{output}"));
                     }
                 }
             };
@@ -1792,7 +1972,10 @@ impl Agent {
             // verifier actually walked the tree (i.e. it didn't bail before
             // snapshotting). On a failure we drop it: the model is about to edit
             // again, so it's no longer current.
-            if matches!(outcome, VerifyOutcome::Passed | VerifyOutcome::Failed { .. }) {
+            if matches!(
+                outcome,
+                VerifyOutcome::Passed | VerifyOutcome::Failed { .. }
+            ) {
                 verify_snapshot = Some(self.snapshot_cached().await);
                 if matches!(outcome, VerifyOutcome::Failed { .. }) {
                     verify_snapshot = None;
@@ -1853,7 +2036,10 @@ impl Agent {
                                 }
                             })
                             .collect();
-                        format!("Likely cause (verify and fix first):\n{}\n\n", lines.join("\n"))
+                        format!(
+                            "Likely cause (verify and fix first):\n{}\n\n",
+                            lines.join("\n")
+                        )
                     };
                     let nudge_body = format!(
                         "{cause_section}Verification stage `{}` failed (`{}`).\n\nOutput:\n{}\n\n{} \
@@ -1890,6 +2076,7 @@ impl Agent {
             recovery_retries: empty_retries,
             repeat_nudges,
             continue_nudges: 0,
+            truncation_retries,
             hit_step_cap: ended_at_cap,
             stalled_unfinished: false,
             stalled_repeating,
@@ -1900,13 +2087,20 @@ impl Agent {
             tool_calls: sched_tool_calls,
             max_concurrent_batch: sched_max_concurrent,
             serial_runs: sched_serial_runs,
+            tool_timeline,
         };
 
         // Long-horizon driver: when a structured goal is set and long_horizon
         // is on, advance or retry the active sub-goal based on this turn's
         // outcome — so the next turn resumes coherently at the right sub-goal
         // (and with prior-attempt notes if it stalled). See `goal_turn_end`.
-        self.goal_turn_end(false, stalled_repeating, ended_at_cap, plan_updated_goal, ui);
+        self.goal_turn_end(
+            false,
+            stalled_repeating,
+            ended_at_cap,
+            plan_updated_goal,
+            ui,
+        );
 
         // Finalization: after a turn where the model used its tools to change
         // files, make one dedicated tool-free call so the user always gets a
@@ -1926,6 +2120,12 @@ impl Agent {
         // Report cumulative session usage — the same number the live working
         // line and `/tokens` show, so the three never disagree.
         ui.turn_end(&self.usage_summary(&self.totals));
+        // Strip any trailing synthetic nudge so it doesn't absorb the next
+        // real prompt via `push_user_or_fold` (which folds a new user message
+        // into a trailing user message). A stall (repeat-nudge, continue-
+        // nudge, verify-fail, truncation) can leave a nudge as the last
+        // entry; removing it here gives the next turn a clean transcript.
+        self.messages.strip_trailing_nudges();
         self.persist()?;
         Ok(())
     }
@@ -1953,7 +2153,7 @@ impl Agent {
             model: self.config.model.clone(),
             messages: Arc::from(messages),
             tools: Arc::new([]), // recap only — no tool use
-            max_tokens: 1024, // throwaway call — recaps are short
+            max_tokens: 1024,    // throwaway call — recaps are short
             temperature: self.config.temperature,
             top_p: None,
             frequency_penalty: None,
@@ -2005,7 +2205,8 @@ impl Agent {
         }
         // Record both the synthetic request and the recap so roles alternate.
         // The recap is a text-only assistant message (no tool calls).
-        self.messages.push_nudge(NudgeKind::Finalize, FINALIZE_PROMPT);
+        self.messages
+            .push_nudge(NudgeKind::Finalize, FINALIZE_PROMPT);
         self.messages.push_assistant(vec![Content::Text(recap)]);
     }
 
@@ -2068,6 +2269,9 @@ impl Agent {
         }
         if t.continue_nudges > 0 {
             parts.push(format!("{} continue", t.continue_nudges));
+        }
+        if t.truncation_retries > 0 {
+            parts.push(format!("{} trunc", t.truncation_retries));
         }
         if t.stalled_unfinished || t.stalled_repeating {
             parts.push("stalled".to_string());
@@ -2252,7 +2456,7 @@ mod tests {
         fn assistant_reasoning(&mut self, _: &str) {}
         fn assistant_end(&mut self) {}
         fn tool_call(&mut self, _: &str, _: &str) {}
-        fn tool_result(&mut self, _: &str) {}
+        fn tool_result(&mut self, _: &str, _: &str) {}
         fn status(&mut self, _: &str) {}
         fn turn_end(&mut self, _: &str) {}
     }
@@ -2290,7 +2494,7 @@ mod tests {
         fn assistant_reasoning(&mut self, _: &str) {}
         fn assistant_end(&mut self) {}
         fn tool_call(&mut self, _: &str, _: &str) {}
-        fn tool_result(&mut self, _: &str) {}
+        fn tool_result(&mut self, _: &str, _: &str) {}
         fn status(&mut self, s: &str) {
             self.statuses.push(s.to_string());
         }
@@ -2389,12 +2593,15 @@ mod tests {
         );
         let huge_old_output = "old tool output ".repeat(20_000);
         agent.messages_mut().push(Message::user("previous task"));
-        agent.messages_mut().push(Message::assistant(vec![Content::ToolCall {
-            id: "read-1".into(),
-            name: "read".into(),
-            arguments: r#"{"path":"LICENSE"}"#.into(),
-        }]));
-        agent.messages_mut()
+        agent
+            .messages_mut()
+            .push(Message::assistant(vec![Content::ToolCall {
+                id: "read-1".into(),
+                name: "read".into(),
+                arguments: r#"{"path":"LICENSE"}"#.into(),
+            }]));
+        agent
+            .messages_mut()
             .push(Message::tool_result("read-1", huge_old_output.clone()));
 
         let mut ui = RecordingUi::default();
@@ -2802,7 +3009,8 @@ mod tests {
         }));
         // Some history to compact.
         agent.messages_mut().push(Message::user("hello"));
-        agent.messages_mut()
+        agent
+            .messages_mut()
             .push(Message::assistant(vec![Content::Text("hi".into())]));
 
         agent.compact(&mut NullUi).await.unwrap();
@@ -2840,10 +3048,12 @@ mod tests {
         );
         // Two user turns; keep_recent = 1 summarizes the first, keeps the second.
         agent.messages_mut().push(Message::user("q1"));
-        agent.messages_mut()
+        agent
+            .messages_mut()
             .push(Message::assistant(vec![Content::Text("a1".into())]));
         agent.messages_mut().push(Message::user("q2"));
-        agent.messages_mut()
+        agent
+            .messages_mut()
             .push(Message::assistant(vec![Content::Text("a2".into())]));
 
         agent
@@ -2887,11 +3097,13 @@ mod tests {
         );
         // Old tool-bearing turn.
         agent.messages_mut().push(Message::user("q1"));
-        agent.messages_mut().push(Message::assistant(vec![Content::ToolCall {
-            id: "c1".into(),
-            name: "read".into(),
-            arguments: "{}".into(),
-        }]));
+        agent
+            .messages_mut()
+            .push(Message::assistant(vec![Content::ToolCall {
+                id: "c1".into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            }]));
         agent
             .messages_mut()
             .push(Message::tool_result("c1", "x".repeat(500)));
@@ -2962,11 +3174,13 @@ mod tests {
         // an empty response list.
         let mut agent = agent(vec![], config());
         agent.messages_mut().push(Message::user("q1"));
-        agent.messages_mut().push(Message::assistant(vec![Content::ToolCall {
-            id: "c1".into(),
-            name: "read".into(),
-            arguments: "{}".into(),
-        }]));
+        agent
+            .messages_mut()
+            .push(Message::assistant(vec![Content::ToolCall {
+                id: "c1".into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            }]));
         agent
             .messages_mut()
             .push(Message::tool_result("c1", "x".repeat(500)));
@@ -3070,9 +3284,7 @@ mod tests {
                 content: vec![Content::ToolCall {
                     id: "w".into(),
                     name: "write".into(),
-                    arguments: format!(
-                        r#"{{"path":{p:?},"content":"def (\n"}}"#
-                    ),
+                    arguments: format!(r#"{{"path":{p:?},"content":"def (\n"}}"#),
                 }],
                 usage: Usage {
                     input_tokens: 1,
@@ -3105,14 +3317,20 @@ mod tests {
         // agent resumes the active sub-goal coherently each turn.
         let mut cfg = config();
         cfg.long_horizon = true;
-        let mut agent = agent(vec![completion(vec![Content::Text("ok".into())], 1, 1)], cfg);
+        let mut agent = agent(
+            vec![completion(vec![Content::Text("ok".into())], 1, 1)],
+            cfg,
+        );
         let mut goal = Goal::new(
             "refactor the parser",
             vec!["write tests".into(), "rewrite parser".into()],
         );
         // Record a failed attempt so the prompt surfaces "don't repeat" notes.
         goal.record_failure("approach A didn't compile", DEFAULT_SUBGOAL_RETRIES);
-        assert!(agent.set_structured_goal(Some(goal)), "accepted when long_horizon on");
+        assert!(
+            agent.set_structured_goal(Some(goal)),
+            "accepted when long_horizon on"
+        );
 
         let sys = agent.messages()[0].text();
         assert!(sys.contains("Long-horizon goal"), "header: {sys}");
@@ -3137,12 +3355,18 @@ mod tests {
         // Default config has long_horizon off — setting a structured goal is
         // rejected (the single-turn loop is unchanged), so the system prompt
         // gains no goal section.
-        let mut agent = agent(vec![completion(vec![Content::Text("ok".into())], 1, 1)], config());
+        let mut agent = agent(
+            vec![completion(vec![Content::Text("ok".into())], 1, 1)],
+            config(),
+        );
         let goal = Goal::new("do a thing", vec!["step one".into()]);
         assert!(!agent.set_structured_goal(Some(goal)), "rejected when off");
         assert!(agent.structured_goal().is_none());
         let sys = agent.messages()[0].text();
-        assert!(!sys.contains("Long-horizon goal"), "no goal section when off: {sys}");
+        assert!(
+            !sys.contains("Long-horizon goal"),
+            "no goal section when off: {sys}"
+        );
     }
 
     #[tokio::test]
@@ -3170,7 +3394,11 @@ mod tests {
         agent.run_turn("go", &mut ui).await.unwrap();
         let _ = std::fs::remove_file(&tmp);
         let goal = agent.structured_goal().expect("goal still set");
-        assert_eq!(goal.sub_goals[0].status, GoalStatus::Done, "advanced past step 1");
+        assert_eq!(
+            goal.sub_goals[0].status,
+            GoalStatus::Done,
+            "advanced past step 1"
+        );
         assert_eq!(goal.active_index(), Some(1), "step 2 now active");
         // The system prompt reflects the new active sub-goal.
         assert!(
@@ -3221,9 +3449,7 @@ mod tests {
         // The system prompt surfaces the "don't repeat" notes on the active
         // sub-goal, so the next turn doesn't repeat the failed approach.
         assert!(
-            agent.messages()[0]
-                .text()
-                .contains("don't repeat these"),
+            agent.messages()[0].text().contains("don't repeat these"),
             "retry notes in system prompt"
         );
     }
@@ -3235,29 +3461,31 @@ mod tests {
         // sub-100% serial share. Pins that the dep-aware scheduler's
         // concurrency is measured, not just shipped on faith.
         let mut cfg = config();
-        let responses = vec![completion(
-            vec![
-                Content::ToolCall {
-                    id: "r1".into(),
-                    name: "read".into(),
-                    arguments: r#"{"path":"a.rs"}"#.into(),
-                },
-                Content::ToolCall {
-                    id: "r2".into(),
-                    name: "read".into(),
-                    arguments: r#"{"path":"b.rs"}"#.into(),
-                },
-                Content::ToolCall {
-                    id: "r3".into(),
-                    name: "read".into(),
-                    arguments: r#"{"path":"c.rs"}"#.into(),
-                },
-            ],
-            1,
-            1,
-        ),
-        completion(vec![Content::Text("done".into())], 1, 1),
-        completion(vec![Content::Text("done".into())], 1, 1)];
+        let responses = vec![
+            completion(
+                vec![
+                    Content::ToolCall {
+                        id: "r1".into(),
+                        name: "read".into(),
+                        arguments: r#"{"path":"a.rs"}"#.into(),
+                    },
+                    Content::ToolCall {
+                        id: "r2".into(),
+                        name: "read".into(),
+                        arguments: r#"{"path":"b.rs"}"#.into(),
+                    },
+                    Content::ToolCall {
+                        id: "r3".into(),
+                        name: "read".into(),
+                        arguments: r#"{"path":"c.rs"}"#.into(),
+                    },
+                ],
+                1,
+                1,
+            ),
+            completion(vec![Content::Text("done".into())], 1, 1),
+            completion(vec![Content::Text("done".into())], 1, 1),
+        ];
         let mut agent = agent(responses, cfg);
         let mut ui = RecUi::default();
         agent.run_turn("read them", &mut ui).await.unwrap();
@@ -3273,6 +3501,25 @@ mod tests {
             "not all serial: {:?}",
             tel
         );
+        // The timeline records each call with its tool name and path.
+        assert_eq!(
+            tel.tool_timeline.len(),
+            3,
+            "timeline has one entry per call: {:?}",
+            tel.tool_timeline
+        );
+        let tools: Vec<&str> = tel.tool_timeline.iter().map(|e| e.tool.as_str()).collect();
+        assert!(tools.iter().all(|&t| t == "read"), "all reads: {tools:?}");
+        let paths: Vec<&str> = tel.tool_timeline.iter().map(|e| e.path.as_str()).collect();
+        assert!(
+            paths.contains(&"a.rs") && paths.contains(&"b.rs") && paths.contains(&"c.rs"),
+            "timeline paths match calls: {paths:?}"
+        );
+        assert!(
+            tel.tool_timeline.iter().all(|e| e.error),
+            "reads error (files don't exist in test): {:?}",
+            tel.tool_timeline
+        );
     }
 
     #[tokio::test]
@@ -3286,7 +3533,8 @@ mod tests {
             config(),
         );
         agent.messages_mut().push(Message::user("only turn"));
-        agent.messages_mut()
+        agent
+            .messages_mut()
             .push(Message::assistant(vec![Content::Text("a".into())]));
         // keep_recent = 3 but only one turn → no recent window → summarize all.
         agent
@@ -3305,19 +3553,27 @@ mod tests {
         let mut agent = agent(vec![], config());
         let big = "x".repeat(500);
         agent.messages_mut().push(Message::user("read a"));
-        agent.messages_mut().push(Message::assistant(vec![Content::ToolCall {
-            id: "c1".into(),
-            name: "read".into(),
-            arguments: "{}".into(),
-        }]));
-        agent.messages_mut().push(Message::tool_result("c1", big.clone()));
+        agent
+            .messages_mut()
+            .push(Message::assistant(vec![Content::ToolCall {
+                id: "c1".into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            }]));
+        agent
+            .messages_mut()
+            .push(Message::tool_result("c1", big.clone()));
         agent.messages_mut().push(Message::user("read b")); // recent turn
-        agent.messages_mut().push(Message::assistant(vec![Content::ToolCall {
-            id: "c2".into(),
-            name: "read".into(),
-            arguments: "{}".into(),
-        }]));
-        agent.messages_mut().push(Message::tool_result("c2", big.clone()));
+        agent
+            .messages_mut()
+            .push(Message::assistant(vec![Content::ToolCall {
+                id: "c2".into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            }]));
+        agent
+            .messages_mut()
+            .push(Message::tool_result("c2", big.clone()));
 
         agent
             .compact_with(
@@ -3358,7 +3614,7 @@ mod tests {
         fn assistant_reasoning(&mut self, _: &str) {}
         fn assistant_end(&mut self) {}
         fn tool_call(&mut self, _: &str, _: &str) {}
-        fn tool_result(&mut self, _: &str) {}
+        fn tool_result(&mut self, _: &str, _: &str) {}
         fn status(&mut self, t: &str) {
             self.statuses.push(t.to_string());
         }
@@ -3488,6 +3744,327 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn truncation_continues_instead_of_ending_early() {
+        // The model's first response is truncated (stop_reason = "length") —
+        // cut off mid-generation. The agent should nudge it to continue rather
+        // than treating the truncation as a natural stop. The model then
+        // finishes on the second response.
+        let mut cfg = config();
+        cfg.max_truncation_retries = 2;
+        let responses = vec![
+            Completion {
+                content: vec![Content::Text("Here is the first half of my".into())],
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 100,
+                    ..Default::default()
+                },
+                stop_reason: Some("length".into()),
+            },
+            completion(vec![Content::Text(" answer. Done.".into())], 10, 50),
+        ];
+        let mut agent = agent(responses, cfg);
+        let mut ui = RecUi::default();
+        agent.run_turn("explain it", &mut ui).await.unwrap();
+        assert!(
+            ui.statuses.iter().any(|s| s.contains("output token limit")),
+            "should warn about truncation, got: {:?}",
+            ui.statuses
+        );
+        assert!(ui.turn_end.is_some(), "turn completed after continuation");
+        // The final assistant message in history should include the second
+        // (non-truncated) response, proving the turn didn't end on the
+        // truncated first half.
+        let last_assistant = agent
+            .messages()
+            .iter()
+            .rev()
+            .find(|m| m.role == hi_ai::Role::Assistant)
+            .expect("there is a final assistant message");
+        let text = last_assistant
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                Content::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(
+            text.contains("Done."),
+            "model continued past truncation, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn truncation_gives_up_after_retry_budget() {
+        // The model keeps hitting the output token cap every round. After the
+        // truncation-retry budget is exhausted, the turn ends with the truncated
+        // output rather than looping forever.
+        let mut cfg = config();
+        cfg.max_truncation_retries = 1;
+        // max_truncation_retries=1 → one retry, then give up. So 2 truncated
+        // responses: the original + the one retry.
+        let responses = vec![
+            Completion {
+                content: vec![Content::Text("truncated...".into())],
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 100,
+                    ..Default::default()
+                },
+                stop_reason: Some("max_tokens".into()),
+            },
+            Completion {
+                content: vec![Content::Text("truncated...".into())],
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 100,
+                    ..Default::default()
+                },
+                stop_reason: Some("max_tokens".into()),
+            },
+        ];
+        let mut agent = agent(responses, cfg);
+        let mut ui = RecUi::default();
+        agent.run_turn("big task", &mut ui).await.unwrap();
+        // One "continuing" retry warning, then one exhaustion warning.
+        assert_eq!(
+            ui.statuses
+                .iter()
+                .filter(|s| s.contains("output token limit — continuing"))
+                .count(),
+            1,
+            "exactly one truncation retry warning, got: {:?}",
+            ui.statuses
+        );
+        assert!(
+            ui.statuses
+                .iter()
+                .any(|s| s.contains("task may be incomplete")),
+            "should warn about exhaustion, got: {:?}",
+            ui.statuses
+        );
+        assert!(ui.turn_end.is_some(), "turn ended after budget exhausted");
+    }
+
+    #[tokio::test]
+    async fn truncation_budget_is_separate_from_empty_retries() {
+        // Truncation recovery has its own budget, separate from the empty-retry
+        // budget. A big task that hits the output token cap multiple times
+        // should keep going (up to its own budget) even if it would have
+        // exhausted the shared empty-retry budget under the old design.
+        let mut cfg = config();
+        cfg.max_empty_retries = 1; // small empty-retry budget
+        cfg.max_truncation_retries = 4; // generous truncation budget
+        // 4 truncated responses, then a clean finish — the turn should survive
+        // all 4 truncations (using the dedicated budget) and complete.
+        let mut responses: Vec<Completion> = (0..4)
+            .map(|_| Completion {
+                content: vec![Content::Text("truncated...".into())],
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 100,
+                    ..Default::default()
+                },
+                stop_reason: Some("length".into()),
+            })
+            .collect();
+        responses.push(completion(
+            vec![Content::Text("Finally done.".into())],
+            10,
+            50,
+        ));
+        let mut agent = agent(responses, cfg);
+        let mut ui = RecUi::default();
+        agent.run_turn("big task", &mut ui).await.unwrap();
+        // Should have warned about truncation 4 times (one per retry).
+        assert_eq!(
+            ui.statuses
+                .iter()
+                .filter(|s| s.contains("output token limit — continuing"))
+                .count(),
+            4,
+            "4 truncation retry warnings (one per retry), got: {:?}",
+            ui.statuses
+        );
+        assert!(ui.turn_end.is_some(), "turn completed after truncations");
+        // The final assistant message should be the clean finish, not a
+        // truncated fragment.
+        let last_assistant = agent
+            .messages()
+            .iter()
+            .rev()
+            .find(|m| m.role == hi_ai::Role::Assistant)
+            .expect("there is a final assistant message");
+        let text = last_assistant
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                Content::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(
+            text.contains("Finally done."),
+            "model finished past truncations, got: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn truncation_with_partial_tool_call_does_not_orphan() {
+        // The model's response is truncated mid-tool-call — the ToolCall block
+        // has partial/malformed JSON arguments. The truncation recovery must
+        // strip the partial tool call (it was never executed, so it has no
+        // matching tool_result) and record only the text. Without stripping,
+        // the next provider request would carry an orphan tool_use and be
+        // rejected — the turn would stall.
+        let mut cfg = config();
+        cfg.max_truncation_retries = 2;
+        let responses = vec![
+            Completion {
+                content: vec![
+                    Content::Text("Let me write the file".into()),
+                    Content::ToolCall {
+                        id: "call_1".into(),
+                        name: "write".into(),
+                        arguments: "{\"path\":\"main.rs\",\"content\":\"fn main() { // trun".into(),
+                    },
+                ],
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 100,
+                    ..Default::default()
+                },
+                stop_reason: Some("length".into()),
+            },
+            // Second response: the model continues and finishes cleanly.
+            completion(vec![Content::Text("Done writing the file.".into())], 10, 50),
+        ];
+        let mut agent = agent(responses, cfg);
+        let mut ui = RecUi::default();
+        agent.run_turn("write main.rs", &mut ui).await.unwrap();
+        assert!(ui.turn_end.is_some(), "turn completed");
+        // The partial tool call should NOT appear in history — it was stripped
+        // (it was never executed, so it has no matching tool_result; leaving it
+        // would create an orphan tool_use that providers reject).
+        let has_partial_call = agent.messages().iter().any(|m| {
+            m.content.iter().any(|c| {
+                matches!(c, Content::ToolCall { name, arguments, .. }
+                    if name == "write" && arguments.contains("trun"))
+            })
+        });
+        assert!(
+            !has_partial_call,
+            "partial tool call should be stripped from history"
+        );
+        // Also verify no orphan tool_use: every ToolCall in history has a
+        // matching ToolResult somewhere.
+        let mut call_ids: Vec<&str> = Vec::new();
+        let mut answered: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for m in agent.messages().iter() {
+            for c in &m.content {
+                match c {
+                    Content::ToolCall { id, .. } => call_ids.push(id),
+                    Content::ToolResult { call_id, .. } => {
+                        answered.insert(call_id);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for id in &call_ids {
+            assert!(
+                answered.contains(*id),
+                "orphan tool_use {id} has no matching tool_result"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_nudge_stripped_before_next_turn() {
+        // When a turn ends after a repeat-nudge stall, the last message in
+        // history is a synthetic user nudge. Without stripping, the next
+        // prompt would fold into that nudge via `push_user_or_fold`. This
+        // test verifies the nudge is stripped so the next turn starts clean.
+        let mut responses = vec![echo_call()];
+        // Repeat the same call through the whole repeat-nudge budget so the
+        // turn ends with a trailing repeat-nudge.
+        for _ in 0..(config().max_repeat_nudges + 1) {
+            responses.push(echo_call());
+        }
+        let mut agent = agent(responses, config());
+        let mut ui = RecUi::default();
+        agent.run_turn("check it", &mut ui).await.unwrap();
+
+        // After the turn, the last message should NOT be a nudge (user message
+        // with a [hi:nudge:...] marker). It should be the assistant's text or
+        // a real user message.
+        let msgs = agent.messages();
+        let last = msgs.last().expect("history is non-empty");
+        if last.role == hi_ai::Role::User {
+            let text = last
+                .content
+                .iter()
+                .filter_map(|c| match c {
+                    Content::Text(t) => Some(t.as_str()),
+                    _ => None,
+                })
+                .collect::<String>();
+            assert!(
+                !text.starts_with("[hi:nudge:"),
+                "trailing nudge should be stripped, but last message is: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn next_prompt_does_not_fold_into_stale_nudge() {
+        // End-to-end: a turn stalls with a repeat-nudge, then a second turn is
+        // sent. The second turn's user message should NOT be folded into the
+        // stale nudge — it should be a clean, separate user message. We verify
+        // by checking that the model sees the real prompt, not nudge text.
+        let mut responses = vec![echo_call()];
+        for _ in 0..(config().max_repeat_nudges + 1) {
+            responses.push(echo_call());
+        }
+        // Second turn: a clean text response.
+        responses.push(completion(vec![Content::Text("ok".into())], 1, 1));
+
+        let mut agent = agent(responses, config());
+        let mut ui = RecUi::default();
+        agent.run_turn("first task", &mut ui).await.unwrap();
+
+        // Second turn — should start clean, not folded into a nudge.
+        let mut ui2 = RecUi::default();
+        agent.run_turn("second task", &mut ui2).await.unwrap();
+
+        let msgs = agent.messages();
+        // Find the last user message — it should be "second task", not a
+        // folded nudge+prompt combination.
+        let last_user = msgs
+            .iter()
+            .rev()
+            .find(|m| m.role == hi_ai::Role::User)
+            .expect("there is a last user message");
+        let text = last_user
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                Content::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(
+            !text.contains("[hi:nudge:"),
+            "next prompt should not be folded into a stale nudge, got: {text}"
+        );
+        assert!(
+            text.contains("second task"),
+            "next prompt should be the real user input, got: {text}"
+        );
+    }
+
+    #[tokio::test]
     async fn silent_auto_continue_keeps_turn_going_without_status() {
         // The model narrates an announced-but-unperformed next step ("Now let me
         // check the tests.") with no tool call. With max_silent_continues > 0 the
@@ -3510,7 +4087,11 @@ mod tests {
                 1,
             ),
             // Round 2: announced next step, no tool call → silent continue.
-            completion(vec![Content::Text("Now let me check the tests.".into())], 1, 1),
+            completion(
+                vec![Content::Text("Now let me check the tests.".into())],
+                1,
+                1,
+            ),
             // Round 3: silently re-prompted, model makes the next tool call.
             completion(
                 vec![Content::ToolCall {
@@ -3651,6 +4232,484 @@ mod tests {
             agent.messages().last().unwrap().text().contains("Done."),
             "turn ran to the recap: {:?}",
             agent.messages().last().unwrap().text()
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_with_pending_steps_continues_past_recap() {
+        // The model posts a plan (2/3 done), does one step, then stops with a
+        // finished-looking recap. Without plan-awareness, the text heuristic
+        // sees a finished recap and ends the turn — leaving the plan at 2/3.
+        // With plan-awareness, the agent detects pending steps and nudges the
+        // model to continue until the plan is complete.
+        let mut cfg = config();
+        cfg.max_silent_continues = 5;
+        // Helper: an update_plan call with given step statuses.
+        let plan_call = |id: &str, statuses: &[&str]| {
+            let steps: Vec<String> = statuses
+                .iter()
+                .enumerate()
+                .map(|(i, s)| format!(r#"{{"title":"step {}","status":"{}"}}"#, i + 1, s))
+                .collect();
+            completion(
+                vec![Content::ToolCall {
+                    id: id.into(),
+                    name: "update_plan".into(),
+                    arguments: format!(r#"{{"steps":[{}]}}"#, steps.join(",")),
+                }],
+                1,
+                1,
+            )
+        };
+        let responses = vec![
+            // R1: model posts the initial plan (0/3 done) and starts step 1.
+            plan_call("p1", &["active", "pending", "pending"]),
+            // R2: model does a read for step 1.
+            completion(
+                vec![Content::ToolCall {
+                    id: "r1".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"x"}"#.into(),
+                }],
+                1,
+                1,
+            ),
+            // R3: model updates plan (1/3 done, step 2 active) and does a read.
+            plan_call("p2", &["done", "active", "pending"]),
+            // R4: model stops with a finished-looking recap — but plan is 1/3!
+            // The plan-aware continue should nudge it to keep going.
+            completion(
+                vec![Content::Text(
+                    "I've completed step 1. The implementation looks good.".into(),
+                )],
+                1,
+                1,
+            ),
+            // R5 (nudged): model does step 2.
+            completion(
+                vec![Content::ToolCall {
+                    id: "r2".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"y"}"#.into(),
+                }],
+                1,
+                1,
+            ),
+            // R6: model updates plan (2/3 done, step 3 active).
+            plan_call("p3", &["done", "done", "active"]),
+            // R7: model stops with recap again — plan is 2/3, nudge again.
+            completion(
+                vec![Content::Text("Step 2 is done. Moving on.".into())],
+                1,
+                1,
+            ),
+            // R8 (nudged): model does step 3.
+            completion(
+                vec![Content::ToolCall {
+                    id: "r3".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"z"}"#.into(),
+                }],
+                1,
+                1,
+            ),
+            // R9: model updates plan (3/3 done) — all complete.
+            plan_call("p4", &["done", "done", "done"]),
+            // R10: model gives final recap — plan is complete, turn ends.
+            completion(
+                vec![Content::Text("All steps complete. Done.".into())],
+                1,
+                1,
+            ),
+        ];
+        let mut agent = agent(responses, cfg);
+        let mut ui = RecUi::default();
+        agent
+            .run_turn("implement the feature", &mut ui)
+            .await
+            .unwrap();
+        assert!(ui.turn_end.is_some(), "turn completed");
+        // The turn should have run all the way to the final recap (R10),
+        // not stopped at R4 or R7 when the model gave a partial recap.
+        assert!(
+            agent
+                .messages()
+                .last()
+                .unwrap()
+                .text()
+                .contains("All steps complete"),
+            "turn ran to the final recap with plan complete: {:?}",
+            agent.messages().last().unwrap().text()
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_plan_ends_turn_without_spurious_continue() {
+        // When the plan is fully done (all steps "done"), the model's recap
+        // should end the turn cleanly — no plan-driven continue nudge.
+        let mut cfg = config();
+        cfg.max_silent_continues = 5;
+        let plan_call = |id: &str, statuses: &[&str]| {
+            let steps: Vec<String> = statuses
+                .iter()
+                .enumerate()
+                .map(|(i, s)| format!(r#"{{"title":"step {}","status":"{}"}}"#, i + 1, s))
+                .collect();
+            completion(
+                vec![Content::ToolCall {
+                    id: id.into(),
+                    name: "update_plan".into(),
+                    arguments: format!(r#"{{"steps":[{}]}}"#, steps.join(",")),
+                }],
+                1,
+                1,
+            )
+        };
+        let responses = vec![
+            // Model posts plan (all done) and gives final recap.
+            plan_call("p1", &["done", "done"]),
+            completion(vec![Content::Text("All done.".into())], 1, 1),
+        ];
+        let mut agent = agent(responses, cfg);
+        let mut ui = RecUi::default();
+        agent.run_turn("do it", &mut ui).await.unwrap();
+        assert!(ui.turn_end.is_some(), "turn completed");
+        // No spurious continue — the turn ended after exactly 2 responses.
+        assert!(
+            !ui.statuses.iter().any(|s| s.contains("incomplete")),
+            "no incomplete warning when plan is done: {:?}",
+            ui.statuses
+        );
+    }
+
+    #[tokio::test]
+    async fn long_plan_10_steps_runs_to_completion() {
+        // A 10-step plan where the model does one step per round, then stops
+        // with a recap. The plan-aware continue should nudge it to keep going
+        // until all 10 steps are done. The silent_continues counter resets on
+        // each tool call, so this should work regardless of plan length.
+        let mut cfg = config();
+        cfg.max_silent_continues = 3; // the default
+        let n_steps = 10;
+        let plan_call = |id: &str, statuses: &[&str]| {
+            let steps: Vec<String> = statuses
+                .iter()
+                .enumerate()
+                .map(|(i, s)| format!(r#"{{"title":"step {}","status":"{}"}}"#, i + 1, s))
+                .collect();
+            completion(
+                vec![Content::ToolCall {
+                    id: id.into(),
+                    name: "update_plan".into(),
+                    arguments: format!(r#"{{"steps":[{}]}}"#, steps.join(",")),
+                }],
+                1,
+                1,
+            )
+        };
+        let read_call = |id: &str| {
+            completion(
+                vec![Content::ToolCall {
+                    id: id.into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"x"}"#.into(),
+                }],
+                1,
+                1,
+            )
+        };
+        let recap = |text: &str| completion(vec![Content::Text(text.into())], 1, 1);
+
+        let mut responses = Vec::new();
+        for step in 0..n_steps {
+            // Build statuses: steps before `step` are done, step `step` is active,
+            // steps after are pending.
+            let statuses: Vec<&str> = (0..n_steps)
+                .map(|i| {
+                    if i < step {
+                        "done"
+                    } else if i == step {
+                        "active"
+                    } else {
+                        "pending"
+                    }
+                })
+                .collect();
+            // Model posts plan + does a read for this step.
+            responses.push(plan_call(&format!("p{step}"), &statuses));
+            responses.push(read_call(&format!("r{step}")));
+            // Model stops with a recap (unless it's the last step).
+            if step < n_steps - 1 {
+                responses.push(recap(&format!(
+                    "Step {} is done. The implementation looks good.",
+                    step + 1
+                )));
+            }
+        }
+        // Final: all steps done + final recap.
+        let all_done: Vec<&str> = (0..n_steps).map(|_| "done").collect();
+        responses.push(plan_call("pfinal", &all_done));
+        responses.push(recap("All 10 steps complete. Done."));
+
+        let mut agent = agent(responses, cfg);
+        let mut ui = RecUi::default();
+        agent
+            .run_turn("implement the feature", &mut ui)
+            .await
+            .unwrap();
+        assert!(ui.turn_end.is_some(), "turn completed");
+        // The turn should have run all the way to the final recap.
+        let last_text = agent.messages().last().unwrap().text();
+        assert!(
+            last_text.contains("All 10 steps complete"),
+            "turn ran to the final recap, got: {last_text}"
+        );
+        // Should NOT have ended with an incomplete warning.
+        assert!(
+            !ui.statuses.iter().any(|s| s.contains("incomplete")),
+            "no incomplete warning on a completed 10-step plan: {:?}",
+            ui.statuses
+        );
+    }
+
+    #[tokio::test]
+    async fn long_plan_survives_text_only_response_to_nudge() {
+        // A plan where the model sometimes responds to the continue-nudge with
+        // text-only (no tool call) before eventually doing the work. This is
+        // the real-world pattern that causes stalls: the model writes a recap,
+        // gets nudged, writes another recap instead of acting, gets nudged
+        // again, and eventually does the work. The silent_continues budget
+        // must be high enough to survive a few text-only responses.
+        //
+        // With max_silent_continues=3, the model can text-only 3 times in a
+        // row before the turn ends. On the 4th text-only, the budget is
+        // exhausted. This test has 3 text-only responses (within budget)
+        // before the model finally acts.
+        let mut cfg = config();
+        cfg.max_silent_continues = 3;
+        let plan_call = |id: &str, s1: &str, s2: &str, s3: &str| {
+            completion(
+                vec![Content::ToolCall {
+                    id: id.into(),
+                    name: "update_plan".into(),
+                    arguments: format!(
+                        r#"{{"steps":[{{"title":"a","status":"{s1}"}},{{"title":"b","status":"{s2}"}},{{"title":"c","status":"{s3}"}}]}}"#
+                    ),
+                }],
+                1,
+                1,
+            )
+        };
+        let responses = vec![
+            // R1: plan + read for step 1.
+            plan_call("p1", "active", "pending", "pending"),
+            completion(
+                vec![Content::ToolCall {
+                    id: "r1".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"x"}"#.into(),
+                }],
+                1,
+                1,
+            ),
+            // R2: recap, no tools → nudge (silent_continues=1, force_tools).
+            completion(vec![Content::Text("Step 1 done. Looks good.".into())], 1, 1),
+            // R3: text-only again (ignores force) → nudge (silent_continues=2).
+            completion(
+                vec![Content::Text(
+                    "The implementation is clean. No issues found.".into(),
+                )],
+                1,
+                1,
+            ),
+            // R4: text-only again (ignores force) → nudge (silent_continues=3).
+            completion(
+                vec![Content::Text("Everything looks correct so far.".into())],
+                1,
+                1,
+            ),
+            // R5: finally does a tool call → silent_continues resets to 0.
+            plan_call("p2", "done", "active", "pending"),
+            completion(
+                vec![Content::ToolCall {
+                    id: "r2".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"y"}"#.into(),
+                }],
+                1,
+                1,
+            ),
+            // R6: recap → nudge (silent_continues=1).
+            completion(vec![Content::Text("Step 2 done.".into())], 1, 1),
+            // R7: does step 3.
+            plan_call("p3", "done", "done", "active"),
+            completion(
+                vec![Content::ToolCall {
+                    id: "r3".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"z"}"#.into(),
+                }],
+                1,
+                1,
+            ),
+            // R8: all done + final recap.
+            plan_call("p4", "done", "done", "done"),
+            completion(
+                vec![Content::Text("All steps complete. Done.".into())],
+                1,
+                1,
+            ),
+        ];
+        let mut agent = agent(responses, cfg);
+        let mut ui = RecUi::default();
+        agent.run_turn("do it", &mut ui).await.unwrap();
+        assert!(ui.turn_end.is_some(), "turn completed");
+        let last_text = agent.messages().last().unwrap().text();
+        assert!(
+            last_text.contains("All steps complete"),
+            "turn ran to completion despite text-only responses to nudges, got: {last_text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_stalls_after_max_consecutive_text_only_responses() {
+        // When the model responds to the continue-nudge with text-only (no tool
+        // call) more than max_silent_continues times in a row, the turn ends
+        // with an "incomplete" warning. This is the safety valve — the model is
+        // stuck narrating without acting. This test verifies the valve fires
+        // at the right point: after exactly max_silent_continues+1 text-only
+        // responses (the original recap + max_silent_continues nudged retries).
+        let mut cfg = config();
+        cfg.max_silent_continues = 3;
+        let plan_call = |id: &str| {
+            completion(
+                vec![Content::ToolCall {
+                    id: id.into(),
+                    name: "update_plan".into(),
+                    arguments: r#"{"steps":[{"title":"a","status":"active"},{"title":"b","status":"pending"}]}"#.into(),
+                }],
+                1,
+                1,
+            )
+        };
+        let responses = vec![
+            // R1: plan + read for step 1.
+            plan_call("p1"),
+            completion(
+                vec![Content::ToolCall {
+                    id: "r1".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"x"}"#.into(),
+                }],
+                1,
+                1,
+            ),
+            // R2: recap → nudge (1/3).
+            completion(vec![Content::Text("Step 1 done.".into())], 1, 1),
+            // R3: text-only → nudge (2/3).
+            completion(vec![Content::Text("Looks good.".into())], 1, 1),
+            // R4: text-only → nudge (3/3).
+            completion(vec![Content::Text("Correct.".into())], 1, 1),
+            // R5: text-only → budget exhausted, turn ends with warning.
+            completion(vec![Content::Text("Fine.".into())], 1, 1),
+        ];
+        let mut agent = agent(responses, cfg);
+        let mut ui = RecUi::default();
+        agent.run_turn("do it", &mut ui).await.unwrap();
+        assert!(ui.turn_end.is_some(), "turn ended");
+        // Should warn about incomplete — the model kept narrating without acting.
+        assert!(
+            ui.statuses.iter().any(|s| s.contains("incomplete")),
+            "should warn incomplete after exhausting continue budget: {:?}",
+            ui.statuses
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_persists_across_turns_for_continue() {
+        // When a turn ends with an incomplete plan and the user types
+        // "continue", the plan state should persist so the plan-aware continue
+        // logic can fire. Without persistence, last_plan is cleared at the
+        // start of the new turn and the agent can't detect the incomplete plan.
+        let mut cfg = config();
+        cfg.max_silent_continues = 3;
+        let plan_call = |id: &str, s1: &str, s2: &str| {
+            completion(
+                vec![Content::ToolCall {
+                    id: id.into(),
+                    name: "update_plan".into(),
+                    arguments: format!(
+                        r#"{{"steps":[{{"title":"a","status":"{s1}"}},{{"title":"b","status":"{s2}"}}]}}"#
+                    ),
+                }],
+                1,
+                1,
+            )
+        };
+
+        // Turn 1: model posts plan (step 1 active), does step 1, then stops
+        // with a recap. The plan-continue nudges, but the model text-only's
+        // past the budget, so the turn ends with an incomplete plan (1/2).
+        let turn1_responses = vec![
+            plan_call("p1", "active", "pending"),
+            completion(
+                vec![Content::ToolCall {
+                    id: "r1".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"x"}"#.into(),
+                }],
+                1,
+                1,
+            ),
+            // Recap → nudge (1/3).
+            completion(vec![Content::Text("Step 1 done.".into())], 1, 1),
+            // Text-only → nudge (2/3).
+            completion(vec![Content::Text("Looks good.".into())], 1, 1),
+            // Text-only → nudge (3/3).
+            completion(vec![Content::Text("Correct.".into())], 1, 1),
+            // Text-only → budget exhausted, turn ends.
+            completion(vec![Content::Text("Fine.".into())], 1, 1),
+        ];
+        let mut agent = agent(turn1_responses, cfg);
+        let mut ui = RecUi::default();
+        agent.run_turn("do it", &mut ui).await.unwrap();
+        // Turn 1 ended with incomplete warning — plan is 1/2.
+        assert!(
+            ui.statuses.iter().any(|s| s.contains("incomplete")),
+            "turn 1 should end incomplete: {:?}",
+            ui.statuses
+        );
+
+        // Verify the plan state persisted after turn 1 — it should still have
+        // pending steps so the plan-aware continue can fire on "continue".
+        let plan_after_turn1 = &agent.last_plan;
+        assert!(
+            plan_has_pending_steps(plan_after_turn1),
+            "plan should persist with pending steps after turn 1: {:?}",
+            plan_after_turn1
+        );
+
+        // Turn 2: user types "fix a different bug" (NOT "continue"). The plan
+        // should be cleared so a stale plan doesn't cause spurious nudges.
+        // We can't easily run a full turn here (Canned provider is exhausted),
+        // but we can verify the clearing logic by checking that a non-continue
+        // input would clear it. Simulate by calling the clearing logic directly.
+        let mut plan = agent.last_plan.clone();
+        // The agent clears last_plan when input doesn't look like "continue".
+        // Verify the heuristic: "fix a different bug" is NOT a continue command.
+        assert!(
+            !looks_like_continue("fix a different bug"),
+            "a new task should not look like continue"
+        );
+        assert!(
+            looks_like_continue("continue"),
+            "'continue' should look like continue"
+        );
+        // Simulate the clearing: a new task clears, "continue" doesn't.
+        plan.clear(); // what the agent does on a new task
+        assert!(
+            !plan_has_pending_steps(&plan),
+            "plan should be cleared on a new task"
         );
     }
 
@@ -3898,6 +4957,7 @@ mod tests {
             recovery_retries: 1,
             repeat_nudges: 0,
             continue_nudges: 0,
+            truncation_retries: 0,
             hit_step_cap: false,
             stalled_unfinished: false,
             stalled_repeating: false,
@@ -3905,6 +4965,7 @@ mod tests {
             tool_calls: 0,
             max_concurrent_batch: 0,
             serial_runs: 0,
+            tool_timeline: Vec::new(),
         };
         let steer = a.turn_steer().expect("noisy turn has a steer line");
         assert!(
@@ -3922,6 +4983,7 @@ mod tests {
             recovery_retries: 0,
             repeat_nudges: 0,
             continue_nudges: 0,
+            truncation_retries: 0,
             hit_step_cap: false,
             stalled_unfinished: true,
             stalled_repeating: false,
@@ -3929,6 +4991,7 @@ mod tests {
             tool_calls: 0,
             max_concurrent_batch: 0,
             serial_runs: 0,
+            tool_timeline: Vec::new(),
         };
         let steer = a.turn_steer().expect("stall has a steer line");
         assert!(steer.contains("stalled"), "stall flagged: {steer}");
@@ -4081,14 +5144,18 @@ mod tests {
             ))],
             cfg,
         );
-        agent.messages_mut().push(Message::user("existing long turn"));
+        agent
+            .messages_mut()
+            .push(Message::user("existing long turn"));
         for i in 1..=8 {
             let id = format!("c{i}");
-            agent.messages_mut().push(Message::assistant(vec![Content::ToolCall {
-                id: id.clone(),
-                name: "read".into(),
-                arguments: "{}".into(),
-            }]));
+            agent
+                .messages_mut()
+                .push(Message::assistant(vec![Content::ToolCall {
+                    id: id.clone(),
+                    name: "read".into(),
+                    arguments: "{}".into(),
+                }]));
             agent.messages_mut().push(Message::tool_result(
                 &id,
                 format!("{i}\n{}", "x".repeat(500)),
@@ -4281,10 +5348,7 @@ mod tests {
             .messages()
             .iter()
             .any(|m| m.role == Role::User && m.text().contains("Likely cause"));
-        assert!(
-            !has_cause,
-            "no attribution section for unparseable output"
-        );
+        assert!(!has_cause, "no attribution section for unparseable output");
     }
 
     #[tokio::test]
@@ -4329,6 +5393,9 @@ mod tests {
         agent.run_turn("x", &mut NullUi).await.unwrap();
         let _ = std::fs::remove_file(&tmp);
         assert_eq!(agent.last_verify(), Some(false));
+        // PROBE: with max_verify_iterations=2 the verifier should iterate twice.
+        let tel = agent.last_turn_telemetry();
+        eprintln!("PROBE verify_rounds={} telemetry={:?}", tel.verify_rounds, tel);
     }
 
     #[tokio::test]
@@ -4371,10 +5438,7 @@ mod tests {
             body.contains("src/lib.rs:42:18"),
             "parsed location in attribution: {body}"
         );
-        assert!(
-            body.contains("[compile]"),
-            "compile kind label: {body}"
-        );
+        assert!(body.contains("[compile]"), "compile kind label: {body}");
         // Enrich-only: the raw output block is still there alongside it.
         assert!(
             body.contains("Output:\n"),

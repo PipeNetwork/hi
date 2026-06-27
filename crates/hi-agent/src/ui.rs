@@ -15,10 +15,22 @@ pub trait Ui: Send {
     fn assistant_reasoning(&mut self, text: &str);
     /// The assistant's streamed message finished (before any tool calls run).
     fn assistant_end(&mut self);
-    /// A tool is about to run, with its raw JSON arguments.
+    /// A tool has started running. Emitted as soon as a call is dispatched
+    /// (even within a concurrent batch) so an interactive frontend can show a
+    /// live "running {tool}" indicator with a timer. Unlike [`tool_call`], this
+    /// is *not* a transcript line — the visible header is emitted later, paired
+    /// with its result, so a reader can tell which result belongs to which call.
+    /// Defaults to no-op; only the live TUI needs it.
+    fn tool_started(&mut self, _name: &str, _arguments: &str) {}
+    /// Emit the transcript header for a tool call, immediately followed by the
+    /// matching [`tool_result`]. In a concurrent batch these are emitted in
+    /// completion order, as (header, result) pairs, so the two never drift
+    /// apart.
     fn tool_call(&mut self, name: &str, arguments: &str);
-    /// The result of a tool call.
-    fn tool_result(&mut self, result: &str);
+    /// The result of a tool call, with the tool's name so a frontend can
+    /// tailor how much to show (e.g. suppress a `read`'s full file body,
+    /// showing just the path that was already named in the `tool_call` line).
+    fn tool_result(&mut self, name: &str, result: &str);
     /// A status note (e.g. verification progress).
     fn status(&mut self, text: &str);
     /// The task plan was created or updated (via the `update_plan` tool). The
@@ -69,8 +81,12 @@ fn salient_arg(name: &str, arguments: &str) -> Option<String> {
             }
         }
         "bash" => collapse_ws(str_field("command")?),
+        "bash_output" | "bash_kill" => str_field("id")?.to_string(),
         "update_plan" => {
-            let n = value.get("steps").and_then(|v| v.as_array()).map_or(0, |a| a.len());
+            let n = value
+                .get("steps")
+                .and_then(|v| v.as_array())
+                .map_or(0, |a| a.len());
             format!("{n} step{}", if n == 1 { "" } else { "s" })
         }
         _ => return None,

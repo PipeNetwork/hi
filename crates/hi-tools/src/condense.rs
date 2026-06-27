@@ -149,6 +149,8 @@ pub(crate) fn looks_like_diagnostics(s: &str) -> bool {
         || l.contains("collected ")                        // pytest "collected N items"
         || (l.contains("running ") && l.contains(" test")) // libtest "running N tests"
         || (l.contains(" passed") && (l.contains(" failed") || l.contains(" error")))
+        || l.contains("--- fail:")                         // go test
+        || l.contains("fail:")                             // go test (case varies)
         // Compilers.
         || l.contains("error[")            // rustc, with an error code
         || l.contains("could not compile") // cargo
@@ -216,9 +218,7 @@ pub(crate) fn truncate_to(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        condense_diagnostics, condense_enabled, truncate_to,
-    };
+    use super::{condense_diagnostics, condense_enabled, truncate_to};
 
     #[test]
     fn condense_toggle_defaults_on_and_parses_off_values() {

@@ -118,7 +118,10 @@ pub(crate) fn completion_items_for(ctx: &CompletionContext) -> Vec<CompletionIte
 
 #[cfg(test)]
 mod tests {
-    use super::{completion_context, CompletionContext::{Arg, Command}};
+    use super::{
+        CompletionContext::{Arg, Command},
+        completion_context,
+    };
 
     #[test]
     fn completion_context_tracks_name_then_argument() {

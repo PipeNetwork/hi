@@ -26,7 +26,9 @@ pub(crate) async fn repl(
     use rustyline::DefaultEditor;
     use rustyline::error::ReadlineError;
 
-    let window = registry.metadata(&settings.model).1
+    let window = registry
+        .metadata(&settings.model)
+        .1
         .map(|w| format!(" · {}k ctx", w / 1000))
         .unwrap_or_default();
     println!(
@@ -98,7 +100,8 @@ pub(crate) async fn repl(
                                 continue;
                             }
                             // Show a preview of what will be committed.
-                            let preview: String = diff.lines().take(20).collect::<Vec<_>>().join("\n");
+                            let preview: String =
+                                diff.lines().take(20).collect::<Vec<_>>().join("\n");
                             let total = diff.lines().count();
                             println!("\x1b[2m--- committing {total} line(s) of changes ---\x1b[0m");
                             println!("{preview}");
@@ -196,6 +199,10 @@ pub(crate) async fn repl(
         };
         let _ = drive_with_spinner(memory, &progress).await;
     }
+
+    // Don't leave background processes (dev servers, watchers) running after
+    // the session ends.
+    hi_tools::kill_background_processes();
 
     if let Some(path) = &history {
         if let Some(parent) = path.parent() {

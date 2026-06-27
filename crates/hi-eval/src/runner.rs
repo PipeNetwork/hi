@@ -7,8 +7,8 @@ use anyhow::{Context, Result};
 use crate::artifacts::{copy_dir, make_workdir};
 use crate::config::{EvalProfile, Task};
 use crate::results::{
-    Candidate, FailKind, RunResult, Trajectory, TrajectoryAttribution, classify,
-    looks_like_build_error,
+    Candidate, FailKind, RunResult, Trajectory, TrajectoryAttribution, TrajectoryToolCall,
+    classify, looks_like_build_error,
 };
 
 /// A content snapshot of `dir` (relative path → bytes), excluding eval/run and
@@ -55,7 +55,7 @@ pub fn dir_snapshot(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
 /// Run all of a config's candidates; the config solves the task if any passes.
 /// Cost and tokens are summed. Candidates run in parallel since each gets its own
 /// isolated workdir — wall-clock is the max, not the sum.
-pub fn run_config(
+pub async fn run_config(
     hi: &Path,
     task_dir: &Path,
     task: &Task,
@@ -63,8 +63,7 @@ pub fn run_config(
     use_verify: bool,
     temperatures: &[f32],
     profile: EvalProfile,
-) -> impl std::future::Future<Output = Result<RunResult>> {
-    async move {
+) -> Result<RunResult> {
     let mut result = RunResult {
         config: config_name.to_string(),
         task: String::new(),
@@ -164,7 +163,6 @@ pub fn run_config(
     result.compat_fallbacks_used.dedup();
     result.verify_output_summary = summaries.join("\n--- candidate ---\n");
     Ok(result)
-    }
 }
 
 /// One independent attempt in an isolated copy of the fixture.
@@ -309,14 +307,12 @@ fn read_report(path: &Path) -> ReportInfo {
             .map(|items| {
                 items
                     .iter()
-                    .filter_map(|a| {
-                        Some(TrajectoryAttribution {
-                            path: a["path"].as_str().unwrap_or("").to_string(),
-                            line: a["line"].as_u64().map(|n| n as u32),
-                            column: a["column"].as_u64().map(|n| n as u32),
-                            message: a["message"].as_str().unwrap_or("").to_string(),
-                            kind: a["kind"].as_str().unwrap_or("").to_string(),
-                        })
+                    .map(|a| TrajectoryAttribution {
+                        path: a["path"].as_str().unwrap_or("").to_string(),
+                        line: a["line"].as_u64().map(|n| n as u32),
+                        column: a["column"].as_u64().map(|n| n as u32),
+                        message: a["message"].as_str().unwrap_or("").to_string(),
+                        kind: a["kind"].as_str().unwrap_or("").to_string(),
                     })
                     .collect()
             })
@@ -324,6 +320,29 @@ fn read_report(path: &Path) -> ReportInfo {
         tool_calls: tel["tool_calls"].as_u64().unwrap_or(0) as u32,
         max_concurrent_batch: tel["max_concurrent_batch"].as_u64().unwrap_or(0) as u32,
         serial_runs: tel["serial_runs"].as_u64().unwrap_or(0) as u32,
+        tool_timeline: tel
+            .get("tool_timeline")
+            .and_then(|v| v.as_array())
+            .unwrap_or(&Vec::new())
+            .iter()
+            .filter_map(|t| {
+                let t = t.as_object()?;
+                Some(TrajectoryToolCall {
+                    tool: t
+                        .get("tool")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    path: t
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    duration_ms: t.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0),
+                    error: t.get("error").and_then(|v| v.as_bool()).unwrap_or(false),
+                })
+            })
+            .collect(),
     };
     ReportInfo {
         tokens: value["total_tokens"].as_u64().unwrap_or(0),

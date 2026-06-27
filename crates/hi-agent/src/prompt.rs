@@ -61,7 +61,9 @@ impl SystemPrompt {
     /// header) — the objective, the sub-goal checklist with statuses, and any
     /// retry notes on the active sub-goal. Survives compaction (system message).
     pub(crate) fn with_goal_state(mut self, section: Option<&str>) -> Self {
-        self.goal_state = section.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        self.goal_state = section
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         self
     }
 
@@ -69,7 +71,9 @@ impl SystemPrompt {
     /// own header) so it survives compaction verbatim — it's part of the system
     /// message, which compaction preserves, not the summarizable history.
     pub(crate) fn with_decisions(mut self, section: Option<&str>) -> Self {
-        self.decisions = section.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        self.decisions = section
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
         self
     }
 

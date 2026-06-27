@@ -56,7 +56,19 @@ impl Ui for PlainUi {
         println!("\x1b[36m⏺ {}\x1b[0m", tool_label(name, arguments));
     }
 
-    fn tool_result(&mut self, result: &str) {
+    fn tool_result(&mut self, name: &str, result: &str) {
+        // Read-only exploration tools (read/list/grep) already named the file
+        // or pattern in their `tool_call` header — blasting their full output
+        // into the transcript is noise. Show a compact line count instead.
+        if matches!(name, "read" | "list" | "grep") {
+            let n = result.lines().count();
+            if n == 0 {
+                println!("\x1b[2m  (no output)\x1b[0m");
+            } else {
+                println!("\x1b[2m  {n} line{}\x1b[0m", if n == 1 { "" } else { "s" });
+            }
+            return;
+        }
         // Enough to show a small edit's diff with its context inline; larger
         // results truncate with a footer (use `/diff` for the full diff).
         const MAX_LINES: usize = 16;
@@ -139,7 +151,7 @@ impl Ui for QuietUi {
         println!();
     }
     fn tool_call(&mut self, _name: &str, _arguments: &str) {}
-    fn tool_result(&mut self, _result: &str) {}
+    fn tool_result(&mut self, _name: &str, _result: &str) {}
     fn status(&mut self, _text: &str) {}
     fn turn_end(&mut self, _summary: &str) {}
 }

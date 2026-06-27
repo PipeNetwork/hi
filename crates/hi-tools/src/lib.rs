@@ -7,6 +7,7 @@ pub mod checkpoint;
 pub mod guard;
 
 mod attribution;
+mod background;
 mod condense;
 mod edit;
 mod paths;
@@ -14,14 +15,15 @@ mod read;
 mod tools;
 
 // Re-exports preserving the crate's pre-split public surface.
+pub use background::kill_all as kill_background_processes;
 pub use condense::condense_diagnostics;
 pub use paths::clear_read_cache;
 pub use tools::{
-    TOOL_SPECS, commit, execute, execute_streaming, fast_check_for, is_read_only, run_check,
-    target_path, tool_specs, working_tree_diff, working_tree_diff_plain,
+    TOOL_SPECS, commit, execute, execute_streaming, fast_check_for, is_filesystem_mutating,
+    is_read_only, run_check, target_path, working_tree_diff, working_tree_diff_plain,
 };
 
-pub use attribution::{parse_attributions, AttrKind, Attribution};
+pub use attribution::{AttrKind, Attribution, parse_attributions};
 
 // `ToolOutput`'s constructors (`plain`/`shown`/`planned`) are crate-private and
 // used by `tools`/`read`; they live here because the type is part of the public
@@ -112,7 +114,9 @@ mod tests {
 
         // Bypass path guard — temp files live outside the project workspace.
         let had_guard = std::env::var_os("HI_NO_PATH_GUARD");
-        unsafe { std::env::set_var("HI_NO_PATH_GUARD", "1"); }
+        unsafe {
+            std::env::set_var("HI_NO_PATH_GUARD", "1");
+        }
 
         // Two edits in one atomic call.
         let args = format!(
@@ -139,7 +143,9 @@ mod tests {
         );
         // Restore env.
         unsafe {
-            if had_guard.is_none() { std::env::remove_var("HI_NO_PATH_GUARD"); }
+            if had_guard.is_none() {
+                std::env::remove_var("HI_NO_PATH_GUARD");
+            }
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -269,8 +275,11 @@ mod tests {
         std::fs::write(dir.join(".git/config"), "UNIQNEEDLE\n").unwrap();
 
         let p = dir.to_string_lossy();
-        let out =
-            execute("grep", &format!(r#"{{"pattern":"UNIQNEEDLE","path":"{p}"}}"#)).await;
+        let out = execute(
+            "grep",
+            &format!(r#"{{"pattern":"UNIQNEEDLE","path":"{p}"}}"#),
+        )
+        .await;
 
         assert!(
             out.content.contains("lib.rs"),
@@ -294,10 +303,14 @@ mod tests {
         let p = path.to_string_lossy();
         // Bypass path guard — temp files live outside the project workspace.
         let had_guard = std::env::var_os("HI_NO_PATH_GUARD");
-        unsafe { std::env::set_var("HI_NO_PATH_GUARD", "1"); }
+        unsafe {
+            std::env::set_var("HI_NO_PATH_GUARD", "1");
+        }
         let out = execute("read", &format!(r#"{{"path":"{p}"}}"#)).await;
         unsafe {
-            if had_guard.is_none() { std::env::remove_var("HI_NO_PATH_GUARD"); }
+            if had_guard.is_none() {
+                std::env::remove_var("HI_NO_PATH_GUARD");
+            }
         }
         assert!(
             out.content.contains("binary file"),
@@ -324,5 +337,42 @@ mod tests {
         let ok = execute("bash", r#"{"command":"echo hello-guard"}"#).await;
         assert!(ok.content.contains("hello-guard"), "{}", ok.content);
     }
-}
 
+    #[tokio::test]
+    async fn background_bash_round_trips_through_execute() {
+        // Start detached: execute returns a handle without waiting for exit.
+        let started = execute("bash", r#"{"command":"echo bg-roundtrip","run_in_background":true}"#)
+            .await;
+        let id = started
+            .content
+            .split('`')
+            .nth(1)
+            .expect("handle id in start message")
+            .to_string();
+        assert!(id.starts_with("bg_"), "got: {}", started.content);
+
+        // Poll until we see the line or the process has exited.
+        let mut seen = String::new();
+        for _ in 0..200 {
+            let out = execute("bash_output", &format!(r#"{{"id":"{id}"}}"#)).await;
+            seen.push_str(&out.content);
+            if seen.contains("bg-roundtrip") && seen.contains("exited") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(seen.contains("bg-roundtrip"), "polled output: {seen:?}");
+
+        // Killing an already-exited process is reported, not an error.
+        let killed = execute("bash_kill", &format!(r#"{{"id":"{id}"}}"#)).await;
+        assert!(!killed.content.starts_with("Error"), "{}", killed.content);
+    }
+
+    #[tokio::test]
+    async fn bash_output_unknown_id_is_a_recoverable_error() {
+        // Tool failures come back as content (so the model can recover), not panics.
+        let out = execute("bash_output", r#"{"id":"bg_nope"}"#).await;
+        assert!(out.content.starts_with("Error"), "{}", out.content);
+        assert!(out.content.contains("bg_nope"), "{}", out.content);
+    }
+}

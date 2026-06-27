@@ -14,8 +14,9 @@ pub(crate) enum UiEvent {
     Text(String),
     Reasoning(String),
     AssistantEnd,
+    ToolStarted(String, String),
     ToolCall(String, String),
-    ToolResult(String),
+    ToolResult(String, String),
     Status(String),
     Plan(Vec<PlanStep>),
     Usage {
@@ -49,11 +50,14 @@ impl Ui for ChannelUi {
     fn assistant_end(&mut self) {
         self.send(UiEvent::AssistantEnd);
     }
+    fn tool_started(&mut self, name: &str, arguments: &str) {
+        self.send(UiEvent::ToolStarted(name.to_string(), arguments.to_string()));
+    }
     fn tool_call(&mut self, name: &str, arguments: &str) {
         self.send(UiEvent::ToolCall(name.to_string(), arguments.to_string()));
     }
-    fn tool_result(&mut self, result: &str) {
-        self.send(UiEvent::ToolResult(result.to_string()));
+    fn tool_result(&mut self, name: &str, result: &str) {
+        self.send(UiEvent::ToolResult(name.to_string(), result.to_string()));
     }
     fn status(&mut self, text: &str) {
         self.send(UiEvent::Status(text.to_string()));

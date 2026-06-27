@@ -42,6 +42,11 @@ pub(crate) enum NudgeKind {
     /// turn when it stops with text. Kept for the typed enum's completeness.)
     #[allow(dead_code)]
     Continue,
+    /// Sent when the model hit the output token cap (`stop_reason: "length"` /
+    /// `"max_tokens"`) mid-generation — the response was truncated, not
+    /// finished. The nudge tells the model to continue from where it was cut
+    /// off so the turn doesn't end on a half-finished output.
+    Truncation,
     /// A verification stage failure fed back to the model for another attempt.
     /// Carries the verify round (1-based) so the replace logic can tell a prior
     /// verify nudge from other synthetic messages.
@@ -66,6 +71,7 @@ const fn nudge_marker(kind: NudgeKind) -> &'static str {
     match kind {
         NudgeKind::Repeat => "[hi:nudge:repeat]",
         NudgeKind::Continue => "[hi:nudge:continue]",
+        NudgeKind::Truncation => "[hi:nudge:truncation]",
         NudgeKind::Verify { .. } => "[hi:nudge:verify]",
         NudgeKind::Finalize => "[hi:nudge:finalize]",
         NudgeKind::Compaction => "[hi:nudge:compaction]",
@@ -75,6 +81,13 @@ const fn nudge_marker(kind: NudgeKind) -> &'static str {
 /// Return the marker prefix for a nudge kind, for matching.
 fn marker_for(kind: NudgeKind) -> &'static str {
     nudge_marker(kind)
+}
+
+/// Whether a text block starts with any known nudge marker — used by
+/// [`Transcript::strip_trailing_nudges`] to identify synthetic user messages
+/// without caring about the specific kind.
+fn is_nudge_text(text: &str) -> bool {
+    text.starts_with("[hi:nudge:")
 }
 
 /// The conversation transcript, enforcing provider-safety invariants.
@@ -170,7 +183,9 @@ impl Transcript {
     /// [`push_assistant_with_results`]: Self::push_assistant_with_results
     pub(crate) fn push_assistant(&mut self, content: Vec<Content>) {
         debug_assert!(
-            !content.iter().any(|c| matches!(c, Content::ToolCall { .. })),
+            !content
+                .iter()
+                .any(|c| matches!(c, Content::ToolCall { .. })),
             "push_assistant used for content with ToolCall blocks; \
              use push_assistant_with_results so tool results are paired"
         );
@@ -229,8 +244,7 @@ impl Transcript {
         call_id: impl Into<String>,
         output: impl Into<String>,
     ) {
-        self.make_mut()
-            .push(Message::tool_result(call_id, output));
+        self.make_mut().push(Message::tool_result(call_id, output));
     }
 
     /// Record an assistant message whose tool calls were *deliberately not
@@ -275,10 +289,12 @@ impl Transcript {
         let marker = marker_for(kind);
         // First, find whether a prior nudge of this kind exists. If not, just
         // append — don't strip the model's just-finished turn.
-        let has_prior = self
-            .messages
-            .iter()
-            .any(|m| m.role == Role::User && m.content.iter().any(|c| matches!(c, Content::Text(t) if t.starts_with(marker))));
+        let has_prior = self.messages.iter().any(|m| {
+            m.role == Role::User
+                && m.content
+                    .iter()
+                    .any(|c| matches!(c, Content::Text(t) if t.starts_with(marker)))
+        });
         let body = text.into();
         let tagged = format!("{}\n{}", marker, body);
         let msgs = self.make_mut();
@@ -305,6 +321,33 @@ impl Transcript {
     }
 
     // ---- rollback / reset ----------------------------------------------
+
+    /// Strip trailing synthetic nudge messages (any `Role::User` message whose
+    /// text starts with a known nudge marker). Called at turn end so a stall
+    /// (repeat-nudge, continue-nudge, verify-fail) doesn't leave a synthetic
+    /// user message as the last entry — which would absorb the next real prompt
+    /// via [`push_user_or_fold`] and make the model "pick up where it stalled"
+    /// instead of addressing the new request.
+    ///
+    /// Only trailing nudges are removed: a nudge followed by a real assistant
+    /// message stays (it's part of the conversation history). Pops at most one
+    /// nudge per call — the common case is a single trailing nudge.
+    pub(crate) fn strip_trailing_nudges(&mut self) {
+        let msgs = self.make_mut();
+        // Pop trailing user messages that are tagged nudges. A nudge is always
+        // followed by `continue` (another model round) or `break` (turn ends),
+        // so at most one trailing nudge is expected — but loop defensively in
+        // case an edge case leaves two.
+        while let Some(last) = msgs.last()
+            && last.role == Role::User
+            && last
+                .content
+                .iter()
+                .any(|c| matches!(c, Content::Text(t) if is_nudge_text(t)))
+        {
+            msgs.pop();
+        }
+    }
 
     /// Discard messages back to `len` — used to drop an interrupted turn so the
     /// conversation stays consistent (no dangling user message, no orphan
@@ -491,10 +534,11 @@ mod tests {
             },
         ]);
         let last = t.as_slice().last().unwrap();
-        assert!(last
-            .content
-            .iter()
-            .all(|c| !matches!(c, Content::ToolCall { .. })));
+        assert!(
+            last.content
+                .iter()
+                .all(|c| !matches!(c, Content::ToolCall { .. }))
+        );
         // No tool result was pushed, and none is needed — no orphan because
         // there's no tool_use either.
         t.validate_for_provider().unwrap();
@@ -580,5 +624,37 @@ mod tests {
         t.rewind_to(before);
         assert_eq!(t.len(), before);
         t.validate_for_provider().unwrap();
+    }
+
+    #[test]
+    fn strip_trailing_nudges_removes_trailing_nudge() {
+        // A turn that ended with a repeat-nudge: the last message is a
+        // synthetic user nudge. Stripping should remove it, leaving the
+        // assistant text as the last message.
+        let mut t = Transcript::new(vec![user("do it"), assistant_text("working")]);
+        t.push_nudge(NudgeKind::Repeat, "Act on the output above.");
+        assert_eq!(t.as_slice().last().unwrap().role, Role::User);
+        t.strip_trailing_nudges();
+        assert_eq!(t.as_slice().last().unwrap().role, Role::Assistant);
+        t.validate_for_provider().unwrap();
+    }
+
+    #[test]
+    fn strip_trailing_nudges_keeps_real_user_message() {
+        // A real user message (no nudge marker) is not stripped.
+        let mut t = Transcript::new(vec![user("do it"), assistant_text("done")]);
+        t.push_user("next task");
+        t.strip_trailing_nudges();
+        assert_eq!(t.as_slice().len(), 3, "real user message is kept");
+        assert_eq!(t.as_slice().last().unwrap().role, Role::User);
+    }
+
+    #[test]
+    fn strip_trailing_nudges_noop_when_last_is_assistant() {
+        // No trailing nudge → no-op.
+        let mut t = Transcript::new(vec![user("do it"), assistant_text("done")]);
+        let len = t.len();
+        t.strip_trailing_nudges();
+        assert_eq!(t.len(), len);
     }
 }

@@ -2,21 +2,21 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
-use crate::paths::{READ_CACHE, validate_workspace_path};
+use crate::paths::{READ_CACHE, cache_key, validate_workspace_path};
 
 /// Apply a multi-file patch in Claude's `apply_patch` format. The envelope is
 /// `*** Begin Patch … *** End Patch`; inside, each `*** Update File:`,
 /// `*** Add File:`, or `*** Delete File:` header introduces a file operation.
 ///
 /// For updates, each line is either context (no prefix), a removal (`-`), or an
-/// addition (`+`). The result file is rebuilt as the "after" state: context and
-/// added lines are emitted in order, removed lines are dropped, and `@@ … @@`
-/// hunk headers are skipped. This works because the model sends the full new
-/// region via context+added lines, with `-` marking only what was removed. We
-/// read the original only to verify the file exists and to diff against for the
-/// UI-friendly result.
-pub(crate) fn apply_multi_patch(patch: &str) -> Result<String> {
+/// addition (`+`). Context and removed lines are validated against the original
+/// file — each must appear, in order — so a stale patch is rejected rather than
+/// silently corrupting the file. Added lines are inserted in place of removed
+/// ones. `@@ … @@` hunk headers are skipped. Lines of the original not mentioned
+/// in any hunk are preserved unchanged.
+pub(crate) async fn apply_multi_patch(patch: &str) -> Result<String> {
     let mut results = Vec::new();
+    let mut unknown: Vec<&str> = Vec::new();
     let lines: Vec<&str> = patch.lines().collect();
 
     // Validate envelope. An empty body is also rejected so the model gets a
@@ -51,12 +51,15 @@ pub(crate) fn apply_multi_patch(patch: &str) -> Result<String> {
             if let Some(parent) = Path::new(path).parent()
                 && !parent.as_os_str().is_empty()
             {
-                std::fs::create_dir_all(parent)
+                tokio::fs::create_dir_all(parent)
+                    .await
                     .with_context(|| format!("creating {}", parent.display()))?;
             }
-            std::fs::write(path, &content).with_context(|| format!("writing {path}"))?;
+            tokio::fs::write(path, &content)
+                .await
+                .with_context(|| format!("writing {path}"))?;
             if let Ok(mut cache) = READ_CACHE.lock() {
-                cache.remove(path);
+                cache.remove(&cache_key(path));
             }
             results.push(format!("+ added {path}"));
             continue;
@@ -66,72 +69,156 @@ pub(crate) fn apply_multi_patch(patch: &str) -> Result<String> {
         if let Some(path) = line.strip_prefix("*** Delete File: ") {
             let path = path.trim();
             validate_workspace_path(path)?;
-            std::fs::remove_file(path).with_context(|| format!("deleting {path}"))?;
+            tokio::fs::remove_file(path)
+                .await
+                .with_context(|| format!("deleting {path}"))?;
             if let Ok(mut cache) = READ_CACHE.lock() {
-                cache.remove(path);
+                cache.remove(&cache_key(path));
             }
             results.push(format!("- deleted {path}"));
             i += 1;
             continue;
         }
 
-        // Update File: rebuild from context + added lines, dropping removed ones.
+        // Update File: apply a hunk-style patch to the file. Context lines (no
+        // prefix) and removed lines (`-`) are validated against the original —
+        // each must appear, in order, so a stale or wrong context line is
+        // rejected rather than silently overwriting real content. Added lines
+        // (`+`) are inserted in place of removed ones. `@@ … @@` hunk headers
+        // are delimiters, skipped. Lines of the original not mentioned in any
+        // hunk are preserved unchanged.
         if let Some(path) = line.strip_prefix("*** Update File: ") {
             let path = path.trim();
             validate_workspace_path(path)?;
-            // Read to verify the file exists (Update File can't create — use
-            // Add File for that). The content isn't needed: the rebuilt "after"
-            // text comes entirely from the patch's context + added lines.
-            std::fs::read_to_string(path)
+            let original = crate::read::read_text_file(path)
+                .await
                 .with_context(|| format!("reading {path} (use *** Add File: to create)"))?;
-            let mut after = String::new();
-            let mut changes = 0u32;
-            i += 1;
+            let orig_lines: Vec<&str> = original.lines().collect();
 
+            // Collect this file's patch lines (until the next `*** ` directive).
+            let mut patch_lines: Vec<&str> = Vec::new();
+            i += 1;
             while i < lines.len() && !lines[i].trim().starts_with("*** ") {
-                let l = lines[i];
-                match l.chars().next() {
-                    Some('+') => {
-                        after.push_str(&l[1..]);
-                        after.push('\n');
-                        changes += 1;
-                        i += 1;
-                    }
-                    Some('-') => {
-                        // Skip removed line — it's dropped from the output.
-                        changes += 1;
-                        i += 1;
-                    }
-                    _ => {
-                        // Context line or `@@ … @@` hunk header. Include the
-                        // line as-is, except for the hunk header, which is just
-                        // a delimiter and not part of the file content.
-                        if !l.trim_start().starts_with("@@") {
-                            after.push_str(l);
-                            after.push('\n');
-                        }
-                        i += 1;
-                    }
-                }
+                patch_lines.push(lines[i]);
+                i += 1;
             }
+
+            let after = apply_hunk_patch(&orig_lines, &patch_lines)
+                .with_context(|| format!("patching {path}"))?;
 
             if let Ok(mut cache) = READ_CACHE.lock() {
-                cache.remove(path);
+                cache.remove(&cache_key(path));
             }
-            std::fs::write(path, &after).with_context(|| format!("writing {path}"))?;
-            results.push(format!("~ updated {path} ({changes} change{})", if changes == 1 { "" } else { "s" }));
+            tokio::fs::write(path, &after)
+                .await
+                .with_context(|| format!("writing {path}"))?;
+            let changes = patch_lines
+                .iter()
+                .filter(|l| l.starts_with('+') || l.starts_with('-'))
+                .count();
+            results.push(format!(
+                "~ updated {path} ({changes} change{})",
+                if changes == 1 { "" } else { "s" }
+            ));
             continue;
         }
 
-        // Unknown directive — skip it rather than aborting the whole patch, so a
-        // minor format variation doesn't lose all the file operations.
+        // Unknown directive — collect it and skip. If no recognized operations
+        // were found, we'll include the unknown directives in the error so the
+        // model can see *why* (e.g. a typo like `*** UpdateFile:` missing a
+        // space) instead of a bare "no operations" message.
+        unknown.push(line);
         i += 1;
     }
 
     if results.is_empty() {
-        bail!("patch contained no file operations");
+        if unknown.is_empty() {
+            bail!("patch contained no file operations");
+        } else {
+            let preview: Vec<String> = unknown.iter().take(3).map(|d| format!("'{d}'")).collect();
+            bail!(
+                "patch contained no file operations (unknown directive{}: {})",
+                if unknown.len() == 1 { "" } else { "s" },
+                preview.join(", ")
+            );
+        }
     }
     Ok(results.join("\n"))
+}
+
+/// Apply a hunk-style patch to a file's lines, validating context. Walks the
+/// original lines with a cursor; for each patch line:
+/// - context (space prefix) or `-` (removed): advance the cursor to the next
+///   matching original line (comparing `trim_end()` so trailing whitespace / CRLF
+///   differences don't cause spurious failures). Emit context lines; skip removed
+///   lines. Lines the cursor skips over are emitted unchanged (preserved).
+/// - `+` (added): emit immediately, cursor doesn't move.
+/// - `@@ … @@`: hunk header, skipped.
+///
+/// If a context or removed line can't be found in the original (ahead of the
+/// cursor), the patch is rejected — a stale context line would silently corrupt
+/// the file otherwise. The trailing newline of the original is preserved.
+fn apply_hunk_patch(orig_lines: &[&str], patch_lines: &[&str]) -> Result<String> {
+    let mut out = String::new();
+    let mut cursor = 0usize; // next unread line in orig_lines
+
+    for pl in patch_lines {
+        if pl.trim_start().starts_with("@@") {
+            continue;
+        }
+        if let Some(added) = pl.strip_prefix('+') {
+            out.push_str(added);
+            out.push('\n');
+            continue;
+        }
+        // Context line (space prefix) or removed line (`-`). The first char is
+        // the prefix; the rest is the line content to match against the original.
+        let (expected, is_removal) = match pl.strip_prefix('-') {
+            Some(rest) => (rest, true),
+            None => {
+                // Context line: strip the leading space prefix. If the line is
+                // empty or doesn't start with a space, use it as-is (tolerant).
+                let content = pl.strip_prefix(' ').unwrap_or(pl);
+                (content, false)
+            }
+        };
+        // Search forward from the cursor for a matching line (trim_end tolerates
+        // trailing whitespace and CRLF differences).
+        let norm_expected = expected.trim_end();
+        let found = orig_lines[cursor..]
+            .iter()
+            .position(|l| l.trim_end() == norm_expected);
+        let Some(rel) = found else {
+            bail!(
+                "context line not found in the original file: {:?} \
+                 (searched from line {}). The patch may be stale — re-read \
+                 the file and regenerate the patch.",
+                expected,
+                cursor + 1
+            );
+        };
+        let abs = cursor + rel;
+        // Emit any skipped original lines (unchanged context between hunks).
+        for line in &orig_lines[cursor..abs] {
+            out.push_str(line);
+            out.push('\n');
+        }
+        // For a context line, emit the original line (preserving its exact
+        // whitespace); for a `-` line, drop it.
+        if !is_removal {
+            out.push_str(orig_lines[abs]);
+            out.push('\n');
+        }
+        cursor = abs + 1;
+    }
+
+    // Emit any remaining original lines (trailing context not mentioned in the patch).
+    for line in &orig_lines[cursor..] {
+        out.push_str(line);
+        out.push('\n');
+    }
+
+    Ok(out)
 }
 
 /// Single-quote a string for safe interpolation into an `sh -c` command.
@@ -417,7 +504,7 @@ pub(crate) fn reindent(new: &str, old_indent: &str, file_indent: &str) -> String
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_edit, apply_multi_patch, diff, edit_not_found_help};
+    use super::{apply_edit, apply_hunk_patch, apply_multi_patch, diff, edit_not_found_help};
 
     #[test]
     fn edit_not_found_points_at_similar_lines() {
@@ -463,12 +550,18 @@ mod tests {
             "summary: {plain}"
         );
         // Unchanged neighbours appear as context (proves we're not changed-only).
-        assert!(plain.contains(" c\n") || plain.contains(" c"), "context: {plain}");
+        assert!(
+            plain.contains(" c\n") || plain.contains(" c"),
+            "context: {plain}"
+        );
         // The change is on line 4, numbered, with both old and new sides shown.
         assert!(plain.contains("4 - d"), "removed line w/ number: {plain}");
         assert!(plain.contains("4 + D"), "added line w/ number: {plain}");
         // Distant lines (line 1) are NOT shown — only context around the change.
-        assert!(!plain.contains("1   a") && !plain.contains("1 + a"), "far context elided: {plain}");
+        assert!(
+            !plain.contains("1   a") && !plain.contains("1 + a"),
+            "far context elided: {plain}"
+        );
     }
 
     /// Strip ANSI SGR escapes (`\x1b[…m`) so tests can assert on plain text.
@@ -579,11 +672,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn apply_multi_patch_adds_updates_and_deletes() {
+    #[tokio::test]
+    async fn apply_multi_patch_adds_updates_and_deletes() {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
-        let orig_cwd = std::env::current_dir().unwrap();
         let had_guard = std::env::var_os("HI_NO_PATH_GUARD");
         let dir = std::env::temp_dir().join(format!(
             "hi-patch-test-{}-{}",
@@ -591,35 +683,35 @@ mod tests {
             N.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_current_dir(&dir).unwrap();
         // Set HI_NO_PATH_GUARD so temp-dir paths aren't rejected.
         // (unsafe: env mutation is unsafe in edition 2024.)
-        unsafe { std::env::set_var("HI_NO_PATH_GUARD", "1"); }
+        unsafe {
+            std::env::set_var("HI_NO_PATH_GUARD", "1");
+        }
 
         std::fs::write(dir.join("update.txt"), "line1\nline2\nline3\n").unwrap();
         std::fs::write(dir.join("delete.txt"), "bye\n").unwrap();
 
-        let patch = "\
-*** Begin Patch
-*** Update File: update.txt
-@@ line1 @@
- line1
- line2
--replaced
-+line2b
- line3
-*** Add File: created.txt
-new content
-*** Delete File: delete.txt
-*** End Patch";
-        let result = apply_multi_patch(patch).unwrap();
+        // Use absolute paths in the patch so the test doesn't depend on cwd
+        // (which races with other async tests that also chdir).
+        let upd = dir.join("update.txt");
+        let cre = dir.join("created.txt");
+        let del = dir.join("delete.txt");
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: {}\n@@ line1 @@\n line1\n-line2\n+line2b\n line3\n*** Add File: {}\nnew content\n*** Delete File: {}\n*** End Patch",
+            upd.display(),
+            cre.display(),
+            del.display(),
+        );
+        let result = apply_multi_patch(&patch).await.unwrap();
 
-        // Update: context + added lines become the new file; `-replaced` is
-        // dropped (it wasn't even in the file, but the format skips `-` lines).
+        // Update: the `-line2` removal is validated against the original (it
+        // must be present), then replaced by `+line2b`. Context lines are
+        // preserved; unmentioned lines are kept.
         let updated = std::fs::read_to_string(dir.join("update.txt")).unwrap();
         assert!(updated.contains("line1"), "context kept");
         assert!(updated.contains("line2b"), "added line present");
-        assert!(!updated.contains("replaced"), "removed line dropped");
+        assert!(!updated.contains("line2\n"), "removed line dropped");
         assert!(updated.contains("line3"), "trailing context kept");
 
         // Add: new file written with the given content.
@@ -642,15 +734,92 @@ new content
                 std::env::remove_var("HI_NO_PATH_GUARD");
             }
         }
-        std::env::set_current_dir(&orig_cwd).ok();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn apply_multi_patch_rejects_bad_envelope() {
+        unsafe {
+            std::env::set_var("HI_NO_PATH_GUARD", "1");
+        }
+        assert!(apply_multi_patch("not a patch").await.is_err());
+        assert!(apply_multi_patch("").await.is_err());
+        unsafe {
+            std::env::remove_var("HI_NO_PATH_GUARD");
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_multi_patch_reports_unknown_directives() {
+        // A patch with only unrecognized directives should name them in the
+        // error so the model can see what went wrong (e.g. a typo).
+        unsafe {
+            std::env::set_var("HI_NO_PATH_GUARD", "1");
+        }
+        let patch = "*** Begin Patch\n*** UpdateFile: src/a.rs\n-old\n+new\n*** End Patch";
+        let err = apply_multi_patch(patch).await.unwrap_err().to_string();
+        assert!(
+            err.contains("unknown directive"),
+            "should mention unknown directive: {err}"
+        );
+        assert!(
+            err.contains("*** UpdateFile:"),
+            "should name the offending directive: {err}"
+        );
+        unsafe {
+            std::env::remove_var("HI_NO_PATH_GUARD");
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_multi_patch_rejects_stale_context() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let had_guard = std::env::var_os("HI_NO_PATH_GUARD");
+        let dir = std::env::temp_dir().join(format!(
+            "hi-patch-stale-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe {
+            std::env::set_var("HI_NO_PATH_GUARD", "1");
+        }
+
+        std::fs::write(dir.join("f.txt"), "alpha\nbeta\ngamma\n").unwrap();
+
+        // The context line "delta" is not in the file — must be rejected.
+        let f = dir.join("f.txt");
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: {}\n alpha\n delta\n+new\n*** End Patch",
+            f.display(),
+        );
+        let result = apply_multi_patch(&patch).await;
+        assert!(result.is_err(), "stale context should be rejected");
+        // The file is untouched.
+        assert_eq!(
+            std::fs::read_to_string(dir.join("f.txt")).unwrap(),
+            "alpha\nbeta\ngamma\n"
+        );
+
+        unsafe {
+            if had_guard.is_some() {
+                std::env::set_var("HI_NO_PATH_GUARD", "1");
+            } else {
+                std::env::remove_var("HI_NO_PATH_GUARD");
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn apply_multi_patch_rejects_bad_envelope() {
-        unsafe { std::env::set_var("HI_NO_PATH_GUARD", "1"); }
-        assert!(apply_multi_patch("not a patch").is_err());
-        assert!(apply_multi_patch("").is_err());
-        unsafe { std::env::remove_var("HI_NO_PATH_GUARD"); }
+    fn apply_hunk_patch_preserves_unmentioned_lines() {
+        // A patch that only touches the middle of a file must preserve the
+        // lines before and after the hunk — not replace the whole file.
+        // Context lines are space-prefixed (unified-diff style).
+        let orig = vec!["a", "b", "c", "d", "e", "f"];
+        let patch = vec![" b", "-c", "+C", " d"];
+        let out = apply_hunk_patch(&orig, &patch).unwrap();
+        assert_eq!(out, "a\nb\nC\nd\ne\nf\n");
     }
 }

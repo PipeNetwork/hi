@@ -12,3 +12,6 @@ anyhow.workspace = true
 similar = "2"
 ignore = "0.4"
 regex = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

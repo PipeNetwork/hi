@@ -197,6 +197,8 @@ async fn main() -> Result<()> {
                 result.as_ref().err(),
             )?;
         }
+        // A one-shot turn may have started background processes; don't leak them.
+        hi_tools::kill_background_processes();
         return result;
     }
 
@@ -218,7 +220,10 @@ async fn main() -> Result<()> {
         )
         .await
         {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                hi_tools::kill_background_processes();
+                return Ok(());
+            }
             Err(err) => eprintln!("\x1b[33mTUI error ({err:#}); falling back to plain mode\x1b[0m"),
         }
     }
@@ -364,6 +369,7 @@ fn write_report(
             "tool_calls": tel.tool_calls,
             "max_concurrent_batch": tel.max_concurrent_batch,
             "serial_runs": tel.serial_runs,
+            "tool_timeline": tel.tool_timeline,
         },
     });
     std::fs::write(path, serde_json::to_string_pretty(&report)?)

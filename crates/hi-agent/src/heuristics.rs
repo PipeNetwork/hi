@@ -1,18 +1,18 @@
 //! Small heuristics and formatters used by the agent loop.
 
 use hi_ai::ToolMode;
-use hi_tools::ToolOutput;
+use hi_tools::{PlanStatus, PlanStep, ToolOutput};
 
 use crate::ui::Ui;
 
 /// Route a tool's output to the right UI surface: a plan update drives the live
 /// tracker (in place), everything else renders as a tool result — its richer
 /// `display` if present, else the model-facing `content`.
-pub(crate) fn emit_tool_output(ui: &mut dyn Ui, output: &ToolOutput) {
+pub(crate) fn emit_tool_output(ui: &mut dyn Ui, name: &str, output: &ToolOutput) {
     if let Some(plan) = output.plan.as_deref() {
         ui.plan(plan);
     } else {
-        ui.tool_result(output.display.as_deref().unwrap_or(&output.content));
+        ui.tool_result(name, output.display.as_deref().unwrap_or(&output.content));
     }
 }
 
@@ -51,8 +51,7 @@ pub(crate) fn tool_deps(calls: &[(String, String, String)]) -> Vec<Vec<usize>> {
                 // Reads wait for an earlier mutation on the same path. If
                 // either side has no parseable path, be safe and serialize
                 // (covers `bash` edits, which have no path).
-                *was_mut
-                    && paths_overlap(their_path.as_deref(), my_path.as_deref())
+                *was_mut && paths_overlap(their_path.as_deref(), my_path.as_deref())
             };
             if must_wait {
                 deps[i].push(j);
@@ -168,6 +167,48 @@ pub(crate) fn looks_like_unfinished_step(text: &str) -> bool {
     // Otherwise judge the trailing line: a dangling colon ("Now let me rewrite
     // main.rs:") or a forward-looking phrase means work was announced, not done.
     last.ends_with(':') || is_forward_intent(last)
+}
+
+/// Whether a plan has unfinished work — any step that is `Pending` or `Active`.
+/// Used by the continue logic to keep the turn going when the model stops
+/// calling tools but the plan isn't complete. The model often writes a
+/// finished-looking recap after one sub-task ("I've implemented proof.rs."),
+/// which the text-based `looks_like_unfinished_step` heuristic can't catch —
+/// but the plan state (2/9 done) is unambiguous.
+pub(crate) fn plan_has_pending_steps(steps: &[PlanStep]) -> bool {
+    steps
+        .iter()
+        .any(|s| s.status == PlanStatus::Pending || s.status == PlanStatus::Active)
+}
+
+/// Whether a user input looks like a "continue" command — a short prompt
+/// asking the agent to keep going, as opposed to a new task. Used to decide
+/// whether to persist the plan state across turns: a "continue" on an
+/// incomplete plan should keep the plan so the plan-aware continue logic can
+/// fire; a new task should clear it so a stale plan doesn't cause spurious
+/// nudges.
+pub(crate) fn looks_like_continue(input: &str) -> bool {
+    let lower = input.trim().to_lowercase();
+    if lower.len() > 50 {
+        return false; // A continue command is short; a new task is longer.
+    }
+    const CONTINUE_PHRASES: &[&str] = &[
+        "continue",
+        "keep going",
+        "go on",
+        "next",
+        "proceed",
+        "resume",
+        "carry on",
+        "finish it",
+        "finish up",
+        "do the rest",
+        "do the remaining",
+        "keep working",
+    ];
+    CONTINUE_PHRASES
+        .iter()
+        .any(|p| lower == *p || lower.starts_with(p))
 }
 
 /// Whether a line expresses *intent to act next* rather than a finished result.
@@ -365,6 +406,69 @@ mod tests {
     }
 
     #[test]
+    fn plan_pending_steps_heuristic() {
+        let step = |status: PlanStatus| PlanStep {
+            title: "x".into(),
+            status,
+        };
+        // All done → no pending work.
+        assert!(!plan_has_pending_steps(&[
+            step(PlanStatus::Done),
+            step(PlanStatus::Done),
+        ]));
+        // Has a pending step → unfinished.
+        assert!(plan_has_pending_steps(&[
+            step(PlanStatus::Done),
+            step(PlanStatus::Pending),
+        ]));
+        // Has an active step → unfinished.
+        assert!(plan_has_pending_steps(&[
+            step(PlanStatus::Done),
+            step(PlanStatus::Active),
+            step(PlanStatus::Pending),
+        ]));
+        // Empty plan → no pending work (no plan to complete).
+        assert!(!plan_has_pending_steps(&[]));
+    }
+
+    #[test]
+    fn looks_like_continue_heuristic() {
+        // Short continue commands.
+        for s in [
+            "continue",
+            "Continue",
+            "CONTINUE",
+            "keep going",
+            "go on",
+            "next",
+            "proceed",
+            "resume",
+            "carry on",
+            "finish it",
+            "do the rest",
+            "keep working",
+            "  continue  ",
+        ] {
+            assert!(looks_like_continue(s), "should flag as continue: {s:?}");
+        }
+        // New tasks — should NOT be flagged as continue.
+        for s in [
+            "fix the bug in parser.rs",
+            "implement a new feature for the CLI",
+            "review the codebase and suggest improvements",
+            "write tests for the auth module",
+            "refactor the error handling to use anyhow",
+            // Too long even if it starts with "continue".
+            "continue working on the feature but also make sure to handle the edge case where the input is empty and the user has not provided a valid path",
+        ] {
+            assert!(
+                !looks_like_continue(s),
+                "should NOT flag as continue: {s:?}"
+            );
+        }
+    }
+
+    #[test]
     fn recovery_sampling_escalates_and_toggles() {
         // Normal round: pass the configured temperature through, no overrides.
         assert_eq!(
@@ -444,7 +548,11 @@ mod tests {
         // write a.rs, read a.rs, read b.rs: the read of a.rs depends on the
         // write; the read of b.rs does not (different path) — independent.
         let calls = vec![
-            ("w".into(), "write".into(), r#"{"path":"a.rs","content":"x"}"#.into()),
+            (
+                "w".into(),
+                "write".into(),
+                r#"{"path":"a.rs","content":"x"}"#.into(),
+            ),
             ("r1".into(), "read".into(), r#"{"path":"a.rs"}"#.into()),
             ("r2".into(), "read".into(), r#"{"path":"b.rs"}"#.into()),
         ];
@@ -464,12 +572,23 @@ mod tests {
     fn tool_deps_serializes_mutating_calls_in_emission_order() {
         // Two writes: the second depends on the first (edits aren't commutative).
         let calls = vec![
-            ("w1".into(), "write".into(), r#"{"path":"a.rs","content":"1"}"#.into()),
-            ("w2".into(), "edit".into(), r#"{"path":"a.rs","old_string":"1","new_string":"2"}"#.into()),
+            (
+                "w1".into(),
+                "write".into(),
+                r#"{"path":"a.rs","content":"1"}"#.into(),
+            ),
+            (
+                "w2".into(),
+                "edit".into(),
+                r#"{"path":"a.rs","old_string":"1","new_string":"2"}"#.into(),
+            ),
         ];
         let deps = tool_deps(&calls);
         assert!(deps[0].is_empty());
-        assert!(deps[1].contains(&0), "second write depends on first: {deps:?}");
+        assert!(
+            deps[1].contains(&0),
+            "second write depends on first: {deps:?}"
+        );
     }
 
     #[test]
@@ -478,11 +597,18 @@ mod tests {
         // serialized after it (the safe fallback — the read might observe the
         // bash edit's effect).
         let calls = vec![
-            ("b".into(), "bash".into(), r#"{"command":"echo x > a.rs"}"#.into()),
+            (
+                "b".into(),
+                "bash".into(),
+                r#"{"command":"echo x > a.rs"}"#.into(),
+            ),
             ("r".into(), "read".into(), r#"{"path":"a.rs"}"#.into()),
         ];
         let deps = tool_deps(&calls);
-        assert!(deps[1].contains(&0), "read after bash edit serializes: {deps:?}");
+        assert!(
+            deps[1].contains(&0),
+            "read after bash edit serializes: {deps:?}"
+        );
     }
 
     #[test]
@@ -504,7 +630,11 @@ mod tests {
         // deps only point backward). This is the regression guard.
         let calls = vec![
             ("r0".into(), "read".into(), r#"{"path":"a.rs"}"#.into()),
-            ("w".into(), "write".into(), r#"{"path":"a.rs","content":"x"}"#.into()),
+            (
+                "w".into(),
+                "write".into(),
+                r#"{"path":"a.rs","content":"x"}"#.into(),
+            ),
             ("r1".into(), "read".into(), r#"{"path":"a.rs"}"#.into()),
             ("r2".into(), "read".into(), r#"{"path":"b.rs"}"#.into()),
         ];
@@ -526,7 +656,11 @@ mod tests {
         // write does not.
         let calls = vec![
             ("r0".into(), "read".into(), r#"{"path":"a.rs"}"#.into()),
-            ("w".into(), "write".into(), r#"{"path":"b.rs","content":"x"}"#.into()),
+            (
+                "w".into(),
+                "write".into(),
+                r#"{"path":"b.rs","content":"x"}"#.into(),
+            ),
             ("r2".into(), "read".into(), r#"{"path":"c.rs"}"#.into()),
         ];
         let deps = tool_deps(&calls);
@@ -544,7 +678,11 @@ mod tests {
         // Contrast: a dependent read (same path as the write) must NOT complete
         // before the write.
         let dep_calls = vec![
-            ("w".into(), "write".into(), r#"{"path":"a.rs","content":"x"}"#.into()),
+            (
+                "w".into(),
+                "write".into(),
+                r#"{"path":"a.rs","content":"x"}"#.into(),
+            ),
             ("r".into(), "read".into(), r#"{"path":"a.rs"}"#.into()),
         ];
         let dep = tool_deps(&dep_calls);

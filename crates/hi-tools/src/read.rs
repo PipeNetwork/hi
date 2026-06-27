@@ -7,10 +7,10 @@ use regex::Regex;
 use serde::Deserialize;
 use tokio::process::Command;
 
-use crate::condense::{truncate};
-use crate::edit::sh_quote;
-use crate::paths::{READ_CACHE, READ_CACHE_MAX, is_vcs_metadata_dir, validate_workspace_path};
 use crate::ToolOutput;
+use crate::condense::truncate;
+use crate::edit::sh_quote;
+use crate::paths::{READ_CACHE, cache_key, is_vcs_metadata_dir, validate_workspace_path};
 
 const DEFAULT_READ_LIMIT: usize = 240;
 
@@ -18,37 +18,38 @@ const DEFAULT_READ_LIMIT: usize = 240;
 pub(crate) async fn run_read(arguments: &str) -> Result<ToolOutput> {
     let args: ReadArgs = crate::tools::parse(arguments)?;
     validate_workspace_path(&args.path)?;
-    // Check the per-turn cache first — models often re-read files.
-    let content = {
-        let cache = READ_CACHE.lock().unwrap();
-        if let Some(cached) = cache.get(&args.path) {
-            cached.clone()
-        } else {
-            drop(cache);
-            // Read as bytes first so we can detect binary files and
-            // give a clear message instead of an opaque UTF-8 error.
-            let bytes = tokio::fs::read(&args.path)
-                .await
-                .with_context(|| format!("reading {}", args.path))?;
-            if is_binary(&bytes) {
-                bail!(
-                    "{} is a binary file ({} bytes) — the `read` tool is for text. \
-                     Use `bash` to inspect it (e.g. `file {}`, `xxd {} | head`).",
-                    args.path,
-                    bytes.len(),
-                    sh_quote(&args.path),
-                    sh_quote(&args.path)
-                );
-            }
-            let content = String::from_utf8_lossy(&bytes).into_owned();
-            if let Ok(mut cache) = READ_CACHE.lock() {
-                if cache.len() >= READ_CACHE_MAX {
-                    cache.clear();
-                }
-                cache.insert(args.path.clone(), content.clone());
-            }
-            content
+    // Check the per-turn cache first — models often re-read files. The guard
+    // is dropped before any await so we never hold a std Mutex across an await
+    // point (clippy::await_holding_lock): the cache lookup is a quick clone,
+    // then the lock is released.
+    let cached = {
+        #[allow(unused_mut)]
+        let mut cache = READ_CACHE.lock().unwrap();
+        cache.get(&cache_key(&args.path)).cloned()
+    };
+    let content = if let Some(cached) = cached {
+        cached
+    } else {
+        // Read as bytes first so we can detect binary files and
+        // give a clear message instead of an opaque UTF-8 error.
+        let bytes = tokio::fs::read(&args.path)
+            .await
+            .with_context(|| format!("reading {}", args.path))?;
+        if is_binary(&bytes) {
+            bail!(
+                "{} is a binary file ({} bytes) — the `read` tool is for text. \
+                 Use `bash` to inspect it (e.g. `file {}`, `xxd {} | head`).",
+                args.path,
+                bytes.len(),
+                sh_quote(&args.path),
+                sh_quote(&args.path)
+            );
         }
+        let content = String::from_utf8_lossy(&bytes).into_owned();
+        if let Ok(mut cache) = READ_CACHE.lock() {
+            cache.insert(cache_key(&args.path), content.clone());
+        }
+        content
     };
     Ok(ToolOutput::plain(truncate(&format_read(
         &content,
@@ -78,7 +79,7 @@ pub(crate) async fn run_list(arguments: &str) -> Result<ToolOutput> {
             Ok(e) => e,
             Err(_) => continue,
         };
-        if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
         }
         let rel = entry.path().to_string_lossy();
@@ -119,7 +120,10 @@ pub(crate) async fn run_glob(arguments: &str) -> Result<ToolOutput> {
         .filter_entry(|e| !is_vcs_metadata_dir(e));
     let mut override_builder = ignore::overrides::OverrideBuilder::new(path);
     if let Err(e) = override_builder.add(&args.pattern) {
-        return Ok(ToolOutput::plain(format!("invalid glob `{}`: {e}", args.pattern)));
+        return Ok(ToolOutput::plain(format!(
+            "invalid glob `{}`: {e}",
+            args.pattern
+        )));
     }
     match override_builder.build() {
         Ok(ov) => {
@@ -129,7 +133,7 @@ pub(crate) async fn run_glob(arguments: &str) -> Result<ToolOutput> {
                     Ok(e) => e,
                     Err(_) => continue,
                 };
-                if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+                if !entry.file_type().is_some_and(|ft| ft.is_file()) {
                     continue;
                 }
                 let rel = entry.path().to_string_lossy();
@@ -143,7 +147,10 @@ pub(crate) async fn run_glob(arguments: &str) -> Result<ToolOutput> {
             }
         }
         Err(e) => {
-            return Ok(ToolOutput::plain(format!("invalid glob `{}`: {e}", args.pattern)));
+            return Ok(ToolOutput::plain(format!(
+                "invalid glob `{}`: {e}",
+                args.pattern
+            )));
         }
     }
     let out = if out.is_empty() {
@@ -187,10 +194,7 @@ pub(crate) async fn run_grep(arguments: &str) -> Result<ToolOutput> {
         cmd_args.push("--".to_string());
         cmd_args.push(pattern.clone());
         cmd_args.push(path.to_string());
-        let output = Command::new("rg")
-            .args(&cmd_args)
-            .output()
-            .await;
+        let output = Command::new("rg").args(&cmd_args).output().await;
         match output {
             Ok(o) if o.status.success() || !o.stdout.is_empty() => {
                 let text = String::from_utf8_lossy(&o.stdout);
@@ -203,9 +207,10 @@ pub(crate) async fn run_grep(arguments: &str) -> Result<ToolOutput> {
             }
             Ok(o) if o.status.code() == Some(1) => {
                 // rg exit 1 = no matches (not an error)
-                return Ok(ToolOutput::plain(
-                    format!("no matches for {}", args.pattern),
-                ));
+                return Ok(ToolOutput::plain(format!(
+                    "no matches for {}",
+                    args.pattern
+                )));
             }
             // Fall through to inline walker on other rg errors.
             _ => {}
@@ -244,38 +249,93 @@ pub(crate) async fn run_grep(arguments: &str) -> Result<ToolOutput> {
     }
     let mut out = String::new();
     let mut count = 0u32;
+    // Auto-size the match cap from the output budget: stop once `out` approaches
+    // `MAX_OUTPUT_CHARS` rather than at a fixed match count. This adapts to the
+    // context window — short matches yield more results, long lines fewer —
+    // without a config knob. A floor of 50 ensures we always show *some* matches
+    // even when lines are very long (truncate will clip the final string).
+    let budget = *crate::condense::MAX_OUTPUT_CHARS;
     let walker = builder.build();
     for entry in walker {
         let entry = match entry {
             Ok(e) => e,
             Err(_) => continue,
         };
-        if !entry.file_type().map_or(false, |ft| ft.is_file()) {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
         }
         let file_path = entry.path();
-        let bytes = match tokio::fs::read(file_path).await {
-            Ok(b) => b,
+        let rel = file_path.to_string_lossy();
+        // Stream line-by-line so large files don't get fully buffered. Open
+        // the file and read lines incrementally; skip binary files (detected
+        // from the first chunk) and unreadable files.
+        let file = match tokio::fs::File::open(file_path).await {
+            Ok(f) => f,
             Err(_) => continue,
         };
-        if is_binary(&bytes) {
+        let mut reader = tokio::io::BufReader::new(file);
+        use tokio::io::AsyncBufReadExt;
+        let mut lines: Vec<(usize, String)> = Vec::new();
+        let mut binary = false;
+        // Read lines into a buffer for context matching. We need random access
+        // for context lines, so we collect the file's lines — but cap the count
+        // so a huge file with no matches can't exhaust memory. The rg fast path
+        // (above) handles large files without buffering; this fallback only runs
+        // when rg isn't installed, and a file past the cap is skipped with a note
+        // rather than scanned.
+        const MAX_LINES_PER_FILE: usize = 50_000;
+        let mut line_no = 0usize;
+        let mut too_large = false;
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line).await {
+                Ok(0) => break,
+                Ok(_) => {
+                    // Strip the trailing newline (read_line includes it).
+                    if line.ends_with('\n') {
+                        line.pop();
+                        if line.ends_with('\r') {
+                            line.pop();
+                        }
+                    }
+                    // Binary detection: a NUL byte in the first 8 KB means this
+                    // isn't text — skip the whole file (same heuristic as `read`).
+                    if line.contains('\0') {
+                        binary = true;
+                        break;
+                    }
+                    line_no += 1;
+                    if line_no > MAX_LINES_PER_FILE {
+                        too_large = true;
+                        break;
+                    }
+                    lines.push((line_no, line));
+                }
+                Err(_) => break,
+            }
+        }
+        if binary {
             continue;
         }
-        let content = String::from_utf8_lossy(&bytes);
-        let rel = file_path.to_string_lossy();
-        let lines: Vec<&str> = content.lines().collect();
-        for (i, line) in lines.iter().enumerate() {
+        if too_large {
+            out.push_str(&format!(
+                "{rel}: (skipped — file exceeds {MAX_LINES_PER_FILE} lines; install ripgrep for full search)\n"
+            ));
+            continue;
+        }
+        for (idx, (_, line)) in lines.iter().enumerate() {
             if re.is_match(line) {
-                let line_no = i + 1;
+                let line_no = lines[idx].0;
                 if context > 0 {
-                    let start = i.saturating_sub(context);
-                    let end = (i + context + 1).min(lines.len());
-                    for ctx_i in start..end {
-                        let marker = if ctx_i == i { ":" } else { "-" };
+                    let start = idx.saturating_sub(context);
+                    let end = (idx + context + 1).min(lines.len());
+                    for (ctx_i, (ctx_no, ctx_line)) in
+                        lines.iter().enumerate().take(end).skip(start)
+                    {
+                        let marker = if ctx_i == idx { ":" } else { "-" };
                         out.push_str(&format!(
                             "{rel}{marker}{}: {}\n",
-                            ctx_i + 1,
-                            lines[ctx_i]
+                            ctx_no, ctx_line
                         ));
                     }
                     out.push_str("--\n");
@@ -283,13 +343,16 @@ pub(crate) async fn run_grep(arguments: &str) -> Result<ToolOutput> {
                     out.push_str(&format!("{rel}:{line_no}: {line}\n"));
                 }
                 count += 1;
-                if count >= 200 {
-                    out.push_str("… (truncated at 200 matches)\n");
+                // Auto-size: stop when we've filled the output budget. The
+                // final `truncate` will clip to exactly `budget`, but we stop
+                // early so we don't scan needlessly after the cap is reached.
+                if out.len() >= budget && count >= 50 {
+                    out.push_str("… (truncated — output budget reached)\n");
                     break;
                 }
             }
         }
-        if count >= 200 {
+        if out.ends_with("output budget reached)\n") {
             break;
         }
     }
@@ -318,7 +381,10 @@ pub(crate) fn format_read(content: &str, offset: Option<usize>, limit: Option<us
     }
     let limit = limit.unwrap_or(DEFAULT_READ_LIMIT);
     let end = start.saturating_add(limit).saturating_sub(1).min(total);
-    let width = end.to_string().len().max(4);
+    // Width from the file's total line count (not this page's end) so the gutter
+    // is consistent across pages — reading lines 1-240 vs 9900-10000 shouldn't
+    // shift the column.
+    let width = total.to_string().len().max(4);
     let mut out = String::new();
     for (i, line) in lines[start - 1..end].iter().enumerate() {
         let n = start + i;
@@ -403,6 +469,23 @@ pub(crate) fn is_binary(bytes: &[u8]) -> bool {
     }
     let probe = &bytes[..bytes.len().min(8192)];
     probe.contains(&0)
+}
+
+/// Read a file as UTF-8 text, bailing with a clear message if it's binary
+/// (same heuristic as `read`). Used by `edit`/`multi_edit` so a binary file
+/// produces a helpful error instead of an opaque `read_to_string` UTF-8 panic.
+pub(crate) async fn read_text_file(path: &str) -> Result<String> {
+    let bytes = tokio::fs::read(path)
+        .await
+        .with_context(|| format!("reading {path}"))?;
+    if is_binary(&bytes) {
+        bail!(
+            "{path} is a binary file ({} bytes) — the `edit`/`multi_edit` tools are for text. \
+             Use `bash` to inspect or modify it.",
+            bytes.len()
+        );
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 #[derive(Deserialize)]
@@ -497,11 +580,6 @@ mod tests {
         // NUL beyond the 8 KB probe window is not detected (same as ripgrep).
         let mut big = vec![b'x'; 9000];
         big.push(0);
-        assert!(
-            !is_binary(&big),
-            "NUL past 8 KB probe is not detected"
-        );
+        assert!(!is_binary(&big), "NUL past 8 KB probe is not detected");
     }
 }
-
-

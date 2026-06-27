@@ -40,7 +40,12 @@ pub fn run(opts: &BestOf) -> Result<()> {
         let temperature = temperature_for(i, opts.candidates);
         let worktree = worktree_path(i);
         if let Err(err) = add_worktree(&worktree) {
-            cleanup(&worktrees.iter().map(|(_, wt, _)| wt.clone()).collect::<Vec<_>>());
+            cleanup(
+                &worktrees
+                    .iter()
+                    .map(|(_, wt, _)| wt.clone())
+                    .collect::<Vec<_>>(),
+            );
             return Err(err);
         }
         worktrees.push((i, worktree, temperature));
@@ -134,8 +139,7 @@ pub fn run(opts: &BestOf) -> Result<()> {
 
     let result = match &winner {
         Some((i, worktree)) => {
-            apply_changes(worktree)
-                .with_context(|| "applying the winning candidate's changes")?;
+            apply_changes(worktree).with_context(|| "applying the winning candidate's changes")?;
             println!(
                 "\x1b[32m✓ applied candidate {} to the working tree\x1b[0m",
                 i + 1

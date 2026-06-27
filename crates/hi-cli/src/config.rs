@@ -354,7 +354,7 @@ pub fn resolve(cli: &Cli, config: &Config, registry: &Registry) -> Result<Settin
     let mut max_tokens = cli
         .max_tokens
         .or(profile.and_then(|p| p.max_tokens))
-        .unwrap_or(4096);
+        .unwrap_or(8192);
     // Don't exceed a known model's output ceiling (avoids a 400 from Anthropic).
     if let Some(info) = registry.lookup(&model)
         && info.max_output > 0
@@ -636,7 +636,11 @@ fn resolve_api_key_for(profile: Option<&Profile>, provider: ProviderName) -> Res
     let hint = match names.len() {
         0 => "an API key env var".to_string(),
         1 => names[0].clone(),
-        _ => format!("{} or {}", names[..names.len() - 1].join(", "), names[names.len() - 1]),
+        _ => format!(
+            "{} or {}",
+            names[..names.len() - 1].join(", "),
+            names[names.len() - 1]
+        ),
     };
     bail!("no API key: pass --api-key or set {hint}");
 }
@@ -695,7 +699,7 @@ fn resolve_named_profile(config: &Config, name: &str, registry: &Registry) -> Re
         .unwrap_or_else(|| provider.default_base_url().to_string());
     let api_key = resolve_api_key_for(Some(profile), provider)?;
 
-    let mut max_tokens = profile.max_tokens.unwrap_or(4096);
+    let mut max_tokens = profile.max_tokens.unwrap_or(8192);
     if let Some(info) = registry.lookup(&model)
         && info.max_output > 0
         && max_tokens > info.max_output

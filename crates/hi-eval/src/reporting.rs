@@ -85,13 +85,14 @@ pub fn print_summary(results: &[RunResult], task_count: usize, active: &[&Config
         // nudges, averaged across the config's cells. Plus the stall rate, so a
         // config that passes but only by repeatedly nudging a stuck model reads
         // as noisier than one that solves cleanly.
-        let avg_extra: f64 =
-            rows.iter().map(|r| r.trajectory.extra_rounds() as f64).sum::<f64>() / rows.len() as f64;
+        let avg_extra: f64 = rows
+            .iter()
+            .map(|r| r.trajectory.extra_rounds() as f64)
+            .sum::<f64>()
+            / rows.len() as f64;
         let stalls = rows
             .iter()
-            .filter(|r| {
-                r.trajectory.stalled_unfinished || r.trajectory.stalled_repeating
-            })
+            .filter(|r| r.trajectory.stalled_unfinished || r.trajectory.stalled_repeating)
             .count();
         if avg_extra > 0.0 || stalls > 0 {
             println!(
@@ -105,22 +106,29 @@ pub fn print_summary(results: &[RunResult], task_count: usize, active: &[&Config
         // serial) isn't benefiting from the dep-aware scheduler; one with high
         // max_concurrent and a low serial share is. Skipped when no cell used
         // tools.
-        let tool_rows: Vec<&RunResult> =
-            rows.iter().filter(|r| r.trajectory.tool_calls > 0).copied().collect();
+        let tool_rows: Vec<&RunResult> = rows
+            .iter()
+            .filter(|r| r.trajectory.tool_calls > 0)
+            .copied()
+            .collect();
         if !tool_rows.is_empty() {
             let avg_max: f64 = tool_rows
                 .iter()
                 .map(|r| r.trajectory.max_concurrent_batch as f64)
                 .sum::<f64>()
                 / tool_rows.len() as f64;
-            let total_calls: u64 = tool_rows.iter().map(|r| r.trajectory.tool_calls as u64).sum();
-            let total_serial: u64 =
-                tool_rows.iter().map(|r| r.trajectory.serial_runs as u64).sum();
-            let serial_pct = if total_calls > 0 {
-                100 * total_serial / total_calls
-            } else {
-                0
-            };
+            let total_calls: u64 = tool_rows
+                .iter()
+                .map(|r| r.trajectory.tool_calls as u64)
+                .sum();
+            let total_serial: u64 = tool_rows
+                .iter()
+                .map(|r| r.trajectory.serial_runs as u64)
+                .sum();
+            let serial_pct = 100_u64
+                .checked_mul(total_serial)
+                .and_then(|p| p.checked_div(total_calls))
+                .unwrap_or(0);
             println!(
                 "           parallel: {avg_max:.1} max concurrent batch · {serial_pct}% of {total_calls} calls serial",
             );
