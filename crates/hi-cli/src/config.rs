@@ -432,9 +432,25 @@ fn migrate_api_key_env_to_literal(config: &mut Config, path: &Path) {
         if std::env::var(&env_name).is_ok_and(|v| !v.is_empty()) {
             continue;
         }
-        // If the value looks like an env var name, it's a real (but unset) env
-        // var reference, not a misplaced literal key — don't migrate it.
+        // If the value looks like an env var name, it could be a legitimate
+        // (but unset) env var reference that the user intentionally configured.
+        // BUT: the old setup wizard (save_config) always wrote api_key_env =
+        // key_envs().first() (e.g. "HI_API_KEY") regardless of what the user
+        // entered — it never stored the actual key. That pattern is: api_key_env
+        // is one of the provider's standard key env names, the env var isn't set,
+        // and there's no literal api_key. In that case, drop the bogus reference
+        // so resolve falls through to the env-var candidates and the onboarding
+        // error, prompting the user to re-enter their key (the new wizard stores
+        // it as a literal api_key).
         if looks_like_env_var_name(&env_name) {
+            let provider = profile.provider.unwrap_or(ProviderName::Openai);
+            let is_standard = provider.key_envs().iter().any(|n| *n == env_name);
+            let has_literal_key = profile.api_key.is_some();
+            if is_standard && !has_literal_key {
+                // Old buggy save_config output — drop it.
+                profile.api_key_env = None;
+                changed = true;
+            }
             continue;
         }
         // The value doesn't look like an env var name and the env var isn't set:
@@ -1537,6 +1553,54 @@ mod tests {
         let p = config.profiles.get("default").unwrap();
         assert_eq!(p.api_key_env.as_deref(), Some(env_name), "should move back to env ref");
         assert!(p.api_key.is_none(), "api_key should be cleared");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrate_drops_standard_env_name_from_buggy_save_config() {
+        // The old setup wizard always wrote api_key_env = key_envs().first()
+        // (e.g. "HI_API_KEY" for pipenetwork) regardless of what the user pasted.
+        // When that env var isn't set, the migration should drop the bogus
+        // reference so resolve falls through to the onboarding error, prompting
+        // the user to re-enter their key (the new wizard stores it as api_key).
+        use super::{Config, Profile, migrate_api_key_env_to_literal};
+        let env_name = "HI_API_KEY";
+        assert!(std::env::var(env_name).is_err(), "precondition: HI_API_KEY must not be set");
+        let dir = std::env::temp_dir().join(format!(
+            "hi-migrate-drop-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let mut config = Config {
+            default_profile: Some("default".into()),
+            profiles: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "default".into(),
+                    Profile {
+                        provider: Some(ProviderName::Pipenetwork),
+                        model: Some("ipop/coder-balanced".into()),
+                        api_key_env: Some(env_name.into()),
+                        ..Default::default()
+                    },
+                );
+                m
+            },
+        };
+        migrate_api_key_env_to_literal(&mut config, &path);
+        let p = config.profiles.get("default").unwrap();
+        assert!(p.api_key_env.is_none(), "bogus standard env ref must be dropped");
+        assert!(p.api_key.is_none(), "no literal key to recover");
+        // File should have been rewritten without api_key_env.
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !text.contains("api_key_env"),
+            "file should not have api_key_env: {text}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
