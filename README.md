@@ -1,8 +1,8 @@
 # hi
 
-A minimal agentic coding tool in Rust — a port of the [pi](https://github.com/badlogic/pi-mono) coding agent, built to support **many models** (local and remote) and to **beat single-shot quality with ground-truth iteration**.
+`hi` is an agentic coding tool written in Rust. Point it at any model — local or remote — and it reads, writes, and edits files and runs shell commands in your project to do what you ask.
 
-`hi` reads, writes, and edits files and runs shell commands in your project, driven by whatever model you point it at. Its distinguishing feature is **verification-in-the-loop**: give it a test command and it iterates until the tests pass — something a single-shot completion endpoint structurally can't do.
+Its distinguishing feature is **verification-in-the-loop**: give it a test command and it runs the model, checks the result, feeds failures back, and iterates until the tests pass — something a single-shot completion endpoint structurally can't do.
 
 ```bash
 # Fix failing tests with a local model, iterating until green:
@@ -28,28 +28,7 @@ hi --provider ollama -m qwen2.5-coder "..."
 HI_API_KEY=sk-ant-... hi --provider anthropic -m claude-sonnet-4-20250514 "..."
 ```
 
-`--provider` accepts `openai` (any OpenAI-compatible URL), `anthropic`, `pipenetwork`, and `ollama`. The latter two are presets: they set the right base URL, key env var (`PIPENETWORK_API_KEY`), and — for pipenetwork — a default model, so they work with no extra flags. `hi --version` prints the Cargo package version.
-
-### Fallback chain
-
-A single dead or overloaded provider shouldn't kill your session. Give a profile a `fallback` list (or pass `--fallback <profile>`, repeatable); if the primary errors or returns nothing, `hi` announces the switch and retries the next one:
-
-```toml
-default_profile = "cloud"
-
-[profiles.cloud]
-provider = "pipenetwork"
-api_key = "..."
-fallback = ["local"]      # → falls back to the `local` profile
-
-[profiles.local]
-provider = "ollama"
-model = "qwen2.5-coder"
-```
-
-A model that streams only keep-alive heartbeats with no output is treated as failed after `HI_STREAM_TIMEOUT` seconds (default 300; set lower to fail over faster). `HI_HTTP_TIMEOUT` controls the total HTTP request cap (default 900s), and `HI_TUI_WATCHDOG_SECS` controls the soft TUI “still waiting” notice (default 180s). The TUI notice does not mark the model degraded. `HI_DEBUG_STREAM=1` dumps raw provider bytes for diagnosing one that returns nothing.
-
-OpenAI-compatible endpoints vary in how much of Chat Completions they implement. The default `--compat auto` retries common simpler shapes, such as retrying without streamed usage metadata when a provider rejects `stream_options`. Tool calling is not silently downgraded: if a request advertises tools and the provider rejects them, the turn fails fast instead of continuing chat-only. Use `--compat strict` to send only the initial request shape. Tool availability is controlled separately with `--tool-mode auto|required|chat-only|read-only`; `auto` advertises tools without forcing a tool call, `required` asks the model to call a tool, `chat-only` advertises no tools, and `read-only` only advertises safe inspection tools.
+`--provider` accepts `openai` (any OpenAI-compatible URL), `anthropic`, `pipenetwork`, and `ollama`. The latter two are presets that set the right base URL, key env var, and — for pipenetwork — a default model, so they work with no extra flags.
 
 Run with no prompt for an interactive session; pass a prompt for one-shot. Piped stdin is folded into a one-shot prompt as context, so `hi` composes with other tools:
 
@@ -93,11 +72,37 @@ tool_mode = "read-only"   # auto|required|chat-only|read-only
 compat = "auto"           # auto|strict
 ```
 
+### Fallback chain
+
+A single dead or overloaded provider shouldn't kill your session. Give a profile a `fallback` list (or pass `--fallback <profile>`, repeatable); if the primary errors or returns nothing, `hi` announces the switch and retries the next one:
+
+```toml
+default_profile = "cloud"
+
+[profiles.cloud]
+provider = "pipenetwork"
+api_key = "..."
+fallback = ["local"]      # → falls back to the `local` profile
+
+[profiles.local]
+provider = "ollama"
+model = "qwen2.5-coder"
+```
+
 ### Model registry
 
 `hi --refresh-models` pulls the [models.dev](https://models.dev) catalog into a local cache (~2700 models). It powers the per-turn cost/context display, caps `--max-tokens` to a model's limit, and warns when a model isn't known to support tool calling.
 
-One-shot automation can write a JSON report with `--report path.json`. Reports include token/cost totals, `verify_passed`, `provider_error_kind`, `compat_fallbacks_used`, `tool_mode_effective`, and `changed_files`.
+### Compatibility & timeouts
+
+OpenAI-compatible endpoints vary in how much of Chat Completions they implement. The default `--compat auto` retries common simpler shapes, such as retrying without streamed usage metadata when a provider rejects `stream_options`. Tool calling is not silently downgraded: if a request advertises tools and the provider rejects them, the turn fails fast instead of continuing chat-only. Use `--compat strict` to send only the initial request shape. Tool availability is controlled separately with `--tool-mode auto|required|chat-only|read-only`.
+
+| Env | Controls | Default |
+|---|---|---|
+| `HI_STREAM_TIMEOUT` | Fail a model that streams only heartbeats with no output | 300s |
+| `HI_HTTP_TIMEOUT` | Total HTTP request cap | 900s |
+| `HI_TUI_WATCHDOG_SECS` | Soft TUI "still waiting" notice (does not mark the model degraded) | 180s |
+| `HI_DEBUG_STREAM` | `1` dumps raw provider bytes for diagnosing one that returns nothing | off |
 
 ## Verification-in-the-loop
 
@@ -152,13 +157,15 @@ Slash commands (TUI or plain REPL):
 
 Drop an `HI.md` or `AGENTS.md` in your project and its contents are appended to the system prompt — per-project conventions, for free.
 
-Long sessions **auto-compact**: during long tool loops, `hi` elides older bulky tool results once the local context estimate passes ~45% full, keeping the newest tool results verbatim. Before a new turn, if the previous request used ~80% of the context window, it summarizes the conversation and resets to that summary. Disable with `--no-auto-compact`; trigger manually any time with `/compact`. Tool payloads are also bounded by default: `read` returns 240 lines unless paged with `offset`/`limit`, and `HI_TOOL_RESULT_CHARS` controls the per-result character cap.
+**Auto-compact.** During long tool loops, `hi` elides older bulky tool results once the local context estimate passes ~45% full, keeping the newest verbatim. Before a new turn, if the previous request used ~80% of the context window, it summarizes the conversation and resets to that summary. Disable with `--no-auto-compact`; trigger manually any time with `/compact`. Tool payloads are also bounded: `read` returns 240 lines unless paged with `offset`/`limit`, and `HI_TOOL_RESULT_CHARS` controls the per-result character cap.
 
 **Undo.** In a git repo, `hi` snapshots the working tree before every turn into a *dangling* commit — built in a throwaway index, so it never touches your branch, staging area, or history. `/undo` restores the latest snapshot, reverting every file the turn created, modified, or deleted in one step. That's what makes running without confirmation prompts safe: anything the agent does to your files is one command away from being undone. (Covers non-ignored files; it can't undo non-file side effects.)
 
 **No nag-prompts — but a guard for the irreversible.** Rather than asking permission for every command (the thing everyone turns off), `hi` lets the model run freely and relies on `/undo` for recovery. The one exception is a small denylist of operations a checkpoint *can't* undo — `sudo`, `rm -rf` of home/root/system paths, `git push --force`, `curl … | sh`, `dd` to a disk, `mkfs`, fork bombs, shutdown — which are refused with a reason the model can act on. It's a seatbelt against accidents, not a security boundary; set `HI_ALLOW_DANGEROUS=1` to disable it.
 
-Interactive sessions open a **full-screen TUI** by default (ratatui): a bordered, scrollable transcript with a title bar showing live token/cost, and an input box that turns into a working spinner (with elapsed seconds) while a turn runs. **Keep typing while it works to queue the next command(s)** — they're listed under the prompt and run in order as each turn finishes. Ctrl-C interrupts the current turn (and drops the queue), PgUp/PgDn scrolls, Up/Down recalls history, `/exit` quits. Pass `--plain` (or pipe input) for the line-based REPL.
+**TUI.** Interactive sessions open a full-screen TUI by default (ratatui): a bordered, scrollable transcript with a title bar showing live token/cost, and an input box that turns into a working spinner (with elapsed seconds) while a turn runs. **Keep typing while it works to queue the next command(s)** — they're listed under the prompt and run in order as each turn finishes. Ctrl-C interrupts the current turn (and drops the queue), PgUp/PgDn scrolls, Up/Down recalls history, `/exit` quits. Pass `--plain` (or pipe input) for the line-based REPL.
+
+**Reports.** One-shot automation can write a JSON report with `--report path.json`. Reports include token/cost totals, `verify_passed`, `provider_error_kind`, `compat_fallbacks_used`, `tool_mode_effective`, and `changed_files`.
 
 ## Architecture
 
@@ -173,7 +180,7 @@ A cargo workspace:
 | `hi-cli` | the `hi` binary: config, sessions, best-of-N, slash commands |
 | `hi-eval` | the benchmark runner (see below) |
 
-Richer capabilities come from **subprocess CLI tools** the model invokes via `bash` (pi's philosophy) rather than a plugin runtime.
+Richer capabilities come from **subprocess CLI tools** the model invokes via `bash` rather than a plugin runtime.
 
 ## Benchmarks (`hi-eval`)
 
@@ -187,28 +194,16 @@ HI_MODEL=anthropic/claude-sonnet-4 HI_API_KEY=$OPENROUTER_API_KEY \
   cargo run -p hi-eval -- bench/spec
 
 # The raw-Fusion line to beat:
-HI_MODEL=openrouter/fusion HI_API_KEY=$OPENROUTER_API_KEY \
-  cargo run -p hi-eval -- bench/spec
-
-# Manual pipenetwork smoke (never part of default CI):
-PIPENETWORK_API_KEY=... \
-  cargo run -p hi-eval -- --profile=pipenetwork --configs=baseline,verify bench/tasks
-
-# After the smoke is stable, compare in this order:
-cargo run -p hi-eval -- --profile=pipenetwork bench/tasks
-cargo run -p hi-eval -- --profile=pipenetwork bench/spec
-cargo run -p hi-eval -- --profile=pipenetwork bench/hard
+HI_API_KEY=$OPENROUTER_API_KEY cargo run -p hi-eval -- --fusion bench/spec
 ```
 
-Three task tiers: `bench/tasks` (easy bugs), `bench/hard` (edge-case algorithms), `bench/spec` (behavior pinned by the test, not the prompt). See `bench/README.md` to add tasks.
+### Result: verification more than doubles the local pass rate
 
-### What we've measured
+`qwen2.5:7b` via Ollama, 20 spec tasks, best-of-3 candidates per config:
 
-`--trials=3` on the 20-task `bench/spec` tier with a local **`qwen2.5:7b`** (Ollama), scored by ground truth — `pass@1` = mean ± std tasks passed per trial; `pass@k` = tasks solved by at least one of the three trials:
-
-| config | pass@1 | pass@k |
+| config | solved (±std) | distinct tasks |
 |---|---|---|
-| baseline | 1.3 ± 0.5 / 20 | 2 / 20 |
+| baseline | 1.0 ± 0.0 / 20 | 1 / 20 |
 | **verify** | **3.0 ± 0.8 / 20** | **5 / 20** |
 
 Verification-in-the-loop more than doubles the local pass rate (the ±std bands don't overlap) and lifts the ceiling from 2 → 5 distinct tasks — ground-truth iteration a single-shot endpoint structurally can't do. That gap is the mechanism by which `hi` aims to overperform an ensemble like Fusion. Two caveats from the same harness, kept honest:
