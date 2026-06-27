@@ -545,6 +545,29 @@ impl Agent {
         self.config.context_window = context_window;
     }
 
+    /// Swap the provider (endpoint + wire format + key) and model for subsequent
+    /// turns. Used by `/provider` to switch profiles mid-session. The caller
+    /// builds the new `Box<dyn Provider>` (e.g. Anthropic vs OpenAI adapter) and
+    /// supplies a model id; pricing/context metadata is refreshed from the
+    /// registry or the provider's live `/models` response.
+    ///
+    /// Safe to call only between turns (the REPL/TUI serialize turns, so a
+    /// command handler runs when no stream is in flight). The conversation
+    /// history is kept — the new provider sees the same messages, just routed to
+    /// a different endpoint.
+    pub fn set_provider(
+        &mut self,
+        provider: Box<dyn Provider>,
+        model: String,
+        price: Option<(f64, f64)>,
+        context_window: Option<u32>,
+    ) {
+        self.provider = provider;
+        self.config.model = model;
+        self.config.price = price;
+        self.config.context_window = context_window;
+    }
+
     /// Reset the live context to just the system prompt. This is transient: it
     /// doesn't rewrite the session file, and the reset point isn't persisted, so
     /// resuming replays the full log.
@@ -1903,9 +1926,7 @@ impl Agent {
                         // invalidate the snapshot cache so a dependent read
                         // (guaranteed to run after by the dep graph) re-walks.
                         // `bash` also invalidates but always runs alone (above).
-                        if hi_tools::is_filesystem_mutating(&calls[i].1)
-                            || calls[i].1 == "bash"
-                        {
+                        if hi_tools::is_filesystem_mutating(&calls[i].1) || calls[i].1 == "bash" {
                             self.invalidate_snapshot();
                             // Proactive per-edit verify: kick off a background
                             // fast check for the edited file so a syntax/lint
@@ -5395,7 +5416,10 @@ mod tests {
         assert_eq!(agent.last_verify(), Some(false));
         // PROBE: with max_verify_iterations=2 the verifier should iterate twice.
         let tel = agent.last_turn_telemetry();
-        eprintln!("PROBE verify_rounds={} telemetry={:?}", tel.verify_rounds, tel);
+        eprintln!(
+            "PROBE verify_rounds={} telemetry={:?}",
+            tel.verify_rounds, tel
+        );
     }
 
     #[tokio::test]

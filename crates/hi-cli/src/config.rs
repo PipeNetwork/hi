@@ -240,7 +240,7 @@ impl ProviderName {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct Config {
     pub default_profile: Option<String>,
     #[serde(default)]
@@ -645,6 +645,13 @@ fn resolve_api_key_for(profile: Option<&Profile>, provider: ProviderName) -> Res
     bail!("no API key: pass --api-key or set {hint}");
 }
 
+/// The sorted list of configured profile names, for `/provider` (no arg).
+pub fn profile_names(config: &Config) -> Vec<String> {
+    let mut names: Vec<String> = config.profiles.keys().cloned().collect();
+    names.sort();
+    names
+}
+
 /// The fallback chain (excluding the primary) — `--fallback` flags first, then
 /// the selected profile's `fallback` list, deduped. Profiles that don't resolve
 /// (missing key/model) are skipped with a warning rather than blocking startup.
@@ -680,8 +687,14 @@ pub fn resolve_fallbacks(cli: &Cli, config: &Config, registry: &Registry) -> Vec
 }
 
 /// Resolve a named profile into [`Settings`] from its own fields + environment
-/// (no CLI overrides — those belong to the primary).
-fn resolve_named_profile(config: &Config, name: &str, registry: &Registry) -> Result<Settings> {
+/// (no CLI overrides — those belong to the primary). Used both for fallback
+/// profiles at startup and for `/provider` switches mid-session.
+///
+/// If the profile has no `model` and the provider has no default, a placeholder
+/// is used — the caller is expected to pick a real model via `/model` from what
+/// the endpoint serves. The placeholder is fine for building the provider and
+/// listing models, but a turn can't run with it.
+pub fn resolve_named_profile(config: &Config, name: &str, registry: &Registry) -> Result<Settings> {
     let profile = config
         .profiles
         .get(name)
@@ -692,7 +705,7 @@ fn resolve_named_profile(config: &Config, name: &str, registry: &Registry) -> Re
         .model
         .clone()
         .or_else(|| provider.default_model().map(String::from))
-        .ok_or_else(|| anyhow!("no model set"))?;
+        .unwrap_or_else(|| format!("__pick_via_model__"));
     let base_url = profile
         .base_url
         .clone()

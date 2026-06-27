@@ -36,6 +36,31 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
 use tokio::sync::mpsc;
 
+/// Info about a configured profile, for the `/provider` list and picker.
+#[derive(Clone, Debug)]
+pub struct ProfileInfo {
+    pub name: String,
+    /// Display label for the provider (e.g. "anthropic", "ollama").
+    pub provider: String,
+    /// The model configured on this profile, if any.
+    pub model: Option<String>,
+}
+
+/// The result of resolving a profile name at runtime: a built provider, the
+/// model id to use, and the provider's display label. The caller swaps these
+/// into the agent via [`Agent::set_provider`].
+pub struct SwitchedProvider {
+    pub provider: Box<dyn hi_ai::Provider>,
+    pub model: String,
+    pub label: String,
+}
+
+/// A callback that resolves a named profile into a built provider + model +
+/// label, for `/provider` mid-session. `hi-cli` supplies this; the TUI calls
+/// it without needing to know about `Config`/`Settings` (which live in
+/// `hi-cli`).
+pub type ProfileResolver = Box<dyn Fn(&str) -> Result<SwitchedProvider> + Send + Sync>;
+
 use completion::{
     CompletionContext, CompletionItem, CompletionState, MODEL_CMD, MODEL_COMPLETION_MAX,
     completion_context, completion_items_for,
@@ -100,7 +125,8 @@ fn watchdog_stuck_timeout_from_value(value: Option<&str>) -> Duration {
 
 /// Run the full-screen TUI until the user quits. `history_path`, if given, is
 /// the file used to persist input history across sessions (shared with the
-/// plain REPL).
+/// plain REPL). `profiles` is the list of configured profiles (for `/provider`
+/// with no arg); `resolver` resolves a name to a built provider at runtime.
 pub async fn run(
     agent: &mut Agent,
     provider: &str,
@@ -108,6 +134,8 @@ pub async fn run(
     registry: &hi_ai::Registry,
     history_path: Option<std::path::PathBuf>,
     auto_memory: bool,
+    profiles: Vec<ProfileInfo>,
+    resolver: ProfileResolver,
 ) -> Result<()> {
     enable_raw_mode().context("entering raw mode")?;
     execute!(io::stdout(), EnterAlternateScreen).context("entering alternate screen")?;
@@ -125,7 +153,7 @@ pub async fn run(
     let mut terminal =
         Terminal::new(CrosstermBackend::new(io::stdout())).context("creating terminal")?;
 
-    let mut app = App::new(provider, model);
+    let mut app = App::new(provider, model, profiles, resolver);
     // Seed the context-fill gauge with the model's window so it reads 0% before
     // the first turn (it refreshes from real usage after each round).
     app.context_window = registry.metadata(model).1;
@@ -472,6 +500,139 @@ pub async fn run(
                     app.picker = Some(ModelPicker::new(ids, &current, tags, &app.served));
                     continue;
                 }
+                // `/provider` with no arg: list configured profiles.
+                // `/provider <name>`: switch to that profile, fetch the new
+                // endpoint's served models, and open the model picker so the
+                // user can pick a model immediately.
+                Command::Provider(arg) => {
+                    let arg = arg.trim().to_string();
+                    if arg.is_empty() {
+                        if app.profiles.is_empty() {
+                            app.push(Line::styled(
+                                "no profiles configured — add [profiles.<name>] to hi.toml"
+                                    .to_string(),
+                                dim(),
+                            ));
+                        } else {
+                            app.push(Line::styled("configured profiles:".to_string(), dim()));
+                            let rows: Vec<String> = app
+                                .profiles
+                                .iter()
+                                .map(|p| {
+                                    let model = p.model.as_deref().unwrap_or("(pick via /model)");
+                                    format!("  {} — {} · {}", p.name, p.provider, model)
+                                })
+                                .collect();
+                            for row in rows {
+                                app.push(Line::styled(row, dim()));
+                            }
+                            app.push(Line::styled(
+                                "/provider <name> to switch".to_string(),
+                                dim(),
+                            ));
+                        }
+                        continue;
+                    }
+                    // Resolve the profile and swap the provider.
+                    match (app.resolver)(&arg) {
+                        Ok(switched) => {
+                            let label = switched.label.clone();
+                            let model = switched.model.clone();
+                            let needs_pick = model == "__pick_via_model__";
+                            // Refresh metadata from the registry for this model.
+                            let (price, window) = registry.metadata(&model);
+                            agent.set_provider(switched.provider, model.clone(), price, window);
+                            app.provider = label.clone();
+                            app.model = model.clone();
+                            app.context_window = window;
+                            app.served.clear();
+                            app.push(Line::styled(
+                                format!("switched to {label} (profile: {arg}) — model: {model}"),
+                                dim(),
+                            ));
+                            if needs_pick {
+                                app.push(Line::styled(
+                                    "no model configured — pick from what this endpoint serves"
+                                        .to_string(),
+                                    dim(),
+                                ));
+                            }
+                            // Fetch served models and open the picker, just like
+                            // `/model` with no arg — so the user can immediately
+                            // pick a model on the new endpoint.
+                            app.fetching = Some(Instant::now());
+                            let mut fetched: Option<Result<Vec<hi_ai::ServedModel>>> = None;
+                            let mut cancelled = false;
+                            {
+                                let fut = agent.list_models();
+                                tokio::pin!(fut);
+                                loop {
+                                    terminal.draw(|f| app.render(f))?;
+                                    tokio::select! {
+                                        result = &mut fut => { fetched = Some(result); break; }
+                                        _ = ticker.tick() => app.spinner = app.spinner.wrapping_add(1),
+                                        maybe = input_rx.recv() => {
+                                            if let Some(Event::Key(key)) = maybe
+                                                && key.kind == KeyEventKind::Press
+                                            {
+                                                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                                                if matches!(key.code, KeyCode::Esc)
+                                                    || (ctrl && matches!(key.code, KeyCode::Char('c')))
+                                                {
+                                                    cancelled = true;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            app.fetching = None;
+                            if cancelled {
+                                continue;
+                            }
+                            let ids = match fetched {
+                                Some(Ok(served)) if !served.is_empty() => {
+                                    app.served =
+                                        served.into_iter().map(|m| (m.id.clone(), m)).collect();
+                                    let mut ids: Vec<String> = app.served.keys().cloned().collect();
+                                    ids.sort();
+                                    ids
+                                }
+                                Some(Ok(_)) => {
+                                    app.push(Line::styled(
+                                        "provider listed no models; showing the catalog"
+                                            .to_string(),
+                                        dim(),
+                                    ));
+                                    registry.model_ids()
+                                }
+                                _ => {
+                                    let note = match fetched {
+                                        Some(Err(err)) => {
+                                            format!(
+                                                "couldn't fetch models ({err:#}); showing the catalog"
+                                            )
+                                        }
+                                        _ => "showing the catalog".to_string(),
+                                    };
+                                    app.push(Line::styled(note, dim()));
+                                    registry.model_ids()
+                                }
+                            };
+                            let current = app.model.clone();
+                            let tags = app.served_tags();
+                            app.picker = Some(ModelPicker::new(ids, &current, tags, &app.served));
+                        }
+                        Err(err) => {
+                            app.push(Line::styled(
+                                format!("/provider failed: {err:#}"),
+                                Style::default().fg(Color::Yellow),
+                            ));
+                        }
+                    }
+                    continue;
+                }
                 other => {
                     app.handle_command(agent, other, registry);
                     continue;
@@ -734,6 +895,10 @@ impl TranscriptEntry {
 struct App {
     provider: String,
     model: String,
+    /// Configured profiles (for `/provider` with no arg).
+    profiles: Vec<ProfileInfo>,
+    /// Resolves a profile name to a built provider at runtime (for `/provider`).
+    resolver: ProfileResolver,
     transcript: Vec<TranscriptEntry>,
     /// The in-progress streamed line: (style, markdown?, text). Committed on
     /// newline/end. `markdown` is set for assistant prose so it's rendered with
@@ -883,10 +1048,17 @@ enum TurnState {
 }
 
 impl App {
-    fn new(provider: &str, model: &str) -> Self {
+    fn new(
+        provider: &str,
+        model: &str,
+        profiles: Vec<ProfileInfo>,
+        resolver: ProfileResolver,
+    ) -> Self {
         Self {
             provider: provider.to_string(),
             model: model.to_string(),
+            profiles,
+            resolver,
             transcript: Vec::new(),
             pending: None,
             reasoning_buffer: String::new(),
@@ -1951,8 +2123,12 @@ impl App {
             }
             Command::Copy(arg) => self.copy(&arg),
             Command::Goal(arg) => self.handle_goal(agent, &arg),
-            // Handled in the event loop (async / runs a turn); never reach here.
-            Command::Compact(_) | Command::Retry | Command::Undo | Command::Init => {}
+            // Handled in the event loop (async / runs a turn / needs config); never reach here.
+            Command::Compact(_)
+            | Command::Retry
+            | Command::Undo
+            | Command::Init
+            | Command::Provider(_) => {}
             Command::Version => {
                 self.push(Line::styled(format!("hi {}", hi_agent::VERSION), dim()));
             }
@@ -2571,9 +2747,19 @@ mod tests {
         out
     }
 
+    /// A no-op resolver for tests — `/provider` isn't exercised in unit tests.
+    fn test_resolver() -> ProfileResolver {
+        Box::new(|_name| anyhow::bail!("no profiles in tests"))
+    }
+
+    /// `App::new` with empty profiles and a dummy resolver, for tests.
+    fn test_app(provider: &str, model: &str) -> App {
+        App::new(provider, model, Vec::new(), test_resolver())
+    }
+
     #[test]
     fn sticky_scroll_unpins_on_scroll_up_and_repins_at_bottom() {
-        let mut app = App::new("openai", "gpt-4o");
+        let mut app = test_app("openai", "gpt-4o");
         // Simulate what render() caches for a transcript taller than the viewport.
         app.view_max_scroll = 100;
         app.view_total = 120;
@@ -2599,7 +2785,7 @@ mod tests {
 
     #[test]
     fn transcript_is_capped_while_following_but_not_while_scrolled_up() {
-        let mut app = App::new("openai", "gpt-4o");
+        let mut app = test_app("openai", "gpt-4o");
         // Following (the default): pushing far past the cap keeps it bounded, and
         // keeps the newest lines (the oldest scroll off the top).
         for i in 0..(MAX_TRANSCRIPT_LINES + 5_000) {
@@ -2635,7 +2821,7 @@ mod tests {
 
     #[test]
     fn scrolling_moves_the_viewport_through_render_and_repins() {
-        let mut app = App::new("openai", "gpt-4o");
+        let mut app = test_app("openai", "gpt-4o");
         for i in 0..100 {
             app.push(Line::raw(format!("line {i:03}")));
         }
@@ -2679,7 +2865,7 @@ mod tests {
 
     #[test]
     fn working_line_names_the_inflight_tool_and_model_phase() {
-        let mut app = App::new("openai", "gpt-4o");
+        let mut app = test_app("openai", "gpt-4o");
         app.set_working(true);
         // Model phase: reasoning then text stream distinctly.
         app.apply(UiEvent::Reasoning("hmm".into()));
@@ -2715,7 +2901,7 @@ mod tests {
 
     #[test]
     fn renders_tool_call_diff_and_spinner() {
-        let mut app = App::new("openai", "gpt-4o");
+        let mut app = test_app("openai", "gpt-4o");
         app.apply(UiEvent::ToolCall(
             "edit".into(),
             "{\"path\":\"src/cli.rs\",\"old_string\":\"a\",\"new_string\":\"b\"}".into(),
@@ -2756,7 +2942,7 @@ mod tests {
 
     #[test]
     fn colorizes_plain_diff_tool_output() {
-        let mut app = App::new("openai", "gpt-4o");
+        let mut app = test_app("openai", "gpt-4o");
         let diff = "--- a/x.rs\n+++ b/x.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n ctx\n";
         app.apply(UiEvent::ToolResult("bash".into(), diff.into()));
         // The content span (after the "  " indent) carries the diff color.
@@ -2791,8 +2977,11 @@ mod tests {
 
     #[test]
     fn non_diff_tool_output_is_not_colorized() {
-        let mut app = App::new("openai", "gpt-4o");
-        app.apply(UiEvent::ToolResult("bash".into(), "- item one\n- item two\n".into()));
+        let mut app = test_app("openai", "gpt-4o");
+        app.apply(UiEvent::ToolResult(
+            "bash".into(),
+            "- item one\n- item two\n".into(),
+        ));
         let any_red = app
             .transcript
             .iter()
@@ -2803,7 +2992,7 @@ mod tests {
 
     #[test]
     fn usage_event_updates_live_counter_and_working_line() {
-        let mut app = App::new("openai", "gpt-4o");
+        let mut app = test_app("openai", "gpt-4o");
         app.set_working(true);
         app.apply(UiEvent::Usage {
             input: 1234,
@@ -2826,7 +3015,7 @@ mod tests {
     #[test]
     fn report_tokens_pushes_cumulative_line() {
         // `/tokens` mid-turn reads the mirrored counter (the agent is borrowed).
-        let mut app = App::new("openai", "gpt-4o");
+        let mut app = test_app("openai", "gpt-4o");
         app.apply(UiEvent::Usage {
             input: 1000,
             output: 250,
@@ -2840,7 +3029,7 @@ mod tests {
 
     #[test]
     fn renders_queued_commands_while_working() {
-        let mut app = App::new("openai", "gpt-4o");
+        let mut app = test_app("openai", "gpt-4o");
         app.set_working(true);
         app.queue.push_back("run the tests".into());
         app.queue.push_back("then commit".into());
@@ -2868,7 +3057,7 @@ mod tests {
     #[test]
     fn renders_pinned_plan_checklist() {
         use hi_agent::PlanStep;
-        let mut app = App::new("openai", "gpt-4o");
+        let mut app = test_app("openai", "gpt-4o");
         app.apply(UiEvent::Plan(vec![
             PlanStep {
                 title: "find leak".into(),
@@ -2930,7 +3119,7 @@ mod tests {
     fn changed_files_line_shows_what_last_turn_touched() {
         // After a turn that changed files, a compact "changed: …" line sits
         // above the input so the user sees what was touched without scrolling.
-        let mut app = App::new("openai", "gpt-4o");
+        let mut app = test_app("openai", "gpt-4o");
         app.last_changed_files = vec!["src/a.rs".into(), "src/b.rs".into()];
         let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
         term.draw(|f| app.render(f)).unwrap();
@@ -2950,7 +3139,7 @@ mod tests {
         // Toggling Ctrl-D opens the panel with the cached diff text and a
         // header; toggling again closes it. We set diff_text directly to avoid
         // a real git call in the unit test.
-        let mut app = App::new("openai", "gpt-4o");
+        let mut app = test_app("openai", "gpt-4o");
         app.show_diff = true;
         app.diff_text = Some("--- a/x\n+++ b/x\n@@ -1,1 +1,1 @@\n-old\n+new\n".into());
         let mut term = Terminal::new(TestBackend::new(60, 14)).unwrap();
@@ -2977,7 +3166,7 @@ mod tests {
     fn ctrl_question_toggles_the_observability_panel() {
         // The Ctrl-? agent-observability panel renders the last turn's telemetry
         // counters, the per-turn tool-call count, and session/context numbers.
-        let mut app = App::new("openai", "gpt-4o");
+        let mut app = test_app("openai", "gpt-4o");
         app.show_debug = true;
         app.last_telemetry = Some(hi_agent::TurnTelemetry {
             verify_rounds: 2,
@@ -3027,7 +3216,7 @@ mod tests {
     fn in_progress_line_is_styled_live() {
         // A heading still streaming (no trailing newline yet) renders styled with
         // its markers stripped — not literally as "## …" until the line commits.
-        let mut app = App::new("openai", "gpt-4o");
+        let mut app = test_app("openai", "gpt-4o");
         app.apply(UiEvent::Text("## Hello world".into()));
         let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
         term.draw(|f| app.render(f)).unwrap();
@@ -3043,7 +3232,7 @@ mod tests {
 
         // Styling the preview must NOT advance the real fence state: a partial
         // opening fence leaves code_lang untouched until its line commits.
-        let mut app2 = App::new("openai", "gpt-4o");
+        let mut app2 = test_app("openai", "gpt-4o");
         app2.apply(UiEvent::Text("```rust".into()));
         term.draw(|f| app2.render(f)).unwrap();
         assert!(
@@ -3054,7 +3243,7 @@ mod tests {
 
     #[test]
     fn edit_key_submits_on_enter_and_clears() {
-        let mut app = App::new("openai", "gpt-4o");
+        let mut app = test_app("openai", "gpt-4o");
         app.input.set("queue me");
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(app.edit_key(&enter).as_deref(), Some("queue me"));
@@ -3065,7 +3254,7 @@ mod tests {
 
     #[test]
     fn renders_title_transcript_and_input() {
-        let mut app = App::new("openai", "gpt-4o");
+        let mut app = test_app("openai", "gpt-4o");
         app.push(Line::raw("› hello"));
         app.apply(UiEvent::Text("hi there\n".into()));
         app.apply(UiEvent::AssistantEnd);
@@ -3083,7 +3272,7 @@ mod tests {
 
     #[test]
     fn turn_end_sets_status_and_marks_transcript_done() {
-        let mut app = App::new("openai", "gpt-4o");
+        let mut app = test_app("openai", "gpt-4o");
         app.apply(UiEvent::TurnEnd("[10 in · 2 out · 12 total]".into()));
         // Usage in the title bar...
         assert!(app.status.contains("12 total"));
@@ -3098,7 +3287,7 @@ mod tests {
         // The agent appends a "steer" suffix to the usage summary for noisy
         // turns; the TUI renders that string verbatim, so the suffix surfaces
         // in both the status bar and the done marker with no TUI-specific code.
-        let mut app = App::new("openai", "gpt-4o");
+        let mut app = test_app("openai", "gpt-4o");
         let noisy = "[↑10 ↓2 · ctx 5% (500/10k) · steer: 2 verify · 1 retry]";
         app.apply(UiEvent::TurnEnd(noisy.into()));
         assert!(
@@ -3112,7 +3301,7 @@ mod tests {
 
     #[test]
     fn assistant_text_becomes_copy_target() {
-        let mut app = App::new("openai", "gpt-4o");
+        let mut app = test_app("openai", "gpt-4o");
         app.apply(UiEvent::Text("first ".into()));
         app.apply(UiEvent::Text("answer\n".into()));
         app.apply(UiEvent::AssistantEnd);
@@ -3131,7 +3320,7 @@ mod tests {
 
     #[test]
     fn transcript_text_serializes_lines() {
-        let mut app = App::new("openai", "gpt-4o");
+        let mut app = test_app("openai", "gpt-4o");
         app.push(Line::raw("one"));
         app.push(Line::from(vec![Span::raw("t"), Span::raw("wo")]));
         assert_eq!(app.transcript_text(), "one\ntwo");
@@ -3139,7 +3328,7 @@ mod tests {
 
     #[test]
     fn completed_turn_without_summary_is_visible() {
-        let mut app = App::new("openai", "gpt-4o");
+        let mut app = test_app("openai", "gpt-4o");
         app.note_turn_completed_without_summary();
         let line = app.transcript.last().unwrap().text();
         assert!(line.contains("✓ done"), "got: {line}");
@@ -3149,12 +3338,15 @@ mod tests {
 
     #[test]
     fn stopped_after_tool_output_without_turn_end_is_visible() {
-        let mut app = App::new("openai", "gpt-4o");
+        let mut app = test_app("openai", "gpt-4o");
         app.apply(UiEvent::ToolCall(
             "edit".into(),
             r#"{"path":"src/main.rs"}"#.into(),
         ));
-        app.apply(UiEvent::ToolResult("edit".into(), "19 additions, 3 deletions".into()));
+        app.apply(UiEvent::ToolResult(
+            "edit".into(),
+            "19 additions, 3 deletions".into(),
+        ));
         app.note_turn_completed_without_summary();
 
         let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
@@ -3175,7 +3367,7 @@ mod tests {
 
     #[test]
     fn failed_turn_is_visible() {
-        let mut app = App::new("openai", "gpt-4o");
+        let mut app = test_app("openai", "gpt-4o");
         app.note_turn_failed("provider disconnected");
         let line = app.transcript.last().unwrap().text();
         assert!(line.contains("✗ failed"), "got: {line}");
@@ -3185,7 +3377,7 @@ mod tests {
 
     #[test]
     fn empty_tool_result_is_visible() {
-        let mut app = App::new("openai", "gpt-4o");
+        let mut app = test_app("openai", "gpt-4o");
         app.apply(UiEvent::ToolCall(
             "bash".into(),
             r#"{"command":"true"}"#.into(),
@@ -3200,7 +3392,7 @@ mod tests {
 
     #[test]
     fn renders_fetching_spinner() {
-        let mut app = App::new("pipenetwork", "ipop/coder-balanced");
+        let mut app = test_app("pipenetwork", "ipop/coder-balanced");
         app.fetching = Some(Instant::now());
         let mut term = Terminal::new(TestBackend::new(60, 10)).unwrap();
         term.draw(|f| app.render(f)).unwrap();
@@ -3214,7 +3406,7 @@ mod tests {
 
     #[test]
     fn renders_model_picker() {
-        let mut app = App::new("openai", "openai/gpt-4o");
+        let mut app = test_app("openai", "openai/gpt-4o");
         app.picker = Some(ModelPicker::new(
             vec!["anthropic/claude-sonnet-4".into(), "openai/gpt-4o".into()],
             "openai/gpt-4o",
@@ -3237,7 +3429,7 @@ mod tests {
 
     #[test]
     fn picker_shows_health_tag() {
-        let mut app = App::new("pipenetwork", "ipop/coder-balanced");
+        let mut app = test_app("pipenetwork", "ipop/coder-balanced");
         let tags = HashMap::from([("claude-sonnet-4.6".to_string(), "degraded".to_string())]);
         app.picker = Some(ModelPicker::new(
             vec!["claude-sonnet-4.6".into(), "ipop/coder-balanced".into()],
@@ -3256,7 +3448,7 @@ mod tests {
 
     #[test]
     fn renders_multiline_input() {
-        let mut app = App::new("openai", "gpt-4o");
+        let mut app = test_app("openai", "gpt-4o");
         app.input.insert_str("first\nsecond\nthird");
         let mut term = Terminal::new(TestBackend::new(40, 14)).unwrap();
         term.draw(|f| app.render(f)).unwrap();
@@ -3271,7 +3463,7 @@ mod tests {
 
     #[test]
     fn alt_enter_and_backslash_insert_newline_instead_of_submitting() {
-        let mut app = App::new("openai", "gpt-4o");
+        let mut app = test_app("openai", "gpt-4o");
         app.input.set("line one");
         let alt_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
         assert_eq!(app.edit_key(&alt_enter), None, "alt+enter does not submit");
@@ -3290,7 +3482,7 @@ mod tests {
 
     #[test]
     fn failed_turn_shows_reason_and_keeps_error() {
-        let mut app = App::new("openai", "gpt-4o");
+        let mut app = test_app("openai", "gpt-4o");
         app.note_turn_failed("API error 401: invalid or expired session");
         // record_model_issue runs next in the real flow; it must NOT clobber the
         // real error with a reliability-count message.
@@ -3313,7 +3505,7 @@ mod tests {
 
     #[test]
     fn backend_wait_notice_does_not_mark_model_degraded() {
-        let mut app = App::new("pipenetwork", "ipop/coder-balanced");
+        let mut app = test_app("pipenetwork", "ipop/coder-balanced");
         app.note_backend_waiting(Duration::from_secs(181), Duration::from_secs(180));
 
         assert_eq!(app.model_issues.get("ipop/coder-balanced"), None);
@@ -3349,7 +3541,7 @@ mod tests {
 
     #[test]
     fn completion_opens_filters_and_closes() {
-        let mut app = App::new("openai", "gpt-4o");
+        let mut app = test_app("openai", "gpt-4o");
         app.input.set("/");
         app.sync_completion();
         assert_eq!(
@@ -3377,7 +3569,7 @@ mod tests {
 
     #[test]
     fn completion_offers_verify_and_goal_keywords() {
-        let mut app = App::new("openai", "gpt-4o");
+        let mut app = test_app("openai", "gpt-4o");
         app.input.set("/verify ");
         app.sync_completion();
         let labels: Vec<String> = app
@@ -3399,7 +3591,7 @@ mod tests {
 
     #[test]
     fn completion_offers_live_model_ids() {
-        let mut app = App::new("openai", "gpt-4o");
+        let mut app = test_app("openai", "gpt-4o");
         app.model_ids = vec!["gpt-4o".into(), "gpt-4o-mini".into(), "claude-opus".into()];
         app.input.set("/model gp");
         app.sync_completion();
@@ -3422,7 +3614,7 @@ mod tests {
 
         // With no catalog loaded, there's no inline menu — the picker still
         // handles `/model` (so the feature degrades, it doesn't break).
-        let mut bare = App::new("openai", "gpt-4o");
+        let mut bare = test_app("openai", "gpt-4o");
         bare.input.set("/model gp");
         bare.sync_completion();
         assert!(bare.completion.is_none());
@@ -3430,7 +3622,7 @@ mod tests {
 
     #[test]
     fn completion_offers_then_fills_compact_kinds() {
-        let mut app = App::new("openai", "gpt-4o");
+        let mut app = test_app("openai", "gpt-4o");
         // The space that used to kill the menu now offers the kinds.
         app.input.set("/compact ");
         app.sync_completion();
@@ -3459,7 +3651,7 @@ mod tests {
 
     #[test]
     fn completing_compact_name_opens_its_kind_menu() {
-        let mut app = App::new("openai", "gpt-4o");
+        let mut app = test_app("openai", "gpt-4o");
         app.input.set("/compact");
         app.sync_completion();
         // Tab accepts the command name, leaving `/compact `…
@@ -3477,7 +3669,7 @@ mod tests {
 
     #[test]
     fn completion_navigation_and_accept() {
-        let mut app = App::new("openai", "gpt-4o");
+        let mut app = test_app("openai", "gpt-4o");
         // No-arg command: Enter accepts and submits immediately.
         app.input.set("/hel");
         app.sync_completion();
@@ -3504,7 +3696,7 @@ mod tests {
 
     #[test]
     fn completion_move_clamps() {
-        let mut app = App::new("openai", "gpt-4o");
+        let mut app = test_app("openai", "gpt-4o");
         app.input.set("/co"); // [commit, compact, copy]
         app.sync_completion();
         let last = app.completion_items().len().saturating_sub(1);
@@ -3518,7 +3710,7 @@ mod tests {
 
     #[test]
     fn renders_completion_menu() {
-        let mut app = App::new("openai", "gpt-4o");
+        let mut app = test_app("openai", "gpt-4o");
         app.input.set("/");
         app.sync_completion();
         let mut term = Terminal::new(TestBackend::new(72, 20)).unwrap();

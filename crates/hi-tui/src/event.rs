@@ -51,7 +51,10 @@ impl Ui for ChannelUi {
         self.send(UiEvent::AssistantEnd);
     }
     fn tool_started(&mut self, name: &str, arguments: &str) {
-        self.send(UiEvent::ToolStarted(name.to_string(), arguments.to_string()));
+        self.send(UiEvent::ToolStarted(
+            name.to_string(),
+            arguments.to_string(),
+        ));
     }
     fn tool_call(&mut self, name: &str, arguments: &str) {
         self.send(UiEvent::ToolCall(name.to_string(), arguments.to_string()));

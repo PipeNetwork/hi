@@ -220,6 +220,11 @@ pub(crate) fn handle_command(
         Command::Unknown(name) => {
             eprintln!("\x1b[33munknown command /{name}; try /help\x1b[0m");
         }
+        // `/provider` is handled inline by the REPL/TUI (it needs the Config
+        // and a provider builder, which this synchronous handler doesn't have).
+        // If it reaches here, it's a no-op — the frontend should have
+        // intercepted it.
+        Command::Provider(_) => {}
     }
     false
 }

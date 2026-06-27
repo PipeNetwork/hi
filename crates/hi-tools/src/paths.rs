@@ -25,7 +25,9 @@ pub(crate) fn validate_workspace_path(path: &str) -> Result<std::path::PathBuf> 
     // fails — so we fall back to *lexical* normalization (resolve `.`/`..`
     // without touching the filesystem) so `..` segments can't escape the
     // workspace via a not-yet-existing path.
-    let canonical = resolved.canonicalize().unwrap_or_else(|_| lexical_abs(&resolved));
+    let canonical = resolved
+        .canonicalize()
+        .unwrap_or_else(|_| lexical_abs(&resolved));
     let canonical_cwd = cwd.canonicalize().unwrap_or(cwd.clone());
     if canonical.starts_with(&canonical_cwd) {
         return Ok(canonical);

@@ -8,6 +8,10 @@ pub enum Command {
     Clear,
     /// Switch the model for subsequent turns (empty = report current).
     Model(String),
+    /// Switch the provider/profile for subsequent turns (empty = report current).
+    /// Named profiles are resolved from the config; the model is then picked
+    /// via `/model` from what the new endpoint serves.
+    Provider(String),
     /// Show cumulative token usage.
     Tokens,
     /// Show current session/runtime status.
@@ -56,6 +60,7 @@ pub fn parse(line: &str) -> Option<Command> {
         "help" | "h" | "?" => Command::Help,
         "clear" | "new" => Command::Clear,
         "model" | "m" => Command::Model(arg),
+        "provider" | "prov" => Command::Provider(arg),
         "tokens" | "usage" | "cost" => Command::Tokens,
         "status" | "st" => Command::Status,
         "log" | "debug" => Command::Log,
@@ -111,6 +116,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "model",
         args: "[id]",
         help: "show or switch the model (no id opens a picker)",
+        arg_values: &[],
+    },
+    CommandSpec {
+        name: "provider",
+        args: "[name]",
+        help: "switch provider/profile (no name lists configured profiles)",
         arg_values: &[],
     },
     CommandSpec {
@@ -356,6 +367,15 @@ mod tests {
             Some(Command::Model("gpt-4o".into()))
         );
         assert_eq!(parse("/model"), Some(Command::Model(String::new())));
+        assert_eq!(
+            parse("/provider sonnet"),
+            Some(Command::Provider("sonnet".into()))
+        );
+        assert_eq!(parse("/provider"), Some(Command::Provider(String::new())));
+        assert_eq!(
+            parse("/prov local"),
+            Some(Command::Provider("local".into()))
+        );
         assert_eq!(
             parse("/verify cargo test"),
             Some(Command::Verify("cargo test".into()))

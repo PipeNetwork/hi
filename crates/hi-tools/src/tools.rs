@@ -486,7 +486,13 @@ pub static TOOL_SPECS: LazyLock<Vec<ToolSpec>> = LazyLock::new(build_tool_specs)
 pub fn is_read_only(name: &str) -> bool {
     matches!(
         name,
-        "read" | "list" | "grep" | "glob" | "diff" | "update_plan" | "record_decision"
+        "read"
+            | "list"
+            | "grep"
+            | "glob"
+            | "diff"
+            | "update_plan"
+            | "record_decision"
             | "bash_output"
     )
 }
@@ -1037,10 +1043,9 @@ mod tests {
     #[tokio::test]
     async fn bash_normal_command_returns_output() {
         let mut sink = |_: &str| {};
-        let out =
-            run_bash_streaming_with_timeout("echo hello", &mut sink, Duration::from_secs(10))
-                .await
-                .expect("ok");
+        let out = run_bash_streaming_with_timeout("echo hello", &mut sink, Duration::from_secs(10))
+            .await
+            .expect("ok");
         assert!(out.contains("hello"), "got: {out:?}");
         assert!(!out.contains("timed out"), "got: {out:?}");
     }
@@ -1087,9 +1092,7 @@ mod tests {
 
     #[test]
     fn bash_timeout_resolution_and_clamping() {
-        use super::{
-            resolve_bash_timeout, DEFAULT_BASH_TIMEOUT_SECS, MAX_BASH_TIMEOUT_SECS,
-        };
+        use super::{DEFAULT_BASH_TIMEOUT_SECS, MAX_BASH_TIMEOUT_SECS, resolve_bash_timeout};
         // Explicit request wins and is honored.
         assert_eq!(resolve_bash_timeout(Some(42)).as_secs(), 42);
         // Absurd values clamp to the ceiling, not unbounded.
@@ -1170,19 +1173,21 @@ mod tests {
         // Malformed JSON → None (tolerant).
         assert_eq!(target_path("read", "not json"), None);
         // apply_patch: first Update/Add File directive's path is extracted.
-        let patch = r#"{"patch":"*** Begin Patch\n*** Update File: src/a.rs\n-old\n+new\n*** End Patch"}"#;
-        assert_eq!(
-            target_path("apply_patch", patch),
-            Some("src/a.rs".into())
-        );
-        let add_patch = r#"{"patch":"*** Begin Patch\n*** Add File: new.txt\nhello\n*** End Patch"}"#;
+        let patch =
+            r#"{"patch":"*** Begin Patch\n*** Update File: src/a.rs\n-old\n+new\n*** End Patch"}"#;
+        assert_eq!(target_path("apply_patch", patch), Some("src/a.rs".into()));
+        let add_patch =
+            r#"{"patch":"*** Begin Patch\n*** Add File: new.txt\nhello\n*** End Patch"}"#;
         assert_eq!(
             target_path("apply_patch", add_patch),
             Some("new.txt".into())
         );
         // No file directives → None.
         assert_eq!(
-            target_path("apply_patch", r#"{"patch":"*** Begin Patch\n*** End Patch"}"#),
+            target_path(
+                "apply_patch",
+                r#"{"patch":"*** Begin Patch\n*** End Patch"}"#
+            ),
             None
         );
     }

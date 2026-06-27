@@ -36,6 +36,7 @@ impl ModelInfo {
 }
 
 /// An in-memory set of known models with best-effort id lookup.
+#[derive(Clone)]
 pub struct Registry {
     models: Vec<ModelInfo>,
 }

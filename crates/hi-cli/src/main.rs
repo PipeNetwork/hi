@@ -210,6 +210,39 @@ async fn main() -> Result<()> {
     // The full-screen TUI is the default interactive experience; fall back to
     // the plain REPL when not on a TTY, when --plain is set, or if it errors.
     if !cli.plain && std::io::stdout().is_terminal() {
+        // Build the profile list and resolver for `/provider` in the TUI.
+        let profiles: Vec<hi_tui::ProfileInfo> = config::profile_names(&file)
+            .into_iter()
+            .map(|name| {
+                let p = file.profiles.get(&name);
+                let provider = p
+                    .and_then(|p| p.provider)
+                    .map(provider_label)
+                    .unwrap_or("openai")
+                    .to_string();
+                let model = p.and_then(|p| p.model.clone());
+                hi_tui::ProfileInfo {
+                    name,
+                    provider,
+                    model,
+                }
+            })
+            .collect();
+        let resolver: hi_tui::ProfileResolver = Box::new({
+            let file = file.clone();
+            let registry = registry.clone();
+            move |name: &str| {
+                let settings = config::resolve_named_profile(&file, name, &registry)?;
+                let label = provider_label(settings.provider).to_string();
+                let model = settings.model.clone();
+                let provider = build_provider(&settings);
+                Ok(hi_tui::SwitchedProvider {
+                    provider,
+                    model,
+                    label,
+                })
+            }
+        });
         match hi_tui::run(
             &mut agent,
             provider_label(settings.provider),
@@ -217,6 +250,8 @@ async fn main() -> Result<()> {
             &registry,
             session::history_path(),
             auto_memory,
+            profiles,
+            resolver,
         )
         .await
         {
@@ -228,7 +263,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    repl(&mut agent, &settings, &registry, auto_memory).await
+    repl(&mut agent, &settings, &file, &registry, auto_memory).await
 }
 
 pub(crate) fn provider_label(provider: ProviderName) -> &'static str {
@@ -416,7 +451,7 @@ fn memory_context(text: &str) -> Option<String> {
     (!text.is_empty()).then(|| format!("# Memory (from past sessions)\n{text}"))
 }
 
-fn build_provider(settings: &Settings) -> Box<dyn Provider> {
+pub(crate) fn build_provider(settings: &Settings) -> Box<dyn Provider> {
     let base_url = settings.base_url.clone();
     let api_key = settings.api_key.clone();
     if settings.provider.is_anthropic() {

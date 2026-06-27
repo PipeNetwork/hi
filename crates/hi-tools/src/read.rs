@@ -333,10 +333,7 @@ pub(crate) async fn run_grep(arguments: &str) -> Result<ToolOutput> {
                         lines.iter().enumerate().take(end).skip(start)
                     {
                         let marker = if ctx_i == idx { ":" } else { "-" };
-                        out.push_str(&format!(
-                            "{rel}{marker}{}: {}\n",
-                            ctx_no, ctx_line
-                        ));
+                        out.push_str(&format!("{rel}{marker}{}: {}\n", ctx_no, ctx_line));
                     }
                     out.push_str("--\n");
                 } else {

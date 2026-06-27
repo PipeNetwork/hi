@@ -9,7 +9,7 @@ use hi_agent::Agent;
 use hi_ai::Registry;
 
 use crate::commands::handle_command;
-use crate::config::Settings;
+use crate::config::{self, Settings};
 use crate::ui::PlainUi;
 use crate::{provider_label, session};
 
@@ -18,6 +18,7 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 pub(crate) async fn repl(
     agent: &mut Agent,
     settings: &Settings,
+    config: &config::Config,
     registry: &Registry,
     auto_memory: bool,
 ) -> Result<()> {
@@ -151,6 +152,77 @@ pub(crate) async fn repl(
                                         "model: {}\n\x1b[2m(couldn't list endpoint models; /model <id> to switch)\x1b[0m",
                                         agent.model()
                                     );
+                                }
+                            }
+                            continue;
+                        }
+                        // `/provider` with no arg: list configured profiles.
+                        // `/provider <name>`: switch to that profile, then list
+                        // the models the new endpoint serves so the user can
+                        // `/model` to pick one.
+                        Command::Provider(arg) => {
+                            let arg = arg.trim();
+                            if arg.is_empty() {
+                                let names = config::profile_names(config);
+                                if names.is_empty() {
+                                    println!(
+                                        "\x1b[2mno profiles configured — add [profiles.<name>] to hi.toml\x1b[0m"
+                                    );
+                                } else {
+                                    println!("\x1b[2mconfigured profiles:\x1b[0m");
+                                    for name in &names {
+                                        let p = config.profiles.get(name);
+                                        let prov = p
+                                            .and_then(|p| p.provider)
+                                            .map(provider_label)
+                                            .unwrap_or("openai");
+                                        let model = p
+                                            .and_then(|p| p.model.as_deref())
+                                            .unwrap_or("(pick via /model)");
+                                        println!("  {name} — {prov} · {model}");
+                                    }
+                                    println!("\x1b[2m/provider <name> to switch\x1b[0m");
+                                }
+                                continue;
+                            }
+                            // Resolve the profile and swap the provider.
+                            match config::resolve_named_profile(config, arg, registry) {
+                                Ok(new_settings) => {
+                                    let label = provider_label(new_settings.provider);
+                                    let model = new_settings.model.clone();
+                                    let provider = crate::build_provider(&new_settings);
+                                    let (price, window) = registry.metadata(&model);
+                                    agent.set_provider(provider, model.clone(), price, window);
+                                    println!(
+                                        "\x1b[2mswitched to {label} (profile: {arg}) — model: {model}\x1b[0m"
+                                    );
+                                    if model == "__pick_via_model__" {
+                                        println!(
+                                            "\x1b[2mno model configured for this profile — use /model to pick from what this endpoint serves\x1b[0m"
+                                        );
+                                    }
+                                    // List what the new endpoint serves, so the
+                                    // user can immediately `/model` to pick.
+                                    match agent.list_models().await {
+                                        Ok(mut models) if !models.is_empty() => {
+                                            models.sort_by(|a, b| a.id.cmp(&b.id));
+                                            println!("\x1b[2mmodels served by {label}:\x1b[0m");
+                                            for m in &models {
+                                                let mark =
+                                                    if m.id == agent.model() { "▶" } else { " " };
+                                                println!("  {mark} {}", m.id);
+                                            }
+                                            println!("\x1b[2m/model <id> to switch\x1b[0m");
+                                        }
+                                        _ => {
+                                            println!(
+                                                "\x1b[2m(couldn't list endpoint models; /model <id> to switch)\x1b[0m"
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(err) => {
+                                    eprintln!("\x1b[33m/provider failed: {err}\x1b[0m");
                                 }
                             }
                             continue;

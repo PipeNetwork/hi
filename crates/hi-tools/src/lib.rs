@@ -341,8 +341,11 @@ mod tests {
     #[tokio::test]
     async fn background_bash_round_trips_through_execute() {
         // Start detached: execute returns a handle without waiting for exit.
-        let started = execute("bash", r#"{"command":"echo bg-roundtrip","run_in_background":true}"#)
-            .await;
+        let started = execute(
+            "bash",
+            r#"{"command":"echo bg-roundtrip","run_in_background":true}"#,
+        )
+        .await;
         let id = started
             .content
             .split('`')
