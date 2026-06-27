@@ -113,41 +113,32 @@ fn save_config(provider: ProviderName, model: &str, api_key: &str) -> Result<std
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let contents = match provider.key_envs().first() {
-        Some(env_name) if !matches!(provider, ProviderName::Ollama) => {
-            // Print the export command for the user, with the key masked
-            // so it doesn't linger in the terminal scrollback.
-            let masked = if api_key.len() > 8 {
-                format!("{}…{}", &api_key[..4], &api_key[api_key.len() - 4..])
-            } else {
-                "***".to_string()
-            };
-            println!("Add this to your shell profile (~/.bashrc, ~/.zshrc, etc.):");
-            println!("  export {env_name}={masked}");
-            println!("(Use the full key — shown masked here for safety.)");
-            format!(
-                "default_profile = \"default\"\n\n\
-                 [profiles.default]\n\
-                 provider = \"{}\"\n\
-                 model = \"{}\"\n\
-                 api_key_env = \"{}\"\n",
-                provider.as_str(),
-                model,
-                env_name,
-            )
-        }
-        _ => {
-            format!(
-                "default_profile = \"default\"\n\n\
-                 [profiles.default]\n\
-                 provider = \"{}\"\n\
-                 model = \"{}\"\n\
-                 api_key = \"{}\"\n",
-                provider.as_str(),
-                model,
-                api_key,
-            )
-        }
+    // Store the literal key in the config file (chmod 600 below). We used to
+    // store an env var reference (api_key_env = "HI_API_KEY") and tell the user
+    // to `export HI_API_KEY=…` in their shell profile, but if they didn't do
+    // that (or didn't restart their shell), every run failed with "env var
+    // HI_API_KEY (from profile) is not set". Storing the key directly is simpler
+    // and works immediately — the config file is already protected.
+    let contents = if matches!(provider, ProviderName::Ollama) {
+        format!(
+            "default_profile = \"default\"\n\n\
+             [profiles.default]\n\
+             provider = \"{}\"\n\
+             model = \"{}\"\n",
+            provider.as_str(),
+            model,
+        )
+    } else {
+        format!(
+            "default_profile = \"default\"\n\n\
+             [profiles.default]\n\
+             provider = \"{}\"\n\
+             model = \"{}\"\n\
+             api_key = \"{}\"\n",
+            provider.as_str(),
+            model,
+            api_key,
+        )
     };
     std::fs::write(&path, contents).with_context(|| format!("writing {}", path.display()))?;
     #[cfg(unix)]

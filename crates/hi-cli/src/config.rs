@@ -953,8 +953,13 @@ fn resolve_api_key_for(profile: Option<&Profile>, provider: ProviderName) -> Res
         return Ok(key);
     }
     if let Some(env_name) = profile.and_then(|p| p.api_key_env.as_ref()) {
-        return std::env::var(env_name)
-            .map_err(|_| anyhow!("env var {env_name} (from profile) is not set"));
+        return std::env::var(env_name).map_err(|_| {
+            anyhow!(
+                "env var {env_name} (from profile) is not set.\n\
+                 Fix: either `export {env_name}=your-key` and restart hi, or re-run the\n\
+                 setup wizard (`hi` with no config) to store the key directly in the config file."
+            )
+        });
     }
     let candidates = provider.key_envs();
     for name in candidates {
