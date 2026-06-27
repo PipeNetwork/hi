@@ -389,13 +389,42 @@ pub fn load_config(explicit: Option<&Path>) -> Result<Config> {
 /// with "env var … (from profile) is not set".
 ///
 /// Fix: if `api_key_env` is set but no env var with that name exists in the
-/// environment, move the value to `api_key` (literal). A genuine env var
-/// reference that isn't set would have errored at resolve time anyway, so this
-/// only ever helps. If the migration changes anything, rewrite the config file
-/// so the repair persists.
+/// environment, AND the value does NOT look like an env var name (i.e. it's a
+/// real key that was misclassified), move it to `api_key` (literal). If the
+/// value *does* look like an env var name and the env var isn't set, leave it
+/// alone — that's a legitimate but unfulfilled env var reference (the user
+/// needs to set the env var), not a misplaced literal key. Moving an env var
+/// name like "HI_API_KEY" to `api_key` would authenticate with the literal
+/// string "HI_API_KEY" and get a 401.
 fn migrate_api_key_env_to_literal(config: &mut Config, path: &Path) {
     let mut changed = false;
     for profile in config.profiles.values_mut() {
+        // First, repair a bad migration from an earlier version of this fix:
+        // the previous migration moved an env var *name* (like "HI_API_KEY")
+        // into `api_key` when the env var wasn't set, causing 401s. If `api_key`
+        // looks like an env var name and that env var is set, replace the value
+        // with the env var's contents. If the env var isn't set, convert it back
+        // to an `api_key_env` reference (the user intended an env var, not a
+        // literal — they need to set it).
+        if let Some(key) = profile.api_key.clone()
+            && looks_like_env_var_name(&key)
+        {
+            if let Ok(val) = std::env::var(&key)
+                && !val.is_empty()
+            {
+                // The env var is set — use its value as the literal key.
+                profile.api_key = Some(val);
+                changed = true;
+            } else {
+                // Env var not set — this is an env var reference, not a key.
+                // Move it back to api_key_env so resolve_api_key_for gives the
+                // right error message ("env var … is not set") instead of a 401.
+                profile.api_key = None;
+                profile.api_key_env = Some(key);
+                changed = true;
+            }
+        }
+
         let Some(env_name) = profile.api_key_env.clone() else {
             continue;
         };
@@ -403,9 +432,14 @@ fn migrate_api_key_env_to_literal(config: &mut Config, path: &Path) {
         if std::env::var(&env_name).is_ok_and(|v| !v.is_empty()) {
             continue;
         }
-        // Not a set env var: treat the value as a literal key. Move it to
-        // `api_key` and clear `api_key_env`. (If `api_key` is already set, the
-        // literal key wins — keep the existing one and just drop the bogus ref.)
+        // If the value looks like an env var name, it's a real (but unset) env
+        // var reference, not a misplaced literal key — don't migrate it.
+        if looks_like_env_var_name(&env_name) {
+            continue;
+        }
+        // The value doesn't look like an env var name and the env var isn't set:
+        // it's a literal key that was misclassified by the old wizard heuristic.
+        // Move it to `api_key` and clear `api_key_env`.
         profile.api_key_env = None;
         if profile.api_key.is_none() {
             profile.api_key = Some(env_name);
@@ -1374,6 +1408,130 @@ mod tests {
         // File should not have been written (no migration needed).
         assert!(!path.exists(), "file should not be rewritten when no migration");
         unsafe { std::env::remove_var(env_name) };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrate_leaves_unset_env_var_name_in_api_key_env_alone() {
+        // An api_key_env that looks like an env var name but the env var isn't
+        // set is a legitimate (unfulfilled) reference — don't move it to api_key
+        // (that would authenticate with the literal string and get a 401).
+        use super::{Config, Profile, migrate_api_key_env_to_literal};
+        let env_name = "HI_NEVER_SET_MIGRATE_999";
+        assert!(std::env::var(env_name).is_err(), "precondition: var must not be set");
+        let dir = std::env::temp_dir().join(format!(
+            "hi-migrate-unset-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let mut config = Config {
+            default_profile: Some("default".into()),
+            profiles: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "default".into(),
+                    Profile {
+                        provider: Some(ProviderName::Pipenetwork),
+                        api_key_env: Some(env_name.into()),
+                        ..Default::default()
+                    },
+                );
+                m
+            },
+        };
+        migrate_api_key_env_to_literal(&mut config, &path);
+        let p = config.profiles.get("default").unwrap();
+        assert_eq!(p.api_key_env.as_deref(), Some(env_name), "unset env ref must stay");
+        assert!(p.api_key.is_none(), "must not become a literal key");
+        assert!(!path.exists(), "file should not be rewritten");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrate_repairs_env_var_name_misplaced_in_api_key() {
+        // The previous version of the migration moved an env var name like
+        // "HI_API_KEY" from api_key_env to api_key when the env var wasn't set,
+        // causing 401s. If the env var IS set, the migration should replace
+        // api_key with the env var's value.
+        use super::{Config, Profile, migrate_api_key_env_to_literal};
+        let env_name = "HI_MIGRATE_REPAIR_123";
+        unsafe { std::env::set_var(env_name, "api_realkey_value") };
+        let dir = std::env::temp_dir().join(format!(
+            "hi-migrate-repair-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let mut config = Config {
+            default_profile: Some("default".into()),
+            profiles: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "default".into(),
+                    Profile {
+                        provider: Some(ProviderName::Pipenetwork),
+                        api_key: Some(env_name.into()), // env var name in api_key
+                        ..Default::default()
+                    },
+                );
+                m
+            },
+        };
+        migrate_api_key_env_to_literal(&mut config, &path);
+        let p = config.profiles.get("default").unwrap();
+        assert_eq!(
+            p.api_key.as_deref(),
+            Some("api_realkey_value"),
+            "should be replaced with env var value"
+        );
+        assert!(p.api_key_env.is_none());
+        unsafe { std::env::remove_var(env_name) };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrate_moves_unset_env_var_name_from_api_key_back_to_env_ref() {
+        // If api_key holds an env var name and the env var is NOT set, move it
+        // back to api_key_env so the user gets the right error ("env var … is
+        // not set") instead of a 401 from authenticating with the var name.
+        use super::{Config, Profile, migrate_api_key_env_to_literal};
+        let env_name = "HI_MIGRATE_BACK_999";
+        assert!(std::env::var(env_name).is_err(), "precondition: var must not be set");
+        let dir = std::env::temp_dir().join(format!(
+            "hi-migrate-back-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let mut config = Config {
+            default_profile: Some("default".into()),
+            profiles: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "default".into(),
+                    Profile {
+                        provider: Some(ProviderName::Pipenetwork),
+                        api_key: Some(env_name.into()),
+                        ..Default::default()
+                    },
+                );
+                m
+            },
+        };
+        migrate_api_key_env_to_literal(&mut config, &path);
+        let p = config.profiles.get("default").unwrap();
+        assert_eq!(p.api_key_env.as_deref(), Some(env_name), "should move back to env ref");
+        assert!(p.api_key.is_none(), "api_key should be cleared");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
