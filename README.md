@@ -48,7 +48,7 @@ Settings resolve in this order: **CLI flags → profile → environment → defa
 |---|---|---|---|
 | Model | `-m, --model` | `HI_MODEL` | — (required) |
 | Base URL | `--base-url` | `HI_BASE_URL` | OpenRouter / `api.anthropic.com` |
-| API key | `--api-key` | `HI_API_KEY`, then `OPENROUTER_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` | — (required) |
+| API key | `--api-key` | `HI_API_KEY`, then provider-specific (`OPENROUTER_API_KEY` / `OPENAI_API_KEY` / `ANTHROPIC_API_KEY` / `PIPENETWORK_API_KEY` / `OLLAMA_API_KEY`) | — (required; Ollama ignores it) |
 | Tool mode | `--tool-mode` | — | `auto` |
 | Compatibility | `--compat` | — | `auto` |
 
@@ -106,14 +106,17 @@ OpenAI-compatible endpoints vary in how much of Chat Completions they implement.
 
 ## Verification-in-the-loop
 
-The headline feature. After the model stops, `hi` runs a check; if it fails, the output is fed back and the model iterates (up to `--max-verify` rounds, default 3).
+The headline feature. After the model stops, `hi` runs a check; if it fails, the output is fed back and the model iterates (up to `--max-verify` rounds, default 2).
 
 ```bash
 hi --verify "cargo test" "make the failing test pass"
-hi --auto-verify "..."     # detects cargo test / pytest / npm test / go test / make test
+hi --auto-verify "..."     # detects a test pipeline: cargo check+test, go build+test,
+                          #   tsc+npm test, ruff+pytest, or make test
 ```
 
-A `--max-steps` cap (default 50) stops runaway tool loops. Each turn prints `[N in · N out · N total · $cost · k/k ctx]`.
+`--auto-verify` doesn't just find a test command — it builds a **multi-stage pipeline** per project: `cargo check` then `cargo test`, `go build` then `go test`, `tsc` then `npm test` (when a tsconfig is present), `ruff check` then `pytest` (when ruff is configured), or `make test`. Faster, localizable errors land before the slower test stage.
+
+A `--max-steps` cap (default 500) stops runaway tool loops. Each turn prints `[N in · N out · N total · $cost · k/k ctx]`.
 
 ## Best-of-N
 
@@ -148,14 +151,22 @@ Slash commands (TUI or plain REPL):
 | `/diff` | show what files have changed this session (`git diff` + new files) |
 | `/copy [all]` | copy the last assistant response to the terminal clipboard; `all` copies the transcript |
 | `/goal [text\|clear]` | show, set, or clear the current session goal injected into future turns |
-| `/compact` | summarize the conversation and reset context to the summary (reclaims room on long sessions) |
+| `/init` | scan the repo and write an `HI.md` project guide (loaded as context in future sessions) |
+| `/compact [kind]` | reclaim context — `hybrid` (summarize old turns, keep recent), `full` (summarize everything), or `elide` (drop old tool output, no model call) |
 | `/retry` | re-run your last message (drops the previous attempt — pairs with `/model`) |
 | `/undo` | revert the file changes the last turn made (restores its git checkpoint) |
+| `/commit` | stage all changes and commit them (`git add -A && git commit`) |
+| `/status` | show provider, model, queue, context, and last turn state |
+| `/log` | write a local debug log for this session (`.hi-debug.log`) |
+| `/export [path]` | export the conversation to a file (default: `transcript.md`) |
 | `/tokens` | cumulative token usage |
+| `/version` | show version |
 | `/clear` | start a fresh conversation |
 | `/exit` | quit |
 
-Drop an `HI.md` or `AGENTS.md` in your project and its contents are appended to the system prompt — per-project conventions, for free.
+Drop an `HI.md` or `AGENTS.md` in your project and its contents are appended to the system prompt — per-project conventions, for free. `/init` scans the repo and writes an `HI.md` for you.
+
+**Auto-memory.** At the end of an interactive session, `hi` distills durable lessons into `.hi/memory.md`, loaded as context next session. Disable with `--no-memory`.
 
 **Auto-compact.** During long tool loops, `hi` elides older bulky tool results once the local context estimate passes ~45% full, keeping the newest verbatim. Before a new turn, if the previous request used ~80% of the context window, it summarizes the conversation and resets to that summary. Disable with `--no-auto-compact`; trigger manually any time with `/compact`. Tool payloads are also bounded: `read` returns 240 lines unless paged with `offset`/`limit`, and `HI_TOOL_RESULT_CHARS` controls the per-result character cap.
 
@@ -174,7 +185,7 @@ A cargo workspace:
 | crate | role |
 |---|---|
 | `hi-ai` | provider-neutral types, the `Provider` trait, OpenAI + Anthropic adapters, retry, models.dev registry |
-| `hi-tools` | the `read` / `write` / `edit` / `bash` / `list` / `grep` tools |
+| `hi-tools` | the tools: `read` / `write` / `edit` / `multi_edit` / `apply_patch` / `bash` / `bash_output` / `bash_kill` / `list` / `grep` / `glob` / `diff` / `commit` / `update_plan` / `record_decision` |
 | `hi-agent` | the agent loop, verify-loop, sessions, the `Ui` trait |
 | `hi-tui` | full-screen terminal UI (transcript, spinner, queue, slash commands) |
 | `hi-cli` | the `hi` binary: config, sessions, best-of-N, slash commands |
@@ -193,8 +204,9 @@ cargo run -p hi-eval -- --validate bench/spec     # check tasks are well-formed 
 HI_MODEL=anthropic/claude-sonnet-4 HI_API_KEY=$OPENROUTER_API_KEY \
   cargo run -p hi-eval -- bench/spec
 
-# The raw-Fusion line to beat:
-HI_API_KEY=$OPENROUTER_API_KEY cargo run -p hi-eval -- --fusion bench/spec
+# The raw-Fusion line to beat (Fusion is selected via env, not a flag):
+HI_MODEL=openrouter/fusion HI_API_KEY=$OPENROUTER_API_KEY \
+  cargo run -p hi-eval -- bench/spec
 ```
 
 ### Result: verification more than doubles the local pass rate
