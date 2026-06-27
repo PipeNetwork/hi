@@ -251,13 +251,12 @@ impl ProviderForm {
         let model = self.fields[2].input.text();
         let base_url = self.fields[3].input.text();
         let provider = PROVIDER_CHOICES[self.provider_idx].0.to_string();
-        // Heuristic: if the key looks like an env var name (all caps + _),
-        // store as env var reference.
-        let store_as_env = !api_key.is_empty()
-            && api_key
-                .chars()
-                .all(|c| c.is_uppercase() || c == '_' || c.is_ascii_digit())
-            && api_key.contains('_');
+        // `store_as_env` is decided by `ProfileForm::to_profile` in hi-cli,
+        // which checks whether the input is the name of an env var that's
+        // actually set. The form can't make that call reliably (and a pasted
+        // literal key that's all-caps+digits+underscores must not be mistaken
+        // for an env var name), so we pass false here.
+        let store_as_env = false;
 
         Some(super::ProfileFormData {
             name,

@@ -535,13 +535,11 @@ fn provider_add_prompt(
         if key.is_empty() {
             (String::new(), false)
         } else {
-            // Heuristic: if it looks like an env var name (all caps + underscores,
-            // no spaces), store as env var reference. Otherwise it's a literal key.
-            let looks_like_env = key
-                .chars()
-                .all(|c| c.is_uppercase() || c == '_' || c.is_ascii_digit())
-                && key.contains('_');
-            (key, looks_like_env)
+            // Store as env var reference only if it's a plausible env var name
+            // AND an env var with that name is actually set — otherwise a real
+            // key that happens to be all-caps+digits+underscores would be
+            // mistaken for an env var name and fail at resolve time.
+            (key.clone(), config::is_env_var_reference(&key))
         }
     };
 
@@ -653,12 +651,8 @@ fn provider_edit_prompt(
         &format!("API key/{key_label} (current: {masked}): "),
     )?;
     if !new_key.is_empty() {
-        let looks_like_env = new_key
-            .chars()
-            .all(|c| c.is_uppercase() || c == '_' || c.is_ascii_digit())
-            && new_key.contains('_');
         form.api_key = new_key;
-        form.store_as_env = looks_like_env;
+        form.store_as_env = config::is_env_var_reference(&form.api_key);
     }
 
     // Model.

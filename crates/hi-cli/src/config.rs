@@ -742,7 +742,16 @@ impl ProfileForm {
             p.base_url = Some(self.base_url.clone());
         }
         if !self.api_key.is_empty() {
-            if self.store_as_env {
+            // The API-key field accepts either a literal key or the *name* of an
+            // env var that holds the key. Distinguish by checking the environment:
+            // if the input is a plausible env var name AND an env var with that
+            // name is actually set, store it as an `api_key_env` reference;
+            // otherwise treat it as a literal key. This is unambiguous — a real
+            // key will never be the name of a set env var, so a pasted key that
+            // happens to be all-caps+digits+underscores is stored correctly
+            // instead of being mistaken for an env var name (which would fail at
+            // resolve time with "env var … is not set").
+            if is_env_var_reference(&self.api_key) {
                 p.api_key_env = Some(self.api_key.clone());
             } else {
                 p.api_key = Some(self.api_key.clone());
@@ -808,6 +817,27 @@ fn validate_profile(profile: &Profile) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Does `s` look like an env var *name* (not a value)? Env var names are
+/// uppercase ASCII letters, digits, and underscores, must contain at least one
+/// underscore (single-word names like `PATH` are rare for API-key vars and we
+/// err toward treating short all-caps tokens as literal keys), and aren't
+/// absurdly long. This is only a pre-filter — the real decision in
+/// `to_profile` also requires the var to be set in the environment.
+fn looks_like_env_var_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 64
+        && s.contains('_')
+        && s.chars()
+            .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
+}
+
+/// Does `s` look like an env var *name* and is an env var with that name
+/// actually set? Used by the wizards to label the field and pre-set
+/// `store_as_env`; `to_profile` makes the final decision the same way.
+pub(crate) fn is_env_var_reference(s: &str) -> bool {
+    looks_like_env_var_name(s) && std::env::var(s).is_ok_and(|v| !v.is_empty())
 }
 
 /// Shown when `hi` is run with nothing configured. Actionable, not terse.
@@ -1157,5 +1187,66 @@ mod tests {
                 "expected rejection for {bad}, got: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn to_profile_literal_key_is_stored_as_api_key_not_env_ref() {
+        // A real API key that happens to be all uppercase + digits + underscores
+        // must NOT be mistaken for an env var name. Without an env var by that
+        // name set in the environment, to_profile stores it as a literal.
+        use super::ProfileForm;
+        let form = ProfileForm {
+            name: "work".into(),
+            provider: ProviderName::Openai,
+            api_key: "SK_LIVE_ABC123_XYZ".into(), // looks like an env var name
+            store_as_env: true, // even if the form said true, to_profile decides
+            model: "gpt-4o".into(),
+            base_url: String::new(),
+        };
+        let p = form.to_profile();
+        assert_eq!(p.api_key.as_deref(), Some("SK_LIVE_ABC123_XYZ"));
+        assert!(p.api_key_env.is_none(), "literal key must not be stored as env ref");
+    }
+
+    #[test]
+    fn to_profile_env_var_name_that_is_set_stored_as_env_ref() {
+        use super::ProfileForm;
+        // Set an env var whose name matches the input.
+        let name = "HI_TEST_KEY_FAKE_123";
+        // SAFETY: single-threaded test; no other thread reads/writes the env.
+        unsafe { std::env::set_var(name, "secret-value") };
+        let form = ProfileForm {
+            name: "work".into(),
+            provider: ProviderName::Openai,
+            api_key: name.into(),
+            store_as_env: false, // to_profile decides regardless
+            model: "gpt-4o".into(),
+            base_url: String::new(),
+        };
+        let p = form.to_profile();
+        assert_eq!(p.api_key_env.as_deref(), Some(name));
+        assert!(p.api_key.is_none(), "env var name must not be stored as literal");
+        // SAFETY: single-threaded test cleanup.
+        unsafe { std::env::remove_var(name) };
+    }
+
+    #[test]
+    fn to_profile_env_var_name_that_is_not_set_stored_as_literal() {
+        // An input that looks like an env var name but no such env var is set
+        // is treated as a literal key (the user pasted a key, not a var name).
+        use super::ProfileForm;
+        let name = "HI_NEVER_SET_KEY_999";
+        assert!(std::env::var(name).is_err(), "precondition: var must not be set");
+        let form = ProfileForm {
+            name: "work".into(),
+            provider: ProviderName::Openai,
+            api_key: name.into(),
+            store_as_env: true,
+            model: "gpt-4o".into(),
+            base_url: String::new(),
+        };
+        let p = form.to_profile();
+        assert_eq!(p.api_key.as_deref(), Some(name));
+        assert!(p.api_key_env.is_none());
     }
 }
