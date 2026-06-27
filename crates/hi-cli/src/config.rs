@@ -843,10 +843,8 @@ pub(crate) fn is_env_var_reference(s: &str) -> bool {
 /// Shown when `hi` is run with nothing configured. Actionable, not terse.
 const ONBOARDING: &str = "no model configured. Get started with one of:
 
-  Local (Ollama):   hi --provider ollama -m qwen2.5-coder \"...\"
-  Anthropic:        ANTHROPIC_API_KEY=...   hi --provider anthropic \"...\"
-  OpenRouter:       OPENROUTER_API_KEY=...  hi -m anthropic/claude-sonnet-4 \"...\"
   pipenetwork.ai:   PIPENETWORK_API_KEY=...  hi --provider pipenetwork \"...\"
+  Local (Ollama):   hi --provider ollama -m qwen2.5-coder \"...\"
 
 Or run `hi` on a real terminal for the interactive setup wizard.
 Or set HI_MODEL, or add a profile in ~/.config/hi/config.toml (see README).

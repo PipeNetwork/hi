@@ -6,10 +6,8 @@ use crate::input::InputLine;
 
 /// The provider choices shown in the form, in display order.
 const PROVIDER_CHOICES: &[(&str, &str)] = &[
-    ("ollama", "Ollama (local)"),
     ("pipenetwork", "pipenetwork.ai"),
-    ("anthropic", "Anthropic"),
-    ("openai", "OpenRouter"),
+    ("ollama", "Ollama (local)"),
 ];
 
 /// One editable field in the form.

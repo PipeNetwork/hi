@@ -510,14 +510,12 @@ fn provider_add_prompt(
     };
 
     // Provider type.
-    println!("  1) Ollama (local)    2) pipenetwork.ai    3) Anthropic    4) OpenRouter");
+    println!("  1) pipenetwork.ai    2) Ollama (local)");
     let provider = loop {
-        match rl_prompt(editor, "Provider [1-4] (default 1): ")?.as_str() {
-            "" | "1" => break ProviderName::Ollama,
-            "2" => break ProviderName::Pipenetwork,
-            "3" => break ProviderName::Anthropic,
-            "4" => break ProviderName::Openai,
-            other => eprintln!("  '{other}' isn't a choice — pick 1-4."),
+        match rl_prompt(editor, "Provider [1-2] (default 1): ")?.as_str() {
+            "" | "1" => break ProviderName::Pipenetwork,
+            "2" => break ProviderName::Ollama,
+            other => eprintln!("  '{other}' isn't a choice — pick 1-2."),
         }
     };
 
@@ -615,20 +613,18 @@ fn provider_edit_prompt(
 
     // Provider type.
     println!(
-        "  current: {} (1=Ollama 2=pipenetwork 3=Anthropic 4=OpenRouter)",
+        "  current: {} (1=pipenetwork.ai 2=Ollama)",
         form.provider.as_str()
     );
     let provider = loop {
-        let input = rl_prompt(editor, "Provider [1-4]: ")?;
+        let input = rl_prompt(editor, "Provider [1-2]: ")?;
         if input.is_empty() {
             break form.provider;
         }
         match input.as_str() {
-            "1" => break ProviderName::Ollama,
-            "2" => break ProviderName::Pipenetwork,
-            "3" => break ProviderName::Anthropic,
-            "4" => break ProviderName::Openai,
-            _ => eprintln!("  pick 1-4"),
+            "1" => break ProviderName::Pipenetwork,
+            "2" => break ProviderName::Ollama,
+            _ => eprintln!("  pick 1-2"),
         }
     };
     form.provider = provider;

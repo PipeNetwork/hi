@@ -9,20 +9,16 @@ use crate::config::{ProviderName, Settings, default_config_path};
 
 pub async fn run() -> Result<Settings> {
     println!("Welcome to hi — let's set up a model provider.\n");
-    println!("  1) Ollama (local)    run models on your machine — free, private, no key");
-    println!("                      needs `ollama serve` running (install: ollama.com)");
-    println!("  2) pipenetwork.ai    hi's hosted endpoint — paste an API key");
-    println!("  3) Anthropic         Claude models — paste an API key");
-    println!("  4) OpenRouter        one key, 100+ models (incl. Claude, GPT, …)\n");
-    println!("  Local-first? Pick 1. Want the cheapest cloud? Pick 4 (OpenRouter).\n");
+    println!("  1) pipenetwork.ai    hi's hosted endpoint — paste an API key");
+    println!("  2) Ollama (local)    run models on your machine — free, private, no key");
+    println!("                      needs `ollama serve` running (install: ollama.com)\n");
+    println!("  Want a cloud model? Pick 1. Local-first? Pick 2.\n");
 
     let provider = loop {
-        match prompt("Provider [1-4] (default 1): ")?.trim() {
-            "" | "1" => break ProviderName::Ollama,
-            "2" => break ProviderName::Pipenetwork,
-            "3" => break ProviderName::Anthropic,
-            "4" => break ProviderName::Openai,
-            other => println!("  '{other}' isn't a choice — pick 1-4."),
+        match prompt("Provider [1-2] (default 1): ")?.trim() {
+            "" | "1" => break ProviderName::Pipenetwork,
+            "2" => break ProviderName::Ollama,
+            other => println!("  '{other}' isn't a choice — pick 1-2."),
         }
     };
 
