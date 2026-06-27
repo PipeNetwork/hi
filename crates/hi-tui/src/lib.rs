@@ -3484,6 +3484,62 @@ mod tests {
     }
 
     #[test]
+    fn following_shows_last_line_when_word_wrapping_creates_extra_rows() {
+        // Regression: `wrapped_height` counted characters (ceil(len/width)) but
+        // ratatui's `WordWrapper` wraps at word boundaries — a word that doesn't
+        // fit the remaining space moves to the next line, and a word wider than
+        // the line is broken across rows. That makes the real wrapped height
+        // LARGER than the char-based estimate, so `max_scroll` was too small
+        // and the bottom of a long message was clipped off-screen.
+        //
+        // Each line below has a 45-char word at width 38: ratatui wraps it to
+        // 3 rows, but the old char-based estimate said 2. With 20 such lines
+        // the ~20-row undercount pushed the last line entirely off-screen.
+        let mut app = test_app("openai", "gpt-4o");
+        for i in 0..20 {
+            app.push(Line::raw(format!(
+                "word{i:02} supercalifragilisticexpialidocious_extras"
+            )));
+        }
+        app.push(Line::raw("LAST_LINE_MARKER_42"));
+
+        let mut term = Terminal::new(TestBackend::new(40, 12)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let screen = dump(&term);
+        assert!(
+            screen.contains("LAST_LINE_MARKER_42"),
+            "last line must be visible when following (word-wrap clip bug):\n{screen}"
+        );
+    }
+
+    #[test]
+    fn following_shows_last_line_with_realistic_prose_word_wrapping() {
+        // A second regression check with normal prose (no artificially long
+        // words). At a narrow width, word-boundary wrapping still produces more
+        // rows than char-based `ceil(len/width)` because words that don't fit
+        // the remaining space leave the current line short. This is the case
+        // that clipped the end of a long assistant message in practice.
+        let mut app = test_app("openai", "gpt-4o");
+        // 30 lines of prose, each ~70 chars. At width 36 (inner of a 38-wide
+        // terminal), char-based says ceil(70/36) = 2 rows per line, but
+        // word-wrap often produces 3 because words straddle the boundary.
+        for i in 0..30 {
+            app.push(Line::raw(format!(
+                "The quick brown fox jumps over the lazy dog and then runs {i:02}"
+            )));
+        }
+        app.push(Line::raw("FINAL_ANSWER_99"));
+
+        let mut term = Terminal::new(TestBackend::new(38, 14)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let screen = dump(&term);
+        assert!(
+            screen.contains("FINAL_ANSWER_99"),
+            "last line must be visible with prose word-wrapping:\n{screen}"
+        );
+    }
+
+    #[test]
     fn working_line_names_the_inflight_tool_and_model_phase() {
         let mut app = test_app("openai", "gpt-4o");
         app.set_working(true);

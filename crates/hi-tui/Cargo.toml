@@ -7,7 +7,7 @@ version.workspace = true
 hi-agent.workspace = true
 hi-ai.workspace = true
 hi-tools.workspace = true
-ratatui.workspace = true
+ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
 crossterm.workspace = true
 futures-util.workspace = true
 tokio.workspace = true

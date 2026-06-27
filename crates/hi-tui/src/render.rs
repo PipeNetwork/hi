@@ -346,6 +346,13 @@ fn find_double_star(chars: &[char], from: usize) -> Option<usize> {
 
 /// Approximate the number of terminal rows `lines` occupy when wrapped to
 /// `width` — used to keep the transcript scrolled to the bottom.
+///
+/// Uses ratatui's own `Paragraph::line_count` (the same `WordWrapper` the
+/// render path uses) so the height estimate exactly matches what the user
+/// sees. A previous version counted characters (`ceil(len/width)`), which
+/// undercounted whenever word-boundary wrapping produced extra rows — the
+/// accumulated shortfall made `max_scroll` too small and the bottom of a
+/// long message was clipped off-screen.
 pub(crate) fn wrapped_height(lines: &[Line], width: u16) -> u16 {
     // Sum in usize and saturate to u16. A long transcript can exceed u16 rows, and
     // a u16 sum (or `as u16` per line) would wrap to a tiny value — zeroing
@@ -353,14 +360,16 @@ pub(crate) fn wrapped_height(lines: &[Line], width: u16) -> u16 {
     let total: usize = if width == 0 {
         lines.len()
     } else {
-        let width = width as usize;
-        lines
-            .iter()
-            .map(|line| {
-                let len: usize = line.spans.iter().map(|s| s.content.chars().count()).sum();
-                if len == 0 { 1 } else { len.div_ceil(width) }
-            })
-            .sum()
+        // `line_count` includes the block's vertical space (borders). We pass
+        // the *inner* width and no block, so it returns the pure text height.
+        // Each call constructs a small Paragraph — cheap relative to rendering.
+        let mut sum = 0usize;
+        for line in lines {
+            let para = ratatui::widgets::Paragraph::new(vec![line.clone()])
+                .wrap(ratatui::widgets::Wrap { trim: false });
+            sum = sum.saturating_add(para.line_count(width));
+        }
+        sum
     };
     total.min(u16::MAX as usize) as u16
 }
