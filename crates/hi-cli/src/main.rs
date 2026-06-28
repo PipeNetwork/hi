@@ -226,6 +226,12 @@ async fn main() -> Result<()> {
         println!("\x1b[2m{summary}\x1b[0m");
     }
 
+    // Landing banner — only on a real terminal in interactive mode (one-shot
+    // prompts and piped/eval runs return above, so they never print it).
+    if std::io::stdout().is_terminal() && prompt_input.is_none() {
+        print_landing(&settings, context_window);
+    }
+
     // The full-screen TUI is the default interactive experience; fall back to
     // the plain REPL when not on a TTY, when --plain is set, or if it errors.
     if !cli.plain && std::io::stdout().is_terminal() {
@@ -305,6 +311,7 @@ async fn main() -> Result<()> {
         match hi_tui::run(
             &mut agent,
             provider_label(settings.provider),
+            &settings.base_url,
             &settings.model,
             &registry,
             session::history_path(),
@@ -337,6 +344,68 @@ pub(crate) fn provider_label(provider: ProviderName) -> &'static str {
         ProviderName::Pipenetwork => "pipenetwork",
         ProviderName::Ollama => "ollama",
     }
+}
+
+/// The "PipeNetwork.AI" wordmark as figlet-style 5-row block letters — the
+/// splash centerpiece, ~2x the height of a normal line. Generated from
+/// `figlet -f small`, then hand-trimmed of trailing whitespace.
+const BANNER: [&str; 5] = [
+    " ___ _           _  _     _                  _       _   ___ ",
+    "| _ (_)_ __  ___| \\| |___| |___ __ _____ _ _| |__   /_\\ |_ _|",
+    "|  _/ | '_ \\/ -_) .` / -_)  _\\ V  V / _ \\ '_| / /_ / _ \\ | | ",
+    "|_| |_| .__/\\___|_|\\_\\___|\\__|\\_/\\_/\\___/_| |_\\_(_)_/ \\_\\___|",
+    "      |_|                                                    ",
+];
+
+/// Print the PipeNetwork.AI landing banner on startup, with the wordmark
+/// rendered ~2x size as a 5-row block-letter banner (all orange). Only called
+/// on a real terminal in interactive mode (one-shot prompts and piped runs are
+/// excluded upstream).
+fn print_landing(settings: &Settings, context_window: Option<u32>) {
+    // Formatting goes through `write_landing`, which is unit-tested; this is
+    // just the stdout sink.
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let _ = write_landing(&mut out, settings, context_window);
+    let _ = out.flush();
+}
+
+/// Render the landing banner into `w`. Separated from `print_landing` so the
+/// exact text (ANSI escapes, banner, model, cwd) can be asserted in tests
+/// without touching real file descriptors.
+fn write_landing<W: std::io::Write>(
+    w: &mut W,
+    settings: &Settings,
+    context_window: Option<u32>,
+) -> std::io::Result<()> {
+    let orange = "\x1b[38;2;255;140;0m";
+    let bold = "\x1b[1m";
+    let dim = "\x1b[2m";
+    let reset = "\x1b[0m";
+
+    // The 5-row block-letter banner, all orange + bold.
+    for row in BANNER {
+        writeln!(w, "{bold}{orange}{row}{reset}")?;
+    }
+
+    // Model + context window + provider.
+    let ctx = context_window
+        .map(|win| format!("({}K context)", win / 1000))
+        .unwrap_or_default();
+    let provider = provider_label(settings.provider);
+    let model_line = if ctx.is_empty() {
+        format!("{} · {}", settings.model, provider)
+    } else {
+        format!("{} {} · {}", settings.model, ctx, provider)
+    };
+    writeln!(w, "{dim}{model_line}{reset}")?;
+
+    // Current working directory.
+    let cwd = std::env::current_dir()
+        .map(|d| d.display().to_string())
+        .unwrap_or_else(|_| "?".into());
+    writeln!(w, "{dim}{cwd}{reset}")?;
+    Ok(())
 }
 
 /// Build the TUI profile list from a config. Shared by the initial list, the
@@ -528,9 +597,12 @@ fn load_project_context() -> Option<String> {
         }
     }
     // Memory distilled from past sessions (auto-maintained at session end).
-    if let Ok(text) = std::fs::read_to_string(hi_agent::memory_file())
-        && let Some(section) = memory_context(&text)
-    {
+    // Hierarchical: project memory (annotated for stale paths/commands) + a
+    // global user-level layer for cross-project preferences.
+    let project = hi_agent::read_project_annotated();
+    let global = hi_agent::read_global_memory();
+    let mem = render_memory_layers(&project, &global);
+    if let Some(section) = memory_context(&mem) {
         parts.push(section);
     }
     // A heuristic repo map so the model can navigate without reading everything.
@@ -551,6 +623,29 @@ fn auto_memory_enabled(no_memory: bool, no_save: bool) -> bool {
 fn memory_context(text: &str) -> Option<String> {
     let text = text.trim();
     (!text.is_empty()).then(|| format!("# Memory (from past sessions)\n{text}"))
+}
+
+/// Render the hierarchical memory layers into a single context block.
+///
+/// Project bullets are emitted first (annotated with stale-path warnings on
+/// render), then global user-level bullets under a sub-heading. Either layer
+/// may be empty.
+fn render_memory_layers(project: &[hi_agent::AnnotatedBullet], global: &str) -> String {
+    let mut out = String::new();
+    for b in project {
+        out.push_str(&b.render());
+        out.push('\n');
+    }
+    let global = global.trim();
+    if !global.is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("## User-level (global)\n");
+        out.push_str(global);
+        out.push('\n');
+    }
+    out
 }
 
 pub(crate) fn build_provider(settings: &Settings) -> Box<dyn Provider> {
@@ -605,7 +700,9 @@ async fn resolve_live_model_metadata(
 
 #[cfg(test)]
 mod tests {
-    use super::{auto_memory_enabled, memory_context};
+    use super::{auto_memory_enabled, memory_context, write_landing};
+    use crate::config::{ProviderName, Settings};
+    use hi_ai::{CompatMode, ToolMode};
 
     #[test]
     fn auto_memory_off_when_disabled_or_unsaved() {
@@ -620,5 +717,99 @@ mod tests {
         assert!(section.starts_with("# Memory (from past sessions)"));
         assert!(section.contains("- run cargo fmt before commits"));
         assert!(memory_context("   \n  ").is_none(), "blank → no section");
+    }
+
+    fn test_settings() -> Settings {
+        Settings {
+            provider: ProviderName::Openai,
+            model: "gpt-4o".into(),
+            base_url: String::new(),
+            api_key: String::new(),
+            max_tokens: 4096,
+            thinking_budget: None,
+            tool_mode: ToolMode::default(),
+            compat: CompatMode::default(),
+        }
+    }
+
+    /// `write_landing` renders the ~2x block-letter "PipeNetwork.AI" banner.
+    /// We render into a `Vec<u8>`, strip ANSI escapes, and assert the banner
+    /// shape (5 figlet rows), the trailing model/cwd lines, and that the raw
+    /// output carries the orange SGR escape — no real file descriptors touched.
+    #[test]
+    fn write_landing_shows_full_pipenetwork_wordmark() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_landing(&mut buf, &test_settings(), Some(128_000)).expect("render landing");
+
+        let raw = String::from_utf8(buf).expect("utf8");
+        let stripped = strip_ansi(&raw);
+        let lines: Vec<&str> = stripped.lines().collect();
+
+        // 5 banner rows + model line + cwd line = 7 content rows.
+        assert!(
+            lines.len() >= 7,
+            "expected ≥7 lines (5 banner + model + cwd), got {}: {lines:?}",
+            lines.len()
+        );
+
+        // The banner rows are the figlet art — they contain block-letter
+        // strokes (pipes, underscores, slashes) and span 5 consecutive rows.
+        let banner = &lines[0..5];
+        // Every banner row is non-empty and carries pipe/underscore strokes.
+        for (i, row) in banner.iter().enumerate() {
+            assert!(
+                row.contains('|') || row.contains('_'),
+                "banner row {i} should carry figlet strokes, got: {row:?}"
+            );
+        }
+
+        // Row 6 (index 5): model + provider + context window.
+        let model_line = lines[5];
+        assert!(
+            model_line.contains("gpt-4o"),
+            "model line missing model: {model_line:?}"
+        );
+        assert!(
+            model_line.contains("openai"),
+            "model line missing provider: {model_line:?}"
+        );
+        assert!(
+            model_line.contains("128K context"),
+            "model line missing context window: {model_line:?}"
+        );
+
+        // Row 7 (index 6): cwd — at minimum, non-empty (a path).
+        assert!(
+            !lines[6].is_empty(),
+            "cwd line should be non-empty, got: {:?}",
+            lines[6]
+        );
+
+        // The raw output must carry the orange SGR escape on banner rows.
+        let orange_count = raw.matches("\x1b[38;2;255;140;0m").count();
+        assert!(
+            orange_count >= 5,
+            "expected ≥5 orange SGR escapes (one per banner row), got {orange_count}"
+        );
+    }
+
+    fn strip_ansi(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+                // Skip until we pass a letter (the terminator of a CSI sequence).
+                i += 2;
+                while i < bytes.len() && !bytes[i].is_ascii_alphabetic() {
+                    i += 1;
+                }
+                i += 1;
+            } else {
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+        }
+        out
     }
 }

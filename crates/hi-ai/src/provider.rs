@@ -80,7 +80,12 @@ pub fn provider_error_usage(err: &anyhow::Error) -> Usage {
 /// `/models` route. Everything past `id` is best-effort — most endpoints report
 /// only the id (then these stay `None`), but some (e.g. pipenetwork.ai) also report
 /// the context window, pricing, and a health status.
-#[derive(Clone, Debug)]
+///
+/// `Serialize`/`Deserialize` back the on-disk startup cache (see `http::cache`):
+/// a successful `/models` fetch is written keyed by provider+base_url and loaded
+/// synchronously next startup so model metadata applies instantly, without
+/// blocking on the network.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ServedModel {
     pub id: String,
     /// Context window in tokens.

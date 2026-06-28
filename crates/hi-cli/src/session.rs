@@ -171,16 +171,45 @@ pub fn resume_summary(loaded: &LoadedSession) -> String {
 }
 
 /// Directory holding all session files (may not exist yet).
+///
+/// Sessions are namespaced by the current working directory so that `hi -c`
+/// and `--list-sessions` only see chats started in *this* project — the
+/// history is no longer global. The namespace key is a short FNV-1a digest of
+/// the canonical cwd; it lives under the same `$XDG_DATA_HOME/hi` (or
+/// `~/.local/share/hi`) root, in a `projects/<digest>/sessions/` subtree.
 pub fn sessions_dir() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share"))
-        })?;
-    Some(base.join("hi").join("sessions"))
+    let base = data_root()?;
+    let digest = cwd_digest();
+    Some(base.join("projects").join(digest).join("sessions"))
 }
 
-/// Path to the persistent REPL input-history file.
+/// The shared data root (`$XDG_DATA_HOME/hi` or `~/.local/share/hi`).
+fn data_root() -> Option<PathBuf> {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+        .map(|p| p.join("hi"))
+}
+
+/// A short, stable, filesystem-safe key for the current working directory.
+/// Uses FNV-1a over the canonicalized path (resolves symlinks, so a project
+/// reached via different paths still maps to one bucket). Falls back to the
+/// raw cwd if canonicalization fails. Sixteen hex chars is enough to avoid
+/// collisions across any realistic number of project dirs while keeping the
+/// directory listing readable.
+fn cwd_digest() -> String {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let key = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in key.as_os_str().as_encoded_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:016x}")
+}
+
+/// Path to the persistent REPL input-history file. Per-directory (lives inside
+/// `sessions_dir()`) so Up-arrow history is scoped to the current project.
 pub fn history_path() -> Option<PathBuf> {
     sessions_dir().and_then(|d| d.parent().map(|p| p.join("history")))
 }
@@ -196,13 +225,40 @@ pub fn new_session_path() -> Result<PathBuf> {
 }
 
 /// Path for an explicit session id (with or without the `.jsonl` suffix).
+///
+/// Looks in the current project's session dir first. If the id isn't found
+/// there, falls back to a search across *all* project buckets under the data
+/// root — so `--resume <id>` keeps working for a session started in a
+/// different directory (e.g. an id copied from a `--list-sessions` run
+/// elsewhere, or resuming after `cd`-ing to another project).
 pub fn session_path(id: &str) -> Result<PathBuf> {
-    let dir = sessions_dir().context("could not determine session directory")?;
     let name = if id.ends_with(".jsonl") {
         id.to_string()
     } else {
         format!("{id}.jsonl")
     };
+    // Current project bucket first.
+    if let Some(dir) = sessions_dir() {
+        let local = dir.join(&name);
+        if local.exists() {
+            return Ok(local);
+        }
+    }
+    // Global fallback: scan every project bucket for a matching file name.
+    if let Some(root) = data_root() {
+        let projects = root.join("projects");
+        if let Ok(read) = fs::read_dir(&projects) {
+            for entry in read.flatten() {
+                let candidate = entry.path().join("sessions").join(&name);
+                if candidate.exists() {
+                    return Ok(candidate);
+                }
+            }
+        }
+    }
+    // Nothing found — return the current-project path so the caller gets a
+    // sensible "no such session" error rather than a panic.
+    let dir = sessions_dir().context("could not determine session directory")?;
     Ok(dir.join(name))
 }
 
@@ -288,32 +344,46 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
 }
 
 /// Print a summary of saved sessions (id, age, first user message).
+///
+/// Walks every project bucket under the data root (sessions are namespaced
+/// per-directory) and lists them newest-first, annotating each with a short
+/// project-digest prefix so you can tell which directory a session belongs to.
 pub fn list_sessions() -> Result<()> {
-    let Some(dir) = sessions_dir() else {
+    let Some(root) = data_root() else {
         println!("no session directory");
         return Ok(());
     };
-    let mut entries: Vec<(PathBuf, SystemTime)> = match fs::read_dir(&dir) {
-        Ok(read) => read
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|ext| ext == "jsonl"))
-            .map(|p| {
-                let modified = fs::metadata(&p)
-                    .and_then(|m| m.modified())
-                    .unwrap_or(UNIX_EPOCH);
-                (p, modified)
-            })
-            .collect(),
-        Err(_) => Vec::new(),
-    };
+    let projects = root.join("projects");
+
+    // Collect (path, modified, project_digest) across all project buckets.
+    let mut entries: Vec<(PathBuf, SystemTime, String)> = Vec::new();
+    if let Ok(buckets) = fs::read_dir(&projects) {
+        for bucket in buckets.flatten() {
+            let digest = bucket.file_name().to_str().unwrap_or("?").to_string();
+            let sess_dir = bucket.path().join("sessions");
+            let Ok(read) = fs::read_dir(&sess_dir) else {
+                continue;
+            };
+            for entry in read.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|ext| ext == "jsonl") {
+                    let modified = fs::metadata(&path)
+                        .and_then(|m| m.modified())
+                        .unwrap_or(UNIX_EPOCH);
+                    entries.push((path, modified, digest.clone()));
+                }
+            }
+        }
+    }
+
     if entries.is_empty() {
-        println!("no sessions in {}", dir.display());
+        println!("no sessions in {}", projects.display());
         return Ok(());
     }
     entries.sort_by_key(|e| std::cmp::Reverse(e.1));
 
     let now = SystemTime::now();
-    for (path, modified) in entries {
+    for (path, modified, digest) in entries {
         let id = path.file_stem().and_then(|s| s.to_str()).unwrap_or("?");
         let age = now
             .duration_since(modified)
@@ -323,7 +393,13 @@ pub fn list_sessions() -> Result<()> {
             .map(|m| session_title(&m))
             .filter(|t| !t.is_empty())
             .unwrap_or_else(|| "(no prompt yet)".to_string());
-        println!("{id}  {age:>6} ago  {}", hi_agent::ui::clip(&title, 70));
+        // Short 8-char project prefix so the column stays narrow but remains
+        // enough to disambiguate sessions from different directories.
+        let proj = &digest[..digest.len().min(8)];
+        println!(
+            "{id}  {age:>6} ago  {proj}  {}",
+            hi_agent::ui::clip(&title, 60)
+        );
     }
     Ok(())
 }
@@ -368,7 +444,7 @@ fn humanize(secs: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{JsonlSession, load_history, session_title};
+    use super::{JsonlSession, cwd_digest, load_history, session_title};
     use hi_agent::SessionSink;
     use hi_ai::{Message, Usage};
 
@@ -509,5 +585,19 @@ mod tests {
         assert_eq!(loaded.messages[0].text(), "hello world");
         // The valid usage line loaded too.
         assert_eq!(loaded.usage.input_tokens, 10);
+    }
+
+    /// `cwd_digest` is deterministic for a given cwd and stable across calls,
+    /// so the same project maps to the same session bucket every run.
+    #[test]
+    fn cwd_digest_is_stable_and_distinct() {
+        let a = cwd_digest();
+        let b = cwd_digest();
+        assert_eq!(a, b, "digest must be stable across calls");
+        assert_eq!(a.len(), 16, "digest is 16 hex chars");
+        assert!(
+            a.chars().all(|c| c.is_ascii_hexdigit()),
+            "digest is filesystem-safe hex: {a}"
+        );
     }
 }

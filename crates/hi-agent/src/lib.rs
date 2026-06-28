@@ -30,7 +30,10 @@ pub use compaction::{CompactionKind, DEFAULT_KEEP_RECENT};
 pub use config::{AgentConfig, VerifyStage};
 pub use heuristics::humanize_count;
 pub use hi_tools::{PlanStatus, PlanStep};
-pub use memory::{memory_file, should_distill_memory};
+pub use memory::{
+    AnnotatedBullet, global_memory_file, memory_file, read_global_memory, read_memory,
+    read_project_annotated, should_distill_memory,
+};
 pub use session::SessionSink;
 pub use ui::{Ui, classify_error, tool_label};
 
@@ -40,7 +43,10 @@ use heuristics::{
     recovery_sampling, recovery_telemetry, respects_deps, textcall_id_offset, tool_deps,
     tool_mode_label,
 };
-use memory::{cap_memory, memory_prompt};
+use memory::{
+    cap_memory, extract_corrections, memory_prompt, split_layers, strip_header,
+    unreferenced_bullets, verify_grounded, write_memory,
+};
 use prompt::SystemPrompt;
 use snapshot::{FileFingerprint, SnapshotCache, changed_files_between};
 use transcript::{NudgeKind, Transcript};
@@ -1308,21 +1314,52 @@ impl Agent {
     /// See [`update_memory`](Self::update_memory); the path is a parameter so tests
     /// can redirect the write to a temp file (no global env/cwd state).
     async fn update_memory_at(&mut self, path: std::path::PathBuf, ui: &mut dyn Ui) {
+        // Read both memory layers, stripping the schema header so the distiller
+        // sees only the bullets (and tolerates a missing/legacy header).
         let existing = std::fs::read_to_string(&path).unwrap_or_default();
+        let existing = strip_header(&existing);
+        let global_path = global_memory_file();
+        let global_existing = std::fs::read_to_string(&global_path).unwrap_or_default();
+        let global_existing = strip_header(&global_existing);
 
         ui.status("distilling session memory…");
 
         // Elide bulky tool outputs — the memory distillation only needs to
-        // understand what was done, not re-read command output verbatim.
-        let start = self.messages.len().min(1);
-        let mut history: Vec<Message> = self.messages.as_slice()[start..].to_vec();
+        // understand what was done, not re-read command output verbatim. Skip
+        // any leading system message explicitly (robust against message order),
+        // rather than assuming index 0 is system.
+        let all = self.messages.as_slice();
+        let start = all
+            .iter()
+            .position(|m| m.role != Role::System)
+            .unwrap_or(all.len());
+        let mut history: Vec<Message> = all[start..].to_vec();
+        // Bound the replay window so a very long session doesn't blow up the
+        // throwaway distillation call: keep the most recent turns, which carry
+        // the durable lessons worth recording.
+        const MEMORY_REPLAY_MAX: usize = 40;
+        let window_start = history.len().saturating_sub(MEMORY_REPLAY_MAX);
+        if window_start > 0 {
+            history.drain(..window_start);
+        }
         let len = history.len();
         compaction::elide_tool_outputs(&mut history, len);
+
+        // Self-learning enrichment: surface corrections and unreferenced facts
+        // so the distiller focuses on the highest-signal material.
+        let corrections = extract_corrections(&history);
+        let transcript_text: String = history.iter().map(|m| m.text()).collect();
+        let recalled = unreferenced_bullets(&existing, &transcript_text);
 
         let mut messages = Vec::with_capacity(history.len() + 2);
         messages.push(self.minimal_system_message());
         messages.extend_from_slice(&history);
-        messages.push(Message::user(memory_prompt(existing.trim())));
+        messages.push(Message::user(memory_prompt(
+            &existing,
+            &global_existing,
+            &corrections,
+            &recalled,
+        )));
 
         let request = ChatRequest {
             model: self.config.model.clone(),
@@ -1380,16 +1417,49 @@ impl Agent {
         if memory.is_empty() {
             return; // nothing durable to save
         }
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+
+        // Groundedness: drop distilled bullets that reference paths or commands
+        // which don't resolve in the current workspace — a hallucinated path or
+        // a stale build command is worse than no memory. Global-routed bullets
+        // (global: prefix) are exempt since they may reference other projects.
+        let memory = verify_grounded(&memory);
+        if memory.trim().is_empty() {
+            return; // nothing left after grounding
         }
-        let notes = memory.lines().filter(|l| !l.trim().is_empty()).count();
-        match std::fs::write(&path, format!("{memory}\n")) {
-            Ok(()) => ui.status(&format!(
-                "✓ saved {notes} memory note(s) to {}",
-                path.display()
-            )),
-            Err(err) => ui.status(&format!("(couldn't write memory: {err})")),
+
+        // Hierarchical routing: split `global:`-prefixed bullets out to the
+        // user-level memory file; the rest stays in project memory.
+        let (project_body, global_body) = split_layers(&memory);
+
+        // Publish each layer atomically + exclusively (temp file + rename under
+        // an O_EXCL lock). A concurrent distillation in the same dir is skipped;
+        // its revision loses to whichever process took the lock first.
+        let mut saved_notes = 0usize;
+        let mut wrote_global = false;
+        if !project_body.trim().is_empty() {
+            match write_memory(&path, &project_body) {
+                Ok(notes) => saved_notes += notes,
+                Err(status) => ui.status(&format!("({status})")),
+            }
+        }
+        if !global_body.trim().is_empty() {
+            match write_memory(&global_path, &global_body) {
+                Ok(notes) => {
+                    saved_notes += notes;
+                    wrote_global = true;
+                }
+                Err(status) => ui.status(&format!("({status})")),
+            }
+        }
+        if saved_notes > 0 {
+            let where_to = if wrote_global {
+                "project + global memory"
+            } else {
+                "project memory"
+            };
+            ui.status(&format!(
+                "✓ saved {saved_notes} memory note(s) to {where_to}"
+            ));
         }
     }
 
@@ -3169,7 +3239,18 @@ mod tests {
 
     #[tokio::test]
     async fn update_memory_writes_file_without_polluting_history() {
-        let path = std::env::temp_dir().join(format!("hi-mem-{}-write.md", std::process::id()));
+        // Use a unique subdir so the per-directory memory lock doesn't collide
+        // with other parallel tests writing into the shared temp root.
+        let dir = std::env::temp_dir().join(format!(
+            "hi-mem-write-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("memory.md");
         let _ = std::fs::remove_file(&path);
         // The model returns a distilled bullet list.
         let mut agent = agent(
@@ -3186,7 +3267,7 @@ mod tests {
         agent.update_memory_at(path.clone(), &mut NullUi).await;
 
         let written = std::fs::read_to_string(&path).expect("memory file written");
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
         assert!(
             written.contains("always run cargo fmt"),
             "distilled: {written}"

@@ -88,6 +88,83 @@ pub async fn fetch_models(builder: RequestBuilder) -> Result<Vec<ServedModel>> {
     }
 }
 
+// --- On-disk startup cache for /models results ---
+//
+// A successful `/models` fetch is cached locally so the next startup applies
+// model metadata (window/price/health) instantly, without blocking on the
+// network. The live fetch still runs in the background and refreshes the cache;
+// the cache just covers the cold-start gap so the UI never looks stalled.
+
+/// The cache file lives in the hi config dir alongside `config.toml`.
+fn cache_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".config"))
+        })?;
+    Some(base.join("hi").join("models-cache.json"))
+}
+
+/// A stable key for a provider endpoint so pipenetwork@v1 and ollama@localhost
+/// don't collide. Includes the base_url so two OpenAI-compatible endpoints with
+/// different URLs get separate entries.
+pub fn cache_key(provider: &str, base_url: &str) -> String {
+    format!("{provider}@{base_url}")
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CacheEntry {
+    /// Unix timestamp (seconds) of the fetch that produced this entry.
+    ts: u64,
+    models: Vec<ServedModel>,
+}
+
+/// Load the cached `/models` result for `key`, if present and not stale.
+/// Entries older than 24h are ignored (model metadata drifts: windows expand,
+/// prices change, models are added/removed).
+pub async fn load_cache(key: &str) -> Option<Vec<ServedModel>> {
+    let path = cache_path()?;
+    let text = tokio::fs::read_to_string(&path).await.ok()?;
+    let map: std::collections::HashMap<String, CacheEntry> = serde_json::from_str(&text).ok()?;
+    let entry = map.get(key)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    if now.saturating_sub(entry.ts) > 24 * 60 * 60 {
+        return None; // stale
+    }
+    Some(entry.models.clone())
+}
+
+/// Persist a fresh `/models` result for `key`, merging with any other providers'
+/// entries already in the cache file. Best-effort: errors are silently dropped
+/// (the cache is an optimization, not a source of truth).
+pub async fn save_cache(key: &str, models: &[ServedModel]) {
+    let Some(path) = cache_path() else { return };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // Load existing entries (other providers) so we don't clobber them.
+    let mut map: std::collections::HashMap<String, CacheEntry> = tokio::fs::read_to_string(&path)
+        .await
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    map.insert(
+        key.to_string(),
+        CacheEntry {
+            ts: now,
+            models: models.to_vec(),
+        },
+    );
+    if let Some(parent) = path.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    let _ = tokio::fs::write(&path, serde_json::to_string(&map).unwrap_or_default()).await;
+}
+
 /// Give up on a stream if the model produces no output — content, reasoning, or
 /// tool tokens — for this long (default 300s, override with `HI_STREAM_TIMEOUT`
 /// in seconds). Keep-alive heartbeats do NOT count as progress: a provider that
@@ -311,5 +388,112 @@ mod tests {
             Some("unavailable"),
             "available:false flagged"
         );
+    }
+
+    #[test]
+    fn cache_key_distinguishes_providers_and_urls() {
+        assert_ne!(
+            cache_key("pipenetwork", "https://api.pipenetwork.ai/v1"),
+            cache_key("ollama", "http://localhost:11434/v1"),
+        );
+        // Same provider, different base URLs → different keys.
+        assert_ne!(
+            cache_key("openai", "https://a.com/v1"),
+            cache_key("openai", "https://b.com/v1"),
+        );
+        // Same inputs → same key.
+        assert_eq!(
+            cache_key("pipenetwork", "https://api.pipenetwork.ai/v1"),
+            cache_key("pipenetwork", "https://api.pipenetwork.ai/v1"),
+        );
+    }
+
+    #[test]
+    fn cache_entry_round_trips_through_json() {
+        // The on-disk cache serializes Vec<ServedModel> + a timestamp. A
+        // round-trip must preserve every field so metadata (window/price/health)
+        // survives across startups.
+        let entry = CacheEntry {
+            ts: 1_700_000_000,
+            models: vec![
+                ServedModel {
+                    id: "ipop/coder-balanced".into(),
+                    context_window: Some(1_000_000),
+                    price: Some((1.0, 2.0)),
+                    status: Some("available".into()),
+                    available: true,
+                },
+                ServedModel {
+                    id: "grok".into(),
+                    context_window: None,
+                    price: None,
+                    status: Some("degraded".into()),
+                    available: false,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        let back: CacheEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.ts, entry.ts);
+        assert_eq!(back.models.len(), 2);
+        assert_eq!(back.models[0].context_window, Some(1_000_000));
+        assert_eq!(back.models[0].price, Some((1.0, 2.0)));
+        assert_eq!(back.models[1].status, Some("degraded".into()));
+        assert!(!back.models[1].available);
+    }
+
+    #[tokio::test]
+    async fn cache_disk_round_trip_uses_temp_home() {
+        // Verify the load/save path through the real filesystem, isolated via a
+        // temp HOME. Runs serially (no other test in this module touches HOME).
+        let dir = std::env::temp_dir().join(format!(
+            "hi-cache-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // SAFETY: this test runs in a single task; no other code in this test
+        // reads HOME/XDG_CONFIG_HOME concurrently. Other tests in this crate
+        // don't touch these vars.
+        unsafe {
+            std::env::set_var("HOME", &dir);
+            std::env::remove_var("XDG_CONFIG_HOME");
+        }
+
+        let key = cache_key("pipenetwork", "https://api.pipenetwork.ai/v1");
+        let models = vec![ServedModel {
+            id: "m1".into(),
+            context_window: Some(128_000),
+            price: None,
+            status: None,
+            available: true,
+        }];
+
+        assert!(load_cache(&key).await.is_none(), "empty before save");
+        save_cache(&key, &models).await;
+        let loaded = load_cache(&key).await.expect("hit after save");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, "m1");
+        assert_eq!(loaded[0].context_window, Some(128_000));
+
+        // A second key doesn't clobber the first.
+        save_cache(&cache_key("ollama", "http://x/v1"), &[]).await;
+        assert!(load_cache(&key).await.is_some(), "first entry preserved");
+
+        // Stale (>24h) entry is ignored.
+        let path = dir.join(".config/hi/models-cache.json");
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut map: std::collections::HashMap<String, CacheEntry> =
+            serde_json::from_str(&text).unwrap();
+        if let Some(e) = map.get_mut(&key) {
+            e.ts = e.ts.saturating_sub(25 * 60 * 60 + 1);
+        }
+        std::fs::write(&path, serde_json::to_string(&map).unwrap()).unwrap();
+        assert!(load_cache(&key).await.is_none(), "stale entry ignored");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

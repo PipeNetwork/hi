@@ -375,8 +375,8 @@ pub fn load_config(explicit: Option<&Path>) -> Result<Config> {
     };
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("reading config {}", path.display()))?;
-    let mut config =
-        toml::from_str::<Config>(&text).with_context(|| format!("parsing config {}", path.display()))?;
+    let mut config = toml::from_str::<Config>(&text)
+        .with_context(|| format!("parsing config {}", path.display()))?;
     migrate_api_key_env_to_literal(&mut config, &path);
     Ok(config)
 }
@@ -1295,13 +1295,16 @@ mod tests {
             name: "work".into(),
             provider: ProviderName::Openai,
             api_key: "SK_LIVE_ABC123_XYZ".into(), // looks like an env var name
-            store_as_env: true, // even if the form said true, to_profile decides
+            store_as_env: true,                   // even if the form said true, to_profile decides
             model: "gpt-4o".into(),
             base_url: String::new(),
         };
         let p = form.to_profile();
         assert_eq!(p.api_key.as_deref(), Some("SK_LIVE_ABC123_XYZ"));
-        assert!(p.api_key_env.is_none(), "literal key must not be stored as env ref");
+        assert!(
+            p.api_key_env.is_none(),
+            "literal key must not be stored as env ref"
+        );
     }
 
     #[test]
@@ -1321,7 +1324,10 @@ mod tests {
         };
         let p = form.to_profile();
         assert_eq!(p.api_key_env.as_deref(), Some(name));
-        assert!(p.api_key.is_none(), "env var name must not be stored as literal");
+        assert!(
+            p.api_key.is_none(),
+            "env var name must not be stored as literal"
+        );
         // SAFETY: single-threaded test cleanup.
         unsafe { std::env::remove_var(name) };
     }
@@ -1332,7 +1338,10 @@ mod tests {
         // is treated as a literal key (the user pasted a key, not a var name).
         use super::ProfileForm;
         let name = "HI_NEVER_SET_KEY_999";
-        assert!(std::env::var(name).is_err(), "precondition: var must not be set");
+        assert!(
+            std::env::var(name).is_err(),
+            "precondition: var must not be set"
+        );
         let form = ProfileForm {
             name: "work".into(),
             provider: ProviderName::Openai,
@@ -1384,7 +1393,10 @@ mod tests {
         assert!(p.api_key_env.is_none(), "bogus env ref must be cleared");
         // The config file should have been rewritten with the repair.
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("api_key ="), "file should have literal api_key");
+        assert!(
+            text.contains("api_key ="),
+            "file should have literal api_key"
+        );
         assert!(
             !text.contains("api_key_env"),
             "file should not have api_key_env: {text}"
@@ -1425,9 +1437,15 @@ mod tests {
         migrate_api_key_env_to_literal(&mut config, &path);
         let p = config.profiles.get("default").unwrap();
         assert_eq!(p.api_key_env.as_deref(), Some(env_name));
-        assert!(p.api_key.is_none(), "legitimate env ref must not become literal");
+        assert!(
+            p.api_key.is_none(),
+            "legitimate env ref must not become literal"
+        );
         // File should not have been written (no migration needed).
-        assert!(!path.exists(), "file should not be rewritten when no migration");
+        assert!(
+            !path.exists(),
+            "file should not be rewritten when no migration"
+        );
         unsafe { std::env::remove_var(env_name) };
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1439,7 +1457,10 @@ mod tests {
         // (that would authenticate with the literal string and get a 401).
         use super::{Config, Profile, migrate_api_key_env_to_literal};
         let env_name = "HI_NEVER_SET_MIGRATE_999";
-        assert!(std::env::var(env_name).is_err(), "precondition: var must not be set");
+        assert!(
+            std::env::var(env_name).is_err(),
+            "precondition: var must not be set"
+        );
         let dir = std::env::temp_dir().join(format!(
             "hi-migrate-unset-{}",
             std::time::SystemTime::now()
@@ -1466,7 +1487,11 @@ mod tests {
         };
         migrate_api_key_env_to_literal(&mut config, &path);
         let p = config.profiles.get("default").unwrap();
-        assert_eq!(p.api_key_env.as_deref(), Some(env_name), "unset env ref must stay");
+        assert_eq!(
+            p.api_key_env.as_deref(),
+            Some(env_name),
+            "unset env ref must stay"
+        );
         assert!(p.api_key.is_none(), "must not become a literal key");
         assert!(!path.exists(), "file should not be rewritten");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1524,7 +1549,10 @@ mod tests {
         // not set") instead of a 401 from authenticating with the var name.
         use super::{Config, Profile, migrate_api_key_env_to_literal};
         let env_name = "HI_MIGRATE_BACK_999";
-        assert!(std::env::var(env_name).is_err(), "precondition: var must not be set");
+        assert!(
+            std::env::var(env_name).is_err(),
+            "precondition: var must not be set"
+        );
         let dir = std::env::temp_dir().join(format!(
             "hi-migrate-back-{}",
             std::time::SystemTime::now()
@@ -1551,7 +1579,11 @@ mod tests {
         };
         migrate_api_key_env_to_literal(&mut config, &path);
         let p = config.profiles.get("default").unwrap();
-        assert_eq!(p.api_key_env.as_deref(), Some(env_name), "should move back to env ref");
+        assert_eq!(
+            p.api_key_env.as_deref(),
+            Some(env_name),
+            "should move back to env ref"
+        );
         assert!(p.api_key.is_none(), "api_key should be cleared");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1565,7 +1597,10 @@ mod tests {
         // the user to re-enter their key (the new wizard stores it as api_key).
         use super::{Config, Profile, migrate_api_key_env_to_literal};
         let env_name = "HI_API_KEY";
-        assert!(std::env::var(env_name).is_err(), "precondition: HI_API_KEY must not be set");
+        assert!(
+            std::env::var(env_name).is_err(),
+            "precondition: HI_API_KEY must not be set"
+        );
         let dir = std::env::temp_dir().join(format!(
             "hi-migrate-drop-{}",
             std::time::SystemTime::now()
@@ -1593,7 +1628,10 @@ mod tests {
         };
         migrate_api_key_env_to_literal(&mut config, &path);
         let p = config.profiles.get("default").unwrap();
-        assert!(p.api_key_env.is_none(), "bogus standard env ref must be dropped");
+        assert!(
+            p.api_key_env.is_none(),
+            "bogus standard env ref must be dropped"
+        );
         assert!(p.api_key.is_none(), "no literal key to recover");
         // File should have been rewritten without api_key_env.
         let text = std::fs::read_to_string(&path).unwrap();

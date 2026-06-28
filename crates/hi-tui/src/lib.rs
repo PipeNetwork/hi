@@ -157,13 +157,85 @@ fn watchdog_stuck_timeout_from_value(value: Option<&str>) -> Duration {
     Duration::from_secs(seconds)
 }
 
-/// True if the provider label refers to a self-hosted/local server (Ollama,
-/// llama.cpp, LM Studio, vLLM, …). These serve their own model list from
-/// `/v1/models`; when that fetch fails the cloud catalog is not a useful
-/// fallback — it's a misleading "mess of models" — so the caller should
-/// surface the error instead.
-fn is_local_provider(label: &str) -> bool {
-    matches!(label, "ollama")
+/// The "PipeNetwork.AI" wordmark rendered as figlet-style 5-row block letters.
+/// All orange, ~2x the height of a normal line — the splash centerpiece.
+/// Generated from `figlet -f small`, then hand-trimmed of trailing whitespace.
+const BANNER: [&str; 5] = [
+    " ___ _           _  _     _                  _       _   ___ ",
+    "| _ (_)_ __  ___| \\| |___| |___ __ _____ _ _| |__   /_\\ |_ _|",
+    "|  _/ | '_ \\/ -_) .` / -_)  _\\ V  V / _ \\ '_| / /_ / _ \\ | | ",
+    "|_| |_| .__/\\___|_|\\_\\___|\\__|\\_/\\_/\\___/_| |_\\_(_)_/ \\_\\___|",
+    "      |_|                                                    ",
+];
+
+/// Build the PipeNetwork.AI landing banner as styled lines, pushed as the
+/// first transcript entries on startup. The full "PipeNetwork.AI" wordmark is
+/// rendered ~2x size as a 5-row block-letter banner (all orange), followed by
+/// the dim model line and the working directory. A blank line of breathing
+/// room follows before the usage hint. Sits at the top of the transcript and
+/// scrolls up naturally as you work.
+fn splash_lines(provider: &str, model: &str, context_window: Option<u32>) -> Vec<Line<'static>> {
+    let orange = Style::default().fg(Color::Rgb(255, 140, 0));
+    let bold_orange = orange.add_modifier(Modifier::BOLD);
+    let dim = dim();
+
+    let ctx = context_window
+        .map(|w| format!(" ({}K context)", w / 1000))
+        .unwrap_or_default();
+    let cwd = std::env::current_dir()
+        .map(|d| d.display().to_string())
+        .unwrap_or_else(|_| "?".into());
+
+    // The 5-row block-letter banner, all orange + bold.
+    let mut lines: Vec<Line<'static>> = BANNER
+        .iter()
+        .map(|row| Line::from(vec![Span::styled((*row).to_string(), bold_orange)]))
+        .collect();
+
+    // Dim model line + working directory below the banner.
+    lines.push(Line::from(vec![Span::styled(
+        format!("{model}{ctx} · {provider}"),
+        dim,
+    )]));
+    lines.push(Line::from(vec![Span::styled(cwd, dim)]));
+
+    // A blank line for breathing room before the usage hint.
+    lines.push(Line::raw(""));
+    lines
+}
+
+/// Apply a freshly fetched `/models` result: update the served-metadata map,
+/// re-apply the current model (so its window/price/health refresh), warn on
+/// degraded health, and persist the result to the on-disk cache for next
+/// startup. A failure or empty list sets a startup notice instead of panicking.
+fn apply_metadata(
+    app: &mut App,
+    agent: &mut Agent,
+    registry: &hi_ai::Registry,
+    result: &Result<Vec<hi_ai::ServedModel>>,
+    cache_key: &str,
+) {
+    match result {
+        Ok(served) if !served.is_empty() => {
+            app.served = served.iter().cloned().map(|m| (m.id.clone(), m)).collect();
+            let model_id = app.model.clone();
+            if let Some(health) = app.apply_model(agent, registry, &model_id) {
+                app.warn_degraded(&model_id, &health);
+            }
+            // Persist for next startup (best-effort, fire-and-forget).
+            let models = served.clone();
+            let key = cache_key.to_string();
+            tokio::spawn(async move {
+                hi_ai::save_cache(&key, &models).await;
+            });
+        }
+        Ok(_) => {
+            app.startup_notice = Some("provider metadata unavailable; using catalog".into());
+        }
+        Err(err) => {
+            app.startup_notice = Some(format!("provider metadata check failed: {err:#}"));
+        }
+    }
 }
 
 /// Run the full-screen TUI until the user quits. `history_path`, if given, is
@@ -174,6 +246,7 @@ fn is_local_provider(label: &str) -> bool {
 pub async fn run(
     agent: &mut Agent,
     provider: &str,
+    base_url: &str,
     model: &str,
     registry: &hi_ai::Registry,
     history_path: Option<std::path::PathBuf>,
@@ -218,6 +291,18 @@ pub async fn run(
     // The catalog, for inline `/model <id>` completion (the picker fetches the
     // live list on demand; this is the synchronous type-ahead source).
     app.model_ids = registry.model_ids();
+    // Load the on-disk /models cache so model metadata (window/price/health)
+    // applies instantly at startup, without blocking on the network. The live
+    // fetch still runs in the background and refreshes this; the cache just
+    // covers the cold-start gap so the UI never looks stalled.
+    let models_cache_key = hi_ai::cache_key(provider, base_url);
+    if let Some(cached) = hi_ai::load_cache(&models_cache_key).await {
+        app.served = cached.into_iter().map(|m| (m.id.clone(), m)).collect();
+        let model_id = app.model.clone();
+        if let Some(health) = app.apply_model(agent, registry, &model_id) {
+            app.warn_degraded(&model_id, &health);
+        }
+    }
     if let Some(path) = &history_path
         && let Ok(text) = std::fs::read_to_string(path)
     {
@@ -225,10 +310,19 @@ pub async fn run(
             .lines()
             .map(str::to_string)
             .filter(|l| !l.trim().is_empty())
+            // Slash commands are never cached on submit; drop any that an older
+            // version persisted, for the same Up-arrow stall reason.
+            .filter(|l| !l.trim_start().starts_with('/'))
             .collect();
     }
     {
-        // A one-line usage hint as the first transcript line. The provider and
+        // The Pipenetwork.ai landing banner as the first transcript lines —
+        // it sits at the top of the transcript and scrolls up naturally as the
+        // session grows, like Claude's landing. Pushed before the usage hint.
+        for line in splash_lines(provider, model, app.context_window) {
+            app.push(line);
+        }
+        // A one-line usage hint as the next transcript line. The provider and
         // model already appear in the border title (top of the box), so we don't
         // repeat them here — that would render as a duplicate header line.
         let ctx = registry
@@ -267,7 +361,40 @@ pub async fn run(
         }
     });
     let mut ticker = tokio::time::interval(TICK);
-    let mut startup_check = app.context_window.is_none();
+    // Startup metadata fetch: race the live `/models` fetch against the first
+    // keystroke, with a spinner ticking and the screen redrawing each tick so
+    // the UI never looks stalled. The on-disk cache already applied instantly
+    // above; this just refreshes it. The fetch future is pinned locally (not
+    // spawned — `Agent` isn't `Send`) and dropped before the main loop so its
+    // borrow of `agent` doesn't block mutable uses during turns. A first input
+    // event that wins the race is buffered for the main loop to process.
+    let mut first_event: Option<Event> = None;
+    let mut meta_result: Option<Result<Vec<hi_ai::ServedModel>>> = None;
+    if app.context_window.is_none() {
+        let meta_fut = agent.list_models();
+        tokio::pin!(meta_fut);
+        loop {
+            terminal.draw(|f| app.render(f))?;
+            tokio::select! {
+                maybe = input_rx.recv() => {
+                    first_event = maybe;
+                    break;
+                }
+                _ = ticker.tick() => {
+                    app.spinner = app.spinner.wrapping_add(1);
+                }
+                result = &mut meta_fut => {
+                    meta_result = Some(result);
+                    break;
+                }
+            }
+        }
+        // `meta_fut` (and its borrow of `agent`) is dropped at the end of this
+        // block, so `apply_metadata` can take `&mut agent` below.
+    }
+    if let Some(result) = meta_result {
+        apply_metadata(&mut app, agent, registry, &result, &models_cache_key);
+    }
 
     'session: loop {
         // Run a queued command first (typed while the previous turn ran);
@@ -276,50 +403,33 @@ pub async fn run(
             Some(queued) => queued,
             None => 'input: loop {
                 terminal.draw(|f| app.render(f))?;
-                // Block on input, with a one-shot startup metadata check racing
-                // in the background. Input always wins immediately; the check is
-                // best-effort and never delays typing into the prompt.
-                let event = if startup_check {
-                    enum StartupRace {
-                        Metadata(Result<Vec<hi_ai::ServedModel>>),
-                        Input(Option<Event>),
-                    }
-                    let race = {
-                        let fut = agent.list_models();
-                        tokio::pin!(fut);
-                        tokio::select! {
-                            result = &mut fut => StartupRace::Metadata(result),
-                            maybe = input_rx.recv() => StartupRace::Input(maybe),
-                        }
-                    };
-                    startup_check = false;
-                    match race {
-                        StartupRace::Metadata(Ok(served)) if !served.is_empty() => {
-                            app.served = served.into_iter().map(|m| (m.id.clone(), m)).collect();
-                            let model_id = app.model.clone();
-                            if let Some(health) = app.apply_model(agent, registry, &model_id) {
-                                app.warn_degraded(&model_id, &health);
+                // The startup metadata fetch already completed (or was skipped)
+                // before the main loop, so this is a plain input wait. The
+                // spinner still ticks during turns (see the working branch).
+                let event = match first_event.take() {
+                    Some(e) => e,
+                    None => {
+                        // Race input against the quit-notice deadline (if armed)
+                        // so the "Press Ctrl-C again to exit" notice auto-clears
+                        // after 1.8s even with no further input.
+                        let next = app.quit_notice;
+                        let event = if let Some(deadline) = next {
+                            let remaining = deadline.saturating_duration_since(Instant::now());
+                            tokio::select! {
+                                maybe = input_rx.recv() => maybe,
+                                _ = tokio::time::sleep(remaining) => {
+                                    app.quit_notice = None;
+                                    continue 'input; // redraw without the notice
+                                }
                             }
-                            continue;
-                        }
-                        StartupRace::Metadata(Ok(_)) => {
-                            app.startup_notice =
-                                Some("provider metadata unavailable; using catalog".to_string());
-                            continue;
-                        }
-                        StartupRace::Metadata(Err(err)) => {
-                            app.startup_notice =
-                                Some(format!("provider metadata check failed: {err:#}"));
-                            continue;
-                        }
-                        StartupRace::Input(Some(event)) => event,
-                        StartupRace::Input(None) => break 'session,
+                        } else {
+                            input_rx.recv().await
+                        };
+                        let Some(event) = event else {
+                            break 'session; // input channel closed (stdin gone)
+                        };
+                        event
                     }
-                } else {
-                    let Some(event) = input_rx.recv().await else {
-                        break 'session; // input channel closed (stdin gone)
-                    };
-                    event
                 };
                 match event {
                     // A paste arrives as one event. Route it to whichever input
@@ -485,10 +595,25 @@ pub async fn run(
                         }
                         match key.code {
                             KeyCode::Char('d') if ctrl && app.input.is_empty() => break 'session,
+                            // Double Ctrl-C to exit: the first press (when idle
+                            // with empty input) arms a transient notice; the
+                            // second while the notice is active quits. With
+                            // non-empty input, Ctrl-C clears the line as usual.
+                            KeyCode::Char('c')
+                                if ctrl && app.input.is_empty() && app.quit_notice.is_some() =>
+                            {
+                                break 'session;
+                            }
+                            KeyCode::Char('c') if ctrl && app.input.is_empty() => {
+                                app.quit_notice =
+                                    Some(Instant::now() + Duration::from_millis(1800));
+                            }
                             KeyCode::Char('c') if ctrl => app.input.clear(),
                             KeyCode::Esc if app.input.is_empty() => break 'session,
                             KeyCode::Esc => app.input.clear(),
                             _ => {
+                                // Any other key dismisses a pending quit notice.
+                                app.quit_notice = None;
                                 if let Some(line) = app.edit_key(&key) {
                                     break 'input line;
                                 }
@@ -639,11 +764,10 @@ pub async fn run(
                     if cancelled {
                         continue;
                     }
-                    // Resolve the model list to show. For a local provider
-                    // (e.g. Ollama) a fetch failure or empty list means the
-                    // server is down or misconfigured — dumping the cloud
-                    // catalog would be a meaningless "mess of models," so we
-                    // surface the error and skip the picker instead.
+                    // Resolve the model list to show. The live `/models` fetch
+                    // is the only source — no static catalog fallback (it dumps
+                    // an irrelevant mess of cloud models). A failure or empty
+                    // list surfaces the error and skips the picker.
                     let ids = match fetched {
                         Some(Ok(served)) if !served.is_empty() => {
                             // Remember the live metadata (window/price/health) so
@@ -654,27 +778,15 @@ pub async fn run(
                             ids
                         }
                         _ => {
-                            let local = is_local_provider(&app.provider);
-                            let note = match (&fetched, local) {
-                                (Some(Ok(_)), true) => {
-                                    "provider listed no models — is the local server running?"
-                                }
-                                (Some(Ok(_)), false) => {
-                                    "provider listed no models; showing the catalog"
-                                }
-                                (Some(Err(err)), true) => &format!(
-                                    "couldn't reach the local server ({err:#}) — check it's running and the base_url is correct"
+                            let note = match &fetched {
+                                Some(Ok(_)) => "provider listed no models — check the endpoint",
+                                Some(Err(err)) => &format!(
+                                    "couldn't fetch models ({err:#}) — check the endpoint and API key"
                                 ),
-                                (Some(Err(err)), false) => {
-                                    &format!("couldn't fetch models ({err:#}); showing the catalog")
-                                }
-                                (None, _) => "showing the catalog",
+                                None => "couldn't fetch models — check the endpoint",
                             };
                             app.push(Line::styled(note.to_string(), dim()));
-                            if local {
-                                continue;
-                            }
-                            registry.model_ids()
+                            continue;
                         }
                     };
                     let current = app.model.clone();
@@ -884,27 +996,17 @@ pub async fn run(
                                     ids
                                 }
                                 _ => {
-                                    let local = is_local_provider(&app.provider);
-                                    let note = match (&fetched, local) {
-                                        (Some(Ok(_)), true) => {
-                                            "provider listed no models — is the local server running?"
+                                    let note = match &fetched {
+                                        Some(Ok(_)) => {
+                                            "provider listed no models — check the endpoint"
                                         }
-                                        (Some(Ok(_)), false) => {
-                                            "provider listed no models; showing the catalog"
-                                        }
-                                        (Some(Err(err)), true) => &format!(
-                                            "couldn't reach the local server ({err:#}) — check it's running and the base_url is correct"
+                                        Some(Err(err)) => &format!(
+                                            "couldn't fetch models ({err:#}) — check the endpoint and API key"
                                         ),
-                                        (Some(Err(err)), false) => &format!(
-                                            "couldn't fetch models ({err:#}); showing the catalog"
-                                        ),
-                                        (None, _) => "showing the catalog",
+                                        None => "couldn't fetch models — check the endpoint",
                                     };
                                     app.push(Line::styled(note.to_string(), dim()));
-                                    if local {
-                                        continue;
-                                    }
-                                    registry.model_ids()
+                                    continue;
                                 }
                             };
                             let current = app.model.clone();
@@ -1342,6 +1444,11 @@ struct App {
     event_log: Vec<String>,
     model_issues: HashMap<String, u32>,
     startup_notice: Option<String>,
+    /// A transient "Press Ctrl-C again to exit" notice, shown after the first
+    /// Ctrl-C when idle. Cleared after ~1.8s (see the deadline race in the idle
+    /// input loop) or when any other key is pressed. A second Ctrl-C while this
+    /// is active quits the session.
+    quit_notice: Option<Instant>,
     /// Active `/`-command completion menu: the query it's synced to and the
     /// highlighted row. `None` when the input isn't a slash-command prefix.
     completion: Option<CompletionState>,
@@ -1449,6 +1556,7 @@ impl App {
             event_log: Vec::new(),
             model_issues: HashMap::new(),
             startup_notice: None,
+            quit_notice: None,
             completion: None,
             focused: true,
             focus_known: false,
@@ -2506,12 +2614,22 @@ impl App {
             Command::Log => self.write_debug_log(),
             Command::Model(id) => {
                 if id.is_empty() {
-                    // Open the interactive picker (filter + arrow-select).
+                    // Open the interactive picker (filter + arrow-select) on the
+                    // live served list — no static catalog fallback.
                     let current = self.model.clone();
                     let tags = self.served_tags();
-                    let ids = registry.model_ids();
+                    let mut ids: Vec<String> = self.served.keys().cloned().collect();
+                    ids.sort();
                     let caps = App::capabilities_map(registry, &ids);
-                    self.picker = Some(ModelPicker::new(ids, &current, tags, &self.served, &caps));
+                    if ids.is_empty() {
+                        self.push(Line::styled(
+                            "no models fetched yet — the endpoint didn't respond".to_string(),
+                            dim(),
+                        ));
+                    } else {
+                        self.picker =
+                            Some(ModelPicker::new(ids, &current, tags, &self.served, &caps));
+                    }
                 } else {
                     let health = self.apply_model(agent, registry, &id);
                     self.push(Line::styled(format!("model set to {id}"), dim()));
@@ -2658,12 +2776,14 @@ impl App {
 
     /// The pinned plan checklist shown just above the input, or empty when no
     /// plan has been posted. Done steps dim out; the active step is bold cyan.
-    /// Capped so a long plan can't swallow the input area.
-    fn plan_lines(&self) -> Vec<Line<'static>> {
+    /// `max_steps` caps how many step lines are rendered (on top of the header)
+    /// so a long plan can't swallow the input area or overflow the screen.
+    fn plan_lines(&self, max_steps: usize) -> Vec<Line<'static>> {
         if self.plan.is_empty() {
             return Vec::new();
         }
-        const MAX_STEPS: usize = 8;
+        const HARD_CAP: usize = 8;
+        let max_steps = max_steps.min(HARD_CAP);
         let total = self.plan.len();
         let done = self
             .plan
@@ -2676,7 +2796,7 @@ impl App {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )];
-        for s in self.plan.iter().take(MAX_STEPS) {
+        for s in self.plan.iter().take(max_steps) {
             let (glyph, glyph_style, title_style) = match s.status {
                 PlanStatus::Done => ('✓', Style::default().fg(Color::Green), dim()),
                 PlanStatus::Active => (
@@ -2693,9 +2813,9 @@ impl App {
                 Span::styled(s.title.clone(), title_style),
             ]));
         }
-        if total > MAX_STEPS {
+        if total > max_steps {
             out.push(Line::styled(
-                format!("  … +{} more", total - MAX_STEPS),
+                format!("  … +{} more", total - max_steps),
                 dim(),
             ));
         }
@@ -2711,9 +2831,6 @@ impl App {
         let queue_extra = usize::from(self.queue.len() > 3);
         let (input_lines, cursor_row, cursor_col) = self.input_view();
         let completion_rows = self.completion_items().len();
-        // The live plan checklist, pinned just above the input (input-bar state only).
-        let plan_block = self.plan_lines();
-        let plan_h = plan_block.len();
         // The optional Ctrl-D diff panel height (header + up to 20 diff lines +
         // optional "more" line) and the compact changed-files summary line.
         let diff_h = if self.show_diff && self.diff_text.is_some() {
@@ -2737,6 +2854,52 @@ impl App {
         } else {
             0
         };
+        // Height of the input box excluding the plan checklist and the 2 border
+        // rows. Used to figure out how many plan steps fit on screen.
+        let base_h = diff_h
+            + changed_h
+            + debug_h
+            + help_h
+            + stream_h
+            + usize::from(self.startup_notice.is_some())
+            + usize::from(self.quit_notice.is_some())
+            + status_lines
+            + completion_rows
+            + input_lines.len()
+            + queued_shown
+            + queue_extra;
+        // The live plan checklist, pinned just above the input (input-bar state
+        // only). The step count is capped to what fits on screen so a long plan
+        // can't make the box taller than the terminal — ratatui's Layout would
+        // otherwise clamp the rect and the Paragraph content would spill past
+        // the bottom border. Reserve one row for the transcript (Min(1) below).
+        let cap = area.height.saturating_sub(1).max(1) as usize;
+        let avail_inner = cap.saturating_sub(base_h + 2);
+        // plan_h = 1 (header) + steps_shown + (1 if total > steps_shown else 0).
+        // Pick the largest step count (up to total and HARD_CAP) whose plan_h
+        // fits avail_inner.
+        let max_steps = if self.plan.is_empty() {
+            0
+        } else {
+            const HARD_CAP: usize = 8;
+            let total = self.plan.len();
+            let upper = total.min(HARD_CAP);
+            // plan_h for a candidate `n` (n <= upper): 1 + n + (total > n) as usize.
+            // Try showing all `upper` first; if it doesn't fit, shrink.
+            let mut n = upper;
+            while n > 0 && 1 + n + usize::from(total > n) > avail_inner {
+                n -= 1;
+            }
+            // If even n=0 (header only, +maybe more) doesn't fit, show 1 step
+            // so the plan is still visible rather than entirely hidden.
+            if 1 + n + usize::from(total > n) > avail_inner {
+                1
+            } else {
+                n
+            }
+        };
+        let plan_block = self.plan_lines(max_steps);
+        let plan_h = plan_block.len();
         let input_h = if self.fetching.is_some() {
             3
         } else if let Some(p) = &self.picker {
@@ -2749,18 +2912,7 @@ impl App {
             let fields = if form.api_key_unneeded() { 3 } else { 4 };
             (fields + 4) as u16
         } else {
-            (plan_h
-                + diff_h
-                + changed_h
-                + debug_h
-                + help_h
-                + stream_h
-                + status_lines
-                + completion_rows
-                + input_lines.len()
-                + queued_shown
-                + queue_extra
-                + 2) as u16
+            (base_h + plan_h + 2).min(cap) as u16
         };
         let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(input_h)]).split(area);
 
@@ -3194,7 +3346,10 @@ impl App {
                 let bindings = [
                     ("Enter", "send the prompt"),
                     ("Alt-Enter / \\", "insert a newline (multi-line prompt)"),
-                    ("Ctrl-C", "interrupt the running turn"),
+                    (
+                        "Ctrl-C",
+                        "interrupt the running turn, or double-press to quit",
+                    ),
                     ("Ctrl-D (idle)", "quit"),
                     ("Ctrl-D (typing)", "toggle the working-tree diff panel"),
                     ("Ctrl-T", "toggle reasoning (thinking) display"),
@@ -3214,6 +3369,12 @@ impl App {
             if let Some(notice) = &self.startup_notice {
                 ilines.push(Line::styled(
                     notice.clone(),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+            if self.quit_notice.is_some() {
+                ilines.push(Line::styled(
+                    "Press Ctrl-C again to exit",
                     Style::default().fg(Color::Yellow),
                 ));
             }
@@ -3312,6 +3473,7 @@ impl App {
                 + help_h
                 + stream_h
                 + usize::from(self.startup_notice.is_some())
+                + usize::from(self.quit_notice.is_some())
                 + status_lines
                 + self.completion_items().len();
             let cx = rows[1].x + 1 + cursor_col;
@@ -3788,6 +3950,175 @@ mod tests {
         assert!(
             app.transcript.is_empty(),
             "plan must not echo into the transcript"
+        );
+    }
+
+    #[test]
+    fn long_plan_does_not_break_input_box_border() {
+        // Regression: when the plan + status + input is taller than the screen,
+        // the input box height used to exceed the terminal height. ratatui's
+        // Layout clamps the fixed-Length rect, so the Paragraph content spilled
+        // past the bottom border — the `╰` landed mid-content and later steps
+        // rendered outside the box. The box must stay closed and fit on screen.
+        use hi_agent::PlanStep;
+        let mut app = test_app("openai", "gpt-4o");
+        app.apply(UiEvent::Plan(
+            (0..8)
+                .map(|i| PlanStep {
+                    title: format!("step {i} with a fairly long title to be realistic"),
+                    status: if i < 3 {
+                        PlanStatus::Done
+                    } else if i == 3 {
+                        PlanStatus::Active
+                    } else {
+                        PlanStatus::Pending
+                    },
+                })
+                .collect(),
+        ));
+        app.working = true;
+        // Tiny height: the full plan (9 lines) + status + input + borders can't fit.
+        let mut term = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let screen = dump(&term);
+
+        // The bottom border must close on its own row, not overlap a plan step.
+        let bottom_rows: Vec<&str> = screen.lines().filter(|l| l.contains('╰')).collect();
+        assert_eq!(
+            bottom_rows.len(),
+            1,
+            "exactly one bottom-left corner:\n{screen}"
+        );
+        // The corner must be the first non-space glyph on its row (a closed
+        // border), not sitting on top of a `✓`/`▸`/`☐` step glyph.
+        let row = bottom_rows[0];
+        assert!(
+            row.trim_start().starts_with('╰'),
+            "bottom border row must start with `╰`, got: {row:?}\n{screen}"
+        );
+        // The plan is truncated to fit, with a "… +N more" line, rather than
+        // overflowing.
+        assert!(
+            screen.contains("… +3 more"),
+            "plan truncated to fit:\n{screen}"
+        );
+        // The box never exceeds the terminal height.
+        assert!(
+            screen.lines().filter(|l| !l.trim().is_empty()).count() <= 12,
+            "box fits on screen:\n{screen}"
+        );
+
+        // A taller terminal shows the whole plan with no truncation.
+        let mut term2 = Terminal::new(TestBackend::new(175, 14)).unwrap();
+        term2.draw(|f| app.render(f)).unwrap();
+        let screen2 = dump(&term2);
+        assert!(
+            screen2.contains("step 7 with a fairly long title to be realistic"),
+            "full plan shown when it fits:\n{screen2}"
+        );
+        assert!(!screen2.contains("… +"), "no truncation when it fits");
+
+        // Extreme case: a plan so large the box would fill the whole screen.
+        // The transcript must still get its Min(1) row and the border must stay
+        // closed — the cap reserves a row for the transcript so Layout never
+        // clamps the box rect.
+        let mut app2 = test_app("openai", "gpt-4o");
+        app2.apply(UiEvent::Plan(
+            (0..20)
+                .map(|i| PlanStep {
+                    title: format!("step {i}"),
+                    status: PlanStatus::Pending,
+                })
+                .collect(),
+        ));
+        app2.working = true;
+        let mut term3 = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        term3.draw(|f| app2.render(f)).unwrap();
+        let screen3 = dump(&term3);
+        let bottom3: Vec<&str> = screen3.lines().filter(|l| l.contains('╰')).collect();
+        assert_eq!(bottom3.len(), 1, "one bottom corner:\n{screen3}");
+        assert!(
+            bottom3[0].trim_start().starts_with('╰'),
+            "border closed, not overlapping content:\n{screen3}"
+        );
+        // The transcript title row survives (top border with `hi ·`).
+        assert!(
+            screen3.contains("hi · openai · gpt-4o"),
+            "transcript keeps its row:\n{screen3}"
+        );
+
+        // Degenerate tiny terminal: must not panic, and the box border stays closed.
+        let mut term4 = Terminal::new(TestBackend::new(60, 3)).unwrap();
+        term4.draw(|f| app2.render(f)).unwrap();
+        let screen4 = dump(&term4);
+        let bottom4: Vec<&str> = screen4.lines().filter(|l| l.contains('╰')).collect();
+        assert_eq!(
+            bottom4.len(),
+            1,
+            "one bottom corner on tiny term:\n{screen4}"
+        );
+    }
+
+    #[test]
+    fn startup_notice_does_not_clip_input_line() {
+        // On first load, a startup notice (e.g. "provider metadata check
+        // failed: …") is pinned above the status line. The box height must
+        // account for it, or the input line gets clipped and the cursor lands
+        // on the wrong row.
+        let mut app = test_app("openai", "gpt-4o");
+        app.startup_notice = Some("provider metadata check failed: connection refused".into());
+        let mut term = Terminal::new(TestBackend::new(70, 10)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let screen = dump(&term);
+        assert!(
+            screen.contains("provider metadata check failed"),
+            "notice shown:\n{screen}"
+        );
+        // The input prompt must still be visible inside the box (not clipped).
+        assert!(screen.contains('›'), "input prompt visible:\n{screen}");
+        // The input box's bottom border closes cleanly (the transcript block
+        // also has a `╰`, so check the last one — the input box is at the bottom).
+        let bottom: Vec<&str> = screen.lines().filter(|l| l.contains('╰')).collect();
+        let input_box_border = bottom.last().expect("input box bottom border");
+        assert!(
+            input_box_border.trim_start().starts_with('╰'),
+            "input box border closed:\n{screen}"
+        );
+        // The notice, status, and prompt all render inside the input box —
+        // i.e. above the input box's bottom border row (the last `╰…─` row).
+        let rows: Vec<&str> = screen.lines().collect();
+        let border_row_idx = rows
+            .iter()
+            .rposition(|l| l.trim_start().starts_with('╰') && l.contains('─'))
+            .unwrap();
+        let above_border: String = rows[..border_row_idx].join("\n");
+        assert!(
+            above_border.contains("provider metadata check failed") && above_border.contains('›'),
+            "notice + prompt above the border:\n{screen}"
+        );
+    }
+
+    #[test]
+    fn quit_notice_renders_and_does_not_clip_input() {
+        // After the first Ctrl-C (idle, empty input), a "Press Ctrl-C again to
+        // exit" notice is pinned above the status line. The box height must
+        // account for it or the input line clips and the cursor lands wrong.
+        let mut app = test_app("openai", "gpt-4o");
+        app.quit_notice = Some(Instant::now() + Duration::from_millis(1800));
+        let mut term = Terminal::new(TestBackend::new(70, 10)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let screen = dump(&term);
+        assert!(
+            screen.contains("Press Ctrl-C again to exit"),
+            "quit notice shown:\n{screen}"
+        );
+        assert!(screen.contains('›'), "input prompt visible:\n{screen}");
+        // The input box bottom border closes cleanly (not overlapping content).
+        let bottom: Vec<&str> = screen.lines().filter(|l| l.contains('╰')).collect();
+        let input_box_border = bottom.last().expect("input box bottom border");
+        assert!(
+            input_box_border.trim_start().starts_with('╰'),
+            "input box border closed:\n{screen}"
         );
     }
 
@@ -4414,5 +4745,83 @@ mod tests {
         assert!(screen.contains("/help"), "lists help: {screen}");
         assert!(screen.contains("/model"), "lists model: {screen}");
         assert!(screen.contains("▶"), "highlights a row: {screen}");
+    }
+
+    /// `splash_lines` now leads with a ~2x block-letter "PipeNetwork.AI"
+    /// banner (5 figlet rows, all orange bold), then the dim model line, the
+    /// cwd, and a trailing blank. Verifies banner shape, orange+bold styling
+    /// on every banner row, the model/cwd content, and the line count.
+    #[test]
+    fn splash_shows_full_pipenetwork_wordmark_in_orange() {
+        let lines = splash_lines("openai", "gpt-4o", Some(128_000));
+
+        // 5 banner rows + model line + cwd line + trailing blank = 8.
+        assert_eq!(
+            lines.len(),
+            8,
+            "expected 8 lines (5 banner + model + cwd + blank)"
+        );
+
+        // Banner: rows 0..5, each one span styled orange + bold, carrying
+        // figlet strokes (pipes / underscores).
+        for (i, line) in lines[0..5].iter().enumerate() {
+            assert_eq!(
+                line.spans.len(),
+                1,
+                "banner row {i} should be a single span, got {} spans",
+                line.spans.len()
+            );
+            let span = &line.spans[0];
+            assert_eq!(
+                span.style.fg,
+                Some(Color::Rgb(255, 140, 0)),
+                "banner row {i} should be orange"
+            );
+            assert!(
+                span.style.add_modifier.contains(Modifier::BOLD),
+                "banner row {i} should be bold"
+            );
+            let text = span.content.to_string();
+            assert!(
+                text.contains('|') || text.contains('_'),
+                "banner row {i} should carry figlet strokes, got: {text:?}"
+            );
+        }
+
+        // Row 5: dim model line (model + provider + context window).
+        let model_line: String = lines[5]
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(
+            model_line.contains("gpt-4o"),
+            "model line missing model: {model_line:?}"
+        );
+        assert!(
+            model_line.contains("openai"),
+            "model line missing provider: {model_line:?}"
+        );
+        assert!(
+            model_line.contains("128K context"),
+            "model line missing context window: {model_line:?}"
+        );
+
+        // Row 6: cwd — non-empty.
+        let cwd_line: String = lines[6]
+            .spans
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect();
+        assert!(
+            !cwd_line.is_empty(),
+            "cwd line should be non-empty, got: {cwd_line:?}"
+        );
+
+        // Row 7: the blank breathing-room line.
+        assert!(
+            lines[7].spans.is_empty(),
+            "last line should be the blank breathing-room line"
+        );
     }
 }
