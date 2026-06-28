@@ -93,6 +93,14 @@ struct StreamingTextFilter<'a> {
     /// Whether we're expecting a `:` after the `"name"` key. If the next
     /// non-whitespace char isn't `:`, this isn't a JSON key-value pair — flush.
     tc_expect_colon: bool,
+    /// Whether any visible assistant text has been forwarded for this response.
+    visible_text_started: bool,
+    /// A leading `{` chunk that may be either a local-model artifact before
+    /// prose or the first byte of real JSON. Hold it until the next chunk.
+    leading_open_brace_pending: bool,
+    /// Once text-style bracket tool protocol starts (`[tool_call:...]` or
+    /// `[read(...)]`), suppress the rest of this assistant stream.
+    bracket_tool_suppression_active: bool,
 }
 
 impl<'a> StreamingTextFilter<'a> {
@@ -108,6 +116,9 @@ impl<'a> StreamingTextFilter<'a> {
             tc_name_checked: false,
             tc_string_count: 0,
             tc_expect_colon: false,
+            visible_text_started: false,
+            leading_open_brace_pending: false,
+            bracket_tool_suppression_active: false,
         }
     }
 
@@ -122,10 +133,44 @@ impl<'a> StreamingTextFilter<'a> {
     fn text(&mut self, chunk: &str) {
         // Phase 1: Strip special tokens, collecting cleaned text.
         let cleaned = self.strip_special_tokens_chunk(chunk);
+        let Some(cleaned) = self.filter_leading_open_brace_artifact(&cleaned) else {
+            return;
+        };
         // Phase 2: Suppress tool-call JSON from the cleaned text.
         if !cleaned.is_empty() {
             self.suppress_tool_calls(&cleaned);
         }
+    }
+
+    fn emit_text(&mut self, text: String) {
+        if text.is_empty() {
+            return;
+        }
+        self.visible_text_started = true;
+        (self.inner)(StreamEvent::Text(text));
+    }
+
+    fn filter_leading_open_brace_artifact(&mut self, chunk: &str) -> Option<String> {
+        if self.visible_text_started || self.tc_depth > 0 {
+            return Some(chunk.to_string());
+        }
+        let mut text = String::new();
+        if self.leading_open_brace_pending {
+            self.leading_open_brace_pending = false;
+            text.push('{');
+        }
+        text.push_str(chunk);
+        if text == "{" {
+            self.leading_open_brace_pending = true;
+            return None;
+        }
+        if let Some(rest) = text.strip_prefix('{') {
+            let trimmed = rest.trim_start();
+            if starts_like_prose_after_stray_open_brace(trimmed) {
+                return Some(trimmed.to_string());
+            }
+        }
+        Some(text)
     }
 
     /// Strip ChatML special tokens from a chunk, buffering partial `<|` starts.
@@ -175,6 +220,16 @@ impl<'a> StreamingTextFilter<'a> {
 
     /// Suppress tool-call JSON from cleaned text, forwarding prose to the sink.
     fn suppress_tool_calls(&mut self, chunk: &str) {
+        if self.bracket_tool_suppression_active {
+            return;
+        }
+        if let Some(index) = find_text_tool_protocol_start(chunk) {
+            if index > 0 {
+                self.suppress_tool_calls(&chunk[..index]);
+            }
+            self.bracket_tool_suppression_active = true;
+            return;
+        }
         if self.tc_depth > 0 {
             self.tc_pending.push_str(chunk);
             self.scan_tc_buffer();
@@ -192,7 +247,21 @@ impl<'a> StreamingTextFilter<'a> {
                 let rest = &chunk[i..];
                 if looks_like_tool_call_start(rest) {
                     if i > 0 {
-                        (self.inner)(StreamEvent::Text(chunk[..i].to_string()));
+                        self.emit_text(chunk[..i].to_string());
+                    }
+                    self.tc_pending = chunk[i..].to_string();
+                    self.tc_depth = 1;
+                    self.tc_in_string = false;
+                    self.tc_escape = false;
+                    self.tc_scanned = 1;
+                    self.tc_name_checked = false;
+                    self.tc_string_count = 0;
+                    self.tc_expect_colon = false;
+                    self.scan_tc_buffer();
+                    return;
+                } else if could_be_tool_call_start_prefix(rest) {
+                    if i > 0 {
+                        self.emit_text(chunk[..i].to_string());
                     }
                     self.tc_pending = chunk[i..].to_string();
                     self.tc_depth = 1;
@@ -208,7 +277,7 @@ impl<'a> StreamingTextFilter<'a> {
             }
             i += 1;
         }
-        (self.inner)(StreamEvent::Text(chunk.to_string()));
+        self.emit_text(chunk.to_string());
     }
 
     /// Continue scanning `tc_pending` from `tc_scanned`.
@@ -246,6 +315,9 @@ impl<'a> StreamingTextFilter<'a> {
                 self.tc_in_string = true;
                 self.tc_string_count += 1;
                 self.tc_expect_colon = false;
+            } else if self.tc_string_count == 0 && !b.is_ascii_whitespace() {
+                self.flush_tc_as_text();
+                return;
             } else if b == b'{' || b == b'[' {
                 self.tc_depth += 1;
                 self.tc_expect_colon = false;
@@ -269,7 +341,8 @@ impl<'a> StreamingTextFilter<'a> {
                     } else {
                         // Not a tool call — flush as text, re-scan the rest.
                         let rest = self.tc_pending[rest_start..].to_string();
-                        (self.inner)(StreamEvent::Text(std::mem::take(&mut self.tc_pending)));
+                        let text = std::mem::take(&mut self.tc_pending);
+                        self.emit_text(text);
                         self.tc_scanned = 0;
                         self.tc_name_checked = false;
                         self.tc_string_count = 0;
@@ -344,7 +417,8 @@ impl<'a> StreamingTextFilter<'a> {
     /// Flush the tool-call buffer as text and reset state.
     fn flush_tc_as_text(&mut self) {
         if !self.tc_pending.is_empty() {
-            (self.inner)(StreamEvent::Text(std::mem::take(&mut self.tc_pending)));
+            let text = std::mem::take(&mut self.tc_pending);
+            self.emit_text(text);
         }
         self.tc_depth = 0;
         self.tc_in_string = false;
@@ -362,10 +436,15 @@ impl<'a> StreamingTextFilter<'a> {
             let st = std::mem::take(&mut self.st_pending);
             self.suppress_tool_calls(&st);
         }
+        if self.leading_open_brace_pending {
+            self.leading_open_brace_pending = false;
+            self.emit_text("{".to_string());
+        }
         // Flush tool-call buffer — might be a partial tool call that never
         // completed (e.g. truncated output). Flush as text so the user sees it.
         if !self.tc_pending.is_empty() {
-            (self.inner)(StreamEvent::Text(std::mem::take(&mut self.tc_pending)));
+            let text = std::mem::take(&mut self.tc_pending);
+            self.emit_text(text);
         }
         self.tc_depth = 0;
         self.tc_in_string = false;
@@ -401,6 +480,51 @@ fn looks_like_tool_call_start(s: &str) -> bool {
         }
     }
     false
+}
+
+/// Check if `s` is an incomplete prefix of a tool-call JSON start. This keeps a
+/// lone `{` chunk from leaking into the UI before the next chunk provides
+/// `"name"`.
+fn could_be_tool_call_start_prefix(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.first() != Some(&b'{') {
+        return false;
+    }
+    let mut i = 1;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if i == bytes.len() {
+        return true;
+    }
+    if bytes[i] != b'"' {
+        return false;
+    }
+    let partial = &s[i + 1..];
+    "name".starts_with(partial) || partial.starts_with("name")
+}
+
+fn starts_like_prose_after_stray_open_brace(s: &str) -> bool {
+    s.starts_with("[tool_call:")
+        || s.chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphabetic() || matches!(ch, '#' | '*' | '-' | '`'))
+}
+
+fn find_text_tool_protocol_start(text: &str) -> Option<usize> {
+    let mut best = None;
+    for marker in ["[tool_call", "[tool_calls"] {
+        if let Some(index) = text.find(marker) {
+            best = Some(best.map_or(index, |current: usize| current.min(index)));
+        }
+    }
+    for name in VALID_TOOL_NAMES {
+        let marker = format!("[{name}(");
+        if let Some(index) = text.find(&marker) {
+            best = Some(best.map_or(index, |current: usize| current.min(index)));
+        }
+    }
+    best
 }
 
 /// Check if a complete JSON string is a tool call: has a `"name"` field with a
@@ -473,6 +597,26 @@ fn strip_special_tokens(text: &str) -> String {
     }
     out.push_str(&text[last..]);
     out
+}
+
+fn strip_leading_open_brace_artifact(text: &str) -> String {
+    let Some(rest) = text.strip_prefix('{') else {
+        return text.to_string();
+    };
+    let trimmed = rest.trim_start();
+    if starts_like_prose_after_stray_open_brace(trimmed) {
+        trimmed.to_string()
+    } else {
+        text.to_string()
+    }
+}
+
+fn strip_text_tool_protocol_artifact(text: &str) -> String {
+    let text = strip_leading_open_brace_artifact(text);
+    let Some(index) = find_text_tool_protocol_start(&text) else {
+        return text;
+    };
+    text[..index].trim_end().to_string()
 }
 
 /// Drain an OpenAI SSE stream (already reduced to `data` strings) into a
@@ -650,7 +794,7 @@ where
     // Strip special tokens from the accumulated text so recorded history stays
     // clean. The streaming filter already removed them from the live display,
     // but the `text` accumulator holds the raw content.
-    let text = strip_special_tokens(&text);
+    let text = strip_text_tool_protocol_artifact(&strip_special_tokens(&text));
     if !text.is_empty() {
         completion.content.push(Content::Text(text));
     }
@@ -1231,6 +1375,133 @@ mod tests {
             streamed.contains("All done."),
             "trailing prose preserved: {streamed:?}"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn suppresses_tool_call_json_when_opening_brace_is_own_chunk() {
+        let stream = never_ending(vec![
+            r#"{"choices":[{"delta":{"content":"{"}}]}"#,
+            r#"{"choices":[{"delta":{"content":"\"name\": \"read\", \"arguments\": {\"path\": \"README.md\"}}"}}]}"#,
+            r#"{"choices":[{"delta":{"content":"Done."}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        ]);
+        let mut collected = Vec::new();
+        let mut sink = |e: StreamEvent| {
+            if let StreamEvent::Text(t) = e {
+                collected.push(t);
+            }
+        };
+        let _completion = collect_completion(stream, IDLE, STALL, &mut sink)
+            .await
+            .unwrap();
+        let streamed = collected.join("");
+        assert!(
+            !streamed.contains('{') && !streamed.contains("\"name\""),
+            "tool-call JSON must not leak from split brace chunk: {streamed:?}"
+        );
+        assert!(
+            streamed.contains("Done."),
+            "trailing prose preserved: {streamed:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn suppresses_leading_open_brace_before_prose() {
+        let stream = never_ending(vec![
+            r#"{"choices":[{"delta":{"content":"{"}}]}"#,
+            r#"{"choices":[{"delta":{"content":"Listing project files."}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        ]);
+        let mut collected = Vec::new();
+        let mut sink = |e: StreamEvent| {
+            if let StreamEvent::Text(t) = e {
+                collected.push(t);
+            }
+        };
+        let completion = collect_completion(stream, IDLE, STALL, &mut sink)
+            .await
+            .unwrap();
+        let streamed = collected.join("");
+        assert_eq!(streamed, "Listing project files.");
+        assert!(matches!(
+            completion.content.first(),
+            Some(Content::Text(text)) if text == "Listing project files."
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn preserves_leading_open_brace_for_real_json() {
+        let stream = never_ending(vec![
+            r#"{"choices":[{"delta":{"content":"{"}}]}"#,
+            r#"{"choices":[{"delta":{"content":"\"foo\": 42}"}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        ]);
+        let mut collected = Vec::new();
+        let mut sink = |e: StreamEvent| {
+            if let StreamEvent::Text(t) = e {
+                collected.push(t);
+            }
+        };
+        let completion = collect_completion(stream, IDLE, STALL, &mut sink)
+            .await
+            .unwrap();
+        let streamed = collected.join("");
+        assert_eq!(streamed, "{\"foo\": 42}");
+        assert!(matches!(
+            completion.content.first(),
+            Some(Content::Text(text)) if text == "{\"foo\": 42}"
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn suppresses_bracketed_function_tool_call_from_streamed_text() {
+        let stream = never_ending(vec![
+            r#"{"choices":[{"delta":{"content":"I'll inspect the project.\n"}}]}"#,
+            r#"{"choices":[{"delta":{"content":"[read({\"path\":\"README.md\"})]"}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        ]);
+        let mut collected = Vec::new();
+        let mut sink = |e: StreamEvent| {
+            if let StreamEvent::Text(t) = e {
+                collected.push(t);
+            }
+        };
+        let completion = collect_completion(stream, IDLE, STALL, &mut sink)
+            .await
+            .unwrap();
+        let streamed = collected.join("");
+        assert_eq!(streamed, "I'll inspect the project.\n");
+        assert!(matches!(
+            completion.content.first(),
+            Some(Content::Text(text)) if text == "I'll inspect the project."
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn suppresses_tagged_tool_call_marker_from_streamed_text() {
+        let stream = never_ending(vec![
+            r#"{"choices":[{"delta":{"content":"I've reviewed README.md.\n"}}]}"#,
+            r#"{"choices":[{"delta":{"content":"[tool_call:call_02d2c4a57bff4ae7b6958ec30ad137b5]\n"}}]}"#,
+            r#"{"choices":[{"delta":{"content":"read({\"path\":\"cr"}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        ]);
+        let mut collected = Vec::new();
+        let mut sink = |e: StreamEvent| {
+            if let StreamEvent::Text(t) = e {
+                collected.push(t);
+            }
+        };
+        let completion = collect_completion(stream, IDLE, STALL, &mut sink)
+            .await
+            .unwrap();
+        let streamed = collected.join("");
+        assert_eq!(streamed, "I've reviewed README.md.\n");
+        assert!(!streamed.contains("[tool_call"));
+        assert!(!streamed.contains("read({"));
+        assert!(matches!(
+            completion.content.first(),
+            Some(Content::Text(text)) if text == "I've reviewed README.md."
+        ));
     }
 
     #[tokio::test(start_paused = true)]
