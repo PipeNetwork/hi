@@ -2065,11 +2065,9 @@ impl App {
     }
 
     fn note_backend_waiting(&mut self, idle: Duration, threshold: Duration) {
+        let _ = (idle, threshold);
         self.push(Line::styled(
-            format!(
-                "⚠ still waiting for backend response after {}s; the API may be retrying or buffering. Ctrl-C cancels, or keep waiting",
-                idle.as_secs().max(threshold.as_secs())
-            ),
+            "⚠ Still thinking. Ctrl-C cancels; keep waiting to continue.",
             Style::default().fg(Color::Yellow),
         ));
         self.follow();
@@ -4537,7 +4535,7 @@ mod tests {
         term.draw(|f| app.render(f)).unwrap();
         let screen = dump(&term);
         assert!(
-            screen.contains("still waiting for backend response after 181s"),
+            screen.contains("Still thinking. Ctrl-C cancels; keep waiting to continue."),
             "soft wait notice shown: {screen}"
         );
         assert!(

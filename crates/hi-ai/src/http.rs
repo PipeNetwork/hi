@@ -166,10 +166,10 @@ pub async fn save_cache(key: &str, models: &[ServedModel]) {
 }
 
 /// Give up on a stream if the model produces no output — content, reasoning, or
-/// tool tokens — for this long (default 300s, override with `HI_STREAM_TIMEOUT`
-/// in seconds). Keep-alive heartbeats do NOT count as progress: a provider that
-/// only sends heartbeats is stalled, not working. (Adapters reset their deadline
-/// whenever they emit a real token.)
+/// tool tokens — and no stream activity arrives for this long (default 300s,
+/// override with `HI_STREAM_TIMEOUT` in seconds). Before the first token,
+/// heartbeat/data frames keep the cold-start wait alive; after output starts,
+/// adapters use the shorter stall timeout and require real tokens.
 pub fn stream_idle_timeout() -> Duration {
     let configured = std::env::var("HI_STREAM_TIMEOUT").ok();
     timeout_from_env_value(configured.as_deref(), DEFAULT_STREAM_IDLE_TIMEOUT_SECS)

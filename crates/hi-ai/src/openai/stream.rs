@@ -622,11 +622,10 @@ fn strip_text_tool_protocol_artifact(text: &str) -> String {
 /// Drain an OpenAI SSE stream (already reduced to `data` strings) into a
 /// [`Completion`], forwarding text/reasoning/tool tokens to `sink`.
 ///
-/// Three deadlines bound the wait, all measured from the last real token
-/// (content/reasoning/tool — keep-alive heartbeats carry none, so they don't
-/// reset the clock):
-/// - **cold start** (no output yet): wait up to `idle` — a request can be
-///   legitimately queued before the first token.
+/// Three deadlines bound the wait:
+/// - **cold start** (no output yet): wait up to `idle` since the last stream
+///   activity. Heartbeat/data frames prove the route is still alive during a
+///   long queue or prefill, even though they are not model output.
 /// - **stall** (output flowed, then stopped without a finish signal): end after
 ///   the shorter `stall`, returning what we have. A multi-second gap *between*
 ///   tokens means the stream has effectively ended; this stops a provider that
@@ -645,7 +644,8 @@ where
     let mut text = String::new();
     let mut tool_calls: Vec<ToolCallBuilder> = Vec::new();
     let mut completion = Completion::default();
-    let mut last_progress = Instant::now();
+    let mut last_activity = Instant::now();
+    let mut last_output = Instant::now();
     let mut finished: Option<Instant> = None;
     let mut progressed = false;
     let mut output_chars = 0usize;
@@ -662,11 +662,14 @@ where
     loop {
         let budget = match finished {
             Some(at) => FINISH_GRACE.saturating_sub(at.elapsed()),
-            None if progressed => stall.saturating_sub(last_progress.elapsed()),
-            None => idle.saturating_sub(last_progress.elapsed()),
+            None if progressed => stall.saturating_sub(last_output.elapsed()),
+            None => idle.saturating_sub(last_activity.elapsed()),
         };
         let data = match tokio::time::timeout(budget, stream.next()).await {
-            Ok(Some(Ok(data))) => data,
+            Ok(Some(Ok(data))) => {
+                last_activity = Instant::now();
+                data
+            }
             // A stream *read* error mid-flight: the provider reset the connection
             // or sent a truncated frame instead of closing cleanly / sending
             // `[DONE]`. If the answer already finished, or output has flowed,
@@ -743,7 +746,7 @@ where
             {
                 output_chars += reasoning.len();
                 filter.forward(StreamEvent::Reasoning(reasoning));
-                last_progress = Instant::now();
+                last_output = Instant::now();
                 progressed = true;
             }
             if let Some(content) = delta.content
@@ -752,11 +755,11 @@ where
                 output_chars += content.len();
                 text.push_str(&content);
                 filter.text(&content);
-                last_progress = Instant::now();
+                last_output = Instant::now();
                 progressed = true;
             }
             if let Some(deltas) = delta.tool_calls {
-                last_progress = Instant::now();
+                last_output = Instant::now();
                 progressed = true;
                 for tcd in deltas {
                     if tool_calls.len() <= tcd.index {
@@ -972,10 +975,17 @@ struct FunctionDelta {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        collections::VecDeque,
+        future::Future,
+        pin::Pin,
+        task::{Context, Poll},
+        time::Duration,
+    };
 
     use anyhow::Result;
-    use futures_util::{StreamExt, stream};
+    use futures_util::{Stream, StreamExt, stream};
+    use tokio::time::Sleep;
 
     use super::collect_completion;
     use crate::types::{Content, StreamEvent};
@@ -995,6 +1005,53 @@ mod tests {
             events.into_iter().map(|s| Ok(s.to_string())).collect();
         items.push(Err(anyhow::anyhow!("error reading stream")));
         stream::iter(items)
+    }
+
+    struct TimedSseStream {
+        events: VecDeque<(Duration, String)>,
+        sleep: Option<Pin<Box<Sleep>>>,
+        pending: Option<String>,
+    }
+
+    impl TimedSseStream {
+        fn new(events: Vec<(Duration, &str)>) -> Self {
+            Self {
+                events: events
+                    .into_iter()
+                    .map(|(delay, data)| (delay, data.to_string()))
+                    .collect(),
+                sleep: None,
+                pending: None,
+            }
+        }
+    }
+
+    impl Stream for TimedSseStream {
+        type Item = Result<String>;
+
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            loop {
+                if let Some(sleep) = self.sleep.as_mut() {
+                    match sleep.as_mut().poll(cx) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(()) => {
+                            self.sleep = None;
+                            let data = self.pending.take().unwrap_or_default();
+                            return Poll::Ready(Some(Ok(data)));
+                        }
+                    }
+                }
+
+                let Some((delay, data)) = self.events.pop_front() else {
+                    return Poll::Pending;
+                };
+                if delay.is_zero() {
+                    return Poll::Ready(Some(Ok(data)));
+                }
+                self.pending = Some(data);
+                self.sleep = Some(Box::pin(tokio::time::sleep(delay)));
+            }
+        }
     }
 
     const STALL: Duration = Duration::from_secs(15);
@@ -1118,6 +1175,31 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("no output"), "got: {err}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heartbeat_chunks_keep_cold_stream_alive_until_content() {
+        // A local route can spend longer than the nominal cold timeout queued or
+        // prefilling while the API still emits empty heartbeat chunks. Those
+        // frames prove the route is alive and must extend the cold wait; once
+        // real output starts, the normal post-token stall timeout applies.
+        let stream = TimedSseStream::new(vec![
+            (Duration::ZERO, r#"{"choices":[]}"#),
+            (IDLE / 2, r#"{"choices":[]}"#),
+            (
+                IDLE / 2 + Duration::from_secs(1),
+                r#"{"choices":[{"delta":{"content":"ready"}}]}"#,
+            ),
+        ]);
+        let mut sink = |_: StreamEvent| {};
+        let completion = collect_completion(stream, IDLE, STALL, &mut sink)
+            .await
+            .unwrap();
+        assert!(
+            matches!(completion.content.first(), Some(Content::Text(t)) if t == "ready"),
+            "content after heartbeat-extended cold wait is returned: {:?}",
+            completion.content
+        );
     }
 
     #[tokio::test(start_paused = true)]
