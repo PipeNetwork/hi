@@ -45,6 +45,7 @@ pub(crate) fn handle_command(
         }
         Command::Status => {
             let t = agent.totals();
+            let tel = agent.last_turn_telemetry();
             let cost = agent
                 .cost_usd()
                 .map(|c| format!("${c:.4}"))
@@ -61,7 +62,7 @@ pub(crate) fn handle_command(
                 })
                 .unwrap_or_else(|| "unknown".into());
             println!(
-                "\x1b[2mstatus: ready\nmodel: {}\nusage: {} in · {} out · {} total\ncost: {}\ncontext: {}\ngoal: {}\nverify: {}\ncheckpoints: {}\x1b[0m",
+                "\x1b[2mstatus: ready\nmodel: {}\nusage: {} in · {} out · {} total\ncost: {}\ncontext: {}\ngoal: {}\nverify: {}\nevidence: {} (reads {}, searches {}, listing_only {}, repair nudges {})\ncheckpoints: {}\x1b[0m",
                 agent.model(),
                 t.input_tokens,
                 t.output_tokens,
@@ -70,6 +71,11 @@ pub(crate) fn handle_command(
                 ctx,
                 agent.goal().unwrap_or("off"),
                 agent.verify_summary(),
+                tel.discovery_depth,
+                tel.file_reads,
+                tel.targeted_searches,
+                tel.listing_only,
+                tel.quality_repair_nudges,
                 agent.checkpoint_count(),
             );
         }
@@ -189,7 +195,8 @@ pub(crate) fn handle_command(
             }
         },
         // Handled in the repl loop (async / runs a turn); never reach here.
-        Command::Compact(_)
+        Command::Prompt(_)
+        | Command::Compact(_)
         | Command::Retry
         | Command::Edit
         | Command::Undo

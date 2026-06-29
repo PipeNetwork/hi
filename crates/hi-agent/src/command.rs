@@ -19,6 +19,8 @@ pub enum Command {
     Tokens,
     /// Show current session/runtime status.
     Status,
+    /// Expanded read-only slash prompt macro that should run as a model turn.
+    Prompt(String),
     /// Write a debug/event log for the current session.
     Log,
     /// Show, set, or clear the verify command turns iterate against. Empty =
@@ -71,7 +73,12 @@ pub fn parse(line: &str) -> Option<Command> {
         "model" | "m" => Command::Model(arg),
         "provider" | "prov" => Command::Provider(arg),
         "tokens" | "usage" | "cost" => Command::Tokens,
-        "status" | "st" => Command::Status,
+        "review" => Command::Prompt(read_only_macro_prompt("review", &arg)),
+        "security" => Command::Prompt(read_only_macro_prompt("security", &arg)),
+        "roadmap" => Command::Prompt(read_only_macro_prompt("roadmap", &arg)),
+        "gaps" => Command::Prompt(read_only_macro_prompt("gaps", &arg)),
+        "status" | "st" if arg.is_empty() => Command::Status,
+        "status" | "st" => Command::Prompt(read_only_macro_prompt("status", &arg)),
         "log" | "debug" => Command::Log,
         "verify" | "test" => Command::Verify(arg),
         "diff" | "changes" => Command::Diff,
@@ -89,6 +96,41 @@ pub fn parse(line: &str) -> Option<Command> {
         "exit" | "quit" | "q" => Command::Quit,
         other => Command::Unknown(other.to_string()),
     })
+}
+
+/// Expand a read-only prompt slash macro, or return `None` for non-macros.
+pub fn expand_prompt_macro(line: &str) -> Option<String> {
+    match parse(line)? {
+        Command::Prompt(prompt) => Some(prompt),
+        _ => None,
+    }
+}
+
+fn read_only_macro_prompt(kind: &str, topic: &str) -> String {
+    let topic = topic.trim();
+    let topic = if topic.is_empty() {
+        "the codebase"
+    } else {
+        topic
+    };
+    let recipe = match kind {
+        "security" => {
+            "Search for unsafe, unwrap, expect, panic!, command execution, filesystem/env access, and secret/token/auth patterns, then read the top matching files."
+        }
+        "status" => {
+            "Inspect git status/diff summary, workspace manifests, README/docs when present, main crate or module entrypoints, and tests."
+        }
+        "roadmap" => {
+            "Inspect workspace manifests, owning modules, tests, and TODO/FIXME or missing-coverage search results before naming build-next work."
+        }
+        "gaps" => {
+            "Inspect workspace manifests, owning modules, tests, and TODO/FIXME or missing-coverage search results before naming gaps."
+        }
+        _ => "Inspect relevant files or targeted search results before giving findings.",
+    };
+    format!(
+        "Read-only {kind} request for: {topic}\n\nDo not write, edit, apply patches, run mutating shell commands, or change files. Use read-only inspection before the final answer. {recipe}\n\nIf only a directory listing is available, keep inspecting or explicitly say the evidence is insufficient instead of making file-specific findings."
+    )
 }
 
 /// One user-facing slash command — the single source of truth for `/help` and
@@ -140,6 +182,30 @@ pub const COMMANDS: &[CommandSpec] = &[
         args: "[cmd|off]",
         help: "show/set/clear the test command turns iterate against",
         arg_values: &[("off", "disable the verify command")],
+    },
+    CommandSpec {
+        name: "review",
+        args: "[topic]",
+        help: "run a read-only code review with file inspection",
+        arg_values: &[],
+    },
+    CommandSpec {
+        name: "security",
+        args: "[topic]",
+        help: "run a read-only security review with targeted search",
+        arg_values: &[],
+    },
+    CommandSpec {
+        name: "roadmap",
+        args: "[topic]",
+        help: "discuss build-next roadmap after inspection",
+        arg_values: &[],
+    },
+    CommandSpec {
+        name: "gaps",
+        args: "[topic]",
+        help: "discuss missing gaps after inspection",
+        arg_values: &[],
     },
     CommandSpec {
         name: "diff",
@@ -222,8 +288,8 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "status",
-        args: "",
-        help: "show provider, model, queue, context, and last turn state",
+        args: "[topic]",
+        help: "show runtime status, or discuss codebase status with a topic",
         arg_values: &[],
     },
     CommandSpec {
@@ -320,7 +386,7 @@ pub fn help_text() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{COMMANDS, Command, matching, parse};
+    use super::{COMMANDS, Command, expand_prompt_macro, matching, parse};
 
     #[test]
     fn every_listed_command_parses_to_a_real_command() {
@@ -421,6 +487,26 @@ mod tests {
         );
         assert_eq!(parse("/verify"), Some(Command::Verify(String::new())));
         assert_eq!(parse("/status"), Some(Command::Status));
+        assert!(matches!(
+            parse("/status codebase state"),
+            Some(Command::Prompt(_))
+        ));
+        assert!(matches!(
+            parse("/review scheduler"),
+            Some(Command::Prompt(_))
+        ));
+        assert!(matches!(
+            parse("/security unsafe unwraps"),
+            Some(Command::Prompt(_))
+        ));
+        assert!(matches!(
+            parse("/roadmap next work"),
+            Some(Command::Prompt(_))
+        ));
+        assert!(matches!(
+            parse("/gaps missing pieces"),
+            Some(Command::Prompt(_))
+        ));
         assert_eq!(parse("/log"), Some(Command::Log));
         assert_eq!(parse("/diff"), Some(Command::Diff));
         assert_eq!(parse("/copy"), Some(Command::Copy(String::new())));
@@ -438,5 +524,26 @@ mod tests {
         assert_eq!(parse("/redo"), Some(Command::Retry));
         assert_eq!(parse("/undo"), Some(Command::Undo));
         assert_eq!(parse("/bogus"), Some(Command::Unknown("bogus".into())));
+    }
+
+    #[test]
+    fn prompt_macros_expand_to_read_only_inspection_prompts() {
+        let review = expand_prompt_macro("/review parser").unwrap();
+        assert!(review.contains("Read-only review request"));
+        assert!(review.contains("parser"));
+        assert!(review.contains("Do not write"));
+        assert!(review.contains("Use read-only inspection"));
+
+        let security = expand_prompt_macro("/security unsafe unwraps").unwrap();
+        assert!(security.contains("unsafe unwraps"));
+        assert!(security.contains("unsafe"));
+        assert!(security.contains("unwrap"));
+        assert!(security.contains("secret/token/auth"));
+
+        let status = expand_prompt_macro("/status codebase state").unwrap();
+        assert!(status.contains("codebase state"));
+        assert!(status.contains("git status/diff"));
+
+        assert!(expand_prompt_macro("/status").is_none());
     }
 }

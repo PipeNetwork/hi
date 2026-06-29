@@ -77,6 +77,7 @@ pub(crate) async fn repl(
                 let input = if let Some(command) = hi_agent::command::parse(&line) {
                     match command {
                         Command::Quit => break,
+                        Command::Prompt(prompt) => prompt,
                         Command::Compact(arg) => {
                             let kind = CompactionKind::from_arg(&arg)
                                 .unwrap_or_else(|| agent.compaction_kind());

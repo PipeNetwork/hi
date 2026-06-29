@@ -63,7 +63,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// not just whether it passed. The counters here are locals inside `run_turn`
 /// that would otherwise be discarded on return; flushing them to this struct
 /// makes the verify/recovery/nudge story queryable.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TurnTelemetry {
     /// How many verify rounds ran this turn (0 = verify off or skipped).
     pub verify_rounds: u32,
@@ -103,6 +103,46 @@ pub struct TurnTelemetry {
     /// execution completion. Lets `--report` and the eval harness diagnose
     /// *where* time went and which calls failed, not just aggregate counts.
     pub tool_timeline: Vec<ToolCallEntry>,
+    /// Number of successful file-read tool calls this turn.
+    pub file_reads: u32,
+    /// Number of successful targeted search or diff tool calls this turn.
+    pub targeted_searches: u32,
+    /// Whether the only successful discovery evidence was a directory listing.
+    pub listing_only: bool,
+    /// First discovery tool kind observed this turn (`none`, `listing`,
+    /// `targeted_search`, or `file_read`).
+    pub first_tool_kind: String,
+    /// Overall read-only discovery depth (`none`, `listing_only`,
+    /// `targeted_search`, `file_read`, or `mixed`).
+    pub discovery_depth: String,
+    /// Times the harness nudged a read-only review to inspect beyond a listing.
+    pub quality_repair_nudges: u32,
+}
+
+impl Default for TurnTelemetry {
+    fn default() -> Self {
+        Self {
+            verify_rounds: 0,
+            recovery_retries: 0,
+            repeat_nudges: 0,
+            continue_nudges: 0,
+            truncation_retries: 0,
+            hit_step_cap: false,
+            stalled_unfinished: false,
+            stalled_repeating: false,
+            verify_attributions: Vec::new(),
+            tool_calls: 0,
+            max_concurrent_batch: 0,
+            serial_runs: 0,
+            tool_timeline: Vec::new(),
+            file_reads: 0,
+            targeted_searches: 0,
+            listing_only: false,
+            first_tool_kind: "none".to_string(),
+            discovery_depth: "none".to_string(),
+            quality_repair_nudges: 0,
+        }
+    }
 }
 
 /// A serializable view of one parsed verify-failure location, for the telemetry
@@ -233,6 +273,324 @@ const REPEAT_NUDGE: &str = "You just ran that exact command last round and its o
 in the conversation above — running it again will only repeat the same result. Act on that output \
 now: make the edit it points to, move to the next step, or if the task is already complete, stop \
 and give your final recap. Do not re-run the same command.";
+
+const REVIEW_DEEPEN_NUDGE: &str = "This read-only review only has a directory listing so far. \
+Do not finalize yet. Use a targeted search or read relevant files, then answer from the inspected \
+evidence. If deeper inspection is impossible, explicitly say the evidence is insufficient.";
+const SECURITY_DEEPEN_NUDGE: &str = "This security review only has a directory listing so far. \
+Do not finalize yet. Search for unsafe, unwrap, expect, panic!, command execution, filesystem/env \
+access, and secret/token/auth patterns, then read the most relevant matching files before answering.";
+const STATUS_DEEPEN_NUDGE: &str = "This status review only has a directory listing so far. Do \
+not finalize yet. Inspect git status or diff summary, workspace manifests, README/docs if present, \
+main crate or module entrypoints, and tests before making status claims.";
+const GAP_DEEPEN_NUDGE: &str = "This gap or roadmap review only has a directory listing so far. \
+Do not finalize yet. Inspect manifests, owning modules, tests, and TODO/FIXME or missing-coverage \
+search results before naming gaps or build-next work.";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReviewIntent {
+    Review,
+    Security,
+    Status,
+    Roadmap,
+    Gaps,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EvidenceKind {
+    Listing,
+    TargetedSearch,
+    FileRead,
+}
+
+impl EvidenceKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Listing => "listing",
+            Self::TargetedSearch => "targeted_search",
+            Self::FileRead => "file_read",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct EvidenceTracker {
+    saw_listing: bool,
+    saw_search: bool,
+    saw_read: bool,
+    file_reads: u32,
+    targeted_searches: u32,
+    first_tool_kind: Option<EvidenceKind>,
+    quality_repair_nudges: u32,
+}
+
+impl EvidenceTracker {
+    fn record_success(&mut self, name: &str, arguments: &str, output: &str) {
+        if output.starts_with("Error:") {
+            return;
+        }
+        let Some(kind) = evidence_kind_for_tool(name, arguments) else {
+            return;
+        };
+        if self.first_tool_kind.is_none() {
+            self.first_tool_kind = Some(kind);
+        }
+        match kind {
+            EvidenceKind::Listing => self.saw_listing = true,
+            EvidenceKind::TargetedSearch => {
+                self.saw_search = true;
+                self.targeted_searches = self.targeted_searches.saturating_add(1);
+            }
+            EvidenceKind::FileRead => {
+                self.saw_read = true;
+                self.file_reads = self.file_reads.saturating_add(1);
+            }
+        }
+    }
+
+    fn listing_only(&self) -> bool {
+        self.saw_listing && !self.saw_search && !self.saw_read
+    }
+
+    fn discovery_depth(&self) -> &'static str {
+        let kinds = usize::from(self.saw_listing)
+            + usize::from(self.saw_search)
+            + usize::from(self.saw_read);
+        match (kinds, self.saw_listing, self.saw_search, self.saw_read) {
+            (0, _, _, _) => "none",
+            (1, true, false, false) => "listing_only",
+            (1, false, true, false) => "targeted_search",
+            (1, false, false, true) => "file_read",
+            _ => "mixed",
+        }
+    }
+
+    fn first_tool_kind(&self) -> &'static str {
+        self.first_tool_kind
+            .map(EvidenceKind::as_str)
+            .unwrap_or("none")
+    }
+}
+
+fn evidence_kind_for_tool(name: &str, arguments: &str) -> Option<EvidenceKind> {
+    match name {
+        "read" => Some(EvidenceKind::FileRead),
+        "grep" | "glob" | "diff" => Some(EvidenceKind::TargetedSearch),
+        "list" => Some(EvidenceKind::Listing),
+        "bash" => evidence_kind_for_bash(arguments),
+        _ => None,
+    }
+}
+
+fn evidence_kind_for_bash(arguments: &str) -> Option<EvidenceKind> {
+    let value = serde_json::from_str::<serde_json::Value>(arguments).ok()?;
+    let command = value
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if command
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-')
+        .any(|word| matches!(word, "cat" | "sed" | "nl" | "head" | "tail"))
+    {
+        return Some(EvidenceKind::FileRead);
+    }
+    if command
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-')
+        .any(|word| matches!(word, "rg" | "grep" | "git"))
+    {
+        return Some(EvidenceKind::TargetedSearch);
+    }
+    if command
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-')
+        .any(|word| matches!(word, "ls" | "find"))
+    {
+        return Some(EvidenceKind::Listing);
+    }
+    None
+}
+
+fn classify_read_only_intent(input: &str) -> Option<ReviewIntent> {
+    let normalized = normalize_intent_text(input);
+    if normalized.trim().is_empty() {
+        return None;
+    }
+    if explicitly_mutating_request(&normalized) && !read_only_language_present(&normalized) {
+        return None;
+    }
+    if contains_any(
+        &normalized,
+        &[
+            "security", "unsafe", "unwrap", "expect", "panic", "secret", "token", "auth",
+        ],
+    ) {
+        return Some(ReviewIntent::Security);
+    }
+    if contains_any(
+        &normalized,
+        &[
+            "missing",
+            "gap",
+            "gaps",
+            "lacks",
+            "whats missing",
+            "what is missing",
+        ],
+    ) {
+        return Some(ReviewIntent::Gaps);
+    }
+    if contains_any(
+        &normalized,
+        &[
+            "roadmap",
+            "build next",
+            "what should build",
+            "what should we build",
+            "consider building",
+        ],
+    ) {
+        return Some(ReviewIntent::Roadmap);
+    }
+    if contains_any(
+        &normalized,
+        &["status", "state", "current state", "discuss state"],
+    ) {
+        return Some(ReviewIntent::Status);
+    }
+    if contains_any(
+        &normalized,
+        &[
+            "review codebase",
+            "code review",
+            "review repo",
+            "review repository",
+            "audit codebase",
+        ],
+    ) {
+        return Some(ReviewIntent::Review);
+    }
+    None
+}
+
+fn normalize_intent_text(input: &str) -> String {
+    let lower = input.to_ascii_lowercase();
+    let fixed = lower
+        .replace("disucss", "discuss")
+        .replace("implimenting", "implementing")
+        .replace("impliment", "implement")
+        .replace("whats its", "whats")
+        .replace("what's its", "whats");
+    fixed
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { ' ' })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn contains_any(haystack: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| haystack.contains(needle))
+}
+
+fn explicitly_mutating_request(normalized: &str) -> bool {
+    let words: Vec<&str> = normalized.split_whitespace().collect();
+    words.iter().any(|word| {
+        matches!(
+            *word,
+            "fix"
+                | "change"
+                | "update"
+                | "write"
+                | "create"
+                | "delete"
+                | "remove"
+                | "refactor"
+                | "patch"
+                | "commit"
+        )
+    }) || (words
+        .iter()
+        .any(|word| matches!(*word, "implement" | "build"))
+        && !contains_any(
+            normalized,
+            &["consider", "should", "what should", "discuss"],
+        ))
+}
+
+fn read_only_language_present(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "read only",
+            "discuss only",
+            "discuss",
+            "review",
+            "audit",
+            "status",
+            "state",
+            "what should",
+            "consider",
+        ],
+    )
+}
+
+fn read_only_turn_prompt(input: &str, intent: ReviewIntent) -> String {
+    let recipe = match intent {
+        ReviewIntent::Security => {
+            "Search for unsafe, unwrap, expect, panic!, command execution, filesystem/env access, and secret/token/auth patterns. Then read the most relevant matching files."
+        }
+        ReviewIntent::Status => {
+            "Inspect git status or diff summary, workspace manifests, README/docs if present, main crate or module entrypoints, and tests."
+        }
+        ReviewIntent::Roadmap => {
+            "Inspect manifests, owning modules, tests, and TODO/FIXME or missing-coverage search results before naming build-next work."
+        }
+        ReviewIntent::Gaps => {
+            "Inspect manifests, owning modules, tests, and TODO/FIXME or missing-coverage search results before naming gaps."
+        }
+        ReviewIntent::Review => {
+            "Inspect relevant files or targeted search results before giving findings."
+        }
+    };
+    format!(
+        "{input}\n\nRead-only review guard: do not write, edit, apply patches, run mutating shell commands, or change files. Use read-only inspection before the final answer. {recipe} If only a directory listing is available, keep inspecting or explicitly say the evidence is insufficient instead of making file-specific findings."
+    )
+}
+
+fn answer_says_insufficient_evidence(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    contains_any(
+        &lower,
+        &[
+            "insufficient evidence",
+            "not enough evidence",
+            "not enough information",
+            "only a directory listing",
+            "only saw a listing",
+            "need to inspect",
+            "need file reads",
+            "need targeted search",
+        ],
+    )
+}
+
+fn should_deepen_review(
+    intent: Option<ReviewIntent>,
+    evidence: &EvidenceTracker,
+    answer: &str,
+) -> bool {
+    intent.is_some() && evidence.listing_only() && !answer_says_insufficient_evidence(answer)
+}
+
+fn deepen_review_nudge(intent: ReviewIntent) -> &'static str {
+    match intent {
+        ReviewIntent::Security => SECURITY_DEEPEN_NUDGE,
+        ReviewIntent::Status => STATUS_DEEPEN_NUDGE,
+        ReviewIntent::Roadmap | ReviewIntent::Gaps => GAP_DEEPEN_NUDGE,
+        ReviewIntent::Review => REVIEW_DEEPEN_NUDGE,
+    }
+}
 
 /// Asked of the model in a dedicated, tool-free call after a turn that changed
 /// files, to guarantee a structured recap even from a model that wouldn't
@@ -1480,7 +1838,15 @@ impl Agent {
     /// run; if it fails, its output is fed back and the model iterates, up to
     /// `max_verify_iterations` rounds.
     pub async fn run_turn(&mut self, input: &str, ui: &mut dyn Ui) -> Result<()> {
-        if self.tools_unavailable_for(input) {
+        let expanded_input =
+            command::expand_prompt_macro(input).unwrap_or_else(|| input.to_string());
+        let read_only_intent = classify_read_only_intent(&expanded_input);
+        let turn_input = read_only_intent
+            .map(|intent| read_only_turn_prompt(&expanded_input, intent))
+            .unwrap_or(expanded_input);
+        let input = turn_input.as_str();
+
+        if read_only_intent.is_none() && self.tools_unavailable_for(input) {
             ui.status(&format!(
                 "tool mode {} does not allow file edits or shell commands for this turn",
                 tool_mode_label(self.config.tool_mode)
@@ -1592,6 +1958,7 @@ impl Agent {
         // status, flushed into telemetry so `--report` can diagnose where time
         // went and which calls failed.
         let mut tool_timeline: Vec<ToolCallEntry> = Vec::new();
+        let mut evidence = EvidenceTracker::default();
         // Signature (name, arguments) of the previous round's tool calls, to
         // spot a model re-issuing the exact same call and looping on it.
         let mut prev_call_sig: Option<Vec<(String, String)>> = None;
@@ -1603,6 +1970,8 @@ impl Agent {
         // same tool call through the whole repeat-nudge budget (drives the
         // incomplete notice and skips the finalization recap).
         let mut stalled_repeating = false;
+        // Whether the turn ended without enough evidence for a read-only review.
+        let mut stalled_unfinished = false;
         // Whether the turn was cut short by the per-turn step cap, so the
         // finalization recap is skipped (the work may be incomplete).
         let mut ended_at_cap = false;
@@ -1673,10 +2042,17 @@ impl Agent {
                 } else {
                     self.config.tool_mode
                 };
+                let tool_availability_mode = if read_only_intent.is_some()
+                    && !matches!(self.config.tool_mode, ToolMode::ChatOnly)
+                {
+                    ToolMode::ReadOnly
+                } else {
+                    self.config.tool_mode
+                };
                 let request = ChatRequest {
                     model: self.config.model.clone(),
                     messages: self.messages.arc(),
-                    tools: self.request_tools(),
+                    tools: self.request_tools_for(tool_availability_mode),
                     max_tokens: self.config.max_tokens,
                     temperature,
                     top_p,
@@ -1689,8 +2065,17 @@ impl Agent {
                     },
                 };
 
+                let buffer_listing_only_review_text =
+                    read_only_intent.is_some() && evidence.listing_only();
+                let mut buffered_assistant_text = String::new();
                 let mut sink = |event: StreamEvent| match event {
-                    StreamEvent::Text(text) => ui.assistant_text(&text),
+                    StreamEvent::Text(text) => {
+                        if buffer_listing_only_review_text {
+                            buffered_assistant_text.push_str(&text);
+                        } else {
+                            ui.assistant_text(&text);
+                        }
+                    }
                     StreamEvent::Reasoning(text) => ui.assistant_reasoning(&text),
                     StreamEvent::Status(text) => {
                         if let Some(fallback) = text.strip_prefix("compat: ") {
@@ -1756,7 +2141,9 @@ impl Agent {
                         return Err(err);
                     }
                 };
-                ui.assistant_end();
+                if !buffer_listing_only_review_text {
+                    ui.assistant_end();
+                }
 
                 self.add_usage(completion.usage);
                 // Let the frontend show the running total climb mid-turn.
@@ -2000,6 +2387,42 @@ impl Agent {
                     // A *finished* response ends the turn cleanly: a final recap
                     // after a multi-step task with a complete plan, or a plain
                     // Q&A answer. Bounded so it can't loop forever.
+                    if should_deepen_review(read_only_intent, &evidence, &assistant_text) {
+                        if evidence.quality_repair_nudges == 0 {
+                            evidence.quality_repair_nudges += 1;
+                            force_tools_next = true;
+                            ui.status(
+                                "review evidence was only a listing; nudging the model to inspect files or search results",
+                            );
+                            self.messages
+                                .push_assistant(std::mem::take(&mut completion.content));
+                            self.messages.push_nudge(
+                                NudgeKind::Continue,
+                                deepen_review_nudge(read_only_intent.expect("checked above")),
+                            );
+                            continue;
+                        }
+
+                        stalled_unfinished = true;
+                        ui.status(
+                            "review still had only listing evidence after repair; returning an insufficient-evidence answer",
+                        );
+                        let insufficient = "Insufficient evidence: only a directory listing was inspected, so I cannot make file-specific review findings without targeted searches or file reads.";
+                        ui.assistant_text(insufficient);
+                        ui.assistant_end();
+                        self.messages
+                            .push_assistant(vec![Content::Text(insufficient.to_string())]);
+                        break false;
+                    }
+                    if buffer_listing_only_review_text {
+                        let text_to_emit = if buffered_assistant_text.is_empty() {
+                            assistant_text.as_str()
+                        } else {
+                            buffered_assistant_text.as_str()
+                        };
+                        ui.assistant_text(text_to_emit);
+                        ui.assistant_end();
+                    }
                     self.messages
                         .push_assistant(std::mem::take(&mut completion.content));
                     let looks_unfinished = looks_like_unfinished_step(&assistant_text);
@@ -2146,6 +2569,7 @@ impl Agent {
                         .await;
                         let duration_ms = started.elapsed().as_millis() as u64;
                         let error = output.content.starts_with("Error:");
+                        evidence.record_success(name, arguments, &output.content);
                         tool_timeline.push(ToolCallEntry {
                             tool: name.clone(),
                             path,
@@ -2250,6 +2674,7 @@ impl Agent {
                         ui.tool_call(name, &calls[i].2);
                         let path = hi_tools::target_path(name, &calls[i].2).unwrap_or_default();
                         let error = output.content.starts_with("Error:");
+                        evidence.record_success(name, &calls[i].2, &output.content);
                         tool_timeline.push(ToolCallEntry {
                             tool: name.clone(),
                             path,
@@ -2456,7 +2881,7 @@ impl Agent {
             continue_nudges: 0,
             truncation_retries,
             hit_step_cap: ended_at_cap,
-            stalled_unfinished: false,
+            stalled_unfinished,
             stalled_repeating,
             verify_attributions: last_verify_attributions
                 .iter()
@@ -2466,6 +2891,12 @@ impl Agent {
             max_concurrent_batch: sched_max_concurrent,
             serial_runs: sched_serial_runs,
             tool_timeline,
+            file_reads: evidence.file_reads,
+            targeted_searches: evidence.targeted_searches,
+            listing_only: evidence.listing_only(),
+            first_tool_kind: evidence.first_tool_kind().to_string(),
+            discovery_depth: evidence.discovery_depth().to_string(),
+            quality_repair_nudges: evidence.quality_repair_nudges,
         };
 
         // Long-horizon driver: when a structured goal is set and long_horizon
@@ -2683,6 +3114,9 @@ impl Agent {
         if t.continue_nudges > 0 {
             parts.push(format!("{} continue", t.continue_nudges));
         }
+        if t.quality_repair_nudges > 0 {
+            parts.push(format!("{} review-repair", t.quality_repair_nudges));
+        }
         if t.truncation_retries > 0 {
             parts.push(format!("{} trunc", t.truncation_retries));
         }
@@ -2696,8 +3130,8 @@ impl Agent {
         }
     }
 
-    fn request_tools(&self) -> Arc<[ToolSpec]> {
-        match self.config.tool_mode {
+    fn request_tools_for(&self, mode: ToolMode) -> Arc<[ToolSpec]> {
+        match mode {
             ToolMode::ChatOnly => Arc::new([]),
             ToolMode::ReadOnly => self
                 .tools
@@ -2845,6 +3279,28 @@ mod tests {
             request: ChatRequest,
             _sink: &mut (dyn FnMut(StreamEvent) + Send),
         ) -> Result<Completion> {
+            self.modes.lock().unwrap().push(request.profile.tool_mode);
+            Ok(self.responses.lock().unwrap().remove(0))
+        }
+    }
+
+    struct RecordRequests {
+        responses: Mutex<Vec<Completion>>,
+        tool_names: std::sync::Arc<Mutex<Vec<Vec<String>>>>,
+        modes: std::sync::Arc<Mutex<Vec<ToolMode>>>,
+    }
+
+    #[async_trait]
+    impl Provider for RecordRequests {
+        async fn stream(
+            &self,
+            request: ChatRequest,
+            _sink: &mut (dyn FnMut(StreamEvent) + Send),
+        ) -> Result<Completion> {
+            self.tool_names
+                .lock()
+                .unwrap()
+                .push(request.tools.iter().map(|tool| tool.name.clone()).collect());
             self.modes.lock().unwrap().push(request.profile.tool_mode);
             Ok(self.responses.lock().unwrap().remove(0))
         }
@@ -5216,6 +5672,187 @@ mod tests {
         );
     }
 
+    #[test]
+    fn typo_heavy_review_prompts_classify_as_read_only_intents() {
+        assert_eq!(
+            classify_read_only_intent("review codebase and discuss status and state"),
+            Some(ReviewIntent::Status)
+        );
+        assert_eq!(
+            classify_read_only_intent(
+                "review for security issues or unsafe unwraps. then disucss only"
+            ),
+            Some(ReviewIntent::Security)
+        );
+        assert_eq!(
+            classify_read_only_intent(
+                "discuss whats its missing and what we should considering building and implimenting"
+            ),
+            Some(ReviewIntent::Gaps)
+        );
+        assert_eq!(classify_read_only_intent("fix the unsafe unwraps"), None);
+    }
+
+    #[tokio::test]
+    async fn security_review_prompts_advertise_only_read_only_tools() {
+        let responses = vec![completion(
+            vec![Content::Text(
+                "Insufficient evidence: I need targeted search or file reads.".into(),
+            )],
+            1,
+            1,
+        )];
+        let tool_names = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let modes = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let provider = RecordRequests {
+            responses: Mutex::new(responses),
+            tool_names: tool_names.clone(),
+            modes: modes.clone(),
+        };
+        let mut agent = Agent::new(Box::new(provider), config());
+        agent
+            .run_turn(
+                "review for security issues or unsafe unwraps. then disucss only",
+                &mut NullUi,
+            )
+            .await
+            .unwrap();
+
+        let names = tool_names.lock().unwrap();
+        let first = names.first().expect("request recorded");
+        assert!(first.iter().any(|name| name == "read"));
+        assert!(first.iter().any(|name| name == "grep"));
+        assert!(first.iter().any(|name| name == "list"));
+        assert!(!first.iter().any(|name| matches!(
+            name.as_str(),
+            "write" | "edit" | "multi_edit" | "apply_patch" | "bash"
+        )));
+        assert_eq!(modes.lock().unwrap()[0], ToolMode::Auto);
+    }
+
+    #[tokio::test]
+    async fn listing_only_review_final_gets_deepen_review_nudge() {
+        let responses = vec![
+            completion(
+                vec![Content::ToolCall {
+                    id: "list".into(),
+                    name: "list".into(),
+                    arguments: r#"{"path":"."}"#.into(),
+                }],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text(
+                    "The repository looks healthy and organized.".into(),
+                )],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::ToolCall {
+                    id: "grep".into(),
+                    name: "grep".into(),
+                    arguments: r#"{"pattern":"fn run_turn","glob":"*.rs"}"#.into(),
+                }],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text(
+                    "Findings:\n- crates/hi-agent/src/lib.rs has the main run_turn loop and should keep review nudges bounded.".into(),
+                )],
+                1,
+                1,
+            ),
+        ];
+        let mut agent = agent(responses, config());
+        let mut ui = RecUi::default();
+
+        agent
+            .run_turn("review codebase and discuss status and state", &mut ui)
+            .await
+            .unwrap();
+
+        assert!(
+            ui.statuses
+                .iter()
+                .any(|status| status.contains("only a listing")),
+            "expected deepen-review nudge status: {:?}",
+            ui.statuses
+        );
+        let telemetry = agent.last_turn_telemetry();
+        assert_eq!(telemetry.quality_repair_nudges, 1);
+        assert_eq!(telemetry.targeted_searches, 1);
+        assert_eq!(telemetry.file_reads, 0);
+        assert!(!telemetry.listing_only);
+        assert_eq!(telemetry.discovery_depth, "mixed");
+        assert!(
+            agent
+                .usage_summary(agent.totals())
+                .contains("review-repair")
+        );
+    }
+
+    #[tokio::test]
+    async fn listing_only_review_repair_exhaustion_returns_insufficient_evidence() {
+        let responses = vec![
+            completion(
+                vec![Content::ToolCall {
+                    id: "list".into(),
+                    name: "list".into(),
+                    arguments: r#"{"path":"."}"#.into(),
+                }],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text(
+                    "The repository looks healthy and organized.".into(),
+                )],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text(
+                    "Findings/Status:\n- The inspected context points to `src/lib.rs`.".into(),
+                )],
+                1,
+                1,
+            ),
+        ];
+        let mut agent = agent(responses, config());
+        let mut ui = RecUi::default();
+
+        agent
+            .run_turn("review codebase and discuss status and state", &mut ui)
+            .await
+            .unwrap();
+
+        assert!(
+            ui.assistant.contains("Insufficient evidence"),
+            "assistant output should be bounded evidence: {}",
+            ui.assistant
+        );
+        assert!(
+            !ui.assistant.contains("src/lib.rs"),
+            "listing-only fallback targets should not be shown as findings: {}",
+            ui.assistant
+        );
+        assert!(
+            ui.statuses
+                .iter()
+                .any(|status| status.contains("only listing evidence after repair")),
+            "expected exhausted repair status: {:?}",
+            ui.statuses
+        );
+        let telemetry = agent.last_turn_telemetry();
+        assert_eq!(telemetry.quality_repair_nudges, 1);
+        assert!(telemetry.listing_only);
+        assert!(telemetry.stalled_unfinished);
+        assert!(agent.usage_summary(agent.totals()).contains("stalled"));
+    }
+
     #[tokio::test]
     async fn does_not_nudge_a_plain_answer() {
         // No tool call this turn (a Q&A-style reply) — never nudge, never warn,
@@ -5554,6 +6191,7 @@ mod tests {
             max_concurrent_batch: 0,
             serial_runs: 0,
             tool_timeline: Vec::new(),
+            ..TurnTelemetry::default()
         };
         let steer = a.turn_steer().expect("noisy turn has a steer line");
         assert!(
@@ -5580,6 +6218,7 @@ mod tests {
             max_concurrent_batch: 0,
             serial_runs: 0,
             tool_timeline: Vec::new(),
+            ..TurnTelemetry::default()
         };
         let steer = a.turn_steer().expect("stall has a steer line");
         assert!(steer.contains("stalled"), "stall flagged: {steer}");

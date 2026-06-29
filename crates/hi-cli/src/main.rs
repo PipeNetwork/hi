@@ -576,6 +576,12 @@ fn write_report(
             "max_concurrent_batch": tel.max_concurrent_batch,
             "serial_runs": tel.serial_runs,
             "tool_timeline": tel.tool_timeline,
+            "file_reads": tel.file_reads,
+            "targeted_searches": tel.targeted_searches,
+            "listing_only": tel.listing_only,
+            "first_tool_kind": tel.first_tool_kind,
+            "discovery_depth": tel.discovery_depth,
+            "quality_repair_nudges": tel.quality_repair_nudges,
         },
     });
     std::fs::write(path, serde_json::to_string_pretty(&report)?)

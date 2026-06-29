@@ -636,6 +636,7 @@ pub async fn run(
         let run_line = if let Some(cmd) = command::parse(&line) {
             match cmd {
                 Command::Quit => break,
+                Command::Prompt(prompt) => prompt,
                 Command::Compact(arg) => {
                     let kind =
                         CompactionKind::from_arg(&arg).unwrap_or_else(|| agent.compaction_kind());
@@ -2140,6 +2141,7 @@ impl App {
             .unwrap_or_else(|| "unknown".to_string());
         let goal = agent.goal().unwrap_or("off");
         let verify = agent.verify_summary();
+        let tel = agent.last_turn_telemetry();
         let error = self.last_error.as_deref().unwrap_or("none");
         let model_issues = self.model_issues.get(&self.model).copied().unwrap_or(0);
         let model_health = if model_issues >= 2 {
@@ -2166,6 +2168,14 @@ impl App {
             format!("model health: {model_health}"),
             format!("goal: {goal}"),
             format!("verify: {verify}"),
+            format!(
+                "evidence: {} (reads {}, searches {}, listing_only {}, repair nudges {})",
+                tel.discovery_depth,
+                tel.file_reads,
+                tel.targeted_searches,
+                tel.listing_only,
+                tel.quality_repair_nudges
+            ),
             format!("last error: {error}"),
             format!(
                 "startup notice: {}",
@@ -2696,7 +2706,8 @@ impl App {
                 }
             }
             // Handled in the event loop (async / runs a turn / needs config); never reach here.
-            Command::Compact(_)
+            Command::Prompt(_)
+            | Command::Compact(_)
             | Command::Retry
             | Command::Edit
             | Command::Undo
@@ -3298,6 +3309,19 @@ impl App {
                     "telemetry: (no turn yet)".to_string()
                 };
                 ilines.push(Line::styled(tel, dim()));
+                if let Some(t) = self.last_telemetry.as_ref() {
+                    ilines.push(Line::styled(
+                        format!(
+                            "evidence: {} · reads {} · searches {} · listing_only {} · repair {}",
+                            t.discovery_depth,
+                            t.file_reads,
+                            t.targeted_searches,
+                            t.listing_only,
+                            t.quality_repair_nudges
+                        ),
+                        dim(),
+                    ));
+                }
                 // Scheduler parallelism: max concurrent batch and serial share.
                 let sched = if let Some(t) = self.last_telemetry.as_ref() {
                     if t.tool_calls > 0 {
@@ -4187,6 +4211,12 @@ mod tests {
             max_concurrent_batch: 3,
             serial_runs: 2,
             tool_timeline: Vec::new(),
+            file_reads: 2,
+            targeted_searches: 1,
+            listing_only: false,
+            first_tool_kind: "read".to_string(),
+            discovery_depth: "mixed".to_string(),
+            quality_repair_nudges: 0,
         });
         app.turn_tool_calls = 7;
         let mut term = Terminal::new(TestBackend::new(60, 16)).unwrap();
