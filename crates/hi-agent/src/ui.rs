@@ -101,6 +101,10 @@ pub fn classify_error(err: &anyhow::Error) -> (&'static str, &'static str) {
             "capacity",
             "capacity is temporarily unavailable — wait a moment, then /retry",
         ),
+        Some(K::ModelUnavailable) => (
+            "model_unavailable",
+            "the requested model route is unavailable — try /model to switch, or /retry if it was temporary",
+        ),
         Some(K::Outage) => (
             "outage",
             "the endpoint is unreachable or returning errors — check the provider's status page, or /provider to switch",
@@ -146,6 +150,7 @@ pub fn error_counts_as_model_issue(err: &anyhow::Error) -> bool {
         hi_ai::provider_error_kind(err),
         Some(
             hi_ai::ProviderErrorKind::CapacityUnavailable
+                | hi_ai::ProviderErrorKind::ModelUnavailable
                 | hi_ai::ProviderErrorKind::QualityRejected
                 | hi_ai::ProviderErrorKind::ToolProtocol
         )
@@ -274,6 +279,22 @@ mod tests {
 
         assert_eq!(kind, "capacity");
         assert!(guidance.contains("temporarily unavailable"));
+        assert!(!error_counts_as_model_issue(&err));
+    }
+
+    #[test]
+    fn model_unavailable_is_not_reported_as_capacity_or_incomplete_turn() {
+        let err: anyhow::Error = ProviderError::new(
+            ProviderErrorKind::ModelUnavailable,
+            "model temporarily unavailable",
+        )
+        .into();
+
+        let (kind, guidance) = classify_error(&err);
+
+        assert_eq!(kind, "model_unavailable");
+        assert!(guidance.contains("/model"));
+        assert!(!guidance.contains("capacity"));
         assert!(!error_counts_as_model_issue(&err));
     }
 

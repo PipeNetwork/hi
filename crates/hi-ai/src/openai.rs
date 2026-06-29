@@ -314,6 +314,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_temporarily_unavailable_is_not_capacity() {
+        let Some(server) = FakeOpenAiServer::new(vec![Response::json(
+            409,
+            r#"{"error":"model temporarily unavailable","code":"capacity_unavailable"}"#,
+        )]) else {
+            return;
+        };
+        let provider = OpenAiProvider::new(server.url().to_string(), "test".into());
+        let err = provider
+            .stream(request(vec![], Default::default()), &mut |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(
+            provider_error_kind(&err),
+            Some(ProviderErrorKind::ModelUnavailable)
+        );
+    }
+
+    #[tokio::test]
     async fn soft_protocol_http_errors_are_classified() {
         for (body, expected) in [
             (

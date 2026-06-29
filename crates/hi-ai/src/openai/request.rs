@@ -83,6 +83,8 @@ pub(crate) fn classify_http_error(status: StatusCode, text: &str) -> ProviderErr
     match status {
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => ProviderErrorKind::Auth,
         StatusCode::TOO_MANY_REQUESTS => ProviderErrorKind::RateLimit,
+        StatusCode::NOT_FOUND => ProviderErrorKind::ModelUnavailable,
+        _ if is_model_unavailable_text(text) => ProviderErrorKind::ModelUnavailable,
         StatusCode::CONFLICT | StatusCode::SERVICE_UNAVAILABLE
             if is_capacity_unavailable_text(text) =>
         {
@@ -132,10 +134,21 @@ pub(crate) fn capacity_retry_after_seconds(text: &str) -> Option<u64> {
 pub(crate) fn is_capacity_unavailable_text(text: &str) -> bool {
     mentions(
         text,
+        &["capacity_unavailable", "capacity temporarily unavailable"],
+    )
+}
+
+pub(crate) fn is_model_unavailable_text(text: &str) -> bool {
+    mentions(
+        text,
         &[
-            "capacity_unavailable",
-            "capacity temporarily unavailable",
-            "temporarily unavailable",
+            "model_unavailable",
+            "model temporarily unavailable",
+            "requested model is unavailable",
+            "model not available",
+            "model not enabled",
+            "model not supported",
+            "unknown model",
         ],
     )
 }

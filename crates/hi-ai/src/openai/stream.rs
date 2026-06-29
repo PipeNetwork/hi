@@ -819,7 +819,9 @@ pub(crate) fn classify_stream_error(err: anyhow::Error) -> ProviderError {
             .with_usage(provider.usage);
     }
     let text = err.to_string();
-    let kind = if request::is_quality_rejected_text(&text) {
+    let kind = if request::is_model_unavailable_text(&text) {
+        ProviderErrorKind::ModelUnavailable
+    } else if request::is_quality_rejected_text(&text) {
         ProviderErrorKind::QualityRejected
     } else if request::is_tool_protocol_text(&text) {
         ProviderErrorKind::ToolProtocol
@@ -859,11 +861,13 @@ fn classify_stream_api_error(message: &str) -> ProviderErrorKind {
         || lower.contains("too many tokens")
     {
         ProviderErrorKind::RequestTooLarge
+    } else if request::is_model_unavailable_text(message) {
+        ProviderErrorKind::ModelUnavailable
     } else if request::is_quality_rejected_text(message) {
         ProviderErrorKind::QualityRejected
     } else if request::is_tool_protocol_text(message) {
         ProviderErrorKind::ToolProtocol
-    } else if lower.contains("capacity") || lower.contains("temporarily unavailable") {
+    } else if lower.contains("capacity") || request::is_capacity_unavailable_text(message) {
         ProviderErrorKind::CapacityUnavailable
     } else if lower.contains("service unavailable")
         || lower.contains("no route")
@@ -1203,6 +1207,18 @@ mod tests {
                 "quality_rejected: insufficient evidence after review evidence repair"
             ),
             ProviderErrorKind::QualityRejected
+        );
+    }
+
+    #[test]
+    fn stream_model_unavailable_message_is_not_capacity() {
+        assert_eq!(
+            classify_stream_api_error("model temporarily unavailable"),
+            ProviderErrorKind::ModelUnavailable
+        );
+        assert_ne!(
+            classify_stream_api_error("model temporarily unavailable"),
+            ProviderErrorKind::CapacityUnavailable
         );
     }
 
