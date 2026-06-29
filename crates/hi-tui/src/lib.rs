@@ -1827,9 +1827,11 @@ impl App {
 
     /// The live "what's happening now" lead for the working line: the in-flight
     /// tool named with its own elapsed timer, otherwise the model phase —
-    /// `thinking…` (reasoning), `responding…` (streaming text), or `waiting for
-    /// the model…` (the round's model call is in flight but nothing's streamed
-    /// yet). Lets you tell a slow tool from a slow model at a glance.
+    /// `thinking…` (reasoning), `responding…` (streaming text), or `Working`
+    /// (the round's model call is in flight but nothing's streamed yet). The
+    /// `Working` lead is rendered with a rolling gray→white→gray wave animation
+    /// (see [`Self::working_spans`]); the others are plain cyan bold. Lets you
+    /// tell a slow tool from a slow model at a glance.
     fn activity_line(&self) -> String {
         // A compact progress suffix for multi-step turns: "round 3 · 5 calls".
         // Suppressed on the first round with no tool calls (the common single-shot case).
@@ -1854,9 +1856,37 @@ impl App {
         let verb = match self.last_turn_event {
             Some(TurnEventKind::Reasoning) => "thinking",
             Some(TurnEventKind::Assistant) => "responding",
-            _ => "waiting for the model",
+            _ => "Working",
         };
         format!("{verb}… {}{progress}", fmt_elapsed(secs))
+    }
+
+    /// The `Working` lead rendered as a rolling wave: every letter starts gray,
+    /// and one letter at a time lights up white (bold) sweeping across the word
+    /// and back, like the Codex app's animation. Driven by the per-redraw
+    /// `spinner` tick so it advances whenever the UI redraws.
+    ///
+    /// Returns the styled spans for the word `Working` (no trailing `…`/timer);
+    /// the caller appends those so the wave stays on the verb itself.
+    fn working_spans(&self) -> Vec<Span<'static>> {
+        const WORD: &str = "Working";
+        let chars: Vec<char> = WORD.chars().collect();
+        let n = chars.len();
+        // Sweep forward 0..n-1 then back n-1..0, giving a 2*(n-1) step cycle.
+        let cycle = 2 * (n - 1).max(1);
+        let step = self.spinner % cycle;
+        let lit = if step < n {
+            step
+        } else {
+            cycle - step
+        };
+        let gray = Style::default().fg(Color::DarkGray);
+        let lit_style = Style::default().fg(Color::White).add_modifier(Modifier::BOLD);
+        chars
+            .iter()
+            .enumerate()
+            .map(|(i, &c)| Span::styled(c.to_string(), if i == lit { lit_style } else { gray }))
+            .collect()
     }
 
     /// Apply a pure editing/navigation key to the input line, shared by the
@@ -3418,15 +3448,45 @@ impl App {
                 // The activity lead (named tool + timer, or thinking/responding)
                 // replaces the old coarse "working… · last: <event>"; its own timer
                 // and the watchdog notices cover the "is it stalled?" signal.
-                ilines.push(Line::from(vec![
-                    Span::styled(
-                        format!("{frame_ch} {}{stats}", self.activity_line()),
+                // The "Working" model phase renders as a rolling gray→white wave
+                // (working_spans); other leads stay cyan bold.
+                let activity = self.activity_line();
+                let is_working_wave = self.current_tool.is_none()
+                    && !matches!(
+                        self.last_turn_event,
+                        Some(TurnEventKind::Reasoning) | Some(TurnEventKind::Assistant)
+                    );
+                let mut lead: Vec<Span<'static>> =
+                    Vec::with_capacity(if is_working_wave { 8 } else { 1 });
+                lead.push(Span::styled(
+                    format!("{frame_ch} "),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                if is_working_wave {
+                    lead.extend(self.working_spans());
+                    // activity_line() == "Working… <secs>[ · round N · M calls]";
+                    // append everything after "Working" (the "…", timer, progress).
+                    if let Some(rest) = activity.strip_prefix("Working") {
+                        lead.push(Span::styled(
+                            rest.to_string(),
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                    }
+                } else {
+                    lead.push(Span::styled(
+                        activity,
                         Style::default()
                             .fg(Color::Cyan)
                             .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled("   Ctrl-C to interrupt", dim()),
-                ]));
+                    ));
+                }
+                lead.push(Span::styled(format!("{stats}"), Style::default()));
+                lead.push(Span::styled("   Ctrl-C to interrupt", dim()));
+                ilines.push(Line::from(lead));
                 // Show a tail of recent streamed tool output (e.g. bash stdout)
                 // so the user sees live progress during long-running commands.
                 for line in &self.tool_stream_tail {
@@ -3757,10 +3817,37 @@ mod tests {
         // …and clears back to the model once the result lands.
         app.apply(UiEvent::ToolResult("bash".into(), "ok".into()));
         assert!(
-            app.activity_line().starts_with("waiting for the model"),
+            app.activity_line().starts_with("Working"),
             "{}",
             app.activity_line()
         );
+    }
+
+    #[test]
+    fn working_wave_sweeps_one_lit_letter_at_a_time() {
+        // "Working" is 7 letters; the lit index sweeps 0..6 then 6..0.
+        // At each tick exactly one letter is white/bold and the rest are gray.
+        let mut app = test_app("openai", "gpt-4o");
+        app.set_working(true);
+        let n = "Working".chars().count();
+        let cycle = 2 * (n - 1);
+        for tick in 0..cycle {
+            app.spinner = tick;
+            let spans = app.working_spans();
+            assert_eq!(spans.len(), n, "one span per letter at tick {tick}");
+            let lit_count = spans
+                .iter()
+                .filter(|s| s.style.fg == Some(Color::White))
+                .count();
+            assert_eq!(lit_count, 1, "exactly one lit letter at tick {tick}");
+            // The lit index matches the forward/back sweep.
+            let expected_lit = if tick < n { tick } else { cycle - tick };
+            assert_eq!(
+                spans[expected_lit].style.fg,
+                Some(Color::White),
+                "lit index {expected_lit} at tick {tick}"
+            );
+        }
     }
 
     #[test]

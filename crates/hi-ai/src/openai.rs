@@ -343,6 +343,10 @@ mod tests {
                 r#"{"error":"quality_rejected: insufficient evidence after review evidence repair"}"#,
                 ProviderErrorKind::QualityRejected,
             ),
+            (
+                r#"{"error":"request not found"}"#,
+                ProviderErrorKind::MalformedStream,
+            ),
         ] {
             let Some(server) = FakeOpenAiServer::new(vec![Response::json(400, body)]) else {
                 return;

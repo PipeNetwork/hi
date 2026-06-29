@@ -827,7 +827,10 @@ pub(crate) fn classify_stream_error(err: anyhow::Error) -> ProviderError {
         ProviderErrorKind::ToolProtocol
     } else if text.contains("no output") {
         ProviderErrorKind::StreamTimeout
-    } else if text.contains("error reading stream") || text.contains("malformed SSE JSON chunk") {
+    } else if text.contains("error reading stream")
+        || text.contains("malformed SSE JSON chunk")
+        || text.to_ascii_lowercase().contains("request not found")
+    {
         ProviderErrorKind::MalformedStream
     } else {
         ProviderErrorKind::Other
@@ -877,6 +880,8 @@ fn classify_stream_api_error(message: &str) -> ProviderErrorKind {
         || lower.contains("first token")
     {
         ProviderErrorKind::Outage
+    } else if lower.contains("request not found") {
+        ProviderErrorKind::MalformedStream
     } else {
         ProviderErrorKind::Other
     }
@@ -1207,6 +1212,14 @@ mod tests {
                 "quality_rejected: insufficient evidence after review evidence repair"
             ),
             ProviderErrorKind::QualityRejected
+        );
+    }
+
+    #[test]
+    fn stream_request_not_found_is_retryable() {
+        assert_eq!(
+            classify_stream_api_error("request not found"),
+            ProviderErrorKind::MalformedStream
         );
     }
 

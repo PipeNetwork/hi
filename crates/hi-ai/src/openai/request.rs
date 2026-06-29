@@ -83,6 +83,7 @@ pub(crate) fn classify_http_error(status: StatusCode, text: &str) -> ProviderErr
     match status {
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => ProviderErrorKind::Auth,
         StatusCode::TOO_MANY_REQUESTS => ProviderErrorKind::RateLimit,
+        _ if mentions(text, &["request not found"]) => ProviderErrorKind::MalformedStream,
         StatusCode::NOT_FOUND => ProviderErrorKind::ModelUnavailable,
         _ if is_model_unavailable_text(text) => ProviderErrorKind::ModelUnavailable,
         StatusCode::CONFLICT | StatusCode::SERVICE_UNAVAILABLE

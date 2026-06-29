@@ -37,6 +37,14 @@ const PYTHON_TUI_MARKERS: &[&str] = &[
     "asciimatics",
     "npyscreen",
 ];
+const RUST_TUI_MARKERS: &[&str] = &[
+    "ratatui",
+    "crossterm",
+    "tui =",
+    "cursive",
+    "termion",
+    "termwiz",
+];
 
 /// Resolve the effective bash timeout: an explicit per-command request wins,
 /// else `HI_BASH_TIMEOUT_SECS`, else the default — always clamped to
@@ -1039,6 +1047,9 @@ fn foreground_interactive_command_reason(command: &str) -> Option<&'static str> 
             return Some("appears to launch a Python terminal UI in the foreground");
         }
     }
+    if program == "cargo" && cargo_run_looks_like_rust_tui(&tokens[program_idx + 1..]) {
+        return Some("appears to launch a Rust terminal UI in the foreground");
+    }
     None
 }
 
@@ -1117,6 +1128,29 @@ fn python_script_looks_interactive(path: &str) -> bool {
     text_looks_like_python_tui(&text)
 }
 
+fn cargo_run_looks_like_rust_tui(tokens: &[String]) -> bool {
+    if !tokens.iter().any(|token| token == "run") {
+        return false;
+    }
+    if tokens.iter().any(|token| {
+        matches!(
+            token.as_str(),
+            "--help" | "-h" | "--version" | "-V" | "help"
+        )
+    }) {
+        return false;
+    }
+    rust_workspace_looks_like_tui()
+}
+
+fn rust_workspace_looks_like_tui() -> bool {
+    let Ok(manifest) = std::fs::read_to_string("Cargo.toml") else {
+        return false;
+    };
+    let lower = manifest.to_ascii_lowercase();
+    RUST_TUI_MARKERS.iter().any(|marker| lower.contains(marker))
+}
+
 fn text_looks_like_python_tui(text: &str) -> bool {
     PYTHON_TUI_MARKERS
         .iter()
@@ -1149,7 +1183,10 @@ mod tests {
         is_read_only, run_bash_streaming_with_timeout, target_path,
     };
     use crate::edit::sh_quote;
+    use std::sync::{LazyLock, Mutex};
     use std::time::Duration;
+
+    static CWD_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     // A command that keeps its stdout pipe open and never exits must still
     // return via the timeout. Before the fix the timeout wrapped only
@@ -1271,6 +1308,37 @@ mod tests {
             "got: {}",
             out.content
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn detects_foreground_rust_tui_cargo_run() {
+        let _guard = CWD_TEST_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("hi-rust-tui-detect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nratatui = \"0.28\"\ncrossterm = \"0.28\"\n",
+        )
+        .unwrap();
+        let old = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+
+        assert!(foreground_interactive_command_reason("cargo run").is_some());
+        assert!(foreground_interactive_command_reason("TERM=xterm cargo run").is_some());
+        assert!(
+            foreground_interactive_command_reason("timeout 5s cargo run").is_none(),
+            "explicit timeout smoke tests are allowed"
+        );
+        assert!(
+            foreground_interactive_command_reason("cargo run -- --help").is_none(),
+            "noninteractive help runs are allowed"
+        );
+        assert!(foreground_interactive_command_reason("cargo test").is_none());
+        assert!(foreground_interactive_command_reason("cargo build").is_none());
+
+        std::env::set_current_dir(old).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

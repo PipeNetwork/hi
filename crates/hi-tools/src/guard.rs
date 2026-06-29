@@ -15,7 +15,9 @@
 /// `None`. This includes irreversible operations plus host-level environment
 /// mutations a git checkpoint cannot undo.
 pub fn blocked_op(command: &str) -> Option<&'static str> {
-    catastrophic_op(command).or_else(|| host_python_package_install(command))
+    catastrophic_op(command)
+        .or_else(|| host_python_package_install(command))
+        .or_else(|| host_or_global_package_install(command))
 }
 
 /// Returns a reason if `command` is irreversibly destructive and should be
@@ -122,6 +124,67 @@ fn host_python_package_install(command: &str) -> Option<&'static str> {
         return Some(
             "installs Python packages into the host environment; use a project virtualenv (for example `.venv/bin/pip install ...`) or an isolated --target/--prefix instead",
         );
+    }
+    None
+}
+
+fn host_or_global_package_install(command: &str) -> Option<&'static str> {
+    if std::env::var_os("HI_ALLOW_DANGEROUS").is_some()
+        || std::env::var_os("HI_ALLOW_HOST_PACKAGE_INSTALL").is_some()
+    {
+        return None;
+    }
+    let expanded = expand_command_substitution(command);
+    let segments: Vec<&str> = expanded
+        .split([';', '\n', '|', '&'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    for seg in segments {
+        let toks: Vec<&str> = seg.split_whitespace().collect();
+        let Some((pos, prog)) = first_program(&toks) else {
+            continue;
+        };
+        let base = basename(prog);
+        let rest = &toks[pos + 1..];
+        if matches!(
+            base,
+            "apt" | "apt-get" | "dnf" | "yum" | "apk" | "pacman" | "brew"
+        ) && rest.iter().any(|tok| {
+            matches!(
+                trim_quotes(tok),
+                "install" | "add" | "-S" | "--sync" | "cask"
+            )
+        }) {
+            return Some(
+                "installs packages with a host package manager; use project-local dependencies instead",
+            );
+        }
+        if base == "cargo"
+            && rest
+                .first()
+                .is_some_and(|tok| trim_quotes(tok) == "install")
+        {
+            return Some(
+                "installs a global Cargo binary; add project dependencies to Cargo.toml instead",
+            );
+        }
+        if matches!(base, "npm" | "pnpm" | "bun")
+            && rest.iter().any(|tok| {
+                let tok = trim_quotes(tok);
+                tok == "-g" || tok == "--global"
+            })
+        {
+            return Some("installs JavaScript packages globally; use the project manifest instead");
+        }
+        if base == "yarn"
+            && rest
+                .iter()
+                .any(|tok| matches!(trim_quotes(tok), "global" | "-g" | "--global"))
+        {
+            return Some("installs JavaScript packages globally; use the project manifest instead");
+        }
     }
     None
 }
@@ -418,6 +481,37 @@ mod tests {
             "PIP_DISABLE_PIP_VERSION_CHECK=1 pip install textual",
         ] {
             assert!(blocked_op(cmd).is_some(), "should block: {cmd}");
+        }
+    }
+
+    #[test]
+    fn blocks_host_or_global_package_installs() {
+        for cmd in [
+            "apt install ripgrep",
+            "apt-get install ripgrep",
+            "brew install ripgrep",
+            "cargo install cargo-edit",
+            "npm install -g typescript",
+            "npm i --global typescript",
+            "pnpm add -g cowsay",
+            "bun add -g cowsay",
+            "yarn global add typescript",
+        ] {
+            assert!(blocked_op(cmd).is_some(), "should block: {cmd}");
+        }
+    }
+
+    #[test]
+    fn allows_project_local_package_installs() {
+        for cmd in [
+            "cargo add ratatui crossterm",
+            "npm install",
+            "npm install react",
+            "pnpm add react",
+            "yarn add react",
+            "bun add react",
+        ] {
+            assert!(blocked_op(cmd).is_none(), "should allow: {cmd}");
         }
     }
 

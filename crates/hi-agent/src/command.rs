@@ -77,6 +77,7 @@ pub fn parse(line: &str) -> Option<Command> {
         "security" => Command::Prompt(read_only_macro_prompt("security", &arg)),
         "roadmap" => Command::Prompt(read_only_macro_prompt("roadmap", &arg)),
         "gaps" => Command::Prompt(read_only_macro_prompt("gaps", &arg)),
+        "build" => Command::Prompt(build_macro_prompt(&arg)),
         "status" | "st" if arg.is_empty() => Command::Status,
         "status" | "st" => Command::Prompt(read_only_macro_prompt("status", &arg)),
         "log" | "debug" => Command::Log,
@@ -130,6 +131,18 @@ fn read_only_macro_prompt(kind: &str, topic: &str) -> String {
     };
     format!(
         "Read-only {kind} request for: {topic}\n\nDo not write, edit, apply patches, run mutating shell commands, or change files. Use read-only inspection before the final answer. {recipe}\n\nIf only a directory listing is available, keep inspecting or explicitly say the evidence is insufficient instead of making file-specific findings."
+    )
+}
+
+fn build_macro_prompt(topic: &str) -> String {
+    let topic = topic.trim();
+    let topic = if topic.is_empty() {
+        "the requested tool"
+    } else {
+        topic
+    };
+    format!(
+        "Build {topic}.\n\nImplementation requirements:\n- Inspect the workspace before choosing files or stack.\n- Choose the local stack implied by existing manifests and entrypoints; if no stack is clear and this is a TUI, create a Rust binary in the current directory using Ratatui and Crossterm.\n- In an empty Rust target directory, prefer `cargo init --bin .` before editing so the manifest has a valid target from the start.\n- Edit or create the required files; do not stop at a plan, explanation, or scaffold.\n- Prefer a compact working vertical slice and small valid tool calls over one huge all-at-once source write.\n- Run an appropriate noninteractive validation command after the last file change.\n- Finish with a concise recap naming changed files and validation commands."
     )
 }
 
@@ -205,6 +218,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "gaps",
         args: "[topic]",
         help: "discuss missing gaps after inspection",
+        arg_values: &[],
+    },
+    CommandSpec {
+        name: "build",
+        args: "[thing]",
+        help: "build a tool/app end-to-end with edits and validation",
         arg_values: &[],
     },
     CommandSpec {
@@ -543,6 +562,13 @@ mod tests {
         let status = expand_prompt_macro("/status codebase state").unwrap();
         assert!(status.contains("codebase state"));
         assert!(status.contains("git status/diff"));
+
+        let build = expand_prompt_macro("/build gpu training calculator").unwrap();
+        assert!(build.contains("Build gpu training calculator."));
+        assert!(build.contains("Inspect the workspace"));
+        assert!(build.contains("Edit or create"));
+        assert!(build.contains("validation command"));
+        assert!(build.contains("changed files and validation commands"));
 
         assert!(expand_prompt_macro("/status").is_none());
     }

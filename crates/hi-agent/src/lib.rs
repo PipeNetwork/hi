@@ -212,6 +212,10 @@ pub const AUTO_KEEP_RECENT: usize = 3;
 /// malformed/empty *stream error* — each retry resampling hotter, before giving
 /// up and surfacing it.
 pub const MAX_EMPTY_RETRIES: u32 = 2;
+/// Invalid tool turns from local/open tool models often recover after an explicit
+/// schema nudge. Keep this separate from empty/malformed stream retries so normal
+/// completion failures do not get a larger budget.
+pub const MAX_TOOL_PROTOCOL_RETRIES: u32 = 4;
 /// Max times one turn will nudge the model to continue after its output was
 /// truncated by the output token cap (`stop_reason: "length"` / `"max_tokens"`).
 /// This is a *separate* budget from [`MAX_EMPTY_RETRIES`] because truncation is
@@ -338,6 +342,33 @@ insufficient for broader roadmap claims.";
 const SECURITY_PREFLIGHT_PATTERN: &str = "unsafe|unwrap\\(|expect\\(|panic!|std::process|process::Command|Command::new|spawn\\(|std::fs|fs::|read_to_string|std::env|env::|secret|token|auth|api_key|apikey|password|credential|bearer";
 const GAP_PREFLIGHT_PATTERN: &str =
     "TODO|FIXME|todo!|unimplemented!|missing|gap|needs coverage|not implemented";
+const IMPLEMENTATION_NO_CHANGES_NUDGE: &str = "This is an implementation request, but no \
+successful file changes are in the transcript yet. Do not finalize. Inspect the workspace if \
+needed, then create or edit the necessary files with write/edit/multi_edit/apply_patch or a \
+project-local scaffold command.";
+const IMPLEMENTATION_MISSING_VALIDATION_NUDGE: &str = "Files changed for this implementation \
+request, but no successful noninteractive validation command ran after the last change. Do not \
+finalize. Run the detected build/test/check command now, then finish with changed files and the \
+validation command.";
+const IMPLEMENTATION_SCAFFOLD_ONLY_NUDGE: &str = "This implementation request has only scaffold \
+or dependency/setup changes so far. Do not finalize yet. Edit the actual source/config files that \
+implement the requested behavior, then run validation after the final edit.";
+const IMPLEMENTATION_EMPTY_TUI_NUDGE: &str = "The implementation preflight found no project \
+manifest. This is a TUI request, so scaffold the Rust binary in the current directory now with \
+`cargo init --bin .`, then add Ratatui/Crossterm, implement the estimator, and validate with \
+`cargo test` or `cargo check`.";
+const TOOL_PROTOCOL_RETRY_NUDGE: &str = "The previous response was rejected by the provider \
+because it was not a valid tool turn. Continue using exactly valid tool calls from the available \
+schemas. For multi-line file creation, prefer `apply_patch` with `*** Add File` hunks, or call \
+`write` with JSON arguments containing `path` and `content`. For shell commands, call `bash` with \
+a JSON `command`. Do not put malformed JSON, markdown fences, or prose inside a tool call.";
+const TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE: &str = "Structured tool calls have been rejected \
+repeatedly by the provider. For this next response only, do not use provider/function tool calling. \
+Emit exactly one plain-text tool call in this XML-ish format and no markdown fences:\n\
+<tool_call>write<arg_key>path</arg_key><arg_value>src/main.rs</arg_value><arg_key>content</arg_key><arg_value>file contents here</arg_value></tool_call>\n\
+For shell commands use:\n\
+<tool_call>bash<arg_key>command</arg_key><arg_value>cargo test</arg_value></tool_call>\n\
+Keep the edit compact; a minimal working vertical slice is better than a huge invalid tool call.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReviewIntent {
@@ -346,6 +377,42 @@ enum ReviewIntent {
     Status,
     Roadmap,
     Gaps,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ImplementationIntent {
+    tui: bool,
+    gpu_training_estimator: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ImplementationTracker {
+    mutation_seen: bool,
+    substantive_edit_seen: bool,
+    validation_after_last_mutation: bool,
+    preferred_validation: Option<String>,
+    no_change_nudges: u32,
+    scaffold_only_nudges: u32,
+    missing_validation_nudges: u32,
+}
+
+impl ImplementationTracker {
+    fn record_tool_result(&mut self, name: &str, arguments: &str, output: &str) {
+        if output.starts_with("Error:") || output.starts_with("⚠ refused:") {
+            return;
+        }
+        if implementation_tool_call_mutates(name, arguments) {
+            self.mutation_seen = true;
+            if implementation_tool_call_substantively_edits(name, arguments) {
+                self.substantive_edit_seen = true;
+            }
+            self.validation_after_last_mutation = false;
+            return;
+        }
+        if self.mutation_seen && implementation_tool_call_validates(name, arguments) {
+            self.validation_after_last_mutation = true;
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -876,6 +943,118 @@ fn read_only_turn_prompt(input: &str, intent: ReviewIntent) -> String {
     )
 }
 
+fn classify_implementation_intent(input: &str) -> Option<ImplementationIntent> {
+    let normalized = normalize_intent_text(input);
+    if normalized.trim().is_empty()
+        || contains_any(
+            &normalized,
+            &[
+                "read only",
+                "read only review guard",
+                "do not write",
+                "use read only inspection",
+                "what should",
+                "should we",
+                "consider",
+                "roadmap",
+            ],
+        )
+    {
+        return None;
+    }
+    let words: Vec<&str> = normalized.split_whitespace().collect();
+    let has_direct_action = words
+        .iter()
+        .any(|word| matches!(*word, "build" | "create" | "make" | "develop" | "scaffold"));
+    let has_generic_action = words
+        .iter()
+        .any(|word| matches!(*word, "implement" | "write"));
+    if !has_direct_action && !has_generic_action {
+        return None;
+    }
+    let has_artifact = words.iter().any(|word| {
+        matches!(
+            *word,
+            "app"
+                | "application"
+                | "tool"
+                | "tui"
+                | "cli"
+                | "calculator"
+                | "estimator"
+                | "dashboard"
+                | "program"
+                | "utility"
+                | "service"
+                | "game"
+        )
+    }) || contains_any(
+        &normalized,
+        &[
+            "command line",
+            "terminal ui",
+            "text ui",
+            "gpu training",
+            "training time",
+            "loan calculator",
+        ],
+    );
+    if !has_artifact {
+        return None;
+    }
+    Some(ImplementationIntent {
+        tui: implementation_mentions_tui(&normalized),
+        gpu_training_estimator: implementation_mentions_gpu_training_estimator(&normalized),
+    })
+}
+
+fn implementation_mentions_tui(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &["tui", "terminal ui", "text ui", "ratatui", "crossterm"],
+    )
+}
+
+fn implementation_mentions_gpu_training_estimator(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "gpu training",
+            "training time",
+            "train time",
+            "training calculator",
+            "training estimator",
+            "how long training",
+            "how long it will take to train",
+        ],
+    ) || (normalized.contains("gpu")
+        && normalized.contains("train")
+        && normalized.contains("calculator"))
+}
+
+fn implementation_turn_prompt(input: &str, intent: ImplementationIntent) -> String {
+    let mut rules = vec![
+        "Implementation guard: inspect the workspace before choosing files or stack.".to_string(),
+        "Choose the existing local stack from manifests and entrypoints. If the workspace is empty or has no manifest, create the minimal project in the current directory rather than a nested sub-project.".to_string(),
+        "Make concrete file changes; do not stop at a plan, explanation, or scaffold.".to_string(),
+        "Prefer a compact working vertical slice and small valid tool calls over one huge all-at-once source write.".to_string(),
+        "Run a noninteractive validation command after the last file change, such as cargo test/check/build, npm test/build, python -m pytest, go test, make test, or an equivalent local command.".to_string(),
+        "The final recap must name changed files and exact validation command(s).".to_string(),
+        "Do not install packages globally or with host package managers. Use project manifests, project-local installs, or a virtual environment when dependencies are necessary.".to_string(),
+    ];
+    if intent.tui {
+        rules.push("For a TUI with no clear existing stack, default to Rust with Ratatui and Crossterm. In an empty directory, prefer `cargo init --bin .` before editing so Cargo.toml already has a valid target. Do not run a foreground TUI directly; validate with unit tests, cargo build/check/test, or a bounded smoke command such as `timeout 5s cargo run`.".to_string());
+    }
+    if intent.gpu_training_estimator {
+        rules.push(gpu_training_estimator_recipe());
+    }
+    format!("{input}\n\n{}", rules.join("\n"))
+}
+
+fn gpu_training_estimator_recipe() -> String {
+    "GPU training estimator requirements: inputs for parameter count, training tokens, precision, and utilization percentage; editable GPU counts for H100 80GB, A100 80GB, L40S, RTX 4090, RTX 3090, and MI300X; estimate `training_flops = 6 * params * tokens` and `seconds = training_flops / (sum(gpu_count * gpu_tflops) * utilization)`; keep pure estimator functions separate from the TUI layer and cover them with unit tests.".to_string()
+}
+
 fn read_only_preflight_initial_calls(intent: ReviewIntent) -> Vec<PreflightCall> {
     let mut calls = Vec::new();
     if matches!(
@@ -1035,6 +1214,677 @@ fn compact_preflight_tool_output(name: &str, output: &str) -> String {
     )
 }
 
+fn implementation_preflight_command() -> &'static str {
+    r#"set +e
+printf '[git_status]\n'
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git status --short 2>&1 | head -80
+else
+  printf 'not a git repository\n'
+fi
+printf '\n[git_diff_stat]\n'
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  git diff --stat 2>&1 | head -80
+else
+  printf 'not a git repository\n'
+fi
+printf '\n[workspace_manifests]\n'
+find . -path './target' -prune -o -path './node_modules' -prune -o -path './.git' -prune -o \( -name Cargo.toml -o -name package.json -o -name pyproject.toml -o -name go.mod -o -name Makefile -o -name justfile \) -print | sort | head -80
+printf '\n[readme_docs]\n'
+find . -maxdepth 3 -path './.git' -prune -o \( -iname 'README*' -o -iname 'DESIGN*' -o -path './docs/*' \) -print | sort | head -80
+printf '\n[likely_entrypoints]\n'
+find . -path './target' -prune -o -path './node_modules' -prune -o -path './.git' -prune -o \( -path './src/main.rs' -o -path './src/lib.rs' -o -path './src/bin/*.rs' -o -path './main.py' -o -path './app.py' -o -path './src/index.*' -o -path './src/main.*' -o -path './app/page.*' \) -print | sort | head -80
+printf '\n[detected_verification]\n'
+if find . -maxdepth 3 -path './target' -prune -o -name Cargo.toml -print -quit | grep -q .; then
+  printf 'primary=cargo test\n'
+  printf 'alternates=cargo check; cargo build\n'
+elif [ -f package.json ]; then
+  if grep -q '"test"' package.json; then printf 'primary=npm test\n'; else printf 'primary=npm run build\n'; fi
+  printf 'alternates=npm run check; npm run lint\n'
+elif [ -f pyproject.toml ]; then
+  printf 'primary=python -m pytest\n'
+elif [ -f go.mod ]; then
+  printf 'primary=go test ./...\n'
+elif [ -f Makefile ]; then
+  printf 'primary=make test\n'
+else
+  printf 'primary=inspect manifests first\n'
+fi
+"#
+}
+
+fn preferred_validation_from_preflight(output: &str) -> Option<String> {
+    for line in output.lines() {
+        let Some(command) = line.trim().strip_prefix("primary=") else {
+            continue;
+        };
+        let command = command.trim();
+        if !command.is_empty() && command != "inspect manifests first" {
+            return Some(command.to_string());
+        }
+    }
+    None
+}
+
+fn should_bootstrap_gpu_training_estimator(intent: ImplementationIntent) -> bool {
+    intent.gpu_training_estimator && implementation_workspace_can_accept_rust_bootstrap()
+}
+
+fn implementation_workspace_can_accept_rust_bootstrap() -> bool {
+    implementation_workspace_can_accept_rust_bootstrap_at(std::path::Path::new("."))
+}
+
+fn implementation_workspace_can_accept_rust_bootstrap_at(root: &std::path::Path) -> bool {
+    let manifest_paths = [
+        "Cargo.toml",
+        "package.json",
+        "pyproject.toml",
+        "go.mod",
+        "Makefile",
+        "justfile",
+    ];
+    if manifest_paths.iter().any(|path| root.join(path).exists()) {
+        return false;
+    }
+    if ["src/main.rs", "src/lib.rs"]
+        .iter()
+        .any(|path| root.join(path).exists())
+    {
+        return false;
+    }
+    if let Ok(mut entries) = std::fs::read_dir(root.join("src"))
+        && entries.next().is_some()
+    {
+        return false;
+    }
+    true
+}
+
+fn gpu_training_estimator_bootstrap_files(
+    intent: ImplementationIntent,
+) -> Vec<(&'static str, String)> {
+    vec![
+        (
+            "Cargo.toml",
+            gpu_training_estimator_bootstrap_cargo_toml(intent),
+        ),
+        ("src/lib.rs", gpu_training_estimator_bootstrap_lib_rs()),
+        (
+            "src/main.rs",
+            gpu_training_estimator_bootstrap_main_rs(intent),
+        ),
+    ]
+}
+
+fn gpu_training_estimator_bootstrap_cargo_toml(intent: ImplementationIntent) -> String {
+    if intent.tui {
+        r#"[package]
+name = "gpu_training_estimator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+crossterm = "0.27"
+ratatui = "0.24"
+"#
+        .to_string()
+    } else {
+        r#"[package]
+name = "gpu_training_estimator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+"#
+        .to_string()
+    }
+}
+
+fn gpu_training_estimator_bootstrap_lib_rs() -> String {
+    r#"#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GpuSpec {
+    pub name: &'static str,
+    pub tflops: f64,
+}
+
+pub const GPU_CATALOG: &[GpuSpec] = &[
+    GpuSpec {
+        name: "H100 80GB",
+        tflops: 989.0,
+    },
+    GpuSpec {
+        name: "A100 80GB",
+        tflops: 312.0,
+    },
+    GpuSpec {
+        name: "L40S",
+        tflops: 362.0,
+    },
+    GpuSpec {
+        name: "RTX 4090",
+        tflops: 330.0,
+    },
+    GpuSpec {
+        name: "RTX 3090",
+        tflops: 142.0,
+    },
+    GpuSpec {
+        name: "MI300X",
+        tflops: 1300.0,
+    },
+];
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum EstimateError {
+    InvalidWorkload,
+    InvalidUtilization,
+    NoGpuThroughput,
+}
+
+impl std::fmt::Display for EstimateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidWorkload => write!(f, "parameters and tokens must be positive numbers"),
+            Self::InvalidUtilization => {
+                write!(f, "utilization percent must be greater than 0 and at most 100")
+            }
+            Self::NoGpuThroughput => write!(f, "at least one GPU must be selected"),
+        }
+    }
+}
+
+impl std::error::Error for EstimateError {}
+
+pub fn training_flops(params: f64, tokens: f64) -> Result<f64, EstimateError> {
+    if !params.is_finite() || !tokens.is_finite() || params <= 0.0 || tokens <= 0.0 {
+        return Err(EstimateError::InvalidWorkload);
+    }
+    Ok(6.0 * params * tokens)
+}
+
+pub fn total_tflops(counts: &[u32]) -> f64 {
+    GPU_CATALOG
+        .iter()
+        .zip(counts.iter().copied())
+        .map(|(gpu, count)| gpu.tflops * f64::from(count))
+        .sum()
+}
+
+pub fn estimate_seconds(
+    params: f64,
+    tokens: f64,
+    utilization_percent: f64,
+    counts: &[u32],
+) -> Result<f64, EstimateError> {
+    if !utilization_percent.is_finite()
+        || utilization_percent <= 0.0
+        || utilization_percent > 100.0
+    {
+        return Err(EstimateError::InvalidUtilization);
+    }
+    let tflops = total_tflops(counts);
+    if tflops <= 0.0 {
+        return Err(EstimateError::NoGpuThroughput);
+    }
+    let denominator = tflops * 1_000_000_000_000.0 * (utilization_percent / 100.0);
+    Ok(training_flops(params, tokens)? / denominator)
+}
+
+pub fn format_duration(seconds: f64) -> String {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return "unavailable".to_string();
+    }
+    let minute = 60.0;
+    let hour = 60.0 * minute;
+    let day = 24.0 * hour;
+    let year = 365.0 * day;
+    if seconds < minute {
+        format!("{seconds:.1} seconds")
+    } else if seconds < hour {
+        format!("{:.1} minutes", seconds / minute)
+    } else if seconds < day {
+        format!("{:.1} hours", seconds / hour)
+    } else if seconds < year {
+        format!("{:.1} days", seconds / day)
+    } else {
+        format!("{:.2} years", seconds / year)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn training_flops_uses_six_times_params_times_tokens() {
+        let flops = training_flops(1.0e9, 2.0e9).unwrap();
+        assert!((flops - 12.0e18).abs() < 1.0);
+    }
+
+    #[test]
+    fn estimates_seconds_from_gpu_counts_and_utilization() {
+        let seconds = estimate_seconds(1.0e9, 1.0e9, 50.0, &[1, 0, 0, 0, 0, 0]).unwrap();
+        let expected = 6.0e18 / (989.0e12 * 0.5);
+        assert!((seconds - expected).abs() < 0.001);
+    }
+
+    #[test]
+    fn rejects_empty_gpu_selection() {
+        assert_eq!(
+            estimate_seconds(1.0e9, 1.0e9, 50.0, &[0, 0, 0, 0, 0, 0]),
+            Err(EstimateError::NoGpuThroughput)
+        );
+    }
+}
+"#
+    .to_string()
+}
+
+fn gpu_training_estimator_bootstrap_main_rs(intent: ImplementationIntent) -> String {
+    if intent.tui {
+        r#"use std::{io, time::Duration};
+
+use crossterm::{
+    event::{self, Event, KeyCode},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use gpu_training_estimator::{estimate_seconds, format_duration, GPU_CATALOG};
+use ratatui::{
+    backend::{Backend, CrosstermBackend},
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Paragraph},
+    Terminal,
+};
+
+struct Field {
+    label: &'static str,
+    value: String,
+}
+
+struct AppState {
+    fields: Vec<Field>,
+    selected: usize,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        let mut fields = vec![
+            Field {
+                label: "Parameters (billions)",
+                value: "7".to_string(),
+            },
+            Field {
+                label: "Training tokens (billions)",
+                value: "300".to_string(),
+            },
+            Field {
+                label: "Precision",
+                value: "bf16".to_string(),
+            },
+            Field {
+                label: "Utilization percent",
+                value: "40".to_string(),
+            },
+        ];
+        for gpu in GPU_CATALOG {
+            fields.push(Field {
+                label: gpu.name,
+                value: if gpu.name == "H100 80GB" { "1" } else { "0" }.to_string(),
+            });
+        }
+        Self {
+            fields,
+            selected: 0,
+        }
+    }
+}
+
+impl AppState {
+    fn next(&mut self) {
+        self.selected = (self.selected + 1) % self.fields.len();
+    }
+
+    fn previous(&mut self) {
+        self.selected = if self.selected == 0 {
+            self.fields.len() - 1
+        } else {
+            self.selected - 1
+        };
+    }
+
+    fn push(&mut self, ch: char) {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+            self.fields[self.selected].value.push(ch);
+        }
+    }
+
+    fn backspace(&mut self) {
+        self.fields[self.selected].value.pop();
+    }
+
+    fn parse_float(&self, index: usize) -> f64 {
+        self.fields[index].value.parse::<f64>().unwrap_or(0.0)
+    }
+
+    fn estimate_label(&self) -> String {
+        let params = self.parse_float(0) * 1.0e9;
+        let tokens = self.parse_float(1) * 1.0e9;
+        let utilization = self.parse_float(3);
+        let counts: Vec<u32> = self
+            .fields
+            .iter()
+            .skip(4)
+            .map(|field| field.value.parse::<u32>().unwrap_or(0))
+            .collect();
+        match estimate_seconds(params, tokens, utilization, &counts) {
+            Ok(seconds) => format!(
+                "Estimate: {} at {} precision",
+                format_duration(seconds),
+                self.fields[2].value
+            ),
+            Err(err) => format!("Estimate unavailable: {err}"),
+        }
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+    let mut state = AppState::default();
+    let result = run_app(&mut terminal, &mut state);
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+    result?;
+    Ok(())
+}
+
+fn run_app<B: Backend>(terminal: &mut Terminal<B>, state: &mut AppState) -> io::Result<()> {
+    loop {
+        terminal.draw(|frame| {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints(
+                    [
+                        Constraint::Length(3),
+                        Constraint::Min(8),
+                        Constraint::Length(3),
+                    ]
+                    .as_ref(),
+                )
+                .split(frame.size());
+
+            let title = Paragraph::new("GPU Training Time Estimator")
+                .block(Block::default().borders(Borders::ALL));
+            frame.render_widget(title, chunks[0]);
+
+            let rows: Vec<Line> = state
+                .fields
+                .iter()
+                .enumerate()
+                .map(|(index, field)| {
+                    let marker = if index == state.selected { "> " } else { "  " };
+                    let style = if index == state.selected {
+                        Style::default().fg(Color::Yellow)
+                    } else {
+                        Style::default()
+                    };
+                    Line::from(vec![
+                        Span::styled(marker, style),
+                        Span::styled(field.label, style),
+                        Span::raw(": "),
+                        Span::raw(field.value.clone()),
+                    ])
+                })
+                .collect();
+            let form = Paragraph::new(rows).block(Block::default().borders(Borders::ALL));
+            frame.render_widget(form, chunks[1]);
+
+            let footer = Paragraph::new(format!(
+                "{} | Tab/arrow keys move, type to edit, Backspace deletes, q quits",
+                state.estimate_label()
+            ))
+            .block(Block::default().borders(Borders::ALL));
+            frame.render_widget(footer, chunks[2]);
+        })?;
+
+        if event::poll(Duration::from_millis(150))? {
+            if let Event::Key(key) = event::read()? {
+                match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                    KeyCode::Tab | KeyCode::Down | KeyCode::Enter => state.next(),
+                    KeyCode::BackTab | KeyCode::Up => state.previous(),
+                    KeyCode::Backspace => state.backspace(),
+                    KeyCode::Char(ch) => state.push(ch),
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+"#
+        .to_string()
+    } else {
+        r#"use std::env;
+
+use gpu_training_estimator::{estimate_seconds, format_duration, GPU_CATALOG};
+
+fn main() {
+    let args: Vec<String> = env::args().collect();
+    if args.iter().any(|arg| arg == "-h" || arg == "--help") {
+        print_usage();
+        return;
+    }
+
+    let params_b = parse_f64(&args, 1, 7.0);
+    let tokens_b = parse_f64(&args, 2, 300.0);
+    let utilization = parse_f64(&args, 3, 40.0);
+    let mut counts = vec![0_u32; GPU_CATALOG.len()];
+    if args.len() <= 4 {
+        counts[0] = 1;
+    } else {
+        for (index, count) in counts.iter_mut().enumerate() {
+            *count = parse_u32(&args, index + 4, 0);
+        }
+    }
+
+    match estimate_seconds(params_b * 1.0e9, tokens_b * 1.0e9, utilization, &counts) {
+        Ok(seconds) => {
+            println!("GPU training estimate");
+            println!("parameters: {params_b:.3}B");
+            println!("tokens: {tokens_b:.3}B");
+            println!("utilization: {utilization:.1}%");
+            for (gpu, count) in GPU_CATALOG.iter().zip(counts.iter()) {
+                println!("{}: {}", gpu.name, count);
+            }
+            println!("estimated time: {}", format_duration(seconds));
+        }
+        Err(err) => {
+            eprintln!("error: {err}");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn parse_f64(args: &[String], index: usize, default: f64) -> f64 {
+    args.get(index)
+        .and_then(|value| value.parse::<f64>().ok())
+        .unwrap_or(default)
+}
+
+fn parse_u32(args: &[String], index: usize, default: u32) -> u32 {
+    args.get(index)
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(default)
+}
+
+fn print_usage() {
+    println!("Usage:");
+    println!("  gpu_training_estimator [params_b] [tokens_b] [utilization_percent] [H100] [A100] [L40S] [RTX4090] [RTX3090] [MI300X]");
+    println!();
+    println!("Defaults estimate 7B parameters, 300B training tokens, 40% utilization, and one H100 80GB.");
+}
+"#
+        .to_string()
+    }
+}
+
+fn bash_command(arguments: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(arguments).ok()?;
+    value
+        .get("command")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+fn implementation_tool_call_mutates(name: &str, arguments: &str) -> bool {
+    if hi_tools::is_filesystem_mutating(name) {
+        return true;
+    }
+    if name != "bash" {
+        return false;
+    }
+    let Some(command) = bash_command(arguments) else {
+        return false;
+    };
+    shell_command_likely_mutates_workspace(&command)
+}
+
+fn implementation_tool_call_substantively_edits(name: &str, arguments: &str) -> bool {
+    if matches!(name, "write" | "edit" | "multi_edit" | "apply_patch") {
+        return true;
+    }
+    if name != "bash" {
+        return false;
+    }
+    let Some(command) = bash_command(arguments) else {
+        return false;
+    };
+    shell_command_likely_edits_files(&command)
+}
+
+fn implementation_tool_call_validates(name: &str, arguments: &str) -> bool {
+    if name != "bash" {
+        return false;
+    }
+    let Some(command) = bash_command(arguments) else {
+        return false;
+    };
+    shell_command_likely_validates(&command)
+}
+
+fn shell_command_likely_mutates_workspace(command: &str) -> bool {
+    let compact = command
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    contains_any(
+        &compact,
+        &[
+            "cargo init",
+            "npm init",
+            "pnpm init",
+            "yarn init",
+            "bun init",
+            "cargo add",
+            "npm install",
+            "pnpm add",
+            "yarn add",
+            "bun add",
+            "mkdir ",
+            "touch ",
+            "cat >",
+            "tee ",
+            "sed -i",
+            "apply_patch",
+            "patch -p",
+        ],
+    )
+}
+
+fn shell_command_likely_edits_files(command: &str) -> bool {
+    let compact = command
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    contains_any(
+        &compact,
+        &[
+            "cat >",
+            "cat <<",
+            "tee ",
+            "sed -i",
+            "perl -i",
+            "apply_patch",
+            "patch -p",
+            "python - <<",
+            "python3 - <<",
+        ],
+    )
+}
+
+fn shell_command_likely_validates(command: &str) -> bool {
+    let compact = command
+        .to_ascii_lowercase()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    contains_any(
+        &compact,
+        &[
+            "cargo test",
+            "cargo check",
+            "cargo build",
+            "cargo clippy",
+            "npm test",
+            "npm run test",
+            "npm run build",
+            "npm run check",
+            "npm run lint",
+            "pnpm test",
+            "pnpm build",
+            "pnpm check",
+            "pnpm lint",
+            "yarn test",
+            "yarn build",
+            "bun test",
+            "bun run build",
+            "pytest",
+            "python -m pytest",
+            "go test",
+            "make test",
+            "make check",
+            "make build",
+            "just test",
+            "just check",
+            "just build",
+            "timeout 5s cargo run",
+            "cargo run --",
+        ],
+    )
+}
+
+fn implementation_missing_validation_nudge(tracker: &ImplementationTracker) -> String {
+    let preferred = tracker
+        .preferred_validation
+        .as_deref()
+        .map(|command| format!(" Prefer `{command}`."))
+        .unwrap_or_default();
+    format!("{IMPLEMENTATION_MISSING_VALIDATION_NUDGE}{preferred}")
+}
+
+fn implementation_text_tool_nudge(reason: &str) -> String {
+    format!("{reason}\n\n{TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE}")
+}
+
 fn answer_says_insufficient_evidence(content: &str) -> bool {
     let lower = content.to_ascii_lowercase();
     contains_any(
@@ -1115,7 +1965,9 @@ fn answer_lacks_review_shape(intent: ReviewIntent, answer: &str) -> bool {
         &lower,
         &[
             "inspected",
+            "reviewed",
             "evidence",
+            "findings:",
             "based on",
             "limited to",
             "from the inspected",
@@ -1169,9 +2021,12 @@ fn answer_lacks_review_shape(intent: ReviewIntent, answer: &str) -> bool {
             &lower,
             &[
                 "finding",
+                "reviewed",
                 "status",
                 "risk",
                 "validation",
+                "tests pass",
+                "test pass",
                 "follow-up",
                 "follow up",
             ],
@@ -2897,6 +3752,136 @@ impl Agent {
         executed
     }
 
+    async fn run_implementation_preflight(
+        &mut self,
+        ui: &mut dyn Ui,
+        tracker: &mut ImplementationTracker,
+        tool_timeline: &mut Vec<ToolCallEntry>,
+    ) -> u32 {
+        let arguments = serde_json::json!({
+            "command": implementation_preflight_command(),
+            "timeout": 30,
+        })
+        .to_string();
+        let id = format!("hi_implementation_preflight_{}", self.messages.len());
+        ui.status("running implementation preflight inspection");
+        ui.tool_started("bash", &arguments);
+        ui.tool_call("bash", &arguments);
+        let started = std::time::Instant::now();
+        let output = execute("bash", &arguments).await;
+        let duration_ms = started.elapsed().as_millis() as u64;
+        let error = output.content.starts_with("Error:");
+        tracker.preferred_validation = preferred_validation_from_preflight(&output.content);
+        tool_timeline.push(ToolCallEntry {
+            tool: "bash".to_string(),
+            path: String::new(),
+            duration_ms,
+            error,
+        });
+        emit_tool_output(ui, "bash", &output);
+        self.messages.push_assistant_with_results(
+            vec![Content::ToolCall {
+                id: id.clone(),
+                name: "bash".to_string(),
+                arguments,
+            }],
+            vec![(id, output.content)],
+        );
+        1
+    }
+
+    async fn run_gpu_training_estimator_bootstrap(
+        &mut self,
+        ui: &mut dyn Ui,
+        tracker: &mut ImplementationTracker,
+        tool_timeline: &mut Vec<ToolCallEntry>,
+        intent: ImplementationIntent,
+    ) -> u32 {
+        ui.status("bootstrapping GPU training estimator project");
+        let mut executed = 0u32;
+        let mut content = Vec::new();
+        let mut results = Vec::new();
+
+        for (index, (path, file_content)) in gpu_training_estimator_bootstrap_files(intent)
+            .into_iter()
+            .enumerate()
+        {
+            let arguments = serde_json::json!({
+                "path": path,
+                "content": file_content,
+            })
+            .to_string();
+            let id = format!(
+                "hi_implementation_bootstrap_{}_{}",
+                self.messages.len(),
+                index
+            );
+            ui.tool_started("write", &arguments);
+            ui.tool_call("write", &arguments);
+            let started = std::time::Instant::now();
+            let output = execute("write", &arguments).await;
+            let duration_ms = started.elapsed().as_millis() as u64;
+            let error = output.content.starts_with("Error:");
+            tracker.record_tool_result("write", &arguments, &output.content);
+            tool_timeline.push(ToolCallEntry {
+                tool: "write".to_string(),
+                path: path.to_string(),
+                duration_ms,
+                error,
+            });
+            emit_tool_output(ui, "write", &output);
+            content.push(Content::ToolCall {
+                id: id.clone(),
+                name: "write".to_string(),
+                arguments,
+            });
+            results.push((id, output.content));
+            self.invalidate_snapshot();
+            executed = executed.saturating_add(1);
+        }
+
+        tracker.preferred_validation = Some("cargo test".to_string());
+        let arguments = serde_json::json!({
+            "command": "cargo test",
+            "timeout": 180,
+        })
+        .to_string();
+        let id = format!(
+            "hi_implementation_bootstrap_validate_{}",
+            self.messages.len()
+        );
+        ui.tool_started("bash", &arguments);
+        ui.tool_call("bash", &arguments);
+        let started = std::time::Instant::now();
+        let output = execute_streaming("bash", &arguments, &mut |line: &str| {
+            ui.tool_stream("bash", line);
+        })
+        .await;
+        let duration_ms = started.elapsed().as_millis() as u64;
+        let error = output.content.starts_with("Error:");
+        tracker.record_tool_result("bash", &arguments, &output.content);
+        tool_timeline.push(ToolCallEntry {
+            tool: "bash".to_string(),
+            path: String::new(),
+            duration_ms,
+            error,
+        });
+        emit_tool_output(ui, "bash", &output);
+        content.push(Content::ToolCall {
+            id: id.clone(),
+            name: "bash".to_string(),
+            arguments,
+        });
+        results.push((id, output.content));
+        self.invalidate_snapshot();
+        executed = executed.saturating_add(1);
+
+        if !content.is_empty() {
+            self.messages.push_assistant_with_results(content, results);
+        }
+        executed
+    }
+
     /// Run one user turn to completion, emitting output through `ui`.
     ///
     /// After the model stops calling tools, an optional verification command is
@@ -2905,10 +3890,24 @@ impl Agent {
     pub async fn run_turn(&mut self, input: &str, ui: &mut dyn Ui) -> Result<()> {
         let expanded_input =
             command::expand_prompt_macro(input).unwrap_or_else(|| input.to_string());
-        let read_only_intent = classify_read_only_intent(&expanded_input);
-        let turn_input = read_only_intent
-            .map(|intent| read_only_turn_prompt(&expanded_input, intent))
-            .unwrap_or(expanded_input);
+        let implementation_candidate = classify_implementation_intent(&expanded_input);
+        let read_only_intent = if implementation_candidate.is_some() {
+            None
+        } else {
+            classify_read_only_intent(&expanded_input)
+        };
+        let implementation_intent = if read_only_intent.is_none() {
+            implementation_candidate
+        } else {
+            None
+        };
+        let turn_input = if let Some(intent) = read_only_intent {
+            read_only_turn_prompt(&expanded_input, intent)
+        } else if let Some(intent) = implementation_intent {
+            implementation_turn_prompt(&expanded_input, intent)
+        } else {
+            expanded_input
+        };
         let input = turn_input.as_str();
 
         if read_only_intent.is_none() && self.tools_unavailable_for(input) {
@@ -3028,6 +4027,8 @@ impl Agent {
         // turn (kept for finalization gating — a plain Q&A turn doesn't need a
         // recap).
         let mut made_tool_call = false;
+        let mut implementation_tracker = ImplementationTracker::default();
+        let mut empty_tui_needs_project = false;
         if let Some(intent) = read_only_intent
             && self.config.read_only_preflight
             && !matches!(self.config.tool_mode, ToolMode::ChatOnly)
@@ -3042,10 +4043,26 @@ impl Agent {
                 sched_max_concurrent = sched_max_concurrent.max(1);
             }
         }
+        if implementation_intent.is_some() && !matches!(self.config.tool_mode, ToolMode::ChatOnly) {
+            let preflight_calls = self
+                .run_implementation_preflight(ui, &mut implementation_tracker, &mut tool_timeline)
+                .await;
+            if preflight_calls > 0 {
+                made_tool_call = true;
+                sched_tool_calls = sched_tool_calls.saturating_add(preflight_calls);
+                sched_serial_runs = sched_serial_runs.saturating_add(preflight_calls);
+                sched_max_concurrent = sched_max_concurrent.max(1);
+            }
+            empty_tui_needs_project = implementation_intent.is_some_and(|intent| intent.tui)
+                && implementation_tracker.preferred_validation.is_none();
+        }
         // Signature (name, arguments) of the previous round's tool calls, to
         // spot a model re-issuing the exact same call and looping on it.
         let mut prev_call_sig: Option<Vec<(String, String)>> = None;
         let mut request_too_large_retried = false;
+        let mut protocol_retries = 0u32;
+        let mut protocol_text_fallbacks = 0u32;
+        let mut text_tool_fallback_next = false;
         // Whether the turn ended because the model kept re-issuing the exact
         // same tool call through the whole repeat-nudge budget (drives the
         // incomplete notice and skips the finalization recap).
@@ -3066,6 +4083,33 @@ impl Agent {
         // avoid a second full tree walk when verify already took one.
         let mut verify_snapshot: Option<Snapshot> = None;
 
+        if let Some(intent) = implementation_intent
+            && !matches!(self.config.tool_mode, ToolMode::ChatOnly)
+            && implementation_tracker.preferred_validation.is_none()
+            && should_bootstrap_gpu_training_estimator(intent)
+        {
+            let bootstrap_calls = self
+                .run_gpu_training_estimator_bootstrap(
+                    ui,
+                    &mut implementation_tracker,
+                    &mut tool_timeline,
+                    intent,
+                )
+                .await;
+            if bootstrap_calls > 0 {
+                made_tool_call = true;
+                sched_tool_calls = sched_tool_calls.saturating_add(bootstrap_calls);
+                sched_serial_runs = sched_serial_runs.saturating_add(bootstrap_calls);
+                sched_max_concurrent = sched_max_concurrent.max(1);
+                empty_tui_needs_project = false;
+            }
+        }
+        if empty_tui_needs_project {
+            force_tools_next = true;
+            self.messages
+                .push_nudge(NudgeKind::Continue, IMPLEMENTATION_EMPTY_TUI_NUDGE);
+        }
+
         'turn: loop {
             // Inner loop: model + tools until the model stops calling tools, or
             // the per-turn step cap is hit.
@@ -3082,8 +4126,17 @@ impl Agent {
                 // `empty_retries` resets on real output, so a normal round runs at
                 // the configured sampling. Toggleable via HI_RECOVERY_SAMPLING for
                 // A/B-ing on the eval harness.
-                let (temperature, top_p, frequency_penalty) =
-                    recovery_sampling(empty_retries, self.config.temperature, *RECOVERY_SAMPLING);
+                let sampling_retries = empty_retries.max(protocol_retries);
+                let sampling_budget = if protocol_retries > empty_retries {
+                    MAX_TOOL_PROTOCOL_RETRIES
+                } else {
+                    self.config.max_empty_retries
+                };
+                let (temperature, top_p, frequency_penalty) = recovery_sampling(
+                    sampling_retries,
+                    self.config.temperature,
+                    *RECOVERY_SAMPLING,
+                );
 
                 // Telemetry for the recovery-sampling A/B: emit a concise debug
                 // line only when sampling is actually being changed (recovery on
@@ -3092,8 +4145,8 @@ impl Agent {
                 // continue nudges re-run at the configured sampling.
                 if let Some(line) = recovery_telemetry(
                     StallMode::Empty,
-                    empty_retries,
-                    self.config.max_empty_retries,
+                    sampling_retries,
+                    sampling_budget,
                     temperature,
                     top_p,
                     frequency_penalty,
@@ -3116,16 +4169,23 @@ impl Agent {
                     "transcript invariant violated before provider send"
                 );
 
+                let request_text_tool_fallback = text_tool_fallback_next;
+                text_tool_fallback_next = false;
+
                 // After a continue-nudge, force this round to call a tool rather
                 // than narrate again or come back empty. Only when tools are
                 // freely available (Auto): never override an intentional
                 // ChatOnly/ReadOnly restriction, and Required already forces.
-                let tool_mode = if force_tools_next && self.config.tool_mode == ToolMode::Auto {
+                let tool_mode = if request_text_tool_fallback {
+                    ToolMode::ChatOnly
+                } else if force_tools_next && self.config.tool_mode == ToolMode::Auto {
                     ToolMode::Required
                 } else {
                     self.config.tool_mode
                 };
-                let tool_availability_mode = if read_only_intent.is_some()
+                let tool_availability_mode = if request_text_tool_fallback {
+                    ToolMode::ChatOnly
+                } else if read_only_intent.is_some()
                     && !matches!(self.config.tool_mode, ToolMode::ChatOnly)
                 {
                     ToolMode::ReadOnly
@@ -3148,7 +4208,8 @@ impl Agent {
                     },
                 };
 
-                let buffer_read_only_review_text = read_only_intent.is_some();
+                let buffer_read_only_review_text =
+                    read_only_intent.is_some() || implementation_intent.is_some();
                 let mut buffered_assistant_text = String::new();
                 let mut sink = |event: StreamEvent| match event {
                     StreamEvent::Text(text) => {
@@ -3189,12 +4250,66 @@ impl Agent {
                         ui.turn_error(kind, &err.to_string(), guidance);
                         return Err(err);
                     }
+                    Err(err)
+                        if provider_error_kind(&err) == Some(ProviderErrorKind::ToolProtocol)
+                            && protocol_retries < MAX_TOOL_PROTOCOL_RETRIES =>
+                    {
+                        ui.assistant_end();
+                        self.add_error_usage(&err);
+                        protocol_retries += 1;
+                        if implementation_intent.is_some() || made_tool_call {
+                            force_tools_next = true;
+                        }
+                        ui.status(&format!(
+                            "⚠ the model emitted an invalid tool turn — retrying with tool-format guidance ({protocol_retries}/{MAX_TOOL_PROTOCOL_RETRIES})"
+                        ));
+                        if self
+                            .messages
+                            .as_slice()
+                            .last()
+                            .is_some_and(|message| message.role == Role::User)
+                        {
+                            self.messages.push_user_or_fold(TOOL_PROTOCOL_RETRY_NUDGE);
+                        } else {
+                            self.messages
+                                .push_nudge(NudgeKind::Continue, TOOL_PROTOCOL_RETRY_NUDGE);
+                        }
+                        continue;
+                    }
+                    Err(err)
+                        if provider_error_kind(&err) == Some(ProviderErrorKind::ToolProtocol)
+                            && implementation_intent.is_some()
+                            && protocol_text_fallbacks < 1 =>
+                    {
+                        ui.assistant_end();
+                        self.add_error_usage(&err);
+                        protocol_text_fallbacks += 1;
+                        text_tool_fallback_next = true;
+                        force_tools_next = false;
+                        ui.status(
+                            "structured tool calls kept failing; falling back to plain-text tool-call parsing",
+                        );
+                        if self
+                            .messages
+                            .as_slice()
+                            .last()
+                            .is_some_and(|message| message.role == Role::User)
+                        {
+                            self.messages
+                                .push_user_or_fold(TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE);
+                        } else {
+                            self.messages
+                                .push_nudge(NudgeKind::Continue, TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE);
+                        }
+                        continue;
+                    }
                     // A transient generation flake — a malformed/garbled stream or
                     // an empty completion. Treat it like a content-less response:
                     // flush, then silently re-run with hotter recovery sampling (a
                     // fresh request, with its own transport retries) up to the same
                     // budget, instead of failing the turn. Terminal errors (auth,
-                    // outage, …) fall through to the abort below.
+                    // outage, …) fall through to the abort below. Invalid tool turns
+                    // use the protocol-specific nudge path above.
                     Err(err)
                         if empty_retries < self.config.max_empty_retries
                             && matches!(
@@ -3500,6 +4615,7 @@ impl Agent {
                 // temperature bump is transient: a later, unrelated stall gets
                 // its own budget rather than inheriting this one's elevation.
                 empty_retries = 0;
+                protocol_retries = 0;
 
                 if calls.is_empty() {
                     // Text but no tool call (the content-less case was handled
@@ -3519,6 +4635,129 @@ impl Agent {
                     // A *finished* response ends the turn cleanly: a final recap
                     // after a multi-step task with a complete plan, or a plain
                     // Q&A answer. Bounded so it can't loop forever.
+                    let looks_unfinished = looks_like_unfinished_step(&assistant_text);
+                    let plan_incomplete = plan_has_pending_steps(&self.last_plan);
+                    if read_only_intent.is_some()
+                        && (looks_unfinished || plan_incomplete)
+                        && silent_continues < self.config.max_silent_continues
+                    {
+                        self.messages
+                            .push_assistant(std::mem::take(&mut completion.content));
+                        silent_continues += 1;
+                        force_tools_next = true;
+                        let nudge = if plan_incomplete && !looks_unfinished {
+                            PLAN_CONTINUE_NUDGE
+                        } else {
+                            SILENT_CONTINUE_NUDGE
+                        };
+                        self.messages.push_nudge(NudgeKind::Continue, nudge);
+                        continue;
+                    }
+                    if implementation_intent.is_some() && !implementation_tracker.mutation_seen {
+                        if implementation_tracker.no_change_nudges < 2 {
+                            implementation_tracker.no_change_nudges += 1;
+                            evidence.quality_repair_nudges =
+                                evidence.quality_repair_nudges.saturating_add(1);
+                            let use_text_fallback = implementation_tracker.no_change_nudges >= 2;
+                            force_tools_next = !use_text_fallback;
+                            text_tool_fallback_next = use_text_fallback;
+                            ui.status(
+	                                "implementation answer had no file changes; nudging the model to edit or scaffold",
+	                            );
+                            self.messages
+                                .push_assistant(std::mem::take(&mut completion.content));
+                            let nudge = if use_text_fallback {
+                                implementation_text_tool_nudge(IMPLEMENTATION_NO_CHANGES_NUDGE)
+                            } else {
+                                IMPLEMENTATION_NO_CHANGES_NUDGE.to_string()
+                            };
+                            self.messages.push_nudge(NudgeKind::Continue, nudge);
+                            continue;
+                        }
+
+                        stalled_unfinished = true;
+                        let incomplete = "Implementation incomplete: the model inspected the workspace but did not make successful file changes, so I am not treating this as completed.";
+                        ui.status("implementation still had no file changes after repair");
+                        ui.assistant_text(incomplete);
+                        ui.assistant_end();
+                        self.messages
+                            .push_assistant(vec![Content::Text(incomplete.to_string())]);
+                        break false;
+                    }
+                    if implementation_intent.is_some()
+                        && implementation_tracker.mutation_seen
+                        && !implementation_tracker.substantive_edit_seen
+                    {
+                        if implementation_tracker.scaffold_only_nudges < 2 {
+                            implementation_tracker.scaffold_only_nudges += 1;
+                            evidence.quality_repair_nudges =
+                                evidence.quality_repair_nudges.saturating_add(1);
+                            let use_text_fallback =
+                                implementation_tracker.scaffold_only_nudges >= 2;
+                            force_tools_next = !use_text_fallback;
+                            text_tool_fallback_next = use_text_fallback;
+                            ui.status(
+	                                "implementation only scaffolded setup files; nudging the model to edit source files",
+	                            );
+                            self.messages
+                                .push_assistant(std::mem::take(&mut completion.content));
+                            let nudge = if use_text_fallback {
+                                implementation_text_tool_nudge(IMPLEMENTATION_SCAFFOLD_ONLY_NUDGE)
+                            } else {
+                                IMPLEMENTATION_SCAFFOLD_ONLY_NUDGE.to_string()
+                            };
+                            self.messages.push_nudge(NudgeKind::Continue, nudge);
+                            continue;
+                        }
+
+                        stalled_unfinished = true;
+                        let incomplete = "Implementation incomplete: only project scaffolding or setup changes were detected, with no source/config edit implementing the requested behavior.";
+                        ui.status(
+                            "implementation still only had scaffold/setup changes after repair",
+                        );
+                        ui.assistant_text(incomplete);
+                        ui.assistant_end();
+                        self.messages
+                            .push_assistant(vec![Content::Text(incomplete.to_string())]);
+                        break false;
+                    }
+                    if implementation_intent.is_some()
+                        && implementation_tracker.mutation_seen
+                        && !implementation_tracker.validation_after_last_mutation
+                    {
+                        if implementation_tracker.missing_validation_nudges < 2 {
+                            implementation_tracker.missing_validation_nudges += 1;
+                            evidence.quality_repair_nudges =
+                                evidence.quality_repair_nudges.saturating_add(1);
+                            let use_text_fallback =
+                                implementation_tracker.missing_validation_nudges >= 2;
+                            force_tools_next = !use_text_fallback;
+                            text_tool_fallback_next = use_text_fallback;
+                            ui.status(
+	                                "implementation changed files without validation; nudging the model to run tests or build",
+	                            );
+                            self.messages
+                                .push_assistant(std::mem::take(&mut completion.content));
+                            let validation_nudge =
+                                implementation_missing_validation_nudge(&implementation_tracker);
+                            let nudge = if use_text_fallback {
+                                implementation_text_tool_nudge(&validation_nudge)
+                            } else {
+                                validation_nudge
+                            };
+                            self.messages.push_nudge(NudgeKind::Continue, nudge);
+                            continue;
+                        }
+
+                        stalled_unfinished = true;
+                        let incomplete = "Implementation incomplete: files were changed, but no successful validation command ran after the last change, so I am not treating this as completed.";
+                        ui.status("implementation still lacked validation after repair");
+                        ui.assistant_text(incomplete);
+                        ui.assistant_end();
+                        self.messages
+                            .push_assistant(vec![Content::Text(incomplete.to_string())]);
+                        break false;
+                    }
                     if should_nudge_no_evidence_review(read_only_intent, &evidence, &assistant_text)
                     {
                         if evidence.quality_repair_nudges == 0 {
@@ -3830,8 +5069,6 @@ impl Agent {
                     }
                     self.messages
                         .push_assistant(std::mem::take(&mut completion.content));
-                    let looks_unfinished = looks_like_unfinished_step(&assistant_text);
-                    let plan_incomplete = plan_has_pending_steps(&self.last_plan);
                     if (looks_unfinished || plan_incomplete)
                         && silent_continues < self.config.max_silent_continues
                     {
@@ -3992,6 +5229,13 @@ impl Agent {
                         let duration_ms = started.elapsed().as_millis() as u64;
                         let error = output.content.starts_with("Error:");
                         evidence.record_success(name, arguments, &output.content);
+                        if implementation_intent.is_some() {
+                            implementation_tracker.record_tool_result(
+                                name,
+                                arguments,
+                                &output.content,
+                            );
+                        }
                         tool_timeline.push(ToolCallEntry {
                             tool: name.clone(),
                             path,
@@ -4097,6 +5341,13 @@ impl Agent {
                         let path = hi_tools::target_path(name, &calls[i].2).unwrap_or_default();
                         let error = output.content.starts_with("Error:");
                         evidence.record_success(name, &calls[i].2, &output.content);
+                        if implementation_intent.is_some() {
+                            implementation_tracker.record_tool_result(
+                                name,
+                                &calls[i].2,
+                                &output.content,
+                            );
+                        }
                         tool_timeline.push(ToolCallEntry {
                             tool: name.clone(),
                             path,
@@ -4326,7 +5577,7 @@ impl Agent {
         // outcome — so the next turn resumes coherently at the right sub-goal
         // (and with prior-attempt notes if it stalled). See `goal_turn_end`.
         self.goal_turn_end(
-            false,
+            stalled_unfinished,
             stalled_repeating,
             ended_at_cap,
             plan_updated_goal,
@@ -4350,6 +5601,7 @@ impl Agent {
         if self.config.finalize
             && made_tool_call
             && !ended_at_cap
+            && !stalled_unfinished
             && !stalled_repeating
             && !self.last_changed_files.is_empty()
         {
@@ -4900,6 +6152,18 @@ mod tests {
         )
     }
 
+    fn bash_completion(command: &str) -> Completion {
+        completion(
+            vec![Content::ToolCall {
+                id: "b".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({ "command": command }).to_string(),
+            }],
+            1,
+            1,
+        )
+    }
+
     /// A unique throwaway file path under the current workspace. The name is
     /// unique per *call* (not just per process), so concurrent test runs and
     /// repeated calls within one process never collide — and a file left
@@ -5071,6 +6335,96 @@ mod tests {
         agent.run_turn("go", &mut NullUi).await.unwrap();
         assert_eq!(agent.messages().last().unwrap().text(), "recovered");
         assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn tool_protocol_error_is_resampled_too() {
+        let (mut agent, requests) = scripted_agent(
+            vec![
+                ProviderStep::Error(ProviderErrorKind::ToolProtocol),
+                ProviderStep::Completion(completion(vec![Content::Text("recovered".into())], 5, 3)),
+            ],
+            config(),
+        );
+        agent.run_turn("go", &mut NullUi).await.unwrap();
+        assert_eq!(agent.messages().last().unwrap().text(), "recovered");
+        assert_eq!(requests.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn tool_protocol_after_tool_progress_gets_guidance_nudge() {
+        let (mut agent, requests) = scripted_agent(
+            vec![
+                ProviderStep::Completion(bash_completion("true")),
+                ProviderStep::Error(ProviderErrorKind::ToolProtocol),
+                ProviderStep::Completion(completion(vec![Content::Text("recovered".into())], 5, 3)),
+            ],
+            config(),
+        );
+        agent.run_turn("go", &mut NullUi).await.unwrap();
+        assert_eq!(agent.messages().last().unwrap().text(), "recovered");
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(
+            requests[2]
+                .iter()
+                .any(|message| message.text().contains("valid tool calls")),
+            "expected protocol guidance in retry request: {:?}",
+            requests[2]
+        );
+    }
+
+    #[tokio::test]
+    async fn implementation_tool_protocol_exhaustion_falls_back_to_text_tool_calls() {
+        let path = temp_file("protocol-text-fallback");
+        let path_string = path.to_string_lossy().to_string();
+        let xmlish_write = format!(
+            "<tool_call>write<arg_key>path</arg_key><arg_value>{path_string}</arg_value><arg_key>content</arg_key><arg_value>ok\n</arg_value></tool_call>"
+        );
+        let (mut agent, requests) = scripted_agent(
+            vec![
+                ProviderStep::Error(ProviderErrorKind::ToolProtocol),
+                ProviderStep::Error(ProviderErrorKind::ToolProtocol),
+                ProviderStep::Error(ProviderErrorKind::ToolProtocol),
+                ProviderStep::Error(ProviderErrorKind::ToolProtocol),
+                ProviderStep::Error(ProviderErrorKind::ToolProtocol),
+                ProviderStep::Completion(completion(vec![Content::Text(xmlish_write)], 5, 3)),
+                ProviderStep::Completion(bash_completion("cargo test --help")),
+                ProviderStep::Completion(completion(
+                    vec![Content::Text(format!(
+                        "Changed {path_string} and validated with cargo test --help."
+                    ))],
+                    5,
+                    3,
+                )),
+            ],
+            config(),
+        );
+        let mut ui = RecordingUi::default();
+        agent
+            .run_turn("build a small CLI GPU training time estimator", &mut ui)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "ok\n");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            ui.statuses
+                .iter()
+                .any(|status| status.contains("plain-text tool-call parsing")),
+            "expected text-tool fallback status: {:?}",
+            ui.statuses
+        );
+        assert!(
+            agent
+                .messages()
+                .last()
+                .unwrap()
+                .text()
+                .contains("validated with cargo test --help")
+        );
+        assert!(requests.lock().unwrap().len() >= 7);
     }
 
     #[tokio::test]
@@ -6532,7 +7886,7 @@ mod tests {
                 vec![Content::ToolCall {
                     id: "r1".into(),
                     name: "read".into(),
-                    arguments: r#"{"path":"src/lib.rs"}"#.into(),
+                    arguments: r#"{"path":"Cargo.toml"}"#.into(),
                 }],
                 1,
                 1,
@@ -6540,7 +7894,7 @@ mod tests {
             // Final recap — a finished answer, text only.
             completion(
                 vec![Content::Text(
-                    "I reviewed src/lib.rs. The architecture is clean and the tests pass.".into(),
+                    "I reviewed Cargo.toml. The workspace status is clear and tests pass.".into(),
                 )],
                 1,
                 1,
@@ -6561,7 +7915,7 @@ mod tests {
         // churning past it with spurious continues.
         let m = agent.messages();
         assert!(
-            m.last().unwrap().text().contains("I reviewed src/lib.rs"),
+            m.last().unwrap().text().contains("I reviewed Cargo.toml"),
             "the recap is the model's final response: {:?}",
             m.last().unwrap().text()
         );
@@ -7174,6 +8528,333 @@ mod tests {
             Some(ReviewIntent::Gaps)
         );
         assert_eq!(classify_read_only_intent("fix the unsafe unwraps"), None);
+    }
+
+    #[test]
+    fn implementation_prompts_classify_without_stealing_gap_reviews() {
+        let intent = classify_implementation_intent(
+            "lets build a small TUI calculator that estimates how long training will take on GPUs",
+        )
+        .expect("implementation prompt");
+        assert!(intent.tui);
+        assert!(intent.gpu_training_estimator);
+
+        assert!(
+            classify_implementation_intent(
+                "discuss whats its missing and what we should considering building and implimenting"
+            )
+            .is_none()
+        );
+        assert_eq!(
+            classify_read_only_intent(
+                "discuss whats its missing and what we should considering building and implimenting"
+            ),
+            Some(ReviewIntent::Gaps)
+        );
+
+        let prompt = implementation_turn_prompt(
+            "/build gpu training calculator",
+            ImplementationIntent {
+                tui: true,
+                gpu_training_estimator: true,
+            },
+        );
+        assert!(prompt.contains("Ratatui"));
+        assert!(prompt.contains("cargo init --bin ."));
+        assert!(prompt.contains("training_flops = 6 * params * tokens"));
+        assert!(prompt.contains("H100 80GB"));
+        assert!(prompt.contains("validation command"));
+    }
+
+    #[test]
+    fn implementation_preflight_detects_rust_validation() {
+        let dir = std::env::temp_dir().join(format!(
+            "hi-implementation-preflight-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(dir.join("README.md"), "# demo\n").unwrap();
+
+        let output = std::process::Command::new("sh")
+            .arg("-lc")
+            .arg(implementation_preflight_command())
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(output.status.success());
+        assert!(stdout.contains("[workspace_manifests]"));
+        assert!(stdout.contains("./Cargo.toml"));
+        assert!(stdout.contains("[likely_entrypoints]"));
+        assert!(stdout.contains("./src/main.rs"));
+        assert_eq!(
+            preferred_validation_from_preflight(&stdout),
+            Some("cargo test".to_string())
+        );
+    }
+
+    #[test]
+    fn gpu_training_estimator_cli_bootstrap_compiles_and_tests() {
+        let dir = std::env::temp_dir().join(format!(
+            "hi-gpu-estimator-cli-bootstrap-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for (path, content) in gpu_training_estimator_bootstrap_files(ImplementationIntent {
+            tui: false,
+            gpu_training_estimator: true,
+        }) {
+            let path = dir.join(path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(path, content).unwrap();
+        }
+
+        let output = std::process::Command::new("cargo")
+            .arg("test")
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            output.status.success(),
+            "generated CLI project should pass cargo test\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+    }
+
+    #[test]
+    fn gpu_training_estimator_tui_bootstrap_uses_ratatui_and_respects_existing_workspace() {
+        let files = gpu_training_estimator_bootstrap_files(ImplementationIntent {
+            tui: true,
+            gpu_training_estimator: true,
+        });
+        let cargo_toml = files
+            .iter()
+            .find(|(path, _)| *path == "Cargo.toml")
+            .map(|(_, content)| content)
+            .unwrap();
+        let main_rs = files
+            .iter()
+            .find(|(path, _)| *path == "src/main.rs")
+            .map(|(_, content)| content)
+            .unwrap();
+        assert!(cargo_toml.contains("ratatui"));
+        assert!(cargo_toml.contains("crossterm"));
+        assert!(main_rs.contains("GPU Training Time Estimator"));
+        assert!(main_rs.contains("estimate_seconds"));
+
+        let dir = std::env::temp_dir().join(format!(
+            "hi-gpu-estimator-existing-workspace-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("Cargo.toml"), "[package]\nname=\"existing\"\n").unwrap();
+        let intent = ImplementationIntent {
+            tui: true,
+            gpu_training_estimator: true,
+        };
+        let can_bootstrap = intent.gpu_training_estimator
+            && implementation_workspace_can_accept_rust_bootstrap_at(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            !can_bootstrap,
+            "bootstrap must not run over an existing manifest"
+        );
+    }
+
+    #[tokio::test]
+    async fn implementation_turn_repairs_no_changes_and_missing_validation() {
+        let path = temp_file("implementation-repair");
+        let path_string = path.to_string_lossy().to_string();
+        let responses = vec![
+            completion(
+                vec![Content::Text("Completed the requested action.".into())],
+                1,
+                1,
+            ),
+            write_completion(&path_string),
+            completion(
+                vec![Content::Text("Implemented the calculator.".into())],
+                1,
+                1,
+            ),
+            bash_completion("cargo test --help"),
+            completion(
+                vec![Content::Text(format!(
+                    "Changed {path_string} and validated with cargo test --help."
+                ))],
+                1,
+                1,
+            ),
+        ];
+        let mut agent = agent(responses, config());
+        let mut ui = RecordingUi::default();
+        agent
+            .run_turn("build a small CLI GPU training time estimator", &mut ui)
+            .await
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            ui.statuses
+                .iter()
+                .any(|status| status.contains("no file changes")),
+            "expected no-change repair status: {:?}",
+            ui.statuses
+        );
+        assert!(
+            ui.statuses
+                .iter()
+                .any(|status| status.contains("without validation")),
+            "expected validation repair status: {:?}",
+            ui.statuses
+        );
+        assert_eq!(agent.last_turn_telemetry().quality_repair_nudges, 2);
+        assert!(
+            agent
+                .messages()
+                .last()
+                .unwrap()
+                .text()
+                .contains("validated with cargo test --help")
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_implementation_does_not_finalize_with_stale_recap() {
+        let path = temp_file("implementation-no-finalize");
+        let path_string = path.to_string_lossy().to_string();
+        let mut cfg = config();
+        cfg.finalize = true;
+        let responses = vec![
+            write_completion(&path_string),
+            completion(vec![Content::Text("Implemented it.".into())], 1, 1),
+            completion(vec![Content::Text("Done.".into())], 1, 1),
+            completion(vec![Content::Text("Final recap.".into())], 1, 1),
+        ];
+        let mut agent = agent(responses, cfg);
+        let mut ui = RecordingUi::default();
+        agent
+            .run_turn("build a small CLI GPU training time estimator", &mut ui)
+            .await
+            .unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            agent
+                .messages()
+                .last()
+                .unwrap()
+                .text()
+                .contains("Implementation incomplete"),
+            "stalled implementation should end on incomplete notice, not a recap"
+        );
+        assert!(agent.last_turn_telemetry().stalled_unfinished);
+    }
+
+    #[tokio::test]
+    async fn scaffold_only_implementation_gets_source_edit_nudge() {
+        let dir = temp_file("implementation-scaffold-only");
+        let dir_string = dir.to_string_lossy().to_string();
+        let responses = vec![
+            bash_completion(&format!("mkdir -p {dir_string}")),
+            completion(vec![Content::Text("Implemented it.".into())], 1, 1),
+            completion(vec![Content::Text("Done.".into())], 1, 1),
+            completion(vec![Content::Text("Final recap.".into())], 1, 1),
+        ];
+        let mut agent = agent(responses, config());
+        let mut ui = RecordingUi::default();
+        agent
+            .run_turn("build a small CLI GPU training time estimator", &mut ui)
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            ui.statuses
+                .iter()
+                .any(|status| status.contains("only scaffolded setup files")),
+            "expected scaffold-only repair status: {:?}",
+            ui.statuses
+        );
+        assert!(
+            agent
+                .messages()
+                .last()
+                .unwrap()
+                .text()
+                .contains("only project scaffolding")
+        );
+        assert!(agent.last_turn_telemetry().stalled_unfinished);
+    }
+
+    #[tokio::test]
+    async fn scaffold_only_repair_can_use_text_tool_fallback_for_source_edit() {
+        let scaffold_dir = temp_file("implementation-scaffold-text-fallback-dir");
+        let scaffold_dir_string = scaffold_dir.to_string_lossy().to_string();
+        let source_path = temp_file("implementation-scaffold-text-fallback-src");
+        let source_path_string = source_path.to_string_lossy().to_string();
+        let xmlish_write = format!(
+            "<tool_call>write<arg_key>path</arg_key><arg_value>{source_path_string}</arg_value><arg_key>content</arg_key><arg_value>implemented\n</arg_value></tool_call>"
+        );
+        let responses = vec![
+            bash_completion(&format!("mkdir -p {scaffold_dir_string}")),
+            completion(vec![Content::Text("Implemented it.".into())], 1, 1),
+            completion(vec![Content::Text("Done.".into())], 1, 1),
+            completion(vec![Content::Text(xmlish_write)], 1, 1),
+            bash_completion("cargo test --help"),
+            completion(
+                vec![Content::Text(format!(
+                    "Changed {source_path_string} and validated with cargo test --help."
+                ))],
+                1,
+                1,
+            ),
+        ];
+        let mut agent = agent(responses, config());
+        let mut ui = RecordingUi::default();
+        agent
+            .run_turn("build a small CLI GPU training time estimator", &mut ui)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&source_path).unwrap(),
+            "implemented\n"
+        );
+        let _ = std::fs::remove_dir_all(&scaffold_dir);
+        let _ = std::fs::remove_file(&source_path);
+
+        assert!(
+            agent
+                .messages()
+                .last()
+                .unwrap()
+                .text()
+                .contains("validated with cargo test --help")
+        );
+        assert!(
+            ui.statuses
+                .iter()
+                .any(|status| status.contains("only scaffolded setup files")),
+            "expected scaffold repair status: {:?}",
+            ui.statuses
+        );
     }
 
     #[test]

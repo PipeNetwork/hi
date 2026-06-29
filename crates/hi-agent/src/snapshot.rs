@@ -27,13 +27,24 @@ pub(crate) async fn workspace_snapshot(
             .git_exclude(true)
             .ignore(true)
             .parents(true)
-            // Prune VCS metadata (.git/.hg/.svn/.jj): walking it would flag
-            // every commit/index write as a "changed file" and balloon the
-            // snapshot. We walk hidden files so real dotfiles are tracked.
+            // Prune VCS metadata and common generated dependency/build trees.
+            // Fresh temp projects often have no .gitignore yet, so relying only
+            // on ignore rules makes `cargo test` or package installs show
+            // hundreds of generated files as changed user work.
             .filter_entry(|e| {
                 !matches!(
                     e.file_name().to_str(),
-                    Some(".git" | ".hg" | ".svn" | ".jj")
+                    Some(
+                        ".git"
+                            | ".hg"
+                            | ".svn"
+                            | ".jj"
+                            | "target"
+                            | "node_modules"
+                            | ".venv"
+                            | "venv"
+                            | "vendor"
+                    )
                 )
             })
             .build()
@@ -117,5 +128,31 @@ impl SnapshotCache {
     /// [`get`]: Self::get
     pub(crate) fn invalidate(&mut self) {
         self.cached = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn workspace_snapshot_ignores_generated_build_directories_without_gitignore() {
+        let dir =
+            std::env::temp_dir().join(format!("hi-snapshot-generated-dirs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("target/debug")).unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn ok() {}\n").unwrap();
+        std::fs::write(dir.join("target/debug/generated.o"), "artifact\n").unwrap();
+
+        let snapshot = workspace_snapshot(&dir).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(snapshot.contains_key("src/lib.rs"));
+        assert!(
+            snapshot.keys().all(|path| !path.starts_with("target/")),
+            "snapshot should ignore target artifacts: {:?}",
+            snapshot.keys().collect::<Vec<_>>()
+        );
     }
 }
