@@ -279,6 +279,7 @@ Do not finalize. Use read-only inspection tools first, then answer from the insp
 If inspection is impossible, explicitly say the evidence is insufficient.";
 const READ_ONLY_SAFE_CONTEXT_WINDOW: u32 = 12_000;
 const READ_ONLY_PREFLIGHT_GREP_MAX_LINES: usize = 32;
+const READ_ONLY_PREFLIGHT_DIFF_MAX_LINES: usize = 160;
 const SECURITY_PREFLIGHT_EXTRA_READ_LIMIT: u32 = 90;
 const DEFAULT_PREFLIGHT_EXTRA_READ_LIMIT: u32 = 120;
 const READ_ONLY_PREFLIGHT_MAX_EXTRA_READS: usize = 3;
@@ -894,19 +895,19 @@ fn preflight_path_relevant_for_intent(intent: ReviewIntent, path: &str) -> bool 
 }
 
 fn compact_preflight_tool_output(name: &str, output: &str) -> String {
-    if name != "grep" {
-        return output.to_string();
-    }
+    let max_lines = match name {
+        "grep" => READ_ONLY_PREFLIGHT_GREP_MAX_LINES,
+        "diff" => READ_ONLY_PREFLIGHT_DIFF_MAX_LINES,
+        _ => return output.to_string(),
+    };
     let mut lines = output.lines().collect::<Vec<_>>();
-    if lines.len() <= READ_ONLY_PREFLIGHT_GREP_MAX_LINES {
+    if lines.len() <= max_lines {
         return output.to_string();
     }
-    let omitted = lines
-        .len()
-        .saturating_sub(READ_ONLY_PREFLIGHT_GREP_MAX_LINES);
-    lines.truncate(READ_ONLY_PREFLIGHT_GREP_MAX_LINES);
+    let omitted = lines.len().saturating_sub(max_lines);
+    lines.truncate(max_lines);
     format!(
-        "{}\n[preflight grep output truncated: {omitted} additional line(s) omitted]",
+        "{}\n[preflight {name} output truncated: {omitted} additional line(s) omitted]",
         lines.join("\n")
     )
 }
@@ -2558,16 +2559,19 @@ impl Agent {
                     calls.push(PreflightCall::read(path, limit));
                 }
             }
-            emit_tool_output(ui, call.name, &output);
+            let compacted_output = compact_preflight_tool_output(call.name, &output.content);
+            let display_output = hi_tools::ToolOutput {
+                content: compacted_output.clone(),
+                display: None,
+                plan: None,
+            };
+            emit_tool_output(ui, call.name, &display_output);
             content.push(Content::ToolCall {
                 id: id.clone(),
                 name: call.name.to_string(),
                 arguments: call.arguments,
             });
-            results.push((
-                id,
-                compact_preflight_tool_output(call.name, &output.content),
-            ));
+            results.push((id, compacted_output));
             executed = executed.saturating_add(1);
         }
 
@@ -7221,6 +7225,14 @@ mod tests {
         let compacted = compact_preflight_tool_output("grep", &long_grep);
         assert!(compacted.contains("preflight grep output truncated"));
         assert!(compacted.lines().count() <= READ_ONLY_PREFLIGHT_GREP_MAX_LINES + 1);
+
+        let long_diff = (0..(READ_ONLY_PREFLIGHT_DIFF_MAX_LINES + 25))
+            .map(|i| format!("diff line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let compacted = compact_preflight_tool_output("diff", &long_diff);
+        assert!(compacted.contains("preflight diff output truncated"));
+        assert!(compacted.lines().count() <= READ_ONLY_PREFLIGHT_DIFF_MAX_LINES + 1);
     }
 
     #[tokio::test]
