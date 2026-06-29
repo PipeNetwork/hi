@@ -8,6 +8,7 @@ use futures_util::{Stream, StreamExt};
 use serde::Deserialize;
 use serde_json::Value;
 
+use super::request;
 use crate::provider::{ProviderError, ProviderErrorKind};
 use crate::types::{
     BillableBreakdown, Completion, Content, StreamEvent, Usage, estimate_messages_tokens,
@@ -818,7 +819,11 @@ pub(crate) fn classify_stream_error(err: anyhow::Error) -> ProviderError {
             .with_usage(provider.usage);
     }
     let text = err.to_string();
-    let kind = if text.contains("no output") {
+    let kind = if request::is_quality_rejected_text(&text) {
+        ProviderErrorKind::QualityRejected
+    } else if request::is_tool_protocol_text(&text) {
+        ProviderErrorKind::ToolProtocol
+    } else if text.contains("no output") {
         ProviderErrorKind::StreamTimeout
     } else if text.contains("error reading stream") || text.contains("malformed SSE JSON chunk") {
         ProviderErrorKind::MalformedStream
@@ -854,6 +859,10 @@ fn classify_stream_api_error(message: &str) -> ProviderErrorKind {
         || lower.contains("too many tokens")
     {
         ProviderErrorKind::RequestTooLarge
+    } else if request::is_quality_rejected_text(message) {
+        ProviderErrorKind::QualityRejected
+    } else if request::is_tool_protocol_text(message) {
+        ProviderErrorKind::ToolProtocol
     } else if lower.contains("capacity") || lower.contains("temporarily unavailable") {
         ProviderErrorKind::CapacityUnavailable
     } else if lower.contains("service unavailable")
@@ -1180,6 +1189,20 @@ mod tests {
                 "request exceeded the resident model context; reduce prompt or tool output and retry"
             ),
             ProviderErrorKind::RequestTooLarge
+        );
+    }
+
+    #[test]
+    fn stream_soft_protocol_messages_are_classified() {
+        assert_eq!(
+            classify_stream_api_error("model output did not satisfy the tool protocol"),
+            ProviderErrorKind::ToolProtocol
+        );
+        assert_eq!(
+            classify_stream_api_error(
+                "quality_rejected: insufficient evidence after review evidence repair"
+            ),
+            ProviderErrorKind::QualityRejected
         );
     }
 

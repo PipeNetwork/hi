@@ -88,6 +88,8 @@ pub(crate) fn classify_http_error(status: StatusCode, text: &str) -> ProviderErr
         {
             ProviderErrorKind::CapacityUnavailable
         }
+        _ if is_quality_rejected_text(text) => ProviderErrorKind::QualityRejected,
+        _ if is_tool_protocol_text(text) => ProviderErrorKind::ToolProtocol,
         s if s.is_server_error() => ProviderErrorKind::Outage,
         StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
             if mentions(
@@ -134,6 +136,32 @@ pub(crate) fn is_capacity_unavailable_text(text: &str) -> bool {
             "capacity_unavailable",
             "capacity temporarily unavailable",
             "temporarily unavailable",
+        ],
+    )
+}
+
+pub(crate) fn is_quality_rejected_text(text: &str) -> bool {
+    mentions(
+        text,
+        &[
+            "quality_rejected",
+            "quality rejected",
+            "quality check",
+            "insufficient evidence",
+            "inspected evidence",
+            "review evidence",
+        ],
+    )
+}
+
+pub(crate) fn is_tool_protocol_text(text: &str) -> bool {
+    mentions(
+        text,
+        &[
+            "tool protocol",
+            "did not satisfy the tool protocol",
+            "did not match the tool protocol",
+            "tool-enabled chat output must be valid json",
         ],
     )
 }

@@ -6134,7 +6134,7 @@ mod tests {
             // Final recap — a finished answer, text only.
             completion(
                 vec![Content::Text(
-                    "I reviewed the codebase. The architecture is clean and the tests pass.".into(),
+                    "I reviewed src/lib.rs. The architecture is clean and the tests pass.".into(),
                 )],
                 1,
                 1,
@@ -6155,7 +6155,7 @@ mod tests {
         // churning past it with spurious continues.
         let m = agent.messages();
         assert!(
-            m.last().unwrap().text().contains("I reviewed the codebase"),
+            m.last().unwrap().text().contains("I reviewed src/lib.rs"),
             "the recap is the model's final response: {:?}",
             m.last().unwrap().text()
         );
@@ -6188,17 +6188,19 @@ mod tests {
         };
         let responses = vec![
             // Stall 1: narrates a next step, no tool call → nudge (budget is 1).
-            completion(vec![Content::Text("Let me read module a.".into())], 1, 1),
+            completion(vec![Content::Text("Let me read Cargo.toml.".into())], 1, 1),
             // Recovers: reads a file → must reset the silent-continue counter.
-            read("a", "src/a.rs"),
+            read("a", "Cargo.toml"),
             // Stall 2: narrates again. With the reset this is still within budget;
             // without it the cumulative counter is already exhausted here.
-            completion(vec![Content::Text("Let me read module b.".into())], 1, 1),
+            completion(vec![Content::Text("Let me read README.md.".into())], 1, 1),
             // Recovers again.
-            read("b", "src/b.rs"),
+            read("b", "README.md"),
             // Finishes with a recap → clean end.
             completion(
-                vec![Content::Text("Reviewed both modules. Done.".into())],
+                vec![Content::Text(
+                    "Reviewed Cargo.toml and README.md. Done.".into(),
+                )],
                 1,
                 1,
             ),
@@ -8643,7 +8645,7 @@ mod tests {
         ];
         let mut agent = agent(responses, config());
         let mut ui = RecUi::default();
-        agent.run_turn("review codebase", &mut ui).await.unwrap();
+        agent.run_turn("say hi", &mut ui).await.unwrap();
         assert!(
             ui.statuses.iter().any(|s| s.contains("retrying (1/")),
             "a retry should be shown, got: {:?}",
@@ -8688,14 +8690,14 @@ mod tests {
         // A turn that ends with real text must not retry or warn.
         let mut agent = agent(
             vec![completion(
-                vec![Content::Text("here's the review".into())],
+                vec![Content::Text("here's the answer".into())],
                 5,
                 3,
             )],
             config(),
         );
         let mut ui = RecUi::default();
-        agent.run_turn("review codebase", &mut ui).await.unwrap();
+        agent.run_turn("say hi", &mut ui).await.unwrap();
         assert!(
             !ui.statuses.iter().any(|s| s.contains("no response")),
             "real text should not warn, got: {:?}",

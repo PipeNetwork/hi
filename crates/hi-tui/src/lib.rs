@@ -4425,6 +4425,35 @@ mod tests {
     }
 
     #[test]
+    fn tool_protocol_failure_does_not_mark_model_degraded() {
+        let mut app = test_app("pipenetwork", "pipe/auto-code");
+        let err: anyhow::Error = hi_ai::ProviderError::new(
+            hi_ai::ProviderErrorKind::ToolProtocol,
+            "model output did not satisfy the tool protocol",
+        )
+        .into();
+        let (kind, guidance) = hi_agent::classify_error(&err);
+
+        app.note_turn_failed(&format!("{err:#}"), kind, guidance);
+        if hi_agent::ui::error_counts_as_model_issue(&err) {
+            app.record_model_issue();
+        }
+
+        let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
+        assert!(
+            lines.iter().any(|line| line.contains("tool_protocol")),
+            "transcript: {lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("degraded in-session")),
+            "transcript: {lines:?}"
+        );
+        assert_eq!(app.model_issues.get("pipe/auto-code"), None);
+    }
+
+    #[test]
     fn empty_tool_result_is_visible() {
         let mut app = test_app("openai", "gpt-4o");
         app.apply(UiEvent::ToolCall(

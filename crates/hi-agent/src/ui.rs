@@ -117,6 +117,14 @@ pub fn classify_error(err: &anyhow::Error) -> (&'static str, &'static str) {
             "context_full",
             "the request exceeded the model's context window — try /compact to reclaim room, then /retry",
         ),
+        Some(K::QualityRejected) => (
+            "quality",
+            "the model did not gather enough evidence for this answer — /retry will ask it to inspect more concrete files",
+        ),
+        Some(K::ToolProtocol) => (
+            "tool_protocol",
+            "the model emitted an invalid tool turn — /retry usually fixes this; switch models only if it repeats",
+        ),
         Some(K::StreamTimeout) => (
             "timeout",
             "the response stream timed out — the endpoint may be slow or overloaded; /retry or /model to switch",
@@ -136,7 +144,11 @@ pub fn classify_error(err: &anyhow::Error) -> (&'static str, &'static str) {
 pub fn error_counts_as_model_issue(err: &anyhow::Error) -> bool {
     !matches!(
         hi_ai::provider_error_kind(err),
-        Some(hi_ai::ProviderErrorKind::CapacityUnavailable)
+        Some(
+            hi_ai::ProviderErrorKind::CapacityUnavailable
+                | hi_ai::ProviderErrorKind::QualityRejected
+                | hi_ai::ProviderErrorKind::ToolProtocol
+        )
     )
 }
 
@@ -263,5 +275,22 @@ mod tests {
         assert_eq!(kind, "capacity");
         assert!(guidance.contains("temporarily unavailable"));
         assert!(!error_counts_as_model_issue(&err));
+    }
+
+    #[test]
+    fn soft_protocol_errors_are_not_model_quality_issues() {
+        for (kind, expected_label) in [
+            (ProviderErrorKind::QualityRejected, "quality"),
+            (ProviderErrorKind::ToolProtocol, "tool_protocol"),
+        ] {
+            let err: anyhow::Error =
+                ProviderError::new(kind, "model output did not satisfy the tool protocol").into();
+
+            let (label, guidance) = classify_error(&err);
+
+            assert_eq!(label, expected_label);
+            assert!(!guidance.is_empty());
+            assert!(!error_counts_as_model_issue(&err));
+        }
     }
 }

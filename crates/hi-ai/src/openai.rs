@@ -314,6 +314,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn soft_protocol_http_errors_are_classified() {
+        for (body, expected) in [
+            (
+                r#"{"error":"model output did not satisfy the tool protocol"}"#,
+                ProviderErrorKind::ToolProtocol,
+            ),
+            (
+                r#"{"error":"quality_rejected: insufficient evidence after review evidence repair"}"#,
+                ProviderErrorKind::QualityRejected,
+            ),
+        ] {
+            let Some(server) = FakeOpenAiServer::new(vec![Response::json(400, body)]) else {
+                return;
+            };
+            let provider = OpenAiProvider::new(server.url().to_string(), "test".into());
+            let err = provider
+                .stream(request(vec![], Default::default()), &mut |_| {})
+                .await
+                .unwrap_err();
+            assert_eq!(provider_error_kind(&err), Some(expected), "{body}");
+        }
+    }
+
+    #[tokio::test]
     async fn server_error_retries_then_succeeds() {
         let Some(server) = FakeOpenAiServer::new(vec![
             Response::json(500, r#"{"error":"temporary outage"}"#),
