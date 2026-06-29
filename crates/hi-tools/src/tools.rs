@@ -23,6 +23,20 @@ const DEFAULT_BASH_TIMEOUT_SECS: u64 = 600;
 /// value can't reintroduce an unbounded stall.
 const MAX_BASH_TIMEOUT_SECS: u64 = 3600;
 const CHECK_TIMEOUT: Duration = Duration::from_secs(300);
+const PYTHON_TUI_MARKERS: &[&str] = &[
+    "from textual",
+    "import textual",
+    "App().run(",
+    "import curses",
+    "from curses",
+    "curses.wrapper(",
+    "import urwid",
+    "from urwid",
+    "prompt_toolkit",
+    "blessed.Terminal",
+    "asciimatics",
+    "npyscreen",
+];
 
 /// Resolve the effective bash timeout: an explicit per-command request wins,
 /// else `HI_BASH_TIMEOUT_SECS`, else the default — always clamped to
@@ -814,12 +828,12 @@ async fn run_bash_streaming_with_timeout(
     on_line: &mut (dyn FnMut(&str) + Send),
     bash_timeout: Duration,
 ) -> Result<String> {
-    // Refuse the handful of irreversible operations a checkpoint can't undo.
-    if let Some(reason) = crate::guard::catastrophic_op(command) {
+    // Refuse operations a checkpoint can't undo or safely contain.
+    if let Some(reason) = crate::guard::blocked_op(command) {
         return Ok(format!(
-            "⚠ refused: this command {reason}. It's blocked as irreversible — the per-turn \
-             checkpoint can't undo it. If it's genuinely needed, ask the user to run it \
-             themselves (they can also set HI_ALLOW_DANGEROUS=1 to disable this guard)."
+            "⚠ refused: this command {reason}. The per-turn checkpoint can't undo it. \
+             If it's genuinely needed, ask the user to run it themselves (or set the \
+             documented override env var for this guard)."
         ));
     }
     // Hardened spawn (detached stdin, piped output, own process group) so a
@@ -988,16 +1002,151 @@ async fn run_bash_tool(
             args.command
         )));
     }
+    if let Some(reason) = foreground_interactive_command_reason(&args.command) {
+        return Ok(ToolOutput::plain(format!(
+            "⚠ refused: this command {reason}. Foreground interactive terminal apps can block \
+             the agent turn. For a smoke test, wrap it with `timeout 5s ... >/tmp/hi-app.out \
+             2>&1` and inspect the captured output, or use import/unit tests for validation. \
+             Use run_in_background:true only for long-lived servers or watchers."
+        )));
+    }
     let timeout = resolve_bash_timeout(args.timeout);
     let out = run_bash_streaming_with_timeout(&args.command, on_line, timeout).await?;
     Ok(ToolOutput::plain(condense(&out)))
 }
 
+fn foreground_interactive_command_reason(command: &str) -> Option<&'static str> {
+    if std::env::var_os("HI_ALLOW_INTERACTIVE_BASH").is_some()
+        || command_has_timeout_wrapper(command)
+    {
+        return None;
+    }
+    let tokens = first_command_tokens(command);
+    let Some((program_idx, program)) = first_program_token(&tokens) else {
+        return None;
+    };
+    let program = basename(program);
+    if program == "textual" {
+        return Some("appears to launch a Textual terminal UI in the foreground");
+    }
+    if is_python_program(program) {
+        if python_inline_code_looks_interactive(&tokens[program_idx + 1..]) {
+            return Some("appears to launch a Python terminal UI in the foreground");
+        }
+        if let Some(script) = python_script_arg(&tokens[program_idx + 1..])
+            && python_script_looks_interactive(&script)
+        {
+            return Some("appears to launch a Python terminal UI in the foreground");
+        }
+    }
+    None
+}
+
+fn command_has_timeout_wrapper(command: &str) -> bool {
+    let tokens = first_command_tokens(command);
+    let Some((_, program)) = first_program_token(&tokens) else {
+        return false;
+    };
+    matches!(basename(program), "timeout" | "gtimeout")
+}
+
+fn first_command_tokens(command: &str) -> Vec<String> {
+    command
+        .split([';', '\n', '|', '&'])
+        .next()
+        .unwrap_or(command)
+        .split_whitespace()
+        .map(|s| s.trim_matches(['"', '\'']).to_string())
+        .collect()
+}
+
+fn first_program_token(tokens: &[String]) -> Option<(usize, &str)> {
+    let mut i = 0;
+    while i < tokens.len() {
+        let tok = tokens[i].as_str();
+        if tok == "env" || is_env_assignment(tok) {
+            i += 1;
+            continue;
+        }
+        return Some((i, tok));
+    }
+    None
+}
+
+fn python_script_arg(tokens: &[String]) -> Option<String> {
+    let mut i = 0;
+    while i < tokens.len() {
+        let tok = tokens[i].as_str();
+        match tok {
+            "-m" | "-c" => return None,
+            "-u" | "-B" | "-q" | "-I" | "-s" | "-S" | "-E" => {
+                i += 1;
+                continue;
+            }
+            _ if tok.starts_with("-X") || tok.starts_with("-W") => {
+                i += 1;
+                continue;
+            }
+            _ if tok.starts_with('-') => {
+                i += 1;
+                continue;
+            }
+            _ => return Some(tok.to_string()),
+        }
+    }
+    None
+}
+
+fn python_inline_code_looks_interactive(tokens: &[String]) -> bool {
+    let Some(pos) = tokens.iter().position(|tok| tok == "-c") else {
+        return false;
+    };
+    let Some(code) = tokens.get(pos + 1) else {
+        return false;
+    };
+    text_looks_like_python_tui(code)
+}
+
+fn python_script_looks_interactive(path: &str) -> bool {
+    if !path.ends_with(".py") {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    text_looks_like_python_tui(&text)
+}
+
+fn text_looks_like_python_tui(text: &str) -> bool {
+    PYTHON_TUI_MARKERS
+        .iter()
+        .any(|marker| text.contains(marker))
+}
+
+fn is_python_program(base: &str) -> bool {
+    base == "python"
+        || base == "python3"
+        || base
+            .strip_prefix("python3.")
+            .is_some_and(|tail| tail.chars().all(|c| c.is_ascii_digit()))
+}
+
+fn basename(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+fn is_env_assignment(tok: &str) -> bool {
+    !tok.starts_with('-')
+        && tok.split_once('=').is_some_and(|(k, _)| {
+            !k.is_empty() && k.chars().all(|c| c.is_alphanumeric() || c == '_')
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        fast_check_for, is_filesystem_mutating, is_read_only, run_bash_streaming_with_timeout,
-        target_path,
+        fast_check_for, foreground_interactive_command_reason, is_filesystem_mutating,
+        is_read_only, run_bash_streaming_with_timeout, target_path,
     };
     use crate::edit::sh_quote;
     use std::time::Duration;
@@ -1063,6 +1212,66 @@ mod tests {
         .expect("must not block on stdin")
         .expect("ok");
         assert!(!out.contains("timed out"), "got: {out:?}");
+    }
+
+    #[test]
+    fn detects_foreground_python_tui_commands() {
+        let dir = std::env::temp_dir().join(format!("hi-tui-detect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let calc = dir.join("calc.py");
+        let script = dir.join("script.py");
+        std::fs::write(
+            &calc,
+            "from textual.app import App\n\nclass Calc(App):\n    pass\n\nCalc().run()\n",
+        )
+        .unwrap();
+        assert!(
+            foreground_interactive_command_reason(&format!("python3 {}", calc.display())).is_some()
+        );
+        assert!(
+            foreground_interactive_command_reason(&format!(
+                "TERM=xterm python3 {}",
+                calc.display()
+            ))
+            .is_some()
+        );
+        assert!(
+            foreground_interactive_command_reason(&format!(
+                "timeout 5s python3 {}",
+                calc.display()
+            ))
+            .is_none(),
+            "explicit timeout smoke tests are allowed"
+        );
+        std::fs::write(&script, "print('done')\n").unwrap();
+        assert!(
+            foreground_interactive_command_reason(&format!("python3 {}", script.display()))
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn bash_refuses_foreground_python_tui() {
+        let dir = std::env::temp_dir().join(format!("hi-tui-bash-refuse-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let calc = dir.join("calc.py");
+        std::fs::write(
+            &calc,
+            "from textual.app import App\n\nclass Calc(App):\n    pass\n\nCalc().run()\n",
+        )
+        .unwrap();
+        let args = serde_json::json!({ "command": format!("python3 {}", calc.display()) });
+        let out = crate::execute("bash", &args.to_string()).await;
+        assert!(out.content.contains("refused"), "got: {}", out.content);
+        assert!(
+            out.content.contains("Foreground interactive terminal apps"),
+            "got: {}",
+            out.content
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // A timeout kills the whole process tree: a child that outlives its `sh`

@@ -14,6 +14,9 @@ use hi_agent::VerifyStage;
 use hi_ai::{CompatMode, Registry, ToolMode};
 use serde::{Deserialize, Serialize};
 
+const DEFAULT_MAX_TOKENS: u32 = 8192;
+const PIPENETWORK_DEFAULT_MAX_TOKENS: u32 = 2048;
+
 /// A minimal agentic coding tool. Works with any OpenAI-compatible endpoint
 /// (OpenRouter, pipenetwork.ai, Ollama, llama.cpp, vLLM) or the native
 /// Anthropic API.
@@ -533,10 +536,8 @@ pub fn resolve(cli: &Cli, config: &Config, registry: &Registry) -> Result<Settin
 
     let api_key = resolve_api_key(cli, profile, provider)?;
 
-    let mut max_tokens = cli
-        .max_tokens
-        .or(profile.and_then(|p| p.max_tokens))
-        .unwrap_or(8192);
+    let mut max_tokens =
+        configured_max_tokens(provider, cli.max_tokens, profile.and_then(|p| p.max_tokens));
     // Don't exceed a known model's output ceiling (avoids a 400 from Anthropic).
     if let Some(info) = registry.lookup(&model)
         && info.max_output > 0
@@ -1069,7 +1070,7 @@ pub fn resolve_named_profile(config: &Config, name: &str, registry: &Registry) -
         .unwrap_or_else(|| provider.default_base_url().to_string());
     let api_key = resolve_api_key_for(Some(profile), provider)?;
 
-    let mut max_tokens = profile.max_tokens.unwrap_or(8192);
+    let mut max_tokens = configured_max_tokens(provider, None, profile.max_tokens);
     if let Some(info) = registry.lookup(&model)
         && info.max_output > 0
         && max_tokens > info.max_output
@@ -1089,9 +1090,32 @@ pub fn resolve_named_profile(config: &Config, name: &str, registry: &Registry) -
     })
 }
 
+fn configured_max_tokens(
+    provider: ProviderName,
+    cli_max_tokens: Option<u32>,
+    profile_max_tokens: Option<u32>,
+) -> u32 {
+    if let Some(value) = cli_max_tokens {
+        return value;
+    }
+    match (provider, profile_max_tokens) {
+        // The setup wizard historically wrote `8192` into pipenetwork profiles.
+        // Treat that legacy value as the old default and use the bounded hosted
+        // route budget instead; an explicit CLI --max-tokens still wins above.
+        (ProviderName::Pipenetwork, None | Some(DEFAULT_MAX_TOKENS)) => {
+            PIPENETWORK_DEFAULT_MAX_TOKENS
+        }
+        (_, Some(value)) => value,
+        (_, None) => DEFAULT_MAX_TOKENS,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Config, Profile, ProviderName, detect_verify_pipeline, save_config_to};
+    use super::{
+        Config, DEFAULT_MAX_TOKENS, PIPENETWORK_DEFAULT_MAX_TOKENS, Profile, ProviderName,
+        configured_max_tokens, detect_verify_pipeline, save_config_to,
+    };
     use std::sync::atomic::{AtomicU32, Ordering};
 
     fn temp_dir_with(marker: &str) -> std::path::PathBuf {
@@ -1184,6 +1208,28 @@ mod tests {
         assert!(
             super::ONBOARDING.contains("--plain"),
             "onboarding should point to the actual opt-out flag"
+        );
+    }
+
+    #[test]
+    fn pipenetwork_default_max_tokens_is_bounded_unless_cli_overrides() {
+        assert_eq!(
+            configured_max_tokens(ProviderName::Pipenetwork, None, None),
+            PIPENETWORK_DEFAULT_MAX_TOKENS
+        );
+        assert_eq!(
+            configured_max_tokens(ProviderName::Pipenetwork, None, Some(DEFAULT_MAX_TOKENS)),
+            PIPENETWORK_DEFAULT_MAX_TOKENS,
+            "legacy wizard profiles should not keep using 8192 by default"
+        );
+        assert_eq!(
+            configured_max_tokens(ProviderName::Pipenetwork, Some(DEFAULT_MAX_TOKENS), None),
+            DEFAULT_MAX_TOKENS,
+            "explicit CLI override is honored"
+        );
+        assert_eq!(
+            configured_max_tokens(ProviderName::Openai, None, None),
+            DEFAULT_MAX_TOKENS
         );
     }
 

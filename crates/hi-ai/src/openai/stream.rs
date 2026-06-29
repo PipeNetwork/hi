@@ -514,7 +514,7 @@ fn starts_like_prose_after_stray_open_brace(s: &str) -> bool {
 
 fn find_text_tool_protocol_start(text: &str) -> Option<usize> {
     let mut best = None;
-    for marker in ["[tool_call", "[tool_calls"] {
+    for marker in ["[tool_call", "[tool_calls", "<tool_call>"] {
         if let Some(index) = text.find(marker) {
             best = Some(best.map_or(index, |current: usize| current.min(index)));
         }
@@ -1665,6 +1665,31 @@ mod tests {
             streamed.contains("{\"foo\": 42}"),
             "non-tool JSON must appear in stream: {streamed:?}"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn suppresses_xmlish_tool_call_from_streamed_text() {
+        let stream = never_ending(vec![
+            r#"{"choices":[{"delta":{"content":"I'll create the file.\n"}}]}"#,
+            r#"{"choices":[{"delta":{"content":"<tool_call>write<arg_key>path</arg_key><arg_value>calc.py</arg_value><arg_key>content</arg_key><arg_value>print(1)</arg_value></tool_call>"}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        ]);
+        let mut collected = Vec::new();
+        let mut sink = |e: StreamEvent| {
+            if let StreamEvent::Text(t) = e {
+                collected.push(t);
+            }
+        };
+        let completion = collect_completion(stream, IDLE, STALL, &mut sink)
+            .await
+            .unwrap();
+        let streamed = collected.join("");
+        assert_eq!(streamed, "I'll create the file.\n");
+        assert!(!streamed.contains("<tool_call"));
+        assert!(matches!(
+            completion.content.first(),
+            Some(Content::Text(text)) if text == "I'll create the file."
+        ));
     }
 
     #[tokio::test(start_paused = true)]

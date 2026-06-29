@@ -78,7 +78,11 @@ pub async fn run() -> Result<Settings> {
         model,
         base_url: provider.default_base_url().to_string(),
         api_key,
-        max_tokens: 8192,
+        max_tokens: if matches!(provider, ProviderName::Pipenetwork) {
+            2048
+        } else {
+            8192
+        },
         thinking_budget: None,
         tool_mode: hi_ai::ToolMode::Auto,
         compat: hi_ai::CompatMode::Auto,

@@ -136,4 +136,13 @@ mod tests {
             "warns that cd doesn't persist"
         );
     }
+
+    #[test]
+    fn system_prompt_steers_incremental_implementation() {
+        let sys = SystemPrompt::new().build();
+        let text = sys.text();
+        assert!(text.contains("standard-library solutions"));
+        assert!(text.contains("coherent chunks"));
+        assert!(text.contains("targeted syntax/build/test command"));
+    }
 }

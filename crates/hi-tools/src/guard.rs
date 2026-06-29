@@ -11,6 +11,13 @@
 //! model could obfuscate around pattern-matching. Set `HI_ALLOW_DANGEROUS=1` to
 //! disable it entirely.
 
+/// Returns a reason if `command` should be refused before execution, else
+/// `None`. This includes irreversible operations plus host-level environment
+/// mutations a git checkpoint cannot undo.
+pub fn blocked_op(command: &str) -> Option<&'static str> {
+    catastrophic_op(command).or_else(|| host_python_package_install(command))
+}
+
 /// Returns a reason if `command` is irreversibly destructive and should be
 /// refused, else `None`.
 pub fn catastrophic_op(command: &str) -> Option<&'static str> {
@@ -89,6 +96,123 @@ pub fn catastrophic_op(command: &str) -> Option<&'static str> {
     catastrophic_rm(&segments)
 }
 
+fn host_python_package_install(command: &str) -> Option<&'static str> {
+    if std::env::var_os("HI_ALLOW_DANGEROUS").is_some()
+        || std::env::var_os("HI_ALLOW_HOST_PACKAGE_INSTALL").is_some()
+        || std::env::var_os("VIRTUAL_ENV").is_some()
+    {
+        return None;
+    }
+
+    let expanded = expand_command_substitution(command);
+    let segments: Vec<&str> = expanded
+        .split([';', '\n', '|', '&'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    for seg in segments {
+        let toks: Vec<&str> = seg.split_whitespace().collect();
+        if !is_pip_install(&toks) {
+            continue;
+        }
+        if pip_install_is_isolated(&toks) {
+            continue;
+        }
+        return Some(
+            "installs Python packages into the host environment; use a project virtualenv (for example `.venv/bin/pip install ...`) or an isolated --target/--prefix instead",
+        );
+    }
+    None
+}
+
+fn is_pip_install(toks: &[&str]) -> bool {
+    let Some((pos, prog)) = first_program(toks) else {
+        return false;
+    };
+    let base = basename(prog);
+    if is_pip_program(base) {
+        return toks[pos + 1..].iter().any(|t| trim_quotes(t) == "install");
+    }
+    if is_python_program(base) {
+        let rest = &toks[pos + 1..];
+        for window in rest.windows(3) {
+            if trim_quotes(window[0]) == "-m"
+                && trim_quotes(window[1]) == "pip"
+                && trim_quotes(window[2]) == "install"
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn pip_install_is_isolated(toks: &[&str]) -> bool {
+    let Some((pos, prog)) = first_program(toks) else {
+        return false;
+    };
+    let prog = trim_quotes(prog);
+    if prog.contains("/.venv/")
+        || prog.starts_with(".venv/")
+        || prog.contains("/venv/")
+        || prog.contains("\\.venv\\")
+        || prog.contains("\\venv\\")
+    {
+        return true;
+    }
+    toks[pos + 1..].iter().any(|tok| {
+        let tok = trim_quotes(tok);
+        tok == "--target"
+            || tok.starts_with("--target=")
+            || tok == "--prefix"
+            || tok.starts_with("--prefix=")
+            || tok == "--root"
+            || tok.starts_with("--root=")
+    })
+}
+
+fn first_program<'a>(toks: &'a [&str]) -> Option<(usize, &'a str)> {
+    let mut i = 0;
+    while i < toks.len() {
+        let tok = trim_quotes(toks[i]);
+        if tok == "env" {
+            i += 1;
+            continue;
+        }
+        if is_env_assignment(tok) {
+            i += 1;
+            continue;
+        }
+        return Some((i, toks[i]));
+    }
+    None
+}
+
+fn is_pip_program(base: &str) -> bool {
+    base == "pip"
+        || base == "pip3"
+        || base
+            .strip_prefix("pip3.")
+            .is_some_and(|tail| tail.chars().all(|c| c.is_ascii_digit()))
+}
+
+fn is_python_program(base: &str) -> bool {
+    base == "python"
+        || base == "python3"
+        || base
+            .strip_prefix("python3.")
+            .is_some_and(|tail| tail.chars().all(|c| c.is_ascii_digit()))
+}
+
+fn basename(path: &str) -> &str {
+    trim_quotes(path).rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+fn trim_quotes(s: &str) -> &str {
+    s.trim_matches(['"', '\''])
+}
+
 /// Replace `$(...)` and `` `...` `` command substitutions with their inner
 /// text, so the segment scanner sees the embedded command. Quotes are stripped
 /// from the inner text for simplicity — this is heuristic, not a full shell
@@ -130,16 +254,19 @@ fn expand_command_substitution(command: &str) -> String {
 /// The program a segment runs, skipping leading `VAR=value` env assignments.
 fn program(seg: &str) -> &str {
     for tok in seg.split_whitespace() {
-        let is_env = !tok.starts_with('-')
-            && tok.split_once('=').is_some_and(|(k, _)| {
-                !k.is_empty() && k.chars().all(|c| c.is_alphanumeric() || c == '_')
-            });
-        if is_env {
+        if is_env_assignment(tok) {
             continue;
         }
         return tok;
     }
     ""
+}
+
+fn is_env_assignment(tok: &str) -> bool {
+    !tok.starts_with('-')
+        && tok.split_once('=').is_some_and(|(k, _)| {
+            !k.is_empty() && k.chars().all(|c| c.is_alphanumeric() || c == '_')
+        })
 }
 
 fn writes_to_disk_device(command: &str) -> bool {
@@ -231,7 +358,7 @@ fn dangerous_target(target: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::catastrophic_op;
+    use super::{blocked_op, catastrophic_op};
 
     #[test]
     fn refuses_irreversible_commands() {
@@ -279,6 +406,30 @@ mod tests {
             "grep -rf pattern src",
         ] {
             assert!(catastrophic_op(cmd).is_none(), "should allow: {cmd}");
+        }
+    }
+
+    #[test]
+    fn blocks_host_python_package_installs() {
+        for cmd in [
+            "pip install textual",
+            "pip3 install --break-system-packages textual",
+            "python3 -m pip install textual",
+            "PIP_DISABLE_PIP_VERSION_CHECK=1 pip install textual",
+        ] {
+            assert!(blocked_op(cmd).is_some(), "should block: {cmd}");
+        }
+    }
+
+    #[test]
+    fn allows_isolated_python_package_installs() {
+        for cmd in [
+            ".venv/bin/pip install textual",
+            "./.venv/bin/python -m pip install textual",
+            "pip install --target vendor textual",
+            "pip install --prefix .deps textual",
+        ] {
+            assert!(blocked_op(cmd).is_none(), "should allow: {cmd}");
         }
     }
 }

@@ -265,6 +265,17 @@ give your final recap.";
 const TRUNCATION_NUDGE: &str = "Your previous response was cut off by the output token limit — \
 it was truncated, not finished. Continue exactly from where you stopped, completing the text or \
 tool call you were in the middle of. Do not restart or repeat what you already produced.";
+const TRUNCATED_TOOL_CALL_NUDGE: &str = "Your previous response was cut off while emitting a tool \
+call. That partial tool call was not executed. Re-issue one fresh, complete tool call now. If the \
+payload is large, split the work into smaller writes/edits or use a bounded shell smoke test; do \
+not continue inside the partial tool-call text.";
+
+fn partial_text_tool_call_start(text: &str) -> Option<usize> {
+    ["<tool_call>", "{\"name\"", "[tool_call", "[tool_calls"]
+        .into_iter()
+        .filter_map(|marker| text.find(marker))
+        .min()
+}
 /// Sent when the model re-issues the exact same tool call as the previous
 /// round. The command already ran and its output is in the history just above —
 /// re-running it will only produce the same result. This nudges the model to act
@@ -366,6 +377,7 @@ struct EvidenceTracker {
     security_secret_search: bool,
     grep_match_lines: u32,
     inspected_paths: Vec<String>,
+    search_hit_snippets: Vec<String>,
     first_tool_kind: Option<EvidenceKind>,
     quality_repair_nudges: u32,
 }
@@ -394,6 +406,7 @@ impl EvidenceTracker {
                     self.grep_match_lines = self
                         .grep_match_lines
                         .saturating_add(grep_match_line_count(output));
+                    self.record_search_hit_snippets(output);
                 }
             }
             EvidenceKind::FileRead => {
@@ -442,6 +455,116 @@ impl EvidenceTracker {
     fn security_search_complete(&self) -> bool {
         self.security_unsafe_search && self.security_execution_search && self.security_secret_search
     }
+
+    fn record_search_hit_snippets(&mut self, output: &str) {
+        const SEARCH_HIT_SNIPPET_LIMIT: usize = 8;
+        let mut candidates = self.search_hit_snippets.clone();
+        for line in output.lines() {
+            let snippet = compact_search_hit_line(line);
+            if snippet.is_empty()
+                || search_hit_score(&snippet) == 0
+                || candidates.iter().any(|existing| existing == &snippet)
+            {
+                continue;
+            }
+            candidates.push(snippet);
+        }
+        candidates.sort_by(|left, right| {
+            search_hit_score(right)
+                .cmp(&search_hit_score(left))
+                .then_with(|| left.cmp(right))
+        });
+        candidates.truncate(SEARCH_HIT_SNIPPET_LIMIT);
+        self.search_hit_snippets = candidates;
+    }
+}
+
+fn compact_search_hit_line(line: &str) -> String {
+    let trimmed = line.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with("no matches")
+        || trimmed.starts_with("Error:")
+        || trimmed.starts_with("[preflight ")
+    {
+        return String::new();
+    }
+    let mut parts = trimmed.splitn(3, ':');
+    let Some(path) = parts.next().map(str::trim).filter(|path| !path.is_empty()) else {
+        return String::new();
+    };
+    let rest = parts.collect::<Vec<_>>().join(":");
+    if rest.trim().is_empty() || !std::path::Path::new(path).is_file() {
+        return String::new();
+    }
+    let rest = rest
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(140)
+        .collect::<String>();
+    format!("{path}: {rest}")
+}
+
+fn search_hit_score(snippet: &str) -> u8 {
+    let lower = snippet.to_ascii_lowercase();
+    let mut score = 0u8;
+    if contains_any(
+        &lower,
+        &[
+            "unsafe", "unwrap(", ".unwrap", "expect(", ".expect", "panic!",
+        ],
+    ) {
+        score = score.saturating_add(5);
+    }
+    if contains_any(
+        &lower,
+        &[
+            "command::new",
+            "process::command",
+            "std::process",
+            ".spawn(",
+            "shell",
+            "exec",
+        ],
+    ) {
+        score = score.saturating_add(4);
+    }
+    if contains_any(
+        &lower,
+        &[
+            "api_key",
+            "apikey",
+            "api-key",
+            "secret",
+            "password",
+            "bearer",
+            "authorization",
+            "credential",
+        ],
+    ) {
+        score = score.saturating_add(4);
+    }
+    if contains_any(
+        &lower,
+        &[
+            "std::env",
+            "env::var",
+            "std::fs",
+            "fs::write",
+            "read_to_string",
+            "remove_file",
+            "set_permissions",
+            "0o600",
+            "0o700",
+        ],
+    ) {
+        score = score.saturating_add(3);
+    }
+    if contains_any(&lower, &["token", "auth"]) {
+        score = score.saturating_add(1);
+    }
+    score
 }
 
 fn grep_match_line_count(output: &str) -> u32 {
@@ -971,16 +1094,131 @@ fn should_nudge_concrete_review_answer(
     evidence: &EvidenceTracker,
     answer: &str,
 ) -> bool {
-    if intent.is_none()
-        || evidence.inspected_paths.is_empty()
-        || answer_says_insufficient_evidence(answer)
-    {
+    let Some(intent) = intent else {
+        return false;
+    };
+    if evidence.inspected_paths.is_empty() || answer_says_insufficient_evidence(answer) {
         return false;
     }
-    !evidence
+    let cites_inspected_path = evidence
         .inspected_paths
         .iter()
-        .any(|path| answer.contains(path))
+        .any(|path| answer.contains(path));
+    !cites_inspected_path
+        || answer_looks_like_generic_inventory_summary(answer)
+        || answer_lacks_review_shape(intent, answer)
+}
+
+fn answer_lacks_review_shape(intent: ReviewIntent, answer: &str) -> bool {
+    let lower = answer.to_ascii_lowercase();
+    let has_evidence_language = contains_any(
+        &lower,
+        &[
+            "inspected",
+            "evidence",
+            "based on",
+            "limited to",
+            "from the inspected",
+            "in the inspected",
+        ],
+    );
+    let has_review_language = match intent {
+        ReviewIntent::Security => contains_any(
+            &lower,
+            &[
+                "finding",
+                "security",
+                "unsafe",
+                "unwrap",
+                "expect",
+                "panic",
+                "secret",
+                "token",
+                "auth",
+                "risk",
+                "follow-up",
+                "follow up",
+            ],
+        ),
+        ReviewIntent::Status => contains_any(
+            &lower,
+            &[
+                "status",
+                "state",
+                "build next",
+                "risk",
+                "validation",
+                "follow-up",
+                "follow up",
+            ],
+        ),
+        ReviewIntent::Roadmap | ReviewIntent::Gaps => contains_any(
+            &lower,
+            &[
+                "missing",
+                "gap",
+                "roadmap",
+                "build next",
+                "risk",
+                "coverage",
+                "follow-up",
+                "follow up",
+            ],
+        ),
+        ReviewIntent::Review => contains_any(
+            &lower,
+            &[
+                "finding",
+                "status",
+                "risk",
+                "validation",
+                "follow-up",
+                "follow up",
+            ],
+        ),
+    };
+    !(has_evidence_language && has_review_language)
+}
+
+fn answer_looks_like_generic_inventory_summary(answer: &str) -> bool {
+    let lower = answer.to_ascii_lowercase();
+    let inventory_markers = [
+        "codebase is",
+        "project is",
+        "repository is",
+        "structured with",
+        "consists of",
+        "main components",
+        "main functionality",
+        "key features",
+        "workspace setup",
+        "entry point",
+        "support for multiple",
+        "supports multiple",
+        "the exact count can be determined",
+        "approximately ",
+    ];
+    let marker_count = inventory_markers
+        .iter()
+        .filter(|marker| lower.contains(**marker))
+        .count();
+    let has_bounded_review_language = contains_any(
+        &lower,
+        &[
+            "findings:",
+            "status:",
+            "evidence:",
+            "inspected evidence",
+            "risks/validation",
+            "build next",
+            "missing/gaps",
+            "limits:",
+            "based on the inspected",
+            "from the inspected",
+            "not a complete",
+        ],
+    );
+    marker_count >= 2 && !has_bounded_review_language
 }
 
 fn should_nudge_read_after_repeated_search(
@@ -1221,6 +1459,30 @@ fn bounded_review_repair_exhaustion_answer(
         lines.push(format!("- Inspected files: {paths}"));
     }
 
+    if !evidence.search_hit_snippets.is_empty() {
+        const SEARCH_HIT_FALLBACK_LIMIT: usize = 6;
+        lines.push(String::new());
+        lines.push("Concrete search matches from inspected evidence:".to_string());
+        for snippet in evidence
+            .search_hit_snippets
+            .iter()
+            .take(SEARCH_HIT_FALLBACK_LIMIT)
+        {
+            lines.push(format!("- {snippet}"));
+        }
+        let omitted = evidence
+            .search_hit_snippets
+            .len()
+            .saturating_sub(SEARCH_HIT_FALLBACK_LIMIT);
+        if omitted > 0 {
+            lines.push(format!("- (+{omitted} more search match target(s))"));
+        }
+        lines.push(
+            "These are pattern-match review targets, not confirmed vulnerabilities or all-clear findings."
+                .to_string(),
+        );
+    }
+
     lines.push(String::new());
     lines.push(format!("Why this stopped: {reason}."));
     lines.push(
@@ -1228,6 +1490,54 @@ fn bounded_review_repair_exhaustion_answer(
             .to_string(),
     );
     lines.join("\n")
+}
+
+fn inspected_paths_for_prompt(evidence: &EvidenceTracker) -> String {
+    if evidence.inspected_paths.is_empty() {
+        return "none".to_string();
+    }
+    const LIMIT: usize = 8;
+    let mut paths = evidence
+        .inspected_paths
+        .iter()
+        .take(LIMIT)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let omitted = evidence.inspected_paths.len().saturating_sub(LIMIT);
+    if omitted > 0 {
+        paths.push_str(&format!(" (+{omitted} more)"));
+    }
+    paths
+}
+
+fn summarize_inspected_evidence_nudge(intent: ReviewIntent, evidence: &EvidenceTracker) -> String {
+    let label = read_only_intent_label(intent);
+    let paths = inspected_paths_for_prompt(evidence);
+    match intent {
+        ReviewIntent::Security => format!(
+            "You already have inspected evidence for this {label}. Do not answer with generic insufficient-evidence text. Produce a bounded security review from only the inspected searches/files. Cite concrete inspected files from this set: {paths}. Include: Findings, Inspected Evidence, Limits, and Follow-up. If a pattern match is only a review target, say that it is not confirmed."
+        ),
+        ReviewIntent::Status => format!(
+            "You already have inspected evidence for this {label}. Do not answer with generic insufficient-evidence text. Produce a bounded status review from only the inspected files. Cite concrete inspected files from this set: {paths}. Include: Status, Evidence, Build Next, and Risks/Validation. Do not claim repo-wide completeness."
+        ),
+        ReviewIntent::Roadmap | ReviewIntent::Gaps => format!(
+            "You already have inspected evidence for this {label}. Do not answer with generic insufficient-evidence text. Produce bounded gaps/build-next notes from only the inspected files and searches. Cite concrete inspected files from this set: {paths}. Include: Missing/Gaps, Build Next, Evidence, and Risks. Do not claim repo-wide completeness."
+        ),
+        ReviewIntent::Review => format!(
+            "You already have inspected evidence for this {label}. Do not answer with generic insufficient-evidence text. Produce bounded findings from only the inspected files/searches. Cite concrete inspected files from this set: {paths}. Include findings, evidence, follow-up, and limits."
+        ),
+    }
+}
+
+fn inspected_insufficient_repair_limit(intent: ReviewIntent) -> u32 {
+    match intent {
+        ReviewIntent::Security => 3,
+        ReviewIntent::Status
+        | ReviewIntent::Roadmap
+        | ReviewIntent::Gaps
+        | ReviewIntent::Review => 2,
+    }
 }
 
 fn no_evidence_review_nudge(intent: ReviewIntent) -> &'static str {
@@ -1287,7 +1597,13 @@ edits before finishing. \
 \
 Never describe a next step without doing it — if you say 'let me read X', call \
 the read tool in the same response. Do not narrate intent; act on it. Keep \
-working until the task is complete, then stop and give your recap.";
+working until the task is complete, then stop and give your recap. \
+\
+Prefer existing project dependencies and standard-library solutions unless the \
+user explicitly asks to add a dependency. For generated or new files, keep each \
+write/edit small enough to fit comfortably in one tool call; build the file in \
+coherent chunks instead of emitting a huge payload. After creating or editing \
+code, run a targeted syntax/build/test command before continuing.";
 
 /// Parse an `update_plan` arguments JSON and apply its step statuses to a
 /// structured goal's sub-goals (mapping by position). Tolerant — a malformed
@@ -2949,11 +3265,18 @@ impl Agent {
                     // has partial/malformed arguments and was never executed, so it
                     // has no matching tool_result. Leaving it in would create an
                     // orphan tool_use that providers reject on the next request.
-                    self.clean_text_tool_calls_from_content(&mut completion.content);
+                    let partial_tool_call =
+                        self.clean_text_tool_calls_from_content(&mut completion.content);
                     self.messages
                         .push_assistant_text_only(std::mem::take(&mut completion.content));
-                    self.messages
-                        .push_nudge(NudgeKind::Truncation, TRUNCATION_NUDGE);
+                    self.messages.push_nudge(
+                        NudgeKind::Truncation,
+                        if partial_tool_call {
+                            TRUNCATED_TOOL_CALL_NUDGE
+                        } else {
+                            TRUNCATION_NUDGE
+                        },
+                    );
                     continue;
                 }
                 // Truncation budget exhausted: the model kept hitting the output
@@ -3228,6 +3551,37 @@ impl Agent {
                         && evidence.saw_read
                         && answer_says_insufficient_evidence(&assistant_text)
                     {
+                        if matches!(intent, ReviewIntent::Security)
+                            && evidence.saw_search
+                            && !evidence.security_search_complete()
+                            && evidence.quality_repair_nudges < 3
+                        {
+                            evidence.quality_repair_nudges += 1;
+                            force_tools_next = true;
+                            ui.status(
+                                "security review reported insufficient evidence before searching all required pattern families; nudging the model to broaden the search",
+                            );
+                            self.messages
+                                .push_assistant(std::mem::take(&mut completion.content));
+                            self.messages
+                                .push_nudge(NudgeKind::Continue, SECURITY_BROAD_SEARCH_NUDGE);
+                            continue;
+                        }
+                        if evidence.quality_repair_nudges
+                            < inspected_insufficient_repair_limit(intent)
+                        {
+                            evidence.quality_repair_nudges += 1;
+                            ui.status(
+                                "review reported insufficient evidence after inspection; nudging the model to summarize inspected files",
+                            );
+                            self.messages
+                                .push_assistant(std::mem::take(&mut completion.content));
+                            self.messages.push_nudge(
+                                NudgeKind::Continue,
+                                summarize_inspected_evidence_nudge(intent, &evidence),
+                            );
+                            continue;
+                        }
                         stalled_unfinished = true;
                         ui.status(
                             "review ended with generic insufficient-evidence text after inspection; returning a bounded evidence summary",
@@ -4225,8 +4579,9 @@ impl Agent {
     /// history. Complete tool calls are extracted and stripped; partial JSON
     /// stays as text. `ToolCall` blocks are left in place — the caller
     /// (`push_assistant_text_only`) strips them.
-    fn clean_text_tool_calls_from_content(&self, content: &mut Vec<Content>) {
+    fn clean_text_tool_calls_from_content(&self, content: &mut Vec<Content>) -> bool {
         let mut new_content = Vec::new();
+        let mut saw_partial_tool_call = false;
         for c in content.drain(..) {
             match c {
                 Content::Text(t) => {
@@ -4240,14 +4595,22 @@ impl Agent {
                                 matches!(p, Content::Text(_) | Content::Thinking { .. })
                             }),
                         );
+                    } else if let Some(index) = partial_text_tool_call_start(&t) {
+                        let prose = t[..index].trim_end();
+                        if !prose.is_empty() {
+                            new_content.push(Content::Text(prose.to_string()));
+                        }
+                        saw_partial_tool_call = true;
                     } else {
                         new_content.push(Content::Text(t));
                     }
                 }
+                Content::ToolCall { .. } => saw_partial_tool_call = true,
                 other => new_content.push(other),
             }
         }
         *content = new_content;
+        saw_partial_tool_call
     }
 
     fn persist(&mut self) -> Result<()> {
@@ -5966,6 +6329,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn truncation_with_partial_text_tool_call_strips_raw_protocol() {
+        let mut cfg = config();
+        cfg.max_truncation_retries = 2;
+        let responses = vec![
+            Completion {
+                content: vec![Content::Text(
+                    "Let me write it.\n<tool_call>write<arg_key>path</arg_key><arg_value>main.py</arg_value><arg_key>content</arg_key><arg_value>print("
+                        .into(),
+                )],
+                usage: Usage {
+                    input_tokens: 10,
+                    output_tokens: 100,
+                    ..Default::default()
+                },
+                stop_reason: Some("max_tokens".into()),
+            },
+            completion(vec![Content::Text("Done after retry.".into())], 10, 50),
+        ];
+        let mut agent = agent(responses, cfg);
+        let mut ui = RecUi::default();
+        agent.run_turn("write main.py", &mut ui).await.unwrap();
+
+        let transcript_text = agent
+            .messages()
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|c| match c {
+                Content::Text(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !transcript_text.contains("<tool_call>"),
+            "partial XML-ish tool call must be stripped: {transcript_text}"
+        );
+        assert!(
+            transcript_text.contains("Re-issue one fresh, complete tool call"),
+            "fresh-tool-call nudge should be recorded: {transcript_text}"
+        );
+    }
+
+    #[tokio::test]
     async fn stale_nudge_stripped_before_next_turn() {
         // When a turn ends after a repeat-nudge stall, the last message in
         // history is a synthetic user nudge. Without stripping, the next
@@ -6853,6 +7259,138 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn generic_inventory_summary_with_path_is_not_accepted_as_status_review() {
+        let mut evidence = EvidenceTracker::default();
+        evidence.record_success("read", r#"{"path":"Cargo.toml"}"#, "[workspace]\n");
+        evidence.record_success(
+            "read",
+            r#"{"path":"crates/hi-agent/src/lib.rs"}"#,
+            "pub struct Agent;\n",
+        );
+
+        let generic = "The codebase is a Rust project structured with multiple crates. \
+It has a workspace setup with Cargo.toml defining dependencies, and the main functionality \
+revolves around an agent loop with tool calling capabilities.";
+        assert!(should_nudge_concrete_review_answer(
+            Some(ReviewIntent::Status),
+            &evidence,
+            generic
+        ));
+
+        let bounded = "Status:\n- Based on the inspected Cargo.toml and \
+crates/hi-agent/src/lib.rs, the workspace exposes the agent crate and the current status \
+surface is the agent loop.\n\nEvidence:\n- Cargo.toml and crates/hi-agent/src/lib.rs \
+were inspected.\n\nRisks/Validation:\n- This is not a complete repo audit.";
+        assert!(!should_nudge_concrete_review_answer(
+            Some(ReviewIntent::Status),
+            &evidence,
+            bounded
+        ));
+    }
+
+    #[test]
+    fn review_answer_needs_bounded_review_shape_not_just_a_path() {
+        let mut evidence = EvidenceTracker::default();
+        evidence.record_success("read", r#"{"path":"src/lib.rs"}"#, "fn main() {}\n");
+
+        assert!(should_nudge_concrete_review_answer(
+            Some(ReviewIntent::Review),
+            &evidence,
+            "src/lib.rs is part of the project and contains Rust code."
+        ));
+        assert!(!should_nudge_concrete_review_answer(
+            Some(ReviewIntent::Review),
+            &evidence,
+            "Findings:\n- Based on the inspected src/lib.rs, no concrete issue was established in that file.\n\nEvidence:\n- src/lib.rs was read.\n\nFollow-up:\n- Inspect callers before making broader claims."
+        ));
+    }
+
+    #[test]
+    fn bounded_repair_exhaustion_includes_search_match_targets() {
+        let inspected_path = temp_file("repair-search-target");
+        std::fs::write(
+            &inspected_path,
+            "fn token() { let value = std::env::var(\"API_KEY\").unwrap(); }\n",
+        )
+        .unwrap();
+        let inspected = inspected_path.to_string_lossy().to_string();
+        let mut evidence = EvidenceTracker::default();
+        evidence.record_success(
+            "grep",
+            &serde_json::json!({
+                "pattern": "unwrap|std::env|api_key|token",
+                "glob": "*.rs"
+            })
+            .to_string(),
+            &format!(
+                "{}:1:/// Context window in tokens.\n{}:2:fn token() {{ let value = std::env::var(\"API_KEY\").unwrap(); }}\n",
+                inspected, inspected
+            ),
+        );
+        evidence.record_success(
+            "read",
+            &serde_json::json!({ "path": inspected.clone() }).to_string(),
+            "1\tfn token() { let value = std::env::var(\"API_KEY\").unwrap(); }\n",
+        );
+
+        let answer = bounded_review_repair_exhaustion_answer(
+            ReviewIntent::Security,
+            &evidence,
+            "the final answer did not cite concrete files",
+        );
+
+        assert!(answer.contains("Concrete search matches from inspected evidence"));
+        assert!(answer.contains(&inspected));
+        assert!(answer.contains("std::env::var"));
+        assert!(answer.contains("pattern-match review targets"));
+        assert!(answer.contains("not confirmed vulnerabilities"));
+        assert_eq!(evidence.search_hit_snippets.len(), 2);
+        assert!(
+            evidence.search_hit_snippets[0].contains("std::env::var"),
+            "high-signal hit should sort first: {:?}",
+            evidence.search_hit_snippets
+        );
+        let _ = std::fs::remove_file(inspected_path);
+    }
+
+    #[test]
+    fn search_hit_snippets_keep_late_high_signal_matches() {
+        let inspected_path = temp_file("repair-search-ranking");
+        std::fs::write(
+            &inspected_path,
+            "fn token() { let value = std::env::var(\"API_KEY\").unwrap(); }\n",
+        )
+        .unwrap();
+        let inspected = inspected_path.to_string_lossy().to_string();
+        let mut output = String::new();
+        for line in 1..=12 {
+            output.push_str(&format!("{inspected}:{line}:/// token budget note\n"));
+        }
+        output.push_str(&format!(
+            "{inspected}:99:fn token() {{ let value = std::env::var(\"API_KEY\").unwrap(); }}\n"
+        ));
+
+        let mut evidence = EvidenceTracker::default();
+        evidence.record_success(
+            "grep",
+            &serde_json::json!({
+                "pattern": "unwrap|std::env|api_key|token",
+                "glob": "*.rs"
+            })
+            .to_string(),
+            &output,
+        );
+
+        assert_eq!(evidence.search_hit_snippets.len(), 8);
+        assert!(
+            evidence.search_hit_snippets[0].contains("std::env::var"),
+            "late high-signal hit should outrank early token-only lines: {:?}",
+            evidence.search_hit_snippets
+        );
+        let _ = std::fs::remove_file(inspected_path);
+    }
+
     #[tokio::test]
     async fn security_review_prompts_advertise_only_read_only_tools() {
         let responses = vec![completion(
@@ -7438,6 +7976,27 @@ mod tests {
                 1,
                 1,
             ),
+            completion(
+                vec![Content::Text(format!(
+                    "Insufficient evidence: I inspected `{inspected}`, but still cannot make concrete security findings."
+                ))],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text(format!(
+                    "Insufficient evidence: I inspected `{inspected}`, but still cannot make concrete security findings."
+                ))],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text(format!(
+                    "Insufficient evidence: I inspected `{inspected}`, but still cannot make concrete security findings."
+                ))],
+                1,
+                1,
+            ),
         ];
         let mut agent = agent(responses, config());
         let mut ui = RecUi::default();
@@ -7472,6 +8031,13 @@ mod tests {
             ui.assistant
         );
         assert!(
+            ui.statuses
+                .iter()
+                .any(|status| status.contains("nudging the model to summarize inspected files")),
+            "expected summarize-evidence repair status: {:?}",
+            ui.statuses
+        );
+        assert!(
             ui.statuses.iter().any(
                 |status| status.contains("generic insufficient-evidence text after inspection")
             ),
@@ -7479,6 +8045,87 @@ mod tests {
             ui.statuses
         );
         assert!(agent.last_turn_telemetry().stalled_unfinished);
+        let _ = std::fs::remove_file(inspected_path);
+    }
+
+    #[tokio::test]
+    async fn read_only_review_generic_insufficient_after_read_gets_summary_repair() {
+        let inspected_path = temp_file("generic-insufficient-summary-repair");
+        std::fs::write(
+            &inspected_path,
+            "pub fn value(input: Option<i32>) -> i32 { input.unwrap_or_default() }\n",
+        )
+        .unwrap();
+        let inspected = inspected_path.to_string_lossy().to_string();
+        let responses = vec![
+            completion(
+                vec![Content::ToolCall {
+                    id: "grep".into(),
+                    name: "grep".into(),
+                    arguments: serde_json::json!({
+                        "pattern": "unsafe|unwrap|expect|panic|std::process|std::fs|std::env|secret|token|auth",
+                        "glob": "*.rs",
+                    })
+                    .to_string(),
+                }],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::ToolCall {
+                    id: "read".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({ "path": inspected.clone() }).to_string(),
+                }],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text(format!(
+                    "Insufficient evidence: I inspected `{inspected}`, but cannot make concrete security findings."
+                ))],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text(format!(
+                    "Findings:\n- `{inspected}` uses `unwrap_or_default`; from the inspected file this is a fallback conversion, not a panic-prone unwrap.\n\nInspected Evidence:\n- `{inspected}` was read after the targeted search.\n\nLimits:\n- This is not a complete audit of uninspected files."
+                ))],
+                1,
+                1,
+            ),
+        ];
+        let mut agent = agent(responses, config());
+        let mut ui = RecUi::default();
+
+        agent
+            .run_turn(
+                "review for security issues or unsafe unwraps. then disucss only",
+                &mut ui,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            ui.statuses
+                .iter()
+                .any(|status| status.contains("nudging the model to summarize inspected files")),
+            "expected summarize-evidence repair status: {:?}",
+            ui.statuses
+        );
+        assert!(
+            ui.assistant.contains(&inspected),
+            "final answer should cite inspected path: {}",
+            ui.assistant
+        );
+        assert!(
+            !ui.assistant.contains("Bounded evidence summary"),
+            "accepted repaired answer should not fall back: {}",
+            ui.assistant
+        );
+        let telemetry = agent.last_turn_telemetry();
+        assert_eq!(telemetry.quality_repair_nudges, 1);
+        assert!(!telemetry.stalled_unfinished);
         let _ = std::fs::remove_file(inspected_path);
     }
 

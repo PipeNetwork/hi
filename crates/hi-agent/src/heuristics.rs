@@ -84,6 +84,92 @@ fn try_parse_tool_call_json(s: &str, start: usize) -> Option<(String, String, us
     Some((name.to_string(), arguments, i + 1))
 }
 
+/// Parse the XML-ish text tool protocol some smaller OpenAI-compatible models
+/// emit, for example:
+/// `<tool_call>bash<arg_key>command</arg_key><arg_value>echo hi</arg_value>`.
+///
+/// A closing `</tool_call>` is accepted but not required; the call ends after the
+/// last complete arg pair. Incomplete arg values are ignored so truncation can be
+/// recovered by the normal continue path instead of executing a partial command.
+fn try_parse_xml_tool_call(s: &str, start: usize) -> Option<(String, String, usize)> {
+    const START: &str = "<tool_call>";
+    const END: &str = "</tool_call>";
+    const ARG_KEY_START: &str = "<arg_key>";
+    const ARG_KEY_END: &str = "</arg_key>";
+    const ARG_VALUE_START: &str = "<arg_value>";
+    const ARG_VALUE_END: &str = "</arg_value>";
+
+    let rest = s.get(start..)?;
+    if !rest.starts_with(START) {
+        return None;
+    }
+
+    let mut pos = start + START.len();
+    while s.as_bytes().get(pos).is_some_and(u8::is_ascii_whitespace) {
+        pos += 1;
+    }
+    let name_start = pos;
+    while let Some(ch) = s[pos..].chars().next() {
+        if ch == '<' || ch.is_whitespace() {
+            break;
+        }
+        pos += ch.len_utf8();
+    }
+    let name = s[name_start..pos].trim();
+    if !is_valid_tool_name(name) {
+        return None;
+    }
+
+    let mut args = serde_json::Map::new();
+    let mut saw_arg = false;
+    loop {
+        while s.as_bytes().get(pos).is_some_and(u8::is_ascii_whitespace) {
+            pos += 1;
+        }
+        if s[pos..].starts_with(END) {
+            pos += END.len();
+            break;
+        }
+        if !s[pos..].starts_with(ARG_KEY_START) {
+            break;
+        }
+        let key_start = pos + ARG_KEY_START.len();
+        let key_rel_end = s[key_start..].find(ARG_KEY_END)?;
+        let key_end = key_start + key_rel_end;
+        let key = s[key_start..key_end].trim();
+        if key.is_empty() {
+            return None;
+        }
+        pos = key_end + ARG_KEY_END.len();
+
+        while s.as_bytes().get(pos).is_some_and(u8::is_ascii_whitespace) {
+            pos += 1;
+        }
+        if !s[pos..].starts_with(ARG_VALUE_START) {
+            return None;
+        }
+        let value_start = pos + ARG_VALUE_START.len();
+        let value_rel_end = s[value_start..].find(ARG_VALUE_END)?;
+        let value_end = value_start + value_rel_end;
+        let value = &s[value_start..value_end];
+        args.insert(
+            key.to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
+        saw_arg = true;
+        pos = value_end + ARG_VALUE_END.len();
+    }
+
+    if !saw_arg {
+        return None;
+    }
+    Some((
+        name.to_string(),
+        serde_json::Value::Object(args).to_string(),
+        pos,
+    ))
+}
+
 /// Scan assistant text for tool-call-like JSON patterns and convert them into
 /// `Content::ToolCall` blocks. This is a fallback for local models (Ollama,
 /// llama.cpp, etc.) that emit tool calls as text instead of using the
@@ -121,9 +207,14 @@ pub(crate) fn parse_text_tool_calls(text: &str, id_offset: usize) -> Vec<Content
     let mut search_from = 0;
 
     while i < bytes.len() {
-        if bytes[i] == b'{'
-            && let Some((name, arguments, end)) = try_parse_tool_call_json(&text, i)
-        {
+        let parsed = if bytes[i] == b'{' {
+            try_parse_tool_call_json(&text, i)
+        } else if bytes[i] == b'<' {
+            try_parse_xml_tool_call(&text, i)
+        } else {
+            None
+        };
+        if let Some((name, arguments, end)) = parsed {
             // Emit the prose before this tool call as a Text block.
             let prose = text[search_from..i].trim_end();
             if !prose.is_empty() {
@@ -948,6 +1039,44 @@ Now I'll read one."#;
         if let Content::ToolCall { arguments, .. } = &content[0] {
             assert!(arguments.contains("foo.rs"), "args preserved: {arguments}");
         }
+    }
+
+    #[test]
+    fn parse_text_tool_calls_finds_xmlish_bash_call() {
+        let text = "I'll run it.\n<tool_call>bash<arg_key>command</arg_key><arg_value>echo hi</arg_value></tool_call>\nDone.";
+        let content = parse_text_tool_calls(text, 0);
+        assert_eq!(tool_call_names(&content), vec!["bash"]);
+        if let Content::ToolCall { arguments, .. } = &content[1] {
+            assert_eq!(arguments, r#"{"command":"echo hi"}"#);
+        } else {
+            panic!("expected tool call: {content:?}");
+        }
+        let p = prose(&content);
+        assert!(!p.contains("<tool_call>"), "XML tool call stripped: {p}");
+        assert!(p.contains("I'll run it."), "leading prose preserved: {p}");
+        assert!(p.contains("Done."), "trailing prose preserved: {p}");
+    }
+
+    #[test]
+    fn parse_text_tool_calls_finds_xmlish_write_call_with_multiline_content() {
+        let text = "<tool_call>write<arg_key>path</arg_key><arg_value>calc.py</arg_value><arg_key>content</arg_key><arg_value>line1\nline2</arg_value>";
+        let content = parse_text_tool_calls(text, 0);
+        assert_eq!(tool_call_names(&content), vec!["write"]);
+        if let Content::ToolCall { arguments, .. } = &content[0] {
+            let value: serde_json::Value = serde_json::from_str(arguments).unwrap();
+            assert_eq!(value["path"], "calc.py");
+            assert_eq!(value["content"], "line1\nline2");
+        } else {
+            panic!("expected tool call: {content:?}");
+        }
+    }
+
+    #[test]
+    fn parse_text_tool_calls_ignores_incomplete_xmlish_call() {
+        let text = "<tool_call>bash<arg_key>command</arg_key><arg_value>echo";
+        let content = parse_text_tool_calls(text, 0);
+        assert!(tool_call_names(&content).is_empty());
+        assert!(prose(&content).contains("<tool_call>"));
     }
 
     #[test]
