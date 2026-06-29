@@ -3039,6 +3039,24 @@ impl Agent {
                             .push_assistant(vec![Content::Text(insufficient.to_string())]);
                         break false;
                     }
+                    if let Some(intent) = read_only_intent
+                        && (evidence.saw_read || evidence.saw_search)
+                    {
+                        stalled_unfinished = true;
+                        ui.status(
+                            "review repeated the same command after inspection; returning a bounded evidence summary",
+                        );
+                        let insufficient = bounded_review_repair_exhaustion_answer(
+                            intent,
+                            &evidence,
+                            "the model kept repeating the same tool call instead of producing findings tied to inspected evidence",
+                        );
+                        ui.assistant_text(&insufficient);
+                        ui.assistant_end();
+                        self.messages
+                            .push_assistant(vec![Content::Text(insufficient)]);
+                        break false;
+                    }
                     ui.status(
                         "⚠ the model kept re-running the same command without acting on the \
                          result — the task may be incomplete. /retry, or send 'continue'.",
@@ -7243,6 +7261,112 @@ mod tests {
         );
         let telemetry = agent.last_turn_telemetry();
         assert_eq!(telemetry.quality_repair_nudges, 2);
+        assert!(telemetry.stalled_unfinished);
+        let _ = std::fs::remove_file(inspected_path);
+    }
+
+    #[tokio::test]
+    async fn read_only_review_repeat_exhaustion_reports_inspected_evidence() {
+        let inspected_path = temp_file("repeat-exhaustion-evidence");
+        std::fs::write(
+            &inspected_path,
+            "pub fn value() -> Option<i32> { Some(1) }\n",
+        )
+        .unwrap();
+        let inspected = inspected_path.to_string_lossy().to_string();
+        let grep_args = serde_json::json!({
+            "pattern": "unwrap\\(",
+            "glob": "*.rs",
+        })
+        .to_string();
+        let responses = vec![
+            completion(
+                vec![Content::ToolCall {
+                    id: "read".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({ "path": inspected.clone() }).to_string(),
+                }],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::ToolCall {
+                    id: "grep1".into(),
+                    name: "grep".into(),
+                    arguments: grep_args.clone(),
+                }],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::ToolCall {
+                    id: "grep2".into(),
+                    name: "grep".into(),
+                    arguments: grep_args.clone(),
+                }],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::ToolCall {
+                    id: "grep3".into(),
+                    name: "grep".into(),
+                    arguments: grep_args.clone(),
+                }],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::ToolCall {
+                    id: "grep4".into(),
+                    name: "grep".into(),
+                    arguments: grep_args,
+                }],
+                1,
+                1,
+            ),
+        ];
+        let mut agent = agent(responses, config());
+        let mut ui = RecUi::default();
+
+        agent
+            .run_turn(
+                "review for security issues or unsafe unwraps. then disucss only",
+                &mut ui,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            ui.assistant
+                .contains("Insufficient evidence for a completed security review"),
+            "expected bounded evidence fallback: {}",
+            ui.assistant
+        );
+        assert!(
+            ui.assistant.contains("Targeted searches: 1"),
+            "repeated searches should not be counted as executed searches: {}",
+            ui.assistant
+        );
+        assert!(
+            ui.assistant.contains("File reads: 1"),
+            "fallback should report file reads: {}",
+            ui.assistant
+        );
+        assert!(
+            ui.assistant.contains(&inspected),
+            "fallback should cite inspected path: {}",
+            ui.assistant
+        );
+        assert!(
+            ui.statuses
+                .iter()
+                .any(|status| status.contains("bounded evidence summary")),
+            "expected bounded repeat-exhaustion status: {:?}",
+            ui.statuses
+        );
+        let telemetry = agent.last_turn_telemetry();
+        assert_eq!(telemetry.repeat_nudges, 2);
         assert!(telemetry.stalled_unfinished);
         let _ = std::fs::remove_file(inspected_path);
     }
