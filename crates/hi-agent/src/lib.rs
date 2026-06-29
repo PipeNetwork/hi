@@ -286,6 +286,13 @@ main crate or module entrypoints, and tests before making status claims.";
 const GAP_DEEPEN_NUDGE: &str = "This gap or roadmap review only has a directory listing so far. \
 Do not finalize yet. Inspect manifests, owning modules, tests, and TODO/FIXME or missing-coverage \
 search results before naming gaps or build-next work.";
+const CONCRETE_REVIEW_NUDGE: &str = "Your read-only review answer did not cite concrete files or \
+modules from the inspected evidence. Do not use mutating tools. Answer again with bounded findings \
+tied to inspected paths, or explicitly say the evidence is insufficient.";
+const READ_AFTER_SEARCH_NUDGE: &str = "The targeted search result is already in the transcript. \
+Do not rerun the same search and do not use mutating tools. Read the most relevant matching file, \
+then answer from that inspected file. If you cannot pick a file to read, explicitly say the \
+evidence is insufficient.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReviewIntent {
@@ -320,6 +327,7 @@ struct EvidenceTracker {
     saw_read: bool,
     file_reads: u32,
     targeted_searches: u32,
+    inspected_paths: Vec<String>,
     first_tool_kind: Option<EvidenceKind>,
     quality_repair_nudges: u32,
 }
@@ -344,6 +352,15 @@ impl EvidenceTracker {
             EvidenceKind::FileRead => {
                 self.saw_read = true;
                 self.file_reads = self.file_reads.saturating_add(1);
+                if let Some(path) = hi_tools::target_path(name, arguments)
+                    && !path.is_empty()
+                    && !self
+                        .inspected_paths
+                        .iter()
+                        .any(|existing| existing == &path)
+                {
+                    self.inspected_paths.push(path);
+                }
             }
         }
     }
@@ -583,6 +600,51 @@ fn should_deepen_review(
     intent.is_some() && evidence.listing_only() && !answer_says_insufficient_evidence(answer)
 }
 
+fn should_nudge_concrete_review_answer(
+    intent: Option<ReviewIntent>,
+    evidence: &EvidenceTracker,
+    answer: &str,
+) -> bool {
+    if intent.is_none()
+        || evidence.inspected_paths.is_empty()
+        || answer_says_insufficient_evidence(answer)
+    {
+        return false;
+    }
+    !evidence
+        .inspected_paths
+        .iter()
+        .any(|path| answer.contains(path))
+}
+
+fn should_nudge_read_after_repeated_search(
+    intent: Option<ReviewIntent>,
+    evidence: &EvidenceTracker,
+) -> bool {
+    intent.is_some() && evidence.saw_search && !evidence.saw_read
+}
+
+fn should_nudge_read_after_search_final(
+    intent: Option<ReviewIntent>,
+    evidence: &EvidenceTracker,
+    answer: &str,
+) -> bool {
+    intent.is_some()
+        && evidence.saw_search
+        && !evidence.saw_read
+        && !answer_says_insufficient_evidence(answer)
+}
+
+fn insufficient_after_repeated_search(evidence: &EvidenceTracker) -> Option<&'static str> {
+    if evidence.saw_search && !evidence.saw_read {
+        Some(
+            "Insufficient evidence: targeted search ran, but no matching file was read, so I cannot make file-specific review findings.",
+        )
+    } else {
+        None
+    }
+}
+
 fn deepen_review_nudge(intent: ReviewIntent) -> &'static str {
     match intent {
         ReviewIntent::Security => SECURITY_DEEPEN_NUDGE,
@@ -590,6 +652,16 @@ fn deepen_review_nudge(intent: ReviewIntent) -> &'static str {
         ReviewIntent::Roadmap | ReviewIntent::Gaps => GAP_DEEPEN_NUDGE,
         ReviewIntent::Review => REVIEW_DEEPEN_NUDGE,
     }
+}
+
+fn read_only_blocks_tool(intent: Option<ReviewIntent>, name: &str) -> bool {
+    intent.is_some() && !hi_tools::is_read_only(name)
+}
+
+fn read_only_blocked_tool_result(name: &str) -> String {
+    format!(
+        "Tool `{name}` blocked: this is a read-only review/discuss-only turn. Use read-only inspection tools and answer from inspected evidence; do not modify files."
+    )
 }
 
 /// Asked of the model in a dedicated, tool-free call after a turn that changed
@@ -2065,12 +2137,11 @@ impl Agent {
                     },
                 };
 
-                let buffer_listing_only_review_text =
-                    read_only_intent.is_some() && evidence.listing_only();
+                let buffer_read_only_review_text = read_only_intent.is_some();
                 let mut buffered_assistant_text = String::new();
                 let mut sink = |event: StreamEvent| match event {
                     StreamEvent::Text(text) => {
-                        if buffer_listing_only_review_text {
+                        if buffer_read_only_review_text {
                             buffered_assistant_text.push_str(&text);
                         } else {
                             ui.assistant_text(&text);
@@ -2141,7 +2212,7 @@ impl Agent {
                         return Err(err);
                     }
                 };
-                if !buffer_listing_only_review_text {
+                if !buffer_read_only_review_text {
                     ui.assistant_end();
                 }
 
@@ -2307,15 +2378,40 @@ impl Agent {
                     if repeat_nudges < self.config.max_repeat_nudges {
                         repeat_nudges += 1;
                         stalled_repeating = true;
-                        ui.status(&format!(
-                            "the model re-ran the same command — its output is already above; \
-                             nudging it to act on it ({repeat_nudges}/{})",
-                            self.config.max_repeat_nudges
-                        ));
-                        self.messages.push_nudge(NudgeKind::Repeat, REPEAT_NUDGE);
+                        let nudge = if should_nudge_read_after_repeated_search(
+                            read_only_intent,
+                            &evidence,
+                        ) {
+                            ui.status(&format!(
+                                    "the model re-ran the same search — nudging it to read a matching file ({repeat_nudges}/{})",
+                                    self.config.max_repeat_nudges
+                                ));
+                            READ_AFTER_SEARCH_NUDGE
+                        } else {
+                            ui.status(&format!(
+                                "the model re-ran the same command — its output is already above; \
+                                     nudging it to act on it ({repeat_nudges}/{})",
+                                self.config.max_repeat_nudges
+                            ));
+                            REPEAT_NUDGE
+                        };
+                        self.messages.push_nudge(NudgeKind::Repeat, nudge);
                         // Keep prev_call_sig as-is so a further repeat is still
                         // detected against the same signature.
                         continue;
+                    }
+                    if read_only_intent.is_some()
+                        && let Some(insufficient) = insufficient_after_repeated_search(&evidence)
+                    {
+                        stalled_unfinished = true;
+                        ui.status(
+                            "review repeated the same search without reading files; returning an insufficient-evidence answer",
+                        );
+                        ui.assistant_text(insufficient);
+                        ui.assistant_end();
+                        self.messages
+                            .push_assistant(vec![Content::Text(insufficient.to_string())]);
+                        break false;
                     }
                     ui.status(
                         "⚠ the model kept re-running the same command without acting on the \
@@ -2414,7 +2510,65 @@ impl Agent {
                             .push_assistant(vec![Content::Text(insufficient.to_string())]);
                         break false;
                     }
-                    if buffer_listing_only_review_text {
+                    if should_nudge_read_after_search_final(
+                        read_only_intent,
+                        &evidence,
+                        &assistant_text,
+                    ) {
+                        if evidence.quality_repair_nudges < 2 {
+                            evidence.quality_repair_nudges += 1;
+                            force_tools_next = true;
+                            ui.status(
+                                "review had targeted search but no file reads; nudging the model to read matching files",
+                            );
+                            self.messages
+                                .push_assistant(std::mem::take(&mut completion.content));
+                            self.messages
+                                .push_nudge(NudgeKind::Continue, READ_AFTER_SEARCH_NUDGE);
+                            continue;
+                        }
+
+                        stalled_unfinished = true;
+                        ui.status(
+                            "review still had targeted search but no file reads after repair; returning an insufficient-evidence answer",
+                        );
+                        let insufficient = insufficient_after_repeated_search(&evidence)
+                            .expect("search without read checked above");
+                        ui.assistant_text(insufficient);
+                        ui.assistant_end();
+                        self.messages
+                            .push_assistant(vec![Content::Text(insufficient.to_string())]);
+                        break false;
+                    }
+                    if should_nudge_concrete_review_answer(
+                        read_only_intent,
+                        &evidence,
+                        &assistant_text,
+                    ) {
+                        if evidence.quality_repair_nudges < 2 {
+                            evidence.quality_repair_nudges += 1;
+                            ui.status(
+                                "review answer lacked concrete inspected files; nudging the model to tie findings to evidence",
+                            );
+                            self.messages
+                                .push_assistant(std::mem::take(&mut completion.content));
+                            self.messages
+                                .push_nudge(NudgeKind::Continue, CONCRETE_REVIEW_NUDGE);
+                            continue;
+                        }
+
+                        stalled_unfinished = true;
+                        ui.status(
+                            "review answer still lacked concrete inspected files after repair; returning an insufficient-evidence answer",
+                        );
+                        let insufficient = "Insufficient evidence: the inspected context was not tied to concrete file-specific findings, so I cannot present this as a completed review.";
+                        ui.assistant_text(insufficient);
+                        ui.assistant_end();
+                        self.messages
+                            .push_assistant(vec![Content::Text(insufficient.to_string())]);
+                        break false;
+                    }
+                    if buffer_read_only_review_text {
                         let text_to_emit = if buffered_assistant_text.is_empty() {
                             assistant_text.as_str()
                         } else {
@@ -2501,6 +2655,23 @@ impl Agent {
                 // self` there). They're instantaneous and have no deps that
                 // matter, so handling them up front is safe.
                 for (i, (id, name, arguments)) in calls.iter().enumerate() {
+                    if read_only_blocks_tool(read_only_intent, name) {
+                        ui.tool_call(name, arguments);
+                        let content = read_only_blocked_tool_result(name);
+                        emit_tool_output(
+                            &mut *ui,
+                            name,
+                            &hi_tools::ToolOutput {
+                                content: content.clone(),
+                                display: None,
+                                plan: None,
+                            },
+                        );
+                        results[i] = Some((id.clone(), content));
+                        completed[i] = true;
+                        completion_order.push(i);
+                        continue;
+                    }
                     if name != "record_decision" {
                         continue;
                     }
@@ -4516,6 +4687,7 @@ mod tests {
         usages: Vec<(u64, u64)>,
         turn_end: Option<String>,
         assistant: String,
+        tool_results: Vec<(String, String)>,
     }
     impl Ui for RecUi {
         fn assistant_text(&mut self, t: &str) {
@@ -4524,7 +4696,10 @@ mod tests {
         fn assistant_reasoning(&mut self, _: &str) {}
         fn assistant_end(&mut self) {}
         fn tool_call(&mut self, _: &str, _: &str) {}
-        fn tool_result(&mut self, _: &str, _: &str) {}
+        fn tool_result(&mut self, name: &str, result: &str) {
+            self.tool_results
+                .push((name.to_string(), result.to_string()));
+        }
         fn status(&mut self, t: &str) {
             self.statuses.push(t.to_string());
         }
@@ -5731,6 +5906,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discuss_only_security_review_blocks_mutating_tool_call_execution() {
+        let path = temp_file("readonly-block");
+        std::fs::write(&path, "old\n").unwrap();
+        let edit_args = serde_json::json!({
+            "path": path.to_string_lossy().to_string(),
+            "old_string": "old\n",
+            "new_string": "new\n",
+        })
+        .to_string();
+        let responses = vec![
+            completion(
+                vec![Content::ToolCall {
+                    id: "edit".into(),
+                    name: "edit".into(),
+                    arguments: edit_args,
+                }],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text(
+                    "Inspected evidence only; no file changes were made.".into(),
+                )],
+                1,
+                1,
+            ),
+        ];
+        let mut agent = agent(responses, config());
+        let mut ui = RecUi::default();
+
+        agent
+            .run_turn(
+                "review for security issues or unsafe unwraps. then disucss only",
+                &mut ui,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "old\n");
+        assert!(
+            ui.tool_results
+                .iter()
+                .any(|(name, result)| { name == "edit" && result.contains("Tool `edit` blocked") }),
+            "expected blocked edit tool result in transcript"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn listing_only_review_final_gets_deepen_review_nudge() {
         let responses = vec![
             completion(
@@ -5751,16 +5975,16 @@ mod tests {
             ),
             completion(
                 vec![Content::ToolCall {
-                    id: "grep".into(),
-                    name: "grep".into(),
-                    arguments: r#"{"pattern":"fn run_turn","glob":"*.rs"}"#.into(),
+                    id: "read".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"Cargo.toml"}"#.into(),
                 }],
                 1,
                 1,
             ),
             completion(
                 vec![Content::Text(
-                    "Findings:\n- crates/hi-agent/src/lib.rs has the main run_turn loop and should keep review nudges bounded.".into(),
+                    "Findings:\n- Cargo.toml defines the workspace members and gives concrete status context for this review.".into(),
                 )],
                 1,
                 1,
@@ -5783,8 +6007,8 @@ mod tests {
         );
         let telemetry = agent.last_turn_telemetry();
         assert_eq!(telemetry.quality_repair_nudges, 1);
-        assert_eq!(telemetry.targeted_searches, 1);
-        assert_eq!(telemetry.file_reads, 0);
+        assert_eq!(telemetry.targeted_searches, 0);
+        assert_eq!(telemetry.file_reads, 1);
         assert!(!telemetry.listing_only);
         assert_eq!(telemetry.discovery_depth, "mixed");
         assert!(
@@ -5792,6 +6016,162 @@ mod tests {
                 .usage_summary(agent.totals())
                 .contains("review-repair")
         );
+    }
+
+    #[tokio::test]
+    async fn read_only_review_generic_final_gets_concrete_evidence_nudge() {
+        let inspected_path = temp_file("concrete-review");
+        std::fs::write(&inspected_path, "fn main() { println!(\"ok\"); }\n").unwrap();
+        let inspected = inspected_path.to_string_lossy().to_string();
+        let responses = vec![
+            completion(
+                vec![Content::ToolCall {
+                    id: "read".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({ "path": inspected.clone() }).to_string(),
+                }],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text(
+                    "No unsafe unwrap issues were found in the inspected code.".into(),
+                )],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text(format!(
+                    "Findings:\n- {inspected}: inspected for unsafe, unwrap, expect, and panic patterns; no security-critical issue was established from that file alone."
+                ))],
+                1,
+                1,
+            ),
+        ];
+        let mut agent = agent(responses, config());
+        let mut ui = RecUi::default();
+
+        agent
+            .run_turn(
+                "review for security issues or unsafe unwraps. then disucss only",
+                &mut ui,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            ui.statuses
+                .iter()
+                .any(|status| status.contains("lacked concrete inspected files")),
+            "expected concrete-evidence nudge status: {:?}",
+            ui.statuses
+        );
+        assert!(
+            agent
+                .messages()
+                .iter()
+                .any(|message| message.role == Role::Assistant
+                    && message.text().contains(&inspected)),
+            "final answer should cite inspected path"
+        );
+        assert_eq!(agent.last_turn_telemetry().quality_repair_nudges, 1);
+        let _ = std::fs::remove_file(inspected_path);
+    }
+
+    #[tokio::test]
+    async fn read_only_review_repeated_search_without_read_returns_insufficient_evidence() {
+        let grep_call = || {
+            completion(
+                vec![Content::ToolCall {
+                    id: "grep".into(),
+                    name: "grep".into(),
+                    arguments: serde_json::json!({
+                        "pattern": "fn run_turn",
+                        "glob": "*.rs",
+                    })
+                    .to_string(),
+                }],
+                1,
+                1,
+            )
+        };
+        let responses = vec![grep_call(), grep_call(), grep_call(), grep_call()];
+        let mut agent = agent(responses, config());
+        let mut ui = RecUi::default();
+
+        agent
+            .run_turn(
+                "review for security issues or unsafe unwraps. then disucss only",
+                &mut ui,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            ui.statuses
+                .iter()
+                .any(|status| status.contains("nudging it to read a matching file")),
+            "expected read-after-search nudge: {:?}",
+            ui.statuses
+        );
+        assert!(
+            ui.assistant
+                .contains("Insufficient evidence: targeted search ran"),
+            "expected insufficient-evidence final: {}",
+            ui.assistant
+        );
+        assert!(agent.last_turn_telemetry().stalled_unfinished);
+    }
+
+    #[tokio::test]
+    async fn read_only_review_search_then_generic_final_requires_file_read() {
+        let responses = vec![
+            completion(
+                vec![Content::ToolCall {
+                    id: "grep".into(),
+                    name: "grep".into(),
+                    arguments: serde_json::json!({
+                        "pattern": "unwrap|expect|panic",
+                        "glob": "*.rs",
+                    })
+                    .to_string(),
+                }],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text("Completed the requested action.".into())],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text(
+                    "Insufficient evidence: targeted search ran, but no matching file was read."
+                        .into(),
+                )],
+                1,
+                1,
+            ),
+        ];
+        let mut agent = agent(responses, config());
+        let mut ui = RecUi::default();
+
+        agent
+            .run_turn(
+                "review for security issues or unsafe unwraps. then disucss only",
+                &mut ui,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            ui.statuses
+                .iter()
+                .any(|status| status.contains("targeted search but no file reads")),
+            "expected search-without-read nudge: {:?}",
+            ui.statuses
+        );
+        assert_eq!(agent.last_turn_telemetry().quality_repair_nudges, 1);
     }
 
     #[tokio::test]
