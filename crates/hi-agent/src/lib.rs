@@ -1172,7 +1172,7 @@ fn bounded_review_repair_exhaustion_answer(
     let label = read_only_intent_label(intent);
     let mut lines = vec![
         format!(
-            "Insufficient evidence for a completed {label}: the model did not produce acceptable file-specific findings after repair."
+            "Bounded evidence summary for an incomplete {label}: the model inspected evidence but did not produce acceptable file-specific findings after repair."
         ),
         String::new(),
         "Inspected evidence:".to_string(),
@@ -3222,6 +3222,25 @@ impl Agent {
                         ui.assistant_end();
                         self.messages
                             .push_assistant(vec![Content::Text(insufficient.to_string())]);
+                        break false;
+                    }
+                    if let Some(intent) = read_only_intent
+                        && evidence.saw_read
+                        && answer_says_insufficient_evidence(&assistant_text)
+                    {
+                        stalled_unfinished = true;
+                        ui.status(
+                            "review ended with generic insufficient-evidence text after inspection; returning a bounded evidence summary",
+                        );
+                        let insufficient = bounded_review_repair_exhaustion_answer(
+                            intent,
+                            &evidence,
+                            "the final answer reported insufficient evidence after inspection instead of summarizing the inspected evidence",
+                        );
+                        ui.assistant_text(&insufficient);
+                        ui.assistant_end();
+                        self.messages
+                            .push_assistant(vec![Content::Text(insufficient)]);
                         break false;
                     }
                     if should_reject_review_repair_template(read_only_intent, &assistant_text) {
@@ -7340,7 +7359,7 @@ mod tests {
 
         assert!(
             ui.assistant
-                .contains("Insufficient evidence for a completed security review"),
+                .contains("Bounded evidence summary for an incomplete security review"),
             "expected bounded evidence fallback: {}",
             ui.assistant
         );
@@ -7367,6 +7386,89 @@ mod tests {
         let telemetry = agent.last_turn_telemetry();
         assert_eq!(telemetry.quality_repair_nudges, 2);
         assert!(telemetry.stalled_unfinished);
+        let _ = std::fs::remove_file(inspected_path);
+    }
+
+    #[tokio::test]
+    async fn read_only_review_generic_insufficient_after_read_reports_evidence() {
+        let inspected_path = temp_file("generic-insufficient-after-read");
+        std::fs::write(
+            &inspected_path,
+            "pub fn value(input: Option<i32>) -> i32 { input.unwrap_or_default() }\n",
+        )
+        .unwrap();
+        let inspected = inspected_path.to_string_lossy().to_string();
+        let responses = vec![
+            completion(
+                vec![Content::ToolCall {
+                    id: "grep".into(),
+                    name: "grep".into(),
+                    arguments: serde_json::json!({
+                        "pattern": "unsafe|unwrap|expect|panic|std::process|std::fs|std::env|secret|token|auth",
+                        "glob": "*.rs",
+                    })
+                    .to_string(),
+                }],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::ToolCall {
+                    id: "read".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({ "path": inspected.clone() }).to_string(),
+                }],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text(format!(
+                    "Insufficient evidence: I inspected `{inspected}`, but cannot make concrete security findings."
+                ))],
+                1,
+                1,
+            ),
+        ];
+        let mut agent = agent(responses, config());
+        let mut ui = RecUi::default();
+
+        agent
+            .run_turn(
+                "review for security issues or unsafe unwraps. then disucss only",
+                &mut ui,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            ui.assistant
+                .contains("Bounded evidence summary for an incomplete security review"),
+            "expected bounded evidence summary: {}",
+            ui.assistant
+        );
+        assert!(
+            ui.assistant.contains("Targeted searches: 1"),
+            "summary should retain search evidence: {}",
+            ui.assistant
+        );
+        assert!(
+            ui.assistant.contains("File reads: 1"),
+            "summary should retain file-read evidence: {}",
+            ui.assistant
+        );
+        assert!(
+            ui.assistant.contains(&inspected),
+            "summary should cite inspected path: {}",
+            ui.assistant
+        );
+        assert!(
+            ui.statuses.iter().any(
+                |status| status.contains("generic insufficient-evidence text after inspection")
+            ),
+            "expected replacement status: {:?}",
+            ui.statuses
+        );
+        assert!(agent.last_turn_telemetry().stalled_unfinished);
         let _ = std::fs::remove_file(inspected_path);
     }
 
@@ -7444,7 +7546,7 @@ mod tests {
 
         assert!(
             ui.assistant
-                .contains("Insufficient evidence for a completed security review"),
+                .contains("Bounded evidence summary for an incomplete security review"),
             "expected bounded evidence fallback: {}",
             ui.assistant
         );
@@ -7557,7 +7659,7 @@ mod tests {
         );
         assert!(
             ui.assistant
-                .contains("Insufficient evidence for a completed gap review"),
+                .contains("Bounded evidence summary for an incomplete gap review"),
             "expected bounded evidence fallback: {}",
             ui.assistant
         );
