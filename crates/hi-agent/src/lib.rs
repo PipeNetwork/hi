@@ -2212,7 +2212,7 @@ impl Agent {
         }
     }
 
-    fn elide_in_turn_context_if_needed(&mut self, ui: &mut dyn Ui, safety_window: Option<u32>) {
+    fn elide_in_turn_context_if_needed(&mut self, _ui: &mut dyn Ui, safety_window: Option<u32>) {
         if !self.config.auto_compact {
             return;
         }
@@ -2241,10 +2241,6 @@ impl Agent {
             return;
         }
 
-        ui.status(&format!(
-            "context ~{}% full — elided old tool output before continuing",
-            used * 100 / u64::from(window)
-        ));
         self.context_used = 0;
     }
 
@@ -8580,8 +8576,8 @@ mod tests {
         assert!(outputs[2].starts_with("3\n"), "{outputs:?}");
         assert!(outputs[7].starts_with("8\n"), "{outputs:?}");
         assert!(
-            ui.statuses.iter().any(|s| s.contains("elided old tool")),
-            "expected elision status, got {:?}",
+            !ui.statuses.iter().any(|s| s.contains("elided old tool")),
+            "in-turn elision should stay quiet, got {:?}",
             ui.statuses
         );
     }
