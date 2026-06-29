@@ -274,6 +274,18 @@ in the conversation above — running it again will only repeat the same result.
 now: make the edit it points to, move to the next step, or if the task is already complete, stop \
 and give your final recap. Do not re-run the same command.";
 
+const NO_EVIDENCE_REVIEW_NUDGE: &str = "This read-only review has no inspected evidence yet. \
+Do not finalize. Use read-only inspection tools first, then answer from the inspected evidence. \
+If inspection is impossible, explicitly say the evidence is insufficient.";
+const NO_EVIDENCE_SECURITY_NUDGE: &str = "This security review has no inspected evidence yet. \
+Do not finalize. Search for unsafe, unwrap, expect, panic!, command execution, filesystem/env \
+access, and secret/token/auth patterns, then read the most relevant matching files before answering.";
+const NO_EVIDENCE_STATUS_NUDGE: &str = "This status review has no inspected evidence yet. \
+Do not finalize. Inspect git status or diff summary, workspace manifests, README/docs if present, \
+main crate or module entrypoints, and tests before making status claims.";
+const NO_EVIDENCE_GAP_NUDGE: &str = "This gap or roadmap review has no inspected evidence yet. \
+Do not finalize. Inspect manifests, owning modules, tests, and TODO/FIXME or missing-coverage \
+search results before naming gaps or build-next work.";
 const REVIEW_DEEPEN_NUDGE: &str = "This read-only review only has a directory listing so far. \
 Do not finalize yet. Use a targeted search or read relevant files, then answer from the inspected \
 evidence. If deeper inspection is impossible, explicitly say the evidence is insufficient.";
@@ -298,6 +310,10 @@ but it has not covered all required pattern families yet. Do not use mutating to
 unsafe/unwrap/expect/panic, command execution/filesystem/env access, and secret/token/auth \
 patterns, then answer only from concrete inspected evidence or explicitly say the evidence is \
 insufficient.";
+const SECURITY_SCOPE_NUDGE: &str = "The security answer made repo-wide all-clear claims that are \
+broader than the inspected files and search results support. Do not use mutating tools. Answer \
+again with findings explicitly bounded to the searched patterns and inspected files, or explicitly \
+say the evidence is insufficient for broader security claims.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReviewIntent {
@@ -379,6 +395,10 @@ impl EvidenceTracker {
 
     fn listing_only(&self) -> bool {
         self.saw_listing && !self.saw_search && !self.saw_read
+    }
+
+    fn has_discovery(&self) -> bool {
+        self.saw_listing || self.saw_search || self.saw_read
     }
 
     fn discovery_depth(&self) -> &'static str {
@@ -703,6 +723,35 @@ fn should_deepen_review(
     intent.is_some() && evidence.listing_only() && !answer_says_insufficient_evidence(answer)
 }
 
+fn should_nudge_no_evidence_review(
+    intent: Option<ReviewIntent>,
+    evidence: &EvidenceTracker,
+    answer: &str,
+) -> bool {
+    intent.is_some() && !evidence.has_discovery() && !answer_says_insufficient_evidence(answer)
+}
+
+fn answer_looks_like_review_repair_template(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    contains_any(
+        &lower,
+        &[
+            "the inspected context points to these concrete review targets",
+            "review observations should stay tied to those files or modules",
+            "convert any broad status claims into file-specific findings",
+            "the inspected context identifies these concrete targets as the likely ownership surface",
+            "gap claims should be tied to those inspected files or modules",
+            "convert broad recommendations into scoped work items tied to the inspected files",
+        ],
+    )
+}
+
+fn should_reject_review_repair_template(intent: Option<ReviewIntent>, answer: &str) -> bool {
+    intent.is_some()
+        && !answer_says_insufficient_evidence(answer)
+        && answer_looks_like_review_repair_template(answer)
+}
+
 fn should_nudge_concrete_review_answer(
     intent: Option<ReviewIntent>,
     evidence: &EvidenceTracker,
@@ -750,6 +799,58 @@ fn should_nudge_security_broad_search(
         && !answer_says_insufficient_evidence(answer)
 }
 
+fn should_nudge_security_scope(
+    intent: Option<ReviewIntent>,
+    evidence: &EvidenceTracker,
+    answer: &str,
+) -> bool {
+    matches!(intent, Some(ReviewIntent::Security))
+        && evidence.saw_search
+        && evidence.saw_read
+        && security_answer_overclaims_scope(answer)
+}
+
+fn security_answer_overclaims_scope(answer: &str) -> bool {
+    if answer_says_insufficient_evidence(answer) {
+        return false;
+    }
+    let lower = answer.to_ascii_lowercase();
+    let broad_all_clear = contains_any(
+        &lower,
+        &[
+            "the codebase does not contain",
+            "the codebase doesn't contain",
+            "the codebase appears to be secure",
+            "codebase appears secure",
+            "secure against common unsafe patterns",
+            "there are no hardcoded secrets",
+            "no hardcoded secrets",
+            "no direct command execution",
+            "does not contain any unsafe",
+            "doesn't contain any unsafe",
+            "no security issues",
+            "no security-critical issues",
+        ],
+    );
+    let bounded = contains_any(
+        &lower,
+        &[
+            "insufficient evidence",
+            "limited to",
+            "based on the inspected",
+            "based on searched",
+            "based on the searched",
+            "from the inspected",
+            "in the inspected",
+            "i only inspected",
+            "not a complete audit",
+            "cannot rule out",
+            "cannot make broad",
+        ],
+    );
+    broad_all_clear && !bounded
+}
+
 fn insufficient_after_repeated_search(evidence: &EvidenceTracker) -> Option<&'static str> {
     if evidence.saw_search && !evidence.saw_read {
         Some(
@@ -778,6 +879,27 @@ fn insufficient_after_incomplete_security_search(evidence: &EvidenceTracker) -> 
         "Insufficient evidence: the security review did not search all required pattern families (missing {}), so I cannot make broad security claims.",
         missing.join(", ")
     ))
+}
+
+fn insufficient_after_security_scope_overclaim() -> &'static str {
+    "Insufficient evidence: the security answer made repo-wide all-clear claims that were broader than the inspected files and search results support."
+}
+
+fn insufficient_after_no_review_evidence() -> &'static str {
+    "Insufficient evidence: no files, searches, diffs, or directory listings were inspected, so I cannot present this as a completed review."
+}
+
+fn insufficient_after_review_repair_template() -> &'static str {
+    "Insufficient evidence: the answer was a generic review-repair template instead of concrete findings tied to inspected files, so I cannot present this as a completed review."
+}
+
+fn no_evidence_review_nudge(intent: ReviewIntent) -> &'static str {
+    match intent {
+        ReviewIntent::Security => NO_EVIDENCE_SECURITY_NUDGE,
+        ReviewIntent::Status => NO_EVIDENCE_STATUS_NUDGE,
+        ReviewIntent::Roadmap | ReviewIntent::Gaps => NO_EVIDENCE_GAP_NUDGE,
+        ReviewIntent::Review => NO_EVIDENCE_REVIEW_NUDGE,
+    }
 }
 
 fn deepen_review_nudge(intent: ReviewIntent) -> &'static str {
@@ -2618,6 +2740,46 @@ impl Agent {
                     // A *finished* response ends the turn cleanly: a final recap
                     // after a multi-step task with a complete plan, or a plain
                     // Q&A answer. Bounded so it can't loop forever.
+                    if should_nudge_no_evidence_review(read_only_intent, &evidence, &assistant_text)
+                    {
+                        if evidence.quality_repair_nudges == 0 {
+                            evidence.quality_repair_nudges += 1;
+                            force_tools_next = true;
+                            ui.status(
+                                "review answer had no inspected evidence; nudging the model to inspect before answering",
+                            );
+                            self.messages
+                                .push_assistant(std::mem::take(&mut completion.content));
+                            self.messages.push_nudge(
+                                NudgeKind::Continue,
+                                no_evidence_review_nudge(read_only_intent.expect("checked above")),
+                            );
+                            continue;
+                        }
+
+                        stalled_unfinished = true;
+                        ui.status(
+                            "review still had no inspected evidence after repair; returning an insufficient-evidence answer",
+                        );
+                        let insufficient = insufficient_after_no_review_evidence();
+                        ui.assistant_text(insufficient);
+                        ui.assistant_end();
+                        self.messages
+                            .push_assistant(vec![Content::Text(insufficient.to_string())]);
+                        break false;
+                    }
+                    if should_reject_review_repair_template(read_only_intent, &assistant_text) {
+                        stalled_unfinished = true;
+                        ui.status(
+                            "review answer was a generic repair template; returning an insufficient-evidence answer",
+                        );
+                        let insufficient = insufficient_after_review_repair_template();
+                        ui.assistant_text(insufficient);
+                        ui.assistant_end();
+                        self.messages
+                            .push_assistant(vec![Content::Text(insufficient.to_string())]);
+                        break false;
+                    }
                     if should_deepen_review(read_only_intent, &evidence, &assistant_text) {
                         if evidence.quality_repair_nudges == 0 {
                             evidence.quality_repair_nudges += 1;
@@ -2703,6 +2865,30 @@ impl Agent {
                         ui.assistant_end();
                         self.messages
                             .push_assistant(vec![Content::Text(insufficient)]);
+                        break false;
+                    }
+                    if should_nudge_security_scope(read_only_intent, &evidence, &assistant_text) {
+                        if evidence.quality_repair_nudges < 4 {
+                            evidence.quality_repair_nudges += 1;
+                            ui.status(
+                                "security answer overclaimed repo-wide safety; nudging the model to bound findings to evidence",
+                            );
+                            self.messages
+                                .push_assistant(std::mem::take(&mut completion.content));
+                            self.messages
+                                .push_nudge(NudgeKind::Continue, SECURITY_SCOPE_NUDGE);
+                            continue;
+                        }
+
+                        stalled_unfinished = true;
+                        ui.status(
+                            "security answer still overclaimed after repair; returning an insufficient-evidence answer",
+                        );
+                        let insufficient = insufficient_after_security_scope_overclaim();
+                        ui.assistant_text(insufficient);
+                        ui.assistant_end();
+                        self.messages
+                            .push_assistant(vec![Content::Text(insufficient.to_string())]);
                         break false;
                     }
                     if should_nudge_concrete_review_answer(
@@ -6094,6 +6280,28 @@ mod tests {
         );
     }
 
+    #[test]
+    fn security_scope_overclaim_requires_bounded_answer() {
+        let mut evidence = EvidenceTracker::default();
+        evidence.record_success(
+            "grep",
+            r#"{"pattern":"unsafe|unwrap|expect|panic|command|std::process|spawn|std::fs|std::env|secret|token|auth","glob":"*.rs"}"#,
+            "src/lib.rs:1: fn main() {}\n",
+        );
+        evidence.record_success("read", r#"{"path":"src/lib.rs"}"#, "1\tfn main() {}\n");
+
+        assert!(should_nudge_security_scope(
+            Some(ReviewIntent::Security),
+            &evidence,
+            "The codebase appears to be secure. There are no hardcoded secrets or direct command execution issues. Specifically, in `src/lib.rs`, no unsafe unwraps were found."
+        ));
+        assert!(!should_nudge_security_scope(
+            Some(ReviewIntent::Security),
+            &evidence,
+            "Based on the inspected `src/lib.rs` and searched patterns, I did not establish a concrete unsafe unwrap finding. This is not a complete audit."
+        ));
+    }
+
     #[tokio::test]
     async fn security_review_prompts_advertise_only_read_only_tools() {
         let responses = vec![completion(
@@ -6152,9 +6360,20 @@ mod tests {
                 1,
             ),
             completion(
-                vec![Content::Text(
-                    "Inspected evidence only; no file changes were made.".into(),
-                )],
+                vec![Content::ToolCall {
+                    id: "read".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({ "path": path.to_string_lossy().to_string() })
+                        .to_string(),
+                }],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text(format!(
+                    "Findings:\n- {}: inspected evidence only; no file changes were made.",
+                    path.to_string_lossy()
+                ))],
                 1,
                 1,
             ),
@@ -6305,6 +6524,150 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_only_review_text_final_without_evidence_gets_inspection_nudge() {
+        let inspected_path = temp_file("no-evidence-review");
+        std::fs::write(&inspected_path, "fn main() { println!(\"ok\"); }\n").unwrap();
+        let inspected = inspected_path.to_string_lossy().to_string();
+        let responses = vec![
+            completion(
+                vec![Content::Text("Completed the requested action.".into())],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::ToolCall {
+                    id: "read".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({ "path": inspected.clone() }).to_string(),
+                }],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text(format!(
+                    "Findings:\n- {inspected}: inspected as the status evidence for this read-only review."
+                ))],
+                1,
+                1,
+            ),
+        ];
+        let modes = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let provider = RecordToolModes {
+            responses: Mutex::new(responses),
+            modes: modes.clone(),
+        };
+        let mut agent = Agent::new(Box::new(provider), config());
+        let mut ui = RecUi::default();
+
+        agent
+            .run_turn("review codebase and discuss status and state", &mut ui)
+            .await
+            .unwrap();
+
+        assert!(
+            ui.statuses
+                .iter()
+                .any(|status| status.contains("no inspected evidence")),
+            "expected no-evidence nudge: {:?}",
+            ui.statuses
+        );
+        let modes = modes.lock().unwrap();
+        assert_eq!(modes[0], ToolMode::Auto);
+        assert_eq!(modes[1], ToolMode::Required);
+        assert_eq!(agent.last_turn_telemetry().quality_repair_nudges, 1);
+        assert_eq!(agent.last_turn_telemetry().file_reads, 1);
+        let _ = std::fs::remove_file(inspected_path);
+    }
+
+    #[tokio::test]
+    async fn read_only_review_no_evidence_repair_exhaustion_returns_insufficient() {
+        let responses = vec![
+            completion(
+                vec![Content::Text("Completed the requested action.".into())],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text("Completed the requested action.".into())],
+                1,
+                1,
+            ),
+        ];
+        let mut agent = agent(responses, config());
+        let mut ui = RecUi::default();
+
+        agent
+            .run_turn(
+                "review for security issues or unsafe unwraps. then disucss only",
+                &mut ui,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            ui.assistant.contains("Insufficient evidence: no files"),
+            "expected bounded insufficient evidence: {}",
+            ui.assistant
+        );
+        assert!(
+            ui.statuses
+                .iter()
+                .any(|status| status.contains("no inspected evidence after repair")),
+            "expected exhausted no-evidence status: {:?}",
+            ui.statuses
+        );
+        let telemetry = agent.last_turn_telemetry();
+        assert_eq!(telemetry.quality_repair_nudges, 1);
+        assert_eq!(telemetry.discovery_depth, "none");
+        assert!(telemetry.stalled_unfinished);
+    }
+
+    #[tokio::test]
+    async fn read_only_review_repair_template_final_is_not_accepted() {
+        let inspected_path = temp_file("repair-template");
+        std::fs::write(&inspected_path, "# hi\n\nA terminal coding assistant.\n").unwrap();
+        let inspected = inspected_path.to_string_lossy().to_string();
+        let responses = vec![
+            completion(
+                vec![Content::ToolCall {
+                    id: "read".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({ "path": inspected.clone() }).to_string(),
+                }],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text(format!(
+                    "Findings/Status:\n- The inspected context points to these concrete review targets: {inspected}, ./Cargo.toml.\n- Review observations should stay tied to those files or modules instead of only summarizing the repository layout.\n\nConcrete Follow-up:\n- Convert any broad status claims into file-specific findings before recommending changes."
+                ))],
+                1,
+                1,
+            ),
+        ];
+        let mut agent = agent(responses, config());
+        let mut ui = RecUi::default();
+
+        agent
+            .run_turn("review codebase and discuss status and state", &mut ui)
+            .await
+            .unwrap();
+
+        assert!(
+            ui.assistant.contains("generic review-repair template"),
+            "expected template rejection fallback: {}",
+            ui.assistant
+        );
+        assert!(
+            !ui.assistant.contains("Findings/Status"),
+            "old repair template must not be surfaced: {}",
+            ui.assistant
+        );
+        assert!(agent.last_turn_telemetry().stalled_unfinished);
+        let _ = std::fs::remove_file(inspected_path);
+    }
+
+    #[tokio::test]
     async fn security_review_with_partial_search_gets_broad_search_nudge() {
         let inspected_path = temp_file("security-broad-search");
         std::fs::write(
@@ -6421,6 +6784,79 @@ mod tests {
         assert_eq!(telemetry.targeted_searches, 2);
         assert_eq!(telemetry.file_reads, 2);
         assert!(!telemetry.listing_only);
+        let _ = std::fs::remove_file(inspected_path);
+    }
+
+    #[tokio::test]
+    async fn security_review_overbroad_all_clear_gets_scope_nudge() {
+        let inspected_path = temp_file("security-scope");
+        std::fs::write(&inspected_path, "fn main() { println!(\"ok\"); }\n").unwrap();
+        let inspected = inspected_path.to_string_lossy().to_string();
+        let responses = vec![
+            completion(
+                vec![Content::ToolCall {
+                    id: "grep".into(),
+                    name: "grep".into(),
+                    arguments: serde_json::json!({
+                        "pattern": "unsafe|unwrap|expect|panic|command|std::process|spawn|std::fs|std::env|secret|token|auth",
+                        "glob": "*.rs",
+                    })
+                    .to_string(),
+                }],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::ToolCall {
+                    id: "read".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({ "path": inspected.clone() }).to_string(),
+                }],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text(format!(
+                    "The codebase appears to be secure. There are no hardcoded secrets or direct command execution issues. Specifically, in `{inspected}`, no unsafe unwraps were found."
+                ))],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text(format!(
+                    "Findings:\n- {inspected}: Based on the inspected file and searched security patterns, I did not establish a concrete unsafe/unwrap finding in this file. This is not a complete audit and does not rule out issues outside the inspected evidence."
+                ))],
+                1,
+                1,
+            ),
+        ];
+        let mut agent = agent(responses, config());
+        let mut ui = RecUi::default();
+
+        agent
+            .run_turn(
+                "review for security issues or unsafe unwraps. then disucss only",
+                &mut ui,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            ui.statuses
+                .iter()
+                .any(|status| status.contains("overclaimed repo-wide safety")),
+            "expected security scope nudge: {:?}",
+            ui.statuses
+        );
+        assert!(
+            agent
+                .messages()
+                .iter()
+                .any(|message| message.role == Role::Assistant
+                    && message.text().contains("not a complete audit")),
+            "final answer should be bounded"
+        );
+        assert_eq!(agent.last_turn_telemetry().quality_repair_nudges, 1);
         let _ = std::fs::remove_file(inspected_path);
     }
 
