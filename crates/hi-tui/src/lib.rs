@@ -1157,22 +1157,26 @@ async fn drive(
         tokio::select! {
             result = &mut fut => {
                 while let Ok(event) = rx.try_recv() {
-                    if matches!(event, UiEvent::TurnEnd(_)) {
+                    if matches!(event, UiEvent::TurnEnd(_) | UiEvent::TurnError(..)) {
                         saw_turn_end = true;
                     }
                     app.apply(event);
                 }
                 if let Err(err) = result {
                     let (kind, guidance) = hi_agent::classify_error(&err);
-                    app.note_turn_failed(&format!("{err:#}"), kind, guidance);
-                    app.record_model_issue();
+                    if !matches!(app.last_turn_state, TurnState::Failed(_)) {
+                        app.note_turn_failed(&format!("{err:#}"), kind, guidance);
+                    }
+                    if hi_agent::ui::error_counts_as_model_issue(&err) {
+                        app.record_model_issue();
+                    }
                 } else if expect_turn_end && !cancelled && !saw_turn_end {
                     app.note_turn_completed_without_summary();
                 }
                 break;
             }
             Some(event) = rx.recv() => {
-                if matches!(event, UiEvent::TurnEnd(_)) {
+                if matches!(event, UiEvent::TurnEnd(_) | UiEvent::TurnError(..)) {
                     saw_turn_end = true;
                 }
                 last_activity = Instant::now();

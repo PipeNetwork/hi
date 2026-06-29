@@ -293,6 +293,11 @@ const READ_AFTER_SEARCH_NUDGE: &str = "The targeted search result is already in 
 Do not rerun the same search and do not use mutating tools. Read the most relevant matching file, \
 then answer from that inspected file. If you cannot pick a file to read, explicitly say the \
 evidence is insufficient.";
+const SECURITY_BROAD_SEARCH_NUDGE: &str = "This security review searched and read some evidence, \
+but it has not covered all required pattern families yet. Do not use mutating tools. Search for \
+unsafe/unwrap/expect/panic, command execution/filesystem/env access, and secret/token/auth \
+patterns, then answer only from concrete inspected evidence or explicitly say the evidence is \
+insufficient.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReviewIntent {
@@ -327,6 +332,9 @@ struct EvidenceTracker {
     saw_read: bool,
     file_reads: u32,
     targeted_searches: u32,
+    security_unsafe_search: bool,
+    security_execution_search: bool,
+    security_secret_search: bool,
     inspected_paths: Vec<String>,
     first_tool_kind: Option<EvidenceKind>,
     quality_repair_nudges: u32,
@@ -348,6 +356,10 @@ impl EvidenceTracker {
             EvidenceKind::TargetedSearch => {
                 self.saw_search = true;
                 self.targeted_searches = self.targeted_searches.saturating_add(1);
+                let families = security_search_families_for_tool(name, arguments);
+                self.security_unsafe_search |= families.unsafe_or_panic;
+                self.security_execution_search |= families.execution_or_fs_env;
+                self.security_secret_search |= families.secret_or_auth;
             }
             EvidenceKind::FileRead => {
                 self.saw_read = true;
@@ -387,6 +399,17 @@ impl EvidenceTracker {
             .map(EvidenceKind::as_str)
             .unwrap_or("none")
     }
+
+    fn security_search_complete(&self) -> bool {
+        self.security_unsafe_search && self.security_execution_search && self.security_secret_search
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SecuritySearchFamilies {
+    unsafe_or_panic: bool,
+    execution_or_fs_env: bool,
+    secret_or_auth: bool,
 }
 
 fn evidence_kind_for_tool(name: &str, arguments: &str) -> Option<EvidenceKind> {
@@ -425,6 +448,86 @@ fn evidence_kind_for_bash(arguments: &str) -> Option<EvidenceKind> {
         return Some(EvidenceKind::Listing);
     }
     None
+}
+
+fn security_search_families_for_tool(name: &str, arguments: &str) -> SecuritySearchFamilies {
+    let Some(search_text) = security_search_text_for_tool(name, arguments) else {
+        return SecuritySearchFamilies::default();
+    };
+    security_search_families(&search_text)
+}
+
+fn security_search_text_for_tool(name: &str, arguments: &str) -> Option<String> {
+    let value = serde_json::from_str::<serde_json::Value>(arguments).ok()?;
+    match name {
+        "grep" => value
+            .get("pattern")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        "glob" => {
+            let mut parts = Vec::new();
+            for key in ["pattern", "path"] {
+                if let Some(text) = value.get(key).and_then(serde_json::Value::as_str)
+                    && !text.is_empty()
+                {
+                    parts.push(text);
+                }
+            }
+            (!parts.is_empty()).then(|| parts.join(" "))
+        }
+        "bash" => value
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+fn security_search_families(search_text: &str) -> SecuritySearchFamilies {
+    let lower = search_text.to_ascii_lowercase();
+    let tokens = lower
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    let has_token = |needles: &[&str]| -> bool {
+        tokens
+            .iter()
+            .any(|token| needles.iter().any(|needle| token == needle))
+    };
+    SecuritySearchFamilies {
+        unsafe_or_panic: contains_any(&lower, &["unsafe", "unwrap", "expect", "panic"]),
+        execution_or_fs_env: contains_any(
+            &lower,
+            &[
+                "command",
+                "std::process",
+                "process::",
+                "shell",
+                "exec",
+                "spawn",
+                "filesystem",
+                "std::fs",
+                "fs::",
+                "read_to_string",
+                "remove_file",
+                "std::env",
+                "env::",
+            ],
+        ) || has_token(&["process", "fs", "file", "write", "env"]),
+        secret_or_auth: contains_any(
+            &lower,
+            &[
+                "secret",
+                "token",
+                "auth",
+                "api_key",
+                "apikey",
+                "password",
+                "credential",
+                "bearer",
+            ],
+        ),
+    }
 }
 
 fn classify_read_only_intent(input: &str) -> Option<ReviewIntent> {
@@ -635,6 +738,18 @@ fn should_nudge_read_after_search_final(
         && !answer_says_insufficient_evidence(answer)
 }
 
+fn should_nudge_security_broad_search(
+    intent: Option<ReviewIntent>,
+    evidence: &EvidenceTracker,
+    answer: &str,
+) -> bool {
+    matches!(intent, Some(ReviewIntent::Security))
+        && evidence.saw_search
+        && evidence.saw_read
+        && !evidence.security_search_complete()
+        && !answer_says_insufficient_evidence(answer)
+}
+
 fn insufficient_after_repeated_search(evidence: &EvidenceTracker) -> Option<&'static str> {
     if evidence.saw_search && !evidence.saw_read {
         Some(
@@ -643,6 +758,26 @@ fn insufficient_after_repeated_search(evidence: &EvidenceTracker) -> Option<&'st
     } else {
         None
     }
+}
+
+fn insufficient_after_incomplete_security_search(evidence: &EvidenceTracker) -> Option<String> {
+    if !evidence.saw_search || !evidence.saw_read || evidence.security_search_complete() {
+        return None;
+    }
+    let mut missing = Vec::new();
+    if !evidence.security_unsafe_search {
+        missing.push("unsafe/unwrap/expect/panic");
+    }
+    if !evidence.security_execution_search {
+        missing.push("command execution/filesystem/env");
+    }
+    if !evidence.security_secret_search {
+        missing.push("secret/token/auth");
+    }
+    Some(format!(
+        "Insufficient evidence: the security review did not search all required pattern families (missing {}), so I cannot make broad security claims.",
+        missing.join(", ")
+    ))
 }
 
 fn deepen_review_nudge(intent: ReviewIntent) -> &'static str {
@@ -2538,6 +2673,36 @@ impl Agent {
                         ui.assistant_end();
                         self.messages
                             .push_assistant(vec![Content::Text(insufficient.to_string())]);
+                        break false;
+                    }
+                    if should_nudge_security_broad_search(
+                        read_only_intent,
+                        &evidence,
+                        &assistant_text,
+                    ) {
+                        if evidence.quality_repair_nudges < 3 {
+                            evidence.quality_repair_nudges += 1;
+                            force_tools_next = true;
+                            ui.status(
+                                "security review missed required pattern families; nudging the model to broaden the search",
+                            );
+                            self.messages
+                                .push_assistant(std::mem::take(&mut completion.content));
+                            self.messages
+                                .push_nudge(NudgeKind::Continue, SECURITY_BROAD_SEARCH_NUDGE);
+                            continue;
+                        }
+
+                        stalled_unfinished = true;
+                        ui.status(
+                            "security review still missed required pattern families after repair; returning an insufficient-evidence answer",
+                        );
+                        let insufficient = insufficient_after_incomplete_security_search(&evidence)
+                            .expect("incomplete security search checked above");
+                        ui.assistant_text(&insufficient);
+                        ui.assistant_end();
+                        self.messages
+                            .push_assistant(vec![Content::Text(insufficient)]);
                         break false;
                     }
                     if should_nudge_concrete_review_answer(
@@ -5868,6 +6033,67 @@ mod tests {
         assert_eq!(classify_read_only_intent("fix the unsafe unwraps"), None);
     }
 
+    #[test]
+    fn security_search_family_detection_covers_required_patterns() {
+        let unsafe_only = security_search_families_for_tool(
+            "grep",
+            r#"{"pattern":"unwrap|expect|panic","glob":"*.rs"}"#,
+        );
+        assert!(unsafe_only.unsafe_or_panic);
+        assert!(!unsafe_only.execution_or_fs_env);
+        assert!(!unsafe_only.secret_or_auth);
+
+        let path_does_not_count = security_search_families_for_tool(
+            "grep",
+            r#"{"pattern":"unwrap","path":"src/file_utils.rs"}"#,
+        );
+        assert!(path_does_not_count.unsafe_or_panic);
+        assert!(!path_does_not_count.execution_or_fs_env);
+
+        let broad = security_search_families_for_tool(
+            "grep",
+            r#"{"pattern":"unsafe|unwrap|expect|panic|command|std::process|spawn|std::fs|read_to_string|std::env|secret|token|auth|api_key|password|bearer","glob":"*.rs"}"#,
+        );
+        assert_eq!(
+            broad,
+            SecuritySearchFamilies {
+                unsafe_or_panic: true,
+                execution_or_fs_env: true,
+                secret_or_auth: true,
+            }
+        );
+
+        let shell = security_search_families_for_tool(
+            "bash",
+            r#"{"command":"rg 'exec|spawn|token|auth' crates"}"#,
+        );
+        assert!(!shell.unsafe_or_panic);
+        assert!(shell.execution_or_fs_env);
+        assert!(shell.secret_or_auth);
+    }
+
+    #[test]
+    fn incomplete_security_search_requires_broadening_after_read() {
+        let mut evidence = EvidenceTracker::default();
+        evidence.record_success(
+            "grep",
+            r#"{"pattern":"unwrap|expect|panic","glob":"*.rs"}"#,
+            "src/lib.rs:1: value.unwrap()\n",
+        );
+        evidence.record_success("read", r#"{"path":"src/lib.rs"}"#, "1\tfn main() {}\n");
+
+        assert!(should_nudge_security_broad_search(
+            Some(ReviewIntent::Security),
+            &evidence,
+            "src/lib.rs: no command execution or secret issues were found."
+        ));
+        assert!(
+            insufficient_after_incomplete_security_search(&evidence)
+                .unwrap()
+                .contains("command execution/filesystem/env")
+        );
+    }
+
     #[tokio::test]
     async fn security_review_prompts_advertise_only_read_only_tools() {
         let responses = vec![completion(
@@ -6075,6 +6301,126 @@ mod tests {
             "final answer should cite inspected path"
         );
         assert_eq!(agent.last_turn_telemetry().quality_repair_nudges, 1);
+        let _ = std::fs::remove_file(inspected_path);
+    }
+
+    #[tokio::test]
+    async fn security_review_with_partial_search_gets_broad_search_nudge() {
+        let inspected_path = temp_file("security-broad-search");
+        std::fs::write(
+            &inspected_path,
+            "fn run() { let value = Some(1).unwrap(); }\n",
+        )
+        .unwrap();
+        let inspected = inspected_path.to_string_lossy().to_string();
+        let responses = vec![
+            completion(
+                vec![Content::ToolCall {
+                    id: "list".into(),
+                    name: "list".into(),
+                    arguments: r#"{"path":"."}"#.into(),
+                }],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text(
+                    "No security issues or unsafe unwraps were found.".into(),
+                )],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::ToolCall {
+                    id: "grep".into(),
+                    name: "grep".into(),
+                    arguments: serde_json::json!({
+                        "pattern": "unwrap|expect|panic",
+                        "glob": "*.rs",
+                    })
+                    .to_string(),
+                }],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::ToolCall {
+                    id: "read".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({ "path": inspected.clone() }).to_string(),
+                }],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text(format!(
+                    "Findings:\n- {inspected}: no unsafe unwrap, command execution, filesystem/env, or secret/token/auth risks were found."
+                ))],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::ToolCall {
+                    id: "grep-broad".into(),
+                    name: "grep".into(),
+                    arguments: serde_json::json!({
+                        "pattern": "unsafe|unwrap|expect|panic|command|std::process|process::|shell|exec|spawn|filesystem|std::fs|fs::|read_to_string|write|remove_file|std::env|env::|secret|token|auth|api_key|apikey|password|credential|bearer",
+                        "glob": "*.rs",
+                    })
+                    .to_string(),
+                }],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::ToolCall {
+                    id: "read-again".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({ "path": inspected.clone() }).to_string(),
+                }],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text(format!(
+                    "Findings:\n- {inspected}: searched unsafe/unwrap/panic, command/filesystem/env, and secret/token/auth patterns; this file contains a direct unwrap but no broader conclusion is made beyond inspected evidence."
+                ))],
+                1,
+                1,
+            ),
+        ];
+        let mut agent = agent(responses, config());
+        let mut ui = RecUi::default();
+
+        agent
+            .run_turn(
+                "review for security issues or unsafe unwraps. then disucss only",
+                &mut ui,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            ui.statuses
+                .iter()
+                .any(|status| status.contains("missed required pattern families")),
+            "expected security broad-search nudge: {:?}",
+            ui.statuses
+        );
+        assert!(
+            agent
+                .messages()
+                .iter()
+                .any(|message| message.role == Role::Assistant
+                    && message.text().contains(&inspected)
+                    && message.text().contains("direct unwrap")),
+            "final answer should cite inspected path after broad search"
+        );
+        let telemetry = agent.last_turn_telemetry();
+        assert_eq!(telemetry.quality_repair_nudges, 2);
+        assert_eq!(telemetry.targeted_searches, 2);
+        assert_eq!(telemetry.file_reads, 2);
+        assert!(!telemetry.listing_only);
         let _ = std::fs::remove_file(inspected_path);
     }
 

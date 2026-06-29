@@ -97,6 +97,10 @@ pub fn classify_error(err: &anyhow::Error) -> (&'static str, &'static str) {
             "rate_limit",
             "the endpoint is rate-limiting you — wait a moment, then /retry",
         ),
+        Some(K::CapacityUnavailable) => (
+            "capacity",
+            "capacity is temporarily unavailable — wait a moment, then /retry",
+        ),
         Some(K::Outage) => (
             "outage",
             "the endpoint is unreachable or returning errors — check the provider's status page, or /provider to switch",
@@ -127,6 +131,13 @@ pub fn classify_error(err: &anyhow::Error) -> (&'static str, &'static str) {
         ),
         Some(K::Other) | None => ("error", ""),
     }
+}
+
+pub fn error_counts_as_model_issue(err: &anyhow::Error) -> bool {
+    !matches!(
+        hi_ai::provider_error_kind(err),
+        Some(hi_ai::ProviderErrorKind::CapacityUnavailable)
+    )
 }
 
 /// A short, human-readable label for a tool call: the tool name followed by its
@@ -185,7 +196,8 @@ pub fn clip(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::tool_label;
+    use super::{classify_error, error_counts_as_model_issue, tool_label};
+    use hi_ai::{ProviderError, ProviderErrorKind};
 
     #[test]
     fn labels_file_tools_by_path() {
@@ -236,5 +248,20 @@ mod tests {
         );
         // Unparsable args still produce something rather than panicking.
         assert_eq!(tool_label("write", "not json"), "write(not json)");
+    }
+
+    #[test]
+    fn capacity_unavailable_is_not_a_model_quality_issue() {
+        let err: anyhow::Error = ProviderError::new(
+            ProviderErrorKind::CapacityUnavailable,
+            "API error 409: capacity temporarily unavailable",
+        )
+        .into();
+
+        let (kind, guidance) = classify_error(&err);
+
+        assert_eq!(kind, "capacity");
+        assert!(guidance.contains("temporarily unavailable"));
+        assert!(!error_counts_as_model_issue(&err));
     }
 }

@@ -10,15 +10,22 @@
 mod request;
 mod stream;
 
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
+use reqwest::header;
 
 use crate::provider::{Provider, ProviderError, ProviderErrorKind};
 use crate::types::{
     ChatRequest, CompatMode, Completion, StreamEvent, Usage, estimate_messages_tokens,
 };
+
+const MAX_CAPACITY_HTTP_RETRIES: u32 = 2;
+const DEFAULT_CAPACITY_RETRY_SECS: u64 = 2;
+const MAX_CAPACITY_RETRY_SECS: u64 = 10;
 
 pub struct OpenAiProvider {
     http: reqwest::Client,
@@ -48,6 +55,7 @@ impl Provider for OpenAiProvider {
         let mut last_error: Option<ProviderError> = None;
         let mut resp = None;
         let mut idx = 0;
+        let mut capacity_retries = 0;
         while idx < attempts.len() {
             let attempt = attempts[idx];
             let body = request::build_body(&request, attempt);
@@ -66,8 +74,25 @@ impl Provider for OpenAiProvider {
             }
 
             let status = response.status();
+            let retry_after = retry_after_header_seconds(&response);
             let text = response.text().await.unwrap_or_default();
             let kind = request::classify_http_error(status, &text);
+            if kind == ProviderErrorKind::CapacityUnavailable
+                && capacity_retries < MAX_CAPACITY_HTTP_RETRIES
+            {
+                capacity_retries += 1;
+                let delay_secs = retry_after
+                    .or_else(|| request::capacity_retry_after_seconds(&text))
+                    .unwrap_or(DEFAULT_CAPACITY_RETRY_SECS)
+                    .min(MAX_CAPACITY_RETRY_SECS);
+                sink(StreamEvent::Status(format!(
+                    "capacity temporarily unavailable; retrying in {delay_secs}s ({capacity_retries}/{MAX_CAPACITY_HTTP_RETRIES})"
+                )));
+                if delay_secs > 0 {
+                    tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                }
+                continue;
+            }
             last_error = Some(ProviderError::new(
                 kind,
                 format!("API error {status}: {text}"),
@@ -132,6 +157,14 @@ impl Provider for OpenAiProvider {
         let url = format!("{}/models", self.base_url);
         crate::http::fetch_models(self.http.get(&url).bearer_auth(&self.api_key)).await
     }
+}
+
+fn retry_after_header_seconds(response: &reqwest::Response) -> Option<u64> {
+    response
+        .headers()
+        .get(header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
 }
 
 #[cfg(test)]
@@ -298,6 +331,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn capacity_unavailable_conflict_retries_then_succeeds() {
+        let Some(server) = FakeOpenAiServer::new(vec![
+            Response::json(
+                409,
+                r#"{"error":"capacity temporarily unavailable","code":"capacity_unavailable","retry_after_seconds":0}"#,
+            ),
+            Response::sse(sse_text("recovered")),
+        ]) else {
+            return;
+        };
+        let provider = OpenAiProvider::new(server.url().to_string(), "test".into());
+        let mut statuses = Vec::new();
+        let mut sink = |event| {
+            if let StreamEvent::Status(status) = event {
+                statuses.push(status);
+            }
+        };
+
+        let completion = provider
+            .stream(request(vec![], Default::default()), &mut sink)
+            .await
+            .unwrap();
+
+        assert!(matches!(completion.content.first(), Some(Content::Text(t)) if t == "recovered"));
+        assert_eq!(server.bodies().len(), 2);
+        assert!(
+            statuses
+                .iter()
+                .any(|status| status.contains("capacity temporarily unavailable")),
+            "{statuses:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn empty_completion_error_carries_usage() {
         let Some(server) = FakeOpenAiServer::new(vec![Response::sse(
             "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":42,\"completion_tokens\":3}}\n\n",
@@ -329,7 +396,10 @@ mod tests {
             .stream(request(vec![], Default::default()), &mut |_| {})
             .await
             .unwrap_err();
-        assert_eq!(provider_error_kind(&err), Some(ProviderErrorKind::Outage));
+        assert_eq!(
+            provider_error_kind(&err),
+            Some(ProviderErrorKind::CapacityUnavailable)
+        );
         assert!(
             err.to_string().contains("capacity temporarily unavailable"),
             "{err}"

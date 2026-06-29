@@ -83,6 +83,11 @@ pub(crate) fn classify_http_error(status: StatusCode, text: &str) -> ProviderErr
     match status {
         StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => ProviderErrorKind::Auth,
         StatusCode::TOO_MANY_REQUESTS => ProviderErrorKind::RateLimit,
+        StatusCode::CONFLICT | StatusCode::SERVICE_UNAVAILABLE
+            if is_capacity_unavailable_text(text) =>
+        {
+            ProviderErrorKind::CapacityUnavailable
+        }
         s if s.is_server_error() => ProviderErrorKind::Outage,
         StatusCode::BAD_REQUEST | StatusCode::UNPROCESSABLE_ENTITY => {
             if mentions(
@@ -105,6 +110,31 @@ pub(crate) fn classify_http_error(status: StatusCode, text: &str) -> ProviderErr
         }
         _ => ProviderErrorKind::Other,
     }
+}
+
+pub(crate) fn capacity_retry_after_seconds(text: &str) -> Option<u64> {
+    serde_json::from_str::<Value>(text).ok().and_then(|value| {
+        value
+            .get("retry_after_seconds")
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                value
+                    .get("error")
+                    .and_then(|error| error.get("retry_after_seconds"))
+                    .and_then(Value::as_u64)
+            })
+    })
+}
+
+pub(crate) fn is_capacity_unavailable_text(text: &str) -> bool {
+    mentions(
+        text,
+        &[
+            "capacity_unavailable",
+            "capacity temporarily unavailable",
+            "temporarily unavailable",
+        ],
+    )
 }
 
 fn mentions(text: &str, needles: &[&str]) -> bool {

@@ -9,6 +9,7 @@ use crate::types::{ChatRequest, Completion, StreamEvent, Usage};
 pub enum ProviderErrorKind {
     Auth,
     RateLimit,
+    CapacityUnavailable,
     Outage,
     UnsupportedRequestShape,
     UnsupportedTools,
@@ -24,6 +25,7 @@ impl ProviderErrorKind {
         match self {
             Self::Auth => "auth",
             Self::RateLimit => "rate_limit",
+            Self::CapacityUnavailable => "capacity_unavailable",
             Self::Outage => "outage",
             Self::UnsupportedRequestShape => "unsupported_request_shape",
             Self::UnsupportedTools => "unsupported_tools",

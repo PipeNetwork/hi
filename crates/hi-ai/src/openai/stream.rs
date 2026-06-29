@@ -847,9 +847,9 @@ fn classify_stream_api_error(message: &str) -> ProviderErrorKind {
     if lower.contains("rate limit") || lower.contains("too many requests") || lower.contains("429")
     {
         ProviderErrorKind::RateLimit
-    } else if lower.contains("capacity")
-        || lower.contains("temporarily unavailable")
-        || lower.contains("service unavailable")
+    } else if lower.contains("capacity") || lower.contains("temporarily unavailable") {
+        ProviderErrorKind::CapacityUnavailable
+    } else if lower.contains("service unavailable")
         || lower.contains("no route")
         || lower.contains("overloaded")
         || lower.contains("cooling down")
