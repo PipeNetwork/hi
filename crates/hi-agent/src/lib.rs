@@ -319,6 +319,10 @@ const SECURITY_SCOPE_NUDGE: &str = "The security answer made repo-wide all-clear
 broader than the inspected files and search results support. Do not use mutating tools. Answer \
 again with findings explicitly bounded to the searched patterns and inspected files, or explicitly \
 say the evidence is insufficient for broader security claims.";
+const GAP_SEARCH_OVERCLAIM_NUDGE: &str = "The gap or roadmap answer claimed there were no \
+TODO/FIXME/missing gaps even though the targeted search returned matches. Do not use mutating \
+tools. Answer again from the inspected files and search matches, or explicitly say the evidence is \
+insufficient for broader roadmap claims.";
 const SECURITY_PREFLIGHT_PATTERN: &str = "unsafe|unwrap\\(|expect\\(|panic!|std::process|process::Command|Command::new|spawn\\(|std::fs|fs::|read_to_string|std::env|env::|secret|token|auth|api_key|apikey|password|credential|bearer";
 const GAP_PREFLIGHT_PATTERN: &str =
     "TODO|FIXME|todo!|unimplemented!|missing|gap|needs coverage|not implemented";
@@ -359,6 +363,7 @@ struct EvidenceTracker {
     security_unsafe_search: bool,
     security_execution_search: bool,
     security_secret_search: bool,
+    grep_match_lines: u32,
     inspected_paths: Vec<String>,
     first_tool_kind: Option<EvidenceKind>,
     quality_repair_nudges: u32,
@@ -384,6 +389,11 @@ impl EvidenceTracker {
                 self.security_unsafe_search |= families.unsafe_or_panic;
                 self.security_execution_search |= families.execution_or_fs_env;
                 self.security_secret_search |= families.secret_or_auth;
+                if name == "grep" {
+                    self.grep_match_lines = self
+                        .grep_match_lines
+                        .saturating_add(grep_match_line_count(output));
+                }
             }
             EvidenceKind::FileRead => {
                 self.saw_read = true;
@@ -431,6 +441,17 @@ impl EvidenceTracker {
     fn security_search_complete(&self) -> bool {
         self.security_unsafe_search && self.security_execution_search && self.security_secret_search
     }
+}
+
+fn grep_match_line_count(output: &str) -> u32 {
+    let trimmed = output.trim();
+    if trimmed.is_empty() || trimmed.starts_with("no matches for ") {
+        return 0;
+    }
+    output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .count() as u32
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1002,6 +1023,16 @@ fn should_nudge_security_scope(
         && security_answer_overclaims_scope(answer)
 }
 
+fn should_nudge_gap_search_overclaim(
+    intent: Option<ReviewIntent>,
+    evidence: &EvidenceTracker,
+    answer: &str,
+) -> bool {
+    matches!(intent, Some(ReviewIntent::Gaps | ReviewIntent::Roadmap))
+        && evidence.grep_match_lines > 0
+        && gap_answer_overclaims_absence(answer)
+}
+
 fn security_answer_overclaims_scope(answer: &str) -> bool {
     if answer_says_insufficient_evidence(answer) {
         return false;
@@ -1041,6 +1072,44 @@ fn security_answer_overclaims_scope(answer: &str) -> bool {
         ],
     );
     broad_all_clear && !bounded
+}
+
+fn gap_answer_overclaims_absence(answer: &str) -> bool {
+    if answer_says_insufficient_evidence(answer) {
+        return false;
+    }
+    let lower = answer.to_ascii_lowercase();
+    let broad_absence = contains_any(
+        &lower,
+        &[
+            "no todo",
+            "no todos",
+            "no todo/fixme",
+            "no fixme",
+            "no fixmes",
+            "no missing implementations",
+            "no obvious gaps",
+            "no obvious missing",
+            "no obvious gaps in functionality",
+            "appears mature with no obvious gaps",
+            "shows no obvious gaps",
+        ],
+    );
+    let bounded = contains_any(
+        &lower,
+        &[
+            "based on the inspected",
+            "based on searched",
+            "based on the searched",
+            "from the inspected",
+            "in the inspected",
+            "i only inspected",
+            "not a complete",
+            "cannot rule out",
+            "cannot make broad",
+        ],
+    );
+    broad_absence && !bounded
 }
 
 fn insufficient_after_repeated_search(evidence: &EvidenceTracker) -> Option<&'static str> {
@@ -3209,7 +3278,7 @@ impl Agent {
                         &evidence,
                         &assistant_text,
                     ) {
-                        if evidence.quality_repair_nudges < 2 {
+                        if evidence.quality_repair_nudges < 1 {
                             evidence.quality_repair_nudges += 1;
                             force_tools_next = true;
                             ui.status(
@@ -3298,6 +3367,42 @@ impl Agent {
                             )
                         } else {
                             insufficient_after_security_scope_overclaim().to_string()
+                        };
+                        ui.assistant_text(&insufficient);
+                        ui.assistant_end();
+                        self.messages
+                            .push_assistant(vec![Content::Text(insufficient)]);
+                        break false;
+                    }
+                    if should_nudge_gap_search_overclaim(
+                        read_only_intent,
+                        &evidence,
+                        &assistant_text,
+                    ) {
+                        if evidence.quality_repair_nudges < 2 {
+                            evidence.quality_repair_nudges += 1;
+                            ui.status(
+                                "gap answer contradicted search matches; nudging the model to bound claims to inspected evidence",
+                            );
+                            self.messages
+                                .push_assistant(std::mem::take(&mut completion.content));
+                            self.messages
+                                .push_nudge(NudgeKind::Continue, GAP_SEARCH_OVERCLAIM_NUDGE);
+                            continue;
+                        }
+
+                        stalled_unfinished = true;
+                        ui.status(
+                            "gap answer still overclaimed after search matches; returning a bounded evidence summary",
+                        );
+                        let insufficient = if let Some(intent) = read_only_intent {
+                            bounded_review_repair_exhaustion_answer(
+                                intent,
+                                &evidence,
+                                "the final answer claimed there were no TODO/FIXME or missing gaps even though targeted search returned matches",
+                            )
+                        } else {
+                            "Insufficient evidence: the final answer overclaimed the absence of gaps despite search matches.".to_string()
                         };
                         ui.assistant_text(&insufficient);
                         ui.assistant_end();
@@ -7367,6 +7472,107 @@ mod tests {
         );
         let telemetry = agent.last_turn_telemetry();
         assert_eq!(telemetry.repeat_nudges, 2);
+        assert!(telemetry.stalled_unfinished);
+        let _ = std::fs::remove_file(inspected_path);
+    }
+
+    #[tokio::test]
+    async fn gap_review_search_match_blocks_no_gap_overclaim() {
+        let inspected_path = temp_file("gap-overclaim-evidence");
+        std::fs::write(
+            &inspected_path,
+            "// TODO: add provider retry coverage\npub fn value() {}\n",
+        )
+        .unwrap();
+        let inspected = inspected_path.to_string_lossy().to_string();
+        let responses = vec![
+            completion(
+                vec![Content::ToolCall {
+                    id: "grep".into(),
+                    name: "grep".into(),
+                    arguments: serde_json::json!({
+                        "pattern": "TODO|FIXME|missing|gap",
+                        "path": inspected.clone(),
+                    })
+                    .to_string(),
+                }],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::ToolCall {
+                    id: "read".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({ "path": inspected.clone() }).to_string(),
+                }],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text(format!(
+                    "{inspected}: The project appears mature with no obvious gaps and no TODO/FIXME markers."
+                ))],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text(format!(
+                    "{inspected}: The project appears mature with no obvious gaps and no TODO/FIXME markers."
+                ))],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text(format!(
+                    "{inspected}: The project appears mature with no obvious gaps and no TODO/FIXME markers."
+                ))],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text(format!(
+                    "{inspected}: The project appears mature with no obvious gaps and no TODO/FIXME markers."
+                ))],
+                1,
+                1,
+            ),
+        ];
+        let mut agent = agent(responses, config());
+        let mut ui = RecUi::default();
+
+        agent
+            .run_turn(
+                "discuss whats its missing and what we should considering building and implimenting",
+                &mut ui,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            ui.statuses
+                .iter()
+                .any(|status| status.contains("contradicted search matches")),
+            "expected gap overclaim nudge: {:?}",
+            ui.statuses
+        );
+        assert!(
+            ui.assistant
+                .contains("Insufficient evidence for a completed gap review"),
+            "expected bounded evidence fallback: {}",
+            ui.assistant
+        );
+        assert!(
+            ui.assistant.contains(&inspected),
+            "fallback should cite inspected path: {}",
+            ui.assistant
+        );
+        assert!(
+            !ui.assistant.contains("no TODO/FIXME markers"),
+            "bad overclaim should not be surfaced: {}",
+            ui.assistant
+        );
+        let telemetry = agent.last_turn_telemetry();
+        assert!(telemetry.quality_repair_nudges >= 1);
         assert!(telemetry.stalled_unfinished);
         let _ = std::fs::remove_file(inspected_path);
     }
