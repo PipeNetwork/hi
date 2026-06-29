@@ -97,6 +97,7 @@ pub(crate) fn classify_http_error(status: StatusCode, text: &str) -> ProviderErr
                     "input exceeds",
                     "context length",
                     "context_length_exceeded",
+                    "resident model context",
                     "too many tokens",
                     "request too large",
                 ],

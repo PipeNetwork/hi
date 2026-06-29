@@ -277,6 +277,11 @@ and give your final recap. Do not re-run the same command.";
 const NO_EVIDENCE_REVIEW_NUDGE: &str = "This read-only review has no inspected evidence yet. \
 Do not finalize. Use read-only inspection tools first, then answer from the inspected evidence. \
 If inspection is impossible, explicitly say the evidence is insufficient.";
+const READ_ONLY_SAFE_CONTEXT_WINDOW: u32 = 12_000;
+const READ_ONLY_PREFLIGHT_GREP_MAX_LINES: usize = 32;
+const SECURITY_PREFLIGHT_EXTRA_READ_LIMIT: u32 = 90;
+const DEFAULT_PREFLIGHT_EXTRA_READ_LIMIT: u32 = 120;
+const READ_ONLY_PREFLIGHT_MAX_EXTRA_READS: usize = 3;
 const NO_EVIDENCE_SECURITY_NUDGE: &str = "This security review has no inspected evidence yet. \
 Do not finalize. Search for unsafe, unwrap, expect, panic!, command execution, filesystem/env \
 access, and secret/token/auth patterns, then read the most relevant matching files before answering.";
@@ -734,8 +739,10 @@ fn read_only_preflight_initial_calls(intent: ReviewIntent) -> Vec<PreflightCall>
     ) {
         calls.push(PreflightCall::new("diff", serde_json::json!({})));
     }
-    push_preflight_read_if_exists(&mut calls, "Cargo.toml", 180);
-    push_preflight_read_if_exists(&mut calls, "README.md", 160);
+    push_preflight_read_if_exists(&mut calls, "Cargo.toml", 100);
+    if !matches!(intent, ReviewIntent::Security) {
+        push_preflight_read_if_exists(&mut calls, "README.md", 100);
+    }
 
     match intent {
         ReviewIntent::Security => {
@@ -743,7 +750,8 @@ fn read_only_preflight_initial_calls(intent: ReviewIntent) -> Vec<PreflightCall>
                 "grep",
                 serde_json::json!({
                     "pattern": SECURITY_PREFLIGHT_PATTERN,
-                    "context": 1,
+                    "context": 0,
+                    "glob": "*.rs",
                 }),
             ));
         }
@@ -758,7 +766,7 @@ fn read_only_preflight_initial_calls(intent: ReviewIntent) -> Vec<PreflightCall>
                 "grep",
                 serde_json::json!({
                     "pattern": GAP_PREFLIGHT_PATTERN,
-                    "context": 1,
+                    "context": 0,
                 }),
             ));
         }
@@ -829,6 +837,57 @@ fn paths_from_grep_output(output: &str) -> Vec<String> {
         }
     }
     paths
+}
+
+fn preflight_path_relevant_for_intent(intent: ReviewIntent, path: &str) -> bool {
+    if !matches!(intent, ReviewIntent::Security) {
+        return true;
+    }
+    let lower = path.to_ascii_lowercase();
+    matches!(
+        lower.rsplit('.').next(),
+        Some(
+            "rs" | "toml"
+                | "lock"
+                | "sh"
+                | "bash"
+                | "zsh"
+                | "py"
+                | "js"
+                | "jsx"
+                | "ts"
+                | "tsx"
+                | "go"
+                | "java"
+                | "kt"
+                | "kts"
+                | "rb"
+                | "php"
+                | "c"
+                | "cc"
+                | "cpp"
+                | "h"
+                | "hpp"
+        )
+    )
+}
+
+fn compact_preflight_tool_output(name: &str, output: &str) -> String {
+    if name != "grep" {
+        return output.to_string();
+    }
+    let mut lines = output.lines().collect::<Vec<_>>();
+    if lines.len() <= READ_ONLY_PREFLIGHT_GREP_MAX_LINES {
+        return output.to_string();
+    }
+    let omitted = lines
+        .len()
+        .saturating_sub(READ_ONLY_PREFLIGHT_GREP_MAX_LINES);
+    lines.truncate(READ_ONLY_PREFLIGHT_GREP_MAX_LINES);
+    format!(
+        "{}\n[preflight grep output truncated: {omitted} additional line(s) omitted]",
+        lines.join("\n")
+    )
 }
 
 fn answer_says_insufficient_evidence(content: &str) -> bool {
@@ -2009,16 +2068,21 @@ impl Agent {
         }
     }
 
-    fn elide_in_turn_context_if_needed(&mut self, ui: &mut dyn Ui) {
+    fn elide_in_turn_context_if_needed(&mut self, ui: &mut dyn Ui, safety_window: Option<u32>) {
         if !self.config.auto_compact {
             return;
         }
-        let Some(window) = self.config.context_window else {
-            return;
+        let window = match (self.config.context_window, safety_window) {
+            (Some(configured), Some(safety)) => configured.min(safety),
+            (Some(configured), None) => configured,
+            (None, Some(safety)) => safety,
+            (None, None) => {
+                return;
+            }
         };
         if window == 0 {
             return;
-        }
+        };
 
         let used = compaction::estimate_tokens(self.messages.as_slice());
         if used * 100 < u64::from(window) * self.config.in_turn_elide_percent {
@@ -2311,6 +2375,11 @@ impl Agent {
         let mut results = Vec::new();
         let mut executed = 0u32;
         let mut extra_reads = Vec::<String>::new();
+        let mut seen_read_paths = calls
+            .iter()
+            .filter(|call| call.name == "read")
+            .filter_map(|call| hi_tools::target_path(call.name, &call.arguments))
+            .collect::<Vec<_>>();
         let id_prefix = format!("hi_preflight_{}", self.messages.len());
 
         while let Some(call) = calls.first().cloned() {
@@ -2332,13 +2401,21 @@ impl Agent {
             });
             if call.name == "grep" {
                 for path in paths_from_grep_output(&output.content) {
-                    if extra_reads.iter().any(|existing| existing == &path) {
+                    if !preflight_path_relevant_for_intent(intent, &path)
+                        || seen_read_paths.iter().any(|existing| existing == &path)
+                        || extra_reads.iter().any(|existing| existing == &path)
+                        || extra_reads.len() >= READ_ONLY_PREFLIGHT_MAX_EXTRA_READS
+                    {
                         continue;
                     }
                     extra_reads.push(path.clone());
-                    if extra_reads.len() <= 4 {
-                        calls.push(PreflightCall::read(path, 180));
-                    }
+                    seen_read_paths.push(path.clone());
+                    let limit = if matches!(intent, ReviewIntent::Security) {
+                        SECURITY_PREFLIGHT_EXTRA_READ_LIMIT
+                    } else {
+                        DEFAULT_PREFLIGHT_EXTRA_READ_LIMIT
+                    };
+                    calls.push(PreflightCall::read(path, limit));
                 }
             }
             emit_tool_output(ui, call.name, &output);
@@ -2347,7 +2424,10 @@ impl Agent {
                 name: call.name.to_string(),
                 arguments: call.arguments,
             });
-            results.push((id, output.content));
+            results.push((
+                id,
+                compact_preflight_tool_output(call.name, &output.content),
+            ));
             executed = executed.saturating_add(1);
         }
 
@@ -2562,7 +2642,10 @@ impl Agent {
                     ui.status(&line);
                 }
 
-                self.elide_in_turn_context_if_needed(ui);
+                let context_safety_window = read_only_intent
+                    .is_some()
+                    .then_some(READ_ONLY_SAFE_CONTEXT_WINDOW);
+                self.elide_in_turn_context_if_needed(ui, context_safety_window);
 
                 // Debug-mode invariant check: the transcript we're about to send
                 // must be provider-safe (every tool_use answered, no consecutive
@@ -6853,6 +6936,43 @@ mod tests {
         assert!(telemetry.targeted_searches >= 1, "{telemetry:?}");
         assert!(!telemetry.listing_only, "{telemetry:?}");
         assert_eq!(telemetry.first_tool_kind, "targeted_search");
+    }
+
+    #[test]
+    fn security_preflight_is_code_scoped_and_bounded() {
+        let calls = read_only_preflight_initial_calls(ReviewIntent::Security);
+        let mut read_paths = Vec::new();
+        let mut grep_args = String::new();
+        for call in &calls {
+            if call.name == "read" {
+                if let Some(path) = hi_tools::target_path(call.name, &call.arguments) {
+                    read_paths.push(path);
+                }
+            } else if call.name == "grep" {
+                grep_args = call.arguments.clone();
+            }
+        }
+
+        assert!(read_paths.iter().any(|path| path == "Cargo.toml"));
+        assert!(!read_paths.iter().any(|path| path == "README.md"));
+        assert!(grep_args.contains(r#""glob":"*.rs""#), "{grep_args}");
+        assert!(grep_args.contains(r#""context":0"#), "{grep_args}");
+        assert!(preflight_path_relevant_for_intent(
+            ReviewIntent::Security,
+            "crates/hi-agent/src/lib.rs"
+        ));
+        assert!(!preflight_path_relevant_for_intent(
+            ReviewIntent::Security,
+            "README.md"
+        ));
+
+        let long_grep = (0..40)
+            .map(|i| format!("src/lib.rs:{i}:unwrap()"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let compacted = compact_preflight_tool_output("grep", &long_grep);
+        assert!(compacted.contains("preflight grep output truncated"));
+        assert!(compacted.lines().count() <= READ_ONLY_PREFLIGHT_GREP_MAX_LINES + 1);
     }
 
     #[tokio::test]

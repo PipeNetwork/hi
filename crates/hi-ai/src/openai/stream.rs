@@ -847,6 +847,13 @@ fn classify_stream_api_error(message: &str) -> ProviderErrorKind {
     if lower.contains("rate limit") || lower.contains("too many requests") || lower.contains("429")
     {
         ProviderErrorKind::RateLimit
+    } else if lower.contains("resident model context")
+        || lower.contains("context_length_exceeded")
+        || lower.contains("context length")
+        || lower.contains("request too large")
+        || lower.contains("too many tokens")
+    {
+        ProviderErrorKind::RequestTooLarge
     } else if lower.contains("capacity") || lower.contains("temporarily unavailable") {
         ProviderErrorKind::CapacityUnavailable
     } else if lower.contains("service unavailable")
@@ -987,7 +994,8 @@ mod tests {
     use futures_util::{Stream, StreamExt, stream};
     use tokio::time::Sleep;
 
-    use super::collect_completion;
+    use super::{classify_stream_api_error, collect_completion};
+    use crate::provider::ProviderErrorKind;
     use crate::types::{Content, StreamEvent};
 
     /// A stream of SSE `data` strings that never ends (no `[DONE]`, socket stays
@@ -1162,6 +1170,16 @@ mod tests {
         assert!(
             err.to_string().contains("error reading stream"),
             "got: {err}"
+        );
+    }
+
+    #[test]
+    fn stream_context_limit_message_is_request_too_large() {
+        assert_eq!(
+            classify_stream_api_error(
+                "request exceeded the resident model context; reduce prompt or tool output and retry"
+            ),
+            ProviderErrorKind::RequestTooLarge
         );
     }
 
