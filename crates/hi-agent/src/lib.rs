@@ -314,6 +314,9 @@ const SECURITY_SCOPE_NUDGE: &str = "The security answer made repo-wide all-clear
 broader than the inspected files and search results support. Do not use mutating tools. Answer \
 again with findings explicitly bounded to the searched patterns and inspected files, or explicitly \
 say the evidence is insufficient for broader security claims.";
+const SECURITY_PREFLIGHT_PATTERN: &str = "unsafe|unwrap\\(|expect\\(|panic!|std::process|process::Command|Command::new|spawn\\(|std::fs|fs::|read_to_string|std::env|env::|secret|token|auth|api_key|apikey|password|credential|bearer";
+const GAP_PREFLIGHT_PATTERN: &str =
+    "TODO|FIXME|todo!|unimplemented!|missing|gap|needs coverage|not implemented";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReviewIntent {
@@ -432,10 +435,35 @@ struct SecuritySearchFamilies {
     secret_or_auth: bool,
 }
 
+#[derive(Clone, Debug)]
+struct PreflightCall {
+    name: &'static str,
+    arguments: String,
+}
+
+impl PreflightCall {
+    fn new(name: &'static str, arguments: serde_json::Value) -> Self {
+        Self {
+            name,
+            arguments: arguments.to_string(),
+        }
+    }
+
+    fn read(path: impl Into<String>, limit: u32) -> Self {
+        Self::new(
+            "read",
+            serde_json::json!({
+                "path": path.into(),
+                "limit": limit,
+            }),
+        )
+    }
+}
+
 fn evidence_kind_for_tool(name: &str, arguments: &str) -> Option<EvidenceKind> {
     match name {
         "read" => Some(EvidenceKind::FileRead),
-        "grep" | "glob" | "diff" => Some(EvidenceKind::TargetedSearch),
+        "grep" | "glob" | "diff" | "status" => Some(EvidenceKind::TargetedSearch),
         "list" => Some(EvidenceKind::Listing),
         "bash" => evidence_kind_for_bash(arguments),
         _ => None,
@@ -696,6 +724,111 @@ fn read_only_turn_prompt(input: &str, intent: ReviewIntent) -> String {
     format!(
         "{input}\n\nRead-only review guard: do not write, edit, apply patches, run mutating shell commands, or change files. Use read-only inspection before the final answer. {recipe} If only a directory listing is available, keep inspecting or explicitly say the evidence is insufficient instead of making file-specific findings."
     )
+}
+
+fn read_only_preflight_initial_calls(intent: ReviewIntent) -> Vec<PreflightCall> {
+    let mut calls = Vec::new();
+    if matches!(
+        intent,
+        ReviewIntent::Review | ReviewIntent::Status | ReviewIntent::Roadmap | ReviewIntent::Gaps
+    ) {
+        calls.push(PreflightCall::new("diff", serde_json::json!({})));
+    }
+    push_preflight_read_if_exists(&mut calls, "Cargo.toml", 180);
+    push_preflight_read_if_exists(&mut calls, "README.md", 160);
+
+    match intent {
+        ReviewIntent::Security => {
+            calls.push(PreflightCall::new(
+                "grep",
+                serde_json::json!({
+                    "pattern": SECURITY_PREFLIGHT_PATTERN,
+                    "context": 1,
+                }),
+            ));
+        }
+        ReviewIntent::Roadmap | ReviewIntent::Gaps => {
+            calls.extend(
+                preflight_entrypoint_candidates()
+                    .into_iter()
+                    .take(3)
+                    .map(|path| PreflightCall::read(path, 180)),
+            );
+            calls.push(PreflightCall::new(
+                "grep",
+                serde_json::json!({
+                    "pattern": GAP_PREFLIGHT_PATTERN,
+                    "context": 1,
+                }),
+            ));
+        }
+        ReviewIntent::Review | ReviewIntent::Status => {
+            calls.extend(
+                preflight_entrypoint_candidates()
+                    .into_iter()
+                    .take(3)
+                    .map(|path| PreflightCall::read(path, 180)),
+            );
+        }
+    }
+    calls
+}
+
+fn push_preflight_read_if_exists(calls: &mut Vec<PreflightCall>, path: &str, limit: u32) {
+    if std::path::Path::new(path).is_file() {
+        calls.push(PreflightCall::read(path, limit));
+    }
+}
+
+fn preflight_entrypoint_candidates() -> Vec<String> {
+    let mut candidates = Vec::new();
+    for path in ["src/lib.rs", "src/main.rs"] {
+        if std::path::Path::new(path).is_file() {
+            candidates.push(path.to_string());
+        }
+    }
+
+    let Ok(entries) = std::fs::read_dir("crates") else {
+        return candidates;
+    };
+    let mut crate_dirs = entries
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|file_type| file_type.is_dir()))
+        .map(|entry| entry.path())
+        .collect::<Vec<_>>();
+    crate_dirs.sort();
+    for crate_dir in crate_dirs {
+        for file in ["src/lib.rs", "src/main.rs"] {
+            let path = crate_dir.join(file);
+            if path.is_file() {
+                candidates.push(path.to_string_lossy().to_string());
+            }
+        }
+    }
+    candidates
+}
+
+fn paths_from_grep_output(output: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    for line in output.lines() {
+        let Some((path, _)) = line.split_once(':') else {
+            continue;
+        };
+        let path = path.trim();
+        if path.is_empty()
+            || path.starts_with("no matches")
+            || path.starts_with("Error:")
+            || !std::path::Path::new(path).is_file()
+            || paths.iter().any(|existing| existing == path)
+        {
+            continue;
+        }
+        paths.push(path.to_string());
+        if paths.len() >= 4 {
+            break;
+        }
+    }
+    paths
 }
 
 fn answer_says_insufficient_evidence(content: &str) -> bool {
@@ -2161,6 +2294,69 @@ impl Agent {
         self.snapshot_cache.invalidate();
     }
 
+    async fn run_read_only_preflight(
+        &mut self,
+        intent: ReviewIntent,
+        ui: &mut dyn Ui,
+        evidence: &mut EvidenceTracker,
+        tool_timeline: &mut Vec<ToolCallEntry>,
+    ) -> u32 {
+        let mut calls = read_only_preflight_initial_calls(intent);
+        if calls.is_empty() {
+            return 0;
+        }
+
+        ui.status("running read-only preflight inspection");
+        let mut content = Vec::new();
+        let mut results = Vec::new();
+        let mut executed = 0u32;
+        let mut extra_reads = Vec::<String>::new();
+        let id_prefix = format!("hi_preflight_{}", self.messages.len());
+
+        while let Some(call) = calls.first().cloned() {
+            calls.remove(0);
+            let id = format!("{id_prefix}_{executed}");
+            ui.tool_started(call.name, &call.arguments);
+            ui.tool_call(call.name, &call.arguments);
+            let started = std::time::Instant::now();
+            let output = execute(call.name, &call.arguments).await;
+            let duration_ms = started.elapsed().as_millis() as u64;
+            let path = hi_tools::target_path(call.name, &call.arguments).unwrap_or_default();
+            let error = output.content.starts_with("Error:");
+            evidence.record_success(call.name, &call.arguments, &output.content);
+            tool_timeline.push(ToolCallEntry {
+                tool: call.name.to_string(),
+                path,
+                duration_ms,
+                error,
+            });
+            if call.name == "grep" {
+                for path in paths_from_grep_output(&output.content) {
+                    if extra_reads.iter().any(|existing| existing == &path) {
+                        continue;
+                    }
+                    extra_reads.push(path.clone());
+                    if extra_reads.len() <= 4 {
+                        calls.push(PreflightCall::read(path, 180));
+                    }
+                }
+            }
+            emit_tool_output(ui, call.name, &output);
+            content.push(Content::ToolCall {
+                id: id.clone(),
+                name: call.name.to_string(),
+                arguments: call.arguments,
+            });
+            results.push((id, output.content));
+            executed = executed.saturating_add(1);
+        }
+
+        if !content.is_empty() {
+            self.messages.push_assistant_with_results(content, results);
+        }
+        executed
+    }
+
     /// Run one user turn to completion, emitting output through `ui`.
     ///
     /// After the model stops calling tools, an optional verification command is
@@ -2288,13 +2484,28 @@ impl Agent {
         // went and which calls failed.
         let mut tool_timeline: Vec<ToolCallEntry> = Vec::new();
         let mut evidence = EvidenceTracker::default();
+        // Whether the model or deterministic preflight has run a tool this
+        // turn (kept for finalization gating — a plain Q&A turn doesn't need a
+        // recap).
+        let mut made_tool_call = false;
+        if let Some(intent) = read_only_intent
+            && self.config.read_only_preflight
+            && !matches!(self.config.tool_mode, ToolMode::ChatOnly)
+        {
+            let preflight_calls = self
+                .run_read_only_preflight(intent, ui, &mut evidence, &mut tool_timeline)
+                .await;
+            if preflight_calls > 0 {
+                made_tool_call = true;
+                sched_tool_calls = sched_tool_calls.saturating_add(preflight_calls);
+                sched_serial_runs = sched_serial_runs.saturating_add(preflight_calls);
+                sched_max_concurrent = sched_max_concurrent.max(1);
+            }
+        }
         // Signature (name, arguments) of the previous round's tool calls, to
         // spot a model re-issuing the exact same call and looping on it.
         let mut prev_call_sig: Option<Vec<(String, String)>> = None;
         let mut request_too_large_retried = false;
-        // Whether the model has run a tool this turn (kept for finalization
-        // gating — a plain Q&A turn doesn't need a recap).
-        let mut made_tool_call = false;
         // Whether the turn ended because the model kept re-issuing the exact
         // same tool call through the whole repeat-nudge budget (drives the
         // incomplete notice and skips the finalization recap).
@@ -3939,6 +4150,9 @@ mod tests {
             // Off so canned-provider tests don't need extra completions for the
             // silent auto-continue; tests that exercise it opt in.
             max_silent_continues: 0,
+            // Most canned-provider tests assert specific nudge behavior before
+            // any deterministic context is added. Preflight has dedicated tests.
+            read_only_preflight: false,
             ..AgentConfig::default()
         }
     }
@@ -6577,6 +6791,68 @@ mod tests {
         assert_eq!(agent.last_turn_telemetry().quality_repair_nudges, 1);
         assert_eq!(agent.last_turn_telemetry().file_reads, 1);
         let _ = std::fs::remove_file(inspected_path);
+    }
+
+    #[tokio::test]
+    async fn read_only_status_preflight_seeds_first_request_with_evidence() {
+        let mut cfg = config();
+        cfg.read_only_preflight = true;
+        let (mut agent, requests) = scripted_agent(
+            vec![ProviderStep::Completion(completion(
+                vec![Content::Text(
+                    "Status:\n- Cargo.toml and README.md were inspected as the workspace manifest and project overview for this status review."
+                        .into(),
+                )],
+                10,
+                4,
+            ))],
+            cfg,
+        );
+
+        let mut ui = RecUi::default();
+        agent
+            .run_turn("review codebase and discuss status and state", &mut ui)
+            .await
+            .unwrap();
+
+        assert!(
+            ui.statuses
+                .iter()
+                .any(|status| status.contains("read-only preflight")),
+            "expected preflight status: {:?}",
+            ui.statuses
+        );
+        let requests = requests.lock().unwrap();
+        let first = requests.first().expect("provider request");
+        let mut tool_names = Vec::new();
+        let mut tool_results = String::new();
+        for message in first {
+            for content in &message.content {
+                match content {
+                    Content::ToolCall { name, .. } => tool_names.push(name.clone()),
+                    Content::ToolResult { output, .. } => {
+                        tool_results.push_str(output);
+                        tool_results.push('\n');
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(
+            tool_names.iter().any(|name| name == "diff"),
+            "{tool_names:?}"
+        );
+        assert!(
+            tool_names.iter().any(|name| name == "read"),
+            "{tool_names:?}"
+        );
+        assert!(tool_results.contains("[package]") || tool_results.contains("[workspace]"));
+        let telemetry = agent.last_turn_telemetry();
+        assert!(telemetry.tool_calls >= 3, "{telemetry:?}");
+        assert!(telemetry.file_reads >= 2, "{telemetry:?}");
+        assert!(telemetry.targeted_searches >= 1, "{telemetry:?}");
+        assert!(!telemetry.listing_only, "{telemetry:?}");
+        assert_eq!(telemetry.first_tool_kind, "targeted_search");
     }
 
     #[tokio::test]

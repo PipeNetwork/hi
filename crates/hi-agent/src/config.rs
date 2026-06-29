@@ -106,6 +106,11 @@ pub struct AgentConfig {
     /// only at turn-end verify. Off by default; only fires for languages with a
     /// genuinely per-file fast check (see `hi_tools::fast_check_for`).
     pub proactive_verify: bool,
+    /// Whether read-only review/status/security/gap turns get a deterministic
+    /// inspection seed before the first model call. This gives small models
+    /// concrete manifests, entrypoints, diffs, and targeted search results to
+    /// answer from instead of starting from `list .` only.
+    pub read_only_preflight: bool,
     /// Whether long-horizon agency is on: a structured `Goal` the agent
     /// decomposes into sub-goals, drives across turns, retries on failure, and
     /// resumes across sessions. Off by default while it stabilizes; when off,
@@ -150,6 +155,7 @@ impl Default for AgentConfig {
             in_turn_elide_percent: IN_TURN_ELIDE_PERCENT,
             in_turn_keep_tool_results: IN_TURN_KEEP_TOOL_RESULTS,
             proactive_verify: false,
+            read_only_preflight: true,
             long_horizon: false,
             max_cost_warn: None,
             confirm_edits: false,
