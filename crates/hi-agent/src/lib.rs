@@ -1085,6 +1085,81 @@ fn insufficient_after_review_repair_template() -> &'static str {
     "Insufficient evidence: the answer was a generic review-repair template instead of concrete findings tied to inspected files, so I cannot present this as a completed review."
 }
 
+fn read_only_intent_label(intent: ReviewIntent) -> &'static str {
+    match intent {
+        ReviewIntent::Security => "security review",
+        ReviewIntent::Status => "status review",
+        ReviewIntent::Roadmap => "roadmap review",
+        ReviewIntent::Gaps => "gap review",
+        ReviewIntent::Review => "review",
+    }
+}
+
+fn bounded_review_repair_exhaustion_answer(
+    intent: ReviewIntent,
+    evidence: &EvidenceTracker,
+    reason: &str,
+) -> String {
+    let label = read_only_intent_label(intent);
+    let mut lines = vec![
+        format!(
+            "Insufficient evidence for a completed {label}: the model did not produce acceptable file-specific findings after repair."
+        ),
+        String::new(),
+        "Inspected evidence:".to_string(),
+        format!("- Targeted searches: {}", evidence.targeted_searches),
+        format!("- File reads: {}", evidence.file_reads),
+    ];
+
+    if matches!(intent, ReviewIntent::Security) {
+        let mut families = Vec::new();
+        if evidence.security_unsafe_search {
+            families.push("unsafe/unwrap/expect/panic");
+        }
+        if evidence.security_execution_search {
+            families.push("command execution/filesystem/env");
+        }
+        if evidence.security_secret_search {
+            families.push("secret/token/auth");
+        }
+        let searched = if families.is_empty() {
+            "none".to_string()
+        } else {
+            families.join(", ")
+        };
+        lines.push(format!("- Security pattern families searched: {searched}"));
+    }
+
+    if evidence.inspected_paths.is_empty() {
+        lines.push("- Inspected files: none".to_string());
+    } else {
+        const INSPECTED_PATH_FALLBACK_LIMIT: usize = 6;
+        let mut paths = evidence
+            .inspected_paths
+            .iter()
+            .take(INSPECTED_PATH_FALLBACK_LIMIT)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let omitted = evidence
+            .inspected_paths
+            .len()
+            .saturating_sub(INSPECTED_PATH_FALLBACK_LIMIT);
+        if omitted > 0 {
+            paths.push_str(&format!(" (+{omitted} more)"));
+        }
+        lines.push(format!("- Inspected files: {paths}"));
+    }
+
+    lines.push(String::new());
+    lines.push(format!("Why this stopped: {reason}."));
+    lines.push(
+        "No file is being changed; this turn remains read-only and no broader repo-wide claim is being made."
+            .to_string(),
+    );
+    lines.join("\n")
+}
+
 fn no_evidence_review_nudge(intent: ReviewIntent) -> &'static str {
     match intent {
         ReviewIntent::Security => NO_EVIDENCE_SECURITY_NUDGE,
@@ -2958,7 +3033,7 @@ impl Agent {
                         ui.status(
                             "review repeated the same search without reading files; returning an insufficient-evidence answer",
                         );
-                        ui.assistant_text(insufficient);
+                        ui.assistant_text(&insufficient);
                         ui.assistant_end();
                         self.messages
                             .push_assistant(vec![Content::Text(insufficient.to_string())]);
@@ -3056,7 +3131,7 @@ impl Agent {
                             "review still had no inspected evidence after repair; returning an insufficient-evidence answer",
                         );
                         let insufficient = insufficient_after_no_review_evidence();
-                        ui.assistant_text(insufficient);
+                        ui.assistant_text(&insufficient);
                         ui.assistant_end();
                         self.messages
                             .push_assistant(vec![Content::Text(insufficient.to_string())]);
@@ -3067,11 +3142,21 @@ impl Agent {
                         ui.status(
                             "review answer was a generic repair template; returning an insufficient-evidence answer",
                         );
-                        let insufficient = insufficient_after_review_repair_template();
-                        ui.assistant_text(insufficient);
+                        let insufficient = if let Some(intent) = read_only_intent
+                            && (evidence.saw_read || evidence.saw_search)
+                        {
+                            bounded_review_repair_exhaustion_answer(
+                                intent,
+                                &evidence,
+                                "the final answer was a generic review-repair template instead of findings tied to inspected files",
+                            )
+                        } else {
+                            insufficient_after_review_repair_template().to_string()
+                        };
+                        ui.assistant_text(&insufficient);
                         ui.assistant_end();
                         self.messages
-                            .push_assistant(vec![Content::Text(insufficient.to_string())]);
+                            .push_assistant(vec![Content::Text(insufficient)]);
                         break false;
                     }
                     if should_deepen_review(read_only_intent, &evidence, &assistant_text) {
@@ -3095,7 +3180,7 @@ impl Agent {
                             "review still had only listing evidence after repair; returning an insufficient-evidence answer",
                         );
                         let insufficient = "Insufficient evidence: only a directory listing was inspected, so I cannot make file-specific review findings without targeted searches or file reads.";
-                        ui.assistant_text(insufficient);
+                        ui.assistant_text(&insufficient);
                         ui.assistant_end();
                         self.messages
                             .push_assistant(vec![Content::Text(insufficient.to_string())]);
@@ -3125,7 +3210,7 @@ impl Agent {
                         );
                         let insufficient = insufficient_after_repeated_search(&evidence)
                             .expect("search without read checked above");
-                        ui.assistant_text(insufficient);
+                        ui.assistant_text(&insufficient);
                         ui.assistant_end();
                         self.messages
                             .push_assistant(vec![Content::Text(insufficient.to_string())]);
@@ -3153,8 +3238,17 @@ impl Agent {
                         ui.status(
                             "security review still missed required pattern families after repair; returning an insufficient-evidence answer",
                         );
-                        let insufficient = insufficient_after_incomplete_security_search(&evidence)
+                        let reason = insufficient_after_incomplete_security_search(&evidence)
                             .expect("incomplete security search checked above");
+                        let insufficient = if let Some(intent) = read_only_intent {
+                            bounded_review_repair_exhaustion_answer(
+                                intent,
+                                &evidence,
+                                reason.trim_start_matches("Insufficient evidence: "),
+                            )
+                        } else {
+                            reason
+                        };
                         ui.assistant_text(&insufficient);
                         ui.assistant_end();
                         self.messages
@@ -3178,11 +3272,19 @@ impl Agent {
                         ui.status(
                             "security answer still overclaimed after repair; returning an insufficient-evidence answer",
                         );
-                        let insufficient = insufficient_after_security_scope_overclaim();
-                        ui.assistant_text(insufficient);
+                        let insufficient = if let Some(intent) = read_only_intent {
+                            bounded_review_repair_exhaustion_answer(
+                                intent,
+                                &evidence,
+                                "the final answer made repo-wide all-clear claims broader than the inspected files and searches support",
+                            )
+                        } else {
+                            insufficient_after_security_scope_overclaim().to_string()
+                        };
+                        ui.assistant_text(&insufficient);
                         ui.assistant_end();
                         self.messages
-                            .push_assistant(vec![Content::Text(insufficient.to_string())]);
+                            .push_assistant(vec![Content::Text(insufficient)]);
                         break false;
                     }
                     if should_nudge_concrete_review_answer(
@@ -3206,11 +3308,19 @@ impl Agent {
                         ui.status(
                             "review answer still lacked concrete inspected files after repair; returning an insufficient-evidence answer",
                         );
-                        let insufficient = "Insufficient evidence: the inspected context was not tied to concrete file-specific findings, so I cannot present this as a completed review.";
-                        ui.assistant_text(insufficient);
+                        let insufficient = if let Some(intent) = read_only_intent {
+                            bounded_review_repair_exhaustion_answer(
+                                intent,
+                                &evidence,
+                                "the final answer did not cite concrete files or modules from the inspected evidence",
+                            )
+                        } else {
+                            "Insufficient evidence: the inspected context was not tied to concrete file-specific findings, so I cannot present this as a completed review.".to_string()
+                        };
+                        ui.assistant_text(&insufficient);
                         ui.assistant_end();
                         self.messages
-                            .push_assistant(vec![Content::Text(insufficient.to_string())]);
+                            .push_assistant(vec![Content::Text(insufficient)]);
                         break false;
                     }
                     if buffer_read_only_review_text {
@@ -7060,6 +7170,80 @@ mod tests {
             ui.assistant
         );
         assert!(agent.last_turn_telemetry().stalled_unfinished);
+        let _ = std::fs::remove_file(inspected_path);
+    }
+
+    #[tokio::test]
+    async fn read_only_review_repair_exhaustion_reports_inspected_evidence() {
+        let inspected_path = temp_file("repair-exhaustion-evidence");
+        std::fs::write(&inspected_path, "pub fn value() -> i32 { 1 }\n").unwrap();
+        let inspected = inspected_path.to_string_lossy().to_string();
+        let responses = vec![
+            completion(
+                vec![Content::ToolCall {
+                    id: "read".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({ "path": inspected.clone() }).to_string(),
+                }],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text("Completed the requested action.".into())],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text("Completed the requested action.".into())],
+                1,
+                1,
+            ),
+            completion(
+                vec![Content::Text("Completed the requested action.".into())],
+                1,
+                1,
+            ),
+        ];
+        let mut agent = agent(responses, config());
+        let mut ui = RecUi::default();
+
+        agent
+            .run_turn(
+                "review for security issues or unsafe unwraps. then disucss only",
+                &mut ui,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            ui.assistant
+                .contains("Insufficient evidence for a completed security review"),
+            "expected bounded evidence fallback: {}",
+            ui.assistant
+        );
+        assert!(
+            ui.assistant.contains("Inspected evidence:"),
+            "fallback should describe inspected evidence: {}",
+            ui.assistant
+        );
+        assert!(
+            ui.assistant.contains("File reads: 1"),
+            "fallback should report file reads: {}",
+            ui.assistant
+        );
+        assert!(
+            ui.assistant.contains(&inspected),
+            "fallback should cite inspected path: {}",
+            ui.assistant
+        );
+        assert!(
+            !ui.assistant.contains("Findings/Status"),
+            "fallback must not invent completed findings: {}",
+            ui.assistant
+        );
+        let telemetry = agent.last_turn_telemetry();
+        assert_eq!(telemetry.quality_repair_nudges, 2);
+        assert!(telemetry.stalled_unfinished);
         let _ = std::fs::remove_file(inspected_path);
     }
 
