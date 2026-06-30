@@ -39,6 +39,10 @@ pub struct Cli {
     #[arg(long)]
     pub base_url: Option<String>,
 
+    /// Override the Pipe MCP endpoint URL used for model discovery.
+    #[arg(long)]
+    pub mcp_url: Option<String>,
+
     /// API key (otherwise read from env; see --help).
     #[arg(long)]
     pub api_key: Option<String>,
@@ -223,6 +227,13 @@ impl ProviderName {
         }
     }
 
+    pub(crate) fn default_mcp_url(self) -> Option<&'static str> {
+        match self {
+            ProviderName::Pipenetwork => Some(hi_ai::PIPE_MCP_DEFAULT_URL),
+            _ => None,
+        }
+    }
+
     /// A sensible default model for presets that have an obvious one.
     pub(crate) fn default_model(self) -> Option<&'static str> {
         match self {
@@ -299,6 +310,8 @@ pub struct Profile {
     pub provider: Option<ProviderName>,
     pub model: Option<String>,
     pub base_url: Option<String>,
+    /// MCP endpoint used for metadata discovery, when supported by the provider.
+    pub mcp_url: Option<String>,
     /// A literal API key (written by the setup wizard).
     pub api_key: Option<String>,
     /// Name of an env var holding the API key for this profile.
@@ -324,7 +337,7 @@ impl serde::Serialize for Profile {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("Profile", 9)?;
+        let mut s = serializer.serialize_struct("Profile", 11)?;
         if let Some(v) = &self.provider {
             s.serialize_field("provider", v)?;
         }
@@ -333,6 +346,9 @@ impl serde::Serialize for Profile {
         }
         if let Some(v) = &self.base_url {
             s.serialize_field("base_url", v)?;
+        }
+        if let Some(v) = &self.mcp_url {
+            s.serialize_field("mcp_url", v)?;
         }
         if let Some(v) = &self.api_key {
             s.serialize_field("api_key", v)?;
@@ -365,6 +381,7 @@ pub struct Settings {
     pub provider: ProviderName,
     pub model: String,
     pub base_url: String,
+    pub mcp_url: Option<String>,
     pub api_key: String,
     pub max_tokens: u32,
     pub thinking_budget: Option<u32>,
@@ -534,6 +551,13 @@ pub fn resolve(cli: &Cli, config: &Config, registry: &Registry) -> Result<Settin
         .or_else(|| std::env::var("HI_BASE_URL").ok())
         .unwrap_or_else(|| provider.default_base_url().to_string());
 
+    let mcp_url = cli
+        .mcp_url
+        .clone()
+        .or_else(|| profile.and_then(|p| p.mcp_url.clone()))
+        .or_else(|| std::env::var("HI_MCP_URL").ok())
+        .or_else(|| provider.default_mcp_url().map(String::from));
+
     let api_key = resolve_api_key(cli, profile, provider)?;
 
     let mut max_tokens =
@@ -562,6 +586,7 @@ pub fn resolve(cli: &Cli, config: &Config, registry: &Registry) -> Result<Settin
         provider,
         model,
         base_url,
+        mcp_url,
         api_key,
         max_tokens,
         thinking_budget,
@@ -1068,6 +1093,11 @@ pub fn resolve_named_profile(config: &Config, name: &str, registry: &Registry) -
         .base_url
         .clone()
         .unwrap_or_else(|| provider.default_base_url().to_string());
+    let mcp_url = profile
+        .mcp_url
+        .clone()
+        .or_else(|| std::env::var("HI_MCP_URL").ok())
+        .or_else(|| provider.default_mcp_url().map(String::from));
     let api_key = resolve_api_key_for(Some(profile), provider)?;
 
     let mut max_tokens = configured_max_tokens(provider, None, profile.max_tokens);
@@ -1082,6 +1112,7 @@ pub fn resolve_named_profile(config: &Config, name: &str, registry: &Registry) -
         provider,
         model,
         base_url,
+        mcp_url,
         api_key,
         max_tokens,
         thinking_budget: profile.thinking_budget,
@@ -1234,6 +1265,15 @@ mod tests {
     }
 
     #[test]
+    fn pipenetwork_has_default_mcp_url() {
+        assert_eq!(
+            ProviderName::Pipenetwork.default_mcp_url(),
+            Some(hi_ai::PIPE_MCP_DEFAULT_URL)
+        );
+        assert_eq!(ProviderName::Openai.default_mcp_url(), None);
+    }
+
+    #[test]
     fn config_round_trips_through_toml() {
         let mut config = Config {
             default_profile: Some("sonnet".into()),
@@ -1244,6 +1284,7 @@ mod tests {
             Profile {
                 provider: Some(ProviderName::Anthropic),
                 model: Some("claude-sonnet-4-20250514".into()),
+                mcp_url: Some("https://example.test/mcp".into()),
                 api_key_env: Some("ANTHROPIC_API_KEY".into()),
                 ..Default::default()
             },
@@ -1265,6 +1306,7 @@ mod tests {
         assert!(text.contains("[profiles.sonnet]"));
         assert!(text.contains("[profiles.local]"));
         assert!(text.contains("provider = \"anthropic\""));
+        assert!(text.contains("mcp_url = \"https://example.test/mcp\""));
         assert!(text.contains("api_key_env = \"ANTHROPIC_API_KEY\""));
         // Ollama profile has no model — it should be absent, not `model = ""`.
         // Check just the local section (between [profiles.local] and the next
@@ -1286,6 +1328,10 @@ mod tests {
         assert_eq!(
             reloaded.profiles.get("sonnet").unwrap().provider,
             Some(ProviderName::Anthropic)
+        );
+        assert_eq!(
+            reloaded.profiles.get("sonnet").unwrap().mcp_url.as_deref(),
+            Some("https://example.test/mcp")
         );
         assert_eq!(
             reloaded.profiles.get("local").unwrap().provider,

@@ -85,6 +85,7 @@ pub async fn run_self_test(active: &[&Config], profile: EvalProfile) -> Result<(
                 use_verify,
                 &temperatures,
                 profile,
+                None,
             )
             .await
             .with_context(|| format!("self-test config '{config_name}' failed to execute"))

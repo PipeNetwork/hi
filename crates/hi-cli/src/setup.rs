@@ -77,6 +77,7 @@ pub async fn run() -> Result<Settings> {
         provider,
         model,
         base_url: provider.default_base_url().to_string(),
+        mcp_url: provider.default_mcp_url().map(String::from),
         api_key,
         max_tokens: if matches!(provider, ProviderName::Pipenetwork) {
             2048

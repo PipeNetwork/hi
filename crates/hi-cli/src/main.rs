@@ -14,8 +14,8 @@ use clap::Parser;
 
 use hi_agent::{Agent, AgentConfig, CompactionKind, VerifyStage};
 use hi_ai::{
-    AnthropicProvider, Backend, FallbackProvider, Message, OpenAiProvider, Provider, Registry,
-    Usage,
+    AnthropicProvider, Backend, FallbackProvider, McpDiscoveryProvider, Message, OpenAiProvider,
+    PipeMcpClient, Provider, Registry, Usage,
 };
 
 use commands::tool_mode_label;
@@ -36,6 +36,9 @@ async fn main() -> Result<()> {
                 println!("provider:   {}", provider_label(settings.provider));
                 println!("model:      {}", settings.model);
                 println!("base_url:   {}", settings.base_url);
+                if let Some(mcp_url) = &settings.mcp_url {
+                    println!("mcp_url:    {mcp_url}");
+                }
                 println!("max_tokens: {}", settings.max_tokens);
                 println!(
                     "thinking:   {}",
@@ -97,6 +100,10 @@ async fn main() -> Result<()> {
             }
         }
     };
+
+    if cli.prompt.as_deref() == Some("mcp") {
+        return run_mcp_command(&settings).await;
+    }
 
     let info = registry.lookup(&settings.model);
     if let Some(info) = info
@@ -268,10 +275,15 @@ async fn main() -> Result<()> {
                     model: data.model.clone(),
                     base_url: data.base_url.clone(),
                 };
-                let profile = form.to_profile();
                 let path = config::writable_config_path(None)
                     .context("could not determine config path")?;
                 let mut file = file.lock().unwrap();
+                let mut profile = form.to_profile();
+                if profile.mcp_url.is_none()
+                    && let Some(existing) = file.profiles.get(&data.name)
+                {
+                    profile.mcp_url = existing.mcp_url.clone();
+                }
                 config::upsert_profile(&mut file, &data.name, profile, &path)?;
                 // Return the updated profile list.
                 Ok(profile_infos(&file))
@@ -323,6 +335,8 @@ async fn main() -> Result<()> {
             loader,
             remover,
             resume_summary,
+            settings.mcp_url.clone(),
+            settings.api_key.clone(),
         )
         .await
         {
@@ -344,6 +358,45 @@ pub(crate) fn provider_label(provider: ProviderName) -> &'static str {
         ProviderName::Pipenetwork => "pipenetwork",
         ProviderName::Ollama => "ollama",
     }
+}
+
+async fn run_mcp_command(settings: &Settings) -> Result<()> {
+    let Some(url) = settings.mcp_url.as_deref() else {
+        return Err(anyhow!("no MCP URL configured for this provider"));
+    };
+    let report = mcp_inspect(url, &settings.api_key, &settings.model).await?;
+    print!("{report}");
+    Ok(())
+}
+
+/// Build the MCP inspection report (server, tools, model count, current model)
+/// as a plain-text block. Shared by the `hi mcp` one-shot and the REPL `/mcp`
+/// command so their output can't drift.
+async fn mcp_inspect(url: &str, api_key: &str, current_model: &str) -> Result<String> {
+    let client = PipeMcpClient::new(url, api_key);
+    let (server, protocol) = client.server_info().await?;
+    let tools = client.tools_list().await?;
+    let models = client.list_models().await?;
+    let mut out = String::new();
+    out.push_str(&format!("mcp_url:  {url}\n"));
+    out.push_str(&format!("server:   {server}\n"));
+    out.push_str(&format!("protocol: {protocol}\n"));
+    out.push_str("tools:\n");
+    for tool in tools {
+        let title = tool.title.as_deref().unwrap_or("");
+        if title.is_empty() {
+            out.push_str(&format!("  {}\n", tool.name));
+        } else {
+            out.push_str(&format!("  {}  - {}\n", tool.name, title));
+        }
+    }
+    out.push_str(&format!("models:   {}\n", models.len()));
+    if let Some(model) = models.iter().find(|m| m.id == current_model) {
+        let health = model.health().unwrap_or("available");
+        let provider = model.provider_label.as_deref().unwrap_or("Pipe");
+        out.push_str(&format!("current:  {} · {} · {}\n", model.id, provider, health));
+    }
+    Ok(out)
 }
 
 /// The "PipeNetwork.AI" wordmark as figlet-style 5-row block letters — the
@@ -660,7 +713,17 @@ pub(crate) fn build_provider(settings: &Settings) -> Box<dyn Provider> {
     if settings.provider.is_anthropic() {
         Box::new(AnthropicProvider::new(base_url, api_key))
     } else {
-        Box::new(OpenAiProvider::new(base_url, api_key))
+        let inner: Box<dyn Provider> = Box::new(OpenAiProvider::new(base_url, api_key.clone()));
+        if settings.provider == ProviderName::Pipenetwork
+            && let Some(mcp_url) = settings.mcp_url.clone()
+        {
+            Box::new(McpDiscoveryProvider::new(
+                inner,
+                PipeMcpClient::new(mcp_url, api_key),
+            ))
+        } else {
+            inner
+        }
     }
 }
 
@@ -730,6 +793,7 @@ mod tests {
             provider: ProviderName::Openai,
             model: "gpt-4o".into(),
             base_url: String::new(),
+            mcp_url: None,
             api_key: String::new(),
             max_tokens: 4096,
             thinking_budget: None,

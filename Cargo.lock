@@ -596,6 +596,7 @@ name = "hi-eval"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "hi-ai",
  "serde",
  "serde_json",
  "tokio",

@@ -33,6 +33,7 @@ use artifacts::{
 };
 use config::{CONFIGS, Config, EvalProfile, Task};
 use reporting::print_summary;
+use results::McpModelArtifact;
 use runner::run_config;
 use selftest::run_self_test;
 
@@ -51,6 +52,16 @@ async fn async_main() -> Result<()> {
         .cloned()
         .unwrap_or_else(|| "bench/tasks".to_string());
     let profile = EvalProfile::parse(args.iter().find_map(|a| a.strip_prefix("--profile=")))?;
+    let requested_models: Option<Vec<String>> = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--models="))
+        .map(|s| {
+            s.split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .collect()
+        });
     let artifacts_dir = args
         .iter()
         .find_map(|a| a.strip_prefix("--artifacts="))
@@ -100,7 +111,15 @@ async fn async_main() -> Result<()> {
         .with_context(|| format!("creating artifacts dir {}", artifacts_dir.display()))?;
 
     let hi = find_hi()?;
-    let model = std::env::var("HI_MODEL").unwrap_or_else(|_| "(unset)".into());
+    let model = default_eval_model(profile);
+    let mcp_catalog = fetch_mcp_catalog(profile).await;
+    let models_to_run = resolve_models_to_run(requested_models, &model, mcp_catalog.as_ref())?;
+    let mcp_model_metadata = |model_id: &str| {
+        mcp_catalog
+            .as_ref()
+            .and_then(|catalog| catalog.get(model_id))
+            .map(mcp_model_artifact)
+    };
     // Mirror hi's env toggles so the run header and artifacts label which side of
     // each A/B this run is: `HI_CONDENSE=0` / `HI_RECOVERY_SAMPLING=0` to disable.
     let env_on = |name: &str| {
@@ -112,9 +131,11 @@ async fn async_main() -> Result<()> {
     let condense_on = env_on("HI_CONDENSE");
     let recovery_on = env_on("HI_RECOVERY_SAMPLING");
     eprintln!(
-        "hi-eval: {} task(s) × {} config(s) × {trials} trial(s) · model={model} · profile={} · condense={} · recovery={} · hi={} · artifacts={}",
+        "hi-eval: {} task(s) × {} config(s) × {} model(s) × {trials} trial(s) · models={} · profile={} · condense={} · recovery={} · hi={} · artifacts={}",
         tasks.len(),
         active.len(),
+        models_to_run.len(),
+        models_to_run.join(","),
         profile.label(),
         if condense_on { "on" } else { "off" },
         if recovery_on { "on" } else { "off" },
@@ -137,54 +158,70 @@ async fn async_main() -> Result<()> {
         if trials > 1 {
             eprintln!("--- trial {}/{trials} ---", trial + 1);
         }
-        // Run all (task, config) pairs for this trial concurrently.
+        // Run all (model, task, config) cells for this trial concurrently.
         let mut futs = Vec::new();
-        for (dir, task) in &tasks {
-            let label = task.name.clone().unwrap_or_else(|| dir_name(dir));
-            for config in &active {
-                let hi = hi.clone();
-                let dir = dir.clone();
-                let task_prompt = task.prompt.clone();
-                let task_verify = task.verify.clone();
-                let config_name = config.name.to_string();
-                let use_verify = config.use_verify;
-                let temperatures = config.temperatures.to_vec();
-                let sem = semaphore.clone();
-                let artifacts_dir = artifacts_dir.clone();
-                let label2 = label.clone();
-                futs.push(tokio::spawn(async move {
-                    let _permit = sem.acquire().await;
-                    let task = Task {
-                        name: Some(label2.clone()),
-                        prompt: task_prompt,
-                        verify: task_verify,
-                    };
-                    let mut result = run_config(
-                        &hi,
-                        &dir,
-                        &task,
-                        &config_name,
-                        use_verify,
-                        &temperatures,
-                        profile,
-                    )
-                    .await
-                    .with_context(|| format!("running task '{}' [{}]", label2, config_name))?;
-                    result.task = label2.clone();
-                    result.trial = trial;
-                    write_artifact(&artifacts_dir, profile, condense_on, recovery_on, &result)?;
-                    eprintln!(
-                        "  {:10} {:4} {}  ({} cand, {} tok, ${:.4}, {:.1}s)",
-                        config_name,
-                        if result.passed { "PASS" } else { "FAIL" },
-                        label2,
-                        result.candidates,
-                        result.tokens,
-                        result.cost_usd,
-                        result.seconds
-                    );
-                    Ok::<_, anyhow::Error>(result)
-                }));
+        for model_id in &models_to_run {
+            let mcp_model = mcp_model_metadata(model_id);
+            for (dir, task) in &tasks {
+                let label = task.name.clone().unwrap_or_else(|| dir_name(dir));
+                for config in &active {
+                    let hi = hi.clone();
+                    let dir = dir.clone();
+                    let task_prompt = task.prompt.clone();
+                    let task_verify = task.verify.clone();
+                    let config_name = config.name.to_string();
+                    let use_verify = config.use_verify;
+                    let temperatures = config.temperatures.to_vec();
+                    let sem = semaphore.clone();
+                    let artifacts_dir = artifacts_dir.clone();
+                    let label2 = label.clone();
+                    let model_for_run = model_id.clone();
+                    let mcp_model = mcp_model.clone();
+                    futs.push(tokio::spawn(async move {
+                        let _permit = sem.acquire().await;
+                        let task = Task {
+                            name: Some(label2.clone()),
+                            prompt: task_prompt,
+                            verify: task_verify,
+                        };
+                        let model_override =
+                            (model_for_run != "(unset)").then_some(model_for_run.clone());
+                        let mut result = run_config(
+                            &hi,
+                            &dir,
+                            &task,
+                            &config_name,
+                            use_verify,
+                            &temperatures,
+                            profile,
+                            model_override,
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "running task '{}' [{}] model={}",
+                                label2, config_name, model_for_run
+                            )
+                        })?;
+                        result.task = label2.clone();
+                        result.trial = trial;
+                        result.model = model_for_run.clone();
+                        result.mcp_model = mcp_model;
+                        write_artifact(&artifacts_dir, profile, condense_on, recovery_on, &result)?;
+                        eprintln!(
+                            "  {:10} {:4} {}  model={} ({} cand, {} tok, ${:.4}, {:.1}s)",
+                            config_name,
+                            if result.passed { "PASS" } else { "FAIL" },
+                            label2,
+                            model_for_run,
+                            result.candidates,
+                            result.tokens,
+                            result.cost_usd,
+                            result.seconds
+                        );
+                        Ok::<_, anyhow::Error>(result)
+                    }));
+                }
             }
         }
         for fut in futs {
@@ -200,4 +237,76 @@ async fn async_main() -> Result<()> {
 
     print_summary(&results, tasks.len(), &active, trials);
     Ok(())
+}
+
+fn default_eval_model(profile: EvalProfile) -> String {
+    std::env::var("HI_MODEL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| match profile {
+            EvalProfile::Pipenetwork | EvalProfile::PipenetworkMcp => {
+                Some("ipop/coder-balanced".to_string())
+            }
+            EvalProfile::Default => None,
+        })
+        .unwrap_or_else(|| "(unset)".to_string())
+}
+
+async fn fetch_mcp_catalog(
+    profile: EvalProfile,
+) -> Option<std::collections::HashMap<String, hi_ai::PipeMcpModelMetadata>> {
+    if !profile.uses_mcp_metadata() {
+        return None;
+    }
+    let key = std::env::var("HI_API_KEY")
+        .or_else(|_| std::env::var("PIPENETWORK_API_KEY"))
+        .or_else(|_| std::env::var("OPENAI_API_KEY"))
+        .ok()?;
+    let url = std::env::var("HI_MCP_URL").unwrap_or_else(|_| hi_ai::PIPE_MCP_DEFAULT_URL.into());
+    let client = hi_ai::PipeMcpClient::new(url, key);
+    match client.model_metadata().await {
+        Ok(models) => Some(models),
+        Err(err) => {
+            eprintln!("hi-eval: MCP model metadata unavailable: {err:#}");
+            None
+        }
+    }
+}
+
+fn resolve_models_to_run(
+    requested: Option<Vec<String>>,
+    default_model: &str,
+    mcp_catalog: Option<&std::collections::HashMap<String, hi_ai::PipeMcpModelMetadata>>,
+) -> Result<Vec<String>> {
+    let mut models = requested.unwrap_or_else(|| vec![default_model.to_string()]);
+    if models.is_empty() {
+        models.push(default_model.to_string());
+    }
+    models.sort();
+    models.dedup();
+    if let Some(catalog) = mcp_catalog {
+        let missing: Vec<String> = models
+            .iter()
+            .filter(|model| !catalog.contains_key(model.as_str()))
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            bail!(
+                "--models contains id(s) not visible through MCP: {}",
+                missing.join(", ")
+            );
+        }
+    }
+    Ok(models)
+}
+
+fn mcp_model_artifact(model: &hi_ai::PipeMcpModelMetadata) -> McpModelArtifact {
+    McpModelArtifact {
+        model_id: model.id.clone(),
+        provider_label: model.provider_label.clone(),
+        available: model.available,
+        status: model.status.clone(),
+        unavailable_reasons: model.unavailable_reasons.clone(),
+        capabilities: model.capabilities.clone(),
+    }
 }

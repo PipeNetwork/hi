@@ -62,8 +62,11 @@ impl ModelEntry {
                 (Some(i), Some(o)) => Some((i * 1_000_000.0, o * 1_000_000.0)),
                 _ => None,
             },
+            provider_label: None,
             status: self.status,
             available: self.available.unwrap_or(true),
+            availability_reason: None,
+            capabilities: Vec::new(),
         }
     }
 }
@@ -420,15 +423,21 @@ mod tests {
                     id: "ipop/coder-balanced".into(),
                     context_window: Some(1_000_000),
                     price: Some((1.0, 2.0)),
+                    provider_label: None,
                     status: Some("available".into()),
                     available: true,
+                    availability_reason: None,
+                    capabilities: Vec::new(),
                 },
                 ServedModel {
                     id: "grok".into(),
                     context_window: None,
                     price: None,
+                    provider_label: None,
                     status: Some("degraded".into()),
                     available: false,
+                    availability_reason: None,
+                    capabilities: Vec::new(),
                 },
             ],
         };
@@ -468,8 +477,11 @@ mod tests {
             id: "m1".into(),
             context_window: Some(128_000),
             price: None,
+            provider_label: None,
             status: None,
             available: true,
+            availability_reason: None,
+            capabilities: Vec::new(),
         }];
 
         assert!(load_cache(&key).await.is_none(), "empty before save");

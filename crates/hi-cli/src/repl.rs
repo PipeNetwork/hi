@@ -372,6 +372,17 @@ pub(crate) async fn repl(
                             }
                             continue;
                         }
+                        Command::Mcp => {
+                            let Some(url) = settings.mcp_url.as_deref() else {
+                                eprintln!("\x1b[33mno MCP URL configured for this provider\x1b[0m");
+                                continue;
+                            };
+                            match crate::mcp_inspect(url, &settings.api_key, &settings.model).await {
+                                Ok(report) => print!("{report}"),
+                                Err(err) => eprintln!("\x1b[33mmcp inspection failed: {err:#}\x1b[0m"),
+                            }
+                            continue;
+                        }
                         other => {
                             handle_command(agent, other, registry);
                             continue;
@@ -664,7 +675,10 @@ fn provider_edit_prompt(
         form.base_url = new_url;
     }
 
-    let profile = form.to_profile();
+    let mut profile = form.to_profile();
+    if profile.mcp_url.is_none() {
+        profile.mcp_url = existing.mcp_url.clone();
+    }
     let path = writable_config_path(None).context("could not determine config path")?;
     upsert_profile(config, &name, profile, &path)?;
     Ok(name)

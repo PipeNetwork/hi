@@ -43,6 +43,7 @@ pub const CONFIGS: &[Config] = &[
 pub enum EvalProfile {
     Default,
     Pipenetwork,
+    PipenetworkMcp,
 }
 
 impl EvalProfile {
@@ -50,7 +51,10 @@ impl EvalProfile {
         match value.unwrap_or("default") {
             "default" => Ok(Self::Default),
             "pipenetwork" => Ok(Self::Pipenetwork),
-            other => bail!("unknown --profile={other}; known: default, pipenetwork"),
+            "pipenetwork-mcp" => Ok(Self::PipenetworkMcp),
+            other => {
+                bail!("unknown --profile={other}; known: default, pipenetwork, pipenetwork-mcp")
+            }
         }
     }
 
@@ -58,13 +62,14 @@ impl EvalProfile {
         match self {
             Self::Default => "default",
             Self::Pipenetwork => "pipenetwork",
+            Self::PipenetworkMcp => "pipenetwork-mcp",
         }
     }
 
     pub fn hi_args(self) -> &'static [&'static str] {
         match self {
             Self::Default => &[],
-            Self::Pipenetwork => &[
+            Self::Pipenetwork | Self::PipenetworkMcp => &[
                 "--provider",
                 "pipenetwork",
                 "--compat",
@@ -76,12 +81,19 @@ impl EvalProfile {
     }
 
     pub fn validate_env(self) -> Result<()> {
-        if matches!(self, Self::Pipenetwork)
+        if matches!(self, Self::Pipenetwork | Self::PipenetworkMcp)
             && std::env::var("PIPENETWORK_API_KEY").is_err()
             && std::env::var("HI_API_KEY").is_err()
         {
-            bail!("--profile=pipenetwork requires PIPENETWORK_API_KEY or HI_API_KEY");
+            bail!(
+                "--profile={} requires PIPENETWORK_API_KEY or HI_API_KEY",
+                self.label()
+            );
         }
         Ok(())
+    }
+
+    pub fn uses_mcp_metadata(self) -> bool {
+        matches!(self, Self::PipenetworkMcp)
     }
 }

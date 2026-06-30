@@ -100,10 +100,21 @@ pub struct ServedModel {
     pub context_window: Option<u32>,
     /// Pricing `(input, output)` in USD per 1M tokens.
     pub price: Option<(f64, f64)>,
+    /// Human-readable provider/source label when the endpoint exposes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_label: Option<String>,
     /// Health label as reported, e.g. "available" or "degraded".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
     /// Whether the endpoint currently flags the model as usable.
+    #[serde(default = "default_available")]
     pub available: bool,
+    /// User-visible reason for unavailability/degradation, if one is public.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub availability_reason: Option<String>,
+    /// Capability tags reported by the endpoint, e.g. "tools" or "reasoning".
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
 }
 
 impl ServedModel {
@@ -117,6 +128,10 @@ impl ServedModel {
             _ => None,
         }
     }
+}
+
+fn default_available() -> bool {
+    true
 }
 
 /// A model backend. Implementations own the wire-format translation and SSE

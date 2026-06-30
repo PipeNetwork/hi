@@ -236,6 +236,8 @@ pub(crate) fn handle_command(
         // If it reaches here, it's a no-op — the frontend should have
         // intercepted it.
         Command::Provider(_) => {}
+        // `/mcp` is handled inline by the REPL/TUI (async + needs settings).
+        Command::Mcp => {}
     }
     false
 }

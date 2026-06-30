@@ -18,6 +18,7 @@ pub fn write_artifact(
     let artifact = RunArtifact {
         task: result.task.clone(),
         config: result.config.to_string(),
+        model: result.model.clone(),
         trial: result.trial,
         profile: profile.label().to_string(),
         condense,
@@ -32,13 +33,15 @@ pub fn write_artifact(
         tokens: result.tokens,
         cost_usd: result.cost_usd,
         duration_seconds: result.seconds,
+        mcp_model: result.mcp_model.clone(),
         verify_output_summary: result.verify_output_summary.clone(),
         trajectory: result.trajectory.clone(),
     };
     let name = format!(
-        "trial-{:03}-{}-{}.json",
+        "trial-{:03}-{}-{}-{}.json",
         result.trial + 1,
         sanitize_name(&result.config),
+        sanitize_name(&result.model),
         sanitize_name(&result.task)
     );
     let json = serde_json::to_string_pretty(&artifact)?;

@@ -63,9 +63,15 @@ pub async fn run_config(
     use_verify: bool,
     temperatures: &[f32],
     profile: EvalProfile,
+    model_override: Option<String>,
 ) -> Result<RunResult> {
+    let model_label = model_override
+        .clone()
+        .or_else(|| std::env::var("HI_MODEL").ok())
+        .unwrap_or_else(|| "(unset)".to_string());
     let mut result = RunResult {
         config: config_name.to_string(),
+        model: model_label,
         task: String::new(),
         trial: 0,
         passed: false,
@@ -79,6 +85,7 @@ pub async fn run_config(
         cost_usd: 0.0,
         tokens: 0,
         seconds: 0.0,
+        mcp_model: None,
         trajectory: Trajectory::default(),
     };
 
@@ -94,6 +101,7 @@ pub async fn run_config(
             let task_dir = task_dir.to_path_buf();
             let prompt = task.prompt.clone();
             let verify = task.verify.clone();
+            let model_override = model_override.clone();
             futs.push(tokio::task::spawn_blocking(move || {
                 run_candidate(
                     &hi,
@@ -106,6 +114,7 @@ pub async fn run_config(
                     use_verify,
                     temperature,
                     profile,
+                    model_override.as_deref(),
                 )
             }));
         }
@@ -173,6 +182,7 @@ pub fn run_candidate(
     use_verify: bool,
     temperature: f32,
     profile: EvalProfile,
+    model_override: Option<&str>,
 ) -> Result<Candidate> {
     let work = make_workdir()?;
     let fixture = task_dir.join("fixture");
@@ -190,6 +200,9 @@ pub fn run_candidate(
         .arg(temperature.to_string());
     for arg in profile.hi_args() {
         cmd.arg(arg);
+    }
+    if let Some(model) = model_override {
+        cmd.env("HI_MODEL", model);
     }
     if use_verify {
         cmd.arg("--verify").arg(&task.verify);

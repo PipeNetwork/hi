@@ -71,6 +71,7 @@ impl Trajectory {
 
 pub struct RunResult {
     pub config: String,
+    pub model: String,
     pub task: String,
     pub trial: usize,
     pub passed: bool,
@@ -85,9 +86,20 @@ pub struct RunResult {
     pub cost_usd: f64,
     pub tokens: u64,
     pub seconds: f64,
+    pub mcp_model: Option<McpModelArtifact>,
     /// Trajectory of the representative (furthest-progressing) candidate —
     /// verify rounds, recovery retries, nudges, last verify attribution.
     pub trajectory: Trajectory,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct McpModelArtifact {
+    pub model_id: String,
+    pub provider_label: Option<String>,
+    pub available: bool,
+    pub status: Option<String>,
+    pub unavailable_reasons: Vec<String>,
+    pub capabilities: Vec<String>,
 }
 
 pub struct Candidate {
@@ -122,6 +134,7 @@ pub enum FailKind {
 pub struct RunArtifact {
     pub task: String,
     pub config: String,
+    pub model: String,
     pub trial: usize,
     pub profile: String,
     /// Whether the tool-output condenser was on for this run (for the A/B).
@@ -138,6 +151,8 @@ pub struct RunArtifact {
     pub tokens: u64,
     pub cost_usd: f64,
     pub duration_seconds: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_model: Option<McpModelArtifact>,
     pub verify_output_summary: String,
     pub trajectory: Trajectory,
 }

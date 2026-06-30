@@ -4,6 +4,7 @@
 pub mod anthropic;
 pub mod fallback;
 mod http;
+pub mod mcp;
 pub mod openai;
 pub mod provider;
 pub mod registry;
@@ -16,6 +17,10 @@ pub use fallback::{Backend, FallbackProvider};
 // Re-export the on-disk /models cache helpers so the TUI can load cached model
 // metadata at startup (instant) and save fresh results from the background fetch.
 pub use http::{cache_key, load_cache, save_cache};
+pub use mcp::{
+    McpDiscoveryProvider, McpTool, PIPE_MCP_DEFAULT_URL, PipeMcpClient, PipeMcpModelHealth,
+    PipeMcpModelMetadata,
+};
 pub use openai::OpenAiProvider;
 pub use provider::{
     Provider, ProviderError, ProviderErrorKind, ServedModel, provider_error_kind,
