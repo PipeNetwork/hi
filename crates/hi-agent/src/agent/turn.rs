@@ -21,7 +21,27 @@ use crate::heuristics::{
     tool_mode_label,
 };
 use crate::snapshot::changed_files_between;
-use crate::steering::*;
+use crate::steering::{
+    CONCRETE_REVIEW_NUDGE, EvidenceTracker, GAP_SEARCH_OVERCLAIM_NUDGE,
+    IMPLEMENTATION_EMPTY_TUI_NUDGE, IMPLEMENTATION_NO_CHANGES_NUDGE,
+    IMPLEMENTATION_SCAFFOLD_ONLY_NUDGE, ImplementationTracker, READ_AFTER_SEARCH_NUDGE,
+    READ_ONLY_SAFE_CONTEXT_WINDOW, REPEAT_NUDGE, ReviewIntent,
+    SECURITY_BROAD_SEARCH_NUDGE, SECURITY_SCOPE_NUDGE, TOOL_PROTOCOL_RETRY_NUDGE,
+    TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE, answer_says_insufficient_evidence,
+    bounded_review_repair_exhaustion_answer, classify_implementation_intent,
+    classify_read_only_intent, deepen_review_nudge, implementation_missing_validation_nudge,
+    implementation_text_tool_nudge, implementation_turn_prompt,
+    inspected_insufficient_repair_limit, insufficient_after_incomplete_security_search,
+    insufficient_after_no_review_evidence, insufficient_after_repeated_search,
+    insufficient_after_review_repair_template, insufficient_after_security_scope_overclaim,
+    no_evidence_review_nudge, read_only_blocked_tool_result, read_only_blocks_tool,
+    read_only_turn_prompt, should_bootstrap_gpu_training_estimator, should_deepen_review,
+    should_nudge_concrete_review_answer, should_nudge_gap_search_overclaim,
+    should_nudge_no_evidence_review, should_nudge_read_after_repeated_search,
+    should_nudge_read_after_search_final, should_nudge_security_broad_search,
+    should_nudge_security_scope, should_reject_review_repair_template,
+    summarize_inspected_evidence_nudge,
+};
 use crate::transcript::NudgeKind;
 use crate::verify::{Snapshot, Verifier, VerifyOutcome, stage_guidance};
 use crate::{

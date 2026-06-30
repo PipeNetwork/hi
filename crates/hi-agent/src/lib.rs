@@ -39,7 +39,19 @@ use transcript::Transcript;
 #[cfg(test)]
 use {
     anyhow::Result, heuristics::{looks_like_continue, plan_has_pending_steps},
-    hi_ai::{Message, ToolMode}, steering::*,
+    hi_ai::{Message, ToolMode},
+    steering::{
+        EvidenceTracker, ImplementationIntent, ReviewIntent, SecuritySearchFamilies,
+        READ_ONLY_PREFLIGHT_DIFF_MAX_LINES, READ_ONLY_PREFLIGHT_GREP_MAX_LINES,
+        bounded_review_repair_exhaustion_answer, classify_implementation_intent,
+        classify_read_only_intent, compact_preflight_tool_output,
+        gpu_training_estimator_bootstrap_files, implementation_preflight_command,
+        implementation_turn_prompt, implementation_workspace_can_accept_rust_bootstrap_at,
+        insufficient_after_incomplete_security_search, preflight_path_relevant_for_intent,
+        preferred_validation_from_preflight, read_only_preflight_initial_calls,
+        security_search_families_for_tool, should_nudge_concrete_review_answer,
+        should_nudge_security_broad_search, should_nudge_security_scope,
+    },
 };
 
 pub use decision::{Decision, DecisionLog};
