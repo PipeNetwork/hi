@@ -1,4 +1,10 @@
-use super::*;
+//! Implementation heuristics: GPU training estimator bootstrap file
+//! generation, tool-call mutation/edit/validation classification, and shell
+//! command analysis. Uses [`contains_any`] from [`intent`](super::intent) and
+//! [`ImplementationIntent`] from [`types`](super::types).
+
+use super::intent::contains_any;
+use super::types::ImplementationIntent;
 pub(crate) fn should_bootstrap_gpu_training_estimator(intent: ImplementationIntent) -> bool {
     intent.gpu_training_estimator && implementation_workspace_can_accept_rust_bootstrap()
 }

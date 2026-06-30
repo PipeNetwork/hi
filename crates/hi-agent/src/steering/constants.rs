@@ -1,3 +1,6 @@
+//! Nudge strings, context limits, and preflight patterns referenced by
+//! [`nudges`](super::nudges) and [`preflight`](super::preflight).
+
 /// Sent when the model re-issues the exact same tool call as the previous
 /// round. The command already ran and its output is in the history just above —
 /// re-running it will only produce the same result. This nudges the model to act

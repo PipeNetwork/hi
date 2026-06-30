@@ -372,12 +372,8 @@ fn capability_tags(value: Option<&Value>) -> Vec<String> {
     };
     let mut tags: Vec<String> = map
         .iter()
-        .filter_map(|(key, value)| {
-            value
-                .as_bool()
-                .unwrap_or(false)
-                .then(|| normalize_capability(key))
-        })
+        .filter(|(_, value)| value.as_bool().unwrap_or(false))
+        .map(|(key, _)| normalize_capability(key))
         .collect();
     tags.sort();
     tags.dedup();

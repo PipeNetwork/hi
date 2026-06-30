@@ -710,7 +710,7 @@ impl crate::Agent {
                         ui.status(
                             "review repeated the same search without reading files; returning an insufficient-evidence answer",
                         );
-                        ui.assistant_text(&insufficient);
+                        ui.assistant_text(insufficient);
                         ui.assistant_end();
                         self.messages
                             .push_assistant(vec![Content::Text(insufficient.to_string())]);
@@ -950,7 +950,7 @@ impl crate::Agent {
                             "review still had no inspected evidence after repair; returning an insufficient-evidence answer",
                         );
                         let insufficient = insufficient_after_no_review_evidence();
-                        ui.assistant_text(&insufficient);
+                        ui.assistant_text(insufficient);
                         ui.assistant_end();
                         self.messages
                             .push_assistant(vec![Content::Text(insufficient.to_string())]);
@@ -1049,7 +1049,7 @@ impl crate::Agent {
                             "review still had only listing evidence after repair; returning an insufficient-evidence answer",
                         );
                         let insufficient = "Insufficient evidence: only a directory listing was inspected, so I cannot make file-specific review findings without targeted searches or file reads.";
-                        ui.assistant_text(&insufficient);
+                        ui.assistant_text(insufficient);
                         ui.assistant_end();
                         self.messages
                             .push_assistant(vec![Content::Text(insufficient.to_string())]);
@@ -1079,7 +1079,7 @@ impl crate::Agent {
                         );
                         let insufficient = insufficient_after_repeated_search(&evidence)
                             .expect("search without read checked above");
-                        ui.assistant_text(&insufficient);
+                        ui.assistant_text(insufficient);
                         ui.assistant_end();
                         self.messages
                             .push_assistant(vec![Content::Text(insufficient.to_string())]);

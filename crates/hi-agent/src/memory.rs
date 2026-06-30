@@ -214,7 +214,7 @@ pub(crate) fn extract_corrections(messages: &[Message]) -> String {
             continue;
         }
         if looks_like_correction(text)
-            || (i > 0 && prev_was_error(&messages[i.saturating_sub(1)]) && !is_tool_result(&msg))
+            || (i > 0 && prev_was_error(&messages[i.saturating_sub(1)]) && !is_tool_result(msg))
         {
             // Strip paste-folded stdin markers that clutter the snippet.
             let clean = text.replace("\n<<<STDIN>>>:", " ");
@@ -408,11 +408,10 @@ fn is_plausible(token: &str) -> bool {
         return Path::new("Makefile").exists() || Path::new("makefile").exists();
     } else if lower.starts_with("just") {
         return Path::new("justfile").exists() || Path::new("Justfile").exists();
-    } else if lower.starts_with("pytest") {
-        return Path::new("pyproject.toml").exists()
-            || Path::new("setup.py").exists()
-            || Path::new("requirements.txt").exists();
-    } else if lower.starts_with("python") || lower.starts_with("ruff") {
+    } else if lower.starts_with("pytest")
+        || lower.starts_with("python")
+        || lower.starts_with("ruff")
+    {
         return Path::new("pyproject.toml").exists()
             || Path::new("setup.py").exists()
             || Path::new("requirements.txt").exists();
@@ -539,10 +538,7 @@ pub(crate) fn write_memory(path: &Path, body: &str) -> Result<usize, String> {
     }
 
     // Exclusive lock — serialized across concurrent processes in this dir.
-    let _lock = match take_lock(parent) {
-        Ok(l) => l,
-        Err(status) => return Err(status),
-    };
+    let _lock = take_lock(parent)?;
 
     // Atomic publish: temp file + rename. fs::rename is atomic on POSIX when
     // source and destination are on the same filesystem (they are — both in

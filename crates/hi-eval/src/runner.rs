@@ -55,6 +55,7 @@ pub fn dir_snapshot(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
 /// Run all of a config's candidates; the config solves the task if any passes.
 /// Cost and tokens are summed. Candidates run in parallel since each gets its own
 /// isolated workdir — wall-clock is the max, not the sum.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_config(
     hi: &Path,
     task_dir: &Path,

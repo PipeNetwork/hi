@@ -213,3 +213,58 @@ async fn verify_runs_when_bash_changes_files() {
     let _ = std::fs::remove_file(&tmp);
     assert_eq!(agent.last_verify(), Some(true));
 }
+
+#[tokio::test]
+async fn proactive_verify_surfaces_a_per_edit_check_failure() {
+    // With proactive_verify on, a write to a .py file with a syntax error
+    // triggers a background `python3 -m py_compile` whose failure surfaces
+    // as a status line during the turn (before turn-end verify). Skipped if
+    // python3 isn't on PATH (the check just won't run).
+    if std::process::Command::new("sh")
+        .arg("-c")
+        .arg("command -v python3")
+        .output()
+        .map(|o| !o.status.success())
+        .unwrap_or(true)
+    {
+        eprintln!("skipping: python3 not on PATH");
+        return;
+    }
+    let _guard = VERIFY_TEST_LOCK.lock().await;
+    let mut cfg = config();
+    cfg.proactive_verify = true;
+    let tmp = temp_file("proactive");
+    let py = tmp.with_extension("py");
+    let p = py.to_string_lossy().to_string();
+    // Write invalid Python so py_compile fails.
+    let responses = vec![
+        Completion {
+            content: vec![Content::ToolCall {
+                id: "w".into(),
+                name: "write".into(),
+                arguments: format!(r#"{{"path":{p:?},"content":"def (\n"}}"#),
+            }],
+            usage: Usage {
+                input_tokens: 1,
+                output_tokens: 1,
+                context_occupancy: 1,
+                ..Default::default()
+            },
+            stop_reason: None,
+        },
+        completion(vec![Content::Text("done".into())], 1, 1),
+    ];
+    let mut agent = agent(responses, cfg);
+    let mut ui = RecUi::default();
+    agent.run_turn("write it", &mut ui).await.unwrap();
+    let _ = std::fs::remove_file(&py);
+    // A proactive-check failure status line names the file.
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|s| s.contains("proactive check failed") && s.contains(&p)),
+        "proactive failure surfaced: {:?}",
+        ui.statuses
+    );
+}
+

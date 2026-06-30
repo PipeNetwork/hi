@@ -1,4 +1,12 @@
-use super::*;
+//! Core steering types: [`ReviewIntent`], [`ImplementationIntent`],
+//! [`EvidenceTracker`], [`ImplementationTracker`], [`PreflightCall`], and
+//! [`SecuritySearchFamilies`]. The tracker impls call into
+//! [`intent`](super::intent) and [`implementation`](super::implementation)
+//! for evidence classification and tool-call inspection.
+
+use super::intent::{compact_search_hit_line, evidence_kind_for_tool, grep_match_line_count, search_hit_score, security_search_families_for_tool};
+use super::implementation::{implementation_tool_call_mutates, implementation_tool_call_substantively_edits, implementation_tool_call_validates};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReviewIntent {
     Review,

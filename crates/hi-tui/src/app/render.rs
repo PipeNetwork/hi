@@ -863,7 +863,7 @@ impl crate::App {
                             .add_modifier(Modifier::BOLD),
                     ));
                 }
-                lead.push(Span::styled(format!("{stats}"), Style::default()));
+                lead.push(Span::styled(stats.to_string(), Style::default()));
                 lead.push(Span::styled("   Ctrl-C to interrupt", dim()));
                 ilines.push(Line::from(lead));
                 // Show a tail of recent streamed tool output (e.g. bash stdout)

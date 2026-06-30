@@ -246,21 +246,7 @@ impl<'a> StreamingTextFilter<'a> {
         while i < bytes.len() {
             if bytes[i] == b'{' {
                 let rest = &chunk[i..];
-                if looks_like_tool_call_start(rest) {
-                    if i > 0 {
-                        self.emit_text(chunk[..i].to_string());
-                    }
-                    self.tc_pending = chunk[i..].to_string();
-                    self.tc_depth = 1;
-                    self.tc_in_string = false;
-                    self.tc_escape = false;
-                    self.tc_scanned = 1;
-                    self.tc_name_checked = false;
-                    self.tc_string_count = 0;
-                    self.tc_expect_colon = false;
-                    self.scan_tc_buffer();
-                    return;
-                } else if could_be_tool_call_start_prefix(rest) {
+                if looks_like_tool_call_start(rest) || could_be_tool_call_start_prefix(rest) {
                     if i > 0 {
                         self.emit_text(chunk[..i].to_string());
                     }

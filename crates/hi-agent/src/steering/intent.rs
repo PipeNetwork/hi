@@ -1,4 +1,8 @@
-use super::*;
+//! Intent classification and prompt builders: [`classify_read_only_intent`],
+//! [`classify_implementation_intent`], evidence-kind detection, and search-hit
+//! scoring. Uses types from [`types`](super::types).
+
+use super::types::{EvidenceKind, ImplementationIntent, ReviewIntent, SecuritySearchFamilies};
 pub(crate) fn compact_search_hit_line(line: &str) -> String {
     let trimmed = line.trim();
     if trimmed.is_empty()

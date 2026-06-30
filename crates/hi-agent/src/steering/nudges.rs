@@ -1,4 +1,12 @@
-use super::*;
+//! Nudge decision functions and answer-shape checks: [`should_nudge_*`],
+//! [`insufficient_after_*`], [`bounded_review_repair_exhaustion_answer`],
+//! and related helpers. Uses nudge strings from [`constants`](super::constants),
+//! [`contains_any`] from [`intent`](super::intent), and tracker types from
+//! [`types`](super::types).
+
+use super::constants::{GAP_DEEPEN_NUDGE, IMPLEMENTATION_MISSING_VALIDATION_NUDGE, NO_EVIDENCE_GAP_NUDGE, NO_EVIDENCE_REVIEW_NUDGE, NO_EVIDENCE_SECURITY_NUDGE, NO_EVIDENCE_STATUS_NUDGE, REVIEW_DEEPEN_NUDGE, SECURITY_DEEPEN_NUDGE, STATUS_DEEPEN_NUDGE, TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE};
+use super::intent::contains_any;
+use super::types::{EvidenceTracker, ImplementationTracker, ReviewIntent};
 pub(crate) fn implementation_missing_validation_nudge(tracker: &ImplementationTracker) -> String {
     let preferred = tracker
         .preferred_validation

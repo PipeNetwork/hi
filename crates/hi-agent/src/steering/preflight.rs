@@ -1,4 +1,10 @@
-use super::*;
+//! Preflight call planning: [`read_only_preflight_initial_calls`] and
+//! helpers for entrypoint detection, grep-output path extraction, and
+//! implementation validation detection. Uses constants from
+//! [`constants`](super::constants) and types from [`types`](super::types).
+
+use super::constants::{GAP_PREFLIGHT_PATTERN, READ_ONLY_PREFLIGHT_DIFF_MAX_LINES, READ_ONLY_PREFLIGHT_GREP_MAX_LINES, SECURITY_PREFLIGHT_PATTERN};
+use super::types::{PreflightCall, ReviewIntent};
 pub(crate) fn read_only_preflight_initial_calls(intent: ReviewIntent) -> Vec<PreflightCall> {
     let mut calls = Vec::new();
     if matches!(

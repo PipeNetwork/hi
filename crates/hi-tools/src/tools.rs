@@ -1030,9 +1030,7 @@ fn foreground_interactive_command_reason(command: &str) -> Option<&'static str> 
         return None;
     }
     let tokens = first_command_tokens(command);
-    let Some((program_idx, program)) = first_program_token(&tokens) else {
-        return None;
-    };
+    let (program_idx, program) = first_program_token(&tokens)?;
     let program = basename(program);
     if program == "textual" {
         return Some("appears to launch a Textual terminal UI in the foreground");
