@@ -24,7 +24,7 @@ pub(crate) struct ModelMeta {
     pub price: Option<(f64, f64)>,
     pub health: Option<String>,
     /// Capability tags from the static catalog: "tools", "reasoning".
-    pub capabilities: Vec<&'static str>,
+    pub capabilities: Vec<String>,
 }
 
 impl ModelMeta {
@@ -33,7 +33,7 @@ impl ModelMeta {
             window: sm.context_window,
             price: sm.price,
             health: sm.health().map(|h| h.to_string()),
-            capabilities: Vec::new(),
+            capabilities: sm.capabilities.clone(),
         }
     }
 }
@@ -116,7 +116,12 @@ impl ModelPicker {
                 }
                 // Attach capability tags from the static catalog when available.
                 if let Some(caps) = capabilities.get(id) {
-                    m.capabilities = caps.clone();
+                    for cap in caps {
+                        let cap = (*cap).to_string();
+                        if !m.capabilities.iter().any(|existing| existing == &cap) {
+                            m.capabilities.push(cap);
+                        }
+                    }
                 }
                 (id.clone(), m)
             })

@@ -54,6 +54,8 @@ pub enum Command {
     Version,
     /// Export the conversation to a file.
     Export(String),
+    /// Inspect the configured MCP endpoint: server info, tools, model count.
+    Mcp,
     Quit,
     /// A `/word` that isn't recognized.
     Unknown(String),
@@ -94,6 +96,7 @@ pub fn parse(line: &str) -> Option<Command> {
         "commit" => Command::Commit,
         "version" | "ver" | "v" => Command::Version,
         "export" => Command::Export(arg),
+        "mcp" => Command::Mcp,
         "exit" | "quit" | "q" => Command::Quit,
         other => Command::Unknown(other.to_string()),
     })
@@ -303,6 +306,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "export",
         args: "[path]",
         help: "export the conversation to a file (default: transcript.md)",
+        arg_values: &[],
+    },
+    CommandSpec {
+        name: "mcp",
+        args: "",
+        help: "inspect the MCP endpoint (server, tools, model count)",
         arg_values: &[],
     },
     CommandSpec {
