@@ -2,7 +2,7 @@
 //!
 //! Runs each task under each config in an isolated copy of its fixture, scores
 //! pass/fail by the task's own verify command (ground truth), and reports
-//! pass-rate, cost, and time per config. This is how we measure whether a
+//! pass-rate and time per config. This is how we measure whether a
 //! lever (e.g. verification-in-the-loop) actually beats a baseline — including
 //! a real backend like `openrouter/fusion`.
 //!
@@ -209,14 +209,13 @@ async fn async_main() -> Result<()> {
                         result.mcp_model = mcp_model;
                         write_artifact(&artifacts_dir, profile, condense_on, recovery_on, &result)?;
                         eprintln!(
-                            "  {:10} {:4} {}  model={} ({} cand, {} tok, ${:.4}, {:.1}s)",
+                            "  {:10} {:4} {}  model={} ({} cand, {} tok, {:.1}s)",
                             config_name,
                             if result.passed { "PASS" } else { "FAIL" },
                             label2,
                             model_for_run,
                             result.candidates,
                             result.tokens,
-                            result.cost_usd,
                             result.seconds
                         );
                         Ok::<_, anyhow::Error>(result)

@@ -756,8 +756,8 @@ pub async fn run(
                             let model = switched.model.clone();
                             let needs_pick = model == "__pick_via_model__";
                             // Refresh metadata from the registry for this model.
-                            let (price, window) = registry.metadata(&model);
-                            agent.set_provider(switched.provider, model.clone(), price, window);
+                            let (_price, window) = registry.metadata(&model);
+                            agent.set_provider(switched.provider, model.clone(), window);
                             app.provider = label.clone();
                             app.model = model.clone();
                             app.active_profile = Some(arg.clone());
@@ -929,8 +929,6 @@ pub async fn run(
             // Capture the turn's trajectory telemetry for the observability
             // panel (verify rounds, recovery retries, nudges, stalls).
             app.last_telemetry = Some(agent.last_turn_telemetry().clone());
-            // Sync cumulative cost for the title bar's persistent display.
-            app.cost_usd = agent.cost_usd();
             // A new turn's edits supersede any open diff panel's snapshot.
             app.diff_text = None;
         }

@@ -143,16 +143,12 @@ async fn main() -> Result<()> {
     let (session_path, loaded) = resolve_session(&cli)?;
 
     let fallbacks = config::resolve_fallbacks(&cli, &file, &registry);
-    let has_fallbacks = !fallbacks.is_empty();
     let provider = build_chain(&settings, fallbacks);
-    let (mut price, context_window) = if settings.provider == ProviderName::Pipenetwork {
+    let context_window = if settings.provider == ProviderName::Pipenetwork {
         resolve_live_model_metadata(provider.as_ref(), &registry, &settings.model).await
     } else {
-        registry.metadata(&settings.model)
+        registry.metadata(&settings.model).1
     };
-    if has_fallbacks {
-        price = None;
-    }
     let agent_config = AgentConfig {
         model: settings.model.clone(),
         max_tokens: settings.max_tokens,
@@ -160,7 +156,6 @@ async fn main() -> Result<()> {
         thinking_budget: settings.thinking_budget,
         tool_mode: settings.tool_mode,
         compat: settings.compat,
-        price,
         context_window,
         project_context: load_project_context(),
         verify: resolve_verify(&cli),
@@ -175,7 +170,6 @@ async fn main() -> Result<()> {
                 keep_recent: hi_agent::DEFAULT_KEEP_RECENT,
             }),
         finalize: !cli.no_finalize,
-        max_cost_warn: cli.max_cost,
         confirm_edits: cli.confirm_edits,
         ..AgentConfig::default()
     };
@@ -186,7 +180,6 @@ async fn main() -> Result<()> {
             agent_config,
             loaded.messages,
             loaded.usage,
-            loaded.cost_usd,
             loaded.checkpoint_refs,
             loaded.structured_goal,
             loaded.decisions,
@@ -513,7 +506,6 @@ fn profile_infos(config: &config::Config) -> Vec<hi_tui::ProfileInfo> {
 struct LoadedAgentSession {
     messages: Vec<Message>,
     usage: Usage,
-    cost_usd: Option<f64>,
     checkpoint_refs: Vec<String>,
     structured_goal: Option<hi_agent::Goal>,
     decisions: hi_agent::DecisionLog,
@@ -531,7 +523,6 @@ fn resolve_session(cli: &Cli) -> Result<(std::path::PathBuf, Option<LoadedAgentS
             Some(LoadedAgentSession {
                 messages: loaded.messages,
                 usage: loaded.usage,
-                cost_usd: loaded.cost_usd,
                 checkpoint_refs: loaded.checkpoint_refs,
                 structured_goal: loaded.goal,
                 decisions: loaded.decisions,
@@ -548,7 +539,6 @@ fn resolve_session(cli: &Cli) -> Result<(std::path::PathBuf, Option<LoadedAgentS
                 Some(LoadedAgentSession {
                     messages: loaded.messages,
                     usage: loaded.usage,
-                    cost_usd: loaded.cost_usd,
                     checkpoint_refs: loaded.checkpoint_refs,
                     structured_goal: loaded.goal,
                     decisions: loaded.decisions,
@@ -619,7 +609,7 @@ fn pipeline_command(stages: &[VerifyStage]) -> Option<String> {
     )
 }
 
-/// Write a machine-readable run report (tokens, cost, verify outcome) for the
+/// Write a machine-readable run report (tokens, verify outcome) for the
 /// eval harness and other automation.
 fn write_report(
     path: &std::path::Path,
@@ -635,7 +625,6 @@ fn write_report(
         "input_tokens": totals.input_tokens,
         "output_tokens": totals.output_tokens,
         "total_tokens": totals.total(),
-        "cost_usd": agent.cost_usd(),
         "verify_passed": agent.last_verify(),
         "provider_error_kind": error.and_then(hi_ai::provider_error_kind).map(|k| k.as_str()),
         "compat_fallbacks_used": agent.last_compat_fallbacks(),
@@ -783,20 +772,15 @@ async fn resolve_live_model_metadata(
     provider: &dyn Provider,
     registry: &Registry,
     model: &str,
-) -> (Option<(f64, f64)>, Option<u32>) {
-    let (catalog_price, catalog_window) = registry.metadata(model);
+) -> Option<u32> {
+    let (_catalog_price, catalog_window) = registry.metadata(model);
     match provider.list_models().await {
         Ok(served) => served
             .into_iter()
             .find(|m| m.id == model)
-            .map(|m| {
-                (
-                    m.price.or(catalog_price),
-                    m.context_window.or(catalog_window),
-                )
-            })
-            .unwrap_or((catalog_price, catalog_window)),
-        Err(_) => (catalog_price, catalog_window),
+            .map(|m| m.context_window.or(catalog_window))
+            .unwrap_or(catalog_window),
+        Err(_) => catalog_window,
     }
 }
 

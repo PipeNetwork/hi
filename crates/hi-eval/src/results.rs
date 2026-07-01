@@ -83,7 +83,6 @@ pub struct RunResult {
     pub verify_output_summary: String,
     pub failure_confidence: Option<&'static str>,
     pub candidates: usize,
-    pub cost_usd: f64,
     pub tokens: u64,
     pub seconds: f64,
     pub mcp_model: Option<McpModelArtifact>,
@@ -110,7 +109,6 @@ pub struct Candidate {
     pub changed_files: Vec<String>,
     pub verify_output_summary: String,
     pub failure_confidence: Option<&'static str>,
-    pub cost_usd: f64,
     pub tokens: u64,
     pub seconds: f64,
     pub trajectory: Trajectory,
@@ -149,7 +147,6 @@ pub struct RunArtifact {
     pub compat_fallbacks_used: Vec<String>,
     pub candidates: usize,
     pub tokens: u64,
-    pub cost_usd: f64,
     pub duration_seconds: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp_model: Option<McpModelArtifact>,

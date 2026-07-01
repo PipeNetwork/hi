@@ -4,8 +4,8 @@ use crate::results::{FailKind, RunResult};
 pub fn print_summary(results: &[RunResult], task_count: usize, active: &[&Config], trials: usize) {
     println!("\n=== Results ({task_count} tasks × {trials} trial(s)) ===");
     println!(
-        "{:<32} {:>14} {:>8} {:>6} {:>11} {:>10} {:>10}",
-        "config", "pass@1", "pass@k", "cand", "tok/trial", "tok/task", "$/trial"
+        "{:<32} {:>14} {:>8} {:>6} {:>11} {:>10}",
+        "config", "pass@1", "pass@k", "cand", "tok/trial", "tok/task"
     );
     let mut models: Vec<&str> = results.iter().map(|r| r.model.as_str()).collect();
     models.sort();
@@ -58,16 +58,14 @@ pub fn print_summary(results: &[RunResult], task_count: usize, active: &[&Config
             // The headline A/B number: mean tokens to attempt one task (summed across
             // a config's candidates). Compare it across condense on/off runs.
             let tok_per_task = tokens / task_count.max(1) as u64;
-            let cost: f64 = rows.iter().map(|r| r.cost_usd).sum::<f64>() / trials as f64;
             println!(
-                "{:<32} {:>14} {:>8} {:>6} {:>11} {:>10} {:>10}",
+                "{:<32} {:>14} {:>8} {:>6} {:>11} {:>10}",
                 label,
                 pass1,
                 format!("{}/{task_count}", solved.len()),
                 config.temperatures.len(),
                 tokens,
                 tok_per_task,
-                format!("${cost:.4}")
             );
 
             // Failure-mode breakdown: where this config loses, across all trials.

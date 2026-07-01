@@ -152,11 +152,6 @@ pub struct Cli {
     #[arg(long, value_name = "PATH")]
     pub report: Option<PathBuf>,
 
-    /// Warn when cumulative session cost exceeds this USD amount (e.g. 0.50).
-    /// The warning is shown after each turn; the turn is not interrupted.
-    #[arg(long, value_name = "USD")]
-    pub max_cost: Option<f64>,
-
     /// Quiet: print only the assistant's text (no tool chatter or usage line).
     #[arg(short = 'q', long)]
     pub quiet: bool,

@@ -138,7 +138,6 @@ impl Provider for OpenAiProvider {
                 cache_creation_tokens: 0,
                 input_includes_cache: true,
                 context_occupancy: estimate_messages_tokens(&request.messages),
-                billable: None,
             })
         })?;
         stream::backfill_missing_usage(&mut completion, &request);

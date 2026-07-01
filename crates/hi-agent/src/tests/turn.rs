@@ -8,7 +8,6 @@ impl SessionSink for FailingCheckpointSession {
         &mut self,
         _messages: &[Message],
         _usage: Usage,
-        _cost_usd: Option<f64>,
     ) -> anyhow::Result<()> {
         Ok(())
     }
@@ -31,7 +30,6 @@ fn resume_restores_retained_checkpoint_refs() {
         config(),
         vec![Message::system("system")],
         Usage::default(),
-        None,
         checkpoints,
         None,
         DecisionLog::default(),
@@ -189,7 +187,6 @@ async fn resume_repairs_provider_invisible_assistant_before_request() {
         config(),
         history,
         Usage::default(),
-        None,
         Vec::new(),
         None,
         DecisionLog::default(),
@@ -241,7 +238,6 @@ async fn resume_repairs_out_of_order_tool_results_before_request() {
         config(),
         history,
         Usage::default(),
-        None,
         Vec::new(),
         None,
         DecisionLog::default(),
@@ -290,7 +286,6 @@ async fn resume_repairs_consecutive_user_messages_before_request() {
         config(),
         history,
         Usage::default(),
-        None,
         Vec::new(),
         None,
         DecisionLog::default(),

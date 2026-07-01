@@ -2201,17 +2201,6 @@ If the task is already complete, stop and give your final recap."
             self.messages.strip_finalize_pair();
         }
 
-        // Cost warning: if the session has exceeded the configured spending
-        // limit, surface a notice so the user can decide whether to continue.
-        if let Some(limit) = self.config.max_cost_warn
-            && let Some(cost) = self.cost_usd
-            && cost >= limit
-        {
-            ui.status(&format!(
-                "⚠ session cost ${cost:.4} has exceeded the --max-cost limit of ${limit:.2}"
-            ));
-        }
-
         // Report cumulative session usage — the same number the live working
         // line and `/tokens` show, so the three never disagree.
         ui.turn_end(&self.usage_summary(&self.totals));
@@ -2315,13 +2304,13 @@ If the task is already complete, stop and give your final recap."
         self.messages.push_assistant(vec![Content::Text(recap)]);
     }
 
-    /// Format a usage line. `usage` carries the cumulative in/out/total/cost;
+    /// Format a usage line. `usage` carries the cumulative in/out/total;
     /// the context gauge instead uses `context_used` (the live conversation
     /// size), since cumulative input sums re-sent context across rounds and so
     /// isn't a measure of how full the window is.
     pub(crate) fn usage_summary(&self, usage: &hi_ai::Usage) -> String {
-        // Cumulative session tokens, ↑ sent / ↓ received — these drive cost and
-        // match the live working line. Abbreviated in the same units as the
+        // Cumulative session tokens, ↑ sent / ↓ received — these match the
+        // live working line. Abbreviated in the same units as the
         // context gauge below so the two never read as raw-vs-rounded.
         let mut summary = format!(
             "[↑{} ↓{}",
@@ -2330,9 +2319,6 @@ If the task is already complete, stop and give your final recap."
         );
         if usage.cache_read_tokens > 0 {
             summary.push_str(&format!(" ⟲{}", humanize_count(usage.cache_read_tokens)));
-        }
-        if let Some(cost) = self.cost_usd {
-            summary.push_str(&format!(" · ${cost:.4}"));
         }
         // The context gauge is a *point-in-time* measure (the last request's
         // size), not cumulative input — so it is correctly smaller than ↑.

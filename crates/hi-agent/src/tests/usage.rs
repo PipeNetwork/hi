@@ -2,15 +2,14 @@ use super::common::*;
 use super::*;
 
 #[tokio::test]
-async fn usage_line_separates_cumulative_spend_from_context_fill() {
-    // The regression guard: with a window + price set, the done line shows
-    // cumulative ↑/↓ session spend (abbreviated, matching the live line), the
-    // cost, and a context gauge that is the *last request's* size — distinct
+async fn usage_line_separates_cumulative_tokens_from_context_fill() {
+    // The regression guard: with a window set, the done line shows
+    // cumulative ↑/↓ session tokens (abbreviated, matching the live line)
+    // and a context gauge that is the *last request's* size — distinct
     // from cumulative input and humanized the same way. Pins against mixing
     // raw/abbreviated units, rendering a count two ways, or conflating the two.
     let mut cfg = config();
     cfg.context_window = Some(1_000_000);
-    cfg.price = Some((5.0, 15.0)); // $/1M (in, out)
     let responses = vec![
         completion(
             vec![Content::ToolCall {
@@ -28,7 +27,7 @@ async fn usage_line_separates_cumulative_spend_from_context_fill() {
     agent.run_turn("go", &mut ui).await.unwrap();
     let line = ui.turn_end.expect("turn_end emitted");
 
-    // Cumulative session spend, arrowed + abbreviated (same shape as the live line).
+    // Cumulative session tokens, arrowed + abbreviated (same shape as the live line).
     assert!(line.contains("↑20k"), "cumulative input ↑ (8k+12k): {line}");
     assert!(
         line.contains("↓300"),
@@ -109,86 +108,6 @@ fn turn_steer_summarizes_trajectory() {
     };
     let steer = a.turn_steer().expect("stall has a steer line");
     assert!(steer.contains("stalled"), "stall flagged: {steer}");
-}
-
-#[tokio::test]
-async fn cost_accumulates_at_price_active_for_each_call() {
-    let mut cfg = config();
-    cfg.price = Some((1.0, 10.0));
-    let responses = vec![
-        completion(vec![Content::Text("first".into())], 1_000, 100),
-        completion(vec![Content::Text("second".into())], 1_000, 100),
-    ];
-    let mut agent = agent(responses, cfg);
-
-    agent.run_turn("first", &mut NullUi).await.unwrap();
-    agent.set_model("m2".into(), Some((2.0, 20.0)), None);
-    agent.run_turn("second", &mut NullUi).await.unwrap();
-
-    assert_eq!(agent.cost_usd(), Some(0.006));
-}
-
-#[test]
-fn add_usage_uses_normalized_billable_across_provider_semantics() {
-    // A session that switches providers mid-run must accrue cost coherently.
-    // The `billable` breakdown is provider-computed, so the agent's cost
-    // math doesn't have to know whether `input_tokens` includes cached
-    // tokens (OpenAI) or excludes them (Anthropic). Pin: an OpenAI-style
-    // usage where input_tokens already includes the cached subset must NOT
-    // double-count the cached tokens, and an Anthropic-style usage where
-    // input excludes cache must still bill the cache portion at a discount.
-    let mut cfg = config();
-    cfg.price = Some((1.0, 10.0)); // $/1M in, out
-    let mut a = agent(vec![], cfg);
-
-    // OpenAI-style: prompt_tokens=1000 includes 400 cached. The normalized
-    // breakdown separates them: 600 regular + 400 cached. Cost must bill
-    // 600 at full price + 400 at 0.5x — NOT 1000 + 400 (double-count).
-    a.add_usage(Usage {
-        input_tokens: 1000,
-        output_tokens: 0,
-        cache_read_tokens: 400,
-        cache_creation_tokens: 0,
-        input_includes_cache: true,
-        context_occupancy: 1000,
-        billable: Some(hi_ai::BillableBreakdown {
-            regular_input: 600,
-            cached_input: 400,
-            cache_creation: 0,
-            output: 0,
-        }),
-    });
-    let openai_cost = a.cost_usd().unwrap();
-    // 600*1 + 400*0.5 = 800 token-units -> $0.0008
-    assert!(
-        (openai_cost - 0.0008).abs() < 1e-9,
-        "openai no double-count: {openai_cost}"
-    );
-
-    // Anthropic-style: input_tokens=600 excludes 400 cache_read + 100
-    // cache_creation. The breakdown bills 600 regular + 400 at 0.5x + 100
-    // at 1.25x. The agent must NOT re-derive (which would wrongly subtract
-    // cache_read from input_tokens).
-    a.add_usage(Usage {
-        input_tokens: 600,
-        output_tokens: 50,
-        cache_read_tokens: 400,
-        cache_creation_tokens: 100,
-        input_includes_cache: false,
-        context_occupancy: 1100,
-        billable: Some(hi_ai::BillableBreakdown {
-            regular_input: 600,
-            cached_input: 400,
-            cache_creation: 100,
-            output: 50,
-        }),
-    });
-    let total = a.cost_usd().unwrap();
-    // anthropic increment: 600*1 + 400*0.5 + 100*1.25 + 50*10 = 600+200+125+500 = 1425 -> $0.001425
-    assert!(
-        (total - (0.0008 + 0.001425)).abs() < 1e-9,
-        "coherent cumulative across providers: {total}"
-    );
 }
 
 #[tokio::test]

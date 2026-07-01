@@ -20,8 +20,6 @@ enum SessionMeta {
     Usage {
         input_tokens: u64,
         output_tokens: u64,
-        #[serde(default)]
-        cost_usd: Option<f64>,
     },
     Checkpoints {
         refs: Vec<String>,
@@ -95,7 +93,7 @@ impl SessionSink for JsonlSession {
         JsonlSession::record_checkpoints(self, refs)
     }
 
-    fn record(&mut self, messages: &[Message], usage: Usage, cost_usd: Option<f64>) -> Result<()> {
+    fn record(&mut self, messages: &[Message], usage: Usage) -> Result<()> {
         if messages.is_empty() && usage.is_zero() {
             return Ok(());
         }
@@ -115,7 +113,6 @@ impl SessionSink for JsonlSession {
         let line = serde_json::to_string(&SessionMeta::Usage {
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
-            cost_usd,
         })?;
         writeln!(writer, "{line}")?;
         writer.flush()?;
@@ -220,7 +217,6 @@ impl SessionSink for JsonlSession {
 pub struct LoadedSession {
     pub messages: Vec<Message>,
     pub usage: Usage,
-    pub cost_usd: Option<f64>,
     pub checkpoint_refs: Vec<String>,
     /// A long-horizon goal persisted across sessions, if any (last write wins).
     pub goal: Option<hi_agent::Goal>,
@@ -228,7 +224,7 @@ pub struct LoadedSession {
     pub decisions: hi_agent::DecisionLog,
 }
 
-/// One-line summary shown when a session is resumed: message count, cost, and
+/// One-line summary shown when a session is resumed: message count and
 /// the last user instruction (clipped), so the user knows what they're walking
 /// back into.
 pub fn resume_summary(loaded: &LoadedSession) -> String {
@@ -237,10 +233,6 @@ pub fn resume_summary(loaded: &LoadedSession) -> String {
         .iter()
         .filter(|m| m.role != Role::System)
         .count();
-    let cost = loaded
-        .cost_usd
-        .map(|c| format!("${c:.2}"))
-        .unwrap_or_else(|| "unknown cost".into());
     let last = loaded
         .messages
         .iter()
@@ -248,7 +240,7 @@ pub fn resume_summary(loaded: &LoadedSession) -> String {
         .find(|m| m.role == Role::User)
         .map(|m| hi_agent::ui::clip(&m.text(), 60))
         .unwrap_or_default();
-    format!("Resumed: {n} messages, {cost}, last: '{last}'")
+    format!("Resumed: {n} messages, last: '{last}'")
 }
 
 /// Directory holding all session files (may not exist yet).
@@ -363,7 +355,6 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
         fs::read_to_string(path).with_context(|| format!("reading session {}", path.display()))?;
     let mut messages = Vec::new();
     let mut usage = Usage::default();
-    let mut cost_usd: Option<f64> = None;
     let mut checkpoint_refs = Vec::new();
     let mut loaded_goal: Option<hi_agent::Goal> = None;
     let mut loaded_decisions = hi_agent::DecisionLog::default();
@@ -376,7 +367,6 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
                 SessionMeta::Usage {
                     input_tokens,
                     output_tokens,
-                    cost_usd: saved_cost,
                 } => {
                     usage = Usage {
                         input_tokens,
@@ -385,9 +375,7 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
                         cache_creation_tokens: 0,
                         input_includes_cache: false,
                         context_occupancy: input_tokens,
-                        billable: None,
                     };
-                    cost_usd = saved_cost;
                 }
                 SessionMeta::Checkpoints { refs } => {
                     checkpoint_refs = refs;
@@ -434,7 +422,6 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
     Ok(LoadedSession {
         messages,
         usage,
-        cost_usd,
         checkpoint_refs,
         goal: loaded_goal,
         decisions: loaded_decisions,
@@ -587,9 +574,7 @@ mod tests {
                     cache_creation_tokens: 0,
                     input_includes_cache: false,
                     context_occupancy: 123,
-                    billable: None,
                 },
-                Some(0.1234),
             )
             .unwrap();
 
@@ -599,7 +584,6 @@ mod tests {
         assert_eq!(loaded.messages.len(), 2);
         assert_eq!(loaded.usage.input_tokens, 123);
         assert_eq!(loaded.usage.output_tokens, 45);
-        assert_eq!(loaded.cost_usd, Some(0.1234));
     }
 
     #[test]
@@ -618,14 +602,13 @@ mod tests {
             .record(
                 &[Message::system("sys-old"), Message::user("old context")],
                 Usage::default(),
-                None,
             )
             .unwrap();
         session
             .record_compaction(&[Message::system("sys-new")])
             .unwrap();
         session
-            .record(&[Message::user("new context")], Usage::default(), None)
+            .record(&[Message::user("new context")], Usage::default())
             .unwrap();
 
         let loaded = load_history(&path).unwrap();
@@ -712,7 +695,6 @@ mod tests {
             .record(
                 &[Message::system("old sys"), Message::user("old attempt")],
                 Usage::default(),
-                None,
             )
             .unwrap();
         session.record_goal(&old_goal).unwrap();
@@ -763,9 +745,7 @@ mod tests {
                     cache_creation_tokens: 0,
                     input_includes_cache: false,
                     context_occupancy: 1,
-                    billable: None,
                 },
-                None,
             )
             .unwrap();
         // A goal mid-progress: sub-goal 1 done, sub-goal 2 active.

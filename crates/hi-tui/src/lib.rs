@@ -415,8 +415,6 @@ pub(crate) struct App {
     pub(crate) mcp_url: Option<String>,
     /// API key used both for chat and for MCP `/mcp` inspection.
     pub(crate) api_key: String,
-    /// Cumulative session USD cost, mirrored from the agent for the title bar.
-    pub(crate) cost_usd: Option<f64>,
     /// How many transcript lines have been trimmed from the top by
     /// [`cap_transcript`]. When > 0, a "↑ N lines compacted" marker shows at
     /// the top of the transcript so it's obvious older content scrolled off.

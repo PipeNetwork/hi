@@ -13,7 +13,6 @@ impl SessionSink for DecisionRecordingSession {
         &mut self,
         _messages: &[Message],
         _usage: Usage,
-        _cost_usd: Option<f64>,
     ) -> anyhow::Result<()> {
         Ok(())
     }
@@ -38,7 +37,6 @@ impl SessionSink for FailingDecisionSession {
         &mut self,
         _messages: &[Message],
         _usage: Usage,
-        _cost_usd: Option<f64>,
     ) -> anyhow::Result<()> {
         Ok(())
     }
@@ -108,7 +106,6 @@ fn resume_restores_decision_log_and_rebuilds_system_prompt() {
         config(),
         vec![Message::system("old prompt without decisions")],
         Usage::default(),
-        None,
         Vec::new(),
         None,
         decisions,

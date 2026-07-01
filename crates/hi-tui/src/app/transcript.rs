@@ -305,7 +305,7 @@ impl crate::App {
                 self.event_log.push(format!("turn_end {summary}"));
                 self.last_turn_event = Some(TurnEventKind::TurnEnd);
                 self.flush_pending();
-                // Tokens/cost go to the status bar; a dim marker in the transcript
+                // Tokens go to the status bar; a dim marker in the transcript
                 // makes the end of a turn unmistakable (so a long run doesn't just
                 // trail off with no clear "done").
                 self.status = summary.trim_matches(['[', ']']).to_string();

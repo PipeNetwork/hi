@@ -73,7 +73,6 @@ impl crate::App {
             context_window: None,
             served: HashMap::new(),
             model_ids: Vec::new(),
-            cost_usd: None,
             trimmed: 0,
             current_assistant: String::new(),
             last_assistant: String::new(),

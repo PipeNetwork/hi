@@ -11,7 +11,7 @@ use serde_json::Value;
 use super::request;
 use crate::provider::{ProviderError, ProviderErrorKind};
 use crate::types::{
-    BillableBreakdown, Completion, Content, StreamEvent, Usage, estimate_messages_tokens,
+    Completion, Content, StreamEvent, Usage, estimate_messages_tokens,
 };
 
 /// Once the model reports a `finish_reason`, it has stopped generating; we wait
@@ -715,15 +715,6 @@ where
                 // is exactly `prompt_tokens` — not `prompt_tokens + cached`.
                 input_includes_cache: true,
                 context_occupancy: usage.prompt_tokens,
-                // Normalized billable breakdown: prompt_tokens is the total, so
-                // regular input is the non-cached remainder. No cache creation
-                // is reported by OpenAI.
-                billable: Some(BillableBreakdown {
-                    regular_input: usage.prompt_tokens.saturating_sub(cached),
-                    cached_input: cached,
-                    cache_creation: 0,
-                    output: usage.completion_tokens,
-                }),
             };
         }
         for choice in chunk.choices {

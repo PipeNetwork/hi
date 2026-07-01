@@ -37,7 +37,6 @@ impl crate::Agent {
         config: AgentConfig,
         history: Vec<Message>,
         usage: Usage,
-        cost_usd: Option<f64>,
         checkpoint_refs: Vec<String>,
         structured_goal: Option<Goal>,
         decisions: DecisionLog,
@@ -45,7 +44,6 @@ impl crate::Agent {
         let persisted = history.len();
         let mut agent = Self::with_messages(provider, config, history, persisted);
         agent.totals = usage;
-        agent.cost_usd = cost_usd;
         agent.checkpoints = checkpoint_refs;
         if agent.checkpoints.len() > crate::MAX_CHECKPOINTS {
             agent
@@ -108,7 +106,6 @@ impl crate::Agent {
             session: None,
             persisted,
             totals: Usage::default(),
-            cost_usd: Some(0.0),
             last_verify: None,
             context_used: 0,
             checkpoints: Vec::new(),
@@ -250,11 +247,6 @@ impl crate::Agent {
     /// Cumulative token usage across the session.
     pub fn totals(&self) -> &Usage {
         &self.totals
-    }
-
-    /// Cumulative USD cost across the session, if pricing is known.
-    pub fn cost_usd(&self) -> Option<f64> {
-        self.cost_usd
     }
 
     /// The context-window occupancy, as last reported by the provider.
@@ -411,39 +403,6 @@ impl crate::Agent {
     }
 
     pub(crate) fn add_usage(&mut self, usage: Usage) {
-        if !usage.is_zero() {
-            match (self.cost_usd, self.config.price) {
-                (Some(total), Some((input_price, output_price))) => {
-                    // Prefer the provider-computed normalized breakdown when
-                    // available — it correctly decomposes tokens into priced
-                    // buckets regardless of provider (OpenAI's prompt_tokens
-                    // includes cached; Anthropic reports cache separately), so
-                    // a session that switches models mid-run still accrues cost
-                    // coherently. Fall back to the input-excludes-cache
-                    // heuristic for legacy/error paths that don't set `billable`.
-                    let cost = if let Some(b) = usage.billable {
-                        (b.regular_input as f64 * input_price
-                            + b.cached_input as f64 * input_price * 0.5
-                            + b.cache_creation as f64 * input_price * 1.25
-                            + b.output as f64 * output_price)
-                            / 1_000_000.0
-                    } else {
-                        let regular_input =
-                            usage.input_tokens.saturating_sub(usage.cache_read_tokens);
-                        (regular_input as f64 * input_price
-                            + usage.cache_read_tokens as f64 * input_price * 0.5
-                            + usage.cache_creation_tokens as f64 * input_price * 1.25
-                            + usage.output_tokens as f64 * output_price)
-                            / 1_000_000.0
-                    };
-                    self.cost_usd = Some(total + cost);
-                }
-                (_, None) => {
-                    self.cost_usd = None;
-                }
-                (None, Some(_)) => {}
-            }
-        }
         self.totals.add(usage);
         let effective_input = usage.effective_input_tokens();
         if effective_input > 0 {
@@ -472,16 +431,14 @@ impl crate::Agent {
         &self.config.model
     }
 
-    /// Switch the model used for subsequent turns, refreshing the pricing and
-    /// context-window metadata that drive the usage display.
+    /// Switch the model used for subsequent turns, refreshing the
+    /// context-window metadata that drives the usage display.
     pub fn set_model(
         &mut self,
         model: String,
-        price: Option<(f64, f64)>,
         context_window: Option<u32>,
     ) {
         self.config.model = model;
-        self.config.price = price;
         self.config.context_window = context_window;
     }
 
@@ -499,12 +456,10 @@ impl crate::Agent {
         &mut self,
         provider: Box<dyn Provider>,
         model: String,
-        price: Option<(f64, f64)>,
         context_window: Option<u32>,
     ) {
         self.provider = provider;
         self.config.model = model;
-        self.config.price = price;
         self.config.context_window = context_window;
     }
 
@@ -694,7 +649,6 @@ impl crate::Agent {
             session.record(
                 &self.messages.as_slice()[self.persisted..],
                 self.totals,
-                self.cost_usd,
             )?;
             self.persisted = self.messages.len();
         }

@@ -370,9 +370,6 @@ pub struct Agent {
     pub(crate) persisted: usize,
     /// Running total of tokens across the session.
     pub(crate) totals: Usage,
-    /// Running USD cost. `None` means some usage was recorded while pricing was
-    /// unknown, so showing a precise total would be misleading.
-    pub(crate) cost_usd: Option<f64>,
     /// Whether the most recent turn's verification passed (None if not run).
     pub(crate) last_verify: Option<bool>,
     /// Input tokens of the most recent model call — a proxy for how full the

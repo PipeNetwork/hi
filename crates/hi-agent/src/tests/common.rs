@@ -140,15 +140,15 @@ impl Ui for NullUi {
     fn turn_end(&mut self, _: &str) {}
 }
 
-pub(crate) type UsageRecords = std::sync::Arc<Mutex<Vec<(Usage, Option<f64>)>>>;
+pub(crate) type UsageRecords = std::sync::Arc<Mutex<Vec<Usage>>>;
 
 pub(crate) struct RecordingSession {
     pub(crate) records: UsageRecords,
 }
 
 impl SessionSink for RecordingSession {
-    fn record(&mut self, _messages: &[Message], usage: Usage, cost_usd: Option<f64>) -> Result<()> {
-        self.records.lock().unwrap().push((usage, cost_usd));
+    fn record(&mut self, _messages: &[Message], usage: Usage) -> Result<()> {
+        self.records.lock().unwrap().push(usage);
         Ok(())
     }
 
@@ -221,7 +221,6 @@ pub(crate) fn agent(responses: Vec<Completion>, cfg: AgentConfig) -> Agent {
 pub(crate) fn resumed_agent(
     history: Vec<Message>,
     usage: Usage,
-    cost_usd: Option<f64>,
     structured_goal: Option<Goal>,
     cfg: AgentConfig,
 ) -> Agent {
@@ -230,7 +229,6 @@ pub(crate) fn resumed_agent(
         cfg,
         history,
         usage,
-        cost_usd,
         Vec::new(),
         structured_goal,
         DecisionLog::default(),

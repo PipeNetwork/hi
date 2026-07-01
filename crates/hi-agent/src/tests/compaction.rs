@@ -36,14 +36,11 @@ async fn compact_replaces_history_with_summary() {
     assert_eq!(agent.totals().output_tokens, 5);
     assert_eq!(
         *records.lock().unwrap(),
-        vec![(
-            Usage {
-                input_tokens: 7,
-                output_tokens: 5,
-                ..Default::default()
-            },
-            None,
-        )],
+        vec![Usage {
+            input_tokens: 7,
+            output_tokens: 5,
+            ..Default::default()
+        }],
         "manual compaction persists summarization usage before writing the durable boundary"
     );
 }

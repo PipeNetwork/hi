@@ -90,7 +90,7 @@ model = "qwen2.5-coder"
 
 ### Model registry
 
-`hi --refresh-models` pulls the [models.dev](https://models.dev) catalog into a local cache (~2700 models). It powers the per-turn cost/context display, caps `--max-tokens` to a model's limit, and warns when a model isn't known to support tool calling.
+`hi --refresh-models` pulls the [models.dev](https://models.dev) catalog into a local cache (~2700 models). It powers the per-turn token/context display, caps `--max-tokens` to a model's limit, and warns when a model isn't known to support tool calling.
 
 ### Compatibility & timeouts
 
@@ -115,7 +115,7 @@ hi --auto-verify "..."     # detects a test pipeline: cargo check+test, go build
 
 `--auto-verify` doesn't just find a test command — it builds a **multi-stage pipeline** per project: `cargo check` then `cargo test`, `go build` then `go test`, `tsc` then `npm test` (when a tsconfig is present), `ruff check` then `pytest` (when ruff is configured), or `make test`. Faster, localizable errors land before the slower test stage.
 
-A `--max-steps` cap (default 500) stops runaway tool loops. Each turn prints `[N in · N out · N total · $cost · k/k ctx]`.
+A `--max-steps` cap (default 500) stops runaway tool loops. Each turn prints `[N in · N out · N total · k/k ctx]`.
 
 ## Best-of-N
 
@@ -174,9 +174,9 @@ Drop an `HI.md` or `AGENTS.md` in your project and its contents are appended to 
 
 **No nag-prompts — but a guard for the irreversible.** Rather than asking permission for every command (the thing everyone turns off), `hi` lets the model run freely and relies on `/undo` for recovery. The one exception is a small denylist of operations a checkpoint *can't* undo — `sudo`, `rm -rf` of home/root/system paths, `git push --force`, `curl … | sh`, `dd` to a disk, `mkfs`, fork bombs, shutdown — which are refused with a reason the model can act on. It's a seatbelt against accidents, not a security boundary; set `HI_ALLOW_DANGEROUS=1` to disable it.
 
-**TUI.** Interactive sessions open a full-screen TUI by default (ratatui): a bordered, scrollable transcript with a title bar showing live token/cost, and an input box that turns into a working spinner (with elapsed seconds) while a turn runs. **Keep typing while it works to queue the next command(s)** — they're listed under the prompt and run in order as each turn finishes. Ctrl-C interrupts the current turn (and drops the queue), PgUp/PgDn scrolls, Up/Down recalls history, `/exit` quits. Pass `--plain` (or pipe input) for the line-based REPL.
+**TUI.** Interactive sessions open a full-screen TUI by default (ratatui): a bordered, scrollable transcript with a title bar showing live token usage, and an input box that turns into a working spinner (with elapsed seconds) while a turn runs. **Keep typing while it works to queue the next command(s)** — they're listed under the prompt and run in order as each turn finishes. Ctrl-C interrupts the current turn (and drops the queue), PgUp/PgDn scrolls, Up/Down recalls history, `/exit` quits. Pass `--plain` (or pipe input) for the line-based REPL.
 
-**Reports.** One-shot automation can write a JSON report with `--report path.json`. Reports include token/cost totals, `verify_passed`, `provider_error_kind`, `compat_fallbacks_used`, `tool_mode_effective`, and `changed_files`.
+**Reports.** One-shot automation can write a JSON report with `--report path.json`. Reports include token totals, `verify_passed`, `provider_error_kind`, `compat_fallbacks_used`, `tool_mode_effective`, and `changed_files`.
 
 ## Architecture
 

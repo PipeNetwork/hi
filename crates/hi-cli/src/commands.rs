@@ -20,10 +20,6 @@ pub(crate) fn handle_command(
         Command::Status => {
             let t = agent.totals();
             let tel = agent.last_turn_telemetry();
-            let cost = agent
-                .cost_usd()
-                .map(|c| format!("${c:.4}"))
-                .unwrap_or_else(|| "unknown".into());
             let ctx = agent
                 .context_window()
                 .map(|w| {
@@ -36,12 +32,11 @@ pub(crate) fn handle_command(
                 })
                 .unwrap_or_else(|| "unknown".into());
             println!(
-                "\x1b[2mstatus: ready\nmodel: {}\nusage: {} in · {} out · {} total\ncost: {}\ncontext: {}\ngoal: {}\nverify: {}\nevidence: {} (reads {}, searches {}, listing_only {}, repair nudges {})\ncheckpoints: {}\x1b[0m",
+                "\x1b[2mstatus: ready\nmodel: {}\nusage: {} in · {} out · {} total\ncontext: {}\ngoal: {}\nverify: {}\nevidence: {} (reads {}, searches {}, listing_only {}, repair nudges {})\ncheckpoints: {}\x1b[0m",
                 agent.model(),
                 t.input_tokens,
                 t.output_tokens,
                 t.total(),
-                cost,
                 ctx,
                 agent.goal().unwrap_or("off"),
                 agent.verify_summary(),
@@ -80,8 +75,8 @@ pub(crate) fn handle_command(
                     registry.model_ids().len()
                 );
             } else {
-                let (price, context_window) = registry.metadata(&id);
-                agent.set_model(id.clone(), price, context_window);
+                let (_price, context_window) = registry.metadata(&id);
+                agent.set_model(id.clone(), context_window);
                 println!("model set to {id}");
             }
         }

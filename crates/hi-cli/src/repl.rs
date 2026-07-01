@@ -334,8 +334,8 @@ pub(crate) async fn repl(
                                     let label = provider_label(new_settings.provider);
                                     let model = new_settings.model.clone();
                                     let provider = crate::build_provider(&new_settings);
-                                    let (price, window) = registry.metadata(&model);
-                                    agent.set_provider(provider, model.clone(), price, window);
+                                    let (_price, window) = registry.metadata(&model);
+                                    agent.set_provider(provider, model.clone(), window);
                                     println!(
                                         "\x1b[2mswitched to {label} (profile: {arg}) — model: {model}\x1b[0m"
                                     );

@@ -52,11 +52,10 @@ impl crate::App {
         registry: &hi_ai::Registry,
         id: &str,
     ) -> Option<String> {
-        let (cat_price, cat_window) = registry.metadata(id);
+        let (_cat_price, cat_window) = registry.metadata(id);
         let served = self.served.get(id);
-        let price = served.and_then(|m| m.price).or(cat_price);
         let window = served.and_then(|m| m.context_window).or(cat_window);
-        agent.set_model(id.to_string(), price, window);
+        agent.set_model(id.to_string(), window);
         self.model = id.to_string();
         self.context_window = window;
         served.and_then(|m| m.health()).map(str::to_string)

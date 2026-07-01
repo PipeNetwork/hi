@@ -69,14 +69,11 @@ async fn update_memory_persists_usage_without_new_messages() {
 
     assert_eq!(
         *records.lock().unwrap(),
-        vec![(
-            Usage {
-                input_tokens: 10,
-                output_tokens: 5,
-                ..Default::default()
-            },
-            None,
-        )]
+        vec![Usage {
+            input_tokens: 10,
+            output_tokens: 5,
+            ..Default::default()
+        }]
     );
 }
 

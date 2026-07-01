@@ -17,7 +17,7 @@ pub struct Config {
     pub use_verify: bool,
     /// One sampling temperature per candidate. The config solves the task if
     /// ANY candidate passes — execution-grounded best-of-N (the test suite is
-    /// the judge). Cost/tokens are summed across all candidates.
+    /// the judge). Tokens are summed across all candidates.
     pub temperatures: &'static [f32],
 }
 

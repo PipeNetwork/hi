@@ -43,8 +43,6 @@ pub struct AgentConfig {
     pub thinking_budget: Option<u32>,
     pub tool_mode: ToolMode,
     pub compat: CompatMode,
-    /// USD per 1M (input, output) tokens, when known — used for cost display.
-    pub price: Option<(f64, f64)>,
     /// Model context window, when known — used to show how full it is.
     pub context_window: Option<u32>,
     /// Project context (e.g. from HI.md/AGENTS.md) appended to the system prompt.
@@ -116,9 +114,6 @@ pub struct AgentConfig {
     /// resumes across sessions. Off by default while it stabilizes; when off,
     /// the agent behaves as the single-turn loop.
     pub long_horizon: bool,
-    /// When set, warn via `ui.status` after each turn if cumulative session
-    /// cost exceeds this USD amount. Does not interrupt the turn.
-    pub max_cost_warn: Option<f64>,
     /// When true, ask the user to confirm each file edit (write/edit/multi_edit/
     /// apply_patch) before applying it. The UI shows a diff preview and prompts
     /// for y/n. In non-interactive mode, edits are auto-approved.
@@ -139,7 +134,6 @@ impl Default for AgentConfig {
             thinking_budget: None,
             tool_mode: ToolMode::Auto,
             compat: CompatMode::Auto,
-            price: None,
             context_window: None,
             project_context: None,
             verify: Vec::new(),
@@ -162,7 +156,6 @@ impl Default for AgentConfig {
             proactive_verify: false,
             read_only_preflight: true,
             long_horizon: false,
-            max_cost_warn: None,
             confirm_edits: false,
             lsp: false,
         }

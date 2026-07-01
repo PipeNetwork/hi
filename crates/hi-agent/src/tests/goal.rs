@@ -13,7 +13,6 @@ impl SessionSink for CompactionRecordingSession {
         &mut self,
         _messages: &[Message],
         _usage: Usage,
-        _cost_usd: Option<f64>,
     ) -> anyhow::Result<()> {
         Ok(())
     }
@@ -31,7 +30,6 @@ impl SessionSink for FailingCompactionSession {
         &mut self,
         _messages: &[Message],
         _usage: Usage,
-        _cost_usd: Option<f64>,
     ) -> anyhow::Result<()> {
         Ok(())
     }
@@ -48,7 +46,6 @@ impl SessionSink for FailingGoalSession {
         &mut self,
         _messages: &[Message],
         _usage: Usage,
-        _cost_usd: Option<f64>,
     ) -> anyhow::Result<()> {
         Ok(())
     }
@@ -75,7 +72,6 @@ impl SessionSink for GoalClearingSession {
         &mut self,
         _messages: &[Message],
         _usage: Usage,
-        _cost_usd: Option<f64>,
     ) -> anyhow::Result<()> {
         Ok(())
     }
@@ -201,7 +197,7 @@ fn structured_goal_clear_records_marker_even_when_long_horizon_is_off() {
     let persisted_goal = Goal::new("old durable goal", vec!["old durable goal".into()]);
     let history = vec![Message::system("old prompt")];
     let cfg = config();
-    let mut agent = resumed_agent(history, Usage::default(), None, Some(persisted_goal), cfg);
+    let mut agent = resumed_agent(history, Usage::default(), Some(persisted_goal), cfg);
     assert!(
         agent.structured_goal().is_none(),
         "long-horizon-off resume intentionally hides structured goal"
@@ -225,7 +221,7 @@ fn transient_goal_set_clears_hidden_persisted_structured_goal() {
     let persisted_goal = Goal::new("old durable goal", vec!["old durable goal".into()]);
     let history = vec![Message::system("old prompt")];
     let cfg = config();
-    let mut agent = resumed_agent(history, Usage::default(), None, Some(persisted_goal), cfg);
+    let mut agent = resumed_agent(history, Usage::default(), Some(persisted_goal), cfg);
     let clears = Arc::new(Mutex::new(0));
     agent.set_session(Box::new(GoalClearingSession {
         clears: clears.clone(),
@@ -251,7 +247,7 @@ fn transient_goal_set_keeps_visible_state_when_hidden_goal_clear_fails() {
     let persisted_goal = Goal::new("old durable goal", vec!["old durable goal".into()]);
     let history = vec![Message::system("old prompt")];
     let cfg = config();
-    let mut agent = resumed_agent(history, Usage::default(), None, Some(persisted_goal), cfg);
+    let mut agent = resumed_agent(history, Usage::default(), Some(persisted_goal), cfg);
     agent.set_session(Box::new(FailingGoalSession));
 
     let err = agent
@@ -317,7 +313,7 @@ fn resume_restores_structured_goal_and_rebuilds_system_prompt() {
         Message::user("previous request"),
     ];
 
-    let agent = resumed_agent(history, Usage::default(), Some(0.42), Some(goal), cfg);
+    let agent = resumed_agent(history, Usage::default(), Some(goal), cfg);
 
     let sys = agent.messages()[0].text();
     assert!(

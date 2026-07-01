@@ -66,7 +66,7 @@ pub trait Ui: Send {
         _context_window: Option<u32>,
     ) {
     }
-    /// End of the turn, with a prebuilt token/cost summary line.
+    /// End of the turn, with a prebuilt token summary line.
     fn turn_end(&mut self, summary: &str);
     /// The list of files changed during the turn (empty for a read-only or
     /// Q&A turn). Emitted just before [`turn_end`] so a frontend can show a

@@ -203,8 +203,8 @@ pub struct Usage {
     pub output_tokens: u64,
     /// Tokens served from a provider-side prompt cache (Anthropic cache_read).
     /// Billed at a discount to the normal input price (50% for OpenAI, ~10%
-    /// for Anthropic); tracked separately so cost calculations can apply the
-    /// discount.
+    /// for Anthropic); tracked separately so the token display can show
+    /// cache hits distinctly.
     #[serde(default)]
     pub cache_read_tokens: u64,
     /// Tokens written to the provider-side prompt cache this request (Anthropic
@@ -232,35 +232,6 @@ pub struct Usage {
     /// re-deriving occupancy from the other fields.
     #[serde(default)]
     pub context_occupancy: u64,
-    /// A normalized, provider-computed breakdown of billable tokens, so the
-    /// agent can sum cost across a session that switches providers/models
-    /// without re-deriving per-provider semantics (which `input_tokens` and
-    /// `cache_read_tokens` encode inconsistently). Each provider adapter fills
-    /// this where the semantics are known; the agent's cost math sums these
-    /// discounted/priced components directly. `None` on legacy/error paths —
-    /// the agent falls back to the heuristic in that case.
-    #[serde(default)]
-    pub billable: Option<BillableBreakdown>,
-}
-
-/// Normalized billable token components, computed at the provider adapter.
-/// Pricing semantics differ by provider (OpenAI's `prompt_tokens` includes the
-/// cached subset; Anthropic reports cache tokens separately), so this is the
-/// provider's own decomposition into the four priced buckets — the agent never
-/// has to guess which tokens are discounted cache vs. regular input.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BillableBreakdown {
-    /// Regular (non-cached) input tokens, billed at the full input price.
-    pub regular_input: u64,
-    /// Tokens served from the prompt cache, billed at the cache-read discount
-    /// (~50% OpenAI, ~10% Anthropic — the agent applies its configured
-    /// discount).
-    pub cached_input: u64,
-    /// Tokens written to the prompt cache this request, billed at a premium
-    /// (~125% Anthropic; 0 for OpenAI which doesn't report it).
-    pub cache_creation: u64,
-    /// Output tokens, billed at the output price.
-    pub output: u64,
 }
 
 impl Usage {

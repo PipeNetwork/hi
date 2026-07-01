@@ -31,7 +31,6 @@ pub fn write_artifact(
         compat_fallbacks_used: result.compat_fallbacks_used.clone(),
         candidates: result.candidates,
         tokens: result.tokens,
-        cost_usd: result.cost_usd,
         duration_seconds: result.seconds,
         mcp_model: result.mcp_model.clone(),
         verify_output_summary: result.verify_output_summary.clone(),

@@ -18,7 +18,6 @@ impl SessionSink for CompactionRecordingSession {
         &mut self,
         _messages: &[Message],
         _usage: Usage,
-        _cost_usd: Option<f64>,
     ) -> anyhow::Result<()> {
         Ok(())
     }
@@ -34,7 +33,6 @@ impl SessionSink for StateReplacementRecordingSession {
         &mut self,
         _messages: &[Message],
         _usage: Usage,
-        _cost_usd: Option<f64>,
     ) -> anyhow::Result<()> {
         Ok(())
     }
@@ -65,7 +63,6 @@ impl SessionSink for FailingCompactionSession {
         &mut self,
         _messages: &[Message],
         _usage: Usage,
-        _cost_usd: Option<f64>,
     ) -> anyhow::Result<()> {
         Ok(())
     }
@@ -739,13 +736,10 @@ async fn terminal_error_persists_usage_before_returning() {
     );
     assert_eq!(
         *records.lock().unwrap(),
-        vec![(
-            Usage {
-                input_tokens: 11,
-                output_tokens: 100,
-                ..Default::default()
-            },
-            None,
-        )]
+        vec![Usage {
+            input_tokens: 11,
+            output_tokens: 100,
+            ..Default::default()
+        }]
     );
 }

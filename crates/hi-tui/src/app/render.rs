@@ -107,13 +107,6 @@ impl crate::App {
                 "context: {ctx}; usage: {input} in · {output} out · {} total",
                 input + output
             ),
-            format!(
-                "cost: {}",
-                agent
-                    .cost_usd()
-                    .map(|c| format!("${c:.4}"))
-                    .unwrap_or_else(|| "unknown".into())
-            ),
             format!("model health: {model_health}"),
             format!("goal: {goal}"),
             format!("verify: {verify}"),
@@ -319,15 +312,12 @@ impl crate::App {
 
         // --- Transcript ---
         let title = format!(" hi · {} · {} ", self.provider, self.model);
-        // Right-aligned: persistent cost + token totals, a context-fill gauge,
-        // then the last status — so spend is always visible without a command.
+        // Right-aligned: persistent token totals, a context-fill gauge,
+        // then the last status — so usage is always visible without a command.
         let mut info_parts: Vec<String> = Vec::new();
         let (input, output) = self.usage;
         if input + output > 0 {
             info_parts.push(format!("↑{} ↓{}", fmt_count(input), fmt_count(output)));
-        }
-        if let Some(cost) = self.cost_usd {
-            info_parts.push(format!("${cost:.4}"));
         }
         if let Some(pct) = self.context_pct() {
             info_parts.push(format!("{pct}% ctx"));

@@ -53,7 +53,7 @@ pub fn dir_snapshot(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
 }
 
 /// Run all of a config's candidates; the config solves the task if any passes.
-/// Cost and tokens are summed. Candidates run in parallel since each gets its own
+/// Tokens are summed. Candidates run in parallel since each gets its own
 /// isolated workdir — wall-clock is the max, not the sum.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_config(
@@ -83,7 +83,6 @@ pub async fn run_config(
         verify_output_summary: String::new(),
         failure_confidence: None,
         candidates: temperatures.len(),
-        cost_usd: 0.0,
         tokens: 0,
         seconds: 0.0,
         mcp_model: None,
@@ -157,7 +156,6 @@ pub async fn run_config(
             summaries.push(candidate.verify_output_summary.clone());
         }
         result.failure_confidence = candidate.failure_confidence;
-        result.cost_usd += candidate.cost_usd;
         result.tokens += candidate.tokens;
         result.seconds += candidate.seconds;
     }
@@ -266,7 +264,6 @@ pub fn run_candidate(
         changed_files: report.changed_files,
         verify_output_summary: summarize_output(&verify_output),
         failure_confidence,
-        cost_usd: report.cost_usd,
         tokens: report.tokens,
         seconds,
         trajectory: report.trajectory,
@@ -293,7 +290,6 @@ fn summarize_output(output: &str) -> String {
 
 struct ReportInfo {
     tokens: u64,
-    cost_usd: f64,
     provider_error_kind: Option<String>,
     compat_fallbacks_used: Vec<String>,
     changed_files: Vec<String>,
@@ -361,7 +357,6 @@ fn read_report(path: &Path) -> ReportInfo {
     };
     ReportInfo {
         tokens: value["total_tokens"].as_u64().unwrap_or(0),
-        cost_usd: value["cost_usd"].as_f64().unwrap_or(0.0),
         provider_error_kind: value["provider_error_kind"].as_str().map(str::to_string),
         compat_fallbacks_used: string_array(&value["compat_fallbacks_used"]),
         changed_files: string_array(&value["changed_files"]),
@@ -373,7 +368,6 @@ impl Default for ReportInfo {
     fn default() -> Self {
         Self {
             tokens: 0,
-            cost_usd: 0.0,
             provider_error_kind: None,
             compat_fallbacks_used: Vec::new(),
             changed_files: Vec::new(),

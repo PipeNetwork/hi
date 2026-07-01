@@ -8,7 +8,7 @@ baseline, including a real backend like `openrouter/fusion`. Without numbers,
 
 `hi-eval` runs every task under every config in an isolated copy of the task's
 `fixture/`, then scores pass/fail with the task's own `verify` command (ground
-truth — the compiler/tests, not a judge model). It reports pass-rate, cost, and
+truth — the compiler/tests, not a judge model). It reports pass-rate and
 tokens per config, and writes machine-readable artifacts for each task/config
 cell. By default artifacts go under `target/hi-eval/runs/<timestamp>-<pid>/`
 as one JSON file per run plus an append-only `runs.jsonl`.
