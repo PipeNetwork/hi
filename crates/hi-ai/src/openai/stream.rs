@@ -10,9 +10,7 @@ use serde_json::Value;
 
 use super::request;
 use crate::provider::{ProviderError, ProviderErrorKind};
-use crate::types::{
-    Completion, Content, StreamEvent, Usage, estimate_messages_tokens,
-};
+use crate::types::{Completion, Content, StreamEvent, Usage, estimate_messages_tokens};
 
 /// Once the model reports a `finish_reason`, it has stopped generating; we wait
 /// only this long for the trailing usage chunk / `[DONE]` before ending the

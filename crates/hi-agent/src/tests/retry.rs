@@ -14,11 +14,7 @@ struct StateReplacementRecordingSession {
 }
 
 impl SessionSink for CompactionRecordingSession {
-    fn record(
-        &mut self,
-        _messages: &[Message],
-        _usage: Usage,
-    ) -> anyhow::Result<()> {
+    fn record(&mut self, _messages: &[Message], _usage: Usage) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -29,11 +25,7 @@ impl SessionSink for CompactionRecordingSession {
 }
 
 impl SessionSink for StateReplacementRecordingSession {
-    fn record(
-        &mut self,
-        _messages: &[Message],
-        _usage: Usage,
-    ) -> anyhow::Result<()> {
+    fn record(&mut self, _messages: &[Message], _usage: Usage) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -59,11 +51,7 @@ impl SessionSink for StateReplacementRecordingSession {
 struct FailingCompactionSession;
 
 impl SessionSink for FailingCompactionSession {
-    fn record(
-        &mut self,
-        _messages: &[Message],
-        _usage: Usage,
-    ) -> anyhow::Result<()> {
+    fn record(&mut self, _messages: &[Message], _usage: Usage) -> anyhow::Result<()> {
         Ok(())
     }
 

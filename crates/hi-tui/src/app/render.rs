@@ -138,34 +138,97 @@ impl crate::App {
     /// pasted multi-line block), plus the cursor's (row, col) within them. Long
     /// inputs show only their last [`MAX_INPUT_ROWS`] lines with a "… more above"
     /// note so they can't swallow the screen.
-    pub(crate) fn input_view(&self) -> (Vec<Line<'static>>, u16, u16) {
+    ///
+    /// `width` is the inner width of the input box (borders already subtracted).
+    /// Each logical line is soft-wrapped to that width so a long single-line
+    /// prompt stays visible and the cursor tracks the wrap instead of running off
+    /// the right edge.
+    pub(crate) fn input_view(&self, width: u16) -> (Vec<Line<'static>>, u16, u16) {
         const MAX_INPUT_ROWS: usize = 10;
+        const PREFIX: usize = 2; // "› " or "  "
         let text = self.input.text();
         let before: String = text.chars().take(self.input.cursor()).collect();
-        let cursor_row_full = before.matches('\n').count();
-        let cursor_col = before.chars().rev().take_while(|&c| c != '\n').count() as u16;
+        let cursor_col_logical =
+            before.chars().rev().take_while(|&c| c != '\n').count() as usize;
 
+        // Inner text width per line (prefix occupies the first 2 columns).
+        let wrap_w = width.saturating_sub(PREFIX as u16).max(1) as usize;
+
+        // Split into logical lines, then soft-wrap each to `wrap_w` columns.
+        // Each entry is (display_lines, cursor_offset_within_this_logical_line)
+        // where cursor_offset is Some(col) if the cursor sits in this logical
+        // line, else None.
         let all: Vec<&str> = text.split('\n').collect();
-        let truncated = all.len() > MAX_INPUT_ROWS;
+        let cursor_logical_row = before.matches('\n').count();
+
+        // Build wrapped display lines and track the cursor's display (row, col).
+        // Each entry: (chunk_text, cursor_col_within_chunk_if_cursor_here).
+        let mut wrapped: Vec<(String, Option<usize>)> = Vec::new();
+        for (li, seg) in all.iter().enumerate() {
+            let cursor_in_this = if li == cursor_logical_row {
+                Some(cursor_col_logical)
+            } else {
+                None
+            };
+            if seg.is_empty() {
+                wrapped.push((String::new(), cursor_in_this));
+                continue;
+            }
+            let chars: Vec<char> = seg.chars().collect();
+            let mut start = 0;
+            while start < chars.len() {
+                let end = (start + wrap_w).min(chars.len());
+                let chunk: String = chars[start..end].iter().collect();
+                // The cursor is in this display line if its logical column falls
+                // within [start, end]. A cursor exactly at `end` (end of a wrapped
+                // chunk) stays on this line's last column rather than jumping to
+                // the next line's column 0 — matches how terminals render it.
+                let cursor_here = cursor_in_this.and_then(|c| {
+                    if c >= start && c <= end {
+                        Some(c - start)
+                    } else {
+                        None
+                    }
+                });
+                wrapped.push((chunk, cursor_here));
+                start = end;
+            }
+        }
+
+        let truncated = wrapped.len() > MAX_INPUT_ROWS;
         let start = if truncated {
-            all.len() - MAX_INPUT_ROWS
+            wrapped.len() - MAX_INPUT_ROWS
         } else {
             0
         };
 
         let mut lines: Vec<Line<'static>> = Vec::new();
+        let mut cursor_row: u16 = 0;
+        let mut cursor_col: u16 = 0;
+        let mut found_cursor = false;
         if truncated {
             lines.push(Line::styled(
-                format!("  ⋮ {start} more line(s) above"),
+                format!("  ⋮ {} more line(s) above", start),
                 dim(),
             ));
         }
-        for (i, seg) in all[start..].iter().enumerate() {
+        for (i, (chunk, cursor_here)) in wrapped[start..].iter().enumerate() {
             let prefix = if i == 0 && !truncated { "› " } else { "  " };
-            lines.push(Line::from(format!("{prefix}{seg}")));
+            lines.push(Line::from(format!("{prefix}{chunk}")));
+            if let Some(col) = cursor_here {
+                if !found_cursor {
+                    cursor_row = u16::from(truncated) + i as u16;
+                    cursor_col = (PREFIX + col) as u16;
+                    found_cursor = true;
+                }
+            }
         }
-        let cursor_row = u16::from(truncated) + cursor_row_full.saturating_sub(start) as u16;
-        (lines, cursor_row, 2 + cursor_col)
+        // Cursor past the very end (e.g. empty input): place at end of last line.
+        if !found_cursor {
+            cursor_row = lines.len().saturating_sub(1) as u16;
+            cursor_col = PREFIX as u16;
+        }
+        (lines, cursor_row, cursor_col)
     }
 
     /// The pinned plan checklist shown just above the input, or empty when no
@@ -223,7 +286,7 @@ impl crate::App {
         let status_lines = 1usize;
         let queued_shown = self.queue.len().min(3);
         let queue_extra = usize::from(self.queue.len() > 3);
-        let (input_lines, cursor_row, cursor_col) = self.input_view();
+        let (input_lines, cursor_row, cursor_col) = self.input_view(area.width.saturating_sub(2));
         let completion_rows = self.completion_items().len();
         // The optional Ctrl-D diff panel height (header + up to 20 diff lines +
         // optional "more" line) and the compact changed-files summary line.

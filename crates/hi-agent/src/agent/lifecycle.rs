@@ -433,11 +433,7 @@ impl crate::Agent {
 
     /// Switch the model used for subsequent turns, refreshing the
     /// context-window metadata that drives the usage display.
-    pub fn set_model(
-        &mut self,
-        model: String,
-        context_window: Option<u32>,
-    ) {
+    pub fn set_model(&mut self, model: String, context_window: Option<u32>) {
         self.config.model = model;
         self.config.context_window = context_window;
     }
@@ -646,10 +642,7 @@ impl crate::Agent {
 
     pub(crate) fn persist(&mut self) -> Result<()> {
         if let Some(session) = self.session.as_mut() {
-            session.record(
-                &self.messages.as_slice()[self.persisted..],
-                self.totals,
-            )?;
+            session.record(&self.messages.as_slice()[self.persisted..], self.totals)?;
             self.persisted = self.messages.len();
         }
         Ok(())

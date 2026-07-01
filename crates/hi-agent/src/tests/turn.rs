@@ -4,11 +4,7 @@ use super::*;
 struct FailingCheckpointSession;
 
 impl SessionSink for FailingCheckpointSession {
-    fn record(
-        &mut self,
-        _messages: &[Message],
-        _usage: Usage,
-    ) -> anyhow::Result<()> {
+    fn record(&mut self, _messages: &[Message], _usage: Usage) -> anyhow::Result<()> {
         Ok(())
     }
 

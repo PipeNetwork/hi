@@ -9,11 +9,7 @@ struct CompactionRecordingSession {
 }
 
 impl SessionSink for CompactionRecordingSession {
-    fn record(
-        &mut self,
-        _messages: &[Message],
-        _usage: Usage,
-    ) -> anyhow::Result<()> {
+    fn record(&mut self, _messages: &[Message], _usage: Usage) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -26,11 +22,7 @@ impl SessionSink for CompactionRecordingSession {
 struct FailingCompactionSession;
 
 impl SessionSink for FailingCompactionSession {
-    fn record(
-        &mut self,
-        _messages: &[Message],
-        _usage: Usage,
-    ) -> anyhow::Result<()> {
+    fn record(&mut self, _messages: &[Message], _usage: Usage) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -42,11 +34,7 @@ impl SessionSink for FailingCompactionSession {
 struct FailingGoalSession;
 
 impl SessionSink for FailingGoalSession {
-    fn record(
-        &mut self,
-        _messages: &[Message],
-        _usage: Usage,
-    ) -> anyhow::Result<()> {
+    fn record(&mut self, _messages: &[Message], _usage: Usage) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -68,11 +56,7 @@ struct GoalClearingSession {
 }
 
 impl SessionSink for GoalClearingSession {
-    fn record(
-        &mut self,
-        _messages: &[Message],
-        _usage: Usage,
-    ) -> anyhow::Result<()> {
+    fn record(&mut self, _messages: &[Message], _usage: Usage) -> anyhow::Result<()> {
         Ok(())
     }
 

@@ -127,14 +127,14 @@ mod tests {
     fn empty_with_usage(input: u64, output: u64) -> Completion {
         Completion {
             content: Vec::new(),
-                        usage: Usage {
-            input_tokens: input,
-            output_tokens: output,
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
-            input_includes_cache: false,
-            context_occupancy: input,
-                        },
+            usage: Usage {
+                input_tokens: input,
+                output_tokens: output,
+                cache_read_tokens: 0,
+                cache_creation_tokens: 0,
+                input_includes_cache: false,
+                context_occupancy: input,
+            },
             stop_reason: None,
         }
     }

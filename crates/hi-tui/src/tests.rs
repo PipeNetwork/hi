@@ -642,6 +642,47 @@ fn quit_notice_renders_and_does_not_clip_input() {
 }
 
 #[test]
+fn long_single_line_input_wraps_and_cursor_tracks_it() {
+    // The bug: a long single-line prompt didn't wrap — it ran off the right
+    // edge and newly typed text was invisible. The input must soft-wrap to the
+    // box width, and the cursor must land on the wrapped row/column where the
+    // caret actually is.
+    let mut app = test_app("openai", "gpt-4o");
+    // 40 chars of text on a 28-wide inner area. prefix = 2, so wrap_w = 26
+    // → two display lines: first 26 chars, then the remaining 14.
+    let long = "abcdefghijklmnopqrstuvwxyz0123456789abcd";
+    app.input.set(long);
+    // Cursor at the very end (typing position).
+    let (lines, cursor_row, cursor_col) = app.input_view(28);
+    // First display line holds the first 26 chars; second holds the rest.
+    assert!(
+        lines.iter().any(|l| l.to_string().contains("abcdefghij")),
+        "first wrapped chunk visible"
+    );
+    assert!(
+        lines.iter().any(|l| l.to_string().contains("abcd")),
+        "tail wrapped onto a second line: {:?}",
+        lines
+    );
+    // Cursor is on the second wrapped row (index 1), past its last char.
+    assert_eq!(cursor_row, 1, "cursor on wrapped row 1");
+    // Second chunk is 14 chars + 2-col prefix → cursor at col 16.
+    assert_eq!(cursor_col, 16, "cursor col tracks wrap");
+}
+
+#[test]
+fn long_input_cursor_in_first_wrapped_chunk_stays_on_row_zero() {
+    let mut app = test_app("openai", "gpt-4o");
+    let long = "abcdefghijklmnopqrstuvwxyz0123456789abcd";
+    app.input.set(long);
+    // Move cursor to column 5 (within the first wrapped chunk).
+    app.input.cursor = 5;
+    let (_lines, cursor_row, cursor_col) = app.input_view(28);
+    assert_eq!(cursor_row, 0, "cursor on first wrapped row");
+    assert_eq!(cursor_col, 2 + 5, "cursor col = prefix + 5");
+}
+
+#[test]
 fn keybindings_help_does_not_advertise_idle_escape_or_ctrl_d_quit() {
     let mut app = test_app("openai", "gpt-4o");
     app.show_help = true;

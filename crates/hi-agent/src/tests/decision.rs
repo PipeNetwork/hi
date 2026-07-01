@@ -9,11 +9,7 @@ struct DecisionRecordingSession {
 }
 
 impl SessionSink for DecisionRecordingSession {
-    fn record(
-        &mut self,
-        _messages: &[Message],
-        _usage: Usage,
-    ) -> anyhow::Result<()> {
+    fn record(&mut self, _messages: &[Message], _usage: Usage) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -33,11 +29,7 @@ impl SessionSink for DecisionRecordingSession {
 struct FailingDecisionSession;
 
 impl SessionSink for FailingDecisionSession {
-    fn record(
-        &mut self,
-        _messages: &[Message],
-        _usage: Usage,
-    ) -> anyhow::Result<()> {
+    fn record(&mut self, _messages: &[Message], _usage: Usage) -> anyhow::Result<()> {
         Ok(())
     }
 
