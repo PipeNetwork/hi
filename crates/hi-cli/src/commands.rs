@@ -117,8 +117,10 @@ pub(crate) fn handle_command(
                 .iter()
                 .filter(|m| m.role != hi_ai::Role::System)
                 .count();
-            agent.clear_history();
-            println!("\x1b[2mcleared {count} messages — starting fresh\x1b[0m");
+            match agent.clear_history() {
+                Ok(()) => println!("\x1b[2mcleared {count} messages — starting fresh\x1b[0m"),
+                Err(err) => eprintln!("\x1b[33mclear failed: {err}\x1b[0m"),
+            }
         }
         Command::Verify(arg) => match arg.trim() {
             "" if agent.verify_is_on() => {
@@ -162,11 +164,10 @@ pub(crate) fn handle_command(
                     }
                 }
             }
-            "clear" | "off" | "none" => {
-                agent.set_goal(None);
-                agent.set_structured_goal(None);
-                println!("\x1b[32m✓ goal cleared\x1b[0m");
-            }
+            "clear" | "off" | "none" => match agent.set_transient_goal(None) {
+                Ok(()) => println!("\x1b[32m✓ goal cleared\x1b[0m"),
+                Err(err) => eprintln!("\x1b[33mgoal clear failed: {err:#}\x1b[0m"),
+            },
             goal => {
                 // When long-horizon agency is on, set a structured goal — a
                 // single sub-goal equal to the objective, which the model
@@ -174,23 +175,30 @@ pub(crate) fn handle_command(
                 // sub-goal statuses). Otherwise fall back to the transient
                 // prompt-injected goal string.
                 if agent.long_horizon() {
-                    let accepted = agent.set_structured_goal(Some(hi_agent::Goal::new(
+                    match agent.set_structured_goal(Some(hi_agent::Goal::new(
                         goal.to_string(),
                         vec![goal.to_string()],
-                    )));
-                    if accepted {
-                        println!(
-                            "\x1b[32m✓ long-horizon goal set — drives sub-goals across turns: {goal}\x1b[0m"
-                        );
-                    } else {
-                        agent.set_goal(Some(goal.to_string()));
-                        println!(
-                            "\x1b[32m✓ goal set — steers every turn until cleared: {goal}\x1b[0m"
-                        );
+                    ))) {
+                        Ok(true) => {
+                            println!(
+                                "\x1b[32m✓ long-horizon goal set — drives sub-goals across turns: {goal}\x1b[0m"
+                            );
+                        }
+                        Ok(false) => match agent.set_transient_goal(Some(goal.to_string())) {
+                            Ok(()) => println!(
+                                "\x1b[32m✓ goal set — steers every turn until cleared: {goal}\x1b[0m"
+                            ),
+                            Err(err) => eprintln!("\x1b[33mgoal set failed: {err:#}\x1b[0m"),
+                        },
+                        Err(err) => eprintln!("\x1b[33mgoal set failed: {err:#}\x1b[0m"),
                     }
                 } else {
-                    agent.set_goal(Some(goal.to_string()));
-                    println!("\x1b[32m✓ goal set — steers every turn until cleared: {goal}\x1b[0m");
+                    match agent.set_transient_goal(Some(goal.to_string())) {
+                        Ok(()) => println!(
+                            "\x1b[32m✓ goal set — steers every turn until cleared: {goal}\x1b[0m"
+                        ),
+                        Err(err) => eprintln!("\x1b[33mgoal set failed: {err:#}\x1b[0m"),
+                    }
                 }
             }
         },

@@ -1,5 +1,5 @@
-use super::*;
 use super::common::*;
+use super::*;
 
 #[tokio::test]
 async fn update_memory_writes_file_without_polluting_history() {
@@ -92,4 +92,3 @@ async fn update_memory_is_best_effort_on_error() {
     agent.update_memory_at(path.clone(), &mut NullUi).await;
     assert!(!path.exists(), "nothing written when distillation fails");
 }
-

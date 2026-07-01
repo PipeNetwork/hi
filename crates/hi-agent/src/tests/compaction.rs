@@ -1,5 +1,5 @@
-use super::*;
 use super::common::*;
+use super::*;
 
 #[tokio::test]
 async fn compact_replaces_history_with_summary() {
@@ -44,7 +44,7 @@ async fn compact_replaces_history_with_summary() {
             },
             None,
         )],
-        "manual compaction persists usage even though compacted messages are transient"
+        "manual compaction persists summarization usage before writing the durable boundary"
     );
 }
 
@@ -93,6 +93,37 @@ async fn hybrid_keeps_recent_and_folds_summary() {
 }
 
 #[tokio::test]
+async fn hybrid_keep_recent_zero_summarizes_instead_of_panicking() {
+    let mut agent = agent(
+        vec![completion(
+            vec![Content::Text("WHOLE SUMMARY".into())],
+            3,
+            2,
+        )],
+        config(),
+    );
+    agent.messages_mut().push(Message::user("q1"));
+    agent
+        .messages_mut()
+        .push(Message::assistant(vec![Content::Text("a1".into())]));
+    agent.messages_mut().push(Message::user("q2"));
+    agent
+        .messages_mut()
+        .push(Message::assistant(vec![Content::Text("a2".into())]));
+
+    agent
+        .compact_with(CompactionKind::Hybrid { keep_recent: 0 }, &mut NullUi)
+        .await
+        .unwrap();
+
+    let m = agent.messages();
+    assert_eq!(m.len(), 2);
+    assert_eq!(m[0].role, Role::System);
+    assert!(m[1].text().contains("WHOLE SUMMARY"));
+    agent.messages.validate_for_provider().unwrap();
+}
+
+#[tokio::test]
 async fn elide_then_summarize_tail_elides_tool_turns_summarizes_qa() {
     // A session with: an old tool-bearing turn (q1 + read + big result), an
     // old Q&A turn (q2 + text), and a recent turn (q3). The new default
@@ -115,6 +146,11 @@ async fn elide_then_summarize_tail_elides_tool_turns_summarizes_qa() {
     agent
         .messages_mut()
         .push(Message::tool_result("c1", "x".repeat(500)));
+    agent
+        .messages_mut()
+        .push(Message::assistant(vec![Content::Text(
+            "a1 after reading the file".into(),
+        )]));
     // Old Q&A turn (no tool results) — this is the conversational tail.
     agent.messages_mut().push(Message::user("q2"));
     agent
@@ -152,6 +188,15 @@ async fn elide_then_summarize_tail_elides_tool_turns_summarizes_qa() {
         !tool_results.iter().any(|o| o.contains(&"x".repeat(100))),
         "old tool output content gone: {tool_results:?}"
     );
+    assert!(
+        m.iter()
+            .any(|msg| msg.role == Role::User && msg.text().contains("q1")),
+        "old tool-bearing user prompt preserved: {m:?}"
+    );
+    assert!(
+        m.iter().any(|msg| msg.text().contains("a1 after reading")),
+        "old post-tool assistant answer preserved: {m:?}"
+    );
     // The Q&A summary is folded into the first kept turn (q3), and q3 stays.
     let user_texts: Vec<String> = m
         .iter()
@@ -166,12 +211,57 @@ async fn elide_then_summarize_tail_elides_tool_turns_summarizes_qa() {
         user_texts.iter().any(|t| t.contains("q3")),
         "recent turn kept: {user_texts:?}"
     );
+    assert!(
+        !user_texts.iter().any(|t| t == "q2"),
+        "old Q&A prompt was summarized, not kept verbatim: {user_texts:?}"
+    );
     // Provider-safe: roles alternate.
     assert!(
         m.windows(2).all(|w| w[0].role != w[1].role),
         "roles must alternate: {:?}",
         m.iter().map(|x| x.role).collect::<Vec<_>>()
     );
+}
+
+#[tokio::test]
+async fn elide_then_summarize_tail_keep_recent_zero_summarizes_instead_of_panicking() {
+    let mut agent = agent(
+        vec![completion(
+            vec![Content::Text("WHOLE SUMMARY".into())],
+            3,
+            2,
+        )],
+        config(),
+    );
+    agent.messages_mut().push(Message::user("q1"));
+    agent
+        .messages_mut()
+        .push(Message::assistant(vec![Content::ToolCall {
+            id: "c1".into(),
+            name: "read".into(),
+            arguments: "{}".into(),
+        }]));
+    agent
+        .messages_mut()
+        .push(Message::tool_result("c1", "x".repeat(500)));
+    agent.messages_mut().push(Message::user("q2"));
+    agent
+        .messages_mut()
+        .push(Message::assistant(vec![Content::Text("a2".into())]));
+
+    agent
+        .compact_with(
+            CompactionKind::ElideThenSummarizeTail { keep_recent: 0 },
+            &mut NullUi,
+        )
+        .await
+        .unwrap();
+
+    let m = agent.messages();
+    assert_eq!(m.len(), 2);
+    assert_eq!(m[0].role, Role::System);
+    assert!(m[1].text().contains("WHOLE SUMMARY"));
+    agent.messages.validate_for_provider().unwrap();
 }
 
 #[tokio::test]
@@ -220,7 +310,6 @@ async fn elide_then_summarize_tail_skips_model_call_when_no_qa_tail() {
         "old tool result elided: {tool_results:?}"
     );
 }
-
 
 #[tokio::test]
 async fn hybrid_falls_back_to_summarize_when_too_few_turns() {
@@ -299,4 +388,3 @@ async fn elide_shrinks_old_tool_output_without_a_model_call() {
     );
     assert_eq!(outputs[1], big, "recent kept verbatim");
 }
-

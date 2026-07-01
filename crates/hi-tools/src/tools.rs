@@ -548,18 +548,27 @@ pub fn target_path(name: &str, arguments: &str) -> Option<String> {
         // (a glob isn't a single file, so return None to avoid over-serializing).
         "grep" => value.get("path")?.as_str().map(str::to_string),
         // apply_patch: the patch text contains `*** Update File: <path>` (or
-        // `*** Add File:`/`*** Delete File:`) directives. Return the first path
-        // so a read of that file after the patch serializes. Multi-file patches
-        // only expose the first path — the safe fallback (serialize after all
-        // earlier mutations) covers the rest.
+        // `*** Add File:`/`*** Delete File:`) directives. Return the path only
+        // when the patch targets exactly one file. Multi-file patches have no
+        // single target, so return None and let dependency inference treat the
+        // mutation as unknown-path, serializing later reads conservatively.
         "apply_patch" => {
             let patch = value.get("patch")?.as_str()?;
-            patch.lines().find_map(|l| {
-                l.trim()
-                    .strip_prefix("*** Update File: ")
-                    .or_else(|| l.trim().strip_prefix("*** Add File: "))
-                    .map(|p| p.trim().to_string())
-            })
+            let mut paths: Vec<String> = patch
+                .lines()
+                .filter_map(|line| {
+                    line.trim()
+                        .strip_prefix("*** Update File: ")
+                        .or_else(|| line.trim().strip_prefix("*** Add File: "))
+                        .or_else(|| line.trim().strip_prefix("*** Delete File: "))
+                        .map(str::trim)
+                        .filter(|path| !path.is_empty())
+                        .map(str::to_string)
+                })
+                .collect();
+            paths.sort();
+            paths.dedup();
+            if paths.len() == 1 { paths.pop() } else { None }
         }
         // diff/glob/bash: no single meaningful target path for dep inference.
         _ => None,
@@ -791,6 +800,42 @@ pub(crate) fn spawn_shell(command: &str) -> Result<tokio::process::Child> {
     cmd.spawn().context("failed to spawn command")
 }
 
+/// Best-effort process-group cleanup for foreground bash futures. This matters
+/// when the future is cancelled before its timeout branch runs: Tokio's
+/// `kill_on_drop` kills the shell child, but not necessarily grandchildren.
+#[cfg(unix)]
+struct ProcessGroupDropGuard {
+    pgid: Option<i32>,
+}
+
+#[cfg(unix)]
+impl ProcessGroupDropGuard {
+    fn for_child(child: &tokio::process::Child) -> Self {
+        Self {
+            pgid: child.id().map(|pid| pid as i32),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ProcessGroupDropGuard {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.pgid {
+            kill_group(pgid);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct ProcessGroupDropGuard;
+
+#[cfg(not(unix))]
+impl ProcessGroupDropGuard {
+    fn for_child(_child: &tokio::process::Child) -> Self {
+        Self
+    }
+}
+
 /// SIGKILL an entire process group by its id. We spawn with `process_group(0)`,
 /// so a process's group id equals its pid; signalling the negative pid reaches
 /// every descendant. No-op on non-Unix (where `child.kill()` is the best we have).
@@ -848,6 +893,7 @@ async fn run_bash_streaming_with_timeout(
     // timeout can SIGKILL the *whole tree* — cargo, the test binary, any leaked
     // daemon — not just the `sh` parent, and nothing blocks waiting on input.
     let mut child = spawn_shell(command)?;
+    let _group_guard = ProcessGroupDropGuard::for_child(&child);
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
@@ -1365,6 +1411,115 @@ mod tests {
         assert!(out.contains("timed out"), "got: {out:?}");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_bash_future_kills_descendants() {
+        let pid_file = std::env::temp_dir().join(format!(
+            "hi-cancel-bash-child-{}-{}.pid",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&pid_file);
+        let pid_path = pid_file.to_string_lossy().to_string();
+        let command = format!(
+            "trap '' HUP; sleep 600 & echo $! > {}; wait",
+            sh_quote(&pid_path)
+        );
+
+        {
+            let mut sink = |_: &str| {};
+            let fut =
+                run_bash_streaming_with_timeout(&command, &mut sink, Duration::from_secs(600));
+            tokio::pin!(fut);
+
+            let child_started = async {
+                for _ in 0..100 {
+                    if pid_file.exists() {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                panic!("background child pid file was not written");
+            };
+
+            tokio::select! {
+                result = &mut fut => panic!("command finished before cancellation: {result:?}"),
+                _ = child_started => {}
+            }
+        }
+
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("pid file readable")
+            .trim()
+            .parse()
+            .expect("pid parseable");
+        for _ in 0..100 {
+            if !process_exists(pid) {
+                let _ = std::fs::remove_file(&pid_file);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        let _ = std::fs::remove_file(&pid_file);
+        panic!("cancelled bash future left descendant process {pid} running");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn foreground_bash_completion_kills_detached_descendants() {
+        let pid_file = std::env::temp_dir().join(format!(
+            "hi-fg-bash-child-{}-{}.pid",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&pid_file);
+        let pid_path = pid_file.to_string_lossy().to_string();
+        let command = format!(
+            "trap '' HUP; sleep 600 >/dev/null 2>&1 & echo $! > {}; echo done",
+            sh_quote(&pid_path)
+        );
+        let mut sink = |_: &str| {};
+
+        let out = run_bash_streaming_with_timeout(&command, &mut sink, Duration::from_secs(5))
+            .await
+            .expect("foreground command returns");
+        assert!(out.contains("done"), "got: {out:?}");
+
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("pid file readable")
+            .trim()
+            .parse()
+            .expect("pid parseable");
+        for _ in 0..100 {
+            if !process_exists(pid) {
+                let _ = std::fs::remove_file(&pid_file);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+        }
+        let _ = std::fs::remove_file(&pid_file);
+        panic!("foreground bash left detached descendant process {pid} running");
+    }
+
+    #[cfg(unix)]
+    fn process_exists(pid: i32) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
     #[test]
     fn bash_timeout_resolution_and_clamping() {
         use super::{DEFAULT_BASH_TIMEOUT_SECS, MAX_BASH_TIMEOUT_SECS, resolve_bash_timeout};
@@ -1447,7 +1602,7 @@ mod tests {
         assert_eq!(target_path("bash", r#"{"command":"echo hi"}"#), None);
         // Malformed JSON → None (tolerant).
         assert_eq!(target_path("read", "not json"), None);
-        // apply_patch: first Update/Add File directive's path is extracted.
+        // apply_patch: a single file directive's path is extracted.
         let patch =
             r#"{"patch":"*** Begin Patch\n*** Update File: src/a.rs\n-old\n+new\n*** End Patch"}"#;
         assert_eq!(target_path("apply_patch", patch), Some("src/a.rs".into()));
@@ -1457,6 +1612,16 @@ mod tests {
             target_path("apply_patch", add_patch),
             Some("new.txt".into())
         );
+        let delete_patch =
+            r#"{"patch":"*** Begin Patch\n*** Delete File: old.txt\n*** End Patch"}"#;
+        assert_eq!(
+            target_path("apply_patch", delete_patch),
+            Some("old.txt".into())
+        );
+        // Multi-file patches have no single target path. Returning None makes
+        // dependency inference serialize later reads conservatively.
+        let multi_patch = r#"{"patch":"*** Begin Patch\n*** Update File: src/a.rs\n-old\n+new\n*** Update File: src/b.rs\n-old\n+new\n*** End Patch"}"#;
+        assert_eq!(target_path("apply_patch", multi_patch), None);
         // No file directives → None.
         assert_eq!(
             target_path(

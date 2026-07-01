@@ -10,7 +10,7 @@ use hi_ai::{
     ChatRequest, Content, Message, ProviderErrorKind, RequestProfile, Role, StreamEvent, ToolMode,
     ToolSpec, provider_error_kind,
 };
-use hi_tools::{execute, execute_streaming};
+use hi_tools::{PlanStatus, execute, execute_streaming};
 
 use crate::command;
 use crate::compaction;
@@ -25,22 +25,22 @@ use crate::steering::{
     CONCRETE_REVIEW_NUDGE, EvidenceTracker, GAP_SEARCH_OVERCLAIM_NUDGE,
     IMPLEMENTATION_EMPTY_TUI_NUDGE, IMPLEMENTATION_NO_CHANGES_NUDGE,
     IMPLEMENTATION_SCAFFOLD_ONLY_NUDGE, ImplementationTracker, READ_AFTER_SEARCH_NUDGE,
-    READ_ONLY_SAFE_CONTEXT_WINDOW, REPEAT_NUDGE, ReviewIntent,
+    READ_ONLY_SAFE_CONTEXT_WINDOW, REPEAT_NUDGE, REREAD_NUDGE, ReviewIntent,
     SECURITY_BROAD_SEARCH_NUDGE, SECURITY_SCOPE_NUDGE, TOOL_PROTOCOL_RETRY_NUDGE,
     TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE, answer_says_insufficient_evidence,
     bounded_review_repair_exhaustion_answer, classify_implementation_intent,
-    classify_read_only_intent, deepen_review_nudge, implementation_missing_validation_nudge,
-    implementation_text_tool_nudge, implementation_turn_prompt,
-    inspected_insufficient_repair_limit, insufficient_after_incomplete_security_search,
-    insufficient_after_no_review_evidence, insufficient_after_repeated_search,
-    insufficient_after_review_repair_template, insufficient_after_security_scope_overclaim,
-    no_evidence_review_nudge, read_only_blocked_tool_result, read_only_blocks_tool,
-    read_only_turn_prompt, should_bootstrap_gpu_training_estimator, should_deepen_review,
-    should_nudge_concrete_review_answer, should_nudge_gap_search_overclaim,
-    should_nudge_no_evidence_review, should_nudge_read_after_repeated_search,
-    should_nudge_read_after_search_final, should_nudge_security_broad_search,
-    should_nudge_security_scope, should_reject_review_repair_template,
-    summarize_inspected_evidence_nudge,
+    classify_read_only_intent, concrete_review_answer_problem, deepen_review_nudge,
+    implementation_missing_validation_nudge, implementation_text_tool_nudge,
+    implementation_turn_prompt, inspected_insufficient_repair_limit, inspected_paths_for_prompt,
+    insufficient_after_incomplete_security_search, insufficient_after_no_review_evidence,
+    insufficient_after_repeated_search, insufficient_after_review_repair_template,
+    insufficient_after_security_scope_overclaim, no_evidence_review_nudge,
+    read_only_blocked_tool_result, read_only_blocks_tool, read_only_turn_prompt,
+    should_bootstrap_gpu_training_estimator, should_deepen_review,
+    should_nudge_gap_search_overclaim, should_nudge_no_evidence_review,
+    should_nudge_read_after_repeated_search, should_nudge_read_after_search_final,
+    should_nudge_security_broad_search, should_nudge_security_scope,
+    should_reject_review_repair_template, summarize_inspected_evidence_nudge,
 };
 use crate::transcript::NudgeKind;
 use crate::verify::{Snapshot, Verifier, VerifyOutcome, stage_guidance};
@@ -50,6 +50,49 @@ use crate::{
     ToolCallEntry, TurnAttribution, TurnTelemetry, Ui, apply_plan_to_goal,
     partial_text_tool_call_start,
 };
+
+#[allow(clippy::too_many_arguments)]
+fn build_turn_telemetry(
+    verify_rounds: u32,
+    recovery_retries: u32,
+    repeat_nudges: u32,
+    continue_nudges: u32,
+    truncation_retries: u32,
+    hit_step_cap: bool,
+    stalled_unfinished: bool,
+    stalled_repeating: bool,
+    verify_attributions: &[hi_tools::Attribution],
+    tool_calls: u32,
+    max_concurrent_batch: u32,
+    serial_runs: u32,
+    tool_timeline: &[ToolCallEntry],
+    evidence: &EvidenceTracker,
+) -> TurnTelemetry {
+    TurnTelemetry {
+        verify_rounds,
+        recovery_retries,
+        repeat_nudges,
+        continue_nudges,
+        truncation_retries,
+        hit_step_cap,
+        stalled_unfinished,
+        stalled_repeating,
+        verify_attributions: verify_attributions
+            .iter()
+            .map(TurnAttribution::from)
+            .collect(),
+        tool_calls,
+        max_concurrent_batch,
+        serial_runs,
+        tool_timeline: tool_timeline.to_vec(),
+        file_reads: evidence.file_reads,
+        targeted_searches: evidence.targeted_searches,
+        listing_only: evidence.listing_only(),
+        first_tool_kind: evidence.first_tool_kind().to_string(),
+        discovery_depth: evidence.discovery_depth().to_string(),
+        quality_repair_nudges: evidence.quality_repair_nudges,
+    }
+}
 
 impl crate::Agent {
     /// Run one user turn to completion, emitting output through `ui`.
@@ -81,15 +124,27 @@ impl crate::Agent {
         let input = turn_input.as_str();
 
         if read_only_intent.is_none() && self.tools_unavailable_for(input) {
+            self.last_verify = None;
+            self.last_changed_files.clear();
+            self.last_compat_fallbacks.clear();
+            self.last_turn_telemetry = TurnTelemetry::default();
+            if !looks_like_continue(input) {
+                self.last_plan.clear();
+            }
+            let response = format!(
+                "I cannot perform coding actions in {} mode because file-edit and shell tools are unavailable. Switch to `--tool-mode auto` or `--tool-mode required` to let me modify the workspace.",
+                tool_mode_label(self.config.tool_mode)
+            );
             ui.status(&format!(
                 "tool mode {} does not allow file edits or shell commands for this turn",
                 tool_mode_label(self.config.tool_mode)
             ));
-            self.messages.push_user(input);
-            self.messages.push_assistant(vec![Content::Text(format!(
-                "I cannot perform coding actions in {} mode because file-edit and shell tools are unavailable. Switch to `--tool-mode auto` or `--tool-mode required` to let me modify the workspace.",
-                tool_mode_label(self.config.tool_mode)
-            ))]);
+            ui.assistant_text(&response);
+            ui.assistant_end();
+            self.messages.strip_trailing_nudges();
+            self.persisted = self.persisted.min(self.messages.len());
+            self.messages.push_user_or_fold(input);
+            self.messages.push_assistant(vec![Content::Text(response)]);
             ui.turn_end(&self.usage_summary(&self.totals));
             self.persist()?;
             return Ok(());
@@ -104,6 +159,11 @@ impl crate::Agent {
             if self.checkpoints.len() > MAX_CHECKPOINTS {
                 self.checkpoints
                     .drain(0..self.checkpoints.len() - MAX_CHECKPOINTS);
+            }
+            if let Some(session) = self.session.as_mut()
+                && let Err(err) = session.record_checkpoints(&self.checkpoints)
+            {
+                ui.status(&format!("(couldn't persist checkpoint refs: {err})"));
             }
         }
 
@@ -142,7 +202,9 @@ impl crate::Agent {
             self.context_used = 0;
         }
 
-        let turn_start = self.messages.len();
+        self.messages.strip_trailing_nudges();
+        self.persisted = self.persisted.min(self.messages.len());
+        let mut turn_start = self.messages.len();
         self.messages.push_user_or_fold(input);
         self.last_verify = None;
         self.last_changed_files.clear();
@@ -161,11 +223,18 @@ impl crate::Agent {
             self.config.verify.clone(),
             self.config.max_verify_iterations,
         );
-        let max_steps = self.config.max_steps;
+        let max_steps = self.config.max_steps.max(1);
+        let max_parallel_tools = self.config.max_parallel_tools.max(1);
         let mut steps = 0u32;
         let mut empty_retries = 0u32;
+        // Consecutive output-limit continuations. This is a stall budget, so it
+        // resets after any non-truncated model response/tool progress.
         let mut truncation_retries = 0u32;
+        // Cumulative truncation nudges for telemetry/UI summaries. Unlike the
+        // consecutive budget above, this should not reset mid-turn.
+        let mut truncation_total_retries = 0u32;
         let mut silent_continues = 0u32;
+        let mut continue_total_nudges = 0u32;
         let mut repeat_nudges = 0u32;
         // Set after a silent-continue nudge: force the *next* round to call a
         // tool (`tool_choice: required`) instead of letting the model narrate
@@ -229,6 +298,11 @@ impl crate::Agent {
         // Signature (name, arguments) of the previous round's tool calls, to
         // spot a model re-issuing the exact same call and looping on it.
         let mut prev_call_sig: Option<Vec<(String, String)>> = None;
+        // Whether the previous executed round added no new evidence (every call
+        // was a read-only inspection already seen). Used by the no-new-evidence
+        // cycle guard to fire only on the *second* consecutive wasted round,
+        // preserving a single legitimate re-inspection after new evidence.
+        let mut prev_added_no_evidence = false;
         let mut request_too_large_retried = false;
         let mut protocol_retries = 0u32;
         let mut protocol_text_fallbacks = 0u32;
@@ -403,18 +477,54 @@ impl crate::Agent {
                         if provider_error_kind(&err)
                             == Some(ProviderErrorKind::RequestTooLarge) =>
                     {
-                        if !request_too_large_retried
-                            && self.retry_after_request_too_large(input, turn_start, ui)
-                        {
-                            request_too_large_retried = true;
-                            continue;
+                        let mut context_drop_persistence_failed = false;
+                        if !request_too_large_retried {
+                            match self.retry_after_request_too_large(input, turn_start, ui) {
+                                Ok(true) => {
+                                    request_too_large_retried = true;
+                                    turn_start = self.messages.len().saturating_sub(1);
+                                    continue;
+                                }
+                                Ok(false) => {}
+                                Err(persist_err) => {
+                                    ui.status(&format!(
+                                        "couldn't persist dropped-context retry state: {persist_err}"
+                                    ));
+                                    context_drop_persistence_failed = true;
+                                }
+                            }
                         }
                         self.truncate_messages(turn_start);
-                        ui.status(
-                            "request still exceeds the provider limit with prior context removed; \
-                             shorten the prompt or attached input, then retry",
-                        );
+                        if context_drop_persistence_failed {
+                            ui.status(
+                                "request exceeds the provider limit, and prior context could not be \
+                                 safely dropped because the session boundary was not persisted; fix \
+                                 session storage or start a fresh/cleared session, then retry",
+                            );
+                        } else {
+                            ui.status(
+                                "request still exceeds the provider limit with prior context removed; \
+                                 shorten the prompt or attached input, then retry",
+                            );
+                        }
                         self.add_error_usage(&err);
+                        self.last_compat_fallbacks = compat_fallbacks.clone();
+                        self.last_turn_telemetry = build_turn_telemetry(
+                            verifier.round(),
+                            empty_retries,
+                            repeat_nudges,
+                            continue_total_nudges,
+                            truncation_total_retries,
+                            ended_at_cap,
+                            stalled_unfinished,
+                            stalled_repeating,
+                            &last_verify_attributions,
+                            sched_tool_calls,
+                            sched_max_concurrent,
+                            sched_serial_runs,
+                            &tool_timeline,
+                            &evidence,
+                        );
                         let _ = self.persist();
                         let (kind, guidance) = crate::ui::classify_error(&err);
                         ui.turn_error(kind, &err.to_string(), guidance);
@@ -502,6 +612,31 @@ impl crate::Agent {
                     }
                     Err(err) => {
                         self.add_error_usage(&err);
+                        if made_tool_call {
+                            self.messages.strip_trailing_nudges();
+                            let end_snapshot = self.snapshot_cached().await;
+                            self.last_changed_files =
+                                changed_files_between(&turn_snapshot, &end_snapshot);
+                        } else {
+                            self.truncate_messages(turn_start);
+                        }
+                        self.last_compat_fallbacks = compat_fallbacks.clone();
+                        self.last_turn_telemetry = build_turn_telemetry(
+                            verifier.round(),
+                            empty_retries,
+                            repeat_nudges,
+                            continue_total_nudges,
+                            truncation_total_retries,
+                            ended_at_cap,
+                            stalled_unfinished,
+                            stalled_repeating,
+                            &last_verify_attributions,
+                            sched_tool_calls,
+                            sched_max_concurrent,
+                            sched_serial_runs,
+                            &tool_timeline,
+                            &evidence,
+                        );
                         let _ = self.persist();
                         let (kind, guidance) = crate::ui::classify_error(&err);
                         ui.turn_error(kind, &err.to_string(), guidance);
@@ -538,6 +673,7 @@ impl crate::Agent {
                 );
                 if truncated && truncation_retries < self.config.max_truncation_retries {
                     truncation_retries += 1;
+                    truncation_total_retries += 1;
                     ui.status(&format!(
                         "⚠ the model hit the output token limit — continuing ({truncation_retries}/{})",
                         self.config.max_truncation_retries
@@ -552,11 +688,31 @@ impl crate::Agent {
                     // orphan tool_use that providers reject on the next request.
                     let partial_tool_call =
                         self.clean_text_tool_calls_from_content(&mut completion.content);
+                    let truncated_text = completion
+                        .content
+                        .iter()
+                        .filter_map(|c| match c {
+                            Content::Text(t) => Some(t.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    let active_tool_work = read_only_intent.is_none()
+                        && (implementation_intent.is_some()
+                            || made_tool_call
+                            || implementation_tracker.mutation_seen
+                            || plan_has_pending_steps(&self.last_plan)
+                            || looks_like_unfinished_step(&truncated_text));
+                    if (partial_tool_call || active_tool_work)
+                        && self.config.tool_mode == ToolMode::Auto
+                    {
+                        force_tools_next = true;
+                    }
                     self.messages
                         .push_assistant_text_only(std::mem::take(&mut completion.content));
                     self.messages.push_nudge(
                         NudgeKind::Truncation,
-                        if partial_tool_call {
+                        if partial_tool_call || active_tool_work {
                             TRUNCATED_TOOL_CALL_NUDGE
                         } else {
                             TRUNCATION_NUDGE
@@ -573,6 +729,7 @@ impl crate::Agent {
                     self.clean_text_tool_calls_from_content(&mut completion.content);
                     self.messages
                         .push_assistant_text_only(std::mem::take(&mut completion.content));
+                    stalled_unfinished = true;
                     ui.status(&format!(
                         "⚠ the model hit the output token limit {max} times — the task may be \
                          incomplete. /retry, or send 'continue'.",
@@ -658,16 +815,65 @@ impl crate::Agent {
 
                 // Repetition guard: the model re-issued the exact same tool
                 // calls (same names, same arguments, same order) as the previous
-                // round. Re-running them can only reproduce the same output, so
-                // don't execute — nudge the model to act on the output it already
-                // has. Bounded; past the budget the turn ends with an honest
-                // "stuck repeating" notice rather than looping until `max_steps`.
+                // round. Re-running most tools can only reproduce the same
+                // output, so don't execute — nudge the model to act on the output
+                // it already has. `bash_output` is intentionally excluded from
+                // this exact-match shortcut because a live background process is
+                // time-dependent and can emit new output between identical polls;
+                // completed/missing/pruned handles are caught below by the
+                // stale-background no-new-evidence path. Bounded; past the
+                // budget the turn ends with an honest "stuck repeating" notice
+                // rather than looping until `max_steps`.
                 let call_sig: Vec<(String, String)> = calls
                     .iter()
                     .map(|(_, name, args)| (name.clone(), args.clone()))
                     .collect();
-                let is_repeat = !calls.is_empty() && prev_call_sig.as_ref() == Some(&call_sig);
-                if is_repeat {
+                let has_background_output_poll = calls
+                    .iter()
+                    .any(|(_, name, _)| name.as_str() == "bash_output");
+                let has_background_handle_call = calls
+                    .iter()
+                    .any(|(_, name, _)| matches!(name.as_str(), "bash_output" | "bash_kill"));
+                let exact_repeat = !calls.is_empty()
+                    && !has_background_output_poll
+                    && prev_call_sig.as_ref() == Some(&call_sig);
+                // No-new-evidence cycle guard: a round whose every call is a
+                // read-only inspection (read/list/grep/glob) or stale background
+                // handle operation already performed earlier this turn. This
+                // catches multi-step cycles like
+                // A→B→C→A→B→C — including grep/list cycles, not just re-reads —
+                // that evade the exact-match check because each round differs
+                // from the one right before it. On large workspaces such a cycle
+                // can otherwise loop until `max_steps` without ever re-issuing an
+                // identical round. `EvidenceTracker::round_adds_evidence` keys on
+                // a stable per-inspection signature (read path/page, list path,
+                // grep pattern/glob/path/context, stale background handle id), so
+                // any re-inspection is caught regardless of cycle length or tool
+                // mix. Shares the same
+                // `repeat_nudges` budget as the exact-match guard so it stays
+                // bounded.
+                //
+                // Fires only on the *second* consecutive no-new-evidence round
+                // (`prev_added_no_evidence`): a single re-inspection right after
+                // new evidence is allowed through (e.g. re-reading a file once a
+                // broader search has surfaced something to re-examine, or paging
+                // further into a file). Once the turn has made a successful
+                // mutation, this guard is advisory only: after the nudge budget
+                // is spent, execute the inspection rather than hard-stalling a
+                // long implementation harness in the middle of a later plan step.
+                let no_new_evidence = !calls.is_empty() && !evidence.round_adds_evidence(&calls);
+                let stale_background_handle_call = no_new_evidence && has_background_handle_call;
+                let is_repeat = exact_repeat
+                    || (no_new_evidence
+                        && (prev_added_no_evidence || stale_background_handle_call));
+                let no_new_after_mutation = is_repeat
+                    && no_new_evidence
+                    && implementation_tracker.mutation_seen
+                    && !stale_background_handle_call;
+                let repeat_budget_available = repeat_nudges < self.config.max_repeat_nudges;
+                let should_skip_for_repeat =
+                    is_repeat && (!no_new_after_mutation || repeat_budget_available);
+                if should_skip_for_repeat {
                     // Record this round's assistant text (the model did emit
                     // something) before nudging, so the history stays coherent.
                     // We deliberately do NOT execute the repeated tool calls, so
@@ -678,10 +884,26 @@ impl crate::Agent {
                     // in a state most providers reject on the next request.
                     self.messages
                         .push_assistant_text_only(std::mem::take(&mut completion.content));
-                    if repeat_nudges < self.config.max_repeat_nudges {
+                    if repeat_budget_available {
                         repeat_nudges += 1;
                         stalled_repeating = true;
-                        let nudge = if should_nudge_read_after_repeated_search(
+                        let nudge = if stale_background_handle_call {
+                            if has_background_output_poll {
+                                ui.status(&format!(
+                                    "the model kept polling stale background process handles — \
+                                     nudging it to stop polling them ({repeat_nudges}/{})",
+                                    self.config.max_repeat_nudges
+                                ));
+                                "The background process handle you just polled is completed, missing, or pruned, so polling it again cannot produce new output. Do not call bash_output for that handle again. Continue from the available output, restart the command if you still need it, or finish with the current result.".to_string()
+                            } else {
+                                ui.status(&format!(
+                                    "the model kept using stale background process handles — \
+                                     nudging it to stop using them ({repeat_nudges}/{})",
+                                    self.config.max_repeat_nudges
+                                ));
+                                "The background process handle you just used is already killed, already exited, missing, or pruned, so calling bash_kill for it again cannot change anything. Do not call bash_kill for that handle again. Continue from the available output, restart the command if you still need it, or finish with the current result.".to_string()
+                            }
+                        } else if should_nudge_read_after_repeated_search(
                             read_only_intent,
                             &evidence,
                         ) {
@@ -689,19 +911,74 @@ impl crate::Agent {
                                     "the model re-ran the same search — nudging it to read a matching file ({repeat_nudges}/{})",
                                     self.config.max_repeat_nudges
                                 ));
-                            READ_AFTER_SEARCH_NUDGE
+                            READ_AFTER_SEARCH_NUDGE.to_string()
+                        } else if implementation_intent.is_some()
+                            && no_new_evidence
+                            && (evidence.saw_read || evidence.saw_search)
+                        {
+                            // Concrete, actionable nudge for implementation tasks:
+                            // name the inspected files and the next plan step (if
+                            // any) so the model has a specific action to take
+                            // instead of a generic "start editing." A strong model
+                            // responds to one concrete nudge; a weak one won't
+                            // respond to any number, so the budget stays tight (2).
+                            // Only fires for no-new-evidence cycles (re-reading
+                            // already-inspected files); exact repeats of non-read
+                            // tools (e.g. re-running a bash command) fall through
+                            // to the generic REPEAT_NUDGE below, which says "don't
+                            // re-run that command" — the right message for that case.
+                            ui.status(&format!(
+                                "the model re-read files it already inspected — their contents are \
+                                 already above; nudging it to act on them ({repeat_nudges}/{})",
+                                self.config.max_repeat_nudges
+                            ));
+                            let paths = inspected_paths_for_prompt(&evidence);
+                            let plan_step = self
+                                .last_plan
+                                .iter()
+                                .find(|s| {
+                                    s.status == PlanStatus::Pending
+                                        || s.status == PlanStatus::Active
+                                })
+                                .map(|s| s.title.as_str());
+                            if let Some(step) = plan_step {
+                                format!(
+                                    "You already inspected these files: {paths}. Their contents are in the conversation above — do not re-read them. \
+Your plan's next step is: \"{step}\". Execute it now with write/edit/multi_edit/apply_patch. \
+Do not read more files first — you have enough context. Act on the next plan step immediately."
+                                )
+                            } else {
+                                format!(
+                                    "You already inspected these files: {paths}. Their contents are in the conversation above — do not re-read them. \
+You have enough context to make progress. Edit one of the inspected files now with write/edit/multi_edit/apply_patch. \
+If the task is already complete, stop and give your final recap."
+                                )
+                            }
+                        } else if no_new_evidence && !exact_repeat {
+                            ui.status(&format!(
+                                "the model re-read files it already inspected — their contents are \
+                                 already above; nudging it to act on them ({repeat_nudges}/{})",
+                                self.config.max_repeat_nudges
+                            ));
+                            REREAD_NUDGE.to_string()
                         } else {
                             ui.status(&format!(
                                 "the model re-ran the same command — its output is already above; \
                                      nudging it to act on it ({repeat_nudges}/{})",
                                 self.config.max_repeat_nudges
                             ));
-                            REPEAT_NUDGE
+                            REPEAT_NUDGE.to_string()
                         };
                         self.messages.push_nudge(NudgeKind::Repeat, nudge);
                         // Keep prev_call_sig as-is so a further repeat is still
                         // detected against the same signature.
                         continue;
+                    }
+                    if stale_background_handle_call {
+                        ui.status(
+                            "background process handles were completed, missing, or pruned (or already killed) and the model kept using them — the task may be incomplete. /retry, or send 'continue'.",
+                        );
+                        break false;
                     }
                     if read_only_intent.is_some()
                         && let Some(insufficient) = insufficient_after_repeated_search(&evidence)
@@ -734,6 +1011,31 @@ impl crate::Agent {
                             .push_assistant(vec![Content::Text(insufficient)]);
                         break false;
                     }
+                    if implementation_intent.is_some()
+                        && (evidence.saw_read || evidence.saw_search)
+                        && !implementation_tracker.mutation_seen
+                    {
+                        // The model inspected the workspace but kept
+                        // re-reading instead of editing, through the whole
+                        // repeat budget. This is the "explore forever, never
+                        // edit" failure mode: report it as
+                        // implementation-incomplete (matching the no-changes
+                        // path) rather than the generic "stuck repeating"
+                        // notice, so the user knows the issue is that no edit
+                        // was made, not that a command failed.
+                        stalled_unfinished = true;
+                        let incomplete = "Implementation incomplete: the model inspected the workspace \
+                        but kept re-reading files instead of making edits, so no file changes were made. \
+                        /retry, or send 'continue' to resume.";
+                        ui.status(
+                            "implementation kept re-reading without editing; no file changes were made",
+                        );
+                        ui.assistant_text(incomplete);
+                        ui.assistant_end();
+                        self.messages
+                            .push_assistant(vec![Content::Text(incomplete.to_string())]);
+                        break false;
+                    }
                     ui.status(
                         "⚠ the model kept re-running the same command without acting on the \
                          result — the task may be incomplete. /retry, or send 'continue'.",
@@ -744,6 +1046,7 @@ impl crate::Agent {
                 // on, so clear any pending repeat-stall state.
                 stalled_repeating = false;
                 prev_call_sig = Some(call_sig);
+                prev_added_no_evidence = no_new_evidence;
 
                 // This round's assistant text, joined and captured before the
                 // content is moved into history. Used both to detect a content-less
@@ -786,6 +1089,7 @@ impl crate::Agent {
                 // its own budget rather than inheriting this one's elevation.
                 empty_retries = 0;
                 protocol_retries = 0;
+                truncation_retries = 0;
 
                 if calls.is_empty() {
                     // Text but no tool call (the content-less case was handled
@@ -814,6 +1118,7 @@ impl crate::Agent {
                         self.messages
                             .push_assistant(std::mem::take(&mut completion.content));
                         silent_continues += 1;
+                        continue_total_nudges += 1;
                         force_tools_next = true;
                         let nudge = if plan_incomplete && !looks_unfinished {
                             PLAN_CONTINUE_NUDGE
@@ -1192,16 +1497,12 @@ impl crate::Agent {
                             .push_assistant(vec![Content::Text(insufficient)]);
                         break false;
                     }
-                    if should_nudge_concrete_review_answer(
-                        read_only_intent,
-                        &evidence,
-                        &assistant_text,
-                    ) {
+                    if let Some(problem) =
+                        concrete_review_answer_problem(read_only_intent, &evidence, &assistant_text)
+                    {
                         if evidence.quality_repair_nudges < 2 {
                             evidence.quality_repair_nudges += 1;
-                            ui.status(
-                                "review answer lacked concrete inspected files; nudging the model to tie findings to evidence",
-                            );
+                            ui.status(problem.status());
                             self.messages
                                 .push_assistant(std::mem::take(&mut completion.content));
                             self.messages
@@ -1210,14 +1511,12 @@ impl crate::Agent {
                         }
 
                         stalled_unfinished = true;
-                        ui.status(
-                            "review answer still lacked concrete inspected files after repair; returning an insufficient-evidence answer",
-                        );
+                        ui.status(problem.exhausted_status());
                         let insufficient = if let Some(intent) = read_only_intent {
                             bounded_review_repair_exhaustion_answer(
                                 intent,
                                 &evidence,
-                                "the final answer did not cite concrete files or modules from the inspected evidence",
+                                problem.reason(),
                             )
                         } else {
                             "Insufficient evidence: the inspected context was not tied to concrete file-specific findings, so I cannot present this as a completed review.".to_string()
@@ -1243,6 +1542,7 @@ impl crate::Agent {
                         && silent_continues < self.config.max_silent_continues
                     {
                         silent_continues += 1;
+                        continue_total_nudges += 1;
                         // Force the next round to actually call a tool, so the
                         // nudge can't be answered with yet another narration or an
                         // empty completion.
@@ -1307,6 +1607,7 @@ impl crate::Agent {
                 let mut results: Vec<Option<(String, String)>> = vec![None; calls.len()];
                 let mut completed = vec![false; calls.len()];
                 let mut completion_order: Vec<usize> = Vec::with_capacity(calls.len());
+                let mut scheduler_forced_skip = false;
                 // Pre-pass: handle `record_decision` calls serially. They mutate
                 // agent state (`self.decisions`) and aren't real tool dispatches,
                 // so they can't run in the parallel `execute` stream (no `&mut
@@ -1366,6 +1667,7 @@ impl crate::Agent {
                                 results[i] = Some((id.clone(), msg));
                                 completed[i] = true;
                                 completion_order.push(i);
+                                done += 1;
                             }
                         }
                         ui.status("⚠ tool call interrupted by user — the model will adapt");
@@ -1376,8 +1678,42 @@ impl crate::Agent {
                         .filter(|&i| !completed[i] && deps[i].iter().all(|&d| completed[d]))
                         .collect();
                     if ready.is_empty() {
-                        // Shouldn't happen (deps point backward) — break to
-                        // avoid spinning if the graph were somehow cyclic.
+                        // Shouldn't happen (deps point backward), but if this
+                        // ever regresses in release builds, do not record an
+                        // assistant tool_use without a visible tool_result/UI
+                        // result for each call. That corrupts the next provider
+                        // request and looks like the model/tool harness stalled.
+                        let unresolved: Vec<usize> =
+                            (0..calls.len()).filter(|&i| !completed[i]).collect();
+                        scheduler_forced_skip = true;
+                        ui.status(
+                            "⚠ tool scheduler could not make progress; marking unresolved calls as skipped",
+                        );
+                        sched_tool_calls += unresolved.len() as u32;
+                        for i in unresolved {
+                            let (id, name, arguments) = &calls[i];
+                            ui.tool_call(name, arguments);
+                            let msg = "Tool scheduler could not make progress; this call was skipped to keep the transcript valid.".to_string();
+                            emit_tool_output(
+                                &mut *ui,
+                                name,
+                                &hi_tools::ToolOutput {
+                                    content: msg.clone(),
+                                    display: None,
+                                    plan: None,
+                                },
+                            );
+                            results[i] = Some((id.clone(), msg));
+                            completed[i] = true;
+                            completion_order.push(i);
+                            done += 1;
+                            tool_timeline.push(ToolCallEntry {
+                                tool: name.clone(),
+                                path: hi_tools::target_path(name, arguments).unwrap_or_default(),
+                                duration_ms: 0,
+                                error: true,
+                            });
+                        }
                         break;
                     }
                     // If any ready call is bash, run it alone (streaming UI).
@@ -1399,13 +1735,7 @@ impl crate::Agent {
                         let duration_ms = started.elapsed().as_millis() as u64;
                         let error = output.content.starts_with("Error:");
                         evidence.record_success(name, arguments, &output.content);
-                        if implementation_intent.is_some() {
-                            implementation_tracker.record_tool_result(
-                                name,
-                                arguments,
-                                &output.content,
-                            );
-                        }
+                        implementation_tracker.record_tool_result(name, arguments, &output.content);
                         tool_timeline.push(ToolCallEntry {
                             tool: name.clone(),
                             path,
@@ -1429,6 +1759,7 @@ impl crate::Agent {
                     // batch, relative order doesn't matter — none depend on
                     // each other, or they wouldn't all be ready).
                     let batch_size = ready.len() as u32;
+                    let actual_concurrency = ready.len().min(max_parallel_tools) as u32;
                     // Signal each call as started so the live TUI can show a
                     // "running {tool}" timer. The transcript header is emitted
                     // later, paired with its result, so headers and results
@@ -1472,16 +1803,16 @@ impl crate::Agent {
                     let outputs: Vec<_> = futures_util::stream::iter(
                         approved.iter().map(|&i| execute(&calls[i].1, &calls[i].2)),
                     )
-                    .buffered(self.config.max_parallel_tools)
+                    .buffered(max_parallel_tools)
                     .collect()
                     .await;
                     let batch_duration_ms = batch_started.elapsed().as_millis() as u64;
-                    // Scheduler telemetry: this batch ran `batch_size` calls
-                    // concurrently; a batch of 1 is a serial run.
+                    // Scheduler telemetry: count every call in the ready batch,
+                    // but report actual concurrency after the configured cap.
                     sched_tool_calls += batch_size;
-                    sched_max_concurrent = sched_max_concurrent.max(batch_size);
-                    if batch_size == 1 {
-                        sched_serial_runs += 1;
+                    sched_max_concurrent = sched_max_concurrent.max(actual_concurrency);
+                    if actual_concurrency == 1 {
+                        sched_serial_runs += batch_size;
                     }
                     // Handle denied calls first: emit their headers and "skipped" results.
                     for &i in &denied {
@@ -1501,6 +1832,7 @@ impl crate::Agent {
                         self.invalidate_snapshot();
                         completed[i] = true;
                         completion_order.push(i);
+                        done += 1;
                     }
                     for (&i, output) in approved.iter().zip(outputs) {
                         let name = &calls[i].1;
@@ -1511,13 +1843,11 @@ impl crate::Agent {
                         let path = hi_tools::target_path(name, &calls[i].2).unwrap_or_default();
                         let error = output.content.starts_with("Error:");
                         evidence.record_success(name, &calls[i].2, &output.content);
-                        if implementation_intent.is_some() {
-                            implementation_tracker.record_tool_result(
-                                name,
-                                &calls[i].2,
-                                &output.content,
-                            );
-                        }
+                        implementation_tracker.record_tool_result(
+                            name,
+                            &calls[i].2,
+                            &output.content,
+                        );
                         tool_timeline.push(ToolCallEntry {
                             tool: name.clone(),
                             path,
@@ -1573,11 +1903,16 @@ impl crate::Agent {
                         done += 1;
                     }
                 }
+                debug_assert_eq!(
+                    done,
+                    calls.len(),
+                    "tool scheduler must account for every call"
+                );
                 // The completion order must respect the dep graph — a real
                 // guarantee now (the scheduler only runs a call after its deps),
                 // not just an emission-order coincidence.
                 debug_assert!(
-                    respects_deps(&deps, &completion_order),
+                    scheduler_forced_skip || respects_deps(&deps, &completion_order),
                     "scheduler completion must respect inferred tool deps: {:?} vs {:?}",
                     deps,
                     completion_order
@@ -1628,7 +1963,15 @@ impl crate::Agent {
                 }
             }
             match outcome {
-                VerifyOutcome::NotRun => break 'turn,
+                VerifyOutcome::NotRun => {
+                    if self.last_verify == Some(false) {
+                        stalled_unfinished = true;
+                        ui.status(
+                            "verification still failed after the retry budget; the task may be incomplete. /retry, or send 'continue'.",
+                        );
+                    }
+                    break 'turn;
+                }
                 VerifyOutcome::SkippedNoChanges { first } => {
                     if first {
                         ui.status("verification skipped — no files changed this turn");
@@ -1717,30 +2060,22 @@ impl crate::Agent {
         // telemetry so `--report` / the eval harness can diagnose the turn's
         // trajectory: how many verify rounds, recovery retries, nudges fired,
         // and where the last verify failure pointed.
-        self.last_turn_telemetry = TurnTelemetry {
-            verify_rounds: verifier.round(),
-            recovery_retries: empty_retries,
+        self.last_turn_telemetry = build_turn_telemetry(
+            verifier.round(),
+            empty_retries,
             repeat_nudges,
-            continue_nudges: 0,
-            truncation_retries,
-            hit_step_cap: ended_at_cap,
+            continue_total_nudges,
+            truncation_total_retries,
+            ended_at_cap,
             stalled_unfinished,
             stalled_repeating,
-            verify_attributions: last_verify_attributions
-                .iter()
-                .map(TurnAttribution::from)
-                .collect(),
-            tool_calls: sched_tool_calls,
-            max_concurrent_batch: sched_max_concurrent,
-            serial_runs: sched_serial_runs,
-            tool_timeline,
-            file_reads: evidence.file_reads,
-            targeted_searches: evidence.targeted_searches,
-            listing_only: evidence.listing_only(),
-            first_tool_kind: evidence.first_tool_kind().to_string(),
-            discovery_depth: evidence.discovery_depth().to_string(),
-            quality_repair_nudges: evidence.quality_repair_nudges,
-        };
+            &last_verify_attributions,
+            sched_tool_calls,
+            sched_max_concurrent,
+            sched_serial_runs,
+            &tool_timeline,
+            &evidence,
+        );
 
         // Long-horizon driver: when a structured goal is set and long_horizon
         // is on, advance or retry the active sub-goal based on this turn's

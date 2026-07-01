@@ -3,6 +3,7 @@
 //! (the per-event state machine that routes crossterm events to `App`).
 
 use std::io;
+use std::io::IsTerminal;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -26,9 +27,8 @@ use crate::model_picker::ModelPicker;
 use crate::provider_form;
 use crate::render::dim;
 use crate::{
-    App, TICK, ProfileInfo, ProfileLoader, ProfileRemover,
-    ProfileResolver, ProfileSaver, TurnState, apply_metadata,
-    splash_lines, watchdog_stuck_timeout,
+    App, ProfileInfo, ProfileLoader, ProfileRemover, ProfileResolver, ProfileSaver, TICK,
+    TurnState, apply_metadata, splash_lines, watchdog_stuck_timeout,
 };
 
 /// Run the full-screen TUI until the user quits. `history_path`, if given, is
@@ -54,7 +54,14 @@ pub async fn run(
     mcp_url: Option<String>,
     api_key: String,
 ) -> Result<()> {
+    if !io::stdin().is_terminal() {
+        anyhow::bail!("TUI requires an interactive stdin");
+    }
+
     enable_raw_mode().context("entering raw mode")?;
+    // Install immediately after raw mode so any later startup error restores
+    // the terminal before main falls back to plain mode.
+    let _restore = Restore;
     execute!(io::stdout(), EnterAlternateScreen).context("entering alternate screen")?;
     // Bracketed paste: the terminal wraps a paste so it arrives as one
     // Event::Paste instead of per-line Enter keys (which would submit each line).
@@ -66,7 +73,6 @@ pub async fn run(
     // us (enabling in-app scroll) but the terminal would then stop doing native
     // click-drag selection, breaking copy/paste. Native selection wins; scroll
     // with PageUp/PageDown.
-    let _restore = Restore;
     let mut terminal =
         Terminal::new(CrosstermBackend::new(io::stdout())).context("creating terminal")?;
 
@@ -133,7 +139,7 @@ pub async fn run(
         }
         app.push(Line::styled(
             format!(
-                "Enter to send · Alt-Enter for a newline · Ctrl-C interrupts · Ctrl-T shows reasoning · Ctrl-D toggles diff · /help for all commands{ctx}.",
+                "Enter to send · Alt-Enter for a newline · Ctrl-C interrupts/double exits · Ctrl-T shows reasoning · Ctrl-D toggles diff · /help for all commands{ctx}.",
             ),
             dim(),
         ));
@@ -174,7 +180,10 @@ pub async fn run(
             terminal.draw(|f| app.render(f))?;
             tokio::select! {
                 maybe = input_rx.recv() => {
-                    first_event = maybe;
+                    let Some(event) = maybe else {
+                        return Ok(());
+                    };
+                    first_event = Some(event);
                     break;
                 }
                 _ = ticker.tick() => {
@@ -222,9 +231,7 @@ pub async fn run(
                         } else {
                             input_rx.recv().await
                         };
-                        let Some(event) = event else {
-                            break 'session; // input channel closed (stdin gone)
-                        };
+                        let Some(event) = event else { break 'session };
                         event
                     }
                 };
@@ -391,7 +398,6 @@ pub async fn run(
                             app.history_search = Some(search);
                         }
                         match key.code {
-                            KeyCode::Char('d') if ctrl && app.input.is_empty() => break 'session,
                             // Double Ctrl-C to exit: the first press (when idle
                             // with empty input) arms a transient notice; the
                             // second while the notice is active quits. With
@@ -406,8 +412,17 @@ pub async fn run(
                                     Some(Instant::now() + Duration::from_millis(1800));
                             }
                             KeyCode::Char('c') if ctrl => app.input.clear(),
-                            KeyCode::Esc if app.input.is_empty() => break 'session,
-                            KeyCode::Esc => app.input.clear(),
+                            KeyCode::Esc => {
+                                app.quit_notice = None;
+                                if app.show_help {
+                                    app.show_help = false;
+                                } else if app.show_diff {
+                                    app.show_diff = false;
+                                    app.diff_text = None;
+                                } else {
+                                    app.input.clear();
+                                }
+                            }
                             _ => {
                                 // Any other key dismisses a pending quit notice.
                                 app.quit_notice = None;
@@ -458,31 +473,42 @@ pub async fn run(
                     app.follow();
                     continue;
                 }
-                Command::Retry => match app.last_prompt.clone() {
-                    Some(prompt) => {
-                        agent.truncate_messages(app.last_turn_start);
-                        let note = match app.last_turn_state {
-                            TurnState::Warning(_) => {
-                                if app.last_turn_had_file_edits {
-                                    "retrying from the last safe message checkpoint; file edits already made stay in the working tree and may be replayed if the model repeats them"
-                                } else {
-                                    "retrying from the last safe message checkpoint; no file edits were recorded in the last turn"
+                Command::Retry => {
+                    match (app.last_prompt.clone(), app.last_turn_snapshot.as_ref()) {
+                        (Some(prompt), Some(snapshot)) => {
+                            if let Err(err) =
+                                agent.rewind_to_snapshot_durable(app.last_turn_start, snapshot)
+                            {
+                                app.push(Line::styled(
+                                    format!("retry failed: {err:#}"),
+                                    Style::default().fg(Color::Yellow),
+                                ));
+                                app.follow();
+                                continue;
+                            }
+                            let note = match app.last_turn_state {
+                                TurnState::Warning(_) => {
+                                    if app.last_turn_had_file_edits {
+                                        "retrying from the last safe message checkpoint; file edits already made stay in the working tree and may be replayed if the model repeats them"
+                                    } else {
+                                        "retrying from the last safe message checkpoint; no file edits were recorded in the last turn"
+                                    }
                                 }
-                            }
-                            TurnState::Failed(_) => {
-                                "retrying after failure from the last safe message checkpoint"
-                            }
-                            _ => "retrying from the last safe message checkpoint",
-                        };
-                        app.push(Line::styled(note.to_string(), dim()));
-                        app.push(Line::styled(format!("retrying: {prompt}"), dim()));
-                        prompt
+                                TurnState::Failed(_) => {
+                                    "retrying after failure from the last safe message checkpoint"
+                                }
+                                _ => "retrying from the last safe message checkpoint",
+                            };
+                            app.push(Line::styled(note.to_string(), dim()));
+                            app.push(Line::styled(format!("retrying: {prompt}"), dim()));
+                            prompt
+                        }
+                        _ => {
+                            app.push(Line::styled("nothing to retry yet".to_string(), dim()));
+                            continue;
+                        }
                     }
-                    None => {
-                        app.push(Line::styled("nothing to retry yet".to_string(), dim()));
-                        continue;
-                    }
-                },
+                }
                 Command::Edit => {
                     // Load the last user prompt into the input line for editing.
                     // Unlike /retry, this doesn't submit — the user edits and
@@ -543,16 +569,18 @@ pub async fn run(
                                 result = &mut fut => { fetched = Some(result); break; }
                                 _ = ticker.tick() => app.spinner = app.spinner.wrapping_add(1),
                                 maybe = input_rx.recv() => {
-                                    if let Some(Event::Key(key)) = maybe
-                                        && key.kind == KeyEventKind::Press
-                                    {
-                                        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                                        if matches!(key.code, KeyCode::Esc)
-                                            || (ctrl && matches!(key.code, KeyCode::Char('c')))
-                                        {
-                                            cancelled = true;
-                                            break;
+                                    match maybe {
+                                        Some(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                                            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                                            if matches!(key.code, KeyCode::Esc)
+                                                || (ctrl && matches!(key.code, KeyCode::Char('c')))
+                                            {
+                                                cancelled = true;
+                                                break;
+                                            }
                                         }
+                                        Some(_) => {}
+                                        None => return Ok(()),
                                     }
                                 }
                             }
@@ -761,16 +789,18 @@ pub async fn run(
                                         result = &mut fut => { fetched = Some(result); break; }
                                         _ = ticker.tick() => app.spinner = app.spinner.wrapping_add(1),
                                         maybe = input_rx.recv() => {
-                                            if let Some(Event::Key(key)) = maybe
-                                                && key.kind == KeyEventKind::Press
-                                            {
-                                                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                                                if matches!(key.code, KeyCode::Esc)
-                                                    || (ctrl && matches!(key.code, KeyCode::Char('c')))
-                                                {
-                                                    cancelled = true;
-                                                    break;
+                                            match maybe {
+                                                Some(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                                                    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                                                    if matches!(key.code, KeyCode::Esc)
+                                                        || (ctrl && matches!(key.code, KeyCode::Char('c')))
+                                                    {
+                                                        cancelled = true;
+                                                        break;
+                                                    }
                                                 }
+                                                Some(_) => {}
+                                                None => return Ok(()),
                                             }
                                         }
                                     }
@@ -841,6 +871,8 @@ pub async fn run(
         let checkpoint = agent.messages().len();
         app.last_turn_start = checkpoint;
         app.last_prompt = Some(run_line.clone());
+        let turn_snapshot = agent.state_snapshot();
+        app.last_turn_snapshot = Some(turn_snapshot.clone());
         // Reset the per-turn tool-call counter for the observability panel.
         app.turn_tool_calls = 0;
         app.turn_rounds = 0;
@@ -848,6 +880,7 @@ pub async fn run(
         app.interrupt = Some(agent.interrupt_handle());
         let (tx, rx) = mpsc::unbounded_channel();
         let mut sink = ChannelUi { tx };
+        let background_before = hi_tools::background_process_ids();
         let cancelled = {
             let fut = agent.run_turn(&run_line, &mut sink);
             drive(
@@ -863,7 +896,15 @@ pub async fn run(
         };
 
         if cancelled {
-            agent.truncate_messages(checkpoint);
+            if let Err(err) = agent.rewind_to_snapshot_durable(checkpoint, &turn_snapshot) {
+                app.push(Line::styled(
+                    format!("couldn't persist interrupted turn discard: {err:#}"),
+                    Style::default().fg(Color::Yellow),
+                ));
+                agent.truncate_messages(checkpoint);
+                agent.restore_state_snapshot(&turn_snapshot);
+            }
+            let killed = hi_tools::kill_background_processes_started_after(&background_before);
             app.last_turn_state = TurnState::Cancelled;
             let dropped = app.queue.len();
             app.queue.clear();
@@ -871,6 +912,11 @@ pub async fn run(
                 format!("^C interrupted; turn discarded ({dropped} queued command(s) dropped)")
             } else {
                 "^C interrupted; turn discarded".to_string()
+            };
+            let msg = if killed > 0 {
+                format!("{msg}; killed {killed} background process(es) started by it")
+            } else {
+                msg
             };
             app.push(Line::styled(msg, Style::default().fg(Color::Yellow)));
         } else {
@@ -1031,6 +1077,10 @@ async fn drive(
                     }
                     Some(Event::FocusGained) => app.set_focus(true),
                     Some(Event::FocusLost) => app.set_focus(false),
+                    None => {
+                        cancelled = true;
+                        break;
+                    }
                     _ => {}
                 }
             }
@@ -1039,4 +1089,3 @@ async fn drive(
     app.waiting_for = None;
     Ok(cancelled)
 }
-

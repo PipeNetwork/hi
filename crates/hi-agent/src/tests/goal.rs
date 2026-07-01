@@ -1,5 +1,94 @@
-use super::*;
 use super::common::*;
+use super::*;
+use std::sync::Arc;
+
+type CompactionRecords = Arc<Mutex<Vec<Vec<Message>>>>;
+
+struct CompactionRecordingSession {
+    records: CompactionRecords,
+}
+
+impl SessionSink for CompactionRecordingSession {
+    fn record(
+        &mut self,
+        _messages: &[Message],
+        _usage: Usage,
+        _cost_usd: Option<f64>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn record_compaction(&mut self, messages: &[Message]) -> anyhow::Result<()> {
+        self.records.lock().unwrap().push(messages.to_vec());
+        Ok(())
+    }
+}
+
+struct FailingCompactionSession;
+
+impl SessionSink for FailingCompactionSession {
+    fn record(
+        &mut self,
+        _messages: &[Message],
+        _usage: Usage,
+        _cost_usd: Option<f64>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn record_compaction(&mut self, _messages: &[Message]) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("disk full"))
+    }
+}
+
+struct FailingGoalSession;
+
+impl SessionSink for FailingGoalSession {
+    fn record(
+        &mut self,
+        _messages: &[Message],
+        _usage: Usage,
+        _cost_usd: Option<f64>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn record_compaction(&mut self, _messages: &[Message]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn record_goal(&mut self, _goal: &Goal) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("disk full"))
+    }
+
+    fn clear_goal(&mut self) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("disk full"))
+    }
+}
+
+struct GoalClearingSession {
+    clears: Arc<Mutex<usize>>,
+}
+
+impl SessionSink for GoalClearingSession {
+    fn record(
+        &mut self,
+        _messages: &[Message],
+        _usage: Usage,
+        _cost_usd: Option<f64>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn record_compaction(&mut self, _messages: &[Message]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn clear_goal(&mut self) -> anyhow::Result<()> {
+        *self.clears.lock().unwrap() += 1;
+        Ok(())
+    }
+}
 
 #[test]
 fn goal_updates_system_prompt_and_clear_history_keeps_it() {
@@ -19,7 +108,7 @@ fn goal_updates_system_prompt_and_clear_history_keeps_it() {
     );
 
     agent.messages_mut().push(Message::user("noise"));
-    agent.clear_history();
+    agent.clear_history().unwrap();
     assert_eq!(agent.messages().len(), 1);
     assert!(
         agent.messages()[0].text().contains("ship a stable TUI"),
@@ -36,6 +125,143 @@ fn goal_updates_system_prompt_and_clear_history_keeps_it() {
     );
 }
 
+#[test]
+fn clear_history_records_durable_compaction_boundary() {
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = agent(vec![], config());
+    agent.messages_mut().push(Message::user("old context"));
+    agent.set_session(Box::new(CompactionRecordingSession {
+        records: records.clone(),
+    }));
+
+    agent.clear_history().unwrap();
+
+    assert_eq!(agent.messages().len(), 1);
+    let records = records.lock().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].len(), 1);
+    assert_eq!(records[0][0].role, Role::System);
+    assert_eq!(records[0][0].text(), agent.messages()[0].text());
+}
+
+#[test]
+fn clear_history_keeps_visible_history_when_persistence_fails() {
+    let mut agent = agent(vec![], config());
+    agent.messages_mut().push(Message::user("old context"));
+    agent.set_session(Box::new(FailingCompactionSession));
+
+    let err = agent.clear_history().unwrap_err();
+
+    assert!(err.to_string().contains("disk full"));
+    assert_eq!(agent.messages().len(), 2);
+    assert_eq!(agent.messages()[1].text(), "old context");
+}
+
+#[test]
+fn structured_goal_set_keeps_visible_state_when_persistence_fails() {
+    let mut cfg = config();
+    cfg.long_horizon = true;
+    let mut agent = agent(vec![], cfg);
+    agent.set_session(Box::new(FailingGoalSession));
+
+    let err = agent
+        .set_structured_goal(Some(Goal::new("ship it", vec!["ship it".into()])))
+        .unwrap_err();
+
+    assert!(err.to_string().contains("disk full"));
+    assert!(agent.structured_goal().is_none());
+    assert!(
+        !agent.messages()[0].text().contains("Long-horizon goal"),
+        "system prompt should not show an unpersisted goal"
+    );
+}
+
+#[test]
+fn structured_goal_clear_keeps_visible_state_when_persistence_fails() {
+    let mut cfg = config();
+    cfg.long_horizon = true;
+    let mut agent = agent(vec![], cfg);
+    agent
+        .set_structured_goal(Some(Goal::new("ship it", vec!["ship it".into()])))
+        .unwrap();
+    agent.set_session(Box::new(FailingGoalSession));
+
+    let err = agent.set_structured_goal(None).unwrap_err();
+
+    assert!(err.to_string().contains("disk full"));
+    assert!(agent.structured_goal().is_some());
+    assert!(
+        agent.messages()[0].text().contains("ship it"),
+        "system prompt should keep the still-active goal"
+    );
+}
+
+#[test]
+fn structured_goal_clear_records_marker_even_when_long_horizon_is_off() {
+    let persisted_goal = Goal::new("old durable goal", vec!["old durable goal".into()]);
+    let history = vec![Message::system("old prompt")];
+    let cfg = config();
+    let mut agent = resumed_agent(history, Usage::default(), None, Some(persisted_goal), cfg);
+    assert!(
+        agent.structured_goal().is_none(),
+        "long-horizon-off resume intentionally hides structured goal"
+    );
+    let clears = Arc::new(Mutex::new(0));
+    agent.set_session(Box::new(GoalClearingSession {
+        clears: clears.clone(),
+    }));
+
+    agent.set_structured_goal(None).unwrap();
+
+    assert_eq!(
+        *clears.lock().unwrap(),
+        1,
+        "clear should write a goal_cleared marker even when no goal is visible"
+    );
+}
+
+#[test]
+fn transient_goal_set_clears_hidden_persisted_structured_goal() {
+    let persisted_goal = Goal::new("old durable goal", vec!["old durable goal".into()]);
+    let history = vec![Message::system("old prompt")];
+    let cfg = config();
+    let mut agent = resumed_agent(history, Usage::default(), None, Some(persisted_goal), cfg);
+    let clears = Arc::new(Mutex::new(0));
+    agent.set_session(Box::new(GoalClearingSession {
+        clears: clears.clone(),
+    }));
+
+    agent
+        .set_transient_goal(Some("new transient goal".into()))
+        .unwrap();
+
+    assert_eq!(
+        *clears.lock().unwrap(),
+        1,
+        "setting a plain goal should tombstone any hidden durable structured goal"
+    );
+    assert_eq!(agent.goal(), Some("new transient goal"));
+    assert!(agent.structured_goal().is_none());
+    assert!(agent.messages()[0].text().contains("new transient goal"));
+    assert!(!agent.messages()[0].text().contains("old durable goal"));
+}
+
+#[test]
+fn transient_goal_set_keeps_visible_state_when_hidden_goal_clear_fails() {
+    let persisted_goal = Goal::new("old durable goal", vec!["old durable goal".into()]);
+    let history = vec![Message::system("old prompt")];
+    let cfg = config();
+    let mut agent = resumed_agent(history, Usage::default(), None, Some(persisted_goal), cfg);
+    agent.set_session(Box::new(FailingGoalSession));
+
+    let err = agent
+        .set_transient_goal(Some("new transient goal".into()))
+        .unwrap_err();
+
+    assert!(err.to_string().contains("disk full"));
+    assert!(agent.goal().is_none());
+    assert!(!agent.messages()[0].text().contains("new transient goal"));
+}
 
 #[tokio::test]
 async fn structured_goal_state_injected_into_system_prompt_when_long_horizon_on() {
@@ -55,7 +281,7 @@ async fn structured_goal_state_injected_into_system_prompt_when_long_horizon_on(
     // Record a failed attempt so the prompt surfaces "don't repeat" notes.
     goal.record_failure("approach A didn't compile", DEFAULT_SUBGOAL_RETRIES);
     assert!(
-        agent.set_structured_goal(Some(goal)),
+        agent.set_structured_goal(Some(goal)).unwrap(),
         "accepted when long_horizon on"
     );
 
@@ -69,11 +295,50 @@ async fn structured_goal_state_injected_into_system_prompt_when_long_horizon_on(
     );
 
     // Clearing the goal removes the section.
-    agent.set_structured_goal(None);
+    agent.set_structured_goal(None).unwrap();
     let sys_after = agent.messages()[0].text();
     assert!(
         !sys_after.contains("Long-horizon goal"),
         "goal section cleared: {sys_after}"
+    );
+}
+
+#[test]
+fn resume_restores_structured_goal_and_rebuilds_system_prompt() {
+    let mut cfg = config();
+    cfg.long_horizon = true;
+    let mut goal = Goal::new(
+        "ship resumed parser",
+        vec!["write tests".into(), "merge parser".into()],
+    );
+    goal.advance();
+    let history = vec![
+        Message::system("old prompt\n\n[Long-horizon goal]\nstale objective\nstale step"),
+        Message::user("previous request"),
+    ];
+
+    let agent = resumed_agent(history, Usage::default(), Some(0.42), Some(goal), cfg);
+
+    let sys = agent.messages()[0].text();
+    assert!(
+        agent.structured_goal().is_some(),
+        "structured goal restored"
+    );
+    assert!(
+        sys.contains("Long-horizon goal"),
+        "goal section restored: {sys}"
+    );
+    assert!(
+        sys.contains("ship resumed parser"),
+        "objective restored: {sys}"
+    );
+    assert!(
+        sys.contains("merge parser"),
+        "active sub-goal restored: {sys}"
+    );
+    assert!(
+        !sys.contains("stale objective") && !sys.contains("stale step"),
+        "resume should rebuild the system prompt from loaded metadata, not keep stale saved goal text: {sys}"
     );
 }
 
@@ -87,7 +352,10 @@ async fn structured_goal_rejected_when_long_horizon_off() {
         config(),
     );
     let goal = Goal::new("do a thing", vec!["step one".into()]);
-    assert!(!agent.set_structured_goal(Some(goal)), "rejected when off");
+    assert!(
+        !agent.set_structured_goal(Some(goal)).unwrap(),
+        "rejected when off"
+    );
     assert!(agent.structured_goal().is_none());
     let sys = agent.messages()[0].text();
     assert!(
@@ -113,10 +381,12 @@ async fn long_horizon_driver_advances_on_clean_turn() {
         completion(vec![Content::Text("done".into())], 1, 1),
     ];
     let mut agent = agent(responses, cfg);
-    agent.set_structured_goal(Some(Goal::new(
-        "refactor",
-        vec!["step one".into(), "step two".into()],
-    )));
+    agent
+        .set_structured_goal(Some(Goal::new(
+            "refactor",
+            vec!["step one".into(), "step two".into()],
+        )))
+        .unwrap();
     let mut ui = RecUi::default();
     agent.run_turn("go", &mut ui).await.unwrap();
     let _ = std::fs::remove_file(&tmp);
@@ -151,10 +421,12 @@ async fn long_horizon_driver_records_failure_on_stall() {
         write_completion("lhstall"),
     ];
     let mut agent = agent(responses, cfg);
-    agent.set_structured_goal(Some(Goal::new(
-        "refactor",
-        vec!["step one".into(), "step two".into()],
-    )));
+    agent
+        .set_structured_goal(Some(Goal::new(
+            "refactor",
+            vec!["step one".into(), "step two".into()],
+        )))
+        .unwrap();
     let mut ui = RecUi::default();
     agent.run_turn("go", &mut ui).await.unwrap();
     let _ = std::fs::remove_file("lhstall");
@@ -181,3 +453,104 @@ async fn long_horizon_driver_records_failure_on_stall() {
     );
 }
 
+#[tokio::test]
+async fn long_horizon_driver_records_failure_on_unfinished_turn() {
+    // A turn can be unfinished without being an exact repeat stall, for example
+    // when an implementation task only scaffolds setup and never edits source.
+    // That should count as a failed attempt on the active sub-goal, not advance
+    // as a clean changed-files turn.
+    let dir = temp_file("lh-unfinished-scaffold");
+    let dir_string = dir.to_string_lossy().to_string();
+
+    let mut cfg = config();
+    cfg.long_horizon = true;
+    let responses = vec![
+        bash_completion(&format!("mkdir -p {dir_string}")),
+        completion(vec![Content::Text("Implemented it.".into())], 1, 1),
+        completion(vec![Content::Text("Done.".into())], 1, 1),
+        completion(vec![Content::Text("Final recap.".into())], 1, 1),
+    ];
+    let mut agent = agent(responses, cfg);
+    agent
+        .set_structured_goal(Some(Goal::new(
+            "build estimator",
+            vec!["implement estimator".into(), "validate estimator".into()],
+        )))
+        .unwrap();
+    let mut ui = RecUi::default();
+
+    agent
+        .run_turn("build a small CLI GPU training time estimator", &mut ui)
+        .await
+        .unwrap();
+
+    let _ = std::fs::remove_dir_all(&dir);
+    let goal = agent.structured_goal().expect("goal still set");
+    assert_eq!(
+        goal.active_index(),
+        Some(0),
+        "unfinished turn did not advance"
+    );
+    assert!(
+        goal.sub_goals[0].attempts > 0,
+        "unfinished turn should record an attempt: {:?}",
+        goal.sub_goals[0]
+    );
+    assert!(
+        goal.sub_goals[0]
+            .notes
+            .iter()
+            .any(|note| note.contains("without completing")),
+        "unfinished reason recorded: {:?}",
+        goal.sub_goals[0].notes
+    );
+    assert!(
+        agent.messages()[0].text().contains("don't repeat these"),
+        "retry notes in system prompt"
+    );
+}
+
+#[tokio::test]
+async fn long_horizon_driver_records_verify_failure_reason_after_exhaustion() {
+    let _guard = VERIFY_TEST_LOCK.lock().await;
+    let tmp = temp_file("lh-verify-failure");
+    let p = tmp.to_string_lossy().to_string();
+
+    let mut cfg = config();
+    cfg.long_horizon = true;
+    cfg.verify = vec![VerifyStage::new("test", "false")];
+    cfg.max_verify_iterations = 1;
+    let responses = vec![
+        write_completion(&p),
+        completion(vec![Content::Text("attempt 1".into())], 1, 1),
+        completion(vec![Content::Text("attempt 2".into())], 1, 1),
+    ];
+    let mut agent = agent(responses, cfg);
+    agent
+        .set_structured_goal(Some(Goal::new(
+            "ship parser",
+            vec!["make parser pass tests".into(), "cleanup".into()],
+        )))
+        .unwrap();
+
+    let mut ui = RecUi::default();
+    agent.run_turn("go", &mut ui).await.unwrap();
+    let _ = std::fs::remove_file(&tmp);
+
+    assert_eq!(agent.last_verify(), Some(false));
+    assert!(agent.last_turn_telemetry().stalled_unfinished);
+    let goal = agent.structured_goal().expect("goal still set");
+    assert_eq!(
+        goal.active_index(),
+        Some(0),
+        "verify failure did not advance"
+    );
+    assert!(
+        goal.sub_goals[0]
+            .notes
+            .iter()
+            .any(|note| note.contains("verification failed")),
+        "verify failure reason recorded: {:?}",
+        goal.sub_goals[0].notes
+    );
+}

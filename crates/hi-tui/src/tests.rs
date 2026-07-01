@@ -1,1424 +1,1461 @@
-    use super::*;
-    use ratatui::backend::TestBackend;
+use super::*;
+use ratatui::backend::TestBackend;
 
-    fn dump(term: &Terminal<TestBackend>) -> String {
-        let buf = term.backend().buffer();
-        let mut out = String::new();
-        for y in 0..buf.area.height {
-            for x in 0..buf.area.width {
-                out.push_str(buf[(x, y)].symbol());
-            }
-            out.push('\n');
+fn dump(term: &Terminal<TestBackend>) -> String {
+    let buf = term.backend().buffer();
+    let mut out = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            out.push_str(buf[(x, y)].symbol());
         }
-        out
+        out.push('\n');
     }
+    out
+}
 
-    /// A no-op resolver for tests — `/provider` isn't exercised in unit tests.
-    fn test_resolver() -> ProfileResolver {
-        Box::new(|_name| anyhow::bail!("no profiles in tests"))
+/// A no-op resolver for tests — `/provider` isn't exercised in unit tests.
+fn test_resolver() -> ProfileResolver {
+    Box::new(|_name| anyhow::bail!("no profiles in tests"))
+}
+
+fn test_saver() -> ProfileSaver {
+    Box::new(|_form| anyhow::bail!("no profiles in tests"))
+}
+
+fn test_loader() -> ProfileLoader {
+    Box::new(|_name| anyhow::bail!("no profiles in tests"))
+}
+
+fn test_remover() -> ProfileRemover {
+    Box::new(|_name| anyhow::bail!("no profiles in tests"))
+}
+
+/// `App::new` with empty profiles and dummy callbacks, for tests.
+fn test_app(provider: &str, model: &str) -> App {
+    App::new(
+        provider,
+        model,
+        Vec::new(),
+        None,
+        test_resolver(),
+        test_saver(),
+        test_loader(),
+        test_remover(),
+        None,
+        String::new(),
+    )
+}
+
+#[test]
+fn sticky_scroll_unpins_on_scroll_up_and_repins_at_bottom() {
+    let mut app = test_app("openai", "gpt-4o");
+    // Simulate what render() caches for a transcript taller than the viewport.
+    app.view_max_scroll = 100;
+    app.view_total = 120;
+    assert!(app.following, "starts pinned to the bottom");
+
+    // Scrolling up unpins, holds an absolute offset, and snapshots the count.
+    app.scroll_up(10);
+    assert!(!app.following, "scroll up unpins");
+    assert_eq!(app.scroll, 90, "offset = max_scroll - 10");
+    assert_eq!(app.total_when_unpinned, 120);
+
+    // Streaming output below must NOT yank a scrolled-up reader back down.
+    app.apply(UiEvent::Text("a fresh streamed line\n".into()));
+    assert!(
+        !app.following,
+        "new output leaves the scrolled-up reader put"
+    );
+
+    // Scrolling back past the bottom re-pins so output follows again.
+    app.scroll_down(1000);
+    assert!(app.following, "reaching the bottom re-pins");
+}
+
+#[test]
+fn transcript_is_capped_while_following_but_not_while_scrolled_up() {
+    let mut app = test_app("openai", "gpt-4o");
+    // Following (the default): pushing far past the cap keeps it bounded, and
+    // keeps the newest lines (the oldest scroll off the top).
+    for i in 0..(MAX_TRANSCRIPT_LINES + 5_000) {
+        app.push(Line::raw(format!("l{i}")));
     }
+    assert_eq!(
+        app.transcript.len(),
+        MAX_TRANSCRIPT_LINES,
+        "bounded while following"
+    );
+    assert_eq!(
+        app.transcript.last().unwrap().text(),
+        format!("l{}", MAX_TRANSCRIPT_LINES + 5_000 - 1),
+        "newest line kept"
+    );
 
-    fn test_saver() -> ProfileSaver {
-        Box::new(|_form| anyhow::bail!("no profiles in tests"))
+    // Scrolled up: pushes are NOT trimmed, or the offsets would shift under a
+    // reader. (render caches the geometry scroll_up needs.)
+    app.view_max_scroll = 50;
+    app.view_total = 60;
+    app.scroll_up(5);
+    assert!(!app.following, "scrolled up");
+    let before = app.transcript.len();
+    for i in 0..1_000 {
+        app.push(Line::raw(format!("m{i}")));
     }
+    assert_eq!(
+        app.transcript.len(),
+        before + 1_000,
+        "grows while scrolled up, no trim"
+    );
+}
 
-    fn test_loader() -> ProfileLoader {
-        Box::new(|_name| anyhow::bail!("no profiles in tests"))
+#[test]
+fn scrolling_moves_the_viewport_through_render_and_repins() {
+    let mut app = test_app("openai", "gpt-4o");
+    for i in 0..100 {
+        app.push(Line::raw(format!("line {i:03}")));
     }
+    let mut term = Terminal::new(TestBackend::new(40, 12)).unwrap();
+    // Following: the bottom is visible, the top is not.
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(
+        screen.contains("line 099"),
+        "bottom visible when following:\n{screen}"
+    );
+    assert!(
+        !screen.contains("line 000"),
+        "top hidden when following:\n{screen}"
+    );
 
-    fn test_remover() -> ProfileRemover {
-        Box::new(|_name| anyhow::bail!("no profiles in tests"))
+    // Scroll up: earlier lines appear, the bottom leaves the viewport.
+    app.scroll_up(40);
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(!app.following, "scroll up unpins");
+    assert!(
+        !screen.contains("line 099"),
+        "bottom gone after scroll up:\n{screen}"
+    );
+    assert!(
+        screen.contains("line 0"),
+        "older lines now visible:\n{screen}"
+    );
+
+    // Scroll back down past the end: re-pins and shows the bottom again.
+    app.scroll_down(1000);
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(app.following, "re-pinned at the bottom");
+    assert!(
+        screen.contains("line 099"),
+        "bottom visible again:\n{screen}"
+    );
+}
+
+#[test]
+fn following_shows_last_line_when_word_wrapping_creates_extra_rows() {
+    // Regression: `wrapped_height` counted characters (ceil(len/width)) but
+    // ratatui's `WordWrapper` wraps at word boundaries — a word that doesn't
+    // fit the remaining space moves to the next line, and a word wider than
+    // the line is broken across rows. That makes the real wrapped height
+    // LARGER than the char-based estimate, so `max_scroll` was too small
+    // and the bottom of a long message was clipped off-screen.
+    //
+    // Each line below has a 45-char word at width 38: ratatui wraps it to
+    // 3 rows, but the old char-based estimate said 2. With 20 such lines
+    // the ~20-row undercount pushed the last line entirely off-screen.
+    let mut app = test_app("openai", "gpt-4o");
+    for i in 0..20 {
+        app.push(Line::raw(format!(
+            "word{i:02} supercalifragilisticexpialidocious_extras"
+        )));
     }
+    app.push(Line::raw("LAST_LINE_MARKER_42"));
 
-    /// `App::new` with empty profiles and dummy callbacks, for tests.
-    fn test_app(provider: &str, model: &str) -> App {
-        App::new(
-            provider,
-            model,
-            Vec::new(),
-            None,
-            test_resolver(),
-            test_saver(),
-            test_loader(),
-            test_remover(),
-            None,
-            String::new(),
-        )
+    let mut term = Terminal::new(TestBackend::new(40, 12)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(
+        screen.contains("LAST_LINE_MARKER_42"),
+        "last line must be visible when following (word-wrap clip bug):\n{screen}"
+    );
+}
+
+#[test]
+fn following_shows_last_line_with_realistic_prose_word_wrapping() {
+    // A second regression check with normal prose (no artificially long
+    // words). At a narrow width, word-boundary wrapping still produces more
+    // rows than char-based `ceil(len/width)` because words that don't fit
+    // the remaining space leave the current line short. This is the case
+    // that clipped the end of a long assistant message in practice.
+    let mut app = test_app("openai", "gpt-4o");
+    // 30 lines of prose, each ~70 chars. At width 36 (inner of a 38-wide
+    // terminal), char-based says ceil(70/36) = 2 rows per line, but
+    // word-wrap often produces 3 because words straddle the boundary.
+    for i in 0..30 {
+        app.push(Line::raw(format!(
+            "The quick brown fox jumps over the lazy dog and then runs {i:02}"
+        )));
     }
+    app.push(Line::raw("FINAL_ANSWER_99"));
 
-    #[test]
-    fn sticky_scroll_unpins_on_scroll_up_and_repins_at_bottom() {
-        let mut app = test_app("openai", "gpt-4o");
-        // Simulate what render() caches for a transcript taller than the viewport.
-        app.view_max_scroll = 100;
-        app.view_total = 120;
-        assert!(app.following, "starts pinned to the bottom");
+    let mut term = Terminal::new(TestBackend::new(38, 14)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(
+        screen.contains("FINAL_ANSWER_99"),
+        "last line must be visible with prose word-wrapping:\n{screen}"
+    );
+}
 
-        // Scrolling up unpins, holds an absolute offset, and snapshots the count.
-        app.scroll_up(10);
-        assert!(!app.following, "scroll up unpins");
-        assert_eq!(app.scroll, 90, "offset = max_scroll - 10");
-        assert_eq!(app.total_when_unpinned, 120);
+#[test]
+fn working_line_names_the_inflight_tool_and_model_phase() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.set_working(true);
+    // Model phase: reasoning then text stream distinctly.
+    app.apply(UiEvent::Reasoning("hmm".into()));
+    assert!(
+        app.activity_line().starts_with("thinking…"),
+        "{}",
+        app.activity_line()
+    );
+    app.apply(UiEvent::Text("here".into()));
+    assert!(
+        app.activity_line().starts_with("responding…"),
+        "{}",
+        app.activity_line()
+    );
+    // A tool starts → the line names it (with its own timer)…
+    app.apply(UiEvent::ToolStarted(
+        "bash".into(),
+        "{\"command\":\"cargo test\"}".into(),
+    ));
+    assert!(
+        app.activity_line().starts_with("running bash cargo test"),
+        "{}",
+        app.activity_line()
+    );
+    // …and clears back to the model once the result lands.
+    app.apply(UiEvent::ToolResult("bash".into(), "ok".into()));
+    assert!(
+        app.activity_line().starts_with("Working"),
+        "{}",
+        app.activity_line()
+    );
+}
 
-        // Streaming output below must NOT yank a scrolled-up reader back down.
-        app.apply(UiEvent::Text("a fresh streamed line\n".into()));
-        assert!(
-            !app.following,
-            "new output leaves the scrolled-up reader put"
-        );
-
-        // Scrolling back past the bottom re-pins so output follows again.
-        app.scroll_down(1000);
-        assert!(app.following, "reaching the bottom re-pins");
-    }
-
-    #[test]
-    fn transcript_is_capped_while_following_but_not_while_scrolled_up() {
-        let mut app = test_app("openai", "gpt-4o");
-        // Following (the default): pushing far past the cap keeps it bounded, and
-        // keeps the newest lines (the oldest scroll off the top).
-        for i in 0..(MAX_TRANSCRIPT_LINES + 5_000) {
-            app.push(Line::raw(format!("l{i}")));
-        }
-        assert_eq!(
-            app.transcript.len(),
-            MAX_TRANSCRIPT_LINES,
-            "bounded while following"
-        );
-        assert_eq!(
-            app.transcript.last().unwrap().text(),
-            format!("l{}", MAX_TRANSCRIPT_LINES + 5_000 - 1),
-            "newest line kept"
-        );
-
-        // Scrolled up: pushes are NOT trimmed, or the offsets would shift under a
-        // reader. (render caches the geometry scroll_up needs.)
-        app.view_max_scroll = 50;
-        app.view_total = 60;
-        app.scroll_up(5);
-        assert!(!app.following, "scrolled up");
-        let before = app.transcript.len();
-        for i in 0..1_000 {
-            app.push(Line::raw(format!("m{i}")));
-        }
-        assert_eq!(
-            app.transcript.len(),
-            before + 1_000,
-            "grows while scrolled up, no trim"
-        );
-    }
-
-    #[test]
-    fn scrolling_moves_the_viewport_through_render_and_repins() {
-        let mut app = test_app("openai", "gpt-4o");
-        for i in 0..100 {
-            app.push(Line::raw(format!("line {i:03}")));
-        }
-        let mut term = Terminal::new(TestBackend::new(40, 12)).unwrap();
-        // Following: the bottom is visible, the top is not.
-        term.draw(|f| app.render(f)).unwrap();
-        let screen = dump(&term);
-        assert!(
-            screen.contains("line 099"),
-            "bottom visible when following:\n{screen}"
-        );
-        assert!(
-            !screen.contains("line 000"),
-            "top hidden when following:\n{screen}"
-        );
-
-        // Scroll up: earlier lines appear, the bottom leaves the viewport.
-        app.scroll_up(40);
-        term.draw(|f| app.render(f)).unwrap();
-        let screen = dump(&term);
-        assert!(!app.following, "scroll up unpins");
-        assert!(
-            !screen.contains("line 099"),
-            "bottom gone after scroll up:\n{screen}"
-        );
-        assert!(
-            screen.contains("line 0"),
-            "older lines now visible:\n{screen}"
-        );
-
-        // Scroll back down past the end: re-pins and shows the bottom again.
-        app.scroll_down(1000);
-        term.draw(|f| app.render(f)).unwrap();
-        let screen = dump(&term);
-        assert!(app.following, "re-pinned at the bottom");
-        assert!(
-            screen.contains("line 099"),
-            "bottom visible again:\n{screen}"
-        );
-    }
-
-    #[test]
-    fn following_shows_last_line_when_word_wrapping_creates_extra_rows() {
-        // Regression: `wrapped_height` counted characters (ceil(len/width)) but
-        // ratatui's `WordWrapper` wraps at word boundaries — a word that doesn't
-        // fit the remaining space moves to the next line, and a word wider than
-        // the line is broken across rows. That makes the real wrapped height
-        // LARGER than the char-based estimate, so `max_scroll` was too small
-        // and the bottom of a long message was clipped off-screen.
-        //
-        // Each line below has a 45-char word at width 38: ratatui wraps it to
-        // 3 rows, but the old char-based estimate said 2. With 20 such lines
-        // the ~20-row undercount pushed the last line entirely off-screen.
-        let mut app = test_app("openai", "gpt-4o");
-        for i in 0..20 {
-            app.push(Line::raw(format!(
-                "word{i:02} supercalifragilisticexpialidocious_extras"
-            )));
-        }
-        app.push(Line::raw("LAST_LINE_MARKER_42"));
-
-        let mut term = Terminal::new(TestBackend::new(40, 12)).unwrap();
-        term.draw(|f| app.render(f)).unwrap();
-        let screen = dump(&term);
-        assert!(
-            screen.contains("LAST_LINE_MARKER_42"),
-            "last line must be visible when following (word-wrap clip bug):\n{screen}"
-        );
-    }
-
-    #[test]
-    fn following_shows_last_line_with_realistic_prose_word_wrapping() {
-        // A second regression check with normal prose (no artificially long
-        // words). At a narrow width, word-boundary wrapping still produces more
-        // rows than char-based `ceil(len/width)` because words that don't fit
-        // the remaining space leave the current line short. This is the case
-        // that clipped the end of a long assistant message in practice.
-        let mut app = test_app("openai", "gpt-4o");
-        // 30 lines of prose, each ~70 chars. At width 36 (inner of a 38-wide
-        // terminal), char-based says ceil(70/36) = 2 rows per line, but
-        // word-wrap often produces 3 because words straddle the boundary.
-        for i in 0..30 {
-            app.push(Line::raw(format!(
-                "The quick brown fox jumps over the lazy dog and then runs {i:02}"
-            )));
-        }
-        app.push(Line::raw("FINAL_ANSWER_99"));
-
-        let mut term = Terminal::new(TestBackend::new(38, 14)).unwrap();
-        term.draw(|f| app.render(f)).unwrap();
-        let screen = dump(&term);
-        assert!(
-            screen.contains("FINAL_ANSWER_99"),
-            "last line must be visible with prose word-wrapping:\n{screen}"
-        );
-    }
-
-    #[test]
-    fn working_line_names_the_inflight_tool_and_model_phase() {
-        let mut app = test_app("openai", "gpt-4o");
-        app.set_working(true);
-        // Model phase: reasoning then text stream distinctly.
-        app.apply(UiEvent::Reasoning("hmm".into()));
-        assert!(
-            app.activity_line().starts_with("thinking…"),
-            "{}",
-            app.activity_line()
-        );
-        app.apply(UiEvent::Text("here".into()));
-        assert!(
-            app.activity_line().starts_with("responding…"),
-            "{}",
-            app.activity_line()
-        );
-        // A tool starts → the line names it (with its own timer)…
-        app.apply(UiEvent::ToolStarted(
-            "bash".into(),
-            "{\"command\":\"cargo test\"}".into(),
-        ));
-        assert!(
-            app.activity_line().starts_with("running bash cargo test"),
-            "{}",
-            app.activity_line()
-        );
-        // …and clears back to the model once the result lands.
-        app.apply(UiEvent::ToolResult("bash".into(), "ok".into()));
-        assert!(
-            app.activity_line().starts_with("Working"),
-            "{}",
-            app.activity_line()
-        );
-    }
-
-    #[test]
-    fn working_wave_sweeps_one_lit_letter_at_a_time() {
-        // "Working" is 7 letters; the lit index sweeps 0..6 then 6..0.
-        // At each tick exactly one letter is white/bold and the rest are gray.
-        let mut app = test_app("openai", "gpt-4o");
-        app.set_working(true);
-        let n = "Working".chars().count();
-        let cycle = 2 * (n - 1);
-        for tick in 0..cycle {
-            app.spinner = tick;
-            let spans = app.working_spans();
-            assert_eq!(spans.len(), n, "one span per letter at tick {tick}");
-            let lit_count = spans
-                .iter()
-                .filter(|s| s.style.fg == Some(Color::White))
-                .count();
-            assert_eq!(lit_count, 1, "exactly one lit letter at tick {tick}");
-            // The lit index matches the forward/back sweep.
-            let expected_lit = if tick < n { tick } else { cycle - tick };
-            assert_eq!(
-                spans[expected_lit].style.fg,
-                Some(Color::White),
-                "lit index {expected_lit} at tick {tick}"
-            );
-        }
-    }
-
-    #[test]
-    fn renders_tool_call_diff_and_spinner() {
-        let mut app = test_app("openai", "gpt-4o");
-        app.apply(UiEvent::ToolCall(
-            "edit".into(),
-            "{\"path\":\"src/cli.rs\",\"old_string\":\"a\",\"new_string\":\"b\"}".into(),
-        ));
-        // ANSI-colored diff line (from the edit tool) must render as text.
-        app.apply(UiEvent::ToolResult(
-            "edit".into(),
-            "\u{1b}[32m+ pub json: bool\u{1b}[0m".into(),
-        ));
-        app.apply(UiEvent::TurnEnd("[1234 in · 56 out · 1290 total]".into()));
-        app.working = true;
-        app.spinner = 2;
-
-        let mut term = Terminal::new(TestBackend::new(56, 13)).unwrap();
-        term.draw(|f| app.render(f)).unwrap();
-        let screen = dump(&term);
-
-        // The header reads as "edit <path>", not a raw JSON dump.
-        assert!(screen.contains("⏺ edit src/cli.rs"), "readable tool header");
-        assert!(
-            !screen.contains("old_string"),
-            "header must not dump JSON args"
-        );
-        assert!(
-            screen.contains("pub json: bool"),
-            "ANSI diff rendered as text"
-        );
-        assert!(screen.contains("1290 total"), "status bar shows usage");
-        assert!(
-            screen.contains(SPINNER[2]) && screen.contains("0s"),
-            "prompt bar shows the spinner + an elapsed timer while working: {screen}"
-        );
-        assert!(
-            screen.contains("Ctrl-C to interrupt"),
-            "prompt bar shows the interrupt hint while working"
-        );
-    }
-
-    #[test]
-    fn colorizes_plain_diff_tool_output() {
-        let mut app = test_app("openai", "gpt-4o");
-        let diff = "--- a/x.rs\n+++ b/x.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n ctx\n";
-        app.apply(UiEvent::ToolResult("bash".into(), diff.into()));
-        // The content span (after the "  " indent) carries the diff color.
-        let colored: Vec<(String, Option<Color>)> = app
-            .transcript
+#[test]
+fn working_wave_sweeps_one_lit_letter_at_a_time() {
+    // "Working" is 7 letters; the lit index sweeps 0..6 then 6..0.
+    // At each tick exactly one letter is white/bold and the rest are gray.
+    let mut app = test_app("openai", "gpt-4o");
+    app.set_working(true);
+    let n = "Working".chars().count();
+    let cycle = 2 * (n - 1);
+    for tick in 0..cycle {
+        app.spinner = tick;
+        let spans = app.working_spans();
+        assert_eq!(spans.len(), n, "one span per letter at tick {tick}");
+        let lit_count = spans
             .iter()
-            .flat_map(|e| e.flatten(false))
-            .map(|l| {
-                let text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
-                (text, l.spans.last().map(|s| s.style.fg).unwrap_or(None))
+            .filter(|s| s.style.fg == Some(Color::White))
+            .count();
+        assert_eq!(lit_count, 1, "exactly one lit letter at tick {tick}");
+        // The lit index matches the forward/back sweep.
+        let expected_lit = if tick < n { tick } else { cycle - tick };
+        assert_eq!(
+            spans[expected_lit].style.fg,
+            Some(Color::White),
+            "lit index {expected_lit} at tick {tick}"
+        );
+    }
+}
+
+#[test]
+fn renders_tool_call_diff_and_spinner() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.apply(UiEvent::ToolCall(
+        "edit".into(),
+        "{\"path\":\"src/cli.rs\",\"old_string\":\"a\",\"new_string\":\"b\"}".into(),
+    ));
+    // ANSI-colored diff line (from the edit tool) must render as text.
+    app.apply(UiEvent::ToolResult(
+        "edit".into(),
+        "\u{1b}[32m+ pub json: bool\u{1b}[0m".into(),
+    ));
+    app.apply(UiEvent::TurnEnd("[1234 in · 56 out · 1290 total]".into()));
+    app.working = true;
+    app.spinner = 2;
+
+    let mut term = Terminal::new(TestBackend::new(56, 13)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+
+    // The header reads as "edit <path>", not a raw JSON dump.
+    assert!(screen.contains("⏺ edit src/cli.rs"), "readable tool header");
+    assert!(
+        !screen.contains("old_string"),
+        "header must not dump JSON args"
+    );
+    assert!(
+        screen.contains("pub json: bool"),
+        "ANSI diff rendered as text"
+    );
+    assert!(screen.contains("1290 total"), "status bar shows usage");
+    assert!(
+        screen.contains(SPINNER[2]) && screen.contains("0s"),
+        "prompt bar shows the spinner + an elapsed timer while working: {screen}"
+    );
+    assert!(
+        screen.contains("Ctrl-C to interrupt"),
+        "prompt bar shows the interrupt hint while working"
+    );
+}
+
+#[test]
+fn colorizes_plain_diff_tool_output() {
+    let mut app = test_app("openai", "gpt-4o");
+    let diff = "--- a/x.rs\n+++ b/x.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n ctx\n";
+    app.apply(UiEvent::ToolResult("bash".into(), diff.into()));
+    // The content span (after the "  " indent) carries the diff color.
+    let colored: Vec<(String, Option<Color>)> = app
+        .transcript
+        .iter()
+        .flat_map(|e| e.flatten(false))
+        .map(|l| {
+            let text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+            (text, l.spans.last().map(|s| s.style.fg).unwrap_or(None))
+        })
+        .collect();
+    assert!(
+        colored
+            .iter()
+            .any(|(t, fg)| t.contains("+new") && *fg == Some(Color::Green)),
+        "added line is green: {colored:?}"
+    );
+    assert!(
+        colored
+            .iter()
+            .any(|(t, fg)| t.contains("-old") && *fg == Some(Color::Red)),
+        "removed line is red"
+    );
+    assert!(
+        colored
+            .iter()
+            .any(|(t, fg)| t.contains("@@") && *fg == Some(Color::Cyan)),
+        "hunk header is cyan"
+    );
+}
+
+#[test]
+fn non_diff_tool_output_is_not_colorized() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.apply(UiEvent::ToolResult(
+        "bash".into(),
+        "- item one\n- item two\n".into(),
+    ));
+    let any_red = app
+        .transcript
+        .iter()
+        .flat_map(|e| e.flatten(false))
+        .any(|l| l.spans.last().map(|s| s.style.fg) == Some(Some(Color::Red)));
+    assert!(!any_red, "a plain list must not be colorized as a diff");
+}
+
+#[test]
+fn usage_event_updates_live_counter_and_working_line() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.set_working(true);
+    app.apply(UiEvent::Usage {
+        input: 1234,
+        output: 340,
+        ctx_used: 64_000,
+        ctx_window: Some(128_000),
+    });
+    assert_eq!(app.usage, (1234, 340));
+    assert_eq!(app.context_pct(), Some(50));
+
+    let mut term = Terminal::new(TestBackend::new(72, 8)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(screen.contains(SPINNER[0]), "spinner shown: {screen}");
+    assert!(screen.contains("↑1.2k"), "live input tokens: {screen}");
+    assert!(screen.contains("↓340"), "live output tokens: {screen}");
+    assert!(screen.contains("50% ctx"), "live context fill: {screen}");
+}
+
+#[test]
+fn report_tokens_pushes_cumulative_line() {
+    // `/tokens` mid-turn reads the mirrored counter (the agent is borrowed).
+    let mut app = test_app("openai", "gpt-4o");
+    app.apply(UiEvent::Usage {
+        input: 1000,
+        output: 250,
+        ctx_used: 0,
+        ctx_window: None,
+    });
+    app.report_tokens();
+    let line = app.transcript.last().unwrap().text();
+    assert_eq!(line, "cumulative: 1000 in · 250 out · 1250 total");
+}
+
+#[test]
+fn renders_queued_commands_while_working() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.set_working(true);
+    app.queue.push_back("run the tests".into());
+    app.queue.push_back("then commit".into());
+    app.input.set("typing a third");
+
+    let mut term = Terminal::new(TestBackend::new(60, 14)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+
+    assert!(screen.contains(SPINNER[0]), "spinner shown while working");
+    assert!(
+        screen.contains("run the tests"),
+        "first queued command shown"
+    );
+    assert!(
+        screen.contains("then commit"),
+        "second queued command shown"
+    );
+    assert!(
+        screen.contains("typing a third"),
+        "input stays editable while working"
+    );
+}
+
+#[test]
+fn renders_pinned_plan_checklist() {
+    use hi_agent::PlanStep;
+    let mut app = test_app("openai", "gpt-4o");
+    app.apply(UiEvent::Plan(vec![
+        PlanStep {
+            title: "find leak".into(),
+            status: PlanStatus::Done,
+        },
+        PlanStep {
+            title: "fix walkers".into(),
+            status: PlanStatus::Active,
+        },
+        PlanStep {
+            title: "add tests".into(),
+            status: PlanStatus::Pending,
+        },
+    ]));
+
+    let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+
+    assert!(
+        screen.contains("plan · 1/3"),
+        "plan header w/ progress:\n{screen}"
+    );
+    assert!(screen.contains("find leak"), "step titles shown:\n{screen}");
+    assert!(screen.contains("fix walkers"));
+    assert!(screen.contains("add tests"));
+    assert!(screen.contains('✓'), "done glyph:\n{screen}");
+    assert!(screen.contains('▸'), "active glyph:\n{screen}");
+
+    // A later update replaces the plan in place — progress advances and the
+    // checklist isn't duplicated into the transcript.
+    app.apply(UiEvent::Plan(vec![
+        PlanStep {
+            title: "find leak".into(),
+            status: PlanStatus::Done,
+        },
+        PlanStep {
+            title: "fix walkers".into(),
+            status: PlanStatus::Done,
+        },
+        PlanStep {
+            title: "add tests".into(),
+            status: PlanStatus::Active,
+        },
+    ]));
+    term.draw(|f| app.render(f)).unwrap();
+    let screen2 = dump(&term);
+    assert!(
+        screen2.contains("plan · 2/3"),
+        "progress advanced:\n{screen2}"
+    );
+    assert!(
+        app.transcript.is_empty(),
+        "plan must not echo into the transcript"
+    );
+}
+
+#[test]
+fn long_plan_does_not_break_input_box_border() {
+    // Regression: when the plan + status + input is taller than the screen,
+    // the input box height used to exceed the terminal height. ratatui's
+    // Layout clamps the fixed-Length rect, so the Paragraph content spilled
+    // past the bottom border — the `╰` landed mid-content and later steps
+    // rendered outside the box. The box must stay closed and fit on screen.
+    use hi_agent::PlanStep;
+    let mut app = test_app("openai", "gpt-4o");
+    app.apply(UiEvent::Plan(
+        (0..8)
+            .map(|i| PlanStep {
+                title: format!("step {i} with a fairly long title to be realistic"),
+                status: if i < 3 {
+                    PlanStatus::Done
+                } else if i == 3 {
+                    PlanStatus::Active
+                } else {
+                    PlanStatus::Pending
+                },
             })
-            .collect();
-        assert!(
-            colored
-                .iter()
-                .any(|(t, fg)| t.contains("+new") && *fg == Some(Color::Green)),
-            "added line is green: {colored:?}"
-        );
-        assert!(
-            colored
-                .iter()
-                .any(|(t, fg)| t.contains("-old") && *fg == Some(Color::Red)),
-            "removed line is red"
-        );
-        assert!(
-            colored
-                .iter()
-                .any(|(t, fg)| t.contains("@@") && *fg == Some(Color::Cyan)),
-            "hunk header is cyan"
-        );
-    }
+            .collect(),
+    ));
+    app.working = true;
+    // Tiny height: the full plan (9 lines) + status + input + borders can't fit.
+    let mut term = Terminal::new(TestBackend::new(80, 12)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
 
-    #[test]
-    fn non_diff_tool_output_is_not_colorized() {
-        let mut app = test_app("openai", "gpt-4o");
-        app.apply(UiEvent::ToolResult(
-            "bash".into(),
-            "- item one\n- item two\n".into(),
-        ));
-        let any_red = app
-            .transcript
-            .iter()
-            .flat_map(|e| e.flatten(false))
-            .any(|l| l.spans.last().map(|s| s.style.fg) == Some(Some(Color::Red)));
-        assert!(!any_red, "a plain list must not be colorized as a diff");
-    }
+    // The bottom border must close on its own row, not overlap a plan step.
+    let bottom_rows: Vec<&str> = screen.lines().filter(|l| l.contains('╰')).collect();
+    assert_eq!(
+        bottom_rows.len(),
+        1,
+        "exactly one bottom-left corner:\n{screen}"
+    );
+    // The corner must be the first non-space glyph on its row (a closed
+    // border), not sitting on top of a `✓`/`▸`/`☐` step glyph.
+    let row = bottom_rows[0];
+    assert!(
+        row.trim_start().starts_with('╰'),
+        "bottom border row must start with `╰`, got: {row:?}\n{screen}"
+    );
+    // The plan is truncated to fit, with a "… +N more" line, rather than
+    // overflowing.
+    assert!(
+        screen.contains("… +3 more"),
+        "plan truncated to fit:\n{screen}"
+    );
+    // The box never exceeds the terminal height.
+    assert!(
+        screen.lines().filter(|l| !l.trim().is_empty()).count() <= 12,
+        "box fits on screen:\n{screen}"
+    );
 
-    #[test]
-    fn usage_event_updates_live_counter_and_working_line() {
-        let mut app = test_app("openai", "gpt-4o");
-        app.set_working(true);
-        app.apply(UiEvent::Usage {
-            input: 1234,
-            output: 340,
-            ctx_used: 64_000,
-            ctx_window: Some(128_000),
-        });
-        assert_eq!(app.usage, (1234, 340));
-        assert_eq!(app.context_pct(), Some(50));
+    // A taller terminal shows the whole plan with no truncation.
+    let mut term2 = Terminal::new(TestBackend::new(175, 14)).unwrap();
+    term2.draw(|f| app.render(f)).unwrap();
+    let screen2 = dump(&term2);
+    assert!(
+        screen2.contains("step 7 with a fairly long title to be realistic"),
+        "full plan shown when it fits:\n{screen2}"
+    );
+    assert!(!screen2.contains("… +"), "no truncation when it fits");
 
-        let mut term = Terminal::new(TestBackend::new(72, 8)).unwrap();
-        term.draw(|f| app.render(f)).unwrap();
-        let screen = dump(&term);
-        assert!(screen.contains(SPINNER[0]), "spinner shown: {screen}");
-        assert!(screen.contains("↑1.2k"), "live input tokens: {screen}");
-        assert!(screen.contains("↓340"), "live output tokens: {screen}");
-        assert!(screen.contains("50% ctx"), "live context fill: {screen}");
-    }
-
-    #[test]
-    fn report_tokens_pushes_cumulative_line() {
-        // `/tokens` mid-turn reads the mirrored counter (the agent is borrowed).
-        let mut app = test_app("openai", "gpt-4o");
-        app.apply(UiEvent::Usage {
-            input: 1000,
-            output: 250,
-            ctx_used: 0,
-            ctx_window: None,
-        });
-        app.report_tokens();
-        let line = app.transcript.last().unwrap().text();
-        assert_eq!(line, "cumulative: 1000 in · 250 out · 1250 total");
-    }
-
-    #[test]
-    fn renders_queued_commands_while_working() {
-        let mut app = test_app("openai", "gpt-4o");
-        app.set_working(true);
-        app.queue.push_back("run the tests".into());
-        app.queue.push_back("then commit".into());
-        app.input.set("typing a third");
-
-        let mut term = Terminal::new(TestBackend::new(60, 14)).unwrap();
-        term.draw(|f| app.render(f)).unwrap();
-        let screen = dump(&term);
-
-        assert!(screen.contains(SPINNER[0]), "spinner shown while working");
-        assert!(
-            screen.contains("run the tests"),
-            "first queued command shown"
-        );
-        assert!(
-            screen.contains("then commit"),
-            "second queued command shown"
-        );
-        assert!(
-            screen.contains("typing a third"),
-            "input stays editable while working"
-        );
-    }
-
-    #[test]
-    fn renders_pinned_plan_checklist() {
-        use hi_agent::PlanStep;
-        let mut app = test_app("openai", "gpt-4o");
-        app.apply(UiEvent::Plan(vec![
-            PlanStep {
-                title: "find leak".into(),
-                status: PlanStatus::Done,
-            },
-            PlanStep {
-                title: "fix walkers".into(),
-                status: PlanStatus::Active,
-            },
-            PlanStep {
-                title: "add tests".into(),
+    // Extreme case: a plan so large the box would fill the whole screen.
+    // The transcript must still get its Min(1) row and the border must stay
+    // closed — the cap reserves a row for the transcript so Layout never
+    // clamps the box rect.
+    let mut app2 = test_app("openai", "gpt-4o");
+    app2.apply(UiEvent::Plan(
+        (0..20)
+            .map(|i| PlanStep {
+                title: format!("step {i}"),
                 status: PlanStatus::Pending,
-            },
-        ]));
+            })
+            .collect(),
+    ));
+    app2.working = true;
+    let mut term3 = Terminal::new(TestBackend::new(60, 10)).unwrap();
+    term3.draw(|f| app2.render(f)).unwrap();
+    let screen3 = dump(&term3);
+    let bottom3: Vec<&str> = screen3.lines().filter(|l| l.contains('╰')).collect();
+    assert_eq!(bottom3.len(), 1, "one bottom corner:\n{screen3}");
+    assert!(
+        bottom3[0].trim_start().starts_with('╰'),
+        "border closed, not overlapping content:\n{screen3}"
+    );
+    // The transcript title row survives (top border with `hi ·`).
+    assert!(
+        screen3.contains("hi · openai · gpt-4o"),
+        "transcript keeps its row:\n{screen3}"
+    );
 
-        let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
-        term.draw(|f| app.render(f)).unwrap();
-        let screen = dump(&term);
+    // Degenerate tiny terminal: must not panic, and the box border stays closed.
+    let mut term4 = Terminal::new(TestBackend::new(60, 3)).unwrap();
+    term4.draw(|f| app2.render(f)).unwrap();
+    let screen4 = dump(&term4);
+    let bottom4: Vec<&str> = screen4.lines().filter(|l| l.contains('╰')).collect();
+    assert_eq!(
+        bottom4.len(),
+        1,
+        "one bottom corner on tiny term:\n{screen4}"
+    );
+}
 
-        assert!(
-            screen.contains("plan · 1/3"),
-            "plan header w/ progress:\n{screen}"
-        );
-        assert!(screen.contains("find leak"), "step titles shown:\n{screen}");
-        assert!(screen.contains("fix walkers"));
-        assert!(screen.contains("add tests"));
-        assert!(screen.contains('✓'), "done glyph:\n{screen}");
-        assert!(screen.contains('▸'), "active glyph:\n{screen}");
+#[test]
+fn startup_notice_does_not_clip_input_line() {
+    // On first load, a startup notice (e.g. "provider metadata check
+    // failed: …") is pinned above the status line. The box height must
+    // account for it, or the input line gets clipped and the cursor lands
+    // on the wrong row.
+    let mut app = test_app("openai", "gpt-4o");
+    app.startup_notice = Some("provider metadata check failed: connection refused".into());
+    let mut term = Terminal::new(TestBackend::new(70, 10)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(
+        screen.contains("provider metadata check failed"),
+        "notice shown:\n{screen}"
+    );
+    // The input prompt must still be visible inside the box (not clipped).
+    assert!(screen.contains('›'), "input prompt visible:\n{screen}");
+    // The input box's bottom border closes cleanly (the transcript block
+    // also has a `╰`, so check the last one — the input box is at the bottom).
+    let bottom: Vec<&str> = screen.lines().filter(|l| l.contains('╰')).collect();
+    let input_box_border = bottom.last().expect("input box bottom border");
+    assert!(
+        input_box_border.trim_start().starts_with('╰'),
+        "input box border closed:\n{screen}"
+    );
+    // The notice, status, and prompt all render inside the input box —
+    // i.e. above the input box's bottom border row (the last `╰…─` row).
+    let rows: Vec<&str> = screen.lines().collect();
+    let border_row_idx = rows
+        .iter()
+        .rposition(|l| l.trim_start().starts_with('╰') && l.contains('─'))
+        .unwrap();
+    let above_border: String = rows[..border_row_idx].join("\n");
+    assert!(
+        above_border.contains("provider metadata check failed") && above_border.contains('›'),
+        "notice + prompt above the border:\n{screen}"
+    );
+}
 
-        // A later update replaces the plan in place — progress advances and the
-        // checklist isn't duplicated into the transcript.
-        app.apply(UiEvent::Plan(vec![
-            PlanStep {
-                title: "find leak".into(),
-                status: PlanStatus::Done,
-            },
-            PlanStep {
-                title: "fix walkers".into(),
-                status: PlanStatus::Done,
-            },
-            PlanStep {
-                title: "add tests".into(),
-                status: PlanStatus::Active,
-            },
-        ]));
-        term.draw(|f| app.render(f)).unwrap();
-        let screen2 = dump(&term);
-        assert!(
-            screen2.contains("plan · 2/3"),
-            "progress advanced:\n{screen2}"
-        );
-        assert!(
-            app.transcript.is_empty(),
-            "plan must not echo into the transcript"
-        );
-    }
+#[test]
+fn quit_notice_renders_and_does_not_clip_input() {
+    // After the first Ctrl-C (idle, empty input), a "Press Ctrl-C again to
+    // exit" notice is pinned above the status line. The box height must
+    // account for it or the input line clips and the cursor lands wrong.
+    let mut app = test_app("openai", "gpt-4o");
+    app.quit_notice = Some(Instant::now() + Duration::from_millis(1800));
+    let mut term = Terminal::new(TestBackend::new(70, 10)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(
+        screen.contains("Press Ctrl-C again to exit"),
+        "quit notice shown:\n{screen}"
+    );
+    assert!(screen.contains('›'), "input prompt visible:\n{screen}");
+    // The input box bottom border closes cleanly (not overlapping content).
+    let bottom: Vec<&str> = screen.lines().filter(|l| l.contains('╰')).collect();
+    let input_box_border = bottom.last().expect("input box bottom border");
+    assert!(
+        input_box_border.trim_start().starts_with('╰'),
+        "input box border closed:\n{screen}"
+    );
+}
 
-    #[test]
-    fn long_plan_does_not_break_input_box_border() {
-        // Regression: when the plan + status + input is taller than the screen,
-        // the input box height used to exceed the terminal height. ratatui's
-        // Layout clamps the fixed-Length rect, so the Paragraph content spilled
-        // past the bottom border — the `╰` landed mid-content and later steps
-        // rendered outside the box. The box must stay closed and fit on screen.
-        use hi_agent::PlanStep;
-        let mut app = test_app("openai", "gpt-4o");
-        app.apply(UiEvent::Plan(
-            (0..8)
-                .map(|i| PlanStep {
-                    title: format!("step {i} with a fairly long title to be realistic"),
-                    status: if i < 3 {
-                        PlanStatus::Done
-                    } else if i == 3 {
-                        PlanStatus::Active
-                    } else {
-                        PlanStatus::Pending
-                    },
-                })
-                .collect(),
-        ));
-        app.working = true;
-        // Tiny height: the full plan (9 lines) + status + input + borders can't fit.
-        let mut term = Terminal::new(TestBackend::new(80, 12)).unwrap();
-        term.draw(|f| app.render(f)).unwrap();
-        let screen = dump(&term);
+#[test]
+fn keybindings_help_does_not_advertise_idle_escape_or_ctrl_d_quit() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.show_help = true;
+    let mut term = Terminal::new(TestBackend::new(80, 18)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
 
-        // The bottom border must close on its own row, not overlap a plan step.
-        let bottom_rows: Vec<&str> = screen.lines().filter(|l| l.contains('╰')).collect();
-        assert_eq!(
-            bottom_rows.len(),
-            1,
-            "exactly one bottom-left corner:\n{screen}"
-        );
-        // The corner must be the first non-space glyph on its row (a closed
-        // border), not sitting on top of a `✓`/`▸`/`☐` step glyph.
-        let row = bottom_rows[0];
-        assert!(
-            row.trim_start().starts_with('╰'),
-            "bottom border row must start with `╰`, got: {row:?}\n{screen}"
-        );
-        // The plan is truncated to fit, with a "… +N more" line, rather than
-        // overflowing.
-        assert!(
-            screen.contains("… +3 more"),
-            "plan truncated to fit:\n{screen}"
-        );
-        // The box never exceeds the terminal height.
-        assert!(
-            screen.lines().filter(|l| !l.trim().is_empty()).count() <= 12,
-            "box fits on screen:\n{screen}"
-        );
+    assert!(
+        screen.contains("Ctrl-D") && screen.contains("toggle the working-tree diff panel"),
+        "Ctrl-D help should describe diff toggle:\n{screen}"
+    );
+    assert!(
+        screen.contains("/quit") && screen.contains("quit"),
+        "explicit quit command should be shown:\n{screen}"
+    );
+    assert!(
+        !screen.contains("Ctrl-D (idle)") && !screen.contains("quit when empty"),
+        "help should not advertise the old accidental-exit bindings:\n{screen}"
+    );
+}
 
-        // A taller terminal shows the whole plan with no truncation.
-        let mut term2 = Terminal::new(TestBackend::new(175, 14)).unwrap();
-        term2.draw(|f| app.render(f)).unwrap();
-        let screen2 = dump(&term2);
-        assert!(
-            screen2.contains("step 7 with a fairly long title to be realistic"),
-            "full plan shown when it fits:\n{screen2}"
-        );
-        assert!(!screen2.contains("… +"), "no truncation when it fits");
+#[test]
+fn changed_files_line_shows_what_last_turn_touched() {
+    // After a turn that changed files, a compact "changed: …" line sits
+    // above the input so the user sees what was touched without scrolling.
+    let mut app = test_app("openai", "gpt-4o");
+    app.last_changed_files = vec!["src/a.rs".into(), "src/b.rs".into()];
+    let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(
+        screen.contains("changed: src/a.rs, src/b.rs"),
+        "changed-files line: {screen}"
+    );
+    assert!(
+        screen.contains("Ctrl-D for diff"),
+        "diff toggle hint: {screen}"
+    );
+}
 
-        // Extreme case: a plan so large the box would fill the whole screen.
-        // The transcript must still get its Min(1) row and the border must stay
-        // closed — the cap reserves a row for the transcript so Layout never
-        // clamps the box rect.
-        let mut app2 = test_app("openai", "gpt-4o");
-        app2.apply(UiEvent::Plan(
-            (0..20)
-                .map(|i| PlanStep {
-                    title: format!("step {i}"),
-                    status: PlanStatus::Pending,
-                })
-                .collect(),
-        ));
-        app2.working = true;
-        let mut term3 = Terminal::new(TestBackend::new(60, 10)).unwrap();
-        term3.draw(|f| app2.render(f)).unwrap();
-        let screen3 = dump(&term3);
-        let bottom3: Vec<&str> = screen3.lines().filter(|l| l.contains('╰')).collect();
-        assert_eq!(bottom3.len(), 1, "one bottom corner:\n{screen3}");
-        assert!(
-            bottom3[0].trim_start().starts_with('╰'),
-            "border closed, not overlapping content:\n{screen3}"
-        );
-        // The transcript title row survives (top border with `hi ·`).
-        assert!(
-            screen3.contains("hi · openai · gpt-4o"),
-            "transcript keeps its row:\n{screen3}"
-        );
+#[test]
+fn ctrl_d_toggles_diff_even_when_input_is_empty() {
+    let mut app = test_app("openai", "gpt-4o");
+    let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
 
-        // Degenerate tiny terminal: must not panic, and the box border stays closed.
-        let mut term4 = Terminal::new(TestBackend::new(60, 3)).unwrap();
-        term4.draw(|f| app2.render(f)).unwrap();
-        let screen4 = dump(&term4);
-        let bottom4: Vec<&str> = screen4.lines().filter(|l| l.contains('╰')).collect();
-        assert_eq!(
-            bottom4.len(),
-            1,
-            "one bottom corner on tiny term:\n{screen4}"
-        );
-    }
+    assert_eq!(app.edit_key(&ctrl_d), None);
+    assert!(app.show_diff, "Ctrl-D should open the diff panel");
+    assert!(app.diff_text.is_some(), "opening should cache diff text");
 
-    #[test]
-    fn startup_notice_does_not_clip_input_line() {
-        // On first load, a startup notice (e.g. "provider metadata check
-        // failed: …") is pinned above the status line. The box height must
-        // account for it, or the input line gets clipped and the cursor lands
-        // on the wrong row.
-        let mut app = test_app("openai", "gpt-4o");
-        app.startup_notice = Some("provider metadata check failed: connection refused".into());
-        let mut term = Terminal::new(TestBackend::new(70, 10)).unwrap();
-        term.draw(|f| app.render(f)).unwrap();
-        let screen = dump(&term);
-        assert!(
-            screen.contains("provider metadata check failed"),
-            "notice shown:\n{screen}"
-        );
-        // The input prompt must still be visible inside the box (not clipped).
-        assert!(screen.contains('›'), "input prompt visible:\n{screen}");
-        // The input box's bottom border closes cleanly (the transcript block
-        // also has a `╰`, so check the last one — the input box is at the bottom).
-        let bottom: Vec<&str> = screen.lines().filter(|l| l.contains('╰')).collect();
-        let input_box_border = bottom.last().expect("input box bottom border");
-        assert!(
-            input_box_border.trim_start().starts_with('╰'),
-            "input box border closed:\n{screen}"
-        );
-        // The notice, status, and prompt all render inside the input box —
-        // i.e. above the input box's bottom border row (the last `╰…─` row).
-        let rows: Vec<&str> = screen.lines().collect();
-        let border_row_idx = rows
+    assert_eq!(app.edit_key(&ctrl_d), None);
+    assert!(!app.show_diff, "second Ctrl-D should close the diff panel");
+    assert!(
+        app.diff_text.is_none(),
+        "closing should clear cached diff text"
+    );
+}
+
+#[test]
+fn ctrl_d_toggles_the_diff_panel() {
+    // Toggling Ctrl-D opens the panel with the cached diff text and a
+    // header; toggling again closes it. We set diff_text directly to avoid
+    // a real git call in the unit test.
+    let mut app = test_app("openai", "gpt-4o");
+    app.show_diff = true;
+    app.diff_text = Some("--- a/x\n+++ b/x\n@@ -1,1 +1,1 @@\n-old\n+new\n".into());
+    let mut term = Terminal::new(TestBackend::new(60, 14)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(
+        screen.contains("diff (Ctrl-D to close)"),
+        "panel header: {screen}"
+    );
+    assert!(screen.contains("+new"), "diff content rendered: {screen}");
+
+    // Closing drops the panel.
+    app.show_diff = false;
+    app.diff_text = None;
+    term.draw(|f| app.render(f)).unwrap();
+    let screen2 = dump(&term);
+    assert!(
+        !screen2.contains("diff (Ctrl-D to close)"),
+        "panel closed: {screen2}"
+    );
+}
+
+#[test]
+fn ctrl_question_toggles_the_observability_panel() {
+    // The Ctrl-? agent-observability panel renders the last turn's telemetry
+    // counters, the per-turn tool-call count, and session/context numbers.
+    let mut app = test_app("openai", "gpt-4o");
+    app.show_debug = true;
+    app.last_telemetry = Some(hi_agent::TurnTelemetry {
+        verify_rounds: 2,
+        recovery_retries: 1,
+        repeat_nudges: 0,
+        continue_nudges: 1,
+        truncation_retries: 0,
+        hit_step_cap: false,
+        stalled_unfinished: false,
+        stalled_repeating: false,
+        verify_attributions: Vec::new(),
+        tool_calls: 7,
+        max_concurrent_batch: 3,
+        serial_runs: 2,
+        tool_timeline: Vec::new(),
+        file_reads: 2,
+        targeted_searches: 1,
+        listing_only: false,
+        first_tool_kind: "read".to_string(),
+        discovery_depth: "mixed".to_string(),
+        quality_repair_nudges: 0,
+    });
+    app.turn_tool_calls = 7;
+    let mut term = Terminal::new(TestBackend::new(60, 16)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(
+        screen.contains("agent (Ctrl-? to close)"),
+        "panel header: {screen}"
+    );
+    assert!(
+        screen.contains("2 verify") && screen.contains("1 retry") && screen.contains("1 continue"),
+        "telemetry counters: {screen}"
+    );
+    assert!(
+        screen.contains("tool calls this turn: 7"),
+        "tool-call count: {screen}"
+    );
+
+    // Closing drops the panel.
+    app.show_debug = false;
+    term.draw(|f| app.render(f)).unwrap();
+    let screen2 = dump(&term);
+    assert!(
+        !screen2.contains("agent (Ctrl-? to close)"),
+        "panel closed: {screen2}"
+    );
+}
+
+#[test]
+fn in_progress_line_is_styled_live() {
+    // A heading still streaming (no trailing newline yet) renders styled with
+    // its markers stripped — not literally as "## …" until the line commits.
+    let mut app = test_app("openai", "gpt-4o");
+    app.apply(UiEvent::Text("## Hello world".into()));
+    let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(
+        screen.contains("Hello world"),
+        "heading text shown:\n{screen}"
+    );
+    assert!(
+        !screen.contains("## Hello"),
+        "marker stripped live:\n{screen}"
+    );
+
+    // Styling the preview must NOT advance the real fence state: a partial
+    // opening fence leaves code_lang untouched until its line commits.
+    let mut app2 = test_app("openai", "gpt-4o");
+    app2.apply(UiEvent::Text("```rust".into()));
+    term.draw(|f| app2.render(f)).unwrap();
+    assert!(
+        app2.code_lang.is_none(),
+        "live preview must not mutate the committed fence state"
+    );
+}
+
+#[test]
+fn edit_key_submits_on_enter_and_clears() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.input.set("queue me");
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(app.edit_key(&enter).as_deref(), Some("queue me"));
+    assert!(app.input.is_empty(), "input cleared after submit");
+    // An empty Enter submits nothing.
+    assert_eq!(app.edit_key(&enter), None);
+}
+
+#[test]
+fn renders_title_transcript_and_input() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.push(Line::raw("› hello"));
+    app.apply(UiEvent::Text("hi there\n".into()));
+    app.apply(UiEvent::AssistantEnd);
+    app.input.set("next question");
+
+    let mut term = Terminal::new(TestBackend::new(50, 12)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+
+    assert!(screen.contains("gpt-4o"), "title shows model");
+    assert!(screen.contains("hello"), "user line");
+    assert!(screen.contains("hi there"), "assistant line");
+    assert!(screen.contains("next question"), "input box");
+}
+
+#[test]
+fn turn_end_sets_status_and_marks_transcript_done() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.apply(UiEvent::TurnEnd("[10 in · 2 out · 12 total]".into()));
+    // Usage in the title bar...
+    assert!(app.status.contains("12 total"));
+    // ...and a clear "done" marker in the transcript so the turn's end shows.
+    assert_eq!(app.transcript.len(), 1);
+    let line = app.transcript[0].text();
+    assert!(line.contains("✓ done"), "got: {line}");
+}
+
+#[test]
+fn turn_end_renders_the_steer_suffix_from_the_summary() {
+    // The agent appends a "steer" suffix to the usage summary for noisy
+    // turns; the TUI renders that string verbatim, so the suffix surfaces
+    // in both the status bar and the done marker with no TUI-specific code.
+    let mut app = test_app("openai", "gpt-4o");
+    let noisy = "[↑10 ↓2 · ctx 5% (500/10k) · steer: 2 verify · 1 retry]";
+    app.apply(UiEvent::TurnEnd(noisy.into()));
+    assert!(
+        app.status.contains("steer: 2 verify"),
+        "steer in status bar: {}",
+        app.status
+    );
+    let line = app.transcript[0].text();
+    assert!(line.contains("steer"), "steer in done marker: {line}");
+}
+
+#[test]
+fn assistant_text_becomes_copy_target() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.apply(UiEvent::Text("first ".into()));
+    app.apply(UiEvent::Text("answer\n".into()));
+    app.apply(UiEvent::AssistantEnd);
+    assert_eq!(app.last_assistant, "first answer");
+
+    app.apply(UiEvent::ToolCall(
+        "bash".into(),
+        r#"{"command":"echo noisy"}"#.into(),
+    ));
+    app.apply(UiEvent::ToolResult("bash".into(), "noisy output".into()));
+    assert_eq!(
+        app.last_assistant, "first answer",
+        "tool logs are not copied as the assistant response"
+    );
+}
+
+#[test]
+fn transcript_text_serializes_lines() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.push(Line::raw("one"));
+    app.push(Line::from(vec![Span::raw("t"), Span::raw("wo")]));
+    assert_eq!(app.transcript_text(), "one\ntwo");
+}
+
+#[test]
+fn completed_turn_without_summary_is_visible() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.note_turn_completed_without_summary();
+    let line = app.transcript.last().unwrap().text();
+    assert!(line.contains("✓ done"), "got: {line}");
+    assert!(line.contains("no usage reported"), "got: {line}");
+    assert_eq!(app.status, "done · no usage reported");
+}
+
+#[test]
+fn stopped_after_tool_output_without_turn_end_is_visible() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.apply(UiEvent::ToolCall(
+        "edit".into(),
+        r#"{"path":"src/main.rs"}"#.into(),
+    ));
+    app.apply(UiEvent::ToolResult(
+        "edit".into(),
+        "19 additions, 3 deletions".into(),
+    ));
+    app.note_turn_completed_without_summary();
+
+    let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
+    assert!(
+        lines
             .iter()
-            .rposition(|l| l.trim_start().starts_with('╰') && l.contains('─'))
-            .unwrap();
-        let above_border: String = rows[..border_row_idx].join("\n");
-        assert!(
-            above_border.contains("provider metadata check failed") && above_border.contains('›'),
-            "notice + prompt above the border:\n{screen}"
-        );
-    }
+            .any(|line| line.contains("stopped after tool output")),
+        "transcript: {lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("degraded in-session")),
+        "transcript: {lines:?}"
+    );
+    assert_eq!(app.status, "stopped after tool output");
+}
 
-    #[test]
-    fn quit_notice_renders_and_does_not_clip_input() {
-        // After the first Ctrl-C (idle, empty input), a "Press Ctrl-C again to
-        // exit" notice is pinned above the status line. The box height must
-        // account for it or the input line clips and the cursor lands wrong.
-        let mut app = test_app("openai", "gpt-4o");
-        app.quit_notice = Some(Instant::now() + Duration::from_millis(1800));
-        let mut term = Terminal::new(TestBackend::new(70, 10)).unwrap();
-        term.draw(|f| app.render(f)).unwrap();
-        let screen = dump(&term);
-        assert!(
-            screen.contains("Press Ctrl-C again to exit"),
-            "quit notice shown:\n{screen}"
-        );
-        assert!(screen.contains('›'), "input prompt visible:\n{screen}");
-        // The input box bottom border closes cleanly (not overlapping content).
-        let bottom: Vec<&str> = screen.lines().filter(|l| l.contains('╰')).collect();
-        let input_box_border = bottom.last().expect("input box bottom border");
-        assert!(
-            input_box_border.trim_start().starts_with('╰'),
-            "input box border closed:\n{screen}"
-        );
-    }
+#[test]
+fn failed_turn_is_visible() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.note_turn_failed(
+        "provider disconnected",
+        "outage",
+        "check the provider's status page",
+    );
+    let line = app.transcript.last().unwrap().text();
+    assert!(line.contains("✗ failed"), "got: {line}");
+    assert!(line.contains("provider disconnected"), "got: {line}");
+    assert!(line.contains("outage"), "got: {line}");
+    assert!(line.contains("💡"), "shows guidance: {line}");
+    assert!(
+        app.status.contains("outage"),
+        "status has kind: {}",
+        app.status
+    );
+}
 
-    #[test]
-    fn changed_files_line_shows_what_last_turn_touched() {
-        // After a turn that changed files, a compact "changed: …" line sits
-        // above the input so the user sees what was touched without scrolling.
-        let mut app = test_app("openai", "gpt-4o");
-        app.last_changed_files = vec!["src/a.rs".into(), "src/b.rs".into()];
-        let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
-        term.draw(|f| app.render(f)).unwrap();
-        let screen = dump(&term);
-        assert!(
-            screen.contains("changed: src/a.rs, src/b.rs"),
-            "changed-files line: {screen}"
-        );
-        assert!(
-            screen.contains("Ctrl-D for diff"),
-            "diff toggle hint: {screen}"
-        );
-    }
+#[test]
+fn tool_protocol_failure_does_not_mark_model_degraded() {
+    let mut app = test_app("pipenetwork", "pipe/auto-code");
+    let err: anyhow::Error = hi_ai::ProviderError::new(
+        hi_ai::ProviderErrorKind::ToolProtocol,
+        "model output did not satisfy the tool protocol",
+    )
+    .into();
+    let (kind, guidance) = hi_agent::classify_error(&err);
 
-    #[test]
-    fn ctrl_d_toggles_the_diff_panel() {
-        // Toggling Ctrl-D opens the panel with the cached diff text and a
-        // header; toggling again closes it. We set diff_text directly to avoid
-        // a real git call in the unit test.
-        let mut app = test_app("openai", "gpt-4o");
-        app.show_diff = true;
-        app.diff_text = Some("--- a/x\n+++ b/x\n@@ -1,1 +1,1 @@\n-old\n+new\n".into());
-        let mut term = Terminal::new(TestBackend::new(60, 14)).unwrap();
-        term.draw(|f| app.render(f)).unwrap();
-        let screen = dump(&term);
-        assert!(
-            screen.contains("diff (Ctrl-D to close)"),
-            "panel header: {screen}"
-        );
-        assert!(screen.contains("+new"), "diff content rendered: {screen}");
-
-        // Closing drops the panel.
-        app.show_diff = false;
-        app.diff_text = None;
-        term.draw(|f| app.render(f)).unwrap();
-        let screen2 = dump(&term);
-        assert!(
-            !screen2.contains("diff (Ctrl-D to close)"),
-            "panel closed: {screen2}"
-        );
-    }
-
-    #[test]
-    fn ctrl_question_toggles_the_observability_panel() {
-        // The Ctrl-? agent-observability panel renders the last turn's telemetry
-        // counters, the per-turn tool-call count, and session/context numbers.
-        let mut app = test_app("openai", "gpt-4o");
-        app.show_debug = true;
-        app.last_telemetry = Some(hi_agent::TurnTelemetry {
-            verify_rounds: 2,
-            recovery_retries: 1,
-            repeat_nudges: 0,
-            continue_nudges: 1,
-            truncation_retries: 0,
-            hit_step_cap: false,
-            stalled_unfinished: false,
-            stalled_repeating: false,
-            verify_attributions: Vec::new(),
-            tool_calls: 7,
-            max_concurrent_batch: 3,
-            serial_runs: 2,
-            tool_timeline: Vec::new(),
-            file_reads: 2,
-            targeted_searches: 1,
-            listing_only: false,
-            first_tool_kind: "read".to_string(),
-            discovery_depth: "mixed".to_string(),
-            quality_repair_nudges: 0,
-        });
-        app.turn_tool_calls = 7;
-        let mut term = Terminal::new(TestBackend::new(60, 16)).unwrap();
-        term.draw(|f| app.render(f)).unwrap();
-        let screen = dump(&term);
-        assert!(
-            screen.contains("agent (Ctrl-? to close)"),
-            "panel header: {screen}"
-        );
-        assert!(
-            screen.contains("2 verify")
-                && screen.contains("1 retry")
-                && screen.contains("1 continue"),
-            "telemetry counters: {screen}"
-        );
-        assert!(
-            screen.contains("tool calls this turn: 7"),
-            "tool-call count: {screen}"
-        );
-
-        // Closing drops the panel.
-        app.show_debug = false;
-        term.draw(|f| app.render(f)).unwrap();
-        let screen2 = dump(&term);
-        assert!(
-            !screen2.contains("agent (Ctrl-? to close)"),
-            "panel closed: {screen2}"
-        );
-    }
-
-    #[test]
-    fn in_progress_line_is_styled_live() {
-        // A heading still streaming (no trailing newline yet) renders styled with
-        // its markers stripped — not literally as "## …" until the line commits.
-        let mut app = test_app("openai", "gpt-4o");
-        app.apply(UiEvent::Text("## Hello world".into()));
-        let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
-        term.draw(|f| app.render(f)).unwrap();
-        let screen = dump(&term);
-        assert!(
-            screen.contains("Hello world"),
-            "heading text shown:\n{screen}"
-        );
-        assert!(
-            !screen.contains("## Hello"),
-            "marker stripped live:\n{screen}"
-        );
-
-        // Styling the preview must NOT advance the real fence state: a partial
-        // opening fence leaves code_lang untouched until its line commits.
-        let mut app2 = test_app("openai", "gpt-4o");
-        app2.apply(UiEvent::Text("```rust".into()));
-        term.draw(|f| app2.render(f)).unwrap();
-        assert!(
-            app2.code_lang.is_none(),
-            "live preview must not mutate the committed fence state"
-        );
-    }
-
-    #[test]
-    fn edit_key_submits_on_enter_and_clears() {
-        let mut app = test_app("openai", "gpt-4o");
-        app.input.set("queue me");
-        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        assert_eq!(app.edit_key(&enter).as_deref(), Some("queue me"));
-        assert!(app.input.is_empty(), "input cleared after submit");
-        // An empty Enter submits nothing.
-        assert_eq!(app.edit_key(&enter), None);
-    }
-
-    #[test]
-    fn renders_title_transcript_and_input() {
-        let mut app = test_app("openai", "gpt-4o");
-        app.push(Line::raw("› hello"));
-        app.apply(UiEvent::Text("hi there\n".into()));
-        app.apply(UiEvent::AssistantEnd);
-        app.input.set("next question");
-
-        let mut term = Terminal::new(TestBackend::new(50, 12)).unwrap();
-        term.draw(|f| app.render(f)).unwrap();
-        let screen = dump(&term);
-
-        assert!(screen.contains("gpt-4o"), "title shows model");
-        assert!(screen.contains("hello"), "user line");
-        assert!(screen.contains("hi there"), "assistant line");
-        assert!(screen.contains("next question"), "input box");
-    }
-
-    #[test]
-    fn turn_end_sets_status_and_marks_transcript_done() {
-        let mut app = test_app("openai", "gpt-4o");
-        app.apply(UiEvent::TurnEnd("[10 in · 2 out · 12 total]".into()));
-        // Usage in the title bar...
-        assert!(app.status.contains("12 total"));
-        // ...and a clear "done" marker in the transcript so the turn's end shows.
-        assert_eq!(app.transcript.len(), 1);
-        let line = app.transcript[0].text();
-        assert!(line.contains("✓ done"), "got: {line}");
-    }
-
-    #[test]
-    fn turn_end_renders_the_steer_suffix_from_the_summary() {
-        // The agent appends a "steer" suffix to the usage summary for noisy
-        // turns; the TUI renders that string verbatim, so the suffix surfaces
-        // in both the status bar and the done marker with no TUI-specific code.
-        let mut app = test_app("openai", "gpt-4o");
-        let noisy = "[↑10 ↓2 · ctx 5% (500/10k) · steer: 2 verify · 1 retry]";
-        app.apply(UiEvent::TurnEnd(noisy.into()));
-        assert!(
-            app.status.contains("steer: 2 verify"),
-            "steer in status bar: {}",
-            app.status
-        );
-        let line = app.transcript[0].text();
-        assert!(line.contains("steer"), "steer in done marker: {line}");
-    }
-
-    #[test]
-    fn assistant_text_becomes_copy_target() {
-        let mut app = test_app("openai", "gpt-4o");
-        app.apply(UiEvent::Text("first ".into()));
-        app.apply(UiEvent::Text("answer\n".into()));
-        app.apply(UiEvent::AssistantEnd);
-        assert_eq!(app.last_assistant, "first answer");
-
-        app.apply(UiEvent::ToolCall(
-            "bash".into(),
-            r#"{"command":"echo noisy"}"#.into(),
-        ));
-        app.apply(UiEvent::ToolResult("bash".into(), "noisy output".into()));
-        assert_eq!(
-            app.last_assistant, "first answer",
-            "tool logs are not copied as the assistant response"
-        );
-    }
-
-    #[test]
-    fn transcript_text_serializes_lines() {
-        let mut app = test_app("openai", "gpt-4o");
-        app.push(Line::raw("one"));
-        app.push(Line::from(vec![Span::raw("t"), Span::raw("wo")]));
-        assert_eq!(app.transcript_text(), "one\ntwo");
-    }
-
-    #[test]
-    fn completed_turn_without_summary_is_visible() {
-        let mut app = test_app("openai", "gpt-4o");
-        app.note_turn_completed_without_summary();
-        let line = app.transcript.last().unwrap().text();
-        assert!(line.contains("✓ done"), "got: {line}");
-        assert!(line.contains("no usage reported"), "got: {line}");
-        assert_eq!(app.status, "done · no usage reported");
-    }
-
-    #[test]
-    fn stopped_after_tool_output_without_turn_end_is_visible() {
-        let mut app = test_app("openai", "gpt-4o");
-        app.apply(UiEvent::ToolCall(
-            "edit".into(),
-            r#"{"path":"src/main.rs"}"#.into(),
-        ));
-        app.apply(UiEvent::ToolResult(
-            "edit".into(),
-            "19 additions, 3 deletions".into(),
-        ));
-        app.note_turn_completed_without_summary();
-
-        let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("stopped after tool output")),
-            "transcript: {lines:?}"
-        );
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("degraded in-session")),
-            "transcript: {lines:?}"
-        );
-        assert_eq!(app.status, "stopped after tool output");
-    }
-
-    #[test]
-    fn failed_turn_is_visible() {
-        let mut app = test_app("openai", "gpt-4o");
-        app.note_turn_failed(
-            "provider disconnected",
-            "outage",
-            "check the provider's status page",
-        );
-        let line = app.transcript.last().unwrap().text();
-        assert!(line.contains("✗ failed"), "got: {line}");
-        assert!(line.contains("provider disconnected"), "got: {line}");
-        assert!(line.contains("outage"), "got: {line}");
-        assert!(line.contains("💡"), "shows guidance: {line}");
-        assert!(
-            app.status.contains("outage"),
-            "status has kind: {}",
-            app.status
-        );
-    }
-
-    #[test]
-    fn tool_protocol_failure_does_not_mark_model_degraded() {
-        let mut app = test_app("pipenetwork", "pipe/auto-code");
-        let err: anyhow::Error = hi_ai::ProviderError::new(
-            hi_ai::ProviderErrorKind::ToolProtocol,
-            "model output did not satisfy the tool protocol",
-        )
-        .into();
-        let (kind, guidance) = hi_agent::classify_error(&err);
-
-        app.note_turn_failed(&format!("{err:#}"), kind, guidance);
-        if hi_agent::ui::error_counts_as_model_issue(&err) {
-            app.record_model_issue();
-        }
-
-        let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
-        assert!(
-            lines.iter().any(|line| line.contains("tool_protocol")),
-            "transcript: {lines:?}"
-        );
-        assert!(
-            !lines
-                .iter()
-                .any(|line| line.contains("degraded in-session")),
-            "transcript: {lines:?}"
-        );
-        assert_eq!(app.model_issues.get("pipe/auto-code"), None);
-    }
-
-    #[test]
-    fn model_unavailable_failure_does_not_mark_model_degraded() {
-        let mut app = test_app("pipenetwork", "pipe/auto-code");
-        let err: anyhow::Error = hi_ai::ProviderError::new(
-            hi_ai::ProviderErrorKind::ModelUnavailable,
-            "model temporarily unavailable",
-        )
-        .into();
-        let (kind, guidance) = hi_agent::classify_error(&err);
-
-        app.note_turn_failed(&format!("{err:#}"), kind, guidance);
-        if hi_agent::ui::error_counts_as_model_issue(&err) {
-            app.record_model_issue();
-        }
-
-        let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
-        assert!(
-            lines.iter().any(|line| line.contains("model_unavailable")),
-            "transcript: {lines:?}"
-        );
-        assert!(
-            !lines
-                .iter()
-                .any(|line| line.contains("degraded in-session")),
-            "transcript: {lines:?}"
-        );
-        assert_eq!(app.model_issues.get("pipe/auto-code"), None);
-    }
-
-    #[test]
-    fn empty_tool_result_is_visible() {
-        let mut app = test_app("openai", "gpt-4o");
-        app.apply(UiEvent::ToolCall(
-            "bash".into(),
-            r#"{"command":"true"}"#.into(),
-        ));
-        app.apply(UiEvent::ToolResult("bash".into(), String::new()));
-        let rendered: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
-        assert!(
-            rendered.iter().any(|line| line.contains("(no output)")),
-            "transcript: {rendered:?}"
-        );
-    }
-
-    #[test]
-    fn renders_fetching_spinner() {
-        let mut app = test_app("pipenetwork", "ipop/coder-balanced");
-        app.fetching = Some(Instant::now());
-        let mut term = Terminal::new(TestBackend::new(60, 10)).unwrap();
-        term.draw(|f| app.render(f)).unwrap();
-        let screen = dump(&term);
-        assert!(
-            screen.contains("fetching models from pipenetwork"),
-            "fetch spinner: {screen}"
-        );
-        assert!(screen.contains("Esc to cancel"), "cancel hint: {screen}");
-    }
-
-    #[test]
-    fn renders_model_picker() {
-        let mut app = test_app("openai", "openai/gpt-4o");
-        app.picker = Some(ModelPicker::new(
-            vec!["anthropic/claude-sonnet-4".into(), "openai/gpt-4o".into()],
-            "openai/gpt-4o",
-            HashMap::new(),
-            &HashMap::new(),
-            &HashMap::new(),
-        ));
-        let mut term = Terminal::new(TestBackend::new(60, 14)).unwrap();
-        term.draw(|f| app.render(f)).unwrap();
-        let screen = dump(&term);
-        assert!(screen.contains("select a model"), "title: {screen}");
-        assert!(screen.contains("filter:"), "filter line: {screen}");
-        assert!(screen.contains("claude-sonnet-4"), "lists models: {screen}");
-        assert!(screen.contains("▶"), "highlights a selection: {screen}");
-        // The active model is marked and pre-selected.
-        assert!(
-            screen.contains("(current)"),
-            "marks current model: {screen}"
-        );
-    }
-
-    #[test]
-    fn picker_shows_health_tag() {
-        let mut app = test_app("pipenetwork", "ipop/coder-balanced");
-        let tags = HashMap::from([("claude-sonnet-4.6".to_string(), "degraded".to_string())]);
-        app.picker = Some(ModelPicker::new(
-            vec!["claude-sonnet-4.6".into(), "ipop/coder-balanced".into()],
-            "ipop/coder-balanced",
-            tags,
-            &HashMap::new(),
-            &HashMap::new(),
-        ));
-        let mut term = Terminal::new(TestBackend::new(60, 14)).unwrap();
-        term.draw(|f| app.render(f)).unwrap();
-        let screen = dump(&term);
-        assert!(
-            screen.contains("[degraded]"),
-            "degraded tag shown: {screen}"
-        );
-    }
-
-    #[test]
-    fn renders_multiline_input() {
-        let mut app = test_app("openai", "gpt-4o");
-        app.input.insert_str("first\nsecond\nthird");
-        let mut term = Terminal::new(TestBackend::new(40, 14)).unwrap();
-        term.draw(|f| app.render(f)).unwrap();
-        let screen = dump(&term);
-        assert!(
-            screen.contains("› first"),
-            "first line with prompt: {screen}"
-        );
-        assert!(screen.contains("second"), "second line: {screen}");
-        assert!(screen.contains("third"), "third line: {screen}");
-    }
-
-    #[test]
-    fn alt_enter_and_backslash_insert_newline_instead_of_submitting() {
-        let mut app = test_app("openai", "gpt-4o");
-        app.input.set("line one");
-        let alt_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
-        assert_eq!(app.edit_key(&alt_enter), None, "alt+enter does not submit");
-        assert_eq!(app.input.text(), "line one\n");
-
-        // Trailing backslash + Enter continues the line (universal fallback).
-        app.input.set("a\\");
-        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        assert_eq!(app.edit_key(&enter), None, "backslash continues");
-        assert_eq!(app.input.text(), "a\n");
-
-        // A normal Enter still submits.
-        app.input.set("go");
-        assert_eq!(app.edit_key(&enter).as_deref(), Some("go"));
-    }
-
-    #[test]
-    fn failed_turn_shows_reason_and_keeps_error() {
-        let mut app = test_app("openai", "gpt-4o");
-        app.note_turn_failed(
-            "API error 401: invalid or expired session",
-            "auth",
-            "check your API key",
-        );
-        // record_model_issue runs next in the real flow; it must NOT clobber the
-        // real error with a reliability-count message.
+    app.note_turn_failed(&format!("{err:#}"), kind, guidance);
+    if hi_agent::ui::error_counts_as_model_issue(&err) {
         app.record_model_issue();
-        assert_eq!(
-            app.last_error.as_deref(),
-            Some("API error 401: invalid or expired session"),
-            "the real error is preserved for /status and /log"
-        );
-        // The bottom bar shows the reason inline, not a bare "failed".
-        let mut term = Terminal::new(TestBackend::new(80, 8)).unwrap();
-        term.draw(|f| app.render(f)).unwrap();
-        let screen = dump(&term);
-        assert!(
-            screen.contains("last: failed — API error 401"),
-            "reason inline: {screen}"
-        );
-        assert!(screen.contains("/retry"), "recovery hint: {screen}");
     }
 
-    #[test]
-    fn backend_wait_notice_does_not_mark_model_degraded() {
-        let mut app = test_app("pipenetwork", "ipop/coder-balanced");
-        app.note_backend_waiting(Duration::from_secs(181), Duration::from_secs(180));
-
-        assert_eq!(app.model_issues.get("ipop/coder-balanced"), None);
-        assert_eq!(app.last_error, None);
-        let mut term = Terminal::new(TestBackend::new(100, 8)).unwrap();
-        term.draw(|f| app.render(f)).unwrap();
-        let screen = dump(&term);
-        assert!(
-            screen.contains("Still thinking. Ctrl-C cancels; keep waiting to continue."),
-            "soft wait notice shown: {screen}"
-        );
-        assert!(
-            !screen.contains("degraded in-session"),
-            "soft wait notice is not model health: {screen}"
-        );
-    }
-
-    #[test]
-    fn watchdog_timeout_default_is_longer_than_client_warning_window() {
-        assert_eq!(
-            watchdog_stuck_timeout_from_value(None),
-            Duration::from_secs(180)
-        );
-        assert_eq!(
-            watchdog_stuck_timeout_from_value(Some("5")),
-            Duration::from_secs(30)
-        );
-        assert_eq!(
-            watchdog_stuck_timeout_from_value(Some("9999")),
-            Duration::from_secs(1_800)
-        );
-    }
-
-    #[test]
-    fn completion_opens_filters_and_closes() {
-        let mut app = test_app("openai", "gpt-4o");
-        app.input.set("/");
-        app.sync_completion();
-        assert_eq!(
-            app.completion_items().len(),
-            hi_agent::command::COMMANDS.len(),
-            "bare slash lists every command"
-        );
-        app.input.set("/co");
-        app.sync_completion();
-        let labels: Vec<String> = app
-            .completion_items()
+    let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
+    assert!(
+        lines.iter().any(|line| line.contains("tool_protocol")),
+        "transcript: {lines:?}"
+    );
+    assert!(
+        !lines
             .iter()
-            .map(|i| i.label.clone())
-            .collect();
-        assert!(
-            labels.contains(&"/copy".to_string()) && labels.contains(&"/compact".to_string()),
-            "got {labels:?}"
-        );
-        assert!(labels.iter().all(|n| n.starts_with("/co")));
-        // A space after a command that takes no argument closes the menu.
-        app.input.set("/diff ");
-        app.sync_completion();
-        assert!(app.completion.is_none());
+            .any(|line| line.contains("degraded in-session")),
+        "transcript: {lines:?}"
+    );
+    assert_eq!(app.model_issues.get("pipe/auto-code"), None);
+}
+
+#[test]
+fn model_unavailable_failure_does_not_mark_model_degraded() {
+    let mut app = test_app("pipenetwork", "pipe/auto-code");
+    let err: anyhow::Error = hi_ai::ProviderError::new(
+        hi_ai::ProviderErrorKind::ModelUnavailable,
+        "model temporarily unavailable",
+    )
+    .into();
+    let (kind, guidance) = hi_agent::classify_error(&err);
+
+    app.note_turn_failed(&format!("{err:#}"), kind, guidance);
+    if hi_agent::ui::error_counts_as_model_issue(&err) {
+        app.record_model_issue();
     }
 
-    #[test]
-    fn completion_offers_verify_and_goal_keywords() {
-        let mut app = test_app("openai", "gpt-4o");
-        app.input.set("/verify ");
-        app.sync_completion();
-        let labels: Vec<String> = app
-            .completion_items()
+    let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
+    assert!(
+        lines.iter().any(|line| line.contains("model_unavailable")),
+        "transcript: {lines:?}"
+    );
+    assert!(
+        !lines
             .iter()
-            .map(|i| i.label.clone())
-            .collect();
-        assert_eq!(labels, vec!["off"], "verify offers its disable keyword");
-        app.input.set("/goal cl");
-        app.sync_completion();
-        let labels: Vec<String> = app
-            .completion_items()
-            .iter()
-            .map(|i| i.label.clone())
-            .collect();
-        assert_eq!(labels, vec!["clear"], "goal offers its clear keyword");
-        assert_eq!(app.accept_completion(true).as_deref(), Some("/goal clear"));
-    }
+            .any(|line| line.contains("degraded in-session")),
+        "transcript: {lines:?}"
+    );
+    assert_eq!(app.model_issues.get("pipe/auto-code"), None);
+}
 
-    #[test]
-    fn completion_offers_live_model_ids() {
-        let mut app = test_app("openai", "gpt-4o");
-        app.model_ids = vec!["gpt-4o".into(), "gpt-4o-mini".into(), "claude-opus".into()];
-        app.input.set("/model gp");
-        app.sync_completion();
-        let labels: Vec<String> = app
-            .completion_items()
-            .iter()
-            .map(|i| i.label.clone())
-            .collect();
-        assert_eq!(
-            labels,
-            vec!["gpt-4o", "gpt-4o-mini"],
-            "filters the catalog by prefix"
-        );
-        // Accepting a row runs the full command.
-        app.completion.as_mut().unwrap().selected = 1;
-        assert_eq!(
-            app.accept_completion(true).as_deref(),
-            Some("/model gpt-4o-mini")
-        );
+#[test]
+fn empty_tool_result_is_visible() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.apply(UiEvent::ToolCall(
+        "bash".into(),
+        r#"{"command":"true"}"#.into(),
+    ));
+    app.apply(UiEvent::ToolResult("bash".into(), String::new()));
+    let rendered: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
+    assert!(
+        rendered.iter().any(|line| line.contains("(no output)")),
+        "transcript: {rendered:?}"
+    );
+}
 
-        // With no catalog loaded, there's no inline menu — the picker still
-        // handles `/model` (so the feature degrades, it doesn't break).
-        let mut bare = test_app("openai", "gpt-4o");
-        bare.input.set("/model gp");
-        bare.sync_completion();
-        assert!(bare.completion.is_none());
-    }
+#[test]
+fn renders_fetching_spinner() {
+    let mut app = test_app("pipenetwork", "ipop/coder-balanced");
+    app.fetching = Some(Instant::now());
+    let mut term = Terminal::new(TestBackend::new(60, 10)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(
+        screen.contains("fetching models from pipenetwork"),
+        "fetch spinner: {screen}"
+    );
+    assert!(screen.contains("Esc to cancel"), "cancel hint: {screen}");
+}
 
-    #[test]
-    fn completion_offers_then_fills_compact_kinds() {
-        let mut app = test_app("openai", "gpt-4o");
-        // The space that used to kill the menu now offers the kinds.
-        app.input.set("/compact ");
-        app.sync_completion();
-        let labels: Vec<String> = app
-            .completion_items()
-            .iter()
-            .map(|i| i.label.clone())
-            .collect();
-        assert_eq!(labels, vec!["hybrid", "full", "elide"], "offers every kind");
-        // Typing narrows by prefix.
-        app.input.set("/compact e");
-        app.sync_completion();
-        let labels: Vec<String> = app
-            .completion_items()
-            .iter()
-            .map(|i| i.label.clone())
-            .collect();
-        assert_eq!(labels, vec!["elide"]);
-        // Accepting a kind fills the whole command and runs it on Enter.
-        assert_eq!(
-            app.accept_completion(true).as_deref(),
-            Some("/compact elide")
-        );
-        assert!(app.completion.is_none(), "menu closes after accept");
-    }
+#[test]
+fn renders_model_picker() {
+    let mut app = test_app("openai", "openai/gpt-4o");
+    app.picker = Some(ModelPicker::new(
+        vec!["anthropic/claude-sonnet-4".into(), "openai/gpt-4o".into()],
+        "openai/gpt-4o",
+        HashMap::new(),
+        &HashMap::new(),
+        &HashMap::new(),
+    ));
+    let mut term = Terminal::new(TestBackend::new(60, 14)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(screen.contains("select a model"), "title: {screen}");
+    assert!(screen.contains("filter:"), "filter line: {screen}");
+    assert!(screen.contains("claude-sonnet-4"), "lists models: {screen}");
+    assert!(screen.contains("▶"), "highlights a selection: {screen}");
+    // The active model is marked and pre-selected.
+    assert!(
+        screen.contains("(current)"),
+        "marks current model: {screen}"
+    );
+}
 
-    #[test]
-    fn completing_compact_name_opens_its_kind_menu() {
-        let mut app = test_app("openai", "gpt-4o");
-        app.input.set("/compact");
-        app.sync_completion();
-        // Tab accepts the command name, leaving `/compact `…
-        app.accept_completion(false);
-        assert_eq!(app.input.text(), "/compact ");
-        // …and the re-sync the Tab handler performs opens the kind menu.
-        app.sync_completion();
-        let labels: Vec<String> = app
-            .completion_items()
-            .iter()
-            .map(|i| i.label.clone())
-            .collect();
-        assert!(labels.contains(&"hybrid".to_string()), "got {labels:?}");
-    }
+#[test]
+fn picker_shows_health_tag() {
+    let mut app = test_app("pipenetwork", "ipop/coder-balanced");
+    let tags = HashMap::from([("claude-sonnet-4.6".to_string(), "degraded".to_string())]);
+    app.picker = Some(ModelPicker::new(
+        vec!["claude-sonnet-4.6".into(), "ipop/coder-balanced".into()],
+        "ipop/coder-balanced",
+        tags,
+        &HashMap::new(),
+        &HashMap::new(),
+    ));
+    let mut term = Terminal::new(TestBackend::new(60, 14)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(
+        screen.contains("[degraded]"),
+        "degraded tag shown: {screen}"
+    );
+}
 
-    #[test]
-    fn completion_navigation_and_accept() {
-        let mut app = test_app("openai", "gpt-4o");
-        // No-arg command: Enter accepts and submits immediately.
-        app.input.set("/hel");
-        app.sync_completion();
-        let line = app.accept_completion(true);
-        assert_eq!(line.as_deref(), Some("/help"));
-        assert!(app.completion.is_none(), "menu closes after accept");
+#[test]
+fn renders_multiline_input() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.input.insert_str("first\nsecond\nthird");
+    let mut term = Terminal::new(TestBackend::new(40, 14)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(
+        screen.contains("› first"),
+        "first line with prompt: {screen}"
+    );
+    assert!(screen.contains("second"), "second line: {screen}");
+    assert!(screen.contains("third"), "third line: {screen}");
+}
 
-        // Arg-taking command: accept leaves a trailing space, does not submit.
-        app.input.set("/mod");
-        app.sync_completion();
-        assert_eq!(
-            app.accept_completion(true),
-            None,
-            "arg command waits for input"
-        );
-        assert_eq!(app.input.text(), "/model ");
+#[test]
+fn alt_enter_and_backslash_insert_newline_instead_of_submitting() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.input.set("line one");
+    let alt_enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT);
+    assert_eq!(app.edit_key(&alt_enter), None, "alt+enter does not submit");
+    assert_eq!(app.input.text(), "line one\n");
 
-        // Tab never submits, even for a no-arg command.
-        app.input.set("/dif");
-        app.sync_completion();
-        assert_eq!(app.accept_completion(false), None);
-        assert_eq!(app.input.text(), "/diff");
-    }
+    // Trailing backslash + Enter continues the line (universal fallback).
+    app.input.set("a\\");
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    assert_eq!(app.edit_key(&enter), None, "backslash continues");
+    assert_eq!(app.input.text(), "a\n");
 
-    #[test]
-    fn completion_move_clamps() {
-        let mut app = test_app("openai", "gpt-4o");
-        app.input.set("/co"); // [commit, compact, context, copy]
-        app.sync_completion();
-        let last = app.completion_items().len().saturating_sub(1);
-        app.completion_move(-1); // already at 0, stays
-        assert_eq!(app.completion.as_ref().unwrap().selected, 0);
+    // A normal Enter still submits.
+    app.input.set("go");
+    assert_eq!(app.edit_key(&enter).as_deref(), Some("go"));
+}
+
+#[test]
+fn failed_turn_shows_reason_and_keeps_error() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.note_turn_failed(
+        "API error 401: invalid or expired session",
+        "auth",
+        "check your API key",
+    );
+    // record_model_issue runs next in the real flow; it must NOT clobber the
+    // real error with a reliability-count message.
+    app.record_model_issue();
+    assert_eq!(
+        app.last_error.as_deref(),
+        Some("API error 401: invalid or expired session"),
+        "the real error is preserved for /status and /log"
+    );
+    // The bottom bar shows the reason inline, not a bare "failed".
+    let mut term = Terminal::new(TestBackend::new(80, 8)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(
+        screen.contains("last: failed — API error 401"),
+        "reason inline: {screen}"
+    );
+    assert!(screen.contains("/retry"), "recovery hint: {screen}");
+}
+
+#[test]
+fn backend_wait_notice_does_not_mark_model_degraded() {
+    let mut app = test_app("pipenetwork", "ipop/coder-balanced");
+    app.note_backend_waiting(Duration::from_secs(181), Duration::from_secs(180));
+
+    assert_eq!(app.model_issues.get("ipop/coder-balanced"), None);
+    assert_eq!(app.last_error, None);
+    let mut term = Terminal::new(TestBackend::new(100, 8)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(
+        screen.contains("Still thinking. Ctrl-C cancels; keep waiting to continue."),
+        "soft wait notice shown: {screen}"
+    );
+    assert!(
+        !screen.contains("degraded in-session"),
+        "soft wait notice is not model health: {screen}"
+    );
+}
+
+#[test]
+fn watchdog_timeout_default_is_longer_than_client_warning_window() {
+    assert_eq!(
+        watchdog_stuck_timeout_from_value(None),
+        Duration::from_secs(180)
+    );
+    assert_eq!(
+        watchdog_stuck_timeout_from_value(Some("5")),
+        Duration::from_secs(30)
+    );
+    assert_eq!(
+        watchdog_stuck_timeout_from_value(Some("9999")),
+        Duration::from_secs(1_800)
+    );
+}
+
+#[test]
+fn completion_opens_filters_and_closes() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.input.set("/");
+    app.sync_completion();
+    assert_eq!(
+        app.completion_items().len(),
+        hi_agent::command::COMMANDS.len(),
+        "bare slash lists every command"
+    );
+    app.input.set("/co");
+    app.sync_completion();
+    let labels: Vec<String> = app
+        .completion_items()
+        .iter()
+        .map(|i| i.label.clone())
+        .collect();
+    assert!(
+        labels.contains(&"/copy".to_string()) && labels.contains(&"/compact".to_string()),
+        "got {labels:?}"
+    );
+    assert!(labels.iter().all(|n| n.starts_with("/co")));
+    // A space after a command that takes no argument closes the menu.
+    app.input.set("/diff ");
+    app.sync_completion();
+    assert!(app.completion.is_none());
+}
+
+#[test]
+fn completion_offers_verify_and_goal_keywords() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.input.set("/verify ");
+    app.sync_completion();
+    let labels: Vec<String> = app
+        .completion_items()
+        .iter()
+        .map(|i| i.label.clone())
+        .collect();
+    assert_eq!(labels, vec!["off"], "verify offers its disable keyword");
+    app.input.set("/goal cl");
+    app.sync_completion();
+    let labels: Vec<String> = app
+        .completion_items()
+        .iter()
+        .map(|i| i.label.clone())
+        .collect();
+    assert_eq!(labels, vec!["clear"], "goal offers its clear keyword");
+    assert_eq!(app.accept_completion(true).as_deref(), Some("/goal clear"));
+}
+
+#[test]
+fn completion_offers_live_model_ids() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.model_ids = vec!["gpt-4o".into(), "gpt-4o-mini".into(), "claude-opus".into()];
+    app.input.set("/model gp");
+    app.sync_completion();
+    let labels: Vec<String> = app
+        .completion_items()
+        .iter()
+        .map(|i| i.label.clone())
+        .collect();
+    assert_eq!(
+        labels,
+        vec!["gpt-4o", "gpt-4o-mini"],
+        "filters the catalog by prefix"
+    );
+    // Accepting a row runs the full command.
+    app.completion.as_mut().unwrap().selected = 1;
+    assert_eq!(
+        app.accept_completion(true).as_deref(),
+        Some("/model gpt-4o-mini")
+    );
+
+    // With no catalog loaded, there's no inline menu — the picker still
+    // handles `/model` (so the feature degrades, it doesn't break).
+    let mut bare = test_app("openai", "gpt-4o");
+    bare.input.set("/model gp");
+    bare.sync_completion();
+    assert!(bare.completion.is_none());
+}
+
+#[test]
+fn completion_offers_then_fills_compact_kinds() {
+    let mut app = test_app("openai", "gpt-4o");
+    // The space that used to kill the menu now offers the kinds.
+    app.input.set("/compact ");
+    app.sync_completion();
+    let labels: Vec<String> = app
+        .completion_items()
+        .iter()
+        .map(|i| i.label.clone())
+        .collect();
+    assert_eq!(labels, vec!["hybrid", "full", "elide"], "offers every kind");
+    // Typing narrows by prefix.
+    app.input.set("/compact e");
+    app.sync_completion();
+    let labels: Vec<String> = app
+        .completion_items()
+        .iter()
+        .map(|i| i.label.clone())
+        .collect();
+    assert_eq!(labels, vec!["elide"]);
+    // Accepting a kind fills the whole command and runs it on Enter.
+    assert_eq!(
+        app.accept_completion(true).as_deref(),
+        Some("/compact elide")
+    );
+    assert!(app.completion.is_none(), "menu closes after accept");
+}
+
+#[test]
+fn completing_compact_name_opens_its_kind_menu() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.input.set("/compact");
+    app.sync_completion();
+    // Tab accepts the command name, leaving `/compact `…
+    app.accept_completion(false);
+    assert_eq!(app.input.text(), "/compact ");
+    // …and the re-sync the Tab handler performs opens the kind menu.
+    app.sync_completion();
+    let labels: Vec<String> = app
+        .completion_items()
+        .iter()
+        .map(|i| i.label.clone())
+        .collect();
+    assert!(labels.contains(&"hybrid".to_string()), "got {labels:?}");
+}
+
+#[test]
+fn completion_navigation_and_accept() {
+    let mut app = test_app("openai", "gpt-4o");
+    // No-arg command: Enter accepts and submits immediately.
+    app.input.set("/hel");
+    app.sync_completion();
+    let line = app.accept_completion(true);
+    assert_eq!(line.as_deref(), Some("/help"));
+    assert!(app.completion.is_none(), "menu closes after accept");
+
+    // Arg-taking command: accept leaves a trailing space, does not submit.
+    app.input.set("/mod");
+    app.sync_completion();
+    assert_eq!(
+        app.accept_completion(true),
+        None,
+        "arg command waits for input"
+    );
+    assert_eq!(app.input.text(), "/model ");
+
+    // Tab never submits, even for a no-arg command.
+    app.input.set("/dif");
+    app.sync_completion();
+    assert_eq!(app.accept_completion(false), None);
+    assert_eq!(app.input.text(), "/diff");
+}
+
+#[test]
+fn completion_move_clamps() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.input.set("/co"); // [commit, compact, context, copy]
+    app.sync_completion();
+    let last = app.completion_items().len().saturating_sub(1);
+    app.completion_move(-1); // already at 0, stays
+    assert_eq!(app.completion.as_ref().unwrap().selected, 0);
+    app.completion_move(1);
+    assert_eq!(app.completion.as_ref().unwrap().selected, 1);
+    // Move past the end to verify clamping.
+    for _ in 0..last + 1 {
         app.completion_move(1);
-        assert_eq!(app.completion.as_ref().unwrap().selected, 1);
-        // Move past the end to verify clamping.
-        for _ in 0..last + 1 {
-            app.completion_move(1);
-        }
-        assert_eq!(app.completion.as_ref().unwrap().selected, last);
     }
+    assert_eq!(app.completion.as_ref().unwrap().selected, last);
+}
 
-    #[test]
-    fn renders_completion_menu() {
-        let mut app = test_app("openai", "gpt-4o");
-        app.input.set("/");
-        app.sync_completion();
-        let mut term = Terminal::new(TestBackend::new(72, 20)).unwrap();
-        term.draw(|f| app.render(f)).unwrap();
-        let screen = dump(&term);
-        assert!(screen.contains("/help"), "lists help: {screen}");
-        assert!(screen.contains("/model"), "lists model: {screen}");
-        assert!(screen.contains("▶"), "highlights a row: {screen}");
-    }
+#[test]
+fn renders_completion_menu() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.input.set("/");
+    app.sync_completion();
+    let mut term = Terminal::new(TestBackend::new(72, 20)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(screen.contains("/help"), "lists help: {screen}");
+    assert!(screen.contains("/model"), "lists model: {screen}");
+    assert!(screen.contains("▶"), "highlights a row: {screen}");
+}
 
-    /// `splash_lines` now leads with a ~2x block-letter "PipeNetwork.AI"
-    /// banner (5 figlet rows, all orange bold), then the dim model line, the
-    /// cwd, and a trailing blank. Verifies banner shape, orange+bold styling
-    /// on every banner row, the model/cwd content, and the line count.
-    #[test]
-    fn splash_shows_full_pipenetwork_wordmark_in_orange() {
-        let lines = splash_lines("openai", "gpt-4o", Some(128_000));
+/// `splash_lines` now leads with a ~2x block-letter "PipeNetwork.AI"
+/// banner (5 figlet rows, all orange bold), then the dim model line, the
+/// cwd, and a trailing blank. Verifies banner shape, orange+bold styling
+/// on every banner row, the model/cwd content, and the line count.
+#[test]
+fn splash_shows_full_pipenetwork_wordmark_in_orange() {
+    let lines = splash_lines("openai", "gpt-4o", Some(128_000));
 
-        // 5 banner rows + model line + cwd line + trailing blank = 8.
+    // 5 banner rows + model line + cwd line + trailing blank = 8.
+    assert_eq!(
+        lines.len(),
+        8,
+        "expected 8 lines (5 banner + model + cwd + blank)"
+    );
+
+    // Banner: rows 0..5, each one span styled orange + bold, carrying
+    // figlet strokes (pipes / underscores).
+    for (i, line) in lines[0..5].iter().enumerate() {
         assert_eq!(
-            lines.len(),
-            8,
-            "expected 8 lines (5 banner + model + cwd + blank)"
+            line.spans.len(),
+            1,
+            "banner row {i} should be a single span, got {} spans",
+            line.spans.len()
         );
-
-        // Banner: rows 0..5, each one span styled orange + bold, carrying
-        // figlet strokes (pipes / underscores).
-        for (i, line) in lines[0..5].iter().enumerate() {
-            assert_eq!(
-                line.spans.len(),
-                1,
-                "banner row {i} should be a single span, got {} spans",
-                line.spans.len()
-            );
-            let span = &line.spans[0];
-            assert_eq!(
-                span.style.fg,
-                Some(Color::Rgb(255, 140, 0)),
-                "banner row {i} should be orange"
-            );
-            assert!(
-                span.style.add_modifier.contains(Modifier::BOLD),
-                "banner row {i} should be bold"
-            );
-            let text = span.content.to_string();
-            assert!(
-                text.contains('|') || text.contains('_'),
-                "banner row {i} should carry figlet strokes, got: {text:?}"
-            );
-        }
-
-        // Row 5: dim model line (model + provider + context window).
-        let model_line: String = lines[5]
-            .spans
-            .iter()
-            .map(|s| s.content.to_string())
-            .collect();
-        assert!(
-            model_line.contains("gpt-4o"),
-            "model line missing model: {model_line:?}"
+        let span = &line.spans[0];
+        assert_eq!(
+            span.style.fg,
+            Some(Color::Rgb(255, 140, 0)),
+            "banner row {i} should be orange"
         );
         assert!(
-            model_line.contains("openai"),
-            "model line missing provider: {model_line:?}"
+            span.style.add_modifier.contains(Modifier::BOLD),
+            "banner row {i} should be bold"
         );
+        let text = span.content.to_string();
         assert!(
-            model_line.contains("128K context"),
-            "model line missing context window: {model_line:?}"
-        );
-
-        // Row 6: cwd — non-empty.
-        let cwd_line: String = lines[6]
-            .spans
-            .iter()
-            .map(|s| s.content.to_string())
-            .collect();
-        assert!(
-            !cwd_line.is_empty(),
-            "cwd line should be non-empty, got: {cwd_line:?}"
-        );
-
-        // Row 7: the blank breathing-room line.
-        assert!(
-            lines[7].spans.is_empty(),
-            "last line should be the blank breathing-room line"
+            text.contains('|') || text.contains('_'),
+            "banner row {i} should carry figlet strokes, got: {text:?}"
         );
     }
+
+    // Row 5: dim model line (model + provider + context window).
+    let model_line: String = lines[5]
+        .spans
+        .iter()
+        .map(|s| s.content.to_string())
+        .collect();
+    assert!(
+        model_line.contains("gpt-4o"),
+        "model line missing model: {model_line:?}"
+    );
+    assert!(
+        model_line.contains("openai"),
+        "model line missing provider: {model_line:?}"
+    );
+    assert!(
+        model_line.contains("128K context"),
+        "model line missing context window: {model_line:?}"
+    );
+
+    // Row 6: cwd — non-empty.
+    let cwd_line: String = lines[6]
+        .spans
+        .iter()
+        .map(|s| s.content.to_string())
+        .collect();
+    assert!(
+        !cwd_line.is_empty(),
+        "cwd line should be non-empty, got: {cwd_line:?}"
+    );
+
+    // Row 7: the blank breathing-room line.
+    assert!(
+        lines[7].spans.is_empty(),
+        "last line should be the blank breathing-room line"
+    );
+}

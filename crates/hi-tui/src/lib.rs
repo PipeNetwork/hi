@@ -21,14 +21,16 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use hi_agent::Agent;
+use hi_agent::{Agent, AgentStateSnapshot};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 #[cfg(test)]
 use {
-    crossterm::event::{KeyCode, KeyEvent, KeyModifiers}, hi_agent::PlanStatus,
-    ratatui::Terminal, crate::event::UiEvent,
+    crate::event::UiEvent,
+    crossterm::event::{KeyCode, KeyEvent, KeyModifiers},
+    hi_agent::PlanStatus,
+    ratatui::Terminal,
 };
 
 /// Info about a configured profile, for the `/provider` list and picker.
@@ -160,7 +162,11 @@ const BANNER: [&str; 5] = [
 /// the dim model line and the working directory. A blank line of breathing
 /// room follows before the usage hint. Sits at the top of the transcript and
 /// scrolls up naturally as you work.
-pub(crate) fn splash_lines(provider: &str, model: &str, context_window: Option<u32>) -> Vec<Line<'static>> {
+pub(crate) fn splash_lines(
+    provider: &str,
+    model: &str,
+    context_window: Option<u32>,
+) -> Vec<Line<'static>> {
     let orange = Style::default().fg(Color::Rgb(255, 140, 0));
     let bold_orange = orange.add_modifier(Modifier::BOLD);
     let dim = dim();
@@ -223,8 +229,6 @@ pub(crate) fn apply_metadata(
         }
     }
 }
-
-
 
 /// One entry in the display transcript. Most content is a plain styled line;
 /// reasoning (CoT) is stored specially so it can be collapsed by default and
@@ -355,6 +359,10 @@ pub(crate) struct App {
     /// Message-history length just before the last turn started, so `/retry`
     /// can drop that turn before re-running.
     pub(crate) last_turn_start: usize,
+    /// Prompt-injected state just before the last turn started, so `/retry` and
+    /// interrupt cleanup do not leak decisions/goals/plans from the discarded
+    /// attempt.
+    pub(crate) last_turn_snapshot: Option<AgentStateSnapshot>,
     /// Active model picker (`/model` with no argument), if any.
     pub(crate) picker: Option<ModelPicker>,
     /// Active provider form (`/provider add` or `/provider edit`), if any.

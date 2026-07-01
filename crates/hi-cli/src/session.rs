@@ -38,6 +38,22 @@ enum SessionMeta {
     Goal {
         goal: hi_agent::Goal,
     },
+    /// The long-horizon goal was explicitly cleared. Last write wins.
+    GoalCleared,
+    /// The intra-session decision log. Last write wins.
+    Decisions {
+        decisions: Vec<hi_agent::Decision>,
+    },
+    /// An explicit replacement of all retry-relevant state. This keeps
+    /// transcript, structured goal, and decisions in sync when a turn is
+    /// discarded by `/retry` or interrupt cleanup.
+    StateReplacement {
+        messages: Vec<Message>,
+        #[serde(default)]
+        goal: Option<hi_agent::Goal>,
+        #[serde(default)]
+        decisions: Vec<hi_agent::Decision>,
+    },
 }
 
 /// Appends messages to a session's JSONL file.
@@ -75,6 +91,10 @@ impl JsonlSession {
 }
 
 impl SessionSink for JsonlSession {
+    fn record_checkpoints(&mut self, refs: &[String]) -> Result<()> {
+        JsonlSession::record_checkpoints(self, refs)
+    }
+
     fn record(&mut self, messages: &[Message], usage: Usage, cost_usd: Option<f64>) -> Result<()> {
         if messages.is_empty() && usage.is_zero() {
             return Ok(());
@@ -135,6 +155,65 @@ impl SessionSink for JsonlSession {
         writer.flush()?;
         Ok(())
     }
+
+    fn clear_goal(&mut self) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .with_context(|| format!("opening {}", self.path.display()))?;
+        let mut writer = BufWriter::new(file);
+        let line = serde_json::to_string(&SessionMeta::GoalCleared)?;
+        writeln!(writer, "{line}")?;
+        writer.flush()?;
+        Ok(())
+    }
+
+    fn record_decisions(&mut self, decisions: &hi_agent::DecisionLog) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .with_context(|| format!("opening {}", self.path.display()))?;
+        let mut writer = BufWriter::new(file);
+        let line = serde_json::to_string(&SessionMeta::Decisions {
+            decisions: decisions.entries().to_vec(),
+        })?;
+        writeln!(writer, "{line}")?;
+        writer.flush()?;
+        Ok(())
+    }
+
+    fn record_state_replacement(
+        &mut self,
+        messages: &[Message],
+        goal: Option<&hi_agent::Goal>,
+        decisions: &hi_agent::DecisionLog,
+    ) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .with_context(|| format!("opening {}", self.path.display()))?;
+        let mut writer = BufWriter::new(file);
+        let line = serde_json::to_string(&SessionMeta::StateReplacement {
+            messages: messages.to_vec(),
+            goal: goal.cloned(),
+            decisions: decisions.entries().to_vec(),
+        })?;
+        writeln!(writer, "{line}")?;
+        writer.flush()?;
+        Ok(())
+    }
 }
 
 #[allow(dead_code)]
@@ -145,6 +224,8 @@ pub struct LoadedSession {
     pub checkpoint_refs: Vec<String>,
     /// A long-horizon goal persisted across sessions, if any (last write wins).
     pub goal: Option<hi_agent::Goal>,
+    /// Intra-session decisions persisted across resume (last write wins).
+    pub decisions: hi_agent::DecisionLog,
 }
 
 /// One-line summary shown when a session is resumed: message count, cost, and
@@ -285,6 +366,7 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
     let mut cost_usd: Option<f64> = None;
     let mut checkpoint_refs = Vec::new();
     let mut loaded_goal: Option<hi_agent::Goal> = None;
+    let mut loaded_decisions = hi_agent::DecisionLog::default();
     for line in text.lines() {
         if line.trim().is_empty() {
             continue;
@@ -308,7 +390,7 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
                     cost_usd = saved_cost;
                 }
                 SessionMeta::Checkpoints { refs } => {
-                    checkpoint_refs.extend(refs);
+                    checkpoint_refs = refs;
                 }
                 SessionMeta::Compaction {
                     messages: compacted,
@@ -318,6 +400,21 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
                 }
                 SessionMeta::Goal { goal } => {
                     loaded_goal = Some(goal);
+                }
+                SessionMeta::GoalCleared => {
+                    loaded_goal = None;
+                }
+                SessionMeta::Decisions { decisions } => {
+                    loaded_decisions = hi_agent::DecisionLog::from_entries(decisions);
+                }
+                SessionMeta::StateReplacement {
+                    messages: replacement,
+                    goal,
+                    decisions,
+                } => {
+                    messages = replacement;
+                    loaded_goal = goal;
+                    loaded_decisions = hi_agent::DecisionLog::from_entries(decisions);
                 }
             }
             continue;
@@ -340,6 +437,7 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
         cost_usd,
         checkpoint_refs,
         goal: loaded_goal,
+        decisions: loaded_decisions,
     })
 }
 
@@ -505,6 +603,142 @@ mod tests {
     }
 
     #[test]
+    fn jsonl_session_compaction_boundary_replaces_prior_messages_on_resume() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "hi-session-clear-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut session = JsonlSession::new(path.clone());
+        session
+            .record(
+                &[Message::system("sys-old"), Message::user("old context")],
+                Usage::default(),
+                None,
+            )
+            .unwrap();
+        session
+            .record_compaction(&[Message::system("sys-new")])
+            .unwrap();
+        session
+            .record(&[Message::user("new context")], Usage::default(), None)
+            .unwrap();
+
+        let loaded = load_history(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(loaded.messages.len(), 2);
+        assert_eq!(loaded.messages[0].text(), "sys-new");
+        assert_eq!(loaded.messages[1].text(), "new context");
+    }
+
+    #[test]
+    fn jsonl_session_round_trips_checkpoint_refs_last_write_wins() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "hi-session-checkpoints-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut session = JsonlSession::new(path.clone());
+
+        session
+            .record_checkpoints(&["old".to_string(), "older".to_string()])
+            .unwrap();
+        session.record_checkpoints(&["new".to_string()]).unwrap();
+
+        let loaded = load_history(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(loaded.checkpoint_refs, vec!["new".to_string()]);
+    }
+
+    #[test]
+    fn jsonl_session_round_trips_decisions() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "hi-session-decisions-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut session = JsonlSession::new(path.clone());
+        let mut decisions = hi_agent::DecisionLog::default();
+        decisions.record(hi_agent::Decision {
+            summary: "use BTreeMap".into(),
+            rationale: "ordered iteration".into(),
+            files: vec!["src/m.rs".into()],
+        });
+
+        session.record_decisions(&decisions).unwrap();
+
+        let loaded = load_history(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(loaded.decisions.entries().len(), 1);
+        assert_eq!(loaded.decisions.entries()[0].summary, "use BTreeMap");
+        assert_eq!(loaded.decisions.entries()[0].files, vec!["src/m.rs"]);
+    }
+
+    #[test]
+    fn jsonl_state_replacement_overrides_prior_messages_goal_and_decisions() {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "hi-session-state-replacement-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut session = JsonlSession::new(path.clone());
+        let old_goal = hi_agent::Goal::new("old goal", vec!["old step".into()]);
+        let mut old_decisions = hi_agent::DecisionLog::default();
+        old_decisions.record(hi_agent::Decision {
+            summary: "discarded decision".into(),
+            rationale: "old attempt".into(),
+            files: Vec::new(),
+        });
+        session
+            .record(
+                &[Message::system("old sys"), Message::user("old attempt")],
+                Usage::default(),
+                None,
+            )
+            .unwrap();
+        session.record_goal(&old_goal).unwrap();
+        session.record_decisions(&old_decisions).unwrap();
+
+        let mut kept_decisions = hi_agent::DecisionLog::default();
+        kept_decisions.record(hi_agent::Decision {
+            summary: "kept decision".into(),
+            rationale: "pre-turn".into(),
+            files: vec!["src/lib.rs".into()],
+        });
+        session
+            .record_state_replacement(&[Message::system("new sys")], None, &kept_decisions)
+            .unwrap();
+
+        let loaded = load_history(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(loaded.messages.len(), 1);
+        assert_eq!(loaded.messages[0].text(), "new sys");
+        assert!(loaded.goal.is_none());
+        assert_eq!(loaded.decisions.entries().len(), 1);
+        assert_eq!(loaded.decisions.entries()[0].summary, "kept decision");
+    }
+
+    #[test]
     fn jsonl_session_round_trips_a_structured_goal() {
         // A long-horizon goal persisted via record_goal survives a load so a
         // /resume picks it up at its active sub-goal.
@@ -543,7 +777,6 @@ mod tests {
         session.record_goal(&goal).unwrap();
 
         let loaded = load_history(&path).unwrap();
-        let _ = std::fs::remove_file(&path);
 
         let loaded_goal = loaded.goal.expect("goal persisted across load");
         assert_eq!(loaded_goal.objective, "refactor the parser");
@@ -553,6 +786,15 @@ mod tests {
             loaded_goal.active_index(),
             Some(1),
             "resumes at the active sub-goal"
+        );
+
+        session.clear_goal().unwrap();
+        let cleared = load_history(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            cleared.goal.is_none(),
+            "goal_cleared metadata should override earlier persisted goals"
         );
     }
 

@@ -364,11 +364,30 @@ fn paths_overlap(a: Option<&str>, b: Option<&str>) -> bool {
 /// scheduler change can't regress the "read-after-write observes the write"
 /// invariant.
 pub(crate) fn respects_deps(deps: &[Vec<usize>], order: &[usize]) -> bool {
-    let pos = |idx: usize| order.iter().position(|&o| o == idx).unwrap();
+    if order.len() != deps.len() {
+        return false;
+    }
+    let mut seen = vec![false; deps.len()];
+    for &idx in order {
+        let Some(slot) = seen.get_mut(idx) else {
+            return false;
+        };
+        if *slot {
+            return false;
+        }
+        *slot = true;
+    }
+
+    let pos = |idx: usize| order.iter().position(|&o| o == idx);
     for (i, ds) in deps.iter().enumerate() {
-        let my_pos = pos(i);
+        let Some(my_pos) = pos(i) else {
+            return false;
+        };
         for &d in ds {
-            if pos(d) > my_pos {
+            let Some(dep_pos) = pos(d) else {
+                return false;
+            };
+            if dep_pos > my_pos {
                 return false;
             }
         }
@@ -897,6 +916,29 @@ mod tests {
     }
 
     #[test]
+    fn tool_deps_multi_file_apply_patch_serializes_following_read() {
+        // A multi-file apply_patch has no single target path. Treat it as an
+        // unknown-path mutation so a same-batch read of any patched file waits
+        // for the patch instead of racing and seeing stale content.
+        let calls = vec![
+            (
+                "p".into(),
+                "apply_patch".into(),
+                serde_json::json!({
+                    "patch": "*** Begin Patch\n*** Update File: a.rs\n-old\n+new\n*** Update File: b.rs\n-old\n+new\n*** End Patch"
+                })
+                .to_string(),
+            ),
+            ("r".into(), "read".into(), r#"{"path":"b.rs"}"#.into()),
+        ];
+        let deps = tool_deps(&calls);
+        assert!(
+            deps[1].contains(&0),
+            "read after multi-file apply_patch serializes: {deps:?}"
+        );
+    }
+
+    #[test]
     fn respects_deps_validates_ordering() {
         // deps: call 1 depends on 0; call 2 depends on 0.
         let deps = vec![vec![], vec![0], vec![0]];
@@ -906,6 +948,14 @@ mod tests {
         assert!(!respects_deps(&deps, &[1, 0, 2]));
         // 2 before 1 is fine (2 doesn't depend on 1).
         assert!(respects_deps(&deps, &[0, 2, 1]));
+        // A partial scheduler result is invalid, not a panic.
+        assert!(!respects_deps(&deps, &[0, 1]));
+        // Duplicating one completed call while omitting another is also invalid.
+        assert!(!respects_deps(&deps, &[0, 1, 1]));
+        // Duplicates are invalid even when every call appears at least once.
+        assert!(!respects_deps(&deps, &[0, 1, 2, 1]));
+        // Out-of-range completion indices are invalid.
+        assert!(!respects_deps(&deps, &[0, 1, 3]));
     }
 
     #[test]

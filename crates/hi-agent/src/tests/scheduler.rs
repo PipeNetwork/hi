@@ -1,5 +1,5 @@
-use super::*;
 use super::common::*;
+use super::*;
 
 #[tokio::test]
 async fn scheduler_parallelism_counts_concurrent_batches() {
@@ -68,4 +68,3 @@ async fn scheduler_parallelism_counts_concurrent_batches() {
         tel.tool_timeline
     );
 }
-

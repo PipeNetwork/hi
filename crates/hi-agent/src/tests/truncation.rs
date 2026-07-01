@@ -1,5 +1,5 @@
-use super::*;
 use super::common::*;
+use super::*;
 
 #[tokio::test]
 async fn truncation_continues_instead_of_ending_early() {
@@ -106,6 +106,62 @@ async fn truncation_gives_up_after_retry_budget() {
 }
 
 #[tokio::test]
+async fn truncation_exhaustion_does_not_finalize_as_done() {
+    let mut cfg = config();
+    cfg.finalize = true;
+    cfg.max_truncation_retries = 1;
+    let path = temp_file("truncation-no-finalize");
+    let p = path.to_string_lossy().to_string();
+    let responses = vec![
+        write_completion(&p),
+        Completion {
+            content: vec![Content::Text("truncated once".into())],
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 100,
+                ..Default::default()
+            },
+            stop_reason: Some("length".into()),
+        },
+        Completion {
+            content: vec![Content::Text("truncated twice".into())],
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 100,
+                ..Default::default()
+            },
+            stop_reason: Some("length".into()),
+        },
+        // Would be consumed by finalize_turn if truncation exhaustion were
+        // incorrectly treated as a completed changed-files turn.
+        completion(
+            vec![Content::Text("FINALIZE RECAP SHOULD NOT RUN".into())],
+            1,
+            1,
+        ),
+    ];
+    let mut agent = agent(responses, cfg);
+    let mut ui = RecUi::default();
+    agent.run_turn("write the big file", &mut ui).await.unwrap();
+    let _ = std::fs::remove_file(&path);
+
+    assert!(
+        agent.last_turn_telemetry().stalled_unfinished,
+        "truncation exhaustion should be an unfinished turn"
+    );
+    assert_eq!(
+        agent.last_turn_telemetry().truncation_retries,
+        1,
+        "telemetry should retain the retry count before exhaustion"
+    );
+    assert!(
+        !ui.assistant.contains("FINALIZE RECAP SHOULD NOT RUN"),
+        "truncation exhaustion must not trigger finalization, assistant was: {}",
+        ui.assistant
+    );
+}
+
+#[tokio::test]
 async fn truncation_budget_is_separate_from_empty_retries() {
     // Truncation recovery has its own budget, separate from the empty-retry
     // budget. A big task that hits the output token cap multiple times
@@ -166,6 +222,134 @@ async fn truncation_budget_is_separate_from_empty_retries() {
         text.contains("Finally done."),
         "model finished past truncations, got: {text}"
     );
+}
+
+#[tokio::test]
+async fn truncation_budget_resets_after_tool_progress() {
+    // The truncation budget is a consecutive-stall budget, not a whole-turn
+    // lifetime budget. A long task can hit the output cap, make real tool
+    // progress, and later hit the cap again. That later truncation should get a
+    // fresh continuation budget instead of ending the harness immediately.
+    let mut cfg = config();
+    cfg.max_truncation_retries = 1;
+    let path = temp_file("truncation-reset-progress");
+    let p = path.to_string_lossy().to_string();
+    let responses = vec![
+        Completion {
+            content: vec![Content::Text(
+                "Let me rewrite the first section with a small patch:".into(),
+            )],
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 100,
+                ..Default::default()
+            },
+            stop_reason: Some("length".into()),
+        },
+        write_completion(&p),
+        Completion {
+            content: vec![Content::Text(
+                "Now I will inspect the result and apply the next patch:".into(),
+            )],
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 100,
+                ..Default::default()
+            },
+            stop_reason: Some("max_tokens".into()),
+        },
+        completion(vec![Content::Text("Finally done.".into())], 10, 50),
+    ];
+    let mut agent = agent(responses, cfg);
+    let mut ui = RecUi::default();
+    agent.run_turn("big task", &mut ui).await.unwrap();
+
+    assert_eq!(
+        ui.statuses
+            .iter()
+            .filter(|s| s.contains("output token limit — continuing"))
+            .count(),
+        2,
+        "each truncation separated by tool progress should get a retry, got: {:?}",
+        ui.statuses
+    );
+    assert!(
+        !ui.statuses
+            .iter()
+            .any(|s| s.contains("task may be incomplete")),
+        "should not exhaust the truncation budget after intervening progress: {:?}",
+        ui.statuses
+    );
+    assert!(
+        ui.turn_end.is_some(),
+        "turn completed after later truncation"
+    );
+    assert_eq!(
+        agent.last_turn_telemetry().truncation_retries,
+        2,
+        "telemetry should retain cumulative truncation nudges"
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn truncation_during_announced_edit_forces_next_tool_call() {
+    // A model often gets cut off while narrating a large edit ("Let me replace
+    // this section...") rather than while emitting JSON. Continuing prose just
+    // burns the truncation budget. For active tool work, the retry should force
+    // a compact complete tool call.
+    let mut cfg = config();
+    cfg.max_truncation_retries = 1;
+    let path = temp_file("truncation-force-tool");
+    let p = path.to_string_lossy().to_string();
+    let responses = vec![
+        Completion {
+            content: vec![Content::Text(
+                "Let me replace src/intra/mod.rs with a compact edit:".into(),
+            )],
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 100,
+                ..Default::default()
+            },
+            stop_reason: Some("length".into()),
+        },
+        write_completion(&p),
+        completion(vec![Content::Text("Done.".into())], 10, 50),
+    ];
+    let modes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordToolModes {
+        responses: Mutex::new(responses),
+        modes: modes.clone(),
+    };
+    let mut agent = Agent::new(Box::new(provider), cfg);
+    let mut ui = RecUi::default();
+    agent.run_turn("big task", &mut ui).await.unwrap();
+
+    let modes = modes.lock().unwrap().clone();
+    assert!(
+        matches!(
+            modes.as_slice(),
+            [hi_ai::ToolMode::Auto, hi_ai::ToolMode::Required, ..]
+        ),
+        "truncation retry should force a tool call, got modes: {:?}",
+        modes
+    );
+    let transcript_text = agent
+        .messages()
+        .iter()
+        .flat_map(|m| m.content.iter())
+        .filter_map(|c| match c {
+            Content::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        transcript_text.contains("Issue one fresh, complete tool call now"),
+        "active-work truncation should get the tool-call nudge: {transcript_text}"
+    );
+    let _ = std::fs::remove_file(path);
 }
 
 #[tokio::test]
@@ -276,8 +460,7 @@ async fn truncation_with_partial_text_tool_call_strips_raw_protocol() {
         "partial XML-ish tool call must be stripped: {transcript_text}"
     );
     assert!(
-        transcript_text.contains("Re-issue one fresh, complete tool call"),
+        transcript_text.contains("Issue one fresh, complete tool call"),
         "fresh-tool-call nudge should be recorded: {transcript_text}"
     );
 }
-

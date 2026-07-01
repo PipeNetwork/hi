@@ -60,6 +60,7 @@ pub(crate) async fn repl(
     // that turn (so we can drop it before re-running).
     let mut last_prompt: Option<String> = None;
     let mut last_turn_start = 0usize;
+    let mut last_turn_snapshot: Option<hi_agent::AgentStateSnapshot> = None;
 
     loop {
         // Refresh profile names for the completer (covers add/edit changes).
@@ -88,17 +89,24 @@ pub(crate) async fn repl(
                                     .await;
                             continue;
                         }
-                        Command::Retry => match last_prompt.clone() {
-                            Some(prompt) => {
-                                agent.truncate_messages(last_turn_start);
-                                println!("\x1b[2mretrying: {prompt}\x1b[0m");
-                                prompt
+                        Command::Retry => {
+                            match (last_prompt.clone(), last_turn_snapshot.as_ref()) {
+                                (Some(prompt), Some(snapshot)) => {
+                                    if let Err(err) =
+                                        agent.rewind_to_snapshot_durable(last_turn_start, snapshot)
+                                    {
+                                        eprintln!("\x1b[33mretry failed: {err:#}\x1b[0m");
+                                        continue;
+                                    }
+                                    println!("\x1b[2mretrying: {prompt}\x1b[0m");
+                                    prompt
+                                }
+                                _ => {
+                                    println!("\x1b[2mnothing to retry yet\x1b[0m");
+                                    continue;
+                                }
                             }
-                            None => {
-                                println!("\x1b[2mnothing to retry yet\x1b[0m");
-                                continue;
-                            }
-                        },
+                        }
                         Command::Edit => {
                             // Load the last user prompt into the line editor
                             // for editing. We use rustyline's `set_line` via
@@ -377,9 +385,12 @@ pub(crate) async fn repl(
                                 eprintln!("\x1b[33mno MCP URL configured for this provider\x1b[0m");
                                 continue;
                             };
-                            match crate::mcp_inspect(url, &settings.api_key, &settings.model).await {
+                            match crate::mcp_inspect(url, &settings.api_key, &settings.model).await
+                            {
                                 Ok(report) => print!("{report}"),
-                                Err(err) => eprintln!("\x1b[33mmcp inspection failed: {err:#}\x1b[0m"),
+                                Err(err) => {
+                                    eprintln!("\x1b[33mmcp inspection failed: {err:#}\x1b[0m")
+                                }
                             }
                             continue;
                         }
@@ -397,14 +408,31 @@ pub(crate) async fn repl(
                 last_prompt = Some(input.clone());
                 let checkpoint = agent.messages().len();
                 last_turn_start = checkpoint;
+                let turn_snapshot = agent.state_snapshot();
+                last_turn_snapshot = Some(turn_snapshot.clone());
+                let background_before = hi_tools::background_process_ids();
                 let progress = Arc::new(AtomicBool::new(false));
                 let cancelled = {
                     let mut plain = PlainUi::with_progress(progress.clone());
                     drive_with_spinner(agent.run_turn(&input, &mut plain), &progress).await
                 };
                 if cancelled {
-                    agent.truncate_messages(checkpoint);
-                    println!("\x1b[33m^C — interrupted; turn discarded\x1b[0m");
+                    if let Err(err) = agent.rewind_to_snapshot_durable(checkpoint, &turn_snapshot) {
+                        eprintln!(
+                            "\x1b[33mcouldn't persist interrupted turn discard: {err:#}\x1b[0m"
+                        );
+                        agent.truncate_messages(checkpoint);
+                        agent.restore_state_snapshot(&turn_snapshot);
+                    }
+                    let killed =
+                        hi_tools::kill_background_processes_started_after(&background_before);
+                    if killed > 0 {
+                        println!(
+                            "\x1b[33m^C — interrupted; turn discarded; killed {killed} background process(es) started by it\x1b[0m"
+                        );
+                    } else {
+                        println!("\x1b[33m^C — interrupted; turn discarded\x1b[0m");
+                    }
                 }
             }
             Err(ReadlineError::Interrupted) => continue, // Ctrl-C: discard the line

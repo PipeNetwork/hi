@@ -15,7 +15,10 @@ mod read;
 mod tools;
 
 // Re-exports preserving the crate's pre-split public surface.
-pub use background::kill_all as kill_background_processes;
+pub use background::{
+    ids as background_process_ids, kill_all as kill_background_processes,
+    kill_started_after as kill_background_processes_started_after,
+};
 pub use condense::condense_diagnostics;
 pub use paths::clear_read_cache;
 pub use tools::{
@@ -340,6 +343,7 @@ mod tests {
 
     #[tokio::test]
     async fn background_bash_round_trips_through_execute() {
+        let _guard = crate::background::TEST_LOCK.lock().await;
         // Start detached: execute returns a handle without waiting for exit.
         let started = execute(
             "bash",

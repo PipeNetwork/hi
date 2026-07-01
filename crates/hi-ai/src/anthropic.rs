@@ -334,26 +334,7 @@ fn to_anthropic_messages(messages: &[Message]) -> (String, Vec<Value>) {
                 i += 1;
             }
             Role::User => {
-                let mut content = Vec::new();
-                for block in &message.content {
-                    match block {
-                        Content::Image { data, media_type } => content.push(json!({
-                            "type": "image",
-                            "source": {
-                                "type": "base64",
-                                "media_type": media_type,
-                                "data": data,
-                            },
-                        })),
-                        Content::Text(text) if !text.is_empty() => {
-                            content.push(json!({ "type": "text", "text": text }));
-                        }
-                        _ => {}
-                    }
-                }
-                if content.is_empty() {
-                    content.push(json!({ "type": "text", "text": message.text() }));
-                }
+                let content = anthropic_user_content(message);
                 out.push(json!({ "role": "user", "content": content }));
                 i += 1;
             }
@@ -409,12 +390,40 @@ fn to_anthropic_messages(messages: &[Message]) -> (String, Vec<Value>) {
                     }
                     i += 1;
                 }
+                while i < messages.len() && messages[i].role == Role::User {
+                    content.extend(anthropic_user_content(&messages[i]));
+                    i += 1;
+                }
                 out.push(json!({ "role": "user", "content": content }));
             }
         }
     }
 
     (system, out)
+}
+
+fn anthropic_user_content(message: &Message) -> Vec<Value> {
+    let mut content = Vec::new();
+    for block in &message.content {
+        match block {
+            Content::Image { data, media_type } => content.push(json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": media_type,
+                    "data": data,
+                },
+            })),
+            Content::Text(text) if !text.is_empty() => {
+                content.push(json!({ "type": "text", "text": text }));
+            }
+            _ => {}
+        }
+    }
+    if content.is_empty() {
+        content.push(json!({ "type": "text", "text": message.text() }));
+    }
+    content
 }
 
 /// Accumulates one streamed content block (text, thinking, or tool_use).
@@ -529,6 +538,28 @@ mod tests {
         assert_eq!(content[0]["type"], "tool_result");
         assert_eq!(content[0]["tool_use_id"], "a");
         assert_eq!(content[1]["tool_use_id"], "b");
+    }
+
+    #[test]
+    fn tool_results_and_following_user_prompt_coalesce_into_one_user_message() {
+        let (_s, out) = to_anthropic_messages(&[
+            Message::assistant(vec![Content::ToolCall {
+                id: "a".into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            }]),
+            Message::tool_result("a", "ra"),
+            Message::user("next prompt"),
+        ]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0]["role"], "assistant");
+        assert_eq!(out[1]["role"], "user");
+        let content = out[1]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 2);
+        assert_eq!(content[0]["type"], "tool_result");
+        assert_eq!(content[0]["tool_use_id"], "a");
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "next prompt");
     }
 
     #[test]

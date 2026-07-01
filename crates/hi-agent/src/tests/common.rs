@@ -1,13 +1,13 @@
 use super::*;
 use async_trait::async_trait;
 use hi_ai::{
-    ChatRequest, Completion, Content, Provider, ProviderError, ProviderErrorKind,
-    StreamEvent, Usage,
+    ChatRequest, Completion, Content, Provider, ProviderError, ProviderErrorKind, StreamEvent,
+    Usage,
 };
 use std::sync::{LazyLock, Mutex};
 
 /// A provider that returns canned completions in order.
-pub(crate) struct Canned(Mutex<Vec<Completion>>);
+pub(crate) struct Canned(pub(crate) Mutex<Vec<Completion>>);
 
 #[async_trait]
 impl Provider for Canned {
@@ -147,12 +147,7 @@ pub(crate) struct RecordingSession {
 }
 
 impl SessionSink for RecordingSession {
-    fn record(
-        &mut self,
-        _messages: &[Message],
-        usage: Usage,
-        cost_usd: Option<f64>,
-    ) -> Result<()> {
+    fn record(&mut self, _messages: &[Message], usage: Usage, cost_usd: Option<f64>) -> Result<()> {
         self.records.lock().unwrap().push((usage, cost_usd));
         Ok(())
     }
@@ -163,10 +158,10 @@ impl SessionSink for RecordingSession {
 }
 
 #[derive(Default)]
-    pub(crate) struct RecordingUi {
-        pub(crate) statuses: Vec<String>,
-        pub(crate) turn_ends: Vec<String>,
-    }
+pub(crate) struct RecordingUi {
+    pub(crate) statuses: Vec<String>,
+    pub(crate) turn_ends: Vec<String>,
+}
 
 impl Ui for RecordingUi {
     fn assistant_text(&mut self, _: &str) {}
@@ -218,6 +213,25 @@ pub(crate) fn completion(content: Vec<Content>, input: u64, output: u64) -> Comp
 
 pub(crate) fn agent(responses: Vec<Completion>, cfg: AgentConfig) -> Agent {
     Agent::new(Box::new(Canned(Mutex::new(responses))), cfg)
+}
+
+pub(crate) fn resumed_agent(
+    history: Vec<Message>,
+    usage: Usage,
+    cost_usd: Option<f64>,
+    structured_goal: Option<Goal>,
+    cfg: AgentConfig,
+) -> Agent {
+    Agent::resume(
+        Box::new(Canned(Mutex::new(Vec::new()))),
+        cfg,
+        history,
+        usage,
+        cost_usd,
+        Vec::new(),
+        structured_goal,
+        DecisionLog::default(),
+    )
 }
 
 pub(crate) fn scripted_agent(
@@ -274,55 +288,54 @@ pub(crate) fn temp_file(tag: &str) -> std::path::PathBuf {
     std::env::current_dir()
         .unwrap()
         .join(format!("hi-test-{tag}-{}-{n}", std::process::id()))
-            }
+}
 
-            #[derive(Default)]
-            pub(crate) struct RecUi {
-                pub(crate) statuses: Vec<String>,
-                pub(crate) usages: Vec<(u64, u64)>,
-                pub(crate) turn_end: Option<String>,
-                pub(crate) assistant: String,
-                pub(crate) tool_results: Vec<(String, String)>,
-            }
-            impl Ui for RecUi {
-                fn assistant_text(&mut self, t: &str) {
-                    self.assistant.push_str(t);
-                }
-                fn assistant_reasoning(&mut self, _: &str) {}
-                fn assistant_end(&mut self) {}
-                fn tool_call(&mut self, _: &str, _: &str) {}
-                fn tool_result(&mut self, name: &str, result: &str) {
-                    self.tool_results
-                        .push((name.to_string(), result.to_string()));
-                }
-                fn status(&mut self, t: &str) {
-                    self.statuses.push(t.to_string());
-                }
-                fn usage(
-                    &mut self,
-                    input_tokens: u64,
-                    output_tokens: u64,
-                    _ctx_used: u64,
-                    _ctx_win: Option<u32>,
-                ) {
-                    self.usages.push((input_tokens, output_tokens));
-                }
-                fn turn_end(&mut self, summary: &str) {
-                    self.turn_end = Some(summary.to_string());
-                }
-            }
+#[derive(Default)]
+pub(crate) struct RecUi {
+    pub(crate) statuses: Vec<String>,
+    pub(crate) usages: Vec<(u64, u64)>,
+    pub(crate) turn_end: Option<String>,
+    pub(crate) assistant: String,
+    pub(crate) tool_results: Vec<(String, String)>,
+}
+impl Ui for RecUi {
+    fn assistant_text(&mut self, t: &str) {
+        self.assistant.push_str(t);
+    }
+    fn assistant_reasoning(&mut self, _: &str) {}
+    fn assistant_end(&mut self) {}
+    fn tool_call(&mut self, _: &str, _: &str) {}
+    fn tool_result(&mut self, name: &str, result: &str) {
+        self.tool_results
+            .push((name.to_string(), result.to_string()));
+    }
+    fn status(&mut self, t: &str) {
+        self.statuses.push(t.to_string());
+    }
+    fn usage(
+        &mut self,
+        input_tokens: u64,
+        output_tokens: u64,
+        _ctx_used: u64,
+        _ctx_win: Option<u32>,
+    ) {
+        self.usages.push((input_tokens, output_tokens));
+    }
+    fn turn_end(&mut self, summary: &str) {
+        self.turn_end = Some(summary.to_string());
+    }
+}
 
-            /// A harmless tool-call round (runs `echo`), marking the turn as actively
-            /// working so a later text-only stop is nudge-eligible.
-            pub(crate) fn echo_call() -> Completion {
-                completion(
-                    vec![Content::ToolCall {
-                        id: "t".into(),
-                        name: "bash".into(),
-                        arguments: "{\"command\":\"echo hi\"}".into(),
-                    }],
-                    1,
-                    1,
-                )
-            }
-
+/// A harmless tool-call round (runs `echo`), marking the turn as actively
+/// working so a later text-only stop is nudge-eligible.
+pub(crate) fn echo_call() -> Completion {
+    completion(
+        vec![Content::ToolCall {
+            id: "t".into(),
+            name: "bash".into(),
+            arguments: "{\"command\":\"echo hi\"}".into(),
+        }],
+        1,
+        1,
+    )
+}

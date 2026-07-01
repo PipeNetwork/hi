@@ -3,7 +3,10 @@
 //! implementation validation detection. Uses constants from
 //! [`constants`](super::constants) and types from [`types`](super::types).
 
-use super::constants::{GAP_PREFLIGHT_PATTERN, READ_ONLY_PREFLIGHT_DIFF_MAX_LINES, READ_ONLY_PREFLIGHT_GREP_MAX_LINES, SECURITY_PREFLIGHT_PATTERN};
+use super::constants::{
+    GAP_PREFLIGHT_PATTERN, READ_ONLY_PREFLIGHT_DIFF_MAX_LINES, READ_ONLY_PREFLIGHT_GREP_MAX_LINES,
+    SECURITY_PREFLIGHT_PATTERN,
+};
 use super::types::{PreflightCall, ReviewIntent};
 pub(crate) fn read_only_preflight_initial_calls(intent: ReviewIntent) -> Vec<PreflightCall> {
     let mut calls = Vec::new();
@@ -56,7 +59,11 @@ pub(crate) fn read_only_preflight_initial_calls(intent: ReviewIntent) -> Vec<Pre
     calls
 }
 
-pub(crate) fn push_preflight_read_if_exists(calls: &mut Vec<PreflightCall>, path: &str, limit: u32) {
+pub(crate) fn push_preflight_read_if_exists(
+    calls: &mut Vec<PreflightCall>,
+    path: &str,
+    limit: u32,
+) {
     if std::path::Path::new(path).is_file() {
         calls.push(PreflightCall::read(path, limit));
     }
@@ -215,4 +222,3 @@ pub(crate) fn preferred_validation_from_preflight(output: &str) -> Option<String
     }
     None
 }
-

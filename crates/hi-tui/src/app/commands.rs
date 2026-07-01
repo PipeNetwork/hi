@@ -1,6 +1,5 @@
 //! `App` methods: commands.
 
-
 use ansi_to_tui::IntoText;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use hi_agent::{Agent, Command, command};
@@ -10,18 +9,14 @@ use ratatui::text::{Line, Text};
 use crate::model_picker::ModelPicker;
 use crate::render::dim;
 use crate::util::{copy_to_clipboard, goal_feedback};
-use crate::{
-    App,
-    TurnState, working_tree_diff_sync,
-};
+use crate::{App, TurnState, working_tree_diff_sync};
 
 impl crate::App {
-
     /// Apply a pure editing/navigation key to the input line, shared by the
     /// idle input phase and the in-turn queue-entry path. Returns the submitted
     /// text on Enter (when non-empty); the caller decides whether to run it now
-    /// or queue it. Phase-specific control keys (Ctrl-C/Ctrl-D/Esc) are handled
-    /// by the caller, not here.
+    /// or queue it. Phase-specific control keys (Ctrl-C/Esc) are handled by the
+    /// caller, not here.
     pub(crate) fn edit_key(&mut self, key: &KeyEvent) -> Option<String> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -229,25 +224,40 @@ impl crate::App {
         // long-horizon agency is on, setting a goal creates a structured `Goal`
         // (a single sub-goal equal to the objective, which the model decomposes
         // as it works via `update_plan`); clearing drops both views.
-        match arg.trim() {
-            "" => {} // no argument — just report the current goal
+        let error = match arg.trim() {
+            "" => None, // no argument — just report the current goal
             "clear" | "off" | "none" => {
-                agent.set_goal(None);
-                agent.set_structured_goal(None);
+                if let Err(err) = agent.set_transient_goal(None) {
+                    Some(format!("goal clear failed: {err:#}"))
+                } else {
+                    None
+                }
             }
             goal => {
                 if agent.long_horizon() {
-                    let accepted = agent.set_structured_goal(Some(hi_agent::Goal::new(
+                    match agent.set_structured_goal(Some(hi_agent::Goal::new(
                         goal.to_string(),
                         vec![goal.to_string()],
-                    )));
-                    if !accepted {
-                        agent.set_goal(Some(goal.to_string()));
+                    ))) {
+                        Ok(true) => None,
+                        Ok(false) => agent
+                            .set_transient_goal(Some(goal.to_string()))
+                            .err()
+                            .map(|err| format!("goal set failed: {err:#}")),
+                        Err(err) => Some(format!("goal set failed: {err:#}")),
                     }
                 } else {
-                    agent.set_goal(Some(goal.to_string()));
+                    agent
+                        .set_transient_goal(Some(goal.to_string()))
+                        .err()
+                        .map(|err| format!("goal set failed: {err:#}"))
                 }
             }
+        };
+        if let Some(msg) = error {
+            self.push(Line::styled(msg, Style::default().fg(Color::Yellow)));
+            self.follow();
+            return;
         }
         // Report whichever view is active.
         let (msg, prominent) = if let Some(g) = agent.structured_goal() {
@@ -279,7 +289,12 @@ impl crate::App {
         self.follow();
     }
 
-    pub(crate) async fn handle_command(&mut self, agent: &mut Agent, command: Command, registry: &hi_ai::Registry) {
+    pub(crate) async fn handle_command(
+        &mut self,
+        agent: &mut Agent,
+        command: Command,
+        registry: &hi_ai::Registry,
+    ) {
         match command {
             Command::Quit => {}
             Command::Help => {
@@ -339,18 +354,27 @@ impl crate::App {
                     .iter()
                     .filter(|m| m.role != hi_ai::Role::System)
                     .count();
-                agent.clear_history();
-                self.transcript.clear();
-                self.pending = None;
-                self.code_lang = None;
-                self.current_assistant.clear();
-                self.last_assistant.clear();
-                self.status.clear();
-                self.last_turn_state = TurnState::Idle;
-                self.push(Line::styled(
-                    format!("cleared {count} messages — starting fresh"),
-                    dim(),
-                ));
+                match agent.clear_history() {
+                    Ok(()) => {
+                        self.transcript.clear();
+                        self.pending = None;
+                        self.code_lang = None;
+                        self.current_assistant.clear();
+                        self.last_assistant.clear();
+                        self.status.clear();
+                        self.last_turn_state = TurnState::Idle;
+                        self.push(Line::styled(
+                            format!("cleared {count} messages — starting fresh"),
+                            dim(),
+                        ));
+                    }
+                    Err(err) => {
+                        self.push(Line::styled(
+                            format!("clear failed: {err}"),
+                            Style::default().fg(Color::Yellow),
+                        ));
+                    }
+                }
             }
             Command::Verify(arg) => {
                 let msg = match arg.trim() {
@@ -421,10 +445,7 @@ impl crate::App {
                 match result {
                     Ok((server, protocol, tools, models)) => {
                         let url = self.mcp_url.as_deref().unwrap_or("");
-                        self.push(Line::styled(
-                            format!("mcp_url:  {url}"),
-                            dim(),
-                        ));
+                        self.push(Line::styled(format!("mcp_url:  {url}"), dim()));
                         self.push(Line::styled(format!("server:   {server}"), dim()));
                         self.push(Line::styled(format!("protocol: {protocol}"), dim()));
                         self.push(Line::styled("tools:", dim()));
@@ -439,16 +460,10 @@ impl crate::App {
                                 ));
                             }
                         }
-                        self.push(Line::styled(
-                            format!("models:   {}", models.len()),
-                            dim(),
-                        ));
+                        self.push(Line::styled(format!("models:   {}", models.len()), dim()));
                         if let Some(model) = models.iter().find(|m| m.id == self.model) {
                             let health = model.health().unwrap_or("available");
-                            let provider = model
-                                .provider_label
-                                .as_deref()
-                                .unwrap_or("Pipe");
+                            let provider = model.provider_label.as_deref().unwrap_or("Pipe");
                             self.push(Line::styled(
                                 format!("current:  {} · {} · {}", model.id, provider, health),
                                 dim(),

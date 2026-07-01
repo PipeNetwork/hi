@@ -27,6 +27,88 @@ use std::sync::Arc;
 
 use hi_ai::{Content, Message, Role};
 
+const PROVIDER_VISIBLE_ASSISTANT_PLACEHOLDER: &str =
+    "Provider-invisible assistant content was omitted from the transcript.";
+
+fn assistant_content_visible_to_providers(content: &[Content]) -> bool {
+    content.iter().any(|c| match c {
+        Content::Text(text) => !text.is_empty(),
+        Content::ToolCall { .. } => true,
+        Content::Thinking {
+            text,
+            signature: Some(signature),
+        } => !text.is_empty() && !signature.is_empty(),
+        _ => false,
+    })
+}
+
+fn tool_call_ids(content: &[Content]) -> Vec<String> {
+    content
+        .iter()
+        .filter_map(|c| match c {
+            Content::ToolCall { id, .. } => Some(id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn tool_result_ids(content: &[Content]) -> Vec<String> {
+    content
+        .iter()
+        .filter_map(|c| match c {
+            Content::ToolResult { call_id, .. } => Some(call_id.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn tool_message_has_only_results(content: &[Content]) -> bool {
+    !content.is_empty()
+        && content
+            .iter()
+            .all(|c| matches!(c, Content::ToolResult { .. }))
+}
+
+fn consume_pending_tool_result(pending: &mut Vec<String>, result_id: &str) -> bool {
+    let Some(pos) = pending.iter().position(|id| id == result_id) else {
+        return false;
+    };
+    pending.remove(pos);
+    true
+}
+
+fn immediate_tool_block_end(
+    messages: &[Message],
+    start: usize,
+    call_ids: &[String],
+) -> Option<usize> {
+    if call_ids.is_empty() {
+        return Some(start);
+    }
+    if messages
+        .get(start)
+        .is_none_or(|message| message.role != Role::Tool)
+    {
+        return None;
+    }
+
+    let mut pending = call_ids.to_vec();
+    let mut i = start;
+    while i < messages.len() && messages[i].role == Role::Tool {
+        if !tool_message_has_only_results(&messages[i].content) {
+            return None;
+        }
+        let result_ids = tool_result_ids(&messages[i].content);
+        for result_id in result_ids {
+            if !consume_pending_tool_result(&mut pending, &result_id) {
+                return None;
+            }
+        }
+        i += 1;
+    }
+    pending.is_empty().then_some(i)
+}
+
 /// The kind of synthetic user message the agent injects (as opposed to real
 /// user input). Typed so nudges can be located by kind instead of by
 /// string-matching their content — the old verify-nudge replace logic grepped
@@ -181,7 +263,7 @@ impl Transcript {
     /// the matching tool results are recorded in the same operation.
     ///
     /// [`push_assistant_with_results`]: Self::push_assistant_with_results
-    pub(crate) fn push_assistant(&mut self, content: Vec<Content>) {
+    pub(crate) fn push_assistant(&mut self, mut content: Vec<Content>) {
         debug_assert!(
             !content
                 .iter()
@@ -189,6 +271,9 @@ impl Transcript {
             "push_assistant used for content with ToolCall blocks; \
              use push_assistant_with_results so tool results are paired"
         );
+        if !assistant_content_visible_to_providers(&content) {
+            content.push(Content::Text(PROVIDER_VISIBLE_ASSISTANT_PLACEHOLDER.into()));
+        }
         self.make_mut().push(Message::assistant(content));
     }
 
@@ -261,11 +346,137 @@ impl Transcript {
     /// carries `tool_use` blocks without matching `tool_result`s. Text and
     /// thinking blocks are kept.
     pub(crate) fn push_assistant_text_only(&mut self, content: Vec<Content>) {
-        let text_only: Vec<Content> = content
+        let mut text_only: Vec<Content> = content
             .into_iter()
             .filter(|c| !matches!(c, Content::ToolCall { .. }))
             .collect();
+        if !assistant_content_visible_to_providers(&text_only) {
+            text_only.push(Content::Text(PROVIDER_VISIBLE_ASSISTANT_PLACEHOLDER.into()));
+        }
         self.make_mut().push(Message::assistant(text_only));
+    }
+
+    /// Repair provider-invisible assistant messages loaded from older sessions.
+    ///
+    /// New transcript appends prevent this state, but sessions saved before that
+    /// guard can still contain assistant turns that serialize to empty provider
+    /// content (for example empty text or unsigned thinking-only content).
+    pub(crate) fn repair_provider_invisible_assistant_messages(&mut self) {
+        let msgs = self.make_mut();
+        for message in msgs.iter_mut() {
+            if message.role == Role::Assistant
+                && !assistant_content_visible_to_providers(&message.content)
+            {
+                message
+                    .content
+                    .push(Content::Text(PROVIDER_VISIBLE_ASSISTANT_PLACEHOLDER.into()));
+            }
+        }
+    }
+
+    /// Repair legacy/corrupted histories with adjacent user turns.
+    ///
+    /// Providers commonly reject consecutive `user` messages. New appends use
+    /// [`push_user_or_fold`](Self::push_user_or_fold), but older saved sessions
+    /// or repair steps that drop invalid tool messages can still leave adjacent
+    /// user turns in the middle of history. Merge them while preserving all
+    /// blocks so resume can proceed.
+    pub(crate) fn repair_consecutive_user_messages(&mut self) {
+        let original = self.as_slice().to_vec();
+        let mut repaired: Vec<Message> = Vec::with_capacity(original.len());
+        for message in original {
+            if message.role == Role::User
+                && let Some(prev) = repaired.last_mut()
+                && prev.role == Role::User
+            {
+                if !prev.content.is_empty() && !message.content.is_empty() {
+                    prev.content.push(Content::Text("\n\n".into()));
+                }
+                prev.content.extend(message.content);
+                continue;
+            }
+            repaired.push(message);
+        }
+        self.messages = Arc::new(repaired);
+    }
+
+    /// Repair legacy/corrupted histories with adjacent assistant turns.
+    ///
+    /// This can be created by older sessions, or by dropping an unsafe
+    /// assistant tool-call skeleton during [`repair_tool_result_ordering`].
+    /// Merge adjacent assistant content so providers that require alternating
+    /// user/assistant turns do not reject the resumed request.
+    pub(crate) fn repair_consecutive_assistant_messages(&mut self) {
+        let original = self.as_slice().to_vec();
+        let mut repaired: Vec<Message> = Vec::with_capacity(original.len());
+        for message in original {
+            if message.role == Role::Assistant
+                && let Some(prev) = repaired.last_mut()
+                && prev.role == Role::Assistant
+            {
+                if !prev.content.is_empty() && !message.content.is_empty() {
+                    prev.content.push(Content::Text("\n\n".into()));
+                }
+                prev.content.extend(message.content);
+                continue;
+            }
+            repaired.push(message);
+        }
+        self.messages = Arc::new(repaired);
+    }
+
+    /// Repair legacy/corrupted histories whose tool results are not immediately
+    /// paired with their assistant tool calls.
+    ///
+    /// Providers require each assistant `tool_use` turn to be followed by the
+    /// matching tool-result block before any other turn. New appends enforce
+    /// that by construction; this repair strips unsafe legacy tool calls and
+    /// drops unmatched tool-result messages so resume can proceed.
+    pub(crate) fn repair_tool_result_ordering(&mut self) {
+        let original = self.as_slice().to_vec();
+        let mut repaired = Vec::with_capacity(original.len());
+        let mut i = 0;
+        while i < original.len() {
+            let mut message = original[i].clone();
+            match message.role {
+                Role::Assistant => {
+                    let call_ids = tool_call_ids(&message.content);
+                    if call_ids.is_empty() {
+                        repaired.push(message);
+                        i += 1;
+                        continue;
+                    }
+                    if let Some(end) = immediate_tool_block_end(&original, i + 1, &call_ids) {
+                        repaired.push(message);
+                        repaired.extend_from_slice(&original[i + 1..end]);
+                        i = end;
+                        continue;
+                    }
+
+                    message
+                        .content
+                        .retain(|content| !matches!(content, Content::ToolCall { .. }));
+                    if !assistant_content_visible_to_providers(&message.content) {
+                        message
+                            .content
+                            .push(Content::Text(PROVIDER_VISIBLE_ASSISTANT_PLACEHOLDER.into()));
+                    }
+                    repaired.push(message);
+                    i += 1;
+                    while i < original.len() && original[i].role == Role::Tool {
+                        i += 1;
+                    }
+                }
+                Role::Tool => {
+                    i += 1;
+                }
+                _ => {
+                    repaired.push(message);
+                    i += 1;
+                }
+            }
+        }
+        self.messages = Arc::new(repaired);
     }
 
     // ---- synthetic nudges ----------------------------------------------
@@ -429,49 +640,78 @@ impl Transcript {
     /// assertion before each provider send. Checks:
     /// - every `ToolCall` id in an assistant message has at least one matching
     ///   `ToolResult` (by `call_id`/`id`) somewhere later in the transcript;
-    /// - no two consecutive messages have the same `User` role (some providers
-    ///   reject this — the compaction strategies fold summaries to avoid it).
+    /// - no adjacent normal conversation messages have the same `User` or
+    ///   `Assistant` role (some providers require alternating turns).
     ///
     /// Returns the first violation found, if any. In release builds this is
     /// still cheap and returns `Ok(())` on a clean transcript.
     pub(crate) fn validate_for_provider(&self) -> Result<(), TranscriptError> {
         let msgs = &self.messages;
-        // Collect all answered call ids (tool results seen so far).
-        let mut answered: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        // Walk oldest→newest; a tool_use is answered if a later tool_result
-        // carries its id. Track pending tool_use ids and check at the end.
-        let mut pending: Vec<&str> = Vec::new();
         let mut prev_role: Option<Role> = None;
-        for m in msgs.iter() {
-            if let Some(prev) = prev_role
-                && prev == Role::User
-                && m.role == Role::User
-            {
-                return Err(TranscriptError::ConsecutiveUser);
+        let mut i = 0;
+        while i < msgs.len() {
+            let m = &msgs[i];
+            if let Some(prev) = prev_role {
+                match (prev, m.role) {
+                    (Role::User, Role::User) => return Err(TranscriptError::ConsecutiveUser),
+                    (Role::Assistant, Role::Assistant) => {
+                        return Err(TranscriptError::ConsecutiveAssistant);
+                    }
+                    _ => {}
+                }
             }
             match m.role {
                 Role::Assistant => {
-                    for c in &m.content {
-                        if let Content::ToolCall { id, .. } = c {
-                            pending.push(id);
+                    if !assistant_content_visible_to_providers(&m.content) {
+                        return Err(TranscriptError::EmptyAssistant);
+                    }
+                    let call_ids = tool_call_ids(&m.content);
+                    if !call_ids.is_empty() {
+                        let mut pending = call_ids;
+                        let Some(next) = msgs.get(i + 1) else {
+                            return Err(TranscriptError::OrphanToolUse(pending.remove(0)));
+                        };
+                        if next.role != Role::Tool {
+                            return Err(TranscriptError::OrphanToolUse(pending.remove(0)));
                         }
+                        i += 1;
+                        while i < msgs.len() && msgs[i].role == Role::Tool {
+                            if !tool_message_has_only_results(&msgs[i].content) {
+                                return Err(TranscriptError::UnexpectedToolResult(
+                                    "non-tool content in tool_result block".to_string(),
+                                ));
+                            }
+                            let result_ids = tool_result_ids(&msgs[i].content);
+                            for result_id in result_ids {
+                                if !consume_pending_tool_result(&mut pending, &result_id) {
+                                    return Err(TranscriptError::UnexpectedToolResult(result_id));
+                                }
+                            }
+                            i += 1;
+                        }
+                        if let Some(missing) = pending.into_iter().next() {
+                            return Err(TranscriptError::OrphanToolUse(missing));
+                        }
+                        prev_role = Some(Role::Tool);
+                        continue;
                     }
                 }
                 Role::Tool => {
-                    for c in &m.content {
-                        if let Content::ToolResult { call_id, .. } = c {
-                            answered.insert(call_id);
-                        }
+                    if !tool_message_has_only_results(&m.content) {
+                        return Err(TranscriptError::UnexpectedToolResult(
+                            "non-tool content in tool_result block".to_string(),
+                        ));
                     }
+                    let id = tool_result_ids(&m.content)
+                        .into_iter()
+                        .next()
+                        .unwrap_or_else(|| "missing tool_result block".to_string());
+                    return Err(TranscriptError::UnexpectedToolResult(id));
                 }
                 _ => {}
             }
             prev_role = Some(m.role);
-        }
-        for id in &pending {
-            if !answered.contains(id) {
-                return Err(TranscriptError::OrphanToolUse((*id).to_string()));
-            }
+            i += 1;
         }
         Ok(())
     }
@@ -482,8 +722,15 @@ impl Transcript {
 pub(crate) enum TranscriptError {
     /// An assistant `tool_use` block with no matching `tool_result`.
     OrphanToolUse(String),
+    /// A `tool_result` appeared without being part of the immediate answer
+    /// block for the preceding assistant tool call.
+    UnexpectedToolResult(String),
     /// Two consecutive user messages (some providers reject this).
     ConsecutiveUser,
+    /// Two consecutive assistant messages (some providers require alternation).
+    ConsecutiveAssistant,
+    /// An assistant message with no provider-visible content blocks.
+    EmptyAssistant,
 }
 
 impl std::fmt::Display for TranscriptError {
@@ -492,7 +739,12 @@ impl std::fmt::Display for TranscriptError {
             Self::OrphanToolUse(id) => {
                 write!(f, "orphan tool_use (no matching tool_result): {id}")
             }
+            Self::UnexpectedToolResult(id) => {
+                write!(f, "unexpected or out-of-order tool_result: {id}")
+            }
             Self::ConsecutiveUser => write!(f, "consecutive user messages"),
+            Self::ConsecutiveAssistant => write!(f, "consecutive assistant messages"),
+            Self::EmptyAssistant => write!(f, "empty/provider-invisible assistant message"),
         }
     }
 }
@@ -624,6 +876,68 @@ mod tests {
     }
 
     #[test]
+    fn push_assistant_text_only_keeps_tool_only_skip_non_empty() {
+        let mut t = Transcript::new(vec![user("again")]);
+        t.push_assistant_text_only(vec![Content::ToolCall {
+            id: "z".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        }]);
+        let last = t.as_slice().last().unwrap();
+        assert_eq!(last.role, Role::Assistant);
+        assert!(
+            last.content
+                .iter()
+                .all(|c| !matches!(c, Content::ToolCall { .. }))
+        );
+        assert!(
+            last.content
+                .iter()
+                .any(|c| matches!(c, Content::Text(t) if !t.trim().is_empty())),
+            "skipped tool-only assistant turns must remain non-empty"
+        );
+        t.validate_for_provider().unwrap();
+    }
+
+    #[test]
+    fn push_assistant_text_only_adds_visible_text_for_unsigned_thinking_only_skip() {
+        let mut t = Transcript::new(vec![user("again")]);
+        t.push_assistant_text_only(vec![
+            Content::Thinking {
+                text: "internal reasoning".into(),
+                signature: None,
+            },
+            Content::ToolCall {
+                id: "z".into(),
+                name: "bash".into(),
+                arguments: "{}".into(),
+            },
+        ]);
+        let last = t.as_slice().last().unwrap();
+        assert!(
+            last.content
+                .iter()
+                .any(|c| matches!(c, Content::Text(t) if !t.trim().is_empty())),
+            "unsigned thinking is dropped by Anthropic serialization, so a visible text block is required"
+        );
+        t.validate_for_provider().unwrap();
+    }
+
+    #[test]
+    fn push_assistant_adds_visible_text_for_empty_content() {
+        let mut t = Transcript::new(vec![user("again")]);
+        t.push_assistant(vec![Content::Text(String::new())]);
+        let last = t.as_slice().last().unwrap();
+        assert!(
+            last.content
+                .iter()
+                .any(|c| matches!(c, Content::Text(t) if !t.trim().is_empty())),
+            "assistant messages must serialize to provider-visible content"
+        );
+        t.validate_for_provider().unwrap();
+    }
+
+    #[test]
     fn replace_last_nudge_pops_prior_cycle() {
         let mut t = Transcript::new(vec![user("fix it"), assistant_text("working")]);
         t.push_nudge(
@@ -665,12 +979,236 @@ mod tests {
     }
 
     #[test]
+    fn validate_catches_out_of_order_tool_result() {
+        let t = Transcript::new(vec![
+            user("do it"),
+            assistant_with_call("c1", "bash"),
+            assistant_text("interposed text"),
+            Message::tool_result("c1", "late result"),
+        ]);
+
+        assert!(matches!(
+            t.validate_for_provider(),
+            Err(TranscriptError::OrphanToolUse(id)) if id == "c1"
+        ));
+    }
+
+    #[test]
+    fn validate_catches_standalone_tool_result() {
+        let t = Transcript::new(vec![user("do it"), Message::tool_result("c1", "orphan")]);
+
+        assert!(matches!(
+            t.validate_for_provider(),
+            Err(TranscriptError::UnexpectedToolResult(id)) if id == "c1"
+        ));
+    }
+
+    #[test]
+    fn validate_catches_non_result_content_inside_tool_message() {
+        let t = Transcript::new(vec![
+            user("do it"),
+            assistant_with_call("c1", "bash"),
+            Message {
+                role: Role::Tool,
+                content: vec![
+                    Content::ToolResult {
+                        call_id: "c1".into(),
+                        output: "ok".into(),
+                    },
+                    Content::Text("this would be ignored by provider serialization".into()),
+                ],
+            },
+        ]);
+
+        assert!(matches!(
+            t.validate_for_provider(),
+            Err(TranscriptError::UnexpectedToolResult(id))
+                if id == "non-tool content in tool_result block"
+        ));
+    }
+
+    #[test]
     fn validate_catches_consecutive_user() {
         let t = Transcript::new(vec![user("a"), user("b"), assistant_text("c")]);
         assert!(matches!(
             t.validate_for_provider(),
             Err(TranscriptError::ConsecutiveUser)
         ));
+    }
+
+    #[test]
+    fn validate_catches_consecutive_assistant() {
+        let t = Transcript::new(vec![user("a"), assistant_text("b"), assistant_text("c")]);
+        assert!(matches!(
+            t.validate_for_provider(),
+            Err(TranscriptError::ConsecutiveAssistant)
+        ));
+    }
+
+    #[test]
+    fn validate_catches_empty_assistant() {
+        let t = Transcript::new(vec![user("a"), Message::assistant(Vec::new())]);
+        assert!(matches!(
+            t.validate_for_provider(),
+            Err(TranscriptError::EmptyAssistant)
+        ));
+    }
+
+    #[test]
+    fn validate_catches_assistant_with_no_provider_visible_content() {
+        let t = Transcript::new(vec![
+            user("a"),
+            Message::assistant(vec![
+                Content::Text(String::new()),
+                Content::Thinking {
+                    text: "unsigned thinking".into(),
+                    signature: None,
+                },
+            ]),
+        ]);
+        assert!(matches!(
+            t.validate_for_provider(),
+            Err(TranscriptError::EmptyAssistant)
+        ));
+    }
+
+    #[test]
+    fn repair_provider_invisible_assistant_messages_fixes_legacy_history() {
+        let mut t = Transcript::new(vec![
+            user("a"),
+            Message::assistant(vec![
+                Content::Text(String::new()),
+                Content::Thinking {
+                    text: "unsigned thinking".into(),
+                    signature: None,
+                },
+            ]),
+        ]);
+
+        t.repair_provider_invisible_assistant_messages();
+
+        let last = t.as_slice().last().unwrap();
+        assert!(
+            last.content
+                .iter()
+                .any(|c| matches!(c, Content::Text(t) if !t.trim().is_empty())),
+            "legacy provider-invisible assistant turns should be repaired"
+        );
+        t.validate_for_provider().unwrap();
+    }
+
+    #[test]
+    fn repair_consecutive_user_messages_merges_legacy_adjacent_users() {
+        let mut t = Transcript::new(vec![
+            user("first"),
+            user("second"),
+            assistant_text("answer"),
+            user("third"),
+            user("fourth"),
+        ]);
+
+        t.repair_consecutive_user_messages();
+
+        let roles: Vec<Role> = t.as_slice().iter().map(|message| message.role).collect();
+        assert_eq!(
+            roles,
+            vec![Role::User, Role::Assistant, Role::User],
+            "adjacent users should be merged without disturbing other roles"
+        );
+        assert!(t.as_slice()[0].text().contains("first"));
+        assert!(t.as_slice()[0].text().contains("second"));
+        assert!(t.as_slice()[2].text().contains("third"));
+        assert!(t.as_slice()[2].text().contains("fourth"));
+        t.validate_for_provider().unwrap();
+    }
+
+    #[test]
+    fn repair_consecutive_assistant_messages_merges_legacy_adjacent_assistants() {
+        let mut t = Transcript::new(vec![
+            user("prompt"),
+            assistant_text("first"),
+            assistant_text("second"),
+            user("next"),
+        ]);
+
+        t.repair_consecutive_assistant_messages();
+
+        let roles: Vec<Role> = t.as_slice().iter().map(|message| message.role).collect();
+        assert_eq!(
+            roles,
+            vec![Role::User, Role::Assistant, Role::User],
+            "adjacent assistants should be merged without disturbing other roles"
+        );
+        assert!(t.as_slice()[1].text().contains("first"));
+        assert!(t.as_slice()[1].text().contains("second"));
+        t.validate_for_provider().unwrap();
+    }
+
+    #[test]
+    fn repair_tool_result_ordering_strips_legacy_out_of_order_tool_call() {
+        let mut t = Transcript::new(vec![
+            user("do it"),
+            Message::assistant(vec![Content::ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                arguments: "{}".into(),
+            }]),
+            assistant_text("interposed text"),
+            Message::tool_result("c1", "late result"),
+        ]);
+
+        t.repair_tool_result_ordering();
+        t.repair_provider_invisible_assistant_messages();
+        t.repair_consecutive_assistant_messages();
+
+        assert!(
+            !t.as_slice().iter().any(|message| {
+                message.content.iter().any(|content| {
+                    matches!(
+                        content,
+                        Content::ToolCall { .. } | Content::ToolResult { .. }
+                    )
+                })
+            }),
+            "unsafe legacy tool skeleton should be stripped: {:?}",
+            t.as_slice()
+        );
+        t.validate_for_provider().unwrap();
+    }
+
+    #[test]
+    fn repair_tool_result_ordering_strips_tool_messages_with_non_result_content() {
+        let mut t = Transcript::new(vec![
+            user("do it"),
+            assistant_with_call("c1", "bash"),
+            Message {
+                role: Role::Tool,
+                content: vec![
+                    Content::ToolResult {
+                        call_id: "c1".into(),
+                        output: "ok".into(),
+                    },
+                    Content::Text("this would be dropped by serializers".into()),
+                ],
+            },
+        ]);
+
+        t.repair_tool_result_ordering();
+        t.repair_provider_invisible_assistant_messages();
+
+        assert!(
+            !t.as_slice().iter().any(|message| {
+                message.content.iter().any(|content| {
+                    matches!(
+                        content,
+                        Content::ToolCall { .. } | Content::ToolResult { .. }
+                    )
+                })
+            }),
+            "unsafe mixed tool message should be stripped: {:?}",
+            t.as_slice()
+        );
+        t.validate_for_provider().unwrap();
     }
 
     #[test]

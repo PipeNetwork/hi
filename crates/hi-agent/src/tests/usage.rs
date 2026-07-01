@@ -1,5 +1,5 @@
-use super::*;
 use super::common::*;
+use super::*;
 
 #[tokio::test]
 async fn usage_line_separates_cumulative_spend_from_context_fill() {
@@ -407,4 +407,3 @@ async fn normal_final_text_does_not_retry() {
         ui.statuses
     );
 }
-

@@ -9,13 +9,11 @@ use ratatui::text::Line;
 use crate::input::InputLine;
 use crate::util::notify_done;
 use crate::{
-    NOTIFY_THRESHOLD, ProfileInfo,
-    ProfileLoader, ProfileRemover, ProfileResolver, ProfileSaver,
+    NOTIFY_THRESHOLD, ProfileInfo, ProfileLoader, ProfileRemover, ProfileResolver, ProfileSaver,
     TurnState,
 };
 
 impl crate::App {
-
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         provider: &str,
@@ -61,6 +59,7 @@ impl crate::App {
             queue: VecDeque::new(),
             last_prompt: None,
             last_turn_start: 0,
+            last_turn_snapshot: None,
             picker: None,
             provider_form: None,
             history_search: None,

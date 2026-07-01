@@ -1,6 +1,7 @@
 //! The agent loop: user message → model → tool calls → results → repeat
 //! until the model stops calling tools. No artificial step limit.
 
+mod agent;
 pub mod command;
 pub mod compaction;
 mod config;
@@ -8,7 +9,6 @@ mod decision;
 mod goal;
 mod heuristics;
 mod memory;
-mod agent;
 mod prompt;
 mod session;
 mod snapshot;
@@ -38,17 +38,19 @@ use transcript::Transcript;
 
 #[cfg(test)]
 use {
-    anyhow::Result, heuristics::{looks_like_continue, plan_has_pending_steps},
+    anyhow::Result,
+    heuristics::{looks_like_continue, plan_has_pending_steps},
     hi_ai::{Message, ToolMode},
     steering::{
-        EvidenceTracker, ImplementationIntent, ReviewIntent, SecuritySearchFamilies,
-        READ_ONLY_PREFLIGHT_DIFF_MAX_LINES, READ_ONLY_PREFLIGHT_GREP_MAX_LINES,
-        bounded_review_repair_exhaustion_answer, classify_implementation_intent,
-        classify_read_only_intent, compact_preflight_tool_output,
-        gpu_training_estimator_bootstrap_files, implementation_preflight_command,
-        implementation_turn_prompt, implementation_workspace_can_accept_rust_bootstrap_at,
-        insufficient_after_incomplete_security_search, preflight_path_relevant_for_intent,
-        preferred_validation_from_preflight, read_only_preflight_initial_calls,
+        ConcreteReviewAnswerProblem, EvidenceTracker, ImplementationIntent,
+        READ_ONLY_PREFLIGHT_DIFF_MAX_LINES, READ_ONLY_PREFLIGHT_GREP_MAX_LINES, ReviewIntent,
+        SecuritySearchFamilies, bounded_review_repair_exhaustion_answer,
+        classify_implementation_intent, classify_read_only_intent, compact_preflight_tool_output,
+        concrete_review_answer_problem, gpu_training_estimator_bootstrap_files,
+        implementation_preflight_command, implementation_turn_prompt,
+        implementation_workspace_can_accept_rust_bootstrap_at, inspection_signature,
+        insufficient_after_incomplete_security_search, preferred_validation_from_preflight,
+        preflight_path_relevant_for_intent, read_only_preflight_initial_calls,
         security_search_families_for_tool, should_nudge_concrete_review_answer,
         should_nudge_security_broad_search, should_nudge_security_scope,
     },
@@ -59,6 +61,19 @@ pub use goal::{DEFAULT_SUBGOAL_RETRIES, Goal, GoalStatus, SubGoal};
 
 /// Crate version (from Cargo.toml).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Pre-turn state that must be restored when an attempt is discarded.
+///
+/// The transcript alone is not enough: tools can update prompt-injected state
+/// such as structured goals, plans, and key decisions before the user retries
+/// or interrupts the turn.
+#[derive(Clone)]
+pub struct AgentStateSnapshot {
+    pub(crate) goal: Option<String>,
+    pub(crate) structured_goal: Option<Goal>,
+    pub(crate) decisions: DecisionLog,
+    pub(crate) last_plan: Vec<PlanStep>,
+}
 
 /// Per-turn telemetry: the trajectory of one `run_turn`, captured so callers
 /// (the `--report` writer, the eval harness) can diagnose *how* a turn went,
@@ -271,10 +286,10 @@ give your final recap.";
 pub(crate) const TRUNCATION_NUDGE: &str = "Your previous response was cut off by the output token limit — \
 it was truncated, not finished. Continue exactly from where you stopped, completing the text or \
 tool call you were in the middle of. Do not restart or repeat what you already produced.";
-pub(crate) const TRUNCATED_TOOL_CALL_NUDGE: &str = "Your previous response was cut off while emitting a tool \
-call. That partial tool call was not executed. Re-issue one fresh, complete tool call now. If the \
-payload is large, split the work into smaller writes/edits or use a bounded shell smoke test; do \
-not continue inside the partial tool-call text.";
+pub(crate) const TRUNCATED_TOOL_CALL_NUDGE: &str = "Your previous response was cut off while emitting or preparing a tool \
+call. That partial work was not executed. Issue one fresh, complete tool call now. If the payload \
+is large, split the work into smaller writes/edits or use a bounded shell smoke test; do not \
+continue inside the partial tool-call text.";
 
 pub(crate) fn partial_text_tool_call_start(text: &str) -> Option<usize> {
     ["<tool_call>", "{\"name\"", "[tool_call", "[tool_calls"]
@@ -401,7 +416,6 @@ pub struct Agent {
     /// recap after one sub-task, even when the plan is only 2/9 done).
     pub(crate) last_plan: Vec<PlanStep>,
 }
-
 
 #[cfg(test)]
 mod tests;

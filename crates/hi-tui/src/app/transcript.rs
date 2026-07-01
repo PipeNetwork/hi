@@ -9,13 +9,9 @@ use ratatui::text::{Line, Text};
 
 use crate::event::UiEvent;
 use crate::render::{diff_lines, dim, looks_like_diff, markdown_line};
-use crate::{
-    MAX_TRANSCRIPT_LINES, TranscriptEntry, TurnEventKind,
-    TurnState,
-};
+use crate::{MAX_TRANSCRIPT_LINES, TranscriptEntry, TurnEventKind, TurnState};
 
 impl crate::App {
-
     pub(crate) fn push(&mut self, line: Line<'static>) {
         self.transcript.push(TranscriptEntry::Line(line));
         self.cap_transcript();

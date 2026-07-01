@@ -1,6 +1,5 @@
 //! `App` methods: render.
 
-
 use hi_agent::{Agent, PlanStatus};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
@@ -10,13 +9,9 @@ use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
 use crate::model_picker::{display_capabilities, display_health, display_price, display_window};
 use crate::render::{diff_lines, dim, markdown_line, wrapped_height};
 use crate::util::{clip_reason, fmt_count, fmt_elapsed};
-use crate::{
-    PICKER_ROWS, SPINNER, TurnEventKind,
-    TurnState,
-};
+use crate::{PICKER_ROWS, SPINNER, TurnEventKind, TurnState};
 
 impl crate::App {
-
     /// The live "what's happening now" lead for the working line: the in-flight
     /// tool named with its own elapsed timer, otherwise the model phase —
     /// `thinking…` (reasoning), `responding…` (streaming text), or `Working`
@@ -783,15 +778,15 @@ impl crate::App {
                     ("Alt-Enter / \\", "insert a newline (multi-line prompt)"),
                     (
                         "Ctrl-C",
-                        "interrupt the running turn, or double-press to quit",
+                        "interrupt the running turn; double-press idle to quit",
                     ),
-                    ("Ctrl-D (idle)", "quit"),
-                    ("Ctrl-D (typing)", "toggle the working-tree diff panel"),
+                    ("Ctrl-D", "toggle the working-tree diff panel"),
                     ("Ctrl-T", "toggle reasoning (thinking) display"),
                     ("Ctrl-?", "toggle agent observability panel"),
                     ("Ctrl-R", "fuzzy-search input history"),
                     ("PageUp/PageDown", "scroll the transcript"),
-                    ("Esc", "clear input, or quit when empty"),
+                    ("Esc", "clear input or dismiss panels"),
+                    ("/quit", "quit"),
                     ("/help", "show all slash commands"),
                 ];
                 for (key, desc) in bindings {

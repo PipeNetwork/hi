@@ -1,5 +1,5 @@
-use super::*;
 use super::common::*;
+use super::*;
 
 #[test]
 fn typo_heavy_review_prompts_classify_as_read_only_intents() {
@@ -56,6 +56,49 @@ fn implementation_prompts_classify_without_stealing_gap_reviews() {
     assert!(prompt.contains("training_flops = 6 * params * tokens"));
     assert!(prompt.contains("H100 80GB"));
     assert!(prompt.contains("validation command"));
+}
+
+#[test]
+fn finish_the_implementation_classifies_as_implementation() {
+    // "finish the av1 implementation" / "finish the parser implementation"
+    // has no explicit artifact word ("app", "tui", …) but "implementation"
+    // itself is the noun naming the thing being built. This is the reported
+    // av1 case where the model cycled through re-reads and the implementation
+    // intent was never detected, so the generic repeat guard fired instead of
+    // the implementation-aware one.
+    assert!(
+        classify_implementation_intent("finish the av1 implementation").is_some(),
+        "'finish the av1 implementation' should classify as implementation"
+    );
+    assert!(
+        classify_implementation_intent("finish the parser implementation").is_some(),
+        "'finish the parser implementation' should classify as implementation"
+    );
+    // The typo form "implimentation" is normalized to "implementation".
+    assert!(
+        classify_implementation_intent("finish the av1 implimentation").is_some(),
+        "'finish the av1 implimentation' (typo) should classify as implementation"
+    );
+    // "implement" as a verb still works (existing behavior).
+    assert!(
+        classify_implementation_intent("implement the parser").is_none(),
+        "'implement the parser' without an artifact word is still None"
+    );
+    // Review/analysis verbs with "implementation" should NOT classify as
+    // implementation — "discuss the implementation" is a review, not a build
+    // request. Without the guard these would steal the review classification.
+    assert!(
+        classify_implementation_intent("discuss the implementation").is_none(),
+        "'discuss the implementation' should not classify as implementation"
+    );
+    assert!(
+        classify_implementation_intent("analyze the implementation").is_none(),
+        "'analyze the implementation' should not classify as implementation"
+    );
+    assert!(
+        classify_implementation_intent("assess the implementation").is_none(),
+        "'assess the implementation' should not classify as implementation"
+    );
 }
 
 #[test]
@@ -480,6 +523,183 @@ fn review_answer_needs_bounded_review_shape_not_just_a_path() {
 }
 
 #[test]
+fn concrete_review_accepts_distinctive_inspected_file_aliases() {
+    let mut evidence = EvidenceTracker::default();
+    evidence.record_success(
+        "read",
+        r#"{"path":"src/pages/top-up.tsx"}"#,
+        "export function TopUp() { return null; }\n",
+    );
+
+    let basename_answer = "Findings:\n- top-up.tsx: Based on the inspected top-up page and security search patterns, no confirmed auth/token issue was established from this file alone.\n\nLimits:\n- This is limited to inspected evidence.";
+    assert_eq!(
+        concrete_review_answer_problem(Some(ReviewIntent::Security), &evidence, basename_answer),
+        None
+    );
+
+    let stem_answer = "Findings:\n- top-up page: Based on the inspected file and security search patterns, no confirmed auth/token issue was established from this file alone.\n\nLimits:\n- This is limited to inspected evidence.";
+    assert_eq!(
+        concrete_review_answer_problem(Some(ReviewIntent::Security), &evidence, stem_answer),
+        None
+    );
+
+    assert_eq!(
+        concrete_review_answer_problem(
+            Some(ReviewIntent::Security),
+            &evidence,
+            "Findings:\n- The inspected page has no confirmed token issue from the reviewed evidence."
+        ),
+        Some(ConcreteReviewAnswerProblem::MissingInspectedCitation)
+    );
+
+    assert_eq!(
+        concrete_review_answer_problem(
+            Some(ReviewIntent::Security),
+            &evidence,
+            "top-up.tsx is part of the project and contains React code."
+        ),
+        Some(ConcreteReviewAnswerProblem::MissingReviewShape)
+    );
+}
+
+#[test]
+fn round_adds_evidence_detects_re_reads_and_re_searches() {
+    let mut evidence = EvidenceTracker::default();
+    // Record one read and one grep.
+    evidence.record_success("read", r#"{"path":"src/lib.rs"}"#, "fn main() {}\n");
+    evidence.record_success(
+        "grep",
+        r#"{"pattern":"unwrap","glob":"*.rs"}"#,
+        "src/lib.rs:1: x.unwrap()\n",
+    );
+    evidence.record_success("bash_kill", r#"{"id":"bg_1"}"#, "[bg_1] already killed");
+
+    let call = |name: &str, args: &str| (String::new(), name.to_string(), args.to_string());
+
+    // Re-reading the same file adds no new evidence.
+    assert!(
+        !evidence.round_adds_evidence(&[call("read", r#"{"path":"src/lib.rs"}"#)]),
+        "re-read of an inspected path adds no evidence"
+    );
+    assert!(
+        evidence.round_adds_evidence(&[call("read", r#"{"path":"src/lib.rs","offset":241}"#)]),
+        "a new read page from an inspected path adds evidence"
+    );
+    // Re-running the same grep adds no new evidence.
+    assert!(
+        !evidence.round_adds_evidence(&[call("grep", r#"{"pattern":"unwrap","glob":"*.rs"}"#)]),
+        "re-run of a seen grep adds no evidence"
+    );
+    assert!(
+        evidence.round_adds_evidence(&[call(
+            "grep",
+            r#"{"pattern":"unwrap","glob":"*.rs","context":2}"#
+        )]),
+        "grep with new context adds evidence"
+    );
+    // Reading a new file adds evidence.
+    assert!(
+        evidence.round_adds_evidence(&[call("read", r#"{"path":"src/main.rs"}"#)]),
+        "read of a new path adds evidence"
+    );
+    // A new grep pattern adds evidence.
+    assert!(
+        evidence.round_adds_evidence(&[call("grep", r#"{"pattern":"panic","glob":"*.rs"}"#)]),
+        "a new grep pattern adds evidence"
+    );
+    assert!(
+        !evidence.round_adds_evidence(&[call("bash_kill", r#"{"id":"bg_1"}"#)]),
+        "reusing a known-terminal background kill handle adds no evidence"
+    );
+    assert!(
+        evidence.round_adds_evidence(&[call("bash_kill", r#"{"id":"bg_2"}"#)]),
+        "a first kill attempt for a new background handle should execute"
+    );
+    // A mix of re-read and new read adds evidence (the new one).
+    assert!(
+        evidence.round_adds_evidence(&[
+            call("read", r#"{"path":"src/lib.rs"}"#),
+            call("read", r#"{"path":"src/main.rs"}"#),
+        ]),
+        "a mix of re-read and new read adds evidence"
+    );
+    // A mutating tool always adds evidence.
+    assert!(
+        evidence.round_adds_evidence(&[call("write", r#"{"path":"x","content":"y"}"#)]),
+        "a mutating tool adds evidence"
+    );
+    // An empty round is treated as adding evidence (not a cycle).
+    assert!(
+        evidence.round_adds_evidence(&[]),
+        "empty round is not a cycle"
+    );
+    assert!(
+        evidence.round_adds_evidence(&[call("read", r#"{"path":42}"#)]),
+        "un-signable read calls should execute and surface their tool error"
+    );
+}
+
+#[test]
+fn inspection_signature_is_stable_and_tool_specific() {
+    assert_eq!(
+        inspection_signature("read", r#"{"path":"src/lib.rs"}"#),
+        Some("read:src/lib.rs:1:default".into())
+    );
+    assert_eq!(
+        inspection_signature("read", r#"{"path":"src/lib.rs","limit":240,"offset":10}"#),
+        Some("read:src/lib.rs:10:240".into())
+    );
+    assert_eq!(
+        inspection_signature("read", r#"{"path":"src/lib.rs","offset":0}"#),
+        Some("read:src/lib.rs:1:default".into())
+    );
+    assert_eq!(
+        inspection_signature("read", r#"{"path":"src/lib.rs","offset":null}"#),
+        Some("read:src/lib.rs:1:default".into())
+    );
+    assert_eq!(
+        inspection_signature("list", r#"{"path":"."}"#),
+        Some("list:.".into())
+    );
+    // list with no path defaults to ".".
+    assert_eq!(inspection_signature("list", r#"{}"#), Some("list:.".into()));
+    assert_eq!(
+        inspection_signature("grep", r#"{"pattern":"unwrap","glob":"*.rs"}"#),
+        Some("grep:unwrap:*.rs::0".into())
+    );
+    assert_eq!(
+        inspection_signature("grep", r#"{"pattern":"unwrap","glob":"*.rs","context":2}"#),
+        Some("grep:unwrap:*.rs::2".into())
+    );
+    assert_eq!(
+        inspection_signature("grep", r#"{"pattern":"unwrap","context":null}"#),
+        Some("grep:unwrap:::0".into())
+    );
+    assert_eq!(
+        inspection_signature("glob", r#"{"pattern":"**/*.rs","path":"src"}"#),
+        Some("glob:**/*.rs:src".into())
+    );
+    assert_eq!(
+        inspection_signature("bash_output", r#"{"id":"bg_1"}"#),
+        Some("bash_output:bg_1".into())
+    );
+    assert_eq!(
+        inspection_signature("bash_kill", r#"{"id":"bg_1"}"#),
+        Some("bash_kill:bg_1".into())
+    );
+    // Mutating/unclassified tools have no signature.
+    assert_eq!(inspection_signature("write", r#"{"path":"x"}"#), None);
+    assert_eq!(inspection_signature("bash", r#"{"command":"ls"}"#), None);
+    assert_eq!(inspection_signature("read", r#"{"path":42}"#), None);
+    assert_eq!(inspection_signature("bash_output", r#"{"id":""}"#), None);
+    assert_eq!(inspection_signature("bash_kill", r#"{"id":""}"#), None);
+    assert_eq!(
+        inspection_signature("grep", r#"{"pattern":"unwrap","context":"two"}"#),
+        None
+    );
+}
+
+#[test]
 fn bounded_repair_exhaustion_includes_search_match_targets() {
     let inspected_path = temp_file("repair-search-target");
     std::fs::write(
@@ -777,12 +997,81 @@ async fn read_only_review_generic_final_gets_concrete_evidence_nudge() {
         agent
             .messages()
             .iter()
-            .any(|message| message.role == Role::Assistant
-                && message.text().contains(&inspected)),
+            .any(|message| message.role == Role::Assistant && message.text().contains(&inspected)),
         "final answer should cite inspected path"
     );
     assert_eq!(agent.last_turn_telemetry().quality_repair_nudges, 1);
     let _ = std::fs::remove_file(inspected_path);
+}
+
+#[tokio::test]
+async fn security_review_accepts_inspected_filename_alias_in_final_answer() {
+    let base = temp_file("security-alias-dir");
+    let inspected_path = base.join("src/pages/top-up.tsx");
+    std::fs::create_dir_all(inspected_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &inspected_path,
+        "export function TopUp() { return <button>top up</button>; }\n",
+    )
+    .unwrap();
+    let inspected = inspected_path.to_string_lossy().to_string();
+    let responses = vec![
+        completion(
+            vec![Content::ToolCall {
+                id: "read".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({ "path": inspected.clone() }).to_string(),
+            }],
+            1,
+            1,
+        ),
+        completion(
+            vec![Content::Text(
+                "Findings:\n- top-up.tsx: Based on the inspected top-up page, no confirmed token/auth or command-execution issue was established from this file alone.\n\nLimits:\n- This is limited to inspected evidence and is not a complete audit."
+                    .into(),
+            )],
+            1,
+            1,
+        ),
+    ];
+    let mut agent = agent(responses, config());
+    let mut ui = RecUi::default();
+
+    agent
+        .run_turn(
+            "review for security issues or unsafe unwraps. then disucss only",
+            &mut ui,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        !ui.assistant.contains("Bounded evidence summary"),
+        "filename alias should be accepted instead of fallback: {}",
+        ui.assistant
+    );
+    assert!(
+        !ui.statuses
+            .iter()
+            .any(|status| status.contains("lacked concrete inspected files")),
+        "should not nudge when final cites inspected filename alias: {:?}",
+        ui.statuses
+    );
+    assert!(
+        agent
+            .messages()
+            .iter()
+            .any(|message| message.role == Role::Assistant
+                && message.text().contains("top-up.tsx")),
+        "final answer should be recorded: {:?}",
+        agent
+            .messages()
+            .iter()
+            .map(|message| message.text())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(agent.last_turn_telemetry().quality_repair_nudges, 0);
+    let _ = std::fs::remove_dir_all(base);
 }
 
 #[tokio::test]
@@ -1211,9 +1500,9 @@ async fn read_only_review_generic_insufficient_after_read_reports_evidence() {
         ui.statuses
     );
     assert!(
-        ui.statuses.iter().any(
-            |status| status.contains("generic insufficient-evidence text after inspection")
-        ),
+        ui.statuses
+            .iter()
+            .any(|status| status.contains("generic insufficient-evidence text after inspection")),
         "expected replacement status: {:?}",
         ui.statuses
     );
@@ -1770,8 +2059,7 @@ async fn read_only_review_search_then_generic_final_requires_file_read() {
         ),
         completion(
             vec![Content::Text(
-                "Insufficient evidence: targeted search ran, but no matching file was read."
-                    .into(),
+                "Insufficient evidence: targeted search ran, but no matching file was read.".into(),
             )],
             1,
             1,
@@ -1856,4 +2144,3 @@ async fn listing_only_review_repair_exhaustion_returns_insufficient_evidence() {
     assert!(telemetry.stalled_unfinished);
     assert!(agent.usage_summary(agent.totals()).contains("stalled"));
 }
-

@@ -13,7 +13,9 @@ pub(crate) fn implementation_workspace_can_accept_rust_bootstrap() -> bool {
     implementation_workspace_can_accept_rust_bootstrap_at(std::path::Path::new("."))
 }
 
-pub(crate) fn implementation_workspace_can_accept_rust_bootstrap_at(root: &std::path::Path) -> bool {
+pub(crate) fn implementation_workspace_can_accept_rust_bootstrap_at(
+    root: &std::path::Path,
+) -> bool {
     let manifest_paths = [
         "Cargo.toml",
         "package.json",
@@ -210,4 +212,3 @@ pub(crate) fn shell_command_likely_validates(command: &str) -> bool {
         ],
     )
 }
-

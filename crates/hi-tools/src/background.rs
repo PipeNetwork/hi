@@ -10,7 +10,7 @@
 //! status — so the pipes are always drained (never deadlocking) and a poll is a
 //! cheap read of already-collected output.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 
@@ -51,6 +51,9 @@ struct BgInner {
 static REGISTRY: LazyLock<Mutex<HashMap<String, Arc<BgProc>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static COUNTER: AtomicU64 = AtomicU64::new(1);
+#[cfg(test)]
+pub(crate) static TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 /// Start `command` in the background and return its handle id (e.g. `bg_1`).
 pub(crate) fn spawn(command: &str) -> Result<String> {
@@ -144,6 +147,37 @@ pub fn kill_all() {
             }
         }
     }
+}
+
+/// Snapshot known background process ids. Used by frontends before a cancellable
+/// turn so they can clean up only processes created by the discarded turn.
+pub fn ids() -> Vec<String> {
+    let mut ids: Vec<String> = REGISTRY.lock().unwrap().keys().cloned().collect();
+    ids.sort_by_key(|id| id_num(id));
+    ids
+}
+
+/// Kill running background processes that were started after `before`.
+/// Returns the number of processes signalled.
+pub fn kill_started_after(before: &[String]) -> usize {
+    let before: HashSet<&str> = before.iter().map(String::as_str).collect();
+    let targets: Vec<String> = {
+        let reg = REGISTRY.lock().unwrap();
+        reg.iter()
+            .filter(|(id, proc)| {
+                !before.contains(id.as_str())
+                    && matches!(proc.inner.lock().unwrap().state, BgState::Running)
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+    let mut killed = 0;
+    for id in targets {
+        if kill(&id).is_ok() {
+            killed += 1;
+        }
+    }
+    killed
 }
 
 fn lookup(id: &str) -> Result<Arc<BgProc>> {
@@ -246,6 +280,7 @@ mod tests {
 
     #[tokio::test]
     async fn background_captures_output_and_exit_code() {
+        let _guard = TEST_LOCK.lock().await;
         let id = spawn("echo hi-bg").unwrap();
         let combined = poll_until_done(&id).await;
         // `poll_until_done` returns the poll that observed the exit; the echoed
@@ -259,6 +294,7 @@ mod tests {
 
     #[tokio::test]
     async fn background_returns_immediately_for_long_process() {
+        let _guard = TEST_LOCK.lock().await;
         // A 600s sleep must not block spawn; it returns an id at once.
         let id = tokio::time::timeout(Duration::from_secs(2), async { spawn("sleep 600") })
             .await
@@ -271,6 +307,7 @@ mod tests {
 
     #[tokio::test]
     async fn background_kill_stops_the_process() {
+        let _guard = TEST_LOCK.lock().await;
         let id = spawn("sleep 600").unwrap();
         let killed = kill(&id).unwrap();
         assert!(killed.contains("killed"), "got: {killed:?}");
@@ -279,6 +316,26 @@ mod tests {
         assert!(out.contains("killed"), "got: {out:?}");
         // Killing again is idempotent.
         assert!(kill(&id).unwrap().contains("already"), "second kill");
+    }
+
+    #[tokio::test]
+    async fn kill_started_after_kills_only_new_running_processes() {
+        let _guard = TEST_LOCK.lock().await;
+        let keep = spawn("sleep 600").unwrap();
+        let before = ids();
+        let doomed = spawn("sleep 600").unwrap();
+
+        let killed = kill_started_after(&before);
+
+        assert_eq!(killed, 1);
+        let doomed_out = poll_until_done(&doomed).await;
+        assert!(doomed_out.contains("killed"), "got: {doomed_out:?}");
+        let keep_out = poll(&keep).unwrap();
+        assert!(
+            keep_out.contains("running"),
+            "pre-existing background process should survive: {keep_out:?}"
+        );
+        kill(&keep).unwrap();
     }
 
     #[tokio::test]

@@ -1,5 +1,169 @@
-use super::*;
 use super::common::*;
+use super::*;
+use std::sync::Arc;
+
+type CompactionRecords = Arc<Mutex<Vec<Vec<Message>>>>;
+type StateReplacementRecords = Arc<Mutex<Vec<(Vec<Message>, Option<Goal>, Vec<Decision>)>>>;
+
+struct CompactionRecordingSession {
+    records: CompactionRecords,
+}
+
+struct StateReplacementRecordingSession {
+    records: StateReplacementRecords,
+}
+
+impl SessionSink for CompactionRecordingSession {
+    fn record(
+        &mut self,
+        _messages: &[Message],
+        _usage: Usage,
+        _cost_usd: Option<f64>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn record_compaction(&mut self, messages: &[Message]) -> anyhow::Result<()> {
+        self.records.lock().unwrap().push(messages.to_vec());
+        Ok(())
+    }
+}
+
+impl SessionSink for StateReplacementRecordingSession {
+    fn record(
+        &mut self,
+        _messages: &[Message],
+        _usage: Usage,
+        _cost_usd: Option<f64>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn record_compaction(&mut self, _messages: &[Message]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn record_state_replacement(
+        &mut self,
+        messages: &[Message],
+        goal: Option<&Goal>,
+        decisions: &DecisionLog,
+    ) -> anyhow::Result<()> {
+        self.records.lock().unwrap().push((
+            messages.to_vec(),
+            goal.cloned(),
+            decisions.entries().to_vec(),
+        ));
+        Ok(())
+    }
+}
+
+struct FailingCompactionSession;
+
+impl SessionSink for FailingCompactionSession {
+    fn record(
+        &mut self,
+        _messages: &[Message],
+        _usage: Usage,
+        _cost_usd: Option<f64>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn record_compaction(&mut self, _messages: &[Message]) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("disk full"))
+    }
+}
+
+#[test]
+fn durable_truncate_records_compaction_boundary() {
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = agent(vec![], config());
+    agent.messages_mut().push(Message::user("old attempt"));
+    agent
+        .messages_mut()
+        .push(Message::assistant(vec![Content::Text("old answer".into())]));
+    agent.set_session(Box::new(CompactionRecordingSession {
+        records: records.clone(),
+    }));
+
+    agent.truncate_messages_durable(1).unwrap();
+
+    assert_eq!(agent.messages().len(), 1);
+    let records = records.lock().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].len(), 1);
+    assert_eq!(records[0][0].role, Role::System);
+}
+
+#[test]
+fn durable_truncate_keeps_live_history_when_persistence_fails() {
+    let mut agent = agent(vec![], config());
+    agent.messages_mut().push(Message::user("old attempt"));
+    agent
+        .messages_mut()
+        .push(Message::assistant(vec![Content::Text("old answer".into())]));
+    agent.set_session(Box::new(FailingCompactionSession));
+
+    let err = agent.truncate_messages_durable(1).unwrap_err();
+
+    assert!(err.to_string().contains("disk full"));
+    assert_eq!(agent.messages().len(), 3);
+    assert_eq!(agent.messages()[1].text(), "old attempt");
+}
+
+#[test]
+fn retry_rewind_restores_state_snapshot_and_rebuilt_system_prompt() {
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let mut agent = agent(vec![], config());
+    agent.set_goal(Some("keep this goal".into()));
+    agent.decisions.record(Decision {
+        summary: "kept decision".into(),
+        rationale: "pre-turn state".into(),
+        files: vec!["src/lib.rs".into()],
+    });
+    agent.refresh_system_message();
+
+    let start = agent.messages().len();
+    let snapshot = agent.state_snapshot();
+
+    agent.messages_mut().push(Message::user("old attempt"));
+    agent.decisions.record(Decision {
+        summary: "discarded decision".into(),
+        rationale: "recorded during abandoned attempt".into(),
+        files: vec!["src/bad.rs".into()],
+    });
+    agent.set_goal(Some("discarded goal".into()));
+    agent
+        .messages_mut()
+        .push(Message::assistant(vec![Content::Text("old answer".into())]));
+    agent.set_session(Box::new(StateReplacementRecordingSession {
+        records: records.clone(),
+    }));
+
+    agent.rewind_to_snapshot_durable(start, &snapshot).unwrap();
+
+    assert_eq!(agent.messages().len(), 1);
+    assert_eq!(agent.goal(), Some("keep this goal"));
+    assert_eq!(agent.decisions().entries().len(), 1);
+    assert_eq!(agent.decisions().entries()[0].summary, "kept decision");
+    let system = agent.messages()[0].text();
+    assert!(system.contains("keep this goal"), "system prompt: {system}");
+    assert!(system.contains("kept decision"), "system prompt: {system}");
+    assert!(
+        !system.contains("discarded decision") && !system.contains("discarded goal"),
+        "discarded state leaked into system prompt: {system}"
+    );
+
+    let records = records.lock().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].0.len(), 1);
+    assert!(records[0].0[0].text().contains("kept decision"));
+    assert!(!records[0].0[0].text().contains("discarded decision"));
+    assert!(records[0].1.is_none());
+    assert_eq!(records[0].2.len(), 1);
+    assert_eq!(records[0].2[0].summary, "kept decision");
+}
 
 #[tokio::test]
 async fn request_too_large_drops_prior_context_and_retries_latest_prompt() {
@@ -67,6 +231,78 @@ async fn request_too_large_drops_prior_context_and_retries_latest_prompt() {
 }
 
 #[tokio::test]
+async fn request_too_large_context_drop_records_durable_boundary() {
+    let records = Arc::new(Mutex::new(Vec::new()));
+    let (mut agent, _requests) = scripted_agent(
+        vec![
+            ProviderStep::RequestTooLarge,
+            ProviderStep::Completion(completion(vec![Content::Text("ok".into())], 12, 3)),
+        ],
+        config(),
+    );
+    agent.messages_mut().push(Message::user("previous task"));
+    agent
+        .messages_mut()
+        .push(Message::assistant(vec![Content::Text(
+            "old answer with huge context".repeat(1000),
+        )]));
+    agent.set_session(Box::new(CompactionRecordingSession {
+        records: records.clone(),
+    }));
+
+    agent
+        .run_turn("fix the current bug", &mut RecordingUi::default())
+        .await
+        .unwrap();
+
+    let records = records.lock().unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].len(),
+        1,
+        "context-drop boundary should persist only the rebuilt system prompt"
+    );
+    assert_eq!(records[0][0].role, Role::System);
+    assert!(
+        !records[0][0].text().contains("previous task"),
+        "discarded context must not survive the durable boundary"
+    );
+}
+
+#[tokio::test]
+async fn request_too_large_keeps_live_context_when_boundary_persistence_fails() {
+    let (mut agent, requests) = scripted_agent(vec![ProviderStep::RequestTooLarge], config());
+    agent.messages_mut().push(Message::user("previous task"));
+    agent
+        .messages_mut()
+        .push(Message::assistant(vec![Content::Text("old answer".into())]));
+    let start_len = agent.messages().len();
+    agent.set_session(Box::new(FailingCompactionSession));
+    let mut ui = RecordingUi::default();
+
+    let err = agent.run_turn("fix it", &mut ui).await.unwrap_err();
+
+    assert_eq!(
+        hi_ai::provider_error_kind(&err),
+        Some(ProviderErrorKind::RequestTooLarge)
+    );
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        1,
+        "failed durable boundary should abort recovery instead of retrying from divergent state"
+    );
+    assert_eq!(agent.messages().len(), start_len);
+    assert_eq!(agent.messages()[1].text(), "previous task");
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|s| s.contains("couldn't persist dropped-context retry state")),
+        "user sees persistence failure: {:?}",
+        ui.statuses
+    );
+}
+
+#[tokio::test]
 async fn request_too_large_latest_prompt_is_removed_after_failed_retry() {
     let (mut agent, _requests) = scripted_agent(vec![ProviderStep::RequestTooLarge], config());
     let start_len = agent.messages().len();
@@ -85,6 +321,56 @@ async fn request_too_large_latest_prompt_is_removed_after_failed_retry() {
         agent.messages().len(),
         start_len,
         "failed oversized prompt is not left in live history"
+    );
+    assert!(
+        ui.statuses.iter().any(|s| s.contains("shorten the prompt")),
+        "user gets actionable status: {:?}",
+        ui.statuses
+    );
+}
+
+#[tokio::test]
+async fn request_too_large_failed_retry_after_dropping_context_removes_latest_prompt() {
+    let (mut agent, requests) = scripted_agent(
+        vec![ProviderStep::RequestTooLarge, ProviderStep::RequestTooLarge],
+        config(),
+    );
+    agent.messages_mut().push(Message::user("previous task"));
+    agent
+        .messages_mut()
+        .push(Message::assistant(vec![Content::Text(
+            "old answer with lots of prior context".into(),
+        )]));
+    let start_len = agent.messages().len();
+    let huge_prompt = "still too large ".repeat(20_000);
+    let mut ui = RecordingUi::default();
+
+    let err = agent.run_turn(&huge_prompt, &mut ui).await.unwrap_err();
+
+    assert_eq!(
+        hi_ai::provider_error_kind(&err),
+        Some(ProviderErrorKind::RequestTooLarge)
+    );
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        2,
+        "first oversized request should retry once with prior context dropped"
+    );
+    assert_eq!(
+        agent.messages().len(),
+        1,
+        "failed retry should remove the rewritten latest prompt instead of leaving it in history"
+    );
+    assert!(
+        agent
+            .messages()
+            .iter()
+            .all(|message| !message.text().contains(&huge_prompt[..64])),
+        "oversized latest prompt should not remain in live history"
+    );
+    assert!(
+        start_len > agent.messages().len(),
+        "test must exercise the context-dropping retry path"
     );
     assert!(
         ui.statuses.iter().any(|s| s.contains("shorten the prompt")),
@@ -267,6 +553,167 @@ async fn terminal_error_aborts_without_retry() {
 }
 
 #[tokio::test]
+async fn terminal_error_resets_stale_turn_telemetry() {
+    let (mut agent, _requests) =
+        scripted_agent(vec![ProviderStep::Error(ProviderErrorKind::Auth)], config());
+    agent.last_turn_telemetry = TurnTelemetry {
+        repeat_nudges: 99,
+        stalled_unfinished: true,
+        tool_calls: 42,
+        ..TurnTelemetry::default()
+    };
+
+    let err = agent.run_turn("go", &mut NullUi).await.unwrap_err();
+
+    assert_eq!(
+        hi_ai::provider_error_kind(&err),
+        Some(ProviderErrorKind::Auth)
+    );
+    let telemetry = agent.last_turn_telemetry();
+    assert_eq!(telemetry.repeat_nudges, 0);
+    assert_eq!(telemetry.tool_calls, 0);
+    assert!(
+        !telemetry.stalled_unfinished,
+        "terminal error should report this failed turn, not stale prior telemetry"
+    );
+}
+
+#[tokio::test]
+async fn terminal_error_after_recovery_retry_reports_retry_count() {
+    let (mut agent, _requests) = scripted_agent(
+        vec![
+            ProviderStep::Error(ProviderErrorKind::MalformedStream),
+            ProviderStep::Error(ProviderErrorKind::Auth),
+        ],
+        config(),
+    );
+
+    let err = agent.run_turn("go", &mut NullUi).await.unwrap_err();
+
+    assert_eq!(
+        hi_ai::provider_error_kind(&err),
+        Some(ProviderErrorKind::Auth)
+    );
+    assert_eq!(
+        agent.last_turn_telemetry().recovery_retries,
+        1,
+        "retry telemetry must survive a terminal error after recovery sampling"
+    );
+}
+
+#[tokio::test]
+async fn terminal_error_after_tool_progress_reports_changed_files_and_tools() {
+    let path = temp_file("terminal-error-tool-progress");
+    let path_string = path.to_string_lossy().to_string();
+    let file_name = path.file_name().unwrap().to_string_lossy().to_string();
+    let (mut agent, _requests) = scripted_agent(
+        vec![
+            ProviderStep::Completion(write_completion(&path_string)),
+            ProviderStep::Error(ProviderErrorKind::Auth),
+        ],
+        config(),
+    );
+
+    let err = agent
+        .run_turn("write the file then continue", &mut NullUi)
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        hi_ai::provider_error_kind(&err),
+        Some(ProviderErrorKind::Auth)
+    );
+    assert!(
+        agent
+            .last_changed_files()
+            .iter()
+            .any(|changed| changed == &file_name),
+        "changed file should be retained after terminal error: {:?}",
+        agent.last_changed_files()
+    );
+    let telemetry = agent.last_turn_telemetry();
+    assert_eq!(telemetry.tool_calls, 1);
+    assert!(
+        telemetry
+            .tool_timeline
+            .iter()
+            .any(|entry| entry.tool == "write" && entry.path == path_string),
+        "write tool telemetry should be retained after terminal error: {:?}",
+        telemetry.tool_timeline
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn terminal_error_drops_failed_prompt_before_next_turn() {
+    let (mut agent, _requests) = scripted_agent(
+        vec![
+            ProviderStep::Error(ProviderErrorKind::Auth),
+            ProviderStep::Completion(completion(vec![Content::Text("ok".into())], 1, 1)),
+        ],
+        config(),
+    );
+
+    let err = agent.run_turn("first task", &mut NullUi).await.unwrap_err();
+    assert_eq!(
+        hi_ai::provider_error_kind(&err),
+        Some(ProviderErrorKind::Auth)
+    );
+
+    agent.run_turn("second task", &mut NullUi).await.unwrap();
+    let last_user = agent
+        .messages()
+        .iter()
+        .rev()
+        .find(|message| message.role == Role::User)
+        .expect("user prompt recorded");
+    let text = last_user.text();
+    assert!(
+        !text.contains("first task"),
+        "failed prompt should not fold into the next turn: {text}"
+    );
+    assert!(
+        text.contains("second task"),
+        "next prompt should be cleanly recorded: {text}"
+    );
+}
+
+#[tokio::test]
+async fn protocol_retry_terminal_error_drops_retry_guidance_before_next_turn() {
+    let (mut agent, _requests) = scripted_agent(
+        vec![
+            ProviderStep::Error(ProviderErrorKind::ToolProtocol),
+            ProviderStep::Error(ProviderErrorKind::Auth),
+            ProviderStep::Completion(completion(vec![Content::Text("ok".into())], 1, 1)),
+        ],
+        config(),
+    );
+
+    let err = agent.run_turn("first task", &mut NullUi).await.unwrap_err();
+    assert_eq!(
+        hi_ai::provider_error_kind(&err),
+        Some(ProviderErrorKind::Auth)
+    );
+
+    agent.run_turn("second task", &mut NullUi).await.unwrap();
+    let last_user = agent
+        .messages()
+        .iter()
+        .rev()
+        .find(|message| message.role == Role::User)
+        .expect("user prompt recorded");
+    let text = last_user.text();
+    assert!(
+        !text.contains("valid tool calls") && !text.contains("[hi:nudge:"),
+        "retry guidance should not leak into the next turn: {text}"
+    );
+    assert!(
+        !text.contains("first task") && text.contains("second task"),
+        "next prompt should be cleanly recorded: {text}"
+    );
+}
+
+#[tokio::test]
 async fn terminal_error_persists_usage_before_returning() {
     let records = std::sync::Arc::new(Mutex::new(Vec::new()));
     let (mut agent, _requests) = scripted_agent(
@@ -302,4 +749,3 @@ async fn terminal_error_persists_usage_before_returning() {
         )]
     );
 }
-

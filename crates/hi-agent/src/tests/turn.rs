@@ -1,5 +1,319 @@
-use super::*;
 use super::common::*;
+use super::*;
+
+struct FailingCheckpointSession;
+
+impl SessionSink for FailingCheckpointSession {
+    fn record(
+        &mut self,
+        _messages: &[Message],
+        _usage: Usage,
+        _cost_usd: Option<f64>,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn record_compaction(&mut self, _messages: &[Message]) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn record_checkpoints(&mut self, _refs: &[String]) -> anyhow::Result<()> {
+        Err(anyhow::anyhow!("disk full"))
+    }
+}
+
+#[test]
+fn resume_restores_retained_checkpoint_refs() {
+    let checkpoints = (0..55).map(|i| format!("{i:040x}")).collect::<Vec<_>>();
+
+    let agent = Agent::resume(
+        Box::new(Canned(Mutex::new(Vec::new()))),
+        config(),
+        vec![Message::system("system")],
+        Usage::default(),
+        None,
+        checkpoints,
+        None,
+        DecisionLog::default(),
+    );
+
+    assert_eq!(
+        agent.checkpoint_count(),
+        MAX_CHECKPOINTS,
+        "resume keeps the retained checkpoint stack, capped to the undo limit"
+    );
+}
+
+#[tokio::test]
+async fn undo_keeps_checkpoint_when_restore_fails() {
+    let mut agent = agent(vec![], config());
+    agent.checkpoints.push("not-a-valid-checkpoint".to_string());
+
+    let err = agent.undo().await.unwrap_err();
+
+    assert!(!err.to_string().is_empty(), "expected restore error");
+    assert_eq!(
+        agent.checkpoint_count(),
+        1,
+        "failed restore should leave the checkpoint available for retry"
+    );
+}
+
+#[tokio::test]
+async fn undo_keeps_checkpoint_when_persisting_shortened_stack_fails() {
+    let Some(checkpoint) = hi_tools::checkpoint::create(std::path::Path::new(".")).await else {
+        return;
+    };
+    let mut agent = agent(vec![], config());
+    agent.checkpoints.push(checkpoint);
+    agent.set_session(Box::new(FailingCheckpointSession));
+
+    let err = agent.undo().await.unwrap_err();
+
+    if !err.to_string().contains("disk full") {
+        assert_eq!(
+            agent.checkpoint_count(),
+            1,
+            "checkpoint stack should stay live when restore fails before checkpoint persistence"
+        );
+        return;
+    }
+    assert_eq!(
+        agent.checkpoint_count(),
+        1,
+        "checkpoint stack should stay live when the shortened stack cannot be persisted"
+    );
+}
+
+#[tokio::test]
+async fn tools_unavailable_fast_path_resets_state_and_shows_message() {
+    let records = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let mut cfg = config();
+    cfg.tool_mode = ToolMode::ChatOnly;
+    let mut agent = agent(vec![], cfg);
+    agent.last_verify = Some(true);
+    agent.last_changed_files = vec!["old.rs".to_string()];
+    agent.last_compat_fallbacks = vec!["compat fallback".to_string()];
+    agent.last_turn_telemetry = TurnTelemetry {
+        repeat_nudges: 7,
+        stalled_unfinished: true,
+        tool_calls: 3,
+        ..TurnTelemetry::default()
+    };
+    agent.last_plan = vec![PlanStep {
+        title: "stale step".to_string(),
+        status: PlanStatus::Active,
+    }];
+    agent
+        .messages_mut()
+        .push(Message::user("[hi:nudge:repeat] stale nudge 1"));
+    agent
+        .messages_mut()
+        .push(Message::user("[hi:nudge:continue] stale nudge 2"));
+    agent
+        .messages_mut()
+        .push(Message::user("[hi:nudge:verify] stale nudge 3"));
+    agent.persisted = agent.messages().len();
+    agent.set_session(Box::new(RecordingSession {
+        records: records.clone(),
+    }));
+    let mut ui = RecUi::default();
+
+    agent
+        .run_turn("fix the crash in src/main.rs", &mut ui)
+        .await
+        .unwrap();
+
+    assert_eq!(agent.last_verify(), None);
+    assert!(agent.last_changed_files().is_empty());
+    assert!(agent.last_compat_fallbacks().is_empty());
+    assert_eq!(agent.last_turn_telemetry(), &TurnTelemetry::default());
+    assert!(agent.last_plan.is_empty());
+    agent.messages.validate_for_provider().unwrap();
+    assert!(
+        !agent
+            .messages()
+            .iter()
+            .any(|message| message.text().contains("[hi:nudge:")),
+        "stale synthetic nudges should be stripped before recording the blocked turn: {:?}",
+        agent
+            .messages()
+            .iter()
+            .map(|message| (message.role, message.text()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(agent.persisted, agent.messages().len());
+    assert_eq!(
+        records.lock().unwrap().len(),
+        1,
+        "blocked turn should persist without a stale persisted index"
+    );
+    assert!(
+        ui.assistant.contains("cannot perform coding actions"),
+        "assistant message should be visible, got: {:?}",
+        ui.assistant
+    );
+    assert!(
+        ui.turn_end
+            .as_deref()
+            .is_some_and(|line| !line.contains("steer:")),
+        "usage summary should not include stale steer telemetry: {:?}",
+        ui.turn_end
+    );
+}
+
+#[tokio::test]
+async fn resume_repairs_provider_invisible_assistant_before_request() {
+    let requests = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let provider = ScriptedProvider {
+        steps: Mutex::new(vec![ProviderStep::Completion(completion(
+            vec![Content::Text("ok".into())],
+            1,
+            1,
+        ))]),
+        requests: requests.clone(),
+    };
+    let history = vec![
+        Message::system("system"),
+        Message::user("old prompt"),
+        Message::assistant(vec![
+            Content::Text(String::new()),
+            Content::Thinking {
+                text: "unsigned thinking".into(),
+                signature: None,
+            },
+        ]),
+    ];
+    let mut agent = Agent::resume(
+        Box::new(provider),
+        config(),
+        history,
+        Usage::default(),
+        None,
+        Vec::new(),
+        None,
+        DecisionLog::default(),
+    );
+    let mut ui = RecUi::default();
+
+    agent.run_turn("next question", &mut ui).await.unwrap();
+
+    agent.messages.validate_for_provider().unwrap();
+    let requests = requests.lock().unwrap();
+    let sent = requests.first().expect("provider request recorded");
+    let repaired = sent
+        .iter()
+        .find(|message| message.role == Role::Assistant)
+        .expect("resumed assistant message sent");
+    assert!(
+        repaired
+            .content
+            .iter()
+            .any(|c| matches!(c, Content::Text(t) if !t.trim().is_empty())),
+        "resumed provider-invisible assistant message should be repaired before request: {repaired:?}"
+    );
+}
+
+#[tokio::test]
+async fn resume_repairs_out_of_order_tool_results_before_request() {
+    let requests = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let provider = ScriptedProvider {
+        steps: Mutex::new(vec![ProviderStep::Completion(completion(
+            vec![Content::Text("ok".into())],
+            1,
+            1,
+        ))]),
+        requests: requests.clone(),
+    };
+    let history = vec![
+        Message::system("system"),
+        Message::user("old prompt"),
+        Message::assistant(vec![Content::ToolCall {
+            id: "c1".into(),
+            name: "bash".into(),
+            arguments: "{}".into(),
+        }]),
+        Message::assistant(vec![Content::Text("interposed answer".into())]),
+        Message::tool_result("c1", "late result"),
+    ];
+    let mut agent = Agent::resume(
+        Box::new(provider),
+        config(),
+        history,
+        Usage::default(),
+        None,
+        Vec::new(),
+        None,
+        DecisionLog::default(),
+    );
+    let mut ui = RecUi::default();
+
+    agent.run_turn("next question", &mut ui).await.unwrap();
+
+    agent.messages.validate_for_provider().unwrap();
+    let requests = requests.lock().unwrap();
+    let sent = requests.first().expect("provider request recorded");
+    assert!(
+        sent.iter().all(|message| message.role != Role::Tool
+            && message
+                .content
+                .iter()
+                .all(|content| !matches!(content, Content::ToolCall { .. }))),
+        "out-of-order legacy tool skeleton should be repaired before request: {sent:?}"
+    );
+    assert!(
+        sent.windows(2)
+            .all(|pair| !(pair[0].role == Role::Assistant && pair[1].role == Role::Assistant)),
+        "stripping an unsafe tool skeleton should not leave adjacent assistant turns: {sent:?}"
+    );
+}
+
+#[tokio::test]
+async fn resume_repairs_consecutive_user_messages_before_request() {
+    let requests = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let provider = ScriptedProvider {
+        steps: Mutex::new(vec![ProviderStep::Completion(completion(
+            vec![Content::Text("ok".into())],
+            1,
+            1,
+        ))]),
+        requests: requests.clone(),
+    };
+    let history = vec![
+        Message::system("system"),
+        Message::user("legacy user one"),
+        Message::user("legacy user two"),
+        Message::assistant(vec![Content::Text("old answer".into())]),
+    ];
+    let mut agent = Agent::resume(
+        Box::new(provider),
+        config(),
+        history,
+        Usage::default(),
+        None,
+        Vec::new(),
+        None,
+        DecisionLog::default(),
+    );
+    let mut ui = RecUi::default();
+
+    agent.run_turn("next question", &mut ui).await.unwrap();
+
+    agent.messages.validate_for_provider().unwrap();
+    let requests = requests.lock().unwrap();
+    let sent = requests.first().expect("provider request recorded");
+    assert!(
+        sent.windows(2)
+            .all(|pair| !(pair[0].role == Role::User && pair[1].role == Role::User)),
+        "resumed request should not contain adjacent user messages: {sent:?}"
+    );
+    assert!(
+        sent.iter().any(|message| message.role == Role::User
+            && message.text().contains("legacy user one")
+            && message.text().contains("legacy user two")),
+        "legacy adjacent users should be folded together before send: {sent:?}"
+    );
+}
 
 #[tokio::test]
 async fn nudges_when_model_repeats_the_same_command() {
@@ -58,6 +372,727 @@ async fn gives_up_with_notice_after_repeat_cap() {
         "stuck-repeating notice after the cap, got: {:?}",
         ui.statuses
     );
+    agent.messages.validate_for_provider().unwrap();
+    assert!(
+        agent
+            .messages()
+            .iter()
+            .filter(|m| m.role == hi_ai::Role::Assistant)
+            .all(|m| !m.content.is_empty()),
+        "skipped repeated tool-call turns must not leave empty assistant messages: {:?}",
+        agent
+            .messages()
+            .iter()
+            .map(|m| (m.role, m.content.len(), m.text()))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[derive(Default)]
+struct DenyEditsUi {
+    confirm_calls: usize,
+    tool_results: Vec<(String, String)>,
+    turn_end: Option<String>,
+}
+
+impl Ui for DenyEditsUi {
+    fn assistant_text(&mut self, _: &str) {}
+    fn assistant_reasoning(&mut self, _: &str) {}
+    fn assistant_end(&mut self) {}
+    fn confirm_edit(&mut self, _: &str, _: &str) -> bool {
+        self.confirm_calls += 1;
+        false
+    }
+    fn tool_call(&mut self, _: &str, _: &str) {}
+    fn tool_result(&mut self, name: &str, result: &str) {
+        self.tool_results
+            .push((name.to_string(), result.to_string()));
+    }
+    fn status(&mut self, _: &str) {}
+    fn turn_end(&mut self, summary: &str) {
+        self.turn_end = Some(summary.to_string());
+    }
+}
+
+#[tokio::test]
+async fn denied_edit_counts_as_completed_for_dependent_calls() {
+    let path = temp_file("denied-edit-dependent-read");
+    let p = path.to_string_lossy().to_string();
+    let response = completion(
+        vec![
+            Content::ToolCall {
+                id: "w".into(),
+                name: "write".into(),
+                arguments: serde_json::json!({ "path": p.clone(), "content": "new" }).to_string(),
+            },
+            Content::ToolCall {
+                id: "r".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({ "path": p }).to_string(),
+            },
+        ],
+        1,
+        1,
+    );
+    let mut cfg = config();
+    cfg.confirm_edits = true;
+    let mut agent = agent(
+        vec![
+            response,
+            completion(vec![Content::Text("Done.".into())], 1, 1),
+        ],
+        cfg,
+    );
+    let mut ui = DenyEditsUi::default();
+
+    agent.run_turn("check it", &mut ui).await.unwrap();
+
+    assert_eq!(ui.confirm_calls, 1);
+    assert_eq!(
+        ui.tool_results
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["write", "read"]
+    );
+    assert!(ui.tool_results[0].1.contains("Edit skipped by user"));
+    assert!(
+        !agent
+            .messages()
+            .iter()
+            .any(|message| message.text().contains("[tool result missing]")),
+        "denied calls should be accounted for without synthesized missing results"
+    );
+    agent.messages.validate_for_provider().unwrap();
+    assert!(ui.turn_end.is_some(), "turn completed");
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn repeated_successful_background_output_poll_is_not_repeat_nudged() {
+    let started = hi_tools::execute(
+        "bash",
+        r#"{"command":"printf bg-live; sleep 1","run_in_background":true}"#,
+    )
+    .await;
+    let id = started
+        .content
+        .split('`')
+        .nth(1)
+        .expect("handle id in start message")
+        .to_string();
+    assert!(id.starts_with("bg_"), "got: {}", started.content);
+    let bash_output = |id: &str| {
+        completion(
+            vec![Content::ToolCall {
+                id: "bo".into(),
+                name: "bash_output".into(),
+                arguments: serde_json::json!({ "id": id }).to_string(),
+            }],
+            1,
+            1,
+        )
+    };
+    let responses = vec![
+        bash_output(&id),
+        bash_output(&id),
+        completion(vec![Content::Text("Done.".into())], 1, 1),
+    ];
+    let mut agent = agent(responses, config());
+    let mut ui = RecUi::default();
+
+    agent
+        .run_turn("watch the background job", &mut ui)
+        .await
+        .unwrap();
+
+    let _ = hi_tools::execute("bash_kill", &format!(r#"{{"id":"{id}"}}"#)).await;
+    let bash_output_results = ui
+        .tool_results
+        .iter()
+        .filter(|(name, _)| name == "bash_output")
+        .count();
+    assert_eq!(
+        bash_output_results, 2,
+        "successful background polls are time-dependent and should both execute: {:?}",
+        ui.tool_results
+    );
+    assert!(
+        !ui.statuses
+            .iter()
+            .any(|s| s.contains("re-ran the same command")
+                || s.contains("kept polling stale background process handles")),
+        "successful background polls should not be repeat-nudged: {:?}",
+        ui.statuses
+    );
+}
+
+#[tokio::test]
+async fn repeated_completed_background_output_poll_is_bounded() {
+    let started = hi_tools::execute(
+        "bash",
+        r#"{"command":"printf bg-complete","run_in_background":true}"#,
+    )
+    .await;
+    let id = started
+        .content
+        .split('`')
+        .nth(1)
+        .expect("handle id in start message")
+        .to_string();
+    assert!(id.starts_with("bg_"), "got: {}", started.content);
+    let args = format!(r#"{{"id":"{id}"}}"#);
+    let mut terminal_seen = false;
+    for _ in 0..50 {
+        let out = hi_tools::execute("bash_output", &args).await;
+        if out.content.contains(": exited") {
+            terminal_seen = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(terminal_seen, "background process should have exited");
+
+    let bash_output = |id: &str| {
+        completion(
+            vec![Content::ToolCall {
+                id: "bo".into(),
+                name: "bash_output".into(),
+                arguments: serde_json::json!({ "id": id }).to_string(),
+            }],
+            1,
+            1,
+        )
+    };
+    let responses = vec![
+        bash_output(&id),
+        bash_output(&id),
+        completion(vec![Content::Text("Done.".into())], 1, 1),
+    ];
+    let mut agent = agent(responses, config());
+    let mut ui = RecUi::default();
+
+    agent
+        .run_turn("check the completed background job", &mut ui)
+        .await
+        .unwrap();
+
+    let bash_output_results = ui
+        .tool_results
+        .iter()
+        .filter(|(name, _)| name == "bash_output")
+        .count();
+    assert_eq!(
+        bash_output_results, 1,
+        "completed background handle should be recognized as stale after one poll: {:?}",
+        ui.tool_results
+    );
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|s| s.contains("kept polling stale background process handles")),
+        "completed background handle should be repeat-nudged: {:?}",
+        ui.statuses
+    );
+}
+
+#[tokio::test]
+async fn nudges_when_model_cycles_missing_background_outputs() {
+    let bash_output = |id: &str| {
+        completion(
+            vec![Content::ToolCall {
+                id: "bo".into(),
+                name: "bash_output".into(),
+                arguments: serde_json::json!({ "id": id }).to_string(),
+            }],
+            1,
+            1,
+        )
+    };
+    let responses = vec![
+        bash_output("bg_missing_1"),
+        bash_output("bg_missing_2"),
+        bash_output("bg_missing_1"),
+        completion(vec![Content::Text("Done.".into())], 1, 1),
+    ];
+    let mut agent = agent(responses, config());
+    let mut ui = RecUi::default();
+
+    agent
+        .run_turn("check the background jobs", &mut ui)
+        .await
+        .unwrap();
+
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|s| s.contains("kept polling stale background process handles")),
+        "expected stale background-output nudge, got: {:?}",
+        ui.statuses
+    );
+    assert!(
+        !ui.statuses
+            .iter()
+            .any(|s| s.contains("re-read files it already inspected")),
+        "background-output cycles should not be reported as file re-reads: {:?}",
+        ui.statuses
+    );
+    let bash_output_results = ui
+        .tool_results
+        .iter()
+        .filter(|(name, _)| name == "bash_output")
+        .count();
+    assert_eq!(
+        bash_output_results, 2,
+        "the repeated missing handle should be skipped, got results: {:?}",
+        ui.tool_results
+    );
+    assert!(ui.turn_end.is_some(), "turn completed after the nudge");
+}
+
+#[tokio::test]
+async fn nudges_when_model_cycles_missing_background_kills() {
+    let bash_kill = |id: &str| {
+        completion(
+            vec![Content::ToolCall {
+                id: "bk".into(),
+                name: "bash_kill".into(),
+                arguments: serde_json::json!({ "id": id }).to_string(),
+            }],
+            1,
+            1,
+        )
+    };
+    let responses = vec![
+        bash_kill("bg_missing_1"),
+        bash_kill("bg_missing_2"),
+        bash_kill("bg_missing_1"),
+        completion(vec![Content::Text("Done.".into())], 1, 1),
+    ];
+    let mut agent = agent(responses, config());
+    let mut ui = RecUi::default();
+
+    agent
+        .run_turn("stop the background jobs", &mut ui)
+        .await
+        .unwrap();
+
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|s| s.contains("kept using stale background process handles")),
+        "expected stale background-kill nudge, got: {:?}",
+        ui.statuses
+    );
+    let bash_kill_results = ui
+        .tool_results
+        .iter()
+        .filter(|(name, _)| name == "bash_kill")
+        .count();
+    assert_eq!(
+        bash_kill_results, 2,
+        "the repeated missing kill handle should be skipped, got results: {:?}",
+        ui.tool_results
+    );
+    assert!(ui.turn_end.is_some(), "turn completed after the nudge");
+}
+
+#[tokio::test]
+async fn missing_background_output_after_prior_mutation_stalls_instead_of_looping() {
+    let path = temp_file("missing-bg-after-mutation");
+    let p = path.to_string_lossy().to_string();
+    let bash_output = |id: &str| {
+        completion(
+            vec![Content::ToolCall {
+                id: "bo".into(),
+                name: "bash_output".into(),
+                arguments: serde_json::json!({ "id": id }).to_string(),
+            }],
+            1,
+            1,
+        )
+    };
+    let mut responses = vec![
+        write_completion(&p),
+        bash_output("bg_missing_1"),
+        bash_output("bg_missing_2"),
+    ];
+    for i in 0..(config().max_repeat_nudges + 1) {
+        responses.push(bash_output(if i % 2 == 0 {
+            "bg_missing_1"
+        } else {
+            "bg_missing_2"
+        }));
+    }
+    let mut agent = agent(responses, config());
+    let mut ui = RecUi::default();
+
+    agent.run_turn("fix the harness", &mut ui).await.unwrap();
+
+    assert_eq!(
+        ui.statuses
+            .iter()
+            .filter(|s| s.contains("kept polling stale background process handles"))
+            .count(),
+        config().max_repeat_nudges as usize,
+        "repeat nudges should be bounded, got: {:?}",
+        ui.statuses
+    );
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|s| s.contains("background process handles were completed, missing, or pruned")),
+        "expected a bounded stale-background stop, got: {:?}",
+        ui.statuses
+    );
+    let bash_output_results = ui
+        .tool_results
+        .iter()
+        .filter(|(name, _)| name == "bash_output")
+        .count();
+    assert_eq!(
+        bash_output_results, 2,
+        "stale background polls should not execute after the two failed handles are known: {:?}",
+        ui.tool_results
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn missing_background_kill_after_prior_mutation_stalls_instead_of_looping() {
+    let path = temp_file("missing-bg-kill-after-mutation");
+    let p = path.to_string_lossy().to_string();
+    let bash_kill = |id: &str| {
+        completion(
+            vec![Content::ToolCall {
+                id: "bk".into(),
+                name: "bash_kill".into(),
+                arguments: serde_json::json!({ "id": id }).to_string(),
+            }],
+            1,
+            1,
+        )
+    };
+    let mut responses = vec![
+        write_completion(&p),
+        bash_kill("bg_missing_1"),
+        bash_kill("bg_missing_2"),
+    ];
+    for i in 0..(config().max_repeat_nudges + 1) {
+        responses.push(bash_kill(if i % 2 == 0 {
+            "bg_missing_1"
+        } else {
+            "bg_missing_2"
+        }));
+    }
+    let mut agent = agent(responses, config());
+    let mut ui = RecUi::default();
+
+    agent.run_turn("fix the harness", &mut ui).await.unwrap();
+
+    assert_eq!(
+        ui.statuses
+            .iter()
+            .filter(|s| s.contains("kept using stale background process handles"))
+            .count(),
+        config().max_repeat_nudges as usize,
+        "repeat nudges should be bounded, got: {:?}",
+        ui.statuses
+    );
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|s| s.contains("background process handles were completed, missing, or pruned")),
+        "expected a bounded stale-background stop, got: {:?}",
+        ui.statuses
+    );
+    let bash_kill_results = ui
+        .tool_results
+        .iter()
+        .filter(|(name, _)| name == "bash_kill")
+        .count();
+    assert_eq!(
+        bash_kill_results, 2,
+        "stale background kills should not execute after the two failed handles are known: {:?}",
+        ui.tool_results
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn implementation_re_read_exhaustion_reports_incomplete_not_stuck_repeating() {
+    // An implementation task where the model reads a file, then keeps
+    // re-reading it through the repeat budget — the "explore forever, never
+    // edit" failure mode. The turn should end with the implementation-incomplete
+    // message (so the user knows no edit was made), NOT the generic "stuck
+    // repeating" notice.
+    let path = temp_file("impl-reread-exhaust");
+    std::fs::write(&path, "fn parse() {}\n").unwrap();
+    let p = path.to_string_lossy().to_string();
+    let read = || {
+        completion(
+            vec![Content::ToolCall {
+                id: "r".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({ "path": p.clone() }).to_string(),
+            }],
+            1,
+            1,
+        )
+    };
+    // Read once (new evidence), then re-read past the budget. The guard
+    // nudges up to max_repeat_nudges times, then stalls on the next re-read.
+    let mut responses = vec![read()];
+    for _ in 0..(config().max_repeat_nudges + 1) {
+        responses.push(read());
+    }
+    let mut agent = agent(responses, config());
+    let mut ui = RecUi::default();
+    agent
+        .run_turn("finish the parser implementation", &mut ui)
+        .await
+        .unwrap();
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|s| s.contains("kept re-reading without editing")),
+        "expected implementation-incomplete status, got: {:?}",
+        ui.statuses
+    );
+    assert!(
+        !ui.statuses.iter().any(|s| s.contains("kept re-running")),
+        "should not use the generic stuck-repeating notice for an impl task, got: {:?}",
+        ui.statuses
+    );
+    assert!(
+        ui.assistant.contains("Implementation incomplete"),
+        "expected implementation-incomplete assistant text, got: {}",
+        ui.assistant
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn re_read_after_prior_mutation_does_not_hard_stall_the_turn() {
+    // This mirrors long harness work: earlier plan steps already changed files,
+    // then a later step gets stuck re-reading inspected context. The no-new-
+    // evidence guard should nudge, but after its advisory budget it must allow
+    // execution so the harness can continue instead of ending the whole turn as
+    // stalled.
+    let path = temp_file("reread-after-mutation");
+    let p = path.to_string_lossy().to_string();
+    let read = || {
+        completion(
+            vec![Content::ToolCall {
+                id: "r".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({ "path": p.clone() }).to_string(),
+            }],
+            1,
+            1,
+        )
+    };
+    let mut responses = vec![
+        write_completion(&p),
+        read(), // first read after the write executes and records evidence
+    ];
+    for _ in 0..(config().max_repeat_nudges + 1) {
+        responses.push(read());
+    }
+    responses.push(completion(vec![Content::Text("Done.".into())], 1, 1));
+
+    let mut agent = agent(responses, config());
+    let mut ui = RecUi::default();
+    agent
+        .run_turn("continue the test extraction", &mut ui)
+        .await
+        .unwrap();
+
+    assert!(
+        ui.turn_end.is_some(),
+        "turn should continue after advisory re-read nudges, got statuses: {:?}",
+        ui.statuses
+    );
+    assert_eq!(
+        ui.statuses
+            .iter()
+            .filter(|s| s.contains("re-read files it already inspected")
+                || s.contains("re-ran the same command"))
+            .count(),
+        config().max_repeat_nudges as usize,
+        "repeat nudges should still be bounded, got: {:?}",
+        ui.statuses
+    );
+    assert!(
+        !ui.statuses.iter().any(|s| s.contains("kept re-running"))
+            && !ui.assistant.contains("Implementation incomplete"),
+        "prior mutations should not be converted into a hard repeat stall, got statuses {:?} assistant {}",
+        ui.statuses,
+        ui.assistant
+    );
+    let read_results = ui
+        .tool_results
+        .iter()
+        .filter(|(name, _)| name == "read")
+        .count();
+    assert!(
+        read_results >= 2,
+        "a re-read should execute after the advisory budget is spent, got tool results: {:?}",
+        ui.tool_results
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn implementation_re_read_cycle_recovers_when_model_edits() {
+    // The concrete nudge (naming inspected files + plan step) gives the model
+    // a specific action to take. The model re-reads, gets nudged to edit, and
+    // then actually makes an edit — the turn should complete successfully, not
+    // stall. This verifies the guard pushes the model toward editing without
+    // killing the turn prematurely.
+    let path = temp_file("impl-reread-recover");
+    std::fs::write(&path, "fn parse() {}\n").unwrap();
+    let p = path.to_string_lossy().to_string();
+    let read = || {
+        completion(
+            vec![Content::ToolCall {
+                id: "r".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({ "path": p.clone() }).to_string(),
+            }],
+            1,
+            1,
+        )
+    };
+    let edit = || {
+        completion(
+            vec![Content::ToolCall {
+                id: "w".into(),
+                name: "write".into(),
+                arguments: serde_json::json!({
+                    "path": p.clone(),
+                    "content": "fn parse() -> i32 { 42 }\n"
+                })
+                .to_string(),
+            }],
+            1,
+            1,
+        )
+    };
+    // Read once (new), re-read once (nudged to edit), then actually edit.
+    // The model gets one nudge, then breaks out of the cycle by editing.
+    let mut responses = vec![
+        read(),
+        read(), // re-read → nudge 1/2
+        edit(), // model heeds the nudge and edits
+        completion(vec![Content::Text("Done.".into())], 1, 1),
+    ];
+    // Extra fallbacks in case preflight consumes an extra round.
+    for _ in 0..4 {
+        responses.push(completion(vec![Content::Text("Done.".into())], 1, 1));
+    }
+    let mut agent = agent(responses, config());
+    let mut ui = RecUi::default();
+    agent
+        .run_turn("finish the parser implementation", &mut ui)
+        .await
+        .unwrap();
+    // The turn completed (the model edited and finished), not stalled.
+    assert!(
+        ui.turn_end.is_some(),
+        "turn should complete after the model edits, got statuses: {:?}",
+        ui.statuses
+    );
+    assert!(
+        !ui.statuses
+            .iter()
+            .any(|s| s.contains("kept re-reading without editing")),
+        "should not stall since the model eventually edited, got: {:?}",
+        ui.statuses
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn implementation_re_read_nudge_names_inspected_files_and_plan_step() {
+    // The implementation re-read nudge must be concrete: it should name the
+    // inspected file paths and the next plan step (if any), not just say
+    // "start editing" generically. A strong model responds to one concrete
+    // nudge; a generic nudge is ignored.
+    let path = temp_file("impl-nudge-concrete");
+    std::fs::write(&path, "fn parse() {}\n").unwrap();
+    let p = path.to_string_lossy().to_string();
+    let read = || {
+        completion(
+            vec![Content::ToolCall {
+                id: "r".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({ "path": p.clone() }).to_string(),
+            }],
+            1,
+            1,
+        )
+    };
+    let plan = || {
+        completion(
+            vec![Content::ToolCall {
+                id: "p".into(),
+                name: "update_plan".into(),
+                arguments: serde_json::json!({
+                    "steps": [
+                        {"title": "Inspect the parser", "status": "done"},
+                        {"title": "Fix the parser bug", "status": "pending"},
+                    ]
+                })
+                .to_string(),
+            }],
+            1,
+            1,
+        )
+    };
+    let mut responses = vec![
+        plan(), // model makes a plan
+        read(), // model reads the file (new evidence)
+        read(), // re-read → nudge (should name the file + plan step)
+        completion(vec![Content::Text("Done.".into())], 1, 1),
+    ];
+    // Extra fallbacks for preflight/plan rounds.
+    for _ in 0..6 {
+        responses.push(completion(vec![Content::Text("Done.".into())], 1, 1));
+    }
+    let mut agent = agent(responses, config());
+    let mut ui = RecUi::default();
+    agent
+        .run_turn("finish the parser implementation", &mut ui)
+        .await
+        .unwrap();
+    // The nudge is a user message in the transcript — find it and verify it
+    // contains the inspected path and the plan step title.
+    let nudge_text = agent
+        .messages()
+        .iter()
+        .filter(|m| m.role == Role::User)
+        .map(|m| m.text())
+        .find(|t| t.contains("do not re-read") || t.contains("do not re-read them"));
+    assert!(
+        nudge_text.is_some(),
+        "expected a re-read nudge in the transcript, got messages: {:?}",
+        agent
+            .messages()
+            .iter()
+            .map(|m| (m.role, m.text().chars().take(80).collect::<String>()))
+            .collect::<Vec<_>>()
+    );
+    let nudge = nudge_text.unwrap();
+    assert!(
+        nudge.contains(&p),
+        "nudge should name the inspected file path, got: {nudge}"
+    );
+    assert!(
+        nudge.contains("Fix the parser bug"),
+        "nudge should name the next plan step, got: {nudge}"
+    );
+    let _ = std::fs::remove_file(path);
 }
 
 #[tokio::test]
@@ -98,6 +1133,244 @@ async fn does_not_nudge_a_different_command() {
     assert!(ui.turn_end.is_some(), "turn completed");
 }
 
+#[tokio::test]
+async fn nudges_when_model_re_reads_already_inspected_files_in_a_cycle() {
+    // The model reads file A, then file B, then file A again. This is a
+    // multi-step read cycle (A→B→A→B→…) that evades the exact-match repeat
+    // guard — each round differs from the one right before it — but burns the
+    // step budget on large workspaces. The re-read cycle guard catches the
+    // third round (re-reading A, already in inspected_paths) and nudges the
+    // model to act on the output it already has.
+    let path_a = temp_file("reread-cycle-a");
+    let path_b = temp_file("reread-cycle-b");
+    std::fs::write(&path_a, "fn a() {}\n").unwrap();
+    std::fs::write(&path_b, "fn b() {}\n").unwrap();
+    let a = path_a.to_string_lossy().to_string();
+    let b = path_b.to_string_lossy().to_string();
+    let read = |p: &str| {
+        completion(
+            vec![Content::ToolCall {
+                id: "r".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({ "path": p }).to_string(),
+            }],
+            1,
+            1,
+        )
+    };
+    let responses = vec![
+        read(&a), // first read of A → executes, A enters inspected_paths
+        read(&b), // first read of B → executes, B enters inspected_paths
+        read(&a), // re-read of A → first consecutive re-read round, executes
+        read(&b), // re-read of B → second consecutive re-read round, caught
+        completion(vec![Content::Text("Done.".into())], 1, 1),
+    ];
+    let mut agent = agent(responses, config());
+    let mut ui = RecUi::default();
+    agent.run_turn("review the code", &mut ui).await.unwrap();
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|s| s.contains("re-read files it already inspected")),
+        "expected a re-read cycle nudge, got: {:?}",
+        ui.statuses
+    );
+    // The turn should complete (the model finishes after the nudge), not stall.
+    assert!(ui.turn_end.is_some(), "turn completed");
+    let _ = std::fs::remove_file(path_a);
+    let _ = std::fs::remove_file(path_b);
+}
+
+#[tokio::test]
+async fn does_not_nudge_mixed_new_and_re_read() {
+    // A round that reads one new file alongside one already-inspected file is
+    // NOT a re-read cycle — the new file is real progress, so both reads
+    // execute and no re-read nudge fires.
+    let path_a = temp_file("reread-mixed-a");
+    let path_c = temp_file("reread-mixed-c");
+    std::fs::write(&path_a, "fn a() {}\n").unwrap();
+    std::fs::write(&path_c, "fn c() {}\n").unwrap();
+    let a = path_a.to_string_lossy().to_string();
+    let c = path_c.to_string_lossy().to_string();
+    let read = |p: &str| Content::ToolCall {
+        id: "r".into(),
+        name: "read".into(),
+        arguments: serde_json::json!({ "path": p }).to_string(),
+    };
+    let responses = vec![
+        // Round 1: read A alone (executes, A enters inspected_paths).
+        completion(vec![read(&a)], 1, 1),
+        // Round 2: read A again AND a new file C in the same round. Not all
+        // re-reads → executes both, no re-read nudge.
+        completion(vec![read(&a), read(&c)], 1, 1),
+        completion(vec![Content::Text("Done.".into())], 1, 1),
+    ];
+    let mut agent = agent(responses, config());
+    let mut ui = RecUi::default();
+    agent.run_turn("review the code", &mut ui).await.unwrap();
+    assert!(
+        !ui.statuses
+            .iter()
+            .any(|s| s.contains("re-read files it already inspected")),
+        "mixed new + re-read should not trigger the re-read nudge, got: {:?}",
+        ui.statuses
+    );
+    assert!(ui.turn_end.is_some(), "turn completed");
+    let _ = std::fs::remove_file(path_a);
+    let _ = std::fs::remove_file(path_c);
+}
+
+#[tokio::test]
+async fn read_that_failed_before_write_can_be_retried_after_write() {
+    // A missing-file read records a stale inspection signature, but a later
+    // write can make the exact same path valid. The cycle guard must allow the
+    // post-write read to execute instead of treating it as a pointless re-read.
+    let path = temp_file("failed-read-then-write");
+    let p = path.to_string_lossy().to_string();
+    let read = || {
+        completion(
+            vec![Content::ToolCall {
+                id: "r".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({ "path": p.clone() }).to_string(),
+            }],
+            1,
+            1,
+        )
+    };
+    let responses = vec![
+        read(), // missing path -> error, signature is recorded as stale
+        write_completion(&p),
+        read(), // must execute now that the write created the file
+        completion(vec![Content::Text("Done.".into())], 1, 1),
+    ];
+
+    let mut agent = agent(responses, config());
+    let mut ui = RecUi::default();
+    agent
+        .run_turn("create the generated file and inspect it", &mut ui)
+        .await
+        .unwrap();
+
+    let read_results: Vec<_> = ui
+        .tool_results
+        .iter()
+        .filter(|(name, _)| name == "read")
+        .collect();
+    assert_eq!(
+        read_results.len(),
+        2,
+        "the read before and after the write should both execute: {:?}",
+        ui.tool_results
+    );
+    assert!(
+        read_results
+            .iter()
+            .any(|(_, output)| output.contains("Error:")),
+        "expected the first missing-file read to surface an error: {:?}",
+        read_results
+    );
+    assert!(
+        read_results
+            .iter()
+            .any(|(_, output)| output.contains("1\tx")),
+        "expected the post-write read to return the generated file: {:?}",
+        read_results
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn nudges_when_model_re_runs_the_same_searches_in_a_cycle() {
+    // A grep cycle (grep "foo" → grep "bar" → grep "foo" → grep "bar") evades
+    // the exact-match repeat guard — each round differs from the one before it
+    // — but the no-new-evidence guard catches it: the third round re-runs a
+    // search already seen, and the fourth is the second consecutive
+    // no-new-evidence round, so it fires.
+    let grep = |pattern: &str| {
+        completion(
+            vec![Content::ToolCall {
+                id: "g".into(),
+                name: "grep".into(),
+                arguments: serde_json::json!({ "pattern": pattern, "glob": "*.rs" }).to_string(),
+            }],
+            1,
+            1,
+        )
+    };
+    let responses = vec![
+        grep("foo"), // new → executes, signature seen
+        grep("bar"), // new → executes, signature seen
+        grep("foo"), // re-run → first no-new-evidence round, executes (grace)
+        grep("bar"), // re-run → second consecutive no-new-evidence round, caught
+        completion(vec![Content::Text("Done.".into())], 1, 1),
+    ];
+    let mut agent = agent(responses, config());
+    let mut ui = RecUi::default();
+    agent.run_turn("review the code", &mut ui).await.unwrap();
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|s| s.contains("re-read files it already inspected")),
+        "expected a no-new-evidence cycle nudge for the grep cycle, got: {:?}",
+        ui.statuses
+    );
+    assert!(ui.turn_end.is_some(), "turn completed");
+}
+
+#[tokio::test]
+async fn allows_one_re_read_after_new_search_then_catches_the_cycle() {
+    // The grace rule: a single re-read right after new evidence (a broader
+    // search) is allowed through, but a *second* consecutive no-new-evidence
+    // round fires. This mirrors the security-review flow (read X → grep broad
+    // → re-read X → re-read X) and proves the guard doesn't suppress a
+    // legitimate re-inspection while still catching the cycle.
+    let path = temp_file("reread-grace");
+    std::fs::write(&path, "fn x() { let y = Some(1).unwrap(); }\n").unwrap();
+    let p = path.to_string_lossy().to_string();
+    let read = || {
+        completion(
+            vec![Content::ToolCall {
+                id: "r".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({ "path": p.clone() }).to_string(),
+            }],
+            1,
+            1,
+        )
+    };
+    let grep = |pattern: &str| {
+        completion(
+            vec![Content::ToolCall {
+                id: "g".into(),
+                name: "grep".into(),
+                arguments: serde_json::json!({ "pattern": pattern, "glob": "*.rs" }).to_string(),
+            }],
+            1,
+            1,
+        )
+    };
+    let responses = vec![
+        read(),         // read X → new, executes
+        grep("unwrap"), // new search → new evidence, executes
+        read(),         // re-read X → first no-new-evidence round, grace, executes
+        read(),         // re-read X → second consecutive no-new-evidence, caught
+        completion(vec![Content::Text("Done.".into())], 1, 1),
+    ];
+    let mut agent = agent(responses, config());
+    let mut ui = RecUi::default();
+    agent.run_turn("review the code", &mut ui).await.unwrap();
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|s| s.contains("re-read files it already inspected")
+                || s.contains("re-ran the same command")),
+        "expected the cycle to fire on the second consecutive re-read, got: {:?}",
+        ui.statuses
+    );
+    assert!(ui.turn_end.is_some(), "turn completed");
+    let _ = std::fs::remove_file(path);
+}
 
 #[tokio::test]
 async fn stale_nudge_stripped_before_next_turn() {
@@ -184,6 +1457,57 @@ async fn next_prompt_does_not_fold_into_stale_nudge() {
 }
 
 #[tokio::test]
+async fn turn_start_strips_stale_nudge_from_resumed_history() {
+    let records = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let (mut agent, requests) = scripted_agent(
+        vec![ProviderStep::Completion(completion(
+            vec![Content::Text("ok".into())],
+            1,
+            1,
+        ))],
+        config(),
+    );
+    agent
+        .messages_mut()
+        .push(Message::user("[hi:nudge:repeat] stale nudge 1"));
+    agent
+        .messages_mut()
+        .push(Message::user("[hi:nudge:continue] stale nudge 2"));
+    agent
+        .messages_mut()
+        .push(Message::user("[hi:nudge:verify] stale nudge 3"));
+    agent.persisted = agent.messages().len();
+    agent.set_session(Box::new(RecordingSession {
+        records: records.clone(),
+    }));
+    let mut ui = RecUi::default();
+
+    agent.run_turn("new task", &mut ui).await.unwrap();
+
+    agent.messages.validate_for_provider().unwrap();
+    let requests = requests.lock().unwrap();
+    let sent_text = requests[0]
+        .iter()
+        .map(|message| message.text())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !sent_text.contains("[hi:nudge:"),
+        "stale synthetic nudge should be stripped before provider request: {sent_text}"
+    );
+    assert!(
+        sent_text.contains("new task"),
+        "provider request should contain the real new prompt: {sent_text}"
+    );
+    assert_eq!(agent.persisted, agent.messages().len());
+    assert_eq!(
+        records.lock().unwrap().len(),
+        1,
+        "turn should persist without a stale persisted index"
+    );
+}
+
+#[tokio::test]
 async fn silent_auto_continue_keeps_turn_going_without_status() {
     // The model narrates an announced-but-unperformed next step ("Now let me
     // check the tests.") with no tool call. With max_silent_continues > 0 the
@@ -239,6 +1563,18 @@ async fn silent_auto_continue_keeps_turn_going_without_status() {
             .any(|s| s.contains("nudging") || s.contains("incomplete")),
         "silent continue then clean finish: {:?}",
         ui.statuses
+    );
+    assert_eq!(
+        agent.last_turn_telemetry().continue_nudges,
+        1,
+        "silent continue nudge should be reported in telemetry"
+    );
+    assert!(
+        ui.turn_end
+            .as_deref()
+            .is_some_and(|summary| summary.contains("1 continue")),
+        "turn summary should include continue steering: {:?}",
+        ui.turn_end
     );
 }
 
@@ -354,8 +1690,12 @@ async fn silent_continue_budget_resets_after_tool_progress() {
         "turn ran to the recap: {:?}",
         agent.messages().last().unwrap().text()
     );
+    assert_eq!(
+        agent.last_turn_telemetry().continue_nudges,
+        2,
+        "telemetry should count cumulative continue nudges even though the consecutive budget resets"
+    );
 }
-
 
 #[tokio::test]
 async fn continue_nudge_forces_tool_choice_on_the_next_round() {
@@ -489,3 +1829,74 @@ async fn batched_read_only_tools_run_and_preserve_order() {
     );
 }
 
+#[tokio::test]
+async fn zero_max_parallel_tools_is_clamped_instead_of_hanging() {
+    let responses = vec![
+        completion(
+            vec![
+                Content::ToolCall {
+                    id: "1".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"Cargo.toml"}"#.into(),
+                },
+                Content::ToolCall {
+                    id: "2".into(),
+                    name: "read".into(),
+                    arguments: r#"{"path":"src/lib.rs"}"#.into(),
+                },
+            ],
+            5,
+            1,
+        ),
+        completion(vec![Content::Text("done".into())], 6, 2),
+    ];
+    let mut cfg = config();
+    cfg.max_parallel_tools = 0;
+    let mut agent = agent(responses, cfg);
+    let mut ui = RecUi::default();
+
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        agent.run_turn("scan", &mut ui),
+    )
+    .await;
+
+    assert!(result.is_ok(), "zero parallelism should not hang");
+    result.unwrap().unwrap();
+    assert_eq!(
+        agent.last_turn_telemetry().max_concurrent_batch,
+        1,
+        "zero config should be clamped to serial execution"
+    );
+    assert_eq!(
+        agent.last_turn_telemetry().serial_runs,
+        2,
+        "both ready reads should run serially under the clamp"
+    );
+    assert_eq!(ui.tool_results.len(), 2, "both tool calls completed");
+}
+
+#[tokio::test]
+async fn zero_max_steps_is_clamped_to_one_model_round() {
+    let responses = vec![completion(vec![Content::Text("done".into())], 4, 2)];
+    let mut cfg = config();
+    cfg.max_steps = 0;
+    let mut agent = agent(responses, cfg);
+    let mut ui = RecUi::default();
+
+    agent.run_turn("answer once", &mut ui).await.unwrap();
+
+    agent.messages.validate_for_provider().unwrap();
+    assert_eq!(
+        agent.messages().last().unwrap().text(),
+        "done",
+        "zero max_steps should not leave a user-only turn"
+    );
+    assert!(
+        !ui.statuses
+            .iter()
+            .any(|status| status.contains("reached step limit (0)")),
+        "zero max_steps should be clamped before the cap is reported: {:?}",
+        ui.statuses
+    );
+}

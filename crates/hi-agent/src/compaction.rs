@@ -121,17 +121,54 @@ pub(crate) fn conversational_tail(messages: &[Message], split: usize) -> Vec<Mes
         // Was the assistant reply in [start..end) tool-free? If there was no
         // assistant message, treat the turn as conversational (a bare user
         // turn, e.g. the last partial turn).
-        let has_tool_call = messages[start..end].iter().any(|m| {
-            m.role == Role::Assistant
-                && m.content
-                    .iter()
-                    .any(|c| matches!(c, Content::ToolCall { .. }))
-        });
-        if !has_tool_call {
+        let has_tool_content = turn_has_tool_content(&messages[start..end]);
+        if !has_tool_content {
             out.extend_from_slice(&messages[start..end]);
         }
     }
     out
+}
+
+/// Old turns that contain tool use/results and should stay in the transcript
+/// when `ElideThenSummarizeTail` summarizes only the Q&A tail. This preserves
+/// the complete user turn, not just the tool-bearing messages, so the model
+/// keeps the prompt that caused each tool call and any final answer after the
+/// result.
+pub(crate) fn tool_bearing_turns(messages: &[Message], split: usize) -> Vec<Message> {
+    let up_to = split.min(messages.len());
+    let starts = user_turn_starts(messages);
+    let mut out = Vec::new();
+
+    // Preserve any legacy prefix before the first user turn if it contains
+    // tool content. New transcripts should not have this shape, but older
+    // compactions may have left assistant/tool skeletons at the front.
+    let first_turn_start = starts.first().copied().unwrap_or(up_to).min(up_to);
+    if first_turn_start > 1 && turn_has_tool_content(&messages[1..first_turn_start]) {
+        out.extend_from_slice(&messages[1..first_turn_start]);
+    }
+
+    for (idx, &start) in starts.iter().enumerate() {
+        if start >= up_to {
+            break;
+        }
+        let end = if idx + 1 < starts.len() {
+            starts[idx + 1].min(up_to)
+        } else {
+            up_to
+        };
+        if turn_has_tool_content(&messages[start..end]) {
+            out.extend_from_slice(&messages[start..end]);
+        }
+    }
+    out
+}
+
+fn turn_has_tool_content(messages: &[Message]) -> bool {
+    messages.iter().any(|m| {
+        m.content
+            .iter()
+            .any(|c| matches!(c, Content::ToolCall { .. } | Content::ToolResult { .. }))
+    })
 }
 
 /// A rough token estimate (~4 chars/token) across all message content — used to
@@ -399,5 +436,41 @@ mod tests {
         assert_eq!(tail2.len(), 2, "q1 + a1 form the Q&A tail: {tail2:?}");
         assert_eq!(tail2[0].role, Role::User);
         assert_eq!(tail2[1].role, Role::Assistant);
+    }
+
+    #[test]
+    fn tool_bearing_turns_preserves_the_complete_tool_turn() {
+        let m = vec![
+            Message::system("sys"),
+            Message::user("q1: inspect file"),
+            Message::assistant(vec![Content::ToolCall {
+                id: "c1".into(),
+                name: "read".into(),
+                arguments: "{}".into(),
+            }]),
+            Message::tool_result("c1", "file contents"),
+            Message::assistant(vec![Content::Text("a1: found the issue".into())]),
+            Message::user("q2: explain rust ownership"),
+            Message::assistant(vec![Content::Text("a2: ownership answer".into())]),
+            Message::user("q3: fix it"),
+        ];
+        let split = recent_split(&m, 1).unwrap();
+
+        let tool_turns = tool_bearing_turns(&m, split);
+
+        assert_eq!(
+            tool_turns.iter().map(|msg| msg.role).collect::<Vec<_>>(),
+            vec![Role::User, Role::Assistant, Role::Tool, Role::Assistant]
+        );
+        assert_eq!(tool_turns[0].text(), "q1: inspect file");
+        assert!(matches!(
+            &tool_turns[2].content[0],
+            Content::ToolResult { output, .. } if output == "file contents"
+        ));
+        assert_eq!(tool_turns[3].text(), "a1: found the issue");
+        assert!(
+            tool_turns.iter().all(|msg| !msg.text().contains("q2")),
+            "tool-free Q&A turn should be summarized instead: {tool_turns:?}"
+        );
     }
 }

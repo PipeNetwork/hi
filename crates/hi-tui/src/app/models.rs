@@ -9,7 +9,6 @@ use ratatui::text::Line;
 use crate::render::dim;
 
 impl crate::App {
-
     /// Health tags (id → label) for the models we have live metadata on, for the
     /// `/model` picker. Healthy models are omitted.
     /// Build a per-model-id capabilities map from the registry, for the model

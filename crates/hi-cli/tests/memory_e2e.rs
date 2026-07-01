@@ -67,6 +67,47 @@ fn run_hi(dir: &Path, server_url: &str, extra_args: &[&str], stdin_script: &str)
     assert!(status.code().is_some(), "hi exited cleanly (not killed)");
 }
 
+fn run_hi_one_shot(dir: &Path, server_url: &str, extra_args: &[&str], prompt: &str) {
+    let output = Command::new(env!("CARGO_BIN_EXE_hi"))
+        .current_dir(dir)
+        .env("HOME", dir)
+        .env("HI_MODEL", "fake/model")
+        .env("HI_BASE_URL", server_url)
+        .env("HI_API_KEY", "test")
+        .args(extra_args)
+        .arg(prompt)
+        .output()
+        .expect("spawn hi");
+    assert!(
+        output.status.success(),
+        "hi failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn one_shot_report_creates_parent_directories() {
+    let Some(server) = FakeOpenAiServer::new(vec![Response::sse(sse_with_usage("ok"))]) else {
+        return;
+    };
+    let tmp = TempDir::new("report");
+    let report = tmp.path().join("reports/nested/run.json");
+    let report_arg = report.to_string_lossy().to_string();
+
+    run_hi_one_shot(
+        tmp.path(),
+        server.url(),
+        &["--no-save", "--report", &report_arg],
+        "say hi",
+    );
+
+    let text = std::fs::read_to_string(&report).expect("report should be written");
+    let json: serde_json::Value = serde_json::from_str(&text).expect("report json");
+    assert_eq!(json["model"], "fake/model");
+    assert_eq!(json["output_tokens"], 5);
+}
+
 #[test]
 fn memory_distills_at_quit_and_reloads_next_session() {
     // Round 1: one turn (with usage, so work is registered) + the quit-time

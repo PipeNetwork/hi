@@ -31,17 +31,34 @@ impl crate::Agent {
 
     /// Resume from previously-saved history (which already includes the system
     /// prompt). The loaded messages are treated as already persisted.
+    #[allow(clippy::too_many_arguments)]
     pub fn resume(
         provider: Box<dyn Provider>,
         config: AgentConfig,
         history: Vec<Message>,
         usage: Usage,
         cost_usd: Option<f64>,
+        checkpoint_refs: Vec<String>,
+        structured_goal: Option<Goal>,
+        decisions: DecisionLog,
     ) -> Self {
         let persisted = history.len();
         let mut agent = Self::with_messages(provider, config, history, persisted);
         agent.totals = usage;
         agent.cost_usd = cost_usd;
+        agent.checkpoints = checkpoint_refs;
+        if agent.checkpoints.len() > crate::MAX_CHECKPOINTS {
+            agent
+                .checkpoints
+                .drain(0..agent.checkpoints.len() - crate::MAX_CHECKPOINTS);
+        }
+        agent.decisions = decisions;
+        agent.structured_goal = agent
+            .config
+            .long_horizon
+            .then_some(structured_goal)
+            .flatten();
+        agent.refresh_system_message();
         agent
     }
 
@@ -58,6 +75,10 @@ impl crate::Agent {
         // action") into the next turn's context.
         messages.strip_finalize_pair();
         messages.strip_trailing_nudges();
+        messages.repair_tool_result_ordering();
+        messages.repair_provider_invisible_assistant_messages();
+        messages.repair_consecutive_assistant_messages();
+        messages.repair_consecutive_user_messages();
         // Clamp persisted to the (possibly shorter) transcript length so the
         // incremental session recorder doesn't slice past the end.
         let persisted = persisted.min(messages.len());
@@ -89,10 +110,16 @@ impl crate::Agent {
     /// checkpoint. Returns `None` if there's nothing to undo, else the number of
     /// files restored or removed.
     pub async fn undo(&mut self) -> Result<Option<usize>> {
-        let Some(target) = self.checkpoints.pop() else {
+        let Some(target) = self.checkpoints.last().cloned() else {
             return Ok(None);
         };
         let n = hi_tools::checkpoint::restore(std::path::Path::new("."), &target).await?;
+        let mut next = self.checkpoints.clone();
+        next.pop();
+        if let Some(session) = self.session.as_mut() {
+            session.record_checkpoints(&next)?;
+        }
+        self.checkpoints = next;
         // The working tree just changed under us, so any cached snapshot is now
         // stale. Without this, the next turn reuses pre-undo fingerprints and
         // change detection / verify gating / last_changed_files can be wrong.
@@ -127,6 +154,79 @@ impl crate::Agent {
     pub fn truncate_messages(&mut self, len: usize) {
         self.messages.rewind_to(len);
         self.persisted = self.persisted.min(self.messages.len());
+    }
+
+    /// Durably rewind the transcript to `len`. Used by explicit `/retry`, where
+    /// the old attempt has already been persisted and must stay discarded after
+    /// resume.
+    pub fn truncate_messages_durable(&mut self, len: usize) -> Result<()> {
+        let len = len.min(self.messages.len());
+        let next = self.messages.as_slice()[..len].to_vec();
+        self.replace_history_with_compaction(next)
+    }
+
+    /// Capture prompt-injected state before a turn starts, so `/retry` or an
+    /// interrupt can discard the attempt without leaking decisions/goals/plans
+    /// recorded during it.
+    pub fn state_snapshot(&self) -> crate::AgentStateSnapshot {
+        crate::AgentStateSnapshot {
+            goal: self.goal.clone(),
+            structured_goal: self.structured_goal.clone(),
+            decisions: self.decisions.clone(),
+            last_plan: self.last_plan.clone(),
+        }
+    }
+
+    /// Live-only restore of a previously captured state snapshot. Used as a
+    /// fallback after a failed durable discard so the current process still
+    /// reflects the user's explicit interrupt.
+    pub fn restore_state_snapshot(&mut self, snapshot: &crate::AgentStateSnapshot) {
+        self.goal = snapshot.goal.clone();
+        self.structured_goal = snapshot.structured_goal.clone();
+        self.decisions = snapshot.decisions.clone();
+        self.last_plan = snapshot.last_plan.clone();
+        self.refresh_system_message();
+    }
+
+    /// Durably discard a turn by rewinding both the transcript and the
+    /// prompt-injected side state to a pre-turn snapshot.
+    pub fn rewind_to_snapshot_durable(
+        &mut self,
+        len: usize,
+        snapshot: &crate::AgentStateSnapshot,
+    ) -> Result<()> {
+        let len = len.min(self.messages.len());
+        let mut next = self.messages.as_slice()[..len].to_vec();
+        let structured_goal = self
+            .config
+            .long_horizon
+            .then_some(snapshot.structured_goal.clone())
+            .flatten();
+        let system = self.system_message_for(
+            snapshot.goal.as_deref(),
+            structured_goal.as_ref(),
+            &snapshot.decisions,
+        );
+        if let Some(first) = next.first_mut() {
+            *first = system;
+        } else {
+            next.push(system);
+        }
+
+        if let Some(session) = self.session.as_mut() {
+            session.record_state_replacement(
+                &next,
+                structured_goal.as_ref(),
+                &snapshot.decisions,
+            )?;
+        }
+        self.messages.replace_all(next);
+        self.persisted = self.messages.len();
+        self.goal = snapshot.goal.clone();
+        self.structured_goal = structured_goal;
+        self.decisions = snapshot.decisions.clone();
+        self.last_plan = snapshot.last_plan.clone();
+        Ok(())
     }
 
     /// Cumulative token usage across the session.
@@ -368,26 +468,42 @@ impl crate::Agent {
         self.config.context_window = context_window;
     }
 
-    /// Reset the live context to just the system prompt. This is transient: it
-    /// doesn't rewrite the session file, and the reset point isn't persisted, so
-    /// resuming replays the full log.
-    pub fn clear_history(&mut self) {
-        self.messages.replace_all(vec![self.system_message()]);
+    /// Reset the live and persisted context to just the current system prompt.
+    pub fn clear_history(&mut self) -> Result<()> {
+        self.replace_history_with_compaction(vec![self.system_message()])
+    }
+
+    pub(crate) fn replace_history_with_compaction(&mut self, messages: Vec<Message>) -> Result<()> {
+        if let Some(session) = self.session.as_mut() {
+            session.record_compaction(&messages)?;
+        }
+        self.messages.replace_all(messages);
         self.persisted = self.messages.len();
+        Ok(())
+    }
+
+    fn system_message_for(
+        &self,
+        goal: Option<&str>,
+        structured_goal: Option<&Goal>,
+        decisions: &DecisionLog,
+    ) -> Message {
+        let goal_section = structured_goal.and_then(|g| g.prompt_section());
+        SystemPrompt::new()
+            .with_project_context(self.config.project_context.as_deref())
+            .with_goal(goal)
+            .with_goal_state(goal_section.as_deref())
+            .with_decisions(decisions.prompt_section().as_deref())
+            .with_finalize(self.config.finalize)
+            .build()
     }
 
     pub(crate) fn system_message(&self) -> Message {
-        let goal_section = self
-            .structured_goal
-            .as_ref()
-            .and_then(|g| g.prompt_section());
-        SystemPrompt::new()
-            .with_project_context(self.config.project_context.as_deref())
-            .with_goal(self.goal.as_deref())
-            .with_goal_state(goal_section.as_deref())
-            .with_decisions(self.decisions.prompt_section().as_deref())
-            .with_finalize(self.config.finalize)
-            .build()
+        self.system_message_for(
+            self.goal.as_deref(),
+            self.structured_goal.as_ref(),
+            &self.decisions,
+        )
     }
 
     /// Minimal system message for throwaway model calls (finalize_turn,
@@ -424,25 +540,32 @@ impl crate::Agent {
         self.refresh_system_message();
     }
 
+    /// Set or clear the transient session goal, first clearing any persisted
+    /// structured long-horizon goal so it cannot reappear on a later resume.
+    pub fn set_transient_goal(&mut self, goal: Option<String>) -> Result<()> {
+        self.set_structured_goal(None)?;
+        self.set_goal(goal);
+        Ok(())
+    }
+
     /// Set or clear a structured long-horizon goal (decomposed into sub-goals).
     /// Only takes effect when `config.long_horizon` is on; when set, the goal's
     /// state is injected into the system prompt each turn so the agent resumes
     /// the active sub-goal. Returns whether it was accepted.
-    pub fn set_structured_goal(&mut self, goal: Option<Goal>) -> bool {
+    pub fn set_structured_goal(&mut self, goal: Option<Goal>) -> Result<bool> {
         if !self.config.long_horizon && goal.is_some() {
-            return false;
+            return Ok(false);
+        }
+        if let Some(session) = self.session.as_mut() {
+            if let Some(g) = &goal {
+                session.record_goal(g)?;
+            } else {
+                session.clear_goal()?;
+            }
         }
         self.structured_goal = goal;
         self.refresh_system_message();
-        // Persist the change so a /resume picks it up. Best-effort: no UI here
-        // (callers can surface failures), so swallow — the goal lives in-memory
-        // for this session regardless.
-        if let Some(session) = self.session.as_mut()
-            && let Some(g) = &self.structured_goal
-        {
-            let _ = session.record_goal(g);
-        }
-        true
+        Ok(true)
     }
 
     /// The structured long-horizon goal, if any (for persistence/observability).
@@ -456,7 +579,6 @@ impl crate::Agent {
     pub fn long_horizon(&self) -> bool {
         self.config.long_horizon
     }
-
 
     /// Whether the most recent turn's verification passed (None if not run).
     pub fn last_verify(&self) -> Option<bool> {
@@ -526,10 +648,6 @@ impl crate::Agent {
     pub fn set_verify_pipeline(&mut self, stages: Vec<VerifyStage>) {
         self.config.verify = stages;
     }
-
-
-
-
 
     pub(crate) fn persist(&mut self) -> Result<()> {
         if let Some(session) = self.session.as_mut() {

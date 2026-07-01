@@ -4,7 +4,12 @@
 //! [`contains_any`] from [`intent`](super::intent), and tracker types from
 //! [`types`](super::types).
 
-use super::constants::{GAP_DEEPEN_NUDGE, IMPLEMENTATION_MISSING_VALIDATION_NUDGE, NO_EVIDENCE_GAP_NUDGE, NO_EVIDENCE_REVIEW_NUDGE, NO_EVIDENCE_SECURITY_NUDGE, NO_EVIDENCE_STATUS_NUDGE, REVIEW_DEEPEN_NUDGE, SECURITY_DEEPEN_NUDGE, STATUS_DEEPEN_NUDGE, TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE};
+use super::constants::{
+    GAP_DEEPEN_NUDGE, IMPLEMENTATION_MISSING_VALIDATION_NUDGE, NO_EVIDENCE_GAP_NUDGE,
+    NO_EVIDENCE_REVIEW_NUDGE, NO_EVIDENCE_SECURITY_NUDGE, NO_EVIDENCE_STATUS_NUDGE,
+    REVIEW_DEEPEN_NUDGE, SECURITY_DEEPEN_NUDGE, STATUS_DEEPEN_NUDGE,
+    TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE,
+};
 use super::intent::contains_any;
 use super::types::{EvidenceTracker, ImplementationTracker, ReviewIntent};
 pub(crate) fn implementation_missing_validation_nudge(tracker: &ImplementationTracker) -> String {
@@ -68,30 +73,136 @@ pub(crate) fn answer_looks_like_review_repair_template(content: &str) -> bool {
     )
 }
 
-pub(crate) fn should_reject_review_repair_template(intent: Option<ReviewIntent>, answer: &str) -> bool {
+pub(crate) fn should_reject_review_repair_template(
+    intent: Option<ReviewIntent>,
+    answer: &str,
+) -> bool {
     intent.is_some()
         && !answer_says_insufficient_evidence(answer)
         && answer_looks_like_review_repair_template(answer)
 }
 
+#[cfg(test)]
 pub(crate) fn should_nudge_concrete_review_answer(
     intent: Option<ReviewIntent>,
     evidence: &EvidenceTracker,
     answer: &str,
 ) -> bool {
-    let Some(intent) = intent else {
-        return false;
-    };
-    if evidence.inspected_paths.is_empty() || answer_says_insufficient_evidence(answer) {
-        return false;
+    concrete_review_answer_problem(intent, evidence, answer).is_some()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ConcreteReviewAnswerProblem {
+    MissingInspectedCitation,
+    GenericInventorySummary,
+    MissingReviewShape,
+}
+
+impl ConcreteReviewAnswerProblem {
+    pub(crate) fn status(self) -> &'static str {
+        match self {
+            Self::MissingInspectedCitation => {
+                "review answer lacked concrete inspected files; nudging the model to tie findings to evidence"
+            }
+            Self::GenericInventorySummary => {
+                "review answer was a generic inventory summary; nudging the model to tie findings to inspected evidence"
+            }
+            Self::MissingReviewShape => {
+                "review answer cited inspected evidence but lacked bounded review findings; nudging the model to answer with findings and limits"
+            }
+        }
     }
-    let cites_inspected_path = evidence
-        .inspected_paths
-        .iter()
-        .any(|path| answer.contains(path));
-    !cites_inspected_path
-        || answer_looks_like_generic_inventory_summary(answer)
-        || answer_lacks_review_shape(intent, answer)
+
+    pub(crate) fn exhausted_status(self) -> &'static str {
+        match self {
+            Self::MissingInspectedCitation => {
+                "review answer still lacked concrete inspected files after repair; returning a bounded evidence summary"
+            }
+            Self::GenericInventorySummary => {
+                "review answer stayed generic after repair; returning a bounded evidence summary"
+            }
+            Self::MissingReviewShape => {
+                "review answer still lacked bounded review findings after repair; returning a bounded evidence summary"
+            }
+        }
+    }
+
+    pub(crate) fn reason(self) -> &'static str {
+        match self {
+            Self::MissingInspectedCitation => {
+                "the final answer did not cite concrete files or modules from the inspected evidence"
+            }
+            Self::GenericInventorySummary => {
+                "the final answer summarized repository inventory instead of tying findings to inspected evidence"
+            }
+            Self::MissingReviewShape => {
+                "the final answer cited inspected evidence but did not include bounded review findings and limits"
+            }
+        }
+    }
+}
+
+pub(crate) fn concrete_review_answer_problem(
+    intent: Option<ReviewIntent>,
+    evidence: &EvidenceTracker,
+    answer: &str,
+) -> Option<ConcreteReviewAnswerProblem> {
+    let intent = intent?;
+    if evidence.inspected_paths.is_empty() || answer_says_insufficient_evidence(answer) {
+        return None;
+    }
+    if !answer_cites_inspected_path(evidence, answer) {
+        return Some(ConcreteReviewAnswerProblem::MissingInspectedCitation);
+    }
+    if answer_looks_like_generic_inventory_summary(answer) {
+        return Some(ConcreteReviewAnswerProblem::GenericInventorySummary);
+    }
+    if answer_lacks_review_shape(intent, answer) {
+        return Some(ConcreteReviewAnswerProblem::MissingReviewShape);
+    }
+    None
+}
+
+pub(crate) fn answer_cites_inspected_path(evidence: &EvidenceTracker, answer: &str) -> bool {
+    let lower = answer.to_ascii_lowercase();
+    evidence.inspected_paths.iter().any(|path| {
+        inspected_path_aliases(path)
+            .iter()
+            .any(|alias| lower.contains(alias))
+    })
+}
+
+fn inspected_path_aliases(path: &str) -> Vec<String> {
+    let mut aliases = Vec::new();
+    let lower_path = path.to_ascii_lowercase();
+    if !lower_path.is_empty() {
+        aliases.push(lower_path);
+    }
+
+    let file_name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if file_name.len() >= 5 && !aliases.iter().any(|alias| alias == &file_name) {
+        aliases.push(file_name.clone());
+    }
+
+    let stem = std::path::Path::new(&file_name)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if is_distinctive_file_stem(&stem) && !aliases.iter().any(|alias| alias == &stem) {
+        aliases.push(stem);
+    }
+    aliases
+}
+
+fn is_distinctive_file_stem(stem: &str) -> bool {
+    stem.len() >= 5
+        && (stem.contains('-') || stem.contains('_'))
+        && !matches!(stem, "index" | "route" | "page" | "main" | "mod" | "lib")
 }
 
 pub(crate) fn answer_lacks_review_shape(intent: ReviewIntent, answer: &str) -> bool {
@@ -341,7 +452,9 @@ pub(crate) fn gap_answer_overclaims_absence(answer: &str) -> bool {
     broad_absence && !bounded
 }
 
-pub(crate) fn insufficient_after_repeated_search(evidence: &EvidenceTracker) -> Option<&'static str> {
+pub(crate) fn insufficient_after_repeated_search(
+    evidence: &EvidenceTracker,
+) -> Option<&'static str> {
     if evidence.saw_search && !evidence.saw_read {
         Some(
             "Insufficient evidence: targeted search ran, but no matching file was read, so I cannot make file-specific review findings.",
@@ -351,7 +464,9 @@ pub(crate) fn insufficient_after_repeated_search(evidence: &EvidenceTracker) -> 
     }
 }
 
-pub(crate) fn insufficient_after_incomplete_security_search(evidence: &EvidenceTracker) -> Option<String> {
+pub(crate) fn insufficient_after_incomplete_security_search(
+    evidence: &EvidenceTracker,
+) -> Option<String> {
     if !evidence.saw_search || !evidence.saw_read || evidence.security_search_complete() {
         return None;
     }
@@ -501,7 +616,10 @@ pub(crate) fn inspected_paths_for_prompt(evidence: &EvidenceTracker) -> String {
     paths
 }
 
-pub(crate) fn summarize_inspected_evidence_nudge(intent: ReviewIntent, evidence: &EvidenceTracker) -> String {
+pub(crate) fn summarize_inspected_evidence_nudge(
+    intent: ReviewIntent,
+    evidence: &EvidenceTracker,
+) -> String {
     let label = read_only_intent_label(intent);
     let paths = inspected_paths_for_prompt(evidence);
     match intent {
@@ -557,4 +675,3 @@ pub(crate) fn read_only_blocked_tool_result(name: &str) -> String {
         "Tool `{name}` blocked: this is a read-only review/discuss-only turn. Use read-only inspection tools and answer from inspected evidence; do not modify files."
     )
 }
-

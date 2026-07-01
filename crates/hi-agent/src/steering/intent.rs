@@ -102,7 +102,6 @@ pub(crate) fn grep_match_line_count(output: &str) -> u32 {
         .count() as u32
 }
 
-
 pub(crate) fn evidence_kind_for_tool(name: &str, arguments: &str) -> Option<EvidenceKind> {
     match name {
         "read" => Some(EvidenceKind::FileRead),
@@ -141,7 +140,10 @@ pub(crate) fn evidence_kind_for_bash(arguments: &str) -> Option<EvidenceKind> {
     None
 }
 
-pub(crate) fn security_search_families_for_tool(name: &str, arguments: &str) -> SecuritySearchFamilies {
+pub(crate) fn security_search_families_for_tool(
+    name: &str,
+    arguments: &str,
+) -> SecuritySearchFamilies {
     let Some(search_text) = security_search_text_for_tool(name, arguments) else {
         return SecuritySearchFamilies::default();
     };
@@ -288,6 +290,7 @@ pub(crate) fn normalize_intent_text(input: &str) -> String {
     let fixed = lower
         .replace("disucss", "discuss")
         .replace("implimenting", "implementing")
+        .replace("implimentation", "implementation")
         .replace("impliment", "implement")
         .replace("whats its", "whats")
         .replace("what's its", "whats");
@@ -383,6 +386,10 @@ pub(crate) fn classify_implementation_intent(input: &str) -> Option<Implementati
                 "should we",
                 "consider",
                 "roadmap",
+                "discuss",
+                "analyze",
+                "assess",
+                "evaluate",
             ],
         )
     {
@@ -392,39 +399,51 @@ pub(crate) fn classify_implementation_intent(input: &str) -> Option<Implementati
     let has_direct_action = words
         .iter()
         .any(|word| matches!(*word, "build" | "create" | "make" | "develop" | "scaffold"));
-    let has_generic_action = words
+    // "implementation"/"implementing" as a noun ("finish the av1
+    // implementation") is both the action and the artifact — the word itself
+    // names the thing being built, so it satisfies `has_artifact` below even
+    // when no explicit artifact word ("app", "tui", …) appears.
+    let has_implementation_noun = words
         .iter()
-        .any(|word| matches!(*word, "implement" | "write"));
+        .any(|word| matches!(*word, "implementation" | "implementing"));
+    let has_generic_action = words.iter().any(|word| {
+        matches!(
+            *word,
+            "implement" | "implementing" | "implementation" | "write"
+        )
+    });
     if !has_direct_action && !has_generic_action {
         return None;
     }
-    let has_artifact = words.iter().any(|word| {
-        matches!(
-            *word,
-            "app"
-                | "application"
-                | "tool"
-                | "tui"
-                | "cli"
-                | "calculator"
-                | "estimator"
-                | "dashboard"
-                | "program"
-                | "utility"
-                | "service"
-                | "game"
-        )
-    }) || contains_any(
-        &normalized,
-        &[
-            "command line",
-            "terminal ui",
-            "text ui",
-            "gpu training",
-            "training time",
-            "loan calculator",
-        ],
-    );
+    let has_artifact = has_implementation_noun
+        || words.iter().any(|word| {
+            matches!(
+                *word,
+                "app"
+                    | "application"
+                    | "tool"
+                    | "tui"
+                    | "cli"
+                    | "calculator"
+                    | "estimator"
+                    | "dashboard"
+                    | "program"
+                    | "utility"
+                    | "service"
+                    | "game"
+            )
+        })
+        || contains_any(
+            &normalized,
+            &[
+                "command line",
+                "terminal ui",
+                "text ui",
+                "gpu training",
+                "training time",
+                "loan calculator",
+            ],
+        );
     if !has_artifact {
         return None;
     }
@@ -480,4 +499,3 @@ pub(crate) fn implementation_turn_prompt(input: &str, intent: ImplementationInte
 pub(crate) fn gpu_training_estimator_recipe() -> String {
     "GPU training estimator requirements: inputs for parameter count, training tokens, precision, and utilization percentage; editable GPU counts for H100 80GB, A100 80GB, L40S, RTX 4090, RTX 3090, and MI300X; estimate `training_flops = 6 * params * tokens` and `seconds = training_flops / (sum(gpu_count * gpu_tflops) * utilization)`; keep pure estimator functions separate from the TUI layer and cover them with unit tests.".to_string()
 }
-

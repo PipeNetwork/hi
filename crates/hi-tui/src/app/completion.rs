@@ -1,14 +1,11 @@
 //! `App` methods: completion.
 
-
-
 use crate::completion::{
     CompletionContext, CompletionItem, CompletionState, MODEL_CMD, MODEL_COMPLETION_MAX,
     PROVIDER_CMD, completion_context, completion_items_for,
 };
 
 impl crate::App {
-
     /// Rows for a completion context — model ids from the live catalog, profile
     /// names from the config, every other command's values from the static
     /// table.

@@ -399,22 +399,22 @@ pub fn help_text() -> String {
     out.push_str("aliases: /m /st /cp /redo /revert /new /changes /usage /debug /h /?");
     out.push_str("\n\nkeybindings (TUI):\n");
     out.push_str("  Ctrl-T             toggle reasoning (thinking) collapse\n");
-    out.push_str("  Ctrl-D (idle)      quit\n");
-    out.push_str("  Ctrl-D (typing)    toggle the working-tree diff panel\n");
+    out.push_str("  Ctrl-D             toggle the working-tree diff panel\n");
     out.push_str("  Ctrl-?             toggle the agent observability panel\n");
-    out.push_str("  Ctrl-C             interrupt the running turn (or clear input)\n");
+    out.push_str("  Ctrl-C             interrupt the running turn; double-press idle to quit\n");
     out.push_str("  Ctrl-R             fuzzy-search input history\n");
     out.push_str("  Ctrl-A / Ctrl-E    move cursor to start / end of the line\n");
     out.push_str("  Ctrl-U             clear the input line\n");
     out.push_str("  Alt-Enter          insert a newline (multi-line prompt)\n");
     out.push_str("  PageUp / PageDown  scroll the transcript\n");
-    out.push_str("  Esc                clear input, or quit when the line is empty\n");
+    out.push_str("  Esc                clear input or dismiss panels\n");
+    out.push_str("  /quit              quit\n");
     out
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{COMMANDS, Command, expand_prompt_macro, matching, parse};
+    use super::{COMMANDS, Command, expand_prompt_macro, help_text, matching, parse};
 
     #[test]
     fn every_listed_command_parses_to_a_real_command() {
@@ -428,6 +428,27 @@ mod tests {
                 Some(_) => {}
             }
         }
+    }
+
+    #[test]
+    fn help_text_matches_non_quitting_idle_keybindings() {
+        let help = help_text();
+        assert!(
+            help.contains("Ctrl-D             toggle the working-tree diff panel"),
+            "Ctrl-D should be documented as diff toggle:\n{help}"
+        );
+        assert!(
+            help.contains("double-press idle to quit"),
+            "Ctrl-C should document idle quit behavior:\n{help}"
+        );
+        assert!(
+            help.contains("Esc                clear input or dismiss panels"),
+            "Esc should not be documented as idle quit:\n{help}"
+        );
+        assert!(
+            !help.contains("Ctrl-D (idle)") && !help.contains("quit when the line is empty"),
+            "stale quit bindings should not be advertised:\n{help}"
+        );
     }
 
     #[test]

@@ -40,6 +40,16 @@ pub struct DecisionLog {
 }
 
 impl DecisionLog {
+    /// Rebuild a log from persisted entries, reusing `record` so duplicate
+    /// summaries and the cap are normalized the same way as live updates.
+    pub fn from_entries(entries: Vec<Decision>) -> Self {
+        let mut log = Self::default();
+        for entry in entries {
+            log.record(entry);
+        }
+        log
+    }
+
     /// Record a decision. If the summary duplicates an existing entry, the
     /// earlier one is replaced (the model is re-stating/refining a decision,
     /// not adding a duplicate).

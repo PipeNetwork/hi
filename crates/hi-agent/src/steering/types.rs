@@ -4,8 +4,14 @@
 //! [`intent`](super::intent) and [`implementation`](super::implementation)
 //! for evidence classification and tool-call inspection.
 
-use super::intent::{compact_search_hit_line, evidence_kind_for_tool, grep_match_line_count, search_hit_score, security_search_families_for_tool};
-use super::implementation::{implementation_tool_call_mutates, implementation_tool_call_substantively_edits, implementation_tool_call_validates};
+use super::implementation::{
+    implementation_tool_call_mutates, implementation_tool_call_substantively_edits,
+    implementation_tool_call_validates,
+};
+use super::intent::{
+    compact_search_hit_line, evidence_kind_for_tool, grep_match_line_count, search_hit_score,
+    security_search_families_for_tool,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ReviewIntent {
@@ -84,12 +90,30 @@ pub(crate) struct EvidenceTracker {
     pub(crate) search_hit_snippets: Vec<String>,
     pub(crate) first_tool_kind: Option<EvidenceKind>,
     pub(crate) quality_repair_nudges: u32,
+    /// Inspection signatures already seen this turn, used by the no-new-evidence
+    /// cycle guard. Each entry is a stable key derived from a read-only tool
+    /// call's identity: `read:<path>:<offset>:<limit>`,
+    /// `list:<path>`, `grep:<pattern>:<glob>:<path>:<context>`,
+    /// `glob:<pattern>:<path>`, or a stale background handle
+    /// `bash_output:<id>`/`bash_kill:<id>`. A round whose
+    /// every read-only call's signature is already in this set adds no new
+    /// evidence — re-running it can only reproduce prior output. Live
+    /// `bash_output` polls are intentionally not recorded here because a running
+    /// background process can emit new output later; missing/pruned/completed
+    /// handles are recorded because polling them again cannot produce new
+    /// output. Mutating tools (write/edit/bash/...) are never added here; a
+    /// round containing a mutating call always counts as potentially new.
+    pub(crate) seen_signatures: Vec<String>,
 }
 
 impl EvidenceTracker {
     pub(crate) fn record_success(&mut self, name: &str, arguments: &str, output: &str) {
         if output.starts_with("Error:") {
+            self.record_inspection_signature(name, arguments);
             return;
+        }
+        if background_handle_is_terminal(name, output) {
+            self.record_inspection_signature(name, arguments);
         }
         let Some(kind) = evidence_kind_for_tool(name, arguments) else {
             return;
@@ -126,6 +150,49 @@ impl EvidenceTracker {
                     self.inspected_paths.push(path);
                 }
             }
+        }
+        // Record the inspection signature so the no-new-evidence guard can
+        // spot a later round re-running the same inspection. Only read-only
+        // discovery tools get a signature; mutating tools are never cyclic in
+        // this sense (a re-edit is handled by the implementation tracker).
+        self.record_inspection_signature(name, arguments);
+    }
+
+    /// Whether a proposed round of calls would add any new evidence. Returns
+    /// `true` if the round is empty, contains a mutating tool, or contains any
+    /// read-only call whose inspection signature has not been seen yet this
+    /// turn. Returns `false` only when every call is a read-only inspection
+    /// already performed earlier — i.e. re-running the round can only reproduce
+    /// prior output. Used by the cycle guard to detect multi-step read/search
+    /// cycles (A→B→C→A→B→C) that evade the exact-match repeat guard.
+    pub(crate) fn round_adds_evidence(&self, calls: &[(String, String, String)]) -> bool {
+        if calls.is_empty() {
+            return true;
+        }
+        for (_, name, args) in calls {
+            match name.as_str() {
+                "read" | "list" | "grep" | "glob" | "bash_output" | "bash_kill" => {
+                    match inspection_signature(name, args) {
+                        Some(sig) if self.seen_signatures.iter().any(|s| s == &sig) => {}
+                        // A new signature, or arguments we cannot signature safely,
+                        // should execute. The normal tool path will surface malformed
+                        // arguments; the cycle guard must not hide them.
+                        _ => return true,
+                    }
+                }
+                // Any mutating or unclassified tool counts as potentially new
+                // evidence — don't let the cycle guard suppress real work.
+                _ => return true,
+            }
+        }
+        false
+    }
+
+    fn record_inspection_signature(&mut self, name: &str, arguments: &str) {
+        if let Some(sig) = inspection_signature(name, arguments)
+            && !self.seen_signatures.iter().any(|s| s == &sig)
+        {
+            self.seen_signatures.push(sig);
         }
     }
 
@@ -183,7 +250,6 @@ impl EvidenceTracker {
     }
 }
 
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SecuritySearchFamilies {
     pub(crate) unsafe_or_panic: bool,
@@ -213,5 +279,79 @@ impl PreflightCall {
                 "limit": limit,
             }),
         )
+    }
+}
+
+/// A stable signature for a read-only inspection call, used to detect rounds
+/// that re-inspect already-seen evidence. Returns `None` for mutating or
+/// unclassified tools (those always count as potentially new evidence). The
+/// signature includes read pagination and grep context because those
+/// arguments change the evidence returned by the tool. A malformed read-only
+/// call returns `None`; callers treat that as potentially new evidence so the
+/// normal tool execution path can report the argument error.
+pub(crate) fn inspection_signature(name: &str, arguments: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
+    match name {
+        "read" => {
+            let path = value.get("path")?.as_str()?;
+            if path.is_empty() {
+                return None;
+            }
+            let offset = optional_u64_field(&value, "offset")?.unwrap_or(1).max(1);
+            let limit = optional_u64_field(&value, "limit")?
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "default".to_string());
+            Some(format!("read:{path}:{offset}:{limit}"))
+        }
+        "list" => {
+            let path = value.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+            Some(format!("list:{path}"))
+        }
+        "grep" => {
+            let pattern = value.get("pattern")?.as_str()?;
+            let glob = value.get("glob").and_then(|v| v.as_str()).unwrap_or("");
+            let path = value.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let context = optional_u64_field(&value, "context")?.unwrap_or(0);
+            Some(format!("grep:{pattern}:{glob}:{path}:{context}"))
+        }
+        "glob" => {
+            let pattern = value.get("pattern")?.as_str()?;
+            let path = value.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            Some(format!("glob:{pattern}:{path}"))
+        }
+        "bash_output" | "bash_kill" => {
+            let id = value.get("id")?.as_str()?;
+            if id.is_empty() {
+                return None;
+            }
+            Some(format!("{name}:{id}"))
+        }
+        _ => None,
+    }
+}
+
+fn optional_u64_field(value: &serde_json::Value, field: &str) -> Option<Option<u64>> {
+    match value.get(field) {
+        Some(v) if v.is_null() => Some(None),
+        Some(v) => v.as_u64().map(Some),
+        None => Some(None),
+    }
+}
+
+fn background_handle_is_terminal(name: &str, output: &str) -> bool {
+    match name {
+        "bash_output" => {
+            let Some(status) = output.lines().next() else {
+                return false;
+            };
+            status.contains(": exited") || status.contains(": killed")
+        }
+        "bash_kill" => {
+            output.starts_with('[')
+                && (output.contains("] killed")
+                    || output.contains("] already exited")
+                    || output.contains("] already killed"))
+        }
+        _ => false,
     }
 }

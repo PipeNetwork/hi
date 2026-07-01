@@ -2,9 +2,9 @@
 //! that advances/retries the active sub-goal, and `handle_record_decision`
 //! for the `record_decision` tool.
 
+use crate::Ui;
 use crate::decision::Decision;
 use crate::goal::{DEFAULT_SUBGOAL_RETRIES, GoalStatus};
-use crate::Ui;
 
 impl crate::Agent {
     /// Long-horizon driver — called at turn end. When a structured goal is set
@@ -16,7 +16,7 @@ impl crate::Agent {
     /// goal-level progression once the turn settles.
     pub(crate) fn goal_turn_end(
         &mut self,
-        _stalled_unfinished: bool,
+        stalled_unfinished: bool,
         stalled_repeating: bool,
         hit_step_cap: bool,
         plan_updated_goal: bool,
@@ -36,6 +36,7 @@ impl crate::Agent {
         // stalling) completes the active sub-goal → advance.
         let verified_clean = matches!(self.last_verify, Some(true));
         let no_verify_clean = self.last_verify.is_none()
+            && !stalled_unfinished
             && !stalled_repeating
             && !hit_step_cap
             && !self.last_changed_files.is_empty();
@@ -43,6 +44,7 @@ impl crate::Agent {
         // no stall) is neutral: neither advance nor record failure. The sub-goal
         // stays active for the next turn, which should do the actual work.
         let no_edit_neutral = self.last_verify.is_none()
+            && !stalled_unfinished
             && !stalled_repeating
             && !hit_step_cap
             && self.last_changed_files.is_empty();
@@ -77,8 +79,12 @@ impl crate::Agent {
         // the budget is exhausted, the sub-goal (and goal) is marked Failed.
         let reason = if hit_step_cap {
             "hit the per-turn step cap"
+        } else if self.last_verify == Some(false) {
+            "verification failed and the turn ended without fixing it"
         } else if stalled_repeating {
             "stalled repeating the same tool call"
+        } else if stalled_unfinished {
+            "ended without completing the requested work"
         } else {
             "verification failed and the turn ended without fixing it"
         };
@@ -114,11 +120,18 @@ impl crate::Agent {
                 if summary.is_empty() {
                     return "Error: record_decision needs a non-empty summary".to_string();
                 }
-                self.decisions.record(Decision {
+                let mut next = self.decisions.clone();
+                next.record(Decision {
                     summary,
                     rationale: args.rationale.trim().to_string(),
                     files: args.files,
                 });
+                if let Some(session) = self.session.as_mut()
+                    && let Err(err) = session.record_decisions(&next)
+                {
+                    return format!("Error: couldn't persist decision: {err}");
+                }
+                self.decisions = next;
                 // Refresh the system prompt so the decision is injected on the
                 // next turn (and visible to the model immediately in history).
                 self.refresh_system_message();
@@ -127,5 +140,4 @@ impl crate::Agent {
             Err(err) => format!("Error: bad record_decision arguments: {err}"),
         }
     }
-
 }

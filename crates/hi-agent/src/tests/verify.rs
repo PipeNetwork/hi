@@ -1,5 +1,5 @@
-use super::*;
 use super::common::*;
+use super::*;
 
 #[tokio::test]
 async fn layered_verify_stops_at_first_failing_stage() {
@@ -100,11 +100,52 @@ async fn verify_failure_exhausts_retries() {
     agent.run_turn("x", &mut NullUi).await.unwrap();
     let _ = std::fs::remove_file(&tmp);
     assert_eq!(agent.last_verify(), Some(false));
-    // PROBE: with max_verify_iterations=2 the verifier should iterate twice.
-    let tel = agent.last_turn_telemetry();
-    eprintln!(
-        "PROBE verify_rounds={} telemetry={:?}",
-        tel.verify_rounds, tel
+    assert_eq!(agent.last_turn_telemetry().verify_rounds, 2);
+    assert!(agent.last_turn_telemetry().stalled_unfinished);
+}
+
+#[tokio::test]
+async fn verify_failure_exhaustion_does_not_finalize_as_done() {
+    let _guard = VERIFY_TEST_LOCK.lock().await;
+    let mut cfg = config();
+    cfg.finalize = true;
+    cfg.verify = vec![VerifyStage::new("test", "false")];
+    cfg.max_verify_iterations = 1;
+    let tmp = temp_file("verify-fail-no-finalize");
+    let p = tmp.to_string_lossy().to_string();
+    let responses = vec![
+        write_completion(&p),
+        completion(vec![Content::Text("attempt 1".into())], 1, 1),
+        completion(vec![Content::Text("attempt 2".into())], 1, 1),
+        // Would be consumed by finalize_turn if failed verification were
+        // incorrectly treated as a completed turn.
+        completion(
+            vec![Content::Text("FINALIZE RECAP SHOULD NOT RUN".into())],
+            1,
+            1,
+        ),
+    ];
+    let mut agent = agent(responses, cfg);
+    let mut ui = RecUi::default();
+    agent.run_turn("x", &mut ui).await.unwrap();
+    let _ = std::fs::remove_file(&tmp);
+
+    assert_eq!(agent.last_verify(), Some(false));
+    assert!(
+        agent.last_turn_telemetry().stalled_unfinished,
+        "failed verification exhaustion should be an unfinished turn"
+    );
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|s| s.contains("verification still failed after the retry budget")),
+        "expected explicit exhausted-verify status, got: {:?}",
+        ui.statuses
+    );
+    assert!(
+        !ui.assistant.contains("FINALIZE RECAP SHOULD NOT RUN"),
+        "failed verification must not trigger finalization, assistant was: {}",
+        ui.assistant
     );
 }
 
@@ -267,4 +308,3 @@ async fn proactive_verify_surfaces_a_per_edit_check_failure() {
         ui.statuses
     );
 }
-

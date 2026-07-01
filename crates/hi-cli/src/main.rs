@@ -187,6 +187,9 @@ async fn main() -> Result<()> {
             loaded.messages,
             loaded.usage,
             loaded.cost_usd,
+            loaded.checkpoint_refs,
+            loaded.structured_goal,
+            loaded.decisions,
         ),
         None => Agent::new(provider, agent_config),
     };
@@ -199,15 +202,17 @@ async fn main() -> Result<()> {
         let mut quiet = ui::QuietUi;
         let view: &mut dyn hi_agent::Ui = if cli.quiet { &mut quiet } else { &mut plain };
         let result = agent.run_turn(&prompt, view).await;
-        if let Some(path) = &cli.report {
+        let report_result = if let Some(path) = &cli.report {
             write_report(
                 path,
                 &agent,
                 &registry,
                 &settings.model,
                 result.as_ref().err(),
-            )?;
-        }
+            )
+        } else {
+            Ok(())
+        };
         if let Err(err) = &result {
             let (kind, guidance) = hi_agent::classify_error(err);
             let suffix = if guidance.is_empty() {
@@ -217,8 +222,14 @@ async fn main() -> Result<()> {
             };
             eprintln!("\x1b[31m{kind}: {err:#}{suffix}\x1b[0m");
         }
+        if let Err(err) = &report_result {
+            eprintln!("\x1b[33mreport error: {err:#}\x1b[0m");
+        }
         // A one-shot turn may have started background processes; don't leak them.
         hi_tools::kill_background_processes();
+        if result.is_ok() {
+            report_result?;
+        }
         return result;
     }
 
@@ -227,21 +238,13 @@ async fn main() -> Result<()> {
     // One-shot prompts return above, so scripted/piped/eval runs never write it.
     let auto_memory = auto_memory_enabled(cli.no_memory, cli.no_save);
 
-    // Show a resume summary when continuing a session, so the user knows what
-    // they're walking back into before the TUI takes over the screen.
-    if let Some(summary) = &resume_summary {
-        println!("\x1b[2m{summary}\x1b[0m");
-    }
-
-    // Landing banner — only on a real terminal in interactive mode (one-shot
-    // prompts and piped/eval runs return above, so they never print it).
-    if std::io::stdout().is_terminal() && prompt_input.is_none() {
-        print_landing(&settings, context_window);
-    }
+    let stdout_is_tty = std::io::stdout().is_terminal();
+    let stdin_is_tty = std::io::stdin().is_terminal();
+    let use_tui = !cli.plain && stdout_is_tty && stdin_is_tty;
 
     // The full-screen TUI is the default interactive experience; fall back to
     // the plain REPL when not on a TTY, when --plain is set, or if it errors.
-    if !cli.plain && std::io::stdout().is_terminal() {
+    if use_tui {
         // Build the profile list and resolver for `/provider` in the TUI.
         let profiles: Vec<hi_tui::ProfileInfo> = profile_infos(&file);
         let active_profile = cli.profile.clone().or_else(|| file.default_profile.clone());
@@ -334,7 +337,7 @@ async fn main() -> Result<()> {
             saver,
             loader,
             remover,
-            resume_summary,
+            resume_summary.clone(),
             settings.mcp_url.clone(),
             settings.api_key.clone(),
         )
@@ -346,6 +349,17 @@ async fn main() -> Result<()> {
             }
             Err(err) => eprintln!("\x1b[33mTUI error ({err:#}); falling back to plain mode\x1b[0m"),
         }
+    }
+
+    // Plain REPL startup (including TUI fallback): print normal-screen context
+    // here, not before TUI launch. The TUI renders its own splash/resume summary
+    // inside the alternate screen; printing them before entering TUI leaves a
+    // stale banner in scrollback and makes a normal exit look like a crash.
+    if let Some(summary) = &resume_summary {
+        println!("\x1b[2m{summary}\x1b[0m");
+    }
+    if stdout_is_tty {
+        print_landing(&settings, context_window);
     }
 
     repl(&mut agent, &settings, &mut file, &registry, auto_memory).await
@@ -394,7 +408,10 @@ async fn mcp_inspect(url: &str, api_key: &str, current_model: &str) -> Result<St
     if let Some(model) = models.iter().find(|m| m.id == current_model) {
         let health = model.health().unwrap_or("available");
         let provider = model.provider_label.as_deref().unwrap_or("Pipe");
-        out.push_str(&format!("current:  {} · {} · {}\n", model.id, provider, health));
+        out.push_str(&format!(
+            "current:  {} · {} · {}\n",
+            model.id, provider, health
+        ));
     }
     Ok(out)
 }
@@ -497,6 +514,9 @@ struct LoadedAgentSession {
     messages: Vec<Message>,
     usage: Usage,
     cost_usd: Option<f64>,
+    checkpoint_refs: Vec<String>,
+    structured_goal: Option<hi_agent::Goal>,
+    decisions: hi_agent::DecisionLog,
     /// A one-line summary of the resumed session, shown to the user on startup.
     resume_summary: Option<String>,
 }
@@ -512,6 +532,9 @@ fn resolve_session(cli: &Cli) -> Result<(std::path::PathBuf, Option<LoadedAgentS
                 messages: loaded.messages,
                 usage: loaded.usage,
                 cost_usd: loaded.cost_usd,
+                checkpoint_refs: loaded.checkpoint_refs,
+                structured_goal: loaded.goal,
+                decisions: loaded.decisions,
                 resume_summary: Some(summary),
             }),
         ));
@@ -526,6 +549,9 @@ fn resolve_session(cli: &Cli) -> Result<(std::path::PathBuf, Option<LoadedAgentS
                     messages: loaded.messages,
                     usage: loaded.usage,
                     cost_usd: loaded.cost_usd,
+                    checkpoint_refs: loaded.checkpoint_refs,
+                    structured_goal: loaded.goal,
+                    decisions: loaded.decisions,
                     resume_summary: Some(summary),
                 }),
             ));
@@ -637,6 +663,13 @@ fn write_report(
             "quality_repair_nudges": tel.quality_repair_nudges,
         },
     });
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating report directory {}", parent.display()))?;
+    }
     std::fs::write(path, serde_json::to_string_pretty(&report)?)
         .with_context(|| format!("writing report {}", path.display()))?;
     Ok(())

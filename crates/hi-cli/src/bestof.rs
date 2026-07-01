@@ -9,7 +9,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 pub struct BestOf<'a> {
     pub exe: &'a Path,
@@ -55,6 +55,7 @@ pub fn run(opts: &BestOf) -> Result<()> {
         "\x1b[36m── running {} candidates in parallel ──────────────────\x1b[0m",
         opts.candidates
     );
+    let cleanup_paths: Vec<PathBuf> = worktrees.iter().map(|(_, wt, _)| wt.clone()).collect();
 
     // Spawn all candidate threads at once so they run concurrently. Each thread
     // owns copies of the scalar settings (the borrowed `BestOf` can't cross the
@@ -99,8 +100,19 @@ pub fn run(opts: &BestOf) -> Result<()> {
 
     // Join all threads and collect results.
     let mut results: Vec<(u32, PathBuf, bool)> = Vec::new();
+    let mut join_error: Option<anyhow::Error> = None;
     for handle in handles {
-        results.push(handle.join().expect("candidate thread panicked"));
+        match handle.join() {
+            Ok(result) => results.push(result),
+            Err(_) => {
+                join_error = Some(anyhow!("candidate thread panicked"));
+            }
+        }
+    }
+
+    if let Some(err) = join_error {
+        cleanup(&cleanup_paths);
+        return Err(err);
     }
 
     // Deterministic order: by candidate index.
@@ -139,12 +151,15 @@ pub fn run(opts: &BestOf) -> Result<()> {
 
     let result = match &winner {
         Some((i, worktree)) => {
-            apply_changes(worktree).with_context(|| "applying the winning candidate's changes")?;
-            println!(
-                "\x1b[32m✓ applied candidate {} to the working tree\x1b[0m",
-                i + 1
-            );
-            Ok(())
+            let result =
+                apply_changes(worktree).with_context(|| "applying the winning candidate's changes");
+            if result.is_ok() {
+                println!(
+                    "\x1b[32m✓ applied candidate {} to the working tree\x1b[0m",
+                    i + 1
+                );
+            }
+            result
         }
         None => {
             println!(
@@ -156,8 +171,7 @@ pub fn run(opts: &BestOf) -> Result<()> {
     };
 
     // Clean up every worktree we created.
-    let all_paths: Vec<PathBuf> = results.iter().map(|(_, wt, _)| wt.clone()).collect();
-    cleanup(&all_paths);
+    cleanup(&cleanup_paths);
     result
 }
 

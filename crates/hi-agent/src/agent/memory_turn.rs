@@ -6,13 +6,13 @@ use std::sync::Arc;
 
 use hi_ai::{ChatRequest, Content, Message, RequestProfile, Role, StreamEvent, ToolMode};
 
+use crate::Ui;
 use crate::compaction;
 use crate::memory::{
     cap_memory, extract_corrections, global_memory_file, memory_file, memory_prompt, split_layers,
     strip_header, unreferenced_bullets, verify_grounded, write_memory,
 };
 use crate::snapshot::FileFingerprint;
-use crate::Ui;
 
 impl crate::Agent {
     /// Distill durable, reusable lessons from this session into the project memory
@@ -181,7 +181,9 @@ impl crate::Agent {
 
     /// Get the workspace snapshot, using the cached version when available.
     /// The cache is valid until invalidated by [`invalidate_snapshot`].
-    pub(crate) async fn snapshot_cached(&mut self) -> std::collections::BTreeMap<String, FileFingerprint> {
+    pub(crate) async fn snapshot_cached(
+        &mut self,
+    ) -> std::collections::BTreeMap<String, FileFingerprint> {
         self.snapshot_cache.get().await
     }
 

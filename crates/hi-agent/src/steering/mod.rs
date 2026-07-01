@@ -7,15 +7,15 @@
 //! touches `Agent` state directly — so it lives outside the main `lib.rs`.
 
 mod constants;
-mod types;
-mod intent;
-mod preflight;
 mod implementation;
+mod intent;
 mod nudges;
+mod preflight;
+mod types;
 
 pub(crate) use constants::*;
-pub(crate) use types::*;
-pub(crate) use intent::*;
-pub(crate) use preflight::*;
 pub(crate) use implementation::*;
+pub(crate) use intent::*;
 pub(crate) use nudges::*;
+pub(crate) use preflight::*;
+pub(crate) use types::*;

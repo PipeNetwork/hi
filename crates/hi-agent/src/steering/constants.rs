@@ -47,6 +47,16 @@ pub(crate) const READ_AFTER_SEARCH_NUDGE: &str = "The targeted search result is 
 Do not rerun the same search and do not use mutating tools. Read the most relevant matching file, \
 then answer from that inspected file. If you cannot pick a file to read, explicitly say the \
 evidence is insufficient.";
+
+/// Sent when the model re-reads files it already inspected earlier this turn
+/// (a multi-step read cycle like A→B→C→A→B→C that evades the exact-match
+/// repeat guard). The file contents are already in the transcript above —
+/// re-reading will only reproduce them. Nudges the model to act on what it
+/// already has instead of cycling until the step cap.
+pub(crate) const REREAD_NUDGE: &str = "You already read these files earlier this turn and their contents \
+are already in the conversation above — reading them again will only repeat the same output. Act on \
+that output now: make the edit it points to, move to the next step, or if the task is already complete, \
+stop and give your final recap. Do not re-read files you have already inspected.";
 pub(crate) const SECURITY_BROAD_SEARCH_NUDGE: &str = "This security review searched and read some evidence, \
 but it has not covered all required pattern families yet. Do not use mutating tools. Search for \
 unsafe/unwrap/expect/panic, command execution/filesystem/env access, and secret/token/auth \
@@ -90,4 +100,3 @@ Emit exactly one plain-text tool call in this XML-ish format and no markdown fen
 For shell commands use:\n\
 <tool_call>bash<arg_key>command</arg_key><arg_value>cargo test</arg_value></tool_call>\n\
 Keep the edit compact; a minimal working vertical slice is better than a huge invalid tool call.";
-
