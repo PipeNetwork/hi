@@ -17,10 +17,11 @@ use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use reqwest::header;
+use serde_json::{Value, json};
 
 use crate::provider::{Provider, ProviderError, ProviderErrorKind};
 use crate::types::{
-    ChatRequest, CompatMode, Completion, StreamEvent, Usage, estimate_messages_tokens,
+    ChatRequest, CompatMode, Completion, StreamEvent, ToolMode, Usage, estimate_messages_tokens,
 };
 
 const MAX_CAPACITY_HTTP_RETRIES: u32 = 2;
@@ -31,6 +32,7 @@ pub struct OpenAiProvider {
     http: reqwest::Client,
     base_url: String,
     api_key: String,
+    pipe_metadata: bool,
 }
 
 impl OpenAiProvider {
@@ -39,7 +41,36 @@ impl OpenAiProvider {
             http: crate::http::agent_http_client(),
             base_url: base_url.trim_end_matches('/').to_string(),
             api_key,
+            pipe_metadata: false,
         }
+    }
+
+    pub fn new_pipenetwork(base_url: String, api_key: String) -> Self {
+        let mut provider = Self::new(base_url, api_key);
+        provider.pipe_metadata = true;
+        provider
+    }
+
+    fn request_metadata(&self, request: &ChatRequest) -> Option<Value> {
+        if !self.pipe_metadata {
+            return None;
+        }
+        let uses_tools =
+            !request.tools.is_empty() && request.profile.tool_mode != ToolMode::ChatOnly;
+        let mut metadata = json!({
+            "endpoint_name": "pipenetworkai",
+            "request_type": if uses_tools {
+                "agent_tool_invocation"
+            } else {
+                "code_generation"
+            },
+            "selected_agent_model": request.model,
+            "max_output_tokens": request.max_tokens,
+        });
+        if uses_tools {
+            metadata["agent_turn_kind"] = json!("root_agent_turn");
+        }
+        Some(metadata)
     }
 }
 
@@ -58,7 +89,8 @@ impl Provider for OpenAiProvider {
         let mut capacity_retries = 0;
         while idx < attempts.len() {
             let attempt = attempts[idx];
-            let body = request::build_body(&request, attempt);
+            let request_metadata = self.request_metadata(&request);
+            let body = request::build_body(&request, attempt, request_metadata.as_ref());
             let response = crate::http::send_with_retry(
                 self.http.post(&url).bearer_auth(&self.api_key).json(&body),
             )
@@ -232,6 +264,44 @@ mod tests {
         let bodies = server.bodies();
         assert_eq!(bodies.len(), 1);
         assert!(bodies[0].contains("\"tools\""));
+    }
+
+    #[tokio::test]
+    async fn pipenetwork_provider_sends_agent_metadata_for_tool_requests() {
+        let Some(server) = FakeOpenAiServer::new(vec![Response::sse(sse_text("ok"))]) else {
+            return;
+        };
+        let provider = OpenAiProvider::new_pipenetwork(server.url().to_string(), "test".into());
+
+        provider
+            .stream(request(vec![tool()], Default::default()), &mut |_| {})
+            .await
+            .unwrap();
+
+        let bodies = server.bodies();
+        let body: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+        assert_eq!(body["metadata"]["endpoint_name"], "pipenetworkai");
+        assert_eq!(body["metadata"]["request_type"], "agent_tool_invocation");
+        assert_eq!(body["metadata"]["agent_turn_kind"], "root_agent_turn");
+        assert_eq!(body["metadata"]["selected_agent_model"], "m");
+        assert_eq!(body["metadata"]["max_output_tokens"], 16);
+    }
+
+    #[tokio::test]
+    async fn generic_openai_provider_does_not_send_pipe_metadata() {
+        let Some(server) = FakeOpenAiServer::new(vec![Response::sse(sse_text("ok"))]) else {
+            return;
+        };
+        let provider = OpenAiProvider::new(server.url().to_string(), "test".into());
+
+        provider
+            .stream(request(vec![tool()], Default::default()), &mut |_| {})
+            .await
+            .unwrap();
+
+        let bodies = server.bodies();
+        let body: serde_json::Value = serde_json::from_str(&bodies[0]).unwrap();
+        assert!(body.get("metadata").is_none());
     }
 
     #[tokio::test]

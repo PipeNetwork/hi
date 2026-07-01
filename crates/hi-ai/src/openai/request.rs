@@ -185,7 +185,11 @@ fn mentions(text: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| lower.contains(needle))
 }
 
-pub(crate) fn build_body(request: &ChatRequest, attempt: RequestAttempt) -> Value {
+pub(crate) fn build_body(
+    request: &ChatRequest,
+    attempt: RequestAttempt,
+    metadata: Option<&Value>,
+) -> Value {
     let messages = to_openai_messages(&request.messages);
     let mut body = json!({
         "model": request.model,
@@ -193,6 +197,9 @@ pub(crate) fn build_body(request: &ChatRequest, attempt: RequestAttempt) -> Valu
         "stream": true,
         "max_tokens": request.max_tokens,
     });
+    if let Some(metadata) = metadata {
+        body["metadata"] = metadata.clone();
+    }
     if attempt.include_usage {
         body["stream_options"] = json!({ "include_usage": true });
     }
@@ -395,12 +402,35 @@ mod tests {
             profile: Default::default(),
         };
 
-        let normal = build_body(&req, request_attempts(&req)[0]);
+        let normal = build_body(&req, request_attempts(&req)[0], None);
         assert_eq!(normal["stream_options"]["include_usage"], true);
 
-        let fallback = build_body(&req, request_attempts(&req)[1]);
+        let fallback = build_body(&req, request_attempts(&req)[1], None);
         assert!(fallback.get("stream_options").is_none());
         assert_eq!(fallback["stream"], true);
+    }
+
+    #[test]
+    fn request_body_can_carry_provider_metadata() {
+        let req = crate::types::ChatRequest {
+            model: "m".into(),
+            messages: vec![Message::user("hi")].into(),
+            tools: vec![].into(),
+            max_tokens: 16,
+            temperature: None,
+            top_p: None,
+            frequency_penalty: None,
+            thinking_budget: None,
+            profile: Default::default(),
+        };
+        let metadata = serde_json::json!({
+            "endpoint_name": "pipenetworkai",
+            "request_type": "code_generation"
+        });
+
+        let body = build_body(&req, request_attempts(&req)[0], Some(&metadata));
+
+        assert_eq!(body["metadata"], metadata);
     }
 
     #[test]
@@ -418,14 +448,14 @@ mod tests {
             thinking_budget: None,
             profile: Default::default(),
         };
-        let plain = build_body(&req, request_attempts(&req)[0]);
+        let plain = build_body(&req, request_attempts(&req)[0], None);
         assert!(plain.get("top_p").is_none(), "omitted when unset");
         assert!(plain.get("frequency_penalty").is_none());
 
         req.temperature = Some(0.9);
         req.top_p = Some(0.95);
         req.frequency_penalty = Some(0.4);
-        let hot = build_body(&req, request_attempts(&req)[0]);
+        let hot = build_body(&req, request_attempts(&req)[0], None);
         // f32 → JSON f64 isn't exact (0.9f32 ≈ 0.89999996), so compare with tolerance.
         let near = |v: &serde_json::Value, want: f64| (v.as_f64().unwrap() - want).abs() < 1e-6;
         assert!(

@@ -735,7 +735,11 @@ pub(crate) fn build_provider(settings: &Settings) -> Box<dyn Provider> {
     if settings.provider.is_anthropic() {
         Box::new(AnthropicProvider::new(base_url, api_key))
     } else {
-        let inner: Box<dyn Provider> = Box::new(OpenAiProvider::new(base_url, api_key.clone()));
+        let inner: Box<dyn Provider> = if settings.provider == ProviderName::Pipenetwork {
+            Box::new(OpenAiProvider::new_pipenetwork(base_url, api_key.clone()))
+        } else {
+            Box::new(OpenAiProvider::new(base_url, api_key.clone()))
+        };
         if settings.provider == ProviderName::Pipenetwork
             && let Some(mcp_url) = settings.mcp_url.clone()
         {
