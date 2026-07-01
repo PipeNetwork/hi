@@ -5,10 +5,10 @@
 //! [`types`](super::types).
 
 use super::constants::{
-    GAP_DEEPEN_NUDGE, IMPLEMENTATION_MISSING_VALIDATION_NUDGE, NO_EVIDENCE_GAP_NUDGE,
-    NO_EVIDENCE_REVIEW_NUDGE, NO_EVIDENCE_SECURITY_NUDGE, NO_EVIDENCE_STATUS_NUDGE,
-    REVIEW_DEEPEN_NUDGE, SECURITY_DEEPEN_NUDGE, STATUS_DEEPEN_NUDGE,
-    TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE,
+    GAP_DEEPEN_NUDGE, IMPLEMENTATION_MISSING_VALIDATION_NUDGE, INSPECTION_SPRAWL_THRESHOLD,
+    MAX_INSPECTION_SPRAWL_NUDGES, NO_EVIDENCE_GAP_NUDGE, NO_EVIDENCE_REVIEW_NUDGE,
+    NO_EVIDENCE_SECURITY_NUDGE, NO_EVIDENCE_STATUS_NUDGE, REVIEW_DEEPEN_NUDGE,
+    SECURITY_DEEPEN_NUDGE, STATUS_DEEPEN_NUDGE, TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE,
 };
 use super::intent::contains_any;
 use super::types::{EvidenceTracker, ImplementationTracker, ReviewIntent};
@@ -668,6 +668,67 @@ pub(crate) fn deepen_review_nudge(intent: ReviewIntent) -> &'static str {
 
 pub(crate) fn read_only_blocks_tool(intent: Option<ReviewIntent>, name: &str) -> bool {
     intent.is_some() && !hi_tools::is_read_only(name)
+}
+
+/// Whether the inspection-sprawl guard should fire this round. True when:
+/// - this is a read-only review turn (`intent.is_some()`),
+/// - the turn has already gathered a lot of evidence
+///   (`inspection_count() >= INSPECTION_SPRAWL_THRESHOLD`),
+/// - every call this round is a read-only inspection (the model is still
+///   gathering, not answering), and
+/// - the sprawl nudge budget is not yet exhausted.
+///
+/// This catches the failure mode the repeat/cycle guard misses: a model that
+/// reads 100 *distinct* files, each with a new inspection signature, so
+/// `round_adds_evidence` always returns true and the repeat budget is never
+/// consumed. Without this guard the turn churns until `max_steps`.
+pub(crate) fn should_nudge_inspection_sprawl(
+    intent: Option<ReviewIntent>,
+    evidence: &EvidenceTracker,
+    calls: &[(String, String, String)],
+) -> bool {
+    let Some(_intent) = intent else {
+        return false;
+    };
+    if evidence.inspection_count() < INSPECTION_SPRAWL_THRESHOLD {
+        return false;
+    }
+    if calls.is_empty() {
+        // An empty round means the model is about to answer, not sprawl.
+        return false;
+    }
+    // Only fire when the whole round is read-only inspection — a mutating or
+    // unclassified call means real work is happening, not sprawl.
+    let all_read_only_inspection = calls
+        .iter()
+        .all(|(_, name, _)| matches!(name.as_str(), "read" | "list" | "grep" | "glob"));
+    if !all_read_only_inspection {
+        return false;
+    }
+    evidence.inspection_sprawl_nudges < MAX_INSPECTION_SPRAWL_NUDGES
+}
+
+/// Whether the inspection-sprawl guard has exhausted its budget and the turn
+/// should hard-stop with a bounded-evidence summary. True on a read-only
+/// review turn that is still sprawling (all calls read-only inspections) after
+/// the sprawl nudge budget is spent.
+pub(crate) fn inspection_sprawl_exhausted(
+    intent: Option<ReviewIntent>,
+    evidence: &EvidenceTracker,
+    calls: &[(String, String, String)],
+) -> bool {
+    let Some(_intent) = intent else {
+        return false;
+    };
+    if evidence.inspection_sprawl_nudges < MAX_INSPECTION_SPRAWL_NUDGES {
+        return false;
+    }
+    if calls.is_empty() {
+        return false;
+    }
+    calls
+        .iter()
+        .all(|(_, name, _)| matches!(name.as_str(), "read" | "list" | "grep" | "glob"))
 }
 
 pub(crate) fn read_only_blocked_tool_result(name: &str) -> String {

@@ -9,7 +9,7 @@ use ratatui::text::{Line, Text};
 
 use crate::event::UiEvent;
 use crate::render::{diff_lines, dim, looks_like_diff, markdown_line};
-use crate::{MAX_TRANSCRIPT_LINES, TranscriptEntry, TurnEventKind, TurnState};
+use crate::{ExploreRun, MAX_TRANSCRIPT_LINES, TranscriptEntry, TurnEventKind, TurnState};
 
 impl crate::App {
     pub(crate) fn push(&mut self, line: Line<'static>) {
@@ -242,10 +242,19 @@ impl crate::App {
                 }
                 self.flush_reasoning();
                 self.flush_pending();
-                self.push(Line::styled(
-                    format!("⏺ {label}"),
-                    Style::default().fg(Color::Cyan),
-                ));
+                // Exploration tools (read/list/grep) defer their header until the
+                // result lands, so the file name and line count share one line
+                // instead of printing a header followed by a bare "N lines".
+                if matches!(name.as_str(), "read" | "list" | "grep") {
+                    self.pending_explore_label = Some(label);
+                } else {
+                    // A non-explore tool breaks any active explore run.
+                    self.explore_run = None;
+                    self.push(Line::styled(
+                        format!("⏺ {label}"),
+                        Style::default().fg(Color::Cyan),
+                    ));
+                }
             }
             UiEvent::ToolResult(name, result) => {
                 self.event_log
@@ -339,17 +348,48 @@ impl crate::App {
     /// consulted rather than a wall of their contents.
     pub(crate) fn push_result(&mut self, name: &str, result: &str) {
         if matches!(name, "read" | "list" | "grep") {
-            let n = result.lines().count();
-            if n == 0 {
-                self.push(Line::styled("  (no output)", dim()));
-            } else {
-                self.push(Line::styled(
-                    format!("  {n} line{}", if n == 1 { "" } else { "s" }),
-                    dim(),
-                ));
+            let n = result.lines().count() as u32;
+            // Collapse the header and the line count into one transcript line:
+            // `⏺ read path/to/file · 113 lines`. Falls back to the bare header
+            // if we never saw the ToolCall (e.g. replay from a transcript).
+            let label = self.pending_explore_label.take();
+            let header = match &label {
+                Some(l) => l.clone(),
+                None => name.to_string(),
+            };
+            // Merge consecutive same-tool explore results into one line, so a
+            // burst of reads renders as `⏺ read 6 files · 743 lines` instead of
+            // six separate lines. A run continues only while the tool name is
+            // the same and no other event has broken the chain.
+            let merge = self
+                .explore_run
+                .as_ref()
+                .map(|r| r.tool == name)
+                .unwrap_or(false);
+            if merge {
+                let run = self.explore_run.as_mut().unwrap();
+                run.count += 1;
+                run.lines += n;
+                if n > 0 {
+                    run.all_empty = false;
+                }
+                let line = self.render_explore_run(&header);
+                self.replace_last_line(line);
+                return;
             }
+            // Start a new run.
+            self.explore_run = Some(ExploreRun {
+                tool: name.to_string(),
+                count: 1,
+                lines: n,
+                all_empty: n == 0,
+            });
+            let line = self.render_explore_run(&header);
+            self.push(Line::styled(line, Style::default().fg(Color::Cyan)));
             return;
         }
+        // A non-explore result breaks any active explore run.
+        self.explore_run = None;
         // Enough to show a small edit's diff with its context inline; larger
         // results truncate with a footer (use `/diff` for the full diff).
         const MAX: usize = 16;
@@ -373,6 +413,48 @@ impl crate::App {
         let extra = result.lines().count().saturating_sub(MAX);
         if extra > 0 {
             self.push(Line::styled(format!("  … {extra} more lines"), dim()));
+        }
+    }
+
+    /// Render the current explore run as a single transcript line. A run of one
+    /// shows the per-call label and line count (`⏺ read src/a.rs · 113 lines`);
+    /// a run of many collapses to a summary (`⏺ read 6 files · 743 lines`).
+    fn render_explore_run(&self, header: &str) -> String {
+        let run = match &self.explore_run {
+            Some(r) => r,
+            None => return format!("⏺ {header}"),
+        };
+        if run.count <= 1 {
+            if run.all_empty {
+                format!("⏺ {header} · (no output)")
+            } else {
+                let s = if run.lines == 1 { "" } else { "s" };
+                format!("⏺ {header} · {} line{}", run.lines, s)
+            }
+        } else {
+            // Multi-call summary: drop the per-file label, show counts.
+            let noun = match run.tool.as_str() {
+                "read" => "files",
+                _ => "calls",
+            };
+            if run.all_empty {
+                format!("⏺ {} {} {} · (no output)", run.tool, run.count, noun)
+            } else {
+                let s = if run.lines == 1 { "" } else { "s" };
+                format!(
+                    "⏺ {} {} {} · {} line{}",
+                    run.tool, run.count, noun, run.lines, s
+                )
+            }
+        }
+    }
+
+    /// Replace the last transcript line in place (used to update a merged
+    /// explore-run line as more results fold in). No-op if the transcript is
+    /// empty or the last entry isn't a plain line.
+    fn replace_last_line(&mut self, text: String) {
+        if let Some(TranscriptEntry::Line(line)) = self.transcript.last_mut() {
+            *line = Line::styled(text, Style::default().fg(Color::Cyan));
         }
     }
 }

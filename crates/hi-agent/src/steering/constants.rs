@@ -48,6 +48,29 @@ Do not rerun the same search and do not use mutating tools. Read the most releva
 then answer from that inspected file. If you cannot pick a file to read, explicitly say the \
 evidence is insufficient.";
 
+/// Sent when a read-only review turn has accumulated a lot of inspected
+/// evidence (many file reads / searches) but the model keeps issuing more
+/// read-only tool calls instead of producing findings. This is the
+/// "inspection sprawl" guard: distinct reads each have a new inspection
+/// signature, so the repeat/cycle guard never fires, and without this nudge
+/// the turn churns until `max_steps`. The nudge pushes the model to stop
+/// inspecting and answer from what it has already seen.
+pub(crate) const INSPECTION_SPRAWL_NUDGE: &str = "You have already inspected a lot of evidence this turn \
+(many file reads and/or searches) and the results are in the conversation above. Stop inspecting now and \
+answer from the evidence you have already gathered. Produce bounded findings tied to concrete \
+inspected files, or explicitly say the evidence is insufficient. Do not read more files.";
+
+/// How many file reads + targeted searches accumulate before the inspection-sprawl
+/// nudge fires on a read-only review turn that still hasn't produced a final
+/// answer. Chosen so a normal focused review (a handful of reads + a search or
+/// two) never trips it, but a sprawl into dozens of reads does.
+pub(crate) const INSPECTION_SPRAWL_THRESHOLD: u32 = 24;
+
+/// How many *additional* read-only inspection rounds are allowed after the
+/// sprawl nudge before the turn hard-stops with a bounded-evidence summary.
+/// Mirrors the repair-budget shape: one nudge, then a bounded stop.
+pub(crate) const MAX_INSPECTION_SPRAWL_NUDGES: u32 = 1;
+
 /// Sent when the model re-reads files it already inspected earlier this turn
 /// (a multi-step read cycle like A→B→C→A→B→C that evades the exact-match
 /// repeat guard). The file contents are already in the transcript above —

@@ -90,6 +90,12 @@ pub(crate) struct EvidenceTracker {
     pub(crate) search_hit_snippets: Vec<String>,
     pub(crate) first_tool_kind: Option<EvidenceKind>,
     pub(crate) quality_repair_nudges: u32,
+    /// How many inspection-sprawl nudges have fired this turn. Incremented in
+    /// the turn loop when a read-only review turn keeps issuing read-only
+    /// inspections past [`INSPECTION_SPRAWL_THRESHOLD`] without producing a
+    /// final answer. Once this exceeds [`MAX_INSPECTION_SPRAWL_NUDGES`] the
+    /// turn hard-stops with a bounded-evidence summary.
+    pub(crate) inspection_sprawl_nudges: u32,
     /// Inspection signatures already seen this turn, used by the no-new-evidence
     /// cycle guard. Each entry is a stable key derived from a read-only tool
     /// call's identity: `read:<path>:<offset>:<limit>`,
@@ -202,6 +208,13 @@ impl EvidenceTracker {
 
     pub(crate) fn has_discovery(&self) -> bool {
         self.saw_listing || self.saw_search || self.saw_read
+    }
+
+    /// Total read-only inspection count (file reads + targeted searches).
+    /// Used by the inspection-sprawl guard to decide when a read-only review
+    /// turn has gathered "enough" evidence to stop inspecting and answer.
+    pub(crate) fn inspection_count(&self) -> u32 {
+        self.file_reads.saturating_add(self.targeted_searches)
     }
 
     pub(crate) fn discovery_depth(&self) -> &'static str {

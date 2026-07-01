@@ -11,17 +11,24 @@ pub struct PlainUi {
     /// Set true on the first real output; the REPL's spinner watches it and
     /// stops drawing once the model starts responding.
     progress: Option<Arc<AtomicBool>>,
+    /// For read/list/grep we defer the `⏺` header until the result lands, so the
+    /// file name and line count collapse into one line instead of two.
+    pending_explore_label: Option<String>,
 }
 
 impl PlainUi {
     pub fn new() -> Self {
-        Self { progress: None }
+        Self {
+            progress: None,
+            pending_explore_label: None,
+        }
     }
 
     /// A PlainUi that clears a REPL "working…" spinner on its first output.
     pub fn with_progress(progress: Arc<AtomicBool>) -> Self {
         Self {
             progress: Some(progress),
+            pending_explore_label: None,
         }
     }
 
@@ -53,6 +60,12 @@ impl Ui for PlainUi {
 
     fn tool_call(&mut self, name: &str, arguments: &str) {
         self.begin_output();
+        // Exploration tools defer their header until the result lands, so the
+        // file name and line count share one line instead of two.
+        if matches!(name, "read" | "list" | "grep") {
+            self.pending_explore_label = Some(tool_label(name, arguments));
+            return;
+        }
         println!("\x1b[36m⏺ {}\x1b[0m", tool_label(name, arguments));
     }
 
@@ -80,16 +93,21 @@ impl Ui for PlainUi {
     }
 
     fn tool_result(&mut self, name: &str, result: &str) {
-        // Read-only exploration tools (read/list/grep) already named the file
-        // or pattern in their `tool_call` header — blasting their full output
-        // into the transcript is noise. Show a compact line count instead.
+        // Read-only exploration tools (read/list/grep) collapse the header and
+        // the line count into one line: `⏺ read path/to/file · 113 lines`.
         if matches!(name, "read" | "list" | "grep") {
             let n = result.lines().count();
-            if n == 0 {
-                println!("\x1b[2m  (no output)\x1b[0m");
+            let header = self
+                .pending_explore_label
+                .take()
+                .unwrap_or_else(|| name.to_string());
+            let suffix = if n == 0 {
+                "(no output)".to_string()
             } else {
-                println!("\x1b[2m  {n} line{}\x1b[0m", if n == 1 { "" } else { "s" });
-            }
+                format!("{n} line{}", if n == 1 { "" } else { "s" })
+            };
+            self.begin_output();
+            println!("\x1b[36m⏺ {header} · {suffix}\x1b[0m");
             return;
         }
         // Enough to show a small edit's diff with its context inline; larger

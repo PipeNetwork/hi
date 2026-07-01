@@ -123,6 +123,11 @@ pub struct AgentConfig {
     /// apply_patch) before applying it. The UI shows a diff preview and prompts
     /// for y/n. In non-interactive mode, edits are auto-approved.
     pub confirm_edits: bool,
+    /// Whether the LSP subsystem is enabled. When on, the agent can use
+    /// `diagnostics`, `definition`, `references`, and `hover` tools that talk
+    /// to an external language server (rust-analyzer, pyright, etc.). Off by
+    /// default; toggle at runtime with `/lsp on` / `/lsp off`.
+    pub lsp: bool,
 }
 
 impl Default for AgentConfig {
@@ -159,6 +164,7 @@ impl Default for AgentConfig {
             long_horizon: false,
             max_cost_warn: None,
             confirm_edits: false,
+            lsp: false,
         }
     }
 }

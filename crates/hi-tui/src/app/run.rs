@@ -1063,12 +1063,10 @@ async fn drive(
                                 }
                             }
                             KeyCode::Esc => app.input.clear(),
-                            // Typing while a turn runs queues the next command —
-                            // except `/tokens`, which reads the live counter and
-                            // runs in sync so you can watch usage climb mid-turn.
+                            // Typing while a turn runs queues the next command — except `/copy`,
+                            // which reads the selection synchronously.
                             _ => if let Some(submitted) = app.edit_key(&key) {
                                 match command::parse(&submitted) {
-                                    Some(Command::Tokens) => app.report_tokens(),
                                     Some(Command::Copy(arg)) => app.copy(&arg),
                                     _ => app.queue.push_back(submitted),
                                 }

@@ -56,6 +56,8 @@ impl crate::App {
             started: None,
             current_tool: None,
             current_tool_started: None,
+            pending_explore_label: None,
+            explore_run: None,
             queue: VecDeque::new(),
             last_prompt: None,
             last_turn_start: 0,
@@ -127,6 +129,8 @@ impl crate::App {
         self.started = working.then(Instant::now);
         self.current_tool = None;
         self.current_tool_started = None;
+        self.pending_explore_label = None;
+        self.explore_run = None;
         if working {
             self.last_turn_event = None;
             self.last_turn_had_file_edits = false;

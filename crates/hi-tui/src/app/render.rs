@@ -74,22 +74,6 @@ impl crate::App {
             .collect()
     }
 
-    /// Push the cumulative-usage line from the live counters. Works mid-turn —
-    /// when the agent itself is borrowed by the running turn — because it reads
-    /// the mirrored `usage` rather than the agent.
-    pub(crate) fn report_tokens(&mut self) {
-        let (input, output) = self.usage;
-        let mut line = format!(
-            "cumulative: {input} in · {output} out · {} total",
-            input + output
-        );
-        if let Some(pct) = self.context_pct() {
-            line.push_str(&format!("  ·  context {pct}% full"));
-        }
-        self.push(Line::styled(line, dim()));
-        self.follow();
-    }
-
     pub(crate) fn report_status(&mut self, agent: &Agent) {
         let (input, output) = self.usage;
         let state = match &self.last_turn_state {

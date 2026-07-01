@@ -5,6 +5,7 @@
 
 pub mod checkpoint;
 pub mod guard;
+mod lsp;
 
 mod attribution;
 mod background;
@@ -20,6 +21,10 @@ pub use background::{
     kill_started_after as kill_background_processes_started_after,
 };
 pub use condense::condense_diagnostics;
+pub use lsp::{
+    lsp_enabled, lsp_manager_handle, lsp_status, lsp_status_report, lsp_status_sync,
+    set_lsp_manager, set_lsp_manager_arc, sync_lsp_document,
+};
 pub use paths::clear_read_cache;
 pub use tools::{
     TOOL_SPECS, commit, execute, execute_streaming, fast_check_for, is_filesystem_mutating,

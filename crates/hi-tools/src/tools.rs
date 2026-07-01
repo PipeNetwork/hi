@@ -342,15 +342,20 @@ fn build_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "read".into(),
-            description: "Read a UTF-8 text file. Lines are returned numbered (`<n>\\t<text>`). Returns at most 240 lines by default; page with offset/limit instead of assuming you saw everything.".into(),
+            description: "Read a UTF-8 text file. Lines are returned numbered (`<n>\\t<text>`). Returns at most 2000 lines by default (the whole file for most source files); page with offset/limit instead of assuming you saw everything. Pass `paths` (an array) to read several files in one call — each is returned under a `──── path ────` header, so a whole directory can be pulled at once.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Path to the file to read." },
+                    "path": { "type": "string", "description": "Path to the file to read. Optional if `paths` is given." },
+                    "paths": {
+                        "type": "array",
+                        "description": "Multiple paths to read in one call. Each file is returned under a header. Prefer this over several single-path `read` calls when reviewing a directory.",
+                        "items": { "type": "string" }
+                    },
                     "offset": { "type": "integer", "description": "1-based line to start at (default: first line)." },
-                    "limit": { "type": "integer", "description": "Maximum number of lines to return (default: 240)." }
+                    "limit": { "type": "integer", "description": "Maximum number of lines to return per file (default: 2000)." }
                 },
-                "required": ["path"]
+                "required": []
             }),
         },
         ToolSpec {
@@ -492,6 +497,56 @@ fn build_tool_specs() -> Vec<ToolSpec> {
                 "required": ["patch"]
             }),
         },
+        ToolSpec {
+            name: "diagnostics".into(),
+            description: "Get LSP diagnostics (errors/warnings) for a file. Requires `/lsp on`. Returns line-level errors — cheaper and more precise than running a full build. Empty path returns diagnostics for all open files.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Path to the file (relative to cwd)." }
+                },
+                "required": []
+            }),
+        },
+        ToolSpec {
+            name: "definition".into(),
+            description: "Goto definition of the symbol at a position. Requires `/lsp on`. Returns file:line:col locations. More precise than grep — respects scopes and types.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Path to the file." },
+                    "line": { "type": "integer", "description": "0-based line number." },
+                    "column": { "type": "integer", "description": "0-based character offset." }
+                },
+                "required": ["path", "line", "column"]
+            }),
+        },
+        ToolSpec {
+            name: "references".into(),
+            description: "Find all references to the symbol at a position. Requires `/lsp on`. Returns call sites as file:line:col. Semantically correct — no false matches from comments or strings.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Path to the file." },
+                    "line": { "type": "integer", "description": "0-based line number." },
+                    "column": { "type": "integer", "description": "0-based character offset." }
+                },
+                "required": ["path", "line", "column"]
+            }),
+        },
+        ToolSpec {
+            name: "hover".into(),
+            description: "Get type and documentation for the symbol at a position. Requires `/lsp on`. Returns the hover text (type signature, docs).".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Path to the file." },
+                    "line": { "type": "integer", "description": "0-based line number." },
+                    "column": { "type": "integer", "description": "0-based character offset." }
+                },
+                "required": ["path", "line", "column"]
+            }),
+        },
     ]
 }
 
@@ -516,6 +571,10 @@ pub fn is_read_only(name: &str) -> bool {
             | "update_plan"
             | "record_decision"
             | "bash_output"
+            | "diagnostics"
+            | "definition"
+            | "references"
+            | "hover"
     )
 }
 
@@ -540,8 +599,24 @@ pub fn is_filesystem_mutating(name: &str) -> bool {
 pub fn target_path(name: &str, arguments: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
     match name {
-        // read/write/edit/multi_edit carry an explicit `path`.
-        "read" | "write" | "edit" | "multi_edit" => value.get("path")?.as_str().map(str::to_string),
+        // read/write/edit/multi_edit carry an explicit `path`. `read` may also
+        // use `paths` (an array): a one-element array is that single path; a
+        // multi-element array has no single target, so return None and let
+        // dependency inference treat it conservatively.
+        "read" => value
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .or_else(|| {
+                value.get("paths").and_then(|v| v.as_array()).and_then(|a| {
+                    if a.len() == 1 {
+                        a[0].as_str().map(str::to_string)
+                    } else {
+                        None
+                    }
+                })
+            }),
+        "write" | "edit" | "multi_edit" => value.get("path")?.as_str().map(str::to_string),
         // list's path is optional (defaults to ".").
         "list" => value.get("path")?.as_str().map(str::to_string),
         // grep: prefer an explicit `path`; fall back to `glob` only as a hint
@@ -668,6 +743,8 @@ async fn run(name: &str, arguments: &str) -> Result<ToolOutput> {
             }
             let written_len = args.content.len();
             let after = crate::read::maybe_format(&args.path, args.content).await;
+            // Sync to LSP so diagnostics stay fresh.
+            crate::lsp::sync_lsp_document(Path::new(&args.path), &after).await;
             let msg = if after.len() != written_len {
                 format!(
                     "Wrote {} bytes to {} (formatter adjusted to {} bytes)",
@@ -699,6 +776,8 @@ async fn run(name: &str, arguments: &str) -> Result<ToolOutput> {
                 cache.remove(&cache_key(&args.path));
             }
             let after = crate::read::maybe_format(&args.path, after).await;
+            // Sync to LSP so diagnostics stay fresh.
+            crate::lsp::sync_lsp_document(Path::new(&args.path), &after).await;
             let count = if args.replace_all {
                 before.matches(&args.old_string).count()
             } else {
@@ -735,6 +814,8 @@ async fn run(name: &str, arguments: &str) -> Result<ToolOutput> {
                 cache.remove(&cache_key(&args.path));
             }
             let after = crate::read::maybe_format(&args.path, after).await;
+            // Sync to LSP so diagnostics stay fresh.
+            crate::lsp::sync_lsp_document(Path::new(&args.path), &after).await;
             Ok(ToolOutput::shown(
                 format!("Applied {} edits to {}", args.edits.len(), args.path),
                 diff(&before, &after),
@@ -770,6 +851,10 @@ async fn run(name: &str, arguments: &str) -> Result<ToolOutput> {
         }
         "glob" => run_glob(arguments).await,
         "grep" => run_grep(arguments).await,
+        "diagnostics" => run_lsp_diagnostics(arguments).await,
+        "definition" => run_lsp_definition(arguments).await,
+        "references" => run_lsp_references(arguments).await,
+        "hover" => run_lsp_hover(arguments).await,
         "apply_patch" => {
             #[derive(Deserialize)]
             struct PatchArgs {
@@ -780,6 +865,158 @@ async fn run(name: &str, arguments: &str) -> Result<ToolOutput> {
             Ok(ToolOutput::plain(result))
         }
         other => bail!("unknown tool: {other}"),
+    }
+}
+
+// --- LSP tool handlers ---
+
+async fn run_lsp_diagnostics(arguments: &str) -> Result<ToolOutput> {
+    let mgr = match crate::lsp::lsp_manager() {
+        Some(m) => m,
+        None => {
+            return Ok(ToolOutput::plain(
+                "LSP not available (use `/lsp on`).".into(),
+            ));
+        }
+    };
+    if !mgr.is_enabled().await {
+        return Ok(ToolOutput::plain("LSP is off (use `/lsp on`).".into()));
+    }
+    #[derive(Deserialize)]
+    struct Args {
+        #[serde(default)]
+        path: String,
+    }
+    let args: Args = parse(arguments)?;
+    if args.path.is_empty() {
+        // No specific file — return diagnostics across all synced documents.
+        let all = mgr.diagnostics_all().await?;
+        if all.is_empty() {
+            return Ok(ToolOutput::plain("No diagnostics.".into()));
+        }
+        let mut out = String::new();
+        for (path, diags) in all {
+            for d in diags {
+                let src = d.source.as_deref().unwrap_or("");
+                out.push_str(&format!(
+                    "{}:{}:{}: {} {}{}\n",
+                    path.display(),
+                    d.line + 1,
+                    d.col + 1,
+                    d.severity,
+                    d.message,
+                    if src.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({src})")
+                    }
+                ));
+            }
+        }
+        return Ok(ToolOutput::plain(out.trim_end().to_string()));
+    }
+    let path = Path::new(&args.path).to_path_buf();
+    // Sync the file first so diagnostics reflect current state.
+    if let Ok(text) = tokio::fs::read_to_string(&path).await {
+        let _ = mgr.sync_document(&path, &text).await;
+    }
+    let diags = mgr.diagnostics(&path).await?;
+    if diags.is_empty() {
+        return Ok(ToolOutput::plain("No diagnostics.".into()));
+    }
+    let mut out = String::new();
+    for d in diags {
+        let src = d.source.as_deref().unwrap_or("");
+        out.push_str(&format!(
+            "{}:{}:{}: {} {}{}\n",
+            path.display(),
+            d.line + 1,
+            d.col + 1,
+            d.severity,
+            d.message,
+            if src.is_empty() {
+                String::new()
+            } else {
+                format!(" ({src})")
+            }
+        ));
+    }
+    Ok(ToolOutput::plain(out.trim_end().to_string()))
+}
+
+async fn run_lsp_definition(arguments: &str) -> Result<ToolOutput> {
+    run_lsp_locations("definition", arguments).await
+}
+
+async fn run_lsp_references(arguments: &str) -> Result<ToolOutput> {
+    run_lsp_locations("references", arguments).await
+}
+
+async fn run_lsp_locations(kind: &str, arguments: &str) -> Result<ToolOutput> {
+    let mgr = match crate::lsp::lsp_manager() {
+        Some(m) => m,
+        None => {
+            return Ok(ToolOutput::plain(
+                "LSP not available (use `/lsp on`).".into(),
+            ));
+        }
+    };
+    if !mgr.is_enabled().await {
+        return Ok(ToolOutput::plain("LSP is off (use `/lsp on`).".into()));
+    }
+    #[derive(Deserialize)]
+    struct Args {
+        path: String,
+        line: u32,
+        column: u32,
+    }
+    let args: Args = parse(arguments)?;
+    let path = Path::new(&args.path).to_path_buf();
+    if let Ok(text) = tokio::fs::read_to_string(&path).await {
+        let _ = mgr.sync_document(&path, &text).await;
+    }
+    let locs = if kind == "definition" {
+        mgr.definition(&path, args.line, args.column).await?
+    } else {
+        mgr.references(&path, args.line, args.column).await?
+    };
+    if locs.is_empty() {
+        return Ok(ToolOutput::plain(format!("No {kind} found.")));
+    }
+    let out = locs
+        .iter()
+        .map(|l| format!("{}:{}:{}", l.path, l.line + 1, l.col + 1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(ToolOutput::plain(out))
+}
+
+async fn run_lsp_hover(arguments: &str) -> Result<ToolOutput> {
+    let mgr = match crate::lsp::lsp_manager() {
+        Some(m) => m,
+        None => {
+            return Ok(ToolOutput::plain(
+                "LSP not available (use `/lsp on`).".into(),
+            ));
+        }
+    };
+    if !mgr.is_enabled().await {
+        return Ok(ToolOutput::plain("LSP is off (use `/lsp on`).".into()));
+    }
+    #[derive(Deserialize)]
+    struct Args {
+        path: String,
+        line: u32,
+        column: u32,
+    }
+    let args: Args = parse(arguments)?;
+    let path = Path::new(&args.path).to_path_buf();
+    if let Ok(text) = tokio::fs::read_to_string(&path).await {
+        let _ = mgr.sync_document(&path, &text).await;
+    }
+    match mgr.hover(&path, args.line, args.column).await? {
+        Some(text) => Ok(ToolOutput::plain(text)),
+        None => Ok(ToolOutput::plain("No hover info.".into())),
     }
 }
 
@@ -1602,6 +1839,16 @@ mod tests {
         assert_eq!(target_path("bash", r#"{"command":"echo hi"}"#), None);
         // Malformed JSON → None (tolerant).
         assert_eq!(target_path("read", "not json"), None);
+        // `read` with `paths`: a one-element array yields that path.
+        assert_eq!(
+            target_path("read", r#"{"paths":["src/a.rs"]}"#),
+            Some("src/a.rs".into())
+        );
+        // A multi-element array has no single target → None.
+        assert_eq!(
+            target_path("read", r#"{"paths":["src/a.rs","src/b.rs"]}"#),
+            None
+        );
         // apply_patch: a single file directive's path is extracted.
         let patch =
             r#"{"patch":"*** Begin Patch\n*** Update File: src/a.rs\n-old\n+new\n*** End Patch"}"#;

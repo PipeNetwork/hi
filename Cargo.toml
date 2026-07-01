@@ -26,3 +26,4 @@ hi-ai = { path = "crates/hi-ai" }
 hi-tools = { path = "crates/hi-tools" }
 hi-agent = { path = "crates/hi-agent" }
 hi-tui = { path = "crates/hi-tui" }
+hi-lsp = { path = "crates/hi-lsp" }

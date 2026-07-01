@@ -6,6 +6,7 @@ version.workspace = true
 [dependencies]
 hi-ai.workspace = true
 hi-tools.workspace = true
+hi-lsp.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

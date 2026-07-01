@@ -15,10 +15,10 @@ pub enum Command {
     /// Subcommands: `add` (create a new profile interactively), `edit [name]`
     /// (edit an existing profile). The frontend parses these from the arg.
     Provider(String),
-    /// Show cumulative token usage.
-    Tokens,
     /// Show current session/runtime status.
     Status,
+    /// Toggle or query the LSP subsystem. Arg: `on`, `off`, or empty (status).
+    Lsp(String),
     /// Expanded read-only slash prompt macro that should run as a model turn.
     Prompt(String),
     /// Write a debug/event log for the current session.
@@ -59,6 +59,8 @@ pub enum Command {
     Quit,
     /// A `/word` that isn't recognized.
     Unknown(String),
+    /// A removed command, retained as a redirect. Carries a hint shown verbatim.
+    Removed(String),
 }
 
 /// Parse a line as a command. Returns `None` for ordinary input (anything not
@@ -74,7 +76,7 @@ pub fn parse(line: &str) -> Option<Command> {
         "clear" | "new" => Command::Clear,
         "model" | "m" => Command::Model(arg),
         "provider" | "prov" => Command::Provider(arg),
-        "tokens" | "usage" | "cost" => Command::Tokens,
+        "usage" | "cost" => Command::Removed("usage — removed; use /status".into()),
         "review" => Command::Prompt(read_only_macro_prompt("review", &arg)),
         "security" => Command::Prompt(read_only_macro_prompt("security", &arg)),
         "roadmap" => Command::Prompt(read_only_macro_prompt("roadmap", &arg)),
@@ -97,6 +99,7 @@ pub fn parse(line: &str) -> Option<Command> {
         "version" | "ver" | "v" => Command::Version,
         "export" => Command::Export(arg),
         "mcp" => Command::Mcp,
+        "lsp" => Command::Lsp(arg),
         "exit" | "quit" | "q" => Command::Quit,
         other => Command::Unknown(other.to_string()),
     })
@@ -315,6 +318,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         arg_values: &[],
     },
     CommandSpec {
+        name: "lsp",
+        args: "[on|off|status]",
+        help: "toggle the LSP subsystem, or show server status",
+        arg_values: &[
+            ("on", "enable LSP"),
+            ("off", "disable LSP"),
+            ("status", "show per-language server state"),
+        ],
+    },
+    CommandSpec {
         name: "status",
         args: "[topic]",
         help: "show runtime status, or discuss codebase status with a topic",
@@ -324,12 +337,6 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "log",
         args: "",
         help: "write a local debug log for this session",
-        arg_values: &[],
-    },
-    CommandSpec {
-        name: "tokens",
-        args: "",
-        help: "cumulative token usage this session",
         arg_values: &[],
     },
     CommandSpec {
@@ -573,6 +580,19 @@ mod tests {
         assert_eq!(parse("/redo"), Some(Command::Retry));
         assert_eq!(parse("/undo"), Some(Command::Undo));
         assert_eq!(parse("/bogus"), Some(Command::Unknown("bogus".into())));
+        // `/lsp` parses with an optional arg.
+        assert_eq!(parse("/lsp"), Some(Command::Lsp(String::new())));
+        assert_eq!(parse("/lsp on"), Some(Command::Lsp("on".into())));
+        assert_eq!(parse("/lsp off"), Some(Command::Lsp("off".into())));
+        // Removed `/tokens` aliases redirect to a hint instead of bare "unknown".
+        assert!(matches!(
+            parse("/usage"),
+            Some(Command::Removed(m)) if m.contains("removed")
+        ));
+        assert!(matches!(
+            parse("/cost"),
+            Some(Command::Removed(m)) if m.contains("removed")
+        ));
     }
 
     #[test]

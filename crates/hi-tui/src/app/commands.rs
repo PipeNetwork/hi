@@ -302,24 +302,6 @@ impl crate::App {
                     self.push(Line::styled(line.to_string(), dim()));
                 }
             }
-            Command::Tokens => {
-                let t = agent.totals();
-                self.usage = (t.input_tokens, t.output_tokens);
-                let cost = agent
-                    .cost_usd()
-                    .map(|c| format!(" · ${c:.4}"))
-                    .unwrap_or_default();
-                self.push(Line::styled(
-                    format!(
-                        "cumulative: {} in · {} out · {} total{}",
-                        t.input_tokens,
-                        t.output_tokens,
-                        t.total(),
-                        cost,
-                    ),
-                    dim(),
-                ));
-            }
             Command::Status => self.report_status(agent),
             Command::Log => self.write_debug_log(),
             Command::Model(id) => {
@@ -478,6 +460,30 @@ impl crate::App {
                     }
                 }
             }
+            Command::Lsp(arg) => {
+                let arg = arg.trim();
+                match arg {
+                    "on" => {
+                        agent.set_lsp_enabled(true);
+                        self.push(Line::styled(
+                            "LSP enabled — servers will warm up on first query.".to_string(),
+                            dim(),
+                        ));
+                    }
+                    "off" => {
+                        agent.set_lsp_enabled(false);
+                        self.push(Line::styled("LSP disabled.".to_string(), dim()));
+                    }
+                    _ => {
+                        // `/lsp` or `/lsp status` — show enabled state plus
+                        // per-language server availability and running state.
+                        let report = hi_tools::lsp_status_report(agent.lsp_enabled());
+                        for line in report.lines() {
+                            self.push(Line::styled(line.to_string(), dim()));
+                        }
+                    }
+                }
+            }
             Command::Export(arg) => {
                 let path = if arg.trim().is_empty() {
                     "transcript.md"
@@ -506,6 +512,9 @@ impl crate::App {
                     format!("unknown command /{name}; try /help"),
                     dim(),
                 ));
+            }
+            Command::Removed(msg) => {
+                self.push(Line::styled(format!("/{msg}"), dim()));
             }
         }
         self.follow();

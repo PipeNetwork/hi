@@ -17,32 +17,6 @@ pub(crate) fn handle_command(
     match command {
         Command::Quit => return true,
         Command::Help => println!("{}", hi_agent::command::help_text()),
-        Command::Tokens => {
-            let t = agent.totals();
-            let cost = agent
-                .cost_usd()
-                .map(|c| format!(" · ${c:.4}"))
-                .unwrap_or_default();
-            let ctx = agent
-                .context_window()
-                .map(|w| {
-                    let pct = if w > 0 {
-                        agent.context_used() * 100 / w as u64
-                    } else {
-                        0
-                    };
-                    format!(" · context: {pct}%")
-                })
-                .unwrap_or_default();
-            println!(
-                "\x1b[2mcumulative: {} in · {} out · {} total{}{}\x1b[0m",
-                t.input_tokens,
-                t.output_tokens,
-                t.total(),
-                cost,
-                ctx,
-            );
-        }
         Command::Status => {
             let t = agent.totals();
             let tel = agent.last_turn_telemetry();
@@ -236,6 +210,9 @@ pub(crate) fn handle_command(
         Command::Unknown(name) => {
             eprintln!("\x1b[33munknown command /{name}; try /help\x1b[0m");
         }
+        Command::Removed(msg) => {
+            eprintln!("\x1b[33m/{msg}\x1b[0m");
+        }
         Command::Context => {
             print!("{}", agent.context_breakdown());
         }
@@ -246,8 +223,33 @@ pub(crate) fn handle_command(
         Command::Provider(_) => {}
         // `/mcp` is handled inline by the REPL/TUI (async + needs settings).
         Command::Mcp => {}
+        Command::Lsp(arg) => {
+            handle_lsp(agent, &arg);
+        }
     }
     false
+}
+
+pub(crate) fn handle_lsp(agent: &hi_agent::Agent, arg: &str) {
+    let arg = arg.trim();
+    match arg {
+        "on" => {
+            agent.set_lsp_enabled(true);
+            println!("\x1b[2mLSP enabled — servers will warm up on first query.\x1b[0m");
+        }
+        "off" => {
+            agent.set_lsp_enabled(false);
+            println!("\x1b[2mLSP disabled.\x1b[0m");
+        }
+        _ => {
+            // `/lsp` or `/lsp status` — show enabled state plus per-language
+            // server availability and running state.
+            let report = hi_tools::lsp_status_report(agent.lsp_enabled());
+            for line in report.lines() {
+                println!("\x1b[2m{line}\x1b[0m");
+            }
+        }
+    }
 }
 
 pub(crate) fn tool_mode_label(mode: hi_ai::ToolMode) -> &'static str {

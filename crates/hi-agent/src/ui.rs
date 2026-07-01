@@ -80,6 +80,13 @@ pub trait Ui: Send {
     /// that already handle `turn_end` should override this for richer
     /// error UX.
     fn turn_error(&mut self, _kind: &str, _message: &str, _guidance: &str) {}
+    /// An internal steering diagnostic — the agent detected a stall (re-reading
+    /// already-inspected files, re-running the same command, polling a dead
+    /// background handle, etc.) and injected a nudge. These are implementation
+    /// details about *how* the agent steers the model, not user-facing status;
+    /// real frontends ignore them (the default). Test/UI recorders capture them
+    /// to assert on steering behavior.
+    fn nudge(&mut self, _text: &str) {}
 }
 
 /// Classify a provider/agent error into a user-facing kind slug and
@@ -173,7 +180,19 @@ fn salient_arg(name: &str, arguments: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(arguments).ok()?;
     let str_field = |key: &str| value.get(key).and_then(|v| v.as_str());
     let label = match name {
-        "read" | "write" | "edit" => str_field("path")?.to_string(),
+        "read" => {
+            // Multi-path reads: show "N files" instead of a single path.
+            if let Some(paths) = value.get("paths").and_then(|v| v.as_array()) {
+                if paths.len() == 1 {
+                    paths[0].as_str()?.to_string()
+                } else {
+                    format!("{} files", paths.len())
+                }
+            } else {
+                str_field("path")?.to_string()
+            }
+        }
+        "write" | "edit" => str_field("path")?.to_string(),
         "list" => str_field("path").unwrap_or(".").to_string(),
         "grep" => {
             let pattern = clip(str_field("pattern")?, 50);
@@ -237,6 +256,16 @@ mod tests {
         assert_eq!(
             tool_label("read", r#"{"path":"Cargo.toml"}"#),
             "read Cargo.toml"
+        );
+        // Multi-path reads: a one-element array still names the file.
+        assert_eq!(
+            tool_label("read", r#"{"paths":["Cargo.toml"]}"#),
+            "read Cargo.toml"
+        );
+        // A multi-element array collapses to "N files".
+        assert_eq!(
+            tool_label("read", r#"{"paths":["a.rs","b.rs","c.rs"]}"#),
+            "read 3 files"
         );
     }
 

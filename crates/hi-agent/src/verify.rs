@@ -99,6 +99,47 @@ impl Verifier {
         self.round += 1;
         let round = self.round;
         let max_rounds = self.max_rounds;
+
+        // LSP fast path: if enabled, check diagnostics on changed files before
+        // running any shell stages. This catches type errors in ~1s instead of
+        // a full `cargo test`/build, and gives line-level errors.
+        if hi_tools::lsp_enabled().await
+            && let Some(mgr) = hi_tools::lsp_manager_handle()
+        {
+            let mut lsp_errors = Vec::new();
+            for file in &changed_files {
+                let path = std::path::Path::new(file);
+                if let Ok(text) = tokio::fs::read_to_string(path).await {
+                    let _ = mgr.sync_document(path, &text).await;
+                }
+                if let Ok(diags) = mgr.diagnostics(path).await {
+                    for d in diags {
+                        if d.severity == "error" {
+                            lsp_errors.push(format!(
+                                "{}:{}:{}: {}",
+                                file,
+                                d.line + 1,
+                                d.col + 1,
+                                d.message
+                            ));
+                        }
+                    }
+                }
+            }
+            if !lsp_errors.is_empty() {
+                let output = format!(
+                    "LSP diagnostics ({} error(s)):\n{}",
+                    lsp_errors.len(),
+                    lsp_errors.join("\n")
+                );
+                return VerifyOutcome::Failed {
+                    stage: VerifyStage::new("lsp", "diagnostics"),
+                    output,
+                    round,
+                };
+            }
+        }
+
         let mut failure = None;
         for stage in &self.stages {
             ui.status(&format!(

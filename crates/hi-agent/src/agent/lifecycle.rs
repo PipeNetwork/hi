@@ -82,6 +82,24 @@ impl crate::Agent {
         // Clamp persisted to the (possibly shorter) transcript length so the
         // incremental session recorder doesn't slice past the end.
         let persisted = persisted.min(messages.len());
+        // Install the process-global LSP manager so the tool layer can reach
+        // it. Synced to `config.lsp` at startup; `/lsp on|off` toggles at
+        // runtime. The OnceLock means the first session's manager wins —
+        // subsequent calls (e.g. resume) reuse the existing one.
+        let lsp_root = std::env::current_dir().unwrap_or_else(|_| ".".into());
+        let mgr = hi_lsp::LspManager::new(lsp_root);
+        if config.lsp {
+            // We can't `.await` here (not async), so spawn a blocking task to
+            // flip the flag. The manager starts disabled by default.
+            let mgr_arc = std::sync::Arc::new(mgr);
+            hi_tools::set_lsp_manager_arc(mgr_arc.clone());
+            // Fire-and-forget the enable — it'll be ready by the first query.
+            tokio::spawn(async move {
+                mgr_arc.set_enabled(true).await;
+            });
+        } else {
+            hi_tools::set_lsp_manager(mgr);
+        }
         Self {
             provider,
             config,
@@ -247,6 +265,28 @@ impl crate::Agent {
     /// The configured context window, if known.
     pub fn context_window(&self) -> Option<u32> {
         self.config.context_window
+    }
+
+    /// Whether the LSP subsystem is enabled.
+    pub fn lsp_enabled(&self) -> bool {
+        self.config.lsp
+    }
+
+    /// Enable or disable the LSP subsystem at runtime (`/lsp on|off`).
+    /// This updates the config flag and the process-global `LspManager`.
+    pub fn set_lsp_enabled(&self, on: bool) {
+        // The config field is behind a shared ref in some callers; we can't
+        // mutate it directly. Instead, toggle the global manager, which is
+        // what the tools actually check.
+        // SAFETY: this is a single-threaded toggle from the REPL/TUI command
+        // handler. The config.lsp field is only read at startup to seed the
+        // manager; runtime checks go through the manager.
+        if let Some(mgr) = hi_tools::lsp_manager_handle() {
+            let mgr = mgr.clone();
+            tokio::spawn(async move {
+                mgr.set_enabled(on).await;
+            });
+        }
     }
 
     /// A human-readable context-occupancy breakdown for `/context`: the

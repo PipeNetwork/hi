@@ -394,6 +394,10 @@ pub(crate) async fn repl(
                             }
                             continue;
                         }
+                        Command::Lsp(arg) => {
+                            crate::commands::handle_lsp(agent, &arg);
+                            continue;
+                        }
                         other => {
                             handle_command(agent, other, registry);
                             continue;

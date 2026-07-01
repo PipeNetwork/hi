@@ -24,23 +24,24 @@ use crate::snapshot::changed_files_between;
 use crate::steering::{
     CONCRETE_REVIEW_NUDGE, EvidenceTracker, GAP_SEARCH_OVERCLAIM_NUDGE,
     IMPLEMENTATION_EMPTY_TUI_NUDGE, IMPLEMENTATION_NO_CHANGES_NUDGE,
-    IMPLEMENTATION_SCAFFOLD_ONLY_NUDGE, ImplementationTracker, READ_AFTER_SEARCH_NUDGE,
-    READ_ONLY_SAFE_CONTEXT_WINDOW, REPEAT_NUDGE, REREAD_NUDGE, ReviewIntent,
-    SECURITY_BROAD_SEARCH_NUDGE, SECURITY_SCOPE_NUDGE, TOOL_PROTOCOL_RETRY_NUDGE,
+    IMPLEMENTATION_SCAFFOLD_ONLY_NUDGE, INSPECTION_SPRAWL_NUDGE, ImplementationTracker,
+    READ_AFTER_SEARCH_NUDGE, READ_ONLY_SAFE_CONTEXT_WINDOW, REPEAT_NUDGE, REREAD_NUDGE,
+    ReviewIntent, SECURITY_BROAD_SEARCH_NUDGE, SECURITY_SCOPE_NUDGE, TOOL_PROTOCOL_RETRY_NUDGE,
     TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE, answer_says_insufficient_evidence,
     bounded_review_repair_exhaustion_answer, classify_implementation_intent,
     classify_read_only_intent, concrete_review_answer_problem, deepen_review_nudge,
     implementation_missing_validation_nudge, implementation_text_tool_nudge,
     implementation_turn_prompt, inspected_insufficient_repair_limit, inspected_paths_for_prompt,
-    insufficient_after_incomplete_security_search, insufficient_after_no_review_evidence,
-    insufficient_after_repeated_search, insufficient_after_review_repair_template,
-    insufficient_after_security_scope_overclaim, no_evidence_review_nudge,
-    read_only_blocked_tool_result, read_only_blocks_tool, read_only_turn_prompt,
-    should_bootstrap_gpu_training_estimator, should_deepen_review,
-    should_nudge_gap_search_overclaim, should_nudge_no_evidence_review,
-    should_nudge_read_after_repeated_search, should_nudge_read_after_search_final,
-    should_nudge_security_broad_search, should_nudge_security_scope,
-    should_reject_review_repair_template, summarize_inspected_evidence_nudge,
+    inspection_sprawl_exhausted, insufficient_after_incomplete_security_search,
+    insufficient_after_no_review_evidence, insufficient_after_repeated_search,
+    insufficient_after_review_repair_template, insufficient_after_security_scope_overclaim,
+    no_evidence_review_nudge, read_only_blocked_tool_result, read_only_blocks_tool,
+    read_only_turn_prompt, should_bootstrap_gpu_training_estimator, should_deepen_review,
+    should_nudge_gap_search_overclaim, should_nudge_inspection_sprawl,
+    should_nudge_no_evidence_review, should_nudge_read_after_repeated_search,
+    should_nudge_read_after_search_final, should_nudge_security_broad_search,
+    should_nudge_security_scope, should_reject_review_repair_template,
+    summarize_inspected_evidence_nudge,
 };
 use crate::transcript::NudgeKind;
 use crate::verify::{Snapshot, Verifier, VerifyOutcome, stage_guidance};
@@ -307,6 +308,7 @@ impl crate::Agent {
         let mut protocol_retries = 0u32;
         let mut protocol_text_fallbacks = 0u32;
         let mut text_tool_fallback_next = false;
+        let mut force_text_answer_next = false;
         // Whether the turn ended because the model kept re-issuing the exact
         // same tool call through the whole repeat-nudge budget (drives the
         // incomplete notice and skips the finalization recap).
@@ -415,19 +417,21 @@ impl crate::Agent {
 
                 let request_text_tool_fallback = text_tool_fallback_next;
                 text_tool_fallback_next = false;
+                let request_text_answer = force_text_answer_next;
+                force_text_answer_next = false;
 
                 // After a continue-nudge, force this round to call a tool rather
                 // than narrate again or come back empty. Only when tools are
                 // freely available (Auto): never override an intentional
                 // ChatOnly/ReadOnly restriction, and Required already forces.
-                let tool_mode = if request_text_tool_fallback {
+                let tool_mode = if request_text_tool_fallback || request_text_answer {
                     ToolMode::ChatOnly
                 } else if force_tools_next && self.config.tool_mode == ToolMode::Auto {
                     ToolMode::Required
                 } else {
                     self.config.tool_mode
                 };
-                let tool_availability_mode = if request_text_tool_fallback {
+                let tool_availability_mode = if request_text_tool_fallback || request_text_answer {
                     ToolMode::ChatOnly
                 } else if read_only_intent.is_some()
                     && !matches!(self.config.tool_mode, ToolMode::ChatOnly)
@@ -738,17 +742,21 @@ impl crate::Agent {
                     break false;
                 }
 
-                let calls: Vec<(String, String, String)> = completion
-                    .tool_calls()
-                    .into_iter()
-                    .map(|c| {
-                        (
-                            c.id.to_string(),
-                            c.name.to_string(),
-                            c.arguments.to_string(),
-                        )
-                    })
-                    .collect();
+                let calls: Vec<(String, String, String)> = if request_text_answer {
+                    Vec::new()
+                } else {
+                    completion
+                        .tool_calls()
+                        .into_iter()
+                        .map(|c| {
+                            (
+                                c.id.to_string(),
+                                c.name.to_string(),
+                                c.arguments.to_string(),
+                            )
+                        })
+                        .collect()
+                };
 
                 // Fallback for local models (Ollama, llama.cpp, etc.) that emit
                 // tool calls as text — raw JSON like {"name":"bash","arguments":…}
@@ -757,7 +765,7 @@ impl crate::Agent {
                 // for tool-call JSON and promote any matches to real ToolCall
                 // blocks so they actually execute. The raw JSON is stripped from
                 // the recorded text so history stays clean.
-                let calls = if calls.is_empty() {
+                let calls = if calls.is_empty() && !request_text_answer {
                     let full_text: String = completion
                         .content
                         .iter()
@@ -889,14 +897,14 @@ impl crate::Agent {
                         stalled_repeating = true;
                         let nudge = if stale_background_handle_call {
                             if has_background_output_poll {
-                                ui.status(&format!(
+                                ui.nudge(&format!(
                                     "the model kept polling stale background process handles — \
                                      nudging it to stop polling them ({repeat_nudges}/{})",
                                     self.config.max_repeat_nudges
                                 ));
                                 "The background process handle you just polled is completed, missing, or pruned, so polling it again cannot produce new output. Do not call bash_output for that handle again. Continue from the available output, restart the command if you still need it, or finish with the current result.".to_string()
                             } else {
-                                ui.status(&format!(
+                                ui.nudge(&format!(
                                     "the model kept using stale background process handles — \
                                      nudging it to stop using them ({repeat_nudges}/{})",
                                     self.config.max_repeat_nudges
@@ -907,10 +915,10 @@ impl crate::Agent {
                             read_only_intent,
                             &evidence,
                         ) {
-                            ui.status(&format!(
-                                    "the model re-ran the same search — nudging it to read a matching file ({repeat_nudges}/{})",
-                                    self.config.max_repeat_nudges
-                                ));
+                            ui.nudge(&format!(
+                                        "the model re-ran the same search — nudging it to read a matching file ({repeat_nudges}/{})",
+                                        self.config.max_repeat_nudges
+                                    ));
                             READ_AFTER_SEARCH_NUDGE.to_string()
                         } else if implementation_intent.is_some()
                             && no_new_evidence
@@ -927,7 +935,7 @@ impl crate::Agent {
                             // tools (e.g. re-running a bash command) fall through
                             // to the generic REPEAT_NUDGE below, which says "don't
                             // re-run that command" — the right message for that case.
-                            ui.status(&format!(
+                            ui.nudge(&format!(
                                 "the model re-read files it already inspected — their contents are \
                                  already above; nudging it to act on them ({repeat_nudges}/{})",
                                 self.config.max_repeat_nudges
@@ -955,14 +963,14 @@ If the task is already complete, stop and give your final recap."
                                 )
                             }
                         } else if no_new_evidence && !exact_repeat {
-                            ui.status(&format!(
+                            ui.nudge(&format!(
                                 "the model re-read files it already inspected — their contents are \
                                  already above; nudging it to act on them ({repeat_nudges}/{})",
                                 self.config.max_repeat_nudges
                             ));
                             REREAD_NUDGE.to_string()
                         } else {
-                            ui.status(&format!(
+                            ui.nudge(&format!(
                                 "the model re-ran the same command — its output is already above; \
                                      nudging it to act on it ({repeat_nudges}/{})",
                                 self.config.max_repeat_nudges
@@ -984,7 +992,7 @@ If the task is already complete, stop and give your final recap."
                         && let Some(insufficient) = insufficient_after_repeated_search(&evidence)
                     {
                         stalled_unfinished = true;
-                        ui.status(
+                        ui.nudge(
                             "review repeated the same search without reading files; returning an insufficient-evidence answer",
                         );
                         ui.assistant_text(insufficient);
@@ -997,7 +1005,7 @@ If the task is already complete, stop and give your final recap."
                         && (evidence.saw_read || evidence.saw_search)
                     {
                         stalled_unfinished = true;
-                        ui.status(
+                        ui.nudge(
                             "review repeated the same command after inspection; returning a bounded evidence summary",
                         );
                         let insufficient = bounded_review_repair_exhaustion_answer(
@@ -1027,7 +1035,7 @@ If the task is already complete, stop and give your final recap."
                         let incomplete = "Implementation incomplete: the model inspected the workspace \
                         but kept re-reading files instead of making edits, so no file changes were made. \
                         /retry, or send 'continue' to resume.";
-                        ui.status(
+                        ui.nudge(
                             "implementation kept re-reading without editing; no file changes were made",
                         );
                         ui.assistant_text(incomplete);
@@ -1047,6 +1055,47 @@ If the task is already complete, stop and give your final recap."
                 stalled_repeating = false;
                 prev_call_sig = Some(call_sig);
                 prev_added_no_evidence = no_new_evidence;
+
+                // Inspection-sprawl guard: a read-only review turn that keeps
+                // reading *distinct* files (each a new inspection signature, so
+                // the repeat/cycle guard above never fires) without ever
+                // producing findings. Once enough evidence has accumulated,
+                // nudge the model to answer; if it keeps sprawling past the
+                // budget, hard-stop with a bounded-evidence summary. This is
+                // the only guard that catches the "read 100 files, never
+                // answer" failure mode — all review-quality guards fire only
+                // on a final text answer, which never comes while the model
+                // keeps issuing tool calls.
+                if inspection_sprawl_exhausted(read_only_intent, &evidence, &calls) {
+                    stalled_unfinished = true;
+                    ui.nudge(
+                        "review kept inspecting new files without producing findings; returning a bounded evidence summary",
+                    );
+                    let insufficient = bounded_review_repair_exhaustion_answer(
+                        read_only_intent.expect("sprawl guard only fires on read-only review"),
+                        &evidence,
+                        "the model kept inspecting new files without producing findings tied to the evidence already gathered",
+                    );
+                    ui.assistant_text(&insufficient);
+                    ui.assistant_end();
+                    self.messages
+                        .push_assistant(vec![Content::Text(insufficient)]);
+                    break false;
+                }
+                if should_nudge_inspection_sprawl(read_only_intent, &evidence, &calls) {
+                    evidence.inspection_sprawl_nudges =
+                        evidence.inspection_sprawl_nudges.saturating_add(1);
+                    force_text_answer_next = true;
+                    ui.nudge(&format!(
+                        "review inspected {} files/searches without answering; nudging it to produce findings",
+                        evidence.inspection_count()
+                    ));
+                    self.messages
+                        .push_assistant_text_only(std::mem::take(&mut completion.content));
+                    self.messages
+                        .push_nudge(NudgeKind::Continue, INSPECTION_SPRAWL_NUDGE);
+                    continue;
+                }
 
                 // This round's assistant text, joined and captured before the
                 // content is moved into history. Used both to detect a content-less
@@ -1111,22 +1160,53 @@ If the task is already complete, stop and give your final recap."
                     // Q&A answer. Bounded so it can't loop forever.
                     let looks_unfinished = looks_like_unfinished_step(&assistant_text);
                     let plan_incomplete = plan_has_pending_steps(&self.last_plan);
-                    if read_only_intent.is_some()
+                    if let Some(intent) = read_only_intent
                         && (looks_unfinished || plan_incomplete)
-                        && silent_continues < self.config.max_silent_continues
                     {
-                        self.messages
-                            .push_assistant(std::mem::take(&mut completion.content));
-                        silent_continues += 1;
-                        continue_total_nudges += 1;
-                        force_tools_next = true;
-                        let nudge = if plan_incomplete && !looks_unfinished {
-                            PLAN_CONTINUE_NUDGE
-                        } else {
-                            SILENT_CONTINUE_NUDGE
-                        };
-                        self.messages.push_nudge(NudgeKind::Continue, nudge);
-                        continue;
+                        if evidence.inspection_sprawl_nudges > 0 {
+                            if evidence.quality_repair_nudges < 2 {
+                                evidence.quality_repair_nudges += 1;
+                                continue_total_nudges += 1;
+                                force_text_answer_next = true;
+                                ui.nudge(
+                                    "review tried to continue inspecting after the sprawl limit; forcing a bounded answer from existing evidence",
+                                );
+                                self.messages
+                                    .push_assistant(std::mem::take(&mut completion.content));
+                                self.messages.push_nudge(
+                                    NudgeKind::Continue,
+                                    summarize_inspected_evidence_nudge(intent, &evidence),
+                                );
+                                continue;
+                            }
+
+                            stalled_unfinished = true;
+                            let insufficient = bounded_review_repair_exhaustion_answer(
+                                intent,
+                                &evidence,
+                                "the final answer kept proposing further inspection after the inspection-sprawl limit",
+                            );
+                            ui.assistant_text(&insufficient);
+                            ui.assistant_end();
+                            self.messages
+                                .push_assistant(vec![Content::Text(insufficient)]);
+                            break false;
+                        }
+
+                        if silent_continues < self.config.max_silent_continues {
+                            self.messages
+                                .push_assistant(std::mem::take(&mut completion.content));
+                            silent_continues += 1;
+                            continue_total_nudges += 1;
+                            force_tools_next = true;
+                            let nudge = if plan_incomplete && !looks_unfinished {
+                                PLAN_CONTINUE_NUDGE
+                            } else {
+                                SILENT_CONTINUE_NUDGE
+                            };
+                            self.messages.push_nudge(NudgeKind::Continue, nudge);
+                            continue;
+                        }
                     }
                     if implementation_intent.is_some() && !implementation_tracker.mutation_seen {
                         if implementation_tracker.no_change_nudges < 2 {
@@ -1136,7 +1216,7 @@ If the task is already complete, stop and give your final recap."
                             let use_text_fallback = implementation_tracker.no_change_nudges >= 2;
                             force_tools_next = !use_text_fallback;
                             text_tool_fallback_next = use_text_fallback;
-                            ui.status(
+                            ui.nudge(
 	                                "implementation answer had no file changes; nudging the model to edit or scaffold",
 	                            );
                             self.messages
@@ -1152,7 +1232,7 @@ If the task is already complete, stop and give your final recap."
 
                         stalled_unfinished = true;
                         let incomplete = "Implementation incomplete: the model inspected the workspace but did not make successful file changes, so I am not treating this as completed.";
-                        ui.status("implementation still had no file changes after repair");
+                        ui.nudge("implementation still had no file changes after repair");
                         ui.assistant_text(incomplete);
                         ui.assistant_end();
                         self.messages
@@ -1171,7 +1251,7 @@ If the task is already complete, stop and give your final recap."
                                 implementation_tracker.scaffold_only_nudges >= 2;
                             force_tools_next = !use_text_fallback;
                             text_tool_fallback_next = use_text_fallback;
-                            ui.status(
+                            ui.nudge(
 	                                "implementation only scaffolded setup files; nudging the model to edit source files",
 	                            );
                             self.messages
@@ -1187,7 +1267,7 @@ If the task is already complete, stop and give your final recap."
 
                         stalled_unfinished = true;
                         let incomplete = "Implementation incomplete: only project scaffolding or setup changes were detected, with no source/config edit implementing the requested behavior.";
-                        ui.status(
+                        ui.nudge(
                             "implementation still only had scaffold/setup changes after repair",
                         );
                         ui.assistant_text(incomplete);
@@ -1208,7 +1288,7 @@ If the task is already complete, stop and give your final recap."
                                 implementation_tracker.missing_validation_nudges >= 2;
                             force_tools_next = !use_text_fallback;
                             text_tool_fallback_next = use_text_fallback;
-                            ui.status(
+                            ui.nudge(
 	                                "implementation changed files without validation; nudging the model to run tests or build",
 	                            );
                             self.messages
@@ -1226,7 +1306,7 @@ If the task is already complete, stop and give your final recap."
 
                         stalled_unfinished = true;
                         let incomplete = "Implementation incomplete: files were changed, but no successful validation command ran after the last change, so I am not treating this as completed.";
-                        ui.status("implementation still lacked validation after repair");
+                        ui.nudge("implementation still lacked validation after repair");
                         ui.assistant_text(incomplete);
                         ui.assistant_end();
                         self.messages
@@ -1238,7 +1318,7 @@ If the task is already complete, stop and give your final recap."
                         if evidence.quality_repair_nudges == 0 {
                             evidence.quality_repair_nudges += 1;
                             force_tools_next = true;
-                            ui.status(
+                            ui.nudge(
                                 "review answer had no inspected evidence; nudging the model to inspect before answering",
                             );
                             self.messages
@@ -1251,7 +1331,7 @@ If the task is already complete, stop and give your final recap."
                         }
 
                         stalled_unfinished = true;
-                        ui.status(
+                        ui.nudge(
                             "review still had no inspected evidence after repair; returning an insufficient-evidence answer",
                         );
                         let insufficient = insufficient_after_no_review_evidence();
@@ -1272,7 +1352,7 @@ If the task is already complete, stop and give your final recap."
                         {
                             evidence.quality_repair_nudges += 1;
                             force_tools_next = true;
-                            ui.status(
+                            ui.nudge(
                                 "security review reported insufficient evidence before searching all required pattern families; nudging the model to broaden the search",
                             );
                             self.messages
@@ -1285,7 +1365,8 @@ If the task is already complete, stop and give your final recap."
                             < inspected_insufficient_repair_limit(intent)
                         {
                             evidence.quality_repair_nudges += 1;
-                            ui.status(
+                            force_text_answer_next = true;
+                            ui.nudge(
                                 "review reported insufficient evidence after inspection; nudging the model to summarize inspected files",
                             );
                             self.messages
@@ -1337,7 +1418,7 @@ If the task is already complete, stop and give your final recap."
                         if evidence.quality_repair_nudges == 0 {
                             evidence.quality_repair_nudges += 1;
                             force_tools_next = true;
-                            ui.status(
+                            ui.nudge(
                                 "review evidence was only a listing; nudging the model to inspect files or search results",
                             );
                             self.messages
@@ -1350,7 +1431,7 @@ If the task is already complete, stop and give your final recap."
                         }
 
                         stalled_unfinished = true;
-                        ui.status(
+                        ui.nudge(
                             "review still had only listing evidence after repair; returning an insufficient-evidence answer",
                         );
                         let insufficient = "Insufficient evidence: only a directory listing was inspected, so I cannot make file-specific review findings without targeted searches or file reads.";
@@ -1368,7 +1449,7 @@ If the task is already complete, stop and give your final recap."
                         if evidence.quality_repair_nudges < 1 {
                             evidence.quality_repair_nudges += 1;
                             force_tools_next = true;
-                            ui.status(
+                            ui.nudge(
                                 "review had targeted search but no file reads; nudging the model to read matching files",
                             );
                             self.messages
@@ -1379,7 +1460,7 @@ If the task is already complete, stop and give your final recap."
                         }
 
                         stalled_unfinished = true;
-                        ui.status(
+                        ui.nudge(
                             "review still had targeted search but no file reads after repair; returning an insufficient-evidence answer",
                         );
                         let insufficient = insufficient_after_repeated_search(&evidence)
@@ -1398,7 +1479,7 @@ If the task is already complete, stop and give your final recap."
                         if evidence.quality_repair_nudges < 3 {
                             evidence.quality_repair_nudges += 1;
                             force_tools_next = true;
-                            ui.status(
+                            ui.nudge(
                                 "security review missed required pattern families; nudging the model to broaden the search",
                             );
                             self.messages
@@ -1409,7 +1490,7 @@ If the task is already complete, stop and give your final recap."
                         }
 
                         stalled_unfinished = true;
-                        ui.status(
+                        ui.nudge(
                             "security review still missed required pattern families after repair; returning an insufficient-evidence answer",
                         );
                         let reason = insufficient_after_incomplete_security_search(&evidence)
@@ -1468,7 +1549,7 @@ If the task is already complete, stop and give your final recap."
                     ) {
                         if evidence.quality_repair_nudges < 2 {
                             evidence.quality_repair_nudges += 1;
-                            ui.status(
+                            ui.nudge(
                                 "gap answer contradicted search matches; nudging the model to bound claims to inspected evidence",
                             );
                             self.messages
@@ -1479,7 +1560,7 @@ If the task is already complete, stop and give your final recap."
                         }
 
                         stalled_unfinished = true;
-                        ui.status(
+                        ui.nudge(
                             "gap answer still overclaimed after search matches; returning a bounded evidence summary",
                         );
                         let insufficient = if let Some(intent) = read_only_intent {
@@ -1502,7 +1583,8 @@ If the task is already complete, stop and give your final recap."
                     {
                         if evidence.quality_repair_nudges < 2 {
                             evidence.quality_repair_nudges += 1;
-                            ui.status(problem.status());
+                            force_text_answer_next = true;
+                            ui.nudge(problem.status());
                             self.messages
                                 .push_assistant(std::mem::take(&mut completion.content));
                             self.messages
@@ -1511,7 +1593,7 @@ If the task is already complete, stop and give your final recap."
                         }
 
                         stalled_unfinished = true;
-                        ui.status(problem.exhausted_status());
+                        ui.nudge(problem.exhausted_status());
                         let insufficient = if let Some(intent) = read_only_intent {
                             bounded_review_repair_exhaustion_answer(
                                 intent,

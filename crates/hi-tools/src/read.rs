@@ -12,50 +12,75 @@ use crate::condense::truncate;
 use crate::edit::sh_quote;
 use crate::paths::{READ_CACHE, cache_key, is_vcs_metadata_dir, validate_workspace_path};
 
-const DEFAULT_READ_LIMIT: usize = 240;
+const DEFAULT_READ_LIMIT: usize = 2000;
 
 /// Run the `read` tool against `arguments` (already-parsed JSON).
+///
+/// Accepts either a single `path` or a `paths` array. When `paths` is given,
+/// every file is read and returned concatenated, each headed by its path —
+/// so a model can pull a whole directory of files in one call instead of
+/// one call per file. A per-file separator makes the boundary unambiguous.
 pub(crate) async fn run_read(arguments: &str) -> Result<ToolOutput> {
     let args: ReadArgs = crate::tools::parse(arguments)?;
-    validate_workspace_path(&args.path)?;
-    // Check the per-turn cache first — models often re-read files. The guard
-    // is dropped before any await so we never hold a std Mutex across an await
-    // point (clippy::await_holding_lock): the cache lookup is a quick clone,
-    // then the lock is released.
-    let cached = {
-        #[allow(unused_mut)]
-        let mut cache = READ_CACHE.lock().unwrap();
-        cache.get(&cache_key(&args.path)).cloned()
-    };
-    let content = if let Some(cached) = cached {
-        cached
-    } else {
-        // Read as bytes first so we can detect binary files and
-        // give a clear message instead of an opaque UTF-8 error.
-        let bytes = tokio::fs::read(&args.path)
-            .await
-            .with_context(|| format!("reading {}", args.path))?;
-        if is_binary(&bytes) {
-            bail!(
-                "{} is a binary file ({} bytes) — the `read` tool is for text. \
-                 Use `bash` to inspect it (e.g. `file {}`, `xxd {} | head`).",
-                args.path,
-                bytes.len(),
-                sh_quote(&args.path),
-                sh_quote(&args.path)
-            );
+    // Multi-file mode: read each path and join with a header per file.
+    if let Some(paths) = args.paths.as_deref() {
+        if paths.is_empty() {
+            bail!("`paths` must list at least one path");
         }
-        let content = String::from_utf8_lossy(&bytes).into_owned();
-        if let Ok(mut cache) = READ_CACHE.lock() {
-            cache.insert(cache_key(&args.path), content.clone());
+        let mut out = String::new();
+        for path in paths {
+            validate_workspace_path(path)?;
+            let body = read_one(path).await?;
+            out.push_str(&format!("──── {path} ────\n"));
+            out.push_str(&truncate(&format_read(&body, args.offset, args.limit)));
+            out.push('\n');
         }
-        content
-    };
+        return Ok(ToolOutput::plain(out));
+    }
+    // Single-file mode.
+    let path = args
+        .path
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("`read` requires `path` or `paths`"))?;
+    validate_workspace_path(path)?;
+    let content = read_one(path).await?;
     Ok(ToolOutput::plain(truncate(&format_read(
         &content,
         args.offset,
         args.limit,
     ))))
+}
+
+/// Read one file as UTF-8 text, using the per-turn cache and bailing clearly
+/// on binary files. Shared by the single- and multi-path read paths.
+async fn read_one(path: &str) -> Result<String> {
+    let cached = {
+        #[allow(unused_mut)]
+        let mut cache = READ_CACHE.lock().unwrap();
+        cache.get(&cache_key(path)).cloned()
+    };
+    if let Some(cached) = cached {
+        return Ok(cached);
+    }
+    // Read as bytes first so we can detect binary files and
+    // give a clear message instead of an opaque UTF-8 error.
+    let bytes = tokio::fs::read(path)
+        .await
+        .with_context(|| format!("reading {path}"))?;
+    if is_binary(&bytes) {
+        bail!(
+            "{path} is a binary file ({} bytes) — the `read` tool is for text. \
+             Use `bash` to inspect it (e.g. `file {}`, `xxd {} | head`).",
+            bytes.len(),
+            sh_quote(path),
+            sh_quote(path)
+        );
+    }
+    let content = String::from_utf8_lossy(&bytes).into_owned();
+    if let Ok(mut cache) = READ_CACHE.lock() {
+        cache.insert(cache_key(path), content.clone());
+    }
+    Ok(content)
 }
 
 /// Run the `list` tool against `arguments` (already-parsed JSON).
@@ -487,11 +512,20 @@ pub(crate) async fn read_text_file(path: &str) -> Result<String> {
 
 #[derive(Deserialize)]
 pub(crate) struct ReadArgs {
-    pub path: String,
-    /// 1-based first line to return (default: start of file).
+    /// Path to a single file. Optional if `paths` is given instead.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Multiple paths to read in one call. Each is returned under a header.
+    /// Use this to pull a whole directory of files at once instead of one
+    /// call per file.
+    #[serde(default)]
+    pub paths: Option<Vec<String>>,
+    /// 1-based first line to return (default: start of file). Applied to
+    /// every file when `paths` is used.
     #[serde(default)]
     pub offset: Option<usize>,
-    /// Max number of lines to return (default: to end of file).
+    /// Max number of lines to return per file (default: 2000, i.e. the whole
+    /// file for most source files). Page with a smaller `limit` + `offset`.
     #[serde(default)]
     pub limit: Option<usize>,
 }

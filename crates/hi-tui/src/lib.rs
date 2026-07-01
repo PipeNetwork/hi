@@ -244,6 +244,21 @@ pub(crate) enum TranscriptEntry {
     },
 }
 
+/// A run of consecutive same-tool exploration results (read/list/grep) being
+/// collapsed into one transcript line, so a burst of reads renders as
+/// `⏺ read 6 files · 743 lines` instead of six separate lines.
+#[derive(Clone, Debug)]
+pub(crate) struct ExploreRun {
+    /// The tool name (`read`/`list`/`grep`).
+    pub tool: String,
+    /// How many results have been folded into this run.
+    pub count: u32,
+    /// Total lines across all folded results.
+    pub lines: u32,
+    /// Whether every result so far was empty (`(no output)`).
+    pub all_empty: bool,
+}
+
 impl TranscriptEntry {
     /// Flatten this entry into display lines under the current `show_reasoning`
     /// setting. A collapsed reasoning block is one dim summary line; expanded,
@@ -352,6 +367,13 @@ pub(crate) struct App {
     /// while the model — not a tool — is the active party.
     pub(crate) current_tool: Option<String>,
     pub(crate) current_tool_started: Option<Instant>,
+    /// For read/list/grep we defer the `⏺` header until the result lands, so the
+    /// file name and line count collapse into one transcript line instead of two.
+    pub(crate) pending_explore_label: Option<String>,
+    /// A run of consecutive same-tool explore results being collapsed into one
+    /// transcript line. `None` when the last transcript line isn't an explore
+    /// result (or a new run hasn't started). Reset by any non-explore event.
+    pub(crate) explore_run: Option<ExploreRun>,
     /// Lines typed while a turn was running, to run once it finishes (FIFO).
     pub(crate) queue: VecDeque<String>,
     /// The last message actually sent to the model, for `/retry`.

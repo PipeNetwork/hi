@@ -385,21 +385,6 @@ fn usage_event_updates_live_counter_and_working_line() {
 }
 
 #[test]
-fn report_tokens_pushes_cumulative_line() {
-    // `/tokens` mid-turn reads the mirrored counter (the agent is borrowed).
-    let mut app = test_app("openai", "gpt-4o");
-    app.apply(UiEvent::Usage {
-        input: 1000,
-        output: 250,
-        ctx_used: 0,
-        ctx_window: None,
-    });
-    app.report_tokens();
-    let line = app.transcript.last().unwrap().text();
-    assert_eq!(line, "cumulative: 1000 in · 250 out · 1250 total");
-}
-
-#[test]
 fn renders_queued_commands_while_working() {
     let mut app = test_app("openai", "gpt-4o");
     app.set_working(true);
@@ -1039,6 +1024,101 @@ fn empty_tool_result_is_visible() {
     assert!(
         rendered.iter().any(|line| line.contains("(no output)")),
         "transcript: {rendered:?}"
+    );
+}
+
+#[test]
+fn explore_tools_collapse_header_and_line_count_into_one_line() {
+    let mut app = test_app("openai", "gpt-4o");
+    // A read call: header is deferred until the result, then both collapse.
+    app.apply(UiEvent::ToolCall(
+        "read".into(),
+        r#"{"path":"src/main.rs"}"#.into(),
+    ));
+    let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
+    // No header emitted yet — it waits for the result.
+    assert!(
+        !lines.iter().any(|l| l.contains("⏺ read")),
+        "no deferred header before result: {lines:?}"
+    );
+    app.apply(UiEvent::ToolResult("read".into(), "a\nb\nc\n".into()));
+    let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
+    // Exactly one line, combining the header and the count.
+    assert!(
+        lines.iter().any(|l| l == "⏺ read src/main.rs · 3 lines"),
+        "collapsed read line: {lines:?}"
+    );
+    assert_eq!(
+        lines.iter().filter(|l| l.contains("⏺ read")).count(),
+        1,
+        "exactly one read header line: {lines:?}"
+    );
+
+    // grep with no matches shows "(no output)" in the same collapsed line.
+    app.apply(UiEvent::ToolCall(
+        "grep".into(),
+        r#"{"pattern":"foo"}"#.into(),
+    ));
+    app.apply(UiEvent::ToolResult("grep".into(), String::new()));
+    let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
+    assert!(
+        lines.iter().any(|l| l == "⏺ grep foo · (no output)"),
+        "collapsed grep empty line: {lines:?}"
+    );
+}
+
+#[test]
+fn consecutive_same_tool_explore_results_merge_into_one_line() {
+    let mut app = test_app("openai", "gpt-4o");
+    // Three reads in a row should collapse to one summary line.
+    app.apply(UiEvent::ToolCall(
+        "read".into(),
+        r#"{"path":"a.rs"}"#.into(),
+    ));
+    app.apply(UiEvent::ToolResult("read".into(), "a\nb\n".into()));
+    app.apply(UiEvent::ToolCall(
+        "read".into(),
+        r#"{"path":"b.rs"}"#.into(),
+    ));
+    app.apply(UiEvent::ToolResult("read".into(), "c\nd\ne\n".into()));
+    app.apply(UiEvent::ToolCall(
+        "read".into(),
+        r#"{"path":"c.rs"}"#.into(),
+    ));
+    app.apply(UiEvent::ToolResult("read".into(), "f\n".into()));
+    let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
+    // Exactly one read line, summarizing all three.
+    assert_eq!(
+        lines.iter().filter(|l| l.contains("⏺ read")).count(),
+        1,
+        "one merged read line: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l == "⏺ read 3 files · 6 lines"),
+        "merged summary: {lines:?}"
+    );
+
+    // A non-explore tool between reads breaks the run.
+    app.apply(UiEvent::ToolCall(
+        "edit".into(),
+        r#"{"path":"a.rs"}"#.into(),
+    ));
+    app.apply(UiEvent::ToolResult("edit".into(), "ok".into()));
+    app.apply(UiEvent::ToolCall(
+        "read".into(),
+        r#"{"path":"d.rs"}"#.into(),
+    ));
+    app.apply(UiEvent::ToolResult("read".into(), "x\ny\n".into()));
+    let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
+    // Now two read lines: the merged 3-file run and a fresh single read.
+    assert_eq!(
+        lines.iter().filter(|l| l.contains("⏺ read")).count(),
+        2,
+        "run broken by edit: {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l == "⏺ read d.rs · 2 lines"),
+        "fresh read after break: {lines:?}"
     );
 }
 

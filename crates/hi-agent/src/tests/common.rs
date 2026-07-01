@@ -172,6 +172,9 @@ impl Ui for RecordingUi {
     fn status(&mut self, s: &str) {
         self.statuses.push(s.to_string());
     }
+    fn nudge(&mut self, s: &str) {
+        self.statuses.push(s.to_string());
+    }
     fn turn_end(&mut self, s: &str) {
         self.turn_ends.push(s.to_string());
     }
@@ -310,6 +313,11 @@ impl Ui for RecUi {
             .push((name.to_string(), result.to_string()));
     }
     fn status(&mut self, t: &str) {
+        self.statuses.push(t.to_string());
+    }
+    fn nudge(&mut self, t: &str) {
+        // Steering diagnostics share the status capture so tests can assert on
+        // them, even though real frontends ignore `nudge`.
         self.statuses.push(t.to_string());
     }
     fn usage(

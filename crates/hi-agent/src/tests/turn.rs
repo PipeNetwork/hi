@@ -1900,3 +1900,90 @@ async fn zero_max_steps_is_clamped_to_one_model_round() {
         ui.statuses
     );
 }
+
+#[tokio::test]
+async fn read_only_review_sprawl_is_bounded() {
+    // The "inspection sprawl" failure mode: a read-only review turn reads many
+    // *distinct* files (each a new inspection signature, so the repeat/cycle
+    // guard never fires) without ever producing findings. Without the sprawl
+    // guard this churns until max_steps. The guard should nudge once past the
+    // threshold, then force the next model round to answer without tools.
+    use crate::steering::INSPECTION_SPRAWL_THRESHOLD;
+
+    // Create enough real temp files that the reads succeed and count as evidence.
+    let n_files = (INSPECTION_SPRAWL_THRESHOLD + 1) as usize;
+    let paths: Vec<String> = (0..n_files)
+        .map(|i| {
+            let p = temp_file(&format!("sprawl-{i}"));
+            std::fs::write(&p, format!("file {i} contents\n")).unwrap();
+            p.to_string_lossy().to_string()
+        })
+        .collect();
+
+    // Each initial round reads a distinct file — never a repeat, always "new
+    // evidence". The extra read attempt after the threshold should be blocked
+    // by the sprawl guard, then the final response answers from existing
+    // evidence.
+    let mut responses: Vec<Completion> = paths
+        .iter()
+        .map(|p| {
+            completion(
+                vec![Content::ToolCall {
+                    id: "r".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({ "path": p }).to_string(),
+                }],
+                1,
+                1,
+            )
+        })
+        .collect();
+    responses.push(completion(
+        vec![Content::Text(format!(
+            "Findings:\n- {}: Based on the inspected evidence, no major issue is confirmed from this file alone.\n\nEvidence:\n- Reviewed the inspected files gathered in this turn.\n\nLimits:\n- This is limited to inspected evidence and is not a full repository audit.",
+            paths[0]
+        ))],
+        1,
+        1,
+    ));
+
+    let modes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordToolModes {
+        responses: Mutex::new(responses),
+        modes: modes.clone(),
+    };
+    let mut agent = Agent::new(Box::new(provider), config());
+    let mut ui = RecUi::default();
+    agent.run_turn("review codebase", &mut ui).await.unwrap();
+
+    // The sprawl nudge fired once the threshold was crossed.
+    assert!(
+        ui.statuses.iter().any(|s| s.contains("without answering")),
+        "expected an inspection-sprawl nudge, got: {:?}",
+        ui.statuses
+    );
+    assert!(
+        !ui.assistant.contains("Bounded evidence summary"),
+        "sprawl should force an answer attempt before falling back: {}",
+        ui.assistant
+    );
+    assert!(
+        ui.assistant.contains("Findings:") && ui.assistant.contains(&paths[0]),
+        "expected the forced text answer as the final answer, got: {}",
+        ui.assistant
+    );
+    let modes = modes.lock().unwrap();
+    assert_eq!(
+        modes.last(),
+        Some(&ToolMode::ChatOnly),
+        "the post-sprawl answer round should be forced chat-only: {modes:?}"
+    );
+    assert!(
+        ui.turn_end.is_some(),
+        "the turn ended rather than churning to max_steps"
+    );
+
+    for p in &paths {
+        let _ = std::fs::remove_file(p);
+    }
+}
