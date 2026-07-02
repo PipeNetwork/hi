@@ -55,7 +55,7 @@ fn default_reference_models() -> Vec<String> {
 }
 
 fn default_reference_timeout_seconds() -> u64 {
-    45
+    90
 }
 
 fn default_reference_max_tokens() -> u32 {
