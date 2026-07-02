@@ -78,6 +78,90 @@ pub fn provider_error_kind(err: &anyhow::Error) -> Option<ProviderErrorKind> {
     err.downcast_ref::<ProviderError>().map(|e| e.kind)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutputCapError {
+    pub available_output_tokens: Option<u32>,
+}
+
+pub fn provider_output_cap_error(err: &anyhow::Error) -> Option<OutputCapError> {
+    output_cap_error_from_text(&provider_error_text(err))
+}
+
+pub fn provider_retry_after_seconds(err: &anyhow::Error) -> Option<u64> {
+    retry_after_seconds_from_text(&provider_error_text(err))
+}
+
+pub fn provider_route_error_is_retryable(err: &anyhow::Error) -> bool {
+    let Some(kind) = provider_error_kind(err) else {
+        return false;
+    };
+    let text = provider_error_text(err);
+    let lower = text.to_ascii_lowercase();
+    match kind {
+        ProviderErrorKind::CapacityUnavailable => true,
+        ProviderErrorKind::ModelUnavailable => {
+            if mentions_any(
+                &lower,
+                &["unknown model", "model not supported", "model not enabled"],
+            ) {
+                return false;
+            }
+            provider_retry_after_seconds(err).is_some()
+                || json_bool_field(&text, "retryable") == Some(true)
+                || mentions_any(
+                    &lower,
+                    &[
+                        "temporarily unavailable",
+                        "temporary unavailable",
+                        "try again",
+                    ],
+                )
+        }
+        _ => false,
+    }
+}
+
+pub fn provider_error_is_temporary_overload(err: &anyhow::Error) -> bool {
+    let Some(kind) = provider_error_kind(err) else {
+        return false;
+    };
+    if !matches!(
+        kind,
+        ProviderErrorKind::RateLimit
+            | ProviderErrorKind::CapacityUnavailable
+            | ProviderErrorKind::ModelUnavailable
+            | ProviderErrorKind::Outage
+    ) {
+        return false;
+    }
+
+    let text = provider_error_text(err);
+    let lower = text.to_ascii_lowercase();
+    if json_code_field(&text).is_some_and(|code| code == "1305") {
+        return true;
+    }
+    mentions_any(
+        &lower,
+        &[
+            "temporarily overloaded",
+            "temporary overload",
+            "provider overloaded",
+            "server overloaded",
+            "model overloaded",
+            "glm overloaded",
+            "glm-5.2 overloaded",
+            "temporarily at capacity",
+        ],
+    ) || (mentions_any(&lower, &["overloaded", "over capacity"])
+        && mentions_any(&lower, &["try again", "retry", "temporarily", "temporary"]))
+}
+
+fn provider_error_text(err: &anyhow::Error) -> String {
+    err.downcast_ref::<ProviderError>()
+        .map(|e| e.message.clone())
+        .unwrap_or_else(|| err.to_string())
+}
+
 pub fn provider_error_usage(err: &anyhow::Error) -> Usage {
     err.downcast_ref::<ProviderError>()
         .map(|e| e.usage)
@@ -164,6 +248,237 @@ fn default_available() -> bool {
     true
 }
 
+fn output_cap_error_from_text(text: &str) -> Option<OutputCapError> {
+    let lower = text.to_ascii_lowercase();
+    if let Some(available) = context_overflow_available_output_tokens(&lower) {
+        return Some(OutputCapError {
+            available_output_tokens: Some(available),
+        });
+    }
+
+    let names_output_limit = mentions_any(
+        &lower,
+        &[
+            "max_tokens",
+            "max output",
+            "max_output_tokens",
+            "maximum output",
+            "output tokens",
+            "in the completion",
+        ],
+    );
+    let names_limit_shape = mentions_any(
+        &lower,
+        &[
+            "less than or equal to",
+            "at most",
+            "max allowed",
+            "maximum allowed",
+            "must be between",
+            "should be [",
+            "range of input length",
+            "greater than",
+        ],
+    );
+    if !(names_output_limit && names_limit_shape) {
+        return None;
+    }
+
+    let limit = number_after_any(
+        &lower,
+        &[
+            "less than or equal to",
+            "at most",
+            "max allowed",
+            "maximum allowed",
+            "maximum of",
+            "max output tokens is",
+            "max_output_tokens is",
+        ],
+    )
+    .or_else(|| upper_bound_in_range(&lower))
+    .or_else(|| largest_number(&lower));
+
+    Some(OutputCapError {
+        available_output_tokens: limit,
+    })
+}
+
+fn context_overflow_available_output_tokens(lower: &str) -> Option<u32> {
+    if !mentions_any(lower, &["maximum context length", "context length"])
+        || !mentions_any(lower, &["in the completion", "output tokens"])
+    {
+        return None;
+    }
+    let max_context = number_after_any(
+        lower,
+        &[
+            "maximum context length is",
+            "maximum context length of",
+            "context length is",
+            "context window is",
+        ],
+    )?;
+    let prompt_tokens = number_before_any(
+        lower,
+        &[
+            " in the messages",
+            " input tokens",
+            " prompt tokens",
+            " tokens in the prompt",
+        ],
+    )?;
+    if prompt_tokens >= max_context {
+        return Some(0);
+    }
+    Some(max_context - prompt_tokens)
+}
+
+fn retry_after_seconds_from_text(text: &str) -> Option<u64> {
+    let value = json_value_from_text(text)?;
+    u64_field_recursive(&value, "retry_after_seconds")
+}
+
+fn json_bool_field(text: &str, key: &str) -> Option<bool> {
+    let value = json_value_from_text(text)?;
+    bool_field_recursive(&value, key)
+}
+
+fn json_code_field(text: &str) -> Option<String> {
+    let value = json_value_from_text(text)?;
+    code_field_recursive(&value)
+}
+
+fn json_value_from_text(text: &str) -> Option<serde_json::Value> {
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text) {
+        return Some(value);
+    }
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    if end <= start {
+        return None;
+    }
+    serde_json::from_str::<serde_json::Value>(&text[start..=end]).ok()
+}
+
+fn u64_field_recursive(value: &serde_json::Value, key: &str) -> Option<u64> {
+    match value {
+        serde_json::Value::Object(object) => object
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| object.values().find_map(|v| u64_field_recursive(v, key))),
+        serde_json::Value::Array(values) => values.iter().find_map(|v| u64_field_recursive(v, key)),
+        _ => None,
+    }
+}
+
+fn bool_field_recursive(value: &serde_json::Value, key: &str) -> Option<bool> {
+    match value {
+        serde_json::Value::Object(object) => object
+            .get(key)
+            .and_then(serde_json::Value::as_bool)
+            .or_else(|| object.values().find_map(|v| bool_field_recursive(v, key))),
+        serde_json::Value::Array(values) => {
+            values.iter().find_map(|v| bool_field_recursive(v, key))
+        }
+        _ => None,
+    }
+}
+
+fn code_field_recursive(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Object(object) => object
+            .get("code")
+            .and_then(|code| match code {
+                serde_json::Value::Number(number) => Some(number.to_string()),
+                serde_json::Value::String(string) => Some(string.clone()),
+                _ => None,
+            })
+            .or_else(|| object.values().find_map(code_field_recursive)),
+        serde_json::Value::Array(values) => values.iter().find_map(code_field_recursive),
+        _ => None,
+    }
+}
+
+fn mentions_any(text: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| text.contains(needle))
+}
+
+fn number_after_any(text: &str, markers: &[&str]) -> Option<u32> {
+    markers
+        .iter()
+        .filter_map(|marker| number_after(text, marker))
+        .next()
+}
+
+fn number_before_any(text: &str, markers: &[&str]) -> Option<u32> {
+    markers
+        .iter()
+        .filter_map(|marker| number_before(text, marker))
+        .next()
+}
+
+fn number_after(text: &str, marker: &str) -> Option<u32> {
+    let start = text.find(marker)? + marker.len();
+    let mut digits = String::new();
+    let mut seen_digit = false;
+    for ch in text[start..].chars() {
+        if ch.is_ascii_digit() {
+            seen_digit = true;
+            digits.push(ch);
+        } else if seen_digit && matches!(ch, ',' | '_') {
+            continue;
+        } else if seen_digit {
+            break;
+        }
+    }
+    digits.parse().ok()
+}
+
+fn number_before(text: &str, marker: &str) -> Option<u32> {
+    let end = text.find(marker)?;
+    let mut digits_rev = String::new();
+    let mut seen_digit = false;
+    for ch in text[..end].chars().rev() {
+        if ch.is_ascii_digit() {
+            seen_digit = true;
+            digits_rev.push(ch);
+        } else if seen_digit && matches!(ch, ',' | '_') {
+            continue;
+        } else if seen_digit {
+            break;
+        }
+    }
+    if digits_rev.is_empty() {
+        return None;
+    }
+    digits_rev.chars().rev().collect::<String>().parse().ok()
+}
+
+fn upper_bound_in_range(text: &str) -> Option<u32> {
+    let open = text.find('[')?;
+    let close = text[open..].find(']')? + open;
+    largest_number(&text[open..=close])
+}
+
+fn largest_number(text: &str) -> Option<u32> {
+    let mut best = None;
+    let mut current = String::new();
+    for ch in text.chars().chain(std::iter::once(' ')) {
+        if ch.is_ascii_digit() {
+            current.push(ch);
+        } else if matches!(ch, ',' | '_') && !current.is_empty() {
+            continue;
+        } else if !current.is_empty() {
+            if let Ok(value) = current.parse::<u32>() {
+                best = Some(best.map_or(value, |prev: u32| prev.max(value)));
+            }
+            current.clear();
+        }
+    }
+    best
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,6 +523,89 @@ mod tests {
             effective_coding_agent_max_tokens("ipop/coder-balanced", 2048, false, None),
             CODING_AGENT_MIN_OUTPUT_TOKENS
         );
+    }
+
+    #[test]
+    fn parses_output_cap_limit_from_provider_error_text() {
+        let err = ProviderError::new(
+            ProviderErrorKind::RequestTooLarge,
+            "API error 400 Bad Request: max_tokens must be less than or equal to 8192",
+        );
+
+        assert_eq!(
+            provider_output_cap_error(&anyhow::Error::new(err)),
+            Some(OutputCapError {
+                available_output_tokens: Some(8192)
+            })
+        );
+    }
+
+    #[test]
+    fn parses_output_cap_from_context_error_when_prompt_fits() {
+        let err = ProviderError::new(
+            ProviderErrorKind::RequestTooLarge,
+            "This model's maximum context length is 131072 tokens. However, you requested 140000 tokens (120000 in the messages, 20000 in the completion).",
+        );
+
+        assert_eq!(
+            provider_output_cap_error(&anyhow::Error::new(err)),
+            Some(OutputCapError {
+                available_output_tokens: Some(11072)
+            })
+        );
+    }
+
+    #[test]
+    fn does_not_parse_prompt_only_context_overflow_as_output_cap() {
+        let err = ProviderError::new(
+            ProviderErrorKind::RequestTooLarge,
+            "input exceeds the model context length; reduce prompt tokens",
+        );
+
+        assert_eq!(provider_output_cap_error(&anyhow::Error::new(err)), None);
+    }
+
+    #[test]
+    fn parses_retry_after_from_nested_api_error_json() {
+        let err = ProviderError::new(
+            ProviderErrorKind::ModelUnavailable,
+            r#"API error 503 Service Unavailable: {"error":{"message":"model temporarily unavailable","retry_after_seconds":10},"retryable":true}"#,
+        );
+
+        let err = anyhow::Error::new(err);
+        assert_eq!(provider_retry_after_seconds(&err), Some(10));
+        assert!(provider_route_error_is_retryable(&err));
+    }
+
+    #[test]
+    fn permanent_model_unavailable_is_not_retryable_route_error() {
+        let err = ProviderError::new(ProviderErrorKind::ModelUnavailable, "unknown model");
+
+        assert!(!provider_route_error_is_retryable(&anyhow::Error::new(err)));
+    }
+
+    #[test]
+    fn parses_external_glm_overload_as_temporary() {
+        let err = ProviderError::new(
+            ProviderErrorKind::RateLimit,
+            r#"API error 429 Too Many Requests: {"error":{"message":"glm-5.2 is temporarily overloaded","code":1305},"retry_after_seconds":0}"#,
+        );
+
+        let err = anyhow::Error::new(err);
+        assert!(provider_error_is_temporary_overload(&err));
+        assert_eq!(provider_retry_after_seconds(&err), Some(0));
+    }
+
+    #[test]
+    fn normal_rate_limit_is_not_provider_overload() {
+        let err = ProviderError::new(
+            ProviderErrorKind::RateLimit,
+            r#"API error 429 Too Many Requests: {"error":{"message":"quota exceeded","code":"rate_limit"}}"#,
+        );
+
+        assert!(!provider_error_is_temporary_overload(&anyhow::Error::new(
+            err
+        )));
     }
 }
 

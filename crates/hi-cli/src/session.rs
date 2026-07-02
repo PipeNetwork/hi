@@ -375,6 +375,7 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
                         cache_creation_tokens: 0,
                         input_includes_cache: false,
                         context_occupancy: input_tokens,
+                        rate_limits: None,
                     };
                 }
                 SessionMeta::Checkpoints { refs } => {
@@ -574,6 +575,7 @@ mod tests {
                     cache_creation_tokens: 0,
                     input_includes_cache: false,
                     context_occupancy: 123,
+                    rate_limits: None,
                 },
             )
             .unwrap();
@@ -745,6 +747,7 @@ mod tests {
                     cache_creation_tokens: 0,
                     input_includes_cache: false,
                     context_occupancy: 1,
+                    rate_limits: None,
                 },
             )
             .unwrap();

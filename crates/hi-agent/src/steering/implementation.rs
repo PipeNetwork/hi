@@ -120,6 +120,72 @@ pub(crate) fn implementation_tool_call_validates(name: &str, arguments: &str) ->
     shell_command_likely_validates(&command)
 }
 
+pub(crate) fn implementation_tool_result_landed_mutation(
+    name: &str,
+    arguments: &str,
+    output: &str,
+) -> bool {
+    if tool_result_is_failure(output) {
+        return false;
+    }
+    if filesystem_mutation_result_landed(name, output) {
+        return true;
+    }
+    if name != "bash" || !implementation_tool_call_mutates(name, arguments) {
+        return false;
+    }
+    bash_result_likely_succeeded(output)
+}
+
+pub(crate) fn implementation_tool_result_landed_substantive_edit(
+    name: &str,
+    arguments: &str,
+    output: &str,
+) -> bool {
+    if tool_result_is_failure(output) {
+        return false;
+    }
+    if filesystem_substantive_edit_result_landed(name, output) {
+        return true;
+    }
+    if name != "bash" || !implementation_tool_call_substantively_edits(name, arguments) {
+        return false;
+    }
+    bash_result_likely_succeeded(output)
+}
+
+fn tool_result_is_failure(output: &str) -> bool {
+    let trimmed = output.trim_start();
+    trimmed.starts_with("Error:")
+        || trimmed.starts_with("⚠ refused:")
+        || trimmed.contains("[exit code ")
+        || trimmed.contains("[timed out after ")
+}
+
+fn filesystem_mutation_result_landed(name: &str, output: &str) -> bool {
+    filesystem_substantive_edit_result_landed(name, output)
+}
+
+fn filesystem_substantive_edit_result_landed(name: &str, output: &str) -> bool {
+    let trimmed = output.trim_start();
+    let lower = trimmed.to_ascii_lowercase();
+    match name {
+        "write" => lower.starts_with("wrote ") && lower.contains(" bytes to "),
+        "edit" => {
+            lower.starts_with("edited ") || lower.starts_with("replaced ") && lower.contains(" in ")
+        }
+        "multi_edit" => lower.starts_with("applied ") && lower.contains(" edits to "),
+        "apply_patch" => trimmed
+            .lines()
+            .any(|line| matches!(line.trim_start().chars().next(), Some('+' | '-' | '~'))),
+        _ => false,
+    }
+}
+
+fn bash_result_likely_succeeded(output: &str) -> bool {
+    !tool_result_is_failure(output)
+}
+
 pub(crate) fn shell_command_likely_mutates_workspace(command: &str) -> bool {
     let compact = command
         .to_ascii_lowercase()
@@ -148,6 +214,50 @@ pub(crate) fn shell_command_likely_mutates_workspace(command: &str) -> bool {
             "patch -p",
         ],
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn landed_filesystem_edits_are_result_based() {
+        assert!(implementation_tool_result_landed_mutation(
+            "write",
+            r#"{"path":"a.rs","content":"x"}"#,
+            "Wrote 1 bytes to a.rs"
+        ));
+        assert!(implementation_tool_result_landed_substantive_edit(
+            "apply_patch",
+            r#"{"patch":"..."}"#,
+            "~ updated src/lib.rs (2 changes)\n+ added src/new.rs"
+        ));
+        assert!(!implementation_tool_result_landed_mutation(
+            "edit",
+            r#"{"path":"a.rs"}"#,
+            "Error: editing a.rs: old string not found"
+        ));
+    }
+
+    #[test]
+    fn failed_bash_edit_does_not_count_as_landed_mutation() {
+        let args = r#"{"command":"sed -i s/nope/yep/ src/lib.rs"}"#;
+        assert!(!implementation_tool_result_landed_mutation(
+            "bash",
+            args,
+            "sed: src/lib.rs: No such file\n[exit code 2]"
+        ));
+        assert!(!implementation_tool_result_landed_mutation(
+            "bash",
+            args,
+            "⚠ refused: this command cannot be safely checkpointed"
+        ));
+        assert!(implementation_tool_result_landed_mutation(
+            "bash",
+            args,
+            "[no output]"
+        ));
+    }
 }
 
 pub(crate) fn shell_command_likely_edits_files(command: &str) -> bool {

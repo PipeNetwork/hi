@@ -8,9 +8,10 @@ use std::sync::Arc;
 use anyhow::Result;
 use hi_ai::{ChatRequest, Content, Message, RequestProfile, StreamEvent, ToolMode};
 
-use crate::SUMMARIZE_PROMPT;
 use crate::Ui;
 use crate::compaction::{self, CompactionKind};
+use crate::transcript::repair_invalid_tool_call_arguments_in_messages;
+use crate::{COMPACTION_REFERENCE_PREFIX, COMPACTION_SUMMARY_END, SUMMARIZE_PROMPT};
 
 impl crate::Agent {
     /// The compaction strategy configured for this session.
@@ -79,10 +80,7 @@ impl crate::Agent {
             return Ok(());
         };
         let system = self.system_message();
-        let next = vec![
-            system,
-            Message::user(format!("[Summary of the conversation so far]\n\n{summary}")),
-        ];
+        let next = vec![system, Message::user(reference_summary_block(&summary))];
         self.replace_history_with_compaction(next)?;
         ui.status("✓ compacted — context reset to the summary");
         Ok(())
@@ -110,9 +108,7 @@ impl crate::Agent {
         let system = self.system_message();
         let mut recent = self.messages.as_slice()[split..].to_vec();
         let head = recent[0].text();
-        recent[0] = Message::user(format!(
-            "[Summary of earlier conversation]\n\n{summary}\n\n---\n\n{head}"
-        ));
+        recent[0] = Message::user(fold_reference_summary_into_user(&summary, &head));
         let mut next = Vec::with_capacity(recent.len() + 1);
         next.push(system);
         next.extend(recent);
@@ -172,9 +168,7 @@ impl crate::Agent {
             // final Assistant answer, so the folded recent User turn alternates
             // correctly.
             let head = recent[0].text();
-            recent[0] = Message::user(format!(
-                "[Summary of earlier conversation]\n\n{summary}\n\n---\n\n{head}"
-            ));
+            recent[0] = Message::user(fold_reference_summary_into_user(&summary, &head));
         }
         let mut next = Vec::with_capacity(1 + old.len() + recent.len());
         next.push(system);
@@ -265,6 +259,7 @@ impl crate::Agent {
         messages.push(self.minimal_system_message());
         messages.extend_from_slice(&slice_owned);
         messages.push(Message::user(SUMMARIZE_PROMPT));
+        repair_invalid_tool_call_arguments_in_messages(&mut messages);
 
         let request = ChatRequest {
             model: self.config.model.clone(),
@@ -295,6 +290,7 @@ impl crate::Agent {
             Ok(completion) => completion,
             Err(err) => {
                 self.add_error_usage(&err);
+                self.emit_usage(ui);
                 // Flush any partially-streamed summary text before returning.
                 ui.assistant_end();
                 let _ = self.persist();
@@ -303,12 +299,7 @@ impl crate::Agent {
         };
         self.add_usage(completion.usage);
         let _ = self.persist();
-        ui.usage(
-            self.totals.input_tokens,
-            self.totals.output_tokens,
-            self.context_used,
-            self.config.context_window,
-        );
+        self.emit_usage(ui);
 
         // Fall back to the final content if the provider didn't stream text.
         // Emit it through the UI before assistant_end so the user sees the
@@ -326,4 +317,16 @@ impl crate::Agent {
         let summary = summary.trim();
         Ok((!summary.is_empty()).then(|| summary.to_string()))
     }
+}
+
+fn reference_summary_block(summary: &str) -> String {
+    format!("{COMPACTION_REFERENCE_PREFIX}\n\n{summary}\n\n{COMPACTION_SUMMARY_END}")
+}
+
+fn fold_reference_summary_into_user(summary: &str, latest_user: &str) -> String {
+    format!(
+        "{}\n\n--- LATEST USER MESSAGE ---\n\n{}",
+        reference_summary_block(summary),
+        latest_user
+    )
 }

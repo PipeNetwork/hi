@@ -9,6 +9,7 @@ use ratatui::text::{Line, Text};
 
 use crate::event::UiEvent;
 use crate::render::{diff_lines, dim, looks_like_diff, markdown_line};
+use crate::util::fmt_rate_limits;
 use crate::{ExploreRun, MAX_TRANSCRIPT_LINES, TranscriptEntry, TurnEventKind, TurnState};
 
 impl crate::App {
@@ -61,8 +62,11 @@ impl crate::App {
         } else {
             format!("\n  💡 {guidance}")
         };
+        let limits = fmt_rate_limits(self.rate_limits)
+            .map(|limits| format!("\n  {limits}"))
+            .unwrap_or_default();
         self.push(Line::styled(
-            format!("✗ failed · {kind}: {error}{guidance_line}"),
+            format!("✗ failed · {kind}: {error}{guidance_line}{limits}"),
             Style::default().fg(Color::Red),
         ));
         self.follow();
@@ -301,6 +305,10 @@ impl crate::App {
                 self.context_used = ctx_used;
                 self.context_window = ctx_window;
             }
+            UiEvent::RateLimits(rate_limits) => {
+                self.event_log.push("rate_limits".to_string());
+                self.rate_limits = rate_limits;
+            }
             UiEvent::TurnEnd(summary) => {
                 self.event_log.push(format!("turn_end {summary}"));
                 self.last_turn_event = Some(TurnEventKind::TurnEnd);
@@ -309,8 +317,18 @@ impl crate::App {
                 // makes the end of a turn unmistakable (so a long run doesn't just
                 // trail off with no clear "done").
                 self.status = summary.trim_matches(['[', ']']).to_string();
-                self.last_turn_state = TurnState::Done(self.status.clone());
-                self.push(Line::styled(format!("✓ done · {}", self.status), dim()));
+                if self.status.contains("stalled") {
+                    self.last_turn_state = TurnState::Warning("incomplete".to_string());
+                    self.last_error = Some("turn ended incomplete".to_string());
+                    self.push(Line::styled(
+                        format!("⚠ incomplete · {}", self.status),
+                        Style::default().fg(Color::Yellow),
+                    ));
+                    self.record_model_issue();
+                } else {
+                    self.last_turn_state = TurnState::Done(self.status.clone());
+                    self.push(Line::styled(format!("✓ done · {}", self.status), dim()));
+                }
                 // No follow(): respect a reader who scrolled up — the "↓ N new"
                 // hint tells them the summary landed below.
             }

@@ -32,6 +32,18 @@ async fn compact_replaces_history_with_summary() {
             .contains("BRIEF: ported the parser"),
         "summary message retained"
     );
+    assert!(
+        agent.messages()[1].text().contains("REFERENCE ONLY"),
+        "compacted summary is marked as historical reference: {}",
+        agent.messages()[1].text()
+    );
+    assert!(
+        agent.messages()[1]
+            .text()
+            .contains("latest user message wins"),
+        "summary boundary tells the model the latest prompt wins: {}",
+        agent.messages()[1].text()
+    );
     // The summarization call's usage is counted.
     assert_eq!(agent.totals().output_tokens, 5);
     assert_eq!(
@@ -79,6 +91,11 @@ async fn hybrid_keeps_recent_and_folds_summary() {
     assert!(
         m[1].text().contains("q2"),
         "recent turn kept: {}",
+        m[1].text()
+    );
+    assert!(
+        m[1].text().contains("--- LATEST USER MESSAGE ---"),
+        "folded summary is separated from active user text: {}",
         m[1].text()
     );
     assert_eq!(m[2].text(), "a2");

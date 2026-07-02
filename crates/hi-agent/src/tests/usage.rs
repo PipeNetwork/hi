@@ -110,6 +110,32 @@ fn turn_steer_summarizes_trajectory() {
     assert!(steer.contains("stalled"), "stall flagged: {steer}");
 }
 
+#[test]
+fn usage_summary_includes_rate_limit_buckets_when_reported() {
+    let a = agent(vec![], config());
+    let line = a.usage_summary(&Usage {
+        input_tokens: 10,
+        output_tokens: 2,
+        rate_limits: Some(hi_ai::RateLimitState {
+            requests_min: hi_ai::RateLimitBucket {
+                limit: 60,
+                remaining: 58,
+                reset_seconds: 12,
+            },
+            tokens_min: hi_ai::RateLimitBucket {
+                limit: 100_000,
+                remaining: 88_000,
+                reset_seconds: 42,
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+
+    assert!(line.contains("limits req 58/60 reset 12s"), "{line}");
+    assert!(line.contains("tok 88k/100k reset 42s"), "{line}");
+}
+
 #[tokio::test]
 async fn emits_running_cumulative_usage_each_round() {
     // Two rounds (tool call, then text). The UI should see the cumulative
@@ -299,7 +325,7 @@ async fn empty_response_gives_up_after_retries() {
     ];
     let mut agent = agent(responses, config());
     let mut ui = RecUi::default();
-    agent.run_turn("review codebase", &mut ui).await.unwrap();
+    agent.run_turn("hello", &mut ui).await.unwrap();
     assert!(
         ui.statuses.iter().any(|s| s.contains("after retrying")),
         "exhaustion should be surfaced, got: {:?}",

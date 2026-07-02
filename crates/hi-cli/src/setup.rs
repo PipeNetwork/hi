@@ -84,6 +84,7 @@ pub async fn run() -> Result<Settings> {
         thinking_budget: None,
         tool_mode: hi_ai::ToolMode::Auto,
         compat: hi_ai::CompatMode::Auto,
+        moa: hi_ai::MoaConfig::default(),
     })
 }
 

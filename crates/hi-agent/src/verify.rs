@@ -30,6 +30,9 @@ pub(crate) enum VerifyOutcome {
     /// is true only on the first round, so the caller can surface a one-time
     /// "skipped" status.
     SkippedNoChanges { first: bool },
+    /// Only prose/documentation files changed. Running a compile/test pipeline
+    /// would add noise but not verify the changed surface.
+    SkippedProseOnly { first: bool },
     /// A stage failed; its output is fed back to the model. The caller records
     /// the nudge and loops. Carries the 1-based round number.
     Failed {
@@ -95,6 +98,10 @@ impl Verifier {
         if changed_files.is_empty() {
             let first = self.round == 0;
             return VerifyOutcome::SkippedNoChanges { first };
+        }
+        if changed_files.iter().all(|path| is_prose_only_path(path)) {
+            let first = self.round == 0;
+            return VerifyOutcome::SkippedProseOnly { first };
         }
         self.round += 1;
         let round = self.round;
@@ -178,6 +185,36 @@ pub(crate) fn stage_guidance(stage: &VerifyStage) -> &'static str {
     }
 }
 
+fn is_prose_only_path(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    let name = normalized
+        .rsplit('/')
+        .next()
+        .unwrap_or(path)
+        .to_ascii_lowercase();
+    if matches!(
+        name.as_str(),
+        "readme"
+            | "license"
+            | "licence"
+            | "copying"
+            | "changelog"
+            | "changes"
+            | "authors"
+            | "contributors"
+            | "notice"
+    ) {
+        return true;
+    }
+    let Some(ext) = name.rsplit_once('.').map(|(_, ext)| ext) else {
+        return false;
+    };
+    matches!(
+        ext,
+        "md" | "markdown" | "txt" | "rst" | "adoc" | "asciidoc" | "org"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -202,5 +239,15 @@ mod tests {
         assert_ne!(stage_guidance(&test_stage), stage_guidance(&compile_stage));
         assert!(stage_guidance(&test_stage).contains("required behavior"));
         assert!(stage_guidance(&compile_stage).contains("root cause"));
+    }
+
+    #[test]
+    fn prose_only_path_detection_is_conservative() {
+        assert!(is_prose_only_path("README.md"));
+        assert!(is_prose_only_path("docs/guide.rst"));
+        assert!(is_prose_only_path("LICENSE"));
+        assert!(!is_prose_only_path("package.json"));
+        assert!(!is_prose_only_path("docs/example.ts"));
+        assert!(!is_prose_only_path(".github/workflows/test.yml"));
     }
 }

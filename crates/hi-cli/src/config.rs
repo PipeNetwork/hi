@@ -279,6 +279,8 @@ impl std::str::FromStr for ProviderName {
 pub struct Config {
     pub default_profile: Option<String>,
     #[serde(default)]
+    pub moa: hi_ai::MoaConfig,
+    #[serde(default)]
     pub profiles: HashMap<String, Profile>,
 }
 
@@ -288,9 +290,12 @@ impl serde::Serialize for Config {
         S: serde::Serializer,
     {
         use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("Config", 2)?;
+        let mut s = serializer.serialize_struct("Config", 3)?;
         if let Some(v) = &self.default_profile {
             s.serialize_field("default_profile", v)?;
+        }
+        if self.moa != hi_ai::MoaConfig::default() {
+            s.serialize_field("moa", &self.moa)?;
         }
         if !self.profiles.is_empty() {
             // BTreeMap serializes as a sorted map → stable, alphabetical output.
@@ -384,6 +389,7 @@ pub struct Settings {
     pub thinking_budget: Option<u32>,
     pub tool_mode: ToolMode,
     pub compat: CompatMode,
+    pub moa: hi_ai::MoaConfig,
 }
 
 pub fn load_config(explicit: Option<&Path>) -> Result<Config> {
@@ -394,6 +400,10 @@ pub fn load_config(explicit: Option<&Path>) -> Result<Config> {
         .with_context(|| format!("reading config {}", path.display()))?;
     let mut config = toml::from_str::<Config>(&text)
         .with_context(|| format!("parsing config {}", path.display()))?;
+    config
+        .moa
+        .validate()
+        .with_context(|| format!("validating MoA config {}", path.display()))?;
     migrate_api_key_env_to_literal(&mut config, &path);
     Ok(config)
 }
@@ -505,6 +515,7 @@ fn config_path(explicit: Option<&Path>) -> Option<PathBuf> {
 
 /// Apply precedence to produce the effective [`Settings`].
 pub fn resolve(cli: &Cli, config: &Config, registry: &Registry) -> Result<Settings> {
+    config.moa.validate()?;
     let profile = match cli.profile.as_ref().or(config.default_profile.as_ref()) {
         Some(name) => Some(
             config
@@ -592,6 +603,7 @@ pub fn resolve(cli: &Cli, config: &Config, registry: &Registry) -> Result<Settin
         thinking_budget,
         tool_mode,
         compat,
+        moa: config.moa.clone(),
     })
 }
 
@@ -1078,6 +1090,7 @@ pub fn resolve_fallbacks(cli: &Cli, config: &Config, registry: &Registry) -> Vec
 /// the endpoint serves. The placeholder is fine for building the provider and
 /// listing models, but a turn can't run with it.
 pub fn resolve_named_profile(config: &Config, name: &str, registry: &Registry) -> Result<Settings> {
+    config.moa.validate()?;
     let profile = config
         .profiles
         .get(name)
@@ -1121,6 +1134,7 @@ pub fn resolve_named_profile(config: &Config, name: &str, registry: &Registry) -
         thinking_budget: profile.thinking_budget,
         tool_mode: profile.tool_mode.unwrap_or_default(),
         compat: profile.compat.unwrap_or_default(),
+        moa: config.moa.clone(),
     })
 }
 
@@ -1528,6 +1542,7 @@ mod tests {
                 );
                 m
             },
+            ..Default::default()
         };
         // No env var named "api_c55ffaeda6574cdb" is set, so this is bogus.
         assert!(std::env::var("api_c55ffaeda6574cdb").is_err());
@@ -1577,6 +1592,7 @@ mod tests {
                 );
                 m
             },
+            ..Default::default()
         };
         migrate_api_key_env_to_literal(&mut config, &path);
         let p = config.profiles.get("default").unwrap();
@@ -1628,6 +1644,7 @@ mod tests {
                 );
                 m
             },
+            ..Default::default()
         };
         migrate_api_key_env_to_literal(&mut config, &path);
         let p = config.profiles.get("default").unwrap();
@@ -1673,6 +1690,7 @@ mod tests {
                 );
                 m
             },
+            ..Default::default()
         };
         migrate_api_key_env_to_literal(&mut config, &path);
         let p = config.profiles.get("default").unwrap();
@@ -1720,6 +1738,7 @@ mod tests {
                 );
                 m
             },
+            ..Default::default()
         };
         migrate_api_key_env_to_literal(&mut config, &path);
         let p = config.profiles.get("default").unwrap();
@@ -1769,6 +1788,7 @@ mod tests {
                 );
                 m
             },
+            ..Default::default()
         };
         migrate_api_key_env_to_literal(&mut config, &path);
         let p = config.profiles.get("default").unwrap();

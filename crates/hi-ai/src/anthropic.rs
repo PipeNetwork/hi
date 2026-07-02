@@ -130,6 +130,7 @@ impl Provider for AnthropicProvider {
                         cache_creation_tokens: 0,
                         input_includes_cache: false,
                         context_occupancy: estimate_messages_tokens(&request.messages),
+                        rate_limits: None,
                     })
                     .into());
                 }

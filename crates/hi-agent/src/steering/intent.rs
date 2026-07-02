@@ -228,61 +228,10 @@ pub(crate) fn classify_read_only_intent(input: &str) -> Option<ReviewIntent> {
     if normalized.trim().is_empty() {
         return None;
     }
-    if explicitly_mutating_request(&normalized) && !read_only_language_present(&normalized) {
-        return None;
+    if let Some(intent) = expanded_read_only_macro_intent(&normalized) {
+        return Some(intent);
     }
-    if contains_any(
-        &normalized,
-        &[
-            "security", "unsafe", "unwrap", "expect", "panic", "secret", "token", "auth",
-        ],
-    ) {
-        return Some(ReviewIntent::Security);
-    }
-    if contains_any(
-        &normalized,
-        &[
-            "missing",
-            "gap",
-            "gaps",
-            "lacks",
-            "whats missing",
-            "what is missing",
-        ],
-    ) {
-        return Some(ReviewIntent::Gaps);
-    }
-    if contains_any(
-        &normalized,
-        &[
-            "roadmap",
-            "build next",
-            "what should build",
-            "what should we build",
-            "consider building",
-        ],
-    ) {
-        return Some(ReviewIntent::Roadmap);
-    }
-    if contains_any(
-        &normalized,
-        &["status", "state", "current state", "discuss state"],
-    ) {
-        return Some(ReviewIntent::Status);
-    }
-    if contains_any(
-        &normalized,
-        &[
-            "review codebase",
-            "code review",
-            "review repo",
-            "review repository",
-            "audit codebase",
-        ],
-    ) {
-        return Some(ReviewIntent::Review);
-    }
-    None
+    explicit_no_mutation_request(&normalized).then(|| no_mutation_review_intent(&normalized))
 }
 
 pub(crate) fn normalize_intent_text(input: &str) -> String {
@@ -307,44 +256,141 @@ pub(crate) fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
 }
 
-pub(crate) fn explicitly_mutating_request(normalized: &str) -> bool {
-    let words: Vec<&str> = normalized.split_whitespace().collect();
-    words.iter().any(|word| {
-        matches!(
-            *word,
-            "fix"
-                | "change"
-                | "update"
-                | "write"
-                | "create"
-                | "delete"
-                | "remove"
-                | "refactor"
-                | "patch"
-                | "commit"
-        )
-    }) || (words
-        .iter()
-        .any(|word| matches!(*word, "implement" | "build"))
-        && !contains_any(
-            normalized,
-            &["consider", "should", "what should", "discuss"],
-        ))
+fn expanded_read_only_macro_intent(normalized: &str) -> Option<ReviewIntent> {
+    if normalized.starts_with("read only security request for") {
+        Some(ReviewIntent::Security)
+    } else if normalized.starts_with("read only status request for") {
+        Some(ReviewIntent::Status)
+    } else if normalized.starts_with("read only roadmap request for") {
+        Some(ReviewIntent::Roadmap)
+    } else if normalized.starts_with("read only gaps request for") {
+        Some(ReviewIntent::Gaps)
+    } else if normalized.starts_with("read only review request for") {
+        Some(ReviewIntent::Review)
+    } else {
+        None
+    }
 }
 
-pub(crate) fn read_only_language_present(normalized: &str) -> bool {
+fn no_mutation_review_intent(normalized: &str) -> ReviewIntent {
+    if explicit_security_review_request(normalized) {
+        ReviewIntent::Security
+    } else if explicit_gap_review_request(normalized) {
+        ReviewIntent::Gaps
+    } else if explicit_roadmap_review_request(normalized) {
+        ReviewIntent::Roadmap
+    } else if explicit_status_review_request(normalized) {
+        ReviewIntent::Status
+    } else if explicit_code_review_request(normalized) {
+        ReviewIntent::Review
+    } else {
+        ReviewIntent::Review
+    }
+}
+
+pub(crate) fn explicit_code_review_request(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "review codebase",
+            "review repo",
+            "review repository",
+            "review this code",
+            "review code",
+            "code review",
+            "review for",
+            "audit codebase",
+            "audit repo",
+            "audit repository",
+            "audit the code",
+            "audit code",
+            "audit for",
+        ],
+    )
+}
+
+pub(crate) fn explicit_security_review_request(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "security review",
+            "security audit",
+            "security issue",
+            "security issues",
+            "review for security",
+            "audit for security",
+            "unsafe unwrap",
+            "unsafe unwraps",
+            "secret leak",
+            "secret leaks",
+            "token leak",
+            "token leaks",
+            "auth leak",
+            "auth leaks",
+        ],
+    )
+}
+
+pub(crate) fn explicit_gap_review_request(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "what is missing",
+            "whats missing",
+            "what missing",
+            "missing gaps",
+            "gap review",
+            "review gaps",
+            "review for gaps",
+            "audit gaps",
+        ],
+    )
+}
+
+pub(crate) fn explicit_roadmap_review_request(normalized: &str) -> bool {
+    contains_any(
+        normalized,
+        &[
+            "roadmap",
+            "build next",
+            "what should build",
+            "what should we build",
+            "what should i build",
+            "what should we do next",
+            "what should i do next",
+            "consider building",
+        ],
+    )
+}
+
+pub(crate) fn explicit_status_review_request(normalized: &str) -> bool {
+    matches!(normalized, "status" | "state")
+        || contains_any(
+            normalized,
+            &[
+                "current status",
+                "project status",
+                "repo status",
+                "repository status",
+                "codebase status",
+                "workspace status",
+                "current state",
+                "state of",
+                "status of",
+                "where are we",
+            ],
+        )
+}
+
+pub(crate) fn explicit_no_mutation_request(normalized: &str) -> bool {
     contains_any(
         normalized,
         &[
             "read only",
             "discuss only",
-            "discuss",
-            "review",
-            "audit",
-            "status",
-            "state",
-            "what should",
-            "consider",
+            "do not write",
+            "do not edit",
+            "no file changes",
         ],
     )
 }
@@ -374,83 +420,18 @@ pub(crate) fn read_only_turn_prompt(input: &str, intent: ReviewIntent) -> String
 
 pub(crate) fn classify_implementation_intent(input: &str) -> Option<ImplementationIntent> {
     let normalized = normalize_intent_text(input);
-    if normalized.trim().is_empty()
-        || contains_any(
-            &normalized,
-            &[
-                "read only",
-                "read only review guard",
-                "do not write",
-                "use read only inspection",
-                "what should",
-                "should we",
-                "consider",
-                "roadmap",
-                "discuss",
-                "analyze",
-                "assess",
-                "evaluate",
-            ],
-        )
-    {
-        return None;
-    }
-    let words: Vec<&str> = normalized.split_whitespace().collect();
-    let has_direct_action = words
-        .iter()
-        .any(|word| matches!(*word, "build" | "create" | "make" | "develop" | "scaffold"));
-    // "implementation"/"implementing" as a noun ("finish the av1
-    // implementation") is both the action and the artifact — the word itself
-    // names the thing being built, so it satisfies `has_artifact` below even
-    // when no explicit artifact word ("app", "tui", …) appears.
-    let has_implementation_noun = words
-        .iter()
-        .any(|word| matches!(*word, "implementation" | "implementing"));
-    let has_generic_action = words.iter().any(|word| {
-        matches!(
-            *word,
-            "implement" | "implementing" | "implementation" | "write"
-        )
-    });
-    if !has_direct_action && !has_generic_action {
-        return None;
-    }
-    let has_artifact = has_implementation_noun
-        || words.iter().any(|word| {
-            matches!(
-                *word,
-                "app"
-                    | "application"
-                    | "tool"
-                    | "tui"
-                    | "cli"
-                    | "calculator"
-                    | "estimator"
-                    | "dashboard"
-                    | "program"
-                    | "utility"
-                    | "service"
-                    | "game"
-            )
-        })
-        || contains_any(
-            &normalized,
-            &[
-                "command line",
-                "terminal ui",
-                "text ui",
-                "gpu training",
-                "training time",
-                "loan calculator",
-            ],
-        );
-    if !has_artifact {
+    if normalized.trim().is_empty() || !expanded_build_macro_request(&normalized) {
         return None;
     }
     Some(ImplementationIntent {
         tui: implementation_mentions_tui(&normalized),
         gpu_training_estimator: implementation_mentions_gpu_training_estimator(&normalized),
     })
+}
+
+fn expanded_build_macro_request(normalized: &str) -> bool {
+    normalized.starts_with("build ")
+        && normalized.contains("implementation requirements inspect the workspace")
 }
 
 pub(crate) fn implementation_mentions_tui(normalized: &str) -> bool {

@@ -713,6 +713,7 @@ where
                 // is exactly `prompt_tokens` — not `prompt_tokens + cached`.
                 input_includes_cache: true,
                 context_occupancy: usage.prompt_tokens,
+                rate_limits: None,
             };
         }
         for choice in chunk.choices {

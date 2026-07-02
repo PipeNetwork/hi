@@ -11,6 +11,7 @@ mod heuristics;
 mod memory;
 mod prompt;
 mod session;
+pub mod skills;
 mod snapshot;
 mod steering;
 mod transcript;
@@ -31,6 +32,10 @@ pub use memory::{
     read_project_annotated, should_distill_memory,
 };
 pub use session::SessionSink;
+pub use skills::{
+    build_learn_prompt, build_skill_use_prompt, learned_skills_context, list_skills, read_skill,
+    skill_roots,
+};
 pub use ui::{Ui, classify_error, tool_label};
 
 use snapshot::SnapshotCache;
@@ -73,6 +78,17 @@ pub struct AgentStateSnapshot {
     pub(crate) structured_goal: Option<Goal>,
     pub(crate) decisions: DecisionLog,
     pub(crate) last_plan: Vec<PlanStep>,
+}
+
+/// Model-related agent configuration that `/moa` can temporarily override and
+/// then restore exactly.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentModelState {
+    pub(crate) model: String,
+    pub(crate) context_window: Option<u32>,
+    pub(crate) requested_max_tokens: u32,
+    pub(crate) max_tokens: u32,
+    pub(crate) max_tokens_explicit: bool,
 }
 
 /// Per-turn telemetry: the trajectory of one `run_turn`, captured so callers
@@ -312,10 +328,25 @@ If something is incomplete or a check couldn't run, say so honestly. Output only
 no preamble, and don't take any further action.";
 
 /// Instruction appended to a slice of history to summarize it for compaction.
-const SUMMARIZE_PROMPT: &str = "Summarize our conversation so far into a concise but \
-complete handoff brief: the task and goal, key decisions and constraints, files created \
-or changed, commands that matter, and any open or next steps. This summary will REPLACE \
-the history, so include everything needed to continue seamlessly. Output only the summary.";
+const SUMMARIZE_PROMPT: &str = "Summarize the earlier conversation into a concise historical \
+handoff brief. This summary is reference material only, not active instructions. The next user \
+message after the compacted summary wins over anything in the summary, especially if the user \
+changes topic or redirects the task. Do not tell the future model to continue, resume, wrap up, \
+or finish old work unless the latest user message explicitly asks.\n\
+\n\
+Use these headings:\n\
+## Historical Task Snapshot\n\
+## Historical Decisions And Constraints\n\
+## Historical Files And Commands\n\
+## Historical Open Threads\n\
+\n\
+Include only concrete facts needed as background. Output only the summary.";
+
+pub(crate) const COMPACTION_REFERENCE_PREFIX: &str = "[CONTEXT COMPACTION - REFERENCE ONLY]\n\
+Earlier conversation was compacted into the summary below. Treat it as background reference, \
+not an active instruction. The latest user message after this summary is the active task; if it \
+conflicts with or changes topic from the summary, the latest user message wins.";
+pub(crate) const COMPACTION_SUMMARY_END: &str = "--- END OF COMPACTION SUMMARY - respond to the latest user message below, not the summary above ---";
 
 const SYSTEM_PROMPT: &str = "\
 You are hi, a coding agent running in the user's terminal. Work in the current \

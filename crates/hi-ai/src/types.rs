@@ -198,6 +198,53 @@ pub enum StreamEvent {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RateLimitBucket {
+    #[serde(default)]
+    pub limit: u64,
+    #[serde(default)]
+    pub remaining: u64,
+    #[serde(default)]
+    pub reset_seconds: u64,
+}
+
+impl RateLimitBucket {
+    pub fn has_data(&self) -> bool {
+        self.limit > 0 || self.remaining > 0 || self.reset_seconds > 0
+    }
+
+    pub fn used(&self) -> u64 {
+        self.limit.saturating_sub(self.remaining)
+    }
+
+    pub fn used_percent(&self) -> Option<u64> {
+        (self.limit > 0).then(|| (self.used().saturating_mul(100) / self.limit).min(100))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RateLimitState {
+    #[serde(default)]
+    pub requests_min: RateLimitBucket,
+    #[serde(default)]
+    pub requests_hour: RateLimitBucket,
+    #[serde(default)]
+    pub tokens_min: RateLimitBucket,
+    #[serde(default)]
+    pub tokens_hour: RateLimitBucket,
+    #[serde(default)]
+    pub captured_at_unix_seconds: u64,
+}
+
+impl RateLimitState {
+    pub fn has_data(&self) -> bool {
+        self.requests_min.has_data()
+            || self.requests_hour.has_data()
+            || self.tokens_min.has_data()
+            || self.tokens_hour.has_data()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
@@ -232,6 +279,11 @@ pub struct Usage {
     /// re-deriving occupancy from the other fields.
     #[serde(default)]
     pub context_occupancy: u64,
+    /// Latest provider rate-limit buckets observed on a response. These are not
+    /// token usage and do not affect [`Usage::is_zero`]; they ride along with
+    /// usage so frontends can show whether failures are route/provider throttles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limits: Option<RateLimitState>,
 }
 
 impl Usage {
@@ -251,6 +303,7 @@ impl Usage {
         self.output_tokens += other.output_tokens;
         self.cache_read_tokens += other.cache_read_tokens;
         self.cache_creation_tokens += other.cache_creation_tokens;
+        self.rate_limits = other.rate_limits;
     }
 
     /// Deprecated: prefer [`Usage::context_occupancy`], which is set by the

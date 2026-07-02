@@ -5,8 +5,8 @@
 //! for evidence classification and tool-call inspection.
 
 use super::implementation::{
-    implementation_tool_call_mutates, implementation_tool_call_substantively_edits,
-    implementation_tool_call_validates,
+    implementation_tool_call_validates, implementation_tool_result_landed_mutation,
+    implementation_tool_result_landed_substantive_edit,
 };
 use super::intent::{
     compact_search_hit_line, evidence_kind_for_tool, grep_match_line_count, search_hit_score,
@@ -41,12 +41,9 @@ pub(crate) struct ImplementationTracker {
 
 impl ImplementationTracker {
     pub(crate) fn record_tool_result(&mut self, name: &str, arguments: &str, output: &str) {
-        if output.starts_with("Error:") || output.starts_with("⚠ refused:") {
-            return;
-        }
-        if implementation_tool_call_mutates(name, arguments) {
+        if implementation_tool_result_landed_mutation(name, arguments, output) {
             self.mutation_seen = true;
-            if implementation_tool_call_substantively_edits(name, arguments) {
+            if implementation_tool_result_landed_substantive_edit(name, arguments, output) {
                 self.substantive_edit_seen = true;
             }
             self.validation_after_last_mutation = false;

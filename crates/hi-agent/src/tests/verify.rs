@@ -229,6 +229,38 @@ async fn verify_skipped_when_no_files_changed() {
 }
 
 #[tokio::test]
+async fn verify_skipped_for_prose_only_changes() {
+    let _guard = VERIFY_TEST_LOCK.lock().await;
+    let tmp = temp_file("docs").with_extension("md");
+    let p = tmp.to_string_lossy().to_string();
+    let mut cfg = config();
+    cfg.verify = vec![VerifyStage::new("test", "false")];
+    let mut agent = agent(
+        vec![
+            write_completion(&p),
+            completion(vec![Content::Text("docs updated".into())], 1, 1),
+        ],
+        cfg,
+    );
+    let mut ui = RecUi::default();
+    agent.run_turn("update docs", &mut ui).await.unwrap();
+    let _ = std::fs::remove_file(&tmp);
+
+    assert_eq!(
+        agent.last_verify(),
+        None,
+        "prose-only changes do not verify"
+    );
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|s| s.contains("skipped — prose-only")),
+        "prose-only skip is surfaced: {:?}",
+        ui.statuses
+    );
+}
+
+#[tokio::test]
 async fn verify_runs_when_bash_changes_files() {
     let _guard = VERIFY_TEST_LOCK.lock().await;
     let tmp = temp_file("bash");

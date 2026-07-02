@@ -533,6 +533,9 @@ pub(crate) fn is_forward_intent(line: &str) -> bool {
     if CLOSINGS.iter().any(|c| lower.contains(c)) {
         return false;
     }
+    if contains_action_ack(&lower) {
+        return true;
+    }
     const FORWARD_INTENT: [&str; 12] = [
         "let me ",
         "let's ",
@@ -548,6 +551,31 @@ pub(crate) fn is_forward_intent(line: &str) -> bool {
         "next, i",
     ];
     FORWARD_INTENT.iter().any(|phrase| lower.contains(phrase))
+}
+
+pub(crate) fn contains_action_ack(lower: &str) -> bool {
+    const ACKS: [&str; 2] = ["i can do that", "i can help with that"];
+    if !ACKS.iter().any(|ack| lower.contains(ack)) {
+        return false;
+    }
+    const ACTION_MARKERS: [&str; 15] = [
+        "look into",
+        "look at",
+        "inspect",
+        "scan",
+        "check",
+        "analyz",
+        "review",
+        "explore",
+        "read",
+        "open",
+        "run",
+        "test",
+        "fix",
+        "debug",
+        "search",
+    ];
+    ACTION_MARKERS.iter().any(|marker| lower.contains(marker))
 }
 
 /// Whether a line is a markdown list item — a bullet (`- `, `* `, `• `) or a
@@ -706,6 +734,25 @@ mod tests {
             "Fixed it — feel free to ask if you want more detail.",
         ] {
             assert!(!looks_like_unfinished_step(t), "should not flag: {t:?}");
+        }
+        for t in [
+            "I can do that by reviewing the repo files first.",
+            "I can help with that by running the tests.",
+        ] {
+            assert!(
+                looks_like_unfinished_step(t),
+                "action ack should flag: {t:?}"
+            );
+        }
+        for t in [
+            "I can do that.",
+            "I can help with that.",
+            "I can help with that if you share more detail.",
+        ] {
+            assert!(
+                !looks_like_unfinished_step(t),
+                "plain acknowledgement should not flag: {t:?}"
+            );
         }
     }
 

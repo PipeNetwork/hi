@@ -74,6 +74,7 @@ impl crate::Agent {
         messages.strip_finalize_pair();
         messages.strip_trailing_nudges();
         messages.repair_tool_result_ordering();
+        messages.repair_invalid_tool_call_arguments();
         messages.repair_provider_invisible_assistant_messages();
         messages.repair_consecutive_assistant_messages();
         messages.repair_consecutive_user_messages();
@@ -414,6 +415,16 @@ impl crate::Agent {
         self.add_usage(provider_error_usage(err));
     }
 
+    pub(crate) fn emit_usage(&self, ui: &mut dyn Ui) {
+        ui.usage(
+            self.totals.input_tokens,
+            self.totals.output_tokens,
+            self.context_used,
+            self.config.context_window,
+        );
+        ui.rate_limits(self.totals.rate_limits);
+    }
+
     /// Number of git checkpoints created so far (for `/undo`).
     pub fn checkpoint_count(&self) -> usize {
         self.checkpoints.len()
@@ -429,6 +440,27 @@ impl crate::Agent {
     /// The model id currently configured for this session.
     pub fn model(&self) -> &str {
         &self.config.model
+    }
+
+    /// Capture the model and token/window settings so a caller can temporarily
+    /// switch models for one turn and restore the previous route exactly.
+    pub fn model_state(&self) -> crate::AgentModelState {
+        crate::AgentModelState {
+            model: self.config.model.clone(),
+            context_window: self.config.context_window,
+            requested_max_tokens: self.config.requested_max_tokens,
+            max_tokens: self.config.max_tokens,
+            max_tokens_explicit: self.config.max_tokens_explicit,
+        }
+    }
+
+    /// Restore a model state captured by [`Agent::model_state`].
+    pub fn restore_model_state(&mut self, state: crate::AgentModelState) {
+        self.config.model = state.model;
+        self.config.context_window = state.context_window;
+        self.config.requested_max_tokens = state.requested_max_tokens;
+        self.config.max_tokens = state.max_tokens;
+        self.config.max_tokens_explicit = state.max_tokens_explicit;
     }
 
     /// Switch the model used for subsequent turns, refreshing live metadata

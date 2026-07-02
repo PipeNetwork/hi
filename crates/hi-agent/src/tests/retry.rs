@@ -455,6 +455,142 @@ async fn empty_completion_error_is_resampled_too() {
 }
 
 #[tokio::test]
+async fn output_cap_error_retries_once_with_advertised_budget() {
+    let mut cfg = config();
+    cfg.max_tokens = 8192;
+    cfg.requested_max_tokens = 8192;
+    let (mut agent, requests, max_tokens) = scripted_agent_recording_max_tokens(
+        vec![
+            ProviderStep::ErrorMessage(
+                ProviderErrorKind::RequestTooLarge,
+                "API error 400 Bad Request: max_tokens must be less than or equal to 4096".into(),
+            ),
+            ProviderStep::Completion(completion(vec![Content::Text("recovered".into())], 5, 3)),
+        ],
+        cfg,
+    );
+
+    agent.run_turn("go", &mut NullUi).await.unwrap();
+
+    assert_eq!(requests.lock().unwrap().len(), 2);
+    assert_eq!(*max_tokens.lock().unwrap(), vec![8192, 4096]);
+    assert_eq!(agent.messages().last().unwrap().text(), "recovered");
+}
+
+#[tokio::test]
+async fn output_cap_error_without_limit_halves_budget_not_2048() {
+    let mut cfg = config();
+    cfg.max_tokens = 8192;
+    cfg.requested_max_tokens = 8192;
+    let (mut agent, _requests, max_tokens) = scripted_agent_recording_max_tokens(
+        vec![
+            ProviderStep::ErrorMessage(
+                ProviderErrorKind::UnsupportedRequestShape,
+                "max_tokens is greater than the provider output limit".into(),
+            ),
+            ProviderStep::Completion(completion(vec![Content::Text("recovered".into())], 5, 3)),
+        ],
+        cfg,
+    );
+
+    agent.run_turn("go", &mut NullUi).await.unwrap();
+
+    assert_eq!(*max_tokens.lock().unwrap(), vec![8192, 4096]);
+}
+
+#[tokio::test]
+async fn retryable_model_unavailable_retries_and_recovers() {
+    let (mut agent, requests) = scripted_agent(
+        vec![
+            ProviderStep::ErrorMessage(
+                ProviderErrorKind::ModelUnavailable,
+                r#"API error 503 Service Unavailable: {"error":"model temporarily unavailable","code":"model_unavailable","retryable":true,"retry_after_seconds":0}"#.into(),
+            ),
+            ProviderStep::Completion(completion(vec![Content::Text("recovered".into())], 5, 3)),
+        ],
+        config(),
+    );
+
+    agent.run_turn("go", &mut NullUi).await.unwrap();
+
+    assert_eq!(requests.lock().unwrap().len(), 2);
+    assert_eq!(agent.messages().last().unwrap().text(), "recovered");
+}
+
+#[tokio::test]
+async fn temporary_provider_overload_gets_extended_retry_budget() {
+    let overload = || {
+        ProviderStep::ErrorMessage(
+            ProviderErrorKind::RateLimit,
+            r#"API error 429 Too Many Requests: {"error":{"message":"glm-5.2 is temporarily overloaded","code":1305},"retry_after_seconds":0}"#.into(),
+        )
+    };
+    let (mut agent, requests) = scripted_agent(
+        vec![
+            overload(),
+            overload(),
+            overload(),
+            overload(),
+            ProviderStep::Completion(completion(vec![Content::Text("recovered".into())], 5, 3)),
+        ],
+        config(),
+    );
+
+    agent.run_turn("go", &mut NullUi).await.unwrap();
+
+    assert_eq!(requests.lock().unwrap().len(), 5);
+    assert_eq!(agent.messages().last().unwrap().text(), "recovered");
+}
+
+#[tokio::test]
+async fn ordinary_rate_limit_does_not_use_overload_retry_budget() {
+    let (mut agent, requests) = scripted_agent(
+        vec![ProviderStep::ErrorMessage(
+            ProviderErrorKind::RateLimit,
+            r#"API error 429 Too Many Requests: {"error":{"message":"quota exceeded","code":"rate_limit"}}"#.into(),
+        )],
+        config(),
+    );
+
+    let err = agent.run_turn("go", &mut NullUi).await.unwrap_err();
+
+    assert_eq!(
+        hi_ai::provider_error_kind(&err),
+        Some(ProviderErrorKind::RateLimit)
+    );
+    assert_eq!(requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn retryable_model_unavailable_exhausts_then_surfaces_error() {
+    let (mut agent, requests) = scripted_agent(
+        vec![
+            ProviderStep::ErrorMessage(
+                ProviderErrorKind::ModelUnavailable,
+                r#"{"error":"model temporarily unavailable","code":"model_unavailable","retryable":true,"retry_after_seconds":0}"#.into(),
+            ),
+            ProviderStep::ErrorMessage(
+                ProviderErrorKind::ModelUnavailable,
+                r#"{"error":"model temporarily unavailable","code":"model_unavailable","retryable":true,"retry_after_seconds":0}"#.into(),
+            ),
+            ProviderStep::ErrorMessage(
+                ProviderErrorKind::ModelUnavailable,
+                r#"{"error":"model temporarily unavailable","code":"model_unavailable","retryable":true,"retry_after_seconds":0}"#.into(),
+            ),
+        ],
+        config(),
+    );
+
+    let err = agent.run_turn("go", &mut NullUi).await.unwrap_err();
+
+    assert_eq!(
+        hi_ai::provider_error_kind(&err),
+        Some(ProviderErrorKind::ModelUnavailable)
+    );
+    assert_eq!(requests.lock().unwrap().len(), 3);
+}
+
+#[tokio::test]
 async fn tool_protocol_error_is_resampled_too() {
     let (mut agent, requests) = scripted_agent(
         vec![
@@ -520,7 +656,7 @@ async fn implementation_tool_protocol_exhaustion_falls_back_to_text_tool_calls()
     );
     let mut ui = RecordingUi::default();
     agent
-        .run_turn("build a small CLI GPU training time estimator", &mut ui)
+        .run_turn("/build a small CLI GPU training time estimator", &mut ui)
         .await
         .unwrap();
     assert_eq!(std::fs::read_to_string(&path).unwrap(), "ok\n");

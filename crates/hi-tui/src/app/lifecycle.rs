@@ -71,6 +71,7 @@ impl crate::App {
             usage: (0, 0),
             context_used: 0,
             context_window: None,
+            rate_limits: None,
             served: HashMap::new(),
             model_ids: Vec::new(),
             trimmed: 0,

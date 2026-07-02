@@ -14,8 +14,8 @@ use clap::Parser;
 
 use hi_agent::{Agent, AgentConfig, CompactionKind, VerifyStage};
 use hi_ai::{
-    AnthropicProvider, Backend, FallbackProvider, McpDiscoveryProvider, Message, OpenAiProvider,
-    PipeMcpClient, Provider, Registry, Usage,
+    AnthropicProvider, Backend, FallbackProvider, McpDiscoveryProvider, Message, MoaProvider,
+    OpenAiProvider, PipeMcpClient, Provider, Registry, Usage,
 };
 
 use commands::tool_mode_label;
@@ -210,17 +210,32 @@ async fn main() -> Result<()> {
         agent.set_session(Box::new(JsonlSession::new(session_path)));
     }
 
-    if let Some(prompt) = prompt_input {
+    if let Some(mut prompt) = prompt_input {
+        let mut restore_model_state: Option<hi_agent::AgentModelState> = None;
+        let mut report_model = settings.model.clone();
+        if let Some(hi_agent::Command::Moa(arg)) = hi_agent::command::parse(&prompt) {
+            let arg = arg.trim().to_string();
+            if arg.is_empty() {
+                return Err(anyhow!("usage: /moa <prompt>"));
+            }
+            restore_model_state = Some(agent.model_state());
+            agent.set_model(hi_ai::MOA_MODEL_CONSERVATIVE.to_string(), None, None);
+            report_model = hi_ai::MOA_MODEL_CONSERVATIVE.to_string();
+            prompt = arg;
+        }
         let mut plain = PlainUi::new();
         let mut quiet = ui::QuietUi;
         let view: &mut dyn hi_agent::Ui = if cli.quiet { &mut quiet } else { &mut plain };
         let result = agent.run_turn(&prompt, view).await;
+        if let Some(state) = restore_model_state {
+            agent.restore_model_state(state);
+        }
         let report_result = if let Some(path) = &cli.report {
             write_report(
                 path,
                 &agent,
                 &registry,
-                &settings.model,
+                &report_model,
                 result.as_ref().err(),
             )
         } else {
@@ -268,7 +283,7 @@ async fn main() -> Result<()> {
                 let settings = config::resolve_named_profile(&file, name, &registry)?;
                 let label = provider_label(settings.provider).to_string();
                 let model = settings.model.clone();
-                let provider = build_provider(&settings);
+                let provider = build_chain(&settings, Vec::new());
                 Ok(hi_tui::SwitchedProvider {
                     provider,
                     model,
@@ -712,6 +727,9 @@ fn load_project_context() -> Option<String> {
     if let Some(map) = config::build_repo_map(std::path::Path::new(".")) {
         parts.push(map);
     }
+    if let Some(section) = hi_agent::learned_skills_context() {
+        parts.push(section);
+    }
     (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
@@ -785,13 +803,23 @@ fn build_backend(settings: &Settings) -> Backend {
 
 /// The primary backend, plus any fallbacks, as a single [`Provider`]. With no
 /// fallbacks it's just the primary provider (no wrapper overhead).
-fn build_chain(primary: &Settings, fallbacks: Vec<Settings>) -> Box<dyn Provider> {
-    if fallbacks.is_empty() {
-        return build_provider(primary);
+pub(crate) fn build_chain(primary: &Settings, fallbacks: Vec<Settings>) -> Box<dyn Provider> {
+    let passthrough: Box<dyn Provider> = if fallbacks.is_empty() {
+        build_provider(primary)
+    } else {
+        let mut chain = vec![build_backend(primary)];
+        chain.extend(fallbacks.iter().map(build_backend));
+        Box::new(FallbackProvider::new(chain))
+    };
+
+    if !primary.moa.enabled {
+        return passthrough;
     }
-    let mut chain = vec![build_backend(primary)];
-    chain.extend(fallbacks.iter().map(build_backend));
-    Box::new(FallbackProvider::new(chain))
+
+    Box::new(
+        MoaProvider::new(passthrough, build_provider(primary), primary.moa.clone())
+            .expect("MoA config should be validated before provider construction"),
+    )
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -872,6 +900,7 @@ mod tests {
             thinking_budget: None,
             tool_mode: ToolMode::default(),
             compat: CompatMode::default(),
+            moa: hi_ai::MoaConfig::default(),
         }
     }
 
@@ -887,6 +916,7 @@ mod tests {
             thinking_budget: None,
             tool_mode: ToolMode::default(),
             compat: CompatMode::default(),
+            moa: hi_ai::MoaConfig::default(),
         }
     }
 

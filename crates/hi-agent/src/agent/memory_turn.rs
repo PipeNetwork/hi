@@ -13,6 +13,7 @@ use crate::memory::{
     strip_header, unreferenced_bullets, verify_grounded, write_memory,
 };
 use crate::snapshot::FileFingerprint;
+use crate::transcript::repair_invalid_tool_call_arguments_in_messages;
 
 impl crate::Agent {
     /// Distill durable, reusable lessons from this session into the project memory
@@ -76,6 +77,7 @@ impl crate::Agent {
             &corrections,
             &recalled,
         )));
+        repair_invalid_tool_call_arguments_in_messages(&mut messages);
 
         let request = ChatRequest {
             model: self.config.model.clone(),

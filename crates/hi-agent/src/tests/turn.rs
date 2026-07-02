@@ -166,6 +166,7 @@ async fn resume_repairs_provider_invisible_assistant_before_request() {
             1,
         ))]),
         requests: requests.clone(),
+        max_tokens: None,
     };
     let history = vec![
         Message::system("system"),
@@ -217,6 +218,7 @@ async fn resume_repairs_out_of_order_tool_results_before_request() {
             1,
         ))]),
         requests: requests.clone(),
+        max_tokens: None,
     };
     let history = vec![
         Message::system("system"),
@@ -270,6 +272,7 @@ async fn resume_repairs_consecutive_user_messages_before_request() {
             1,
         ))]),
         requests: requests.clone(),
+        max_tokens: None,
     };
     let history = vec![
         Message::system("system"),
@@ -840,7 +843,7 @@ async fn implementation_re_read_exhaustion_reports_incomplete_not_stuck_repeatin
     let mut agent = agent(responses, config());
     let mut ui = RecUi::default();
     agent
-        .run_turn("finish the parser implementation", &mut ui)
+        .run_turn("/build parser implementation", &mut ui)
         .await
         .unwrap();
     assert!(
@@ -985,7 +988,7 @@ async fn implementation_re_read_cycle_recovers_when_model_edits() {
     let mut agent = agent(responses, config());
     let mut ui = RecUi::default();
     agent
-        .run_turn("finish the parser implementation", &mut ui)
+        .run_turn("/build parser implementation", &mut ui)
         .await
         .unwrap();
     // The turn completed (the model edited and finished), not stalled.
@@ -1054,7 +1057,7 @@ async fn implementation_re_read_nudge_names_inspected_files_and_plan_step() {
     let mut agent = agent(responses, config());
     let mut ui = RecUi::default();
     agent
-        .run_turn("finish the parser implementation", &mut ui)
+        .run_turn("/build parser implementation", &mut ui)
         .await
         .unwrap();
     // The nudge is a user message in the transcript — find it and verify it
@@ -1122,6 +1125,55 @@ async fn does_not_nudge_a_different_command() {
         ui.statuses
     );
     assert!(ui.turn_end.is_some(), "turn completed");
+}
+
+#[tokio::test]
+async fn nudges_when_different_inspections_return_the_same_output() {
+    let dir_a = temp_file("same-output-dir-a");
+    let dir_b = temp_file("same-output-dir-b");
+    std::fs::create_dir(&dir_a).unwrap();
+    std::fs::create_dir(&dir_b).unwrap();
+    let a = dir_a.to_string_lossy().to_string();
+    let b = dir_b.to_string_lossy().to_string();
+    let list = |path: &str| {
+        completion(
+            vec![Content::ToolCall {
+                id: "l".into(),
+                name: "list".into(),
+                arguments: serde_json::json!({ "path": path }).to_string(),
+            }],
+            1,
+            1,
+        )
+    };
+    let responses = vec![
+        list(&a),
+        list(&b),
+        completion(vec![Content::Text("Done.".into())], 1, 1),
+    ];
+    let mut agent = agent(responses, config());
+    let mut ui = RecUi::default();
+
+    agent.run_turn("inspect the dirs", &mut ui).await.unwrap();
+
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|s| s.contains("same inspection output")),
+        "expected result-hash no-progress nudge, got: {:?}",
+        ui.statuses
+    );
+    assert_eq!(
+        ui.tool_results
+            .iter()
+            .filter(|(name, _)| name == "list")
+            .count(),
+        2,
+        "the guard should fire after observing the repeated output"
+    );
+    assert!(ui.turn_end.is_some(), "turn completed after the nudge");
+    let _ = std::fs::remove_dir_all(dir_a);
+    let _ = std::fs::remove_dir_all(dir_b);
 }
 
 #[tokio::test]
@@ -1603,7 +1655,7 @@ async fn finished_recap_after_tool_use_ends_without_incomplete_warning() {
     ];
     let mut agent = agent(responses, cfg);
     let mut ui = RecUi::default();
-    agent.run_turn("review codebase", &mut ui).await.unwrap();
+    agent.run_turn("/review codebase", &mut ui).await.unwrap();
     // The turn ended after exactly the two canned responses — a spurious
     // continue would have asked for a third and panicked on the empty queue.
     assert!(ui.turn_end.is_some(), "turn completed");
@@ -1668,7 +1720,7 @@ async fn silent_continue_budget_resets_after_tool_progress() {
     ];
     let mut agent = agent(responses, cfg);
     let mut ui = RecUi::default();
-    agent.run_turn("review codebase", &mut ui).await.unwrap();
+    agent.run_turn("/review codebase", &mut ui).await.unwrap();
     assert!(ui.turn_end.is_some(), "turn completed");
     assert!(
         !ui.statuses.iter().any(|s| s.contains("incomplete")),
@@ -1945,7 +1997,7 @@ async fn read_only_review_sprawl_is_bounded() {
     };
     let mut agent = Agent::new(Box::new(provider), config());
     let mut ui = RecUi::default();
-    agent.run_turn("review codebase", &mut ui).await.unwrap();
+    agent.run_turn("/review codebase", &mut ui).await.unwrap();
 
     // The sprawl nudge fired once the threshold was crossed.
     assert!(

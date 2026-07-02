@@ -100,6 +100,8 @@ pub async fn run(
     // covers the cold-start gap so the UI never looks stalled.
     let models_cache_key = hi_ai::cache_key(provider, base_url);
     if let Some(cached) = hi_ai::load_cache(&models_cache_key).await {
+        app.model_ids = cached.iter().map(|m| m.id.clone()).collect();
+        app.model_ids.sort();
         app.served = cached.into_iter().map(|m| (m.id.clone(), m)).collect();
         let model_id = app.model.clone();
         if let Some(health) = app.apply_model(agent, registry, &model_id) {
@@ -445,10 +447,25 @@ pub async fn run(
         // Slash commands. Most are handled inline; `/compact` runs a model call
         // (driven like a turn so the spinner shows); `/retry` yields the prompt
         // to re-run in the turn phase below.
+        let mut restore_model_state: Option<hi_agent::AgentModelState> = None;
+        let mut restore_app_model: Option<(String, Option<u32>)> = None;
         let run_line = if let Some(cmd) = command::parse(&line) {
             match cmd {
                 Command::Quit => break,
                 Command::Prompt(prompt) => prompt,
+                Command::Moa(prompt) => {
+                    let prompt = prompt.trim().to_string();
+                    if prompt.is_empty() {
+                        app.push(Line::styled("usage: /moa <prompt>".to_string(), dim()));
+                        continue;
+                    }
+                    restore_model_state = Some(agent.model_state());
+                    restore_app_model = Some((app.model.clone(), app.context_window));
+                    agent.set_model(hi_ai::MOA_MODEL_CONSERVATIVE.to_string(), None, None);
+                    app.model = hi_ai::MOA_MODEL_CONSERVATIVE.to_string();
+                    app.context_window = None;
+                    prompt
+                }
                 Command::Compact(arg) => {
                     let kind =
                         CompactionKind::from_arg(&arg).unwrap_or_else(|| agent.compaction_kind());
@@ -532,6 +549,34 @@ pub async fn run(
                     ));
                     command::INIT_PROMPT.to_string()
                 }
+                Command::Learn(request) => {
+                    app.push(Line::styled(
+                        "learning a reusable skill…".to_string(),
+                        dim(),
+                    ));
+                    hi_agent::build_learn_prompt(&request)
+                }
+                Command::Skill(name) => {
+                    let name = name.trim();
+                    if name.is_empty() {
+                        app.push(Line::styled("usage: /skill <name>".to_string(), dim()));
+                        app.follow();
+                        continue;
+                    }
+                    match hi_agent::read_skill(name) {
+                        Ok(skill) => {
+                            hi_agent::build_skill_use_prompt(&skill.skill.name, &skill.content)
+                        }
+                        Err(err) => {
+                            app.push(Line::styled(
+                                format!("{err}"),
+                                Style::default().fg(Color::Yellow),
+                            ));
+                            app.follow();
+                            continue;
+                        }
+                    }
+                }
                 Command::Undo => {
                     let checkpoints = agent.checkpoint_count();
                     if checkpoints > 0 {
@@ -601,6 +646,7 @@ pub async fn run(
                             app.served = served.into_iter().map(|m| (m.id.clone(), m)).collect();
                             let mut ids: Vec<String> = app.served.keys().cloned().collect();
                             ids.sort();
+                            app.model_ids = ids.clone();
                             ids
                         }
                         _ => {
@@ -824,6 +870,7 @@ pub async fn run(
                                         served.into_iter().map(|m| (m.id.clone(), m)).collect();
                                     let mut ids: Vec<String> = app.served.keys().cloned().collect();
                                     ids.sort();
+                                    app.model_ids = ids.clone();
                                     app.push(Line::styled(
                                         format!("{count} models available — pick one"),
                                         dim(),
@@ -938,6 +985,13 @@ pub async fn run(
             app.last_telemetry = Some(agent.last_turn_telemetry().clone());
             // A new turn's edits supersede any open diff panel's snapshot.
             app.diff_text = None;
+        }
+        if let Some(state) = restore_model_state.take() {
+            agent.restore_model_state(state);
+        }
+        if let Some((model, context_window)) = restore_app_model.take() {
+            app.model = model;
+            app.context_window = context_window;
         }
         app.set_working(false);
         // No follow() at turn end: if the user scrolled up to read mid-turn, leave

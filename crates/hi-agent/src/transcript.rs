@@ -62,6 +62,34 @@ fn tool_result_ids(content: &[Content]) -> Vec<String> {
         .collect()
 }
 
+fn tool_call_arguments_are_valid(arguments: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .is_ok_and(|value| matches!(value, serde_json::Value::Object(_)))
+}
+
+fn repair_tool_call_arguments(content: &mut [Content]) -> usize {
+    let mut repaired = 0usize;
+    for block in content {
+        if let Content::ToolCall { arguments, .. } = block
+            && !tool_call_arguments_are_valid(arguments)
+        {
+            *arguments = "{}".to_string();
+            repaired += 1;
+        }
+    }
+    repaired
+}
+
+pub(crate) fn repair_invalid_tool_call_arguments_in_messages(messages: &mut [Message]) -> usize {
+    let mut repaired = 0usize;
+    for message in messages {
+        if message.role == Role::Assistant {
+            repaired += repair_tool_call_arguments(&mut message.content);
+        }
+    }
+    repaired
+}
+
 fn tool_message_has_only_results(content: &[Content]) -> bool {
     !content.is_empty()
         && content
@@ -289,9 +317,10 @@ impl Transcript {
     /// transcript provider-safe even in release builds).
     pub(crate) fn push_assistant_with_results(
         &mut self,
-        content: Vec<Content>,
+        mut content: Vec<Content>,
         results: Vec<(String, String)>,
     ) {
+        repair_tool_call_arguments(&mut content);
         let call_ids: Vec<String> = content
             .iter()
             .filter_map(|c| match c {
@@ -477,6 +506,18 @@ impl Transcript {
             }
         }
         self.messages = Arc::new(repaired);
+    }
+
+    /// Repair malformed tool-call argument blocks loaded from older sessions or
+    /// emitted by a flaky provider before this transcript is sent again.
+    ///
+    /// Tool arguments must be a JSON object string. If a saved assistant block
+    /// contains partial JSON or a non-object value, providers may reject the
+    /// next request before the model can recover. Replace only the arguments
+    /// with `{}`; keep the call id/name and matching tool result so transcript
+    /// ordering remains intact.
+    pub(crate) fn repair_invalid_tool_call_arguments(&mut self) -> usize {
+        repair_invalid_tool_call_arguments_in_messages(self.make_mut())
     }
 
     // ---- synthetic nudges ----------------------------------------------
@@ -667,6 +708,20 @@ impl Transcript {
                     }
                     let call_ids = tool_call_ids(&m.content);
                     if !call_ids.is_empty() {
+                        for content in &m.content {
+                            if let Content::ToolCall {
+                                id,
+                                name,
+                                arguments,
+                            } = content
+                                && !tool_call_arguments_are_valid(arguments)
+                            {
+                                return Err(TranscriptError::InvalidToolArguments {
+                                    id: id.clone(),
+                                    name: name.clone(),
+                                });
+                            }
+                        }
                         let mut pending = call_ids;
                         let Some(next) = msgs.get(i + 1) else {
                             return Err(TranscriptError::OrphanToolUse(pending.remove(0)));
@@ -731,6 +786,8 @@ pub(crate) enum TranscriptError {
     ConsecutiveAssistant,
     /// An assistant message with no provider-visible content blocks.
     EmptyAssistant,
+    /// An assistant tool call whose `arguments` block is not a JSON object.
+    InvalidToolArguments { id: String, name: String },
 }
 
 impl std::fmt::Display for TranscriptError {
@@ -745,6 +802,12 @@ impl std::fmt::Display for TranscriptError {
             Self::ConsecutiveUser => write!(f, "consecutive user messages"),
             Self::ConsecutiveAssistant => write!(f, "consecutive assistant messages"),
             Self::EmptyAssistant => write!(f, "empty/provider-invisible assistant message"),
+            Self::InvalidToolArguments { id, name } => {
+                write!(
+                    f,
+                    "invalid JSON object arguments for tool_use {name} ({id})"
+                )
+            }
         }
     }
 }
@@ -850,6 +913,25 @@ mod tests {
             &msgs[3].content[0],
             Content::ToolResult { output, .. } if output == "out-b"
         ));
+        t.validate_for_provider().unwrap();
+    }
+
+    #[test]
+    fn push_assistant_with_results_repairs_invalid_tool_arguments() {
+        let mut t = Transcript::new(vec![user("do it")]);
+        t.push_assistant_with_results(
+            vec![Content::ToolCall {
+                id: "bad".into(),
+                name: "read".into(),
+                arguments: "{\"path\":".into(),
+            }],
+            vec![("bad".into(), "Error: invalid tool arguments".into())],
+        );
+
+        let Content::ToolCall { arguments, .. } = &t.as_slice()[1].content[0] else {
+            panic!("expected tool call");
+        };
+        assert_eq!(arguments, "{}");
         t.validate_for_provider().unwrap();
     }
 
@@ -976,6 +1058,30 @@ mod tests {
             t.validate_for_provider(),
             Err(TranscriptError::OrphanToolUse(id)) if id == "o"
         ));
+    }
+
+    #[test]
+    fn repair_invalid_tool_call_arguments_fixes_legacy_history() {
+        let mut t = Transcript::new(vec![
+            user("do it"),
+            Message::assistant(vec![Content::ToolCall {
+                id: "legacy".into(),
+                name: "bash".into(),
+                arguments: "[\"not\", \"an\", \"object\"]".into(),
+            }]),
+            Message::tool_result("legacy", "Error: invalid tool arguments"),
+        ]);
+
+        assert!(matches!(
+            t.validate_for_provider(),
+            Err(TranscriptError::InvalidToolArguments { id, .. }) if id == "legacy"
+        ));
+        assert_eq!(t.repair_invalid_tool_call_arguments(), 1);
+        let Content::ToolCall { arguments, .. } = &t.as_slice()[1].content[0] else {
+            panic!("expected tool call");
+        };
+        assert_eq!(arguments, "{}");
+        t.validate_for_provider().unwrap();
     }
 
     #[test]

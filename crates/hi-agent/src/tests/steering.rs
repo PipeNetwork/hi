@@ -2,32 +2,48 @@ use super::common::*;
 use super::*;
 
 #[test]
-fn typo_heavy_review_prompts_classify_as_read_only_intents() {
+fn explicit_controls_classify_as_read_only_intents() {
+    let status_macro = command::expand_prompt_macro("/status codebase state").unwrap();
     assert_eq!(
-        classify_read_only_intent("review codebase and discuss status and state"),
+        classify_read_only_intent(&status_macro),
         Some(ReviewIntent::Status)
     );
+    let security_macro = command::expand_prompt_macro("/security unsafe unwraps").unwrap();
     assert_eq!(
-        classify_read_only_intent(
-            "review for security issues or unsafe unwraps. then disucss only"
-        ),
+        classify_read_only_intent(&security_macro),
+        Some(ReviewIntent::Security)
+    );
+    let audit_macro = command::expand_prompt_macro("/audit token leaks").unwrap();
+    assert_eq!(
+        classify_read_only_intent(&audit_macro),
+        Some(ReviewIntent::Security)
+    );
+    let gaps_macro = command::expand_prompt_macro("/gaps missing coverage").unwrap();
+    assert_eq!(
+        classify_read_only_intent(&gaps_macro),
+        Some(ReviewIntent::Gaps)
+    );
+    let roadmap_macro = command::expand_prompt_macro("/roadmap next work").unwrap();
+    assert_eq!(
+        classify_read_only_intent(&roadmap_macro),
+        Some(ReviewIntent::Roadmap)
+    );
+    assert_eq!(
+        classify_read_only_intent("review this code for auth leaks but do not edit"),
         Some(ReviewIntent::Security)
     );
     assert_eq!(
-        classify_read_only_intent(
-            "discuss whats its missing and what we should considering building and implimenting"
-        ),
-        Some(ReviewIntent::Gaps)
+        classify_read_only_intent("review codebase and discuss status and state"),
+        None
     );
+    assert_eq!(classify_read_only_intent("status"), None);
     assert_eq!(classify_read_only_intent("fix the unsafe unwraps"), None);
 }
 
 #[test]
-fn implementation_prompts_classify_without_stealing_gap_reviews() {
-    let intent = classify_implementation_intent(
-        "lets build a small TUI calculator that estimates how long training will take on GPUs",
-    )
-    .expect("implementation prompt");
+fn build_macro_classifies_as_implementation_without_stealing_discussion() {
+    let build_macro = command::expand_prompt_macro("/build gpu training TUI calculator").unwrap();
+    let intent = classify_implementation_intent(&build_macro).expect("implementation prompt");
     assert!(intent.tui);
     assert!(intent.gpu_training_estimator);
 
@@ -41,7 +57,7 @@ fn implementation_prompts_classify_without_stealing_gap_reviews() {
         classify_read_only_intent(
             "discuss whats its missing and what we should considering building and implimenting"
         ),
-        Some(ReviewIntent::Gaps)
+        None
     );
 
     let prompt = implementation_turn_prompt(
@@ -59,46 +75,121 @@ fn implementation_prompts_classify_without_stealing_gap_reviews() {
 }
 
 #[test]
-fn finish_the_implementation_classifies_as_implementation() {
-    // "finish the av1 implementation" / "finish the parser implementation"
-    // has no explicit artifact word ("app", "tui", …) but "implementation"
-    // itself is the noun naming the thing being built. This is the reported
-    // av1 case where the model cycled through re-reads and the implementation
-    // intent was never detected, so the generic repeat guard fired instead of
-    // the implementation-aware one.
-    assert!(
-        classify_implementation_intent("finish the av1 implementation").is_some(),
-        "'finish the av1 implementation' should classify as implementation"
+fn discuss_without_explicit_review_signal_stays_conversational() {
+    for prompt in [
+        "discuss status and state",
+        r#"discuss this auth token status json: HealthLive{ "status": "ok", "auth": { "token": "redacted" } }"#,
+        "discuss missing auth token json",
+    ] {
+        assert_eq!(
+            classify_read_only_intent(prompt),
+            None,
+            "plain discuss prompt must not enter read-only review mode: {prompt:?}"
+        );
+        assert_eq!(
+            classify_implementation_intent(prompt),
+            None,
+            "plain discuss prompt must not become an implementation request: {prompt:?}"
+        );
+    }
+
+    assert_eq!(
+        classify_read_only_intent("discuss only: review this code for auth leaks"),
+        Some(ReviewIntent::Security)
     );
-    assert!(
-        classify_implementation_intent("finish the parser implementation").is_some(),
-        "'finish the parser implementation' should classify as implementation"
+    assert_eq!(
+        classify_read_only_intent("review codebase and discuss status and state"),
+        None
     );
-    // The typo form "implimentation" is normalized to "implementation".
-    assert!(
-        classify_implementation_intent("finish the av1 implimentation").is_some(),
-        "'finish the av1 implimentation' (typo) should classify as implementation"
+}
+
+#[test]
+fn ux_cleanup_with_live_json_stays_normal_agent_mode() {
+    let prompt = r#"clean up UX so its not showing a bunch of json: HealthLive{
+      "status": "ok",
+      "ready": true,
+      "secret_canary_enforced": false,
+      "auth": { "token": "redacted" }
+    } StatsLive{ "nodes_online": 1, "requests_failed": 0 }"#;
+
+    assert_eq!(
+        classify_implementation_intent(prompt),
+        None,
+        "ordinary UX cleanup prose should stay in normal agent mode"
     );
-    // "implement" as a verb still works (existing behavior).
-    assert!(
-        classify_implementation_intent("implement the parser").is_none(),
-        "'implement the parser' without an artifact word is still None"
+    assert_eq!(
+        classify_read_only_intent(prompt),
+        None,
+        "pasted JSON must not trigger security review mode"
     );
-    // Review/analysis verbs with "implementation" should NOT classify as
-    // implementation — "discuss the implementation" is a review, not a build
-    // request. Without the guard these would steal the review classification.
-    assert!(
-        classify_implementation_intent("discuss the implementation").is_none(),
-        "'discuss the implementation' should not classify as implementation"
+}
+
+#[test]
+fn mutating_review_and_diagnostic_prompts_do_not_enter_read_only_review() {
+    for prompt in [
+        "review and fix auth token display in the login page",
+        "review for security issues and fix them",
+        "audit for token leaks and patch the backend route",
+        "fix review page auth token display",
+        "update status page UI",
+    ] {
+        assert_eq!(
+            classify_implementation_intent(prompt),
+            None,
+            "ordinary mutating prose should stay in normal agent mode: {prompt:?}"
+        );
+        assert_eq!(
+            classify_read_only_intent(prompt),
+            None,
+            "mutating prompt must not enter read-only review mode: {prompt:?}"
+        );
+    }
+
+    for prompt in [
+        r#"what is happening here: HealthLive{ "status": "ok", "auth": { "token": "redacted" } }"#,
+        "update me on backend api status",
+        "give me an update on the provider route state",
+    ] {
+        assert_eq!(
+            classify_implementation_intent(prompt),
+            None,
+            "informational prompt must not become an implementation request: {prompt:?}"
+        );
+        assert_eq!(
+            classify_read_only_intent(prompt),
+            None,
+            "pasted diagnostics/status wording must not invent a read-only repo review: {prompt:?}"
+        );
+    }
+
+    assert_eq!(
+        classify_read_only_intent("review this code for auth leaks but do not edit"),
+        Some(ReviewIntent::Security)
     );
-    assert!(
-        classify_implementation_intent("analyze the implementation").is_none(),
-        "'analyze the implementation' should not classify as implementation"
+    assert_eq!(
+        classify_read_only_intent("review codebase and discuss status and state"),
+        None
     );
-    assert!(
-        classify_implementation_intent("assess the implementation").is_none(),
-        "'assess the implementation' should not classify as implementation"
-    );
+    assert_eq!(classify_read_only_intent("status"), None);
+}
+
+#[test]
+fn plain_implementation_prose_does_not_trigger_implementation_mode() {
+    for prompt in [
+        "finish the av1 implementation",
+        "finish the parser implementation",
+        "finish the av1 implimentation",
+        "implement the parser",
+        "discuss the implementation",
+        "analyze the implementation",
+        "assess the implementation",
+    ] {
+        assert_eq!(
+            classify_implementation_intent(prompt),
+            None,
+            "ordinary prose should not trigger implementation mode: {prompt:?}"
+        );
+    }
 }
 
 #[test]
@@ -241,7 +332,7 @@ async fn implementation_turn_repairs_no_changes_and_missing_validation() {
     let mut agent = agent(responses, config());
     let mut ui = RecordingUi::default();
     agent
-        .run_turn("build a small CLI GPU training time estimator", &mut ui)
+        .run_turn("/build a small CLI GPU training time estimator", &mut ui)
         .await
         .unwrap();
     let _ = std::fs::remove_file(&path);
@@ -286,7 +377,7 @@ async fn stalled_implementation_does_not_finalize_with_stale_recap() {
     let mut agent = agent(responses, cfg);
     let mut ui = RecordingUi::default();
     agent
-        .run_turn("build a small CLI GPU training time estimator", &mut ui)
+        .run_turn("/build a small CLI GPU training time estimator", &mut ui)
         .await
         .unwrap();
     let _ = std::fs::remove_file(&path);
@@ -316,7 +407,7 @@ async fn scaffold_only_implementation_gets_source_edit_nudge() {
     let mut agent = agent(responses, config());
     let mut ui = RecordingUi::default();
     agent
-        .run_turn("build a small CLI GPU training time estimator", &mut ui)
+        .run_turn("/build a small CLI GPU training time estimator", &mut ui)
         .await
         .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
@@ -365,7 +456,7 @@ async fn scaffold_only_repair_can_use_text_tool_fallback_for_source_edit() {
     let mut agent = agent(responses, config());
     let mut ui = RecordingUi::default();
     agent
-        .run_turn("build a small CLI GPU training time estimator", &mut ui)
+        .run_turn("/build a small CLI GPU training time estimator", &mut ui)
         .await
         .unwrap();
     assert_eq!(
@@ -921,7 +1012,7 @@ async fn listing_only_review_final_gets_deepen_review_nudge() {
     let mut ui = RecUi::default();
 
     agent
-        .run_turn("review codebase and discuss status and state", &mut ui)
+        .run_turn("/status codebase state", &mut ui)
         .await
         .unwrap();
 
@@ -1111,7 +1202,7 @@ async fn read_only_review_text_final_without_evidence_gets_inspection_nudge() {
     let mut ui = RecUi::default();
 
     agent
-        .run_turn("review codebase and discuss status and state", &mut ui)
+        .run_turn("/status codebase state", &mut ui)
         .await
         .unwrap();
 
@@ -1148,7 +1239,7 @@ async fn read_only_status_preflight_seeds_first_request_with_evidence() {
 
     let mut ui = RecUi::default();
     agent
-        .run_turn("review codebase and discuss status and state", &mut ui)
+        .run_turn("/status codebase state", &mut ui)
         .await
         .unwrap();
 
@@ -1190,6 +1281,53 @@ async fn read_only_status_preflight_seeds_first_request_with_evidence() {
     assert!(telemetry.targeted_searches >= 1, "{telemetry:?}");
     assert!(!telemetry.listing_only, "{telemetry:?}");
     assert_eq!(telemetry.first_tool_kind, "targeted_search");
+}
+
+#[tokio::test]
+async fn ux_cleanup_with_live_json_does_not_enter_read_only_preflight() {
+    let mut cfg = config();
+    cfg.read_only_preflight = true;
+    let path = temp_file("ux-json-implementation");
+    let (mut agent, _requests) = scripted_agent(
+        vec![
+            ProviderStep::Completion(write_completion(&path.to_string_lossy())),
+            ProviderStep::Completion(bash_completion("cargo --version # cargo check")),
+            ProviderStep::Completion(completion(
+                vec![Content::Text("Implemented the overview summary UI.".into())],
+                10,
+                4,
+            )),
+        ],
+        cfg,
+    );
+
+    let mut ui = RecUi::default();
+    agent
+        .run_turn(
+            r#"clean up UX so its not showing a bunch of json: HealthLive{
+              "status": "ok",
+              "ready": true,
+              "secret_canary_enforced": false,
+              "auth": { "token": "redacted" }
+            } StatsLive{ "nodes_online": 1, "requests_failed": 0 }"#,
+            &mut ui,
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        !ui.statuses
+            .iter()
+            .any(|status| status.contains("read-only preflight")),
+        "UX cleanup must not run read-only preflight: {:?}",
+        ui.statuses
+    );
+    assert!(
+        !ui.assistant.contains("Bounded evidence summary"),
+        "implementation prompts must not return review fallback summaries: {}",
+        ui.assistant
+    );
+    let _ = std::fs::remove_file(path);
 }
 
 #[test]
@@ -1307,7 +1445,7 @@ async fn read_only_review_repair_template_final_is_not_accepted() {
     let mut ui = RecUi::default();
 
     agent
-        .run_turn("review codebase and discuss status and state", &mut ui)
+        .run_turn("/status codebase state", &mut ui)
         .await
         .unwrap();
 
@@ -1762,10 +1900,7 @@ async fn gap_review_search_match_blocks_no_gap_overclaim() {
     let mut ui = RecUi::default();
 
     agent
-        .run_turn(
-            "discuss whats its missing and what we should considering building and implimenting",
-            &mut ui,
-        )
+        .run_turn("/gaps missing coverage and build-next work", &mut ui)
         .await
         .unwrap();
 
@@ -2117,7 +2252,7 @@ async fn listing_only_review_repair_exhaustion_returns_insufficient_evidence() {
     let mut ui = RecUi::default();
 
     agent
-        .run_turn("review codebase and discuss status and state", &mut ui)
+        .run_turn("/status codebase state", &mut ui)
         .await
         .unwrap();
 

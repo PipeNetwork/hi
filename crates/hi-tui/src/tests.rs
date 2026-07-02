@@ -385,6 +385,34 @@ fn usage_event_updates_live_counter_and_working_line() {
 }
 
 #[test]
+fn rate_limit_event_updates_working_line() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.set_working(true);
+    app.apply(UiEvent::RateLimits(Some(hi_ai::RateLimitState {
+        requests_min: hi_ai::RateLimitBucket {
+            limit: 60,
+            remaining: 58,
+            reset_seconds: 12,
+        },
+        tokens_min: hi_ai::RateLimitBucket {
+            limit: 100_000,
+            remaining: 88_000,
+            reset_seconds: 42,
+        },
+        ..Default::default()
+    })));
+
+    let mut term = Terminal::new(TestBackend::new(100, 8)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(
+        screen.contains("limits req 58/60"),
+        "request bucket: {screen}"
+    );
+    assert!(screen.contains("tok 88k/100k"), "token bucket: {screen}");
+}
+
+#[test]
 fn renders_queued_commands_while_working() {
     let mut app = test_app("openai", "gpt-4o");
     app.set_working(true);
@@ -907,6 +935,21 @@ fn turn_end_renders_the_steer_suffix_from_the_summary() {
     );
     let line = app.transcript[0].text();
     assert!(line.contains("steer"), "steer in done marker: {line}");
+}
+
+#[test]
+fn stalled_turn_end_is_marked_incomplete_not_done() {
+    let mut app = test_app("openai", "gpt-4o");
+    let stalled = "[↑10 ↓2 · ctx 5% (500/10k) · steer: 2 repeat · stalled]";
+    app.apply(UiEvent::TurnEnd(stalled.into()));
+
+    assert!(app.status.contains("stalled"), "status: {}", app.status);
+    let line = app.transcript[0].text();
+    assert!(line.contains("⚠ incomplete"), "got: {line}");
+    assert!(
+        !line.contains("✓ done"),
+        "stalled turns must not be green done: {line}"
+    );
 }
 
 #[test]

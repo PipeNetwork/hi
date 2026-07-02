@@ -396,13 +396,30 @@ impl crate::App {
                     self.push(Line::styled(line.to_string(), dim()));
                 }
             }
+            Command::Skills => {
+                let skills = hi_agent::list_skills();
+                if skills.is_empty() {
+                    self.push(Line::styled("no learned skills found".to_string(), dim()));
+                } else {
+                    self.push(Line::styled("learned skills:".to_string(), dim()));
+                    for skill in skills {
+                        self.push(Line::styled(
+                            format!("  {}  [{}]  {}", skill.name, skill.scope, skill.description),
+                            dim(),
+                        ));
+                    }
+                }
+            }
             // Handled in the event loop (async / runs a turn / needs config); never reach here.
             Command::Prompt(_)
+            | Command::Moa(_)
             | Command::Compact(_)
             | Command::Retry
             | Command::Edit
             | Command::Undo
             | Command::Init
+            | Command::Learn(_)
+            | Command::Skill(_)
             | Command::Provider(_) => {}
             Command::Version => {
                 self.push(Line::styled(format!("hi {}", hi_agent::VERSION), dim()));

@@ -460,7 +460,7 @@ async fn long_horizon_driver_records_failure_on_unfinished_turn() {
     let mut ui = RecUi::default();
 
     agent
-        .run_turn("build a small CLI GPU training time estimator", &mut ui)
+        .run_turn("/build a small CLI GPU training time estimator", &mut ui)
         .await
         .unwrap();
 

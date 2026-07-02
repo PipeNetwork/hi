@@ -212,6 +212,8 @@ pub(crate) fn apply_metadata(
     match result {
         Ok(served) if !served.is_empty() => {
             app.served = served.iter().cloned().map(|m| (m.id.clone(), m)).collect();
+            app.model_ids = served.iter().map(|m| m.id.clone()).collect();
+            app.model_ids.sort();
             let model_id = app.model.clone();
             if let Some(health) = app.apply_model(agent, registry, &model_id) {
                 app.warn_degraded(&model_id, &health);
@@ -408,6 +410,8 @@ pub(crate) struct App {
     /// window, for the live context-fill gauge.
     pub(crate) context_used: u64,
     pub(crate) context_window: Option<u32>,
+    /// Latest provider rate-limit buckets observed on a model response.
+    pub(crate) rate_limits: Option<hi_ai::RateLimitState>,
     /// Live per-model metadata (window/price/health) learned from the endpoint's
     /// `/models`, keyed by id — used to apply a model's settings and flag health.
     pub(crate) served: HashMap<String, hi_ai::ServedModel>,

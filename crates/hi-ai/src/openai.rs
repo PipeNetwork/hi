@@ -10,7 +10,7 @@
 mod request;
 mod stream;
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -21,7 +21,8 @@ use serde_json::{Value, json};
 
 use crate::provider::{Provider, ProviderError, ProviderErrorKind};
 use crate::types::{
-    ChatRequest, CompatMode, Completion, StreamEvent, ToolMode, Usage, estimate_messages_tokens,
+    ChatRequest, CompatMode, Completion, RateLimitBucket, RateLimitState, StreamEvent, ToolMode,
+    Usage, estimate_messages_tokens,
 };
 
 const MAX_CAPACITY_HTTP_RETRIES: u32 = 2;
@@ -107,6 +108,7 @@ impl Provider for OpenAiProvider {
 
             let status = response.status();
             let retry_after = retry_after_header_seconds(&response);
+            let rate_limits = rate_limits_from_headers(response.headers());
             let text = response.text().await.unwrap_or_default();
             let kind = request::classify_http_error(status, &text);
             if kind == ProviderErrorKind::CapacityUnavailable
@@ -125,10 +127,14 @@ impl Provider for OpenAiProvider {
                 }
                 continue;
             }
-            last_error = Some(ProviderError::new(
-                kind,
-                format!("API error {status}: {text}"),
-            ));
+            let mut error = ProviderError::new(kind, format!("API error {status}: {text}"));
+            if let Some(rate_limits) = rate_limits {
+                error = error.with_usage(Usage {
+                    rate_limits: Some(rate_limits),
+                    ..Default::default()
+                });
+            }
+            last_error = Some(error);
             if request.profile.compat == CompatMode::Strict {
                 break;
             }
@@ -148,6 +154,7 @@ impl Provider for OpenAiProvider {
                 })
                 .into());
         };
+        let rate_limits = rate_limits_from_headers(resp.headers());
 
         // `debug_tap` optionally echoes the raw wire bytes when HI_DEBUG_STREAM
         // is set. Reduce the stream to its SSE `data` strings so the collection
@@ -170,9 +177,11 @@ impl Provider for OpenAiProvider {
                 cache_creation_tokens: 0,
                 input_includes_cache: true,
                 context_occupancy: estimate_messages_tokens(&request.messages),
+                rate_limits,
             })
         })?;
         stream::backfill_missing_usage(&mut completion, &request);
+        completion.usage.rate_limits = completion.usage.rate_limits.or(rate_limits);
         if completion.content.is_empty() {
             return Err(ProviderError::new(
                 ProviderErrorKind::EmptyCompletion,
@@ -198,14 +207,61 @@ fn retry_after_header_seconds(response: &reqwest::Response) -> Option<u64> {
         .and_then(|value| value.trim().parse::<u64>().ok())
 }
 
+fn rate_limits_from_headers(headers: &header::HeaderMap) -> Option<RateLimitState> {
+    if !headers
+        .keys()
+        .any(|name| name.as_str().starts_with("x-ratelimit-"))
+    {
+        return None;
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+    let state = RateLimitState {
+        requests_min: rate_limit_bucket(headers, "requests", ""),
+        requests_hour: rate_limit_bucket(headers, "requests", "-1h"),
+        tokens_min: rate_limit_bucket(headers, "tokens", ""),
+        tokens_hour: rate_limit_bucket(headers, "tokens", "-1h"),
+        captured_at_unix_seconds: now,
+    };
+    state.has_data().then_some(state)
+}
+
+fn rate_limit_bucket(
+    headers: &header::HeaderMap,
+    resource: &'static str,
+    suffix: &'static str,
+) -> RateLimitBucket {
+    RateLimitBucket {
+        limit: header_number(headers, &format!("x-ratelimit-limit-{resource}{suffix}")),
+        remaining: header_number(
+            headers,
+            &format!("x-ratelimit-remaining-{resource}{suffix}"),
+        ),
+        reset_seconds: header_number(headers, &format!("x-ratelimit-reset-{resource}{suffix}")),
+    }
+}
+
+fn header_number(headers: &header::HeaderMap, name: &str) -> u64 {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .map(|value| value as u64)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::OpenAiProvider;
-    use crate::provider::{Provider, ProviderErrorKind, provider_error_kind};
+    use super::{OpenAiProvider, rate_limits_from_headers};
+    use crate::provider::{Provider, ProviderErrorKind, provider_error_kind, provider_error_usage};
     use crate::test_support::{FakeOpenAiServer, Response, sse_text};
     use crate::types::{
         ChatRequest, Content, Message, RequestProfile, StreamEvent, ToolMode, ToolSpec,
     };
+    use reqwest::header::{HeaderMap, HeaderValue};
 
     #[tokio::test]
     async fn fake_server_rejects_stream_options_then_succeeds() {
@@ -242,6 +298,84 @@ mod tests {
         let bodies = server.bodies();
         assert!(bodies[0].contains("stream_options"));
         assert!(!bodies[1].contains("stream_options"));
+    }
+
+    #[tokio::test]
+    async fn success_captures_rate_limit_headers() {
+        let Some(server) = FakeOpenAiServer::new(vec![
+            Response::sse(sse_text("ok"))
+                .with_header("x-ratelimit-limit-requests", "60")
+                .with_header("x-ratelimit-remaining-requests", "58")
+                .with_header("x-ratelimit-reset-requests", "12")
+                .with_header("x-ratelimit-limit-tokens", "100000")
+                .with_header("x-ratelimit-remaining-tokens", "88000")
+                .with_header("x-ratelimit-reset-tokens", "42"),
+        ]) else {
+            return;
+        };
+        let provider = OpenAiProvider::new(server.url().to_string(), "test".into());
+        let completion = provider
+            .stream(request(vec![], Default::default()), &mut |_| {})
+            .await
+            .unwrap();
+        let limits = completion
+            .usage
+            .rate_limits
+            .expect("rate limit headers parsed");
+        assert_eq!(limits.requests_min.limit, 60);
+        assert_eq!(limits.requests_min.remaining, 58);
+        assert_eq!(limits.requests_min.reset_seconds, 12);
+        assert_eq!(limits.tokens_min.limit, 100000);
+        assert_eq!(limits.tokens_min.remaining, 88000);
+        assert_eq!(limits.tokens_min.reset_seconds, 42);
+    }
+
+    #[tokio::test]
+    async fn http_errors_carry_rate_limit_headers_in_usage() {
+        let Some(server) = FakeOpenAiServer::new(vec![
+            Response::json(429, r#"{"error":"too many requests"}"#)
+                .with_header("x-ratelimit-limit-requests", "60")
+                .with_header("x-ratelimit-remaining-requests", "0")
+                .with_header("x-ratelimit-reset-requests", "55"),
+        ]) else {
+            return;
+        };
+        let provider = OpenAiProvider::new(server.url().to_string(), "test".into());
+        let err = provider
+            .stream(request(vec![], Default::default()), &mut |_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(
+            provider_error_kind(&err),
+            Some(ProviderErrorKind::RateLimit)
+        );
+        let usage = provider_error_usage(&err);
+        let limits = usage.rate_limits.expect("rate limit headers parsed");
+        assert_eq!(limits.requests_min.limit, 60);
+        assert_eq!(limits.requests_min.remaining, 0);
+        assert_eq!(limits.requests_min.reset_seconds, 55);
+    }
+
+    #[test]
+    fn parses_hourly_rate_limit_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-ratelimit-limit-requests-1h",
+            HeaderValue::from_static("1200"),
+        );
+        headers.insert(
+            "x-ratelimit-remaining-requests-1h",
+            HeaderValue::from_static("1197"),
+        );
+        headers.insert(
+            "x-ratelimit-reset-requests-1h",
+            HeaderValue::from_static("3580"),
+        );
+        let limits = rate_limits_from_headers(&headers).expect("headers parsed");
+        assert_eq!(limits.requests_hour.limit, 1200);
+        assert_eq!(limits.requests_hour.remaining, 1197);
+        assert_eq!(limits.requests_hour.reset_seconds, 3580);
+        assert!(limits.captured_at_unix_seconds > 0);
     }
 
     #[tokio::test]

@@ -8,7 +8,7 @@ use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
 
 use crate::model_picker::{display_capabilities, display_health, display_price, display_window};
 use crate::render::{diff_lines, dim, markdown_line, wrapped_height};
-use crate::util::{clip_reason, fmt_count, fmt_elapsed};
+use crate::util::{clip_reason, fmt_count, fmt_elapsed, fmt_rate_limits};
 use crate::{PICKER_ROWS, SPINNER, TurnEventKind, TurnState};
 
 impl crate::App {
@@ -148,8 +148,7 @@ impl crate::App {
         const PREFIX: usize = 2; // "› " or "  "
         let text = self.input.text();
         let before: String = text.chars().take(self.input.cursor()).collect();
-        let cursor_col_logical =
-            before.chars().rev().take_while(|&c| c != '\n').count() as usize;
+        let cursor_col_logical = before.chars().rev().take_while(|&c| c != '\n').count() as usize;
 
         // Inner text width per line (prefix occupies the first 2 columns).
         let wrap_w = width.saturating_sub(PREFIX as u16).max(1) as usize;
@@ -800,6 +799,9 @@ impl crate::App {
                     format!("session: ↑{} ↓{}{ctx}", fmt_count(input), fmt_count(output)),
                     dim(),
                 ));
+                if let Some(limits) = fmt_rate_limits(self.rate_limits) {
+                    ilines.push(Line::styled(limits, dim()));
+                }
             }
             // The `?` keybindings help overlay: a compact, contextual cheat
             // sheet. Toggled by pressing `?` on an empty input line.
@@ -855,6 +857,9 @@ impl crate::App {
                 }
                 if let Some(pct) = self.context_pct() {
                     stats.push_str(&format!(" · {pct}% ctx"));
+                }
+                if let Some(limits) = fmt_rate_limits(self.rate_limits) {
+                    stats.push_str(&format!(" · {limits}"));
                 }
                 // The activity lead (named tool + timer, or thinking/responding)
                 // replaces the old coarse "working… · last: <event>"; its own timer

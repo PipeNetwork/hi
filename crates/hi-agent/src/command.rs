@@ -8,6 +8,8 @@ pub enum Command {
     Clear,
     /// Switch the model for subsequent turns (empty = report current).
     Model(String),
+    /// Run exactly one turn through the conservative MoA virtual route.
+    Moa(String),
     /// Switch the provider/profile for subsequent turns (empty = report current).
     /// Named profiles are resolved from the config; the model is then picked
     /// via `/model` from what the new endpoint serves.
@@ -37,6 +39,12 @@ pub enum Command {
     Context,
     /// Explore the repo and write a project-context file (runs as a turn).
     Init,
+    /// Learn a reusable workflow and write one local SKILL.md (runs as a turn).
+    Learn(String),
+    /// List discovered project/global learned skills.
+    Skills,
+    /// Use a learned skill by name as the next model turn.
+    Skill(String),
     /// Reclaim context. Empty arg = configured strategy; `full`/`hybrid`/`elide`
     /// pick one explicitly.
     Compact(String),
@@ -75,10 +83,11 @@ pub fn parse(line: &str) -> Option<Command> {
         "help" | "h" | "?" => Command::Help,
         "clear" | "new" => Command::Clear,
         "model" | "m" => Command::Model(arg),
+        "moa" => Command::Moa(arg),
         "provider" | "prov" => Command::Provider(arg),
         "usage" | "cost" => Command::Removed("usage — removed; use /status".into()),
         "review" => Command::Prompt(read_only_macro_prompt("review", &arg)),
-        "security" => Command::Prompt(read_only_macro_prompt("security", &arg)),
+        "security" | "audit" => Command::Prompt(read_only_macro_prompt("security", &arg)),
         "roadmap" => Command::Prompt(read_only_macro_prompt("roadmap", &arg)),
         "gaps" => Command::Prompt(read_only_macro_prompt("gaps", &arg)),
         "build" => Command::Prompt(build_macro_prompt(&arg)),
@@ -91,6 +100,9 @@ pub fn parse(line: &str) -> Option<Command> {
         "goal" => Command::Goal(arg),
         "context" | "ctx" => Command::Context,
         "init" => Command::Init,
+        "learn" => Command::Learn(arg),
+        "skills" => Command::Skills,
+        "skill" => Command::Skill(arg),
         "compact" => Command::Compact(arg),
         "retry" | "redo" => Command::Retry,
         "edit" => Command::Edit,
@@ -191,6 +203,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         arg_values: &[],
     },
     CommandSpec {
+        name: "moa",
+        args: "<prompt>",
+        help: "run one prompt through moa/conservative, then restore the current model",
+        arg_values: &[],
+    },
+    CommandSpec {
         name: "provider",
         args: "[name|add|edit|remove]",
         help: "switch profile, or add/edit/remove a profile (no arg lists all)",
@@ -212,6 +230,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "security",
         args: "[topic]",
         help: "run a read-only security review with targeted search",
+        arg_values: &[],
+    },
+    CommandSpec {
+        name: "audit",
+        args: "[topic]",
+        help: "run a read-only security audit with targeted search",
         arg_values: &[],
     },
     CommandSpec {
@@ -260,6 +284,24 @@ pub const COMMANDS: &[CommandSpec] = &[
         name: "init",
         args: "",
         help: "scan the repo and write an HI.md project guide",
+        arg_values: &[],
+    },
+    CommandSpec {
+        name: "learn",
+        args: "[request]",
+        help: "write one reusable local SKILL.md from a workflow",
+        arg_values: &[],
+    },
+    CommandSpec {
+        name: "skills",
+        args: "",
+        help: "list learned project/global skills",
+        arg_values: &[],
+    },
+    CommandSpec {
+        name: "skill",
+        args: "<name>",
+        help: "inject a learned skill for the next turn",
         arg_values: &[],
     },
     CommandSpec {
@@ -513,6 +555,10 @@ mod tests {
         );
         assert_eq!(parse("/model"), Some(Command::Model(String::new())));
         assert_eq!(
+            parse("/moa fix this"),
+            Some(Command::Moa("fix this".into()))
+        );
+        assert_eq!(
             parse("/provider sonnet"),
             Some(Command::Provider("sonnet".into()))
         );
@@ -556,6 +602,10 @@ mod tests {
             Some(Command::Prompt(_))
         ));
         assert!(matches!(
+            parse("/audit token leaks"),
+            Some(Command::Prompt(_))
+        ));
+        assert!(matches!(
             parse("/roadmap next work"),
             Some(Command::Prompt(_))
         ));
@@ -571,6 +621,17 @@ mod tests {
         assert_eq!(
             parse("/goal ship it"),
             Some(Command::Goal("ship it".into()))
+        );
+        assert_eq!(parse("/init"), Some(Command::Init));
+        assert_eq!(
+            parse("/learn fix this"),
+            Some(Command::Learn("fix this".into()))
+        );
+        assert_eq!(parse("/learn"), Some(Command::Learn(String::new())));
+        assert_eq!(parse("/skills"), Some(Command::Skills));
+        assert_eq!(
+            parse("/skill release-flow"),
+            Some(Command::Skill("release-flow".into()))
         );
         assert_eq!(parse("/compact"), Some(Command::Compact(String::new())));
         assert_eq!(
@@ -608,6 +669,11 @@ mod tests {
         assert!(security.contains("unsafe"));
         assert!(security.contains("unwrap"));
         assert!(security.contains("secret/token/auth"));
+
+        let audit = expand_prompt_macro("/audit token leaks").unwrap();
+        assert!(audit.contains("Read-only security request"));
+        assert!(audit.contains("token leaks"));
+        assert!(audit.contains("secret/token/auth"));
 
         let status = expand_prompt_macro("/status codebase state").unwrap();
         assert!(status.contains("codebase state"));

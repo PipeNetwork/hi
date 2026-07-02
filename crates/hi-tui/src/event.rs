@@ -27,6 +27,7 @@ pub(crate) enum UiEvent {
         ctx_used: u64,
         ctx_window: Option<u32>,
     },
+    RateLimits(Option<hi_ai::RateLimitState>),
     TurnEnd(String),
     /// A classified turn failure: (kind slug, raw message, guidance hint).
     TurnError(String, String, String),
@@ -98,6 +99,9 @@ impl Ui for ChannelUi {
     }
     fn turn_end(&mut self, summary: &str) {
         self.send(UiEvent::TurnEnd(summary.to_string()));
+    }
+    fn rate_limits(&mut self, rate_limits: Option<hi_ai::RateLimitState>) {
+        self.send(UiEvent::RateLimits(rate_limits));
     }
     fn turn_error(&mut self, kind: &str, message: &str, guidance: &str) {
         self.send(UiEvent::TurnError(

@@ -66,6 +66,10 @@ pub trait Ui: Send {
         _context_window: Option<u32>,
     ) {
     }
+    /// Latest provider rate-limit buckets observed on a model response. Emitted
+    /// alongside usage when available so frontends can distinguish endpoint
+    /// throttling from route/model failures. Defaults to ignoring it.
+    fn rate_limits(&mut self, _rate_limits: Option<hi_ai::RateLimitState>) {}
     /// End of the turn, with a prebuilt token summary line.
     fn turn_end(&mut self, summary: &str);
     /// The list of files changed during the turn (empty for a read-only or

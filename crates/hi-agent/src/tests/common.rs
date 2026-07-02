@@ -91,12 +91,14 @@ pub(crate) enum ProviderStep {
     RequestTooLarge,
     /// Fail this round with a provider error of the given kind.
     Error(ProviderErrorKind),
+    ErrorMessage(ProviderErrorKind, String),
     ErrorWithUsage(ProviderErrorKind, Usage),
 }
 
 pub(crate) struct ScriptedProvider {
     pub(crate) steps: Mutex<Vec<ProviderStep>>,
     pub(crate) requests: std::sync::Arc<Mutex<Vec<Vec<Message>>>>,
+    pub(crate) max_tokens: Option<std::sync::Arc<Mutex<Vec<u32>>>>,
 }
 
 #[async_trait]
@@ -110,6 +112,9 @@ impl Provider for ScriptedProvider {
             .lock()
             .unwrap()
             .push(request.messages.to_vec());
+        if let Some(max_tokens) = &self.max_tokens {
+            max_tokens.lock().unwrap().push(request.max_tokens);
+        }
         match self.steps.lock().unwrap().remove(0) {
             ProviderStep::Completion(completion) => Ok(completion),
             ProviderStep::RequestTooLarge => Err(ProviderError::new(
@@ -119,6 +124,9 @@ impl Provider for ScriptedProvider {
             .into()),
             ProviderStep::Error(kind) => {
                 Err(ProviderError::new(kind, "scripted provider error").into())
+            }
+            ProviderStep::ErrorMessage(kind, message) => {
+                Err(ProviderError::new(kind, message).into())
             }
             ProviderStep::ErrorWithUsage(kind, usage) => {
                 Err(ProviderError::new(kind, "scripted provider error")
@@ -245,8 +253,27 @@ pub(crate) fn scripted_agent(
     let provider = ScriptedProvider {
         steps: Mutex::new(steps),
         requests: requests.clone(),
+        max_tokens: None,
     };
     (Agent::new(Box::new(provider), cfg), requests)
+}
+
+pub(crate) fn scripted_agent_recording_max_tokens(
+    steps: Vec<ProviderStep>,
+    cfg: AgentConfig,
+) -> (
+    Agent,
+    std::sync::Arc<Mutex<Vec<Vec<Message>>>>,
+    std::sync::Arc<Mutex<Vec<u32>>>,
+) {
+    let requests = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let max_tokens = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let provider = ScriptedProvider {
+        steps: Mutex::new(steps),
+        requests: requests.clone(),
+        max_tokens: Some(max_tokens.clone()),
+    };
+    (Agent::new(Box::new(provider), cfg), requests, max_tokens)
 }
 
 pub(crate) static VERIFY_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
@@ -297,6 +324,7 @@ pub(crate) fn temp_file(tag: &str) -> std::path::PathBuf {
 pub(crate) struct RecUi {
     pub(crate) statuses: Vec<String>,
     pub(crate) usages: Vec<(u64, u64)>,
+    pub(crate) rate_limits: Vec<Option<hi_ai::RateLimitState>>,
     pub(crate) turn_end: Option<String>,
     pub(crate) assistant: String,
     pub(crate) tool_results: Vec<(String, String)>,
@@ -328,6 +356,9 @@ impl Ui for RecUi {
         _ctx_win: Option<u32>,
     ) {
         self.usages.push((input_tokens, output_tokens));
+    }
+    fn rate_limits(&mut self, rate_limits: Option<hi_ai::RateLimitState>) {
+        self.rate_limits.push(rate_limits);
     }
     fn turn_end(&mut self, summary: &str) {
         self.turn_end = Some(summary.to_string());

@@ -75,10 +75,21 @@ pub(crate) async fn repl(
 
                 // Resolve the line to a prompt to run. Commands either handle
                 // themselves (and `continue`) or yield a prompt (`/retry`).
+                let mut restore_model_state: Option<hi_agent::AgentModelState> = None;
                 let input = if let Some(command) = hi_agent::command::parse(&line) {
                     match command {
                         Command::Quit => break,
                         Command::Prompt(prompt) => prompt,
+                        Command::Moa(prompt) => {
+                            let prompt = prompt.trim().to_string();
+                            if prompt.is_empty() {
+                                println!("\x1b[2musage: /moa <prompt>\x1b[0m");
+                                continue;
+                            }
+                            restore_model_state = Some(agent.model_state());
+                            agent.set_model(hi_ai::MOA_MODEL_CONSERVATIVE.to_string(), None, None);
+                            prompt
+                        }
                         Command::Compact(arg) => {
                             let kind = CompactionKind::from_arg(&arg)
                                 .unwrap_or_else(|| agent.compaction_kind());
@@ -139,6 +150,27 @@ pub(crate) async fn repl(
                         Command::Init => {
                             println!("\x1b[2mscanning the project to write HI.md…\x1b[0m");
                             hi_agent::command::INIT_PROMPT.to_string()
+                        }
+                        Command::Learn(request) => {
+                            println!("\x1b[2mlearning a reusable skill…\x1b[0m");
+                            hi_agent::build_learn_prompt(&request)
+                        }
+                        Command::Skill(name) => {
+                            let name = name.trim();
+                            if name.is_empty() {
+                                println!("\x1b[2musage: /skill <name>\x1b[0m");
+                                continue;
+                            }
+                            match hi_agent::read_skill(name) {
+                                Ok(skill) => hi_agent::build_skill_use_prompt(
+                                    &skill.skill.name,
+                                    &skill.content,
+                                ),
+                                Err(err) => {
+                                    println!("\x1b[33m{err}\x1b[0m");
+                                    continue;
+                                }
+                            }
                         }
                         Command::Diff => {
                             let diff = hi_tools::working_tree_diff().await;
@@ -354,7 +386,7 @@ pub(crate) async fn repl(
                                 Ok(new_settings) => {
                                     let label = provider_label(new_settings.provider);
                                     let model = new_settings.model.clone();
-                                    let provider = crate::build_provider(&new_settings);
+                                    let provider = crate::build_chain(&new_settings, Vec::new());
                                     let (_price, window) = registry.metadata(&model);
                                     agent.set_provider(
                                         provider,
@@ -475,6 +507,9 @@ pub(crate) async fn repl(
                     } else {
                         println!("\x1b[33m^C — interrupted; turn discarded\x1b[0m");
                     }
+                }
+                if let Some(state) = restore_model_state.take() {
+                    agent.restore_model_state(state);
                 }
             }
             Err(ReadlineError::Interrupted) => continue, // Ctrl-C: discard the line

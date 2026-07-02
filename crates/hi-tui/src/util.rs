@@ -35,6 +35,38 @@ pub(crate) fn fmt_elapsed(secs: u64) -> String {
     }
 }
 
+pub(crate) fn fmt_rate_limits(limits: Option<hi_ai::RateLimitState>) -> Option<String> {
+    let limits = limits.filter(|limits| limits.has_data())?;
+    let mut parts = Vec::new();
+    if let Some(part) = fmt_bucket("req", limits.requests_min) {
+        parts.push(part);
+    } else if let Some(part) = fmt_bucket("req/hr", limits.requests_hour) {
+        parts.push(part);
+    }
+    if let Some(part) = fmt_bucket("tok", limits.tokens_min) {
+        parts.push(part);
+    } else if let Some(part) = fmt_bucket("tok/hr", limits.tokens_hour) {
+        parts.push(part);
+    }
+    (!parts.is_empty()).then(|| format!("limits {}", parts.join(" · ")))
+}
+
+fn fmt_bucket(label: &str, bucket: hi_ai::RateLimitBucket) -> Option<String> {
+    if bucket.limit == 0 {
+        return None;
+    }
+    let reset = if bucket.reset_seconds > 0 {
+        format!(" reset {}", fmt_elapsed(bucket.reset_seconds))
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "{label} {}/{}{reset}",
+        fmt_count(bucket.remaining),
+        fmt_count(bucket.limit)
+    ))
+}
+
 /// Nudge the terminal that a turn finished: the BEL (which most terminals turn
 /// into a dock bounce / taskbar flash / audible ping when unfocused) plus an
 /// OSC 9 desktop notification for terminals that support it (iTerm2, WezTerm, …).

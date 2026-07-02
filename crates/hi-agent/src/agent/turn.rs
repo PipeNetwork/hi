@@ -7,8 +7,8 @@ use std::sync::Arc;
 use anyhow::Result;
 use futures_util::StreamExt;
 use hi_ai::{
-    ChatRequest, Content, Message, ProviderErrorKind, RequestProfile, Role, StreamEvent, ToolMode,
-    ToolSpec, provider_error_kind,
+    ChatRequest, Content, Message, OutputCapError, ProviderErrorKind, RateLimitBucket,
+    RateLimitState, RequestProfile, Role, StreamEvent, ToolMode, ToolSpec, provider_error_kind,
 };
 use hi_tools::{PlanStatus, execute, execute_streaming};
 
@@ -27,7 +27,7 @@ use crate::steering::{
     IMPLEMENTATION_SCAFFOLD_ONLY_NUDGE, INSPECTION_SPRAWL_NUDGE, ImplementationTracker,
     READ_AFTER_SEARCH_NUDGE, READ_ONLY_SAFE_CONTEXT_WINDOW, REPEAT_NUDGE, REREAD_NUDGE,
     ReviewIntent, SECURITY_BROAD_SEARCH_NUDGE, SECURITY_SCOPE_NUDGE, TOOL_PROTOCOL_RETRY_NUDGE,
-    TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE, answer_says_insufficient_evidence,
+    TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE, ToolLoopGuardrail, answer_says_insufficient_evidence,
     bounded_review_repair_exhaustion_answer, classify_implementation_intent,
     classify_read_only_intent, concrete_review_answer_problem, deepen_review_nudge,
     implementation_missing_validation_nudge, implementation_text_tool_nudge,
@@ -43,7 +43,7 @@ use crate::steering::{
     should_nudge_security_scope, should_reject_review_repair_template,
     summarize_inspected_evidence_nudge,
 };
-use crate::transcript::NudgeKind;
+use crate::transcript::{NudgeKind, repair_invalid_tool_call_arguments_in_messages};
 use crate::verify::{Snapshot, Verifier, VerifyOutcome, stage_guidance};
 use crate::{
     AUTO_KEEP_RECENT, FINALIZE_PROMPT, MAX_CHECKPOINTS, MAX_TOOL_PROTOCOL_RETRIES,
@@ -92,6 +92,92 @@ fn build_turn_telemetry(
         first_tool_kind: evidence.first_tool_kind().to_string(),
         discovery_depth: evidence.discovery_depth().to_string(),
         quality_repair_nudges: evidence.quality_repair_nudges,
+    }
+}
+
+const MAX_TRANSIENT_ROUTE_RETRIES: u32 = 2;
+const TRANSIENT_ROUTE_RETRY_DELAYS: [u64; 2] = [2, 5];
+const MAX_TRANSIENT_ROUTE_RETRY_DELAY_SECS: u64 = 30;
+const MAX_PROVIDER_OVERLOAD_RETRIES: u32 = 4;
+const PROVIDER_OVERLOAD_RETRY_DELAYS: [u64; 4] = [5, 15, 30, 60];
+const MAX_PROVIDER_OVERLOAD_RETRY_DELAY_SECS: u64 = 90;
+const MIN_OUTPUT_CAP_RETRY_TOKENS: u32 = 512;
+
+#[derive(Default)]
+struct TurnRetryState {
+    request_too_large_retried: bool,
+    output_cap_retry_attempted: bool,
+    transient_route_retries: u32,
+    provider_overload_retries: u32,
+    protocol_retries: u32,
+    protocol_text_fallbacks: u32,
+}
+
+impl TurnRetryState {
+    fn record_provider_success(&mut self) {
+        self.output_cap_retry_attempted = false;
+        self.transient_route_retries = 0;
+        self.provider_overload_retries = 0;
+    }
+}
+
+fn output_cap_retry_tokens(current: u32, cap: OutputCapError) -> Option<u32> {
+    let next = if let Some(available) = cap.available_output_tokens {
+        available.min(current.saturating_sub(1))
+    } else if current > 1024 {
+        (current / 2).max(1024)
+    } else {
+        return None;
+    };
+    (next >= MIN_OUTPUT_CAP_RETRY_TOKENS && next < current).then_some(next)
+}
+
+fn transient_route_retry_delay(retry: u32, err: &anyhow::Error) -> std::time::Duration {
+    provider_retry_delay(
+        retry,
+        err,
+        &TRANSIENT_ROUTE_RETRY_DELAYS,
+        MAX_TRANSIENT_ROUTE_RETRY_DELAY_SECS,
+    )
+}
+
+fn provider_overload_retry_delay(retry: u32, err: &anyhow::Error) -> std::time::Duration {
+    provider_retry_delay(
+        retry,
+        err,
+        &PROVIDER_OVERLOAD_RETRY_DELAYS,
+        MAX_PROVIDER_OVERLOAD_RETRY_DELAY_SECS,
+    )
+}
+
+fn provider_retry_delay(
+    retry: u32,
+    err: &anyhow::Error,
+    default_delays: &[u64],
+    max_delay_secs: u64,
+) -> std::time::Duration {
+    let default = default_delays
+        .get(retry.saturating_sub(1) as usize)
+        .copied()
+        .unwrap_or(*default_delays.last().unwrap_or(&5));
+    let secs = hi_ai::provider_retry_after_seconds(err)
+        .unwrap_or(default)
+        .min(max_delay_secs);
+    if secs == 0 {
+        return std::time::Duration::ZERO;
+    }
+    let jitter_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| u64::from(duration.subsec_millis()) % 250)
+        .unwrap_or(0);
+    std::time::Duration::from_secs(secs) + std::time::Duration::from_millis(jitter_ms)
+}
+
+fn delay_label(delay: std::time::Duration) -> String {
+    if delay.is_zero() {
+        "now".to_string()
+    } else {
+        format!("{}s", delay.as_secs())
     }
 }
 
@@ -304,11 +390,11 @@ impl crate::Agent {
         // cycle guard to fire only on the *second* consecutive wasted round,
         // preserving a single legitimate re-inspection after new evidence.
         let mut prev_added_no_evidence = false;
-        let mut request_too_large_retried = false;
-        let mut protocol_retries = 0u32;
-        let mut protocol_text_fallbacks = 0u32;
+        let mut retry_state = TurnRetryState::default();
+        let mut request_max_tokens_override: Option<u32> = None;
         let mut text_tool_fallback_next = false;
         let mut force_text_answer_next = false;
+        let mut tool_guardrail = ToolLoopGuardrail::default();
         // Whether the turn ended because the model kept re-issuing the exact
         // same tool call through the whole repeat-nudge budget (drives the
         // incomplete notice and skips the finalization recap).
@@ -372,8 +458,8 @@ impl crate::Agent {
                 // `empty_retries` resets on real output, so a normal round runs at
                 // the configured sampling. Toggleable via HI_RECOVERY_SAMPLING for
                 // A/B-ing on the eval harness.
-                let sampling_retries = empty_retries.max(protocol_retries);
-                let sampling_budget = if protocol_retries > empty_retries {
+                let sampling_retries = empty_retries.max(retry_state.protocol_retries);
+                let sampling_budget = if retry_state.protocol_retries > empty_retries {
                     MAX_TOOL_PROTOCOL_RETRIES
                 } else {
                     self.config.max_empty_retries
@@ -405,6 +491,8 @@ impl crate::Agent {
                     .is_some()
                     .then_some(READ_ONLY_SAFE_CONTEXT_WINDOW);
                 self.elide_in_turn_context_if_needed(ui, context_safety_window);
+
+                self.messages.repair_invalid_tool_call_arguments();
 
                 // Debug-mode invariant check: the transcript we're about to send
                 // must be provider-safe (every tool_use answered, no consecutive
@@ -440,11 +528,13 @@ impl crate::Agent {
                 } else {
                     self.config.tool_mode
                 };
+                let request_max_tokens =
+                    request_max_tokens_override.unwrap_or(self.config.max_tokens);
                 let request = ChatRequest {
                     model: self.config.model.clone(),
                     messages: self.messages.arc(),
                     tools: self.request_tools_for(tool_availability_mode),
-                    max_tokens: self.config.max_tokens,
+                    max_tokens: request_max_tokens,
                     temperature,
                     top_p,
                     frequency_penalty,
@@ -476,16 +566,77 @@ impl crate::Agent {
                     }
                 };
                 let mut completion = match self.provider.stream(request, &mut sink).await {
-                    Ok(completion) => completion,
+                    Ok(completion) => {
+                        retry_state.record_provider_success();
+                        completion
+                    }
+                    Err(err)
+                        if !retry_state.output_cap_retry_attempted
+                            && hi_ai::provider_output_cap_error(&err)
+                                .and_then(|cap| output_cap_retry_tokens(request_max_tokens, cap))
+                                .is_some() =>
+                    {
+                        ui.assistant_end();
+                        self.add_error_usage(&err);
+                        self.emit_usage(ui);
+                        retry_state.output_cap_retry_attempted = true;
+                        let new_max = hi_ai::provider_output_cap_error(&err)
+                            .and_then(|cap| output_cap_retry_tokens(request_max_tokens, cap))
+                            .expect("guard checked retry tokens");
+                        request_max_tokens_override = Some(new_max);
+                        ui.nudge(&format!(
+                            "provider rejected the output budget; retrying this turn with max_tokens={new_max}"
+                        ));
+                        continue;
+                    }
+                    Err(err)
+                        if retry_state.provider_overload_retries
+                            < MAX_PROVIDER_OVERLOAD_RETRIES
+                            && hi_ai::provider_error_is_temporary_overload(&err) =>
+                    {
+                        ui.assistant_end();
+                        self.add_error_usage(&err);
+                        self.emit_usage(ui);
+                        retry_state.provider_overload_retries += 1;
+                        let retry = retry_state.provider_overload_retries;
+                        let delay = provider_overload_retry_delay(retry, &err);
+                        ui.nudge(&format!(
+                            "model provider temporarily overloaded; retrying {} ({retry}/{MAX_PROVIDER_OVERLOAD_RETRIES})",
+                            delay_label(delay)
+                        ));
+                        if !delay.is_zero() {
+                            tokio::time::sleep(delay).await;
+                        }
+                        continue;
+                    }
+                    Err(err)
+                        if retry_state.transient_route_retries < MAX_TRANSIENT_ROUTE_RETRIES
+                            && hi_ai::provider_route_error_is_retryable(&err) =>
+                    {
+                        ui.assistant_end();
+                        self.add_error_usage(&err);
+                        self.emit_usage(ui);
+                        retry_state.transient_route_retries += 1;
+                        let retry = retry_state.transient_route_retries;
+                        let delay = transient_route_retry_delay(retry, &err);
+                        ui.nudge(&format!(
+                            "model route temporarily unavailable; retrying {} ({retry}/{MAX_TRANSIENT_ROUTE_RETRIES})",
+                            delay_label(delay)
+                        ));
+                        if !delay.is_zero() {
+                            tokio::time::sleep(delay).await;
+                        }
+                        continue;
+                    }
                     Err(err)
                         if provider_error_kind(&err)
                             == Some(ProviderErrorKind::RequestTooLarge) =>
                     {
                         let mut context_drop_persistence_failed = false;
-                        if !request_too_large_retried {
+                        if !retry_state.request_too_large_retried {
                             match self.retry_after_request_too_large(input, turn_start, ui) {
                                 Ok(true) => {
-                                    request_too_large_retried = true;
+                                    retry_state.request_too_large_retried = true;
                                     turn_start = self.messages.len().saturating_sub(1);
                                     continue;
                                 }
@@ -512,6 +663,7 @@ impl crate::Agent {
                             );
                         }
                         self.add_error_usage(&err);
+                        self.emit_usage(ui);
                         self.last_compat_fallbacks = compat_fallbacks.clone();
                         self.last_turn_telemetry = build_turn_telemetry(
                             verifier.round(),
@@ -536,11 +688,13 @@ impl crate::Agent {
                     }
                     Err(err)
                         if provider_error_kind(&err) == Some(ProviderErrorKind::ToolProtocol)
-                            && protocol_retries < MAX_TOOL_PROTOCOL_RETRIES =>
+                            && retry_state.protocol_retries < MAX_TOOL_PROTOCOL_RETRIES =>
                     {
                         ui.assistant_end();
                         self.add_error_usage(&err);
-                        protocol_retries += 1;
+                        self.emit_usage(ui);
+                        retry_state.protocol_retries += 1;
+                        let protocol_retries = retry_state.protocol_retries;
                         if implementation_intent.is_some() || made_tool_call {
                             force_tools_next = true;
                         }
@@ -563,11 +717,12 @@ impl crate::Agent {
                     Err(err)
                         if provider_error_kind(&err) == Some(ProviderErrorKind::ToolProtocol)
                             && implementation_intent.is_some()
-                            && protocol_text_fallbacks < 1 =>
+                            && retry_state.protocol_text_fallbacks < 1 =>
                     {
                         ui.assistant_end();
                         self.add_error_usage(&err);
-                        protocol_text_fallbacks += 1;
+                        self.emit_usage(ui);
+                        retry_state.protocol_text_fallbacks += 1;
                         text_tool_fallback_next = true;
                         force_tools_next = false;
                         ui.status(
@@ -606,6 +761,7 @@ impl crate::Agent {
                     {
                         ui.assistant_end();
                         self.add_error_usage(&err);
+                        self.emit_usage(ui);
                         empty_retries += 1;
                         ui.nudge(&format!(
                             "⚠ the model's response didn't come through cleanly — \
@@ -616,6 +772,7 @@ impl crate::Agent {
                     }
                     Err(err) => {
                         self.add_error_usage(&err);
+                        self.emit_usage(ui);
                         if made_tool_call {
                             self.messages.strip_trailing_nudges();
                             let end_snapshot = self.snapshot_cached().await;
@@ -653,12 +810,7 @@ impl crate::Agent {
 
                 self.add_usage(completion.usage);
                 // Let the frontend show the running total climb mid-turn.
-                ui.usage(
-                    self.totals.input_tokens,
-                    self.totals.output_tokens,
-                    self.context_used,
-                    self.config.context_window,
-                );
+                self.emit_usage(ui);
 
                 // Truncation recovery: the model hit the output token cap
                 // (`stop_reason: "length"` / `"max_tokens"`) mid-generation.
@@ -1137,7 +1289,7 @@ If the task is already complete, stop and give your final recap."
                 // temperature bump is transient: a later, unrelated stall gets
                 // its own budget rather than inheriting this one's elevation.
                 empty_retries = 0;
-                protocol_retries = 0;
+                retry_state.protocol_retries = 0;
                 truncation_retries = 0;
 
                 if calls.is_empty() {
@@ -1668,6 +1820,11 @@ If the task is already complete, stop and give your final recap."
                 // The model acted, so drop the forced-tool-choice we may have set
                 // after a nudge — the next round is free to narrate or finish.
                 force_tools_next = false;
+                let hash_guard_applies = calls
+                    .iter()
+                    .all(|(_, name, _)| matches!(name.as_str(), "read" | "list" | "grep" | "glob"));
+                let mut hashable_idempotent_results = 0usize;
+                let mut repeated_idempotent_results = 0usize;
                 // Infer within-batch dependencies (a read of a file a mutating
                 // call earlier in the batch targeted must observe that mutation;
                 // mutating calls serialize). The scheduler below runs ready
@@ -1818,6 +1975,14 @@ If the task is already complete, stop and give your final recap."
                         let error = output.content.starts_with("Error:");
                         evidence.record_success(name, arguments, &output.content);
                         implementation_tracker.record_tool_result(name, arguments, &output.content);
+                        let progress =
+                            tool_guardrail.record_tool_result(name, arguments, &output.content);
+                        if progress.hashable_idempotent {
+                            hashable_idempotent_results += 1;
+                            if progress.repeated_idempotent_result {
+                                repeated_idempotent_results += 1;
+                            }
+                        }
                         tool_timeline.push(ToolCallEntry {
                             tool: name.clone(),
                             path,
@@ -1930,6 +2095,14 @@ If the task is already complete, stop and give your final recap."
                             &calls[i].2,
                             &output.content,
                         );
+                        let progress =
+                            tool_guardrail.record_tool_result(name, &calls[i].2, &output.content);
+                        if progress.hashable_idempotent {
+                            hashable_idempotent_results += 1;
+                            if progress.repeated_idempotent_result {
+                                repeated_idempotent_results += 1;
+                            }
+                        }
                         tool_timeline.push(ToolCallEntry {
                             tool: name.clone(),
                             path,
@@ -2015,6 +2188,55 @@ If the task is already complete, stop and give your final recap."
                         ui.status(&format!("⚠ proactive check failed for {path}:\n{output}"));
                     }
                 }
+                let repeated_result_no_progress = hash_guard_applies
+                    && hashable_idempotent_results == calls.len()
+                    && repeated_idempotent_results == calls.len();
+                if repeated_result_no_progress {
+                    prev_added_no_evidence = true;
+                    let repeat_budget_available = repeat_nudges < self.config.max_repeat_nudges;
+                    let no_new_after_mutation = implementation_tracker.mutation_seen;
+                    if repeat_budget_available {
+                        repeat_nudges += 1;
+                        stalled_repeating = true;
+                        ui.nudge(&format!(
+                            "the model got the same inspection output again — nudging it to act on already-returned evidence ({repeat_nudges}/{})",
+                            self.config.max_repeat_nudges
+                        ));
+                        self.messages.push_nudge(NudgeKind::Repeat, REREAD_NUDGE);
+                        continue;
+                    }
+                    if !no_new_after_mutation {
+                        if let Some(intent) = read_only_intent {
+                            stalled_unfinished = true;
+                            ui.nudge(
+                                "review kept getting the same inspection output; returning a bounded evidence summary",
+                            );
+                            let insufficient = bounded_review_repair_exhaustion_answer(
+                                intent,
+                                &evidence,
+                                "the model kept getting the same inspection output instead of producing findings tied to inspected evidence",
+                            );
+                            ui.assistant_text(&insufficient);
+                            ui.assistant_end();
+                            self.messages
+                                .push_assistant(vec![Content::Text(insufficient)]);
+                            break false;
+                        }
+                        if implementation_intent.is_some() && !implementation_tracker.mutation_seen
+                        {
+                            stalled_unfinished = true;
+                            let incomplete = "Implementation incomplete: the model kept getting the same inspection output instead of making edits, so no file changes were made. /retry, or send 'continue' to resume.";
+                            ui.nudge(
+                                "implementation repeated equivalent inspection output without editing",
+                            );
+                            ui.assistant_text(incomplete);
+                            ui.assistant_end();
+                            self.messages
+                                .push_assistant(vec![Content::Text(incomplete.to_string())]);
+                            break false;
+                        }
+                    }
+                }
             };
 
             if hit_cap {
@@ -2037,7 +2259,9 @@ If the task is already complete, stop and give your final recap."
             // again, so it's no longer current.
             if matches!(
                 outcome,
-                VerifyOutcome::Passed | VerifyOutcome::Failed { .. }
+                VerifyOutcome::Passed
+                    | VerifyOutcome::Failed { .. }
+                    | VerifyOutcome::SkippedProseOnly { .. }
             ) {
                 verify_snapshot = Some(self.snapshot_cached().await);
                 if matches!(outcome, VerifyOutcome::Failed { .. }) {
@@ -2057,6 +2281,12 @@ If the task is already complete, stop and give your final recap."
                 VerifyOutcome::SkippedNoChanges { first } => {
                     if first {
                         ui.status("verification skipped — no files changed this turn");
+                    }
+                    break 'turn;
+                }
+                VerifyOutcome::SkippedProseOnly { first } => {
+                    if first {
+                        ui.status("verification skipped — prose-only files changed this turn");
                     }
                     break 'turn;
                 }
@@ -2232,6 +2462,7 @@ If the task is already complete, stop and give your final recap."
         messages.push(self.minimal_system_message());
         messages.extend_from_slice(turn);
         messages.push(Message::user(FINALIZE_PROMPT));
+        repair_invalid_tool_call_arguments_in_messages(&mut messages);
 
         let request = ChatRequest {
             model: self.config.model.clone(),
@@ -2262,6 +2493,7 @@ If the task is already complete, stop and give your final recap."
             Ok(completion) => completion,
             Err(err) => {
                 self.add_error_usage(&err);
+                self.emit_usage(ui);
                 // Flush any partially-streamed recap text before the status
                 // line, so it isn't left dangling in the UI's pending buffer.
                 ui.assistant_end();
@@ -2271,12 +2503,7 @@ If the task is already complete, stop and give your final recap."
         };
 
         self.add_usage(completion.usage);
-        ui.usage(
-            self.totals.input_tokens,
-            self.totals.output_tokens,
-            self.context_used,
-            self.config.context_window,
-        );
+        self.emit_usage(ui);
 
         // Fall back to the final content if the provider didn't stream text.
         // Emit it through the UI before assistant_end so the user actually sees
@@ -2331,6 +2558,9 @@ If the task is already complete, stop and give your final recap."
                 humanize_count(self.context_used),
                 humanize_count(u64::from(window)),
             ));
+        }
+        if let Some(limits) = usage.rate_limits.and_then(rate_limit_summary) {
+            summary.push_str(&format!(" · {limits}"));
         }
         // Per-turn trajectory: a terse "steer" suffix when the turn needed
         // more than one shot, so a noisy success reads differently from a clean
@@ -2436,5 +2666,63 @@ If the task is already complete, stop and give your final recap."
         }
         *content = new_content;
         saw_partial_tool_call
+    }
+}
+
+fn rate_limit_summary(limits: RateLimitState) -> Option<String> {
+    if !limits.has_data() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if let Some(part) = rate_limit_bucket_summary("req", limits.requests_min) {
+        parts.push(part);
+    } else if let Some(part) = rate_limit_bucket_summary("req/hr", limits.requests_hour) {
+        parts.push(part);
+    }
+    if let Some(part) = rate_limit_bucket_summary("tok", limits.tokens_min) {
+        parts.push(part);
+    } else if let Some(part) = rate_limit_bucket_summary("tok/hr", limits.tokens_hour) {
+        parts.push(part);
+    }
+    (!parts.is_empty()).then(|| format!("limits {}", parts.join(" · ")))
+}
+
+fn rate_limit_bucket_summary(label: &str, bucket: RateLimitBucket) -> Option<String> {
+    if bucket.limit == 0 {
+        return None;
+    }
+    let reset = if bucket.reset_seconds > 0 {
+        format!(" reset {}", format_rate_limit_reset(bucket.reset_seconds))
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "{label} {}/{}{reset}",
+        humanize_count(bucket.remaining),
+        humanize_count(bucket.limit)
+    ))
+}
+
+fn format_rate_limit_reset(seconds: u64) -> String {
+    match seconds {
+        0..=59 => format!("{seconds}s"),
+        60..=3599 => {
+            let minutes = seconds / 60;
+            let secs = seconds % 60;
+            if secs == 0 {
+                format!("{minutes}m")
+            } else {
+                format!("{minutes}m {secs}s")
+            }
+        }
+        _ => {
+            let hours = seconds / 3600;
+            let minutes = (seconds % 3600) / 60;
+            if minutes == 0 {
+                format!("{hours}h")
+            } else {
+                format!("{hours}h {minutes}m")
+            }
+        }
     }
 }

@@ -11,6 +11,7 @@ mod implementation;
 mod intent;
 mod nudges;
 mod preflight;
+mod tool_guardrail;
 mod types;
 
 pub(crate) use constants::*;
@@ -18,4 +19,5 @@ pub(crate) use implementation::*;
 pub(crate) use intent::*;
 pub(crate) use nudges::*;
 pub(crate) use preflight::*;
+pub(crate) use tool_guardrail::*;
 pub(crate) use types::*;

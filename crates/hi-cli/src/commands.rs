@@ -173,11 +173,14 @@ pub(crate) fn handle_command(
         },
         // Handled in the repl loop (async / runs a turn); never reach here.
         Command::Prompt(_)
+        | Command::Moa(_)
         | Command::Compact(_)
         | Command::Retry
         | Command::Edit
         | Command::Undo
         | Command::Init
+        | Command::Learn(_)
+        | Command::Skill(_)
         | Command::Diff
         | Command::Commit => {}
         Command::Version => {
@@ -210,6 +213,16 @@ pub(crate) fn handle_command(
         }
         Command::Context => {
             print!("{}", agent.context_breakdown());
+        }
+        Command::Skills => {
+            let skills = hi_agent::list_skills();
+            if skills.is_empty() {
+                println!("\x1b[2mno learned skills found\x1b[0m");
+            } else {
+                for skill in skills {
+                    println!("{}  [{}]  {}", skill.name, skill.scope, skill.description);
+                }
+            }
         }
         // `/provider` is handled inline by the REPL/TUI (it needs the Config
         // and a provider builder, which this synchronous handler doesn't have).

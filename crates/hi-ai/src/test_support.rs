@@ -42,6 +42,7 @@ impl FakeOpenAiServer {
 pub struct Response {
     status: u16,
     content_type: &'static str,
+    headers: Vec<(String, String)>,
     body: String,
 }
 
@@ -50,6 +51,7 @@ impl Response {
         Self {
             status,
             content_type: "application/json",
+            headers: Vec::new(),
             body: body.into(),
         }
     }
@@ -58,8 +60,14 @@ impl Response {
         Self {
             status: 200,
             content_type: "text/event-stream",
+            headers: Vec::new(),
             body: body.into(),
         }
+    }
+
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
     }
 
     fn to_http(&self) -> String {
@@ -74,11 +82,17 @@ impl Response {
             503 => "Service Unavailable",
             _ => "Status",
         };
+        let extra_headers: String = self
+            .headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .collect();
         format!(
-            "HTTP/1.1 {} {}\r\ncontent-type: {}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            "HTTP/1.1 {} {}\r\ncontent-type: {}\r\n{}content-length: {}\r\nconnection: close\r\n\r\n{}",
             self.status,
             reason,
             self.content_type,
+            extra_headers,
             self.body.len(),
             self.body
         )
