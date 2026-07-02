@@ -23,6 +23,8 @@ const DEFAULT_BASH_TIMEOUT_SECS: u64 = 600;
 /// value can't reintroduce an unbounded stall.
 const MAX_BASH_TIMEOUT_SECS: u64 = 3600;
 const CHECK_TIMEOUT: Duration = Duration::from_secs(300);
+const HF_AGENT_ENV_VAR: &str = "AI_AGENT";
+const HF_AGENT_ID: &str = "hi";
 const PYTHON_TUI_MARKERS: &[&str] = &[
     "from textual",
     "import textual",
@@ -64,7 +66,9 @@ fn resolve_bash_timeout(requested: Option<u64>) -> Duration {
 /// Run a verification command (e.g. a test suite) and report `(passed, output)`
 /// based on its exit status. Used by the agent's verification loop.
 pub async fn run_check(command: &str) -> (bool, String) {
-    let future = Command::new("sh").arg("-c").arg(command).output();
+    let mut cmd = Command::new("sh");
+    mark_agent_harness(&mut cmd).arg("-c").arg(command);
+    let future = cmd.output();
     match tokio::time::timeout(CHECK_TIMEOUT, future).await {
         Ok(Ok(output)) => {
             let mut text = String::new();
@@ -1026,7 +1030,8 @@ async fn run_lsp_hover(arguments: &str) -> Result<ToolOutput> {
 /// background bash paths so both behave identically.
 pub(crate) fn spawn_shell(command: &str) -> Result<tokio::process::Child> {
     let mut cmd = Command::new("sh");
-    cmd.arg("-c")
+    mark_agent_harness(&mut cmd)
+        .arg("-c")
         .arg(command)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -1035,6 +1040,10 @@ pub(crate) fn spawn_shell(command: &str) -> Result<tokio::process::Child> {
     #[cfg(unix)]
     cmd.process_group(0);
     cmd.spawn().context("failed to spawn command")
+}
+
+fn mark_agent_harness(cmd: &mut Command) -> &mut Command {
+    cmd.env(HF_AGENT_ENV_VAR, HF_AGENT_ID)
 }
 
 /// Best-effort process-group cleanup for foreground bash futures. This matters
@@ -1461,7 +1470,7 @@ fn is_env_assignment(tok: &str) -> bool {
 mod tests {
     use super::{
         fast_check_for, foreground_interactive_command_reason, is_filesystem_mutating,
-        is_read_only, run_bash_streaming_with_timeout, target_path,
+        is_read_only, run_bash_streaming_with_timeout, run_check, target_path,
     };
     use crate::edit::sh_quote;
     use std::sync::{LazyLock, Mutex};
@@ -1515,6 +1524,26 @@ mod tests {
             .expect("ok");
         assert!(out.contains("hello"), "got: {out:?}");
         assert!(!out.contains("timed out"), "got: {out:?}");
+    }
+
+    #[tokio::test]
+    async fn bash_marks_hugging_face_agent_harness() {
+        let mut sink = |_: &str| {};
+        let out = run_bash_streaming_with_timeout(
+            "printf '%s' \"$AI_AGENT\"",
+            &mut sink,
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("ok");
+        assert_eq!(out.trim_end(), "hi");
+    }
+
+    #[tokio::test]
+    async fn verify_marks_hugging_face_agent_harness() {
+        let (passed, out) = run_check("printf '%s' \"$AI_AGENT\"").await;
+        assert!(passed, "got: {out:?}");
+        assert_eq!(out, "hi");
     }
 
     // stdin is detached: a command reading stdin sees EOF immediately rather
