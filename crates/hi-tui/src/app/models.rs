@@ -55,7 +55,11 @@ impl crate::App {
         let (_cat_price, cat_window) = registry.metadata(id);
         let served = self.served.get(id);
         let window = served.and_then(|m| m.context_window).or(cat_window);
-        agent.set_model(id.to_string(), window);
+        agent.set_model(
+            id.to_string(),
+            window,
+            served.and_then(|m| m.max_output_tokens),
+        );
         self.model = id.to_string();
         self.context_window = window;
         served.and_then(|m| m.health()).map(str::to_string)

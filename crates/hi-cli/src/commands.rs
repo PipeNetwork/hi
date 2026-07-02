@@ -76,7 +76,7 @@ pub(crate) fn handle_command(
                 );
             } else {
                 let (_price, context_window) = registry.metadata(&id);
-                agent.set_model(id.clone(), context_window);
+                agent.set_model(id.clone(), context_window, None);
                 println!("model set to {id}");
             }
         }

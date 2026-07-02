@@ -38,7 +38,15 @@ impl VerifyStage {
 /// Per-session configuration the agent applies to every request.
 pub struct AgentConfig {
     pub model: String,
+    /// The user/config requested output-token cap before live model metadata is
+    /// applied. Kept separately so `/model` switches can recompute the active
+    /// cap without inheriting the previous route's live limit.
+    pub requested_max_tokens: u32,
     pub max_tokens: u32,
+    /// True when the user deliberately set the cap (CLI or non-default profile).
+    /// Explicit caps are honored, only clamped downward to a model's advertised
+    /// limit.
+    pub max_tokens_explicit: bool,
     pub temperature: Option<f32>,
     pub thinking_budget: Option<u32>,
     pub tool_mode: ToolMode,
@@ -129,7 +137,9 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             model: String::new(),
+            requested_max_tokens: 8192,
             max_tokens: 8192,
+            max_tokens_explicit: false,
             temperature: None,
             thinking_budget: None,
             tool_mode: ToolMode::Auto,

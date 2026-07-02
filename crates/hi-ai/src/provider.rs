@@ -98,6 +98,9 @@ pub struct ServedModel {
     pub id: String,
     /// Context window in tokens.
     pub context_window: Option<u32>,
+    /// Maximum output tokens the endpoint says this model/route supports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_output_tokens: Option<u32>,
     /// Pricing `(input, output)` in USD per 1M tokens.
     pub price: Option<(f64, f64)>,
     /// Human-readable provider/source label when the endpoint exposes one.
@@ -117,6 +120,33 @@ pub struct ServedModel {
     pub capabilities: Vec<String>,
 }
 
+pub const CODING_AGENT_MIN_OUTPUT_TOKENS: u32 = 8192;
+
+pub fn effective_coding_agent_max_tokens(
+    model: &str,
+    configured_max_tokens: u32,
+    max_tokens_explicit: bool,
+    advertised_max_output_tokens: Option<u32>,
+) -> u32 {
+    let advertised = advertised_max_output_tokens.filter(|limit| *limit > 0);
+    let configured = if !max_tokens_explicit && is_pipenetwork_coding_route(model) {
+        configured_max_tokens.max(CODING_AGENT_MIN_OUTPUT_TOKENS)
+    } else {
+        configured_max_tokens
+    };
+
+    match advertised {
+        Some(limit) if max_tokens_explicit => configured.min(limit),
+        Some(limit) if is_pipenetwork_coding_route(model) => limit,
+        Some(limit) => configured.min(limit),
+        None => configured,
+    }
+}
+
+pub fn is_pipenetwork_coding_route(model: &str) -> bool {
+    matches!(model, "ipop/coder-balanced" | "pipe/auto-code")
+}
+
 impl ServedModel {
     /// A short health label worth flagging, or `None` when the model is healthy
     /// (or the endpoint reported nothing). Used to warn before you rely on a
@@ -132,6 +162,53 @@ impl ServedModel {
 
 fn default_available() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pipenetwork_coding_routes_use_advertised_output_limit_when_implicit() {
+        assert_eq!(
+            effective_coding_agent_max_tokens(
+                "ipop/coder-balanced",
+                CODING_AGENT_MIN_OUTPUT_TOKENS,
+                false,
+                Some(131_072),
+            ),
+            131_072
+        );
+        assert_eq!(
+            effective_coding_agent_max_tokens(
+                "pipe/auto-code",
+                CODING_AGENT_MIN_OUTPUT_TOKENS,
+                false,
+                Some(16_384),
+            ),
+            16_384
+        );
+    }
+
+    #[test]
+    fn explicit_output_limit_is_honored_and_clamped() {
+        assert_eq!(
+            effective_coding_agent_max_tokens("ipop/coder-balanced", 4096, true, Some(131_072)),
+            4096
+        );
+        assert_eq!(
+            effective_coding_agent_max_tokens("pipe/auto-code", 65_536, true, Some(16_384)),
+            16_384
+        );
+    }
+
+    #[test]
+    fn coding_routes_never_drop_below_the_default_without_an_advertised_cap() {
+        assert_eq!(
+            effective_coding_agent_max_tokens("ipop/coder-balanced", 2048, false, None),
+            CODING_AGENT_MIN_OUTPUT_TOKENS
+        );
+    }
 }
 
 /// A model backend. Implementations own the wire-format translation and SSE

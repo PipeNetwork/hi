@@ -284,12 +284,14 @@ give your final recap.";
 /// mid-generation, not finished. The nudge tells the model to continue from
 /// where it stopped so the turn doesn't end on a half-finished output.
 pub(crate) const TRUNCATION_NUDGE: &str = "Your previous response was cut off by the output token limit — \
-it was truncated, not finished. Continue exactly from where you stopped, completing the text or \
-tool call you were in the middle of. Do not restart or repeat what you already produced.";
+it was truncated, not finished. Continue from where you stopped, but keep the continuation small: \
+finish the current paragraph or call exactly one tool for the next smallest concrete action. Do not \
+restart, repeat what you already produced, or write a long narrative continuation.";
 pub(crate) const TRUNCATED_TOOL_CALL_NUDGE: &str = "Your previous response was cut off while emitting or preparing a tool \
 call. That partial work was not executed. Issue one fresh, complete tool call now. If the payload \
-is large, split the work into smaller writes/edits or use a bounded shell smoke test; do not \
-continue inside the partial tool-call text.";
+is large, split the work into smaller writes/edits and do only the next chunk; use bounded shell \
+smoke tests for verification. Do not continue inside the partial tool-call text or emit prose \
+instead of the next concrete action.";
 
 pub(crate) fn partial_text_tool_call_start(text: &str) -> Option<usize> {
     ["<tool_call>", "{\"name\"", "[tool_call", "[tool_calls"]

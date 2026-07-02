@@ -23,7 +23,8 @@ pub use mcp::{
 };
 pub use openai::OpenAiProvider;
 pub use provider::{
-    Provider, ProviderError, ProviderErrorKind, ServedModel, provider_error_kind,
+    CODING_AGENT_MIN_OUTPUT_TOKENS, Provider, ProviderError, ProviderErrorKind, ServedModel,
+    effective_coding_agent_max_tokens, is_pipenetwork_coding_route, provider_error_kind,
     provider_error_usage,
 };
 pub use registry::{ModelInfo, Registry};

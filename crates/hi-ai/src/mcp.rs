@@ -219,6 +219,7 @@ pub struct PipeMcpModelMetadata {
     pub id: String,
     pub provider_label: Option<String>,
     pub context_window: Option<u32>,
+    pub max_output_tokens: Option<u32>,
     /// Pricing `(input, output)` in USD per 1M tokens.
     pub price: Option<(f64, f64)>,
     pub status: Option<String>,
@@ -236,6 +237,7 @@ impl PipeMcpModelMetadata {
         ServedModel {
             id: self.id,
             context_window: self.context_window,
+            max_output_tokens: self.max_output_tokens,
             price: self.price,
             provider_label: self.provider_label,
             status: self.status,
@@ -309,10 +311,18 @@ fn parse_one_model_metadata(value: &Value) -> Option<PipeMcpModelMetadata> {
             .get("provider_label")
             .and_then(Value::as_str)
             .map(str::to_string),
-        context_window: value
-            .get("context_window")
-            .and_then(Value::as_u64)
-            .and_then(|n| u32::try_from(n).ok()),
+        context_window: u32_metadata(value, &["context_window", "max_context_tokens"]),
+        max_output_tokens: u32_metadata(
+            value,
+            &[
+                "max_output_tokens",
+                "max_completion_tokens",
+                "output_token_limit",
+                "/limits/max_output_tokens",
+                "/limits/max_completion_tokens",
+                "/limits/output_tokens",
+            ],
+        ),
         price: match (
             pricing.get("input_token_rate").and_then(Value::as_f64),
             pricing.get("output_token_rate").and_then(Value::as_f64),
@@ -380,6 +390,17 @@ fn capability_tags(value: Option<&Value>) -> Vec<String> {
     tags
 }
 
+fn u32_metadata(value: &Value, fields_or_pointers: &[&str]) -> Option<u32> {
+    fields_or_pointers.iter().find_map(|field| {
+        let raw = if field.starts_with('/') {
+            value.pointer(field)
+        } else {
+            value.get(field)
+        }?;
+        raw.as_u64().and_then(|n| u32::try_from(n).ok())
+    })
+}
+
 fn normalize_capability(key: &str) -> String {
     match key {
         "parallel_tool_calls" => "parallel-tools".to_string(),
@@ -413,6 +434,9 @@ mod tests {
                 "id": "ipop/coder-balanced",
                 "provider_label": "Pipe",
                 "context_window": 1000000,
+                "limits": {
+                    "max_output_tokens": 131072
+                },
                 "capabilities": {
                     "chat": true,
                     "tools": true,
@@ -439,12 +463,14 @@ mod tests {
         assert_eq!(model.id, "ipop/coder-balanced");
         assert_eq!(model.provider_label.as_deref(), Some("Pipe"));
         assert_eq!(model.context_window, Some(1_000_000));
+        assert_eq!(model.max_output_tokens, Some(131_072));
         assert_eq!(model.price, Some((1.0, 2.0)));
         assert!(model.capabilities.contains(&"tools".to_string()));
         assert!(model.capabilities.contains(&"parallel-tools".to_string()));
 
         let served = models.into_iter().next().unwrap().into_served();
         assert_eq!(served.provider_label.as_deref(), Some("Pipe"));
+        assert_eq!(served.max_output_tokens, Some(131_072));
         assert_eq!(served.health(), None);
     }
 

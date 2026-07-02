@@ -431,11 +431,22 @@ impl crate::Agent {
         &self.config.model
     }
 
-    /// Switch the model used for subsequent turns, refreshing the
-    /// context-window metadata that drives the usage display.
-    pub fn set_model(&mut self, model: String, context_window: Option<u32>) {
+    /// Switch the model used for subsequent turns, refreshing live metadata
+    /// that drives the usage display and output-token budget.
+    pub fn set_model(
+        &mut self,
+        model: String,
+        context_window: Option<u32>,
+        max_output_tokens: Option<u32>,
+    ) {
         self.config.model = model;
         self.config.context_window = context_window;
+        self.config.max_tokens = hi_ai::effective_coding_agent_max_tokens(
+            &self.config.model,
+            self.config.requested_max_tokens,
+            self.config.max_tokens_explicit,
+            max_output_tokens,
+        );
     }
 
     /// Swap the provider (endpoint + wire format + key) and model for subsequent
@@ -453,10 +464,14 @@ impl crate::Agent {
         provider: Box<dyn Provider>,
         model: String,
         context_window: Option<u32>,
+        requested_max_tokens: u32,
+        max_tokens_explicit: bool,
+        max_output_tokens: Option<u32>,
     ) {
         self.provider = provider;
-        self.config.model = model;
-        self.config.context_window = context_window;
+        self.config.requested_max_tokens = requested_max_tokens;
+        self.config.max_tokens_explicit = max_tokens_explicit;
+        self.set_model(model, context_window, max_output_tokens);
     }
 
     /// Reset the live and persisted context to just the current system prompt.

@@ -15,7 +15,8 @@ use hi_ai::{CompatMode, Registry, ToolMode};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_MAX_TOKENS: u32 = 8192;
-const PIPENETWORK_DEFAULT_MAX_TOKENS: u32 = 2048;
+const PIPENETWORK_DEFAULT_MAX_TOKENS: u32 = DEFAULT_MAX_TOKENS;
+const LEGACY_PIPENETWORK_DEFAULT_MAX_TOKENS: u32 = 2048;
 
 /// A minimal agentic coding tool. Works with any OpenAI-compatible endpoint
 /// (OpenRouter, pipenetwork.ai, Ollama, llama.cpp, vLLM) or the native
@@ -379,6 +380,7 @@ pub struct Settings {
     pub mcp_url: Option<String>,
     pub api_key: String,
     pub max_tokens: u32,
+    pub max_tokens_explicit: bool,
     pub thinking_budget: Option<u32>,
     pub tool_mode: ToolMode,
     pub compat: CompatMode,
@@ -555,8 +557,10 @@ pub fn resolve(cli: &Cli, config: &Config, registry: &Registry) -> Result<Settin
 
     let api_key = resolve_api_key(cli, profile, provider)?;
 
-    let mut max_tokens =
-        configured_max_tokens(provider, cli.max_tokens, profile.and_then(|p| p.max_tokens));
+    let profile_max_tokens = profile.and_then(|p| p.max_tokens);
+    let max_tokens = configured_max_tokens(provider, cli.max_tokens, profile_max_tokens);
+    let max_tokens_explicit = max_tokens_is_explicit(provider, cli.max_tokens, profile_max_tokens);
+    let mut max_tokens = max_tokens;
     // Don't exceed a known model's output ceiling (avoids a 400 from Anthropic).
     if let Some(info) = registry.lookup(&model)
         && info.max_output > 0
@@ -584,6 +588,7 @@ pub fn resolve(cli: &Cli, config: &Config, registry: &Registry) -> Result<Settin
         mcp_url,
         api_key,
         max_tokens,
+        max_tokens_explicit,
         thinking_budget,
         tool_mode,
         compat,
@@ -1095,7 +1100,9 @@ pub fn resolve_named_profile(config: &Config, name: &str, registry: &Registry) -
         .or_else(|| provider.default_mcp_url().map(String::from));
     let api_key = resolve_api_key_for(Some(profile), provider)?;
 
-    let mut max_tokens = configured_max_tokens(provider, None, profile.max_tokens);
+    let max_tokens = configured_max_tokens(provider, None, profile.max_tokens);
+    let max_tokens_explicit = max_tokens_is_explicit(provider, None, profile.max_tokens);
+    let mut max_tokens = max_tokens;
     if let Some(info) = registry.lookup(&model)
         && info.max_output > 0
         && max_tokens > info.max_output
@@ -1110,6 +1117,7 @@ pub fn resolve_named_profile(config: &Config, name: &str, registry: &Registry) -
         mcp_url,
         api_key,
         max_tokens,
+        max_tokens_explicit,
         thinking_budget: profile.thinking_budget,
         tool_mode: profile.tool_mode.unwrap_or_default(),
         compat: profile.compat.unwrap_or_default(),
@@ -1125,22 +1133,42 @@ fn configured_max_tokens(
         return value;
     }
     match (provider, profile_max_tokens) {
-        // The setup wizard historically wrote `8192` into pipenetwork profiles.
-        // Treat that legacy value as the old default and use the bounded hosted
-        // route budget instead; an explicit CLI --max-tokens still wins above.
-        (ProviderName::Pipenetwork, None | Some(DEFAULT_MAX_TOKENS)) => {
-            PIPENETWORK_DEFAULT_MAX_TOKENS
-        }
+        // Pipenetwork profiles may carry old wizard defaults. Treat those as
+        // implicit so live API limits can size coding-agent turns at runtime;
+        // an explicit CLI --max-tokens still wins above.
+        (
+            ProviderName::Pipenetwork,
+            None | Some(DEFAULT_MAX_TOKENS) | Some(LEGACY_PIPENETWORK_DEFAULT_MAX_TOKENS),
+        ) => PIPENETWORK_DEFAULT_MAX_TOKENS,
         (_, Some(value)) => value,
         (_, None) => DEFAULT_MAX_TOKENS,
+    }
+}
+
+fn max_tokens_is_explicit(
+    provider: ProviderName,
+    cli_max_tokens: Option<u32>,
+    profile_max_tokens: Option<u32>,
+) -> bool {
+    if cli_max_tokens.is_some() {
+        return true;
+    }
+    match (provider, profile_max_tokens) {
+        (
+            ProviderName::Pipenetwork,
+            None | Some(DEFAULT_MAX_TOKENS) | Some(LEGACY_PIPENETWORK_DEFAULT_MAX_TOKENS),
+        ) => false,
+        (_, Some(_)) => true,
+        (_, None) => false,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        Config, DEFAULT_MAX_TOKENS, PIPENETWORK_DEFAULT_MAX_TOKENS, Profile, ProviderName,
-        configured_max_tokens, detect_verify_pipeline, save_config_to,
+        Config, DEFAULT_MAX_TOKENS, LEGACY_PIPENETWORK_DEFAULT_MAX_TOKENS,
+        PIPENETWORK_DEFAULT_MAX_TOKENS, Profile, ProviderName, configured_max_tokens,
+        detect_verify_pipeline, max_tokens_is_explicit, save_config_to,
     };
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -1240,18 +1268,47 @@ mod tests {
     #[test]
     fn pipenetwork_default_max_tokens_is_bounded_unless_cli_overrides() {
         assert_eq!(
+            PIPENETWORK_DEFAULT_MAX_TOKENS, 8192,
+            "Pipenetwork coding-agent turns need enough headroom to avoid routine continuation recovery"
+        );
+        assert_eq!(
             configured_max_tokens(ProviderName::Pipenetwork, None, None),
             PIPENETWORK_DEFAULT_MAX_TOKENS
         );
         assert_eq!(
             configured_max_tokens(ProviderName::Pipenetwork, None, Some(DEFAULT_MAX_TOKENS)),
             PIPENETWORK_DEFAULT_MAX_TOKENS,
-            "legacy wizard profiles should not keep using 8192 by default"
+            "default-valued profiles should be live-sized at runtime"
+        );
+        assert_eq!(
+            configured_max_tokens(
+                ProviderName::Pipenetwork,
+                None,
+                Some(LEGACY_PIPENETWORK_DEFAULT_MAX_TOKENS)
+            ),
+            PIPENETWORK_DEFAULT_MAX_TOKENS,
+            "legacy 2048 profiles must not keep undersizing coding-agent turns"
         );
         assert_eq!(
             configured_max_tokens(ProviderName::Pipenetwork, Some(DEFAULT_MAX_TOKENS), None),
             DEFAULT_MAX_TOKENS,
             "explicit CLI override is honored"
+        );
+        assert!(
+            !max_tokens_is_explicit(ProviderName::Pipenetwork, None, Some(DEFAULT_MAX_TOKENS)),
+            "profile default should not block live output sizing"
+        );
+        assert!(
+            !max_tokens_is_explicit(
+                ProviderName::Pipenetwork,
+                None,
+                Some(LEGACY_PIPENETWORK_DEFAULT_MAX_TOKENS)
+            ),
+            "legacy 2048 profile default should not block live output sizing"
+        );
+        assert!(
+            max_tokens_is_explicit(ProviderName::Pipenetwork, Some(2048), None),
+            "CLI 2048 is deliberate and should remain explicit"
         );
         assert_eq!(
             configured_max_tokens(ProviderName::Openai, None, None),

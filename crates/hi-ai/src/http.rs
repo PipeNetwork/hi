@@ -43,6 +43,10 @@ struct ModelEntry {
     #[serde(default)]
     max_context_tokens: Option<u32>,
     #[serde(default)]
+    max_output_tokens: Option<u32>,
+    #[serde(default)]
+    max_completion_tokens: Option<u32>,
+    #[serde(default)]
     input_token_rate: Option<f64>,
     #[serde(default)]
     output_token_rate: Option<f64>,
@@ -57,6 +61,7 @@ impl ModelEntry {
         ServedModel {
             id: self.id,
             context_window: self.max_context_tokens,
+            max_output_tokens: self.max_output_tokens.or(self.max_completion_tokens),
             // Reported rates are per token; the rest of the app uses per-1M.
             price: match (self.input_token_rate, self.output_token_rate) {
                 (Some(i), Some(o)) => Some((i * 1_000_000.0, o * 1_000_000.0)),
@@ -371,8 +376,10 @@ mod tests {
         // pipenetwork.ai extends /models with window, per-token rates, and health.
         let json = r#"{"data":[
             {"id":"ipop/coder-balanced","max_context_tokens":1000000,
+             "max_output_tokens":131072,
              "input_token_rate":0.000001,"output_token_rate":0.000002,
              "status":"available","available":true},
+            {"id":"pipe/auto-code","max_completion_tokens":16384},
             {"id":"grok","status":"degraded","available":true},
             {"id":"down","available":false}
         ]}"#;
@@ -380,14 +387,17 @@ mod tests {
         let served: Vec<ServedModel> = list.data.into_iter().map(ModelEntry::into_served).collect();
 
         assert_eq!(served[0].context_window, Some(1_000_000));
+        assert_eq!(served[0].max_output_tokens, Some(131_072));
         assert_eq!(served[0].price, Some((1.0, 2.0))); // per-token → per-1M
         assert_eq!(served[0].health(), None, "available is healthy");
 
-        assert_eq!(served[1].context_window, None);
-        assert_eq!(served[1].health(), Some("degraded"));
+        assert_eq!(served[1].max_output_tokens, Some(16_384));
+
+        assert_eq!(served[2].context_window, None);
+        assert_eq!(served[2].health(), Some("degraded"));
 
         assert_eq!(
-            served[2].health(),
+            served[3].health(),
             Some("unavailable"),
             "available:false flagged"
         );
@@ -422,6 +432,7 @@ mod tests {
                 ServedModel {
                     id: "ipop/coder-balanced".into(),
                     context_window: Some(1_000_000),
+                    max_output_tokens: Some(131_072),
                     price: Some((1.0, 2.0)),
                     provider_label: None,
                     status: Some("available".into()),
@@ -432,6 +443,7 @@ mod tests {
                 ServedModel {
                     id: "grok".into(),
                     context_window: None,
+                    max_output_tokens: None,
                     price: None,
                     provider_label: None,
                     status: Some("degraded".into()),
@@ -446,6 +458,7 @@ mod tests {
         assert_eq!(back.ts, entry.ts);
         assert_eq!(back.models.len(), 2);
         assert_eq!(back.models[0].context_window, Some(1_000_000));
+        assert_eq!(back.models[0].max_output_tokens, Some(131_072));
         assert_eq!(back.models[0].price, Some((1.0, 2.0)));
         assert_eq!(back.models[1].status, Some("degraded".into()));
         assert!(!back.models[1].available);
@@ -476,6 +489,7 @@ mod tests {
         let models = vec![ServedModel {
             id: "m1".into(),
             context_window: Some(128_000),
+            max_output_tokens: Some(16_384),
             price: None,
             provider_label: None,
             status: None,
@@ -490,6 +504,7 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].id, "m1");
         assert_eq!(loaded[0].context_window, Some(128_000));
+        assert_eq!(loaded[0].max_output_tokens, Some(16_384));
 
         // A second key doesn't clobber the first.
         save_cache(&cache_key("ollama", "http://x/v1"), &[]).await;

@@ -207,6 +207,27 @@ pub(crate) async fn repl(
                             }
                             continue;
                         }
+                        Command::Model(id) => {
+                            let served = agent
+                                .list_models()
+                                .await
+                                .ok()
+                                .and_then(|models| models.into_iter().find(|m| m.id == id));
+                            let (_price, cat_window) = registry.metadata(&id);
+                            let window = served
+                                .as_ref()
+                                .and_then(|m| m.context_window)
+                                .or(cat_window);
+                            let max_output = served.as_ref().and_then(|m| m.max_output_tokens);
+                            agent.set_model(id.clone(), window, max_output);
+                            println!("model set to {id}");
+                            if let Some(health) = served.as_ref().and_then(|m| m.health()) {
+                                println!(
+                                    "\x1b[33mwarning: {id} is reported {health} on this endpoint\x1b[0m"
+                                );
+                            }
+                            continue;
+                        }
                         // `/provider` with no arg: list configured profiles.
                         // `/provider <name>`: switch to that profile, then list
                         // the models the new endpoint serves so the user can
@@ -335,7 +356,14 @@ pub(crate) async fn repl(
                                     let model = new_settings.model.clone();
                                     let provider = crate::build_provider(&new_settings);
                                     let (_price, window) = registry.metadata(&model);
-                                    agent.set_provider(provider, model.clone(), window);
+                                    agent.set_provider(
+                                        provider,
+                                        model.clone(),
+                                        window,
+                                        new_settings.max_tokens,
+                                        new_settings.max_tokens_explicit,
+                                        None,
+                                    );
                                     println!(
                                         "\x1b[2mswitched to {label} (profile: {arg}) — model: {model}\x1b[0m"
                                     );
@@ -348,6 +376,16 @@ pub(crate) async fn repl(
                                     // user can immediately `/model` to pick.
                                     match agent.list_models().await {
                                         Ok(mut models) if !models.is_empty() => {
+                                            if let Some(served) =
+                                                models.iter().find(|m| m.id == model)
+                                            {
+                                                let window = served.context_window.or(window);
+                                                agent.set_model(
+                                                    model.clone(),
+                                                    window,
+                                                    served.max_output_tokens,
+                                                );
+                                            }
                                             models.sort_by(|a, b| a.id.cmp(&b.id));
                                             println!("\x1b[2mmodels served by {label}:\x1b[0m");
                                             for m in &models {

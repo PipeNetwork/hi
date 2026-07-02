@@ -52,6 +52,8 @@ pub struct SwitchedProvider {
     pub provider: Box<dyn hi_ai::Provider>,
     pub model: String,
     pub label: String,
+    pub max_tokens: u32,
+    pub max_tokens_explicit: bool,
 }
 
 /// A callback that resolves a named profile into a built provider + model +

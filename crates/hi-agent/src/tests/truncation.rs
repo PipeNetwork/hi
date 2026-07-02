@@ -54,6 +54,44 @@ async fn truncation_continues_instead_of_ending_early() {
 }
 
 #[tokio::test]
+async fn truncation_recovery_is_internal_not_user_visible_status() {
+    let mut cfg = config();
+    cfg.max_truncation_retries = 2;
+    let responses = vec![
+        Completion {
+            content: vec![Content::Text("Here is the first half".into())],
+            usage: Usage {
+                input_tokens: 10,
+                output_tokens: 100,
+                ..Default::default()
+            },
+            stop_reason: Some("length".into()),
+        },
+        completion(vec![Content::Text(" and the finish.".into())], 10, 50),
+    ];
+    let mut agent = agent(responses, cfg);
+    let mut ui = SplitUi::default();
+    agent.run_turn("explain it", &mut ui).await.unwrap();
+
+    assert!(
+        ui.statuses
+            .iter()
+            .all(|s| !s.contains("output token limit")),
+        "truncation recovery must not be user-visible status: {:?}",
+        ui.statuses
+    );
+    assert!(
+        ui.nudges.iter().any(|s| s.contains("output token limit")),
+        "internal recovery telemetry should remain available to tests: {:?}",
+        ui.nudges
+    );
+    assert!(
+        ui.turn_end.is_some(),
+        "turn completed after hidden continuation"
+    );
+}
+
+#[tokio::test]
 async fn truncation_gives_up_after_retry_budget() {
     // The model keeps hitting the output token cap every round. After the
     // truncation-retry budget is exhausted, the turn ends with the truncated

@@ -757,7 +757,14 @@ pub async fn run(
                             let needs_pick = model == "__pick_via_model__";
                             // Refresh metadata from the registry for this model.
                             let (_price, window) = registry.metadata(&model);
-                            agent.set_provider(switched.provider, model.clone(), window);
+                            agent.set_provider(
+                                switched.provider,
+                                model.clone(),
+                                window,
+                                switched.max_tokens,
+                                switched.max_tokens_explicit,
+                                None,
+                            );
                             app.provider = label.clone();
                             app.model = model.clone();
                             app.active_profile = Some(arg.clone());

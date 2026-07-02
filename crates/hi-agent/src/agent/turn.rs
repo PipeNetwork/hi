@@ -398,7 +398,7 @@ impl crate::Agent {
                     frequency_penalty,
                     *RECOVERY_SAMPLING,
                 ) {
-                    ui.status(&line);
+                    ui.nudge(&line);
                 }
 
                 let context_safety_window = read_only_intent
@@ -544,7 +544,7 @@ impl crate::Agent {
                         if implementation_intent.is_some() || made_tool_call {
                             force_tools_next = true;
                         }
-                        ui.status(&format!(
+                        ui.nudge(&format!(
                             "⚠ the model emitted an invalid tool turn — retrying with tool-format guidance ({protocol_retries}/{MAX_TOOL_PROTOCOL_RETRIES})"
                         ));
                         if self
@@ -607,7 +607,7 @@ impl crate::Agent {
                         ui.assistant_end();
                         self.add_error_usage(&err);
                         empty_retries += 1;
-                        ui.status(&format!(
+                        ui.nudge(&format!(
                             "⚠ the model's response didn't come through cleanly — \
                              retrying ({empty_retries}/{})",
                             self.config.max_empty_retries
@@ -678,7 +678,7 @@ impl crate::Agent {
                 if truncated && truncation_retries < self.config.max_truncation_retries {
                     truncation_retries += 1;
                     truncation_total_retries += 1;
-                    ui.status(&format!(
+                    ui.nudge(&format!(
                         "⚠ the model hit the output token limit — continuing ({truncation_retries}/{})",
                         self.config.max_truncation_retries
                     ));
@@ -734,7 +734,7 @@ impl crate::Agent {
                     self.messages
                         .push_assistant_text_only(std::mem::take(&mut completion.content));
                     stalled_unfinished = true;
-                    ui.status(&format!(
+                    ui.nudge(&format!(
                         "⚠ the model hit the output token limit {max} times — the task may be \
                          incomplete. /retry, or send 'continue'.",
                         max = self.config.max_truncation_retries,

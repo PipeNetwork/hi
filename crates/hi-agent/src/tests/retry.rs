@@ -392,6 +392,30 @@ async fn malformed_stream_retries_and_recovers() {
 }
 
 #[tokio::test]
+async fn malformed_stream_retry_is_internal_not_user_visible_status() {
+    let (mut agent, _requests) = scripted_agent(
+        vec![
+            ProviderStep::Error(ProviderErrorKind::MalformedStream),
+            ProviderStep::Completion(completion(vec![Content::Text("recovered".into())], 5, 3)),
+        ],
+        config(),
+    );
+    let mut ui = SplitUi::default();
+    agent.run_turn("go", &mut ui).await.unwrap();
+
+    assert!(
+        ui.statuses.iter().all(|s| !s.contains("retrying")),
+        "malformed-stream recovery must not be user-visible status: {:?}",
+        ui.statuses
+    );
+    assert!(
+        ui.nudges.iter().any(|s| s.contains("retrying")),
+        "internal retry telemetry should remain available to tests: {:?}",
+        ui.nudges
+    );
+}
+
+#[tokio::test]
 async fn retry_counts_usage_from_failed_attempt() {
     let (mut agent, _requests) = scripted_agent(
         vec![

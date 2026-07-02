@@ -79,11 +79,8 @@ pub async fn run() -> Result<Settings> {
         base_url: provider.default_base_url().to_string(),
         mcp_url: provider.default_mcp_url().map(String::from),
         api_key,
-        max_tokens: if matches!(provider, ProviderName::Pipenetwork) {
-            2048
-        } else {
-            8192
-        },
+        max_tokens: 8192,
+        max_tokens_explicit: false,
         thinking_budget: None,
         tool_mode: hi_ai::ToolMode::Auto,
         compat: hi_ai::CompatMode::Auto,

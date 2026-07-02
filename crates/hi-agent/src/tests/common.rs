@@ -183,7 +183,9 @@ impl Ui for RecordingUi {
 pub(crate) fn config() -> AgentConfig {
     AgentConfig {
         model: "m".into(),
+        requested_max_tokens: 100,
         max_tokens: 100,
+        max_tokens_explicit: true,
         max_verify_iterations: 2,
         auto_compact: false,
         // Default to summarize so the existing summarize/auto tests are
@@ -329,6 +331,30 @@ impl Ui for RecUi {
     }
     fn turn_end(&mut self, summary: &str) {
         self.turn_end = Some(summary.to_string());
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct SplitUi {
+    pub(crate) statuses: Vec<String>,
+    pub(crate) nudges: Vec<String>,
+    pub(crate) turn_end: Option<String>,
+}
+
+impl Ui for SplitUi {
+    fn assistant_text(&mut self, _: &str) {}
+    fn assistant_reasoning(&mut self, _: &str) {}
+    fn assistant_end(&mut self) {}
+    fn tool_call(&mut self, _: &str, _: &str) {}
+    fn tool_result(&mut self, _: &str, _: &str) {}
+    fn status(&mut self, t: &str) {
+        self.statuses.push(t.to_string());
+    }
+    fn nudge(&mut self, t: &str) {
+        self.nudges.push(t.to_string());
+    }
+    fn turn_end(&mut self, s: &str) {
+        self.turn_end = Some(s.to_string());
     }
 }
 

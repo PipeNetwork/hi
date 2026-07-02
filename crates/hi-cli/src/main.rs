@@ -33,13 +33,27 @@ async fn main() -> Result<()> {
         let file = config::load_config(cli.config.as_deref())?;
         match config::resolve(&cli, &file, &registry) {
             Ok(settings) => {
+                let live = if settings.provider == ProviderName::Pipenetwork {
+                    let provider = build_provider(&settings);
+                    resolve_live_model_metadata(provider.as_ref(), &registry, &settings.model).await
+                } else {
+                    LiveModelMetadata {
+                        context_window: registry.metadata(&settings.model).1,
+                        max_output_tokens: None,
+                    }
+                };
+                let effective_max_tokens =
+                    effective_max_tokens_for_model(&settings, live.max_output_tokens);
                 println!("provider:   {}", provider_label(settings.provider));
                 println!("model:      {}", settings.model);
                 println!("base_url:   {}", settings.base_url);
                 if let Some(mcp_url) = &settings.mcp_url {
                     println!("mcp_url:    {mcp_url}");
                 }
-                println!("max_tokens: {}", settings.max_tokens);
+                println!("max_tokens: {}", effective_max_tokens);
+                if let Some(limit) = live.max_output_tokens {
+                    println!("model_max_output_tokens: {limit}");
+                }
                 println!(
                     "thinking:   {}",
                     settings
@@ -144,19 +158,25 @@ async fn main() -> Result<()> {
 
     let fallbacks = config::resolve_fallbacks(&cli, &file, &registry);
     let provider = build_chain(&settings, fallbacks);
-    let context_window = if settings.provider == ProviderName::Pipenetwork {
+    let live_metadata = if settings.provider == ProviderName::Pipenetwork {
         resolve_live_model_metadata(provider.as_ref(), &registry, &settings.model).await
     } else {
-        registry.metadata(&settings.model).1
+        LiveModelMetadata {
+            context_window: registry.metadata(&settings.model).1,
+            max_output_tokens: None,
+        }
     };
+    let max_tokens = effective_max_tokens_for_model(&settings, live_metadata.max_output_tokens);
     let agent_config = AgentConfig {
         model: settings.model.clone(),
-        max_tokens: settings.max_tokens,
+        requested_max_tokens: settings.max_tokens,
+        max_tokens,
+        max_tokens_explicit: settings.max_tokens_explicit,
         temperature: cli.temperature,
         thinking_budget: settings.thinking_budget,
         tool_mode: settings.tool_mode,
         compat: settings.compat,
-        context_window,
+        context_window: live_metadata.context_window,
         project_context: load_project_context(),
         verify: resolve_verify(&cli),
         max_verify_iterations: cli.max_verify,
@@ -253,6 +273,8 @@ async fn main() -> Result<()> {
                     provider,
                     model,
                     label,
+                    max_tokens: settings.max_tokens,
+                    max_tokens_explicit: settings.max_tokens_explicit,
                 })
             }
         });
@@ -352,7 +374,7 @@ async fn main() -> Result<()> {
         println!("\x1b[2m{summary}\x1b[0m");
     }
     if stdout_is_tty {
-        print_landing(&settings, context_window);
+        print_landing(&settings, live_metadata.context_window);
     }
 
     repl(&mut agent, &settings, &mut file, &registry, auto_memory).await
@@ -772,25 +794,54 @@ fn build_chain(primary: &Settings, fallbacks: Vec<Settings>) -> Box<dyn Provider
     Box::new(FallbackProvider::new(chain))
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct LiveModelMetadata {
+    context_window: Option<u32>,
+    max_output_tokens: Option<u32>,
+}
+
+fn effective_max_tokens_for_model(
+    settings: &Settings,
+    advertised_max_output_tokens: Option<u32>,
+) -> u32 {
+    hi_ai::effective_coding_agent_max_tokens(
+        &settings.model,
+        settings.max_tokens,
+        settings.max_tokens_explicit,
+        advertised_max_output_tokens,
+    )
+}
+
 async fn resolve_live_model_metadata(
     provider: &dyn Provider,
     registry: &Registry,
     model: &str,
-) -> Option<u32> {
+) -> LiveModelMetadata {
     let (_catalog_price, catalog_window) = registry.metadata(model);
     match provider.list_models().await {
         Ok(served) => served
             .into_iter()
             .find(|m| m.id == model)
-            .map(|m| m.context_window.or(catalog_window))
-            .unwrap_or(catalog_window),
-        Err(_) => catalog_window,
+            .map(|m| LiveModelMetadata {
+                context_window: m.context_window.or(catalog_window),
+                max_output_tokens: m.max_output_tokens,
+            })
+            .unwrap_or(LiveModelMetadata {
+                context_window: catalog_window,
+                max_output_tokens: None,
+            }),
+        Err(_) => LiveModelMetadata {
+            context_window: catalog_window,
+            max_output_tokens: None,
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{auto_memory_enabled, memory_context, write_landing};
+    use super::{
+        auto_memory_enabled, effective_max_tokens_for_model, memory_context, write_landing,
+    };
     use crate::config::{ProviderName, Settings};
     use hi_ai::{CompatMode, ToolMode};
 
@@ -817,10 +868,53 @@ mod tests {
             mcp_url: None,
             api_key: String::new(),
             max_tokens: 4096,
+            max_tokens_explicit: true,
             thinking_budget: None,
             tool_mode: ToolMode::default(),
             compat: CompatMode::default(),
         }
+    }
+
+    fn pipenetwork_settings(model: &str, max_tokens: u32, explicit: bool) -> Settings {
+        Settings {
+            provider: ProviderName::Pipenetwork,
+            model: model.into(),
+            base_url: String::new(),
+            mcp_url: None,
+            api_key: String::new(),
+            max_tokens,
+            max_tokens_explicit: explicit,
+            thinking_budget: None,
+            tool_mode: ToolMode::default(),
+            compat: CompatMode::default(),
+        }
+    }
+
+    #[test]
+    fn pipenetwork_coding_routes_apply_live_output_limits() {
+        let balanced = pipenetwork_settings("ipop/coder-balanced", 8192, false);
+        assert_eq!(
+            effective_max_tokens_for_model(&balanced, Some(131_072)),
+            131_072
+        );
+
+        let auto_code = pipenetwork_settings("pipe/auto-code", 8192, false);
+        assert_eq!(
+            effective_max_tokens_for_model(&auto_code, Some(16_384)),
+            16_384
+        );
+    }
+
+    #[test]
+    fn explicit_max_tokens_survive_live_metadata_but_clamp_down() {
+        let lower = pipenetwork_settings("ipop/coder-balanced", 4096, true);
+        assert_eq!(effective_max_tokens_for_model(&lower, Some(131_072)), 4096);
+
+        let too_high = pipenetwork_settings("pipe/auto-code", 65_536, true);
+        assert_eq!(
+            effective_max_tokens_for_model(&too_high, Some(16_384)),
+            16_384
+        );
     }
 
     /// `write_landing` renders the ~2x block-letter "PipeNetwork.AI" banner.
