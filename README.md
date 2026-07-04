@@ -54,7 +54,7 @@ Settings resolve in this order: **CLI flags → profile → environment → defa
 
 ### Config profiles
 
-Keep several models on hand in `./hi.toml` or `~/.config/hi/config.toml` and switch with `-p` at startup or `/provider` mid-session:
+Keep several models on hand in `./hi.toml` or `~/.config/hi/config.toml` and use one with `-p` at startup or `/provider` mid-session:
 
 ```toml
 default_profile = "sonnet"
@@ -66,14 +66,14 @@ api_key_env = "ANTHROPIC_API_KEY"
 
 [profiles.local]
 provider = "ollama"
-# no model field — /provider local then /model to pick from what Ollama serves
+# no model field — set one later with /model
 ```
 
-`/provider <name>` swaps the endpoint (base URL, API key, wire format) mid-session, then opens the model picker so you pick a model from what the new endpoint actually serves. The `model` field is optional — if omitted, you pick via `/model` after switching. `/provider add` creates a new profile interactively (in the TUI, a form with provider picker, API key, model, and base URL fields); `/provider edit [name]` modifies an existing one. Both write to your config file.
+`/provider <name>` changes the active profile (base URL, API key, wire format) mid-session, then opens the model picker over the live model list. The `model` field is optional and can be set later with `/model`. `/provider add` creates a new profile interactively (in the TUI, a form with provider picker, API key, model, and base URL fields); `/provider edit [name]` modifies an existing one. Both write to your config file.
 
 ### Fallback chain
 
-A single dead or overloaded provider shouldn't kill your session. Give a profile a `fallback` list (or pass `--fallback <profile>`, repeatable); if the primary errors or returns nothing, `hi` announces the switch and retries the next one:
+Give a profile a `fallback` list (or pass `--fallback <profile>`, repeatable); if a turn needs another configured profile, `hi` announces the handoff and retries there:
 
 ```toml
 default_profile = "cloud"
@@ -92,14 +92,12 @@ model = "qwen2.5-coder"
 
 `hi --refresh-models` pulls the [models.dev](https://models.dev) catalog into a local cache (~2700 models). It powers the per-turn token/context display, caps `--max-tokens` to a model's limit, and warns when a model isn't known to support tool calling.
 
-### Compatibility & timeouts
+### Compatibility
 
 OpenAI-compatible endpoints vary in how much of Chat Completions they implement. The default `--compat auto` retries common simpler shapes, such as retrying without streamed usage metadata when a provider rejects `stream_options`. Tool calling is not silently downgraded: if a request advertises tools and the provider rejects them, the turn fails fast instead of continuing chat-only. Use `--compat strict` to send only the initial request shape. Tool availability is controlled separately with `--tool-mode auto|required|chat-only|read-only`.
 
 | Env | Controls | Default |
 |---|---|---|
-| `HI_STREAM_TIMEOUT` | Fail a model that streams only heartbeats with no output | 300s |
-| `HI_HTTP_TIMEOUT` | Total HTTP request cap | 900s |
 | `HI_TUI_WATCHDOG_SECS` | Soft TUI "still waiting" notice (does not mark the model degraded) | 180s |
 | `HI_DEBUG_STREAM` | `1` dumps raw provider bytes for diagnosing one that returns nothing | off |
 
@@ -119,7 +117,7 @@ A `--max-steps` cap (default 500) stops runaway tool loops. Each turn prints `[N
 
 ## Best-of-N
 
-Run several attempts and keep the one that actually passes — the **test suite is the judge**, not another model.
+Run several attempts and keep the one that actually passes — the **test suite is the judge**.
 
 ```bash
 hi --best-of 3 --auto-verify "implement the spec in README"
@@ -145,8 +143,8 @@ Slash commands (TUI or plain REPL):
 | command | does |
 |---|---|
 | `/help` | list commands |
-| `/model [id]` | switch by id, or — with no id — open an interactive picker over the models **your provider actually serves** (live `/v1/models`; type to filter, ↑/↓, Enter). Falls back to the models.dev catalog if the endpoint can't list them. |
-| `/provider [name\|add\|edit]` | switch to a configured profile (no name lists them), `add` to create a new profile interactively, `edit [name]` to modify one. After switching, the model picker opens with what the new endpoint serves. |
+| `/model [id]` | set by id, or — with no id — open an interactive picker over the live model list (type to filter, ↑/↓, Enter). |
+| `/provider [name\|add\|edit]` | use a configured profile (no name lists them), `add` to create a new profile interactively, `edit [name]` to modify one. |
 | `/verify [cmd\|off]` | show, set, or clear the test command turns iterate against — turn the verify-loop on without restarting |
 | `/diff` | show what files have changed this session (`git diff` + new files) |
 | `/copy [all]` | copy the last assistant response to the terminal clipboard; `all` copies the transcript |

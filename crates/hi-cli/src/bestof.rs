@@ -20,7 +20,7 @@ pub struct BestOf<'a> {
     pub verify: &'a str,
     pub prompt: &'a str,
     pub candidates: u32,
-    pub max_steps: u32,
+    pub max_steps: Option<u32>,
     pub max_verify: u32,
 }
 
@@ -193,12 +193,15 @@ fn run_candidate(opts: &BestOf, worktree: &Path, temperature: f32) -> Result<boo
             opts.verify,
             "--temperature",
             &temperature.to_string(),
-            "--max-steps",
-            &opts.max_steps.to_string(),
             "--max-verify",
             &opts.max_verify.to_string(),
-            opts.prompt,
         ])
+        .args(
+            opts.max_steps
+                .map(|max_steps| vec!["--max-steps".to_string(), max_steps.to_string()])
+                .unwrap_or_default(),
+        )
+        .arg(opts.prompt)
         .status()
         .context("failed to launch candidate hi")?;
     Ok(status.success())
@@ -250,9 +253,11 @@ fn add_worktree(path: &Path) -> Result<()> {
 
 /// Ground-truth check: run the verify command in the worktree ourselves.
 fn verify_passes(worktree: &Path, verify: &str) -> bool {
+    hi_tools::prepare_verify_workdir(worktree);
     Command::new("sh")
         .arg("-c")
         .arg(verify)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
         .current_dir(worktree)
         .output()
         .map(|o| o.status.success())
@@ -337,7 +342,7 @@ mod tests {
             verify: "true",
             prompt: "do the thing",
             candidates: 1,
-            max_steps: 1,
+            max_steps: Some(1),
             max_verify: 1,
         };
 

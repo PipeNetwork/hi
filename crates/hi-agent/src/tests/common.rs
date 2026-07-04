@@ -258,6 +258,7 @@ pub(crate) fn scripted_agent(
     (Agent::new(Box::new(provider), cfg), requests)
 }
 
+#[allow(clippy::type_complexity)]
 pub(crate) fn scripted_agent_recording_max_tokens(
     steps: Vec<ProviderStep>,
     cfg: AgentConfig,
@@ -362,6 +363,14 @@ impl Ui for RecUi {
     }
     fn turn_end(&mut self, summary: &str) {
         self.turn_end = Some(summary.to_string());
+    }
+    fn turn_error(&mut self, kind: &str, message: &str, guidance: &str) {
+        let suffix = if guidance.is_empty() {
+            String::new()
+        } else {
+            format!(" — {guidance}")
+        };
+        self.statuses.push(format!("{kind}: {message}{suffix}"));
     }
 }
 

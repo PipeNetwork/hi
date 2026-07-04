@@ -1,6 +1,6 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result, bail};
@@ -130,13 +130,36 @@ pub fn validate_task(dir: &Path, task: &Task) -> std::result::Result<(), String>
 }
 
 pub fn verify_in(dir: &Path, cmd: &str) -> bool {
+    verify_output_in(dir, cmd)
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+pub fn verify_output_in(dir: &Path, cmd: &str) -> std::io::Result<Output> {
+    prepare_verify_workdir(dir);
     Command::new("sh")
         .arg("-c")
         .arg(cmd)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
         .current_dir(dir)
         .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+}
+
+pub fn prepare_verify_workdir(dir: &Path) {
+    fn walk(dir: &Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if entry.file_name() == "__pycache__" {
+                let _ = std::fs::remove_dir_all(&path);
+            } else if path.is_dir() {
+                walk(&path);
+            }
+        }
+    }
+    walk(dir);
 }
 
 pub fn discover_tasks(dir: &Path) -> Result<Vec<(PathBuf, Task)>> {
@@ -203,4 +226,29 @@ pub fn dir_name(path: &Path) -> String {
         .and_then(|n| n.to_str())
         .unwrap_or("task")
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_in_prunes_python_bytecode_cache_before_running() {
+        let dir = make_workdir().expect("temp dir");
+        std::fs::write(dir.join("solution.py"), "def value():\n    return 1\n").unwrap();
+        let pycache = dir.join("__pycache__");
+        std::fs::create_dir_all(&pycache).unwrap();
+        std::fs::write(pycache.join("solution.cpython-311.pyc"), b"stale").unwrap();
+
+        assert!(verify_in(
+            &dir,
+            "python3 -c \"import solution; assert solution.value() == 1\""
+        ));
+        assert!(
+            !pycache.exists(),
+            "verify should remove stale Python bytecode cache before import"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

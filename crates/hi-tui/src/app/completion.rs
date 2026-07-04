@@ -66,7 +66,7 @@ impl crate::App {
                 let help = format!(
                     "{} · {}",
                     p.provider,
-                    p.model.as_deref().unwrap_or("pick via /model")
+                    p.model.as_deref().unwrap_or("not configured")
                 );
                 items.push(CompletionItem {
                     label: p.name.clone(),

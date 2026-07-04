@@ -162,24 +162,19 @@ impl Provider for OpenAiProvider {
         let stream = crate::http::debug_tap(resp.bytes_stream())
             .eventsource()
             .map(|res| res.map(|event| event.data).context("error reading stream"));
-        let mut completion = stream::collect_completion(
-            Box::pin(stream),
-            crate::http::stream_idle_timeout(),
-            crate::http::stream_stall_timeout(),
-            sink,
-        )
-        .await
-        .map_err(|err| {
-            stream::classify_stream_error(err).with_usage(Usage {
-                input_tokens: estimate_messages_tokens(&request.messages),
-                output_tokens: request.max_tokens as u64,
-                cache_read_tokens: 0,
-                cache_creation_tokens: 0,
-                input_includes_cache: true,
-                context_occupancy: estimate_messages_tokens(&request.messages),
-                rate_limits,
-            })
-        })?;
+        let mut completion = stream::collect_completion(Box::pin(stream), sink)
+            .await
+            .map_err(|err| {
+                stream::classify_stream_error(err).with_usage(Usage {
+                    input_tokens: estimate_messages_tokens(&request.messages),
+                    output_tokens: request.max_tokens as u64,
+                    cache_read_tokens: 0,
+                    cache_creation_tokens: 0,
+                    input_includes_cache: true,
+                    context_occupancy: estimate_messages_tokens(&request.messages),
+                    rate_limits,
+                })
+            })?;
         stream::backfill_missing_usage(&mut completion, &request);
         completion.usage.rate_limits = completion.usage.rate_limits.or(rate_limits);
         if completion.content.is_empty() {
@@ -566,7 +561,7 @@ mod tests {
     #[tokio::test]
     async fn server_error_retries_then_succeeds() {
         let Some(server) = FakeOpenAiServer::new(vec![
-            Response::json(500, r#"{"error":"temporary outage"}"#),
+            Response::json(500, r#"{"error":"temporary server error"}"#),
             Response::sse(sse_text("recovered")),
         ]) else {
             return;

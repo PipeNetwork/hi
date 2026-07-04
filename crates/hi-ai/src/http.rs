@@ -16,20 +16,26 @@ use serde::Deserialize;
 
 use crate::provider::ServedModel;
 
+/// The agent identifier sent over HTTP, mirroring the `AI_AGENT=hi` env var the
+/// shell path sets (`hi-tools::tools::mark_agent_harness`). HuggingFace-side
+/// infrastructure that detects `hi` agent harnesses keys off this token; sending
+/// it as a header makes the identification consistent across the subprocess and
+/// in-process HTTP surfaces.
+const HF_AGENT_HEADER_NAME: &str = "AI_AGENT";
+const HF_AGENT_ID: &str = "hi";
+
 /// Retry budget for transient connection/timeout errors: brief, then surface.
 const MAX_RETRIES: u32 = 3;
-/// Wider budget for a transient *server outage* (5xx): ~6 attempts with the
+/// Wider budget for transient server 5xx responses: ~6 attempts with the
 /// capped backoff below span ~12s — enough to silently ride out a quick provider
 /// restart/deploy (a 502 while it rolls out an update) instead of failing the
 /// turn. Scoped to the status path; a 502 arrives as a fast HTTP response, so the
 /// cost is just the backoff sleeps, not stacked connection timeouts.
-const OUTAGE_RETRIES: u32 = 6;
+const SERVER_ERROR_RETRIES: u32 = 6;
 const BASE_DELAY_MS: u64 = 250;
 /// Cap on a single backoff so the wider budget stays bounded (a few seconds per
 /// wait) instead of exploding exponentially.
 const MAX_DELAY_MS: u64 = 4_000;
-const DEFAULT_STREAM_IDLE_TIMEOUT_SECS: u64 = 300;
-const DEFAULT_HTTP_TIMEOUT_SECS: u64 = 900;
 
 #[derive(Deserialize)]
 struct ModelsList {
@@ -79,29 +85,21 @@ impl ModelEntry {
 /// GET an OpenAI/Anthropic-style `/models` list from an already-authenticated
 /// request and return the served models — what the *current endpoint* actually
 /// offers (with any live window/price/health it reports), as opposed to the
-/// static models.dev catalog. Bounded by a short timeout so a hung endpoint
-/// can't wedge the caller; on timeout the caller falls back to the catalog.
+/// static models.dev catalog.
 pub async fn fetch_models(builder: RequestBuilder) -> Result<Vec<ServedModel>> {
-    let fetch = async {
-        let resp = send_with_retry(builder).await?;
-        if !resp.status().is_success() {
-            bail!("models endpoint returned {}", resp.status());
-        }
-        let list: ModelsList = resp.json().await.context("parsing models list")?;
-        Ok(list.data.into_iter().map(ModelEntry::into_served).collect())
-    };
-    match tokio::time::timeout(Duration::from_secs(6), fetch).await {
-        Ok(result) => result,
-        Err(_) => bail!("models request timed out after 6s"),
+    let resp = send_with_retry(builder).await?;
+    if !resp.status().is_success() {
+        bail!("models endpoint returned {}", resp.status());
     }
+    let list: ModelsList = resp.json().await.context("parsing models list")?;
+    Ok(list.data.into_iter().map(ModelEntry::into_served).collect())
 }
 
 // --- On-disk startup cache for /models results ---
 //
 // A successful `/models` fetch is cached locally so the next startup applies
 // model metadata (window/price/health) instantly, without blocking on the
-// network. The live fetch still runs in the background and refreshes the cache;
-// the cache just covers the cold-start gap so the UI never looks stalled.
+// network. The live fetch still runs in the background and refreshes the cache.
 
 /// The cache file lives in the hi config dir alongside `config.toml`.
 fn cache_path() -> Option<std::path::PathBuf> {
@@ -173,41 +171,6 @@ pub async fn save_cache(key: &str, models: &[ServedModel]) {
     let _ = tokio::fs::write(&path, serde_json::to_string(&map).unwrap_or_default()).await;
 }
 
-/// Give up on a stream if the model produces no output — content, reasoning, or
-/// tool tokens — and no stream activity arrives for this long (default 300s,
-/// override with `HI_STREAM_TIMEOUT` in seconds). Before the first token,
-/// heartbeat/data frames keep the cold-start wait alive; after output starts,
-/// adapters use the shorter stall timeout and require real tokens.
-pub fn stream_idle_timeout() -> Duration {
-    let configured = std::env::var("HI_STREAM_TIMEOUT").ok();
-    timeout_from_env_value(configured.as_deref(), DEFAULT_STREAM_IDLE_TIMEOUT_SECS)
-}
-
-/// Once output *has* started flowing, end the stream this long after tokens stop
-/// if no completion signal (`finish_reason`/`[DONE]`/socket close) arrives —
-/// covers a provider that streams a full answer then holds the connection open
-/// without terminating it (default 15s, override with `HI_STREAM_STALL`). Much
-/// shorter than the cold-start [`stream_idle_timeout`] because a multi-second
-/// gap *between* tokens means the stream has effectively ended, whereas a slow
-/// time-to-first-token can be a legitimately queued request.
-pub fn stream_stall_timeout() -> Duration {
-    let configured = std::env::var("HI_STREAM_STALL").ok();
-    timeout_from_env_value(configured.as_deref(), 15)
-}
-
-fn agent_http_timeout() -> Duration {
-    let configured = std::env::var("HI_HTTP_TIMEOUT").ok();
-    timeout_from_env_value(configured.as_deref(), DEFAULT_HTTP_TIMEOUT_SECS)
-}
-
-fn timeout_from_env_value(value: Option<&str>, default_seconds: u64) -> Duration {
-    value
-        .and_then(|v| v.parse::<u64>().ok())
-        .filter(|seconds| *seconds > 0)
-        .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(default_seconds))
-}
-
 /// When `HI_DEBUG_STREAM` is set, echo every raw byte chunk (escaped, so SSE
 /// comment heartbeats and data lines are both visible) to stderr — a wire-level
 /// view for diagnosing a provider that returns nothing. A no-op otherwise.
@@ -235,12 +198,21 @@ where
 /// default `Client::new()` does pool internally, but this sets explicit
 /// limits and keep-alive so long sessions reuse connections reliably.
 pub fn agent_http_client() -> reqwest::Client {
+    // Identify hi to upstream HTTP services. `User-Agent` is the standard
+    // channel; the `AI_AGENT` header mirrors the env-var convention the shell
+    // path already uses, so HuggingFace infra sees a consistent `hi` marker on
+    // both the subprocess and in-process HTTP surfaces. Additive for existing
+    // providers — unknown headers are ignored.
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Ok(value) = reqwest::header::HeaderValue::from_str(HF_AGENT_ID) {
+        headers.insert(HF_AGENT_HEADER_NAME, value);
+    }
     reqwest::Client::builder()
+        .user_agent(format!("hi/{}", env!("CARGO_PKG_VERSION")))
+        .default_headers(headers)
         .pool_idle_timeout(Some(Duration::from_secs(90)))
         .pool_max_idle_per_host(4)
         .tcp_keepalive(Some(Duration::from_secs(60)))
-        .connect_timeout(Duration::from_secs(15))
-        .timeout(agent_http_timeout())
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
 }
@@ -277,12 +249,12 @@ pub async fn send_with_retry(builder: RequestBuilder) -> Result<Response> {
 }
 
 /// How many times a given response status is worth retrying: a wide budget for a
-/// transient 5xx outage (ride out a deploy), none otherwise. A 429 throttle (and
+/// transient 5xx response (ride out a deploy), none otherwise. A 429 throttle (and
 /// every other 4xx) surfaces immediately — retrying a rate limit just stalls the
 /// turn and can deepen the throttle; the caller backs off deliberately instead.
 fn retry_limit(status: StatusCode) -> u32 {
     if status.is_server_error() {
-        OUTAGE_RETRIES
+        SERVER_ERROR_RETRIES
     } else {
         0
     }
@@ -308,14 +280,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_server_outages_are_retried() {
-        // 5xx (transient outage / deploy) rides out the wider budget…
-        assert_eq!(retry_limit(StatusCode::BAD_GATEWAY), OUTAGE_RETRIES);
-        assert_eq!(retry_limit(StatusCode::SERVICE_UNAVAILABLE), OUTAGE_RETRIES);
-        assert_eq!(retry_limit(StatusCode::GATEWAY_TIMEOUT), OUTAGE_RETRIES);
-        // The outage budget is non-zero — a compile-time invariant, asserted in a
+    fn only_server_errors_are_retried() {
+        // 5xx responses ride out the wider budget.
+        assert_eq!(retry_limit(StatusCode::BAD_GATEWAY), SERVER_ERROR_RETRIES);
+        assert_eq!(
+            retry_limit(StatusCode::SERVICE_UNAVAILABLE),
+            SERVER_ERROR_RETRIES
+        );
+        assert_eq!(
+            retry_limit(StatusCode::GATEWAY_TIMEOUT),
+            SERVER_ERROR_RETRIES
+        );
+        // The 5xx budget is non-zero — a compile-time invariant, asserted in a
         // const block so clippy doesn't flag it as a constant-condition assertion.
-        const _: () = assert!(OUTAGE_RETRIES > 0);
+        const _: () = assert!(SERVER_ERROR_RETRIES > 0);
         // …everything else surfaces immediately: a 429 throttle, auth, client errors.
         assert_eq!(retry_limit(StatusCode::TOO_MANY_REQUESTS), 0);
         assert_eq!(retry_limit(StatusCode::BAD_REQUEST), 0);
@@ -333,30 +311,6 @@ mod tests {
         assert_eq!(backoff_delay(5), MAX_DELAY_MS);
         assert_eq!(backoff_delay(6), MAX_DELAY_MS);
         assert_eq!(backoff_delay(64), MAX_DELAY_MS);
-    }
-
-    #[test]
-    fn timeout_defaults_are_long_enough_for_backend_retrying() {
-        assert_eq!(
-            timeout_from_env_value(None, DEFAULT_STREAM_IDLE_TIMEOUT_SECS),
-            Duration::from_secs(300)
-        );
-        assert_eq!(
-            timeout_from_env_value(None, DEFAULT_HTTP_TIMEOUT_SECS),
-            Duration::from_secs(900)
-        );
-        assert_eq!(
-            timeout_from_env_value(Some("42"), DEFAULT_STREAM_IDLE_TIMEOUT_SECS),
-            Duration::from_secs(42)
-        );
-        assert_eq!(
-            timeout_from_env_value(Some("0"), DEFAULT_STREAM_IDLE_TIMEOUT_SECS),
-            Duration::from_secs(300)
-        );
-        assert_eq!(
-            timeout_from_env_value(Some("not-a-number"), DEFAULT_HTTP_TIMEOUT_SECS),
-            Duration::from_secs(900)
-        );
     }
 
     #[test]

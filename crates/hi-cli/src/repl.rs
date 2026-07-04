@@ -1,5 +1,6 @@
 //! The plain line REPL loop and the animated-spinner turn driver.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -21,6 +22,8 @@ pub(crate) async fn repl(
     config: &mut config::Config,
     registry: &Registry,
     auto_memory: bool,
+    active_profile: Option<String>,
+    config_path: Option<PathBuf>,
 ) -> Result<()> {
     use hi_agent::Command;
     use hi_agent::CompactionKind;
@@ -211,28 +214,24 @@ pub(crate) async fn repl(
                             }
                             continue;
                         }
-                        // `/model` with no id: list what the provider actually serves.
+                        // `/model` with no id: list available live models.
                         Command::Model(id) if id.is_empty() => {
                             match agent.list_models().await {
                                 Ok(mut models) if !models.is_empty() => {
                                     models.sort_by(|a, b| a.id.cmp(&b.id));
                                     println!(
-                                        "\x1b[2mmodels served by this endpoint (current: {}):\x1b[0m",
+                                        "\x1b[2mavailable models (current: {}):\x1b[0m",
                                         agent.model()
                                     );
                                     for m in &models {
                                         let mark = if m.id == agent.model() { "▶" } else { " " };
-                                        let tag = m
-                                            .health()
-                                            .map(|h| format!("  ({h})"))
-                                            .unwrap_or_default();
-                                        println!("  {mark} {}{tag}", m.id);
+                                        println!("  {mark} {}", m.id);
                                     }
-                                    println!("\x1b[2m/model <id> to switch\x1b[0m");
+                                    println!("\x1b[2muse /model <id> to set the model\x1b[0m");
                                 }
                                 _ => {
                                     println!(
-                                        "model: {}\n\x1b[2m(couldn't list endpoint models; /model <id> to switch)\x1b[0m",
+                                        "model: {}\n\x1b[2m(live model list not loaded; use /model <id> to set the model)\x1b[0m",
                                         agent.model()
                                     );
                                 }
@@ -252,18 +251,32 @@ pub(crate) async fn repl(
                                 .or(cat_window);
                             let max_output = served.as_ref().and_then(|m| m.max_output_tokens);
                             agent.set_model(id.clone(), window, max_output);
-                            println!("model set to {id}");
-                            if let Some(health) = served.as_ref().and_then(|m| m.health()) {
-                                println!(
-                                    "\x1b[33mwarning: {id} is reported {health} on this endpoint\x1b[0m"
-                                );
+                            if let Some(name) = active_profile.as_deref() {
+                                match config::writable_config_path(config_path.as_deref())
+                                    .ok_or_else(|| {
+                                        anyhow::anyhow!("could not determine config path")
+                                    })
+                                    .and_then(|path| {
+                                        config::set_profile_model(config, name, &id, &path)
+                                    }) {
+                                    Ok(()) => {
+                                        println!("model set to {id} (saved to profile {name})");
+                                    }
+                                    Err(err) => {
+                                        println!("model set to {id}");
+                                        eprintln!(
+                                            "\x1b[33mcouldn't save model to profile '{name}': {err:#}\x1b[0m"
+                                        );
+                                    }
+                                }
+                            } else {
+                                println!("model set to {id}");
                             }
                             continue;
                         }
                         // `/provider` with no arg: list configured profiles.
-                        // `/provider <name>`: switch to that profile, then list
-                        // the models the new endpoint serves so the user can
-                        // `/model` to pick one.
+                        // `/provider <name>`: use that profile, then list live
+                        // model metadata so `/model` can set one when needed.
                         // `/provider add`: interactively create a new profile.
                         // `/provider edit [name]`: edit an existing profile.
                         Command::Provider(arg) => {
@@ -273,7 +286,7 @@ pub(crate) async fn repl(
                                 match provider_add_prompt(config, &mut editor) {
                                     Ok(name) => {
                                         println!(
-                                            "\x1b[2msaved profile '{name}' — /provider {name} to switch\x1b[0m"
+                                            "\x1b[2msaved profile '{name}' — /provider {name} to use\x1b[0m"
                                         );
                                     }
                                     Err(err) => {
@@ -312,7 +325,7 @@ pub(crate) async fn repl(
                                 let active = config.default_profile.as_ref();
                                 if active.map(|a| a.as_str()) == Some(&target) {
                                     eprintln!(
-                                        "\x1b[33mcan't remove '{target}' — it's the active profile; switch first\x1b[0m"
+                                        "\x1b[33mcan't remove '{target}' — make a different profile active first\x1b[0m"
                                     );
                                     continue;
                                 }
@@ -336,7 +349,7 @@ pub(crate) async fn repl(
                                 }
                                 continue;
                             }
-                            // --- Switch / list ---
+                            // --- Use / list ---
                             if arg.is_empty() {
                                 let names = config::profile_names(config);
                                 if names.is_empty() {
@@ -354,7 +367,7 @@ pub(crate) async fn repl(
                                             .unwrap_or("openai");
                                         let model = p
                                             .and_then(|p| p.model.as_deref())
-                                            .unwrap_or("(pick via /model)");
+                                            .unwrap_or("(not configured)");
                                         let mark = if active == Some(name.as_str()) {
                                             "▶"
                                         } else {
@@ -376,12 +389,12 @@ pub(crate) async fn repl(
                                         println!("\x1b[2m{row}\x1b[0m");
                                     }
                                     println!(
-                                        "\x1b[2m/provider <name> to switch · /provider add · /provider edit [name] · /provider remove [name]\x1b[0m"
+                                        "\x1b[2m/provider <name> to use a profile · /provider add · /provider edit [name] · /provider remove [name]\x1b[0m"
                                     );
                                 }
                                 continue;
                             }
-                            // Resolve the profile and swap the provider.
+                            // Resolve the profile and update the provider.
                             match config::resolve_named_profile(config, arg, registry) {
                                 Ok(new_settings) => {
                                     let label = provider_label(new_settings.provider);
@@ -397,15 +410,14 @@ pub(crate) async fn repl(
                                         None,
                                     );
                                     println!(
-                                        "\x1b[2mswitched to {label} (profile: {arg}) — model: {model}\x1b[0m"
+                                        "\x1b[2musing {label} (profile: {arg}) — model: {model}\x1b[0m"
                                     );
-                                    if model == "__pick_via_model__" {
+                                    if model == "__model_not_configured__" {
                                         println!(
-                                            "\x1b[2mno model configured for this profile — use /model to pick from what this endpoint serves\x1b[0m"
+                                            "\x1b[2mno model configured for this profile — use /model to view available models\x1b[0m"
                                         );
                                     }
-                                    // List what the new endpoint serves, so the
-                                    // user can immediately `/model` to pick.
+                                    // List available live models for the active profile.
                                     match agent.list_models().await {
                                         Ok(mut models) if !models.is_empty() => {
                                             if let Some(served) =
@@ -419,28 +431,20 @@ pub(crate) async fn repl(
                                                 );
                                             }
                                             models.sort_by(|a, b| a.id.cmp(&b.id));
-                                            println!("\x1b[2mmodels served by {label}:\x1b[0m");
+                                            println!("\x1b[2mavailable models for {label}:\x1b[0m");
                                             for m in &models {
                                                 let mark =
                                                     if m.id == agent.model() { "▶" } else { " " };
                                                 println!("  {mark} {}", m.id);
                                             }
-                                            println!("\x1b[2m/model <id> to switch\x1b[0m");
+                                            println!(
+                                                "\x1b[2muse /model <id> to set the model\x1b[0m"
+                                            );
                                         }
                                         _ => {
-                                            let local = matches!(
-                                                new_settings.provider,
-                                                config::ProviderName::Ollama
+                                            println!(
+                                                "\x1b[2m(live model list not loaded; use /model <id> to set the model)\x1b[0m"
                                             );
-                                            if local {
-                                                println!(
-                                                    "\x1b[2m(couldn't reach the local server — is it running and is the base_url correct? /model <id> to switch)\x1b[0m"
-                                                );
-                                            } else {
-                                                println!(
-                                                    "\x1b[2m(couldn't list endpoint models; /model <id> to switch)\x1b[0m"
-                                                );
-                                            }
                                         }
                                     }
                                 }
@@ -461,6 +465,13 @@ pub(crate) async fn repl(
                                 Err(err) => {
                                     eprintln!("\x1b[33mmcp inspection failed: {err:#}\x1b[0m")
                                 }
+                            }
+                            continue;
+                        }
+                        Command::Hf(arg) => {
+                            match handle_hf_command(&arg).await {
+                                Ok(text) => print!("{text}"),
+                                Err(err) => eprintln!("\x1b[33m/hf failed: {err:#}\x1b[0m"),
                             }
                             continue;
                         }
@@ -544,6 +555,119 @@ pub(crate) async fn repl(
         let _ = editor.save_history(path);
     }
     Ok(())
+}
+
+async fn handle_hf_command(arg: &str) -> Result<String> {
+    let arg = arg.trim();
+    let mut parts = arg.split_whitespace();
+    let Some(subcommand) = parts.next() else {
+        return Ok("usage: /hf search <query> | /hf files <repo[@revision]> | /hf download <repo[@revision]> <filename> [output]\n".to_string());
+    };
+    match subcommand {
+        "search" => {
+            let query = arg.strip_prefix("search").unwrap_or("").trim();
+            if query.is_empty() {
+                bail!("usage: /hf search <query>");
+            }
+            let client = hi_ai::HuggingFaceHubClient::from_env();
+            let models = client.search_models(query, 10).await?;
+            Ok(format_hf_search(&models))
+        }
+        "files" => {
+            let repo = parts
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("usage: /hf files <repo[@revision]>"))?;
+            let repo = hi_ai::HfRepoRef::parse(repo)?;
+            let client = hi_ai::HuggingFaceHubClient::from_env();
+            let files = client.list_files(&repo).await?;
+            Ok(format_hf_files(&repo, &files))
+        }
+        "download" => {
+            let repo = parts
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("usage: /hf download <repo[@revision]> <filename> [output]"))?;
+            let filename = parts
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("usage: /hf download <repo[@revision]> <filename> [output]"))?;
+            let output = parts.next();
+            let source = if repo.contains(':') {
+                repo.to_string()
+            } else {
+                format!("{repo}:{filename}")
+            };
+            let mut args = serde_json::json!({ "source": source });
+            if let Some(output) = output {
+                args["output"] = serde_json::Value::String(output.to_string());
+            }
+            let out = hi_tools::run_web_download(&args.to_string()).await?;
+            Ok(format!("{}\n", out.content))
+        }
+        _ => Ok("usage: /hf search <query> | /hf files <repo[@revision]> | /hf download <repo[@revision]> <filename> [output]\n".to_string()),
+    }
+}
+
+fn format_hf_search(models: &[hi_ai::ModelCandidate]) -> String {
+    if models.is_empty() {
+        return "No Hugging Face models found.\n".to_string();
+    }
+    let mut out = String::from("Hugging Face models:\n");
+    for model in models {
+        let tags = model
+            .tags
+            .iter()
+            .take(4)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let downloads = model
+            .downloads
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "-".into());
+        let likes = model
+            .likes
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "-".into());
+        let runnable = if model.runnable {
+            "runnable"
+        } else {
+            "not runnable by provider"
+        };
+        out.push_str(&format!(
+            "  {}  [downloads: {downloads}, likes: {likes}]  {runnable}\n",
+            model.id
+        ));
+        if !tags.is_empty() {
+            out.push_str(&format!("    tags: {tags}\n"));
+        }
+    }
+    out
+}
+
+fn format_hf_files(repo: &hi_ai::HfRepoRef, files: &[hi_ai::HfFileInfo]) -> String {
+    if files.is_empty() {
+        return format!("No files found in {}@{}.\n", repo.repo_id, repo.revision);
+    }
+    let mut out = format!("Files in {}@{}:\n", repo.repo_id, repo.revision);
+    for file in files {
+        let size = file.size.map(human_size).unwrap_or_default();
+        out.push_str(&format!("  {}  {size}\n", file.path));
+    }
+    out
+}
+
+fn human_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 /// Drive a model future (a turn or a compaction) to completion, showing an
@@ -658,10 +782,10 @@ fn provider_add_prompt(
         }
     };
 
-    // Model (optional — can pick via /model after switching).
+    // Model (optional; blank keeps the provider default when one exists).
     let default_model = provider.default_model().unwrap_or("");
     let model = if default_model.is_empty() {
-        rl_prompt(editor, "Model id (optional — blank to pick via /model): ")?
+        rl_prompt(editor, "Model id (optional): ")?
     } else {
         rl_prompt(editor, &format!("Model id (default {default_model}): "))?.to_string()
     };

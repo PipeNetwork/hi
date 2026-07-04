@@ -94,7 +94,7 @@ pub async fn run(
     // The catalog, for inline `/model <id>` completion (the picker fetches the
     // live list on demand; this is the synchronous type-ahead source).
     app.model_ids = registry.model_ids();
-    // Load the on-disk /models cache so model metadata (window/price/health)
+    // Load the on-disk /models cache so model metadata (window/price)
     // applies instantly at startup, without blocking on the network. The live
     // fetch still runs in the background and refreshes this; the cache just
     // covers the cold-start gap so the UI never looks stalled.
@@ -104,9 +104,7 @@ pub async fn run(
         app.model_ids.sort();
         app.served = cached.into_iter().map(|m| (m.id.clone(), m)).collect();
         let model_id = app.model.clone();
-        if let Some(health) = app.apply_model(agent, registry, &model_id) {
-            app.warn_degraded(&model_id, &health);
-        }
+        app.apply_model(agent, registry, &model_id);
     }
     if let Some(path) = &history_path
         && let Ok(text) = std::fs::read_to_string(path)
@@ -577,6 +575,23 @@ pub async fn run(
                         }
                     }
                 }
+                Command::Hf(arg) => {
+                    match handle_hf_command(&arg).await {
+                        Ok(text) => {
+                            for line in text.lines() {
+                                app.push(Line::styled(line.to_string(), dim()));
+                            }
+                        }
+                        Err(err) => {
+                            app.push(Line::styled(
+                                format!("/hf failed: {err:#}"),
+                                Style::default().fg(Color::Yellow),
+                            ));
+                        }
+                    }
+                    app.follow();
+                    continue;
+                }
                 Command::Undo => {
                     let checkpoints = agent.checkpoint_count();
                     if checkpoints > 0 {
@@ -597,10 +612,9 @@ pub async fn run(
                     app.follow();
                     continue;
                 }
-                // Open the picker on the provider's *live* model list (what this
-                // endpoint actually serves), falling back to the static catalog.
+                // Open the picker on the live model list.
                 // The fetch runs behind a spinner so the UI stays responsive and
-                // Esc/Ctrl-C can cancel a slow or hung endpoint.
+                // Esc/Ctrl-C can cancel the request.
                 Command::Model(id) if id.is_empty() => {
                     app.fetching = Some(Instant::now());
                     let mut fetched: Option<Result<Vec<hi_ai::ServedModel>>> = None;
@@ -641,8 +655,8 @@ pub async fn run(
                     // list surfaces the error and skips the picker.
                     let ids = match fetched {
                         Some(Ok(served)) if !served.is_empty() => {
-                            // Remember the live metadata (window/price/health) so
-                            // selecting a model can apply it and tag its health.
+                            // Remember the live metadata (window/price) so
+                            // selecting a model can apply it.
                             app.served = served.into_iter().map(|m| (m.id.clone(), m)).collect();
                             let mut ids: Vec<String> = app.served.keys().cloned().collect();
                             ids.sort();
@@ -651,11 +665,9 @@ pub async fn run(
                         }
                         _ => {
                             let note = match &fetched {
-                                Some(Ok(_)) => "provider listed no models — check the endpoint",
-                                Some(Err(err)) => &format!(
-                                    "couldn't fetch models ({err:#}) — check the endpoint and API key"
-                                ),
-                                None => "couldn't fetch models — check the endpoint",
+                                Some(Ok(_)) => "live model list is empty".to_string(),
+                                Some(Err(err)) => format!("live model list not loaded: {err:#}"),
+                                None => "live model list not loaded".to_string(),
                             };
                             app.push(Line::styled(note.to_string(), dim()));
                             continue;
@@ -668,9 +680,8 @@ pub async fn run(
                     continue;
                 }
                 // `/provider` with no arg: list configured profiles.
-                // `/provider <name>`: switch to that profile, fetch the new
-                // endpoint's served models, and open the model picker so the
-                // user can pick a model immediately.
+                // `/provider <name>`: use that profile, fetch the live model
+                // metadata, and open the model selector.
                 Command::Provider(arg) => {
                     let arg = arg.trim().to_string();
                     // --- Subcommands ---
@@ -680,7 +691,7 @@ pub async fn run(
                     }
                     if let Some(edit_name) = arg.strip_prefix("edit") {
                         let edit_name = edit_name.trim();
-                        // If no name given, pick the first profile (or show a hint).
+                        // If no name is given, use the first profile (or show a hint).
                         let target = if edit_name.is_empty() {
                             if app.profiles.is_empty() {
                                 app.push(Line::styled(
@@ -718,7 +729,7 @@ pub async fn run(
                         .or_else(|| arg.strip_prefix("rm"))
                     {
                         let rm_name = rm_name.trim();
-                        // If no name given, pick the first profile (or show a hint).
+                        // If no name is given, use the first profile (or show a hint).
                         let target = if rm_name.is_empty() {
                             if app.profiles.is_empty() {
                                 app.push(Line::styled("no profiles to remove".to_string(), dim()));
@@ -731,7 +742,7 @@ pub async fn run(
                         // Don't remove the active profile — the agent is using it.
                         if app.active_profile.as_deref() == Some(&target) {
                             app.push(Line::styled(
-                                format!("can't remove '{target}' — it's the active profile; switch first"),
+                                format!("can't remove '{target}' — make a different profile active first"),
                                 Style::default().fg(Color::Yellow),
                             ));
                             continue;
@@ -753,7 +764,7 @@ pub async fn run(
                         }
                         continue;
                     }
-                    // --- Switch / list ---
+                    // --- Use / list ---
                     if arg.is_empty() {
                         if app.profiles.is_empty() {
                             app.push(Line::styled(
@@ -770,7 +781,7 @@ pub async fn run(
                                 .map(|p| {
                                     let is_active = active.as_deref() == Some(&p.name);
                                     let mark = if is_active { "▶" } else { " " };
-                                    let model = p.model.as_deref().unwrap_or("(pick via /model)");
+                                    let model = p.model.as_deref().unwrap_or("(not configured)");
                                     let mut row =
                                         format!("  {mark} {} — {} · {}", p.name, p.provider, model);
                                     if let Some(url) = &p.base_url {
@@ -788,19 +799,19 @@ pub async fn run(
                                 app.push(Line::styled(row, style));
                             }
                             app.push(Line::styled(
-                                "/provider <name> to switch · /provider add · /provider edit [name] · /provider remove [name]"
+                                "/provider <name> to use a profile · /provider add · /provider edit [name] · /provider remove [name]"
                                     .to_string(),
                                 dim(),
                             ));
                         }
                         continue;
                     }
-                    // Resolve the profile and swap the provider.
+                    // Resolve the profile and update the provider.
                     match (app.resolver)(&arg) {
                         Ok(switched) => {
                             let label = switched.label.clone();
                             let model = switched.model.clone();
-                            let needs_pick = model == "__pick_via_model__";
+                            let needs_model = model == "__model_not_configured__";
                             // Refresh metadata from the registry for this model.
                             let (_price, window) = registry.metadata(&model);
                             agent.set_provider(
@@ -817,19 +828,18 @@ pub async fn run(
                             app.context_window = window;
                             app.served.clear();
                             app.push(Line::styled(
-                                format!("switched to {label} (profile: {arg}) — model: {model}"),
+                                format!("using {label} (profile: {arg}) — model: {model}"),
                                 dim(),
                             ));
-                            if needs_pick {
+                            if needs_model {
                                 app.push(Line::styled(
-                                    "no model configured — pick from what this endpoint serves"
+                                    "no model configured — choose from the available models"
                                         .to_string(),
                                     dim(),
                                 ));
                             }
-                            // Fetch served models and open the picker, just like
-                            // `/model` with no arg — so the user can immediately
-                            // pick a model on the new endpoint.
+                            // Fetch served models and open the selector, just like
+                            // `/model` with no arg.
                             app.fetching = Some(Instant::now());
                             let mut fetched: Option<Result<Vec<hi_ai::ServedModel>>> = None;
                             let mut cancelled = false;
@@ -872,20 +882,18 @@ pub async fn run(
                                     ids.sort();
                                     app.model_ids = ids.clone();
                                     app.push(Line::styled(
-                                        format!("{count} models available — pick one"),
+                                        format!("{count} models available — select one"),
                                         dim(),
                                     ));
                                     ids
                                 }
                                 _ => {
                                     let note = match &fetched {
-                                        Some(Ok(_)) => {
-                                            "provider listed no models — check the endpoint"
+                                        Some(Ok(_)) => "live model list is empty".to_string(),
+                                        Some(Err(err)) => {
+                                            format!("live model list not loaded: {err:#}")
                                         }
-                                        Some(Err(err)) => &format!(
-                                            "couldn't fetch models ({err:#}) — check the endpoint and API key"
-                                        ),
-                                        None => "couldn't fetch models — check the endpoint",
+                                        None => "live model list not loaded".to_string(),
                                     };
                                     app.push(Line::styled(note.to_string(), dim()));
                                     continue;
@@ -1036,6 +1044,119 @@ pub async fn run(
     Ok(())
 }
 
+async fn handle_hf_command(arg: &str) -> Result<String> {
+    let arg = arg.trim();
+    let mut parts = arg.split_whitespace();
+    let Some(subcommand) = parts.next() else {
+        return Ok("usage: /hf search <query> | /hf files <repo[@revision]> | /hf download <repo[@revision]> <filename> [output]".to_string());
+    };
+    match subcommand {
+        "search" => {
+            let query = arg.strip_prefix("search").unwrap_or("").trim();
+            if query.is_empty() {
+                anyhow::bail!("usage: /hf search <query>");
+            }
+            let client = hi_ai::HuggingFaceHubClient::from_env();
+            let models = client.search_models(query, 10).await?;
+            Ok(format_hf_search(&models))
+        }
+        "files" => {
+            let repo = parts
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("usage: /hf files <repo[@revision]>"))?;
+            let repo = hi_ai::HfRepoRef::parse(repo)?;
+            let client = hi_ai::HuggingFaceHubClient::from_env();
+            let files = client.list_files(&repo).await?;
+            Ok(format_hf_files(&repo, &files))
+        }
+        "download" => {
+            let repo = parts.next().ok_or_else(|| {
+                anyhow::anyhow!("usage: /hf download <repo[@revision]> <filename> [output]")
+            })?;
+            let filename = parts.next().ok_or_else(|| {
+                anyhow::anyhow!("usage: /hf download <repo[@revision]> <filename> [output]")
+            })?;
+            let output = parts.next();
+            let source = if repo.contains(':') {
+                repo.to_string()
+            } else {
+                format!("{repo}:{filename}")
+            };
+            let mut args = serde_json::json!({ "source": source });
+            if let Some(output) = output {
+                args["output"] = serde_json::Value::String(output.to_string());
+            }
+            let out = hi_tools::run_web_download(&args.to_string()).await?;
+            Ok(out.content)
+        }
+        _ => Ok("usage: /hf search <query> | /hf files <repo[@revision]> | /hf download <repo[@revision]> <filename> [output]".to_string()),
+    }
+}
+
+fn format_hf_search(models: &[hi_ai::ModelCandidate]) -> String {
+    if models.is_empty() {
+        return "No Hugging Face models found.".to_string();
+    }
+    let mut out = String::from("Hugging Face models:\n");
+    for model in models {
+        let tags = model
+            .tags
+            .iter()
+            .take(4)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let downloads = model
+            .downloads
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "-".into());
+        let likes = model
+            .likes
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "-".into());
+        let runnable = if model.runnable {
+            "runnable"
+        } else {
+            "not runnable by provider"
+        };
+        out.push_str(&format!(
+            "  {}  [downloads: {downloads}, likes: {likes}]  {runnable}\n",
+            model.id
+        ));
+        if !tags.is_empty() {
+            out.push_str(&format!("    tags: {tags}\n"));
+        }
+    }
+    out.trim_end().to_string()
+}
+
+fn format_hf_files(repo: &hi_ai::HfRepoRef, files: &[hi_ai::HfFileInfo]) -> String {
+    if files.is_empty() {
+        return format!("No files found in {}@{}.", repo.repo_id, repo.revision);
+    }
+    let mut out = format!("Files in {}@{}:\n", repo.repo_id, repo.revision);
+    for file in files {
+        let size = file.size.map(human_size).unwrap_or_default();
+        out.push_str(&format!("  {}  {size}\n", file.path));
+    }
+    out.trim_end().to_string()
+}
+
+fn human_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 /// Drive a model future (a turn or a compaction) to completion while keeping
 /// the UI live: redraw + spin every tick, drain the agent's events, let the
 /// user scroll/queue/cancel. Returns whether the user cancelled with Ctrl-C.
@@ -1089,7 +1210,7 @@ async fn drive(
                 let idle = last_activity.elapsed();
                 app.waiting_for = Some(idle);
                 // Only notify about a quiet backend while no tool is legitimately
-                // running. This is a soft notice, not a model health signal.
+                // running. This is only a soft wait notice.
                 if expect_turn_end
                     && !watchdog_stuck
                     && app.current_tool.is_none()

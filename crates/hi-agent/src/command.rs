@@ -6,13 +6,13 @@ pub enum Command {
     Help,
     /// Reset the conversation, keeping only the system prompt.
     Clear,
-    /// Switch the model for subsequent turns (empty = report current).
+    /// Set the model for subsequent turns (empty = report current).
     Model(String),
     /// Run exactly one turn through the conservative MoA virtual route.
     Moa(String),
-    /// Switch the provider/profile for subsequent turns (empty = report current).
-    /// Named profiles are resolved from the config; the model is then picked
-    /// via `/model` from what the new endpoint serves.
+    /// Use a provider/profile for subsequent turns (empty = report current).
+    /// Named profiles are resolved from the config; the model can be set later
+    /// with `/model` when the profile does not configure one.
     ///
     /// Subcommands: `add` (create a new profile interactively), `edit [name]`
     /// (edit an existing profile). The frontend parses these from the arg.
@@ -46,7 +46,7 @@ pub enum Command {
     /// Use a learned skill by name as the next model turn.
     Skill(String),
     /// Reclaim context. Empty arg = configured strategy; `full`/`hybrid`/`elide`
-    /// pick one explicitly.
+    /// select one explicitly.
     Compact(String),
     /// Re-run the last user message (after truncating its previous attempt).
     Retry,
@@ -64,6 +64,8 @@ pub enum Command {
     Export(String),
     /// Inspect the configured MCP endpoint: server info, tools, model count.
     Mcp,
+    /// Discover/list/download Hugging Face Hub model artifacts.
+    Hf(String),
     Quit,
     /// A `/word` that isn't recognized.
     Unknown(String),
@@ -111,6 +113,7 @@ pub fn parse(line: &str) -> Option<Command> {
         "version" | "ver" | "v" => Command::Version,
         "export" => Command::Export(arg),
         "mcp" => Command::Mcp,
+        "hf" | "huggingface" => Command::Hf(arg),
         "lsp" => Command::Lsp(arg),
         "exit" | "quit" | "q" => Command::Quit,
         other => Command::Unknown(other.to_string()),
@@ -199,7 +202,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "model",
         args: "[id]",
-        help: "show or switch the model (no id opens a picker)",
+        help: "show or set the model (no id opens the selector)",
         arg_values: &[],
     },
     CommandSpec {
@@ -211,7 +214,7 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "provider",
         args: "[name|add|edit|remove]",
-        help: "switch profile, or add/edit/remove a profile (no arg lists all)",
+        help: "use a profile, or add/edit/remove a profile (no arg lists all)",
         arg_values: &[],
     },
     CommandSpec {
@@ -358,6 +361,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         args: "",
         help: "inspect the MCP endpoint (server, tools, model count)",
         arg_values: &[],
+    },
+    CommandSpec {
+        name: "hf",
+        args: "<search|files|download> ...",
+        help: "discover and download Hugging Face Hub model files",
+        arg_values: &[
+            ("search", "search Hub models"),
+            ("files", "list repo files"),
+            ("download", "download one repo file"),
+        ],
     },
     CommandSpec {
         name: "lsp",
@@ -645,6 +658,10 @@ mod tests {
         assert_eq!(parse("/lsp"), Some(Command::Lsp(String::new())));
         assert_eq!(parse("/lsp on"), Some(Command::Lsp("on".into())));
         assert_eq!(parse("/lsp off"), Some(Command::Lsp("off".into())));
+        assert_eq!(
+            parse("/hf search llama"),
+            Some(Command::Hf("search llama".into()))
+        );
         // Removed `/tokens` aliases redirect to a hint instead of bare "unknown".
         assert!(matches!(
             parse("/usage"),

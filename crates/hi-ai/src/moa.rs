@@ -6,7 +6,6 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Result, bail};
 use async_trait::async_trait;
@@ -52,10 +51,6 @@ fn default_aggregator_model() -> String {
 
 fn default_reference_models() -> Vec<String> {
     vec![MOA_REFERENCE_CONSERVATIVE.to_string()]
-}
-
-fn default_reference_timeout_seconds() -> u64 {
-    90
 }
 
 fn default_reference_max_tokens() -> u32 {
@@ -114,8 +109,6 @@ pub struct MoaPreset {
     pub aggregator_model: String,
     #[serde(default = "default_reference_models")]
     pub reference_models: Vec<String>,
-    #[serde(default = "default_reference_timeout_seconds")]
-    pub reference_timeout_seconds: u64,
     #[serde(default = "default_reference_max_tokens")]
     pub reference_max_tokens: u32,
     #[serde(default = "default_reference_tool_result_budget_chars")]
@@ -127,7 +120,6 @@ impl Default for MoaPreset {
         Self {
             aggregator_model: default_aggregator_model(),
             reference_models: default_reference_models(),
-            reference_timeout_seconds: default_reference_timeout_seconds(),
             reference_max_tokens: default_reference_max_tokens(),
             reference_tool_result_budget_chars: default_reference_tool_result_budget_chars(),
         }
@@ -160,9 +152,6 @@ impl MoaPreset {
             .any(|model| is_recursive_moa_route(model))
         {
             bail!("MoA preset '{name}' cannot reference another MoA route");
-        }
-        if self.reference_timeout_seconds == 0 {
-            bail!("MoA preset '{name}' reference_timeout_seconds must be greater than 0");
         }
         if self.reference_max_tokens == 0 {
             bail!("MoA preset '{name}' reference_max_tokens must be greater than 0");
@@ -244,36 +233,27 @@ impl MoaProvider {
             .cloned()
             .unwrap_or_else(|| MOA_REFERENCE_CONSERVATIVE.to_string());
         let reference_request = reference_request(request, preset, reference_model.clone());
-        let timeout = Duration::from_secs(preset.reference_timeout_seconds);
         let mut private_sink = |_event: StreamEvent| {};
 
-        match tokio::time::timeout(
-            timeout,
-            self.routes.stream(reference_request, &mut private_sink),
-        )
-        .await
+        match self
+            .routes
+            .stream(reference_request, &mut private_sink)
+            .await
         {
-            Ok(Ok(completion)) => {
+            Ok(completion) => {
                 let usage = completion.usage;
                 (
                     guidance_from_completion(&reference_model, completion),
                     usage,
                 )
             }
-            Ok(Err(err)) => {
+            Err(err) => {
                 let usage = provider_error_usage(&err);
                 (
                     unavailable_guidance(&reference_model, &err.to_string()),
                     usage,
                 )
             }
-            Err(_) => (
-                unavailable_guidance(
-                    &reference_model,
-                    &format!("timed out after {}s", preset.reference_timeout_seconds),
-                ),
-                Usage::default(),
-            ),
         }
     }
 }

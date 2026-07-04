@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 
-use crate::artifacts::{copy_dir, make_workdir};
+use crate::artifacts::{copy_dir, make_workdir, verify_output_in};
 use crate::config::{EvalProfile, Task};
 use crate::results::{
     Candidate, FailKind, RunResult, Trajectory, TrajectoryAttribution, TrajectoryToolCall,
@@ -225,12 +225,7 @@ pub fn run_candidate(
 
     // Ground truth: run the verify command ourselves, capturing its output so
     // we can classify *how* a failure failed (compile vs. logic).
-    let (passed, verify_output) = match Command::new("sh")
-        .arg("-c")
-        .arg(&task.verify)
-        .current_dir(&work)
-        .output()
-    {
+    let (passed, verify_output) = match verify_output_in(&work, &task.verify) {
         Ok(o) => {
             let mut out = String::from_utf8_lossy(&o.stdout).into_owned();
             out.push_str(&String::from_utf8_lossy(&o.stderr));
@@ -288,6 +283,7 @@ fn summarize_output(output: &str) -> String {
     format!("{head}\n\n[... verify output truncated ...]\n\n{tail}")
 }
 
+#[derive(Default)]
 struct ReportInfo {
     tokens: u64,
     provider_error_kind: Option<String>,
@@ -361,18 +357,6 @@ fn read_report(path: &Path) -> ReportInfo {
         compat_fallbacks_used: string_array(&value["compat_fallbacks_used"]),
         changed_files: string_array(&value["changed_files"]),
         trajectory,
-    }
-}
-
-impl Default for ReportInfo {
-    fn default() -> Self {
-        Self {
-            tokens: 0,
-            provider_error_kind: None,
-            compat_fallbacks_used: Vec::new(),
-            changed_files: Vec::new(),
-            trajectory: Trajectory::default(),
-        }
     }
 }
 

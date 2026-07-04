@@ -6,12 +6,20 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use hi_ai::{ChatRequest, Content, Message, RequestProfile, StreamEvent, ToolMode};
+use hi_ai::{
+    ChatRequest, Content, Message, ProviderError, ProviderErrorKind, RequestProfile, StreamEvent,
+    ToolMode,
+};
 
 use crate::Ui;
 use crate::compaction::{self, CompactionKind};
 use crate::transcript::repair_invalid_tool_call_arguments_in_messages;
 use crate::{COMPACTION_REFERENCE_PREFIX, COMPACTION_SUMMARY_END, SUMMARIZE_PROMPT};
+
+pub(crate) struct ContextPreflight {
+    pub(crate) max_tokens: u32,
+    pub(crate) dropped_prior_context: bool,
+}
 
 impl crate::Agent {
     /// The compaction strategy configured for this session.
@@ -64,6 +72,137 @@ impl crate::Agent {
             "provider rejected the request as too large; dropped prior conversation context and retrying",
         );
         Ok(true)
+    }
+
+    /// Refuse or shrink a request that can be locally estimated to exceed the
+    /// advertised context window. This keeps predictable overflow from reaching
+    /// the API as a 400, while preserving the provider-reactive retry for byte
+    /// caps or unexpectedly stricter providers.
+    pub(crate) fn ensure_request_fits_context(
+        &mut self,
+        input: &str,
+        turn_start: usize,
+        requested_max_tokens: u32,
+        request_overhead_tokens: u64,
+        safety_window: Option<u32>,
+        ui: &mut dyn Ui,
+    ) -> Result<ContextPreflight> {
+        let Some(window) = self.effective_context_window(safety_window) else {
+            return Ok(ContextPreflight {
+                max_tokens: requested_max_tokens,
+                dropped_prior_context: false,
+            });
+        };
+        if window == 0 {
+            return Ok(ContextPreflight {
+                max_tokens: requested_max_tokens,
+                dropped_prior_context: false,
+            });
+        }
+
+        let mut dropped_prior_context = false;
+        if self.request_estimated_tokens(requested_max_tokens, request_overhead_tokens)
+            <= u64::from(window)
+        {
+            return Ok(ContextPreflight {
+                max_tokens: requested_max_tokens,
+                dropped_prior_context,
+            });
+        }
+
+        if self.config.auto_compact {
+            let freed = compaction::elide_tool_outputs_except_recent(
+                self.messages.mutate_slice(),
+                self.config.in_turn_keep_tool_results,
+            );
+            if freed > 0 {
+                self.context_used = 0;
+                ui.status(&format!(
+                    "elided ~{}k chars of old tool output before request to fit context",
+                    freed / 1000
+                ));
+            }
+            if self.request_estimated_tokens(requested_max_tokens, request_overhead_tokens)
+                <= u64::from(window)
+            {
+                return Ok(ContextPreflight {
+                    max_tokens: requested_max_tokens,
+                    dropped_prior_context,
+                });
+            }
+
+            // Do not run model-based summarizing compaction here: the latest
+            // user prompt has already been appended, and summarizing the whole
+            // transcript can erase the exact task we are about to answer. The
+            // pre-turn auto-compact path still performs summarization before a
+            // new prompt is added; at send time we either elide deterministic
+            // bulk or drop prior context while preserving the latest prompt.
+        }
+
+        if turn_start > 1 {
+            self.replace_history_with_compaction(vec![self.system_message()])?;
+            self.messages.push_user(format!(
+                "[Earlier conversation context was omitted because the next request would exceed \
+                 the model context window. Continue from this latest user request; ask for missing \
+                 details if the omitted context is required.]\n\n{input}"
+            ));
+            self.context_used = 0;
+            dropped_prior_context = true;
+            ui.status(
+                "request would exceed the model context window; dropped prior conversation context and retrying",
+            );
+
+            if self.request_estimated_tokens(requested_max_tokens, request_overhead_tokens)
+                <= u64::from(window)
+            {
+                return Ok(ContextPreflight {
+                    max_tokens: requested_max_tokens,
+                    dropped_prior_context,
+                });
+            }
+        }
+
+        let prompt_estimate = self.request_estimated_tokens(0, request_overhead_tokens);
+        if prompt_estimate < u64::from(window) {
+            let available = (u64::from(window) - prompt_estimate).min(u64::from(u32::MAX)) as u32;
+            if available > 0 && available < requested_max_tokens {
+                ui.nudge(&format!(
+                    "request would exceed the model context window; reducing max_tokens from {requested_max_tokens} to {available}"
+                ));
+                return Ok(ContextPreflight {
+                    max_tokens: available,
+                    dropped_prior_context,
+                });
+            }
+        }
+
+        let estimated =
+            self.request_estimated_tokens(requested_max_tokens, request_overhead_tokens);
+        ui.status(
+            "request would exceed the model context window even after local context recovery; shorten the prompt or attached input, then retry",
+        );
+        Err(ProviderError::new(
+            ProviderErrorKind::RequestTooLarge,
+            format!(
+                "estimated request context {estimated} tokens exceeds model context window of {window} tokens"
+            ),
+        )
+        .into())
+    }
+
+    fn effective_context_window(&self, safety_window: Option<u32>) -> Option<u32> {
+        match (self.config.context_window, safety_window) {
+            (Some(configured), Some(safety)) => Some(configured.min(safety)),
+            (Some(configured), None) => Some(configured),
+            (None, Some(safety)) => Some(safety),
+            (None, None) => None,
+        }
+    }
+
+    fn request_estimated_tokens(&self, max_tokens: u32, request_overhead_tokens: u64) -> u64 {
+        compaction::estimate_tokens(self.messages.as_slice())
+            .saturating_add(request_overhead_tokens)
+            .saturating_add(u64::from(max_tokens))
     }
 
     /// Summarize the whole conversation and reset to system + summary.

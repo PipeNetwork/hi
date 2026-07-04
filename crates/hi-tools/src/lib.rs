@@ -14,6 +14,7 @@ mod edit;
 mod paths;
 mod read;
 mod tools;
+mod web;
 
 // Re-exports preserving the crate's pre-split public surface.
 pub use background::{
@@ -28,8 +29,10 @@ pub use lsp::{
 pub use paths::clear_read_cache;
 pub use tools::{
     TOOL_SPECS, commit, execute, execute_streaming, fast_check_for, is_filesystem_mutating,
-    is_read_only, run_check, target_path, working_tree_diff, working_tree_diff_plain,
+    is_read_only, prepare_verify_workdir, run_check, target_path, working_tree_diff,
+    working_tree_diff_plain,
 };
+pub use web::{run_web_download, run_web_fetch, run_web_search};
 
 pub use attribution::{AttrKind, Attribution, parse_attributions};
 

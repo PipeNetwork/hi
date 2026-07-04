@@ -44,6 +44,13 @@ pub(crate) async fn workspace_snapshot(
                             | ".venv"
                             | "venv"
                             | "vendor"
+                            | "models"
+                            | ".cache"
+                            | "dist"
+                            | "build"
+                            | ".next"
+                            | ".turbo"
+                            | "coverage"
                     )
                 )
             })
@@ -152,6 +159,50 @@ mod tests {
         assert!(
             snapshot.keys().all(|path| !path.starts_with("target/")),
             "snapshot should ignore target artifacts: {:?}",
+            snapshot.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_snapshot_ignores_heavy_untracked_directories_without_gitignore() {
+        let dir = std::env::temp_dir().join(format!(
+            "hi-snapshot-heavy-untracked-dirs-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        for path in [
+            "models/model.bin",
+            ".cache/tool/output",
+            "dist/app.js",
+            "build/output",
+            ".next/cache",
+            ".turbo/cache",
+            "coverage/lcov.info",
+        ] {
+            let path = dir.join(path);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "generated\n").unwrap();
+        }
+        std::fs::write(dir.join("src/lib.rs"), "pub fn ok() {}\n").unwrap();
+
+        let snapshot = workspace_snapshot(&dir).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(snapshot.contains_key("src/lib.rs"));
+        assert!(
+            snapshot.keys().all(|path| ![
+                "models/",
+                ".cache/",
+                "dist/",
+                "build/",
+                ".next/",
+                ".turbo/",
+                "coverage/",
+            ]
+            .iter()
+            .any(|prefix| path.starts_with(prefix))),
+            "snapshot should ignore heavy generated dirs: {:?}",
             snapshot.keys().collect::<Vec<_>>()
         );
     }

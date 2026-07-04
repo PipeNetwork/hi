@@ -624,6 +624,7 @@ dependencies = [
  "ignore",
  "libc",
  "regex",
+ "reqwest",
  "serde",
  "serde_json",
  "similar",
@@ -642,6 +643,7 @@ dependencies = [
  "hi-ai",
  "hi-tools",
  "ratatui",
+ "serde_json",
  "tokio",
 ]
 

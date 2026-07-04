@@ -1,14 +1,12 @@
-//! Nudge decision functions and answer-shape checks: [`should_nudge_*`],
-//! [`insufficient_after_*`], [`bounded_review_repair_exhaustion_answer`],
-//! and related helpers. Uses nudge strings from [`constants`](super::constants),
-//! [`contains_any`] from [`intent`](super::intent), and tracker types from
-//! [`types`](super::types).
+//! Nudge decision functions and answer-shape checks. Uses nudge strings from
+//! [`constants`](super::constants), [`contains_any`] from [`intent`](super::intent),
+//! and tracker types from [`types`](super::types).
 
 use super::constants::{
-    GAP_DEEPEN_NUDGE, IMPLEMENTATION_MISSING_VALIDATION_NUDGE, INSPECTION_SPRAWL_THRESHOLD,
-    MAX_INSPECTION_SPRAWL_NUDGES, NO_EVIDENCE_GAP_NUDGE, NO_EVIDENCE_REVIEW_NUDGE,
-    NO_EVIDENCE_SECURITY_NUDGE, NO_EVIDENCE_STATUS_NUDGE, REVIEW_DEEPEN_NUDGE,
-    SECURITY_DEEPEN_NUDGE, STATUS_DEEPEN_NUDGE, TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE,
+    GAP_DEEPEN_NUDGE, IMPLEMENTATION_MISSING_VALIDATION_NUDGE, MAX_INSPECTION_SPRAWL_NUDGES,
+    NO_EVIDENCE_GAP_NUDGE, NO_EVIDENCE_REVIEW_NUDGE, NO_EVIDENCE_SECURITY_NUDGE,
+    NO_EVIDENCE_STATUS_NUDGE, REVIEW_DEEPEN_NUDGE, SECURITY_DEEPEN_NUDGE, STATUS_DEEPEN_NUDGE,
+    TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE,
 };
 use super::intent::contains_any;
 use super::types::{EvidenceTracker, ImplementationTracker, ReviewIntent};
@@ -116,27 +114,13 @@ impl ConcreteReviewAnswerProblem {
     pub(crate) fn exhausted_status(self) -> &'static str {
         match self {
             Self::MissingInspectedCitation => {
-                "review answer still lacked concrete inspected files after repair; returning a bounded evidence summary"
+                "review answer still lacked concrete inspected files after repair; stopping incomplete"
             }
             Self::GenericInventorySummary => {
-                "review answer stayed generic after repair; returning a bounded evidence summary"
+                "review answer stayed generic after repair; stopping incomplete"
             }
             Self::MissingReviewShape => {
-                "review answer still lacked bounded review findings after repair; returning a bounded evidence summary"
-            }
-        }
-    }
-
-    pub(crate) fn reason(self) -> &'static str {
-        match self {
-            Self::MissingInspectedCitation => {
-                "the final answer did not cite concrete files or modules from the inspected evidence"
-            }
-            Self::GenericInventorySummary => {
-                "the final answer summarized repository inventory instead of tying findings to inspected evidence"
-            }
-            Self::MissingReviewShape => {
-                "the final answer cited inspected evidence but did not include bounded review findings and limits"
+                "review answer still lacked bounded review findings after repair; stopping incomplete"
             }
         }
     }
@@ -452,52 +436,6 @@ pub(crate) fn gap_answer_overclaims_absence(answer: &str) -> bool {
     broad_absence && !bounded
 }
 
-pub(crate) fn insufficient_after_repeated_search(
-    evidence: &EvidenceTracker,
-) -> Option<&'static str> {
-    if evidence.saw_search && !evidence.saw_read {
-        Some(
-            "Insufficient evidence: targeted search ran, but no matching file was read, so I cannot make file-specific review findings.",
-        )
-    } else {
-        None
-    }
-}
-
-pub(crate) fn insufficient_after_incomplete_security_search(
-    evidence: &EvidenceTracker,
-) -> Option<String> {
-    if !evidence.saw_search || !evidence.saw_read || evidence.security_search_complete() {
-        return None;
-    }
-    let mut missing = Vec::new();
-    if !evidence.security_unsafe_search {
-        missing.push("unsafe/unwrap/expect/panic");
-    }
-    if !evidence.security_execution_search {
-        missing.push("command execution/filesystem/env");
-    }
-    if !evidence.security_secret_search {
-        missing.push("secret/token/auth");
-    }
-    Some(format!(
-        "Insufficient evidence: the security review did not search all required pattern families (missing {}), so I cannot make broad security claims.",
-        missing.join(", ")
-    ))
-}
-
-pub(crate) fn insufficient_after_security_scope_overclaim() -> &'static str {
-    "Insufficient evidence: the security answer made repo-wide all-clear claims that were broader than the inspected files and search results support."
-}
-
-pub(crate) fn insufficient_after_no_review_evidence() -> &'static str {
-    "Insufficient evidence: no files, searches, diffs, or directory listings were inspected, so I cannot present this as a completed review."
-}
-
-pub(crate) fn insufficient_after_review_repair_template() -> &'static str {
-    "Insufficient evidence: the answer was a generic review-repair template instead of concrete findings tied to inspected files, so I cannot present this as a completed review."
-}
-
 pub(crate) fn read_only_intent_label(intent: ReviewIntent) -> &'static str {
     match intent {
         ReviewIntent::Security => "security review",
@@ -506,95 +444,6 @@ pub(crate) fn read_only_intent_label(intent: ReviewIntent) -> &'static str {
         ReviewIntent::Gaps => "gap review",
         ReviewIntent::Review => "review",
     }
-}
-
-pub(crate) fn bounded_review_repair_exhaustion_answer(
-    intent: ReviewIntent,
-    evidence: &EvidenceTracker,
-    reason: &str,
-) -> String {
-    let label = read_only_intent_label(intent);
-    let mut lines = vec![
-        format!(
-            "Bounded evidence summary for an incomplete {label}: the model inspected evidence but did not produce acceptable file-specific findings after repair."
-        ),
-        String::new(),
-        "Inspected evidence:".to_string(),
-        format!("- Targeted searches: {}", evidence.targeted_searches),
-        format!("- File reads: {}", evidence.file_reads),
-    ];
-
-    if matches!(intent, ReviewIntent::Security) {
-        let mut families = Vec::new();
-        if evidence.security_unsafe_search {
-            families.push("unsafe/unwrap/expect/panic");
-        }
-        if evidence.security_execution_search {
-            families.push("command execution/filesystem/env");
-        }
-        if evidence.security_secret_search {
-            families.push("secret/token/auth");
-        }
-        let searched = if families.is_empty() {
-            "none".to_string()
-        } else {
-            families.join(", ")
-        };
-        lines.push(format!("- Security pattern families searched: {searched}"));
-    }
-
-    if evidence.inspected_paths.is_empty() {
-        lines.push("- Inspected files: none".to_string());
-    } else {
-        const INSPECTED_PATH_FALLBACK_LIMIT: usize = 6;
-        let mut paths = evidence
-            .inspected_paths
-            .iter()
-            .take(INSPECTED_PATH_FALLBACK_LIMIT)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(", ");
-        let omitted = evidence
-            .inspected_paths
-            .len()
-            .saturating_sub(INSPECTED_PATH_FALLBACK_LIMIT);
-        if omitted > 0 {
-            paths.push_str(&format!(" (+{omitted} more)"));
-        }
-        lines.push(format!("- Inspected files: {paths}"));
-    }
-
-    if !evidence.search_hit_snippets.is_empty() {
-        const SEARCH_HIT_FALLBACK_LIMIT: usize = 6;
-        lines.push(String::new());
-        lines.push("Concrete search matches from inspected evidence:".to_string());
-        for snippet in evidence
-            .search_hit_snippets
-            .iter()
-            .take(SEARCH_HIT_FALLBACK_LIMIT)
-        {
-            lines.push(format!("- {snippet}"));
-        }
-        let omitted = evidence
-            .search_hit_snippets
-            .len()
-            .saturating_sub(SEARCH_HIT_FALLBACK_LIMIT);
-        if omitted > 0 {
-            lines.push(format!("- (+{omitted} more search match target(s))"));
-        }
-        lines.push(
-            "These are pattern-match review targets, not confirmed vulnerabilities or all-clear findings."
-                .to_string(),
-        );
-    }
-
-    lines.push(String::new());
-    lines.push(format!("Why this stopped: {reason}."));
-    lines.push(
-        "No file is being changed; this turn remains read-only and no broader repo-wide claim is being made."
-            .to_string(),
-    );
-    lines.join("\n")
 }
 
 pub(crate) fn inspected_paths_for_prompt(evidence: &EvidenceTracker) -> String {
@@ -624,27 +473,27 @@ pub(crate) fn summarize_inspected_evidence_nudge(
     let paths = inspected_paths_for_prompt(evidence);
     match intent {
         ReviewIntent::Security => format!(
-            "You already have inspected evidence for this {label}. Do not answer with generic insufficient-evidence text. Produce a bounded security review from only the inspected searches/files. Cite concrete inspected files from this set: {paths}. Include: Findings, Inspected Evidence, Limits, and Follow-up. If a pattern match is only a review target, say that it is not confirmed."
+            "You already have inspected evidence for this {label}. Do not answer with a generic refusal or evidence disclaimer. Produce a bounded security review from only the inspected searches/files. Cite concrete inspected files from this set: {paths}. Include: Findings, Inspected Evidence, Limits, and Follow-up. If a pattern match is only a review target, say that it is not confirmed."
         ),
         ReviewIntent::Status => format!(
-            "You already have inspected evidence for this {label}. Do not answer with generic insufficient-evidence text. Produce a bounded status review from only the inspected files. Cite concrete inspected files from this set: {paths}. Include: Status, Evidence, Build Next, and Risks/Validation. Do not claim repo-wide completeness."
+            "You already have inspected evidence for this {label}. Do not answer with a generic refusal or evidence disclaimer. Produce a bounded status review from only the inspected files. Cite concrete inspected files from this set: {paths}. Include: Status, Evidence, Build Next, and Risks/Validation. Do not claim repo-wide completeness."
         ),
         ReviewIntent::Roadmap | ReviewIntent::Gaps => format!(
-            "You already have inspected evidence for this {label}. Do not answer with generic insufficient-evidence text. Produce bounded gaps/build-next notes from only the inspected files and searches. Cite concrete inspected files from this set: {paths}. Include: Missing/Gaps, Build Next, Evidence, and Risks. Do not claim repo-wide completeness."
+            "You already have inspected evidence for this {label}. Do not answer with a generic refusal or evidence disclaimer. Produce bounded gaps/build-next notes from only the inspected files and searches. Cite concrete inspected files from this set: {paths}. Include: Missing/Gaps, Build Next, Evidence, and Risks. Do not claim repo-wide completeness."
         ),
         ReviewIntent::Review => format!(
-            "You already have inspected evidence for this {label}. Do not answer with generic insufficient-evidence text. Produce bounded findings from only the inspected files/searches. Cite concrete inspected files from this set: {paths}. Include findings, evidence, follow-up, and limits."
+            "You already have inspected evidence for this {label}. Do not answer with a generic refusal or evidence disclaimer. Produce bounded findings from only the inspected files/searches. Cite concrete inspected files from this set: {paths}. Include findings, evidence, follow-up, and limits."
         ),
     }
 }
 
 pub(crate) fn inspected_insufficient_repair_limit(intent: ReviewIntent) -> u32 {
     match intent {
-        ReviewIntent::Security => 3,
+        ReviewIntent::Security => 4,
         ReviewIntent::Status
         | ReviewIntent::Roadmap
         | ReviewIntent::Gaps
-        | ReviewIntent::Review => 2,
+        | ReviewIntent::Review => 3,
     }
 }
 
@@ -670,10 +519,16 @@ pub(crate) fn read_only_blocks_tool(intent: Option<ReviewIntent>, name: &str) ->
     intent.is_some() && !hi_tools::is_read_only(name)
 }
 
+pub(crate) fn inspection_sprawl_nudge(cap: u32, used: u32) -> String {
+    format!(
+        "You have reached the read-only inspection cap for this turn ({used}/{cap} file reads/searches). The results are in the conversation above. Stop inspecting now and answer from the evidence you have already gathered. Produce bounded findings tied to concrete inspected files and include a Limits section. Do not read or search more files."
+    )
+}
+
 /// Whether the inspection-sprawl guard should fire this round. True when:
 /// - this is a read-only review turn (`intent.is_some()`),
 /// - the turn has already gathered a lot of evidence
-///   (`inspection_count() >= INSPECTION_SPRAWL_THRESHOLD`),
+///   (`inspection_count() >= active_inspection_cap`),
 /// - every call this round is a read-only inspection (the model is still
 ///   gathering, not answering), and
 /// - the sprawl nudge budget is not yet exhausted.
@@ -686,11 +541,15 @@ pub(crate) fn should_nudge_inspection_sprawl(
     intent: Option<ReviewIntent>,
     evidence: &EvidenceTracker,
     calls: &[(String, String, String)],
+    active_inspection_cap: Option<u32>,
 ) -> bool {
     let Some(_intent) = intent else {
         return false;
     };
-    if evidence.inspection_count() < INSPECTION_SPRAWL_THRESHOLD {
+    let Some(cap) = active_inspection_cap else {
+        return false;
+    };
+    if evidence.inspection_count() < cap {
         return false;
     }
     if calls.is_empty() {
@@ -709,17 +568,24 @@ pub(crate) fn should_nudge_inspection_sprawl(
 }
 
 /// Whether the inspection-sprawl guard has exhausted its budget and the turn
-/// should hard-stop with a bounded-evidence summary. True on a read-only
-/// review turn that is still sprawling (all calls read-only inspections) after
-/// the sprawl nudge budget is spent.
+/// should stop incomplete. True on a read-only review turn that is still
+/// sprawling (all calls read-only inspections) after the sprawl nudge budget is
+/// spent.
 pub(crate) fn inspection_sprawl_exhausted(
     intent: Option<ReviewIntent>,
     evidence: &EvidenceTracker,
     calls: &[(String, String, String)],
+    active_inspection_cap: Option<u32>,
 ) -> bool {
     let Some(_intent) = intent else {
         return false;
     };
+    let Some(cap) = active_inspection_cap else {
+        return false;
+    };
+    if evidence.inspection_count() < cap {
+        return false;
+    }
     if evidence.inspection_sprawl_nudges < MAX_INSPECTION_SPRAWL_NUDGES {
         return false;
     }

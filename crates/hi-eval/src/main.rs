@@ -266,7 +266,7 @@ async fn fetch_mcp_catalog(
     match client.model_metadata().await {
         Ok(models) => Some(models),
         Err(err) => {
-            eprintln!("hi-eval: MCP model metadata unavailable: {err:#}");
+            eprintln!("hi-eval: MCP model metadata not loaded: {err:#}");
             None
         }
     }

@@ -67,8 +67,8 @@ pub trait Ui: Send {
     ) {
     }
     /// Latest provider rate-limit buckets observed on a model response. Emitted
-    /// alongside usage when available so frontends can distinguish endpoint
-    /// throttling from route/model failures. Defaults to ignoring it.
+    /// alongside usage when available so frontends can distinguish throttling
+    /// from other request failures. Defaults to ignoring it.
     fn rate_limits(&mut self, _rate_limits: Option<hi_ai::RateLimitState>) {}
     /// End of the turn, with a prebuilt token summary line.
     fn turn_end(&mut self, summary: &str);
@@ -78,7 +78,7 @@ pub trait Ui: Send {
     /// to no-op — only interactive frontends render it.
     fn changed_files(&mut self, _files: &[String]) {}
     /// The turn failed with a classified error. `kind` is a short slug
-    /// (`auth`, `rate_limit`, `outage`, …) so a frontend can tailor its
+    /// (`auth`, `rate_limit`, `request`, ...) so a frontend can tailor its
     /// presentation; `message` is the raw error text; `guidance` is a
     /// user-facing remediation hint. Defaults to ignoring — frontends
     /// that already handle `turn_end` should override this for richer
@@ -106,27 +106,27 @@ pub fn classify_error(err: &anyhow::Error) -> (&'static str, &'static str) {
         ),
         Some(K::RateLimit) => (
             "rate_limit",
-            "the endpoint is rate-limiting you — wait a moment, then /retry",
+            "request limit reached — wait a moment, then /retry",
         ),
         Some(K::CapacityUnavailable) => (
             "capacity",
-            "capacity is temporarily unavailable — wait a moment, then /retry",
+            "capacity is limited right now — wait a moment, then /retry",
         ),
         Some(K::ModelUnavailable) => (
-            "model_unavailable",
-            "the requested model route is unavailable — try /model to switch, or /retry if it was temporary",
+            "request",
+            "the request did not complete — wait a moment, then /retry",
         ),
         Some(K::Outage) => (
-            "outage",
-            "the endpoint is unreachable or returning errors — check the provider's status page, or /provider to switch",
+            "request",
+            "the request did not complete — wait a moment, then /retry",
         ),
         Some(K::UnsupportedRequestShape) => (
             "compat",
-            "the provider rejected the request shape — try --compat auto, or /model to switch to a model with better tool support",
+            "the request shape was not accepted — try --compat auto, then /retry",
         ),
         Some(K::UnsupportedTools) => (
             "tools",
-            "this model doesn't support tool use — try /model to switch, or --tool-mode chat-only for a Q&A turn",
+            "tool use was not accepted — use --tool-mode chat-only for a Q&A turn",
         ),
         Some(K::RequestTooLarge) => (
             "context_full",
@@ -138,19 +138,15 @@ pub fn classify_error(err: &anyhow::Error) -> (&'static str, &'static str) {
         ),
         Some(K::ToolProtocol) => (
             "tool_protocol",
-            "the model emitted an invalid tool turn — /retry usually fixes this; switch models only if it repeats",
-        ),
-        Some(K::StreamTimeout) => (
-            "timeout",
-            "the response stream timed out — the endpoint may be slow or overloaded; /retry or /model to switch",
+            "the tool turn was invalid — /retry usually fixes this",
         ),
         Some(K::MalformedStream) => (
             "malformed",
-            "the provider sent a malformed response — this is often a server-side bug; /retry, or /model to switch",
+            "the response could not be parsed — /retry usually fixes this",
         ),
         Some(K::EmptyCompletion) => (
             "empty",
-            "the model returned an empty response — /retry, or /model to switch to a more reliable model",
+            "the model returned an empty response — /retry usually fixes this",
         ),
         Some(K::Other) | None => ("error", ""),
     }
@@ -301,7 +297,7 @@ mod tests {
     }
 
     #[test]
-    fn capacity_unavailable_is_not_a_model_quality_issue() {
+    fn capacity_limit_is_not_a_model_quality_issue() {
         let err: anyhow::Error = ProviderError::new(
             ProviderErrorKind::CapacityUnavailable,
             "API error 409: capacity temporarily unavailable",
@@ -311,12 +307,12 @@ mod tests {
         let (kind, guidance) = classify_error(&err);
 
         assert_eq!(kind, "capacity");
-        assert!(guidance.contains("temporarily unavailable"));
+        assert!(guidance.contains("capacity is limited"));
         assert!(!error_counts_as_model_issue(&err));
     }
 
     #[test]
-    fn model_unavailable_is_not_reported_as_capacity_or_incomplete_turn() {
+    fn route_rejection_is_not_reported_as_capacity_or_incomplete_turn() {
         let err: anyhow::Error = ProviderError::new(
             ProviderErrorKind::ModelUnavailable,
             "model temporarily unavailable",
@@ -325,8 +321,9 @@ mod tests {
 
         let (kind, guidance) = classify_error(&err);
 
-        assert_eq!(kind, "model_unavailable");
-        assert!(guidance.contains("/model"));
+        assert_eq!(kind, "request");
+        assert!(!guidance.contains("/model"));
+        assert!(!guidance.contains("switch"));
         assert!(!guidance.contains("capacity"));
         assert!(!error_counts_as_model_issue(&err));
     }

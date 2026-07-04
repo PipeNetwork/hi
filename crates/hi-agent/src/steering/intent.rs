@@ -105,8 +105,8 @@ pub(crate) fn grep_match_line_count(output: &str) -> u32 {
 pub(crate) fn evidence_kind_for_tool(name: &str, arguments: &str) -> Option<EvidenceKind> {
     match name {
         "read" => Some(EvidenceKind::FileRead),
-        "grep" | "glob" | "diff" | "status" => Some(EvidenceKind::TargetedSearch),
-        "list" => Some(EvidenceKind::Listing),
+        "grep" | "glob" => Some(EvidenceKind::TargetedSearch),
+        "list" | "diff" | "status" => Some(EvidenceKind::Listing),
         "bash" => evidence_kind_for_bash(arguments),
         _ => None,
     }
@@ -256,6 +256,72 @@ pub(crate) fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
 }
 
+pub(crate) fn default_read_only_inspection_cap(intent: ReviewIntent) -> u32 {
+    match intent {
+        ReviewIntent::Review => super::constants::REVIEW_INSPECTION_CAP,
+        ReviewIntent::Status => super::constants::STATUS_INSPECTION_CAP,
+        ReviewIntent::Roadmap => super::constants::ROADMAP_INSPECTION_CAP,
+        ReviewIntent::Gaps => super::constants::GAPS_INSPECTION_CAP,
+        ReviewIntent::Security => super::constants::SECURITY_INSPECTION_CAP,
+    }
+}
+
+pub(crate) fn active_read_only_inspection_cap(input: &str, intent: ReviewIntent) -> u32 {
+    let default = default_read_only_inspection_cap(intent);
+    explicit_read_only_inspection_cap(input).map_or(default, |cap| default.min(cap))
+}
+
+pub(crate) fn explicit_read_only_inspection_cap(input: &str) -> Option<u32> {
+    let normalized = normalize_intent_text(input);
+    let words = normalized.split_whitespace().collect::<Vec<_>>();
+    let mut cap: Option<u32> = None;
+    for index in 0..words.len() {
+        let parsed = parse_inspection_cap_at(&words, index);
+        cap = match (cap, parsed) {
+            (Some(existing), Some(parsed)) => Some(existing.min(parsed)),
+            (None, Some(parsed)) => Some(parsed),
+            (existing, None) => existing,
+        };
+    }
+    cap
+}
+
+fn parse_inspection_cap_at(words: &[&str], index: usize) -> Option<u32> {
+    if words.get(index..index + 2) == Some(&["at", "most"]) {
+        return parse_cap_after_number(words, index + 2);
+    }
+    if words.get(index..index + 4) == Some(&["use", "no", "more", "than"])
+        || words.get(index..index + 3) == Some(&["no", "more", "than"])
+    {
+        let number_index = if words.get(index) == Some(&"use") {
+            index + 4
+        } else {
+            index + 3
+        };
+        return parse_cap_after_number(words, number_index);
+    }
+    if matches!(words.get(index), Some(&"max" | &"maximum")) {
+        return parse_cap_after_number(words, index + 1);
+    }
+    None
+}
+
+fn parse_cap_after_number(words: &[&str], number_index: usize) -> Option<u32> {
+    let number = words.get(number_index)?.parse::<u32>().ok()?;
+    if number == 0 {
+        return None;
+    }
+    let mut noun_index = number_index + 1;
+    if matches!(words.get(noun_index), Some(&"file" | &"tool")) {
+        noun_index += 1;
+    }
+    matches!(
+        words.get(noun_index),
+        Some(&"inspection" | &"inspections" | &"read" | &"reads")
+    )
+    .then_some(number)
+}
+
 fn expanded_read_only_macro_intent(normalized: &str) -> Option<ReviewIntent> {
     if normalized.starts_with("read only security request for") {
         Some(ReviewIntent::Security)
@@ -281,32 +347,11 @@ fn no_mutation_review_intent(normalized: &str) -> ReviewIntent {
         ReviewIntent::Roadmap
     } else if explicit_status_review_request(normalized) {
         ReviewIntent::Status
-    } else if explicit_code_review_request(normalized) {
-        ReviewIntent::Review
     } else {
+        // Both an explicit code-review request and the default (no recognized
+        // review kind) map to a plain code review.
         ReviewIntent::Review
     }
-}
-
-pub(crate) fn explicit_code_review_request(normalized: &str) -> bool {
-    contains_any(
-        normalized,
-        &[
-            "review codebase",
-            "review repo",
-            "review repository",
-            "review this code",
-            "review code",
-            "code review",
-            "review for",
-            "audit codebase",
-            "audit repo",
-            "audit repository",
-            "audit the code",
-            "audit code",
-            "audit for",
-        ],
-    )
 }
 
 pub(crate) fn explicit_security_review_request(normalized: &str) -> bool {
@@ -390,12 +435,22 @@ pub(crate) fn explicit_no_mutation_request(normalized: &str) -> bool {
             "discuss only",
             "do not write",
             "do not edit",
+            "do not modify",
+            "do not change",
+            "don t write",
+            "don t edit",
+            "don t modify",
+            "don t change",
+            "without modifying",
+            "without changing",
             "no file changes",
+            "no changes",
         ],
     )
 }
 
 pub(crate) fn read_only_turn_prompt(input: &str, intent: ReviewIntent) -> String {
+    let cap = active_read_only_inspection_cap(input, intent);
     let recipe = match intent {
         ReviewIntent::Security => {
             "Search for unsafe, unwrap, expect, panic!, command execution, filesystem/env access, and secret/token/auth patterns. Then read the most relevant matching files."
@@ -414,7 +469,7 @@ pub(crate) fn read_only_turn_prompt(input: &str, intent: ReviewIntent) -> String
         }
     };
     format!(
-        "{input}\n\nRead-only review guard: do not write, edit, apply patches, run mutating shell commands, or change files. Use read-only inspection before the final answer. {recipe} If only a directory listing is available, keep inspecting or explicitly say the evidence is insufficient instead of making file-specific findings."
+        "{input}\n\nRead-only review guard: do not write, edit, apply patches, run mutating shell commands, or change files. Use read-only inspection before the final answer. Active inspection cap: at most {cap} file reads/searches for this turn; listings and diffs may provide context but do not raise the cap. Once the cap is reached, answer from gathered evidence instead of inspecting more. {recipe} If only a directory listing is available, keep inspecting before making file-specific findings."
     )
 }
 

@@ -443,7 +443,7 @@ impl crate::Agent {
     }
 
     /// Capture the model and token/window settings so a caller can temporarily
-    /// switch models for one turn and restore the previous route exactly.
+    /// use a different model for one turn and restore the previous route exactly.
     pub fn model_state(&self) -> crate::AgentModelState {
         crate::AgentModelState {
             model: self.config.model.clone(),
@@ -481,8 +481,8 @@ impl crate::Agent {
         );
     }
 
-    /// Swap the provider (endpoint + wire format + key) and model for subsequent
-    /// turns. Used by `/provider` to switch profiles mid-session. The caller
+    /// Update the provider (endpoint + wire format + key) and model for subsequent
+    /// turns. Used by `/provider` to use profiles mid-session. The caller
     /// builds the new `Box<dyn Provider>` (e.g. Anthropic vs OpenAI adapter) and
     /// supplies a model id; pricing/context metadata is refreshed from the
     /// registry or the provider's live `/models` response.

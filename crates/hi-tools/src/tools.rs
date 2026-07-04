@@ -23,6 +23,7 @@ const DEFAULT_BASH_TIMEOUT_SECS: u64 = 600;
 /// value can't reintroduce an unbounded stall.
 const MAX_BASH_TIMEOUT_SECS: u64 = 3600;
 const CHECK_TIMEOUT: Duration = Duration::from_secs(300);
+const MAX_UNTRACKED_DIFF_ENTRIES: usize = 200;
 const HF_AGENT_ENV_VAR: &str = "AI_AGENT";
 const HF_AGENT_ID: &str = "hi";
 const PYTHON_TUI_MARKERS: &[&str] = &[
@@ -66,8 +67,12 @@ fn resolve_bash_timeout(requested: Option<u64>) -> Duration {
 /// Run a verification command (e.g. a test suite) and report `(passed, output)`
 /// based on its exit status. Used by the agent's verification loop.
 pub async fn run_check(command: &str) -> (bool, String) {
+    prepare_verify_workdir(std::path::Path::new("."));
     let mut cmd = Command::new("sh");
-    mark_agent_harness(&mut cmd).arg("-c").arg(command);
+    mark_agent_harness(&mut cmd)
+        .env("PYTHONDONTWRITEBYTECODE", "1")
+        .arg("-c")
+        .arg(command);
     let future = cmd.output();
     match tokio::time::timeout(CHECK_TIMEOUT, future).await {
         Ok(Ok(output)) => {
@@ -88,6 +93,28 @@ pub async fn run_check(command: &str) -> (bool, String) {
             format!("verification timed out after {}s", CHECK_TIMEOUT.as_secs()),
         ),
     }
+}
+
+/// Best-effort cleanup before running a verification command.
+///
+/// Python's import cache can otherwise make same-size, same-second edits look
+/// unchanged to `python -c "import solution"` checks. Pruning only `__pycache__`
+/// directories keeps this narrow and harmless for non-Python checks.
+pub fn prepare_verify_workdir(dir: &std::path::Path) {
+    fn walk(dir: &std::path::Path) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if entry.file_name() == "__pycache__" {
+                let _ = std::fs::remove_dir_all(&path);
+            } else if path.is_dir() {
+                walk(&path);
+            }
+        }
+    }
+    walk(dir);
 }
 
 /// A per-file "fast check" command for `path`'s language — a quick, file-scoped
@@ -195,11 +222,51 @@ async fn working_tree_diff_impl(color: bool) -> String {
     }
     if !new_files.is_empty() {
         out.push_str("\nnew (untracked) files:\n");
-        for f in new_files {
-            out.push_str(&format!("  + {f}\n"));
-        }
+        out.push_str(&render_untracked_files(
+            &new_files,
+            MAX_UNTRACKED_DIFF_ENTRIES,
+        ));
     }
     out
+}
+
+fn render_untracked_files(files: &[&str], limit: usize) -> String {
+    let mut collapsed = std::collections::BTreeMap::<String, usize>::new();
+    for file in files {
+        let path = file.trim();
+        if path.is_empty() {
+            continue;
+        }
+        *collapsed.entry(collapse_untracked_path(path)).or_default() += 1;
+    }
+
+    let total = collapsed.len();
+    let mut out = String::new();
+    for (path, count) in collapsed.into_iter().take(limit) {
+        if count > 1 && path.ends_with('/') {
+            out.push_str(&format!("  + {path} ({count} entries)\n"));
+        } else {
+            out.push_str(&format!("  + {path}\n"));
+        }
+    }
+    if total > limit {
+        let omitted = total - limit;
+        out.push_str(&format!(
+            "  ... omitted {omitted} untracked entr{} (limit {limit})\n",
+            if omitted == 1 { "y" } else { "ies" }
+        ));
+    }
+    out
+}
+
+fn collapse_untracked_path(path: &str) -> String {
+    let normalized = path.replace('\\', "/");
+    let mut components = normalized.split('/').filter(|part| !part.is_empty());
+    match (components.next(), components.next()) {
+        (Some(first), Some(_)) => format!("{first}/"),
+        (Some(first), None) => first.to_string(),
+        _ => path.to_string(),
+    }
 }
 
 /// Stage all working-tree changes and commit them with an auto-generated
@@ -551,6 +618,42 @@ fn build_tool_specs() -> Vec<ToolSpec> {
                 "required": ["path", "line", "column"]
             }),
         },
+        ToolSpec {
+            name: "web_search".into(),
+            description: "Search the web for current information outside the repo — library docs, API specs, current events, model catalogs, recent release notes. Returns cited results (title, URL, snippet). Don't use this for things `read`/`grep`/`list` can answer locally.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "The search query." },
+                    "max_results": { "type": "integer", "description": "Maximum results to return (default 5, cap 10)." }
+                },
+                "required": ["query"]
+            }),
+        },
+        ToolSpec {
+            name: "web_fetch".into(),
+            description: "Fetch a public URL and return its content (JSON pretty-printed, HTML stripped to text, truncated). No API key needed. Use this for documentation pages, public API URLs, or any direct URL the model needs to read. For search-engine results use `web_search`; for Hugging Face model discovery use `/hf` or Hub API URLs explicitly.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "The http:// or https:// URL to fetch." }
+                },
+                "required": ["url"]
+            }),
+        },
+        ToolSpec {
+            name: "web_download".into(),
+            description: "Download a file from Hugging Face Hub or any direct public URL. Runs in the background — returns a handle to poll with `bash_output` and stop with `bash_kill`. For a Hugging Face repo, pass `source` as `org/model`, `org/model@revision`, or `org/model@revision:filename`; if no filename is given, lists the repo's files first. Full HTTP(S) URLs are direct downloads, not Hub discovery. The `output` path defaults to the file's basename and must be within the workspace.".into(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "source": { "type": "string", "description": "Hugging Face repo ref (`org/model`, `org/model@revision`, `org/model:filename`) or full URL." },
+                    "filename": { "type": "string", "description": "Filename within the repo (optional — if omitted, lists available files)." },
+                    "output": { "type": "string", "description": "Local path to save the file (defaults to basename, must be in workspace)." }
+                },
+                "required": ["source"]
+            }),
+        },
     ]
 }
 
@@ -579,6 +682,8 @@ pub fn is_read_only(name: &str) -> bool {
             | "definition"
             | "references"
             | "hover"
+            | "web_search"
+            | "web_fetch"
     )
 }
 
@@ -859,6 +964,9 @@ async fn run(name: &str, arguments: &str) -> Result<ToolOutput> {
         "definition" => run_lsp_definition(arguments).await,
         "references" => run_lsp_references(arguments).await,
         "hover" => run_lsp_hover(arguments).await,
+        "web_search" => crate::web::run_web_search(arguments).await,
+        "web_fetch" => crate::web::run_web_fetch(arguments).await,
+        "web_download" => crate::web::run_web_download(arguments).await,
         "apply_patch" => {
             #[derive(Deserialize)]
             struct PatchArgs {
@@ -1037,6 +1145,10 @@ pub(crate) fn spawn_shell(command: &str) -> Result<tokio::process::Child> {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
+    // Strip API keys / tokens from the child environment so a `bash` tool call
+    // like `echo $HI_API_KEY` can't exfiltrate the user's credentials into the
+    // transcript. The shell still inherits PATH, HOME, LANG, VIRTUAL_ENV, etc.
+    scrub_secrets(&mut cmd);
     #[cfg(unix)]
     cmd.process_group(0);
     cmd.spawn().context("failed to spawn command")
@@ -1044,6 +1156,30 @@ pub(crate) fn spawn_shell(command: &str) -> Result<tokio::process::Child> {
 
 fn mark_agent_harness(cmd: &mut Command) -> &mut Command {
     cmd.env(HF_AGENT_ENV_VAR, HF_AGENT_ID)
+}
+
+/// Environment variables stripped from every spawned shell because they hold
+/// provider credentials, search-backend keys, or other secrets. Anything not
+/// listed here is still inherited, so the model keeps PATH/HOME/VIRTUAL_ENV.
+const SECRET_ENV_VARS: &[&str] = &[
+    "HI_API_KEY",
+    "HI_WEB_SEARCH_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENROUTER_API_KEY",
+    "PIPENETWORK_API_KEY",
+    "OLLAMA_API_KEY",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
+    "AZURE_OPENAI_API_KEY",
+    "HUGGING_FACE_HUB_TOKEN",
+    "HF_TOKEN",
+];
+
+fn scrub_secrets(cmd: &mut Command) {
+    for var in SECRET_ENV_VARS {
+        cmd.env_remove(var);
+    }
 }
 
 /// Best-effort process-group cleanup for foreground bash futures. This matters
@@ -1470,13 +1606,33 @@ fn is_env_assignment(tok: &str) -> bool {
 mod tests {
     use super::{
         fast_check_for, foreground_interactive_command_reason, is_filesystem_mutating,
-        is_read_only, run_bash_streaming_with_timeout, run_check, target_path,
+        is_read_only, render_untracked_files, run_bash_streaming_with_timeout, run_check,
+        target_path,
     };
     use crate::edit::sh_quote;
     use std::sync::{LazyLock, Mutex};
     use std::time::Duration;
 
     static CWD_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    #[test]
+    fn diff_untracked_files_are_collapsed_and_capped() {
+        let files = [
+            "models/a.bin",
+            "models/b.bin",
+            "scratch/one.txt",
+            "scratch/two.txt",
+            "top.txt",
+            "z.txt",
+        ];
+
+        let rendered = render_untracked_files(&files, 3);
+
+        assert!(rendered.contains("  + models/ (2 entries)"));
+        assert!(rendered.contains("  + scratch/ (2 entries)"));
+        assert!(rendered.contains("  ... omitted 1 untracked entry (limit 3)"));
+        assert!(!rendered.contains("models/a.bin"));
+    }
 
     // A command that keeps its stdout pipe open and never exits must still
     // return via the timeout. Before the fix the timeout wrapped only
@@ -1527,7 +1683,14 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn bash_marks_hugging_face_agent_harness() {
+        // Run a subprocess in the process cwd: serialize with the
+        // set_current_dir tests so they can't swap/remove the cwd under us.
+        // The std MutexGuard is held across the await deliberately: the only
+        // other contender is a sync `#[test]` on a different thread, which
+        // blocks on `lock()` without deadlocking this async task's worker.
+        let _guard = CWD_TEST_LOCK.lock().unwrap();
         let mut sink = |_: &str| {};
         let out = run_bash_streaming_with_timeout(
             "printf '%s' \"$AI_AGENT\"",
@@ -1540,7 +1703,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn verify_marks_hugging_face_agent_harness() {
+        // Same race as bash_marks_hugging_face_agent_harness: run_check spawns
+        // `sh -c` in the process cwd, which a concurrent set_current_dir test
+        // can remove mid-run. See that test for the lock-across-await rationale.
+        let _guard = CWD_TEST_LOCK.lock().unwrap();
         let (passed, out) = run_check("printf '%s' \"$AI_AGENT\"").await;
         assert!(passed, "got: {out:?}");
         assert_eq!(out, "hi");

@@ -68,9 +68,9 @@ pub(crate) fn handle_command(
         Command::Model(id) => {
             if id.is_empty() {
                 // The line REPL can't do an arrow-select picker; show the current
-                // model + how to switch (the full-screen TUI has a live picker).
+                // model and the number of known model ids.
                 println!(
-                    "model: {}\n\x1b[2m{} models known — `/model <id>` to switch (the TUI's /model opens an interactive picker)\x1b[0m",
+                    "model: {}\n\x1b[2m{} models known\x1b[0m",
                     agent.model(),
                     registry.model_ids().len()
                 );
@@ -182,7 +182,8 @@ pub(crate) fn handle_command(
         | Command::Learn(_)
         | Command::Skill(_)
         | Command::Diff
-        | Command::Commit => {}
+        | Command::Commit
+        | Command::Hf(_) => {}
         Command::Version => {
             println!("hi {}", hi_agent::VERSION);
         }

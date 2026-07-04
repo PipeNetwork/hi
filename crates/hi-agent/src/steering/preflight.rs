@@ -186,13 +186,13 @@ else
   printf 'not a git repository\n'
 fi
 printf '\n[workspace_manifests]\n'
-find . -path './target' -prune -o -path './node_modules' -prune -o -path './.git' -prune -o \( -name Cargo.toml -o -name package.json -o -name pyproject.toml -o -name go.mod -o -name Makefile -o -name justfile \) -print | sort | head -80
+find . \( -path './.git' -o -path './target' -o -path './node_modules' -o -path './.venv' -o -path './venv' -o -path './vendor' -o -path './models' -o -path './.cache' -o -path './dist' -o -path './build' -o -path './.next' -o -path './.turbo' -o -path './coverage' \) -prune -o \( -name Cargo.toml -o -name package.json -o -name pyproject.toml -o -name go.mod -o -name Makefile -o -name justfile \) -print | head -80
 printf '\n[readme_docs]\n'
-find . -maxdepth 3 -path './.git' -prune -o \( -iname 'README*' -o -iname 'DESIGN*' -o -path './docs/*' \) -print | sort | head -80
+find . -maxdepth 3 \( -path './.git' -o -path './target' -o -path './node_modules' -o -path './.venv' -o -path './venv' -o -path './vendor' -o -path './models' -o -path './.cache' -o -path './dist' -o -path './build' -o -path './.next' -o -path './.turbo' -o -path './coverage' \) -prune -o \( -iname 'README*' -o -iname 'DESIGN*' -o -path './docs/*' \) -print | head -80
 printf '\n[likely_entrypoints]\n'
-find . -path './target' -prune -o -path './node_modules' -prune -o -path './.git' -prune -o \( -path './src/main.rs' -o -path './src/lib.rs' -o -path './src/bin/*.rs' -o -path './main.py' -o -path './app.py' -o -path './src/index.*' -o -path './src/main.*' -o -path './app/page.*' \) -print | sort | head -80
+find . \( -path './.git' -o -path './target' -o -path './node_modules' -o -path './.venv' -o -path './venv' -o -path './vendor' -o -path './models' -o -path './.cache' -o -path './dist' -o -path './build' -o -path './.next' -o -path './.turbo' -o -path './coverage' \) -prune -o \( -path './src/main.rs' -o -path './src/lib.rs' -o -path './src/bin/*.rs' -o -path './main.py' -o -path './app.py' -o -path './src/index.*' -o -path './src/main.*' -o -path './app/page.*' \) -print | head -80
 printf '\n[detected_verification]\n'
-if find . -maxdepth 3 -path './target' -prune -o -name Cargo.toml -print -quit | grep -q .; then
+if find . -maxdepth 3 \( -path './.git' -o -path './target' -o -path './node_modules' -o -path './.venv' -o -path './venv' -o -path './vendor' -o -path './models' -o -path './.cache' -o -path './dist' -o -path './build' -o -path './.next' -o -path './.turbo' -o -path './coverage' \) -prune -o -name Cargo.toml -print -quit | grep -q .; then
   printf 'primary=cargo test\n'
   printf 'alternates=cargo check; cargo build\n'
 elif [ -f package.json ]; then

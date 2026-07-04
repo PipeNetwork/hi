@@ -5,8 +5,8 @@
 //! for evidence classification and tool-call inspection.
 
 use super::implementation::{
-    implementation_tool_call_validates, implementation_tool_result_landed_mutation,
-    implementation_tool_result_landed_substantive_edit,
+    bash_no_progress_signature, implementation_tool_call_validates,
+    implementation_tool_result_landed_mutation, implementation_tool_result_landed_substantive_edit,
 };
 use super::intent::{
     compact_search_hit_line, evidence_kind_for_tool, grep_match_line_count, search_hit_score,
@@ -89,23 +89,25 @@ pub(crate) struct EvidenceTracker {
     pub(crate) quality_repair_nudges: u32,
     /// How many inspection-sprawl nudges have fired this turn. Incremented in
     /// the turn loop when a read-only review turn keeps issuing read-only
-    /// inspections past [`INSPECTION_SPRAWL_THRESHOLD`] without producing a
+    /// inspections past the active intent-specific inspection cap without producing a
     /// final answer. Once this exceeds [`MAX_INSPECTION_SPRAWL_NUDGES`] the
-    /// turn hard-stops with a bounded-evidence summary.
+    /// turn stops incomplete rather than fabricating a review.
     pub(crate) inspection_sprawl_nudges: u32,
     /// Inspection signatures already seen this turn, used by the no-new-evidence
     /// cycle guard. Each entry is a stable key derived from a read-only tool
     /// call's identity: `read:<path>:<offset>:<limit>`,
     /// `list:<path>`, `grep:<pattern>:<glob>:<path>:<context>`,
-    /// `glob:<pattern>:<path>`, or a stale background handle
-    /// `bash_output:<id>`/`bash_kill:<id>`. A round whose
+    /// `glob:<pattern>:<path>`, a stale background handle
+    /// `bash_output:<id>`/`bash_kill:<id>`, or a narrow no-progress bash command.
+    /// A round whose
     /// every read-only call's signature is already in this set adds no new
     /// evidence — re-running it can only reproduce prior output. Live
     /// `bash_output` polls are intentionally not recorded here because a running
     /// background process can emit new output later; missing/pruned/completed
     /// handles are recorded because polling them again cannot produce new
-    /// output. Mutating tools (write/edit/bash/...) are never added here; a
-    /// round containing a mutating call always counts as potentially new.
+    /// output. Mutating tools are never added here; ordinary bash still counts
+    /// as potentially new, but a tightly recognized no-op/control bash command
+    /// gets a signature so stop/quit/done loops are bounded.
     pub(crate) seen_signatures: Vec<String>,
 }
 
@@ -116,6 +118,9 @@ impl EvidenceTracker {
             return;
         }
         if background_handle_is_terminal(name, output) {
+            self.record_inspection_signature(name, arguments);
+        }
+        if name == "bash" {
             self.record_inspection_signature(name, arguments);
         }
         let Some(kind) = evidence_kind_for_tool(name, arguments) else {
@@ -174,7 +179,7 @@ impl EvidenceTracker {
         }
         for (_, name, args) in calls {
             match name.as_str() {
-                "read" | "list" | "grep" | "glob" | "bash_output" | "bash_kill" => {
+                "read" | "list" | "grep" | "glob" | "bash_output" | "bash_kill" | "bash" => {
                     match inspection_signature(name, args) {
                         Some(sig) if self.seen_signatures.iter().any(|s| s == &sig) => {}
                         // A new signature, or arguments we cannot signature safely,
@@ -336,6 +341,7 @@ pub(crate) fn inspection_signature(name: &str, arguments: &str) -> Option<String
             }
             Some(format!("{name}:{id}"))
         }
+        "bash" => bash_no_progress_signature(arguments).map(|sig| format!("bash:{sig}")),
         _ => None,
     }
 }

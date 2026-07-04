@@ -30,6 +30,66 @@ fn test_remover() -> ProfileRemover {
     Box::new(|_name| anyhow::bail!("no profiles in tests"))
 }
 
+#[test]
+fn selected_model_persists_to_active_profile() {
+    let stored = std::sync::Arc::new(std::sync::Mutex::new(ProfileFormData {
+        name: "default".into(),
+        provider: "pipenetwork".into(),
+        api_key: "test-key".into(),
+        store_as_env: false,
+        model: "pipe/auto-code".into(),
+        base_url: String::new(),
+    }));
+    let loader_state = stored.clone();
+    let saver_state = stored.clone();
+    let loader: ProfileLoader = Box::new(move |name| {
+        assert_eq!(name, "default");
+        Ok(loader_state.lock().unwrap().clone())
+    });
+    let saver: ProfileSaver = Box::new(move |data| {
+        *saver_state.lock().unwrap() = data.clone();
+        Ok(vec![ProfileInfo {
+            name: data.name.clone(),
+            provider: data.provider.clone(),
+            model: Some(data.model.clone()),
+            base_url: None,
+        }])
+    });
+
+    let mut app = App::new(
+        "pipenetwork",
+        "pipe/auto-code",
+        vec![ProfileInfo {
+            name: "default".into(),
+            provider: "pipenetwork".into(),
+            model: Some("pipe/auto-code".into()),
+            base_url: None,
+        }],
+        Some("default".into()),
+        test_resolver(),
+        saver,
+        loader,
+        test_remover(),
+        None,
+        String::new(),
+    );
+
+    let saved = app
+        .persist_active_profile_model("ipop/coder-balanced")
+        .expect("persist selected model");
+
+    assert_eq!(saved.as_deref(), Some("default"));
+    assert_eq!(
+        stored.lock().unwrap().model,
+        "ipop/coder-balanced",
+        "profile form was rewritten with selected model"
+    );
+    assert_eq!(
+        app.profiles[0].model.as_deref(),
+        Some("ipop/coder-balanced")
+    );
+}
+
 /// `App::new` with empty profiles and dummy callbacks, for tests.
 fn test_app(provider: &str, model: &str) -> App {
     App::new(
@@ -608,17 +668,17 @@ fn long_plan_does_not_break_input_box_border() {
 
 #[test]
 fn startup_notice_does_not_clip_input_line() {
-    // On first load, a startup notice (e.g. "provider metadata check
-    // failed: …") is pinned above the status line. The box height must
+    // On first load, a startup notice (e.g. "model metadata not loaded: …")
+    // is pinned above the status line. The box height must
     // account for it, or the input line gets clipped and the cursor lands
     // on the wrong row.
     let mut app = test_app("openai", "gpt-4o");
-    app.startup_notice = Some("provider metadata check failed: connection refused".into());
+    app.startup_notice = Some("model metadata not loaded: connection refused".into());
     let mut term = Terminal::new(TestBackend::new(70, 10)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     let screen = dump(&term);
     assert!(
-        screen.contains("provider metadata check failed"),
+        screen.contains("model metadata not loaded"),
         "notice shown:\n{screen}"
     );
     // The input prompt must still be visible inside the box (not clipped).
@@ -640,7 +700,7 @@ fn startup_notice_does_not_clip_input_line() {
         .unwrap();
     let above_border: String = rows[..border_row_idx].join("\n");
     assert!(
-        above_border.contains("provider metadata check failed") && above_border.contains('›'),
+        above_border.contains("model metadata not loaded") && above_border.contains('›'),
         "notice + prompt above the border:\n{screen}"
     );
 }
@@ -803,11 +863,16 @@ fn ctrl_question_toggles_the_observability_panel() {
     let mut app = test_app("openai", "gpt-4o");
     app.show_debug = true;
     app.last_telemetry = Some(hi_agent::TurnTelemetry {
+        effective_max_steps: 120,
         verify_rounds: 2,
         recovery_retries: 1,
         repeat_nudges: 0,
         continue_nudges: 1,
         truncation_retries: 0,
+        no_progress_streak: 0,
+        forced_final_answer_attempts: 0,
+        last_progress_reason: "accepted final answer".to_string(),
+        last_stall_reason: String::new(),
         hit_step_cap: false,
         stalled_unfinished: false,
         stalled_repeating: false,
@@ -816,6 +881,7 @@ fn ctrl_question_toggles_the_observability_panel() {
         max_concurrent_batch: 3,
         serial_runs: 2,
         tool_timeline: Vec::new(),
+        progress_events: Vec::new(),
         file_reads: 2,
         targeted_searches: 1,
         listing_only: false,
@@ -1010,29 +1076,26 @@ fn stopped_after_tool_output_without_turn_end_is_visible() {
         "transcript: {lines:?}"
     );
     assert!(
-        lines
+        !lines
             .iter()
             .any(|line| line.contains("degraded in-session")),
         "transcript: {lines:?}"
     );
+    assert_eq!(app.model_issues.get("gpt-4o"), Some(&1));
     assert_eq!(app.status, "stopped after tool output");
 }
 
 #[test]
 fn failed_turn_is_visible() {
     let mut app = test_app("openai", "gpt-4o");
-    app.note_turn_failed(
-        "provider disconnected",
-        "outage",
-        "check the provider's status page",
-    );
+    app.note_turn_failed("request failed", "request", "wait a moment, then /retry");
     let line = app.transcript.last().unwrap().text();
     assert!(line.contains("✗ failed"), "got: {line}");
-    assert!(line.contains("provider disconnected"), "got: {line}");
-    assert!(line.contains("outage"), "got: {line}");
+    assert!(line.contains("request failed"), "got: {line}");
+    assert!(line.contains("request"), "got: {line}");
     assert!(line.contains("💡"), "shows guidance: {line}");
     assert!(
-        app.status.contains("outage"),
+        app.status.contains("request"),
         "status has kind: {}",
         app.status
     );
@@ -1068,7 +1131,7 @@ fn tool_protocol_failure_does_not_mark_model_degraded() {
 }
 
 #[test]
-fn model_unavailable_failure_does_not_mark_model_degraded() {
+fn route_rejection_failure_does_not_mark_model_degraded() {
     let mut app = test_app("pipenetwork", "pipe/auto-code");
     let err: anyhow::Error = hi_ai::ProviderError::new(
         hi_ai::ProviderErrorKind::ModelUnavailable,
@@ -1084,7 +1147,7 @@ fn model_unavailable_failure_does_not_mark_model_degraded() {
 
     let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
     assert!(
-        lines.iter().any(|line| line.contains("model_unavailable")),
+        lines.iter().any(|line| line.contains("request")),
         "transcript: {lines:?}"
     );
     assert!(
@@ -1245,7 +1308,7 @@ fn renders_model_picker() {
 }
 
 #[test]
-fn picker_shows_health_tag() {
+fn picker_hides_health_tag() {
     let mut app = test_app("pipenetwork", "ipop/coder-balanced");
     let tags = HashMap::from([("claude-sonnet-4.6".to_string(), "degraded".to_string())]);
     app.picker = Some(ModelPicker::new(
@@ -1259,8 +1322,8 @@ fn picker_shows_health_tag() {
     term.draw(|f| app.render(f)).unwrap();
     let screen = dump(&term);
     assert!(
-        screen.contains("[degraded]"),
-        "degraded tag shown: {screen}"
+        !screen.contains("[degraded]"),
+        "health tag should not be shown: {screen}"
     );
 }
 
@@ -1341,7 +1404,7 @@ fn backend_wait_notice_does_not_mark_model_degraded() {
     );
     assert!(
         !screen.contains("degraded in-session"),
-        "soft wait notice is not model health: {screen}"
+        "soft wait notice should not surface model health: {screen}"
     );
 }
 

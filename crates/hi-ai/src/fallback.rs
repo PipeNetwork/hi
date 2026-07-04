@@ -1,7 +1,6 @@
 //! A [`Provider`] that tries a chain of backends in order, moving to the next
-//! when one errors or returns nothing — so a single dead or overloaded provider
-//! (e.g. a coding endpoint that streams only keep-alive heartbeats) doesn't kill
-//! the turn.
+//! when one errors or returns nothing, carrying usage from failed attempts into
+//! the final result.
 
 use anyhow::Result;
 use async_trait::async_trait;

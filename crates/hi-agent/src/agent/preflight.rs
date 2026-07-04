@@ -3,34 +3,126 @@
 //! implementation preflight (entrypoint detection + optional GPU estimator
 //! bootstrap + validation command).
 
+use futures_util::StreamExt;
 use hi_ai::Content;
 use hi_tools::{execute, execute_streaming};
 
 use crate::heuristics::emit_tool_output;
 use crate::steering::{
-    DEFAULT_PREFLIGHT_EXTRA_READ_LIMIT, EvidenceTracker, ImplementationIntent,
+    DEFAULT_PREFLIGHT_EXTRA_READ_LIMIT, EvidenceKind, EvidenceTracker, ImplementationIntent,
     ImplementationTracker, PreflightCall, READ_ONLY_PREFLIGHT_MAX_EXTRA_READS, ReviewIntent,
-    SECURITY_PREFLIGHT_EXTRA_READ_LIMIT, compact_preflight_tool_output,
-    gpu_training_estimator_bootstrap_files, implementation_preflight_command,
+    SECURITY_PREFLIGHT_EXTRA_READ_LIMIT, compact_preflight_tool_output, evidence_kind_for_tool,
+    gpu_training_estimator_bootstrap_files, implementation_preflight_command, inspection_signature,
     paths_from_grep_output, preferred_validation_from_preflight,
     preflight_path_relevant_for_intent, read_only_preflight_initial_calls,
 };
 use crate::{ToolCallEntry, Ui};
 
+struct PreflightExecution {
+    call: PreflightCall,
+    id: String,
+    output: hi_tools::ToolOutput,
+    duration_ms: u64,
+    path: String,
+    error: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PreflightSummary {
+    pub(crate) executed: u32,
+    pub(crate) max_concurrent_batch: u32,
+    pub(crate) serial_runs: u32,
+}
+
+async fn execute_preflight_batch(
+    calls: Vec<PreflightCall>,
+    id_prefix: &str,
+    start_index: u32,
+    max_parallel: usize,
+    ui: &mut dyn Ui,
+) -> Vec<PreflightExecution> {
+    if calls.is_empty() {
+        return Vec::new();
+    }
+    for call in &calls {
+        ui.tool_started(call.name, &call.arguments);
+        ui.tool_call(call.name, &call.arguments);
+    }
+    futures_util::stream::iter(calls.into_iter().enumerate().map(|(offset, call)| {
+        let id = format!("{id_prefix}_{}", start_index.saturating_add(offset as u32));
+        async move {
+            let started = std::time::Instant::now();
+            let output = execute(call.name, &call.arguments).await;
+            let duration_ms = started.elapsed().as_millis() as u64;
+            let path = hi_tools::target_path(call.name, &call.arguments).unwrap_or_default();
+            let error = output.content.starts_with("Error:");
+            PreflightExecution {
+                call,
+                id,
+                output,
+                duration_ms,
+                path,
+                error,
+            }
+        }
+    }))
+    .buffered(max_parallel.max(1))
+    .collect()
+    .await
+}
+
+fn record_preflight_batch(summary: &mut PreflightSummary, batch_len: usize, max_parallel: usize) {
+    if batch_len == 0 {
+        return;
+    }
+    let actual_concurrency = batch_len.min(max_parallel.max(1)) as u32;
+    summary.executed = summary.executed.saturating_add(batch_len as u32);
+    summary.max_concurrent_batch = summary.max_concurrent_batch.max(actual_concurrency);
+    if actual_concurrency == 1 {
+        summary.serial_runs = summary.serial_runs.saturating_add(batch_len as u32);
+    }
+}
+
+fn call_counts_against_inspection_cap(call: &PreflightCall) -> bool {
+    matches!(
+        evidence_kind_for_tool(call.name, &call.arguments),
+        Some(EvidenceKind::FileRead | EvidenceKind::TargetedSearch)
+    )
+}
+
+fn cap_preflight_calls(calls: Vec<PreflightCall>, inspection_cap: u32) -> Vec<PreflightCall> {
+    let mut used = 0u32;
+    calls
+        .into_iter()
+        .filter(|call| {
+            if !call_counts_against_inspection_cap(call) {
+                return true;
+            }
+            if used >= inspection_cap {
+                return false;
+            }
+            used = used.saturating_add(1);
+            true
+        })
+        .collect()
+}
+
 impl crate::Agent {
     pub(crate) async fn run_read_only_preflight(
         &mut self,
         intent: ReviewIntent,
+        inspection_cap: u32,
         ui: &mut dyn Ui,
         evidence: &mut EvidenceTracker,
         tool_timeline: &mut Vec<ToolCallEntry>,
-    ) -> u32 {
-        let mut calls = read_only_preflight_initial_calls(intent);
+    ) -> PreflightSummary {
+        let calls = cap_preflight_calls(read_only_preflight_initial_calls(intent), inspection_cap);
         if calls.is_empty() {
-            return 0;
+            return PreflightSummary::default();
         }
 
         ui.status("running read-only preflight inspection");
+        let mut summary = PreflightSummary::default();
         let mut content = Vec::new();
         let mut results = Vec::new();
         let mut executed = 0u32;
@@ -42,62 +134,136 @@ impl crate::Agent {
             .collect::<Vec<_>>();
         let id_prefix = format!("hi_preflight_{}", self.messages.len());
 
-        while let Some(call) = calls.first().cloned() {
-            calls.remove(0);
-            let id = format!("{id_prefix}_{executed}");
-            ui.tool_started(call.name, &call.arguments);
-            ui.tool_call(call.name, &call.arguments);
-            let started = std::time::Instant::now();
-            let output = execute(call.name, &call.arguments).await;
-            let duration_ms = started.elapsed().as_millis() as u64;
-            let path = hi_tools::target_path(call.name, &call.arguments).unwrap_or_default();
-            let error = output.content.starts_with("Error:");
-            evidence.record_success(call.name, &call.arguments, &output.content);
+        let initial_batch_len = calls.len();
+        let initial_results = execute_preflight_batch(
+            calls,
+            &id_prefix,
+            executed,
+            self.config.max_parallel_tools,
+            ui,
+        )
+        .await;
+        record_preflight_batch(
+            &mut summary,
+            initial_batch_len,
+            self.config.max_parallel_tools,
+        );
+        for result in initial_results {
+            evidence.record_success(
+                result.call.name,
+                &result.call.arguments,
+                &result.output.content,
+            );
             tool_timeline.push(ToolCallEntry {
-                tool: call.name.to_string(),
-                path,
-                duration_ms,
-                error,
+                tool: result.call.name.to_string(),
+                path: result.path,
+                duration_ms: result.duration_ms,
+                error: result.error,
+                progress_kind: "meaningful".to_string(),
+                progress_reason: "preflight inspection evidence".to_string(),
+                normalized_signature: inspection_signature(
+                    result.call.name,
+                    &result.call.arguments,
+                ),
             });
-            if call.name == "grep" {
-                for path in paths_from_grep_output(&output.content) {
+            if result.call.name == "grep" {
+                let remaining_extra_reads =
+                    inspection_cap.saturating_sub(evidence.inspection_count()) as usize;
+                for path in paths_from_grep_output(&result.output.content) {
                     if !preflight_path_relevant_for_intent(intent, &path)
                         || seen_read_paths.iter().any(|existing| existing == &path)
                         || extra_reads.iter().any(|existing| existing == &path)
                         || extra_reads.len() >= READ_ONLY_PREFLIGHT_MAX_EXTRA_READS
+                        || extra_reads.len() >= remaining_extra_reads
                     {
                         continue;
                     }
                     extra_reads.push(path.clone());
                     seen_read_paths.push(path.clone());
-                    let limit = if matches!(intent, ReviewIntent::Security) {
-                        SECURITY_PREFLIGHT_EXTRA_READ_LIMIT
-                    } else {
-                        DEFAULT_PREFLIGHT_EXTRA_READ_LIMIT
-                    };
-                    calls.push(PreflightCall::read(path, limit));
                 }
             }
-            let compacted_output = compact_preflight_tool_output(call.name, &output.content);
+            let compacted_output =
+                compact_preflight_tool_output(result.call.name, &result.output.content);
             let display_output = hi_tools::ToolOutput {
                 content: compacted_output.clone(),
                 display: None,
                 plan: None,
             };
-            emit_tool_output(ui, call.name, &display_output);
+            emit_tool_output(ui, result.call.name, &display_output);
             content.push(Content::ToolCall {
-                id: id.clone(),
-                name: call.name.to_string(),
-                arguments: call.arguments,
+                id: result.id.clone(),
+                name: result.call.name.to_string(),
+                arguments: result.call.arguments,
             });
-            results.push((id, compacted_output));
+            results.push((result.id, compacted_output));
+            executed = executed.saturating_add(1);
+        }
+
+        let extra_calls = extra_reads
+            .into_iter()
+            .map(|path| {
+                let limit = if matches!(intent, ReviewIntent::Security) {
+                    SECURITY_PREFLIGHT_EXTRA_READ_LIMIT
+                } else {
+                    DEFAULT_PREFLIGHT_EXTRA_READ_LIMIT
+                };
+                PreflightCall::read(path, limit)
+            })
+            .collect::<Vec<_>>();
+        let extra_batch_len = extra_calls.len();
+        let extra_results = execute_preflight_batch(
+            extra_calls,
+            &id_prefix,
+            executed,
+            self.config.max_parallel_tools,
+            ui,
+        )
+        .await;
+        record_preflight_batch(
+            &mut summary,
+            extra_batch_len,
+            self.config.max_parallel_tools,
+        );
+        for result in extra_results {
+            evidence.record_success(
+                result.call.name,
+                &result.call.arguments,
+                &result.output.content,
+            );
+            tool_timeline.push(ToolCallEntry {
+                tool: result.call.name.to_string(),
+                path: result.path,
+                duration_ms: result.duration_ms,
+                error: result.error,
+                progress_kind: "meaningful".to_string(),
+                progress_reason: "preflight inspection evidence".to_string(),
+                normalized_signature: inspection_signature(
+                    result.call.name,
+                    &result.call.arguments,
+                ),
+            });
+            let compacted_output =
+                compact_preflight_tool_output(result.call.name, &result.output.content);
+            let display_output = hi_tools::ToolOutput {
+                content: compacted_output.clone(),
+                display: None,
+                plan: None,
+            };
+            emit_tool_output(ui, result.call.name, &display_output);
+            content.push(Content::ToolCall {
+                id: result.id.clone(),
+                name: result.call.name.to_string(),
+                arguments: result.call.arguments,
+            });
+            results.push((result.id, compacted_output));
             executed = executed.saturating_add(1);
         }
 
         if !content.is_empty() {
             self.messages.push_assistant_with_results(content, results);
         }
-        executed
+        debug_assert_eq!(summary.executed, executed);
+        summary
     }
 
     pub(crate) async fn run_implementation_preflight(
@@ -125,6 +291,9 @@ impl crate::Agent {
             path: String::new(),
             duration_ms,
             error,
+            progress_kind: "weak".to_string(),
+            progress_reason: "implementation preflight inspection".to_string(),
+            normalized_signature: None,
         });
         emit_tool_output(ui, "bash", &output);
         self.messages.push_assistant_with_results(
@@ -176,6 +345,9 @@ impl crate::Agent {
                 path: path.to_string(),
                 duration_ms,
                 error,
+                progress_kind: "meaningful".to_string(),
+                progress_reason: "successful mutation".to_string(),
+                normalized_signature: None,
             });
             emit_tool_output(ui, "write", &output);
             content.push(Content::ToolCall {
@@ -213,6 +385,9 @@ impl crate::Agent {
             path: String::new(),
             duration_ms,
             error,
+            progress_kind: "meaningful".to_string(),
+            progress_reason: "successful validation after mutation".to_string(),
+            normalized_signature: None,
         });
         emit_tool_output(ui, "bash", &output);
         content.push(Content::ToolCall {

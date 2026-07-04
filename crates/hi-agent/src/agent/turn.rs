@@ -24,19 +24,20 @@ use crate::snapshot::changed_files_between;
 use crate::steering::{
     CONCRETE_REVIEW_NUDGE, EvidenceTracker, GAP_SEARCH_OVERCLAIM_NUDGE,
     IMPLEMENTATION_EMPTY_TUI_NUDGE, IMPLEMENTATION_NO_CHANGES_NUDGE,
-    IMPLEMENTATION_SCAFFOLD_ONLY_NUDGE, INSPECTION_SPRAWL_NUDGE, ImplementationTracker,
+    IMPLEMENTATION_SCAFFOLD_ONLY_NUDGE, ImplementationTracker, POST_TOOL_EMPTY_RESPONSE_NUDGE,
     READ_AFTER_SEARCH_NUDGE, READ_ONLY_SAFE_CONTEXT_WINDOW, REPEAT_NUDGE, REREAD_NUDGE,
     ReviewIntent, SECURITY_BROAD_SEARCH_NUDGE, SECURITY_SCOPE_NUDGE, TOOL_PROTOCOL_RETRY_NUDGE,
-    TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE, ToolLoopGuardrail, answer_says_insufficient_evidence,
-    bounded_review_repair_exhaustion_answer, classify_implementation_intent,
-    classify_read_only_intent, concrete_review_answer_problem, deepen_review_nudge,
-    implementation_missing_validation_nudge, implementation_text_tool_nudge,
-    implementation_turn_prompt, inspected_insufficient_repair_limit, inspected_paths_for_prompt,
-    inspection_sprawl_exhausted, insufficient_after_incomplete_security_search,
-    insufficient_after_no_review_evidence, insufficient_after_repeated_search,
-    insufficient_after_review_repair_template, insufficient_after_security_scope_overclaim,
-    no_evidence_review_nudge, read_only_blocked_tool_result, read_only_blocks_tool,
-    read_only_turn_prompt, should_bootstrap_gpu_training_estimator, should_deepen_review,
+    TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE, ToolLoopGuardrail, active_read_only_inspection_cap,
+    answer_says_insufficient_evidence, bash_no_progress_signature, classify_bash_command,
+    classify_implementation_intent, classify_read_only_intent, concrete_review_answer_problem,
+    deepen_review_nudge, evidence_kind_for_tool, implementation_missing_validation_nudge,
+    implementation_text_tool_nudge, implementation_tool_call_mutates,
+    implementation_tool_call_validates, implementation_tool_result_landed_mutation,
+    implementation_tool_result_landed_substantive_edit, implementation_turn_prompt,
+    inspected_insufficient_repair_limit, inspected_paths_for_prompt, inspection_signature,
+    inspection_sprawl_exhausted, inspection_sprawl_nudge, no_evidence_review_nudge,
+    read_only_blocked_tool_result, read_only_blocks_tool, read_only_turn_prompt,
+    should_bootstrap_gpu_training_estimator, should_deepen_review,
     should_nudge_gap_search_overclaim, should_nudge_inspection_sprawl,
     should_nudge_no_evidence_review, should_nudge_read_after_repeated_search,
     should_nudge_read_after_search_final, should_nudge_security_broad_search,
@@ -46,19 +47,21 @@ use crate::steering::{
 use crate::transcript::{NudgeKind, repair_invalid_tool_call_arguments_in_messages};
 use crate::verify::{Snapshot, Verifier, VerifyOutcome, stage_guidance};
 use crate::{
-    AUTO_KEEP_RECENT, FINALIZE_PROMPT, MAX_CHECKPOINTS, MAX_TOOL_PROTOCOL_RETRIES,
-    PLAN_CONTINUE_NUDGE, SILENT_CONTINUE_NUDGE, TRUNCATED_TOOL_CALL_NUDGE, TRUNCATION_NUDGE,
+    AUTO_KEEP_RECENT, FINALIZE_PROMPT, MAX_TOOL_PROTOCOL_RETRIES, PLAN_CONTINUE_NUDGE,
+    ProgressEvent, SILENT_CONTINUE_NUDGE, TRUNCATED_TOOL_CALL_NUDGE, TRUNCATION_NUDGE,
     ToolCallEntry, TurnAttribution, TurnTelemetry, Ui, apply_plan_to_goal,
     partial_text_tool_call_start,
 };
 
 #[allow(clippy::too_many_arguments)]
 fn build_turn_telemetry(
+    effective_max_steps: u32,
     verify_rounds: u32,
     recovery_retries: u32,
     repeat_nudges: u32,
     continue_nudges: u32,
     truncation_retries: u32,
+    progress: &ProgressTracker,
     hit_step_cap: bool,
     stalled_unfinished: bool,
     stalled_repeating: bool,
@@ -70,11 +73,16 @@ fn build_turn_telemetry(
     evidence: &EvidenceTracker,
 ) -> TurnTelemetry {
     TurnTelemetry {
+        effective_max_steps,
         verify_rounds,
         recovery_retries,
         repeat_nudges,
         continue_nudges,
         truncation_retries,
+        no_progress_streak: progress.no_progress_streak,
+        forced_final_answer_attempts: progress.forced_final_answer_attempts,
+        last_progress_reason: progress.last_progress_reason.clone(),
+        last_stall_reason: progress.last_stall_reason.clone(),
         hit_step_cap,
         stalled_unfinished,
         stalled_repeating,
@@ -86,12 +94,306 @@ fn build_turn_telemetry(
         max_concurrent_batch,
         serial_runs,
         tool_timeline: tool_timeline.to_vec(),
+        progress_events: progress.events.clone(),
         file_reads: evidence.file_reads,
         targeted_searches: evidence.targeted_searches,
         listing_only: evidence.listing_only(),
         first_tool_kind: evidence.first_tool_kind().to_string(),
         discovery_depth: evidence.discovery_depth().to_string(),
         quality_repair_nudges: evidence.quality_repair_nudges,
+    }
+}
+
+const PROGRESS_EVENT_LIMIT: usize = 20;
+const NO_PROGRESS_FINAL_ANSWER_NUDGE_THRESHOLD: u32 = 2;
+const NO_PROGRESS_FINAL_ANSWER_NUDGE: &str = "You have not made new progress after repeated tool-use nudges. Stop using tools now and give the best final answer from the evidence already in the conversation. If the task cannot be completed from that evidence, say exactly what is missing.";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProgressKind {
+    Meaningful,
+    Weak,
+    None,
+}
+
+impl ProgressKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Meaningful => "meaningful",
+            Self::Weak => "weak",
+            Self::None => "none",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ToolProgressLabel {
+    kind: ProgressKind,
+    reason: String,
+    signature: Option<String>,
+}
+
+impl ToolProgressLabel {
+    fn new(kind: ProgressKind, reason: impl Into<String>, signature: Option<String>) -> Self {
+        Self {
+            kind,
+            reason: reason.into(),
+            signature,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ProgressTracker {
+    no_progress_streak: u32,
+    no_progress_nudges: u32,
+    forced_final_answer_attempts: u32,
+    last_progress_reason: String,
+    last_stall_reason: String,
+    events: Vec<ProgressEvent>,
+}
+
+impl Default for ProgressTracker {
+    fn default() -> Self {
+        Self {
+            no_progress_streak: 0,
+            no_progress_nudges: 0,
+            forced_final_answer_attempts: 0,
+            last_progress_reason: String::new(),
+            last_stall_reason: String::new(),
+            events: Vec::new(),
+        }
+    }
+}
+
+impl ProgressTracker {
+    fn push_event(
+        &mut self,
+        kind: ProgressKind,
+        reason: impl Into<String>,
+        signature: Option<String>,
+    ) {
+        self.events.push(ProgressEvent {
+            kind: kind.as_str().to_string(),
+            reason: reason.into(),
+            signature,
+        });
+        if self.events.len() > PROGRESS_EVENT_LIMIT {
+            let excess = self.events.len() - PROGRESS_EVENT_LIMIT;
+            self.events.drain(0..excess);
+        }
+    }
+
+    fn record(&mut self, kind: ProgressKind, reason: impl Into<String>, signature: Option<String>) {
+        let reason = reason.into();
+        match kind {
+            ProgressKind::Meaningful | ProgressKind::Weak => {
+                self.no_progress_streak = 0;
+                self.last_progress_reason = reason.clone();
+            }
+            ProgressKind::None => {
+                self.no_progress_streak = self.no_progress_streak.saturating_add(1);
+                self.last_stall_reason = reason.clone();
+            }
+        }
+        self.push_event(kind, reason, signature);
+    }
+
+    fn record_no_progress_nudge(
+        &mut self,
+        reason: impl Into<String>,
+        signature: Option<String>,
+    ) -> bool {
+        self.no_progress_nudges = self.no_progress_nudges.saturating_add(1);
+        self.record(ProgressKind::None, reason, signature);
+        self.no_progress_nudges >= NO_PROGRESS_FINAL_ANSWER_NUDGE_THRESHOLD
+            && self.forced_final_answer_attempts == 0
+    }
+
+    fn record_tool(&mut self, label: &ToolProgressLabel) {
+        self.push_event(label.kind, label.reason.clone(), label.signature.clone());
+    }
+
+    fn record_round_from_tools(&mut self, labels: &[ToolProgressLabel]) {
+        if let Some(label) = labels
+            .iter()
+            .find(|label| label.kind == ProgressKind::Meaningful)
+        {
+            self.record(
+                ProgressKind::Meaningful,
+                label.reason.clone(),
+                label.signature.clone(),
+            );
+        } else if labels.iter().all(|label| label.kind == ProgressKind::None) {
+            self.record(ProgressKind::None, "tool round made no progress", None);
+        } else if let Some(label) = labels.first() {
+            self.record(
+                ProgressKind::Weak,
+                label.reason.clone(),
+                label.signature.clone(),
+            );
+        }
+    }
+
+    fn record_final_answer(&mut self) {
+        self.record(ProgressKind::Meaningful, "accepted final answer", None);
+    }
+
+    fn record_forced_final_answer_attempt(&mut self) {
+        self.forced_final_answer_attempts = self.forced_final_answer_attempts.saturating_add(1);
+    }
+}
+
+fn effective_max_steps_for_turn(
+    config: &crate::AgentConfig,
+    read_only_intent: Option<ReviewIntent>,
+    implementation_intent: Option<crate::steering::ImplementationIntent>,
+) -> u32 {
+    if config.max_steps_explicit {
+        return config.max_steps.max(1);
+    }
+    if config.long_horizon {
+        200
+    } else if implementation_intent.is_some() {
+        120
+    } else if read_only_intent.is_some() {
+        80
+    } else {
+        20
+    }
+}
+
+fn no_progress_signature_for_calls(calls: &[(String, String, String)]) -> Option<String> {
+    calls.iter().find_map(|(_, name, args)| {
+        inspection_signature(name, args)
+            .or_else(|| bash_no_progress_signature(args).map(|sig| format!("bash:{sig}")))
+    })
+}
+
+fn forced_final_answer_is_unusable(text: &str, plan_incomplete: bool) -> bool {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || plan_incomplete || looks_like_unfinished_step(trimmed) {
+        return true;
+    }
+    parse_text_tool_calls(trimmed, 0)
+        .iter()
+        .any(|content| matches!(content, Content::ToolCall { .. }))
+}
+
+fn signature_seen(evidence: &EvidenceTracker, signature: &Option<String>) -> bool {
+    signature
+        .as_ref()
+        .is_some_and(|sig| evidence.seen_signatures.iter().any(|seen| seen == sig))
+}
+
+fn background_handle_terminal(name: &str, output: &str) -> bool {
+    match name {
+        "bash_output" => output
+            .lines()
+            .next()
+            .is_some_and(|status| status.contains(": exited") || status.contains(": killed")),
+        "bash_kill" => {
+            output.starts_with('[')
+                && (output.contains("] killed")
+                    || output.contains("] already exited")
+                    || output.contains("] already killed"))
+        }
+        _ => false,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn classify_tool_progress(
+    name: &str,
+    arguments: &str,
+    output: &str,
+    error: bool,
+    signature: Option<String>,
+    signature_was_seen: bool,
+    repeated_idempotent_result: bool,
+    tracker_before: &ImplementationTracker,
+    plan_changed: bool,
+) -> ToolProgressLabel {
+    if plan_changed {
+        return ToolProgressLabel::new(ProgressKind::Meaningful, "changed plan state", signature);
+    }
+    if repeated_idempotent_result {
+        return ToolProgressLabel::new(
+            ProgressKind::None,
+            "repeated idempotent tool output",
+            signature,
+        );
+    }
+    if name == "bash" && bash_no_progress_signature(arguments).is_some() {
+        return ToolProgressLabel::new(
+            ProgressKind::None,
+            "semantic no-op bash command",
+            signature,
+        );
+    }
+    if signature_was_seen {
+        let reason = if matches!(name, "bash_output" | "bash_kill")
+            && background_handle_terminal(name, output)
+        {
+            "stale background handle"
+        } else {
+            "repeated inspection signature"
+        };
+        return ToolProgressLabel::new(ProgressKind::None, reason, signature);
+    }
+    if error {
+        return ToolProgressLabel::new(ProgressKind::Weak, "tool returned an error", signature);
+    }
+    if implementation_tool_result_landed_substantive_edit(name, arguments, output) {
+        return ToolProgressLabel::new(ProgressKind::Meaningful, "substantive edit", signature);
+    }
+    if implementation_tool_result_landed_mutation(name, arguments, output) {
+        return ToolProgressLabel::new(ProgressKind::Meaningful, "successful mutation", signature);
+    }
+    if tracker_before.mutation_seen && implementation_tool_call_validates(name, arguments) {
+        return ToolProgressLabel::new(
+            ProgressKind::Meaningful,
+            "successful validation after mutation",
+            signature,
+        );
+    }
+    if let Some(kind) = evidence_kind_for_tool(name, arguments) {
+        let (progress_kind, reason) = match kind {
+            crate::steering::EvidenceKind::FileRead => {
+                (ProgressKind::Meaningful, "new file evidence")
+            }
+            crate::steering::EvidenceKind::TargetedSearch => {
+                (ProgressKind::Meaningful, "new targeted search evidence")
+            }
+            crate::steering::EvidenceKind::Listing => (ProgressKind::Weak, "new listing evidence"),
+        };
+        return ToolProgressLabel::new(progress_kind, reason, signature);
+    }
+    if name == "bash" {
+        let Some(command) = crate::steering::bash_command(arguments) else {
+            return ToolProgressLabel::new(ProgressKind::Weak, "bash command completed", signature);
+        };
+        let kind = classify_bash_command(&command);
+        let reason = format!("bash {} command completed", kind.as_str());
+        return ToolProgressLabel::new(ProgressKind::Weak, reason, signature);
+    }
+    ToolProgressLabel::new(ProgressKind::Weak, "tool completed", signature)
+}
+
+fn tool_entry(
+    tool: String,
+    path: String,
+    duration_ms: u64,
+    error: bool,
+    progress: &ToolProgressLabel,
+) -> ToolCallEntry {
+    ToolCallEntry {
+        tool,
+        path,
+        duration_ms,
+        error,
+        progress_kind: progress.kind.as_str().to_string(),
+        progress_reason: progress.reason.clone(),
+        normalized_signature: progress.signature.clone(),
     }
 }
 
@@ -102,6 +404,7 @@ const MAX_PROVIDER_OVERLOAD_RETRIES: u32 = 4;
 const PROVIDER_OVERLOAD_RETRY_DELAYS: [u64; 4] = [5, 15, 30, 60];
 const MAX_PROVIDER_OVERLOAD_RETRY_DELAY_SECS: u64 = 90;
 const MIN_OUTPUT_CAP_RETRY_TOKENS: u32 = 512;
+const INCOMPLETE_STATUS: &str = "turn stopped incomplete";
 
 #[derive(Default)]
 struct TurnRetryState {
@@ -181,7 +484,68 @@ fn delay_label(delay: std::time::Duration) -> String {
     }
 }
 
+fn estimate_tool_schema_tokens(tools: &[ToolSpec]) -> u64 {
+    tools
+        .iter()
+        .map(|tool| {
+            hi_ai::estimate_text_tokens(&tool.name)
+                + hi_ai::estimate_text_tokens(&tool.description)
+                + hi_ai::estimate_text_tokens(&tool.parameters.to_string())
+        })
+        .sum()
+}
+
 impl crate::Agent {
+    fn nudge_after_post_tool_empty_response(
+        &mut self,
+        force_tools_next: &mut bool,
+        force_tool_call: bool,
+    ) {
+        self.messages
+            .push_nudge_or_fold(NudgeKind::Continue, POST_TOOL_EMPTY_RESPONSE_NUDGE);
+        if force_tool_call {
+            *force_tools_next = true;
+        }
+    }
+
+    async fn ensure_turn_checkpoint(&mut self, checkpoint_created: &mut bool, _ui: &mut dyn Ui) {
+        if *checkpoint_created {
+            return;
+        }
+        *checkpoint_created = true;
+        #[cfg(test)]
+        return;
+        #[cfg(not(test))]
+        {
+            // Snapshot lazily, immediately before the first approved mutating
+            // tool. Creating a checkpoint requires walking non-ignored
+            // untracked files so `/undo` does not delete pre-existing user
+            // files. On large worktrees this is too expensive for read-only or
+            // conversational turns.
+            if let Some(sha) = hi_tools::checkpoint::create(std::path::Path::new(".")).await {
+                self.checkpoints.push(sha);
+                if self.checkpoints.len() > crate::MAX_CHECKPOINTS {
+                    self.checkpoints
+                        .drain(0..self.checkpoints.len() - crate::MAX_CHECKPOINTS);
+                }
+                if let Some(session) = self.session.as_mut()
+                    && let Err(err) = session.record_checkpoints(&self.checkpoints)
+                {
+                    _ui.status(&format!("(couldn't persist checkpoint refs: {err})"));
+                }
+            }
+        }
+    }
+
+    async fn ensure_turn_snapshot(&mut self, turn_snapshot: &mut Option<Snapshot>) -> Snapshot {
+        if let Some(snapshot) = turn_snapshot.as_ref() {
+            return snapshot.clone();
+        }
+        let snapshot = self.snapshot_cached().await;
+        *turn_snapshot = Some(snapshot.clone());
+        snapshot
+    }
+
     /// Run one user turn to completion, emitting output through `ui`.
     ///
     /// After the model stops calling tools, an optional verification command is
@@ -201,6 +565,8 @@ impl crate::Agent {
         } else {
             None
         };
+        let read_only_inspection_cap =
+            read_only_intent.map(|intent| active_read_only_inspection_cap(&expanded_input, intent));
         let turn_input = if let Some(intent) = read_only_intent {
             read_only_turn_prompt(&expanded_input, intent)
         } else if let Some(intent) = implementation_intent {
@@ -218,41 +584,20 @@ impl crate::Agent {
             if !looks_like_continue(input) {
                 self.last_plan.clear();
             }
-            let response = format!(
-                "I cannot perform coding actions in {} mode because file-edit and shell tools are unavailable. Switch to `--tool-mode auto` or `--tool-mode required` to let me modify the workspace.",
-                tool_mode_label(self.config.tool_mode)
-            );
-            ui.status(&format!(
-                "tool mode {} does not allow file edits or shell commands for this turn",
-                tool_mode_label(self.config.tool_mode)
-            ));
-            ui.assistant_text(&response);
-            ui.assistant_end();
             self.messages.strip_trailing_nudges();
             self.persisted = self.persisted.min(self.messages.len());
-            self.messages.push_user_or_fold(input);
-            self.messages.push_assistant(vec![Content::Text(response)]);
-            ui.turn_end(&self.usage_summary(&self.totals));
             self.persist()?;
+            ui.turn_error(
+                "tools",
+                &format!(
+                    "tool mode {} blocks file edits and shell commands",
+                    tool_mode_label(self.config.tool_mode)
+                ),
+                "",
+            );
             return Ok(());
         }
-        // Snapshot the working tree before this turn touches anything, so `/undo`
-        // can revert it. Best-effort: no-op outside a git repo.
-        if let Some(sha) = hi_tools::checkpoint::create(std::path::Path::new(".")).await {
-            self.checkpoints.push(sha);
-            // Drop oldest checkpoints beyond the cap so the vec doesn't grow
-            // without bound over a very long session. `/undo` only needs the
-            // most recent few.
-            if self.checkpoints.len() > MAX_CHECKPOINTS {
-                self.checkpoints
-                    .drain(0..self.checkpoints.len() - MAX_CHECKPOINTS);
-            }
-            if let Some(session) = self.session.as_mut()
-                && let Err(err) = session.record_checkpoints(&self.checkpoints)
-            {
-                ui.status(&format!("(couldn't persist checkpoint refs: {err})"));
-            }
-        }
+        let mut turn_checkpoint_created = false;
 
         // If the context window is filling up, reclaim room before adding more,
         // so the session keeps going instead of overflowing. Two tiers: a free,
@@ -310,7 +655,8 @@ impl crate::Agent {
             self.config.verify.clone(),
             self.config.max_verify_iterations,
         );
-        let max_steps = self.config.max_steps.max(1);
+        let max_steps =
+            effective_max_steps_for_turn(&self.config, read_only_intent, implementation_intent);
         let max_parallel_tools = self.config.max_parallel_tools.max(1);
         let mut steps = 0u32;
         let mut empty_retries = 0u32;
@@ -323,6 +669,7 @@ impl crate::Agent {
         let mut silent_continues = 0u32;
         let mut continue_total_nudges = 0u32;
         let mut repeat_nudges = 0u32;
+        let mut progress_tracker = ProgressTracker::default();
         // Set after a silent-continue nudge: force the *next* round to call a
         // tool (`tool_choice: required`) instead of letting the model narrate
         // again or return an empty completion. Some models (e.g. weaker
@@ -359,14 +706,20 @@ impl crate::Agent {
             && self.config.read_only_preflight
             && !matches!(self.config.tool_mode, ToolMode::ChatOnly)
         {
-            let preflight_calls = self
-                .run_read_only_preflight(intent, ui, &mut evidence, &mut tool_timeline)
+            let preflight = self
+                .run_read_only_preflight(
+                    intent,
+                    read_only_inspection_cap.unwrap_or_else(|| evidence.inspection_count()),
+                    ui,
+                    &mut evidence,
+                    &mut tool_timeline,
+                )
                 .await;
-            if preflight_calls > 0 {
+            if preflight.executed > 0 {
                 made_tool_call = true;
-                sched_tool_calls = sched_tool_calls.saturating_add(preflight_calls);
-                sched_serial_runs = sched_serial_runs.saturating_add(preflight_calls);
-                sched_max_concurrent = sched_max_concurrent.max(1);
+                sched_tool_calls = sched_tool_calls.saturating_add(preflight.executed);
+                sched_serial_runs = sched_serial_runs.saturating_add(preflight.serial_runs);
+                sched_max_concurrent = sched_max_concurrent.max(preflight.max_concurrent_batch);
             }
         }
         if implementation_intent.is_some() && !matches!(self.config.tool_mode, ToolMode::ChatOnly) {
@@ -394,10 +747,11 @@ impl crate::Agent {
         let mut request_max_tokens_override: Option<u32> = None;
         let mut text_tool_fallback_next = false;
         let mut force_text_answer_next = false;
+        let mut force_no_progress_final_answer_next = false;
         let mut tool_guardrail = ToolLoopGuardrail::default();
         // Whether the turn ended because the model kept re-issuing the exact
         // same tool call through the whole repeat-nudge budget (drives the
-        // incomplete notice and skips the finalization recap).
+        // stalled telemetry and skips the finalization recap).
         let mut stalled_repeating = false;
         // Whether the turn ended without enough evidence for a read-only review.
         let mut stalled_unfinished = false;
@@ -407,10 +761,11 @@ impl crate::Agent {
         // Attributions parsed from the most recent verify failure — captured
         // here so they survive to turn end and can be flushed into telemetry.
         let mut last_verify_attributions: Vec<hi_tools::Attribution> = Vec::new();
-        // Snapshot the turn baseline so verification only runs when the
-        // workspace ends up changed. This catches `bash` edits too, while
-        // skipping verify when a turn makes no net file changes.
-        let turn_snapshot: Snapshot = self.snapshot_cached().await;
+        // Snapshot the turn baseline lazily. Read-only/chat turns should not
+        // walk the whole workspace just to prove nothing changed; the baseline
+        // is captured before the first actual mutation, or before verification
+        // when verify stages are configured.
+        let mut turn_snapshot: Option<Snapshot> = None;
         // Snapshot from the most recent verify check. Reused at turn end to
         // avoid a second full tree walk when verify already took one.
         let mut verify_snapshot: Option<Snapshot> = None;
@@ -420,6 +775,9 @@ impl crate::Agent {
             && implementation_tracker.preferred_validation.is_none()
             && should_bootstrap_gpu_training_estimator(intent)
         {
+            self.ensure_turn_snapshot(&mut turn_snapshot).await;
+            self.ensure_turn_checkpoint(&mut turn_checkpoint_created, ui)
+                .await;
             let bootstrap_calls = self
                 .run_gpu_training_estimator_bootstrap(
                     ui,
@@ -507,19 +865,30 @@ impl crate::Agent {
                 text_tool_fallback_next = false;
                 let request_text_answer = force_text_answer_next;
                 force_text_answer_next = false;
+                let request_no_progress_final_answer = force_no_progress_final_answer_next;
+                if request_no_progress_final_answer {
+                    progress_tracker.record_forced_final_answer_attempt();
+                }
+                force_no_progress_final_answer_next = false;
 
                 // After a continue-nudge, force this round to call a tool rather
                 // than narrate again or come back empty. Only when tools are
                 // freely available (Auto): never override an intentional
                 // ChatOnly/ReadOnly restriction, and Required already forces.
-                let tool_mode = if request_text_tool_fallback || request_text_answer {
+                let tool_mode = if request_text_tool_fallback
+                    || request_text_answer
+                    || request_no_progress_final_answer
+                {
                     ToolMode::ChatOnly
                 } else if force_tools_next && self.config.tool_mode == ToolMode::Auto {
                     ToolMode::Required
                 } else {
                     self.config.tool_mode
                 };
-                let tool_availability_mode = if request_text_tool_fallback || request_text_answer {
+                let tool_availability_mode = if request_text_tool_fallback
+                    || request_text_answer
+                    || request_no_progress_final_answer
+                {
                     ToolMode::ChatOnly
                 } else if read_only_intent.is_some()
                     && !matches!(self.config.tool_mode, ToolMode::ChatOnly)
@@ -528,12 +897,58 @@ impl crate::Agent {
                 } else {
                     self.config.tool_mode
                 };
-                let request_max_tokens =
+                let requested_request_max_tokens =
                     request_max_tokens_override.unwrap_or(self.config.max_tokens);
+                let request_tools = self.request_tools_for(tool_availability_mode);
+                let context_preflight = match self.ensure_request_fits_context(
+                    input,
+                    turn_start,
+                    requested_request_max_tokens,
+                    estimate_tool_schema_tokens(&request_tools),
+                    context_safety_window,
+                    ui,
+                ) {
+                    Ok(context_preflight) => context_preflight,
+                    Err(err) => {
+                        self.truncate_messages(turn_start);
+                        self.add_error_usage(&err);
+                        self.emit_usage(ui);
+                        self.last_compat_fallbacks = compat_fallbacks.clone();
+                        self.last_turn_telemetry = build_turn_telemetry(
+                            max_steps,
+                            verifier.round(),
+                            empty_retries,
+                            repeat_nudges,
+                            continue_total_nudges,
+                            truncation_total_retries,
+                            &progress_tracker,
+                            ended_at_cap,
+                            stalled_unfinished,
+                            stalled_repeating,
+                            &last_verify_attributions,
+                            sched_tool_calls,
+                            sched_max_concurrent,
+                            sched_serial_runs,
+                            &tool_timeline,
+                            &evidence,
+                        );
+                        let _ = self.persist();
+                        let (kind, guidance) = crate::ui::classify_error(&err);
+                        ui.turn_error(kind, &err.to_string(), guidance);
+                        return Err(err);
+                    }
+                };
+                if context_preflight.dropped_prior_context {
+                    turn_start = self.messages.len().saturating_sub(1);
+                }
+                let request_max_tokens = context_preflight.max_tokens;
+                if request_max_tokens != requested_request_max_tokens {
+                    request_max_tokens_override = Some(request_max_tokens);
+                }
                 let request = ChatRequest {
                     model: self.config.model.clone(),
                     messages: self.messages.arc(),
-                    tools: self.request_tools_for(tool_availability_mode),
+                    tools: request_tools,
                     max_tokens: request_max_tokens,
                     temperature,
                     top_p,
@@ -549,11 +964,13 @@ impl crate::Agent {
                 let buffer_read_only_review_text =
                     read_only_intent.is_some() || implementation_intent.is_some();
                 let mut buffered_assistant_text = String::new();
+                let mut streamed_assistant_text = false;
                 let mut sink = |event: StreamEvent| match event {
                     StreamEvent::Text(text) => {
                         if buffer_read_only_review_text {
                             buffered_assistant_text.push_str(&text);
                         } else {
+                            streamed_assistant_text = true;
                             ui.assistant_text(&text);
                         }
                     }
@@ -601,7 +1018,7 @@ impl crate::Agent {
                         let retry = retry_state.provider_overload_retries;
                         let delay = provider_overload_retry_delay(retry, &err);
                         ui.nudge(&format!(
-                            "model provider temporarily overloaded; retrying {} ({retry}/{MAX_PROVIDER_OVERLOAD_RETRIES})",
+                            "request did not complete; retrying {} ({retry}/{MAX_PROVIDER_OVERLOAD_RETRIES})",
                             delay_label(delay)
                         ));
                         if !delay.is_zero() {
@@ -620,7 +1037,7 @@ impl crate::Agent {
                         let retry = retry_state.transient_route_retries;
                         let delay = transient_route_retry_delay(retry, &err);
                         ui.nudge(&format!(
-                            "model route temporarily unavailable; retrying {} ({retry}/{MAX_TRANSIENT_ROUTE_RETRIES})",
+                            "request did not complete; retrying {} ({retry}/{MAX_TRANSIENT_ROUTE_RETRIES})",
                             delay_label(delay)
                         ));
                         if !delay.is_zero() {
@@ -666,11 +1083,13 @@ impl crate::Agent {
                         self.emit_usage(ui);
                         self.last_compat_fallbacks = compat_fallbacks.clone();
                         self.last_turn_telemetry = build_turn_telemetry(
+                            max_steps,
                             verifier.round(),
                             empty_retries,
                             repeat_nudges,
                             continue_total_nudges,
                             truncation_total_retries,
+                            &progress_tracker,
                             ended_at_cap,
                             stalled_unfinished,
                             stalled_repeating,
@@ -747,7 +1166,7 @@ impl crate::Agent {
                     // flush, then silently re-run with hotter recovery sampling (a
                     // fresh request, with its own transport retries) up to the same
                     // budget, instead of failing the turn. Terminal errors (auth,
-                    // outage, …) fall through to the abort below. Invalid tool turns
+                    // rate limits, ...) fall through to the abort below. Invalid tool turns
                     // use the protocol-specific nudge path above.
                     Err(err)
                         if empty_retries < self.config.max_empty_retries
@@ -763,6 +1182,12 @@ impl crate::Agent {
                         self.add_error_usage(&err);
                         self.emit_usage(ui);
                         empty_retries += 1;
+                        if made_tool_call {
+                            self.nudge_after_post_tool_empty_response(
+                                &mut force_tools_next,
+                                implementation_intent.is_some(),
+                            );
+                        }
                         ui.nudge(&format!(
                             "⚠ the model's response didn't come through cleanly — \
                              retrying ({empty_retries}/{})",
@@ -773,21 +1198,25 @@ impl crate::Agent {
                     Err(err) => {
                         self.add_error_usage(&err);
                         self.emit_usage(ui);
-                        if made_tool_call {
+                        if let Some(turn_snapshot) = turn_snapshot.as_ref() {
                             self.messages.strip_trailing_nudges();
                             let end_snapshot = self.snapshot_cached().await;
                             self.last_changed_files =
-                                changed_files_between(&turn_snapshot, &end_snapshot);
+                                changed_files_between(turn_snapshot, &end_snapshot);
+                        } else if made_tool_call {
+                            self.last_changed_files.clear();
                         } else {
                             self.truncate_messages(turn_start);
                         }
                         self.last_compat_fallbacks = compat_fallbacks.clone();
                         self.last_turn_telemetry = build_turn_telemetry(
+                            max_steps,
                             verifier.round(),
                             empty_retries,
                             repeat_nudges,
                             continue_total_nudges,
                             truncation_total_retries,
+                            &progress_tracker,
                             ended_at_cap,
                             stalled_unfinished,
                             stalled_repeating,
@@ -894,21 +1323,22 @@ impl crate::Agent {
                     break false;
                 }
 
-                let calls: Vec<(String, String, String)> = if request_text_answer {
-                    Vec::new()
-                } else {
-                    completion
-                        .tool_calls()
-                        .into_iter()
-                        .map(|c| {
-                            (
-                                c.id.to_string(),
-                                c.name.to_string(),
-                                c.arguments.to_string(),
-                            )
-                        })
-                        .collect()
-                };
+                let calls: Vec<(String, String, String)> =
+                    if request_text_answer || request_no_progress_final_answer {
+                        Vec::new()
+                    } else {
+                        completion
+                            .tool_calls()
+                            .into_iter()
+                            .map(|c| {
+                                (
+                                    c.id.to_string(),
+                                    c.name.to_string(),
+                                    c.arguments.to_string(),
+                                )
+                            })
+                            .collect()
+                    };
 
                 // Fallback for local models (Ollama, llama.cpp, etc.) that emit
                 // tool calls as text — raw JSON like {"name":"bash","arguments":…}
@@ -917,7 +1347,10 @@ impl crate::Agent {
                 // for tool-call JSON and promote any matches to real ToolCall
                 // blocks so they actually execute. The raw JSON is stripped from
                 // the recorded text so history stays clean.
-                let calls = if calls.is_empty() && !request_text_answer {
+                let calls = if calls.is_empty()
+                    && !request_text_answer
+                    && !request_no_progress_final_answer
+                {
                     let full_text: String = completion
                         .content
                         .iter()
@@ -994,6 +1427,9 @@ impl crate::Agent {
                 let has_background_handle_call = calls
                     .iter()
                     .any(|(_, name, _)| matches!(name.as_str(), "bash_output" | "bash_kill"));
+                let has_no_progress_bash = calls.iter().any(|(_, name, args)| {
+                    name == "bash" && bash_no_progress_signature(args).is_some()
+                });
                 let exact_repeat = !calls.is_empty()
                     && !has_background_output_poll
                     && prev_call_sig.as_ref() == Some(&call_sig);
@@ -1047,6 +1483,19 @@ impl crate::Agent {
                     if repeat_budget_available {
                         repeat_nudges += 1;
                         stalled_repeating = true;
+                        let stall_reason = if stale_background_handle_call {
+                            "stale background handle"
+                        } else if has_no_progress_bash {
+                            "semantic no-op bash command"
+                        } else if no_new_evidence {
+                            "repeated inspection signature"
+                        } else {
+                            "skipped repeated calls"
+                        };
+                        let force_final_after_nudge = progress_tracker.record_no_progress_nudge(
+                            stall_reason,
+                            no_progress_signature_for_calls(&calls),
+                        ) && !no_new_after_mutation;
                         let nudge = if stale_background_handle_call {
                             if has_background_output_poll {
                                 ui.nudge(&format!(
@@ -1114,6 +1563,12 @@ You have enough context to make progress. Edit one of the inspected files now wi
 If the task is already complete, stop and give your final recap."
                                 )
                             }
+                        } else if has_no_progress_bash {
+                            ui.nudge(&format!(
+                                "the model kept running no-op shell commands — nudging it to finish without more bash calls ({repeat_nudges}/{})",
+                                self.config.max_repeat_nudges
+                            ));
+                            "The bash command you just called only says stop/quit/done or otherwise does no work. Do not call bash for that. If the task is complete, finish with a text answer; otherwise use a tool that inspects or changes the workspace.".to_string()
                         } else if no_new_evidence && !exact_repeat {
                             ui.nudge(&format!(
                                 "the model re-read files it already inspected — their contents are \
@@ -1129,6 +1584,13 @@ If the task is already complete, stop and give your final recap."
                             ));
                             REPEAT_NUDGE.to_string()
                         };
+                        let nudge = if force_final_after_nudge {
+                            force_no_progress_final_answer_next = true;
+                            force_tools_next = false;
+                            format!("{nudge}\n\n{NO_PROGRESS_FINAL_ANSWER_NUDGE}")
+                        } else {
+                            nudge
+                        };
                         self.messages.push_nudge(NudgeKind::Repeat, nudge);
                         // Keep prev_call_sig as-is so a further repeat is still
                         // detected against the same signature.
@@ -1140,17 +1602,18 @@ If the task is already complete, stop and give your final recap."
                         );
                         break false;
                     }
-                    if read_only_intent.is_some()
-                        && let Some(insufficient) = insufficient_after_repeated_search(&evidence)
-                    {
+                    if has_no_progress_bash {
+                        stalled_unfinished = true;
+                        ui.nudge("model repeated no-op shell commands; stopping incomplete");
+                        ui.status(INCOMPLETE_STATUS);
+                        break false;
+                    }
+                    if read_only_intent.is_some() && evidence.saw_search && !evidence.saw_read {
                         stalled_unfinished = true;
                         ui.nudge(
-                            "review repeated the same search without reading files; returning an insufficient-evidence answer",
+                            "review repeated the same search without reading files; stopping incomplete",
                         );
-                        ui.assistant_text(insufficient);
-                        ui.assistant_end();
-                        self.messages
-                            .push_assistant(vec![Content::Text(insufficient.to_string())]);
+                        ui.status(INCOMPLETE_STATUS);
                         break false;
                     }
                     if let Some(intent) = read_only_intent
@@ -1158,17 +1621,10 @@ If the task is already complete, stop and give your final recap."
                     {
                         stalled_unfinished = true;
                         ui.nudge(
-                            "review repeated the same command after inspection; returning a bounded evidence summary",
+                            "review repeated the same command after inspection; stopping incomplete",
                         );
-                        let insufficient = bounded_review_repair_exhaustion_answer(
-                            intent,
-                            &evidence,
-                            "the model kept repeating the same tool call instead of producing findings tied to inspected evidence",
-                        );
-                        ui.assistant_text(&insufficient);
-                        ui.assistant_end();
-                        self.messages
-                            .push_assistant(vec![Content::Text(insufficient)]);
+                        let _ = (intent, &evidence);
+                        ui.status(INCOMPLETE_STATUS);
                         break false;
                     }
                     if implementation_intent.is_some()
@@ -1184,16 +1640,10 @@ If the task is already complete, stop and give your final recap."
                         // notice, so the user knows the issue is that no edit
                         // was made, not that a command failed.
                         stalled_unfinished = true;
-                        let incomplete = "Implementation incomplete: the model inspected the workspace \
-                        but kept re-reading files instead of making edits, so no file changes were made. \
-                        /retry, or send 'continue' to resume.";
                         ui.nudge(
                             "implementation kept re-reading without editing; no file changes were made",
                         );
-                        ui.assistant_text(incomplete);
-                        ui.assistant_end();
-                        self.messages
-                            .push_assistant(vec![Content::Text(incomplete.to_string())]);
+                        ui.status(INCOMPLETE_STATUS);
                         break false;
                     }
                     ui.status(
@@ -1213,39 +1663,45 @@ If the task is already complete, stop and give your final recap."
                 // the repeat/cycle guard above never fires) without ever
                 // producing findings. Once enough evidence has accumulated,
                 // nudge the model to answer; if it keeps sprawling past the
-                // budget, hard-stop with a bounded-evidence summary. This is
+                // budget, stop incomplete rather than fabricate an answer. This is
                 // the only guard that catches the "read 100 files, never
                 // answer" failure mode — all review-quality guards fire only
                 // on a final text answer, which never comes while the model
                 // keeps issuing tool calls.
-                if inspection_sprawl_exhausted(read_only_intent, &evidence, &calls) {
+                if inspection_sprawl_exhausted(
+                    read_only_intent,
+                    &evidence,
+                    &calls,
+                    read_only_inspection_cap,
+                ) {
                     stalled_unfinished = true;
                     ui.nudge(
-                        "review kept inspecting new files without producing findings; returning a bounded evidence summary",
-                    );
-                    let insufficient = bounded_review_repair_exhaustion_answer(
-                        read_only_intent.expect("sprawl guard only fires on read-only review"),
-                        &evidence,
-                        "the model kept inspecting new files without producing findings tied to the evidence already gathered",
-                    );
-                    ui.assistant_text(&insufficient);
-                    ui.assistant_end();
-                    self.messages
-                        .push_assistant(vec![Content::Text(insufficient)]);
+                            "review kept inspecting new files without producing findings; stopping incomplete",
+                        );
+                    ui.status(INCOMPLETE_STATUS);
                     break false;
                 }
-                if should_nudge_inspection_sprawl(read_only_intent, &evidence, &calls) {
+                if should_nudge_inspection_sprawl(
+                    read_only_intent,
+                    &evidence,
+                    &calls,
+                    read_only_inspection_cap,
+                ) {
                     evidence.inspection_sprawl_nudges =
                         evidence.inspection_sprawl_nudges.saturating_add(1);
                     force_text_answer_next = true;
+                    let cap =
+                        read_only_inspection_cap.unwrap_or_else(|| evidence.inspection_count());
                     ui.nudge(&format!(
                         "review inspected {} files/searches without answering; nudging it to produce findings",
                         evidence.inspection_count()
                     ));
                     self.messages
                         .push_assistant_text_only(std::mem::take(&mut completion.content));
-                    self.messages
-                        .push_nudge(NudgeKind::Continue, INSPECTION_SPRAWL_NUDGE);
+                    self.messages.push_nudge(
+                        NudgeKind::Continue,
+                        inspection_sprawl_nudge(cap, evidence.inspection_count()),
+                    );
                     continue;
                 }
 
@@ -1264,6 +1720,38 @@ If the task is already complete, stop and give your final recap."
                     .join("\n");
                 let has_text = !assistant_text.trim().is_empty();
 
+                if request_no_progress_final_answer {
+                    let unusable = forced_final_answer_is_unusable(
+                        &assistant_text,
+                        plan_has_pending_steps(&self.last_plan),
+                    );
+                    if has_text && (buffer_read_only_review_text || !streamed_assistant_text) {
+                        let text_to_emit = if buffered_assistant_text.is_empty() {
+                            assistant_text.as_str()
+                        } else {
+                            buffered_assistant_text.as_str()
+                        };
+                        ui.assistant_text(text_to_emit);
+                        ui.assistant_end();
+                    }
+                    if unusable {
+                        self.messages
+                            .push_assistant_text_only(std::mem::take(&mut completion.content));
+                        stalled_unfinished = true;
+                        progress_tracker.record(
+                            ProgressKind::None,
+                            "forced final-answer attempt was unusable",
+                            None,
+                        );
+                        ui.status(INCOMPLETE_STATUS);
+                        break false;
+                    }
+                    self.messages
+                        .push_assistant(std::mem::take(&mut completion.content));
+                    progress_tracker.record_final_answer();
+                    break false;
+                }
+
                 // Auto-recover from a content-less response — no tool calls and no
                 // text, i.e. a flaky provider returning only reasoning or an empty
                 // message. Silently re-run a few times before giving up, each
@@ -1273,16 +1761,19 @@ If the task is already complete, stop and give your final recap."
                 if calls.is_empty() && !has_text {
                     if empty_retries < self.config.max_empty_retries {
                         empty_retries += 1;
+                        if made_tool_call {
+                            self.nudge_after_post_tool_empty_response(
+                                &mut force_tools_next,
+                                implementation_intent.is_some(),
+                            );
+                        }
                         ui.status(&format!(
                             "⚠ the model returned no response — retrying ({empty_retries}/{})",
                             self.config.max_empty_retries
                         ));
                         continue;
                     }
-                    ui.status(
-                        "⚠ the model returned no response after retrying — try /retry, or \
-                         /model to switch.",
-                    );
+                    ui.status("⚠ the model returned no response after retrying — try /retry.");
                     break false;
                 }
                 // Real output this round — clear the retry counter so the
@@ -1316,7 +1807,7 @@ If the task is already complete, stop and give your final recap."
                         && (looks_unfinished || plan_incomplete)
                     {
                         if evidence.inspection_sprawl_nudges > 0 {
-                            if evidence.quality_repair_nudges < 2 {
+                            if evidence.quality_repair_nudges < 3 {
                                 evidence.quality_repair_nudges += 1;
                                 continue_total_nudges += 1;
                                 force_text_answer_next = true;
@@ -1333,15 +1824,8 @@ If the task is already complete, stop and give your final recap."
                             }
 
                             stalled_unfinished = true;
-                            let insufficient = bounded_review_repair_exhaustion_answer(
-                                intent,
-                                &evidence,
-                                "the final answer kept proposing further inspection after the inspection-sprawl limit",
-                            );
-                            ui.assistant_text(&insufficient);
-                            ui.assistant_end();
-                            self.messages
-                                .push_assistant(vec![Content::Text(insufficient)]);
+                            let _ = intent;
+                            ui.status(INCOMPLETE_STATUS);
                             break false;
                         }
 
@@ -1383,12 +1867,8 @@ If the task is already complete, stop and give your final recap."
                         }
 
                         stalled_unfinished = true;
-                        let incomplete = "Implementation incomplete: the model inspected the workspace but did not make successful file changes, so I am not treating this as completed.";
                         ui.nudge("implementation still had no file changes after repair");
-                        ui.assistant_text(incomplete);
-                        ui.assistant_end();
-                        self.messages
-                            .push_assistant(vec![Content::Text(incomplete.to_string())]);
+                        ui.status(INCOMPLETE_STATUS);
                         break false;
                     }
                     if implementation_intent.is_some()
@@ -1418,14 +1898,10 @@ If the task is already complete, stop and give your final recap."
                         }
 
                         stalled_unfinished = true;
-                        let incomplete = "Implementation incomplete: only project scaffolding or setup changes were detected, with no source/config edit implementing the requested behavior.";
                         ui.nudge(
                             "implementation still only had scaffold/setup changes after repair",
                         );
-                        ui.assistant_text(incomplete);
-                        ui.assistant_end();
-                        self.messages
-                            .push_assistant(vec![Content::Text(incomplete.to_string())]);
+                        ui.status(INCOMPLETE_STATUS);
                         break false;
                     }
                     if implementation_intent.is_some()
@@ -1457,17 +1933,13 @@ If the task is already complete, stop and give your final recap."
                         }
 
                         stalled_unfinished = true;
-                        let incomplete = "Implementation incomplete: files were changed, but no successful validation command ran after the last change, so I am not treating this as completed.";
                         ui.nudge("implementation still lacked validation after repair");
-                        ui.assistant_text(incomplete);
-                        ui.assistant_end();
-                        self.messages
-                            .push_assistant(vec![Content::Text(incomplete.to_string())]);
+                        ui.status(INCOMPLETE_STATUS);
                         break false;
                     }
                     if should_nudge_no_evidence_review(read_only_intent, &evidence, &assistant_text)
                     {
-                        if evidence.quality_repair_nudges == 0 {
+                        if evidence.quality_repair_nudges < 3 {
                             evidence.quality_repair_nudges += 1;
                             force_tools_next = true;
                             ui.nudge(
@@ -1484,13 +1956,9 @@ If the task is already complete, stop and give your final recap."
 
                         stalled_unfinished = true;
                         ui.nudge(
-                            "review still had no inspected evidence after repair; returning an insufficient-evidence answer",
+                            "review still had no inspected evidence after repair; stopping incomplete",
                         );
-                        let insufficient = insufficient_after_no_review_evidence();
-                        ui.assistant_text(insufficient);
-                        ui.assistant_end();
-                        self.messages
-                            .push_assistant(vec![Content::Text(insufficient.to_string())]);
+                        ui.status(INCOMPLETE_STATUS);
                         break false;
                     }
                     if let Some(intent) = read_only_intent
@@ -1500,12 +1968,12 @@ If the task is already complete, stop and give your final recap."
                         if matches!(intent, ReviewIntent::Security)
                             && evidence.saw_search
                             && !evidence.security_search_complete()
-                            && evidence.quality_repair_nudges < 3
+                            && evidence.quality_repair_nudges < 4
                         {
                             evidence.quality_repair_nudges += 1;
                             force_tools_next = true;
                             ui.nudge(
-                                "security review reported insufficient evidence before searching all required pattern families; nudging the model to broaden the search",
+                                "security review gave a generic evidence disclaimer before searching all required pattern families; nudging the model to broaden the search",
                             );
                             self.messages
                                 .push_assistant(std::mem::take(&mut completion.content));
@@ -1519,7 +1987,7 @@ If the task is already complete, stop and give your final recap."
                             evidence.quality_repair_nudges += 1;
                             force_text_answer_next = true;
                             ui.nudge(
-                                "review reported insufficient evidence after inspection; nudging the model to summarize inspected files",
+                                "review gave a generic evidence disclaimer after inspection; nudging the model to answer from inspected files",
                             );
                             self.messages
                                 .push_assistant(std::mem::take(&mut completion.content));
@@ -1531,43 +1999,41 @@ If the task is already complete, stop and give your final recap."
                         }
                         stalled_unfinished = true;
                         ui.status(
-                            "review ended with generic insufficient-evidence text after inspection; returning a bounded evidence summary",
+                            "review kept returning a generic evidence disclaimer after inspection; stopping incomplete",
                         );
-                        let insufficient = bounded_review_repair_exhaustion_answer(
-                            intent,
-                            &evidence,
-                            "the final answer reported insufficient evidence after inspection instead of summarizing the inspected evidence",
-                        );
-                        ui.assistant_text(&insufficient);
-                        ui.assistant_end();
-                        self.messages
-                            .push_assistant(vec![Content::Text(insufficient)]);
+                        let _ = (intent, &evidence);
+                        ui.status(INCOMPLETE_STATUS);
                         break false;
                     }
                     if should_reject_review_repair_template(read_only_intent, &assistant_text) {
-                        stalled_unfinished = true;
-                        ui.status(
-                            "review answer was a generic repair template; returning an insufficient-evidence answer",
-                        );
-                        let insufficient = if let Some(intent) = read_only_intent
-                            && (evidence.saw_read || evidence.saw_search)
+                        if let Some(intent) = read_only_intent
+                            && evidence.quality_repair_nudges < 3
                         {
-                            bounded_review_repair_exhaustion_answer(
-                                intent,
-                                &evidence,
-                                "the final answer was a generic review-repair template instead of findings tied to inspected files",
-                            )
-                        } else {
-                            insufficient_after_review_repair_template().to_string()
-                        };
-                        ui.assistant_text(&insufficient);
-                        ui.assistant_end();
-                        self.messages
-                            .push_assistant(vec![Content::Text(insufficient)]);
+                            evidence.quality_repair_nudges += 1;
+                            let has_inspected_evidence = evidence.saw_read || evidence.saw_search;
+                            force_text_answer_next = has_inspected_evidence;
+                            force_tools_next = !has_inspected_evidence;
+                            ui.nudge(
+                                "review answer was a generic repair template; nudging the model to produce a concrete bounded review",
+                            );
+                            self.messages
+                                .push_assistant(std::mem::take(&mut completion.content));
+                            let nudge = if has_inspected_evidence {
+                                summarize_inspected_evidence_nudge(intent, &evidence)
+                            } else {
+                                deepen_review_nudge(intent).to_string()
+                            };
+                            self.messages.push_nudge(NudgeKind::Continue, nudge);
+                            continue;
+                        }
+
+                        stalled_unfinished = true;
+                        ui.status("review answer stayed generic after repair; stopping incomplete");
+                        ui.status(INCOMPLETE_STATUS);
                         break false;
                     }
                     if should_deepen_review(read_only_intent, &evidence, &assistant_text) {
-                        if evidence.quality_repair_nudges == 0 {
+                        if evidence.quality_repair_nudges < 3 {
                             evidence.quality_repair_nudges += 1;
                             force_tools_next = true;
                             ui.nudge(
@@ -1584,13 +2050,9 @@ If the task is already complete, stop and give your final recap."
 
                         stalled_unfinished = true;
                         ui.nudge(
-                            "review still had only listing evidence after repair; returning an insufficient-evidence answer",
+                            "review still had only listing evidence after repair; stopping incomplete",
                         );
-                        let insufficient = "Insufficient evidence: only a directory listing was inspected, so I cannot make file-specific review findings without targeted searches or file reads.";
-                        ui.assistant_text(insufficient);
-                        ui.assistant_end();
-                        self.messages
-                            .push_assistant(vec![Content::Text(insufficient.to_string())]);
+                        ui.status(INCOMPLETE_STATUS);
                         break false;
                     }
                     if should_nudge_read_after_search_final(
@@ -1598,7 +2060,7 @@ If the task is already complete, stop and give your final recap."
                         &evidence,
                         &assistant_text,
                     ) {
-                        if evidence.quality_repair_nudges < 1 {
+                        if evidence.quality_repair_nudges < 2 {
                             evidence.quality_repair_nudges += 1;
                             force_tools_next = true;
                             ui.nudge(
@@ -1613,14 +2075,9 @@ If the task is already complete, stop and give your final recap."
 
                         stalled_unfinished = true;
                         ui.nudge(
-                            "review still had targeted search but no file reads after repair; returning an insufficient-evidence answer",
+                            "review still had targeted search but no file reads after repair; stopping incomplete",
                         );
-                        let insufficient = insufficient_after_repeated_search(&evidence)
-                            .expect("search without read checked above");
-                        ui.assistant_text(insufficient);
-                        ui.assistant_end();
-                        self.messages
-                            .push_assistant(vec![Content::Text(insufficient.to_string())]);
+                        ui.status(INCOMPLETE_STATUS);
                         break false;
                     }
                     if should_nudge_security_broad_search(
@@ -1628,7 +2085,7 @@ If the task is already complete, stop and give your final recap."
                         &evidence,
                         &assistant_text,
                     ) {
-                        if evidence.quality_repair_nudges < 3 {
+                        if evidence.quality_repair_nudges < 4 {
                             evidence.quality_repair_nudges += 1;
                             force_tools_next = true;
                             ui.nudge(
@@ -1643,27 +2100,13 @@ If the task is already complete, stop and give your final recap."
 
                         stalled_unfinished = true;
                         ui.nudge(
-                            "security review still missed required pattern families after repair; returning an insufficient-evidence answer",
+                            "security review still missed required pattern families after repair; stopping incomplete",
                         );
-                        let reason = insufficient_after_incomplete_security_search(&evidence)
-                            .expect("incomplete security search checked above");
-                        let insufficient = if let Some(intent) = read_only_intent {
-                            bounded_review_repair_exhaustion_answer(
-                                intent,
-                                &evidence,
-                                reason.trim_start_matches("Insufficient evidence: "),
-                            )
-                        } else {
-                            reason
-                        };
-                        ui.assistant_text(&insufficient);
-                        ui.assistant_end();
-                        self.messages
-                            .push_assistant(vec![Content::Text(insufficient)]);
+                        ui.status(INCOMPLETE_STATUS);
                         break false;
                     }
                     if should_nudge_security_scope(read_only_intent, &evidence, &assistant_text) {
-                        if evidence.quality_repair_nudges < 4 {
+                        if evidence.quality_repair_nudges < 5 {
                             evidence.quality_repair_nudges += 1;
                             ui.status(
                                 "security answer overclaimed repo-wide safety; nudging the model to bound findings to evidence",
@@ -1677,21 +2120,9 @@ If the task is already complete, stop and give your final recap."
 
                         stalled_unfinished = true;
                         ui.status(
-                            "security answer still overclaimed after repair; returning an insufficient-evidence answer",
+                            "security answer still overclaimed after repair; stopping incomplete",
                         );
-                        let insufficient = if let Some(intent) = read_only_intent {
-                            bounded_review_repair_exhaustion_answer(
-                                intent,
-                                &evidence,
-                                "the final answer made repo-wide all-clear claims broader than the inspected files and searches support",
-                            )
-                        } else {
-                            insufficient_after_security_scope_overclaim().to_string()
-                        };
-                        ui.assistant_text(&insufficient);
-                        ui.assistant_end();
-                        self.messages
-                            .push_assistant(vec![Content::Text(insufficient)]);
+                        ui.status(INCOMPLETE_STATUS);
                         break false;
                     }
                     if should_nudge_gap_search_overclaim(
@@ -1699,7 +2130,7 @@ If the task is already complete, stop and give your final recap."
                         &evidence,
                         &assistant_text,
                     ) {
-                        if evidence.quality_repair_nudges < 2 {
+                        if evidence.quality_repair_nudges < 3 {
                             evidence.quality_repair_nudges += 1;
                             ui.nudge(
                                 "gap answer contradicted search matches; nudging the model to bound claims to inspected evidence",
@@ -1713,27 +2144,15 @@ If the task is already complete, stop and give your final recap."
 
                         stalled_unfinished = true;
                         ui.nudge(
-                            "gap answer still overclaimed after search matches; returning a bounded evidence summary",
+                            "gap answer still overclaimed after search matches; stopping incomplete",
                         );
-                        let insufficient = if let Some(intent) = read_only_intent {
-                            bounded_review_repair_exhaustion_answer(
-                                intent,
-                                &evidence,
-                                "the final answer claimed there were no TODO/FIXME or missing gaps even though targeted search returned matches",
-                            )
-                        } else {
-                            "Insufficient evidence: the final answer overclaimed the absence of gaps despite search matches.".to_string()
-                        };
-                        ui.assistant_text(&insufficient);
-                        ui.assistant_end();
-                        self.messages
-                            .push_assistant(vec![Content::Text(insufficient)]);
+                        ui.status(INCOMPLETE_STATUS);
                         break false;
                     }
                     if let Some(problem) =
                         concrete_review_answer_problem(read_only_intent, &evidence, &assistant_text)
                     {
-                        if evidence.quality_repair_nudges < 2 {
+                        if evidence.quality_repair_nudges < 3 {
                             evidence.quality_repair_nudges += 1;
                             force_text_answer_next = true;
                             ui.nudge(problem.status());
@@ -1746,19 +2165,7 @@ If the task is already complete, stop and give your final recap."
 
                         stalled_unfinished = true;
                         ui.nudge(problem.exhausted_status());
-                        let insufficient = if let Some(intent) = read_only_intent {
-                            bounded_review_repair_exhaustion_answer(
-                                intent,
-                                &evidence,
-                                problem.reason(),
-                            )
-                        } else {
-                            "Insufficient evidence: the inspected context was not tied to concrete file-specific findings, so I cannot present this as a completed review.".to_string()
-                        };
-                        ui.assistant_text(&insufficient);
-                        ui.assistant_end();
-                        self.messages
-                            .push_assistant(vec![Content::Text(insufficient)]);
+                        ui.status(INCOMPLETE_STATUS);
                         break false;
                     }
                     if buffer_read_only_review_text {
@@ -1802,6 +2209,15 @@ If the task is already complete, stop and give your final recap."
                              incomplete. /retry, or send 'continue'.",
                         );
                     }
+                    if looks_unfinished || plan_incomplete {
+                        progress_tracker.record(
+                            ProgressKind::Weak,
+                            "text answer looked unfinished",
+                            None,
+                        );
+                    } else {
+                        progress_tracker.record_final_answer();
+                    }
                     break false;
                 }
                 // The model requested tool calls — it's actively working.
@@ -1825,6 +2241,7 @@ If the task is already complete, stop and give your final recap."
                     .all(|(_, name, _)| matches!(name.as_str(), "read" | "list" | "grep" | "glob"));
                 let mut hashable_idempotent_results = 0usize;
                 let mut repeated_idempotent_results = 0usize;
+                let mut tool_progress_labels: Vec<ToolProgressLabel> = Vec::new();
                 // Infer within-batch dependencies (a read of a file a mutating
                 // call earlier in the batch targeted must observe that mutation;
                 // mutating calls serialize). The scheduler below runs ready
@@ -1946,12 +2363,20 @@ If the task is already complete, stop and give your final recap."
                             completed[i] = true;
                             completion_order.push(i);
                             done += 1;
-                            tool_timeline.push(ToolCallEntry {
-                                tool: name.clone(),
-                                path: hi_tools::target_path(name, arguments).unwrap_or_default(),
-                                duration_ms: 0,
-                                error: true,
-                            });
+                            let progress_label = ToolProgressLabel::new(
+                                ProgressKind::None,
+                                "scheduler forced skip",
+                                inspection_signature(name, arguments),
+                            );
+                            progress_tracker.record_tool(&progress_label);
+                            tool_progress_labels.push(progress_label.clone());
+                            tool_timeline.push(tool_entry(
+                                name.clone(),
+                                hi_tools::target_path(name, arguments).unwrap_or_default(),
+                                0,
+                                true,
+                                &progress_label,
+                            ));
                         }
                         break;
                     }
@@ -1959,9 +2384,13 @@ If the task is already complete, stop and give your final recap."
                     let bash_idx = ready.iter().copied().find(|&i| calls[i].1 == "bash");
                     if let Some(i) = bash_idx {
                         let (id, name, arguments) = &calls[i];
-                        // Confirm edit if in --confirm-edits mode and this is a
-                        // mutating tool. Bash is mutating but we let it run
-                        // (the guard layer handles catastrophic ops).
+                        // Bash can mutate the workspace in ways static shell
+                        // heuristics miss (redirection, scripts, build tools),
+                        // so capture the baseline/checkpoint before it runs.
+                        // The guard layer still blocks catastrophic commands.
+                        self.ensure_turn_snapshot(&mut turn_snapshot).await;
+                        self.ensure_turn_checkpoint(&mut turn_checkpoint_created, ui)
+                            .await;
                         ui.tool_started(name, arguments);
                         ui.tool_call(name, arguments);
                         let path = hi_tools::target_path(name, arguments).unwrap_or_default();
@@ -1973,6 +2402,9 @@ If the task is already complete, stop and give your final recap."
                         .await;
                         let duration_ms = started.elapsed().as_millis() as u64;
                         let error = output.content.starts_with("Error:");
+                        let signature = inspection_signature(name, arguments);
+                        let signature_was_seen = signature_seen(&evidence, &signature);
+                        let tracker_before = implementation_tracker.clone();
                         evidence.record_success(name, arguments, &output.content);
                         implementation_tracker.record_tool_result(name, arguments, &output.content);
                         let progress =
@@ -1983,12 +2415,26 @@ If the task is already complete, stop and give your final recap."
                                 repeated_idempotent_results += 1;
                             }
                         }
-                        tool_timeline.push(ToolCallEntry {
-                            tool: name.clone(),
+                        let progress_label = classify_tool_progress(
+                            name,
+                            arguments,
+                            &output.content,
+                            error,
+                            signature,
+                            signature_was_seen,
+                            progress.repeated_idempotent_result,
+                            &tracker_before,
+                            false,
+                        );
+                        progress_tracker.record_tool(&progress_label);
+                        tool_progress_labels.push(progress_label.clone());
+                        tool_timeline.push(tool_entry(
+                            name.clone(),
                             path,
                             duration_ms,
                             error,
-                        });
+                            &progress_label,
+                        ));
                         emit_tool_output(&mut *ui, name, &output);
                         results[i] = Some((id.clone(), output.content));
                         self.invalidate_snapshot();
@@ -2047,6 +2493,14 @@ If the task is already complete, stop and give your final recap."
                         .copied()
                         .filter(|i| !denied.contains(i))
                         .collect();
+                    if approved
+                        .iter()
+                        .any(|&i| implementation_tool_call_mutates(&calls[i].1, &calls[i].2))
+                    {
+                        self.ensure_turn_snapshot(&mut turn_snapshot).await;
+                        self.ensure_turn_checkpoint(&mut turn_checkpoint_created, ui)
+                            .await;
+                    }
                     let outputs: Vec<_> = futures_util::stream::iter(
                         approved.iter().map(|&i| execute(&calls[i].1, &calls[i].2)),
                     )
@@ -2077,6 +2531,20 @@ If the task is already complete, stop and give your final recap."
                         );
                         results[i] = Some((calls[i].0.clone(), skipped_msg));
                         self.invalidate_snapshot();
+                        let progress_label = ToolProgressLabel::new(
+                            ProgressKind::Weak,
+                            "tool skipped by user",
+                            inspection_signature(name, &calls[i].2),
+                        );
+                        progress_tracker.record_tool(&progress_label);
+                        tool_progress_labels.push(progress_label.clone());
+                        tool_timeline.push(tool_entry(
+                            name.clone(),
+                            hi_tools::target_path(name, &calls[i].2).unwrap_or_default(),
+                            0,
+                            true,
+                            &progress_label,
+                        ));
                         completed[i] = true;
                         completion_order.push(i);
                         done += 1;
@@ -2089,6 +2557,14 @@ If the task is already complete, stop and give your final recap."
                         ui.tool_call(name, &calls[i].2);
                         let path = hi_tools::target_path(name, &calls[i].2).unwrap_or_default();
                         let error = output.content.starts_with("Error:");
+                        let signature = inspection_signature(name, &calls[i].2);
+                        let signature_was_seen = signature_seen(&evidence, &signature);
+                        let tracker_before = implementation_tracker.clone();
+                        let plan_changed = calls[i].1 == "update_plan"
+                            && output
+                                .plan
+                                .as_deref()
+                                .is_some_and(|plan| self.last_plan.as_slice() != plan);
                         evidence.record_success(name, &calls[i].2, &output.content);
                         implementation_tracker.record_tool_result(
                             name,
@@ -2103,12 +2579,26 @@ If the task is already complete, stop and give your final recap."
                                 repeated_idempotent_results += 1;
                             }
                         }
-                        tool_timeline.push(ToolCallEntry {
-                            tool: name.clone(),
-                            path,
-                            duration_ms: batch_duration_ms,
+                        let progress_label = classify_tool_progress(
+                            name,
+                            &calls[i].2,
+                            &output.content,
                             error,
-                        });
+                            signature,
+                            signature_was_seen,
+                            progress.repeated_idempotent_result,
+                            &tracker_before,
+                            plan_changed,
+                        );
+                        progress_tracker.record_tool(&progress_label);
+                        tool_progress_labels.push(progress_label.clone());
+                        tool_timeline.push(tool_entry(
+                            name.clone(),
+                            path,
+                            batch_duration_ms,
+                            error,
+                            &progress_label,
+                        ));
                         emit_tool_output(&mut *ui, name, &output);
                         results[i] = Some((calls[i].0.clone(), output.content));
                         // Track the latest plan state so the continue logic can
@@ -2198,44 +2688,51 @@ If the task is already complete, stop and give your final recap."
                     if repeat_budget_available {
                         repeat_nudges += 1;
                         stalled_repeating = true;
+                        let force_final_after_nudge = progress_tracker.record_no_progress_nudge(
+                            "repeated idempotent tool output",
+                            no_progress_signature_for_calls(&calls),
+                        );
                         ui.nudge(&format!(
                             "the model got the same inspection output again — nudging it to act on already-returned evidence ({repeat_nudges}/{})",
                             self.config.max_repeat_nudges
                         ));
-                        self.messages.push_nudge(NudgeKind::Repeat, REREAD_NUDGE);
+                        let nudge = if force_final_after_nudge {
+                            force_no_progress_final_answer_next = true;
+                            force_tools_next = false;
+                            format!("{REREAD_NUDGE}\n\n{NO_PROGRESS_FINAL_ANSWER_NUDGE}")
+                        } else {
+                            REREAD_NUDGE.to_string()
+                        };
+                        self.messages.push_nudge(NudgeKind::Repeat, nudge);
                         continue;
                     }
+                    progress_tracker.record(
+                        ProgressKind::None,
+                        "repeated idempotent tool output",
+                        no_progress_signature_for_calls(&calls),
+                    );
                     if !no_new_after_mutation {
                         if let Some(intent) = read_only_intent {
                             stalled_unfinished = true;
                             ui.nudge(
-                                "review kept getting the same inspection output; returning a bounded evidence summary",
+                                "review kept getting the same inspection output; stopping incomplete",
                             );
-                            let insufficient = bounded_review_repair_exhaustion_answer(
-                                intent,
-                                &evidence,
-                                "the model kept getting the same inspection output instead of producing findings tied to inspected evidence",
-                            );
-                            ui.assistant_text(&insufficient);
-                            ui.assistant_end();
-                            self.messages
-                                .push_assistant(vec![Content::Text(insufficient)]);
+                            let _ = intent;
+                            ui.status(INCOMPLETE_STATUS);
                             break false;
                         }
                         if implementation_intent.is_some() && !implementation_tracker.mutation_seen
                         {
                             stalled_unfinished = true;
-                            let incomplete = "Implementation incomplete: the model kept getting the same inspection output instead of making edits, so no file changes were made. /retry, or send 'continue' to resume.";
                             ui.nudge(
                                 "implementation repeated equivalent inspection output without editing",
                             );
-                            ui.assistant_text(incomplete);
-                            ui.assistant_end();
-                            self.messages
-                                .push_assistant(vec![Content::Text(incomplete.to_string())]);
+                            ui.status(INCOMPLETE_STATUS);
                             break false;
                         }
                     }
+                } else if !tool_progress_labels.is_empty() {
+                    progress_tracker.record_round_from_tools(&tool_progress_labels);
                 }
             };
 
@@ -2250,9 +2747,14 @@ If the task is already complete, stop and give your final recap."
             // its output is fed back. A passing pipeline ends the turn. The state
             // machine (round counter, change gating, stage execution) lives in the
             // `Verifier`; this loop just reacts to its outcome.
-            let outcome = verifier
-                .check(&turn_snapshot, &mut self.snapshot_cache, ui)
-                .await;
+            let outcome = if verifier.is_on() {
+                let baseline = self.ensure_turn_snapshot(&mut turn_snapshot).await;
+                verifier
+                    .check(&baseline, &mut self.snapshot_cache, ui)
+                    .await
+            } else {
+                VerifyOutcome::NotRun
+            };
             // Capture the verify snapshot for turn-end reuse whenever the
             // verifier actually walked the tree (i.e. it didn't bail before
             // snapshotting). On a failure we drop it: the model is about to edit
@@ -2362,22 +2864,28 @@ If the task is already complete, stop and give your final recap."
 
         // Reuse the verify snapshot when available (verify passed or found no
         // changes — no model work happened since). Otherwise take a fresh one.
-        let end_snapshot = match verify_snapshot.take() {
-            Some(s) => s,
-            None => self.snapshot_cached().await,
-        };
-        self.last_changed_files = changed_files_between(&turn_snapshot, &end_snapshot);
+        if let Some(turn_snapshot) = turn_snapshot.as_ref() {
+            let end_snapshot = match verify_snapshot.take() {
+                Some(s) => s,
+                None => self.snapshot_cached().await,
+            };
+            self.last_changed_files = changed_files_between(turn_snapshot, &end_snapshot);
+        } else {
+            self.last_changed_files.clear();
+        }
         self.last_compat_fallbacks = compat_fallbacks;
         // Flush the per-turn counters (otherwise discarded locals) into
         // telemetry so `--report` / the eval harness can diagnose the turn's
         // trajectory: how many verify rounds, recovery retries, nudges fired,
         // and where the last verify failure pointed.
         self.last_turn_telemetry = build_turn_telemetry(
+            max_steps,
             verifier.round(),
             empty_retries,
             repeat_nudges,
             continue_total_nudges,
             truncation_total_retries,
+            &progress_tracker,
             ended_at_cap,
             stalled_unfinished,
             stalled_repeating,

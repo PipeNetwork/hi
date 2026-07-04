@@ -163,11 +163,13 @@ async fn emits_running_cumulative_usage_each_round() {
 async fn auto_compacts_when_context_fills() {
     let mut cfg = config();
     cfg.auto_compact = true;
-    cfg.context_window = Some(100);
+    cfg.context_window = Some(2_000);
+    cfg.compact_target_percent = 1;
+    cfg.tool_mode = ToolMode::ChatOnly;
     let responses = vec![
-        completion(vec![Content::Text("ans1".into())], 90, 1), // fills context to 90%
+        completion(vec![Content::Text("ans1".into())], 1_800, 1), // fills context to 90%
         completion(vec![Content::Text("CONVO SUMMARY".into())], 5, 5), // the compaction call
-        completion(vec![Content::Text("ans2".into())], 5, 1),  // turn two, post-compaction
+        completion(vec![Content::Text("ans2".into())], 5, 1),     // turn two, post-compaction
     ];
     let mut agent = agent(responses, cfg);
     let mut ui = RecUi::default();
@@ -194,7 +196,8 @@ async fn auto_compacts_when_context_fills() {
 async fn elides_old_tool_outputs_before_model_request() {
     let mut cfg = config();
     cfg.auto_compact = true;
-    cfg.context_window = Some(100);
+    cfg.context_window = Some(2_000);
+    cfg.tool_mode = ToolMode::ChatOnly;
     let (mut agent, requests) = scripted_agent(
         vec![ProviderStep::Completion(completion(
             vec![Content::Text("done".into())],

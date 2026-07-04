@@ -533,6 +533,41 @@ impl Transcript {
         self.make_mut().push(Message::user(tagged));
     }
 
+    /// Append a synthetic nudge while preserving provider-safe alternation. If
+    /// the previous message is the same nudge kind, replace it; if it is another
+    /// user message, fold this nudge into that message instead of creating
+    /// consecutive user turns.
+    pub(crate) fn push_nudge_or_fold(&mut self, kind: NudgeKind, text: impl Into<String>) {
+        let marker = marker_for(kind);
+        let body = text.into();
+        let tagged = format!("{marker}\n{body}");
+        let msgs = self.make_mut();
+        if let Some(last) = msgs.last_mut()
+            && last.role == Role::User
+        {
+            if last
+                .content
+                .iter()
+                .any(|c| matches!(c, Content::Text(t) if t.starts_with(marker)))
+            {
+                last.content = vec![Content::Text(tagged)];
+                return;
+            }
+
+            let mut folded = String::new();
+            for c in &last.content {
+                if let Content::Text(t) = c {
+                    folded.push_str(t);
+                    folded.push_str("\n\n---\n\n");
+                }
+            }
+            folded.push_str(&tagged);
+            last.content = vec![Content::Text(folded)];
+            return;
+        }
+        msgs.push(Message::user(tagged));
+    }
+
     /// Replace the most recent nudge of `kind` (and any trailing assistant /
     /// tool messages after it) with a fresh one. Used by the verify loop so
     /// only the latest verification output stays in context instead of
@@ -594,9 +629,8 @@ impl Transcript {
     pub(crate) fn strip_trailing_nudges(&mut self) {
         let msgs = self.make_mut();
         // Pop trailing user messages that are tagged nudges. A nudge is always
-        // followed by `continue` (another model round) or `break` (turn ends),
-        // so at most one trailing nudge is expected — but loop defensively in
-        // case an edge case leaves two.
+        // followed by `continue` or `break` (turn ends), so at most one trailing
+        // nudge is expected — but loop defensively in case an edge case leaves two.
         while let Some(last) = msgs.last()
             && last.role == Role::User
             && last
@@ -1346,6 +1380,34 @@ mod tests {
         );
         t.rewind_to(before);
         assert_eq!(t.len(), before);
+        t.validate_for_provider().unwrap();
+    }
+
+    #[test]
+    fn push_nudge_or_fold_preserves_user_turn_alternation() {
+        let mut t = Transcript::new(vec![user("do it"), assistant_text("working")]);
+        t.push_nudge(NudgeKind::Verify { round: 1 }, "Verification failed.");
+        t.push_nudge_or_fold(NudgeKind::Continue, "The model returned empty.");
+
+        assert_eq!(t.as_slice().len(), 3);
+        let last = t.as_slice().last().unwrap();
+        assert_eq!(last.role, Role::User);
+        let text = last.text();
+        assert!(text.starts_with(nudge_marker(NudgeKind::Verify { round: 1 })));
+        assert!(text.contains(nudge_marker(NudgeKind::Continue)));
+        t.validate_for_provider().unwrap();
+    }
+
+    #[test]
+    fn push_nudge_or_fold_replaces_same_trailing_nudge() {
+        let mut t = Transcript::new(vec![user("do it"), assistant_text("working")]);
+        t.push_nudge_or_fold(NudgeKind::Continue, "first");
+        t.push_nudge_or_fold(NudgeKind::Continue, "second");
+
+        assert_eq!(t.as_slice().len(), 3);
+        let text = t.as_slice().last().unwrap().text();
+        assert!(text.contains("second"));
+        assert!(!text.contains("first"));
         t.validate_for_provider().unwrap();
     }
 

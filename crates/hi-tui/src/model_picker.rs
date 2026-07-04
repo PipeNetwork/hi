@@ -10,19 +10,17 @@ use crate::PICKER_ROWS;
 static EMPTY_META: ModelMeta = ModelMeta {
     window: None,
     price: None,
-    health: None,
     capabilities: Vec::new(),
 };
 
 /// One row of model metadata for display: the id plus whatever the endpoint
-/// reported (price, context window, health). Price/window/health come from the
-/// `/models` route when available; otherwise they're blank.
+/// reported (price and context window). Price/window come from the `/models`
+/// route when available; otherwise they're blank.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct ModelMeta {
     /// `id` is stored in `ModelPicker::all`; this holds only the extras.
     pub window: Option<u32>,
     pub price: Option<(f64, f64)>,
-    pub health: Option<String>,
     /// Capability tags from the static catalog: "tools", "reasoning".
     pub capabilities: Vec<String>,
 }
@@ -32,7 +30,6 @@ impl ModelMeta {
         Self {
             window: sm.context_window,
             price: sm.price,
-            health: sm.health().map(|h| h.to_string()),
             capabilities: sm.capabilities.clone(),
         }
     }
@@ -76,7 +73,7 @@ pub(crate) struct ModelPicker {
     pub all: Vec<String>,
     /// The model in use when the picker opened — pre-selected and marked.
     pub current: String,
-    /// Per-id metadata for display (health/price/window), from the endpoint's
+    /// Per-id metadata for display (price/window), from the endpoint's
     /// `/models` route when available. Keyed by model id.
     pub meta: HashMap<String, ModelMeta>,
     pub filter: String,
@@ -90,15 +87,14 @@ impl ModelPicker {
     pub fn new(
         all: Vec<String>,
         current: &str,
-        tags: HashMap<String, String>,
+        _tags: HashMap<String, String>,
         served: &HashMap<String, ServedModel>,
         capabilities: &HashMap<String, Vec<&'static str>>,
     ) -> Self {
         let matches: Vec<usize> = (0..all.len()).collect();
         // Open with the current model highlighted (and scrolled into view).
         let selected = all.iter().position(|id| id == current).unwrap_or(0);
-        // Build per-id metadata: prefer served-model data from /models, fall
-        // back to the health-only `tags` map.
+        // Build per-id metadata from /models when available.
         let meta = all
             .iter()
             .map(|id| {
@@ -106,14 +102,7 @@ impl ModelPicker {
                     .get(id)
                     .map(ModelMeta::from_served)
                     .unwrap_or_default();
-                // If served didn't report health but the legacy tags map has it,
-                // use that.
                 let mut m = m;
-                if m.health.is_none()
-                    && let Some(h) = tags.get(id)
-                {
-                    m.health = Some(h.clone());
-                }
                 // Attach capability tags from the static catalog when available.
                 if let Some(caps) = capabilities.get(id) {
                     for cap in caps {
@@ -212,11 +201,6 @@ pub(crate) fn display_window(meta: &ModelMeta) -> String {
 /// Format a model's price for display in the picker column.
 pub(crate) fn display_price(meta: &ModelMeta) -> String {
     meta.price.map(fmt_price).unwrap_or_default()
-}
-
-/// Format a model's health label for display in the picker column.
-pub(crate) fn display_health(meta: &ModelMeta) -> String {
-    meta.health.clone().unwrap_or_default()
 }
 
 /// Format capability tags as a compact string: "tools·reasoning" or "".

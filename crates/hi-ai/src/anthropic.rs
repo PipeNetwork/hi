@@ -5,8 +5,6 @@
 //! an event-typed SSE stream. Extended thinking is surfaced as `thinking`
 //! blocks whose `signature` must be echoed back on the next turn.
 
-use std::time::{Duration, Instant};
-
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
@@ -15,7 +13,7 @@ use serde_json::{Value, json};
 
 use crate::provider::{Provider, ProviderError, ProviderErrorKind};
 use crate::types::{
-    ChatRequest, Completion, Content, Message, Role, StreamEvent, Usage,
+    ChatRequest, Completion, Content, Message, Role, StreamEvent,
     estimate_completion_output_tokens, estimate_messages_tokens,
 };
 
@@ -68,73 +66,17 @@ impl Provider for AnthropicProvider {
         }
 
         // `debug_tap` optionally echoes the raw wire bytes when HI_DEBUG_STREAM
-        // is set. We give up only if no real output arrives for STREAM_IDLE_TIMEOUT:
-        // `last_progress` is reset on every event except `ping` (the heartbeat),
-        // so a streaming model never trips it but a heartbeat-only stall does.
+        // is set.
         let mut stream = crate::http::debug_tap(resp.bytes_stream()).eventsource();
         let mut blocks: Vec<Option<BlockBuilder>> = Vec::new();
         let mut completion = Completion::default();
-        let idle = crate::http::stream_idle_timeout();
-        let stall = crate::http::stream_stall_timeout();
-        // FINISH_GRACE: once Anthropic sends a `message_delta` carrying a
-        // `stop_reason`, generation is over; we wait only this long for any
-        // trailing usage chunk before ending the turn. Without it, a provider
-        // that emits the final `message_delta` but never closes the socket
-        // would wedge the turn until the much longer idle timeout expires.
-        const FINISH_GRACE: Duration = Duration::from_secs(3);
-        let mut last_progress = Instant::now();
-        let mut progressed = false;
-        let mut finished: Option<Instant> = None;
+        let mut stream_complete = false;
 
         loop {
-            // Three deadlines bound the wait, all measured from the last real
-            // output token (`content_block_delta`); keep-alive `ping`
-            // heartbeats and metadata events carry no output, so they don't
-            // reset the clock:
-            // - **finish** (`stop_reason` seen): a short FINISH_GRACE catches
-            //   any trailing usage chunk, then stop even if the socket never
-            //   closes.
-            // - **stall** (output flowed, then stopped without finish): end
-            //   after the shorter `stall`, returning what we have.
-            // - **cold start** (no output yet): wait up to `idle` — a request
-            //   can be legitimately queued before the first token.
-            let budget = match finished {
-                Some(at) => FINISH_GRACE.saturating_sub(at.elapsed()),
-                None if progressed => stall.saturating_sub(last_progress.elapsed()),
-                None => idle.saturating_sub(last_progress.elapsed()),
+            let Some(event) = stream.next().await else {
+                break;
             };
-            let event = match tokio::time::timeout(budget, stream.next()).await {
-                Ok(Some(event)) => event.context("error reading stream")?,
-                Ok(None) => break,
-                // Past stop_reason the answer is complete; don't let a provider
-                // that never closes the socket hang a finished turn.
-                Err(_) if finished.is_some() => break,
-                // Output flowed then stalled with no finish signal: treat what
-                // we have as the response rather than waiting out the full
-                // cold-start timeout.
-                Err(_) if progressed => break,
-                Err(_) => {
-                    return Err(ProviderError::new(
-                        ProviderErrorKind::StreamTimeout,
-                        format!(
-                            "model produced no output for {}s — the provider streamed only \
-                             keep-alive heartbeats. It may be overloaded or the model unavailable; \
-                             try again, or switch with /model.",
-                            idle.as_secs()
-                        ),
-                    )
-                    .with_usage(Usage {
-                        input_tokens: estimate_messages_tokens(&request.messages),
-                        output_tokens: 0,
-                        cache_read_tokens: 0,
-                        cache_creation_tokens: 0,
-                        input_includes_cache: false,
-                        context_occupancy: estimate_messages_tokens(&request.messages),
-                        rate_limits: None,
-                    })
-                    .into());
-                }
-            };
+            let event = event.context("error reading stream")?;
             let Ok(data) = serde_json::from_str::<Value>(&event.data) else {
                 continue;
             };
@@ -169,8 +111,6 @@ impl Provider for AnthropicProvider {
                     blocks[index] = Some(BlockBuilder::start(&data["content_block"]));
                 }
                 "content_block_delta" => {
-                    progressed = true;
-                    last_progress = Instant::now();
                     let index = data["index"].as_u64().unwrap_or(0) as usize;
                     if let Some(Some(builder)) = blocks.get_mut(index) {
                         builder.apply_delta(&data["delta"], sink);
@@ -179,7 +119,7 @@ impl Provider for AnthropicProvider {
                 "message_delta" => {
                     if let Some(reason) = data["delta"]["stop_reason"].as_str() {
                         completion.stop_reason = Some(reason.to_string());
-                        finished.get_or_insert_with(Instant::now);
+                        stream_complete = true;
                     }
                     if let Some(tokens) = data["usage"]["output_tokens"].as_u64() {
                         completion.usage.output_tokens = tokens;
@@ -202,6 +142,9 @@ impl Provider for AnthropicProvider {
                     .into());
                 }
                 _ => {}
+            }
+            if stream_complete {
+                break;
             }
         }
 

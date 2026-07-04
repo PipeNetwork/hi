@@ -1,9 +1,7 @@
 //! Streaming response parsing: drain an OpenAI SSE stream into a
 //! [`Completion`], reassemble fragmented tool calls, and parse usage chunks.
 
-use std::time::{Duration, Instant};
-
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use futures_util::{Stream, StreamExt};
 use serde::Deserialize;
 use serde_json::Value;
@@ -11,13 +9,6 @@ use serde_json::Value;
 use super::request;
 use crate::provider::{ProviderError, ProviderErrorKind};
 use crate::types::{Completion, Content, StreamEvent, Usage, estimate_messages_tokens};
-
-/// Once the model reports a `finish_reason`, it has stopped generating; we wait
-/// only this long for the trailing usage chunk / `[DONE]` before ending the
-/// turn. Without it, a provider that emits `finish_reason` but never sends
-/// `[DONE]` (nor closes the socket) would wedge the turn until the much longer
-/// idle timeout expires — a completed answer left spinning for ~2 minutes.
-const FINISH_GRACE: Duration = Duration::from_secs(3);
 
 /// ChatML special tokens that some local models (Qwen, Yi, etc.) emit as text
 /// content when the server doesn't strip them. They start with `<|` and end
@@ -607,20 +598,12 @@ fn strip_text_tool_protocol_artifact(text: &str) -> String {
 /// Drain an OpenAI SSE stream (already reduced to `data` strings) into a
 /// [`Completion`], forwarding text/reasoning/tool tokens to `sink`.
 ///
-/// Three deadlines bound the wait:
-/// - **cold start** (no output yet): wait up to `idle` since the last stream
-///   activity. Heartbeat/data frames prove the route is still alive during a
-///   long queue or prefill, even though they are not model output.
-/// - **stall** (output flowed, then stopped without a finish signal): end after
-///   the shorter `stall`, returning what we have. A multi-second gap *between*
-///   tokens means the stream has effectively ended; this stops a provider that
-///   streams a full answer then holds the socket open from hanging the turn.
-/// - **finish** (`finish_reason` seen): a short [`FINISH_GRACE`] catches any
-///   trailing usage chunk, then stop even if `[DONE]` never comes.
+/// The collector reads until the provider sends `[DONE]`, closes the stream,
+/// returns a stream error, or reports a `finish_reason`. A `finish_reason` is
+/// treated as completion so providers that omit `[DONE]` cannot leave a
+/// completed answer spinning forever.
 pub(crate) async fn collect_completion<S>(
     mut stream: S,
-    idle: Duration,
-    stall: Duration,
     sink: &mut (dyn FnMut(StreamEvent) + Send),
 ) -> Result<Completion>
 where
@@ -629,10 +612,8 @@ where
     let mut text = String::new();
     let mut tool_calls: Vec<ToolCallBuilder> = Vec::new();
     let mut completion = Completion::default();
-    let mut last_activity = Instant::now();
-    let mut last_output = Instant::now();
-    let mut finished: Option<Instant> = None;
     let mut progressed = false;
+    let mut stream_complete = false;
     let mut output_chars = 0usize;
     // Wrap the sink so ChatML special tokens (<|im_start|>, <|im_end|>, …) are
     // stripped from streamed text, and tool-call JSON (`{"name":…}`) that local
@@ -645,44 +626,22 @@ where
     let mut filter = StreamingTextFilter::new(sink);
 
     loop {
-        let budget = match finished {
-            Some(at) => FINISH_GRACE.saturating_sub(at.elapsed()),
-            None if progressed => stall.saturating_sub(last_output.elapsed()),
-            None => idle.saturating_sub(last_activity.elapsed()),
-        };
-        let data = match tokio::time::timeout(budget, stream.next()).await {
-            Ok(Some(Ok(data))) => {
-                last_activity = Instant::now();
-                data
-            }
+        let data = match stream.next().await {
+            Some(Ok(data)) => data,
             // A stream *read* error mid-flight: the provider reset the connection
             // or sent a truncated frame instead of closing cleanly / sending
             // `[DONE]`. If the answer already finished, or output has flowed,
             // treat it as an unclean end of a complete response and return what
             // we have — discarding a fully-streamed answer to force a retry is
-            // worse than tolerating the unclean close. (This guard mirrors the
-            // timeout branches below; without it a finished response was thrown
-            // away as a "malformed stream" whenever the socket RST'd after the
-            // last token.) With no output yet, it's a genuine failure: propagate.
-            Ok(Some(Err(err))) => {
-                if finished.is_some() || progressed {
+            // worse than tolerating the unclean close. With no output yet, it's
+            // a genuine failure: propagate.
+            Some(Err(err)) => {
+                if stream_complete || progressed {
                     break;
                 }
                 return Err(err);
             }
-            Ok(None) => break,
-            // Past finish_reason the answer is complete; don't let a provider that
-            // omits `[DONE]` (or never closes the socket) hang a finished turn.
-            Err(_) if finished.is_some() => break,
-            // Output flowed then stalled with no finish signal: treat what we have
-            // as the response rather than waiting out the full cold-start timeout.
-            Err(_) if progressed => break,
-            Err(_) => bail!(
-                "model produced no output for {}s — the provider streamed only \
-                 keep-alive heartbeats. It may be overloaded or the model unavailable; \
-                 try again, or switch with /model.",
-                idle.as_secs()
-            ),
+            None => break,
         };
         if data == "[DONE]" {
             break;
@@ -723,7 +682,6 @@ where
             {
                 output_chars += reasoning.len();
                 filter.forward(StreamEvent::Reasoning(reasoning));
-                last_output = Instant::now();
                 progressed = true;
             }
             if let Some(content) = delta.content
@@ -732,11 +690,9 @@ where
                 output_chars += content.len();
                 text.push_str(&content);
                 filter.text(&content);
-                last_output = Instant::now();
                 progressed = true;
             }
             if let Some(deltas) = delta.tool_calls {
-                last_output = Instant::now();
                 progressed = true;
                 for tcd in deltas {
                     if tool_calls.len() <= tcd.index {
@@ -762,8 +718,11 @@ where
             }
             if let Some(finish_reason) = choice.finish_reason {
                 completion.stop_reason = Some(finish_reason);
-                finished.get_or_insert_with(Instant::now);
+                stream_complete = true;
             }
+        }
+        if stream_complete {
+            break;
         }
     }
 
@@ -801,9 +760,8 @@ pub(crate) fn classify_stream_error(err: anyhow::Error) -> ProviderError {
         ProviderErrorKind::QualityRejected
     } else if request::is_tool_protocol_text(&text) {
         ProviderErrorKind::ToolProtocol
-    } else if text.contains("no output") {
-        ProviderErrorKind::StreamTimeout
     } else if text.contains("error reading stream")
+        || text.contains("no output")
         || text.contains("malformed SSE JSON chunk")
         || text.to_ascii_lowercase().contains("request not found")
     {
@@ -1045,7 +1003,7 @@ mod tests {
                 }
 
                 let Some((delay, data)) = self.events.pop_front() else {
-                    return Poll::Pending;
+                    return Poll::Ready(None);
                 };
                 if delay.is_zero() {
                     return Poll::Ready(Some(Ok(data)));
@@ -1056,22 +1014,17 @@ mod tests {
         }
     }
 
-    const STALL: Duration = Duration::from_secs(15);
-    const IDLE: Duration = Duration::from_secs(120);
-
     #[tokio::test(start_paused = true)]
     async fn stops_after_finish_reason_without_done() {
-        // The bug: pipenetwork.ai sends `finish_reason` then neither `[DONE]` nor a
-        // socket close, so a finished answer used to spin until the 120s idle
-        // timeout. Now the short finish-grace ends the turn promptly.
+        // Some providers send `finish_reason` and then neither `[DONE]` nor a
+        // socket close. Treating the finish marker as terminal returns promptly
+        // without any timer.
         let stream = never_ending(vec![
             r#"{"choices":[{"delta":{"content":"the answer"},"finish_reason":null}]}"#,
             r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
         ]);
         let mut sink = |_: StreamEvent| {};
-        let completion = collect_completion(stream, IDLE, STALL, &mut sink)
-            .await
-            .unwrap();
+        let completion = collect_completion(stream, &mut sink).await.unwrap();
         assert_eq!(completion.stop_reason.as_deref(), Some("stop"));
         assert!(
             matches!(completion.content.first(), Some(Content::Text(t)) if t == "the answer"),
@@ -1081,32 +1034,27 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn trailing_usage_chunk_after_finish_is_captured() {
-        // Providers send the usage chunk right after `finish_reason`; the grace
-        // window must be long enough to catch it.
+    async fn usage_on_finish_chunk_is_captured() {
+        // Usage included on the same chunk as `finish_reason` is captured without
+        // requiring a trailing grace timer.
         let stream = never_ending(vec![
-            r#"{"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}"#,
-            r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2}}"#,
+            r#"{"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2}}"#,
         ]);
         let mut sink = |_: StreamEvent| {};
-        let completion = collect_completion(stream, IDLE, STALL, &mut sink)
-            .await
-            .unwrap();
+        let completion = collect_completion(stream, &mut sink).await.unwrap();
         assert_eq!(completion.usage.input_tokens, 10);
         assert_eq!(completion.usage.output_tokens, 2);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn returns_partial_when_stream_stalls_after_content() {
-        // The reported bug: the model streams a full answer, then the provider
-        // sends no finish_reason / [DONE] and holds the socket open. Once output
-        // has flowed, the short stall window ends the turn with what we have,
-        // instead of spinning out the full cold-start idle timeout.
-        let stream = never_ending(vec![r#"{"choices":[{"delta":{"content":"the answer"}}]}"#]);
+    async fn returns_partial_when_stream_closes_after_content() {
+        // If the provider closes after content without an explicit finish marker,
+        // keep the content that was already streamed.
+        let stream = stream::iter(vec![Ok(
+            r#"{"choices":[{"delta":{"content":"the answer"}}]}"#.to_string(),
+        )]);
         let mut sink = |_: StreamEvent| {};
-        let completion = collect_completion(stream, IDLE, STALL, &mut sink)
-            .await
-            .unwrap();
+        let completion = collect_completion(stream, &mut sink).await.unwrap();
         assert!(
             matches!(completion.content.first(), Some(Content::Text(t)) if t == "the answer"),
             "the streamed answer is returned: {:?}",
@@ -1124,9 +1072,7 @@ mod tests {
             r#"{"choices":[{"delta":{"content":"the answer"},"finish_reason":"stop"}]}"#,
         ]);
         let mut sink = |_: StreamEvent| {};
-        let completion = collect_completion(stream, IDLE, STALL, &mut sink)
-            .await
-            .unwrap();
+        let completion = collect_completion(stream, &mut sink).await.unwrap();
         assert_eq!(completion.stop_reason.as_deref(), Some("stop"));
         assert!(
             matches!(completion.content.first(), Some(Content::Text(t)) if t == "the answer"),
@@ -1142,9 +1088,7 @@ mod tests {
         // policy as a post-content stall.
         let stream = errors_after(vec![r#"{"choices":[{"delta":{"content":"partial"}}]}"#]);
         let mut sink = |_: StreamEvent| {};
-        let completion = collect_completion(stream, IDLE, STALL, &mut sink)
-            .await
-            .unwrap();
+        let completion = collect_completion(stream, &mut sink).await.unwrap();
         assert!(
             matches!(completion.content.first(), Some(Content::Text(t)) if t == "partial"),
             "content received before the error is kept: {:?}",
@@ -1158,9 +1102,7 @@ mod tests {
         // salvage — propagate it (the caller decides whether to retry).
         let stream = errors_after(vec![]);
         let mut sink = |_: StreamEvent| {};
-        let err = collect_completion(stream, IDLE, STALL, &mut sink)
-            .await
-            .unwrap_err();
+        let err = collect_completion(stream, &mut sink).await.unwrap_err();
         assert!(
             err.to_string().contains("error reading stream"),
             "got: {err}"
@@ -1200,7 +1142,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_model_unavailable_message_is_not_capacity() {
+    fn stream_route_rejection_message_is_not_capacity() {
         assert_eq!(
             classify_stream_api_error("model temporarily unavailable"),
             ProviderErrorKind::ModelUnavailable
@@ -1212,35 +1154,30 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn bails_when_no_output_at_all() {
-        // Nothing ever streamed (cold-start): the long idle timeout trips and we
-        // surface the "no output" error rather than returning an empty success.
-        let stream = never_ending(vec![]);
+    async fn closed_stream_without_output_returns_empty_completion() {
+        // Without an idle timeout, a cleanly closed empty stream is represented as
+        // an empty completion; the provider adapter maps that to EmptyCompletion.
+        let stream = stream::empty();
         let mut sink = |_: StreamEvent| {};
-        let err = collect_completion(stream, IDLE, STALL, &mut sink)
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("no output"), "got: {err}");
+        let completion = collect_completion(stream, &mut sink).await.unwrap();
+        assert!(completion.content.is_empty());
     }
 
     #[tokio::test(start_paused = true)]
     async fn heartbeat_chunks_keep_cold_stream_alive_until_content() {
-        // A local route can spend longer than the nominal cold timeout queued or
-        // prefilling while the API still emits empty heartbeat chunks. Those
-        // frames prove the route is alive and must extend the cold wait; once
-        // real output starts, the normal post-token stall timeout applies.
+        // A local route can spend time queued or prefilling while the API emits
+        // empty heartbeat chunks. With no idle timer, delayed real output is still
+        // accepted when it arrives.
         let stream = TimedSseStream::new(vec![
             (Duration::ZERO, r#"{"choices":[]}"#),
-            (IDLE / 2, r#"{"choices":[]}"#),
+            (Duration::from_secs(60), r#"{"choices":[]}"#),
             (
-                IDLE / 2 + Duration::from_secs(1),
+                Duration::from_secs(61),
                 r#"{"choices":[{"delta":{"content":"ready"}}]}"#,
             ),
         ]);
         let mut sink = |_: StreamEvent| {};
-        let completion = collect_completion(stream, IDLE, STALL, &mut sink)
-            .await
-            .unwrap();
+        let completion = collect_completion(stream, &mut sink).await.unwrap();
         assert!(
             matches!(completion.content.first(), Some(Content::Text(t)) if t == "ready"),
             "content after heartbeat-extended cold wait is returned: {:?}",
@@ -1255,9 +1192,7 @@ mod tests {
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"sh","arguments":"mand\":\"echo hi\"}"}}]},"finish_reason":"tool_calls"}]}"#,
         ]);
         let mut sink = |_: StreamEvent| {};
-        let completion = collect_completion(stream, IDLE, STALL, &mut sink)
-            .await
-            .unwrap();
+        let completion = collect_completion(stream, &mut sink).await.unwrap();
         let calls = completion.tool_calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].id, "call_1");
@@ -1277,9 +1212,7 @@ mod tests {
             r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
         ]);
         let mut sink = |_: StreamEvent| {};
-        let completion = collect_completion(stream, IDLE, STALL, &mut sink)
-            .await
-            .unwrap();
+        let completion = collect_completion(stream, &mut sink).await.unwrap();
         let calls = completion.tool_calls();
         assert_eq!(calls.len(), 2);
         // Each call gets a unique synthesized id, not both empty.
@@ -1297,13 +1230,10 @@ mod tests {
         // not prompt_tokens + cached_tokens (the double-counting bug this field
         // replaces).
         let stream = never_ending(vec![
-            r#"{"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}"#,
-            r#"{"choices":[],"usage":{"prompt_tokens":1000,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":400}}}"#,
+            r#"{"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1000,"completion_tokens":2,"prompt_tokens_details":{"cached_tokens":400}}}"#,
         ]);
         let mut sink = |_: StreamEvent| {};
-        let completion = collect_completion(stream, IDLE, STALL, &mut sink)
-            .await
-            .unwrap();
+        let completion = collect_completion(stream, &mut sink).await.unwrap();
         assert_eq!(completion.usage.input_tokens, 1000);
         assert_eq!(completion.usage.cache_read_tokens, 400);
         assert_eq!(
@@ -1328,9 +1258,7 @@ mod tests {
                 collected.push(t);
             }
         };
-        let completion = collect_completion(stream, IDLE, STALL, &mut sink)
-            .await
-            .unwrap();
+        let completion = collect_completion(stream, &mut sink).await.unwrap();
         let streamed = collected.join("");
         assert!(
             !streamed.contains("<|im_start|>") && !streamed.contains("<|im_end|>"),
@@ -1370,9 +1298,7 @@ mod tests {
                 collected.push(t);
             }
         };
-        let completion = collect_completion(stream, IDLE, STALL, &mut sink)
-            .await
-            .unwrap();
+        let completion = collect_completion(stream, &mut sink).await.unwrap();
         let streamed = collected.join("");
         assert!(
             !streamed.contains("<|im_start|>"),
@@ -1403,9 +1329,7 @@ mod tests {
             r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
         ]);
         let mut sink = |_: StreamEvent| {};
-        let completion = collect_completion(stream, IDLE, STALL, &mut sink)
-            .await
-            .unwrap();
+        let completion = collect_completion(stream, &mut sink).await.unwrap();
         let text = completion
             .content
             .iter()
@@ -1429,9 +1353,7 @@ mod tests {
                 collected.push(t);
             }
         };
-        let _completion = collect_completion(stream, IDLE, STALL, &mut sink)
-            .await
-            .unwrap();
+        let _completion = collect_completion(stream, &mut sink).await.unwrap();
         let streamed = collected.join("");
         assert_eq!(streamed, "hello <|");
     }
@@ -1454,9 +1376,7 @@ mod tests {
                 collected.push(t);
             }
         };
-        let _completion = collect_completion(stream, IDLE, STALL, &mut sink)
-            .await
-            .unwrap();
+        let _completion = collect_completion(stream, &mut sink).await.unwrap();
         let streamed = collected.join("");
         assert!(
             !streamed.contains("\"name\""),
@@ -1491,9 +1411,7 @@ mod tests {
                 collected.push(t);
             }
         };
-        let _completion = collect_completion(stream, IDLE, STALL, &mut sink)
-            .await
-            .unwrap();
+        let _completion = collect_completion(stream, &mut sink).await.unwrap();
         let streamed = collected.join("");
         assert!(
             !streamed.contains("\"name\"") && !streamed.contains("\"edit\""),
@@ -1519,9 +1437,7 @@ mod tests {
                 collected.push(t);
             }
         };
-        let _completion = collect_completion(stream, IDLE, STALL, &mut sink)
-            .await
-            .unwrap();
+        let _completion = collect_completion(stream, &mut sink).await.unwrap();
         let streamed = collected.join("");
         assert!(
             !streamed.contains('{') && !streamed.contains("\"name\""),
@@ -1546,9 +1462,7 @@ mod tests {
                 collected.push(t);
             }
         };
-        let completion = collect_completion(stream, IDLE, STALL, &mut sink)
-            .await
-            .unwrap();
+        let completion = collect_completion(stream, &mut sink).await.unwrap();
         let streamed = collected.join("");
         assert_eq!(streamed, "Listing project files.");
         assert!(matches!(
@@ -1570,9 +1484,7 @@ mod tests {
                 collected.push(t);
             }
         };
-        let completion = collect_completion(stream, IDLE, STALL, &mut sink)
-            .await
-            .unwrap();
+        let completion = collect_completion(stream, &mut sink).await.unwrap();
         let streamed = collected.join("");
         assert_eq!(streamed, "{\"foo\": 42}");
         assert!(matches!(
@@ -1594,9 +1506,7 @@ mod tests {
                 collected.push(t);
             }
         };
-        let completion = collect_completion(stream, IDLE, STALL, &mut sink)
-            .await
-            .unwrap();
+        let completion = collect_completion(stream, &mut sink).await.unwrap();
         let streamed = collected.join("");
         assert_eq!(streamed, "I'll inspect the project.\n");
         assert!(matches!(
@@ -1619,9 +1529,7 @@ mod tests {
                 collected.push(t);
             }
         };
-        let completion = collect_completion(stream, IDLE, STALL, &mut sink)
-            .await
-            .unwrap();
+        let completion = collect_completion(stream, &mut sink).await.unwrap();
         let streamed = collected.join("");
         assert_eq!(streamed, "I've reviewed README.md.\n");
         assert!(!streamed.contains("[tool_call"));
@@ -1646,9 +1554,7 @@ mod tests {
                 collected.push(t);
             }
         };
-        let _completion = collect_completion(stream, IDLE, STALL, &mut sink)
-            .await
-            .unwrap();
+        let _completion = collect_completion(stream, &mut sink).await.unwrap();
         let streamed = collected.join("");
         assert!(
             streamed.contains("{\"foo\": 42}"),
@@ -1669,9 +1575,7 @@ mod tests {
                 collected.push(t);
             }
         };
-        let completion = collect_completion(stream, IDLE, STALL, &mut sink)
-            .await
-            .unwrap();
+        let completion = collect_completion(stream, &mut sink).await.unwrap();
         let streamed = collected.join("");
         assert_eq!(streamed, "I'll create the file.\n");
         assert!(!streamed.contains("<tool_call"));
@@ -1694,9 +1598,7 @@ mod tests {
                 collected.push(t);
             }
         };
-        let _completion = collect_completion(stream, IDLE, STALL, &mut sink)
-            .await
-            .unwrap();
+        let _completion = collect_completion(stream, &mut sink).await.unwrap();
         let streamed = collected.join("");
         assert!(
             !streamed.contains("\"name\""),
@@ -1725,9 +1627,7 @@ mod tests {
                 collected.push(t);
             }
         };
-        let _completion = collect_completion(stream, IDLE, STALL, &mut sink)
-            .await
-            .unwrap();
+        let _completion = collect_completion(stream, &mut sink).await.unwrap();
         let streamed = collected.join("");
         assert!(
             streamed.contains("patterns"),
@@ -1749,9 +1649,7 @@ mod tests {
                 collected.push(t);
             }
         };
-        let _completion = collect_completion(stream, IDLE, STALL, &mut sink)
-            .await
-            .unwrap();
+        let _completion = collect_completion(stream, &mut sink).await.unwrap();
         let streamed = collected.join("");
         assert!(
             streamed.contains("not_a_tool"),

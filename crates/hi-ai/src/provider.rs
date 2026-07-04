@@ -17,7 +17,6 @@ pub enum ProviderErrorKind {
     RequestTooLarge,
     QualityRejected,
     ToolProtocol,
-    StreamTimeout,
     MalformedStream,
     EmptyCompletion,
     Other,
@@ -28,15 +27,14 @@ impl ProviderErrorKind {
         match self {
             Self::Auth => "auth",
             Self::RateLimit => "rate_limit",
-            Self::CapacityUnavailable => "capacity_unavailable",
-            Self::ModelUnavailable => "model_unavailable",
-            Self::Outage => "outage",
+            Self::CapacityUnavailable => "capacity",
+            Self::ModelUnavailable => "request",
+            Self::Outage => "request",
             Self::UnsupportedRequestShape => "unsupported_request_shape",
             Self::UnsupportedTools => "unsupported_tools",
             Self::RequestTooLarge => "request_too_large",
             Self::QualityRejected => "quality_rejected",
             Self::ToolProtocol => "tool_protocol",
-            Self::StreamTimeout => "stream_timeout",
             Self::MalformedStream => "malformed_stream",
             Self::EmptyCompletion => "empty_completion",
             Self::Other => "other",
@@ -479,6 +477,28 @@ fn largest_number(text: &str) -> Option<u32> {
     best
 }
 
+/// A model backend. Implementations own the wire-format translation and SSE
+/// reassembly so the agent loop stays provider-agnostic.
+///
+/// `sink` is invoked for each incremental [`StreamEvent`] as it arrives; the
+/// returned [`Completion`] is the fully-assembled assistant turn (text,
+/// reasoning, and tool calls).
+#[async_trait]
+pub trait Provider: Send + Sync {
+    async fn stream(
+        &self,
+        request: ChatRequest,
+        sink: &mut (dyn FnMut(StreamEvent) + Send),
+    ) -> Result<Completion>;
+
+    /// The models this endpoint actually serves (via its `/models` route), with
+    /// any live metadata reported. Default: empty, so callers fall back to the
+    /// static models.dev catalog.
+    async fn list_models(&self) -> Result<Vec<ServedModel>> {
+        Ok(Vec::new())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -578,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn permanent_model_unavailable_is_not_retryable_route_error() {
+    fn permanent_route_rejection_is_not_retryable_route_error() {
         let err = ProviderError::new(ProviderErrorKind::ModelUnavailable, "unknown model");
 
         assert!(!provider_route_error_is_retryable(&anyhow::Error::new(err)));
@@ -606,27 +626,5 @@ mod tests {
         assert!(!provider_error_is_temporary_overload(&anyhow::Error::new(
             err
         )));
-    }
-}
-
-/// A model backend. Implementations own the wire-format translation and SSE
-/// reassembly so the agent loop stays provider-agnostic.
-///
-/// `sink` is invoked for each incremental [`StreamEvent`] as it arrives; the
-/// returned [`Completion`] is the fully-assembled assistant turn (text,
-/// reasoning, and tool calls).
-#[async_trait]
-pub trait Provider: Send + Sync {
-    async fn stream(
-        &self,
-        request: ChatRequest,
-        sink: &mut (dyn FnMut(StreamEvent) + Send),
-    ) -> Result<Completion>;
-
-    /// The models this endpoint actually serves (via its `/models` route), with
-    /// any live metadata reported. Default: empty, so callers fall back to the
-    /// static models.dev catalog.
-    async fn list_models(&self) -> Result<Vec<ServedModel>> {
-        Ok(Vec::new())
     }
 }

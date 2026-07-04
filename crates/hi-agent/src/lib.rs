@@ -49,12 +49,11 @@ use {
     steering::{
         ConcreteReviewAnswerProblem, EvidenceTracker, ImplementationIntent,
         READ_ONLY_PREFLIGHT_DIFF_MAX_LINES, READ_ONLY_PREFLIGHT_GREP_MAX_LINES, ReviewIntent,
-        SecuritySearchFamilies, bounded_review_repair_exhaustion_answer,
-        classify_implementation_intent, classify_read_only_intent, compact_preflight_tool_output,
-        concrete_review_answer_problem, gpu_training_estimator_bootstrap_files,
-        implementation_preflight_command, implementation_turn_prompt,
-        implementation_workspace_can_accept_rust_bootstrap_at, inspection_signature,
-        insufficient_after_incomplete_security_search, preferred_validation_from_preflight,
+        SecuritySearchFamilies, classify_implementation_intent, classify_read_only_intent,
+        compact_preflight_tool_output, concrete_review_answer_problem,
+        gpu_training_estimator_bootstrap_files, implementation_preflight_command,
+        implementation_turn_prompt, implementation_workspace_can_accept_rust_bootstrap_at,
+        inspection_signature, preferred_validation_from_preflight,
         preflight_path_relevant_for_intent, read_only_preflight_initial_calls,
         security_search_families_for_tool, should_nudge_concrete_review_answer,
         should_nudge_security_broad_search, should_nudge_security_scope,
@@ -98,6 +97,9 @@ pub struct AgentModelState {
 /// makes the verify/recovery/nudge story queryable.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TurnTelemetry {
+    /// Effective model-call cap used for this turn after dynamic defaults and
+    /// explicit overrides are resolved.
+    pub effective_max_steps: u32,
     /// How many verify rounds ran this turn (0 = verify off or skipped).
     pub verify_rounds: u32,
     /// Times a content-less / malformed response was silently re-sampled
@@ -110,6 +112,15 @@ pub struct TurnTelemetry {
     /// Times the truncation recovery nudged the model to continue after hitting
     /// the output token cap. 0 on a turn that never hit the limit.
     pub truncation_retries: u32,
+    /// Consecutive rounds classified as making no semantic progress at turn end.
+    pub no_progress_streak: u32,
+    /// Number of chat-only final-answer recovery attempts after no-progress
+    /// nudges.
+    pub forced_final_answer_attempts: u32,
+    /// Last meaningful or weak progress reason observed this turn.
+    pub last_progress_reason: String,
+    /// Last no-progress/stall reason observed this turn.
+    pub last_stall_reason: String,
     /// Whether the turn hit the per-turn step cap (`max_steps`).
     pub hit_step_cap: bool,
     /// Whether the turn ended stalled on announced-but-unrun steps.
@@ -136,6 +147,8 @@ pub struct TurnTelemetry {
     /// execution completion. Lets `--report` and the eval harness diagnose
     /// *where* time went and which calls failed, not just aggregate counts.
     pub tool_timeline: Vec<ToolCallEntry>,
+    /// Bounded progress/stall event trail. Contains at most the last 20 events.
+    pub progress_events: Vec<ProgressEvent>,
     /// Number of successful file-read tool calls this turn.
     pub file_reads: u32,
     /// Number of successful targeted search or diff tool calls this turn.
@@ -155,11 +168,16 @@ pub struct TurnTelemetry {
 impl Default for TurnTelemetry {
     fn default() -> Self {
         Self {
+            effective_max_steps: 0,
             verify_rounds: 0,
             recovery_retries: 0,
             repeat_nudges: 0,
             continue_nudges: 0,
             truncation_retries: 0,
+            no_progress_streak: 0,
+            forced_final_answer_attempts: 0,
+            last_progress_reason: String::new(),
+            last_stall_reason: String::new(),
             hit_step_cap: false,
             stalled_unfinished: false,
             stalled_repeating: false,
@@ -168,6 +186,7 @@ impl Default for TurnTelemetry {
             max_concurrent_batch: 0,
             serial_runs: 0,
             tool_timeline: Vec::new(),
+            progress_events: Vec::new(),
             file_reads: 0,
             targeted_searches: 0,
             listing_only: false,
@@ -176,6 +195,17 @@ impl Default for TurnTelemetry {
             quality_repair_nudges: 0,
         }
     }
+}
+
+/// One bounded progress diagnostic event in a turn. `kind` is one of
+/// `"meaningful"`, `"weak"`, or `"none"`. `signature` is present only for
+/// normalized/safe tool identities such as read paths, grep patterns, stale
+/// background handle ids, or the narrow no-progress bash categories.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProgressEvent {
+    pub kind: String,
+    pub reason: String,
+    pub signature: Option<String>,
 }
 
 /// A serializable view of one parsed verify-failure location, for the telemetry
@@ -225,6 +255,12 @@ pub struct ToolCallEntry {
     pub duration_ms: u64,
     /// Whether the tool's output indicated an error (starts with `"Error:"`).
     pub error: bool,
+    /// Per-call progress classification (`meaningful`, `weak`, or `none`).
+    pub progress_kind: String,
+    /// Short reason for the per-call progress classification.
+    pub progress_reason: String,
+    /// Normalized safe signature when one is available.
+    pub normalized_signature: Option<String>,
 }
 
 /// Auto-compact once the context window is at least this percent full.
@@ -366,7 +402,16 @@ Prefer existing project dependencies and standard-library solutions unless the \
 user explicitly asks to add a dependency. For generated or new files, keep each \
 write/edit small enough to fit comfortably in one tool call; build the file in \
 coherent chunks instead of emitting a huge payload. After creating or editing \
-code, run a targeted syntax/build/test command before continuing.";
+code, run a targeted syntax/build/test command before continuing. \
+\
+Use `web_search` when the user asks about something outside this repo — current \
+events, library docs, API specs, model availability, recent releases — or when \
+you'd otherwise have to guess a fact. Use `web_fetch` to read a specific public \
+URL (e.g. a HuggingFace Hub API endpoint, a docs page) — it needs no API key. \
+Use `web_download` to download model weights or files from HuggingFace Hub — \
+pass `org/model` as `source`; it runs in the background, so poll with \
+`bash_output` and stop with `bash_kill`. Don't use these for anything \
+`read`/`grep`/`list` can answer locally.";
 
 /// Parse an `update_plan` arguments JSON and apply its step statuses to a
 /// structured goal's sub-goals (mapping by position). Tolerant — a malformed

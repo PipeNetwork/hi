@@ -47,8 +47,8 @@ pub(crate) fn next_degraded_attempt(
     {
         return None;
     }
-    // A persistent outage that already survived transport retries: try the next
-    // (degraded) shape in case the 5xx was really a request-shape problem.
+    // A persistent 5xx that already survived transport retries: try the next
+    // shape in case the response was really a request-shape problem.
     if matches!(kind, ProviderErrorKind::Outage) && after < attempts.len() {
         return Some(after);
     }

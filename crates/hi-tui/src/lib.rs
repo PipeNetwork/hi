@@ -199,9 +199,9 @@ pub(crate) fn splash_lines(
 }
 
 /// Apply a freshly fetched `/models` result: update the served-metadata map,
-/// re-apply the current model (so its window/price/health refresh), warn on
-/// degraded health, and persist the result to the on-disk cache for next
-/// startup. A failure or empty list sets a startup notice instead of panicking.
+/// re-apply the current model (so its window/price refresh), and persist the
+/// result to the on-disk cache for next startup. A failure or empty list sets a
+/// startup notice instead of panicking.
 pub(crate) fn apply_metadata(
     app: &mut App,
     agent: &mut Agent,
@@ -215,9 +215,7 @@ pub(crate) fn apply_metadata(
             app.model_ids = served.iter().map(|m| m.id.clone()).collect();
             app.model_ids.sort();
             let model_id = app.model.clone();
-            if let Some(health) = app.apply_model(agent, registry, &model_id) {
-                app.warn_degraded(&model_id, &health);
-            }
+            app.apply_model(agent, registry, &model_id);
             // Persist for next startup (best-effort, fire-and-forget).
             let models = served.clone();
             let key = cache_key.to_string();
@@ -226,10 +224,10 @@ pub(crate) fn apply_metadata(
             });
         }
         Ok(_) => {
-            app.startup_notice = Some("provider metadata unavailable; using catalog".into());
+            app.startup_notice = Some("model metadata not loaded; using catalog".into());
         }
         Err(err) => {
-            app.startup_notice = Some(format!("provider metadata check failed: {err:#}"));
+            app.startup_notice = Some(format!("model metadata not loaded: {err:#}"));
         }
     }
 }
@@ -317,7 +315,7 @@ pub(crate) struct App {
     /// and feeds "interrupted by user" back to the model.
     pub(crate) interrupt: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// The name of the currently-active profile, if any (for marking it in the
-    /// `/provider` list). Updated when the user switches via `/provider <name>`.
+    /// `/provider` list). Updated when the user uses `/provider <name>`.
     pub(crate) active_profile: Option<String>,
     /// Configured profiles (for `/provider` with no arg).
     pub(crate) profiles: Vec<ProfileInfo>,
@@ -412,8 +410,8 @@ pub(crate) struct App {
     pub(crate) context_window: Option<u32>,
     /// Latest provider rate-limit buckets observed on a model response.
     pub(crate) rate_limits: Option<hi_ai::RateLimitState>,
-    /// Live per-model metadata (window/price/health) learned from the endpoint's
-    /// `/models`, keyed by id — used to apply a model's settings and flag health.
+    /// Live per-model metadata (window/price/limits) learned from the endpoint's
+    /// `/models`, keyed by id — used to apply a model's settings.
     pub(crate) served: HashMap<String, hi_ai::ServedModel>,
     /// The model catalog (ids), for inline `/model <id>` type-ahead completion.
     pub(crate) model_ids: Vec<String>,

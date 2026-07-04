@@ -6,7 +6,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
 
-use crate::model_picker::{display_capabilities, display_health, display_price, display_window};
+use crate::model_picker::{display_capabilities, display_price, display_window};
 use crate::render::{diff_lines, dim, markdown_line, wrapped_height};
 use crate::util::{clip_reason, fmt_count, fmt_elapsed, fmt_rate_limits};
 use crate::{PICKER_ROWS, SPINNER, TurnEventKind, TurnState};
@@ -92,14 +92,6 @@ impl crate::App {
         let verify = agent.verify_summary();
         let tel = agent.last_turn_telemetry();
         let error = self.last_error.as_deref().unwrap_or("none");
-        let model_issues = self.model_issues.get(&self.model).copied().unwrap_or(0);
-        let model_health = if model_issues >= 2 {
-            format!("degraded ({model_issues} issue(s))")
-        } else if model_issues == 1 {
-            "degraded (1 issue)".to_string()
-        } else {
-            "ok".to_string()
-        };
         for line in [
             format!("status: {state}"),
             format!("provider/model: {} · {}", self.provider, self.model),
@@ -107,7 +99,6 @@ impl crate::App {
                 "context: {ctx}; usage: {input} in · {output} out · {} total",
                 input + output
             ),
-            format!("model health: {model_health}"),
             format!("goal: {goal}"),
             format!("verify: {verify}"),
             format!(
@@ -148,7 +139,7 @@ impl crate::App {
         const PREFIX: usize = 2; // "› " or "  "
         let text = self.input.text();
         let before: String = text.chars().take(self.input.cursor()).collect();
-        let cursor_col_logical = before.chars().rev().take_while(|&c| c != '\n').count() as usize;
+        let cursor_col_logical = before.chars().rev().take_while(|&c| c != '\n').count();
 
         // Inner text width per line (prefix occupies the first 2 columns).
         let wrap_w = width.saturating_sub(PREFIX as u16).max(1) as usize;
@@ -214,12 +205,12 @@ impl crate::App {
         for (i, (chunk, cursor_here)) in wrapped[start..].iter().enumerate() {
             let prefix = if i == 0 && !truncated { "› " } else { "  " };
             lines.push(Line::from(format!("{prefix}{chunk}")));
-            if let Some(col) = cursor_here {
-                if !found_cursor {
-                    cursor_row = u16::from(truncated) + i as u16;
-                    cursor_col = (PREFIX + col) as u16;
-                    found_cursor = true;
-                }
+            if let Some(col) = cursor_here
+                && !found_cursor
+            {
+                cursor_row = u16::from(truncated) + i as u16;
+                cursor_col = (PREFIX + col) as u16;
+                found_cursor = true;
             }
         }
         // Cursor past the very end (e.g. empty input): place at end of last line.
@@ -512,10 +503,6 @@ impl crate::App {
                 let mut tag = String::new();
                 if row.id == p.current {
                     tag.push_str(" (current)");
-                }
-                let health = display_health(row.meta);
-                if !health.is_empty() {
-                    tag.push_str(&format!(" [{health}]"));
                 }
                 let caps = display_capabilities(row.meta);
                 if !caps.is_empty() {

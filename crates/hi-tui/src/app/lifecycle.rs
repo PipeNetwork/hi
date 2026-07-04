@@ -3,9 +3,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-use ratatui::style::{Color, Style};
-use ratatui::text::Line;
-
 use crate::input::InputLine;
 use crate::util::notify_done;
 use crate::{
@@ -143,30 +140,12 @@ impl crate::App {
     }
 
     pub(crate) fn record_model_issue(&mut self) {
-        let count = {
+        let _count = {
             let entry = self.model_issues.entry(self.model.clone()).or_insert(0);
             *entry += 1;
             *entry
         };
         // Note: don't touch `last_error` here — it holds the actual failure
-        // reason set by the caller; the per-model count lives in `model_issues`
-        // and surfaces via `/status` model health.
-        if count == 1 {
-            self.push(Line::styled(
-                format!(
-                    "⚠ {} returned an incomplete turn; it is now marked degraded in-session. Consider /model",
-                    self.model
-                ),
-                Style::default().fg(Color::Yellow),
-            ));
-        } else if count >= 2 {
-            self.push(Line::styled(
-                format!(
-                    "⚠ {} has had {count} reliability issue(s) this session and is degraded; consider /model",
-                    self.model
-                ),
-                Style::default().fg(Color::Yellow),
-            ));
-        }
+        // reason set by the caller. The per-model count remains internal.
     }
 }

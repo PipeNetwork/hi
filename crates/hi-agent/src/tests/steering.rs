@@ -1,5 +1,10 @@
 use super::common::*;
 use super::*;
+use crate::steering::{
+    GAPS_INSPECTION_CAP, REVIEW_INSPECTION_CAP, ROADMAP_INSPECTION_CAP, SECURITY_INSPECTION_CAP,
+    STATUS_INSPECTION_CAP, active_read_only_inspection_cap, default_read_only_inspection_cap,
+    explicit_read_only_inspection_cap, read_only_turn_prompt,
+};
 
 #[test]
 fn explicit_controls_classify_as_read_only_intents() {
@@ -33,11 +38,100 @@ fn explicit_controls_classify_as_read_only_intents() {
         Some(ReviewIntent::Security)
     );
     assert_eq!(
+        classify_read_only_intent(
+            "Review this codebase for issues related to ipop/coder-balanced API routing or latency. Use at most 4 file inspections. Do not modify files. Return concise findings only."
+        ),
+        Some(ReviewIntent::Review)
+    );
+    assert_eq!(
         classify_read_only_intent("review codebase and discuss status and state"),
         None
     );
     assert_eq!(classify_read_only_intent("status"), None);
     assert_eq!(classify_read_only_intent("fix the unsafe unwraps"), None);
+}
+
+#[test]
+fn read_only_inspection_caps_are_intent_specific() {
+    assert_eq!(
+        default_read_only_inspection_cap(ReviewIntent::Review),
+        REVIEW_INSPECTION_CAP
+    );
+    assert_eq!(
+        default_read_only_inspection_cap(ReviewIntent::Status),
+        STATUS_INSPECTION_CAP
+    );
+    assert_eq!(
+        default_read_only_inspection_cap(ReviewIntent::Roadmap),
+        ROADMAP_INSPECTION_CAP
+    );
+    assert_eq!(
+        default_read_only_inspection_cap(ReviewIntent::Gaps),
+        GAPS_INSPECTION_CAP
+    );
+    assert_eq!(
+        default_read_only_inspection_cap(ReviewIntent::Security),
+        SECURITY_INSPECTION_CAP
+    );
+}
+
+#[test]
+fn explicit_read_only_inspection_cap_phrases_parse() {
+    assert_eq!(
+        explicit_read_only_inspection_cap("Review this codebase. Use at most 4 file inspections."),
+        Some(4)
+    );
+    assert_eq!(
+        explicit_read_only_inspection_cap("use no more than 4 reads"),
+        Some(4)
+    );
+    assert_eq!(
+        explicit_read_only_inspection_cap("max 4 file reads"),
+        Some(4)
+    );
+    assert_eq!(
+        explicit_read_only_inspection_cap("At most 20 file inspections; max 12 reads."),
+        Some(12)
+    );
+}
+
+#[test]
+fn explicit_read_only_inspection_cap_ignores_non_caps() {
+    assert_eq!(
+        explicit_read_only_inspection_cap("read 4 files before answering"),
+        None
+    );
+    assert_eq!(
+        explicit_read_only_inspection_cap("use 4 reads if needed"),
+        None
+    );
+    assert_eq!(
+        explicit_read_only_inspection_cap("inspect at least 4 files"),
+        None
+    );
+}
+
+#[test]
+fn active_read_only_inspection_cap_clamps_to_lower_prompt_limit() {
+    assert_eq!(
+        active_read_only_inspection_cap(
+            "Security review. Use at most 4 file inspections.",
+            ReviewIntent::Security
+        ),
+        4
+    );
+    assert_eq!(
+        active_read_only_inspection_cap(
+            "Security review. Use at most 40 file inspections.",
+            ReviewIntent::Security
+        ),
+        SECURITY_INSPECTION_CAP
+    );
+    let prompt = read_only_turn_prompt(
+        "Review this codebase. Use at most 4 file inspections.",
+        ReviewIntent::Review,
+    );
+    assert!(prompt.contains("Active inspection cap: at most 4 file reads/searches"));
 }
 
 #[test]
@@ -207,6 +301,10 @@ fn implementation_preflight_detects_rust_validation() {
     .unwrap();
     std::fs::write(dir.join("src/main.rs"), "fn main() {}\n").unwrap();
     std::fs::write(dir.join("README.md"), "# demo\n").unwrap();
+    std::fs::create_dir_all(dir.join("models/nested")).unwrap();
+    std::fs::write(dir.join("models/nested/Cargo.toml"), "[package]\n").unwrap();
+    std::fs::create_dir_all(dir.join(".turbo/docs")).unwrap();
+    std::fs::write(dir.join(".turbo/docs/README.md"), "# generated\n").unwrap();
 
     let output = std::process::Command::new("sh")
         .arg("-lc")
@@ -222,6 +320,8 @@ fn implementation_preflight_detects_rust_validation() {
     assert!(stdout.contains("./Cargo.toml"));
     assert!(stdout.contains("[likely_entrypoints]"));
     assert!(stdout.contains("./src/main.rs"));
+    assert!(!stdout.contains("./models/nested/Cargo.toml"));
+    assert!(!stdout.contains("./.turbo/docs/README.md"));
     assert_eq!(
         preferred_validation_from_preflight(&stdout),
         Some("cargo test".to_string())
@@ -383,13 +483,13 @@ async fn stalled_implementation_does_not_finalize_with_stale_recap() {
     let _ = std::fs::remove_file(&path);
 
     assert!(
-        agent
+        !agent
             .messages()
             .last()
             .unwrap()
             .text()
-            .contains("Implementation incomplete"),
-        "stalled implementation should end on incomplete notice, not a recap"
+            .contains("Final recap"),
+        "stalled implementation should not finalize with a recap"
     );
     assert!(agent.last_turn_telemetry().stalled_unfinished);
 }
@@ -420,12 +520,13 @@ async fn scaffold_only_implementation_gets_source_edit_nudge() {
         ui.statuses
     );
     assert!(
-        agent
+        !agent
             .messages()
             .last()
             .unwrap()
             .text()
-            .contains("only project scaffolding")
+            .contains("Final recap"),
+        "stalled implementation should not finalize with a recap"
     );
     assert!(agent.last_turn_telemetry().stalled_unfinished);
 }
@@ -537,11 +638,7 @@ fn incomplete_security_search_requires_broadening_after_read() {
         &evidence,
         "src/lib.rs: no command execution or secret issues were found."
     ));
-    assert!(
-        insufficient_after_incomplete_security_search(&evidence)
-            .unwrap()
-            .contains("command execution/filesystem/env")
-    );
+    assert!(!evidence.security_search_complete());
 }
 
 #[test]
@@ -791,54 +888,6 @@ fn inspection_signature_is_stable_and_tool_specific() {
 }
 
 #[test]
-fn bounded_repair_exhaustion_includes_search_match_targets() {
-    let inspected_path = temp_file("repair-search-target");
-    std::fs::write(
-        &inspected_path,
-        "fn token() { let value = std::env::var(\"API_KEY\").unwrap(); }\n",
-    )
-    .unwrap();
-    let inspected = inspected_path.to_string_lossy().to_string();
-    let mut evidence = EvidenceTracker::default();
-    evidence.record_success(
-        "grep",
-        &serde_json::json!({
-            "pattern": "unwrap|std::env|api_key|token",
-            "glob": "*.rs"
-        })
-        .to_string(),
-        &format!(
-            "{}:1:/// Context window in tokens.\n{}:2:fn token() {{ let value = std::env::var(\"API_KEY\").unwrap(); }}\n",
-            inspected, inspected
-        ),
-    );
-    evidence.record_success(
-        "read",
-        &serde_json::json!({ "path": inspected.clone() }).to_string(),
-        "1\tfn token() { let value = std::env::var(\"API_KEY\").unwrap(); }\n",
-    );
-
-    let answer = bounded_review_repair_exhaustion_answer(
-        ReviewIntent::Security,
-        &evidence,
-        "the final answer did not cite concrete files",
-    );
-
-    assert!(answer.contains("Concrete search matches from inspected evidence"));
-    assert!(answer.contains(&inspected));
-    assert!(answer.contains("std::env::var"));
-    assert!(answer.contains("pattern-match review targets"));
-    assert!(answer.contains("not confirmed vulnerabilities"));
-    assert_eq!(evidence.search_hit_snippets.len(), 2);
-    assert!(
-        evidence.search_hit_snippets[0].contains("std::env::var"),
-        "high-signal hit should sort first: {:?}",
-        evidence.search_hit_snippets
-    );
-    let _ = std::fs::remove_file(inspected_path);
-}
-
-#[test]
 fn search_hit_snippets_keep_late_high_signal_matches() {
     let inspected_path = temp_file("repair-search-ranking");
     std::fs::write(
@@ -879,7 +928,7 @@ fn search_hit_snippets_keep_late_high_signal_matches() {
 async fn security_review_prompts_advertise_only_read_only_tools() {
     let responses = vec![completion(
         vec![Content::Text(
-            "Insufficient evidence: I need targeted search or file reads.".into(),
+            "I need to inspect targeted search results or file reads first.".into(),
         )],
         1,
         1,
@@ -1137,7 +1186,7 @@ async fn security_review_accepts_inspected_filename_alias_in_final_answer() {
         .unwrap();
 
     assert!(
-        !ui.assistant.contains("Bounded evidence summary"),
+        !ui.assistant.contains("fallback summary"),
         "filename alias should be accepted instead of fallback: {}",
         ui.assistant
     );
@@ -1278,9 +1327,9 @@ async fn read_only_status_preflight_seeds_first_request_with_evidence() {
     let telemetry = agent.last_turn_telemetry();
     assert!(telemetry.tool_calls >= 3, "{telemetry:?}");
     assert!(telemetry.file_reads >= 2, "{telemetry:?}");
-    assert!(telemetry.targeted_searches >= 1, "{telemetry:?}");
+    assert_eq!(telemetry.targeted_searches, 0, "{telemetry:?}");
     assert!(!telemetry.listing_only, "{telemetry:?}");
-    assert_eq!(telemetry.first_tool_kind, "targeted_search");
+    assert_eq!(telemetry.first_tool_kind, "listing");
 }
 
 #[tokio::test]
@@ -1323,7 +1372,7 @@ async fn ux_cleanup_with_live_json_does_not_enter_read_only_preflight() {
         ui.statuses
     );
     assert!(
-        !ui.assistant.contains("Bounded evidence summary"),
+        !ui.assistant.contains("fallback summary"),
         "implementation prompts must not return review fallback summaries: {}",
         ui.assistant
     );
@@ -1376,8 +1425,18 @@ fn security_preflight_is_code_scoped_and_bounded() {
 }
 
 #[tokio::test]
-async fn read_only_review_no_evidence_repair_exhaustion_returns_insufficient() {
+async fn read_only_review_no_evidence_repair_exhaustion_stops_incomplete() {
     let responses = vec![
+        completion(
+            vec![Content::Text("Completed the requested action.".into())],
+            1,
+            1,
+        ),
+        completion(
+            vec![Content::Text("Completed the requested action.".into())],
+            1,
+            1,
+        ),
         completion(
             vec![Content::Text("Completed the requested action.".into())],
             1,
@@ -1401,8 +1460,8 @@ async fn read_only_review_no_evidence_repair_exhaustion_returns_insufficient() {
         .unwrap();
 
     assert!(
-        ui.assistant.contains("Insufficient evidence: no files"),
-        "expected bounded insufficient evidence: {}",
+        ui.assistant.trim().is_empty(),
+        "guardrail should not emit canned assistant text: {}",
         ui.assistant
     );
     assert!(
@@ -1413,7 +1472,7 @@ async fn read_only_review_no_evidence_repair_exhaustion_returns_insufficient() {
         ui.statuses
     );
     let telemetry = agent.last_turn_telemetry();
-    assert_eq!(telemetry.quality_repair_nudges, 1);
+    assert_eq!(telemetry.quality_repair_nudges, 3);
     assert_eq!(telemetry.discovery_depth, "none");
     assert!(telemetry.stalled_unfinished);
 }
@@ -1440,6 +1499,13 @@ async fn read_only_review_repair_template_final_is_not_accepted() {
             1,
             1,
         ),
+        completion(
+            vec![Content::Text(format!(
+                "Status:\n- `{inspected}` identifies this as a terminal coding assistant.\n\nEvidence:\n- Read `{inspected}` during this review.\n\nBuild Next:\n- Inspect command routing and tool execution modules before making broader status claims.\n\nRisks/Validation:\n- Limited to inspected evidence; not a full repository review."
+            ))],
+            1,
+            1,
+        ),
     ];
     let mut agent = agent(responses, config());
     let mut ui = RecUi::default();
@@ -1450,8 +1516,8 @@ async fn read_only_review_repair_template_final_is_not_accepted() {
         .unwrap();
 
     assert!(
-        ui.assistant.contains("generic review-repair template"),
-        "expected template rejection fallback: {}",
+        ui.assistant.contains(&inspected),
+        "repaired model answer should cite inspected evidence: {}",
         ui.assistant
     );
     assert!(
@@ -1459,7 +1525,8 @@ async fn read_only_review_repair_template_final_is_not_accepted() {
         "old repair template must not be surfaced: {}",
         ui.assistant
     );
-    assert!(agent.last_turn_telemetry().stalled_unfinished);
+    assert!(!agent.last_turn_telemetry().stalled_unfinished);
+    assert_eq!(agent.last_turn_telemetry().quality_repair_nudges, 1);
     let _ = std::fs::remove_file(inspected_path);
 }
 
@@ -1493,6 +1560,11 @@ async fn read_only_review_repair_exhaustion_reports_inspected_evidence() {
             1,
             1,
         ),
+        completion(
+            vec![Content::Text("Completed the requested action.".into())],
+            1,
+            1,
+        ),
     ];
     let mut agent = agent(responses, config());
     let mut ui = RecUi::default();
@@ -1506,33 +1578,12 @@ async fn read_only_review_repair_exhaustion_reports_inspected_evidence() {
         .unwrap();
 
     assert!(
-        ui.assistant
-            .contains("Bounded evidence summary for an incomplete security review"),
-        "expected bounded evidence fallback: {}",
-        ui.assistant
-    );
-    assert!(
-        ui.assistant.contains("Inspected evidence:"),
-        "fallback should describe inspected evidence: {}",
-        ui.assistant
-    );
-    assert!(
-        ui.assistant.contains("File reads: 1"),
-        "fallback should report file reads: {}",
-        ui.assistant
-    );
-    assert!(
-        ui.assistant.contains(&inspected),
-        "fallback should cite inspected path: {}",
-        ui.assistant
-    );
-    assert!(
-        !ui.assistant.contains("Findings/Status"),
-        "fallback must not invent completed findings: {}",
+        ui.assistant.trim().is_empty(),
+        "guardrail should not emit canned assistant text: {}",
         ui.assistant
     );
     let telemetry = agent.last_turn_telemetry();
-    assert_eq!(telemetry.quality_repair_nudges, 2);
+    assert_eq!(telemetry.quality_repair_nudges, 3);
     assert!(telemetry.stalled_unfinished);
     let _ = std::fs::remove_file(inspected_path);
 }
@@ -1571,28 +1622,35 @@ async fn read_only_review_generic_insufficient_after_read_reports_evidence() {
         ),
         completion(
             vec![Content::Text(format!(
-                "Insufficient evidence: I inspected `{inspected}`, but cannot make concrete security findings."
+                "Not enough evidence: I inspected `{inspected}`, but cannot make concrete security findings."
             ))],
             1,
             1,
         ),
         completion(
             vec![Content::Text(format!(
-                "Insufficient evidence: I inspected `{inspected}`, but still cannot make concrete security findings."
+                "Not enough evidence: I inspected `{inspected}`, but still cannot make concrete security findings."
             ))],
             1,
             1,
         ),
         completion(
             vec![Content::Text(format!(
-                "Insufficient evidence: I inspected `{inspected}`, but still cannot make concrete security findings."
+                "Not enough evidence: I inspected `{inspected}`, but still cannot make concrete security findings."
             ))],
             1,
             1,
         ),
         completion(
             vec![Content::Text(format!(
-                "Insufficient evidence: I inspected `{inspected}`, but still cannot make concrete security findings."
+                "Not enough evidence: I inspected `{inspected}`, but still cannot make concrete security findings."
+            ))],
+            1,
+            1,
+        ),
+        completion(
+            vec![Content::Text(format!(
+                "Not enough evidence: I inspected `{inspected}`, but still cannot make concrete security findings."
             ))],
             1,
             1,
@@ -1610,37 +1668,21 @@ async fn read_only_review_generic_insufficient_after_read_reports_evidence() {
         .unwrap();
 
     assert!(
-        ui.assistant
-            .contains("Bounded evidence summary for an incomplete security review"),
-        "expected bounded evidence summary: {}",
-        ui.assistant
-    );
-    assert!(
-        ui.assistant.contains("Targeted searches: 1"),
-        "summary should retain search evidence: {}",
-        ui.assistant
-    );
-    assert!(
-        ui.assistant.contains("File reads: 1"),
-        "summary should retain file-read evidence: {}",
-        ui.assistant
-    );
-    assert!(
-        ui.assistant.contains(&inspected),
-        "summary should cite inspected path: {}",
+        ui.assistant.trim().is_empty(),
+        "guardrail should not emit canned assistant text: {}",
         ui.assistant
     );
     assert!(
         ui.statuses
             .iter()
-            .any(|status| status.contains("nudging the model to summarize inspected files")),
+            .any(|status| status.contains("nudging the model to answer from inspected files")),
         "expected summarize-evidence repair status: {:?}",
         ui.statuses
     );
     assert!(
         ui.statuses
             .iter()
-            .any(|status| status.contains("generic insufficient-evidence text after inspection")),
+            .any(|status| status.contains("generic evidence disclaimer after inspection")),
         "expected replacement status: {:?}",
         ui.statuses
     );
@@ -1682,7 +1724,7 @@ async fn read_only_review_generic_insufficient_after_read_gets_summary_repair() 
         ),
         completion(
             vec![Content::Text(format!(
-                "Insufficient evidence: I inspected `{inspected}`, but cannot make concrete security findings."
+                "Not enough evidence: I inspected `{inspected}`, but cannot make concrete security findings."
             ))],
             1,
             1,
@@ -1709,7 +1751,7 @@ async fn read_only_review_generic_insufficient_after_read_gets_summary_repair() 
     assert!(
         ui.statuses
             .iter()
-            .any(|status| status.contains("nudging the model to summarize inspected files")),
+            .any(|status| status.contains("nudging the model to answer from inspected files")),
         "expected summarize-evidence repair status: {:?}",
         ui.statuses
     );
@@ -1719,7 +1761,7 @@ async fn read_only_review_generic_insufficient_after_read_gets_summary_repair() 
         ui.assistant
     );
     assert!(
-        !ui.assistant.contains("Bounded evidence summary"),
+        !ui.assistant.contains("fallback summary"),
         "accepted repaired answer should not fall back: {}",
         ui.assistant
     );
@@ -1802,35 +1844,20 @@ async fn read_only_review_repeat_exhaustion_reports_inspected_evidence() {
         .unwrap();
 
     assert!(
-        ui.assistant
-            .contains("Bounded evidence summary for an incomplete security review"),
-        "expected bounded evidence fallback: {}",
-        ui.assistant
-    );
-    assert!(
-        ui.assistant.contains("Targeted searches: 1"),
-        "repeated searches should not be counted as executed searches: {}",
-        ui.assistant
-    );
-    assert!(
-        ui.assistant.contains("File reads: 1"),
-        "fallback should report file reads: {}",
-        ui.assistant
-    );
-    assert!(
-        ui.assistant.contains(&inspected),
-        "fallback should cite inspected path: {}",
+        ui.assistant.trim().is_empty(),
+        "guardrail should not emit canned assistant text: {}",
         ui.assistant
     );
     assert!(
         ui.statuses
             .iter()
-            .any(|status| status.contains("bounded evidence summary")),
-        "expected bounded repeat-exhaustion status: {:?}",
+            .any(|status| status.contains("turn stopped incomplete")),
+        "expected forced final recovery to stop incomplete: {:?}",
         ui.statuses
     );
     let telemetry = agent.last_turn_telemetry();
     assert_eq!(telemetry.repeat_nudges, 2);
+    assert_eq!(telemetry.forced_final_answer_attempts, 1);
     assert!(telemetry.stalled_unfinished);
     let _ = std::fs::remove_file(inspected_path);
 }
@@ -1912,19 +1939,8 @@ async fn gap_review_search_match_blocks_no_gap_overclaim() {
         ui.statuses
     );
     assert!(
-        ui.assistant
-            .contains("Bounded evidence summary for an incomplete gap review"),
-        "expected bounded evidence fallback: {}",
-        ui.assistant
-    );
-    assert!(
-        ui.assistant.contains(&inspected),
-        "fallback should cite inspected path: {}",
-        ui.assistant
-    );
-    assert!(
-        !ui.assistant.contains("no TODO/FIXME markers"),
-        "bad overclaim should not be surfaced: {}",
+        ui.assistant.trim().is_empty(),
+        "guardrail should not emit canned assistant text: {}",
         ui.assistant
     );
     let telemetry = agent.last_turn_telemetry();
@@ -2127,7 +2143,7 @@ async fn security_review_overbroad_all_clear_gets_scope_nudge() {
 }
 
 #[tokio::test]
-async fn read_only_review_repeated_search_without_read_returns_insufficient_evidence() {
+async fn read_only_review_repeated_search_without_read_stops_incomplete() {
     let grep_call = || {
         completion(
             vec![Content::ToolCall {
@@ -2163,9 +2179,8 @@ async fn read_only_review_repeated_search_without_read_returns_insufficient_evid
         ui.statuses
     );
     assert!(
-        ui.assistant
-            .contains("Insufficient evidence: targeted search ran"),
-        "expected insufficient-evidence final: {}",
+        ui.assistant.trim().is_empty(),
+        "guardrail should not emit canned assistant text: {}",
         ui.assistant
     );
     assert!(agent.last_turn_telemetry().stalled_unfinished);
@@ -2173,6 +2188,9 @@ async fn read_only_review_repeated_search_without_read_returns_insufficient_evid
 
 #[tokio::test]
 async fn read_only_review_search_then_generic_final_requires_file_read() {
+    let inspected_path = temp_file("search-then-read-review");
+    std::fs::write(&inspected_path, "pub fn run_turn() {}\n").unwrap();
+    let inspected = inspected_path.to_string_lossy().to_string();
     let responses = vec![
         completion(
             vec![Content::ToolCall {
@@ -2194,8 +2212,24 @@ async fn read_only_review_search_then_generic_final_requires_file_read() {
         ),
         completion(
             vec![Content::Text(
-                "Insufficient evidence: targeted search ran, but no matching file was read.".into(),
+                "Targeted search ran, but I have not read a matching file yet.".into(),
             )],
+            1,
+            1,
+        ),
+        completion(
+            vec![Content::ToolCall {
+                id: "read".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({ "path": inspected.clone() }).to_string(),
+            }],
+            1,
+            1,
+        ),
+        completion(
+            vec![Content::Text(format!(
+                "Findings:\n- `{inspected}` was read after targeted search and contains the reviewed entrypoint.\n\nEvidence:\n- Read `{inspected}`.\n\nLimits:\n- Limited to inspected evidence."
+            ))],
             1,
             1,
         ),
@@ -2203,13 +2237,7 @@ async fn read_only_review_search_then_generic_final_requires_file_read() {
     let mut agent = agent(responses, config());
     let mut ui = RecUi::default();
 
-    agent
-        .run_turn(
-            "review for security issues or unsafe unwraps. then disucss only",
-            &mut ui,
-        )
-        .await
-        .unwrap();
+    agent.run_turn("/review codebase", &mut ui).await.unwrap();
 
     assert!(
         ui.statuses
@@ -2218,11 +2246,18 @@ async fn read_only_review_search_then_generic_final_requires_file_read() {
         "expected search-without-read nudge: {:?}",
         ui.statuses
     );
-    assert_eq!(agent.last_turn_telemetry().quality_repair_nudges, 1);
+    assert_eq!(agent.last_turn_telemetry().quality_repair_nudges, 2);
+    assert_eq!(agent.last_turn_telemetry().file_reads, 1);
+    assert!(
+        ui.assistant.contains(&inspected),
+        "final answer should cite the file read after the nudge: {}",
+        ui.assistant
+    );
+    let _ = std::fs::remove_file(inspected_path);
 }
 
 #[tokio::test]
-async fn listing_only_review_repair_exhaustion_returns_insufficient_evidence() {
+async fn listing_only_review_repair_exhaustion_stops_incomplete() {
     let responses = vec![
         completion(
             vec![Content::ToolCall {
@@ -2247,6 +2282,20 @@ async fn listing_only_review_repair_exhaustion_returns_insufficient_evidence() {
             1,
             1,
         ),
+        completion(
+            vec![Content::Text(
+                "The repository looks healthy and organized.".into(),
+            )],
+            1,
+            1,
+        ),
+        completion(
+            vec![Content::Text(
+                "The repository looks healthy and organized.".into(),
+            )],
+            1,
+            1,
+        ),
     ];
     let mut agent = agent(responses, config());
     let mut ui = RecUi::default();
@@ -2257,13 +2306,8 @@ async fn listing_only_review_repair_exhaustion_returns_insufficient_evidence() {
         .unwrap();
 
     assert!(
-        ui.assistant.contains("Insufficient evidence"),
-        "assistant output should be bounded evidence: {}",
-        ui.assistant
-    );
-    assert!(
-        !ui.assistant.contains("src/lib.rs"),
-        "listing-only fallback targets should not be shown as findings: {}",
+        ui.assistant.trim().is_empty(),
+        "guardrail should not emit canned assistant text: {}",
         ui.assistant
     );
     assert!(
@@ -2274,7 +2318,7 @@ async fn listing_only_review_repair_exhaustion_returns_insufficient_evidence() {
         ui.statuses
     );
     let telemetry = agent.last_turn_telemetry();
-    assert_eq!(telemetry.quality_repair_nudges, 1);
+    assert_eq!(telemetry.quality_repair_nudges, 3);
     assert!(telemetry.listing_only);
     assert!(telemetry.stalled_unfinished);
     assert!(agent.usage_summary(agent.totals()).contains("stalled"));

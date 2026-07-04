@@ -5,7 +5,6 @@
 //! provider and uses MCP only for model catalog/health metadata.
 
 use std::collections::HashMap;
-use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
@@ -134,19 +133,13 @@ impl PipeMcpClient {
     }
 
     pub async fn list_models(&self) -> Result<Vec<ServedModel>> {
-        let fetch = async {
-            let value = self
-                .call_tool(TOOL_MODELS_LIST, json!({ "include_unavailable": true }))
-                .await?;
-            Ok(parse_model_metadata(&value)
-                .into_iter()
-                .map(PipeMcpModelMetadata::into_served)
-                .collect())
-        };
-        match tokio::time::timeout(Duration::from_secs(6), fetch).await {
-            Ok(result) => result,
-            Err(_) => bail!("MCP models request timed out after 6s"),
-        }
+        let value = self
+            .call_tool(TOOL_MODELS_LIST, json!({ "include_unavailable": true }))
+            .await?;
+        Ok(parse_model_metadata(&value)
+            .into_iter()
+            .map(PipeMcpModelMetadata::into_served)
+            .collect())
     }
 
     pub async fn model_metadata(&self) -> Result<HashMap<String, PipeMcpModelMetadata>> {

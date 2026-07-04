@@ -12,7 +12,7 @@ and give your final recap. Do not re-run the same command.";
 
 pub(crate) const NO_EVIDENCE_REVIEW_NUDGE: &str = "This read-only review has no inspected evidence yet. \
 Do not finalize. Use read-only inspection tools first, then answer from the inspected evidence. \
-If inspection is impossible, explicitly say the evidence is insufficient.";
+If inspection is impossible, explain which inspection failed and what remains unknown.";
 pub(crate) const READ_ONLY_SAFE_CONTEXT_WINDOW: u32 = 12_000;
 pub(crate) const READ_ONLY_PREFLIGHT_GREP_MAX_LINES: usize = 32;
 pub(crate) const READ_ONLY_PREFLIGHT_DIFF_MAX_LINES: usize = 160;
@@ -30,7 +30,7 @@ Do not finalize. Inspect manifests, owning modules, tests, and TODO/FIXME or mis
 search results before naming gaps or build-next work.";
 pub(crate) const REVIEW_DEEPEN_NUDGE: &str = "This read-only review only has a directory listing so far. \
 Do not finalize yet. Use a targeted search or read relevant files, then answer from the inspected \
-evidence. If deeper inspection is impossible, explicitly say the evidence is insufficient.";
+evidence. If deeper inspection is impossible, explain which files or searches could not be checked.";
 pub(crate) const SECURITY_DEEPEN_NUDGE: &str = "This security review only has a directory listing so far. \
 Do not finalize yet. Search for unsafe, unwrap, expect, panic!, command execution, filesystem/env \
 access, and secret/token/auth patterns, then read the most relevant matching files before answering.";
@@ -42,34 +42,23 @@ Do not finalize yet. Inspect manifests, owning modules, tests, and TODO/FIXME or
 search results before naming gaps or build-next work.";
 pub(crate) const CONCRETE_REVIEW_NUDGE: &str = "Your read-only review answer did not cite concrete files or \
 modules from the inspected evidence. Do not use mutating tools. Answer again with bounded findings \
-tied to inspected paths, or explicitly say the evidence is insufficient.";
+tied to inspected paths and a brief Limits section naming what remains unknown.";
 pub(crate) const READ_AFTER_SEARCH_NUDGE: &str = "The targeted search result is already in the transcript. \
 Do not rerun the same search and do not use mutating tools. Read the most relevant matching file, \
-then answer from that inspected file. If you cannot pick a file to read, explicitly say the \
-evidence is insufficient.";
+then answer from that inspected file. If you cannot pick a file to read, explain that limitation \
+and answer only from the search output.";
 
-/// Sent when a read-only review turn has accumulated a lot of inspected
-/// evidence (many file reads / searches) but the model keeps issuing more
-/// read-only tool calls instead of producing findings. This is the
-/// "inspection sprawl" guard: distinct reads each have a new inspection
-/// signature, so the repeat/cycle guard never fires, and without this nudge
-/// the turn churns until `max_steps`. The nudge pushes the model to stop
-/// inspecting and answer from what it has already seen.
-pub(crate) const INSPECTION_SPRAWL_NUDGE: &str = "You have already inspected a lot of evidence this turn \
-(many file reads and/or searches) and the results are in the conversation above. Stop inspecting now and \
-answer from the evidence you have already gathered. Produce bounded findings tied to concrete \
-inspected files, or explicitly say the evidence is insufficient. Do not read more files.";
-
-/// How many file reads + targeted searches accumulate before the inspection-sprawl
-/// nudge fires on a read-only review turn that still hasn't produced a final
-/// answer. Chosen so a normal focused review (a handful of reads + a search or
-/// two) never trips it, but a sprawl into dozens of reads does.
-pub(crate) const INSPECTION_SPRAWL_THRESHOLD: u32 = 24;
+/// Default file-read + targeted-search caps for read-only review turns. Listings
+/// and diffs remain useful context, but they do not increase this count.
+pub(crate) const REVIEW_INSPECTION_CAP: u32 = 16;
+pub(crate) const STATUS_INSPECTION_CAP: u32 = 12;
+pub(crate) const ROADMAP_INSPECTION_CAP: u32 = 14;
+pub(crate) const GAPS_INSPECTION_CAP: u32 = 14;
+pub(crate) const SECURITY_INSPECTION_CAP: u32 = 20;
 
 /// How many *additional* read-only inspection rounds are allowed after the
-/// sprawl nudge before the turn hard-stops with a bounded-evidence summary.
-/// Mirrors the repair-budget shape: one nudge, then a bounded stop.
-pub(crate) const MAX_INSPECTION_SPRAWL_NUDGES: u32 = 1;
+/// sprawl nudge before the turn stops incomplete.
+pub(crate) const MAX_INSPECTION_SPRAWL_NUDGES: u32 = 2;
 
 /// Sent when the model re-reads files it already inspected earlier this turn
 /// (a multi-step read cycle like A→B→C→A→B→C that evades the exact-match
@@ -83,16 +72,16 @@ stop and give your final recap. Do not re-read files you have already inspected.
 pub(crate) const SECURITY_BROAD_SEARCH_NUDGE: &str = "This security review searched and read some evidence, \
 but it has not covered all required pattern families yet. Do not use mutating tools. Search for \
 unsafe/unwrap/expect/panic, command execution/filesystem/env access, and secret/token/auth \
-patterns, then answer only from concrete inspected evidence or explicitly say the evidence is \
-insufficient.";
+patterns, then answer only from concrete inspected evidence with a Limits section for unsearched \
+areas.";
 pub(crate) const SECURITY_SCOPE_NUDGE: &str = "The security answer made repo-wide all-clear claims that are \
 broader than the inspected files and search results support. Do not use mutating tools. Answer \
-again with findings explicitly bounded to the searched patterns and inspected files, or explicitly \
-say the evidence is insufficient for broader security claims.";
+again with findings explicitly bounded to the searched patterns and inspected files, and name any \
+broader security claims that remain unverified.";
 pub(crate) const GAP_SEARCH_OVERCLAIM_NUDGE: &str = "The gap or roadmap answer claimed there were no \
 TODO/FIXME/missing gaps even though the targeted search returned matches. Do not use mutating \
-tools. Answer again from the inspected files and search matches, or explicitly say the evidence is \
-insufficient for broader roadmap claims.";
+tools. Answer again from the inspected files and search matches, with Limits for broader roadmap \
+claims.";
 pub(crate) const SECURITY_PREFLIGHT_PATTERN: &str = "unsafe|unwrap\\(|expect\\(|panic!|std::process|process::Command|Command::new|spawn\\(|std::fs|fs::|read_to_string|std::env|env::|secret|token|auth|api_key|apikey|password|credential|bearer";
 pub(crate) const GAP_PREFLIGHT_PATTERN: &str =
     "TODO|FIXME|todo!|unimplemented!|missing|gap|needs coverage|not implemented";
@@ -111,6 +100,10 @@ pub(crate) const IMPLEMENTATION_EMPTY_TUI_NUDGE: &str = "The implementation pref
 manifest. This is a TUI request, so scaffold the Rust binary in the current directory now with \
 `cargo init --bin .`, then add Ratatui/Crossterm, implement the estimator, and validate with \
 `cargo test` or `cargo check`.";
+pub(crate) const POST_TOOL_EMPTY_RESPONSE_NUDGE: &str = "The previous model response after the tool \
+results was empty. Continue from the returned tool output now. If more workspace inspection is \
+needed, use the available tools; otherwise answer or implement the next concrete step. Do not \
+repeat the same read-only calls unless their prior output lacks the needed details.";
 pub(crate) const TOOL_PROTOCOL_RETRY_NUDGE: &str = "The previous response was rejected by the provider \
 because it was not a valid tool turn. Continue using exactly valid tool calls from the available \
 schemas. For multi-line file creation, prefer `apply_patch` with `*** Add File` hunks, or call \

@@ -64,6 +64,9 @@ pub struct AgentConfig {
     pub max_verify_iterations: u32,
     /// Safety cap on model calls per turn, to stop runaway tool loops.
     pub max_steps: u32,
+    /// Whether `max_steps` was explicitly requested by the caller. When false,
+    /// the turn loop chooses a conservative dynamic cap from the turn intent.
+    pub max_steps_explicit: bool,
     /// When the context window fills past a threshold, summarize-and-reset
     /// before the next turn so a long session doesn't overflow the model.
     pub auto_compact: bool,
@@ -149,6 +152,7 @@ impl Default for AgentConfig {
             verify: Vec::new(),
             max_verify_iterations: 2,
             max_steps: 500,
+            max_steps_explicit: true,
             auto_compact: true,
             compaction: CompactionKind::ElideThenSummarizeTail {
                 keep_recent: DEFAULT_KEEP_RECENT,

@@ -8,6 +8,7 @@ mod setup;
 mod ui;
 
 use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
@@ -131,6 +132,14 @@ async fn main() -> Result<()> {
 
     // Fold piped stdin into the one-shot prompt as context.
     let prompt_input = effective_prompt(&cli)?;
+    let report_path = cli
+        .report
+        .as_ref()
+        .map(|path| absolutize_path(path.as_path()))
+        .transpose()?;
+    if let Some(prompt) = prompt_input.as_deref() {
+        maybe_chdir_to_prompt_review_target(prompt)?;
+    }
 
     if cli.best_of > 1 {
         let prompt = prompt_input
@@ -180,7 +189,10 @@ async fn main() -> Result<()> {
         project_context: load_project_context(),
         verify: resolve_verify(&cli),
         max_verify_iterations: cli.max_verify,
-        max_steps: cli.max_steps,
+        max_steps: cli
+            .max_steps
+            .unwrap_or_else(|| AgentConfig::default().max_steps),
+        max_steps_explicit: cli.max_steps.is_some(),
         auto_compact: !cli.no_auto_compact,
         compaction: cli
             .compaction
@@ -230,7 +242,7 @@ async fn main() -> Result<()> {
         if let Some(state) = restore_model_state {
             agent.restore_model_state(state);
         }
-        let report_result = if let Some(path) = &cli.report {
+        let report_result = if let Some(path) = &report_path {
             write_report(
                 path,
                 &agent,
@@ -269,13 +281,13 @@ async fn main() -> Result<()> {
     let stdout_is_tty = std::io::stdout().is_terminal();
     let stdin_is_tty = std::io::stdin().is_terminal();
     let use_tui = !cli.plain && stdout_is_tty && stdin_is_tty;
+    let active_profile = cli.profile.clone().or_else(|| file.default_profile.clone());
 
     // The full-screen TUI is the default interactive experience; fall back to
     // the plain REPL when not on a TTY, when --plain is set, or if it errors.
     if use_tui {
         // Build the profile list and resolver for `/provider` in the TUI.
         let profiles: Vec<hi_tui::ProfileInfo> = profile_infos(&file);
-        let active_profile = cli.profile.clone().or_else(|| file.default_profile.clone());
         let resolver: hi_tui::ProfileResolver = Box::new({
             let file = file.clone();
             let registry = registry.clone();
@@ -295,6 +307,7 @@ async fn main() -> Result<()> {
         });
         let saver: hi_tui::ProfileSaver = Box::new({
             let file = std::sync::Mutex::new(file.clone());
+            let config_path = cli.config.clone();
             move |data: &hi_tui::ProfileFormData| {
                 let provider = data
                     .provider
@@ -308,7 +321,7 @@ async fn main() -> Result<()> {
                     model: data.model.clone(),
                     base_url: data.base_url.clone(),
                 };
-                let path = config::writable_config_path(None)
+                let path = config::writable_config_path(config_path.as_deref())
                     .context("could not determine config path")?;
                 let mut file = file.lock().unwrap();
                 let mut profile = form.to_profile();
@@ -342,8 +355,9 @@ async fn main() -> Result<()> {
         });
         let remover: hi_tui::ProfileRemover = Box::new({
             let file = std::sync::Mutex::new(file.clone());
+            let config_path = cli.config.clone();
             move |name: &str| {
-                let path = config::writable_config_path(None)
+                let path = config::writable_config_path(config_path.as_deref())
                     .context("could not determine config path")?;
                 let mut file = file.lock().unwrap();
                 let existed = config::remove_profile(&mut file, name, &path)?;
@@ -362,7 +376,7 @@ async fn main() -> Result<()> {
             session::history_path(),
             auto_memory,
             profiles,
-            active_profile,
+            active_profile.clone(),
             resolver,
             saver,
             loader,
@@ -392,7 +406,16 @@ async fn main() -> Result<()> {
         print_landing(&settings, live_metadata.context_window);
     }
 
-    repl(&mut agent, &settings, &mut file, &registry, auto_memory).await
+    repl(
+        &mut agent,
+        &settings,
+        &mut file,
+        &registry,
+        auto_memory,
+        active_profile,
+        cli.config.clone(),
+    )
+    .await
 }
 
 pub(crate) fn provider_label(provider: ProviderName) -> &'static str {
@@ -436,12 +459,8 @@ async fn mcp_inspect(url: &str, api_key: &str, current_model: &str) -> Result<St
     }
     out.push_str(&format!("models:   {}\n", models.len()));
     if let Some(model) = models.iter().find(|m| m.id == current_model) {
-        let health = model.health().unwrap_or("available");
         let provider = model.provider_label.as_deref().unwrap_or("Pipe");
-        out.push_str(&format!(
-            "current:  {} · {} · {}\n",
-            model.id, provider, health
-        ));
+        out.push_str(&format!("current:  {} · {}\n", model.id, provider));
     }
     Ok(out)
 }
@@ -607,6 +626,130 @@ fn effective_prompt(cli: &Cli) -> Result<Option<String>> {
     Ok(Some(format!("{prompt}\n\nstdin:\n```\n{piped}\n```")))
 }
 
+fn absolutize_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    Ok(std::env::current_dir()
+        .context("determining current directory")?
+        .join(path))
+}
+
+fn maybe_chdir_to_prompt_review_target(prompt: &str) -> Result<Option<PathBuf>> {
+    let Some(target) = review_target_dir_from_prompt(prompt) else {
+        return Ok(None);
+    };
+    let current = std::env::current_dir().context("determining current directory")?;
+    let current = current.canonicalize().unwrap_or(current);
+    if target == current {
+        return Ok(Some(target));
+    }
+    std::env::set_current_dir(&target)
+        .with_context(|| format!("changing to review target {}", target.display()))?;
+    Ok(Some(target))
+}
+
+fn review_target_dir_from_prompt(prompt: &str) -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    review_target_dir_from_prompt_at(prompt, &cwd, home.as_deref())
+}
+
+fn review_target_dir_from_prompt_at(
+    prompt: &str,
+    cwd: &Path,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    let prompt = prompt
+        .split("\n\nstdin:\n```")
+        .next()
+        .unwrap_or(prompt)
+        .trim();
+    if !prompt_looks_like_review_request(prompt) {
+        return None;
+    }
+    prompt
+        .split_whitespace()
+        .filter_map(trim_prompt_path_token)
+        .filter_map(|token| expand_review_target_token(token, cwd, home))
+        .next()
+}
+
+fn prompt_looks_like_review_request(prompt: &str) -> bool {
+    let normalized = prompt
+        .split_whitespace()
+        .filter(|raw| match trim_prompt_path_token(raw) {
+            Some(token) => !token_looks_pathish(token),
+            None => true,
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { ' ' })
+        .collect::<String>();
+    let words = normalized.split_whitespace().collect::<Vec<_>>();
+    words.iter().any(|word| {
+        matches!(
+            *word,
+            "review" | "audit" | "status" | "roadmap" | "gap" | "gaps" | "security"
+        )
+    })
+}
+
+fn trim_prompt_path_token(raw: &str) -> Option<&str> {
+    let mut token = raw.trim_matches(|ch: char| {
+        matches!(
+            ch,
+            '"' | '\'' | '`' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}' | ','
+        )
+    });
+    while token.len() > 1
+        && token
+            .chars()
+            .last()
+            .is_some_and(|ch| matches!(ch, '.' | ',' | ';' | ':' | '?' | '!'))
+    {
+        token = &token[..token.len() - 1];
+    }
+    (!token.is_empty()).then_some(token)
+}
+
+fn token_looks_pathish(token: &str) -> bool {
+    token == "~"
+        || token == "."
+        || token == ".."
+        || token.starts_with("~/")
+        || token.starts_with("./")
+        || token.starts_with("../")
+        || token.starts_with('/')
+        || token.contains('/')
+}
+
+fn expand_review_target_token(token: &str, cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
+    if token.contains("://") {
+        return None;
+    }
+    let expanded = if token == "~" {
+        home?.to_path_buf()
+    } else if let Some(rest) = token.strip_prefix("~/") {
+        home?.join(rest)
+    } else {
+        PathBuf::from(token)
+    };
+    let path = if expanded.is_absolute() {
+        expanded
+    } else if token_looks_pathish(token) {
+        cwd.join(expanded)
+    } else {
+        return None;
+    };
+    if !path.is_dir() {
+        return None;
+    }
+    Some(path.canonicalize().unwrap_or(path))
+}
+
 /// The verification pipeline: an explicit `--verify` wins (one stage); otherwise
 /// `--auto-verify` detects a layered pipeline from the working directory. Empty
 /// = verification off.
@@ -668,11 +811,16 @@ fn write_report(
         "tool_mode_effective": tool_mode_label(agent.tool_mode()),
         "changed_files": agent.last_changed_files(),
         "telemetry": {
+            "effective_max_steps": tel.effective_max_steps,
             "verify_rounds": tel.verify_rounds,
             "recovery_retries": tel.recovery_retries,
             "repeat_nudges": tel.repeat_nudges,
             "continue_nudges": tel.continue_nudges,
             "truncation_retries": tel.truncation_retries,
+            "no_progress_streak": tel.no_progress_streak,
+            "forced_final_answer_attempts": tel.forced_final_answer_attempts,
+            "last_progress_reason": tel.last_progress_reason,
+            "last_stall_reason": tel.last_stall_reason,
             "hit_step_cap": tel.hit_step_cap,
             "stalled_unfinished": tel.stalled_unfinished,
             "stalled_repeating": tel.stalled_repeating,
@@ -681,6 +829,7 @@ fn write_report(
             "max_concurrent_batch": tel.max_concurrent_batch,
             "serial_runs": tel.serial_runs,
             "tool_timeline": tel.tool_timeline,
+            "progress_events": tel.progress_events,
             "file_reads": tel.file_reads,
             "targeted_searches": tel.targeted_searches,
             "listing_only": tel.listing_only,
@@ -868,10 +1017,12 @@ async fn resolve_live_model_metadata(
 #[cfg(test)]
 mod tests {
     use super::{
-        auto_memory_enabled, effective_max_tokens_for_model, memory_context, write_landing,
+        auto_memory_enabled, effective_max_tokens_for_model, memory_context,
+        review_target_dir_from_prompt_at, write_landing,
     };
     use crate::config::{ProviderName, Settings};
     use hi_ai::{CompatMode, ToolMode};
+    use std::path::PathBuf;
 
     #[test]
     fn auto_memory_off_when_disabled_or_unsaved() {
@@ -918,6 +1069,74 @@ mod tests {
             compat: CompatMode::default(),
             moa: hi_ai::MoaConfig::default(),
         }
+    }
+
+    fn temp_review_dir(name: &str) -> PathBuf {
+        let unique = format!(
+            "hi-target-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.canonicalize().unwrap()
+    }
+
+    #[test]
+    fn review_target_detects_absolute_directory() {
+        let dir = temp_review_dir("absolute");
+        let cwd = std::env::current_dir().unwrap();
+
+        let found = review_target_dir_from_prompt_at(
+            &format!("review {} and discuss only", dir.display()),
+            &cwd,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(found, dir);
+        let _ = std::fs::remove_dir_all(found);
+    }
+
+    #[test]
+    fn review_target_expands_home_directory() {
+        let home = temp_review_dir("home");
+        let repo = home.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let cwd = std::env::current_dir().unwrap();
+
+        let found =
+            review_target_dir_from_prompt_at("security review ~/repo read only", &cwd, Some(&home))
+                .unwrap();
+
+        assert_eq!(found, repo.canonicalize().unwrap());
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn review_target_ignores_non_review_prompt() {
+        let dir = temp_review_dir("non-review");
+        let cwd = std::env::current_dir().unwrap();
+
+        let found = review_target_dir_from_prompt_at(&format!("fix {}", dir.display()), &cwd, None);
+
+        assert!(found.is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn review_target_ignores_paths_only_in_folded_stdin() {
+        let dir = temp_review_dir("stdin");
+        let cwd = std::env::current_dir().unwrap();
+        let prompt = format!("review codebase\n\nstdin:\n```\n{}\n```", dir.display());
+
+        let found = review_target_dir_from_prompt_at(&prompt, &cwd, None);
+
+        assert!(found.is_none());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

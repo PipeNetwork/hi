@@ -365,6 +365,131 @@ async fn request_too_large_failed_retry_after_dropping_context_removes_latest_pr
 }
 
 #[tokio::test]
+async fn context_preflight_rejects_hopeless_oversized_prompt_without_provider_call() {
+    let mut cfg = config();
+    cfg.context_window = Some(1);
+    cfg.tool_mode = ToolMode::ChatOnly;
+    let (mut agent, requests) = scripted_agent(vec![], cfg);
+    let start_len = agent.messages().len();
+    let mut ui = RecordingUi::default();
+
+    let err = agent.run_turn("x", &mut ui).await.unwrap_err();
+
+    assert_eq!(
+        hi_ai::provider_error_kind(&err),
+        Some(ProviderErrorKind::RequestTooLarge)
+    );
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "locally impossible requests should not be sent to the provider"
+    );
+    assert_eq!(
+        agent.messages().len(),
+        start_len,
+        "failed oversized prompt is not left in live history"
+    );
+    assert!(
+        ui.statuses.iter().any(|s| s.contains("shorten the prompt")),
+        "user gets actionable status: {:?}",
+        ui.statuses
+    );
+}
+
+#[tokio::test]
+async fn context_preflight_reduces_output_budget_to_available_headroom() {
+    let mut cfg = config();
+    cfg.tool_mode = ToolMode::ChatOnly;
+    cfg.max_tokens = 8192;
+    cfg.requested_max_tokens = 8192;
+    let (mut agent, _requests, max_tokens) = scripted_agent_recording_max_tokens(
+        vec![ProviderStep::Completion(completion(
+            vec![Content::Text("ok".into())],
+            10,
+            2,
+        ))],
+        cfg,
+    );
+    let prompt = "hello";
+    let prompt_estimate =
+        hi_ai::estimate_messages_tokens(agent.messages()) + hi_ai::estimate_text_tokens(prompt);
+    let expected_headroom = 2048;
+    agent.set_model(
+        "m".into(),
+        Some((prompt_estimate + expected_headroom).try_into().unwrap()),
+        None,
+    );
+
+    agent.run_turn(prompt, &mut NullUi).await.unwrap();
+
+    assert_eq!(*max_tokens.lock().unwrap(), vec![expected_headroom as u32]);
+}
+
+#[tokio::test]
+async fn context_preflight_drops_prior_context_before_first_provider_call() {
+    let mut cfg = config();
+    cfg.tool_mode = ToolMode::ChatOnly;
+    cfg.max_tokens = 512;
+    cfg.requested_max_tokens = 512;
+    let (mut agent, requests) = scripted_agent(
+        vec![ProviderStep::Completion(completion(
+            vec![Content::Text("ok".into())],
+            10,
+            2,
+        ))],
+        cfg,
+    );
+    let huge_old = "old context ".repeat(20_000);
+    agent.messages_mut().push(Message::user(huge_old.clone()));
+    agent
+        .messages_mut()
+        .push(Message::assistant(vec![Content::Text("old answer".into())]));
+
+    let prompt = "answer the current question";
+    let system_estimate = hi_ai::estimate_messages_tokens(&agent.messages()[..1]);
+    let latest_estimate = hi_ai::estimate_text_tokens(prompt);
+    let window = system_estimate + latest_estimate + 512 + 128;
+    assert!(
+        hi_ai::estimate_messages_tokens(agent.messages()) + latest_estimate + 512 > window,
+        "test must start over the window before dropping old context"
+    );
+    agent.set_model("m".into(), Some(window.try_into().unwrap()), None);
+    let mut ui = RecordingUi::default();
+
+    agent.run_turn(prompt, &mut ui).await.unwrap();
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        1,
+        "prior context should be dropped before the first provider call"
+    );
+    let sent = requests[0]
+        .iter()
+        .map(Message::text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        sent.contains("Earlier conversation context was omitted"),
+        "request includes context omission marker: {sent}"
+    );
+    assert!(
+        sent.contains(prompt),
+        "latest user request is preserved: {sent}"
+    );
+    assert!(
+        !sent.contains(&huge_old[..64]),
+        "oversized prior context should not be sent"
+    );
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|s| s.contains("dropped prior conversation context")),
+        "user sees recovery status: {:?}",
+        ui.statuses
+    );
+}
+
+#[tokio::test]
 async fn malformed_stream_retries_and_recovers() {
     // A garbled stream on the first call is silently re-run (with recovery
     // sampling) rather than failing the turn — then it recovers.
@@ -455,6 +580,77 @@ async fn empty_completion_error_is_resampled_too() {
 }
 
 #[tokio::test]
+async fn empty_completion_after_tool_results_gets_continuation_nudge() {
+    let read_cargo = Content::ToolCall {
+        id: "r".into(),
+        name: "read".into(),
+        arguments: serde_json::json!({ "path": "Cargo.toml", "limit": 20 }).to_string(),
+    };
+    let (mut agent, requests) = scripted_agent(
+        vec![
+            ProviderStep::Completion(completion(vec![read_cargo], 5, 1)),
+            ProviderStep::Error(ProviderErrorKind::EmptyCompletion),
+            ProviderStep::Error(ProviderErrorKind::EmptyCompletion),
+            ProviderStep::Completion(completion(vec![Content::Text("recovered".into())], 8, 2)),
+        ],
+        config(),
+    );
+
+    agent.run_turn("say hi", &mut NullUi).await.unwrap();
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 4);
+    let retry_request = &requests[3];
+    assert!(
+        retry_request
+            .last()
+            .is_some_and(|message| message.role == Role::User
+                && message
+                    .text()
+                    .contains("previous model response after the tool results was empty")),
+        "retry should include a post-tool empty-response nudge: {retry_request:#?}"
+    );
+    assert!(
+        retry_request
+            .windows(2)
+            .all(|pair| !(pair[0].role == Role::User && pair[1].role == Role::User)),
+        "nudge must not create consecutive user messages: {retry_request:#?}"
+    );
+}
+
+#[tokio::test]
+async fn contentless_completion_after_tool_results_gets_continuation_nudge() {
+    let read_cargo = Content::ToolCall {
+        id: "r".into(),
+        name: "read".into(),
+        arguments: serde_json::json!({ "path": "Cargo.toml", "limit": 20 }).to_string(),
+    };
+    let (mut agent, requests) = scripted_agent(
+        vec![
+            ProviderStep::Completion(completion(vec![read_cargo], 5, 1)),
+            ProviderStep::Completion(completion(vec![], 8, 0)),
+            ProviderStep::Completion(completion(vec![Content::Text("recovered".into())], 8, 2)),
+        ],
+        config(),
+    );
+
+    agent.run_turn("say hi", &mut NullUi).await.unwrap();
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    let retry_request = &requests[2];
+    assert!(
+        retry_request
+            .last()
+            .is_some_and(|message| message.role == Role::User
+                && message
+                    .text()
+                    .contains("previous model response after the tool results was empty")),
+        "retry should include a post-tool empty-response nudge: {retry_request:#?}"
+    );
+}
+
+#[tokio::test]
 async fn output_cap_error_retries_once_with_advertised_budget() {
     let mut cfg = config();
     cfg.max_tokens = 8192;
@@ -499,7 +695,7 @@ async fn output_cap_error_without_limit_halves_budget_not_2048() {
 }
 
 #[tokio::test]
-async fn retryable_model_unavailable_retries_and_recovers() {
+async fn retryable_route_rejection_retries_and_recovers() {
     let (mut agent, requests) = scripted_agent(
         vec![
             ProviderStep::ErrorMessage(
@@ -562,7 +758,7 @@ async fn ordinary_rate_limit_does_not_use_overload_retry_budget() {
 }
 
 #[tokio::test]
-async fn retryable_model_unavailable_exhausts_then_surfaces_error() {
+async fn retryable_route_rejection_exhausts_then_surfaces_error() {
     let (mut agent, requests) = scripted_agent(
         vec![
             ProviderStep::ErrorMessage(

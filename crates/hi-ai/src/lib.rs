@@ -4,6 +4,7 @@
 pub mod anthropic;
 pub mod fallback;
 mod http;
+pub mod huggingface;
 pub mod mcp;
 pub mod moa;
 pub mod openai;
@@ -15,9 +16,13 @@ pub mod types;
 
 pub use anthropic::AnthropicProvider;
 pub use fallback::{Backend, FallbackProvider};
+pub use huggingface::{
+    HfFileInfo, HfModelInfo, HfRepoRef, HuggingFaceHubClient, ModelCandidate, ModelDiscovery,
+    ModelDiscoveryQuery, ModelSource,
+};
 // Re-export the on-disk /models cache helpers so the TUI can load cached model
 // metadata at startup (instant) and save fresh results from the background fetch.
-pub use http::{cache_key, load_cache, save_cache};
+pub use http::{agent_http_client, cache_key, load_cache, save_cache};
 pub use mcp::{
     McpDiscoveryProvider, McpTool, PIPE_MCP_DEFAULT_URL, PipeMcpClient, PipeMcpModelHealth,
     PipeMcpModelMetadata,

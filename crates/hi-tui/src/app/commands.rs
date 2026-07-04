@@ -315,7 +315,7 @@ impl crate::App {
                     let caps = App::capabilities_map(registry, &ids);
                     if ids.is_empty() {
                         self.push(Line::styled(
-                            "no models fetched yet — the endpoint didn't respond".to_string(),
+                            "no live model list available yet".to_string(),
                             dim(),
                         ));
                     } else {
@@ -323,11 +323,7 @@ impl crate::App {
                             Some(ModelPicker::new(ids, &current, tags, &self.served, &caps));
                     }
                 } else {
-                    let health = self.apply_model(agent, registry, &id);
-                    self.push(Line::styled(format!("model set to {id}"), dim()));
-                    if let Some(h) = health {
-                        self.warn_degraded(&id, &h);
-                    }
+                    self.select_model(agent, registry, &id);
                 }
             }
             Command::Clear => {
@@ -420,6 +416,7 @@ impl crate::App {
             | Command::Init
             | Command::Learn(_)
             | Command::Skill(_)
+            | Command::Hf(_)
             | Command::Provider(_) => {}
             Command::Version => {
                 self.push(Line::styled(format!("hi {}", hi_agent::VERSION), dim()));
@@ -461,10 +458,9 @@ impl crate::App {
                         }
                         self.push(Line::styled(format!("models:   {}", models.len()), dim()));
                         if let Some(model) = models.iter().find(|m| m.id == self.model) {
-                            let health = model.health().unwrap_or("available");
                             let provider = model.provider_label.as_deref().unwrap_or("Pipe");
                             self.push(Line::styled(
-                                format!("current:  {} · {} · {}", model.id, provider, health),
+                                format!("current:  {} · {}", model.id, provider),
                                 dim(),
                             ));
                         }

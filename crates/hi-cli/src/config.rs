@@ -2,7 +2,7 @@
 //!
 //! Precedence, highest first: explicit CLI flags → selected profile → env vars
 //! → built-in defaults. Profiles let a user keep several models on hand
-//! (e.g. a cloud Anthropic profile and a local Ollama profile) and switch with
+//! (e.g. a cloud Anthropic profile and a local Ollama profile) and use one with
 //! `-p <name>`.
 
 use std::collections::{BTreeMap, HashMap};
@@ -141,8 +141,8 @@ pub struct Cli {
     pub max_verify: u32,
 
     /// Safety cap on model calls per turn (stops runaway tool loops).
-    #[arg(long, default_value_t = 500)]
-    pub max_steps: u32,
+    #[arg(long)]
+    pub max_steps: Option<u32>,
 
     /// Run N candidate attempts in isolated git worktrees and keep the first
     /// that passes verification. Requires --verify/--auto-verify and a prompt.
@@ -920,6 +920,22 @@ pub fn upsert_profile(
     save_config_to(config, config_path)
 }
 
+/// Update only the selected model on an existing profile and save it to disk.
+pub fn set_profile_model(
+    config: &mut Config,
+    name: &str,
+    model: &str,
+    config_path: &Path,
+) -> Result<()> {
+    let profile = config
+        .profiles
+        .get_mut(name)
+        .ok_or_else(|| anyhow!("profile '{name}' not found in config"))?;
+    profile.model = Some(model.to_string());
+    validate_profile(profile)?;
+    save_config_to(config, config_path)
+}
+
 /// Remove a profile from the config and save it to disk. Returns `false` if the
 /// profile didn't exist (caller may treat that as an error or a no-op).
 pub fn remove_profile(config: &mut Config, name: &str, config_path: &Path) -> Result<bool> {
@@ -1083,12 +1099,11 @@ pub fn resolve_fallbacks(cli: &Cli, config: &Config, registry: &Registry) -> Vec
 
 /// Resolve a named profile into [`Settings`] from its own fields + environment
 /// (no CLI overrides — those belong to the primary). Used both for fallback
-/// profiles at startup and for `/provider` switches mid-session.
+/// profiles at startup and for `/provider` changes mid-session.
 ///
 /// If the profile has no `model` and the provider has no default, a placeholder
-/// is used — the caller is expected to pick a real model via `/model` from what
-/// the endpoint serves. The placeholder is fine for building the provider and
-/// listing models, but a turn can't run with it.
+/// is used. The placeholder is fine for building the provider and listing
+/// models, but a turn can't run with it.
 pub fn resolve_named_profile(config: &Config, name: &str, registry: &Registry) -> Result<Settings> {
     config.moa.validate()?;
     let profile = config
@@ -1101,7 +1116,7 @@ pub fn resolve_named_profile(config: &Config, name: &str, registry: &Registry) -
         .model
         .clone()
         .or_else(|| provider.default_model().map(String::from))
-        .unwrap_or_else(|| "__pick_via_model__".to_string());
+        .unwrap_or_else(|| "__model_not_configured__".to_string());
     let base_url = profile
         .base_url
         .clone()
@@ -1511,6 +1526,47 @@ mod tests {
         let p = form.to_profile();
         assert_eq!(p.api_key.as_deref(), Some(name));
         assert!(p.api_key_env.is_none());
+    }
+
+    #[test]
+    fn set_profile_model_updates_only_model() {
+        use super::{Config, Profile, set_profile_model};
+        let dir = std::env::temp_dir().join(format!(
+            "hi-set-model-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let mut config = Config {
+            default_profile: Some("default".into()),
+            profiles: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "default".into(),
+                    Profile {
+                        provider: Some(ProviderName::Pipenetwork),
+                        model: Some("pipe/auto-code".into()),
+                        api_key: Some("test-key".into()),
+                        ..Default::default()
+                    },
+                );
+                m
+            },
+            ..Default::default()
+        };
+
+        set_profile_model(&mut config, "default", "ipop/coder-balanced", &path).expect("set model");
+
+        let p = config.profiles.get("default").unwrap();
+        assert_eq!(p.model.as_deref(), Some("ipop/coder-balanced"));
+        assert_eq!(p.api_key.as_deref(), Some("test-key"));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("model = \"ipop/coder-balanced\""));
+        assert!(text.contains("api_key = \"test-key\""));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

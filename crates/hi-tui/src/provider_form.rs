@@ -48,7 +48,7 @@ impl ProviderForm {
                 Field {
                     label: "Model",
                     input: InputLine::default(),
-                    placeholder: "optional — blank to pick via /model",
+                    placeholder: "optional",
                 },
                 Field {
                     label: "Base URL",

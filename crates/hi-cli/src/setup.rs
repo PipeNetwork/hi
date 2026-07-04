@@ -51,8 +51,7 @@ pub async fn run() -> Result<Settings> {
         key
     };
 
-    // Test the connection before saving, so the user discovers a bad key
-    // or unreachable server now — not on their first turn.
+    // Test the connection before saving, so configuration issues surface during setup.
     print!("\x1b[2m  testing connection…\x1b[0m\r");
     let _ = std::io::Write::flush(&mut std::io::stdout());
     let test_result = test_connection(provider, &model, &api_key).await;
@@ -88,9 +87,8 @@ pub async fn run() -> Result<Settings> {
     })
 }
 
-/// Test the connection by listing models from the endpoint. Returns `Ok(())`
-/// if the endpoint responded (even with an empty list), or an error if it
-/// couldn't be reached / the key was rejected.
+/// Test the connection by listing models. Returns `Ok(())` for any successful
+/// model-list response, including an empty list.
 async fn test_connection(provider: ProviderName, _model: &str, api_key: &str) -> Result<()> {
     use hi_ai::{OpenAiProvider, Provider};
     let base_url = provider.default_base_url();
