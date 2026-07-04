@@ -11,6 +11,38 @@ use crate::render::{diff_lines, dim, markdown_line, wrapped_height};
 use crate::util::{clip_reason, fmt_count, fmt_elapsed, fmt_rate_limits};
 use crate::{PICKER_ROWS, SPINNER, TurnEventKind, TurnState};
 
+fn review_repair_summary(t: &hi_agent::TurnTelemetry) -> Option<String> {
+    if t.quality_repair_nudges == 0
+        && t.review_repair_counts.is_empty()
+        && t.review_repair_exhaustion_reason.is_empty()
+    {
+        return None;
+    }
+
+    let mut parts = vec![format!("total {}", t.quality_repair_nudges)];
+    let mut counts = t.review_repair_counts.iter().collect::<Vec<_>>();
+    counts.sort_by(|(left_mode, left_count), (right_mode, right_count)| {
+        right_count
+            .cmp(left_count)
+            .then_with(|| left_mode.cmp(right_mode))
+    });
+    let top_modes = counts
+        .into_iter()
+        .take(2)
+        .map(|(mode, count)| format!("{}={count}", hi_agent::compact_review_repair_label(mode)))
+        .collect::<Vec<_>>();
+    if !top_modes.is_empty() {
+        parts.push(format!("top {}", top_modes.join(", ")));
+    }
+    if !t.review_repair_exhaustion_reason.is_empty() {
+        parts.push(format!(
+            "exhausted {}",
+            hi_agent::compact_review_repair_label(&t.review_repair_exhaustion_reason)
+        ));
+    }
+    Some(format!("review repair: {}", parts.join(" · ")))
+}
+
 impl crate::App {
     /// The live "what's happening now" lead for the working line: the in-flight
     /// tool named with its own elapsed timer, otherwise the model phase —
@@ -291,8 +323,17 @@ impl crate::App {
             0
         };
         let changed_h = usize::from(!self.last_changed_files.is_empty() && !self.working);
-        // The Ctrl-? observability panel: header + 3 diagnostic lines.
-        let debug_h = if self.show_debug { 5 } else { 0 };
+        // The Ctrl-? observability panel: header plus present diagnostic lines.
+        let debug_h = if self.show_debug {
+            let telemetry_h = if let Some(t) = self.last_telemetry.as_ref() {
+                1 + usize::from(t.tool_calls > 0) + usize::from(review_repair_summary(t).is_some())
+            } else {
+                0
+            };
+            4 + telemetry_h + usize::from(fmt_rate_limits(self.rate_limits).is_some())
+        } else {
+            0
+        };
         // The `?` keybindings help overlay: header + 10 lines.
         let help_h = if self.show_help { 12 } else { 0 };
         // Live streamed tool output tail (e.g. bash stdout), shown while a tool runs.
@@ -752,6 +793,9 @@ impl crate::App {
                         ),
                         dim(),
                     ));
+                    if let Some(repair) = review_repair_summary(t) {
+                        ilines.push(Line::styled(repair, dim()));
+                    }
                 }
                 // Scheduler parallelism: max concurrent batch and serial share.
                 let sched = if let Some(t) = self.last_telemetry.as_ref() {

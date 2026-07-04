@@ -862,6 +862,9 @@ fn ctrl_question_toggles_the_observability_panel() {
     // counters, the per-turn tool-call count, and session/context numbers.
     let mut app = test_app("openai", "gpt-4o");
     app.show_debug = true;
+    let mut repair_counts = std::collections::BTreeMap::new();
+    repair_counts.insert("review_listing_only".to_string(), 4);
+    repair_counts.insert("review_no_evidence".to_string(), 1);
     app.last_telemetry = Some(hi_agent::TurnTelemetry {
         effective_max_steps: 120,
         verify_rounds: 2,
@@ -887,10 +890,13 @@ fn ctrl_question_toggles_the_observability_panel() {
         listing_only: false,
         first_tool_kind: "read".to_string(),
         discovery_depth: "mixed".to_string(),
-        quality_repair_nudges: 0,
+        quality_repair_nudges: 5,
+        review_repair_exhaustion_reason: "review_listing_only_exhausted".to_string(),
+        review_repair_counts: repair_counts,
+        review_repair_stopped_by_exhaustion: true,
     });
     app.turn_tool_calls = 7;
-    let mut term = Terminal::new(TestBackend::new(60, 16)).unwrap();
+    let mut term = Terminal::new(TestBackend::new(96, 18)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     let screen = dump(&term);
     assert!(
@@ -905,6 +911,12 @@ fn ctrl_question_toggles_the_observability_panel() {
         screen.contains("tool calls this turn: 7"),
         "tool-call count: {screen}"
     );
+    assert!(
+        screen.contains("review repair: total 5")
+            && screen.contains("top listing=4")
+            && screen.contains("exhausted listing"),
+        "review repair diagnostics: {screen}"
+    );
 
     // Closing drops the panel.
     app.show_debug = false;
@@ -913,6 +925,38 @@ fn ctrl_question_toggles_the_observability_panel() {
     assert!(
         !screen2.contains("agent (Ctrl-? to close)"),
         "panel closed: {screen2}"
+    );
+}
+
+#[test]
+fn ctrl_question_compacts_long_review_repair_mode_names() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.show_debug = true;
+    let mut repair_counts = std::collections::BTreeMap::new();
+    repair_counts.insert("review_security_broad_search".to_string(), 12);
+    repair_counts.insert("review_gap_search_overclaim".to_string(), 9);
+    app.last_telemetry = Some(hi_agent::TurnTelemetry {
+        effective_max_steps: 120,
+        quality_repair_nudges: 21,
+        review_repair_exhaustion_reason: "review_security_broad_search_exhausted".to_string(),
+        review_repair_counts: repair_counts,
+        review_repair_stopped_by_exhaustion: true,
+        ..hi_agent::TurnTelemetry::default()
+    });
+
+    let mut term = Terminal::new(TestBackend::new(96, 14)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = dump(&term);
+    assert!(
+        screen.contains("top security_broad=12")
+            && screen.contains("gap_overclaim=9")
+            && screen.contains("exhausted security_broad"),
+        "compact review-repair labels: {screen}"
+    );
+    assert!(
+        !screen.contains("review_security_broad_search")
+            && !screen.contains("review_gap_search_overclaim"),
+        "raw long repair keys should not render in Ctrl-?: {screen}"
     );
 }
 

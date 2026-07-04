@@ -2,7 +2,7 @@
 //! tool calls → results → repeat, then verify), `finalize_turn`, and the
 //! per-turn steering/tool-selection helpers.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use anyhow::Result;
 use futures_util::StreamExt;
@@ -26,18 +26,18 @@ use crate::steering::{
     IMPLEMENTATION_EMPTY_TUI_NUDGE, IMPLEMENTATION_NO_CHANGES_NUDGE,
     IMPLEMENTATION_SCAFFOLD_ONLY_NUDGE, ImplementationTracker, POST_TOOL_EMPTY_RESPONSE_NUDGE,
     READ_AFTER_SEARCH_NUDGE, READ_ONLY_SAFE_CONTEXT_WINDOW, REPEAT_NUDGE, REREAD_NUDGE,
-    ReviewIntent, SECURITY_BROAD_SEARCH_NUDGE, SECURITY_SCOPE_NUDGE, TOOL_PROTOCOL_RETRY_NUDGE,
-    TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE, ToolLoopGuardrail, active_read_only_inspection_cap,
-    answer_says_insufficient_evidence, bash_no_progress_signature, classify_bash_command,
-    classify_implementation_intent, classify_read_only_intent, concrete_review_answer_problem,
-    deepen_review_nudge, evidence_kind_for_tool, implementation_missing_validation_nudge,
-    implementation_text_tool_nudge, implementation_tool_call_mutates,
-    implementation_tool_call_validates, implementation_tool_result_landed_mutation,
-    implementation_tool_result_landed_substantive_edit, implementation_turn_prompt,
-    inspected_insufficient_repair_limit, inspected_paths_for_prompt, inspection_signature,
+    ReviewIntent, ReviewRepairMode, SECURITY_BROAD_SEARCH_NUDGE, SECURITY_SCOPE_NUDGE,
+    TOOL_PROTOCOL_RETRY_NUDGE, TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE, ToolLoopGuardrail,
+    active_read_only_inspection_cap, answer_says_insufficient_evidence, bash_no_progress_signature,
+    classify_bash_command, classify_implementation_intent, classify_read_only_intent,
+    concrete_review_answer_problem, deepen_review_nudge, evidence_kind_for_tool,
+    implementation_missing_validation_nudge, implementation_text_tool_nudge,
+    implementation_tool_call_mutates, implementation_tool_call_validates,
+    implementation_tool_result_landed_mutation, implementation_tool_result_landed_substantive_edit,
+    implementation_turn_prompt, inspected_paths_for_prompt, inspection_signature,
     inspection_sprawl_exhausted, inspection_sprawl_nudge, no_evidence_review_nudge,
     read_only_blocked_tool_result, read_only_blocks_tool, read_only_turn_prompt,
-    should_bootstrap_gpu_training_estimator, should_deepen_review,
+    repair_nudge_with_required_next, should_bootstrap_gpu_training_estimator, should_deepen_review,
     should_nudge_gap_search_overclaim, should_nudge_inspection_sprawl,
     should_nudge_no_evidence_review, should_nudge_read_after_repeated_search,
     should_nudge_read_after_search_final, should_nudge_security_broad_search,
@@ -71,6 +71,7 @@ fn build_turn_telemetry(
     serial_runs: u32,
     tool_timeline: &[ToolCallEntry],
     evidence: &EvidenceTracker,
+    review_repair: &ReviewRepairState,
 ) -> TurnTelemetry {
     TurnTelemetry {
         effective_max_steps,
@@ -101,6 +102,9 @@ fn build_turn_telemetry(
         first_tool_kind: evidence.first_tool_kind().to_string(),
         discovery_depth: evidence.discovery_depth().to_string(),
         quality_repair_nudges: evidence.quality_repair_nudges,
+        review_repair_exhaustion_reason: review_repair.exhaustion_reason.clone(),
+        review_repair_counts: review_repair.counts.clone(),
+        review_repair_stopped_by_exhaustion: !review_repair.exhaustion_reason.is_empty(),
     }
 }
 
@@ -407,6 +411,43 @@ const MIN_OUTPUT_CAP_RETRY_TOKENS: u32 = 512;
 const INCOMPLETE_STATUS: &str = "turn stopped incomplete";
 
 #[derive(Default)]
+struct ReviewRepairState {
+    counts: BTreeMap<String, u32>,
+    exhaustion_reason: String,
+}
+
+impl ReviewRepairState {
+    fn count(&self, mode: ReviewRepairMode) -> u32 {
+        self.counts.get(mode.key()).copied().unwrap_or(0)
+    }
+
+    fn has_budget(&self, mode: ReviewRepairMode) -> bool {
+        self.count(mode) < mode.default_limit()
+    }
+
+    fn spend(&mut self, mode: ReviewRepairMode, evidence: &mut EvidenceTracker) -> bool {
+        if !self.has_budget(mode) {
+            return false;
+        }
+        let entry = self.counts.entry(mode.key().to_string()).or_insert(0);
+        *entry = (*entry).saturating_add(1);
+        evidence.quality_repair_nudges = evidence.quality_repair_nudges.saturating_add(1);
+        true
+    }
+
+    fn note(&mut self, mode: ReviewRepairMode) {
+        let entry = self.counts.entry(mode.key().to_string()).or_insert(0);
+        *entry = (*entry).saturating_add(1);
+    }
+
+    fn exhausted(&mut self, mode: ReviewRepairMode) -> &'static str {
+        let reason = mode.exhaustion_key();
+        self.exhaustion_reason = reason.to_string();
+        reason
+    }
+}
+
+#[derive(Default)]
 struct TurnRetryState {
     request_too_large_retried: bool,
     output_cap_retry_attempted: bool,
@@ -696,6 +737,7 @@ impl crate::Agent {
         // went and which calls failed.
         let mut tool_timeline: Vec<ToolCallEntry> = Vec::new();
         let mut evidence = EvidenceTracker::default();
+        let mut review_repair = ReviewRepairState::default();
         // Whether the model or deterministic preflight has run a tool this
         // turn (kept for finalization gating — a plain Q&A turn doesn't need a
         // recap).
@@ -931,6 +973,7 @@ impl crate::Agent {
                             sched_serial_runs,
                             &tool_timeline,
                             &evidence,
+                            &review_repair,
                         );
                         let _ = self.persist();
                         let (kind, guidance) = crate::ui::classify_error(&err);
@@ -1099,6 +1142,7 @@ impl crate::Agent {
                             sched_serial_runs,
                             &tool_timeline,
                             &evidence,
+                            &review_repair,
                         );
                         let _ = self.persist();
                         let (kind, guidance) = crate::ui::classify_error(&err);
@@ -1226,6 +1270,7 @@ impl crate::Agent {
                             sched_serial_runs,
                             &tool_timeline,
                             &evidence,
+                            &review_repair,
                         );
                         let _ = self.persist();
                         let (kind, guidance) = crate::ui::classify_error(&err);
@@ -1939,22 +1984,28 @@ If the task is already complete, stop and give your final recap."
                     }
                     if should_nudge_no_evidence_review(read_only_intent, &evidence, &assistant_text)
                     {
-                        if evidence.quality_repair_nudges < 3 {
-                            evidence.quality_repair_nudges += 1;
+                        let mode = ReviewRepairMode::NoEvidence;
+                        if review_repair.spend(mode, &mut evidence) {
                             force_tools_next = true;
                             ui.nudge(
                                 "review answer had no inspected evidence; nudging the model to inspect before answering",
                             );
-                            self.messages
-                                .push_assistant(std::mem::take(&mut completion.content));
+                            self.messages.push_assistant_repair_note(mode);
                             self.messages.push_nudge(
                                 NudgeKind::Continue,
-                                no_evidence_review_nudge(read_only_intent.expect("checked above")),
+                                repair_nudge_with_required_next(
+                                    mode,
+                                    no_evidence_review_nudge(
+                                        read_only_intent.expect("checked above"),
+                                    ),
+                                ),
                             );
                             continue;
                         }
 
                         stalled_unfinished = true;
+                        let reason = review_repair.exhausted(mode);
+                        progress_tracker.record(ProgressKind::None, reason, None);
                         ui.nudge(
                             "review still had no inspected evidence after repair; stopping incomplete",
                         );
@@ -1968,36 +2019,54 @@ If the task is already complete, stop and give your final recap."
                         if matches!(intent, ReviewIntent::Security)
                             && evidence.saw_search
                             && !evidence.security_search_complete()
-                            && evidence.quality_repair_nudges < 4
+                            && review_repair
+                                .spend(ReviewRepairMode::SecurityBroadSearch, &mut evidence)
                         {
-                            evidence.quality_repair_nudges += 1;
                             force_tools_next = true;
                             ui.nudge(
                                 "security review gave a generic evidence disclaimer before searching all required pattern families; nudging the model to broaden the search",
                             );
                             self.messages
-                                .push_assistant(std::mem::take(&mut completion.content));
-                            self.messages
-                                .push_nudge(NudgeKind::Continue, SECURITY_BROAD_SEARCH_NUDGE);
+                                .push_assistant_repair_note(ReviewRepairMode::SecurityBroadSearch);
+                            self.messages.push_nudge(
+                                NudgeKind::Continue,
+                                repair_nudge_with_required_next(
+                                    ReviewRepairMode::SecurityBroadSearch,
+                                    SECURITY_BROAD_SEARCH_NUDGE,
+                                ),
+                            );
                             continue;
                         }
-                        if evidence.quality_repair_nudges
-                            < inspected_insufficient_repair_limit(intent)
-                        {
-                            evidence.quality_repair_nudges += 1;
+                        let mode = ReviewRepairMode::InspectedDisclaimer;
+                        let chat_mode = ReviewRepairMode::InspectedDisclaimerChatAttempt;
+                        let has_disclaimer_budget = review_repair.has_budget(mode);
+                        let has_chat_attempt_budget = review_repair.has_budget(chat_mode);
+                        if has_disclaimer_budget || has_chat_attempt_budget {
+                            if has_disclaimer_budget {
+                                review_repair.spend(mode, &mut evidence);
+                            } else {
+                                evidence.quality_repair_nudges =
+                                    evidence.quality_repair_nudges.saturating_add(1);
+                            }
+                            review_repair.note(chat_mode);
                             force_text_answer_next = true;
+                            force_tools_next = false;
                             ui.nudge(
                                 "review gave a generic evidence disclaimer after inspection; nudging the model to answer from inspected files",
                             );
-                            self.messages
-                                .push_assistant(std::mem::take(&mut completion.content));
+                            self.messages.push_assistant_repair_note(mode);
                             self.messages.push_nudge(
                                 NudgeKind::Continue,
-                                summarize_inspected_evidence_nudge(intent, &evidence),
+                                repair_nudge_with_required_next(
+                                    mode,
+                                    summarize_inspected_evidence_nudge(intent, &evidence),
+                                ),
                             );
                             continue;
                         }
                         stalled_unfinished = true;
+                        let reason = review_repair.exhausted(mode);
+                        progress_tracker.record(ProgressKind::None, reason, None);
                         ui.status(
                             "review kept returning a generic evidence disclaimer after inspection; stopping incomplete",
                         );
@@ -2005,50 +2074,66 @@ If the task is already complete, stop and give your final recap."
                         ui.status(INCOMPLETE_STATUS);
                         break false;
                     }
-                    if should_reject_review_repair_template(read_only_intent, &assistant_text) {
+                    let needs_evidence_depth_repair = evidence.listing_only()
+                        || (evidence.saw_search && !evidence.saw_read)
+                        || (matches!(read_only_intent, Some(ReviewIntent::Security))
+                            && evidence.saw_search
+                            && evidence.saw_read
+                            && !evidence.security_search_complete());
+                    if !needs_evidence_depth_repair
+                        && should_reject_review_repair_template(read_only_intent, &assistant_text)
+                    {
                         if let Some(intent) = read_only_intent
-                            && evidence.quality_repair_nudges < 3
+                            && review_repair.spend(ReviewRepairMode::GenericTemplate, &mut evidence)
                         {
-                            evidence.quality_repair_nudges += 1;
+                            let mode = ReviewRepairMode::GenericTemplate;
                             let has_inspected_evidence = evidence.saw_read || evidence.saw_search;
                             force_text_answer_next = has_inspected_evidence;
                             force_tools_next = !has_inspected_evidence;
                             ui.nudge(
                                 "review answer was a generic repair template; nudging the model to produce a concrete bounded review",
                             );
-                            self.messages
-                                .push_assistant(std::mem::take(&mut completion.content));
+                            self.messages.push_assistant_repair_note(mode);
                             let nudge = if has_inspected_evidence {
                                 summarize_inspected_evidence_nudge(intent, &evidence)
                             } else {
                                 deepen_review_nudge(intent).to_string()
                             };
-                            self.messages.push_nudge(NudgeKind::Continue, nudge);
+                            self.messages.push_nudge(
+                                NudgeKind::Continue,
+                                repair_nudge_with_required_next(mode, nudge),
+                            );
                             continue;
                         }
 
                         stalled_unfinished = true;
+                        let reason = review_repair.exhausted(ReviewRepairMode::GenericTemplate);
+                        progress_tracker.record(ProgressKind::None, reason, None);
                         ui.status("review answer stayed generic after repair; stopping incomplete");
                         ui.status(INCOMPLETE_STATUS);
                         break false;
                     }
                     if should_deepen_review(read_only_intent, &evidence, &assistant_text) {
-                        if evidence.quality_repair_nudges < 3 {
-                            evidence.quality_repair_nudges += 1;
+                        let mode = ReviewRepairMode::ListingOnly;
+                        if review_repair.spend(mode, &mut evidence) {
                             force_tools_next = true;
                             ui.nudge(
                                 "review evidence was only a listing; nudging the model to inspect files or search results",
                             );
-                            self.messages
-                                .push_assistant(std::mem::take(&mut completion.content));
+                            self.messages.push_assistant_repair_note(mode);
                             self.messages.push_nudge(
                                 NudgeKind::Continue,
-                                deepen_review_nudge(read_only_intent.expect("checked above")),
+                                repair_nudge_with_required_next(
+                                    mode,
+                                    deepen_review_nudge(read_only_intent.expect("checked above")),
+                                ),
                             );
                             continue;
                         }
 
                         stalled_unfinished = true;
+                        let reason = review_repair.exhausted(mode);
+                        progress_tracker.record(ProgressKind::None, reason, None);
                         ui.nudge(
                             "review still had only listing evidence after repair; stopping incomplete",
                         );
@@ -2060,20 +2145,23 @@ If the task is already complete, stop and give your final recap."
                         &evidence,
                         &assistant_text,
                     ) {
-                        if evidence.quality_repair_nudges < 2 {
-                            evidence.quality_repair_nudges += 1;
+                        let mode = ReviewRepairMode::ReadAfterSearch;
+                        if review_repair.spend(mode, &mut evidence) {
                             force_tools_next = true;
                             ui.nudge(
                                 "review had targeted search but no file reads; nudging the model to read matching files",
                             );
-                            self.messages
-                                .push_assistant(std::mem::take(&mut completion.content));
-                            self.messages
-                                .push_nudge(NudgeKind::Continue, READ_AFTER_SEARCH_NUDGE);
+                            self.messages.push_assistant_repair_note(mode);
+                            self.messages.push_nudge(
+                                NudgeKind::Continue,
+                                repair_nudge_with_required_next(mode, READ_AFTER_SEARCH_NUDGE),
+                            );
                             continue;
                         }
 
                         stalled_unfinished = true;
+                        let reason = review_repair.exhausted(mode);
+                        progress_tracker.record(ProgressKind::None, reason, None);
                         ui.nudge(
                             "review still had targeted search but no file reads after repair; stopping incomplete",
                         );
@@ -2085,20 +2173,23 @@ If the task is already complete, stop and give your final recap."
                         &evidence,
                         &assistant_text,
                     ) {
-                        if evidence.quality_repair_nudges < 4 {
-                            evidence.quality_repair_nudges += 1;
+                        let mode = ReviewRepairMode::SecurityBroadSearch;
+                        if review_repair.spend(mode, &mut evidence) {
                             force_tools_next = true;
                             ui.nudge(
                                 "security review missed required pattern families; nudging the model to broaden the search",
                             );
-                            self.messages
-                                .push_assistant(std::mem::take(&mut completion.content));
-                            self.messages
-                                .push_nudge(NudgeKind::Continue, SECURITY_BROAD_SEARCH_NUDGE);
+                            self.messages.push_assistant_repair_note(mode);
+                            self.messages.push_nudge(
+                                NudgeKind::Continue,
+                                repair_nudge_with_required_next(mode, SECURITY_BROAD_SEARCH_NUDGE),
+                            );
                             continue;
                         }
 
                         stalled_unfinished = true;
+                        let reason = review_repair.exhausted(mode);
+                        progress_tracker.record(ProgressKind::None, reason, None);
                         ui.nudge(
                             "security review still missed required pattern families after repair; stopping incomplete",
                         );
@@ -2106,19 +2197,22 @@ If the task is already complete, stop and give your final recap."
                         break false;
                     }
                     if should_nudge_security_scope(read_only_intent, &evidence, &assistant_text) {
-                        if evidence.quality_repair_nudges < 5 {
-                            evidence.quality_repair_nudges += 1;
+                        let mode = ReviewRepairMode::SecurityScope;
+                        if review_repair.spend(mode, &mut evidence) {
                             ui.status(
                                 "security answer overclaimed repo-wide safety; nudging the model to bound findings to evidence",
                             );
-                            self.messages
-                                .push_assistant(std::mem::take(&mut completion.content));
-                            self.messages
-                                .push_nudge(NudgeKind::Continue, SECURITY_SCOPE_NUDGE);
+                            self.messages.push_assistant_repair_note(mode);
+                            self.messages.push_nudge(
+                                NudgeKind::Continue,
+                                repair_nudge_with_required_next(mode, SECURITY_SCOPE_NUDGE),
+                            );
                             continue;
                         }
 
                         stalled_unfinished = true;
+                        let reason = review_repair.exhausted(mode);
+                        progress_tracker.record(ProgressKind::None, reason, None);
                         ui.status(
                             "security answer still overclaimed after repair; stopping incomplete",
                         );
@@ -2130,19 +2224,22 @@ If the task is already complete, stop and give your final recap."
                         &evidence,
                         &assistant_text,
                     ) {
-                        if evidence.quality_repair_nudges < 3 {
-                            evidence.quality_repair_nudges += 1;
+                        let mode = ReviewRepairMode::GapSearchOverclaim;
+                        if review_repair.spend(mode, &mut evidence) {
                             ui.nudge(
                                 "gap answer contradicted search matches; nudging the model to bound claims to inspected evidence",
                             );
-                            self.messages
-                                .push_assistant(std::mem::take(&mut completion.content));
-                            self.messages
-                                .push_nudge(NudgeKind::Continue, GAP_SEARCH_OVERCLAIM_NUDGE);
+                            self.messages.push_assistant_repair_note(mode);
+                            self.messages.push_nudge(
+                                NudgeKind::Continue,
+                                repair_nudge_with_required_next(mode, GAP_SEARCH_OVERCLAIM_NUDGE),
+                            );
                             continue;
                         }
 
                         stalled_unfinished = true;
+                        let reason = review_repair.exhausted(mode);
+                        progress_tracker.record(ProgressKind::None, reason, None);
                         ui.nudge(
                             "gap answer still overclaimed after search matches; stopping incomplete",
                         );
@@ -2152,18 +2249,21 @@ If the task is already complete, stop and give your final recap."
                     if let Some(problem) =
                         concrete_review_answer_problem(read_only_intent, &evidence, &assistant_text)
                     {
-                        if evidence.quality_repair_nudges < 3 {
-                            evidence.quality_repair_nudges += 1;
+                        let mode = ReviewRepairMode::ConcreteAnswer;
+                        if review_repair.spend(mode, &mut evidence) {
                             force_text_answer_next = true;
                             ui.nudge(problem.status());
-                            self.messages
-                                .push_assistant(std::mem::take(&mut completion.content));
-                            self.messages
-                                .push_nudge(NudgeKind::Continue, CONCRETE_REVIEW_NUDGE);
+                            self.messages.push_assistant_repair_note(mode);
+                            self.messages.push_nudge(
+                                NudgeKind::Continue,
+                                repair_nudge_with_required_next(mode, CONCRETE_REVIEW_NUDGE),
+                            );
                             continue;
                         }
 
                         stalled_unfinished = true;
+                        let reason = review_repair.exhausted(mode);
+                        progress_tracker.record(ProgressKind::None, reason, None);
                         ui.nudge(problem.exhausted_status());
                         ui.status(INCOMPLETE_STATUS);
                         break false;
@@ -2895,6 +2995,7 @@ If the task is already complete, stop and give your final recap."
             sched_serial_runs,
             &tool_timeline,
             &evidence,
+            &review_repair,
         );
 
         // Long-horizon driver: when a structured goal is set and long_horizon

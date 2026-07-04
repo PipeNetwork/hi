@@ -538,7 +538,7 @@ mod tests {
                 ProviderErrorKind::ToolProtocol,
             ),
             (
-                r#"{"error":"quality_rejected: insufficient evidence after review evidence repair"}"#,
+                r#"{"error":"quality_rejected: provider quality check failed"}"#,
                 ProviderErrorKind::QualityRejected,
             ),
             (

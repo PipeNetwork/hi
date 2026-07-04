@@ -195,6 +195,8 @@ async fn working_tree_diff_impl(color: bool) -> String {
                     .await
                     .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
                     .unwrap_or_default()
+            } else if git_diff_failed_not_repo(&stderr) {
+                return "not a git repository; no git diff available".to_string();
             } else {
                 return format!(
                     "not a git repository (or git unavailable): {}",
@@ -228,6 +230,15 @@ async fn working_tree_diff_impl(color: bool) -> String {
         ));
     }
     out
+}
+
+fn git_diff_failed_not_repo(stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("not a git repository")
+        || lower.contains("not a git repo")
+        || lower.contains("outside repository")
+        || lower.contains("outside a work tree")
+        || lower.contains("usage: git diff")
 }
 
 fn render_untracked_files(files: &[&str], limit: usize) -> String {
@@ -1607,7 +1618,7 @@ mod tests {
     use super::{
         fast_check_for, foreground_interactive_command_reason, is_filesystem_mutating,
         is_read_only, render_untracked_files, run_bash_streaming_with_timeout, run_check,
-        target_path,
+        target_path, working_tree_diff_plain,
     };
     use crate::edit::sh_quote;
     use std::sync::{LazyLock, Mutex};
@@ -1632,6 +1643,23 @@ mod tests {
         assert!(rendered.contains("  + scratch/ (2 entries)"));
         assert!(rendered.contains("  ... omitted 1 untracked entry (limit 3)"));
         assert!(!rendered.contains("models/a.bin"));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn diff_in_non_git_directory_is_concise() {
+        let _guard = CWD_TEST_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!("hi-diff-non-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+
+        let output = working_tree_diff_plain().await;
+
+        std::env::set_current_dir(old).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(output, "not a git repository; no git diff available");
     }
 
     // A command that keeps its stdout pipe open and never exits must still

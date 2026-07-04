@@ -1126,9 +1126,11 @@ mod tests {
             ProviderErrorKind::ToolProtocol
         );
         assert_eq!(
-            classify_stream_api_error(
-                "quality_rejected: insufficient evidence after review evidence repair"
-            ),
+            classify_stream_api_error("quality_rejected: provider quality check failed"),
+            ProviderErrorKind::QualityRejected
+        );
+        assert_ne!(
+            classify_stream_api_error("inspected evidence disclaimer after repair"),
             ProviderErrorKind::QualityRejected
         );
     }

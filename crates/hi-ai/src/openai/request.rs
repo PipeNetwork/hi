@@ -155,12 +155,19 @@ pub(crate) fn is_model_unavailable_text(text: &str) -> bool {
 }
 
 pub(crate) fn is_quality_rejected_text(text: &str) -> bool {
+    if is_review_evidence_repair_text(text) {
+        return false;
+    }
+    mentions(
+        text,
+        &["quality_rejected", "quality rejected", "quality check"],
+    )
+}
+
+fn is_review_evidence_repair_text(text: &str) -> bool {
     mentions(
         text,
         &[
-            "quality_rejected",
-            "quality rejected",
-            "quality check",
             "insufficient evidence",
             "inspected evidence",
             "review evidence",
@@ -339,7 +346,13 @@ pub(crate) fn to_openai_messages(messages: &[Message]) -> Vec<Value> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_body, request_attempts, to_openai_messages};
+    use super::{
+        build_body, classify_http_error, is_quality_rejected_text, request_attempts,
+        to_openai_messages,
+    };
+    use reqwest::StatusCode;
+
+    use crate::provider::ProviderErrorKind;
     use crate::types::Message;
 
     #[test]
@@ -469,5 +482,36 @@ mod tests {
             "frequency_penalty: {}",
             hot["frequency_penalty"]
         );
+    }
+
+    #[test]
+    fn review_evidence_repair_text_is_not_quality_rejected() {
+        for text in [
+            "insufficient evidence after review repair",
+            "model needs inspected evidence before answering",
+            "review evidence repair exhausted",
+            "quality_rejected: review evidence repair exhausted",
+        ] {
+            assert!(
+                !is_quality_rejected_text(text),
+                "review repair text should not be quality_rejected: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_review_quality_rejected_text_still_classifies() {
+        for text in [
+            "quality_rejected: provider quality check failed",
+            r#"{"error":"quality_rejected: provider quality check failed"}"#,
+            r#"{"error":{"message":"quality_rejected: provider quality check failed"}}"#,
+        ] {
+            assert!(is_quality_rejected_text(text), "{text}");
+            assert_eq!(
+                classify_http_error(StatusCode::BAD_REQUEST, text),
+                ProviderErrorKind::QualityRejected,
+                "{text}"
+            );
+        }
     }
 }

@@ -43,17 +43,17 @@ pub(crate) fn answer_says_insufficient_evidence(content: &str) -> bool {
 pub(crate) fn should_deepen_review(
     intent: Option<ReviewIntent>,
     evidence: &EvidenceTracker,
-    answer: &str,
+    _answer: &str,
 ) -> bool {
-    intent.is_some() && evidence.listing_only() && !answer_says_insufficient_evidence(answer)
+    intent.is_some() && evidence.listing_only()
 }
 
 pub(crate) fn should_nudge_no_evidence_review(
     intent: Option<ReviewIntent>,
     evidence: &EvidenceTracker,
-    answer: &str,
+    _answer: &str,
 ) -> bool {
-    intent.is_some() && !evidence.has_discovery() && !answer_says_insufficient_evidence(answer)
+    intent.is_some() && !evidence.has_discovery()
 }
 
 pub(crate) fn answer_looks_like_review_repair_template(content: &str) -> bool {
@@ -140,6 +140,9 @@ pub(crate) fn concrete_review_answer_problem(
     }
     if answer_looks_like_generic_inventory_summary(answer) {
         return Some(ConcreteReviewAnswerProblem::GenericInventorySummary);
+    }
+    if answer_is_concise_bounded_review(intent, answer) {
+        return None;
     }
     if answer_lacks_review_shape(intent, answer) {
         return Some(ConcreteReviewAnswerProblem::MissingReviewShape);
@@ -265,6 +268,93 @@ pub(crate) fn answer_lacks_review_shape(intent: ReviewIntent, answer: &str) -> b
     !(has_evidence_language && has_review_language)
 }
 
+fn answer_is_concise_bounded_review(intent: ReviewIntent, answer: &str) -> bool {
+    let lower = answer.to_ascii_lowercase();
+    let has_evidence_language = contains_any(
+        &lower,
+        &[
+            "inspected",
+            "reviewed",
+            "read",
+            "evidence",
+            "based on",
+            "from the inspected",
+            "in the inspected",
+        ],
+    );
+    let has_bounded_limit = contains_any(
+        &lower,
+        &[
+            "limit:",
+            "limits:",
+            "limited to",
+            "not a complete",
+            "only inspected",
+            "from this file alone",
+            "outside the inspected",
+            "cannot rule out",
+        ],
+    );
+    let has_review_signal = match intent {
+        ReviewIntent::Security => contains_any(
+            &lower,
+            &[
+                "security",
+                "unsafe",
+                "unwrap",
+                "expect",
+                "panic",
+                "secret",
+                "token",
+                "auth",
+                "risk",
+                "finding",
+                "issue",
+                "confirmed",
+            ],
+        ),
+        ReviewIntent::Status => contains_any(
+            &lower,
+            &[
+                "status",
+                "state",
+                "blocker",
+                "validation",
+                "risk",
+                "current",
+                "review",
+                "confirmed",
+            ],
+        ),
+        ReviewIntent::Roadmap | ReviewIntent::Gaps => contains_any(
+            &lower,
+            &[
+                "missing",
+                "gap",
+                "roadmap",
+                "build next",
+                "coverage",
+                "risk",
+                "work",
+                "confirmed",
+            ],
+        ),
+        ReviewIntent::Review => contains_any(
+            &lower,
+            &[
+                "finding",
+                "review",
+                "issue",
+                "risk",
+                "follow-up",
+                "follow up",
+                "confirmed",
+            ],
+        ),
+    };
+    has_evidence_language && has_bounded_limit && has_review_signal
+}
+
 pub(crate) fn answer_looks_like_generic_inventory_summary(answer: &str) -> bool {
     let lower = answer.to_ascii_lowercase();
     let inventory_markers = [
@@ -316,12 +406,9 @@ pub(crate) fn should_nudge_read_after_repeated_search(
 pub(crate) fn should_nudge_read_after_search_final(
     intent: Option<ReviewIntent>,
     evidence: &EvidenceTracker,
-    answer: &str,
+    _answer: &str,
 ) -> bool {
-    intent.is_some()
-        && evidence.saw_search
-        && !evidence.saw_read
-        && !answer_says_insufficient_evidence(answer)
+    intent.is_some() && evidence.saw_search && !evidence.saw_read
 }
 
 pub(crate) fn should_nudge_security_broad_search(
@@ -484,16 +571,6 @@ pub(crate) fn summarize_inspected_evidence_nudge(
         ReviewIntent::Review => format!(
             "You already have inspected evidence for this {label}. Do not answer with a generic refusal or evidence disclaimer. Produce bounded findings from only the inspected files/searches. Cite concrete inspected files from this set: {paths}. Include findings, evidence, follow-up, and limits."
         ),
-    }
-}
-
-pub(crate) fn inspected_insufficient_repair_limit(intent: ReviewIntent) -> u32 {
-    match intent {
-        ReviewIntent::Security => 4,
-        ReviewIntent::Status
-        | ReviewIntent::Roadmap
-        | ReviewIntent::Gaps
-        | ReviewIntent::Review => 3,
     }
 }
 

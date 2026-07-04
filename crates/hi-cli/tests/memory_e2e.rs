@@ -66,8 +66,13 @@ fn run_hi(dir: &Path, server_url: &str, extra_args: &[&str], stdin_script: &str)
     assert!(status.code().is_some(), "hi exited cleanly (not killed)");
 }
 
-fn run_hi_one_shot(dir: &Path, server_url: &str, extra_args: &[&str], prompt: &str) {
-    let output = Command::new(env!("CARGO_BIN_EXE_hi"))
+fn run_hi_one_shot_output(
+    dir: &Path,
+    server_url: &str,
+    extra_args: &[&str],
+    prompt: &str,
+) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_hi"))
         .current_dir(dir)
         .env("HOME", dir)
         .env("HI_MODEL", "fake/model")
@@ -76,7 +81,11 @@ fn run_hi_one_shot(dir: &Path, server_url: &str, extra_args: &[&str], prompt: &s
         .args(extra_args)
         .arg(prompt)
         .output()
-        .expect("spawn hi");
+        .expect("spawn hi")
+}
+
+fn run_hi_one_shot(dir: &Path, server_url: &str, extra_args: &[&str], prompt: &str) {
+    let output = run_hi_one_shot_output(dir, server_url, extra_args, prompt);
     assert!(
         output.status.success(),
         "hi failed\nstdout:\n{}\nstderr:\n{}",
@@ -105,6 +114,98 @@ fn one_shot_report_creates_parent_directories() {
     let json: serde_json::Value = serde_json::from_str(&text).expect("report json");
     assert_eq!(json["model"], "fake/model");
     assert_eq!(json["output_tokens"], 5);
+}
+
+#[test]
+fn review_repair_report_contains_stall_telemetry() {
+    let weak_review = "The repository looks healthy and organized.";
+    let Some(server) = FakeOpenAiServer::new(
+        (0..5)
+            .map(|_| Response::sse(sse_with_usage(weak_review)))
+            .collect(),
+    ) else {
+        return;
+    };
+    let tmp = TempDir::new("review-report");
+    let report = tmp.path().join("reports/review.json");
+    let report_arg = report.to_string_lossy().to_string();
+
+    let output = run_hi_one_shot_output(
+        tmp.path(),
+        server.url(),
+        &[
+            "--no-save",
+            "--no-memory",
+            "--no-auto-compact",
+            "--no-finalize",
+            "--report",
+            &report_arg,
+        ],
+        "/status codebase state",
+    );
+    assert!(
+        output.status.success(),
+        "hi failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let visible = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let visible_lower = visible.to_ascii_lowercase();
+    assert!(
+        !visible_lower.contains("insufficient evidence")
+            && !visible_lower.contains("quality_rejected"),
+        "review repair text should not leak visibly:\n{visible}"
+    );
+    let bodies = server.bodies();
+    assert!(
+        bodies.len() > 1,
+        "weak review answer should trigger additional model calls"
+    );
+    assert!(
+        bodies
+            .iter()
+            .any(|body| body.contains("not a git repository; no git diff available")),
+        "non-git preflight diff output should be concise: {bodies:?}"
+    );
+    assert!(
+        !bodies
+            .iter()
+            .any(|body| body.to_ascii_lowercase().contains("usage: git diff")),
+        "non-git preflight diff output should not include verbose git help: {bodies:?}"
+    );
+
+    let text = std::fs::read_to_string(&report).expect("report should be written");
+    let json: serde_json::Value = serde_json::from_str(&text).expect("report json");
+    let telemetry = &json["telemetry"];
+    assert_eq!(telemetry["quality_repair_nudges"], 4);
+    assert_eq!(
+        telemetry["last_stall_reason"],
+        "review_listing_only_exhausted"
+    );
+    assert_eq!(
+        telemetry["review_repair_exhaustion_reason"],
+        "review_listing_only_exhausted"
+    );
+    assert_eq!(telemetry["review_repair_counts"]["review_listing_only"], 4);
+    assert_eq!(telemetry["review_repair_stopped_by_exhaustion"], true);
+    assert_eq!(telemetry["stopped_by_step_cap"], false);
+    assert_eq!(telemetry["stalled_unfinished"], true);
+    assert_eq!(telemetry["hit_step_cap"], false);
+    assert!(telemetry["progress_events"].is_array());
+    assert!(telemetry["tool_timeline"].is_array());
+    assert!(
+        telemetry["progress_events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["reason"] == "review_listing_only_exhausted"),
+        "progress events should include review exhaustion reason: {telemetry}"
+    );
 }
 
 #[test]

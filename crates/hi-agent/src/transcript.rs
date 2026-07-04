@@ -25,6 +25,7 @@
 
 use std::sync::Arc;
 
+use crate::steering::ReviewRepairMode;
 use hi_ai::{Content, Message, Role};
 
 const PROVIDER_VISIBLE_ASSISTANT_PLACEHOLDER: &str =
@@ -303,6 +304,26 @@ impl Transcript {
             content.push(Content::Text(PROVIDER_VISIBLE_ASSISTANT_PLACEHOLDER.into()));
         }
         self.make_mut().push(Message::assistant(content));
+    }
+
+    /// Append a short provider-visible assistant note for a rejected text-only
+    /// review draft. The rejected draft itself is intentionally not recorded:
+    /// weaker models tend to imitate their own failed answer if it remains in
+    /// context, while the following nudge already carries the repair guidance.
+    pub(crate) fn push_assistant_repair_note(&mut self, mode: ReviewRepairMode) {
+        let reason = mode.key();
+        let required_next = mode.required_next();
+        let note = format!(
+            "[review retry: reason={reason}; required_next={required_next}; do_not_repeat_previous_draft]"
+        );
+        let note_lower = note.to_ascii_lowercase();
+        debug_assert!(
+            !note_lower.contains("insufficient evidence")
+                && !note_lower.contains("quality_rejected"),
+            "repair note reason should not include provider/error trigger text"
+        );
+        self.make_mut()
+            .push(Message::assistant(vec![Content::Text(note)]));
     }
 
     /// Append an assistant message that contains `ToolCall` blocks, immediately
@@ -864,6 +885,52 @@ mod tests {
             name: name.into(),
             arguments: "{}".into(),
         }])
+    }
+
+    #[test]
+    fn assistant_repair_notes_are_directive_and_trigger_free() {
+        let cases = [
+            (
+                ReviewRepairMode::NoEvidence,
+                "review_no_evidence",
+                "inspect_files_before_answering",
+            ),
+            (
+                ReviewRepairMode::ListingOnly,
+                "review_listing_only",
+                "inspect_one_concrete_file_before_answering",
+            ),
+            (
+                ReviewRepairMode::ReadAfterSearch,
+                "review_read_after_search",
+                "read_one_matching_file_before_answering",
+            ),
+            (
+                ReviewRepairMode::InspectedDisclaimer,
+                "review_inspected_disclaimer",
+                "chat_only_bounded_answer_from_inspected_files",
+            ),
+            (
+                ReviewRepairMode::ConcreteAnswer,
+                "review_concrete_answer",
+                "cite_findings_plus_limits",
+            ),
+        ];
+
+        for (mode, reason, required_next) in cases {
+            let mut t = Transcript::new(vec![user("review this")]);
+            t.push_assistant_repair_note(mode);
+            let text = t.as_slice().last().unwrap().text();
+            assert_eq!(
+                text,
+                format!(
+                    "[review retry: reason={reason}; required_next={required_next}; do_not_repeat_previous_draft]"
+                )
+            );
+            let lower = text.to_ascii_lowercase();
+            assert!(!lower.contains("insufficient evidence"), "{text}");
+            assert!(!lower.contains("quality_rejected"), "{text}");
+        }
     }
 
     #[test]

@@ -1,9 +1,10 @@
 use super::common::*;
 use super::*;
 use crate::steering::{
-    GAPS_INSPECTION_CAP, REVIEW_INSPECTION_CAP, ROADMAP_INSPECTION_CAP, SECURITY_INSPECTION_CAP,
-    STATUS_INSPECTION_CAP, active_read_only_inspection_cap, default_read_only_inspection_cap,
-    explicit_read_only_inspection_cap, read_only_turn_prompt,
+    GAPS_INSPECTION_CAP, REVIEW_INSPECTION_CAP, ROADMAP_INSPECTION_CAP, ReviewRepairMode,
+    SECURITY_INSPECTION_CAP, STATUS_INSPECTION_CAP, active_read_only_inspection_cap,
+    default_read_only_inspection_cap, explicit_read_only_inspection_cap, read_only_turn_prompt,
+    repair_nudge_with_required_next,
 };
 
 #[test]
@@ -73,6 +74,122 @@ fn read_only_inspection_caps_are_intent_specific() {
         default_read_only_inspection_cap(ReviewIntent::Security),
         SECURITY_INSPECTION_CAP
     );
+}
+
+#[test]
+fn review_repair_modes_map_stable_metadata() {
+    let expected = [
+        (
+            ReviewRepairMode::NoEvidence,
+            "review_no_evidence",
+            "review_no_evidence_exhausted",
+            "inspect_files_before_answering",
+            "no_evidence",
+            4,
+        ),
+        (
+            ReviewRepairMode::ListingOnly,
+            "review_listing_only",
+            "review_listing_only_exhausted",
+            "inspect_one_concrete_file_before_answering",
+            "listing",
+            4,
+        ),
+        (
+            ReviewRepairMode::GenericTemplate,
+            "review_generic_template",
+            "review_generic_disclaimer_exhausted",
+            "produce_concrete_bounded_review",
+            "generic",
+            4,
+        ),
+        (
+            ReviewRepairMode::InspectedDisclaimer,
+            "review_inspected_disclaimer",
+            "review_generic_disclaimer_exhausted",
+            "chat_only_bounded_answer_from_inspected_files",
+            "disclaimer",
+            4,
+        ),
+        (
+            ReviewRepairMode::InspectedDisclaimerChatAttempt,
+            "review_inspected_disclaimer_chat_attempt",
+            "review_generic_disclaimer_exhausted",
+            "chat_only_bounded_answer_from_inspected_files",
+            "disclaimer_chat",
+            2,
+        ),
+        (
+            ReviewRepairMode::ConcreteAnswer,
+            "review_concrete_answer",
+            "review_concrete_answer_exhausted",
+            "cite_findings_plus_limits",
+            "concrete",
+            4,
+        ),
+        (
+            ReviewRepairMode::ReadAfterSearch,
+            "review_read_after_search",
+            "review_read_after_search_exhausted",
+            "read_one_matching_file_before_answering",
+            "read_after_search",
+            2,
+        ),
+        (
+            ReviewRepairMode::SecurityBroadSearch,
+            "review_security_broad_search",
+            "review_security_broad_search_exhausted",
+            "search_required_security_patterns_before_answering",
+            "security_broad",
+            4,
+        ),
+        (
+            ReviewRepairMode::SecurityScope,
+            "review_security_scope",
+            "review_security_scope_exhausted",
+            "bound_security_claims_to_inspected_evidence",
+            "security_scope",
+            5,
+        ),
+        (
+            ReviewRepairMode::GapSearchOverclaim,
+            "review_gap_search_overclaim",
+            "review_gap_search_overclaim_exhausted",
+            "cite_search_matches_plus_limits",
+            "gap_overclaim",
+            3,
+        ),
+    ];
+
+    assert_eq!(ReviewRepairMode::ALL.len(), expected.len());
+    for (mode, key, exhaustion, required_next, compact, limit) in expected {
+        assert!(ReviewRepairMode::ALL.contains(&mode));
+        assert_eq!(mode.key(), key);
+        assert_eq!(mode.exhaustion_key(), exhaustion);
+        assert_eq!(mode.required_next(), required_next);
+        assert_eq!(mode.compact_label(), compact);
+        assert_eq!(mode.default_limit(), limit);
+        assert_eq!(crate::compact_review_repair_label(key), compact);
+    }
+    assert_eq!(
+        crate::compact_review_repair_label("review_listing_only_exhausted"),
+        "listing"
+    );
+    assert_eq!(
+        crate::compact_review_repair_label("review_generic_disclaimer_exhausted"),
+        "generic"
+    );
+}
+
+#[test]
+fn visible_review_repair_nudges_repeat_required_next_action() {
+    let nudge = repair_nudge_with_required_next(
+        ReviewRepairMode::ReadAfterSearch,
+        "The targeted search result is already in the transcript.",
+    );
+
+    assert!(nudge.contains("Required next action `read_one_matching_file_before_answering`"));
+    assert!(nudge.contains("read one matching file from the search results before answering"));
 }
 
 #[test]
@@ -751,6 +868,35 @@ fn concrete_review_accepts_distinctive_inspected_file_aliases() {
 }
 
 #[test]
+fn concrete_review_accepts_concise_cited_answers_with_limits() {
+    let mut security_evidence = EvidenceTracker::default();
+    security_evidence.record_success(
+        "read",
+        r#"{"path":"src/lib.rs"}"#,
+        "pub fn value(input: Option<i32>) -> i32 { input.unwrap_or_default() }\n",
+    );
+    assert_eq!(
+        concrete_review_answer_problem(
+            Some(ReviewIntent::Security),
+            &security_evidence,
+            "src/lib.rs: reviewed for unsafe/unwrap issues from inspected evidence; no confirmed finding from this file alone. Limits: only src/lib.rs was inspected."
+        ),
+        None
+    );
+
+    let mut status_evidence = EvidenceTracker::default();
+    status_evidence.record_success("read", r#"{"path":"Cargo.toml"}"#, "[workspace]\n");
+    assert_eq!(
+        concrete_review_answer_problem(
+            Some(ReviewIntent::Status),
+            &status_evidence,
+            "Cargo.toml: status reviewed from the inspected manifest; no current blocker was established. Limits: only Cargo.toml was inspected, and no validation was run."
+        ),
+        None
+    );
+}
+
+#[test]
 fn round_adds_evidence_detects_re_reads_and_re_searches() {
     let mut evidence = EvidenceTracker::default();
     // Record one read and one grep.
@@ -926,13 +1072,31 @@ fn search_hit_snippets_keep_late_high_signal_matches() {
 
 #[tokio::test]
 async fn security_review_prompts_advertise_only_read_only_tools() {
-    let responses = vec![completion(
-        vec![Content::Text(
-            "I need to inspect targeted search results or file reads first.".into(),
-        )],
-        1,
-        1,
-    )];
+    let responses = vec![
+        completion(
+            vec![Content::Text(
+                "I need to inspect targeted search results or file reads first.".into(),
+            )],
+            1,
+            1,
+        ),
+        completion(
+            vec![Content::ToolCall {
+                id: "read".into(),
+                name: "read".into(),
+                arguments: r#"{"path":"Cargo.toml"}"#.into(),
+            }],
+            1,
+            1,
+        ),
+        completion(
+            vec![Content::Text(
+                "Findings:\n- Cargo.toml was inspected as security review context.\n\nLimits:\n- Limited to inspected evidence.".into(),
+            )],
+            1,
+            1,
+        ),
+    ];
     let tool_names = std::sync::Arc::new(Mutex::new(Vec::new()));
     let modes = std::sync::Arc::new(Mutex::new(Vec::new()));
     let provider = RecordRequests {
@@ -1428,22 +1592,37 @@ fn security_preflight_is_code_scoped_and_bounded() {
 async fn read_only_review_no_evidence_repair_exhaustion_stops_incomplete() {
     let responses = vec![
         completion(
-            vec![Content::Text("Completed the requested action.".into())],
+            vec![Content::Text(
+                "Not enough evidence to review without inspecting files.".into(),
+            )],
             1,
             1,
         ),
         completion(
-            vec![Content::Text("Completed the requested action.".into())],
+            vec![Content::Text(
+                "Not enough evidence to review without inspecting files.".into(),
+            )],
             1,
             1,
         ),
         completion(
-            vec![Content::Text("Completed the requested action.".into())],
+            vec![Content::Text(
+                "Not enough evidence to review without inspecting files.".into(),
+            )],
             1,
             1,
         ),
         completion(
-            vec![Content::Text("Completed the requested action.".into())],
+            vec![Content::Text(
+                "Not enough evidence to review without inspecting files.".into(),
+            )],
+            1,
+            1,
+        ),
+        completion(
+            vec![Content::Text(
+                "Not enough evidence to review without inspecting files.".into(),
+            )],
             1,
             1,
         ),
@@ -1472,9 +1651,166 @@ async fn read_only_review_no_evidence_repair_exhaustion_stops_incomplete() {
         ui.statuses
     );
     let telemetry = agent.last_turn_telemetry();
-    assert_eq!(telemetry.quality_repair_nudges, 3);
+    assert_eq!(telemetry.quality_repair_nudges, 4);
     assert_eq!(telemetry.discovery_depth, "none");
+    assert_eq!(telemetry.last_stall_reason, "review_no_evidence_exhausted");
     assert!(telemetry.stalled_unfinished);
+}
+
+#[tokio::test]
+async fn listing_only_review_gets_full_budget_after_no_evidence_repair() {
+    let responses = vec![
+        completion(
+            vec![Content::Text(
+                "The repository looks healthy and organized.".into(),
+            )],
+            1,
+            1,
+        ),
+        completion(
+            vec![Content::ToolCall {
+                id: "list".into(),
+                name: "list".into(),
+                arguments: r#"{"path":"."}"#.into(),
+            }],
+            1,
+            1,
+        ),
+        completion(
+            vec![Content::Text(
+                "The repository looks healthy and organized.".into(),
+            )],
+            1,
+            1,
+        ),
+        completion(
+            vec![Content::Text(
+                "The repository looks healthy and organized.".into(),
+            )],
+            1,
+            1,
+        ),
+        completion(
+            vec![Content::Text(
+                "The repository looks healthy and organized.".into(),
+            )],
+            1,
+            1,
+        ),
+        completion(
+            vec![Content::Text(
+                "The repository looks healthy and organized.".into(),
+            )],
+            1,
+            1,
+        ),
+        completion(
+            vec![Content::Text(
+                "The repository looks healthy and organized.".into(),
+            )],
+            1,
+            1,
+        ),
+    ];
+    let mut agent = agent(responses, config());
+    let mut ui = RecUi::default();
+
+    agent
+        .run_turn("/status codebase state", &mut ui)
+        .await
+        .unwrap();
+
+    let telemetry = agent.last_turn_telemetry();
+    assert_eq!(telemetry.quality_repair_nudges, 5);
+    assert_eq!(telemetry.review_repair_counts["review_no_evidence"], 1);
+    assert_eq!(telemetry.review_repair_counts["review_listing_only"], 4);
+    assert_eq!(
+        telemetry.review_repair_exhaustion_reason,
+        "review_listing_only_exhausted"
+    );
+    assert_eq!(telemetry.last_stall_reason, "review_listing_only_exhausted");
+    assert!(telemetry.stalled_unfinished);
+}
+
+#[tokio::test]
+async fn rejected_text_only_review_draft_is_compacted_in_repair_context() {
+    let responses = vec![
+        ProviderStep::Completion(completion(
+            vec![Content::Text(
+                "The repository looks healthy and organized.".into(),
+            )],
+            1,
+            1,
+        )),
+        ProviderStep::Completion(completion(
+            vec![Content::ToolCall {
+                id: "read".into(),
+                name: "read".into(),
+                arguments: r#"{"path":"Cargo.toml"}"#.into(),
+            }],
+            1,
+            1,
+        )),
+        ProviderStep::Completion(completion(
+            vec![Content::Text(
+                "Status:\n- Based on the inspected Cargo.toml, the workspace manifest was reviewed.\n\nEvidence:\n- Cargo.toml was read.\n\nRisks/Validation:\n- Limited to inspected evidence.".into(),
+            )],
+            1,
+            1,
+        )),
+    ];
+    let (mut agent, requests) = scripted_agent(responses, config());
+    let mut ui = RecUi::default();
+
+    agent
+        .run_turn("/status codebase state", &mut ui)
+        .await
+        .unwrap();
+
+    let requests = requests.lock().unwrap();
+    assert!(
+        requests.len() >= 2,
+        "expected a repair request: {requests:?}"
+    );
+    let second_request_text = requests[1]
+        .iter()
+        .map(Message::text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        second_request_text.contains(
+            "[review retry: reason=review_no_evidence; required_next=inspect_files_before_answering; do_not_repeat_previous_draft]"
+        ),
+        "repair note missing from provider context: {second_request_text}"
+    );
+    assert!(
+        !second_request_text.contains("The repository looks healthy and organized."),
+        "rejected draft should not be fed back verbatim: {second_request_text}"
+    );
+    assert!(
+        !second_request_text
+            .to_ascii_lowercase()
+            .contains("insufficient evidence"),
+        "repair note should avoid noisy provider/review trigger wording: {second_request_text}"
+    );
+
+    assert!(
+        agent.messages().iter().any(|message| {
+            message.role == Role::Assistant
+                && message.content.iter().any(
+                    |content| matches!(content, Content::ToolCall { name, .. } if name == "read"),
+                )
+        }),
+        "assistant tool-call turns must still be stored normally"
+    );
+    assert!(
+        agent
+            .messages()
+            .iter()
+            .any(|message| message.role == Role::Assistant
+                && message.text().contains("Based on the inspected Cargo.toml")),
+        "accepted final review answer should be stored normally"
+    );
 }
 
 #[tokio::test]
@@ -1565,6 +1901,11 @@ async fn read_only_review_repair_exhaustion_reports_inspected_evidence() {
             1,
             1,
         ),
+        completion(
+            vec![Content::Text("Completed the requested action.".into())],
+            1,
+            1,
+        ),
     ];
     let mut agent = agent(responses, config());
     let mut ui = RecUi::default();
@@ -1583,7 +1924,11 @@ async fn read_only_review_repair_exhaustion_reports_inspected_evidence() {
         ui.assistant
     );
     let telemetry = agent.last_turn_telemetry();
-    assert_eq!(telemetry.quality_repair_nudges, 3);
+    assert_eq!(telemetry.quality_repair_nudges, 4);
+    assert_eq!(
+        telemetry.last_stall_reason,
+        "review_concrete_answer_exhausted"
+    );
     assert!(telemetry.stalled_unfinished);
     let _ = std::fs::remove_file(inspected_path);
 }
@@ -1686,7 +2031,12 @@ async fn read_only_review_generic_insufficient_after_read_reports_evidence() {
         "expected replacement status: {:?}",
         ui.statuses
     );
-    assert!(agent.last_turn_telemetry().stalled_unfinished);
+    let telemetry = agent.last_turn_telemetry();
+    assert_eq!(
+        telemetry.last_stall_reason,
+        "review_generic_disclaimer_exhausted"
+    );
+    assert!(telemetry.stalled_unfinished);
     let _ = std::fs::remove_file(inspected_path);
 }
 
@@ -1737,7 +2087,12 @@ async fn read_only_review_generic_insufficient_after_read_gets_summary_repair() 
             1,
         ),
     ];
-    let mut agent = agent(responses, config());
+    let modes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordToolModes {
+        responses: Mutex::new(responses),
+        modes: modes.clone(),
+    };
+    let mut agent = Agent::new(Box::new(provider), config());
     let mut ui = RecUi::default();
 
     agent
@@ -1768,6 +2123,96 @@ async fn read_only_review_generic_insufficient_after_read_gets_summary_repair() 
     let telemetry = agent.last_turn_telemetry();
     assert_eq!(telemetry.quality_repair_nudges, 1);
     assert!(!telemetry.stalled_unfinished);
+    let modes = modes.lock().unwrap();
+    assert_eq!(
+        modes.last(),
+        Some(&ToolMode::ChatOnly),
+        "summary repair should force a chat-only answer attempt: {modes:?}"
+    );
+    let _ = std::fs::remove_file(inspected_path);
+}
+
+#[tokio::test]
+async fn inspected_disclaimer_chat_attempts_do_not_share_unrelated_repair_budget() {
+    let inspected_path = temp_file("inspected-disclaimer-independent");
+    std::fs::write(&inspected_path, "[workspace]\n").unwrap();
+    let inspected = inspected_path.to_string_lossy().to_string();
+    let responses = vec![
+        completion(
+            vec![Content::Text(
+                "The repository looks healthy and organized.".into(),
+            )],
+            1,
+            1,
+        ),
+        completion(
+            vec![Content::ToolCall {
+                id: "read".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({ "path": inspected.clone() }).to_string(),
+            }],
+            1,
+            1,
+        ),
+        completion(
+            vec![Content::Text(
+                "Not enough evidence to provide a review without more file reads.".into(),
+            )],
+            1,
+            1,
+        ),
+        completion(
+            vec![Content::Text(
+                "Not enough evidence to provide a review without more file reads.".into(),
+            )],
+            1,
+            1,
+        ),
+        completion(
+            vec![Content::Text(format!(
+                "Status:\n- Based on the inspected {inspected}, the workspace manifest was reviewed.\n\nEvidence:\n- {inspected} was read.\n\nRisks/Validation:\n- Limited to inspected evidence."
+            ))],
+            1,
+            1,
+        ),
+    ];
+    let modes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let provider = RecordToolModes {
+        responses: Mutex::new(responses),
+        modes: modes.clone(),
+    };
+    let mut agent = Agent::new(Box::new(provider), config());
+    let mut ui = RecUi::default();
+
+    agent
+        .run_turn("/status codebase state", &mut ui)
+        .await
+        .unwrap();
+
+    let telemetry = agent.last_turn_telemetry();
+    assert_eq!(telemetry.review_repair_counts["review_no_evidence"], 1);
+    assert_eq!(
+        telemetry.review_repair_counts["review_inspected_disclaimer"],
+        2
+    );
+    assert_eq!(
+        telemetry.review_repair_counts["review_inspected_disclaimer_chat_attempt"],
+        2
+    );
+    assert_eq!(telemetry.quality_repair_nudges, 3);
+    assert!(!telemetry.stalled_unfinished);
+    let modes = modes.lock().unwrap();
+    assert_eq!(
+        modes.as_slice(),
+        &[
+            ToolMode::Auto,
+            ToolMode::Required,
+            ToolMode::Auto,
+            ToolMode::ChatOnly,
+            ToolMode::ChatOnly,
+        ],
+        "inspected-disclaimer repairs should force independent chat-only answer attempts: {modes:?}"
+    );
     let _ = std::fs::remove_file(inspected_path);
 }
 
@@ -2270,7 +2715,8 @@ async fn listing_only_review_repair_exhaustion_stops_incomplete() {
         ),
         completion(
             vec![Content::Text(
-                "The repository looks healthy and organized.".into(),
+                "Only a directory listing is available; I need to inspect files before reviewing."
+                    .into(),
             )],
             1,
             1,
@@ -2278,6 +2724,13 @@ async fn listing_only_review_repair_exhaustion_stops_incomplete() {
         completion(
             vec![Content::Text(
                 "Findings/Status:\n- The inspected context points to `src/lib.rs`.".into(),
+            )],
+            1,
+            1,
+        ),
+        completion(
+            vec![Content::Text(
+                "The repository looks healthy and organized.".into(),
             )],
             1,
             1,
@@ -2318,8 +2771,9 @@ async fn listing_only_review_repair_exhaustion_stops_incomplete() {
         ui.statuses
     );
     let telemetry = agent.last_turn_telemetry();
-    assert_eq!(telemetry.quality_repair_nudges, 3);
+    assert_eq!(telemetry.quality_repair_nudges, 4);
     assert!(telemetry.listing_only);
+    assert_eq!(telemetry.last_stall_reason, "review_listing_only_exhausted");
     assert!(telemetry.stalled_unfinished);
     assert!(agent.usage_summary(agent.totals()).contains("stalled"));
 }

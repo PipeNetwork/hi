@@ -18,7 +18,7 @@ mod transcript;
 pub mod ui;
 mod verify;
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use hi_ai::{Provider, ToolSpec, Usage};
 
@@ -65,6 +65,11 @@ pub use goal::{DEFAULT_SUBGOAL_RETRIES, Goal, GoalStatus, SubGoal};
 
 /// Crate version (from Cargo.toml).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Compact display label for a review-repair telemetry key or exhaustion key.
+pub fn compact_review_repair_label(label: &str) -> String {
+    steering::compact_review_repair_label(label)
+}
 
 /// Pre-turn state that must be restored when an attempt is discarded.
 ///
@@ -163,6 +168,16 @@ pub struct TurnTelemetry {
     pub discovery_depth: String,
     /// Times the harness nudged a read-only review to inspect beyond a listing.
     pub quality_repair_nudges: u32,
+    /// Review-repair exhaustion reason, when a read-only review stopped
+    /// incomplete after exhausting a local repair mode.
+    pub review_repair_exhaustion_reason: String,
+    /// Per-mode review repair counts. `quality_repair_nudges` remains the
+    /// compatibility aggregate; this map explains which repair modes spent it.
+    pub review_repair_counts: BTreeMap<String, u32>,
+    /// Whether the turn stopped because a review-repair mode exhausted its
+    /// local budget. Compare with `hit_step_cap` to distinguish repair
+    /// exhaustion from the global model-call backstop.
+    pub review_repair_stopped_by_exhaustion: bool,
 }
 
 impl Default for TurnTelemetry {
@@ -193,6 +208,9 @@ impl Default for TurnTelemetry {
             first_tool_kind: "none".to_string(),
             discovery_depth: "none".to_string(),
             quality_repair_nudges: 0,
+            review_repair_exhaustion_reason: String::new(),
+            review_repair_counts: BTreeMap::new(),
+            review_repair_stopped_by_exhaustion: false,
         }
     }
 }

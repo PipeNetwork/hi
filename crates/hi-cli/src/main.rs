@@ -836,6 +836,10 @@ fn write_report(
             "first_tool_kind": tel.first_tool_kind,
             "discovery_depth": tel.discovery_depth,
             "quality_repair_nudges": tel.quality_repair_nudges,
+            "review_repair_exhaustion_reason": tel.review_repair_exhaustion_reason,
+            "review_repair_counts": tel.review_repair_counts,
+            "review_repair_stopped_by_exhaustion": tel.review_repair_stopped_by_exhaustion,
+            "stopped_by_step_cap": tel.hit_step_cap,
         },
     });
     if let Some(parent) = path
