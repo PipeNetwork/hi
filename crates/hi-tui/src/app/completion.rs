@@ -1,5 +1,7 @@
 //! `App` methods: completion.
 
+use crossterm::event::{KeyCode, KeyEvent};
+
 use crate::completion::{
     CompletionContext, CompletionItem, CompletionState, MODEL_CMD, MODEL_COMPLETION_MAX,
     PROVIDER_CMD, completion_context, completion_items_for,
@@ -101,6 +103,25 @@ impl crate::App {
                 }
             }
             _ => self.completion = None,
+        }
+    }
+
+    /// Re-sync completion after an editing key. History recall can load a slash
+    /// command like `/help` into the input; keep completion closed there so the
+    /// next Up/Down continues moving through history instead of navigating the
+    /// command menu.
+    pub(crate) fn sync_completion_after_edit_key(
+        &mut self,
+        key: &KeyEvent,
+        history_search_was_active: bool,
+    ) {
+        if history_search_was_active
+            || self.history_search.is_some()
+            || matches!(key.code, KeyCode::Up | KeyCode::Down)
+        {
+            self.completion = None;
+        } else {
+            self.sync_completion();
         }
     }
 

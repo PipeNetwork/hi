@@ -1,6 +1,6 @@
 //! The plain line REPL loop and the animated-spinner turn driver.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -22,7 +22,7 @@ pub(crate) async fn repl(
     config: &mut config::Config,
     registry: &Registry,
     auto_memory: bool,
-    active_profile: Option<String>,
+    mut active_profile: Option<String>,
     config_path: Option<PathBuf>,
 ) -> Result<()> {
     use hi_agent::Command;
@@ -470,8 +470,31 @@ pub(crate) async fn repl(
                             continue;
                         }
                         Command::Hf(arg) => {
-                            match hi_tools::handle_hf_command(&arg, &mut hf_state).await {
-                                Ok(text) => print!("{text}"),
+                            match hi_tools::handle_hf_command_result(&arg, &mut hf_state).await {
+                                Ok(hi_tools::HfCommandResult::Text(text)) => print!("{text}"),
+                                Ok(hi_tools::HfCommandResult::MlxReady(run)) => {
+                                    print!("{}", run.message);
+                                    match switch_to_mlx_profile(
+                                        agent,
+                                        config,
+                                        registry,
+                                        config_path.as_deref(),
+                                        &run,
+                                    )
+                                    .await
+                                    {
+                                        Ok(()) => {
+                                            active_profile = Some(run.profile_name.clone());
+                                            println!(
+                                                "\x1b[2musing local MLX profile '{}' — model: {}\x1b[0m",
+                                                run.profile_name, run.model_id
+                                            );
+                                        }
+                                        Err(err) => eprintln!(
+                                            "\x1b[33m/hf run --mlx profile switch failed: {err:#}\x1b[0m"
+                                        ),
+                                    }
+                                }
                                 Err(err) => eprintln!("\x1b[33m/hf failed: {err:#}\x1b[0m"),
                             }
                             continue;
@@ -554,6 +577,44 @@ pub(crate) async fn repl(
             let _ = std::fs::create_dir_all(parent);
         }
         let _ = editor.save_history(path);
+    }
+    Ok(())
+}
+
+async fn switch_to_mlx_profile(
+    agent: &mut Agent,
+    config: &mut config::Config,
+    registry: &Registry,
+    config_path: Option<&Path>,
+    run: &hi_tools::HfMlxRun,
+) -> Result<()> {
+    let path = config::writable_config_path(config_path)
+        .context("could not determine config path for MLX profile")?;
+    let profile = config::Profile {
+        provider: Some(config::ProviderName::Openai),
+        model: Some(run.model_id.clone()),
+        base_url: Some(run.base_url.clone()),
+        api_key: Some("local".to_string()),
+        max_tokens: Some(2048),
+        ..Default::default()
+    };
+    config::upsert_profile_as_default(config, &run.profile_name, profile, &path)?;
+    let settings = config::resolve_named_profile(config, &run.profile_name, registry)?;
+    let provider = crate::build_chain(&settings, Vec::new());
+    let (_price, mut window) = registry.metadata(&settings.model);
+    agent.set_provider(
+        provider,
+        settings.model.clone(),
+        window,
+        settings.max_tokens,
+        settings.max_tokens_explicit,
+        None,
+    );
+    if let Ok(models) = agent.list_models().await
+        && let Some(served) = models.into_iter().find(|model| model.id == settings.model)
+    {
+        window = served.context_window.or(window);
+        agent.set_model(settings.model.clone(), window, served.max_output_tokens);
     }
     Ok(())
 }

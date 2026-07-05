@@ -30,6 +30,10 @@ fn test_remover() -> ProfileRemover {
     Box::new(|_name| anyhow::bail!("no profiles in tests"))
 }
 
+fn test_mlx_switcher() -> MlxProfileSwitcher {
+    Box::new(|_run| anyhow::bail!("no mlx profiles in tests"))
+}
+
 #[test]
 fn selected_model_persists_to_active_profile() {
     let stored = std::sync::Arc::new(std::sync::Mutex::new(ProfileFormData {
@@ -70,6 +74,7 @@ fn selected_model_persists_to_active_profile() {
         saver,
         loader,
         test_remover(),
+        test_mlx_switcher(),
         None,
         String::new(),
     );
@@ -101,6 +106,7 @@ fn test_app(provider: &str, model: &str) -> App {
         test_saver(),
         test_loader(),
         test_remover(),
+        test_mlx_switcher(),
         None,
         String::new(),
     )
@@ -1494,6 +1500,57 @@ fn completion_opens_filters_and_closes() {
     app.input.set("/diff ");
     app.sync_completion();
     assert!(app.completion.is_none());
+}
+
+#[test]
+fn history_recall_of_slash_command_keeps_completion_closed() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.input.history = vec!["ask first".into(), "/help".into(), "ask last".into()];
+    let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
+
+    assert_eq!(app.edit_key(&up), None);
+    app.sync_completion_after_edit_key(&up, false);
+    assert_eq!(app.input.text(), "ask last");
+    assert!(app.completion.is_none());
+
+    assert_eq!(app.edit_key(&up), None);
+    app.sync_completion_after_edit_key(&up, false);
+    assert_eq!(app.input.text(), "/help");
+    assert!(
+        app.completion.is_none(),
+        "history recall must not open slash completion"
+    );
+
+    assert_eq!(app.edit_key(&up), None);
+    app.sync_completion_after_edit_key(&up, false);
+    assert_eq!(app.input.text(), "ask first");
+    assert!(app.completion.is_none());
+}
+
+#[test]
+fn history_search_recall_of_slash_command_keeps_completion_closed() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.input.history = vec!["ask first".into(), "/help".into()];
+    let mut search = HistorySearch::default();
+    search.refilter(&app.input.history);
+    app.history_search = Some(search);
+
+    let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+    let history_search_was_active = app.history_search.is_some();
+    assert_eq!(app.edit_key(&esc), None);
+    app.sync_completion_after_edit_key(&esc, history_search_was_active);
+
+    assert_eq!(app.input.text(), "/help");
+    assert!(
+        app.completion.is_none(),
+        "loading a slash command from Ctrl-R should leave arrows for history"
+    );
+
+    app.sync_completion();
+    assert!(
+        app.completion.is_some(),
+        "normal slash completion remains available outside history recall"
+    );
 }
 
 #[test]

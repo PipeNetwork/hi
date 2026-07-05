@@ -122,13 +122,7 @@ impl InputLine {
     pub fn submit(&mut self) -> String {
         let line = self.text();
         self.clear();
-        // Never cache slash commands. Loading one via Up-arrow into the input
-        // line opens the `/`-completion menu, which then swallows Up/Down for
-        // menu navigation — so the user stalls on that history entry and can't
-        // scroll past it. Skipping them in the first place keeps history to
-        // real prompts only.
-        let is_slash_command = line.trim_start().starts_with('/');
-        if !is_slash_command && !line.trim().is_empty() && self.history.last() != Some(&line) {
+        if !line.trim().is_empty() && self.history.last() != Some(&line) {
             self.history.push(line.clone());
         }
         line
@@ -205,11 +199,8 @@ mod tests {
         assert_eq!(input.text(), "a\nb\nc");
     }
 
-    /// Slash commands must never enter history. Otherwise loading one via
-    /// Up-arrow opens the `/`-completion menu and swallows subsequent Up/Down
-    /// (menu nav), stalling history scroll on that entry.
     #[test]
-    fn slash_commands_are_not_cached_in_history() {
+    fn slash_commands_are_cached_in_history() {
         let mut input = InputLine::default();
 
         // A real prompt is cached.
@@ -218,7 +209,7 @@ mod tests {
         assert_eq!(input.history, vec!["fix the bug"]);
 
         // Slash commands — bare, with leading whitespace, and with args — are
-        // all skipped.
+        // cached like any other input.
         input.set("/help");
         input.submit();
         input.set("   /model gpt-4o");
@@ -228,13 +219,22 @@ mod tests {
 
         assert_eq!(
             input.history,
-            vec!["fix the bug"],
-            "no slash command should be cached"
+            vec!["fix the bug", "/help", "   /model gpt-4o", "/provider"],
+            "slash commands should be available through input history"
         );
 
         // The next real prompt still appends after them.
         input.set("next real prompt");
         input.submit();
-        assert_eq!(input.history, vec!["fix the bug", "next real prompt"]);
+        assert_eq!(
+            input.history,
+            vec![
+                "fix the bug",
+                "/help",
+                "   /model gpt-4o",
+                "/provider",
+                "next real prompt"
+            ]
+        );
     }
 }

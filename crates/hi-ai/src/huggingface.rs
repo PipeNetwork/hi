@@ -226,37 +226,60 @@ impl HuggingFaceHubClient {
         if author.is_empty() {
             bail!("Hugging Face author is empty");
         }
-        let limit = limit.clamp(1, 100).to_string();
-        let response = self
-            .with_auth(
-                self.http
-                    .get(format!("{}/api/models", self.endpoint))
-                    .query(&[
-                        ("author", author),
-                        ("limit", limit.as_str()),
-                        ("full", "true"),
-                    ])
-                    .header(header::ACCEPT, "application/json"),
-            )
-            .send()
-            .await
-            .with_context(|| format!("listing Hugging Face models for author {author}"))?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            bail!(
-                "Hugging Face author listing returned {status}: {}",
-                clip(&body, 240)
+        let max_models = limit.max(1);
+        let mut cursor: Option<String> = None;
+        let mut models = Vec::new();
+        while models.len() < max_models {
+            let page_limit = (max_models - models.len()).clamp(1, 100).to_string();
+            let mut request = self
+                .http
+                .get(format!("{}/api/models", self.endpoint))
+                .query(&[
+                    ("author", author),
+                    ("limit", page_limit.as_str()),
+                    ("full", "true"),
+                ])
+                .header(header::ACCEPT, "application/json");
+            if let Some(cursor) = &cursor {
+                request = request.query(&[("cursor", cursor.as_str())]);
+            }
+            let response = self
+                .with_auth(request)
+                .send()
+                .await
+                .with_context(|| format!("listing Hugging Face models for author {author}"))?;
+            let status = response.status();
+            if !status.is_success() {
+                let body = response.text().await.unwrap_or_default();
+                bail!(
+                    "Hugging Face author listing returned {status}: {}",
+                    clip(&body, 240)
+                );
+            }
+            let next_cursor = next_cursor_from_headers(response.headers());
+            let value: Value = response
+                .json()
+                .await
+                .context("parsing Hugging Face author listing")?;
+            let before = models.len();
+            models.extend(
+                parse_hub_models(&value)
+                    .into_iter()
+                    .map(HubModel::into_candidate),
             );
+            if models.len() >= max_models {
+                models.truncate(max_models);
+                break;
+            }
+            if models.len() == before {
+                break;
+            }
+            let Some(next_cursor) = next_cursor else {
+                break;
+            };
+            cursor = Some(next_cursor);
         }
-        let value: Value = response
-            .json()
-            .await
-            .context("parsing Hugging Face author listing")?;
-        Ok(parse_hub_models(&value)
-            .into_iter()
-            .map(HubModel::into_candidate)
-            .collect())
+        Ok(models)
     }
 
     pub async fn model_info(&self, repo: &HfRepoRef) -> Result<HfModelInfo> {
@@ -582,6 +605,59 @@ fn percent_encode(input: &str) -> String {
     out
 }
 
+fn next_cursor_from_headers(headers: &header::HeaderMap) -> Option<String> {
+    headers
+        .get(header::LINK)
+        .and_then(|value| value.to_str().ok())
+        .and_then(next_cursor_from_link)
+}
+
+fn next_cursor_from_link(link: &str) -> Option<String> {
+    for part in link.split(',') {
+        let part = part.trim();
+        if !(part.contains("rel=\"next\"") || part.contains("rel=next")) {
+            continue;
+        }
+        let url = part.strip_prefix('<')?.split_once('>')?.0;
+        let query = url.split_once('?')?.1;
+        for param in query.split('&') {
+            let (key, value) = param.split_once('=').unwrap_or((param, ""));
+            if key == "cursor" {
+                return Some(percent_decode(value));
+            }
+        }
+    }
+    None
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2]))
+        {
+            out.push((hi << 4) | lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 fn non_empty_env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|s| !s.trim().is_empty())
 }
@@ -726,6 +802,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn author_models_follows_next_link_until_limit() {
+        let server = MockHub::new_sequence(vec![
+            MockReply {
+                status: 200,
+                body: r#"[{"id":"pipenetwork/one","siblings":[{"rfilename":"one.gguf"}]}]"#,
+                headers: vec![(
+                    "link",
+                    r#"</api/models?author=pipenetwork&limit=1&full=true&cursor=page2>; rel="next""#,
+                )],
+            },
+            MockReply {
+                status: 200,
+                body: r#"[{"id":"pipenetwork/two","siblings":[{"rfilename":"two.gguf"}]}]"#,
+                headers: Vec::new(),
+            },
+        ]);
+        let client = HuggingFaceHubClient::new(server.url(), None);
+
+        let models = client.author_models("pipenetwork", 2).await.unwrap();
+
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "pipenetwork/one");
+        assert_eq!(models[1].id, "pipenetwork/two");
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("limit=2"));
+        assert!(requests[1].contains("cursor=page2"));
+    }
+
+    #[tokio::test]
     async fn list_files_maps_tree_and_sends_token_only_when_configured() {
         let server = MockHub::new(
             200,
@@ -758,31 +864,56 @@ mod tests {
         assert!(err.to_string().contains("Hugging Face search returned 404"));
     }
 
+    struct MockReply {
+        status: u16,
+        body: &'static str,
+        headers: Vec<(&'static str, &'static str)>,
+    }
+
     struct MockHub {
         url: String,
-        request: Arc<Mutex<String>>,
+        requests: Arc<Mutex<Vec<String>>>,
     }
 
     impl MockHub {
         fn new(status: u16, body: &'static str) -> Self {
+            Self::new_sequence(vec![MockReply {
+                status,
+                body,
+                headers: Vec::new(),
+            }])
+        }
+
+        fn new_sequence(responses: Vec<MockReply>) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
-            let request = Arc::new(Mutex::new(String::new()));
-            let thread_request = request.clone();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let thread_requests = requests.clone();
             std::thread::spawn(move || {
-                let Ok((mut stream, _)) = listener.accept() else {
-                    return;
-                };
-                let raw = read_request(&mut stream);
-                *thread_request.lock().unwrap() = raw;
-                let reason = if status == 200 { "OK" } else { "Status" };
-                let response = format!(
-                    "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = stream.write_all(response.as_bytes());
+                for reply in responses {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        return;
+                    };
+                    let raw = read_request(&mut stream);
+                    thread_requests.lock().unwrap().push(raw);
+                    let reason = if reply.status == 200 { "OK" } else { "Status" };
+                    let mut response = format!(
+                        "HTTP/1.1 {} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n",
+                        reply.status,
+                        reply.body.len()
+                    );
+                    for (name, value) in reply.headers {
+                        response.push_str(name);
+                        response.push_str(": ");
+                        response.push_str(value);
+                        response.push_str("\r\n");
+                    }
+                    response.push_str("\r\n");
+                    response.push_str(reply.body);
+                    let _ = stream.write_all(response.as_bytes());
+                }
             });
-            Self { url, request }
+            Self { url, requests }
         }
 
         fn url(&self) -> String {
@@ -790,7 +921,16 @@ mod tests {
         }
 
         fn request(&self) -> String {
-            self.request.lock().unwrap().clone()
+            self.requests
+                .lock()
+                .unwrap()
+                .first()
+                .cloned()
+                .unwrap_or_default()
+        }
+
+        fn requests(&self) -> Vec<String> {
+            self.requests.lock().unwrap().clone()
         }
     }
 

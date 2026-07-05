@@ -920,6 +920,19 @@ pub fn upsert_profile(
     save_config_to(config, config_path)
 }
 
+/// Add or replace a profile, select it as the default profile, and save.
+pub fn upsert_profile_as_default(
+    config: &mut Config,
+    name: &str,
+    profile: Profile,
+    config_path: &Path,
+) -> Result<()> {
+    validate_profile(&profile)?;
+    config.profiles.insert(name.to_string(), profile);
+    config.default_profile = Some(name.to_string());
+    save_config_to(config, config_path)
+}
+
 /// Update only the selected model on an existing profile and save it to disk.
 pub fn set_profile_model(
     config: &mut Config,

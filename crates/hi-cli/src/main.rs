@@ -367,6 +367,45 @@ async fn main() -> Result<()> {
                 Ok(profile_infos(&file))
             }
         });
+        let mlx_switcher: hi_tui::MlxProfileSwitcher = Box::new({
+            let file = std::sync::Mutex::new(file.clone());
+            let config_path = cli.config.clone();
+            let registry = registry.clone();
+            move |run: &hi_tools::HfMlxRun| {
+                let path = config::writable_config_path(config_path.as_deref())
+                    .context("could not determine config path")?;
+                let mut file = file.lock().unwrap();
+                let profile = config::Profile {
+                    provider: Some(ProviderName::Openai),
+                    model: Some(run.model_id.clone()),
+                    base_url: Some(run.base_url.clone()),
+                    api_key: Some("local".to_string()),
+                    max_tokens: Some(2048),
+                    ..Default::default()
+                };
+                config::upsert_profile_as_default(
+                    &mut file,
+                    &run.profile_name,
+                    profile,
+                    &path,
+                )?;
+                let settings =
+                    config::resolve_named_profile(&file, &run.profile_name, &registry)?;
+                let label = provider_label(settings.provider).to_string();
+                let model = settings.model.clone();
+                let provider = build_chain(&settings, Vec::new());
+                Ok(hi_tui::MlxProfileSwitch {
+                    switched: hi_tui::SwitchedProvider {
+                        provider,
+                        model,
+                        label,
+                        max_tokens: settings.max_tokens,
+                        max_tokens_explicit: settings.max_tokens_explicit,
+                    },
+                    profiles: profile_infos(&file),
+                })
+            }
+        });
         match hi_tui::run(
             &mut agent,
             provider_label(settings.provider),
@@ -381,6 +420,7 @@ async fn main() -> Result<()> {
             saver,
             loader,
             remover,
+            mlx_switcher,
             resume_summary.clone(),
             settings.mcp_url.clone(),
             settings.api_key.clone(),

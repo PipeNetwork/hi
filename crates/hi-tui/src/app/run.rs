@@ -27,8 +27,8 @@ use crate::model_picker::ModelPicker;
 use crate::provider_form;
 use crate::render::dim;
 use crate::{
-    App, ProfileInfo, ProfileLoader, ProfileRemover, ProfileResolver, ProfileSaver, TICK,
-    TurnState, apply_metadata, splash_lines, watchdog_stuck_timeout,
+    App, MlxProfileSwitcher, ProfileInfo, ProfileLoader, ProfileRemover, ProfileResolver,
+    ProfileSaver, TICK, TurnState, apply_metadata, splash_lines, watchdog_stuck_timeout,
 };
 
 /// Run the full-screen TUI until the user quits. `history_path`, if given, is
@@ -50,6 +50,7 @@ pub async fn run(
     saver: ProfileSaver,
     loader: ProfileLoader,
     remover: ProfileRemover,
+    mlx_switcher: MlxProfileSwitcher,
     resume_summary: Option<String>,
     mcp_url: Option<String>,
     api_key: String,
@@ -85,6 +86,7 @@ pub async fn run(
         saver,
         loader,
         remover,
+        mlx_switcher,
         mcp_url,
         api_key,
     );
@@ -113,9 +115,6 @@ pub async fn run(
             .lines()
             .map(str::to_string)
             .filter(|l| !l.trim().is_empty())
-            // Slash commands are never cached on submit; drop any that an older
-            // version persisted, for the same Up-arrow stall reason.
-            .filter(|l| !l.trim_start().starts_with('/'))
             .collect();
     }
     {
@@ -362,6 +361,7 @@ pub async fn run(
                         if key.kind == KeyEventKind::Press && app.completion.is_some() =>
                     {
                         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                        let history_search_was_active = app.history_search.is_some();
                         match key.code {
                             KeyCode::Char('c') if ctrl => app.input.clear(),
                             KeyCode::Esc => app.completion = None,
@@ -382,12 +382,13 @@ pub async fn run(
                                 if let Some(line) = app.edit_key(&key) {
                                     break 'input line;
                                 }
-                                app.sync_completion();
+                                app.sync_completion_after_edit_key(&key, history_search_was_active);
                             }
                         }
                     }
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                        let history_search_was_active = app.history_search.is_some();
                         // Ctrl-R opens reverse history search (when not already
                         // in it and there's history to search).
                         if ctrl
@@ -431,7 +432,7 @@ pub async fn run(
                                 if let Some(line) = app.edit_key(&key) {
                                     break 'input line;
                                 }
-                                app.sync_completion();
+                                app.sync_completion_after_edit_key(&key, history_search_was_active);
                             }
                         }
                     }
@@ -578,10 +579,54 @@ pub async fn run(
                     }
                 }
                 Command::Hf(arg) => {
-                    match hi_tools::handle_hf_command(&arg, &mut hf_state).await {
-                        Ok(text) => {
+                    match hi_tools::handle_hf_command_result(&arg, &mut hf_state).await {
+                        Ok(hi_tools::HfCommandResult::Text(text)) => {
                             for line in text.lines() {
                                 app.push(Line::styled(line.to_string(), dim()));
+                            }
+                        }
+                        Ok(hi_tools::HfCommandResult::MlxReady(run)) => {
+                            for line in run.message.lines() {
+                                app.push(Line::styled(line.to_string(), dim()));
+                            }
+                            match (app.mlx_switcher)(&run) {
+                                Ok(switched) => {
+                                    let label = switched.switched.label.clone();
+                                    let model = switched.switched.model.clone();
+                                    let (_price, window) = registry.metadata(&model);
+                                    agent.set_provider(
+                                        switched.switched.provider,
+                                        model.clone(),
+                                        window,
+                                        switched.switched.max_tokens,
+                                        switched.switched.max_tokens_explicit,
+                                        None,
+                                    );
+                                    if let Ok(models) = agent.list_models().await {
+                                        app.served = models
+                                            .into_iter()
+                                            .map(|model| (model.id.clone(), model))
+                                            .collect();
+                                    }
+                                    app.provider = label.clone();
+                                    app.model = model.clone();
+                                    app.active_profile = Some(run.profile_name.clone());
+                                    app.profiles = switched.profiles;
+                                    app.apply_model(agent, registry, &model);
+                                    app.push(Line::styled(
+                                        format!(
+                                            "using local MLX profile '{}' — model: {model}",
+                                            run.profile_name
+                                        ),
+                                        dim(),
+                                    ));
+                                }
+                                Err(err) => {
+                                    app.push(Line::styled(
+                                        format!("/hf run --mlx profile switch failed: {err:#}"),
+                                        Style::default().fg(Color::Yellow),
+                                    ));
+                                }
                             }
                         }
                         Err(err) => {

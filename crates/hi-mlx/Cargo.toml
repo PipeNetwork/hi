@@ -1,0 +1,29 @@
+[package]
+name = "hi-mlx"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+clap.workspace = true
+futures-util.workspace = true
+safetensors.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokenizers.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+mlx-rs = { package = "pmetal-mlx-rs", version = "0.25.8", optional = true, default-features = false, features = ["accelerate", "metal", "safetensors"] }
+mlx-sys = { package = "pmetal-mlx-sys", version = "0.2.4", optional = true, default-features = false, features = ["accelerate", "metal"] }
+
+[features]
+default = ["mlx"]
+mlx = ["dep:mlx-rs", "dep:mlx-sys"]
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

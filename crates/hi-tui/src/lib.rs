@@ -56,11 +56,22 @@ pub struct SwitchedProvider {
     pub max_tokens_explicit: bool,
 }
 
+/// Result of saving/selecting a managed local MLX profile.
+pub struct MlxProfileSwitch {
+    pub switched: SwitchedProvider,
+    pub profiles: Vec<ProfileInfo>,
+}
+
 /// A callback that resolves a named profile into a built provider + model +
 /// label, for `/provider` mid-session. `hi-cli` supplies this; the TUI calls
 /// it without needing to know about `Config`/`Settings` (which live in
 /// `hi-cli`).
 pub type ProfileResolver = Box<dyn Fn(&str) -> Result<SwitchedProvider> + Send + Sync>;
+
+/// A callback that persists the `/hf run --mlx` profile and returns a built
+/// provider for immediate use.
+pub type MlxProfileSwitcher =
+    Box<dyn Fn(&hi_tools::HfMlxRun) -> Result<MlxProfileSwitch> + Send + Sync>;
 
 /// Form data for creating or editing a profile, exchanged between the TUI
 /// (which collects it via a form) and `hi-cli` (which writes it to the config
@@ -327,6 +338,8 @@ pub(crate) struct App {
     pub(crate) loader: ProfileLoader,
     /// Removes a profile from the config file (for `/provider remove`).
     pub(crate) remover: ProfileRemover,
+    /// Saves/selects a managed local MLX profile after `/hf run --mlx`.
+    pub(crate) mlx_switcher: MlxProfileSwitcher,
     pub(crate) transcript: Vec<TranscriptEntry>,
     /// The in-progress streamed line: (style, markdown?, text). Committed on
     /// newline/end. `markdown` is set for assistant prose so it's rendered with

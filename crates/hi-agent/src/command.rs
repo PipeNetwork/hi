@@ -113,7 +113,7 @@ pub fn parse(line: &str) -> Option<Command> {
         "version" | "ver" | "v" => Command::Version,
         "export" => Command::Export(arg),
         "mcp" => Command::Mcp,
-        "hf" | "huggingface" => Command::Hf(arg),
+        "hf" | "hd" | "huggingface" => Command::Hf(arg),
         "lsp" => Command::Lsp(arg),
         "exit" | "quit" | "q" => Command::Quit,
         other => Command::Unknown(other.to_string()),
@@ -378,9 +378,12 @@ pub const COMMANDS: &[CommandSpec] = &[
             ),
             (
                 "--",
-                "with download, fetch every file and delete after each",
+                "with download, fetch every file in a repo or active author menu and delete after each",
             ),
-            ("--keep", "with download, keep every file in a directory"),
+            (
+                "--keep",
+                "with download, keep every file in a repo or active author menu",
+            ),
         ],
     },
     CommandSpec {
@@ -672,6 +675,10 @@ mod tests {
         assert_eq!(
             parse("/hf search llama"),
             Some(Command::Hf("search llama".into()))
+        );
+        assert_eq!(
+            parse("/hd download --"),
+            Some(Command::Hf("download --".into()))
         );
         // Removed `/tokens` aliases redirect to a hint instead of bare "unknown".
         assert!(matches!(

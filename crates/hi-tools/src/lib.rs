@@ -23,7 +23,9 @@ pub use background::{
     kill_started_after as kill_background_processes_started_after,
 };
 pub use condense::condense_diagnostics;
-pub use hf::{HfCommandState, handle_hf_command};
+pub use hf::{
+    HfCommandResult, HfCommandState, HfMlxRun, handle_hf_command, handle_hf_command_result,
+};
 pub use lsp::{
     lsp_enabled, lsp_manager_handle, lsp_status, lsp_status_report, lsp_status_sync,
     set_lsp_manager, set_lsp_manager_arc, sync_lsp_document,
