@@ -6,11 +6,13 @@ MODEL_ROOT="${HI_MLX_MODELS_DIR:-$ROOT/.hi/models}"
 HOST="${HI_MLX_HOST:-127.0.0.1}"
 PORT_BASE="${HI_MLX_PORT_BASE:-18080}"
 MAX_TOKENS="${HI_MLX_MAX_TOKENS:-64}"
+TOOL_MAX_TOKENS="${HI_MLX_TOOL_MAX_TOKENS:-256}"
 HEALTH_TIMEOUT="${HI_MLX_HEALTH_TIMEOUT:-900}"
 ARTIFACT_ROOT="${HI_MLX_ACCEPTANCE_ARTIFACTS:-$ROOT/target/hi-mlx-acceptance}"
 RUN_ID="$(date +%Y%m%d-%H%M%S)"
 ARTIFACT_DIR="$ARTIFACT_ROOT/$RUN_ID"
 BIN="${HI_MLX_BIN:-$ROOT/target/debug/hi-mlx}"
+HI_BIN="${HI_BIN:-$ROOT/target/debug/hi}"
 
 REPOS=(
   "mlx-community/Qwen3-0.6B-4bit"
@@ -41,8 +43,10 @@ Environment:
   HI_MLX_BIN                     Default: target/debug/hi-mlx
   HI_MLX_PORT_BASE               Default: 18080
   HI_MLX_MAX_TOKENS              Default: 64
+  HI_MLX_TOOL_MAX_TOKENS         Default: 256
   HI_MLX_HEALTH_TIMEOUT          Default: 900 seconds
   HI_MLX_ACCEPTANCE_ARTIFACTS    Default: target/hi-mlx-acceptance
+  HI_BIN                         Default: target/debug/hi
 
 Examples:
   scripts/hi_mlx_acceptance_matrix.sh
@@ -116,20 +120,10 @@ download_repo() {
   local repo="$1"
   local dir="$2"
   mkdir -p "$dir"
-  if command -v hf >/dev/null 2>&1; then
-    hf download "$repo" --local-dir "$dir"
-  elif command -v huggingface-cli >/dev/null 2>&1; then
-    huggingface-cli download "$repo" --local-dir "$dir"
+  if [[ -x "$HI_BIN" ]]; then
+    "$HI_BIN" hf download "$repo" --keep "$dir"
   else
-    cat >&2 <<EOF
-Model directory is missing and no Hugging Face downloader was found:
-  $dir
-
-Install one of:
-  python3 -m pip install --user huggingface_hub
-  python3 -m pip install --user 'huggingface_hub[cli]'
-EOF
-    exit 1
+    cargo run -p hi -- hf download "$repo" --keep "$dir"
   fi
 }
 
@@ -251,8 +245,8 @@ mkdir -p "$MODEL_ROOT" "$ARTIFACT_DIR"
 log "artifacts: $ARTIFACT_DIR"
 
 if ((run_build)); then
-  log "building hi-mlx"
-  cargo build -p hi-mlx
+  log "building hi and hi-mlx"
+  cargo build -p hi -p hi-mlx
 fi
 
 if ((run_unit)); then
@@ -364,7 +358,7 @@ PY
 
   if ((run_tool)); then
     log "tool call"
-    tool_payload="$(python3 - "$repo" "$MAX_TOKENS" <<'PY'
+    tool_payload="$(python3 - "$repo" "$TOOL_MAX_TOKENS" <<'PY'
 import json, sys
 print(json.dumps({
     "model": sys.argv[1],

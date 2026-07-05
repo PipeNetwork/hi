@@ -2,6 +2,7 @@ use anyhow::{Result, anyhow, bail};
 use serde_json::json;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -214,6 +215,46 @@ pub async fn handle_hf_command_result(
         "run" => start_mlx_run(arg.strip_prefix("run").unwrap_or("").trim(), state).await,
         _ => Ok(HfCommandResult::Text(hf_usage())),
     }
+}
+
+pub async fn download_repo_keep_foreground(
+    repo_source: &str,
+    output_dir: impl AsRef<Path>,
+) -> Result<String> {
+    let client = hi_ai::HuggingFaceHubClient::from_env();
+    let repo = hi_ai::HfRepoRef::parse(repo_source)?;
+    let files = client.list_files(&repo).await?;
+    if files.is_empty() {
+        return Ok(format!(
+            "No files found in {}@{}.\n",
+            repo.repo_id, repo.revision
+        ));
+    }
+    let output_dir = output_dir.as_ref();
+    let command = all_download_command(&client, &repo, &files, output_dir, WholeRepoMode::Keep)?;
+    let status = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(&command)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .await?;
+    if !status.success() {
+        bail!(
+            "download failed for {}@{} into {} with status {}",
+            repo.repo_id,
+            repo.revision,
+            output_dir.display(),
+            status
+        );
+    }
+    Ok(format!(
+        "Downloaded {} file(s) from {}@{} to {}\n",
+        files.len(),
+        repo.repo_id,
+        repo.revision,
+        output_dir.display()
+    ))
 }
 
 fn hf_usage() -> String {

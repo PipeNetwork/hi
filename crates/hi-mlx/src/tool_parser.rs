@@ -30,7 +30,9 @@ pub fn parse_tool_calls(text: &str, tools: &[Tool]) -> Option<Vec<NormalizedTool
 
 fn parse_json_tool_calls(text: &str, allowed: &[&str]) -> Option<Vec<NormalizedToolCall>> {
     let trimmed = strip_code_fence(text.trim());
-    let value: Value = serde_json::from_str(trimmed).ok()?;
+    let value: Value = serde_json::from_str(trimmed).ok().or_else(|| {
+        find_json_value(trimmed).and_then(|candidate| serde_json::from_str(candidate).ok())
+    })?;
     let calls = if let Some(array) = value.get("tool_calls").and_then(Value::as_array) {
         array.iter().collect::<Vec<_>>()
     } else if let Some(call) = value.get("tool_call") {
@@ -51,6 +53,50 @@ fn parse_json_tool_calls(text: &str, allowed: &[&str]) -> Option<Vec<NormalizedT
         }
     }
     (!out.is_empty()).then_some(out)
+}
+
+fn find_json_value(text: &str) -> Option<&str> {
+    for (start, ch) in text.char_indices() {
+        let close = match ch {
+            '{' => '}',
+            '[' => ']',
+            _ => continue,
+        };
+        if let Some(end) = balanced_json_end(&text[start..], ch, close) {
+            return Some(&text[start..start + end]);
+        }
+    }
+    None
+}
+
+fn balanced_json_end(text: &str, open: char, close: char) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (idx, ch) in text.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            c if c == open => depth += 1,
+            c if c == close => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(idx + ch.len_utf8());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn parse_bracket_tool_calls(text: &str, allowed: &[&str]) -> Option<Vec<NormalizedToolCall>> {
@@ -147,6 +193,18 @@ mod tests {
     #[test]
     fn bracket_tool_call_output_is_normalized() {
         let calls = parse_tool_calls(r#"[read({"path":"README.md"})]"#, &tools()).unwrap();
+
+        assert_eq!(calls[0].function.name, "read");
+        assert_eq!(calls[0].function.arguments, r#"{"path":"README.md"}"#);
+    }
+
+    #[test]
+    fn json_tool_call_with_reasoning_prefix_is_normalized() {
+        let calls = parse_tool_calls(
+            "<think>choosing a tool</think>\n\n{\"name\":\"read\",\"arguments\":{\"path\":\"README.md\"}}",
+            &tools(),
+        )
+        .unwrap();
 
         assert_eq!(calls[0].function.name, "read");
         assert_eq!(calls[0].function.arguments, r#"{"path":"README.md"}"#);

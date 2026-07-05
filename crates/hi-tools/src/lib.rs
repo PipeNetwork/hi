@@ -24,7 +24,8 @@ pub use background::{
 };
 pub use condense::condense_diagnostics;
 pub use hf::{
-    HfCommandResult, HfCommandState, HfMlxRun, handle_hf_command, handle_hf_command_result,
+    HfCommandResult, HfCommandState, HfMlxRun, download_repo_keep_foreground, handle_hf_command,
+    handle_hf_command_result,
 };
 pub use lsp::{
     lsp_enabled, lsp_manager_handle, lsp_status, lsp_status_report, lsp_status_sync,

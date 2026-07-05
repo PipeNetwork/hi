@@ -27,6 +27,11 @@ use ui::PlainUi;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let raw_args = std::env::args().collect::<Vec<_>>();
+    if raw_args.get(1).map(String::as_str) == Some("hf") {
+        return run_hf_cli(&raw_args[2..]).await;
+    }
+
     let cli = Cli::parse();
 
     if cli.show_config {
@@ -383,14 +388,8 @@ async fn main() -> Result<()> {
                     max_tokens: Some(2048),
                     ..Default::default()
                 };
-                config::upsert_profile_as_default(
-                    &mut file,
-                    &run.profile_name,
-                    profile,
-                    &path,
-                )?;
-                let settings =
-                    config::resolve_named_profile(&file, &run.profile_name, &registry)?;
+                config::upsert_profile_as_default(&mut file, &run.profile_name, profile, &path)?;
+                let settings = config::resolve_named_profile(&file, &run.profile_name, &registry)?;
                 let label = provider_label(settings.provider).to_string();
                 let model = settings.model.clone();
                 let provider = build_chain(&settings, Vec::new());
@@ -473,6 +472,41 @@ async fn run_mcp_command(settings: &Settings) -> Result<()> {
     };
     let report = mcp_inspect(url, &settings.api_key, &settings.model).await?;
     print!("{report}");
+    Ok(())
+}
+
+async fn run_hf_cli(args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        print!(
+            "{}",
+            hi_tools::handle_hf_command("help", &mut hi_tools::HfCommandState::default()).await?
+        );
+        return Ok(());
+    }
+    if args.first().map(String::as_str) == Some("download")
+        && args
+            .get(2)
+            .map(String::as_str)
+            .is_some_and(|arg| matches!(arg, "--keep" | "keep"))
+    {
+        let repo = args
+            .get(1)
+            .ok_or_else(|| anyhow!("usage: hi hf download <repo[@revision]> --keep <dir>"))?;
+        let dir = args
+            .get(3)
+            .ok_or_else(|| anyhow!("usage: hi hf download <repo[@revision]> --keep <dir>"))?;
+        print!(
+            "{}",
+            hi_tools::download_repo_keep_foreground(repo, dir).await?
+        );
+        return Ok(());
+    }
+
+    let mut state = hi_tools::HfCommandState::default();
+    match hi_tools::handle_hf_command_result(&args.join(" "), &mut state).await? {
+        hi_tools::HfCommandResult::Text(text) => print!("{text}"),
+        hi_tools::HfCommandResult::MlxReady(run) => print!("{}", run.message),
+    }
     Ok(())
 }
 
