@@ -1732,6 +1732,407 @@ async fn listing_only_review_gets_full_budget_after_no_evidence_repair() {
     assert!(telemetry.stalled_unfinished);
 }
 
+fn provider_request_text(requests: &[Vec<Message>], index: usize) -> String {
+    requests
+        .get(index)
+        .unwrap_or_else(|| panic!("missing provider request {index}; saw {}", requests.len()))
+        .iter()
+        .map(Message::text)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn assert_provider_repair_context(
+    requests: &[Vec<Message>],
+    request_index: usize,
+    mode: ReviewRepairMode,
+    rejected_draft: &str,
+) {
+    let text = provider_request_text(requests, request_index);
+    let note = format!(
+        "[review retry: reason={}; required_next={}; do_not_repeat_previous_draft]",
+        mode.key(),
+        mode.required_next()
+    );
+    assert!(
+        text.contains(&note),
+        "compact repair note missing from request {request_index}: {text}"
+    );
+    assert!(
+        text.contains(&format!("Required next action `{}`", mode.required_next())),
+        "provider-visible nudge should include exact required_next `{}`: {text}",
+        mode.required_next()
+    );
+    assert!(
+        !text.contains(rejected_draft),
+        "rejected draft should not be replayed into provider context: {text}"
+    );
+
+    let repair_note = requests[request_index]
+        .iter()
+        .filter(|message| message.role == Role::Assistant)
+        .map(Message::text)
+        .find(|message| message.contains("[review retry: reason="))
+        .expect("repair note assistant message");
+    let lower = repair_note.to_ascii_lowercase();
+    assert!(
+        !lower.contains("insufficient evidence") && !lower.contains("quality_rejected"),
+        "compact repair note should stay trigger-free: {repair_note}"
+    );
+}
+
+fn assert_successful_repair_telemetry(
+    agent: &Agent,
+    expected_nudges: u32,
+    expected_counts: &[(ReviewRepairMode, u32)],
+) {
+    let telemetry = agent.last_turn_telemetry();
+    assert_eq!(telemetry.quality_repair_nudges, expected_nudges);
+    for (mode, count) in expected_counts {
+        assert_eq!(
+            telemetry
+                .review_repair_counts
+                .get(mode.key())
+                .copied()
+                .unwrap_or(0),
+            *count,
+            "unexpected count for {} in {:?}",
+            mode.key(),
+            telemetry.review_repair_counts
+        );
+    }
+    assert_eq!(telemetry.review_repair_counts.len(), expected_counts.len());
+    assert_eq!(telemetry.review_repair_exhaustion_reason, "");
+    assert!(!telemetry.review_repair_stopped_by_exhaustion);
+    assert!(!telemetry.hit_step_cap);
+    assert!(!telemetry.stalled_unfinished);
+}
+
+#[tokio::test]
+async fn deterministic_review_repair_matrix_compacts_drafts_and_reports_counts() {
+    let no_evidence_path = temp_file("matrix-no-evidence");
+    std::fs::write(&no_evidence_path, "[workspace]\n").unwrap();
+    let no_evidence = no_evidence_path.to_string_lossy().to_string();
+    let no_evidence_rejected = "Completed the requested action.";
+    let (mut agent, requests) = scripted_agent(
+        vec![
+            ProviderStep::Completion(completion(
+                vec![Content::Text(no_evidence_rejected.into())],
+                1,
+                1,
+            )),
+            ProviderStep::Completion(completion(
+                vec![Content::ToolCall {
+                    id: "read-no-evidence".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({ "path": no_evidence.clone() }).to_string(),
+                }],
+                1,
+                1,
+            )),
+            ProviderStep::Completion(completion(
+                vec![Content::Text(format!(
+                    "Status:\n- `{no_evidence}` was read and reviewed as status evidence.\n\nLimits:\n- Limited to inspected evidence; not a complete repository review."
+                ))],
+                1,
+                1,
+            )),
+        ],
+        config(),
+    );
+    let mut ui = RecUi::default();
+    agent
+        .run_turn("/status codebase state", &mut ui)
+        .await
+        .unwrap();
+    {
+        let requests = requests.lock().unwrap();
+        assert_provider_repair_context(
+            &requests,
+            1,
+            ReviewRepairMode::NoEvidence,
+            no_evidence_rejected,
+        );
+    }
+    assert_successful_repair_telemetry(&agent, 1, &[(ReviewRepairMode::NoEvidence, 1)]);
+    let _ = std::fs::remove_file(no_evidence_path);
+
+    let listing_path = temp_file("matrix-listing");
+    std::fs::write(&listing_path, "[package]\nname = \"matrix\"\n").unwrap();
+    let listing = listing_path.to_string_lossy().to_string();
+    let listing_rejected = "The repository looks healthy and organized.";
+    let (mut agent, requests) = scripted_agent(
+        vec![
+            ProviderStep::Completion(completion(
+                vec![Content::ToolCall {
+                    id: "list".into(),
+                    name: "list".into(),
+                    arguments: r#"{"path":"."}"#.into(),
+                }],
+                1,
+                1,
+            )),
+            ProviderStep::Completion(completion(
+                vec![Content::Text(listing_rejected.into())],
+                1,
+                1,
+            )),
+            ProviderStep::Completion(completion(
+                vec![Content::ToolCall {
+                    id: "read-listing".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({ "path": listing.clone() }).to_string(),
+                }],
+                1,
+                1,
+            )),
+            ProviderStep::Completion(completion(
+                vec![Content::Text(format!(
+                    "Status:\n- `{listing}` was read after the listing and reviewed as concrete status evidence.\n\nLimits:\n- Limited to inspected evidence; not a complete repository review."
+                ))],
+                1,
+                1,
+            )),
+        ],
+        config(),
+    );
+    let mut ui = RecUi::default();
+    agent
+        .run_turn("/status codebase state", &mut ui)
+        .await
+        .unwrap();
+    {
+        let requests = requests.lock().unwrap();
+        assert_provider_repair_context(
+            &requests,
+            2,
+            ReviewRepairMode::ListingOnly,
+            listing_rejected,
+        );
+    }
+    assert_successful_repair_telemetry(&agent, 1, &[(ReviewRepairMode::ListingOnly, 1)]);
+    let _ = std::fs::remove_file(listing_path);
+
+    let search_path = temp_file("matrix-search");
+    std::fs::write(
+        &search_path,
+        "pub fn target_marker() { let value = Some(1).unwrap(); }\n",
+    )
+    .unwrap();
+    let search = search_path.to_string_lossy().to_string();
+    let search_rejected = "Targeted search found the relevant symbol, but no file was read.";
+    let (mut agent, requests) = scripted_agent(
+        vec![
+            ProviderStep::Completion(completion(
+                vec![Content::ToolCall {
+                    id: "grep".into(),
+                    name: "grep".into(),
+                    arguments: serde_json::json!({
+                        "pattern": "target_marker|unwrap",
+                        "path": search.clone(),
+                    })
+                    .to_string(),
+                }],
+                1,
+                1,
+            )),
+            ProviderStep::Completion(completion(
+                vec![Content::Text(search_rejected.into())],
+                1,
+                1,
+            )),
+            ProviderStep::Completion(completion(
+                vec![Content::ToolCall {
+                    id: "read-search".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({ "path": search.clone() }).to_string(),
+                }],
+                1,
+                1,
+            )),
+            ProviderStep::Completion(completion(
+                vec![Content::Text(format!(
+                    "Findings:\n- `{search}` was read after targeted search and reviewed as evidence for the unwrap finding.\n\nLimits:\n- Limited to inspected evidence; not a complete review."
+                ))],
+                1,
+                1,
+            )),
+        ],
+        config(),
+    );
+    let mut ui = RecUi::default();
+    agent.run_turn("/review codebase", &mut ui).await.unwrap();
+    {
+        let requests = requests.lock().unwrap();
+        assert_provider_repair_context(
+            &requests,
+            2,
+            ReviewRepairMode::ReadAfterSearch,
+            search_rejected,
+        );
+    }
+    assert_successful_repair_telemetry(&agent, 1, &[(ReviewRepairMode::ReadAfterSearch, 1)]);
+    let _ = std::fs::remove_file(search_path);
+
+    let disclaimer_path = temp_file("matrix-disclaimer");
+    std::fs::write(
+        &disclaimer_path,
+        "pub fn status() -> &'static str { \"ok\" }\n",
+    )
+    .unwrap();
+    let disclaimer = disclaimer_path.to_string_lossy().to_string();
+    let disclaimer_rejected = "Not enough evidence to provide a review without more file reads.";
+    let (mut agent, requests) = scripted_agent(
+        vec![
+            ProviderStep::Completion(completion(
+                vec![Content::ToolCall {
+                    id: "read-disclaimer".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({ "path": disclaimer.clone() }).to_string(),
+                }],
+                1,
+                1,
+            )),
+            ProviderStep::Completion(completion(
+                vec![Content::Text(disclaimer_rejected.into())],
+                1,
+                1,
+            )),
+            ProviderStep::Completion(completion(
+                vec![Content::Text(format!(
+                    "Status:\n- `{disclaimer}` was read and reviewed as the available status evidence.\n\nLimits:\n- Limited to inspected evidence; not a complete repository review."
+                ))],
+                1,
+                1,
+            )),
+        ],
+        config(),
+    );
+    let mut ui = RecUi::default();
+    agent
+        .run_turn("/status codebase state", &mut ui)
+        .await
+        .unwrap();
+    {
+        let requests = requests.lock().unwrap();
+        assert_provider_repair_context(
+            &requests,
+            2,
+            ReviewRepairMode::InspectedDisclaimer,
+            disclaimer_rejected,
+        );
+    }
+    assert_successful_repair_telemetry(
+        &agent,
+        1,
+        &[
+            (ReviewRepairMode::InspectedDisclaimer, 1),
+            (ReviewRepairMode::InspectedDisclaimerChatAttempt, 1),
+        ],
+    );
+    let _ = std::fs::remove_file(disclaimer_path);
+
+    let inventory_path = temp_file("matrix-inventory");
+    std::fs::write(&inventory_path, "pub fn inventory_target() {}\n").unwrap();
+    let inventory = inventory_path.to_string_lossy().to_string();
+    let inventory_rejected = format!(
+        "`{inventory}` shows the project is structured with a Cargo workspace. The codebase is organized around main components and supports multiple workflows."
+    );
+    let (mut agent, requests) = scripted_agent(
+        vec![
+            ProviderStep::Completion(completion(
+                vec![Content::ToolCall {
+                    id: "read-inventory".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({ "path": inventory.clone() }).to_string(),
+                }],
+                1,
+                1,
+            )),
+            ProviderStep::Completion(completion(
+                vec![Content::Text(inventory_rejected.clone())],
+                1,
+                1,
+            )),
+            ProviderStep::Completion(completion(
+                vec![Content::Text(format!(
+                    "Status:\n- `{inventory}` was read and reviewed as concrete status evidence instead of a generic inventory.\n\nLimits:\n- Limited to inspected evidence; not a complete repository review."
+                ))],
+                1,
+                1,
+            )),
+        ],
+        config(),
+    );
+    let mut ui = RecUi::default();
+    agent
+        .run_turn("/status codebase state", &mut ui)
+        .await
+        .unwrap();
+    {
+        let requests = requests.lock().unwrap();
+        assert_provider_repair_context(
+            &requests,
+            2,
+            ReviewRepairMode::ConcreteAnswer,
+            &inventory_rejected,
+        );
+    }
+    assert_successful_repair_telemetry(&agent, 1, &[(ReviewRepairMode::ConcreteAnswer, 1)]);
+    let _ = std::fs::remove_file(inventory_path);
+
+    let valid_path = temp_file("matrix-valid");
+    std::fs::write(&valid_path, "pub fn valid_status() -> bool { true }\n").unwrap();
+    let valid = valid_path.to_string_lossy().to_string();
+    let (mut agent, requests) = scripted_agent(
+        vec![
+            ProviderStep::Completion(completion(
+                vec![Content::ToolCall {
+                    id: "read-valid".into(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({ "path": valid.clone() }).to_string(),
+                }],
+                1,
+                1,
+            )),
+            ProviderStep::Completion(completion(
+                vec![Content::Text(format!(
+                    "Status:\n- `{valid}` was read and reviewed as current status evidence.\n\nLimits:\n- Limited to inspected evidence; not a complete repository review."
+                ))],
+                1,
+                1,
+            )),
+        ],
+        config(),
+    );
+    let mut ui = RecUi::default();
+    agent
+        .run_turn("/status codebase state", &mut ui)
+        .await
+        .unwrap();
+    {
+        let requests = requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            2,
+            "accepted concise cited answer should not trigger repair: {requests:?}"
+        );
+        let combined = requests
+            .iter()
+            .flat_map(|request| request.iter())
+            .map(Message::text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !combined.contains("[review retry: reason=")
+                && !combined.contains("Required next action `"),
+            "accepted concise answer should not add repair context: {combined}"
+        );
+    }
+    assert_successful_repair_telemetry(&agent, 0, &[]);
+    let _ = std::fs::remove_file(valid_path);
+}
+
 #[tokio::test]
 async fn rejected_text_only_review_draft_is_compacted_in_repair_context() {
     let responses = vec![

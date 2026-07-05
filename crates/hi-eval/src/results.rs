@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 /// Per-turn trajectory telemetry mirrored from the agent's `TurnTelemetry` /
@@ -16,9 +18,31 @@ pub struct Trajectory {
     /// the output token cap. 0 on a turn that never hit the limit.
     #[serde(default)]
     pub truncation_retries: u32,
+    /// Effective model-call cap used for this turn after dynamic defaults and
+    /// explicit overrides are resolved.
+    #[serde(default)]
+    pub effective_max_steps: u32,
     pub hit_step_cap: bool,
+    /// Alias surfaced by `--report` to distinguish global step-cap stops from
+    /// review-repair exhaustion.
+    #[serde(default)]
+    pub stopped_by_step_cap: bool,
     pub stalled_unfinished: bool,
     pub stalled_repeating: bool,
+    /// Aggregate count of local review-repair nudges spent this turn.
+    #[serde(default)]
+    pub quality_repair_nudges: u32,
+    /// Per-mode review-repair counts.
+    #[serde(default)]
+    pub review_repair_counts: BTreeMap<String, u32>,
+    /// Review-repair exhaustion reason, when a local repair budget stopped the
+    /// turn incomplete.
+    #[serde(default)]
+    pub review_repair_exhaustion_reason: String,
+    /// Whether the turn stopped because a review-repair mode exhausted its
+    /// local budget.
+    #[serde(default)]
+    pub review_repair_stopped_by_exhaustion: bool,
     pub verify_attributions: Vec<TrajectoryAttribution>,
     /// Scheduler parallelism: total tool calls this turn.
     #[serde(default)]
@@ -58,14 +82,16 @@ pub struct TrajectoryAttribution {
 
 impl Trajectory {
     /// The total number of "extra" model nudges this turn required beyond a
-    /// clean one-shot: verify rounds + recovery retries + repeat/continue
-    /// nudges. A clean turn is 0; higher means the model needed more steering.
+    /// clean one-shot: verify rounds + recovery retries + repeat/continue/
+    /// truncation/review-repair nudges. A clean turn is 0; higher means the
+    /// model needed more steering.
     pub fn extra_rounds(&self) -> u32 {
         self.verify_rounds
             + self.recovery_retries
             + self.repeat_nudges
             + self.continue_nudges
             + self.truncation_retries
+            + self.quality_repair_nudges
     }
 }
 
@@ -259,17 +285,42 @@ mod tests {
     }
 
     #[test]
-    fn extra_rounds_includes_truncation_retries() {
+    fn extra_rounds_includes_truncation_and_review_repair_retries() {
         use super::Trajectory;
         let t = Trajectory {
             truncation_retries: 3,
+            quality_repair_nudges: 2,
             verify_rounds: 1,
             recovery_retries: 1,
             repeat_nudges: 0,
             continue_nudges: 0,
             ..Default::default()
         };
-        // 1 verify + 1 recovery + 3 truncation = 5 total extra rounds.
-        assert_eq!(t.extra_rounds(), 5);
+        // 1 verify + 1 recovery + 3 truncation + 2 repair = 7 total extra rounds.
+        assert_eq!(t.extra_rounds(), 7);
+    }
+
+    #[test]
+    fn trajectory_defaults_review_repair_fields_for_old_artifacts() {
+        use super::Trajectory;
+
+        let old = serde_json::json!({
+            "verify_rounds": 0,
+            "recovery_retries": 0,
+            "repeat_nudges": 0,
+            "continue_nudges": 0,
+            "hit_step_cap": false,
+            "stalled_unfinished": false,
+            "stalled_repeating": false,
+            "verify_attributions": []
+        });
+        let t: Trajectory = serde_json::from_value(old).expect("old trajectory artifact");
+
+        assert_eq!(t.effective_max_steps, 0);
+        assert_eq!(t.quality_repair_nudges, 0);
+        assert!(t.review_repair_counts.is_empty());
+        assert_eq!(t.review_repair_exhaustion_reason, "");
+        assert!(!t.review_repair_stopped_by_exhaustion);
+        assert!(!t.stopped_by_step_cap);
     }
 }

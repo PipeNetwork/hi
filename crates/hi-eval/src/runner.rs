@@ -300,15 +300,37 @@ fn read_report(path: &Path) -> ReportInfo {
         return ReportInfo::default();
     };
     let tel = &value["telemetry"];
+    let stopped_by_step_cap = tel["stopped_by_step_cap"]
+        .as_bool()
+        .unwrap_or_else(|| tel["hit_step_cap"].as_bool().unwrap_or(false));
     let trajectory = Trajectory {
         verify_rounds: tel["verify_rounds"].as_u64().unwrap_or(0) as u32,
         recovery_retries: tel["recovery_retries"].as_u64().unwrap_or(0) as u32,
         repeat_nudges: tel["repeat_nudges"].as_u64().unwrap_or(0) as u32,
         continue_nudges: tel["continue_nudges"].as_u64().unwrap_or(0) as u32,
         truncation_retries: tel["truncation_retries"].as_u64().unwrap_or(0) as u32,
+        effective_max_steps: tel["effective_max_steps"].as_u64().unwrap_or(0) as u32,
         hit_step_cap: tel["hit_step_cap"].as_bool().unwrap_or(false),
+        stopped_by_step_cap,
         stalled_unfinished: tel["stalled_unfinished"].as_bool().unwrap_or(false),
         stalled_repeating: tel["stalled_repeating"].as_bool().unwrap_or(false),
+        quality_repair_nudges: tel["quality_repair_nudges"].as_u64().unwrap_or(0) as u32,
+        review_repair_counts: tel["review_repair_counts"]
+            .as_object()
+            .map(|counts| {
+                counts
+                    .iter()
+                    .map(|(mode, value)| (mode.clone(), value.as_u64().unwrap_or(0) as u32))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        review_repair_exhaustion_reason: tel["review_repair_exhaustion_reason"]
+            .as_str()
+            .unwrap_or("")
+            .to_string(),
+        review_repair_stopped_by_exhaustion: tel["review_repair_stopped_by_exhaustion"]
+            .as_bool()
+            .unwrap_or(false),
         verify_attributions: tel["verify_attributions"]
             .as_array()
             .map(|items| {
@@ -374,7 +396,7 @@ fn string_array(value: &serde_json::Value) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::dir_snapshot;
+    use super::{dir_snapshot, read_report};
 
     #[test]
     fn dir_snapshot_ignores_build_artifacts() {
@@ -396,5 +418,57 @@ mod tests {
         assert_ne!(before, after_source, "source edits must still count");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn read_report_parses_review_repair_trajectory_fields() {
+        let path = std::env::temp_dir().join(format!(
+            "hi-eval-review-repair-report-{}.json",
+            std::process::id()
+        ));
+        let report = serde_json::json!({
+            "total_tokens": 123,
+            "changed_files": [],
+            "compat_fallbacks_used": [],
+            "telemetry": {
+                "effective_max_steps": 12,
+                "verify_rounds": 0,
+                "recovery_retries": 0,
+                "repeat_nudges": 0,
+                "continue_nudges": 0,
+                "truncation_retries": 0,
+                "hit_step_cap": false,
+                "stopped_by_step_cap": false,
+                "stalled_unfinished": true,
+                "stalled_repeating": false,
+                "quality_repair_nudges": 4,
+                "review_repair_counts": {
+                    "review_listing_only": 4
+                },
+                "review_repair_exhaustion_reason": "review_listing_only_exhausted",
+                "review_repair_stopped_by_exhaustion": true,
+                "verify_attributions": []
+            }
+        });
+        std::fs::write(&path, serde_json::to_string(&report).unwrap()).unwrap();
+
+        let parsed = read_report(&path);
+
+        assert_eq!(parsed.tokens, 123);
+        assert_eq!(parsed.trajectory.effective_max_steps, 12);
+        assert_eq!(parsed.trajectory.quality_repair_nudges, 4);
+        assert_eq!(
+            parsed.trajectory.review_repair_counts["review_listing_only"],
+            4
+        );
+        assert_eq!(
+            parsed.trajectory.review_repair_exhaustion_reason,
+            "review_listing_only_exhausted"
+        );
+        assert!(parsed.trajectory.review_repair_stopped_by_exhaustion);
+        assert!(!parsed.trajectory.stopped_by_step_cap);
+        assert!(!parsed.trajectory.hit_step_cap);
+
+        let _ = std::fs::remove_file(path);
     }
 }
