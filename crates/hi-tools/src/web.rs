@@ -494,16 +494,20 @@ fn is_root() -> bool {
 /// server (HuggingFace's CDN honours HTTP range requests), so a multi-GB model
 /// file downloads several times faster than a single curl connection. Falls
 /// back to resumable single-connection `curl` when aria2c isn't on PATH.
-fn download_command(url: &str, output_path: &str) -> String {
+pub(crate) fn download_command(url: &str, output_path: &str) -> String {
+    let agent_header = shell_quote(&agent_header());
+    let user_agent = shell_quote(&agent_user_agent());
     if aria2c_available() {
         // -x16  : up to 16 connections per server (range requests)
         // -s16  : split each file into 16 segments downloaded in parallel
         // -c    : resume / continue a partial download
         // -k 1M : raise the minimum split size so small files aren't over-split
+        // --header/--user-agent : identify every range request as hi.
         // --file-allocation=none : skip pre-allocation (slow on some FSes)
         // --console-log-level=warn : keep the polled output terse
         format!(
-            "aria2c -x16 -s16 -c -k 1M --file-allocation=none \
+            "aria2c -x16 -s16 -c -k 1M --header {agent_header} \
+             --user-agent {user_agent} --file-allocation=none \
              --console-log-level=warn --summary-interval=0 \
              -d {dir} -o {name} {url}",
             dir = shell_quote(
@@ -525,11 +529,19 @@ fn download_command(url: &str, output_path: &str) -> String {
     } else {
         // Resumable single-connection download (-L follows redirects, -C - resumes).
         format!(
-            "curl -L -C - --fail -o {out} {url}",
+            "curl -L -C - --fail -H {agent_header} -A {user_agent} -o {out} {url}",
             out = shell_quote(output_path),
             url = shell_quote(url),
         )
     }
+}
+
+fn agent_header() -> String {
+    "AI_AGENT: hi".to_string()
+}
+
+fn agent_user_agent() -> String {
+    format!("hi/{}", env!("CARGO_PKG_VERSION"))
 }
 
 /// What `resolve_download` produces: either a direct URL to fetch, or a file
@@ -603,7 +615,7 @@ fn format_size(bytes: u64) -> String {
 }
 
 /// Minimal shell quoting for a single argument.
-fn shell_quote(s: &str) -> String {
+pub(crate) fn shell_quote(s: &str) -> String {
     if s.chars()
         .all(|c| c.is_ascii_alphanumeric() || c == '/' || c == '.' || c == '_' || c == '-')
     {
@@ -965,12 +977,25 @@ mod tests {
                 cmd.contains("-d 'out'") || cmd.contains("-d out"),
                 "missing dir: {cmd}"
             );
+            assert!(
+                cmd.contains("--header 'AI_AGENT: hi'"),
+                "missing agent header: {cmd}"
+            );
+            assert!(
+                cmd.contains("--user-agent hi/"),
+                "missing user-agent: {cmd}"
+            );
             assert!(cmd.contains("-o f.gguf"), "missing name: {cmd}");
             assert!(cmd.contains("resolve/main/f.gguf"), "missing url: {cmd}");
         } else {
             // curl fallback path.
             assert!(cmd.starts_with("curl"), "unexpected command: {cmd}");
             assert!(cmd.contains("-C -"), "curl should resume: {cmd}");
+            assert!(
+                cmd.contains("-H 'AI_AGENT: hi'"),
+                "missing agent header: {cmd}"
+            );
+            assert!(cmd.contains("-A hi/"), "missing user-agent: {cmd}");
         }
     }
 
@@ -980,11 +1005,16 @@ mod tests {
         // absent the command must be a resumable curl. We can't remove aria2c,
         // so just assert the fallback string is well-formed when constructed.
         let cmd = format!(
-            "curl -L -C - --fail -o {out} {url}",
+            "curl -L -C - --fail -H {agent_header} -A {user_agent} -o {out} {url}",
+            agent_header = shell_quote(&agent_header()),
+            user_agent = shell_quote(&agent_user_agent()),
             out = shell_quote("a/b.gguf"),
             url = shell_quote("https://example.com/b.gguf"),
         );
-        assert!(cmd.contains("curl -L -C - --fail -o"));
+        assert!(cmd.starts_with("curl -L -C - --fail"));
+        assert!(cmd.contains(" -o a/b.gguf "));
+        assert!(cmd.contains("-H 'AI_AGENT: hi'"));
+        assert!(cmd.contains("-A hi/"));
         assert!(cmd.contains("a/b.gguf"));
     }
 

@@ -217,6 +217,48 @@ impl HuggingFaceHubClient {
             .collect())
     }
 
+    pub async fn author_models(
+        &self,
+        author: impl AsRef<str>,
+        limit: usize,
+    ) -> Result<Vec<ModelCandidate>> {
+        let author = author.as_ref().trim();
+        if author.is_empty() {
+            bail!("Hugging Face author is empty");
+        }
+        let limit = limit.clamp(1, 100).to_string();
+        let response = self
+            .with_auth(
+                self.http
+                    .get(format!("{}/api/models", self.endpoint))
+                    .query(&[
+                        ("author", author),
+                        ("limit", limit.as_str()),
+                        ("full", "true"),
+                    ])
+                    .header(header::ACCEPT, "application/json"),
+            )
+            .send()
+            .await
+            .with_context(|| format!("listing Hugging Face models for author {author}"))?;
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            bail!(
+                "Hugging Face author listing returned {status}: {}",
+                clip(&body, 240)
+            );
+        }
+        let value: Value = response
+            .json()
+            .await
+            .context("parsing Hugging Face author listing")?;
+        Ok(parse_hub_models(&value)
+            .into_iter()
+            .map(HubModel::into_candidate)
+            .collect())
+    }
+
     pub async fn model_info(&self, repo: &HfRepoRef) -> Result<HfModelInfo> {
         let url = format!(
             "{}/api/models/{}/revision/{}",
@@ -660,6 +702,27 @@ mod tests {
         assert_eq!(models[0].downloads, Some(42));
         assert_eq!(models[0].likes, None);
         assert!(models[0].files.is_empty());
+    }
+
+    #[tokio::test]
+    async fn author_models_queries_author_catalog() {
+        let server = MockHub::new(
+            200,
+            r#"[{"id":"pipenetwork/model","downloads":7,"siblings":[{"rfilename":"model.gguf"}]}]"#,
+        );
+        let client = HuggingFaceHubClient::new(server.url(), None);
+
+        let models = client.author_models("pipenetwork", 100).await.unwrap();
+
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0].id, "pipenetwork/model");
+        assert_eq!(models[0].downloads, Some(7));
+        assert_eq!(models[0].files[0].path, "model.gguf");
+        let request = server.request();
+        assert!(request.contains("/api/models?"));
+        assert!(request.contains("author=pipenetwork"));
+        assert!(request.contains("limit=100"));
+        assert!(request.contains("full=true"));
     }
 
     #[tokio::test]

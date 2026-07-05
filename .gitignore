@@ -13,3 +13,9 @@
 # so the workspace snapshot can see them for change detection). These are
 # cleaned up by the tests; this pattern catches any that leak from older tests.
 .hi-verify-*
+
+# Local Python virtualenv (created by tooling, not source).
+/.venv/
+
+# Downloaded model weights / artifacts (large, machine-local).
+/models/

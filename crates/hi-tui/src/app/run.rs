@@ -202,6 +202,8 @@ pub async fn run(
         apply_metadata(&mut app, agent, registry, &result, &models_cache_key);
     }
 
+    let mut hf_state = hi_tools::HfCommandState::default();
+
     'session: loop {
         // Run a queued command first (typed while the previous turn ran);
         // otherwise edit the input line until the user submits.
@@ -576,7 +578,7 @@ pub async fn run(
                     }
                 }
                 Command::Hf(arg) => {
-                    match handle_hf_command(&arg).await {
+                    match hi_tools::handle_hf_command(&arg, &mut hf_state).await {
                         Ok(text) => {
                             for line in text.lines() {
                                 app.push(Line::styled(line.to_string(), dim()));
@@ -1042,119 +1044,6 @@ pub async fn run(
     }
 
     Ok(())
-}
-
-async fn handle_hf_command(arg: &str) -> Result<String> {
-    let arg = arg.trim();
-    let mut parts = arg.split_whitespace();
-    let Some(subcommand) = parts.next() else {
-        return Ok("usage: /hf search <query> | /hf files <repo[@revision]> | /hf download <repo[@revision]> <filename> [output]".to_string());
-    };
-    match subcommand {
-        "search" => {
-            let query = arg.strip_prefix("search").unwrap_or("").trim();
-            if query.is_empty() {
-                anyhow::bail!("usage: /hf search <query>");
-            }
-            let client = hi_ai::HuggingFaceHubClient::from_env();
-            let models = client.search_models(query, 10).await?;
-            Ok(format_hf_search(&models))
-        }
-        "files" => {
-            let repo = parts
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("usage: /hf files <repo[@revision]>"))?;
-            let repo = hi_ai::HfRepoRef::parse(repo)?;
-            let client = hi_ai::HuggingFaceHubClient::from_env();
-            let files = client.list_files(&repo).await?;
-            Ok(format_hf_files(&repo, &files))
-        }
-        "download" => {
-            let repo = parts.next().ok_or_else(|| {
-                anyhow::anyhow!("usage: /hf download <repo[@revision]> <filename> [output]")
-            })?;
-            let filename = parts.next().ok_or_else(|| {
-                anyhow::anyhow!("usage: /hf download <repo[@revision]> <filename> [output]")
-            })?;
-            let output = parts.next();
-            let source = if repo.contains(':') {
-                repo.to_string()
-            } else {
-                format!("{repo}:{filename}")
-            };
-            let mut args = serde_json::json!({ "source": source });
-            if let Some(output) = output {
-                args["output"] = serde_json::Value::String(output.to_string());
-            }
-            let out = hi_tools::run_web_download(&args.to_string()).await?;
-            Ok(out.content)
-        }
-        _ => Ok("usage: /hf search <query> | /hf files <repo[@revision]> | /hf download <repo[@revision]> <filename> [output]".to_string()),
-    }
-}
-
-fn format_hf_search(models: &[hi_ai::ModelCandidate]) -> String {
-    if models.is_empty() {
-        return "No Hugging Face models found.".to_string();
-    }
-    let mut out = String::from("Hugging Face models:\n");
-    for model in models {
-        let tags = model
-            .tags
-            .iter()
-            .take(4)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(", ");
-        let downloads = model
-            .downloads
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "-".into());
-        let likes = model
-            .likes
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| "-".into());
-        let runnable = if model.runnable {
-            "runnable"
-        } else {
-            "not runnable by provider"
-        };
-        out.push_str(&format!(
-            "  {}  [downloads: {downloads}, likes: {likes}]  {runnable}\n",
-            model.id
-        ));
-        if !tags.is_empty() {
-            out.push_str(&format!("    tags: {tags}\n"));
-        }
-    }
-    out.trim_end().to_string()
-}
-
-fn format_hf_files(repo: &hi_ai::HfRepoRef, files: &[hi_ai::HfFileInfo]) -> String {
-    if files.is_empty() {
-        return format!("No files found in {}@{}.", repo.repo_id, repo.revision);
-    }
-    let mut out = format!("Files in {}@{}:\n", repo.repo_id, repo.revision);
-    for file in files {
-        let size = file.size.map(human_size).unwrap_or_default();
-        out.push_str(&format!("  {}  {size}\n", file.path));
-    }
-    out.trim_end().to_string()
-}
-
-fn human_size(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-    if bytes >= GB {
-        format!("{:.2} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.1} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{bytes} B")
-    }
 }
 
 /// Drive a model future (a turn or a compaction) to completion while keeping

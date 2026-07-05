@@ -364,12 +364,23 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "hf",
-        args: "<search|files|download> ...",
+        args: "<search|menu|files|download> ...",
         help: "discover and download Hugging Face Hub model files",
         arg_values: &[
             ("search", "search Hub models"),
-            ("files", "list repo files"),
-            ("download", "download one repo file"),
+            ("menu", "list downloadable repos for a Hub author"),
+            ("author", "alias for menu"),
+            ("user", "alias for menu"),
+            ("files", "list repo files; accepts a menu number"),
+            (
+                "download",
+                "download one repo file; accepts menu/file numbers",
+            ),
+            (
+                "--",
+                "with download, fetch every file and delete after each",
+            ),
+            ("--keep", "with download, keep every file in a directory"),
         ],
     },
     CommandSpec {
