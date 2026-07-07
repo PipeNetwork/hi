@@ -1,6 +1,6 @@
 use anyhow::Result;
 
-use crate::backend::{GenerationOutput, GenerationRequest};
+use crate::backend::{GenerationEvent, GenerationOutput, GenerationRequest};
 use crate::config::MlxModelConfig;
 use crate::generate::TokenizerRuntime;
 use crate::weights::WeightCatalog;
@@ -19,6 +19,17 @@ impl NativeRuntime {
     }
 
     pub fn generate(&mut self, _request: GenerationRequest) -> Result<GenerationOutput> {
+        anyhow::bail!("native MLX inference requires Apple Silicon macOS")
+    }
+
+    pub fn stream_generate<F>(
+        &mut self,
+        _request: GenerationRequest,
+        _on_event: F,
+    ) -> Result<GenerationOutput>
+    where
+        F: FnMut(GenerationEvent) -> Result<()>,
+    {
         anyhow::bail!("native MLX inference requires Apple Silicon macOS")
     }
 }
@@ -48,12 +59,30 @@ impl NativeRuntime {
     pub fn generate(&mut self, request: GenerationRequest) -> Result<GenerationOutput> {
         native::generate(&self.config, self.model.as_mut(), &self.tokenizer, request)
     }
+
+    pub fn stream_generate<F>(
+        &mut self,
+        request: GenerationRequest,
+        on_event: F,
+    ) -> Result<GenerationOutput>
+    where
+        F: FnMut(GenerationEvent) -> Result<()>,
+    {
+        native::stream_generate(
+            &self.config,
+            self.model.as_mut(),
+            &self.tokenizer,
+            request,
+            on_event,
+        )
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 pub trait CausalLm {
     fn forward(&mut self, input_ids: &[u32]) -> Result<mlx_rs::Array>;
     fn reset_cache(&mut self);
+    fn prepare_cache(&mut self, _capacity: i32) {}
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
@@ -65,16 +94,16 @@ mod native {
     use mlx_rs::fast::{
         ScaledDotProductAttentionMask, layer_norm, rms_norm, rope, scaled_dot_product_attention,
     };
-    use mlx_rs::ops::indexing::{IndexOp, put_along_axis, take_along_axis};
+    use mlx_rs::ops::indexing::{IndexOp, TryIndexMutOp, put_along_axis, take_along_axis};
     use mlx_rs::ops::{
         argpartition_axis, broadcast_to, concatenate_axis, cos, dequantize, einsum, matmul,
         maximum, mean_axis, minimum, rsqrt, sigmoid, sin, softmax_axis, split_sections, stack_axis,
-        sum_axis, which,
+        sum_axis, which, zeros_dtype,
     };
     use mlx_rs::{Array, Stream, transforms};
 
     use super::CausalLm;
-    use crate::backend::{GenerationOutput, GenerationRequest};
+    use crate::backend::{GenerationEvent, GenerationOutput, GenerationRequest};
     use crate::config::{MlxModelConfig, QuantizationSpec};
     use crate::generate::{LogitsProcessor, TokenizerRuntime, hit_stop};
     use crate::manifest::ModelFamily;
@@ -95,6 +124,16 @@ mod native {
             ModelFamily::DeepSeek | ModelFamily::GlmFlash => {
                 Ok(Box::new(MlaLike::new(config.clone(), arrays)?))
             }
+            ModelFamily::Llama
+            | ModelFamily::Mistral
+            | ModelFamily::Mixtral
+            | ModelFamily::Gemma
+            | ModelFamily::Phi => {
+                bail!(
+                    "{} MLX models are not supported by hi-mlx yet; use --backend cuda",
+                    config.family.label()
+                )
+            }
         }
     }
 
@@ -104,24 +143,44 @@ mod native {
         tokenizer: &TokenizerRuntime,
         request: GenerationRequest,
     ) -> Result<GenerationOutput> {
+        stream_generate(config, model, tokenizer, request, |_| Ok(()))
+    }
+
+    pub fn stream_generate<F>(
+        config: &MlxModelConfig,
+        model: &mut dyn CausalLm,
+        tokenizer: &TokenizerRuntime,
+        request: GenerationRequest,
+        mut on_event: F,
+    ) -> Result<GenerationOutput>
+    where
+        F: FnMut(GenerationEvent) -> Result<()>,
+    {
         let prompt_tokens = tokenizer.encode(&request.prompt)?;
         if prompt_tokens.is_empty() {
             bail!("prompt encoded to zero tokens");
         }
         model.reset_cache();
+        let max_tokens = request.max_tokens.max(1);
+        let cache_capacity = prompt_tokens
+            .len()
+            .saturating_add(max_tokens as usize)
+            .min(i32::MAX as usize) as i32;
+        model.prepare_cache(cache_capacity);
+
         let mut tokens = prompt_tokens.clone();
         let mut generated = Vec::new();
-        let mut processor = LogitsProcessor::new(request.temperature, request.top_p, 1.0, 0x4849);
-        let max_tokens = request.max_tokens.max(1);
-        let mut next_input = prompt_tokens;
+        let mut processor = LogitsProcessor::new(
+            request.temperature,
+            request.top_p,
+            1.0,
+            request.seed.unwrap_or(0x4849),
+        );
+        let mut decoded_text = String::new();
+        let mut logits = prefill_logits(model, &prompt_tokens, prefill_chunk_size())?;
         for _ in 0..max_tokens {
-            let logits = model.forward(&next_input)?;
             let next = if request.temperature <= f32::EPSILON {
-                let last = crate::generate::mlx::last_token_logits(&logits)?;
-                last.iter()
-                    .enumerate()
-                    .max_by(|a, b| a.1.total_cmp(b.1))
-                    .map(|(idx, _)| idx as u32)
+                crate::generate::mlx::greedy_next_token(&logits)?
             } else {
                 crate::generate::mlx::sample_next_token(&logits, &mut processor, &tokens)?
             };
@@ -130,17 +189,62 @@ mod native {
             };
             tokens.push(next);
             generated.push(next);
+            let current_text = tokenizer.decode(&generated)?;
+            let delta = decoded_delta(&decoded_text, &current_text, tokenizer, next)?;
+            decoded_text = current_text;
+            on_event(GenerationEvent::TokenDelta {
+                token_id: next,
+                text: delta,
+            })?;
             if hit_stop(&generated, &config.eos_token_ids) {
                 break;
             }
-            next_input = vec![next];
+            logits = model.forward(&[next])?;
         }
         let text = tokenizer.decode(&generated)?;
-        Ok(GenerationOutput {
+        let output = GenerationOutput {
             prompt_tokens: tokens.len().saturating_sub(generated.len()) as u64,
             completion_tokens: generated.len() as u64,
             text,
-        })
+        };
+        on_event(GenerationEvent::Finished {
+            output: output.clone(),
+        })?;
+        Ok(output)
+    }
+
+    fn prefill_logits(
+        model: &mut dyn CausalLm,
+        prompt_tokens: &[u32],
+        chunk_size: usize,
+    ) -> Result<Array> {
+        let chunk_size = chunk_size.max(1);
+        let mut logits = None;
+        for chunk in prompt_tokens.chunks(chunk_size) {
+            logits = Some(model.forward(chunk)?);
+        }
+        logits.ok_or_else(|| anyhow!("prompt encoded to zero tokens"))
+    }
+
+    fn prefill_chunk_size() -> usize {
+        std::env::var("HI_MLX_PREFILL_CHUNK_SIZE")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(2048)
+    }
+
+    fn decoded_delta(
+        previous_text: &str,
+        current_text: &str,
+        tokenizer: &TokenizerRuntime,
+        token: u32,
+    ) -> Result<String> {
+        if let Some(delta) = current_text.strip_prefix(previous_text) {
+            Ok(delta.to_string())
+        } else {
+            tokenizer.decode(&[token])
+        }
     }
 
     #[derive(Clone)]
@@ -149,6 +253,8 @@ mod native {
         value: Option<Array>,
         offset: i32,
         max_len: Option<i32>,
+        capacity: Option<i32>,
+        start: i32,
     }
 
     impl Cache {
@@ -162,6 +268,8 @@ mod native {
                 value: None,
                 offset: 0,
                 max_len,
+                capacity: None,
+                start: 0,
             }
         }
 
@@ -169,6 +277,12 @@ mod native {
             self.key = None;
             self.value = None;
             self.offset = 0;
+            self.start = 0;
+        }
+
+        fn prepare_capacity(&mut self, capacity: i32) {
+            self.capacity = Some(capacity.max(1));
+            self.reset();
         }
 
         fn update(&mut self, key: Array, value: Array) -> Result<(Array, Array)> {
@@ -177,6 +291,16 @@ mod native {
         }
 
         fn update_with_start(&mut self, key: Array, value: Array) -> Result<(Array, Array, i32)> {
+            if self.max_len.is_some() {
+                return self.update_ring(key, value);
+            }
+            if self.capacity.is_some() {
+                return self.update_dense(key, value);
+            }
+            self.update_concat(key, value)
+        }
+
+        fn update_concat(&mut self, key: Array, value: Array) -> Result<(Array, Array, i32)> {
             let previous_offset = self.offset;
             let new_len = key.shape()[2];
             let out_key = match self.key.take() {
@@ -190,6 +314,7 @@ mod native {
             let total_len = previous_offset + new_len;
             let key_start = total_len - out_key.shape()[2];
             self.offset = total_len;
+            self.start = key_start;
 
             let (stored_key, stored_value) = match self.max_len {
                 Some(max_len) if out_key.shape()[2] > max_len => {
@@ -205,12 +330,154 @@ mod native {
             self.value = Some(stored_value);
             Ok((out_key, out_value, key_start))
         }
+
+        fn update_dense(&mut self, key: Array, value: Array) -> Result<(Array, Array, i32)> {
+            let previous_offset = self.offset;
+            let new_len = key.shape()[2];
+            let total_len = previous_offset + new_len;
+            let Some(capacity) = self.capacity else {
+                return self.update_concat(key, value);
+            };
+            if total_len > capacity {
+                self.capacity = None;
+                let previous_key = self.materialized_key()?;
+                let previous_value = self.materialized_value()?;
+                self.key = previous_key;
+                self.value = previous_value;
+                return self.update_concat(key, value);
+            }
+
+            let mut key_buffer = self
+                .key
+                .take()
+                .unwrap_or_else(|| dense_buffer_like(&key, capacity));
+            let mut value_buffer = self
+                .value
+                .take()
+                .unwrap_or_else(|| dense_buffer_like(&value, capacity));
+            key_buffer.try_index_mut((.., .., previous_offset..total_len, ..), key)?;
+            value_buffer.try_index_mut((.., .., previous_offset..total_len, ..), value)?;
+            let out_key = key_buffer.index((.., .., ..total_len, ..));
+            let out_value = value_buffer.index((.., .., ..total_len, ..));
+            self.key = Some(key_buffer);
+            self.value = Some(value_buffer);
+            self.offset = total_len;
+            self.start = 0;
+            Ok((out_key, out_value, 0))
+        }
+
+        fn update_ring(&mut self, key: Array, value: Array) -> Result<(Array, Array, i32)> {
+            let max_len = self.max_len.unwrap_or(1).max(1);
+            let previous_offset = self.offset;
+            let new_len = key.shape()[2];
+            let total_len = previous_offset + new_len;
+
+            let mut key_buffer = self
+                .key
+                .take()
+                .unwrap_or_else(|| dense_buffer_like(&key, max_len));
+            let mut value_buffer = self
+                .value
+                .take()
+                .unwrap_or_else(|| dense_buffer_like(&value, max_len));
+
+            if new_len >= max_len {
+                let trim_start = new_len - max_len;
+                key_buffer.try_index_mut(
+                    (.., .., ..max_len, ..),
+                    key.index((.., .., trim_start.., ..)),
+                )?;
+                value_buffer.try_index_mut(
+                    (.., .., ..max_len, ..),
+                    value.index((.., .., trim_start.., ..)),
+                )?;
+            } else {
+                let write_start = previous_offset.rem_euclid(max_len);
+                let first_len = (max_len - write_start).min(new_len);
+                let first_end = write_start + first_len;
+                key_buffer.try_index_mut(
+                    (.., .., write_start..first_end, ..),
+                    key.index((.., .., ..first_len, ..)),
+                )?;
+                value_buffer.try_index_mut(
+                    (.., .., write_start..first_end, ..),
+                    value.index((.., .., ..first_len, ..)),
+                )?;
+                let remaining = new_len - first_len;
+                if remaining > 0 {
+                    key_buffer.try_index_mut(
+                        (.., .., ..remaining, ..),
+                        key.index((.., .., first_len.., ..)),
+                    )?;
+                    value_buffer.try_index_mut(
+                        (.., .., ..remaining, ..),
+                        value.index((.., .., first_len.., ..)),
+                    )?;
+                }
+            }
+
+            self.key = Some(key_buffer);
+            self.value = Some(value_buffer);
+            self.offset = total_len;
+            let stored_len = total_len.min(max_len);
+            self.start = total_len - stored_len;
+            let out_key = self
+                .materialized_key()?
+                .expect("ring cache key set after update");
+            let out_value = self
+                .materialized_value()?
+                .expect("ring cache value set after update");
+            Ok((out_key, out_value, self.start))
+        }
+
+        fn materialized_key(&self) -> Result<Option<Array>> {
+            self.materialized(self.key.as_ref())
+        }
+
+        fn materialized_value(&self) -> Result<Option<Array>> {
+            self.materialized(self.value.as_ref())
+        }
+
+        fn materialized(&self, buffer: Option<&Array>) -> Result<Option<Array>> {
+            let Some(buffer) = buffer else {
+                return Ok(None);
+            };
+            let Some(max_len) = self.max_len else {
+                return Ok(Some(buffer.index((.., .., ..self.offset, ..))));
+            };
+            let stored_len = self.offset.min(max_len);
+            if stored_len <= 0 {
+                return Ok(None);
+            }
+            if stored_len < max_len {
+                return Ok(Some(buffer.index((.., .., ..stored_len, ..))));
+            }
+            let start_pos = self.start.rem_euclid(max_len);
+            if start_pos == 0 {
+                Ok(Some(buffer.clone()))
+            } else {
+                Ok(Some(concatenate_axis(
+                    &[
+                        buffer.index((.., .., start_pos..max_len, ..)),
+                        buffer.index((.., .., ..start_pos, ..)),
+                    ],
+                    2,
+                )?))
+            }
+        }
+    }
+
+    fn dense_buffer_like(reference: &Array, capacity: i32) -> Array {
+        let mut shape = reference.shape().to_vec();
+        shape[2] = capacity;
+        zeros_dtype(&shape, reference.dtype()).expect("valid dense KV cache shape")
     }
 
     #[derive(Clone)]
     struct KeyCache {
         key: Option<Array>,
         offset: i32,
+        capacity: Option<i32>,
     }
 
     impl KeyCache {
@@ -218,16 +485,53 @@ mod native {
             Self {
                 key: None,
                 offset: 0,
+                capacity: None,
             }
         }
 
+        fn prepare_capacity(&mut self, capacity: i32) {
+            self.capacity = Some(capacity.max(1));
+            self.key = None;
+            self.offset = 0;
+        }
+
         fn update(&mut self, key: Array) -> Result<Array> {
+            if self.capacity.is_some() {
+                return self.update_dense(key);
+            }
             let out_key = match self.key.take() {
                 Some(prev) => concatenate_axis(&[prev, key], 2)?,
                 None => key,
             };
             self.offset = out_key.shape()[2];
             self.key = Some(out_key.clone());
+            Ok(out_key)
+        }
+
+        fn update_dense(&mut self, key: Array) -> Result<Array> {
+            let previous_offset = self.offset;
+            let new_len = key.shape()[2];
+            let total_len = previous_offset + new_len;
+            let Some(capacity) = self.capacity else {
+                return self.update(key);
+            };
+            if total_len > capacity {
+                self.capacity = None;
+                let previous = self
+                    .key
+                    .as_ref()
+                    .map(|key| key.index((.., .., ..self.offset, ..)));
+                self.key = previous;
+                return self.update(key);
+            }
+            let mut buffer = self
+                .key
+                .take()
+                .unwrap_or_else(|| dense_buffer_like(&key, capacity));
+            buffer.try_index_mut((.., .., previous_offset..total_len, ..), key)?;
+            let out_key = buffer.index((.., .., ..total_len, ..));
+            self.offset = total_len;
+            self.key = Some(buffer);
             Ok(out_key)
         }
     }
@@ -533,17 +837,28 @@ mod native {
                 None,
             )?;
             let (k, v) = self.cache.update(k, v)?;
-            let mask = if l > 1 && offset == 0 {
-                Some(ScaledDotProductAttentionMask::Causal)
-            } else {
-                None
-            };
             let scale = (self.head_dim as f32).powf(-0.5);
-            let output = match mask {
-                Some(mask) => {
-                    scaled_dot_product_attention(&q, &k, &v, scale, mask, None::<&Array>)?
-                }
-                None => scaled_dot_product_attention(&q, &k, &v, scale, None, None::<&Array>)?,
+            let output = if l > 1 && offset == 0 {
+                scaled_dot_product_attention(
+                    &q,
+                    &k,
+                    &v,
+                    scale,
+                    ScaledDotProductAttentionMask::Causal,
+                    None::<&Array>,
+                )?
+            } else if l > 1 {
+                let mask = causal_attention_mask(l, k.shape()[2], offset);
+                scaled_dot_product_attention(
+                    &q,
+                    &k,
+                    &v,
+                    scale,
+                    ScaledDotProductAttentionMask::Array(&mask),
+                    None::<&Array>,
+                )?
+            } else {
+                scaled_dot_product_attention(&q, &k, &v, scale, None, None::<&Array>)?
             };
             let output = output.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
                 b,
@@ -1362,6 +1677,15 @@ mod native {
                 layer.attention.reset_cache();
             }
         }
+
+        fn prepare_cache(&mut self, capacity: i32) {
+            for layer in &mut self.layers {
+                layer.attention.cache.prepare_capacity(capacity);
+                if let Some(indexer) = &mut layer.attention.indexer {
+                    indexer.cache.prepare_capacity(capacity);
+                }
+            }
+        }
     }
 
     enum V4GroupedLinear {
@@ -1622,6 +1946,7 @@ mod native {
         cache: Cache,
         compressor: Option<V4Compressor>,
         indexer: Option<V4Indexer>,
+        compressed_mask_cache: HashMap<(i32, i32, i32, i32), Array>,
         compress_ratio: i32,
         num_heads: i32,
         head_dim: i32,
@@ -1687,6 +2012,7 @@ mod native {
                 cache: Cache::with_max_len(config.sliding_window.map(|window| window as i32)),
                 compressor,
                 indexer,
+                compressed_mask_cache: HashMap::new(),
                 compress_ratio: compress_ratio as i32,
                 num_heads: config.num_attention_heads as i32,
                 head_dim,
@@ -1815,12 +2141,8 @@ mod native {
 
             let b = raw_k.shape()[0];
             let query_len = raw_mask.shape()[2];
-            let mut compressed_mask = compressed_attention_mask(
-                query_len,
-                compressed_k.shape()[2],
-                offset,
-                self.compress_ratio,
-            );
+            let mut compressed_mask =
+                self.cached_compressed_attention_mask(query_len, compressed_k.shape()[2], offset);
 
             if let Some(indexer) = self.indexer.as_mut()
                 && let Some(topk_indices) = indexer.forward(x, query_latent, offset)?
@@ -1833,11 +2155,10 @@ mod native {
                         broadcast_to(&idx, &[b, 1, idx.shape()[2], compressed_v.shape()[3]])?;
                     compressed_k = take_along_axis(&compressed_k, &idx_k, Some(2))?;
                     compressed_v = take_along_axis(&compressed_v, &idx_v, Some(2))?;
-                    compressed_mask = compressed_attention_mask(
+                    compressed_mask = self.cached_compressed_attention_mask(
                         query_len,
                         compressed_k.shape()[2],
                         offset,
-                        self.compress_ratio,
                     );
                 } else {
                     let sparse_shape = [b, 1, query_len, compressed_k.shape()[2]];
@@ -1854,13 +2175,43 @@ mod native {
             Ok((k, v, Some(mask)))
         }
 
+        fn cached_compressed_attention_mask(
+            &mut self,
+            query_len: i32,
+            compressed_len: i32,
+            offset: i32,
+        ) -> Array {
+            let key = (query_len, compressed_len, offset, self.compress_ratio);
+            if let Some(mask) = self.compressed_mask_cache.get(&key) {
+                return mask.clone();
+            }
+            if self.compressed_mask_cache.len() > 64 {
+                self.compressed_mask_cache.clear();
+            }
+            let mask =
+                compressed_attention_mask(query_len, compressed_len, offset, self.compress_ratio);
+            self.compressed_mask_cache.insert(key, mask.clone());
+            mask
+        }
+
         fn reset_cache(&mut self) {
             self.cache.reset();
+            self.compressed_mask_cache.clear();
             if let Some(compressor) = &mut self.compressor {
                 compressor.reset();
             }
             if let Some(indexer) = &mut self.indexer {
                 indexer.reset();
+            }
+        }
+
+        fn prepare_cache(&mut self, capacity: i32) {
+            self.cache.prepare_capacity(capacity);
+            if let Some(compressor) = &mut self.compressor {
+                compressor.prepare_capacity(capacity);
+            }
+            if let Some(indexer) = &mut self.indexer {
+                indexer.prepare_capacity(capacity);
             }
         }
     }
@@ -1967,6 +2318,13 @@ mod native {
             self.pending = None;
             self.pending_start = 0;
         }
+
+        fn prepare_capacity(&mut self, capacity: i32) {
+            let compressed_capacity = (capacity + self.ratio - 1) / self.ratio;
+            self.cache.prepare_capacity(compressed_capacity.max(1));
+            self.pending = None;
+            self.pending_start = 0;
+        }
     }
 
     struct V4Indexer {
@@ -2048,6 +2406,10 @@ mod native {
 
         fn reset(&mut self) {
             self.compressor.reset();
+        }
+
+        fn prepare_capacity(&mut self, capacity: i32) {
+            self.compressor.prepare_capacity(capacity);
         }
     }
 
@@ -2330,6 +2692,12 @@ mod native {
                 layer.attention.reset_cache();
             }
         }
+
+        fn prepare_cache(&mut self, capacity: i32) {
+            for layer in &mut self.layers {
+                layer.attention.prepare_cache(capacity);
+            }
+        }
     }
 
     struct QwenMoe {
@@ -2551,6 +2919,12 @@ mod native {
         fn reset_cache(&mut self) {
             for layer in &mut self.layers {
                 layer.attention.cache.reset();
+            }
+        }
+
+        fn prepare_cache(&mut self, capacity: i32) {
+            for layer in &mut self.layers {
+                layer.attention.cache.prepare_capacity(capacity);
             }
         }
     }

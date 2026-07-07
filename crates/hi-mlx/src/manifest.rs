@@ -1,67 +1,12 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 2048;
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ModelInfo {
-    pub id: String,
-    pub path: PathBuf,
-    pub family: ModelFamily,
-    pub model_type: String,
-    pub architecture: String,
-    pub context_length: Option<u32>,
-    pub max_output_tokens: u32,
-    pub tokenizer: TokenizerInfo,
-    pub chat_template: bool,
-    pub weight_shards: Vec<WeightShard>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum ModelFamily {
-    Qwen2,
-    Qwen3,
-    DeepSeek,
-    GlmFlash,
-}
-
-impl ModelFamily {
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::Qwen2 => "qwen2",
-            Self::Qwen3 => "qwen3",
-            Self::DeepSeek => "deepseek",
-            Self::GlmFlash => "glm-flash",
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct TokenizerInfo {
-    pub tokenizer_json: bool,
-    pub tokenizer_config: bool,
-    pub special_tokens_map: bool,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct WeightShard {
-    pub path: String,
-    pub bytes: u64,
-    pub tensor_count: Option<usize>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ListedModel {
-    pub path: PathBuf,
-    pub id: Option<String>,
-    pub supported: bool,
-    pub summary: String,
-}
+pub use hi_local_core::model::{
+    DEFAULT_MAX_OUTPUT_TOKENS, ListedModel, ModelFamily, ModelInfo, TokenizerInfo, WeightShard,
+};
 
 pub fn inspect_model(path: impl AsRef<Path>, model_id: Option<String>) -> Result<ModelInfo> {
     let path = path.as_ref();
@@ -395,6 +340,8 @@ pub mod test_support {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     #[test]

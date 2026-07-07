@@ -16,12 +16,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 async-trait = "0.1"
+base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
 axum = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 safetensors = "0.4"
 tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
+memmap2 = "0.9"
 toml = "0.8"
 rustyline = "14"
 ratatui = "0.29"
@@ -32,3 +34,4 @@ hi-tools = { path = "crates/hi-tools" }
 hi-agent = { path = "crates/hi-agent" }
 hi-tui = { path = "crates/hi-tui" }
 hi-lsp = { path = "crates/hi-lsp" }
+hi-local-core = { path = "crates/hi-local-core" }

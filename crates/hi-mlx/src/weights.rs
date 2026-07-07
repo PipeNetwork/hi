@@ -124,6 +124,16 @@ impl WeightCatalog {
                     )?;
                 }
             }
+            crate::manifest::ModelFamily::Llama
+            | crate::manifest::ModelFamily::Mistral
+            | crate::manifest::ModelFamily::Mixtral
+            | crate::manifest::ModelFamily::Gemma
+            | crate::manifest::ModelFamily::Phi => {
+                bail!(
+                    "{} MLX weights are not supported by hi-mlx yet; use --backend cuda",
+                    config.family.label()
+                )
+            }
         }
         if self.quantization.has_weight_shape_packed {
             bail!(

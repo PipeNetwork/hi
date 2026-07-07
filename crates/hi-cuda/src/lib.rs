@@ -1,0 +1,25123 @@
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64 as StdAtomicU64, Ordering as StdOrdering};
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, anyhow, bail};
+use async_trait::async_trait;
+use futures_util::stream;
+use hi_gguf::{GgufFile, QwenGgufConfig, inspect_model};
+use hi_local_core::backend::{
+    BackendHealth, GenerationEvent, GenerationOutput, GenerationRequest, GenerationStream,
+    ImageInput, ImageSource, ImageUrlKind, InferenceBackend, MultimodalInput, MultimodalSupport,
+    SamplingDefaults, VideoInput, VideoSource,
+};
+use hi_local_core::model::ModelInfo;
+use image::imageops::FilterType;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+
+pub mod gpu;
+pub mod kernels;
+pub mod qwen_cpu;
+pub mod runtime;
+
+const CUDA_ATTENTION_FAST_HEAD_DIM_MAX: usize = 256;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CudaExecution {
+    Gpu,
+    CpuReference,
+}
+
+impl CudaExecution {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Gpu => "gpu",
+            Self::CpuReference => "cpu-reference",
+        }
+    }
+
+    pub fn default_for_build() -> Self {
+        if cfg!(feature = "native-cuda") {
+            Self::Gpu
+        } else {
+            Self::CpuReference
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CudaKvCacheMode {
+    Legacy,
+    Paged,
+}
+
+impl CudaKvCacheMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Paged => "paged",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CudaAttentionHealth {
+    status: &'static str,
+    detail: String,
+}
+
+fn qwen_attention_key_value_head_dims(qwen: &QwenGgufConfig) -> Result<(usize, usize)> {
+    let qk_head_dim = qwen
+        .attention_key_head_dim()
+        .map(usize::try_from)
+        .transpose()
+        .context("qwen attention key head dimension does not fit usize")?
+        .ok_or_else(|| {
+            anyhow!(
+                "qwen attention key length is incompatible with embedding length {} and attention heads {}",
+                qwen.embedding_length,
+                qwen.attention_head_count
+            )
+        })?;
+    let v_head_dim = qwen
+        .attention_value_head_dim()
+        .map(usize::try_from)
+        .transpose()
+        .context("qwen attention value head dimension does not fit usize")?
+        .ok_or_else(|| {
+            anyhow!(
+                "qwen attention value length is incompatible with embedding length {} and attention heads {}",
+                qwen.embedding_length,
+                qwen.attention_head_count
+            )
+        })?;
+    Ok((qk_head_dim, v_head_dim))
+}
+
+fn cuda_attention_health_status(
+    execution: CudaExecution,
+    kv_cache_mode: CudaKvCacheMode,
+    paged_kv_available: bool,
+    head_dims: Option<(usize, usize)>,
+    multimodal_generation: bool,
+) -> CudaAttentionHealth {
+    let head_dim_label = head_dims
+        .map(|(qk_head_dim, v_head_dim)| {
+            if qk_head_dim == v_head_dim {
+                qk_head_dim.to_string()
+            } else {
+                format!("qk:{qk_head_dim},v:{v_head_dim}")
+            }
+        })
+        .unwrap_or_else(|| "unknown".to_string());
+    let fast_head_dim = head_dims.is_some_and(|(qk_head_dim, v_head_dim)| {
+        qk_head_dim.max(v_head_dim) <= CUDA_ATTENTION_FAST_HEAD_DIM_MAX
+    });
+    let multimodal = cuda_attention_multimodal_detail(
+        multimodal_generation,
+        fast_head_dim,
+        kv_cache_mode,
+        paged_kv_available,
+    );
+
+    if execution != CudaExecution::Gpu {
+        return CudaAttentionHealth {
+            status: "legacy",
+            detail: format!(
+                "mode=disabled,head_dim={head_dim_label},head_dim_max={},kv_cache=disabled,decode=legacy(paths=single-text|batched-text,fallback_reason=cpu-reference),prefill=legacy(paths=text|batched-text|multimodal,fallback_reason=cpu-reference),multimodal=disabled(prompt_embeddings=unavailable,fallback_reason=cpu-reference)",
+                CUDA_ATTENTION_FAST_HEAD_DIM_MAX
+            ),
+        };
+    }
+
+    if head_dims.is_none() {
+        return CudaAttentionHealth {
+            status: "legacy",
+            detail: format!(
+                "mode=legacy,head_dim=unknown,head_dim_max={},kv_cache={},decode=legacy(paths=single-text|batched-text,fallback_reason=invalid-head-dim),prefill=legacy(paths=text|batched-text|multimodal,fallback_reason=invalid-head-dim),multimodal=legacy(prompt_embeddings=legacy,fallback_reason=invalid-head-dim)",
+                CUDA_ATTENTION_FAST_HEAD_DIM_MAX,
+                kv_cache_mode.label(),
+            ),
+        };
+    }
+
+    match (kv_cache_mode, paged_kv_available, fast_head_dim) {
+        (CudaKvCacheMode::Paged, true, true) => CudaAttentionHealth {
+            status: "tiled-paged",
+            detail: format!(
+                "mode=tiled-paged,head_dim={head_dim_label},head_dim_max={},kv_cache=paged,decode=tiled-paged(paths=single-text|batched-text,fallback_reason=none),decode_fallback=paged(head_dim_min={},fallback_reason=wide-head),prefill=tiled-contiguous(paths=text|batched-text|multimodal,fallback_reason=none),prefill_fallback=legacy(head_dim_min={},fallback_reason=wide-head),multimodal={multimodal}",
+                CUDA_ATTENTION_FAST_HEAD_DIM_MAX,
+                CUDA_ATTENTION_FAST_HEAD_DIM_MAX + 1,
+                CUDA_ATTENTION_FAST_HEAD_DIM_MAX + 1,
+            ),
+        },
+        (CudaKvCacheMode::Paged, true, false) => CudaAttentionHealth {
+            status: "paged-generic",
+            detail: format!(
+                "mode=paged-generic,head_dim={head_dim_label},head_dim_max={},kv_cache=paged,decode=paged-generic(paths=single-text|batched-text,fallback_from=tiled-paged,fallback_reason=wide-head),prefill=contiguous-generic(paths=text|batched-text|multimodal,fallback_from=tiled-contiguous,fallback_reason=wide-head),multimodal={multimodal}",
+                CUDA_ATTENTION_FAST_HEAD_DIM_MAX
+            ),
+        },
+        (CudaKvCacheMode::Paged, false, true) => CudaAttentionHealth {
+            status: "flash-online",
+            detail: format!(
+                "mode=flash-online,head_dim={head_dim_label},head_dim_max={},kv_cache=paged-unavailable,decode=flash-online(paths=single-text|batched-text,fallback_reason=paged-kv-unavailable),decode_fallback=legacy(head_dim_min={},fallback_reason=wide-head),prefill=tiled-contiguous(paths=text|batched-text|multimodal,fallback_reason=paged-kv-unavailable),prefill_fallback=legacy(head_dim_min={},fallback_reason=wide-head),multimodal={multimodal}",
+                CUDA_ATTENTION_FAST_HEAD_DIM_MAX,
+                CUDA_ATTENTION_FAST_HEAD_DIM_MAX + 1,
+                CUDA_ATTENTION_FAST_HEAD_DIM_MAX + 1,
+            ),
+        },
+        (CudaKvCacheMode::Paged, false, false) => CudaAttentionHealth {
+            status: "contiguous-generic",
+            detail: format!(
+                "mode=contiguous-generic,head_dim={head_dim_label},head_dim_max={},kv_cache=paged-unavailable,decode=contiguous-generic(paths=single-text|batched-text,fallback_reason=paged-kv-unavailable|wide-head),prefill=contiguous-generic(paths=text|batched-text|multimodal,fallback_reason=paged-kv-unavailable|wide-head),multimodal={multimodal}",
+                CUDA_ATTENTION_FAST_HEAD_DIM_MAX
+            ),
+        },
+        (CudaKvCacheMode::Legacy, _, true) => CudaAttentionHealth {
+            status: "flash-online",
+            detail: format!(
+                "mode=flash-online,head_dim={head_dim_label},head_dim_max={},kv_cache=legacy,decode=flash-online(paths=single-text|batched-text,fallback_reason=none),decode_fallback=legacy(head_dim_min={},fallback_reason=wide-head),prefill=tiled-contiguous(paths=text|batched-text|multimodal,fallback_reason=none),prefill_fallback=legacy(head_dim_min={},fallback_reason=wide-head),multimodal={multimodal}",
+                CUDA_ATTENTION_FAST_HEAD_DIM_MAX,
+                CUDA_ATTENTION_FAST_HEAD_DIM_MAX + 1,
+                CUDA_ATTENTION_FAST_HEAD_DIM_MAX + 1,
+            ),
+        },
+        (CudaKvCacheMode::Legacy, _, false) => CudaAttentionHealth {
+            status: "contiguous-generic",
+            detail: format!(
+                "mode=contiguous-generic,head_dim={head_dim_label},head_dim_max={},kv_cache=legacy,decode=contiguous-generic(paths=single-text|batched-text,fallback_from=flash-online,fallback_reason=wide-head),prefill=contiguous-generic(paths=text|batched-text|multimodal,fallback_from=tiled-contiguous,fallback_reason=wide-head),multimodal={multimodal}",
+                CUDA_ATTENTION_FAST_HEAD_DIM_MAX
+            ),
+        },
+    }
+}
+
+fn cuda_attention_multimodal_detail(
+    multimodal_generation: bool,
+    fast_head_dim: bool,
+    kv_cache_mode: CudaKvCacheMode,
+    paged_kv_available: bool,
+) -> &'static str {
+    match (
+        multimodal_generation,
+        fast_head_dim,
+        kv_cache_mode,
+        paged_kv_available,
+    ) {
+        (true, true, CudaKvCacheMode::Paged, true) => {
+            "tiled-paged(prompt_embeddings=tiled-paged,prefill=tiled-contiguous,decode=tiled-paged,fallback_reason=none)"
+        }
+        (true, true, _, _) => {
+            "tiled-contiguous(prompt_embeddings=tiled-contiguous,fallback_reason=none)"
+        }
+        (true, false, _, _) => {
+            "contiguous-generic(prompt_embeddings=contiguous-generic,fallback_from=tiled-contiguous,fallback_reason=wide-head)"
+        }
+        (false, _, _, _) => "text-only(prompt_embeddings=unavailable,fallback_reason=no-mmproj)",
+    }
+}
+
+#[derive(Debug)]
+pub struct CudaBackend {
+    model: ModelInfo,
+    chat_template: Option<String>,
+    qwen: QwenGgufConfig,
+    execution: CudaExecution,
+    config: CudaBackendConfig,
+    cpu_reference: Arc<qwen_cpu::QwenCpuReference>,
+    gpu_model: Result<Arc<Mutex<gpu::CudaQwenGpuModel>>, String>,
+    runtime: Result<runtime::CudaRuntimeInfo, String>,
+    scheduler: Option<CudaGenerationScheduler>,
+    kv_pages: Option<Arc<CudaPagedKvCacheManager>>,
+    mmproj: Option<CudaMmprojInfo>,
+    multimodal_stats: Arc<CudaMultimodalStats>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CudaBackendConfig {
+    pub max_batch_size: usize,
+    pub max_active_requests: usize,
+    pub max_batched_tokens: usize,
+    pub max_wait_us: u64,
+    pub kv_cache_mode: CudaKvCacheMode,
+    pub kv_page_size: usize,
+    pub mmproj_path: Option<PathBuf>,
+}
+
+const CUDA_SCHEDULER_MAX_WAIT_US: u64 = 60_000_000;
+
+#[derive(Clone, Debug)]
+struct CudaMmprojInfo {
+    path: PathBuf,
+    tensor_count: usize,
+    total_tensor_bytes: u64,
+    vision: Result<Arc<Mutex<gpu::CudaVisionEncoder>>, String>,
+}
+
+#[derive(Debug, Default)]
+struct CudaMultimodalStats {
+    multimodal_requests: AtomicU64,
+    multimodal_media_inputs: AtomicU64,
+    vision_batched_requests: AtomicU64,
+    vision_batched_batches: AtomicU64,
+    multimodal_decode_batched_requests: AtomicU64,
+    vision_legacy_requests: AtomicU64,
+    vision_legacy_batches: AtomicU64,
+    vision_legacy_media_inputs: AtomicU64,
+    vision_legacy_projected_rows: AtomicU64,
+    multimodal_decode_legacy_requests: AtomicU64,
+    multimodal_decode_paged_requests: AtomicU64,
+    multimodal_fallback_requests: AtomicU64,
+    multimodal_fallback_direct_requests: AtomicU64,
+    multimodal_fallback_mixed_batch_requests: AtomicU64,
+    multimodal_fallback_decode_group_singleton_requests: AtomicU64,
+    multimodal_fallback_projection_failed_requests: AtomicU64,
+    multimodal_fallback_projection_mismatch_requests: AtomicU64,
+    multimodal_fallback_incompatible_prompt_requests: AtomicU64,
+    multimodal_fallback_token_budget_requests: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CudaMultimodalStatsSnapshot {
+    multimodal_requests: u64,
+    multimodal_media_inputs: u64,
+    vision_batched_requests: u64,
+    vision_batched_batches: u64,
+    multimodal_decode_batched_requests: u64,
+    vision_legacy_requests: u64,
+    vision_legacy_batches: u64,
+    vision_legacy_media_inputs: u64,
+    vision_legacy_projected_rows: u64,
+    multimodal_decode_legacy_requests: u64,
+    multimodal_decode_paged_requests: u64,
+    multimodal_fallback_requests: u64,
+    multimodal_fallback_direct_requests: u64,
+    multimodal_fallback_mixed_batch_requests: u64,
+    multimodal_fallback_decode_group_singleton_requests: u64,
+    multimodal_fallback_projection_failed_requests: u64,
+    multimodal_fallback_projection_mismatch_requests: u64,
+    multimodal_fallback_incompatible_prompt_requests: u64,
+    multimodal_fallback_token_budget_requests: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CudaMultimodalFallbackReason {
+    Direct,
+    MixedBatch,
+    DecodeGroupSingleton,
+    ProjectionFailed,
+    ProjectionMismatch,
+    IncompatiblePrompt,
+    TokenBudget,
+}
+
+impl CudaMultimodalStats {
+    fn snapshot(&self) -> CudaMultimodalStatsSnapshot {
+        CudaMultimodalStatsSnapshot {
+            multimodal_requests: self.multimodal_requests.load(Ordering::Relaxed),
+            multimodal_media_inputs: self.multimodal_media_inputs.load(Ordering::Relaxed),
+            vision_batched_requests: self.vision_batched_requests.load(Ordering::Relaxed),
+            vision_batched_batches: self.vision_batched_batches.load(Ordering::Relaxed),
+            multimodal_decode_batched_requests: self
+                .multimodal_decode_batched_requests
+                .load(Ordering::Relaxed),
+            vision_legacy_requests: self.vision_legacy_requests.load(Ordering::Relaxed),
+            vision_legacy_batches: self.vision_legacy_batches.load(Ordering::Relaxed),
+            vision_legacy_media_inputs: self.vision_legacy_media_inputs.load(Ordering::Relaxed),
+            vision_legacy_projected_rows: self.vision_legacy_projected_rows.load(Ordering::Relaxed),
+            multimodal_decode_legacy_requests: self
+                .multimodal_decode_legacy_requests
+                .load(Ordering::Relaxed),
+            multimodal_decode_paged_requests: self
+                .multimodal_decode_paged_requests
+                .load(Ordering::Relaxed),
+            multimodal_fallback_requests: self.multimodal_fallback_requests.load(Ordering::Relaxed),
+            multimodal_fallback_direct_requests: self
+                .multimodal_fallback_direct_requests
+                .load(Ordering::Relaxed),
+            multimodal_fallback_mixed_batch_requests: self
+                .multimodal_fallback_mixed_batch_requests
+                .load(Ordering::Relaxed),
+            multimodal_fallback_decode_group_singleton_requests: self
+                .multimodal_fallback_decode_group_singleton_requests
+                .load(Ordering::Relaxed),
+            multimodal_fallback_projection_failed_requests: self
+                .multimodal_fallback_projection_failed_requests
+                .load(Ordering::Relaxed),
+            multimodal_fallback_projection_mismatch_requests: self
+                .multimodal_fallback_projection_mismatch_requests
+                .load(Ordering::Relaxed),
+            multimodal_fallback_incompatible_prompt_requests: self
+                .multimodal_fallback_incompatible_prompt_requests
+                .load(Ordering::Relaxed),
+            multimodal_fallback_token_budget_requests: self
+                .multimodal_fallback_token_budget_requests
+                .load(Ordering::Relaxed),
+        }
+    }
+}
+
+fn record_multimodal_fallback(
+    stats: &CudaMultimodalStats,
+    reason: CudaMultimodalFallbackReason,
+    count: usize,
+) {
+    if count == 0 {
+        return;
+    }
+    let count = u64::try_from(count).unwrap_or(u64::MAX);
+    stats
+        .multimodal_fallback_requests
+        .fetch_add(count, Ordering::Relaxed);
+    match reason {
+        CudaMultimodalFallbackReason::Direct => {
+            stats
+                .multimodal_fallback_direct_requests
+                .fetch_add(count, Ordering::Relaxed);
+        }
+        CudaMultimodalFallbackReason::MixedBatch => {
+            stats
+                .multimodal_fallback_mixed_batch_requests
+                .fetch_add(count, Ordering::Relaxed);
+        }
+        CudaMultimodalFallbackReason::DecodeGroupSingleton => {
+            stats
+                .multimodal_fallback_decode_group_singleton_requests
+                .fetch_add(count, Ordering::Relaxed);
+        }
+        CudaMultimodalFallbackReason::ProjectionFailed => {
+            stats
+                .multimodal_fallback_projection_failed_requests
+                .fetch_add(count, Ordering::Relaxed);
+        }
+        CudaMultimodalFallbackReason::ProjectionMismatch => {
+            stats
+                .multimodal_fallback_projection_mismatch_requests
+                .fetch_add(count, Ordering::Relaxed);
+        }
+        CudaMultimodalFallbackReason::IncompatiblePrompt => {
+            stats
+                .multimodal_fallback_incompatible_prompt_requests
+                .fetch_add(count, Ordering::Relaxed);
+        }
+        CudaMultimodalFallbackReason::TokenBudget => {
+            stats
+                .multimodal_fallback_token_budget_requests
+                .fetch_add(count, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Default for CudaBackendConfig {
+    fn default() -> Self {
+        Self {
+            max_batch_size: 8,
+            max_active_requests: 8,
+            max_batched_tokens: 8192,
+            max_wait_us: 2000,
+            kv_cache_mode: CudaKvCacheMode::Paged,
+            kv_page_size: 16,
+            mmproj_path: None,
+        }
+    }
+}
+
+impl CudaBackendConfig {
+    pub fn validate(&self) -> Result<()> {
+        if self.max_batch_size == 0 {
+            bail!("--max-batch-size must be greater than zero");
+        }
+        if self.max_active_requests == 0 {
+            bail!("--max-active-requests must be greater than zero");
+        }
+        if self.max_batched_tokens == 0 {
+            bail!("--max-batched-tokens must be greater than zero");
+        }
+        if self.max_wait_us > CUDA_SCHEDULER_MAX_WAIT_US {
+            bail!("--max-wait-us must be less than or equal to {CUDA_SCHEDULER_MAX_WAIT_US}");
+        }
+        if !matches!(self.kv_page_size, 8 | 16 | 32 | 64) {
+            bail!("--kv-page-size must be one of 8, 16, 32, or 64");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct CudaPagedKvCacheManager {
+    page_size: usize,
+    pages_total: usize,
+    bytes_per_page: usize,
+    bytes_total: usize,
+    free_pages: Mutex<Vec<usize>>,
+    allocated_pages: AtomicUsize,
+    peak_allocated_pages: AtomicUsize,
+    total_allocations: AtomicU64,
+    failed_allocations: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CudaPagedKvCacheSnapshot {
+    page_size: usize,
+    pages_total: usize,
+    pages_free: usize,
+    pages_used: usize,
+    peak_pages_used: usize,
+    bytes_per_page: usize,
+    bytes_total: usize,
+    total_allocations: u64,
+    failed_allocations: u64,
+}
+
+#[derive(Debug)]
+struct CudaPagedKvCacheLease {
+    manager: Arc<CudaPagedKvCacheManager>,
+    pages: Vec<usize>,
+}
+
+impl CudaPagedKvCacheManager {
+    fn for_qwen(
+        qwen: &QwenGgufConfig,
+        max_batched_tokens: usize,
+        page_size: usize,
+    ) -> Result<Self> {
+        let context = usize::try_from(qwen.context_length)
+            .context("qwen context_length does not fit usize")?;
+        let layer_count =
+            usize::try_from(qwen.block_count).context("qwen block_count does not fit usize")?;
+        let heads = usize::try_from(qwen.attention_head_count)
+            .context("qwen attention_head_count does not fit usize")?;
+        let metadata_kv_heads = usize::try_from(qwen.attention_head_count_kv)
+            .context("qwen attention_head_count_kv does not fit usize")?;
+        if context == 0 {
+            bail!("qwen context_length must be greater than zero");
+        }
+        if layer_count == 0 {
+            bail!("qwen block_count must be greater than zero");
+        }
+        let kv_heads = if qwen.attention_mla_tensor_layout {
+            heads
+        } else {
+            metadata_kv_heads
+        };
+        let (qk_head_dim, v_head_dim) = qwen_attention_key_value_head_dims(qwen)?;
+        if heads == 0 || kv_heads == 0 || qk_head_dim == 0 || v_head_dim == 0 {
+            bail!(
+                "qwen attention heads {heads} and kv heads {kv_heads} are incompatible with key/value head dimensions {qk_head_dim}/{v_head_dim}"
+            );
+        }
+        if heads % kv_heads != 0 {
+            bail!("qwen attention heads {heads} must be a multiple of kv heads {kv_heads}");
+        }
+        let pages_total = div_ceil_usize(max_batched_tokens.max(1), page_size)?;
+        let bytes_per_page = layer_count
+            .checked_mul(kv_heads)
+            .and_then(|value| value.checked_mul(qk_head_dim.checked_add(v_head_dim)?))
+            .and_then(|value| value.checked_mul(page_size))
+            .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+            .context("CUDA paged KV page byte count overflows usize")?;
+        let bytes_total = bytes_per_page
+            .checked_mul(pages_total)
+            .context("CUDA paged KV total byte count overflows usize")?;
+        Self::new(page_size, pages_total, bytes_per_page, bytes_total)
+    }
+
+    fn new(
+        page_size: usize,
+        pages_total: usize,
+        bytes_per_page: usize,
+        bytes_total: usize,
+    ) -> Result<Self> {
+        if !matches!(page_size, 8 | 16 | 32 | 64) {
+            bail!("CUDA paged KV page_size must be one of 8, 16, 32, or 64");
+        }
+        if pages_total == 0 {
+            bail!("CUDA paged KV pages_total must be greater than zero");
+        }
+        let free_pages = (0..pages_total).rev().collect::<Vec<_>>();
+        Ok(Self {
+            page_size,
+            pages_total,
+            bytes_per_page,
+            bytes_total,
+            free_pages: Mutex::new(free_pages),
+            allocated_pages: AtomicUsize::new(0),
+            peak_allocated_pages: AtomicUsize::new(0),
+            total_allocations: AtomicU64::new(0),
+            failed_allocations: AtomicU64::new(0),
+        })
+    }
+
+    fn allocate_for_tokens(self: &Arc<Self>, token_count: usize) -> Result<CudaPagedKvCacheLease> {
+        let pages_needed = self.pages_for_tokens(token_count)?;
+        let mut free_pages = self
+            .free_pages
+            .lock()
+            .map_err(|_| anyhow!("CUDA paged KV allocator lock poisoned"))?;
+        if pages_needed > free_pages.len() {
+            self.failed_allocations.fetch_add(1, Ordering::Relaxed);
+            bail!(
+                "insufficient_gpu_memory: CUDA paged KV cache requires {pages_needed} page(s) for {token_count} token(s), but only {} of {} page(s) are free (page_size={})",
+                free_pages.len(),
+                self.pages_total,
+                self.page_size
+            );
+        }
+        let start = free_pages.len() - pages_needed;
+        let pages = free_pages.split_off(start);
+        drop(free_pages);
+
+        let allocated = self
+            .allocated_pages
+            .fetch_add(pages_needed, Ordering::Relaxed)
+            .saturating_add(pages_needed);
+        update_atomic_max(&self.peak_allocated_pages, allocated);
+        self.total_allocations.fetch_add(1, Ordering::Relaxed);
+        Ok(CudaPagedKvCacheLease {
+            manager: self.clone(),
+            pages,
+        })
+    }
+
+    fn pages_for_tokens(&self, token_count: usize) -> Result<usize> {
+        div_ceil_usize(token_count.max(1), self.page_size)
+    }
+
+    fn snapshot(&self) -> CudaPagedKvCacheSnapshot {
+        let pages_free = self
+            .free_pages
+            .lock()
+            .map(|free_pages| free_pages.len())
+            .unwrap_or(0);
+        CudaPagedKvCacheSnapshot {
+            page_size: self.page_size,
+            pages_total: self.pages_total,
+            pages_free,
+            pages_used: self.allocated_pages.load(Ordering::Relaxed),
+            peak_pages_used: self.peak_allocated_pages.load(Ordering::Relaxed),
+            bytes_per_page: self.bytes_per_page,
+            bytes_total: self.bytes_total,
+            total_allocations: self.total_allocations.load(Ordering::Relaxed),
+            failed_allocations: self.failed_allocations.load(Ordering::Relaxed),
+        }
+    }
+
+    fn release_pages(&self, pages: &mut Vec<usize>) {
+        let count = pages.len();
+        if count == 0 {
+            return;
+        }
+        let mut free_pages = self
+            .free_pages
+            .lock()
+            .expect("CUDA paged KV allocator lock poisoned");
+        free_pages.extend(pages.drain(..));
+        self.allocated_pages.fetch_sub(count, Ordering::Relaxed);
+    }
+}
+
+impl Drop for CudaPagedKvCacheLease {
+    fn drop(&mut self) {
+        self.manager.release_pages(&mut self.pages);
+    }
+}
+
+fn div_ceil_usize(value: usize, divisor: usize) -> Result<usize> {
+    if divisor == 0 {
+        bail!("division by zero in CUDA paged KV sizing");
+    }
+    value
+        .checked_add(divisor - 1)
+        .and_then(|value| value.checked_div(divisor))
+        .context("CUDA paged KV division overflows usize")
+}
+
+impl CudaBackend {
+    pub fn load(path: impl AsRef<Path>, model_id: Option<String>) -> Result<Self> {
+        Self::load_with_execution(path, model_id, CudaExecution::default_for_build())
+    }
+
+    pub fn load_with_execution(
+        path: impl AsRef<Path>,
+        model_id: Option<String>,
+        execution: CudaExecution,
+    ) -> Result<Self> {
+        Self::load_with_config(path, model_id, execution, CudaBackendConfig::default())
+    }
+
+    pub fn load_with_config(
+        path: impl AsRef<Path>,
+        model_id: Option<String>,
+        execution: CudaExecution,
+        config: CudaBackendConfig,
+    ) -> Result<Self> {
+        config.validate()?;
+        let path = path.as_ref();
+        let mmproj = config
+            .mmproj_path
+            .as_ref()
+            .map(load_mmproj_info)
+            .transpose()?;
+        let gguf = GgufFile::open(path)?;
+        let chat_template = gguf.chat_template().map(ToString::to_string);
+        let qwen = gguf.qwen_config()?;
+        gguf.validate_qwen_tensors()?;
+        let cpu_reference = Arc::new(qwen_cpu::QwenCpuReference::from_gguf(&gguf)?);
+        let gpu_model = gpu::CudaQwenGpuModel::from_gguf(&gguf)
+            .map(Mutex::new)
+            .map(Arc::new)
+            .map_err(|err| err.to_string());
+        let model = inspect_model(path, model_id)?;
+        let runtime = runtime::CudaRuntime::probe()
+            .map(|runtime| runtime.info().clone())
+            .map_err(|err| err.to_string());
+        if execution == CudaExecution::Gpu {
+            if let Err(err) = &runtime {
+                bail!("CUDA gpu execution is unavailable: {err}");
+            }
+            if let Err(err) = &gpu_model {
+                bail!("CUDA gpu execution is unavailable: {err}");
+            }
+        }
+        let kv_pages =
+            if execution == CudaExecution::Gpu && config.kv_cache_mode == CudaKvCacheMode::Paged {
+                Some(Arc::new(CudaPagedKvCacheManager::for_qwen(
+                    &qwen,
+                    config.max_batched_tokens,
+                    config.kv_page_size,
+                )?))
+            } else {
+                None
+            };
+        let multimodal_stats = Arc::new(CudaMultimodalStats::default());
+        let scheduler = if execution == CudaExecution::Gpu {
+            let gpu_model = gpu_model
+                .as_ref()
+                .expect("gpu_model is available after gpu execution validation")
+                .clone();
+            Some(CudaGenerationScheduler::start(
+                CudaSchedulerState {
+                    qwen: qwen.clone(),
+                    max_output_tokens: model.max_output_tokens,
+                    cpu_reference: cpu_reference.clone(),
+                    gpu_model,
+                    kv_pages: kv_pages.clone(),
+                    kv_cache_mode: config.kv_cache_mode,
+                    kv_page_size: config.kv_page_size,
+                    mmproj: mmproj.clone(),
+                    multimodal_stats: multimodal_stats.clone(),
+                },
+                config.max_batch_size,
+                config.max_active_requests,
+                config.max_wait_us,
+                config.max_batched_tokens,
+            )?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            model,
+            chat_template,
+            qwen,
+            execution,
+            config,
+            cpu_reference,
+            gpu_model,
+            runtime,
+            scheduler,
+            kv_pages,
+            mmproj,
+            multimodal_stats,
+        })
+    }
+
+    pub fn qwen_config(&self) -> &QwenGgufConfig {
+        &self.qwen
+    }
+
+    pub fn execution(&self) -> CudaExecution {
+        self.execution
+    }
+
+    fn runtime_status(&self) -> String {
+        match &self.runtime {
+            Ok(info) => format!(
+                "cuda-runtime=available(devices={},runtime={},driver={})",
+                info.device_count, info.runtime_version, info.driver_version
+            ),
+            Err(err) => format!("cuda-runtime=unavailable({err})"),
+        }
+    }
+
+    fn gpu_status(&self) -> String {
+        match &self.gpu_model {
+            Ok(model) => match model.lock() {
+                Ok(model) => format!(
+                    "gpu-weights=loaded(tensors={},bytes={}); gpu-matrices=loaded(count={},bytes={},quantized={}); gpu-vectors=loaded(count={},bytes={})",
+                    model.info().tensor_count,
+                    model.info().total_device_bytes,
+                    model.info().matrix_count,
+                    model.info().total_matrix_bytes,
+                    model.info().quantized_matrix_count,
+                    model.info().vector_count,
+                    model.info().total_vector_bytes
+                ),
+                Err(_) => "gpu-weights=unavailable(model lock poisoned)".to_string(),
+            },
+            Err(err) => format!("gpu-weights=unavailable({err})"),
+        }
+    }
+
+    fn supports_multimodal_generation(&self) -> bool {
+        if self.execution != CudaExecution::Gpu {
+            return false;
+        }
+        let Some(mmproj) = &self.mmproj else {
+            return false;
+        };
+        let Ok(vision) = &mmproj.vision else {
+            return false;
+        };
+        let Ok(vision) = vision.lock() else {
+            return false;
+        };
+        vision.info().output_dim == self.qwen.embedding_length as usize
+    }
+
+    fn multimodal_status(&self) -> String {
+        match &self.mmproj {
+            Some(mmproj) => {
+                let mut generation_status = "vision=unsupported,generation=unsupported".to_string();
+                let vision = match &mmproj.vision {
+                    Ok(vision) => match vision.lock() {
+                        Ok(vision) => {
+                            let info = vision.info();
+                            if self.execution == CudaExecution::Gpu
+                                && info.output_dim == self.qwen.embedding_length as usize
+                            {
+                                generation_status =
+                                    format!("vision={},generation=enabled", info.variant);
+                            } else if self.execution == CudaExecution::Gpu {
+                                generation_status = format!(
+                                    "vision={},generation=unsupported(vision_output_dim_{}_qwen_embedding_dim_{})",
+                                    info.variant, info.output_dim, self.qwen.embedding_length
+                                );
+                            } else {
+                                generation_status = format!(
+                                    "vision={},generation=unsupported(cpu-reference)",
+                                    info.variant
+                                );
+                            }
+                            format!(
+                                "vision-encoder=loaded(variant={},patch={},temporal_patch={},tokens_per_second={},merge={},hidden_dim={},ff_dim={},output_dim={},blocks={},heads={},device_bytes={},matrices={},vectors={},window_attention={})",
+                                info.variant,
+                                info.patch_size,
+                                info.temporal_patch_size,
+                                info.tokens_per_second,
+                                info.spatial_merge_size,
+                                info.hidden_dim,
+                                info.feed_forward_dim,
+                                info.output_dim,
+                                info.block_count,
+                                info.head_count,
+                                info.total_device_bytes,
+                                info.matrix_count,
+                                info.vector_count,
+                                info.uses_window_attention
+                            )
+                        }
+                        Err(_) => "vision-encoder=unavailable(vision lock poisoned)".to_string(),
+                    },
+                    Err(err) => format!("vision-encoder=unavailable({err:#})"),
+                };
+                format!(
+                    "mmproj-loaded(path={},tensors={},bytes={},{};{})",
+                    mmproj.path.display(),
+                    mmproj.tensor_count,
+                    mmproj.total_tensor_bytes,
+                    vision,
+                    generation_status
+                )
+            }
+            None => "text-only".to_string(),
+        }
+    }
+
+    fn kv_cache_status(&self) -> String {
+        if self.execution != CudaExecution::Gpu {
+            return "disabled".to_string();
+        }
+        match self.config.kv_cache_mode {
+            CudaKvCacheMode::Legacy => {
+                format!(
+                    "legacy(page_size={},pages_total=0,pages_free=0)",
+                    self.config.kv_page_size
+                )
+            }
+            CudaKvCacheMode::Paged => match &self.kv_pages {
+                Some(manager) => {
+                    let snapshot = manager.snapshot();
+                    let pages_used_per_mille =
+                        ratio_per_mille(snapshot.pages_used as u64, snapshot.pages_total as u64);
+                    let pages_free_per_mille =
+                        ratio_per_mille(snapshot.pages_free as u64, snapshot.pages_total as u64);
+                    let peak_pages_used_per_mille = ratio_per_mille(
+                        snapshot.peak_pages_used as u64,
+                        snapshot.pages_total as u64,
+                    );
+                    let pressure = kv_cache_pressure_label(&snapshot);
+                    let multimodal_backend = if self.mmproj.is_none() {
+                        "legacy(reason=text-only)"
+                    } else if !self.supports_multimodal_generation() {
+                        "legacy(reason=unsupported-mmproj)"
+                    } else {
+                        "paged(prompt_embeddings=single-paged|batched-lease-backed,fallback_reason=none)"
+                    };
+                    format!(
+                        "paged(page_size={},pages_total={},pages_free={},pages_used={},peak_pages_used={},pages_free_per_mille={},pages_used_per_mille={},peak_pages_used_per_mille={},pressure={},bytes_per_page={},bytes_total={},allocations={},allocation_failures={},kernel_backend=paged-single-text,batched_backend=paged-text,multimodal_backend={})",
+                        snapshot.page_size,
+                        snapshot.pages_total,
+                        snapshot.pages_free,
+                        snapshot.pages_used,
+                        snapshot.peak_pages_used,
+                        pages_free_per_mille,
+                        pages_used_per_mille,
+                        peak_pages_used_per_mille,
+                        pressure,
+                        snapshot.bytes_per_page,
+                        snapshot.bytes_total,
+                        snapshot.total_allocations,
+                        snapshot.failed_allocations,
+                        multimodal_backend
+                    )
+                }
+                None => format!(
+                    "legacy(requested=paged,fallback=paged-kv-unavailable,page_size={},pages_total=0,pages_free=0)",
+                    self.config.kv_page_size
+                ),
+            },
+        }
+    }
+
+    fn gpu_feature_status(&self) -> String {
+        let text_continuous = if self.execution != CudaExecution::Gpu {
+            "disabled(reason=cpu-reference)"
+        } else if self.config.kv_cache_mode != CudaKvCacheMode::Paged {
+            "disabled(reason=kv-cache-legacy)"
+        } else if self.kv_pages.is_none() {
+            "disabled(reason=paged-kv-unavailable)"
+        } else {
+            "enabled"
+        };
+        let moe_text_batching = if self.qwen.expert_count.is_some() {
+            if text_continuous == "enabled" {
+                "continuous-iteration"
+            } else {
+                "fallback(reason=non-continuous-scheduler)"
+            }
+        } else {
+            "not-applicable"
+        };
+        let multimodal_paged_kv = if self.execution != CudaExecution::Gpu {
+            "disabled(reason=cpu-reference)"
+        } else if self.mmproj.is_none() {
+            "disabled(reason=text-only)"
+        } else if !self.supports_multimodal_generation() {
+            "disabled(reason=unsupported-mmproj)"
+        } else if self.config.kv_cache_mode != CudaKvCacheMode::Paged {
+            "disabled(reason=kv-cache-legacy)"
+        } else if self.kv_pages.is_none() {
+            "disabled(reason=paged-kv-unavailable)"
+        } else {
+            "enabled(scope=single-and-batched-prompt-embeddings,batched_backend=scheduler-leased,fallback_reason=none)"
+        };
+        format!(
+            "text-continuous={text_continuous},moe-text-batching={moe_text_batching},multimodal-paged-kv={multimodal_paged_kv},attention-fast-head-dim-max={CUDA_ATTENTION_FAST_HEAD_DIM_MAX}"
+        )
+    }
+
+    fn prefix_cache_status(&self, scheduler: Option<CudaSchedulerSnapshot>) -> String {
+        if self.execution != CudaExecution::Gpu {
+            return "disabled(reason=cpu-reference)".to_string();
+        }
+        if self.config.kv_cache_mode != CudaKvCacheMode::Paged {
+            return "disabled(reason=kv-cache-legacy)".to_string();
+        }
+        if self.kv_pages.is_none() {
+            return "disabled(reason=paged-kv-unavailable)".to_string();
+        }
+        let Some(snapshot) = scheduler else {
+            return "disabled(reason=scheduler-unavailable)".to_string();
+        };
+        format!(
+            "enabled(scope=batch,backend=paged-shared-prefix,batches={},requests={},tokens_total={})",
+            snapshot.shared_prefix_batches,
+            snapshot.shared_prefix_requests,
+            snapshot.shared_prefix_tokens
+        )
+    }
+
+    fn multimodal_batching_status(&self) -> &'static str {
+        match &self.mmproj {
+            None => "text-only",
+            Some(_) if self.supports_multimodal_generation() => {
+                "enabled(vision_stage=batching-enabled,decode=prefix-batched|mrope-batched,fallback=no-placeholder-mrope-rejected)"
+            }
+            Some(_) => "unsupported(multimodal-generation-unavailable)",
+        }
+    }
+
+    fn attention_health_status(&self) -> CudaAttentionHealth {
+        cuda_attention_health_status(
+            self.execution,
+            self.config.kv_cache_mode,
+            self.kv_pages.is_some(),
+            qwen_attention_key_value_head_dims(&self.qwen).ok(),
+            self.supports_multimodal_generation(),
+        )
+    }
+
+    fn multimodal_metrics_status(&self) -> String {
+        let snapshot = self.multimodal_stats.snapshot();
+        format!(
+            "enabled,vision_batched_requests={},vision_batched_batches={},multimodal_decode_batched_requests={},vision_legacy_requests={},vision_legacy_batches={},vision_legacy_media_inputs={},vision_legacy_projected_rows={},multimodal_decode_legacy_requests={},multimodal_decode_paged_requests={},multimodal_requests={},multimodal_media_inputs={},multimodal_fallback_requests={},multimodal_fallback_direct_requests={},multimodal_fallback_mixed_batch_requests={},multimodal_fallback_decode_group_singleton_requests={},multimodal_fallback_projection_failed_requests={},multimodal_fallback_projection_mismatch_requests={},multimodal_fallback_incompatible_prompt_requests={},multimodal_fallback_token_budget_requests={}",
+            snapshot.vision_batched_requests,
+            snapshot.vision_batched_batches,
+            snapshot.multimodal_decode_batched_requests,
+            snapshot.vision_legacy_requests,
+            snapshot.vision_legacy_batches,
+            snapshot.vision_legacy_media_inputs,
+            snapshot.vision_legacy_projected_rows,
+            snapshot.multimodal_decode_legacy_requests,
+            snapshot.multimodal_decode_paged_requests,
+            snapshot.multimodal_requests,
+            snapshot.multimodal_media_inputs,
+            snapshot.multimodal_fallback_requests,
+            snapshot.multimodal_fallback_direct_requests,
+            snapshot.multimodal_fallback_mixed_batch_requests,
+            snapshot.multimodal_fallback_decode_group_singleton_requests,
+            snapshot.multimodal_fallback_projection_failed_requests,
+            snapshot.multimodal_fallback_projection_mismatch_requests,
+            snapshot.multimodal_fallback_incompatible_prompt_requests,
+            snapshot.multimodal_fallback_token_budget_requests
+        )
+    }
+
+    fn scheduler_mode(&self) -> &'static str {
+        if self.execution == CudaExecution::Gpu
+            && self.config.kv_cache_mode == CudaKvCacheMode::Paged
+            && self.kv_pages.is_some()
+        {
+            "continuous-iteration"
+        } else {
+            "length-bucketed-variable-limits"
+        }
+    }
+
+    fn continuous_kv_backend(&self) -> &'static str {
+        if self.scheduler_mode() != "continuous-iteration" {
+            "fallback"
+        } else if self.qwen.recurrent_ssm_tensor_layout {
+            "recompute-state-recurrent-ssm"
+        } else {
+            "append-only-paged"
+        }
+    }
+
+    fn generate_events(&self, request: &GenerationRequest) -> Result<CudaGeneration> {
+        if !request.media_inputs.is_empty() {
+            self.multimodal_stats
+                .multimodal_requests
+                .fetch_add(1, Ordering::Relaxed);
+            self.multimodal_stats.multimodal_media_inputs.fetch_add(
+                u64::try_from(request.media_inputs.len()).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            if self.execution == CudaExecution::Gpu {
+                if let Some(scheduler) = &self.scheduler {
+                    scheduler.record_direct_fallback(CudaSchedulerFallbackReason::Multimodal, 1);
+                    record_multimodal_fallback(
+                        &self.multimodal_stats,
+                        CudaMultimodalFallbackReason::Direct,
+                        1,
+                    );
+                }
+            }
+            let projection = self.project_media_inputs(&request.media_inputs)?;
+            if self.execution != CudaExecution::Gpu {
+                bail!(
+                    "CUDA Qwen multimodal projector processed {} media input(s) into {} projected embedding row(s), but multimodal generation requires execution=gpu; cpu-reference remains text-only debug mode",
+                    projection.media_count,
+                    projection.projected_rows
+                );
+            }
+            return self.generate_events_gpu_with_visual_prefix(request, projection);
+        }
+        match self.execution {
+            CudaExecution::Gpu => self.generate_events_gpu(request),
+            CudaExecution::CpuReference => self.generate_events_cpu_reference(request),
+        }
+    }
+
+    fn generate_events_cpu_reference(&self, request: &GenerationRequest) -> Result<CudaGeneration> {
+        if let Some(seed) = request.seed {
+            let mut rng = StdRng::seed_from_u64(seed);
+            self.generate_events_cpu_reference_with_rng(request, &mut rng)
+        } else {
+            let mut rng = rand::thread_rng();
+            self.generate_events_cpu_reference_with_rng(request, &mut rng)
+        }
+    }
+
+    fn generate_events_cpu_reference_with_rng<R: rand::Rng + ?Sized>(
+        &self,
+        request: &GenerationRequest,
+        rng: &mut R,
+    ) -> Result<CudaGeneration> {
+        let prompt_tokens = self.cpu_reference.tokenizer().encode(&request.prompt)?;
+        if prompt_tokens.is_empty() {
+            bail!("prompt encoded to zero tokens");
+        }
+        let max_tokens = validate_generation_max_tokens(request, self.model.max_output_tokens)?;
+        validate_generation_context_budget(&self.qwen, prompt_tokens.len(), max_tokens)?;
+        let stop_token_sequences =
+            generation_stop_token_sequences(&self.cpu_reference, &request.stop_sequences)?;
+
+        let mut context = prompt_tokens.clone();
+        let mut generated = Vec::new();
+        for _ in 0..max_tokens {
+            let logits = self.cpu_reference.last_logits(&context)?;
+            let next = qwen_cpu::sample_from_logits_with_rng(
+                &logits,
+                request.temperature,
+                request.top_p,
+                request.top_k,
+                rng,
+            )?;
+            context.push(next);
+            generated.push(next);
+            if Some(next) == self.qwen.eos_token_id
+                || generated_stop_match(&generated, &stop_token_sequences).is_some()
+            {
+                break;
+            }
+        }
+
+        cuda_generation_from_tokens_with_prompt_count_and_stops(
+            &self.cpu_reference,
+            prompt_tokens.len(),
+            generated,
+            &request.stop_sequences,
+        )
+    }
+
+    fn generate_events_gpu(&self, request: &GenerationRequest) -> Result<CudaGeneration> {
+        let model = self
+            .gpu_model
+            .as_ref()
+            .map_err(|err| anyhow!("CUDA gpu execution is unavailable: {err}"))?;
+        generate_events_gpu_from(
+            model,
+            &self.cpu_reference,
+            &self.qwen,
+            request,
+            self.model.max_output_tokens,
+            self.config.kv_cache_mode,
+            self.config.kv_page_size,
+        )
+    }
+
+    fn generate_events_gpu_with_visual_prefix(
+        &self,
+        request: &GenerationRequest,
+        projection: VisualProjection,
+    ) -> Result<CudaGeneration> {
+        let model = self
+            .gpu_model
+            .as_ref()
+            .map_err(|err| anyhow!("CUDA gpu execution is unavailable: {err}"))?;
+        generate_events_gpu_with_visual_prefix_from(
+            model,
+            &self.cpu_reference,
+            &self.qwen,
+            request,
+            self.model.max_output_tokens,
+            self.config.kv_cache_mode,
+            self.config.kv_page_size,
+            projection,
+            &self.multimodal_stats,
+        )
+    }
+
+    fn project_media_inputs(&self, media_inputs: &[MultimodalInput]) -> Result<VisualProjection> {
+        project_media_inputs_with_stats(self.mmproj.as_ref(), &self.multimodal_stats, media_inputs)
+    }
+
+    #[cfg(all(test, feature = "native-cuda"))]
+    fn project_media_input_batches(
+        &self,
+        media_batches: &[Vec<MultimodalInput>],
+    ) -> Result<Vec<VisualProjection>> {
+        project_media_input_batches_with_stats(
+            self.mmproj.as_ref(),
+            &self.multimodal_stats,
+            media_batches,
+        )
+    }
+}
+
+fn generate_events_gpu_with_visual_prefix_from(
+    gpu_model: &Arc<Mutex<gpu::CudaQwenGpuModel>>,
+    cpu_reference: &qwen_cpu::QwenCpuReference,
+    qwen: &QwenGgufConfig,
+    request: &GenerationRequest,
+    max_output_tokens: u32,
+    kv_cache_mode: CudaKvCacheMode,
+    kv_page_size: usize,
+    projection: VisualProjection,
+    multimodal_stats: &CudaMultimodalStats,
+) -> Result<CudaGeneration> {
+    let prompt_tokens = cpu_reference.tokenizer().encode(&request.prompt)?;
+    if prompt_tokens.is_empty() {
+        bail!("prompt encoded to zero tokens");
+    }
+    let embed_dim = usize::try_from(qwen.embedding_length)
+        .context("qwen embedding length does not fit usize")?;
+    if projection.projected_dim != embed_dim {
+        bail!(
+            "projected visual embedding dim {} does not match Qwen embedding dim {embed_dim}",
+            projection.projected_dim
+        );
+    }
+    match kv_cache_mode {
+        CudaKvCacheMode::Legacy => multimodal_stats
+            .multimodal_decode_legacy_requests
+            .fetch_add(1, Ordering::Relaxed),
+        CudaKvCacheMode::Paged => multimodal_stats
+            .multimodal_decode_paged_requests
+            .fetch_add(1, Ordering::Relaxed),
+    };
+    let context_limit = usize::try_from(qwen.context_length)
+        .map_err(|_| anyhow!("qwen context length does not fit usize"))?;
+    let max_tokens = validate_generation_max_tokens(request, max_output_tokens)?;
+    let stop_token_sequences =
+        generation_stop_token_sequences(cpu_reference, &request.stop_sequences)?;
+
+    let generated = {
+        let model = gpu_model
+            .lock()
+            .map_err(|_| anyhow!("CUDA gpu model lock poisoned"))?;
+        let image_token_id = cpu_reference.tokenizer().token_id("<|image_pad|>");
+        let video_token_id = cpu_reference.tokenizer().token_id("<|video_pad|>");
+        if image_token_id.is_some() || video_token_id.is_some() {
+            let visual_token_count = prompt_tokens
+                .iter()
+                .filter(|token| {
+                    image_token_id.is_some_and(|id| **token == id)
+                        || video_token_id.is_some_and(|id| **token == id)
+                })
+                .count();
+            if visual_token_count > 0 {
+                let prompt_embeddings = multimodal_prompt_embeddings(
+                    &model,
+                    &prompt_tokens,
+                    image_token_id,
+                    video_token_id,
+                    &projection.embeddings,
+                    projection.projected_dim,
+                    &projection.items,
+                )?;
+                if prompt_embeddings.rows > context_limit {
+                    bail!(
+                        "context_length_exceeded: multimodal prompt length {} exceeds qwen context length {context_limit}",
+                        prompt_embeddings.rows
+                    );
+                }
+                validate_generation_context_budget(qwen, prompt_embeddings.rows, max_tokens)?;
+                if request_uses_greedy_cuda_defaults(request) {
+                    let generated = match (kv_cache_mode, qwen.rope_dimension_sections.is_some()) {
+                        (CudaKvCacheMode::Paged, true) => model
+                            .generate_greedy_tokens_with_prompt_embeddings_and_positions_paged_and_stop_sequences(
+                                &prompt_embeddings.embeddings,
+                                prompt_embeddings.rows,
+                                &prompt_embeddings.position_ids,
+                                prompt_embeddings.next_position,
+                                max_tokens,
+                                qwen.eos_token_id,
+                                kv_page_size,
+                                &stop_token_sequences,
+                            )?,
+                        (CudaKvCacheMode::Paged, false) => model
+                            .generate_greedy_tokens_with_prompt_embeddings_paged_and_stop_sequences(
+                                &prompt_embeddings.embeddings,
+                                prompt_embeddings.rows,
+                                max_tokens,
+                                qwen.eos_token_id,
+                                kv_page_size,
+                                &stop_token_sequences,
+                            )?,
+                        (CudaKvCacheMode::Legacy, true) => model
+                            .generate_greedy_tokens_with_prompt_embeddings_and_positions_and_stop_sequences(
+                                &prompt_embeddings.embeddings,
+                                prompt_embeddings.rows,
+                                &prompt_embeddings.position_ids,
+                                prompt_embeddings.next_position,
+                                max_tokens,
+                                qwen.eos_token_id,
+                                &stop_token_sequences,
+                            )?,
+                        (CudaKvCacheMode::Legacy, false) => model
+                            .generate_greedy_tokens_with_prompt_embeddings_and_stop_sequences(
+                                &prompt_embeddings.embeddings,
+                                prompt_embeddings.rows,
+                                max_tokens,
+                                qwen.eos_token_id,
+                                &stop_token_sequences,
+                            )?,
+                    };
+                    return cuda_generation_from_tokens_with_prompt_count_and_stops(
+                        cpu_reference,
+                        prompt_embeddings.rows,
+                        generated,
+                        &request.stop_sequences,
+                    );
+                }
+                let generated = match (kv_cache_mode, qwen.rope_dimension_sections.is_some()) {
+                    (CudaKvCacheMode::Paged, true) => model
+                        .generate_sampled_tokens_with_prompt_embeddings_and_positions_paged_and_stop_sequences(
+                            &prompt_embeddings.embeddings,
+                            prompt_embeddings.rows,
+                            &prompt_embeddings.position_ids,
+                            prompt_embeddings.next_position,
+                            max_tokens,
+                            qwen.eos_token_id,
+                            request.temperature,
+                            request.top_p,
+                            request.top_k,
+                            request.seed,
+                            kv_page_size,
+                            &stop_token_sequences,
+                        )?,
+                    (CudaKvCacheMode::Paged, false) => model
+                        .generate_sampled_tokens_with_prompt_embeddings_paged_and_stop_sequences(
+                            &prompt_embeddings.embeddings,
+                            prompt_embeddings.rows,
+                            max_tokens,
+                            qwen.eos_token_id,
+                            request.temperature,
+                            request.top_p,
+                            request.top_k,
+                            request.seed,
+                            kv_page_size,
+                            &stop_token_sequences,
+                        )?,
+                    (CudaKvCacheMode::Legacy, true) => model
+                        .generate_sampled_tokens_with_prompt_embeddings_and_positions_and_stop_sequences(
+                            &prompt_embeddings.embeddings,
+                            prompt_embeddings.rows,
+                            &prompt_embeddings.position_ids,
+                            prompt_embeddings.next_position,
+                            max_tokens,
+                            qwen.eos_token_id,
+                            request.temperature,
+                            request.top_p,
+                            request.top_k,
+                            request.seed,
+                            &stop_token_sequences,
+                        )?,
+                    (CudaKvCacheMode::Legacy, false) => model
+                        .generate_sampled_tokens_with_prompt_embeddings_and_stop_sequences(
+                            &prompt_embeddings.embeddings,
+                            prompt_embeddings.rows,
+                            max_tokens,
+                            qwen.eos_token_id,
+                            request.temperature,
+                            request.top_p,
+                            request.top_k,
+                            request.seed,
+                            &stop_token_sequences,
+                        )?,
+                };
+                return cuda_generation_from_tokens_with_prompt_count_and_stops(
+                    cpu_reference,
+                    prompt_embeddings.rows,
+                    generated,
+                    &request.stop_sequences,
+                );
+            }
+        }
+        if qwen.rope_dimension_sections.is_some() {
+            bail!(
+                "Qwen-VL multimodal generation requires <|image_pad|> or <|video_pad|> placeholders in the prompt so multimodal MRoPE positions can be assigned"
+            );
+        }
+        let prompt_count = prompt_tokens
+            .len()
+            .checked_add(projection.projected_rows)
+            .context("CUDA multimodal prompt token count overflows usize")?;
+        if prompt_count > context_limit {
+            bail!(
+                "context_length_exceeded: multimodal prompt length {prompt_count} exceeds qwen context length {context_limit}"
+            );
+        }
+        validate_generation_context_budget(qwen, prompt_count, max_tokens)?;
+        match (kv_cache_mode, request_uses_greedy_cuda_defaults(request)) {
+            (CudaKvCacheMode::Paged, true) => model
+                .generate_greedy_tokens_with_prefix_embeddings_paged_and_stop_sequences(
+                    &projection.embeddings,
+                    projection.projected_rows,
+                    &prompt_tokens,
+                    max_tokens,
+                    qwen.eos_token_id,
+                    kv_page_size,
+                    &stop_token_sequences,
+                )?,
+            (CudaKvCacheMode::Paged, false) => model
+                .generate_sampled_tokens_with_prefix_embeddings_paged_and_stop_sequences(
+                    &projection.embeddings,
+                    projection.projected_rows,
+                    &prompt_tokens,
+                    max_tokens,
+                    qwen.eos_token_id,
+                    request.temperature,
+                    request.top_p,
+                    request.top_k,
+                    request.seed,
+                    kv_page_size,
+                    &stop_token_sequences,
+                )?,
+            (CudaKvCacheMode::Legacy, true) => model
+                .generate_greedy_tokens_with_prefix_embeddings_and_stop_sequences(
+                    &projection.embeddings,
+                    projection.projected_rows,
+                    &prompt_tokens,
+                    max_tokens,
+                    qwen.eos_token_id,
+                    &stop_token_sequences,
+                )?,
+            (CudaKvCacheMode::Legacy, false) => model
+                .generate_sampled_tokens_with_prefix_embeddings_and_stop_sequences(
+                    &projection.embeddings,
+                    projection.projected_rows,
+                    &prompt_tokens,
+                    max_tokens,
+                    qwen.eos_token_id,
+                    request.temperature,
+                    request.top_p,
+                    request.top_k,
+                    request.seed,
+                    &stop_token_sequences,
+                )?,
+        }
+    };
+
+    let prompt_count = prompt_tokens
+        .len()
+        .checked_add(projection.projected_rows)
+        .context("CUDA multimodal prompt token count overflows usize")?;
+    cuda_generation_from_tokens_with_prompt_count_and_stops(
+        cpu_reference,
+        prompt_count,
+        generated,
+        &request.stop_sequences,
+    )
+}
+
+fn project_media_inputs_with_stats(
+    mmproj: Option<&CudaMmprojInfo>,
+    stats: &CudaMultimodalStats,
+    media_inputs: &[MultimodalInput],
+) -> Result<VisualProjection> {
+    if media_inputs.len() > 1 {
+        let media_batches = vec![media_inputs.to_vec()];
+        let mut projections =
+            project_media_input_batches_with_stats(mmproj, stats, &media_batches)?;
+        return projections
+            .pop()
+            .ok_or_else(|| anyhow!("batched CUDA vision projection returned no projection"));
+    }
+    let media_batches = vec![media_inputs.to_vec()];
+    let mut projections = project_media_input_batches_with_mmproj(mmproj, &media_batches)?;
+    let projection = projections
+        .pop()
+        .ok_or_else(|| anyhow!("CUDA vision projection returned no projection"))?;
+    stats.vision_legacy_requests.fetch_add(1, Ordering::Relaxed);
+    stats.vision_legacy_batches.fetch_add(1, Ordering::Relaxed);
+    stats.vision_legacy_media_inputs.fetch_add(
+        u64::try_from(media_inputs.len()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+    stats.vision_legacy_projected_rows.fetch_add(
+        u64::try_from(projection.projected_rows).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+    Ok(projection)
+}
+
+fn project_media_input_batches_with_stats(
+    mmproj: Option<&CudaMmprojInfo>,
+    stats: &CudaMultimodalStats,
+    media_batches: &[Vec<MultimodalInput>],
+) -> Result<Vec<VisualProjection>> {
+    let projections = project_media_input_batches_with_mmproj(mmproj, media_batches)?;
+    stats.vision_batched_requests.fetch_add(
+        u64::try_from(media_batches.len()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+    stats.vision_batched_batches.fetch_add(1, Ordering::Relaxed);
+    Ok(projections)
+}
+
+fn project_media_input_batches_with_mmproj(
+    mmproj: Option<&CudaMmprojInfo>,
+    media_batches: &[Vec<MultimodalInput>],
+) -> Result<Vec<VisualProjection>> {
+    if media_batches.is_empty() {
+        bail!("CUDA Qwen-VL vision batching requires at least one request");
+    }
+    let Some(mmproj) = mmproj else {
+        bail!(
+            "multimodal inputs require a CUDA Qwen multimodal model with an mmproj path; this backend has no multimodal projector loaded"
+        );
+    };
+    let vision = mmproj
+        .vision
+        .as_ref()
+        .map_err(|err| anyhow!("CUDA Qwen-VL vision encoder is unavailable: {err}"))?;
+    let vision = vision
+        .lock()
+        .map_err(|_| anyhow!("CUDA Qwen-VL vision encoder lock poisoned"))?;
+    let info = vision.info().clone();
+    let mut all_values = Vec::new();
+    let mut all_grids = Vec::new();
+    let mut request_patches = Vec::with_capacity(media_batches.len());
+    let mut total_projected_rows = 0usize;
+    for media_inputs in media_batches {
+        let patches = media_inputs_to_vision_patches(media_inputs, &info)?;
+        total_projected_rows = total_projected_rows
+            .checked_add(patches.projected_rows)
+            .context("CUDA batched vision projected row count overflows usize")?;
+        all_values.extend(patches.values);
+        all_grids.extend(patches.grids);
+        request_patches.push((media_inputs.len(), patches.projected_rows, patches.items));
+    }
+    let projected_dim = info.output_dim;
+    let projected = vision
+        .encode_patches_host(&all_values, &all_grids)
+        .context("encoding batched multimodal inputs with CUDA Qwen-VL vision encoder")?;
+    let expected = total_projected_rows
+        .checked_mul(projected_dim)
+        .context("CUDA vision projected feature count overflows usize")?;
+    if projected.len() != expected {
+        bail!(
+            "CUDA vision encoder returned {} projected values; expected {} visual row(s) x dim {projected_dim} = {expected}",
+            projected.len(),
+            total_projected_rows
+        );
+    }
+    let mut offset = 0usize;
+    let mut projections = Vec::with_capacity(request_patches.len());
+    for (media_count, projected_rows, items) in request_patches {
+        let len = projected_rows
+            .checked_mul(projected_dim)
+            .context("CUDA batched vision projection slice length overflows usize")?;
+        let end = offset
+            .checked_add(len)
+            .context("CUDA batched vision projection slice offset overflows usize")?;
+        let embeddings = projected
+            .get(offset..end)
+            .ok_or_else(|| anyhow!("CUDA batched vision projection ended early"))?
+            .to_vec();
+        projections.push(VisualProjection {
+            media_count,
+            projected_rows,
+            projected_dim,
+            items,
+            embeddings,
+        });
+        offset = end;
+    }
+    if offset != projected.len() {
+        bail!(
+            "CUDA batched vision projection has {} trailing values after split",
+            projected.len() - offset
+        );
+    }
+    Ok(projections)
+}
+
+struct VisualProjection {
+    media_count: usize,
+    projected_rows: usize,
+    projected_dim: usize,
+    items: Vec<VisualProjectionItem>,
+    embeddings: Vec<f32>,
+}
+
+struct MultimodalPromptEmbeddings {
+    embeddings: Vec<f32>,
+    rows: usize,
+    position_ids: Vec<[u32; 3]>,
+    next_position: usize,
+}
+
+fn multimodal_prompt_embeddings(
+    model: &gpu::CudaQwenGpuModel,
+    prompt_tokens: &[u32],
+    image_token_id: Option<u32>,
+    video_token_id: Option<u32>,
+    visual_embeddings: &[f32],
+    embed_dim: usize,
+    items: &[VisualProjectionItem],
+) -> Result<MultimodalPromptEmbeddings> {
+    if items.is_empty() {
+        bail!("multimodal prompt has no visual items");
+    }
+    for item in items {
+        visual_token_id_for_item(item, image_token_id, video_token_id)?;
+    }
+    let visual_token_count = prompt_tokens
+        .iter()
+        .filter(|token| visual_token_modality(**token, image_token_id, video_token_id).is_some())
+        .count();
+    if visual_token_count == 0 {
+        bail!("multimodal prompt has no image/video placeholder tokens");
+    }
+    let visual_rows = visual_embeddings
+        .len()
+        .checked_div(embed_dim)
+        .ok_or_else(|| anyhow!("visual embedding dim must be greater than zero"))?;
+    if visual_embeddings.len() != visual_rows * embed_dim {
+        bail!("visual embedding buffer length is not divisible by embedding dim {embed_dim}");
+    }
+    let token_embeddings = model.embed_tokens_host(prompt_tokens)?;
+    let mut output = Vec::with_capacity(token_embeddings.len() + visual_embeddings.len());
+    let mut position_ids = Vec::with_capacity(prompt_tokens.len() + visual_rows);
+    let mut cursor_position = 0usize;
+    let mut max_position = 0usize;
+    if visual_token_count == items.len() {
+        let mut item_idx = 0usize;
+        let mut visual_row_offset = 0usize;
+        for (token_idx, token) in prompt_tokens.iter().copied().enumerate() {
+            if let Some(modality) = visual_token_modality(token, image_token_id, video_token_id) {
+                let item = items
+                    .get(item_idx)
+                    .ok_or_else(|| anyhow!("visual placeholder exceeded media item count"))?;
+                if modality != item.modality {
+                    bail!(
+                        "visual placeholder token modality {:?} does not match media item {:?}",
+                        modality,
+                        item.modality
+                    );
+                }
+                let relative_positions =
+                    qwen_vl_language_media_positions(item.language_grid, item.second_per_grid_t)?;
+                if relative_positions.len() != item.rows {
+                    bail!(
+                        "language grid {:?} produced {} MRoPE positions; expected {}",
+                        item.language_grid,
+                        relative_positions.len(),
+                        item.rows
+                    );
+                }
+                let start = visual_row_offset
+                    .checked_mul(embed_dim)
+                    .context("visual embedding offset overflows usize")?;
+                let end = start
+                    .checked_add(
+                        item.rows
+                            .checked_mul(embed_dim)
+                            .context("visual embedding row span overflows usize")?,
+                    )
+                    .context("visual embedding end overflows usize")?;
+                output.extend_from_slice(
+                    visual_embeddings
+                        .get(start..end)
+                        .ok_or_else(|| anyhow!("visual embedding slice is out of range"))?,
+                );
+                for position in relative_positions {
+                    let t = cursor_position
+                        .checked_add(position[0])
+                        .context("MRoPE temporal position overflows usize")?;
+                    let h = cursor_position
+                        .checked_add(position[1])
+                        .context("MRoPE height position overflows usize")?;
+                    let w = cursor_position
+                        .checked_add(position[2])
+                        .context("MRoPE width position overflows usize")?;
+                    max_position = max_position.max(t).max(h).max(w);
+                    position_ids.push([
+                        u32::try_from(t).context("MRoPE temporal position does not fit u32")?,
+                        u32::try_from(h).context("MRoPE height position does not fit u32")?,
+                        u32::try_from(w).context("MRoPE width position does not fit u32")?,
+                    ]);
+                }
+                visual_row_offset += item.rows;
+                cursor_position = cursor_position
+                    .checked_add(visual_spatial_advance(item)?)
+                    .context("next MRoPE cursor position overflows usize")?;
+                item_idx += 1;
+            } else {
+                let start = token_idx
+                    .checked_mul(embed_dim)
+                    .context("token embedding offset overflows usize")?;
+                output.extend_from_slice(&token_embeddings[start..start + embed_dim]);
+                max_position = max_position.max(cursor_position);
+                let position = u32::try_from(cursor_position)
+                    .context("text MRoPE position does not fit u32")?;
+                position_ids.push([position, position, position]);
+                cursor_position = cursor_position
+                    .checked_add(1)
+                    .context("next MRoPE position overflows usize")?;
+            }
+        }
+        if item_idx != items.len() {
+            bail!("not all media items were consumed by visual placeholders");
+        }
+        if visual_row_offset != visual_rows {
+            bail!("not all visual embedding rows were consumed by visual placeholders");
+        }
+    } else if visual_token_count == visual_rows {
+        let relative_positions = items
+            .iter()
+            .map(|item| {
+                qwen_vl_language_media_positions(item.language_grid, item.second_per_grid_t)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for (positions, item) in relative_positions.iter().zip(items) {
+            if positions.len() != item.rows {
+                bail!(
+                    "language grid produced {} MRoPE positions; expected {}",
+                    positions.len(),
+                    item.rows
+                );
+            }
+        }
+        let mut item_idx = 0usize;
+        let mut row_in_item = 0usize;
+        let mut visual_row_offset = 0usize;
+        let mut item_base = cursor_position;
+        for (token_idx, token) in prompt_tokens.iter().copied().enumerate() {
+            if let Some(modality) = visual_token_modality(token, image_token_id, video_token_id) {
+                let item = items
+                    .get(item_idx)
+                    .ok_or_else(|| anyhow!("visual row placeholder exceeded media item count"))?;
+                if modality != item.modality {
+                    bail!(
+                        "visual row placeholder token modality {:?} does not match media item {:?}",
+                        modality,
+                        item.modality
+                    );
+                }
+                if row_in_item == 0 {
+                    item_base = cursor_position;
+                }
+                let positions = relative_positions
+                    .get(item_idx)
+                    .ok_or_else(|| anyhow!("visual row placeholder exceeded media item count"))?;
+                let position = positions
+                    .get(row_in_item)
+                    .ok_or_else(|| anyhow!("visual row placeholder exceeded image row count"))?;
+                let start = visual_row_offset
+                    .checked_mul(embed_dim)
+                    .context("visual embedding offset overflows usize")?;
+                output.extend_from_slice(&visual_embeddings[start..start + embed_dim]);
+                let t = item_base
+                    .checked_add(position[0])
+                    .context("MRoPE temporal position overflows usize")?;
+                let h = item_base
+                    .checked_add(position[1])
+                    .context("MRoPE height position overflows usize")?;
+                let w = item_base
+                    .checked_add(position[2])
+                    .context("MRoPE width position overflows usize")?;
+                max_position = max_position.max(t).max(h).max(w);
+                position_ids.push([
+                    u32::try_from(t).context("MRoPE temporal position does not fit u32")?,
+                    u32::try_from(h).context("MRoPE height position does not fit u32")?,
+                    u32::try_from(w).context("MRoPE width position does not fit u32")?,
+                ]);
+                visual_row_offset += 1;
+                row_in_item += 1;
+                if row_in_item == item.rows {
+                    cursor_position = cursor_position
+                        .checked_add(visual_spatial_advance(item)?)
+                        .context("next MRoPE cursor position overflows usize")?;
+                    item_idx += 1;
+                    row_in_item = 0;
+                };
+            } else {
+                if row_in_item != 0 {
+                    bail!(
+                        "expanded visual row placeholders for each media item must be contiguous"
+                    );
+                }
+                let start = token_idx
+                    .checked_mul(embed_dim)
+                    .context("token embedding offset overflows usize")?;
+                output.extend_from_slice(&token_embeddings[start..start + embed_dim]);
+                max_position = max_position.max(cursor_position);
+                let position = u32::try_from(cursor_position)
+                    .context("text MRoPE position does not fit u32")?;
+                position_ids.push([position, position, position]);
+                cursor_position = cursor_position
+                    .checked_add(1)
+                    .context("next MRoPE position overflows usize")?;
+            }
+        }
+        if row_in_item != 0 {
+            bail!("expanded visual row placeholders ended in the middle of a media item");
+        }
+        if item_idx != items.len() {
+            bail!("not all media items were consumed by expanded visual placeholders");
+        }
+        if visual_row_offset != visual_rows {
+            bail!("not all visual embedding rows were consumed by visual placeholders");
+        }
+    } else {
+        bail!(
+            "visual placeholder token count {visual_token_count} does not match media count {} or visual row count {visual_rows}",
+            items.len()
+        );
+    }
+    let rows = output
+        .len()
+        .checked_div(embed_dim)
+        .ok_or_else(|| anyhow!("embedding dim must be greater than zero"))?;
+    if rows != position_ids.len() {
+        bail!(
+            "multimodal prompt produced {rows} embedding rows but {} position rows",
+            position_ids.len()
+        );
+    }
+    Ok(MultimodalPromptEmbeddings {
+        embeddings: output,
+        rows,
+        position_ids,
+        next_position: max_position
+            .checked_add(1)
+            .context("next MRoPE decode position overflows usize")?,
+    })
+}
+
+fn visual_token_id_for_item(
+    item: &VisualProjectionItem,
+    image_token_id: Option<u32>,
+    video_token_id: Option<u32>,
+) -> Result<u32> {
+    match item.modality {
+        VisualModality::Image => image_token_id
+            .ok_or_else(|| anyhow!("Qwen-VL tokenizer is missing <|image_pad|> token")),
+        VisualModality::Video => video_token_id
+            .ok_or_else(|| anyhow!("Qwen-VL tokenizer is missing <|video_pad|> token")),
+    }
+}
+
+fn visual_token_modality(
+    token: u32,
+    image_token_id: Option<u32>,
+    video_token_id: Option<u32>,
+) -> Option<VisualModality> {
+    if image_token_id.is_some_and(|id| token == id) {
+        return Some(VisualModality::Image);
+    }
+    if video_token_id.is_some_and(|id| token == id) {
+        return Some(VisualModality::Video);
+    }
+    None
+}
+
+fn visual_spatial_advance(item: &VisualProjectionItem) -> Result<usize> {
+    item.language_grid[1]
+        .max(item.language_grid[2])
+        .checked_add(0)
+        .context("visual spatial MRoPE advance overflows usize")
+}
+
+fn qwen_vl_language_media_positions(
+    grid: [usize; 3],
+    temporal_position_interval: usize,
+) -> Result<Vec<[usize; 3]>> {
+    let [t, h, w] = grid;
+    if t == 0 || h == 0 || w == 0 {
+        bail!("Qwen-VL language media grid must be non-zero, got {grid:?}");
+    }
+    if temporal_position_interval == 0 {
+        bail!("Qwen-VL temporal position interval must be non-zero");
+    }
+    let rows = t
+        .checked_mul(h)
+        .and_then(|value| value.checked_mul(w))
+        .context("Qwen-VL language media grid row count overflows usize")?;
+    let mut positions = Vec::with_capacity(rows);
+    for ti in 0..t {
+        for hi in 0..h {
+            for wi in 0..w {
+                positions.push([
+                    ti.checked_mul(temporal_position_interval)
+                        .context("Qwen-VL temporal language position overflows usize")?,
+                    hi,
+                    wi,
+                ]);
+            }
+        }
+    }
+    Ok(positions)
+}
+
+fn load_mmproj_info(path: &PathBuf) -> Result<CudaMmprojInfo> {
+    let gguf = GgufFile::open(path)
+        .with_context(|| format!("loading CUDA Qwen mmproj GGUF from {}", path.display()))?;
+    let total_tensor_bytes = gguf.tensors().iter().try_fold(0u64, |acc, tensor| {
+        Ok::<_, anyhow::Error>(acc + tensor.byte_len()?)
+    })?;
+    let vision = gpu::CudaVisionEncoder::from_gguf(&gguf)
+        .map(Mutex::new)
+        .map(Arc::new)
+        .map_err(|err| format!("{err:#}"));
+    Ok(CudaMmprojInfo {
+        path: path.clone(),
+        tensor_count: gguf.tensors().len(),
+        total_tensor_bytes,
+        vision,
+    })
+}
+
+struct VisionPatchBatch {
+    values: Vec<f32>,
+    grids: Vec<[usize; 3]>,
+    projected_rows: usize,
+    items: Vec<VisualProjectionItem>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VisualModality {
+    Image,
+    Video,
+}
+
+#[derive(Clone, Debug)]
+struct VisualProjectionItem {
+    modality: VisualModality,
+    rows: usize,
+    language_grid: [usize; 3],
+    second_per_grid_t: usize,
+}
+
+const DEFAULT_VIDEO_FPS: f32 = 2.0;
+const DEFAULT_VIDEO_MIN_FRAMES: usize = 4;
+const DEFAULT_VIDEO_MAX_FRAMES: usize = 768;
+const DEFAULT_VIDEO_MIN_TOKEN_NUM: usize = 128;
+const DEFAULT_VIDEO_MAX_TOKEN_NUM: usize = 768;
+const MAX_MEDIA_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
+static MEDIA_TEMP_COUNTER: StdAtomicU64 = StdAtomicU64::new(0);
+
+fn media_inputs_to_vision_patches(
+    media_inputs: &[MultimodalInput],
+    info: &gpu::CudaVisionEncoderInfo,
+) -> Result<VisionPatchBatch> {
+    if media_inputs.is_empty() {
+        bail!("CUDA Qwen-VL vision encoding requires at least one multimodal input");
+    }
+    let mut values = Vec::new();
+    let mut grids = Vec::with_capacity(media_inputs.len());
+    let mut projected_rows = 0usize;
+    let mut items = Vec::with_capacity(media_inputs.len());
+    for input in media_inputs {
+        let (patches, grid, modality, second_per_grid_t) = match input {
+            MultimodalInput::Image(image) => {
+                let (patches, grid) = image_input_to_qwen_vl_patches(image, info)?;
+                (patches, grid, VisualModality::Image, 1)
+            }
+            MultimodalInput::Video(video) => {
+                let (patches, grid, second_per_grid_t) =
+                    video_input_to_qwen_vl_patches(video, info)?;
+                (patches, grid, VisualModality::Video, second_per_grid_t)
+            }
+        };
+        let merge_unit = info
+            .spatial_merge_size
+            .checked_mul(info.spatial_merge_size)
+            .context("CUDA vision merge unit overflows usize")?;
+        let patch_rows = grid[0]
+            .checked_mul(grid[1])
+            .and_then(|value| value.checked_mul(grid[2]))
+            .context("CUDA vision grid patch rows overflow usize")?;
+        if patch_rows % merge_unit != 0 {
+            bail!(
+                "CUDA vision patch rows {patch_rows} are not divisible by merge unit {merge_unit}"
+            );
+        }
+        if grid[1] % info.spatial_merge_size != 0 || grid[2] % info.spatial_merge_size != 0 {
+            bail!(
+                "CUDA vision grid {grid:?} is not divisible by spatial merge size {}",
+                info.spatial_merge_size
+            );
+        }
+        let rows = patch_rows / merge_unit;
+        projected_rows = projected_rows
+            .checked_add(rows)
+            .context("CUDA vision projected row count overflows usize")?;
+        items.push(VisualProjectionItem {
+            modality,
+            rows,
+            language_grid: [
+                grid[0],
+                grid[1] / info.spatial_merge_size,
+                grid[2] / info.spatial_merge_size,
+            ],
+            second_per_grid_t,
+        });
+        values.extend(patches);
+        grids.push(grid);
+    }
+    Ok(VisionPatchBatch {
+        values,
+        grids,
+        projected_rows,
+        items,
+    })
+}
+
+fn image_input_to_qwen_vl_patches(
+    image: &ImageInput,
+    info: &gpu::CudaVisionEncoderInfo,
+) -> Result<(Vec<f32>, [usize; 3])> {
+    let bytes = image_input_bytes(image)?;
+    image_bytes_to_qwen_vl_patches(&bytes, info)
+}
+
+fn image_input_bytes(image: &ImageInput) -> Result<Vec<u8>> {
+    match &image.source {
+        ImageSource::Data { media_type, bytes } => {
+            if !media_type.to_ascii_lowercase().starts_with("image/") {
+                bail!("unsupported CUDA multimodal media type '{media_type}'; expected image/*");
+            }
+            if bytes.is_empty() {
+                bail!("CUDA multimodal data image payload must not be empty");
+            }
+            Ok(bytes.clone())
+        }
+        ImageSource::Url { kind, url } => media_url_bytes(*kind, url, "image"),
+    }
+}
+
+fn image_bytes_to_qwen_vl_patches(
+    bytes: &[u8],
+    info: &gpu::CudaVisionEncoderInfo,
+) -> Result<(Vec<f32>, [usize; 3])> {
+    let rgb = decode_image_rgb(bytes)?;
+    let (width, height) = rgb.dimensions();
+    let height = usize::try_from(height).context("image height does not fit usize")?;
+    let width = usize::try_from(width).context("image width does not fit usize")?;
+    let factor = info
+        .patch_size
+        .checked_mul(info.spatial_merge_size)
+        .context("CUDA vision resize factor overflows usize")?;
+    let (resized_h, resized_w) =
+        smart_resize(height, width, factor, info.min_pixels, info.max_pixels)?;
+    let resized = image::imageops::resize(
+        &rgb,
+        u32::try_from(resized_w).context("resized image width does not fit u32")?,
+        u32::try_from(resized_h).context("resized image height does not fit u32")?,
+        FilterType::CatmullRom,
+    );
+    let grid_h = resized_h / info.patch_size;
+    let grid_w = resized_w / info.patch_size;
+    let grid = [1usize, grid_h, grid_w];
+    let patch_dim = 3usize
+        .checked_mul(info.temporal_patch_size)
+        .and_then(|value| value.checked_mul(info.patch_size))
+        .and_then(|value| value.checked_mul(info.patch_size))
+        .context("CUDA vision patch dim overflows usize")?;
+    let patch_rows = grid_h
+        .checked_mul(grid_w)
+        .context("CUDA vision patch row count overflows usize")?;
+    let mut patches = Vec::with_capacity(
+        patch_rows
+            .checked_mul(patch_dim)
+            .context("CUDA vision patch value count overflows usize")?,
+    );
+    for block_h in 0..(grid_h / info.spatial_merge_size) {
+        for block_w in 0..(grid_w / info.spatial_merge_size) {
+            for merge_h in 0..info.spatial_merge_size {
+                for merge_w in 0..info.spatial_merge_size {
+                    let patch_y = (block_h * info.spatial_merge_size + merge_h) * info.patch_size;
+                    let patch_x = (block_w * info.spatial_merge_size + merge_w) * info.patch_size;
+                    for channel in 0..3usize {
+                        for _temporal in 0..info.temporal_patch_size {
+                            for y in 0..info.patch_size {
+                                for x in 0..info.patch_size {
+                                    let pixel = resized.get_pixel(
+                                        u32::try_from(patch_x + x)
+                                            .context("patch x position does not fit u32")?,
+                                        u32::try_from(patch_y + y)
+                                            .context("patch y position does not fit u32")?,
+                                    );
+                                    let value = f32::from(pixel[channel]) / 255.0;
+                                    patches.push(
+                                        (value - info.image_mean[channel])
+                                            / info.image_std[channel],
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok((patches, grid))
+}
+
+fn video_input_to_qwen_vl_patches(
+    video: &VideoInput,
+    info: &gpu::CudaVisionEncoderInfo,
+) -> Result<(Vec<f32>, [usize; 3], usize)> {
+    let (mut frames, sampled_fps) = match &video.source {
+        VideoSource::Data { media_type, bytes } => {
+            if !media_type.to_ascii_lowercase().starts_with("video/") {
+                bail!("unsupported CUDA multimodal media type '{media_type}'; expected video/*");
+            }
+            if bytes.is_empty() {
+                bail!("CUDA multimodal data video payload must not be empty");
+            }
+            let suffix = media_type_extension(media_type).unwrap_or("video");
+            let input = TempMediaPath::file("hi-cuda-video-input", suffix)?;
+            input.write_all(bytes)?;
+            extract_video_frames_with_ffmpeg(input.path(), video)?
+        }
+        VideoSource::Url { kind, url } => match kind {
+            ImageUrlKind::Local => {
+                let path = local_media_path(url)?;
+                extract_video_frames_with_ffmpeg(&path, video)?
+            }
+            ImageUrlKind::Http => {
+                let bytes = media_url_bytes(*kind, url, "video")?;
+                let input = TempMediaPath::file("hi-cuda-video-input", "video")?;
+                input.write_all(&bytes)?;
+                extract_video_frames_with_ffmpeg(input.path(), video)?
+            }
+        },
+        VideoSource::Frames(frame_inputs) => {
+            if frame_inputs.is_empty() {
+                bail!("CUDA multimodal video frame list must not be empty");
+            }
+            let mut frames = Vec::with_capacity(frame_inputs.len());
+            for frame in frame_inputs {
+                frames.push(decode_image_rgb(&image_input_bytes(frame)?)?);
+            }
+            (frames, video.fps.unwrap_or(DEFAULT_VIDEO_FPS))
+        }
+    };
+
+    normalize_video_frame_count(&mut frames, video, info.temporal_patch_size)?;
+    let temporal_position_interval = if info.variant == "qwen2.5-vl" {
+        let second_per_grid_t = ((info.temporal_patch_size as f32) / sampled_fps)
+            .floor()
+            .max(1.0) as usize;
+        info.tokens_per_second
+            .checked_mul(second_per_grid_t)
+            .context("Qwen2.5-VL temporal MRoPE interval overflows usize")?
+    } else {
+        1
+    };
+    let (patches, grid) = video_frames_to_qwen_vl_patches(&frames, info)?;
+    Ok((patches, grid, temporal_position_interval))
+}
+
+fn decode_image_rgb(bytes: &[u8]) -> Result<image::RgbImage> {
+    Ok(image::load_from_memory(bytes)
+        .context("decoding image input")?
+        .to_rgb8())
+}
+
+fn video_frames_to_qwen_vl_patches(
+    frames: &[image::RgbImage],
+    info: &gpu::CudaVisionEncoderInfo,
+) -> Result<(Vec<f32>, [usize; 3])> {
+    if frames.is_empty() {
+        bail!("CUDA Qwen-VL video requires at least one decoded frame");
+    }
+    if info.temporal_patch_size == 0 {
+        bail!("CUDA Qwen-VL temporal patch size must be non-zero");
+    }
+    if frames.len() % info.temporal_patch_size != 0 {
+        bail!(
+            "CUDA Qwen-VL video frame count {} is not divisible by temporal patch size {}",
+            frames.len(),
+            info.temporal_patch_size
+        );
+    }
+    let (width, height) = frames[0].dimensions();
+    let height = usize::try_from(height).context("video frame height does not fit usize")?;
+    let width = usize::try_from(width).context("video frame width does not fit usize")?;
+    let factor = info
+        .patch_size
+        .checked_mul(info.spatial_merge_size)
+        .context("CUDA vision resize factor overflows usize")?;
+    let (min_pixels, max_pixels) = video_pixel_bounds(info, factor)?;
+    let (resized_h, resized_w) = smart_resize(height, width, factor, min_pixels, max_pixels)?;
+    let resized = frames
+        .iter()
+        .map(|frame| -> Result<image::RgbImage> {
+            Ok(image::imageops::resize(
+                frame,
+                u32::try_from(resized_w).context("resized video width does not fit u32")?,
+                u32::try_from(resized_h).context("resized video height does not fit u32")?,
+                FilterType::CatmullRom,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let grid_t = resized.len() / info.temporal_patch_size;
+    let grid_h = resized_h / info.patch_size;
+    let grid_w = resized_w / info.patch_size;
+    let grid = [grid_t, grid_h, grid_w];
+    let patch_dim = 3usize
+        .checked_mul(info.temporal_patch_size)
+        .and_then(|value| value.checked_mul(info.patch_size))
+        .and_then(|value| value.checked_mul(info.patch_size))
+        .context("CUDA vision video patch dim overflows usize")?;
+    let patch_rows = grid_t
+        .checked_mul(grid_h)
+        .and_then(|value| value.checked_mul(grid_w))
+        .context("CUDA vision video patch row count overflows usize")?;
+    let mut patches = Vec::with_capacity(
+        patch_rows
+            .checked_mul(patch_dim)
+            .context("CUDA vision video patch value count overflows usize")?,
+    );
+    for t_block in 0..grid_t {
+        for block_h in 0..(grid_h / info.spatial_merge_size) {
+            for block_w in 0..(grid_w / info.spatial_merge_size) {
+                for merge_h in 0..info.spatial_merge_size {
+                    for merge_w in 0..info.spatial_merge_size {
+                        let patch_y =
+                            (block_h * info.spatial_merge_size + merge_h) * info.patch_size;
+                        let patch_x =
+                            (block_w * info.spatial_merge_size + merge_w) * info.patch_size;
+                        for channel in 0..3usize {
+                            for temporal in 0..info.temporal_patch_size {
+                                let frame = &resized[t_block * info.temporal_patch_size + temporal];
+                                for y in 0..info.patch_size {
+                                    for x in 0..info.patch_size {
+                                        let pixel = frame.get_pixel(
+                                            u32::try_from(patch_x + x).context(
+                                                "video patch x position does not fit u32",
+                                            )?,
+                                            u32::try_from(patch_y + y).context(
+                                                "video patch y position does not fit u32",
+                                            )?,
+                                        );
+                                        let value = f32::from(pixel[channel]) / 255.0;
+                                        patches.push(
+                                            (value - info.image_mean[channel])
+                                                / info.image_std[channel],
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok((patches, grid))
+}
+
+fn normalize_video_frame_count(
+    frames: &mut Vec<image::RgbImage>,
+    video: &VideoInput,
+    temporal_patch_size: usize,
+) -> Result<()> {
+    if temporal_patch_size == 0 {
+        bail!("CUDA Qwen-VL temporal patch size must be non-zero");
+    }
+    if frames.is_empty() {
+        bail!("CUDA Qwen-VL video produced no frames");
+    }
+    let min_frames = ceil_by_factor(
+        video.min_frames.unwrap_or(DEFAULT_VIDEO_MIN_FRAMES),
+        temporal_patch_size,
+    );
+    let max_frames = floor_by_factor(
+        video
+            .max_frames
+            .unwrap_or(DEFAULT_VIDEO_MAX_FRAMES)
+            .max(temporal_patch_size),
+        temporal_patch_size,
+    )
+    .max(temporal_patch_size);
+    let target = if let Some(nframes) = video.nframes {
+        round_by_factor(nframes, temporal_patch_size)
+            .max(temporal_patch_size)
+            .min(max_frames)
+    } else {
+        floor_by_factor(
+            frames.len().min(max_frames).max(min_frames),
+            temporal_patch_size,
+        )
+        .max(temporal_patch_size)
+    };
+    if frames.len() > target {
+        *frames = sample_uniform_frames(frames, target);
+    }
+    while frames.len() < target {
+        let last = frames
+            .last()
+            .ok_or_else(|| anyhow!("CUDA Qwen-VL video has no frame to pad"))?
+            .clone();
+        frames.push(last);
+    }
+    while frames.len() % temporal_patch_size != 0 {
+        let last = frames
+            .last()
+            .ok_or_else(|| anyhow!("CUDA Qwen-VL video has no frame to pad"))?
+            .clone();
+        frames.push(last);
+    }
+    Ok(())
+}
+
+fn sample_uniform_frames(frames: &[image::RgbImage], target: usize) -> Vec<image::RgbImage> {
+    if target >= frames.len() {
+        return frames.to_vec();
+    }
+    if target <= 1 {
+        return vec![frames[0].clone()];
+    }
+    let last = frames.len() - 1;
+    (0..target)
+        .map(|idx| {
+            let source = ((idx * last) as f64 / (target - 1) as f64).round() as usize;
+            frames[source.min(last)].clone()
+        })
+        .collect()
+}
+
+fn round_by_factor(value: usize, factor: usize) -> usize {
+    if factor == 0 {
+        return value;
+    }
+    (((value as f64) / (factor as f64)).round() as usize).max(1) * factor
+}
+
+fn ceil_by_factor(value: usize, factor: usize) -> usize {
+    if factor == 0 {
+        return value;
+    }
+    value.div_ceil(factor) * factor
+}
+
+fn floor_by_factor(value: usize, factor: usize) -> usize {
+    if factor == 0 {
+        return value;
+    }
+    (value / factor) * factor
+}
+
+fn video_pixel_bounds(info: &gpu::CudaVisionEncoderInfo, factor: usize) -> Result<(usize, usize)> {
+    let factor_pixels = factor
+        .checked_mul(factor)
+        .context("CUDA vision video factor pixels overflow usize")?;
+    let default_min = DEFAULT_VIDEO_MIN_TOKEN_NUM
+        .checked_mul(factor_pixels)
+        .context("CUDA vision video min pixels overflow usize")?;
+    let default_max = DEFAULT_VIDEO_MAX_TOKEN_NUM
+        .checked_mul(factor_pixels)
+        .context("CUDA vision video max pixels overflow usize")?;
+    let min_pixels = info.min_pixels.max(default_min);
+    let max_pixels = info.max_pixels.min(default_max).max(min_pixels);
+    Ok((min_pixels, max_pixels))
+}
+
+fn extract_video_frames_with_ffmpeg(
+    input_path: &Path,
+    video: &VideoInput,
+) -> Result<(Vec<image::RgbImage>, f32)> {
+    if !input_path.exists() {
+        bail!("video input path {} does not exist", input_path.display());
+    }
+    let fps = video.fps.unwrap_or(DEFAULT_VIDEO_FPS);
+    if !fps.is_finite() || fps <= 0.0 {
+        bail!("video fps must be a positive finite number, got {fps}");
+    }
+    let frame_limit = video
+        .nframes
+        .or(video.max_frames)
+        .unwrap_or(DEFAULT_VIDEO_MAX_FRAMES)
+        .max(1);
+    let frame_dir = TempMediaPath::dir("hi-cuda-video-frames")?;
+    let output_pattern = frame_dir.path().join("frame_%06d.png");
+    let status = Command::new("ffmpeg")
+        .arg("-nostdin")
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-i")
+        .arg(input_path)
+        .arg("-vf")
+        .arg(format!("fps={fps}"))
+        .arg("-frames:v")
+        .arg(frame_limit.to_string())
+        .arg(&output_pattern)
+        .status()
+        .with_context(|| {
+            "running ffmpeg to decode video frames; install ffmpeg or send a video frame list"
+                .to_string()
+        })?;
+    if !status.success() {
+        bail!("ffmpeg failed to decode video frames with status {status}");
+    }
+    let mut frame_paths = fs::read_dir(frame_dir.path())
+        .with_context(|| {
+            format!(
+                "reading decoded video frame dir {}",
+                frame_dir.path().display()
+            )
+        })?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<std::io::Result<Vec<_>>>()
+        .context("listing decoded video frames")?;
+    frame_paths.sort();
+    if frame_paths.is_empty() {
+        bail!("ffmpeg decoded zero video frames");
+    }
+    let mut frames = Vec::with_capacity(frame_paths.len());
+    for path in frame_paths {
+        let bytes =
+            fs::read(&path).with_context(|| format!("reading decoded frame {}", path.display()))?;
+        frames.push(decode_image_rgb(&bytes)?);
+    }
+    Ok((frames, fps))
+}
+
+struct TempMediaPath {
+    path: PathBuf,
+    is_dir: bool,
+}
+
+impl TempMediaPath {
+    fn file(prefix: &str, suffix: &str) -> Result<Self> {
+        let path = unique_temp_path(prefix, suffix);
+        fs::File::create(&path)
+            .with_context(|| format!("creating temporary media file {}", path.display()))?;
+        Ok(Self {
+            path,
+            is_dir: false,
+        })
+    }
+
+    fn dir(prefix: &str) -> Result<Self> {
+        let path = unique_temp_path(prefix, "dir");
+        fs::create_dir(&path)
+            .with_context(|| format!("creating temporary media directory {}", path.display()))?;
+        Ok(Self { path, is_dir: true })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn write_all(&self, bytes: &[u8]) -> Result<()> {
+        let mut file = fs::File::create(&self.path)
+            .with_context(|| format!("opening temporary media file {}", self.path.display()))?;
+        file.write_all(bytes)
+            .with_context(|| format!("writing temporary media file {}", self.path.display()))
+    }
+}
+
+impl Drop for TempMediaPath {
+    fn drop(&mut self) {
+        let _ = if self.is_dir {
+            fs::remove_dir_all(&self.path)
+        } else {
+            fs::remove_file(&self.path)
+        };
+    }
+}
+
+fn unique_temp_path(prefix: &str, suffix: &str) -> PathBuf {
+    let id = MEDIA_TEMP_COUNTER.fetch_add(1, StdOrdering::Relaxed);
+    std::env::temp_dir().join(format!("{prefix}-{}-{id}.{suffix}", std::process::id()))
+}
+
+fn media_type_extension(media_type: &str) -> Option<&'static str> {
+    match media_type.to_ascii_lowercase().as_str() {
+        "video/mp4" => Some("mp4"),
+        "video/webm" => Some("webm"),
+        "video/quicktime" => Some("mov"),
+        "video/x-matroska" => Some("mkv"),
+        _ => None,
+    }
+}
+
+fn media_url_bytes(kind: ImageUrlKind, url: &str, media_label: &str) -> Result<Vec<u8>> {
+    match kind {
+        ImageUrlKind::Local => {
+            let path = local_media_path(url)?;
+            fs::read(&path)
+                .with_context(|| format!("reading local {media_label} URL {}", path.display()))
+        }
+        ImageUrlKind::Http => {
+            let client = reqwest::blocking::Client::builder()
+                .timeout(Duration::from_secs(120))
+                .user_agent("hi-local-cuda-multimodal/0.1")
+                .build()
+                .context("building HTTP media client")?;
+            let mut response = client
+                .get(url)
+                .send()
+                .with_context(|| format!("fetching HTTP {media_label} URL {url}"))?
+                .error_for_status()
+                .with_context(|| format!("HTTP {media_label} URL {url} returned an error"))?;
+            let content_length = response.content_length();
+            if content_length.is_some_and(|len| len > MAX_MEDIA_DOWNLOAD_BYTES) {
+                bail!(
+                    "HTTP {media_label} URL {url} is too large: {} bytes exceeds limit {}",
+                    content_length.unwrap_or(0),
+                    MAX_MEDIA_DOWNLOAD_BYTES
+                );
+            }
+            let mut bytes = Vec::new();
+            response
+                .copy_to(&mut bytes)
+                .with_context(|| format!("reading HTTP {media_label} URL {url}"))?;
+            if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_MEDIA_DOWNLOAD_BYTES {
+                bail!(
+                    "HTTP {media_label} URL {url} is too large: {} bytes exceeds limit {}",
+                    bytes.len(),
+                    MAX_MEDIA_DOWNLOAD_BYTES
+                );
+            }
+            Ok(bytes)
+        }
+    }
+}
+
+fn local_media_path(url: &str) -> Result<PathBuf> {
+    let path = url.strip_prefix("file://").unwrap_or(url);
+    if path.trim().is_empty() {
+        bail!("local media URL must not be empty");
+    }
+    Ok(PathBuf::from(path))
+}
+
+fn smart_resize(
+    height: usize,
+    width: usize,
+    factor: usize,
+    min_pixels: usize,
+    max_pixels: usize,
+) -> Result<(usize, usize)> {
+    if height == 0 || width == 0 || factor == 0 {
+        bail!("image dimensions and resize factor must be non-zero");
+    }
+    let aspect = height.max(width) as f64 / height.min(width) as f64;
+    if aspect > 200.0 {
+        bail!("image absolute aspect ratio must be smaller than 200, got {aspect}");
+    }
+    let round_to_factor = |value: usize| -> usize {
+        (((value as f64) / (factor as f64)).round() as usize).max(1) * factor
+    };
+    let mut h_bar = round_to_factor(height);
+    let mut w_bar = round_to_factor(width);
+    if h_bar
+        .checked_mul(w_bar)
+        .is_some_and(|pixels| pixels > max_pixels)
+    {
+        let beta = ((height * width) as f64 / max_pixels as f64).sqrt();
+        h_bar = ((((height as f64) / beta / factor as f64).floor() as usize).max(1)) * factor;
+        w_bar = ((((width as f64) / beta / factor as f64).floor() as usize).max(1)) * factor;
+    } else if h_bar
+        .checked_mul(w_bar)
+        .is_some_and(|pixels| pixels < min_pixels)
+    {
+        let beta = (min_pixels as f64 / (height * width) as f64).sqrt();
+        h_bar = (((height as f64) * beta / factor as f64).ceil() as usize) * factor;
+        w_bar = (((width as f64) * beta / factor as f64).ceil() as usize) * factor;
+    }
+    Ok((h_bar.max(factor), w_bar.max(factor)))
+}
+
+fn request_uses_greedy_cuda_defaults(request: &GenerationRequest) -> bool {
+    (!request.temperature.is_finite() || request.temperature <= 0.0)
+        && (!request.top_p.is_finite() || (request.top_p - 1.0).abs() <= f32::EPSILON)
+        && request.top_k.is_none()
+}
+
+fn validate_generation_sampling_parameters(request: &GenerationRequest) -> Result<()> {
+    if !request.temperature.is_finite() || request.temperature < 0.0 {
+        bail!(
+            "invalid_sampling_parameter: temperature must be a finite number greater than or equal to 0"
+        );
+    }
+    if !request.top_p.is_finite() || !(0.0..=1.0).contains(&request.top_p) {
+        bail!("invalid_sampling_parameter: top_p must be a finite number between 0 and 1");
+    }
+    if request.top_k == Some(0) {
+        bail!("invalid_sampling_parameter: top_k must be greater than 0 when provided");
+    }
+    Ok(())
+}
+
+struct CudaGeneration {
+    deltas: Vec<(u32, String)>,
+    output: GenerationOutput,
+}
+
+fn generate_events_gpu_from(
+    gpu_model: &Arc<Mutex<gpu::CudaQwenGpuModel>>,
+    cpu_reference: &qwen_cpu::QwenCpuReference,
+    qwen: &QwenGgufConfig,
+    request: &GenerationRequest,
+    max_output_tokens: u32,
+    kv_cache_mode: CudaKvCacheMode,
+    kv_page_size: usize,
+) -> Result<CudaGeneration> {
+    generate_events_gpu_from_with_cancellation(
+        gpu_model,
+        cpu_reference,
+        qwen,
+        request,
+        max_output_tokens,
+        kv_cache_mode,
+        kv_page_size,
+        || false,
+    )
+}
+
+fn generate_events_gpu_from_with_cancellation<F>(
+    gpu_model: &Arc<Mutex<gpu::CudaQwenGpuModel>>,
+    cpu_reference: &qwen_cpu::QwenCpuReference,
+    qwen: &QwenGgufConfig,
+    request: &GenerationRequest,
+    max_output_tokens: u32,
+    kv_cache_mode: CudaKvCacheMode,
+    kv_page_size: usize,
+    mut is_cancelled: F,
+) -> Result<CudaGeneration>
+where
+    F: FnMut() -> bool,
+{
+    if !request.media_inputs.is_empty() {
+        bail!(
+            "multimodal inputs reached the CUDA text generation path without multimodal processing"
+        );
+    }
+    let prompt_tokens = cpu_reference.tokenizer().encode(&request.prompt)?;
+    if prompt_tokens.is_empty() {
+        bail!("prompt encoded to zero tokens");
+    }
+    let context_limit = usize::try_from(qwen.context_length)
+        .map_err(|_| anyhow!("qwen context length does not fit usize"))?;
+    if prompt_tokens.len() > context_limit {
+        bail!(
+            "context_length_exceeded: prompt length {} exceeds qwen context length {context_limit}",
+            prompt_tokens.len()
+        );
+    }
+    let max_tokens = validate_generation_max_tokens(request, max_output_tokens)?;
+    validate_generation_context_budget(qwen, prompt_tokens.len(), max_tokens)?;
+    let stop_token_sequences =
+        generation_stop_token_sequences(cpu_reference, &request.stop_sequences)?;
+
+    let generated = {
+        let model = gpu_model
+            .lock()
+            .map_err(|_| anyhow!("CUDA gpu model lock poisoned"))?;
+        if request_uses_greedy_cuda_defaults(request) {
+            match kv_cache_mode {
+                CudaKvCacheMode::Legacy => model
+                    .generate_greedy_tokens_with_stop_sequences_and_cancellation(
+                        &prompt_tokens,
+                        max_tokens,
+                        qwen.eos_token_id,
+                        &stop_token_sequences,
+                        &mut is_cancelled,
+                    )?,
+                CudaKvCacheMode::Paged => model
+                    .generate_greedy_tokens_paged_with_stop_sequences_and_cancellation(
+                        &prompt_tokens,
+                        max_tokens,
+                        qwen.eos_token_id,
+                        kv_page_size,
+                        &stop_token_sequences,
+                        &mut is_cancelled,
+                    )?,
+            }
+        } else {
+            match kv_cache_mode {
+                CudaKvCacheMode::Legacy => model
+                    .generate_sampled_tokens_with_stop_sequences_and_cancellation(
+                        &prompt_tokens,
+                        max_tokens,
+                        qwen.eos_token_id,
+                        request.temperature,
+                        request.top_p,
+                        request.top_k,
+                        request.seed,
+                        &stop_token_sequences,
+                        &mut is_cancelled,
+                    )?,
+                CudaKvCacheMode::Paged => model
+                    .generate_sampled_tokens_paged_with_stop_sequences_and_cancellation(
+                        &prompt_tokens,
+                        max_tokens,
+                        qwen.eos_token_id,
+                        request.temperature,
+                        request.top_p,
+                        request.top_k,
+                        request.seed,
+                        kv_page_size,
+                        &stop_token_sequences,
+                        &mut is_cancelled,
+                    )?,
+            }
+        }
+    };
+
+    cuda_generation_from_tokens_with_prompt_count_and_stops(
+        cpu_reference,
+        prompt_tokens.len(),
+        generated,
+        &request.stop_sequences,
+    )
+}
+
+struct CudaSchedulerState {
+    qwen: QwenGgufConfig,
+    max_output_tokens: u32,
+    cpu_reference: Arc<qwen_cpu::QwenCpuReference>,
+    gpu_model: Arc<Mutex<gpu::CudaQwenGpuModel>>,
+    kv_pages: Option<Arc<CudaPagedKvCacheManager>>,
+    kv_cache_mode: CudaKvCacheMode,
+    kv_page_size: usize,
+    mmproj: Option<CudaMmprojInfo>,
+    multimodal_stats: Arc<CudaMultimodalStats>,
+}
+
+#[derive(Clone, Debug)]
+struct CudaGenerationScheduler {
+    tx: mpsc::Sender<CudaSchedulerJob>,
+    stats: Arc<CudaSchedulerStats>,
+    max_active_requests: usize,
+}
+
+struct CudaSchedulerJob {
+    request: GenerationRequest,
+    tx: tokio::sync::mpsc::Sender<Result<GenerationEvent>>,
+    submitted_at: Instant,
+}
+
+#[derive(Debug)]
+struct CudaSchedulerStats {
+    total_batches: AtomicU64,
+    total_requests: AtomicU64,
+    gpu_batched_batches: AtomicU64,
+    gpu_batched_requests: AtomicU64,
+    paged_lease_batched_requests: AtomicU64,
+    paged_internal_batched_requests: AtomicU64,
+    greedy_batched_requests: AtomicU64,
+    sampled_batched_requests: AtomicU64,
+    shared_prefix_batches: AtomicU64,
+    shared_prefix_requests: AtomicU64,
+    shared_prefix_tokens: AtomicU64,
+    fallback_requests: AtomicU64,
+    fallback_single_request: AtomicU64,
+    fallback_moe_requests: AtomicU64,
+    fallback_multimodal_requests: AtomicU64,
+    fallback_tokenizer_requests: AtomicU64,
+    fallback_bucket_requests: AtomicU64,
+    fallback_other_requests: AtomicU64,
+    batch_plan_eligible_requests: AtomicU64,
+    batch_plan_ineligible_requests: AtomicU64,
+    token_budget_split_groups: AtomicU64,
+    token_budget_split_requests: AtomicU64,
+    token_budget_split_chunks: AtomicU64,
+    continuous_step_admissions: AtomicU64,
+    continuous_admitted_requests: AtomicU64,
+    continuous_decode_iterations: AtomicU64,
+    continuous_prefill_batches: AtomicU64,
+    continuous_prefill_requests: AtomicU64,
+    continuous_append_decode_batches: AtomicU64,
+    continuous_append_decode_requests: AtomicU64,
+    continuous_mid_decode_retirements: AtomicU64,
+    continuous_mid_decode_cancellations: AtomicU64,
+    completed_requests: AtomicU64,
+    errored_requests: AtomicU64,
+    cancelled_requests: AtomicU64,
+    capacity_rejected_requests: AtomicU64,
+    capacity_max_active_rejected_requests: AtomicU64,
+    capacity_rejected_active_requests_total: AtomicU64,
+    capacity_rejected_active_requests_max: AtomicUsize,
+    admission_rejected_requests: AtomicU64,
+    admission_errored_requests: AtomicU64,
+    admission_cancelled_requests: AtomicU64,
+    admission_context_rejected_requests: AtomicU64,
+    admission_invalid_request_rejected_requests: AtomicU64,
+    admission_memory_rejected_requests: AtomicU64,
+    admission_other_rejected_requests: AtomicU64,
+    admission_requested_pages: AtomicU64,
+    admission_granted_pages: AtomicU64,
+    admission_rejected_pages: AtomicU64,
+    admission_page_requests: AtomicU64,
+    admission_requested_pages_max: AtomicUsize,
+    admission_granted_pages_max: AtomicUsize,
+    admission_rejected_pages_max: AtomicUsize,
+    queue_waited_requests: AtomicU64,
+    queue_wait_micros: AtomicU64,
+    max_queue_wait_micros: AtomicU64,
+    idle_wakeups: AtomicU64,
+    idle_micros: AtomicU64,
+    max_idle_micros: AtomicU64,
+    prefill_tokens: AtomicU64,
+    decode_tokens: AtomicU64,
+    prefill_micros: AtomicU64,
+    decode_micros: AtomicU64,
+    max_observed_batch: AtomicUsize,
+    peak_pending_requests: AtomicUsize,
+    peak_inflight_requests: AtomicUsize,
+    inflight_requests: AtomicUsize,
+    pending_requests: AtomicUsize,
+    active_batch_size: AtomicUsize,
+}
+
+#[derive(Clone, Copy)]
+struct CudaSchedulerSnapshot {
+    total_batches: u64,
+    total_requests: u64,
+    gpu_batched_batches: u64,
+    gpu_batched_requests: u64,
+    paged_lease_batched_requests: u64,
+    paged_internal_batched_requests: u64,
+    greedy_batched_requests: u64,
+    sampled_batched_requests: u64,
+    shared_prefix_batches: u64,
+    shared_prefix_requests: u64,
+    shared_prefix_tokens: u64,
+    fallback_requests: u64,
+    fallback_single_request: u64,
+    fallback_moe_requests: u64,
+    fallback_multimodal_requests: u64,
+    fallback_tokenizer_requests: u64,
+    fallback_bucket_requests: u64,
+    fallback_other_requests: u64,
+    batch_plan_eligible_requests: u64,
+    batch_plan_ineligible_requests: u64,
+    token_budget_split_groups: u64,
+    token_budget_split_requests: u64,
+    token_budget_split_chunks: u64,
+    continuous_step_admissions: u64,
+    continuous_admitted_requests: u64,
+    continuous_decode_iterations: u64,
+    continuous_prefill_batches: u64,
+    continuous_prefill_requests: u64,
+    continuous_append_decode_batches: u64,
+    continuous_append_decode_requests: u64,
+    continuous_mid_decode_retirements: u64,
+    continuous_mid_decode_cancellations: u64,
+    completed_requests: u64,
+    errored_requests: u64,
+    cancelled_requests: u64,
+    capacity_rejected_requests: u64,
+    capacity_max_active_rejected_requests: u64,
+    capacity_rejected_active_requests_total: u64,
+    capacity_rejected_active_requests_max: usize,
+    admission_rejected_requests: u64,
+    admission_errored_requests: u64,
+    admission_cancelled_requests: u64,
+    admission_context_rejected_requests: u64,
+    admission_invalid_request_rejected_requests: u64,
+    admission_memory_rejected_requests: u64,
+    admission_other_rejected_requests: u64,
+    admission_requested_pages: u64,
+    admission_granted_pages: u64,
+    admission_rejected_pages: u64,
+    admission_page_requests: u64,
+    admission_requested_pages_max: usize,
+    admission_granted_pages_max: usize,
+    admission_rejected_pages_max: usize,
+    queue_waited_requests: u64,
+    queue_wait_micros: u64,
+    max_queue_wait_micros: u64,
+    idle_wakeups: u64,
+    idle_micros: u64,
+    max_idle_micros: u64,
+    prefill_tokens: u64,
+    decode_tokens: u64,
+    prefill_micros: u64,
+    decode_micros: u64,
+    max_observed_batch: usize,
+    peak_pending_requests: usize,
+    peak_inflight_requests: usize,
+    inflight_requests: usize,
+    pending_requests: usize,
+    active_batch_size: usize,
+}
+
+#[derive(Default)]
+struct CudaSchedulerBatchOutcome {
+    gpu_batched_batches: usize,
+    gpu_batched_requests: usize,
+    paged_lease_batched_requests: usize,
+    paged_internal_batched_requests: usize,
+    greedy_batched_requests: usize,
+    sampled_batched_requests: usize,
+    shared_prefix_batches: usize,
+    shared_prefix_requests: usize,
+    shared_prefix_tokens: u64,
+    fallback_requests: usize,
+    fallback_single_request: usize,
+    fallback_moe_requests: usize,
+    fallback_multimodal_requests: usize,
+    fallback_tokenizer_requests: usize,
+    fallback_bucket_requests: usize,
+    fallback_other_requests: usize,
+    batch_plan_eligible_requests: usize,
+    batch_plan_ineligible_requests: usize,
+    token_budget_split_groups: usize,
+    token_budget_split_requests: usize,
+    token_budget_split_chunks: usize,
+    completed_requests: usize,
+    errored_requests: usize,
+    cancelled_requests: usize,
+    prefill_tokens: u64,
+    decode_tokens: u64,
+    prefill_micros: u64,
+    decode_micros: u64,
+}
+
+fn add_scheduler_batch_outcome(
+    outcome: &mut CudaSchedulerBatchOutcome,
+    other: CudaSchedulerBatchOutcome,
+) {
+    outcome.gpu_batched_batches = outcome
+        .gpu_batched_batches
+        .saturating_add(other.gpu_batched_batches);
+    outcome.gpu_batched_requests = outcome
+        .gpu_batched_requests
+        .saturating_add(other.gpu_batched_requests);
+    outcome.paged_lease_batched_requests = outcome
+        .paged_lease_batched_requests
+        .saturating_add(other.paged_lease_batched_requests);
+    outcome.paged_internal_batched_requests = outcome
+        .paged_internal_batched_requests
+        .saturating_add(other.paged_internal_batched_requests);
+    outcome.greedy_batched_requests = outcome
+        .greedy_batched_requests
+        .saturating_add(other.greedy_batched_requests);
+    outcome.sampled_batched_requests = outcome
+        .sampled_batched_requests
+        .saturating_add(other.sampled_batched_requests);
+    outcome.shared_prefix_batches = outcome
+        .shared_prefix_batches
+        .saturating_add(other.shared_prefix_batches);
+    outcome.shared_prefix_requests = outcome
+        .shared_prefix_requests
+        .saturating_add(other.shared_prefix_requests);
+    outcome.shared_prefix_tokens = outcome
+        .shared_prefix_tokens
+        .saturating_add(other.shared_prefix_tokens);
+    outcome.fallback_requests = outcome
+        .fallback_requests
+        .saturating_add(other.fallback_requests);
+    outcome.fallback_single_request = outcome
+        .fallback_single_request
+        .saturating_add(other.fallback_single_request);
+    outcome.fallback_moe_requests = outcome
+        .fallback_moe_requests
+        .saturating_add(other.fallback_moe_requests);
+    outcome.fallback_multimodal_requests = outcome
+        .fallback_multimodal_requests
+        .saturating_add(other.fallback_multimodal_requests);
+    outcome.fallback_tokenizer_requests = outcome
+        .fallback_tokenizer_requests
+        .saturating_add(other.fallback_tokenizer_requests);
+    outcome.fallback_bucket_requests = outcome
+        .fallback_bucket_requests
+        .saturating_add(other.fallback_bucket_requests);
+    outcome.fallback_other_requests = outcome
+        .fallback_other_requests
+        .saturating_add(other.fallback_other_requests);
+    outcome.batch_plan_eligible_requests = outcome
+        .batch_plan_eligible_requests
+        .saturating_add(other.batch_plan_eligible_requests);
+    outcome.batch_plan_ineligible_requests = outcome
+        .batch_plan_ineligible_requests
+        .saturating_add(other.batch_plan_ineligible_requests);
+    outcome.token_budget_split_groups = outcome
+        .token_budget_split_groups
+        .saturating_add(other.token_budget_split_groups);
+    outcome.token_budget_split_requests = outcome
+        .token_budget_split_requests
+        .saturating_add(other.token_budget_split_requests);
+    outcome.token_budget_split_chunks = outcome
+        .token_budget_split_chunks
+        .saturating_add(other.token_budget_split_chunks);
+    outcome.completed_requests = outcome
+        .completed_requests
+        .saturating_add(other.completed_requests);
+    outcome.errored_requests = outcome
+        .errored_requests
+        .saturating_add(other.errored_requests);
+    outcome.cancelled_requests = outcome
+        .cancelled_requests
+        .saturating_add(other.cancelled_requests);
+    outcome.prefill_tokens = outcome.prefill_tokens.saturating_add(other.prefill_tokens);
+    outcome.decode_tokens = outcome.decode_tokens.saturating_add(other.decode_tokens);
+    outcome.prefill_micros = outcome.prefill_micros.saturating_add(other.prefill_micros);
+    outcome.decode_micros = outcome.decode_micros.saturating_add(other.decode_micros);
+}
+
+#[derive(Clone, Copy, Default)]
+struct CudaSchedulerTokenTiming {
+    prefill_tokens: u64,
+    decode_tokens: u64,
+    prefill_micros: u64,
+    decode_micros: u64,
+}
+
+#[derive(Clone, Copy, Default)]
+struct CudaSchedulerDispatch {
+    timing: CudaSchedulerTokenTiming,
+    completed: bool,
+    errored: bool,
+    cancelled: bool,
+}
+
+struct CudaSchedulerAdmission {
+    batch: Vec<CudaSchedulerJob>,
+    leases: Vec<CudaPagedKvCacheLease>,
+    rejected_requests: usize,
+    errored_requests: usize,
+    cancelled_requests: usize,
+    rejection_reasons: CudaSchedulerAdmissionReasonCounts,
+    requested_pages: usize,
+    granted_pages: usize,
+    rejected_pages: usize,
+    page_requests: usize,
+    requested_pages_max: usize,
+    granted_pages_max: usize,
+    rejected_pages_max: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CudaSchedulerAdmissionReasonCounts {
+    context_length: usize,
+    invalid_request: usize,
+    insufficient_gpu_memory: usize,
+    other: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CudaSchedulerAdmissionRejectionReason {
+    ContextLength,
+    InvalidRequest,
+    InsufficientGpuMemory,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum CudaSchedulerSamplingKey {
+    Greedy,
+    Sampled {
+        temperature_bits: u32,
+        top_p_bits: u32,
+        top_k: Option<u32>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CudaSchedulerPagedBatchStorage {
+    None,
+    LeaseBacked,
+    Internal,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CudaSchedulerFallbackReason {
+    SingleRequest,
+    Multimodal,
+    Tokenizer,
+    BucketSingleton,
+    Other,
+}
+
+struct CudaSchedulerLeasePageTables {
+    tables: Vec<Vec<usize>>,
+    physical_page_count: usize,
+}
+
+enum CudaSchedulerBatchPlan {
+    Compatible {
+        encoded: Vec<Vec<u32>>,
+        groups: BTreeMap<(usize, CudaSchedulerSamplingKey), Vec<usize>>,
+    },
+    MultimodalCompatible,
+    Fallback(CudaSchedulerFallbackReason),
+}
+
+fn new_cuda_scheduler_stats() -> CudaSchedulerStats {
+    CudaSchedulerStats {
+        total_batches: AtomicU64::new(0),
+        total_requests: AtomicU64::new(0),
+        gpu_batched_batches: AtomicU64::new(0),
+        gpu_batched_requests: AtomicU64::new(0),
+        paged_lease_batched_requests: AtomicU64::new(0),
+        paged_internal_batched_requests: AtomicU64::new(0),
+        greedy_batched_requests: AtomicU64::new(0),
+        sampled_batched_requests: AtomicU64::new(0),
+        shared_prefix_batches: AtomicU64::new(0),
+        shared_prefix_requests: AtomicU64::new(0),
+        shared_prefix_tokens: AtomicU64::new(0),
+        fallback_requests: AtomicU64::new(0),
+        fallback_single_request: AtomicU64::new(0),
+        fallback_moe_requests: AtomicU64::new(0),
+        fallback_multimodal_requests: AtomicU64::new(0),
+        fallback_tokenizer_requests: AtomicU64::new(0),
+        fallback_bucket_requests: AtomicU64::new(0),
+        fallback_other_requests: AtomicU64::new(0),
+        batch_plan_eligible_requests: AtomicU64::new(0),
+        batch_plan_ineligible_requests: AtomicU64::new(0),
+        token_budget_split_groups: AtomicU64::new(0),
+        token_budget_split_requests: AtomicU64::new(0),
+        token_budget_split_chunks: AtomicU64::new(0),
+        continuous_step_admissions: AtomicU64::new(0),
+        continuous_admitted_requests: AtomicU64::new(0),
+        continuous_decode_iterations: AtomicU64::new(0),
+        continuous_prefill_batches: AtomicU64::new(0),
+        continuous_prefill_requests: AtomicU64::new(0),
+        continuous_append_decode_batches: AtomicU64::new(0),
+        continuous_append_decode_requests: AtomicU64::new(0),
+        continuous_mid_decode_retirements: AtomicU64::new(0),
+        continuous_mid_decode_cancellations: AtomicU64::new(0),
+        completed_requests: AtomicU64::new(0),
+        errored_requests: AtomicU64::new(0),
+        cancelled_requests: AtomicU64::new(0),
+        capacity_rejected_requests: AtomicU64::new(0),
+        capacity_max_active_rejected_requests: AtomicU64::new(0),
+        capacity_rejected_active_requests_total: AtomicU64::new(0),
+        capacity_rejected_active_requests_max: AtomicUsize::new(0),
+        admission_rejected_requests: AtomicU64::new(0),
+        admission_errored_requests: AtomicU64::new(0),
+        admission_cancelled_requests: AtomicU64::new(0),
+        admission_context_rejected_requests: AtomicU64::new(0),
+        admission_invalid_request_rejected_requests: AtomicU64::new(0),
+        admission_memory_rejected_requests: AtomicU64::new(0),
+        admission_other_rejected_requests: AtomicU64::new(0),
+        admission_requested_pages: AtomicU64::new(0),
+        admission_granted_pages: AtomicU64::new(0),
+        admission_rejected_pages: AtomicU64::new(0),
+        admission_page_requests: AtomicU64::new(0),
+        admission_requested_pages_max: AtomicUsize::new(0),
+        admission_granted_pages_max: AtomicUsize::new(0),
+        admission_rejected_pages_max: AtomicUsize::new(0),
+        queue_waited_requests: AtomicU64::new(0),
+        queue_wait_micros: AtomicU64::new(0),
+        max_queue_wait_micros: AtomicU64::new(0),
+        idle_wakeups: AtomicU64::new(0),
+        idle_micros: AtomicU64::new(0),
+        max_idle_micros: AtomicU64::new(0),
+        prefill_tokens: AtomicU64::new(0),
+        decode_tokens: AtomicU64::new(0),
+        prefill_micros: AtomicU64::new(0),
+        decode_micros: AtomicU64::new(0),
+        max_observed_batch: AtomicUsize::new(0),
+        peak_pending_requests: AtomicUsize::new(0),
+        peak_inflight_requests: AtomicUsize::new(0),
+        inflight_requests: AtomicUsize::new(0),
+        pending_requests: AtomicUsize::new(0),
+        active_batch_size: AtomicUsize::new(0),
+    }
+}
+
+impl CudaGenerationScheduler {
+    fn start(
+        state: CudaSchedulerState,
+        max_batch_size: usize,
+        max_active_requests: usize,
+        max_wait_us: u64,
+        max_batched_tokens: usize,
+    ) -> Result<Self> {
+        let (tx, rx) = mpsc::channel();
+        let stats = Arc::new(new_cuda_scheduler_stats());
+        let worker_stats = stats.clone();
+        let max_batch_size = max_batch_size.max(1);
+        thread::Builder::new()
+            .name("hi-cuda-generation-scheduler".to_string())
+            .spawn(move || {
+                scheduler_worker_loop(
+                    state,
+                    rx,
+                    worker_stats,
+                    max_batch_size,
+                    max_active_requests.max(1),
+                    max_wait_us,
+                    max_batched_tokens,
+                )
+            })
+            .map_err(|err| anyhow!("failed to spawn CUDA generation scheduler worker: {err}"))?;
+        Ok(Self {
+            tx,
+            stats,
+            max_active_requests: max_active_requests.max(1),
+        })
+    }
+
+    async fn submit(&self, request: GenerationRequest) -> Result<GenerationStream> {
+        let inflight = match try_acquire_scheduler_slot(
+            &self.stats.inflight_requests,
+            self.max_active_requests,
+        ) {
+            Ok(inflight) => inflight,
+            Err(current) => {
+                self.stats
+                    .capacity_rejected_requests
+                    .fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .capacity_max_active_rejected_requests
+                    .fetch_add(1, Ordering::Relaxed);
+                self.stats
+                    .capacity_rejected_active_requests_total
+                    .fetch_add(usize_to_u64(current), Ordering::Relaxed);
+                update_atomic_max(&self.stats.capacity_rejected_active_requests_max, current);
+                bail!(
+                    "scheduler_over_capacity: CUDA generation scheduler has {current} active request(s), max_active_requests={}",
+                    self.max_active_requests
+                );
+            }
+        };
+        update_atomic_max(&self.stats.peak_inflight_requests, inflight);
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let pending = self
+            .stats
+            .pending_requests
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        update_atomic_max(&self.stats.peak_pending_requests, pending);
+        if let Err(err) = self.tx.send(CudaSchedulerJob {
+            request,
+            tx,
+            submitted_at: Instant::now(),
+        }) {
+            self.stats.pending_requests.fetch_sub(1, Ordering::Relaxed);
+            release_scheduler_slots(&self.stats.inflight_requests, 1);
+            bail!("CUDA generation scheduler is stopped: {err}");
+        }
+        let events = stream::unfold(rx, |mut rx| async {
+            rx.recv().await.map(|event| (event, rx))
+        });
+        Ok(Box::pin(events))
+    }
+
+    fn record_direct_fallback(&self, reason: CudaSchedulerFallbackReason, count: usize) {
+        if count == 0 {
+            return;
+        }
+        let count_u64 = u64::try_from(count).unwrap_or(u64::MAX);
+        self.stats.total_batches.fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .total_requests
+            .fetch_add(count_u64, Ordering::Relaxed);
+        self.stats
+            .fallback_requests
+            .fetch_add(count_u64, Ordering::Relaxed);
+        self.stats
+            .batch_plan_ineligible_requests
+            .fetch_add(count_u64, Ordering::Relaxed);
+        update_atomic_max(&self.stats.max_observed_batch, count);
+        match reason {
+            CudaSchedulerFallbackReason::SingleRequest => {
+                self.stats
+                    .fallback_single_request
+                    .fetch_add(count_u64, Ordering::Relaxed);
+            }
+            CudaSchedulerFallbackReason::Multimodal => {
+                self.stats
+                    .fallback_multimodal_requests
+                    .fetch_add(count_u64, Ordering::Relaxed);
+            }
+            CudaSchedulerFallbackReason::Tokenizer => {
+                self.stats
+                    .fallback_tokenizer_requests
+                    .fetch_add(count_u64, Ordering::Relaxed);
+            }
+            CudaSchedulerFallbackReason::BucketSingleton => {
+                self.stats
+                    .fallback_bucket_requests
+                    .fetch_add(count_u64, Ordering::Relaxed);
+            }
+            CudaSchedulerFallbackReason::Other => {
+                self.stats
+                    .fallback_other_requests
+                    .fetch_add(count_u64, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn snapshot(&self) -> CudaSchedulerSnapshot {
+        CudaSchedulerSnapshot {
+            total_batches: self.stats.total_batches.load(Ordering::Relaxed),
+            total_requests: self.stats.total_requests.load(Ordering::Relaxed),
+            gpu_batched_batches: self.stats.gpu_batched_batches.load(Ordering::Relaxed),
+            gpu_batched_requests: self.stats.gpu_batched_requests.load(Ordering::Relaxed),
+            paged_lease_batched_requests: self
+                .stats
+                .paged_lease_batched_requests
+                .load(Ordering::Relaxed),
+            paged_internal_batched_requests: self
+                .stats
+                .paged_internal_batched_requests
+                .load(Ordering::Relaxed),
+            greedy_batched_requests: self.stats.greedy_batched_requests.load(Ordering::Relaxed),
+            sampled_batched_requests: self.stats.sampled_batched_requests.load(Ordering::Relaxed),
+            shared_prefix_batches: self.stats.shared_prefix_batches.load(Ordering::Relaxed),
+            shared_prefix_requests: self.stats.shared_prefix_requests.load(Ordering::Relaxed),
+            shared_prefix_tokens: self.stats.shared_prefix_tokens.load(Ordering::Relaxed),
+            fallback_requests: self.stats.fallback_requests.load(Ordering::Relaxed),
+            fallback_single_request: self.stats.fallback_single_request.load(Ordering::Relaxed),
+            fallback_moe_requests: self.stats.fallback_moe_requests.load(Ordering::Relaxed),
+            fallback_multimodal_requests: self
+                .stats
+                .fallback_multimodal_requests
+                .load(Ordering::Relaxed),
+            fallback_tokenizer_requests: self
+                .stats
+                .fallback_tokenizer_requests
+                .load(Ordering::Relaxed),
+            fallback_bucket_requests: self.stats.fallback_bucket_requests.load(Ordering::Relaxed),
+            fallback_other_requests: self.stats.fallback_other_requests.load(Ordering::Relaxed),
+            batch_plan_eligible_requests: self
+                .stats
+                .batch_plan_eligible_requests
+                .load(Ordering::Relaxed),
+            batch_plan_ineligible_requests: self
+                .stats
+                .batch_plan_ineligible_requests
+                .load(Ordering::Relaxed),
+            token_budget_split_groups: self.stats.token_budget_split_groups.load(Ordering::Relaxed),
+            token_budget_split_requests: self
+                .stats
+                .token_budget_split_requests
+                .load(Ordering::Relaxed),
+            token_budget_split_chunks: self.stats.token_budget_split_chunks.load(Ordering::Relaxed),
+            continuous_step_admissions: self
+                .stats
+                .continuous_step_admissions
+                .load(Ordering::Relaxed),
+            continuous_admitted_requests: self
+                .stats
+                .continuous_admitted_requests
+                .load(Ordering::Relaxed),
+            continuous_decode_iterations: self
+                .stats
+                .continuous_decode_iterations
+                .load(Ordering::Relaxed),
+            continuous_prefill_batches: self
+                .stats
+                .continuous_prefill_batches
+                .load(Ordering::Relaxed),
+            continuous_prefill_requests: self
+                .stats
+                .continuous_prefill_requests
+                .load(Ordering::Relaxed),
+            continuous_append_decode_batches: self
+                .stats
+                .continuous_append_decode_batches
+                .load(Ordering::Relaxed),
+            continuous_append_decode_requests: self
+                .stats
+                .continuous_append_decode_requests
+                .load(Ordering::Relaxed),
+            continuous_mid_decode_retirements: self
+                .stats
+                .continuous_mid_decode_retirements
+                .load(Ordering::Relaxed),
+            continuous_mid_decode_cancellations: self
+                .stats
+                .continuous_mid_decode_cancellations
+                .load(Ordering::Relaxed),
+            completed_requests: self.stats.completed_requests.load(Ordering::Relaxed),
+            errored_requests: self.stats.errored_requests.load(Ordering::Relaxed),
+            cancelled_requests: self.stats.cancelled_requests.load(Ordering::Relaxed),
+            capacity_rejected_requests: self
+                .stats
+                .capacity_rejected_requests
+                .load(Ordering::Relaxed),
+            capacity_max_active_rejected_requests: self
+                .stats
+                .capacity_max_active_rejected_requests
+                .load(Ordering::Relaxed),
+            capacity_rejected_active_requests_total: self
+                .stats
+                .capacity_rejected_active_requests_total
+                .load(Ordering::Relaxed),
+            capacity_rejected_active_requests_max: self
+                .stats
+                .capacity_rejected_active_requests_max
+                .load(Ordering::Relaxed),
+            admission_rejected_requests: self
+                .stats
+                .admission_rejected_requests
+                .load(Ordering::Relaxed),
+            admission_errored_requests: self
+                .stats
+                .admission_errored_requests
+                .load(Ordering::Relaxed),
+            admission_cancelled_requests: self
+                .stats
+                .admission_cancelled_requests
+                .load(Ordering::Relaxed),
+            admission_context_rejected_requests: self
+                .stats
+                .admission_context_rejected_requests
+                .load(Ordering::Relaxed),
+            admission_invalid_request_rejected_requests: self
+                .stats
+                .admission_invalid_request_rejected_requests
+                .load(Ordering::Relaxed),
+            admission_memory_rejected_requests: self
+                .stats
+                .admission_memory_rejected_requests
+                .load(Ordering::Relaxed),
+            admission_other_rejected_requests: self
+                .stats
+                .admission_other_rejected_requests
+                .load(Ordering::Relaxed),
+            admission_requested_pages: self.stats.admission_requested_pages.load(Ordering::Relaxed),
+            admission_granted_pages: self.stats.admission_granted_pages.load(Ordering::Relaxed),
+            admission_rejected_pages: self.stats.admission_rejected_pages.load(Ordering::Relaxed),
+            admission_page_requests: self.stats.admission_page_requests.load(Ordering::Relaxed),
+            admission_requested_pages_max: self
+                .stats
+                .admission_requested_pages_max
+                .load(Ordering::Relaxed),
+            admission_granted_pages_max: self
+                .stats
+                .admission_granted_pages_max
+                .load(Ordering::Relaxed),
+            admission_rejected_pages_max: self
+                .stats
+                .admission_rejected_pages_max
+                .load(Ordering::Relaxed),
+            queue_waited_requests: self.stats.queue_waited_requests.load(Ordering::Relaxed),
+            queue_wait_micros: self.stats.queue_wait_micros.load(Ordering::Relaxed),
+            max_queue_wait_micros: self.stats.max_queue_wait_micros.load(Ordering::Relaxed),
+            idle_wakeups: self.stats.idle_wakeups.load(Ordering::Relaxed),
+            idle_micros: self.stats.idle_micros.load(Ordering::Relaxed),
+            max_idle_micros: self.stats.max_idle_micros.load(Ordering::Relaxed),
+            prefill_tokens: self.stats.prefill_tokens.load(Ordering::Relaxed),
+            decode_tokens: self.stats.decode_tokens.load(Ordering::Relaxed),
+            prefill_micros: self.stats.prefill_micros.load(Ordering::Relaxed),
+            decode_micros: self.stats.decode_micros.load(Ordering::Relaxed),
+            max_observed_batch: self.stats.max_observed_batch.load(Ordering::Relaxed),
+            peak_pending_requests: self.stats.peak_pending_requests.load(Ordering::Relaxed),
+            peak_inflight_requests: self.stats.peak_inflight_requests.load(Ordering::Relaxed),
+            inflight_requests: self.stats.inflight_requests.load(Ordering::Relaxed),
+            pending_requests: self.stats.pending_requests.load(Ordering::Relaxed),
+            active_batch_size: self.stats.active_batch_size.load(Ordering::Relaxed),
+        }
+    }
+}
+
+fn scheduler_worker_loop(
+    state: CudaSchedulerState,
+    rx: mpsc::Receiver<CudaSchedulerJob>,
+    stats: Arc<CudaSchedulerStats>,
+    max_batch_size: usize,
+    max_active_requests: usize,
+    max_wait_us: u64,
+    max_batched_tokens: usize,
+) {
+    if supports_continuous_iteration_scheduler(&state) {
+        continuous_scheduler_worker_loop(
+            state,
+            rx,
+            stats,
+            max_batch_size,
+            max_active_requests,
+            max_wait_us,
+            max_batched_tokens,
+        );
+    } else {
+        length_bucket_scheduler_worker_loop(
+            state,
+            rx,
+            stats,
+            max_batch_size,
+            max_wait_us,
+            max_batched_tokens,
+        );
+    }
+}
+
+fn supports_continuous_iteration_scheduler(state: &CudaSchedulerState) -> bool {
+    state.kv_cache_mode == CudaKvCacheMode::Paged && state.kv_pages.is_some()
+}
+
+fn length_bucket_scheduler_worker_loop(
+    state: CudaSchedulerState,
+    rx: mpsc::Receiver<CudaSchedulerJob>,
+    stats: Arc<CudaSchedulerStats>,
+    max_batch_size: usize,
+    max_wait_us: u64,
+    max_batched_tokens: usize,
+) {
+    loop {
+        let idle_started = Instant::now();
+        let first = match rx.recv() {
+            Ok(first) => first,
+            Err(_) => break,
+        };
+        record_scheduler_idle_wait(&stats, idle_started, Instant::now());
+        let batch = recv_scheduler_batch(&rx, first, max_batch_size, max_wait_us);
+        let received_batch_size = batch.len();
+        let (batch, cancelled) = retain_open_scheduler_jobs(batch);
+        stats
+            .pending_requests
+            .fetch_sub(received_batch_size, Ordering::Relaxed);
+        if cancelled > 0 {
+            stats.cancelled_requests.fetch_add(
+                u64::try_from(cancelled).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            release_scheduler_slots(&stats.inflight_requests, cancelled);
+        }
+        let batch_size = batch.len();
+        if batch_size == 0 {
+            continue;
+        }
+        record_scheduler_queue_wait(&stats, &batch, Instant::now());
+        let admission = admit_scheduler_batch(&state, batch);
+        let mut batch = admission.batch;
+        let mut kv_leases = admission.leases;
+        let rejected_requests = admission.rejected_requests;
+        let admission_errored_requests = admission.errored_requests;
+        let admission_cancelled_requests = admission.cancelled_requests;
+        let admission_rejection_reasons = admission.rejection_reasons;
+        let admission_page_requests = admission.page_requests;
+        let admission_requested_pages_max = admission.requested_pages_max;
+        let admission_granted_pages_max = admission.granted_pages_max;
+        let admission_rejected_pages_max = admission.rejected_pages_max;
+        stats.admission_requested_pages.fetch_add(
+            u64::try_from(admission.requested_pages).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        stats.admission_granted_pages.fetch_add(
+            u64::try_from(admission.granted_pages).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        stats.admission_rejected_pages.fetch_add(
+            u64::try_from(admission.rejected_pages).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        stats.admission_page_requests.fetch_add(
+            u64::try_from(admission_page_requests).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        update_atomic_max(
+            &stats.admission_requested_pages_max,
+            admission_requested_pages_max,
+        );
+        update_atomic_max(
+            &stats.admission_granted_pages_max,
+            admission_granted_pages_max,
+        );
+        update_atomic_max(
+            &stats.admission_rejected_pages_max,
+            admission_rejected_pages_max,
+        );
+        if rejected_requests > 0 {
+            stats.admission_rejected_requests.fetch_add(
+                u64::try_from(rejected_requests).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            release_scheduler_slots(&stats.inflight_requests, rejected_requests);
+        }
+        if admission_errored_requests > 0 {
+            stats.errored_requests.fetch_add(
+                u64::try_from(admission_errored_requests).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            stats.admission_errored_requests.fetch_add(
+                u64::try_from(admission_errored_requests).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        }
+        if admission_cancelled_requests > 0 {
+            stats.cancelled_requests.fetch_add(
+                u64::try_from(admission_cancelled_requests).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            stats.admission_cancelled_requests.fetch_add(
+                u64::try_from(admission_cancelled_requests).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            release_scheduler_slots(&stats.inflight_requests, admission_cancelled_requests);
+        }
+        stats.admission_context_rejected_requests.fetch_add(
+            u64::try_from(admission_rejection_reasons.context_length).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        stats.admission_invalid_request_rejected_requests.fetch_add(
+            u64::try_from(admission_rejection_reasons.invalid_request).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        stats.admission_memory_rejected_requests.fetch_add(
+            u64::try_from(admission_rejection_reasons.insufficient_gpu_memory).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        stats.admission_other_rejected_requests.fetch_add(
+            u64::try_from(admission_rejection_reasons.other).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        let cancelled_after_admission = retain_open_scheduler_admission(&mut batch, &mut kv_leases);
+        if cancelled_after_admission > 0 {
+            stats.cancelled_requests.fetch_add(
+                u64::try_from(cancelled_after_admission).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            release_scheduler_slots(&stats.inflight_requests, cancelled_after_admission);
+        }
+        let batch_size = batch.len();
+        if batch_size == 0 {
+            continue;
+        }
+        stats.total_batches.fetch_add(1, Ordering::Relaxed);
+        stats.total_requests.fetch_add(
+            u64::try_from(batch_size).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        update_atomic_max(&stats.max_observed_batch, batch_size);
+        stats.active_batch_size.store(batch_size, Ordering::Relaxed);
+        let outcome = process_scheduler_batch(&state, batch, &kv_leases, max_batched_tokens);
+        if outcome.gpu_batched_requests > 0 {
+            stats.gpu_batched_batches.fetch_add(
+                u64::try_from(outcome.gpu_batched_batches).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            stats.gpu_batched_requests.fetch_add(
+                u64::try_from(outcome.gpu_batched_requests).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            stats.paged_lease_batched_requests.fetch_add(
+                u64::try_from(outcome.paged_lease_batched_requests).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            stats.paged_internal_batched_requests.fetch_add(
+                u64::try_from(outcome.paged_internal_batched_requests).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            stats.greedy_batched_requests.fetch_add(
+                u64::try_from(outcome.greedy_batched_requests).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+            stats.sampled_batched_requests.fetch_add(
+                u64::try_from(outcome.sampled_batched_requests).unwrap_or(u64::MAX),
+                Ordering::Relaxed,
+            );
+        }
+        stats.shared_prefix_batches.fetch_add(
+            u64::try_from(outcome.shared_prefix_batches).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        stats.shared_prefix_requests.fetch_add(
+            u64::try_from(outcome.shared_prefix_requests).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        stats
+            .shared_prefix_tokens
+            .fetch_add(outcome.shared_prefix_tokens, Ordering::Relaxed);
+        stats.fallback_requests.fetch_add(
+            u64::try_from(outcome.fallback_requests).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        stats.fallback_single_request.fetch_add(
+            u64::try_from(outcome.fallback_single_request).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        stats.fallback_moe_requests.fetch_add(
+            u64::try_from(outcome.fallback_moe_requests).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        stats.fallback_multimodal_requests.fetch_add(
+            u64::try_from(outcome.fallback_multimodal_requests).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        stats.fallback_tokenizer_requests.fetch_add(
+            u64::try_from(outcome.fallback_tokenizer_requests).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        stats.fallback_bucket_requests.fetch_add(
+            u64::try_from(outcome.fallback_bucket_requests).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        stats.fallback_other_requests.fetch_add(
+            u64::try_from(outcome.fallback_other_requests).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        stats.batch_plan_eligible_requests.fetch_add(
+            u64::try_from(outcome.batch_plan_eligible_requests).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        stats.batch_plan_ineligible_requests.fetch_add(
+            u64::try_from(outcome.batch_plan_ineligible_requests).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        stats.token_budget_split_groups.fetch_add(
+            u64::try_from(outcome.token_budget_split_groups).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        stats.token_budget_split_requests.fetch_add(
+            u64::try_from(outcome.token_budget_split_requests).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        stats.token_budget_split_chunks.fetch_add(
+            u64::try_from(outcome.token_budget_split_chunks).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        stats.completed_requests.fetch_add(
+            u64::try_from(outcome.completed_requests).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        stats.errored_requests.fetch_add(
+            u64::try_from(outcome.errored_requests).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        stats.cancelled_requests.fetch_add(
+            u64::try_from(outcome.cancelled_requests).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        stats
+            .prefill_tokens
+            .fetch_add(outcome.prefill_tokens, Ordering::Relaxed);
+        stats
+            .decode_tokens
+            .fetch_add(outcome.decode_tokens, Ordering::Relaxed);
+        stats
+            .prefill_micros
+            .fetch_add(outcome.prefill_micros, Ordering::Relaxed);
+        stats
+            .decode_micros
+            .fetch_add(outcome.decode_micros, Ordering::Relaxed);
+        stats.active_batch_size.store(0, Ordering::Relaxed);
+        release_scheduler_slots(&stats.inflight_requests, batch_size);
+    }
+}
+
+struct CudaContinuousTextRequest {
+    job: CudaSchedulerJob,
+    prompt_tokens: Vec<u32>,
+    generated_tokens: Vec<u32>,
+    previous_text: String,
+    max_tokens: usize,
+    stop_token_sequences: Vec<Vec<u32>>,
+    sampling_key: CudaSchedulerSamplingKey,
+    rng: Option<StdRng>,
+    lease: CudaPagedKvCacheLease,
+}
+
+impl CudaContinuousTextRequest {
+    fn context_len(&self) -> usize {
+        self.prompt_tokens
+            .len()
+            .saturating_add(self.generated_tokens.len())
+    }
+
+    fn page_table_for_context(&self, page_size: usize) -> Result<Vec<usize>> {
+        self.page_table_for_token_count(self.context_len(), page_size)
+    }
+
+    fn page_table_for_prompt(&self, page_size: usize) -> Result<Vec<usize>> {
+        self.page_table_for_token_count(self.prompt_tokens.len(), page_size)
+    }
+
+    fn page_table_for_token_count(
+        &self,
+        token_count: usize,
+        page_size: usize,
+    ) -> Result<Vec<usize>> {
+        let pages_needed = div_ceil_usize(token_count.max(1), page_size)?;
+        if self.lease.pages.len() < pages_needed {
+            bail!(
+                "CUDA continuous paged decode lease has {} page(s), but token count {token_count} requires {pages_needed}",
+                self.lease.pages.len(),
+            );
+        }
+        Ok(self.lease.pages[..pages_needed].to_vec())
+    }
+}
+
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+enum CudaContinuousStepPhase {
+    Prefill,
+    Decode,
+}
+
+#[derive(Clone, Copy)]
+enum CudaContinuousRetireReason {
+    Completed,
+    Errored,
+    Cancelled,
+}
+
+fn continuous_scheduler_worker_loop(
+    state: CudaSchedulerState,
+    rx: mpsc::Receiver<CudaSchedulerJob>,
+    stats: Arc<CudaSchedulerStats>,
+    max_batch_size: usize,
+    max_active_requests: usize,
+    max_wait_us: u64,
+    max_batched_tokens: usize,
+) {
+    let mut active = Vec::new();
+    loop {
+        let mut ready = Vec::new();
+        if active.is_empty() {
+            let idle_started = Instant::now();
+            let first = match rx.recv() {
+                Ok(first) => first,
+                Err(_) => break,
+            };
+            record_scheduler_idle_wait(&stats, idle_started, Instant::now());
+            ready = recv_scheduler_batch(&rx, first, max_active_requests.max(1), max_wait_us);
+        }
+
+        let remaining_capacity = max_active_requests.saturating_sub(active.len());
+        if remaining_capacity > ready.len() {
+            drain_ready_continuous_jobs(&rx, &mut ready, remaining_capacity);
+        }
+
+        if !ready.is_empty() {
+            admit_continuous_ready_jobs(
+                &state,
+                &stats,
+                &mut active,
+                ready,
+                max_batch_size,
+                max_batched_tokens,
+            );
+        }
+
+        if active.is_empty() {
+            continue;
+        }
+
+        stats
+            .active_batch_size
+            .store(active.len(), Ordering::Relaxed);
+        stats
+            .continuous_decode_iterations
+            .fetch_add(1, Ordering::Relaxed);
+        process_continuous_decode_iteration(&state, &stats, &mut active, max_batch_size);
+        stats
+            .active_batch_size
+            .store(active.len(), Ordering::Relaxed);
+    }
+}
+
+fn drain_ready_continuous_jobs(
+    rx: &mpsc::Receiver<CudaSchedulerJob>,
+    jobs: &mut Vec<CudaSchedulerJob>,
+    limit: usize,
+) {
+    while jobs.len() < limit {
+        match rx.try_recv() {
+            Ok(job) => jobs.push(job),
+            Err(_) => break,
+        }
+    }
+}
+
+fn admit_continuous_ready_jobs(
+    state: &CudaSchedulerState,
+    stats: &CudaSchedulerStats,
+    active: &mut Vec<CudaContinuousTextRequest>,
+    jobs: Vec<CudaSchedulerJob>,
+    max_batch_size: usize,
+    max_batched_tokens: usize,
+) {
+    let received = jobs.len();
+    stats
+        .pending_requests
+        .fetch_sub(received, Ordering::Relaxed);
+    if received == 0 {
+        return;
+    }
+
+    let (jobs, cancelled) = retain_open_scheduler_jobs(jobs);
+    if cancelled > 0 {
+        stats
+            .cancelled_requests
+            .fetch_add(usize_to_u64(cancelled), Ordering::Relaxed);
+        release_scheduler_slots(&stats.inflight_requests, cancelled);
+    }
+    if jobs.is_empty() {
+        return;
+    }
+    let open_count = jobs.len();
+    stats.total_batches.fetch_add(1, Ordering::Relaxed);
+    stats
+        .total_requests
+        .fetch_add(usize_to_u64(open_count), Ordering::Relaxed);
+    update_atomic_max(&stats.max_observed_batch, open_count);
+    record_scheduler_queue_wait(stats, &jobs, Instant::now());
+
+    let mut text_jobs = Vec::with_capacity(open_count);
+    let mut multimodal_jobs = Vec::new();
+    for job in jobs {
+        if job.request.media_inputs.is_empty() {
+            text_jobs.push(job);
+        } else {
+            multimodal_jobs.push(job);
+        }
+    }
+
+    for media_chunk in multimodal_jobs.chunks(max_batch_size.max(1)) {
+        let outcome = process_multimodal_scheduler_batch(state, media_chunk, max_batched_tokens);
+        record_scheduler_batch_outcome_stats(stats, outcome);
+        release_scheduler_slots(&stats.inflight_requests, media_chunk.len());
+    }
+
+    let mut admitted = 0usize;
+    for job in text_jobs {
+        match admit_continuous_text_job(state, stats, job) {
+            Some(request) => {
+                admitted = admitted.saturating_add(1);
+                active.push(request);
+            }
+            None => {}
+        }
+    }
+
+    if admitted > 0 {
+        stats
+            .continuous_step_admissions
+            .fetch_add(1, Ordering::Relaxed);
+        stats
+            .continuous_admitted_requests
+            .fetch_add(usize_to_u64(admitted), Ordering::Relaxed);
+        stats
+            .batch_plan_eligible_requests
+            .fetch_add(usize_to_u64(admitted), Ordering::Relaxed);
+    }
+    let active_token_budget = active.iter().fold(0usize, |sum, request| {
+        sum.saturating_add(request.context_len())
+    });
+    if active_token_budget > max_batched_tokens {
+        stats
+            .token_budget_split_groups
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn admit_continuous_text_job(
+    state: &CudaSchedulerState,
+    stats: &CudaSchedulerStats,
+    job: CudaSchedulerJob,
+) -> Option<CudaContinuousTextRequest> {
+    if job.tx.is_closed() {
+        stats.cancelled_requests.fetch_add(1, Ordering::Relaxed);
+        stats
+            .admission_cancelled_requests
+            .fetch_add(1, Ordering::Relaxed);
+        release_scheduler_slots(&stats.inflight_requests, 1);
+        return None;
+    }
+
+    let result = (|| -> Result<(Vec<u32>, usize, Vec<Vec<u32>>)> {
+        let prompt_tokens = state
+            .cpu_reference
+            .tokenizer()
+            .encode(&job.request.prompt)?;
+        if prompt_tokens.is_empty() {
+            bail!("prompt encoded to zero tokens");
+        }
+        let max_tokens = validate_generation_max_tokens(&job.request, state.max_output_tokens)?;
+        validate_generation_context_budget(&state.qwen, prompt_tokens.len(), max_tokens)?;
+        let stop_token_sequences =
+            generation_stop_token_sequences(&state.cpu_reference, &job.request.stop_sequences)?;
+        Ok((prompt_tokens, max_tokens, stop_token_sequences))
+    })();
+
+    let (prompt_tokens, max_tokens, stop_token_sequences) = match result {
+        Ok(values) => values,
+        Err(err) => {
+            record_continuous_admission_error(stats, &job.tx, err, None);
+            release_scheduler_slots(&stats.inflight_requests, 1);
+            return None;
+        }
+    };
+
+    let token_budget = match prompt_tokens.len().checked_add(max_tokens) {
+        Some(token_budget) => token_budget,
+        None => {
+            record_continuous_admission_error(
+                stats,
+                &job.tx,
+                anyhow!("CUDA continuous paged request token budget overflows usize"),
+                None,
+            );
+            release_scheduler_slots(&stats.inflight_requests, 1);
+            return None;
+        }
+    };
+    let Some(kv_pages) = &state.kv_pages else {
+        record_continuous_admission_error(
+            stats,
+            &job.tx,
+            anyhow!("CUDA continuous scheduler requires paged KV leases"),
+            None,
+        );
+        release_scheduler_slots(&stats.inflight_requests, 1);
+        return None;
+    };
+    let pages_needed = match kv_pages.pages_for_tokens(token_budget) {
+        Ok(pages_needed) => pages_needed,
+        Err(err) => {
+            record_continuous_admission_error(stats, &job.tx, err, None);
+            release_scheduler_slots(&stats.inflight_requests, 1);
+            return None;
+        }
+    };
+    stats
+        .admission_page_requests
+        .fetch_add(1, Ordering::Relaxed);
+    stats
+        .admission_requested_pages
+        .fetch_add(usize_to_u64(pages_needed), Ordering::Relaxed);
+    update_atomic_max(&stats.admission_requested_pages_max, pages_needed);
+
+    let lease = match kv_pages.allocate_for_tokens(token_budget) {
+        Ok(lease) => lease,
+        Err(err) => {
+            record_continuous_admission_error(stats, &job.tx, err, Some(pages_needed));
+            release_scheduler_slots(&stats.inflight_requests, 1);
+            return None;
+        }
+    };
+    stats
+        .admission_granted_pages
+        .fetch_add(usize_to_u64(lease.pages.len()), Ordering::Relaxed);
+    update_atomic_max(&stats.admission_granted_pages_max, lease.pages.len());
+
+    let sampling_key = scheduler_sampling_key(&job.request);
+    let rng = match sampling_key {
+        CudaSchedulerSamplingKey::Greedy => None,
+        CudaSchedulerSamplingKey::Sampled { .. } => Some(StdRng::seed_from_u64(
+            job.request.seed.unwrap_or_else(|| rand::random::<u64>()),
+        )),
+    };
+    Some(CudaContinuousTextRequest {
+        job,
+        prompt_tokens,
+        generated_tokens: Vec::new(),
+        previous_text: String::new(),
+        max_tokens,
+        stop_token_sequences,
+        sampling_key,
+        rng,
+        lease,
+    })
+}
+
+fn record_continuous_admission_error(
+    stats: &CudaSchedulerStats,
+    tx: &tokio::sync::mpsc::Sender<Result<GenerationEvent>>,
+    err: anyhow::Error,
+    rejected_pages: Option<usize>,
+) {
+    let reason = scheduler_admission_rejection_reason(&err);
+    if let Some(rejected_pages) = rejected_pages {
+        stats
+            .admission_rejected_pages
+            .fetch_add(usize_to_u64(rejected_pages), Ordering::Relaxed);
+        update_atomic_max(&stats.admission_rejected_pages_max, rejected_pages);
+    }
+    if send_scheduler_error(tx, err).is_ok() {
+        stats
+            .admission_rejected_requests
+            .fetch_add(1, Ordering::Relaxed);
+        stats
+            .admission_errored_requests
+            .fetch_add(1, Ordering::Relaxed);
+        stats.errored_requests.fetch_add(1, Ordering::Relaxed);
+        match reason {
+            CudaSchedulerAdmissionRejectionReason::ContextLength => {
+                stats
+                    .admission_context_rejected_requests
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            CudaSchedulerAdmissionRejectionReason::InvalidRequest => {
+                stats
+                    .admission_invalid_request_rejected_requests
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            CudaSchedulerAdmissionRejectionReason::InsufficientGpuMemory => {
+                stats
+                    .admission_memory_rejected_requests
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            CudaSchedulerAdmissionRejectionReason::Other => {
+                stats
+                    .admission_other_rejected_requests
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    } else {
+        stats.cancelled_requests.fetch_add(1, Ordering::Relaxed);
+        stats
+            .admission_cancelled_requests
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn record_scheduler_batch_outcome_stats(
+    stats: &CudaSchedulerStats,
+    outcome: CudaSchedulerBatchOutcome,
+) {
+    if outcome.gpu_batched_requests > 0 {
+        stats
+            .gpu_batched_batches
+            .fetch_add(usize_to_u64(outcome.gpu_batched_batches), Ordering::Relaxed);
+        stats.gpu_batched_requests.fetch_add(
+            usize_to_u64(outcome.gpu_batched_requests),
+            Ordering::Relaxed,
+        );
+        stats.paged_lease_batched_requests.fetch_add(
+            usize_to_u64(outcome.paged_lease_batched_requests),
+            Ordering::Relaxed,
+        );
+        stats.paged_internal_batched_requests.fetch_add(
+            usize_to_u64(outcome.paged_internal_batched_requests),
+            Ordering::Relaxed,
+        );
+        stats.greedy_batched_requests.fetch_add(
+            usize_to_u64(outcome.greedy_batched_requests),
+            Ordering::Relaxed,
+        );
+        stats.sampled_batched_requests.fetch_add(
+            usize_to_u64(outcome.sampled_batched_requests),
+            Ordering::Relaxed,
+        );
+    }
+    stats.shared_prefix_batches.fetch_add(
+        usize_to_u64(outcome.shared_prefix_batches),
+        Ordering::Relaxed,
+    );
+    stats.shared_prefix_requests.fetch_add(
+        usize_to_u64(outcome.shared_prefix_requests),
+        Ordering::Relaxed,
+    );
+    stats
+        .shared_prefix_tokens
+        .fetch_add(outcome.shared_prefix_tokens, Ordering::Relaxed);
+    stats
+        .fallback_requests
+        .fetch_add(usize_to_u64(outcome.fallback_requests), Ordering::Relaxed);
+    stats.fallback_single_request.fetch_add(
+        usize_to_u64(outcome.fallback_single_request),
+        Ordering::Relaxed,
+    );
+    stats.fallback_moe_requests.fetch_add(
+        usize_to_u64(outcome.fallback_moe_requests),
+        Ordering::Relaxed,
+    );
+    stats.fallback_multimodal_requests.fetch_add(
+        usize_to_u64(outcome.fallback_multimodal_requests),
+        Ordering::Relaxed,
+    );
+    stats.fallback_tokenizer_requests.fetch_add(
+        usize_to_u64(outcome.fallback_tokenizer_requests),
+        Ordering::Relaxed,
+    );
+    stats.fallback_bucket_requests.fetch_add(
+        usize_to_u64(outcome.fallback_bucket_requests),
+        Ordering::Relaxed,
+    );
+    stats.fallback_other_requests.fetch_add(
+        usize_to_u64(outcome.fallback_other_requests),
+        Ordering::Relaxed,
+    );
+    stats.batch_plan_eligible_requests.fetch_add(
+        usize_to_u64(outcome.batch_plan_eligible_requests),
+        Ordering::Relaxed,
+    );
+    stats.batch_plan_ineligible_requests.fetch_add(
+        usize_to_u64(outcome.batch_plan_ineligible_requests),
+        Ordering::Relaxed,
+    );
+    stats.token_budget_split_groups.fetch_add(
+        usize_to_u64(outcome.token_budget_split_groups),
+        Ordering::Relaxed,
+    );
+    stats.token_budget_split_requests.fetch_add(
+        usize_to_u64(outcome.token_budget_split_requests),
+        Ordering::Relaxed,
+    );
+    stats.token_budget_split_chunks.fetch_add(
+        usize_to_u64(outcome.token_budget_split_chunks),
+        Ordering::Relaxed,
+    );
+    stats
+        .completed_requests
+        .fetch_add(usize_to_u64(outcome.completed_requests), Ordering::Relaxed);
+    stats
+        .errored_requests
+        .fetch_add(usize_to_u64(outcome.errored_requests), Ordering::Relaxed);
+    stats
+        .cancelled_requests
+        .fetch_add(usize_to_u64(outcome.cancelled_requests), Ordering::Relaxed);
+    stats
+        .prefill_tokens
+        .fetch_add(outcome.prefill_tokens, Ordering::Relaxed);
+    stats
+        .decode_tokens
+        .fetch_add(outcome.decode_tokens, Ordering::Relaxed);
+    stats
+        .prefill_micros
+        .fetch_add(outcome.prefill_micros, Ordering::Relaxed);
+    stats
+        .decode_micros
+        .fetch_add(outcome.decode_micros, Ordering::Relaxed);
+}
+
+fn process_continuous_decode_iteration(
+    state: &CudaSchedulerState,
+    stats: &CudaSchedulerStats,
+    active: &mut Vec<CudaContinuousTextRequest>,
+    max_batch_size: usize,
+) {
+    let mut retire = vec![None; active.len()];
+    for (idx, request) in active.iter().enumerate() {
+        if request.job.tx.is_closed() {
+            retire[idx] = Some(CudaContinuousRetireReason::Cancelled);
+        }
+    }
+
+    let mut groups: BTreeMap<
+        (CudaContinuousStepPhase, usize, CudaSchedulerSamplingKey),
+        Vec<usize>,
+    > = BTreeMap::new();
+    for (idx, request) in active.iter().enumerate() {
+        if retire[idx].is_none() {
+            let phase = if request.generated_tokens.is_empty() {
+                CudaContinuousStepPhase::Prefill
+            } else {
+                CudaContinuousStepPhase::Decode
+            };
+            let token_count = match phase {
+                CudaContinuousStepPhase::Prefill => request.prompt_tokens.len(),
+                CudaContinuousStepPhase::Decode => request.context_len(),
+            };
+            groups
+                .entry((phase, token_count, request.sampling_key))
+                .or_default()
+                .push(idx);
+        }
+    }
+
+    for ((phase, token_count, sampling_key), indexes) in groups {
+        for chunk in indexes.chunks(max_batch_size.max(1)) {
+            let chunk = chunk
+                .iter()
+                .copied()
+                .filter(|idx| retire[*idx].is_none())
+                .collect::<Vec<_>>();
+            if chunk.is_empty() {
+                continue;
+            }
+            process_continuous_decode_chunk(
+                state,
+                stats,
+                active,
+                &mut retire,
+                phase,
+                token_count,
+                sampling_key,
+                &chunk,
+            );
+        }
+    }
+
+    let mut completed = 0usize;
+    let mut errored = 0usize;
+    let mut cancelled = 0usize;
+    for reason in retire.iter().flatten().copied() {
+        match reason {
+            CudaContinuousRetireReason::Completed => completed = completed.saturating_add(1),
+            CudaContinuousRetireReason::Errored => errored = errored.saturating_add(1),
+            CudaContinuousRetireReason::Cancelled => cancelled = cancelled.saturating_add(1),
+        }
+    }
+    if completed > 0 {
+        stats
+            .completed_requests
+            .fetch_add(usize_to_u64(completed), Ordering::Relaxed);
+    }
+    if errored > 0 {
+        stats
+            .errored_requests
+            .fetch_add(usize_to_u64(errored), Ordering::Relaxed);
+    }
+    if cancelled > 0 {
+        stats
+            .cancelled_requests
+            .fetch_add(usize_to_u64(cancelled), Ordering::Relaxed);
+        stats
+            .continuous_mid_decode_cancellations
+            .fetch_add(usize_to_u64(cancelled), Ordering::Relaxed);
+    }
+    let retired = completed.saturating_add(errored);
+    if retired > 0 {
+        stats
+            .continuous_mid_decode_retirements
+            .fetch_add(usize_to_u64(retired), Ordering::Relaxed);
+    }
+    let total_retired = retired.saturating_add(cancelled);
+    if total_retired > 0 {
+        release_scheduler_slots(&stats.inflight_requests, total_retired);
+        for idx in (0..active.len()).rev() {
+            if retire[idx].is_some() {
+                active.remove(idx);
+            }
+        }
+    }
+}
+
+fn process_continuous_decode_chunk(
+    state: &CudaSchedulerState,
+    stats: &CudaSchedulerStats,
+    active: &mut [CudaContinuousTextRequest],
+    retire: &mut [Option<CudaContinuousRetireReason>],
+    phase: CudaContinuousStepPhase,
+    token_count: usize,
+    sampling_key: CudaSchedulerSamplingKey,
+    indexes: &[usize],
+) {
+    let model = match state.gpu_model.lock() {
+        Ok(model) => model,
+        Err(_) => {
+            for idx in indexes {
+                mark_continuous_error(
+                    active,
+                    retire,
+                    *idx,
+                    anyhow!("CUDA gpu model lock poisoned"),
+                );
+            }
+            return;
+        }
+    };
+    let indexes = retain_open_continuous_indexes(active, retire, indexes);
+    if indexes.is_empty() {
+        return;
+    }
+    let Some(kv_pages) = &state.kv_pages else {
+        for idx in &indexes {
+            mark_continuous_error(
+                active,
+                retire,
+                *idx,
+                anyhow!("CUDA continuous decode requires paged KV leases"),
+            );
+        }
+        return;
+    };
+    let page_tables = match indexes
+        .iter()
+        .map(|idx| match phase {
+            CudaContinuousStepPhase::Prefill => {
+                active[*idx].page_table_for_prompt(state.kv_page_size)
+            }
+            CudaContinuousStepPhase::Decode => {
+                active[*idx].page_table_for_context(state.kv_page_size)
+            }
+        })
+        .collect::<Result<Vec<_>>>()
+    {
+        Ok(page_tables) => page_tables,
+        Err(err) => {
+            for idx in &indexes {
+                mark_continuous_error(active, retire, *idx, anyhow!("{err}"));
+            }
+            return;
+        }
+    };
+    let started = Instant::now();
+    let mut shared_prefix_reused_tokens = 0;
+    let result = match phase {
+        CudaContinuousStepPhase::Prefill => {
+            let inputs = indexes
+                .iter()
+                .map(|idx| active[*idx].prompt_tokens.clone())
+                .collect::<Vec<_>>();
+            shared_prefix_reused_tokens =
+                continuous_shared_prefix_reused_token_count(&inputs, token_count);
+            if shared_prefix_reused_tokens > 0 {
+                stats.shared_prefix_batches.fetch_add(1, Ordering::Relaxed);
+                stats
+                    .shared_prefix_requests
+                    .fetch_add(usize_to_u64(indexes.len()), Ordering::Relaxed);
+                stats
+                    .shared_prefix_tokens
+                    .fetch_add(shared_prefix_reused_tokens, Ordering::Relaxed);
+            }
+            match sampling_key {
+                CudaSchedulerSamplingKey::Greedy => model
+                    .prefill_greedy_next_tokens_batch_paged_with_page_tables(
+                        &inputs,
+                        state.kv_page_size,
+                        &page_tables,
+                        kv_pages.pages_total,
+                    ),
+                CudaSchedulerSamplingKey::Sampled {
+                    temperature_bits,
+                    top_p_bits,
+                    top_k,
+                } => {
+                    let samples = continuous_sampling_values(active, &indexes);
+                    model.prefill_sampled_next_tokens_batch_paged_with_page_tables(
+                        &inputs,
+                        f32::from_bits(temperature_bits),
+                        f32::from_bits(top_p_bits),
+                        top_k,
+                        &samples,
+                        state.kv_page_size,
+                        &page_tables,
+                        kv_pages.pages_total,
+                    )
+                }
+            }
+        }
+        CudaContinuousStepPhase::Decode => {
+            if state.qwen.recurrent_ssm_tensor_layout {
+                let inputs = indexes
+                    .iter()
+                    .map(|idx| {
+                        let request = &active[*idx];
+                        let mut context = Vec::with_capacity(request.context_len());
+                        context.extend_from_slice(&request.prompt_tokens);
+                        context.extend_from_slice(&request.generated_tokens);
+                        context
+                    })
+                    .collect::<Vec<_>>();
+                match sampling_key {
+                    CudaSchedulerSamplingKey::Greedy => model
+                        .greedy_next_tokens_batch_paged_with_page_tables(
+                            &inputs,
+                            state.kv_page_size,
+                            &page_tables,
+                            kv_pages.pages_total,
+                        ),
+                    CudaSchedulerSamplingKey::Sampled {
+                        temperature_bits,
+                        top_p_bits,
+                        top_k,
+                    } => {
+                        let samples = continuous_sampling_values(active, &indexes);
+                        model.sampled_next_tokens_batch_paged_with_page_tables(
+                            &inputs,
+                            f32::from_bits(temperature_bits),
+                            f32::from_bits(top_p_bits),
+                            top_k,
+                            &samples,
+                            state.kv_page_size,
+                            &page_tables,
+                            kv_pages.pages_total,
+                        )
+                    }
+                }
+            } else {
+                let position = match token_count.checked_sub(1) {
+                    Some(position) => position,
+                    None => {
+                        for idx in &indexes {
+                            mark_continuous_error(
+                                active,
+                                retire,
+                                *idx,
+                                anyhow!(
+                                    "CUDA continuous append decode requires a non-empty context"
+                                ),
+                            );
+                        }
+                        return;
+                    }
+                };
+                let decode_tokens =
+                    match indexes
+                        .iter()
+                        .map(|idx| {
+                            active[*idx]
+                        .generated_tokens
+                        .last()
+                        .copied()
+                        .ok_or_else(|| {
+                            anyhow!("CUDA continuous append decode request has no generated token")
+                        })
+                        })
+                        .collect::<Result<Vec<_>>>()
+                    {
+                        Ok(tokens) => tokens,
+                        Err(err) => {
+                            for idx in &indexes {
+                                mark_continuous_error(active, retire, *idx, anyhow!("{err}"));
+                            }
+                            return;
+                        }
+                    };
+                match sampling_key {
+                    CudaSchedulerSamplingKey::Greedy => model
+                        .decode_greedy_next_tokens_batch_paged_with_page_tables(
+                            &decode_tokens,
+                            position,
+                            state.kv_page_size,
+                            &page_tables,
+                            kv_pages.pages_total,
+                        ),
+                    CudaSchedulerSamplingKey::Sampled {
+                        temperature_bits,
+                        top_p_bits,
+                        top_k,
+                    } => {
+                        let samples = continuous_sampling_values(active, &indexes);
+                        model.decode_sampled_next_tokens_batch_paged_with_page_tables(
+                            &decode_tokens,
+                            position,
+                            f32::from_bits(temperature_bits),
+                            f32::from_bits(top_p_bits),
+                            top_k,
+                            &samples,
+                            state.kv_page_size,
+                            &page_tables,
+                            kv_pages.pages_total,
+                        )
+                    }
+                }
+            }
+        }
+    };
+    let elapsed = started.elapsed();
+    let count = indexes.len();
+    let prefill_tokens = match phase {
+        CudaContinuousStepPhase::Prefill => usize_to_u64(token_count.saturating_mul(count))
+            .saturating_sub(shared_prefix_reused_tokens),
+        CudaContinuousStepPhase::Decode if state.qwen.recurrent_ssm_tensor_layout => {
+            usize_to_u64(token_count.saturating_mul(count))
+        }
+        CudaContinuousStepPhase::Decode => 0,
+    };
+    let timing = scheduler_token_timing(prefill_tokens, usize_to_u64(count), elapsed);
+    stats
+        .prefill_tokens
+        .fetch_add(timing.prefill_tokens, Ordering::Relaxed);
+    stats
+        .decode_tokens
+        .fetch_add(timing.decode_tokens, Ordering::Relaxed);
+    stats
+        .prefill_micros
+        .fetch_add(timing.prefill_micros, Ordering::Relaxed);
+    stats
+        .decode_micros
+        .fetch_add(timing.decode_micros, Ordering::Relaxed);
+
+    match result {
+        Ok(tokens) if tokens.len() == indexes.len() => {
+            record_continuous_decode_batch_stats(stats, phase, sampling_key, count);
+            for (idx, token) in indexes.iter().copied().zip(tokens) {
+                if retire[idx].is_some() {
+                    continue;
+                }
+                if active[idx].job.tx.is_closed() {
+                    retire[idx] = Some(CudaContinuousRetireReason::Cancelled);
+                    continue;
+                }
+                active[idx].generated_tokens.push(token);
+                match send_continuous_token_delta(state, &mut active[idx], token) {
+                    Ok(()) => {}
+                    Err(CudaContinuousRetireReason::Cancelled) => {
+                        retire[idx] = Some(CudaContinuousRetireReason::Cancelled);
+                        continue;
+                    }
+                    Err(CudaContinuousRetireReason::Errored) => {
+                        retire[idx] = Some(CudaContinuousRetireReason::Errored);
+                        continue;
+                    }
+                    Err(CudaContinuousRetireReason::Completed) => unreachable!(),
+                }
+                if continuous_request_finished(&state.qwen, &active[idx], token) {
+                    retire[idx] = Some(finish_continuous_request(state, &active[idx]));
+                }
+            }
+        }
+        Ok(tokens) => {
+            let err = anyhow!(
+                "CUDA continuous paged decode returned {} token(s) for {} request(s)",
+                tokens.len(),
+                indexes.len()
+            );
+            for idx in &indexes {
+                mark_continuous_error(active, retire, *idx, anyhow!("{err}"));
+            }
+        }
+        Err(err) => {
+            for idx in &indexes {
+                mark_continuous_error(active, retire, *idx, anyhow!("{err}"));
+            }
+        }
+    }
+}
+
+fn retain_open_continuous_indexes(
+    active: &[CudaContinuousTextRequest],
+    retire: &mut [Option<CudaContinuousRetireReason>],
+    indexes: &[usize],
+) -> Vec<usize> {
+    let mut open = Vec::with_capacity(indexes.len());
+    for &idx in indexes {
+        if retire[idx].is_some() {
+            continue;
+        }
+        if active[idx].job.tx.is_closed() {
+            retire[idx] = Some(CudaContinuousRetireReason::Cancelled);
+        } else {
+            open.push(idx);
+        }
+    }
+    open
+}
+
+fn continuous_shared_prefix_reused_token_count(inputs: &[Vec<u32>], context_len: usize) -> u64 {
+    if inputs.len() < 2 {
+        return 0;
+    }
+    let indexes = (0..inputs.len()).collect::<Vec<_>>();
+    usize_to_u64(scheduler_shared_prefix_reused_token_count(
+        inputs,
+        &indexes,
+        context_len,
+    ))
+}
+
+fn continuous_sampling_values(
+    active: &mut [CudaContinuousTextRequest],
+    indexes: &[usize],
+) -> Vec<f32> {
+    indexes
+        .iter()
+        .map(|idx| {
+            active[*idx]
+                .rng
+                .as_mut()
+                .map(|rng| rng.gen_range(0.0f32..1.0f32))
+                .unwrap_or(0.0)
+        })
+        .collect()
+}
+
+fn record_continuous_decode_batch_stats(
+    stats: &CudaSchedulerStats,
+    phase: CudaContinuousStepPhase,
+    sampling_key: CudaSchedulerSamplingKey,
+    count: usize,
+) {
+    stats.gpu_batched_batches.fetch_add(1, Ordering::Relaxed);
+    stats
+        .gpu_batched_requests
+        .fetch_add(usize_to_u64(count), Ordering::Relaxed);
+    stats
+        .paged_lease_batched_requests
+        .fetch_add(usize_to_u64(count), Ordering::Relaxed);
+    match phase {
+        CudaContinuousStepPhase::Prefill => {
+            stats
+                .continuous_prefill_batches
+                .fetch_add(1, Ordering::Relaxed);
+            stats
+                .continuous_prefill_requests
+                .fetch_add(usize_to_u64(count), Ordering::Relaxed);
+        }
+        CudaContinuousStepPhase::Decode => {
+            stats
+                .continuous_append_decode_batches
+                .fetch_add(1, Ordering::Relaxed);
+            stats
+                .continuous_append_decode_requests
+                .fetch_add(usize_to_u64(count), Ordering::Relaxed);
+        }
+    }
+    update_atomic_max(&stats.max_observed_batch, count);
+    match sampling_key {
+        CudaSchedulerSamplingKey::Greedy => {
+            stats
+                .greedy_batched_requests
+                .fetch_add(usize_to_u64(count), Ordering::Relaxed);
+        }
+        CudaSchedulerSamplingKey::Sampled { .. } => {
+            stats
+                .sampled_batched_requests
+                .fetch_add(usize_to_u64(count), Ordering::Relaxed);
+        }
+    }
+}
+
+fn send_continuous_token_delta(
+    state: &CudaSchedulerState,
+    request: &mut CudaContinuousTextRequest,
+    token: u32,
+) -> std::result::Result<(), CudaContinuousRetireReason> {
+    let current_text = match state
+        .cpu_reference
+        .tokenizer()
+        .decode(&request.generated_tokens)
+    {
+        Ok(text) => text,
+        Err(err) => {
+            let _ = send_scheduler_error(&request.job.tx, err);
+            return Err(CudaContinuousRetireReason::Errored);
+        }
+    };
+    let delta = current_text
+        .strip_prefix(&request.previous_text)
+        .unwrap_or(&current_text)
+        .to_string();
+    request.previous_text = current_text;
+    if delta.is_empty() {
+        return Ok(());
+    }
+    request
+        .job
+        .tx
+        .blocking_send(Ok(GenerationEvent::TokenDelta {
+            token_id: token,
+            text: delta,
+        }))
+        .map_err(|_| CudaContinuousRetireReason::Cancelled)
+}
+
+fn continuous_request_finished(
+    qwen: &QwenGgufConfig,
+    request: &CudaContinuousTextRequest,
+    token: u32,
+) -> bool {
+    Some(token) == qwen.eos_token_id
+        || request.generated_tokens.len() >= request.max_tokens
+        || generated_ends_with_stop_sequence(
+            &request.generated_tokens,
+            &request.stop_token_sequences,
+        )
+}
+
+fn finish_continuous_request(
+    state: &CudaSchedulerState,
+    request: &CudaContinuousTextRequest,
+) -> CudaContinuousRetireReason {
+    match cuda_generation_from_tokens(
+        &state.cpu_reference,
+        &request.prompt_tokens,
+        request.generated_tokens.clone(),
+        &request.job.request.stop_sequences,
+    ) {
+        Ok(generation) => {
+            if request
+                .job
+                .tx
+                .blocking_send(Ok(GenerationEvent::Finished {
+                    output: generation.output,
+                }))
+                .is_ok()
+            {
+                CudaContinuousRetireReason::Completed
+            } else {
+                CudaContinuousRetireReason::Cancelled
+            }
+        }
+        Err(err) => {
+            let _ = send_scheduler_error(&request.job.tx, err);
+            CudaContinuousRetireReason::Errored
+        }
+    }
+}
+
+fn mark_continuous_error(
+    active: &[CudaContinuousTextRequest],
+    retire: &mut [Option<CudaContinuousRetireReason>],
+    idx: usize,
+    err: anyhow::Error,
+) {
+    if retire[idx].is_some() {
+        return;
+    }
+    retire[idx] = if send_scheduler_error(&active[idx].job.tx, err).is_ok() {
+        Some(CudaContinuousRetireReason::Errored)
+    } else {
+        Some(CudaContinuousRetireReason::Cancelled)
+    };
+}
+
+fn recv_scheduler_batch<T>(
+    rx: &mpsc::Receiver<T>,
+    first: T,
+    max_batch_size: usize,
+    max_wait_us: u64,
+) -> Vec<T> {
+    let max_batch_size = max_batch_size.max(1);
+    let mut batch = Vec::with_capacity(max_batch_size);
+    batch.push(first);
+    if max_batch_size == 1 {
+        return batch;
+    }
+
+    if max_wait_us == 0 || max_wait_us > CUDA_SCHEDULER_MAX_WAIT_US {
+        drain_ready_scheduler_batch(rx, &mut batch, max_batch_size);
+        return batch;
+    }
+
+    let Some(deadline) = Instant::now().checked_add(Duration::from_micros(max_wait_us)) else {
+        drain_ready_scheduler_batch(rx, &mut batch, max_batch_size);
+        return batch;
+    };
+    while batch.len() < max_batch_size {
+        match rx.try_recv() {
+            Ok(job) => batch.push(job),
+            Err(mpsc::TryRecvError::Disconnected) => break,
+            Err(mpsc::TryRecvError::Empty) => {
+                let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                    break;
+                };
+                match rx.recv_timeout(remaining) {
+                    Ok(job) => batch.push(job),
+                    Err(_) => break,
+                }
+            }
+        }
+    }
+    batch
+}
+
+fn drain_ready_scheduler_batch<T>(
+    rx: &mpsc::Receiver<T>,
+    batch: &mut Vec<T>,
+    max_batch_size: usize,
+) {
+    while batch.len() < max_batch_size {
+        match rx.try_recv() {
+            Ok(job) => batch.push(job),
+            Err(_) => break,
+        }
+    }
+}
+
+fn retain_open_scheduler_jobs(batch: Vec<CudaSchedulerJob>) -> (Vec<CudaSchedulerJob>, usize) {
+    let original_len = batch.len();
+    let retained = batch
+        .into_iter()
+        .filter(|job| !job.tx.is_closed())
+        .collect::<Vec<_>>();
+    let cancelled = original_len.saturating_sub(retained.len());
+    (retained, cancelled)
+}
+
+fn retain_open_scheduler_admission(
+    batch: &mut Vec<CudaSchedulerJob>,
+    leases: &mut Vec<CudaPagedKvCacheLease>,
+) -> usize {
+    if leases.is_empty() {
+        let original_len = batch.len();
+        batch.retain(|job| !job.tx.is_closed());
+        return original_len.saturating_sub(batch.len());
+    }
+
+    let lease_backed_requests = batch
+        .iter()
+        .filter(|job| job.request.media_inputs.is_empty())
+        .count();
+    debug_assert_eq!(lease_backed_requests, leases.len());
+    if lease_backed_requests != leases.len() {
+        let original_len = batch.len();
+        batch.retain(|job| !job.tx.is_closed());
+        leases.clear();
+        return original_len.saturating_sub(batch.len());
+    }
+
+    let mut retained_batch = Vec::with_capacity(batch.len());
+    let mut retained_leases = Vec::with_capacity(leases.len());
+    let mut cancelled = 0usize;
+    let mut leases_iter = std::mem::take(leases).into_iter();
+    for job in std::mem::take(batch) {
+        if !job.request.media_inputs.is_empty() {
+            if job.tx.is_closed() {
+                cancelled = cancelled.saturating_add(1);
+            } else {
+                retained_batch.push(job);
+            }
+            continue;
+        }
+        let Some(lease) = leases_iter.next() else {
+            if job.tx.is_closed() {
+                cancelled = cancelled.saturating_add(1);
+            } else {
+                retained_batch.push(job);
+            }
+            continue;
+        };
+        if job.tx.is_closed() {
+            cancelled = cancelled.saturating_add(1);
+        } else {
+            retained_batch.push(job);
+            retained_leases.push(lease);
+        }
+    }
+    debug_assert_eq!(leases_iter.len(), 0);
+    *batch = retained_batch;
+    *leases = retained_leases;
+    cancelled
+}
+
+fn admit_scheduler_batch(
+    state: &CudaSchedulerState,
+    batch: Vec<CudaSchedulerJob>,
+) -> CudaSchedulerAdmission {
+    let mut admitted = Vec::with_capacity(batch.len());
+    let mut leases = Vec::with_capacity(batch.len());
+    let mut rejected_requests = 0usize;
+    let mut errored_requests = 0usize;
+    let mut cancelled_requests = 0usize;
+    let mut rejection_reasons = CudaSchedulerAdmissionReasonCounts::default();
+    let mut requested_pages = 0usize;
+    let mut granted_pages = 0usize;
+    let mut rejected_pages = 0usize;
+    let mut page_requests = 0usize;
+    let mut requested_pages_max = 0usize;
+    let mut granted_pages_max = 0usize;
+    let mut rejected_pages_max = 0usize;
+    for job in batch {
+        if job.tx.is_closed() {
+            cancelled_requests = cancelled_requests.saturating_add(1);
+            continue;
+        }
+        if !job.request.media_inputs.is_empty() {
+            admitted.push(job);
+            continue;
+        }
+        let token_budget = match scheduler_kv_token_budget(
+            &state.cpu_reference,
+            &state.qwen,
+            &job.request,
+            state.max_output_tokens,
+        ) {
+            Ok(token_budget) => token_budget,
+            Err(err) => {
+                let reason = scheduler_admission_rejection_reason(&err);
+                if job.tx.blocking_send(Err(err)).is_ok() {
+                    rejected_requests = rejected_requests.saturating_add(1);
+                    errored_requests = errored_requests.saturating_add(1);
+                    record_scheduler_admission_rejection(&mut rejection_reasons, reason);
+                } else {
+                    cancelled_requests = cancelled_requests.saturating_add(1);
+                }
+                continue;
+            }
+        };
+        if let Some(kv_pages) = &state.kv_pages {
+            let pages_needed = match kv_pages.pages_for_tokens(token_budget) {
+                Ok(pages_needed) => pages_needed,
+                Err(err) => {
+                    let reason = scheduler_admission_rejection_reason(&err);
+                    if job.tx.blocking_send(Err(err)).is_ok() {
+                        rejected_requests = rejected_requests.saturating_add(1);
+                        errored_requests = errored_requests.saturating_add(1);
+                        record_scheduler_admission_rejection(&mut rejection_reasons, reason);
+                    } else {
+                        cancelled_requests = cancelled_requests.saturating_add(1);
+                    }
+                    continue;
+                }
+            };
+            page_requests = page_requests.saturating_add(1);
+            requested_pages = requested_pages.saturating_add(pages_needed);
+            requested_pages_max = requested_pages_max.max(pages_needed);
+            match kv_pages.allocate_for_tokens(token_budget) {
+                Ok(lease) => {
+                    let granted = lease.pages.len();
+                    granted_pages = granted_pages.saturating_add(granted);
+                    granted_pages_max = granted_pages_max.max(granted);
+                    leases.push(lease);
+                    admitted.push(job);
+                }
+                Err(err) => {
+                    let reason = scheduler_admission_rejection_reason(&err);
+                    rejected_pages = rejected_pages.saturating_add(pages_needed);
+                    rejected_pages_max = rejected_pages_max.max(pages_needed);
+                    if job.tx.blocking_send(Err(err)).is_ok() {
+                        rejected_requests = rejected_requests.saturating_add(1);
+                        errored_requests = errored_requests.saturating_add(1);
+                        record_scheduler_admission_rejection(&mut rejection_reasons, reason);
+                    } else {
+                        cancelled_requests = cancelled_requests.saturating_add(1);
+                    }
+                }
+            }
+        } else {
+            admitted.push(job);
+        }
+    }
+
+    CudaSchedulerAdmission {
+        batch: admitted,
+        leases,
+        rejected_requests,
+        errored_requests,
+        cancelled_requests,
+        rejection_reasons,
+        requested_pages,
+        granted_pages,
+        rejected_pages,
+        page_requests,
+        requested_pages_max,
+        granted_pages_max,
+        rejected_pages_max,
+    }
+}
+
+fn scheduler_kv_token_budget(
+    cpu_reference: &qwen_cpu::QwenCpuReference,
+    qwen: &QwenGgufConfig,
+    request: &GenerationRequest,
+    max_output_tokens: u32,
+) -> Result<usize> {
+    let prompt_tokens = cpu_reference.tokenizer().encode(&request.prompt)?;
+    let prompt_len = prompt_tokens.len().max(1);
+    let max_tokens = validate_generation_max_tokens(request, max_output_tokens)?;
+    validate_generation_context_budget(qwen, prompt_len, max_tokens)?;
+    let requested = prompt_len
+        .checked_add(max_tokens)
+        .context("CUDA paged KV request token budget overflows usize")?;
+    Ok(requested)
+}
+
+fn scheduler_admission_rejection_reason(
+    err: &anyhow::Error,
+) -> CudaSchedulerAdmissionRejectionReason {
+    let message = err.to_string();
+    if message.contains("context_length_exceeded") {
+        CudaSchedulerAdmissionRejectionReason::ContextLength
+    } else if message.contains("invalid_request_parameter") {
+        CudaSchedulerAdmissionRejectionReason::InvalidRequest
+    } else if message.contains("insufficient_gpu_memory") {
+        CudaSchedulerAdmissionRejectionReason::InsufficientGpuMemory
+    } else {
+        CudaSchedulerAdmissionRejectionReason::Other
+    }
+}
+
+fn record_scheduler_admission_rejection(
+    counts: &mut CudaSchedulerAdmissionReasonCounts,
+    reason: CudaSchedulerAdmissionRejectionReason,
+) {
+    match reason {
+        CudaSchedulerAdmissionRejectionReason::ContextLength => {
+            counts.context_length = counts.context_length.saturating_add(1);
+        }
+        CudaSchedulerAdmissionRejectionReason::InvalidRequest => {
+            counts.invalid_request = counts.invalid_request.saturating_add(1);
+        }
+        CudaSchedulerAdmissionRejectionReason::InsufficientGpuMemory => {
+            counts.insufficient_gpu_memory = counts.insufficient_gpu_memory.saturating_add(1);
+        }
+        CudaSchedulerAdmissionRejectionReason::Other => {
+            counts.other = counts.other.saturating_add(1);
+        }
+    }
+}
+
+fn generation_max_tokens_usize(request: &GenerationRequest) -> Result<usize> {
+    if request.max_tokens == 0 {
+        bail!("invalid_request_parameter: max_tokens must be greater than 0");
+    }
+    usize::try_from(request.max_tokens).context("max_tokens does not fit usize")
+}
+
+fn validate_generation_max_tokens(
+    request: &GenerationRequest,
+    max_output_tokens: u32,
+) -> Result<usize> {
+    let max_tokens = generation_max_tokens_usize(request)?;
+    let output_limit =
+        usize::try_from(max_output_tokens).context("max_output_tokens does not fit usize")?;
+    if max_tokens > output_limit {
+        bail!(
+            "invalid_request_parameter: max_tokens {max_tokens} exceeds model max_output_tokens {max_output_tokens}"
+        );
+    }
+    Ok(max_tokens)
+}
+
+fn validate_generation_context_budget(
+    qwen: &QwenGgufConfig,
+    prompt_len: usize,
+    max_tokens: usize,
+) -> Result<()> {
+    let context =
+        usize::try_from(qwen.context_length).context("qwen context_length does not fit usize")?;
+    if context == 0 {
+        bail!("qwen context_length must be greater than zero");
+    }
+    if max_tokens == 0 {
+        bail!("invalid_request_parameter: max_tokens must be greater than 0");
+    }
+    if prompt_len > context {
+        bail!(
+            "context_length_exceeded: prompt length {prompt_len} exceeds qwen context length {context}"
+        );
+    }
+    let requested = prompt_len
+        .checked_add(max_tokens)
+        .context("CUDA generation token budget overflows usize")?;
+    if requested > context {
+        bail!(
+            "context_length_exceeded: prompt length {prompt_len} plus max_tokens {} exceeds qwen context length {context}",
+            max_tokens
+        );
+    }
+    Ok(())
+}
+
+fn process_scheduler_batch(
+    state: &CudaSchedulerState,
+    batch: Vec<CudaSchedulerJob>,
+    leases: &[CudaPagedKvCacheLease],
+    max_batched_tokens: usize,
+) -> CudaSchedulerBatchOutcome {
+    process_scheduler_batch_with_multimodal_reason(state, batch, leases, max_batched_tokens, None)
+}
+
+fn process_scheduler_batch_with_multimodal_reason(
+    state: &CudaSchedulerState,
+    batch: Vec<CudaSchedulerJob>,
+    leases: &[CudaPagedKvCacheLease],
+    max_batched_tokens: usize,
+    forced_multimodal_fallback_reason: Option<CudaMultimodalFallbackReason>,
+) -> CudaSchedulerBatchOutcome {
+    let media_requests = batch
+        .iter()
+        .filter(|job| !job.request.media_inputs.is_empty())
+        .count();
+    if media_requests > 0 && media_requests < batch.len() {
+        let mut text_batch = Vec::with_capacity(batch.len() - media_requests);
+        let mut media_batch = Vec::with_capacity(media_requests);
+        for job in batch {
+            if job.request.media_inputs.is_empty() {
+                text_batch.push(job);
+            } else {
+                media_batch.push(job);
+            }
+        }
+
+        let mut outcome = CudaSchedulerBatchOutcome::default();
+        if !text_batch.is_empty() {
+            let text_outcome = process_scheduler_batch_with_multimodal_reason(
+                state,
+                text_batch,
+                leases,
+                max_batched_tokens,
+                None,
+            );
+            add_scheduler_batch_outcome(&mut outcome, text_outcome);
+        }
+        if !media_batch.is_empty() {
+            let media_outcome = process_scheduler_batch_with_multimodal_reason(
+                state,
+                media_batch,
+                &[],
+                max_batched_tokens,
+                Some(CudaMultimodalFallbackReason::MixedBatch),
+            );
+            add_scheduler_batch_outcome(&mut outcome, media_outcome);
+        }
+        return outcome;
+    }
+
+    match plan_scheduler_gpu_batch(state, &batch) {
+        CudaSchedulerBatchPlan::Compatible { encoded, groups } => {
+            let mut outcome = process_compatible_gpu_batch(
+                state,
+                &batch,
+                leases,
+                max_batched_tokens,
+                encoded,
+                groups,
+            );
+            outcome.batch_plan_eligible_requests = outcome
+                .batch_plan_eligible_requests
+                .saturating_add(batch.len());
+            outcome
+        }
+        CudaSchedulerBatchPlan::MultimodalCompatible => {
+            process_multimodal_scheduler_batch(state, &batch, max_batched_tokens)
+        }
+        CudaSchedulerBatchPlan::Fallback(fallback_reason) => {
+            let mut outcome = CudaSchedulerBatchOutcome::default();
+            outcome.batch_plan_ineligible_requests = outcome
+                .batch_plan_ineligible_requests
+                .saturating_add(batch.len());
+            let media_requests = batch
+                .iter()
+                .filter(|job| !job.request.media_inputs.is_empty())
+                .count();
+            let multimodal_fallback_reason = forced_multimodal_fallback_reason.or_else(|| {
+                if media_requests > 0 && media_requests < batch.len() {
+                    Some(CudaMultimodalFallbackReason::MixedBatch)
+                } else if media_requests > 0 {
+                    Some(CudaMultimodalFallbackReason::DecodeGroupSingleton)
+                } else {
+                    None
+                }
+            });
+            for job in batch {
+                if job.tx.is_closed() {
+                    outcome.cancelled_requests = outcome.cancelled_requests.saturating_add(1);
+                    continue;
+                }
+                let dispatch = if job.request.media_inputs.is_empty() {
+                    send_single_scheduler_job(state, &job)
+                } else {
+                    send_single_scheduler_multimodal_job(state, &job)
+                };
+                add_scheduler_token_timing(&mut outcome, dispatch.timing);
+                record_scheduler_dispatch_lifecycle(&mut outcome, dispatch);
+                let reason = if job.request.media_inputs.is_empty() {
+                    fallback_reason
+                } else {
+                    CudaSchedulerFallbackReason::Multimodal
+                };
+                record_scheduler_fallback(&mut outcome, reason, 1);
+                if !job.request.media_inputs.is_empty() {
+                    if let Some(reason) = multimodal_fallback_reason {
+                        record_multimodal_fallback(&state.multimodal_stats, reason, 1);
+                    }
+                }
+            }
+            outcome
+        }
+    }
+}
+
+fn plan_scheduler_gpu_batch(
+    state: &CudaSchedulerState,
+    batch: &[CudaSchedulerJob],
+) -> CudaSchedulerBatchPlan {
+    let media_requests = batch
+        .iter()
+        .filter(|job| !job.request.media_inputs.is_empty())
+        .count();
+    if media_requests > 0 {
+        if media_requests == batch.len() && batch.len() >= 2 {
+            return CudaSchedulerBatchPlan::MultimodalCompatible;
+        }
+        return CudaSchedulerBatchPlan::Fallback(CudaSchedulerFallbackReason::Multimodal);
+    }
+    if batch.len() < 2 {
+        return CudaSchedulerBatchPlan::Fallback(CudaSchedulerFallbackReason::SingleRequest);
+    }
+    if state.qwen.recurrent_ssm_tensor_layout {
+        return CudaSchedulerBatchPlan::Fallback(CudaSchedulerFallbackReason::Other);
+    }
+    let mut encoded = Vec::with_capacity(batch.len());
+    let mut groups: BTreeMap<(usize, CudaSchedulerSamplingKey), Vec<usize>> = BTreeMap::new();
+    for (idx, job) in batch.iter().enumerate() {
+        let sampling_key = scheduler_sampling_key(&job.request);
+        let tokens = match state.cpu_reference.tokenizer().encode(&job.request.prompt) {
+            Ok(tokens) if !tokens.is_empty() => tokens,
+            Ok(_) | Err(_) => {
+                return CudaSchedulerBatchPlan::Fallback(CudaSchedulerFallbackReason::Tokenizer);
+            }
+        };
+        groups
+            .entry((tokens.len(), sampling_key))
+            .or_default()
+            .push(idx);
+        encoded.push(tokens);
+    }
+    if groups.is_empty() {
+        CudaSchedulerBatchPlan::Fallback(CudaSchedulerFallbackReason::Other)
+    } else {
+        CudaSchedulerBatchPlan::Compatible { encoded, groups }
+    }
+}
+
+fn process_multimodal_scheduler_batch(
+    state: &CudaSchedulerState,
+    batch: &[CudaSchedulerJob],
+    max_batched_tokens: usize,
+) -> CudaSchedulerBatchOutcome {
+    let mut outcome = CudaSchedulerBatchOutcome::default();
+    let indexes = batch
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, job)| (!job.tx.is_closed()).then_some(idx))
+        .collect::<Vec<_>>();
+    if indexes.is_empty() {
+        outcome.cancelled_requests = outcome.cancelled_requests.saturating_add(batch.len());
+        return outcome;
+    }
+    if indexes.len() < 2 {
+        for idx in indexes {
+            outcome.batch_plan_ineligible_requests =
+                outcome.batch_plan_ineligible_requests.saturating_add(1);
+            let dispatch = send_single_scheduler_multimodal_job(state, &batch[idx]);
+            add_scheduler_token_timing(&mut outcome, dispatch.timing);
+            record_scheduler_dispatch_lifecycle(&mut outcome, dispatch);
+            record_scheduler_fallback(&mut outcome, CudaSchedulerFallbackReason::Multimodal, 1);
+            record_multimodal_fallback(
+                &state.multimodal_stats,
+                CudaMultimodalFallbackReason::DecodeGroupSingleton,
+                1,
+            );
+        }
+        return outcome;
+    }
+
+    for idx in &indexes {
+        record_multimodal_request_metrics(&state.multimodal_stats, &batch[*idx].request);
+    }
+    let media_batches = indexes
+        .iter()
+        .map(|idx| batch[*idx].request.media_inputs.clone())
+        .collect::<Vec<_>>();
+    let projections = match project_media_input_batches_with_stats(
+        state.mmproj.as_ref(),
+        &state.multimodal_stats,
+        &media_batches,
+    ) {
+        Ok(projections) => projections,
+        Err(err) => {
+            for idx in indexes {
+                outcome.batch_plan_ineligible_requests =
+                    outcome.batch_plan_ineligible_requests.saturating_add(1);
+                record_scheduler_sent_error(
+                    &mut outcome,
+                    &batch[idx].tx,
+                    anyhow!("failed to batch CUDA multimodal vision projection: {err}"),
+                );
+                record_scheduler_fallback(&mut outcome, CudaSchedulerFallbackReason::Multimodal, 1);
+                record_multimodal_fallback(
+                    &state.multimodal_stats,
+                    CudaMultimodalFallbackReason::ProjectionFailed,
+                    1,
+                );
+            }
+            return outcome;
+        }
+    };
+    if projections.len() != indexes.len() {
+        for idx in indexes {
+            outcome.batch_plan_ineligible_requests =
+                outcome.batch_plan_ineligible_requests.saturating_add(1);
+            record_scheduler_sent_error(
+                &mut outcome,
+                &batch[idx].tx,
+                anyhow!(
+                    "batched CUDA multimodal vision projection returned {} projection(s) for {} request(s)",
+                    projections.len(),
+                    media_batches.len()
+                ),
+            );
+            record_scheduler_fallback(&mut outcome, CudaSchedulerFallbackReason::Multimodal, 1);
+            record_multimodal_fallback(
+                &state.multimodal_stats,
+                CudaMultimodalFallbackReason::ProjectionMismatch,
+                1,
+            );
+        }
+        return outcome;
+    }
+
+    let remaining = process_multimodal_prefix_decode_groups(
+        state,
+        batch,
+        indexes,
+        projections,
+        max_batched_tokens,
+        &mut outcome,
+    );
+
+    for (idx, projection, reason) in remaining {
+        if batch[idx].tx.is_closed() {
+            outcome.cancelled_requests = outcome.cancelled_requests.saturating_add(1);
+            continue;
+        }
+        outcome.batch_plan_ineligible_requests =
+            outcome.batch_plan_ineligible_requests.saturating_add(1);
+        let started = Instant::now();
+        let result = generate_events_gpu_with_visual_prefix_from(
+            &state.gpu_model,
+            &state.cpu_reference,
+            &state.qwen,
+            &batch[idx].request,
+            state.max_output_tokens,
+            state.kv_cache_mode,
+            state.kv_page_size,
+            projection,
+            &state.multimodal_stats,
+        )
+        .map(|generation| {
+            let timing = scheduler_token_timing(
+                generation.output.prompt_tokens,
+                generation.output.completion_tokens,
+                started.elapsed(),
+            );
+            (generation, timing)
+        });
+        match result {
+            Ok((generation, timing)) => {
+                add_scheduler_token_timing(&mut outcome, timing);
+                if send_generation_events(&batch[idx].tx, generation).is_err() {
+                    outcome.cancelled_requests = outcome.cancelled_requests.saturating_add(1);
+                } else {
+                    outcome.completed_requests = outcome.completed_requests.saturating_add(1);
+                }
+            }
+            Err(err) => record_scheduler_sent_error(&mut outcome, &batch[idx].tx, err),
+        }
+        record_scheduler_fallback(&mut outcome, CudaSchedulerFallbackReason::Multimodal, 1);
+        record_multimodal_fallback(&state.multimodal_stats, reason, 1);
+    }
+    outcome
+}
+
+struct CudaMultimodalPrefixBatchCandidate {
+    batch_idx: usize,
+    prompt_tokens: Vec<u32>,
+    projection: VisualProjection,
+    prompt_embeddings: Option<MultimodalPromptEmbeddings>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct CudaMultimodalMropeBatchKey {
+    position_ids: Vec<[u32; 3]>,
+    next_position: usize,
+}
+
+fn process_multimodal_prefix_decode_groups(
+    state: &CudaSchedulerState,
+    batch: &[CudaSchedulerJob],
+    indexes: Vec<usize>,
+    projections: Vec<VisualProjection>,
+    max_batched_tokens: usize,
+    outcome: &mut CudaSchedulerBatchOutcome,
+) -> Vec<(usize, VisualProjection, CudaMultimodalFallbackReason)> {
+    if indexes.len() != projections.len() {
+        return indexes
+            .into_iter()
+            .zip(projections)
+            .map(|(idx, projection)| {
+                (
+                    idx,
+                    projection,
+                    CudaMultimodalFallbackReason::ProjectionMismatch,
+                )
+            })
+            .collect();
+    }
+    let embed_dim = match usize::try_from(state.qwen.embedding_length) {
+        Ok(embed_dim) => embed_dim,
+        Err(_) => {
+            return indexes
+                .into_iter()
+                .zip(projections)
+                .map(|(idx, projection)| {
+                    (
+                        idx,
+                        projection,
+                        CudaMultimodalFallbackReason::IncompatiblePrompt,
+                    )
+                })
+                .collect();
+        }
+    };
+    let image_token_id = state.cpu_reference.tokenizer().token_id("<|image_pad|>");
+    let video_token_id = state.cpu_reference.tokenizer().token_id("<|video_pad|>");
+    let mut remaining = Vec::new();
+    let mut groups: BTreeMap<
+        (
+            usize,
+            usize,
+            Option<CudaMultimodalMropeBatchKey>,
+            CudaSchedulerSamplingKey,
+        ),
+        Vec<CudaMultimodalPrefixBatchCandidate>,
+    > = BTreeMap::new();
+
+    for (idx, projection) in indexes.into_iter().zip(projections) {
+        if batch[idx].tx.is_closed() {
+            outcome.cancelled_requests = outcome.cancelled_requests.saturating_add(1);
+            continue;
+        }
+        if projection.projected_dim != embed_dim || projection.projected_rows == 0 {
+            remaining.push((
+                idx,
+                projection,
+                CudaMultimodalFallbackReason::ProjectionMismatch,
+            ));
+            continue;
+        }
+        let tokens = match state
+            .cpu_reference
+            .tokenizer()
+            .encode(&batch[idx].request.prompt)
+        {
+            Ok(tokens) if !tokens.is_empty() => tokens,
+            _ => {
+                remaining.push((
+                    idx,
+                    projection,
+                    CudaMultimodalFallbackReason::IncompatiblePrompt,
+                ));
+                continue;
+            }
+        };
+        let has_visual_placeholder = tokens.iter().any(|token| {
+            image_token_id.is_some_and(|id| *token == id)
+                || video_token_id.is_some_and(|id| *token == id)
+        });
+        let prompt_embeddings = if state.qwen.rope_dimension_sections.is_some() {
+            if !has_visual_placeholder {
+                remaining.push((
+                    idx,
+                    projection,
+                    CudaMultimodalFallbackReason::IncompatiblePrompt,
+                ));
+                continue;
+            }
+            let model = match state.gpu_model.lock() {
+                Ok(model) => model,
+                Err(_) => {
+                    remaining.push((
+                        idx,
+                        projection,
+                        CudaMultimodalFallbackReason::IncompatiblePrompt,
+                    ));
+                    continue;
+                }
+            };
+            match multimodal_prompt_embeddings(
+                &model,
+                &tokens,
+                image_token_id,
+                video_token_id,
+                &projection.embeddings,
+                projection.projected_dim,
+                &projection.items,
+            ) {
+                Ok(prompt_embeddings) => Some(prompt_embeddings),
+                Err(_) => {
+                    remaining.push((
+                        idx,
+                        projection,
+                        CudaMultimodalFallbackReason::IncompatiblePrompt,
+                    ));
+                    continue;
+                }
+            }
+        } else {
+            if has_visual_placeholder {
+                remaining.push((
+                    idx,
+                    projection,
+                    CudaMultimodalFallbackReason::IncompatiblePrompt,
+                ));
+                continue;
+            }
+            None
+        };
+        let prompt_rows = prompt_embeddings
+            .as_ref()
+            .map(|prompt_embeddings| prompt_embeddings.rows)
+            .unwrap_or(tokens.len());
+        let prefix_rows = if prompt_embeddings.is_some() {
+            0
+        } else {
+            projection.projected_rows
+        };
+        if prompt_rows == 0 {
+            remaining.push((
+                idx,
+                projection,
+                CudaMultimodalFallbackReason::IncompatiblePrompt,
+            ));
+            continue;
+        }
+        let mrope_key =
+            prompt_embeddings
+                .as_ref()
+                .map(|prompt_embeddings| CudaMultimodalMropeBatchKey {
+                    position_ids: prompt_embeddings.position_ids.clone(),
+                    next_position: prompt_embeddings.next_position,
+                });
+        let key = (
+            prompt_rows,
+            prefix_rows,
+            mrope_key,
+            scheduler_sampling_key(&batch[idx].request),
+        );
+        groups
+            .entry(key)
+            .or_default()
+            .push(CudaMultimodalPrefixBatchCandidate {
+                batch_idx: idx,
+                prompt_tokens: tokens,
+                projection,
+                prompt_embeddings,
+            });
+    }
+
+    for ((prompt_token_len, prefix_rows, _mrope_key, sampling_key), candidates) in groups {
+        if candidates.len() < 2 {
+            remaining.extend(candidates.into_iter().map(|candidate| {
+                (
+                    candidate.batch_idx,
+                    candidate.projection,
+                    CudaMultimodalFallbackReason::DecodeGroupSingleton,
+                )
+            }));
+            continue;
+        }
+        let Some(prompt_count) = prompt_token_len.checked_add(prefix_rows) else {
+            process_multimodal_prefix_decode_candidate_batch(
+                state,
+                batch,
+                prompt_token_len,
+                prefix_rows,
+                sampling_key,
+                candidates,
+                outcome,
+            );
+            continue;
+        };
+        let candidate_count = candidates.len();
+        let chunks = multimodal_prefix_candidate_token_budget_chunks(
+            batch,
+            candidates,
+            prompt_count,
+            max_batched_tokens,
+        );
+        record_scheduler_token_budget_split(outcome, candidate_count, chunks.len());
+        for candidates in chunks {
+            if candidates.len() < 2 {
+                remaining.extend(candidates.into_iter().map(|candidate| {
+                    (
+                        candidate.batch_idx,
+                        candidate.projection,
+                        CudaMultimodalFallbackReason::TokenBudget,
+                    )
+                }));
+                continue;
+            }
+            process_multimodal_prefix_decode_candidate_batch(
+                state,
+                batch,
+                prompt_token_len,
+                prefix_rows,
+                sampling_key,
+                candidates,
+                outcome,
+            );
+        }
+    }
+
+    remaining
+}
+
+fn record_scheduler_token_budget_split(
+    outcome: &mut CudaSchedulerBatchOutcome,
+    request_count: usize,
+    chunk_count: usize,
+) {
+    if chunk_count <= 1 {
+        return;
+    }
+    outcome.token_budget_split_groups = outcome.token_budget_split_groups.saturating_add(1);
+    outcome.token_budget_split_requests = outcome
+        .token_budget_split_requests
+        .saturating_add(request_count);
+    outcome.token_budget_split_chunks = outcome
+        .token_budget_split_chunks
+        .saturating_add(chunk_count);
+}
+
+fn multimodal_prefix_candidate_token_budget_chunks(
+    batch: &[CudaSchedulerJob],
+    candidates: Vec<CudaMultimodalPrefixBatchCandidate>,
+    prompt_count: usize,
+    max_batched_tokens: usize,
+) -> Vec<Vec<CudaMultimodalPrefixBatchCandidate>> {
+    let limit = max_batched_tokens.max(1);
+    let mut chunks = Vec::new();
+    let mut current = Vec::new();
+    let mut current_tokens = 0usize;
+    for candidate in candidates {
+        let max_tokens = generation_max_tokens_usize(&batch[candidate.batch_idx].request)
+            .unwrap_or(usize::MAX)
+            .max(1);
+        let token_budget = prompt_count.max(1).saturating_add(max_tokens);
+        if !current.is_empty() && current_tokens.saturating_add(token_budget) > limit {
+            chunks.push(std::mem::take(&mut current));
+            current_tokens = 0;
+        }
+        current.push(candidate);
+        current_tokens = current_tokens.saturating_add(token_budget);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn process_multimodal_prefix_decode_candidate_batch(
+    state: &CudaSchedulerState,
+    batch: &[CudaSchedulerJob],
+    prompt_token_len: usize,
+    prefix_rows: usize,
+    sampling_key: CudaSchedulerSamplingKey,
+    candidates: Vec<CudaMultimodalPrefixBatchCandidate>,
+    outcome: &mut CudaSchedulerBatchOutcome,
+) {
+    let prompt_count = match prompt_token_len.checked_add(prefix_rows) {
+        Some(prompt_count) => prompt_count,
+        None => {
+            for candidate in candidates {
+                record_scheduler_sent_error(
+                    outcome,
+                    &batch[candidate.batch_idx].tx,
+                    anyhow!("CUDA batched multimodal prompt length overflows usize"),
+                );
+            }
+            return;
+        }
+    };
+    let group_limits = match candidates
+        .iter()
+        .map(|candidate| generation_max_tokens_usize(&batch[candidate.batch_idx].request))
+        .collect::<Result<Vec<_>>>()
+    {
+        Ok(limits) => limits,
+        Err(err) => {
+            for candidate in candidates {
+                record_scheduler_sent_error(
+                    outcome,
+                    &batch[candidate.batch_idx].tx,
+                    anyhow!("{err}"),
+                );
+            }
+            return;
+        }
+    };
+    let group_stop_token_sequences = match candidates
+        .iter()
+        .map(|candidate| {
+            generation_stop_token_sequences(
+                &state.cpu_reference,
+                &batch[candidate.batch_idx].request.stop_sequences,
+            )
+        })
+        .collect::<Result<Vec<_>>>()
+    {
+        Ok(stop_sequences) => stop_sequences,
+        Err(err) => {
+            for candidate in candidates {
+                record_scheduler_sent_error(
+                    outcome,
+                    &batch[candidate.batch_idx].tx,
+                    anyhow!("{err}"),
+                );
+            }
+            return;
+        }
+    };
+    let prefix_embeddings = candidates
+        .iter()
+        .map(|candidate| candidate.projection.embeddings.clone())
+        .collect::<Vec<_>>();
+    let prompt_tokens = candidates
+        .iter()
+        .map(|candidate| candidate.prompt_tokens.clone())
+        .collect::<Vec<_>>();
+    let group_seeds = candidates
+        .iter()
+        .map(|candidate| batch[candidate.batch_idx].request.seed)
+        .collect::<Vec<_>>();
+    let max_decode_steps = group_limits.iter().copied().max().unwrap_or(1);
+    let token_capacity = match prompt_count.checked_add(max_decode_steps) {
+        Some(token_capacity) => token_capacity,
+        None => {
+            for candidate in candidates {
+                record_scheduler_sent_error(
+                    outcome,
+                    &batch[candidate.batch_idx].tx,
+                    anyhow!("CUDA batched multimodal token capacity overflows usize"),
+                );
+            }
+            return;
+        }
+    };
+    let lease_backed_pages = if state.kv_cache_mode == CudaKvCacheMode::Paged {
+        match &state.kv_pages {
+            Some(kv_pages) => {
+                let mut leases = Vec::with_capacity(candidates.len());
+                let mut page_tables = Vec::with_capacity(candidates.len());
+                let pages_needed = match div_ceil_usize(token_capacity.max(1), state.kv_page_size) {
+                    Ok(pages_needed) => pages_needed,
+                    Err(err) => {
+                        for candidate in candidates {
+                            record_scheduler_sent_error(
+                                outcome,
+                                &batch[candidate.batch_idx].tx,
+                                anyhow!(
+                                    "CUDA batched multimodal paged KV allocation failed: {err}"
+                                ),
+                            );
+                        }
+                        return;
+                    }
+                };
+                for candidate in &candidates {
+                    match kv_pages.allocate_for_tokens(token_capacity) {
+                        Ok(lease) => {
+                            if lease.pages.len() < pages_needed {
+                                record_scheduler_sent_error(
+                                    outcome,
+                                    &batch[candidate.batch_idx].tx,
+                                    anyhow!(
+                                        "CUDA batched multimodal paged KV lease has {} page(s), expected at least {pages_needed}",
+                                        lease.pages.len()
+                                    ),
+                                );
+                                return;
+                            }
+                            page_tables.push(lease.pages[..pages_needed].to_vec());
+                            leases.push(lease);
+                        }
+                        Err(err) => {
+                            for candidate in &candidates {
+                                record_scheduler_sent_error(
+                                    outcome,
+                                    &batch[candidate.batch_idx].tx,
+                                    anyhow!(
+                                        "CUDA batched multimodal paged KV allocation failed: {err}"
+                                    ),
+                                );
+                            }
+                            return;
+                        }
+                    }
+                }
+                Some((
+                    leases,
+                    CudaSchedulerLeasePageTables {
+                        tables: page_tables,
+                        physical_page_count: kv_pages.pages_total,
+                    },
+                ))
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    let started = Instant::now();
+    let model = match state.gpu_model.lock() {
+        Ok(model) => model,
+        Err(_) => {
+            for candidate in &candidates {
+                record_scheduler_sent_error(
+                    outcome,
+                    &batch[candidate.batch_idx].tx,
+                    anyhow!("CUDA gpu model lock poisoned"),
+                );
+            }
+            outcome.batch_plan_eligible_requests = outcome
+                .batch_plan_eligible_requests
+                .saturating_add(candidates.len());
+            return;
+        }
+    };
+    let is_group_cancelled = |group_idx: usize| {
+        candidates
+            .get(group_idx)
+            .is_none_or(|candidate| batch[candidate.batch_idx].tx.is_closed())
+    };
+    let uses_mrope_prompt_embeddings = candidates
+        .iter()
+        .any(|candidate| candidate.prompt_embeddings.is_some());
+    let paged_storage = match state.kv_cache_mode {
+        CudaKvCacheMode::Legacy => CudaSchedulerPagedBatchStorage::None,
+        CudaKvCacheMode::Paged if lease_backed_pages.is_some() => {
+            CudaSchedulerPagedBatchStorage::LeaseBacked
+        }
+        CudaKvCacheMode::Paged => CudaSchedulerPagedBatchStorage::Internal,
+    };
+    let lease_page_tables = lease_backed_pages
+        .as_ref()
+        .map(|(_, page_tables)| page_tables);
+    let result = if uses_mrope_prompt_embeddings {
+        if candidates
+            .iter()
+            .any(|candidate| candidate.prompt_embeddings.is_none())
+        {
+            Err(anyhow!(
+                "CUDA batched multimodal decode cannot mix MRoPE prompt embeddings and visual prefixes"
+            ))
+        } else {
+            let prompt_embeddings = candidates
+                .iter()
+                .filter_map(|candidate| {
+                    candidate
+                        .prompt_embeddings
+                        .as_ref()
+                        .map(|prompt_embeddings| prompt_embeddings.embeddings.clone())
+                })
+                .collect::<Vec<_>>();
+            let position_ids = candidates
+                .iter()
+                .filter_map(|candidate| {
+                    candidate
+                        .prompt_embeddings
+                        .as_ref()
+                        .map(|prompt_embeddings| prompt_embeddings.position_ids.clone())
+                })
+                .collect::<Vec<_>>();
+            let next_rope_positions = candidates
+                .iter()
+                .filter_map(|candidate| {
+                    candidate
+                        .prompt_embeddings
+                        .as_ref()
+                        .map(|prompt_embeddings| prompt_embeddings.next_position)
+                })
+                .collect::<Vec<_>>();
+            match sampling_key {
+                CudaSchedulerSamplingKey::Greedy => match state.kv_cache_mode {
+                    CudaKvCacheMode::Legacy => model
+                        .generate_greedy_tokens_batch_with_prompt_embeddings_positions_and_limits_and_cancellation(
+                            &prompt_embeddings,
+                            prompt_count,
+                            &position_ids,
+                            &next_rope_positions,
+                            &group_limits,
+                            state.qwen.eos_token_id,
+                            &group_stop_token_sequences,
+                            is_group_cancelled,
+                        ),
+                    CudaKvCacheMode::Paged => {
+                        if let Some(page_tables) = lease_page_tables {
+                            model
+                                .generate_greedy_tokens_batch_with_prompt_embeddings_positions_paged_page_tables_and_limits_and_cancellation(
+                                    &prompt_embeddings,
+                                    prompt_count,
+                                    &position_ids,
+                                    &next_rope_positions,
+                                    &group_limits,
+                                    state.qwen.eos_token_id,
+                                    state.kv_page_size,
+                                    &page_tables.tables,
+                                    page_tables.physical_page_count,
+                                    &group_stop_token_sequences,
+                                    is_group_cancelled,
+                                )
+                        } else {
+                            model
+                                .generate_greedy_tokens_batch_with_prompt_embeddings_positions_paged_and_limits_and_cancellation(
+                                    &prompt_embeddings,
+                                    prompt_count,
+                                    &position_ids,
+                                    &next_rope_positions,
+                                    &group_limits,
+                                    state.qwen.eos_token_id,
+                                    state.kv_page_size,
+                                    &group_stop_token_sequences,
+                                    is_group_cancelled,
+                                )
+                        }
+                    }
+                },
+                CudaSchedulerSamplingKey::Sampled {
+                    temperature_bits,
+                    top_p_bits,
+                    top_k,
+                } => match state.kv_cache_mode {
+                    CudaKvCacheMode::Legacy => model
+                        .generate_sampled_tokens_batch_with_prompt_embeddings_positions_and_limits_and_cancellation(
+                            &prompt_embeddings,
+                            prompt_count,
+                            &position_ids,
+                            &next_rope_positions,
+                            &group_limits,
+                            state.qwen.eos_token_id,
+                            f32::from_bits(temperature_bits),
+                            f32::from_bits(top_p_bits),
+                            top_k,
+                            &group_seeds,
+                            &group_stop_token_sequences,
+                            is_group_cancelled,
+                        ),
+                    CudaKvCacheMode::Paged => {
+                        if let Some(page_tables) = lease_page_tables {
+                            model
+                                .generate_sampled_tokens_batch_with_prompt_embeddings_positions_paged_page_tables_and_limits_and_cancellation(
+                                    &prompt_embeddings,
+                                    prompt_count,
+                                    &position_ids,
+                                    &next_rope_positions,
+                                    &group_limits,
+                                    state.qwen.eos_token_id,
+                                    f32::from_bits(temperature_bits),
+                                    f32::from_bits(top_p_bits),
+                                    top_k,
+                                    &group_seeds,
+                                    state.kv_page_size,
+                                    &page_tables.tables,
+                                    page_tables.physical_page_count,
+                                    &group_stop_token_sequences,
+                                    is_group_cancelled,
+                                )
+                        } else {
+                            model
+                                .generate_sampled_tokens_batch_with_prompt_embeddings_positions_paged_and_limits_and_cancellation(
+                                    &prompt_embeddings,
+                                    prompt_count,
+                                    &position_ids,
+                                    &next_rope_positions,
+                                    &group_limits,
+                                    state.qwen.eos_token_id,
+                                    f32::from_bits(temperature_bits),
+                                    f32::from_bits(top_p_bits),
+                                    top_k,
+                                    &group_seeds,
+                                    state.kv_page_size,
+                                    &group_stop_token_sequences,
+                                    is_group_cancelled,
+                                )
+                        }
+                    }
+                },
+            }
+        }
+    } else {
+        match sampling_key {
+            CudaSchedulerSamplingKey::Greedy => match state.kv_cache_mode {
+                CudaKvCacheMode::Legacy => model
+                    .generate_greedy_tokens_batch_with_prefix_embeddings_and_limits_and_cancellation(
+                        &prefix_embeddings,
+                        prefix_rows,
+                        &prompt_tokens,
+                        &group_limits,
+                        state.qwen.eos_token_id,
+                        &group_stop_token_sequences,
+                        is_group_cancelled,
+                    ),
+                CudaKvCacheMode::Paged => {
+                    if let Some(page_tables) = lease_page_tables {
+                        model
+                            .generate_greedy_tokens_batch_with_prefix_embeddings_paged_page_tables_and_limits_and_cancellation(
+                                &prefix_embeddings,
+                                prefix_rows,
+                                &prompt_tokens,
+                                &group_limits,
+                                state.qwen.eos_token_id,
+                                state.kv_page_size,
+                                &page_tables.tables,
+                                page_tables.physical_page_count,
+                                &group_stop_token_sequences,
+                                is_group_cancelled,
+                            )
+                    } else {
+                        model
+                            .generate_greedy_tokens_batch_with_prefix_embeddings_paged_and_limits_and_cancellation(
+                                &prefix_embeddings,
+                                prefix_rows,
+                                &prompt_tokens,
+                                &group_limits,
+                                state.qwen.eos_token_id,
+                                state.kv_page_size,
+                                &group_stop_token_sequences,
+                                is_group_cancelled,
+                            )
+                    }
+                }
+            },
+            CudaSchedulerSamplingKey::Sampled {
+                temperature_bits,
+                top_p_bits,
+                top_k,
+            } => match state.kv_cache_mode {
+                CudaKvCacheMode::Legacy => model
+                    .generate_sampled_tokens_batch_with_prefix_embeddings_and_limits_and_cancellation(
+                        &prefix_embeddings,
+                        prefix_rows,
+                        &prompt_tokens,
+                        &group_limits,
+                        state.qwen.eos_token_id,
+                        f32::from_bits(temperature_bits),
+                        f32::from_bits(top_p_bits),
+                        top_k,
+                        &group_seeds,
+                        &group_stop_token_sequences,
+                        is_group_cancelled,
+                    ),
+                CudaKvCacheMode::Paged => {
+                    if let Some(page_tables) = lease_page_tables {
+                        model
+                            .generate_sampled_tokens_batch_with_prefix_embeddings_paged_page_tables_and_limits_and_cancellation(
+                                &prefix_embeddings,
+                                prefix_rows,
+                                &prompt_tokens,
+                                &group_limits,
+                                state.qwen.eos_token_id,
+                                f32::from_bits(temperature_bits),
+                                f32::from_bits(top_p_bits),
+                                top_k,
+                                &group_seeds,
+                                state.kv_page_size,
+                                &page_tables.tables,
+                                page_tables.physical_page_count,
+                                &group_stop_token_sequences,
+                                is_group_cancelled,
+                            )
+                    } else {
+                        model
+                            .generate_sampled_tokens_batch_with_prefix_embeddings_paged_and_limits_and_cancellation(
+                                &prefix_embeddings,
+                                prefix_rows,
+                                &prompt_tokens,
+                                &group_limits,
+                                state.qwen.eos_token_id,
+                                f32::from_bits(temperature_bits),
+                                f32::from_bits(top_p_bits),
+                                top_k,
+                                &group_seeds,
+                                state.kv_page_size,
+                                &group_stop_token_sequences,
+                                is_group_cancelled,
+                            )
+                    }
+                }
+            },
+        }
+    };
+    let elapsed = started.elapsed();
+    outcome.batch_plan_eligible_requests = outcome
+        .batch_plan_eligible_requests
+        .saturating_add(candidates.len());
+    match result {
+        Ok(generated) if generated.len() == candidates.len() => {
+            state
+                .multimodal_stats
+                .multimodal_decode_batched_requests
+                .fetch_add(usize_to_u64(candidates.len()), Ordering::Relaxed);
+            let decode_tokens = generated.iter().map(Vec::len).sum::<usize>();
+            let timing = scheduler_token_timing(
+                usize_to_u64(prompt_count.saturating_mul(candidates.len())),
+                usize_to_u64(decode_tokens),
+                elapsed,
+            );
+            add_scheduler_token_timing(outcome, timing);
+            record_batched_scheduler_outcome(
+                outcome,
+                sampling_key,
+                paged_storage,
+                candidates.len(),
+            );
+            for (candidate, generated) in candidates.into_iter().zip(generated) {
+                let idx = candidate.batch_idx;
+                if batch[idx].tx.is_closed() {
+                    outcome.cancelled_requests = outcome.cancelled_requests.saturating_add(1);
+                    continue;
+                }
+                let generation = match cuda_generation_from_tokens_with_prompt_count_and_stops(
+                    &state.cpu_reference,
+                    prompt_count,
+                    generated,
+                    &batch[idx].request.stop_sequences,
+                ) {
+                    Ok(generation) => generation,
+                    Err(err) => {
+                        record_scheduler_sent_error(outcome, &batch[idx].tx, err);
+                        continue;
+                    }
+                };
+                if send_generation_events(&batch[idx].tx, generation).is_err() {
+                    outcome.cancelled_requests = outcome.cancelled_requests.saturating_add(1);
+                } else {
+                    outcome.completed_requests = outcome.completed_requests.saturating_add(1);
+                }
+            }
+        }
+        Ok(generated) => {
+            let expected = candidates.len();
+            for candidate in candidates {
+                record_scheduler_sent_error(
+                    outcome,
+                    &batch[candidate.batch_idx].tx,
+                    anyhow!(
+                        "CUDA batched multimodal decode returned {} output(s) for {} request(s)",
+                        generated.len(),
+                        expected
+                    ),
+                );
+            }
+        }
+        Err(err) => {
+            for candidate in candidates {
+                record_scheduler_sent_error(
+                    outcome,
+                    &batch[candidate.batch_idx].tx,
+                    anyhow!("CUDA batched multimodal decode failed: {err}"),
+                );
+            }
+        }
+    }
+}
+
+fn process_compatible_gpu_batch(
+    state: &CudaSchedulerState,
+    batch: &[CudaSchedulerJob],
+    leases: &[CudaPagedKvCacheLease],
+    max_batched_tokens: usize,
+    encoded: Vec<Vec<u32>>,
+    groups: BTreeMap<(usize, CudaSchedulerSamplingKey), Vec<usize>>,
+) -> CudaSchedulerBatchOutcome {
+    let mut outcome = CudaSchedulerBatchOutcome::default();
+    for ((prompt_len, sampling_key), indexes) in groups {
+        let can_reuse_shared_prefix = |candidate: &[usize], decode_limits: &[usize]| {
+            if state.kv_cache_mode != CudaKvCacheMode::Paged || state.kv_pages.is_none() {
+                return false;
+            }
+            let max_decode_steps = decode_limits.iter().copied().max().unwrap_or(1);
+            let token_capacity = prompt_len
+                .checked_add(max_decode_steps)
+                .unwrap_or(usize::MAX);
+            scheduler_lease_page_tables_for_group(state, candidate, leases, token_capacity)
+                .is_some()
+        };
+        let chunks = scheduler_token_budget_chunks_with_prefix_reuse(
+            &encoded,
+            &indexes,
+            prompt_len,
+            max_batched_tokens,
+            can_reuse_shared_prefix,
+            |idx| generation_max_tokens_usize(&batch[idx].request).unwrap_or(usize::MAX),
+        );
+        record_scheduler_token_budget_split(&mut outcome, indexes.len(), chunks.len());
+        for indexes in chunks {
+            let indexes = retain_open_scheduler_indexes(batch, &indexes, &mut outcome);
+            if indexes.is_empty() {
+                continue;
+            }
+            if indexes.len() >= 2 {
+                let group_inputs = indexes
+                    .iter()
+                    .map(|idx| encoded[*idx].clone())
+                    .collect::<Vec<_>>();
+                let group_limits = indexes
+                    .iter()
+                    .map(|idx| batch[*idx].request.max_tokens.max(1) as usize)
+                    .collect::<Vec<_>>();
+                let group_seeds = indexes
+                    .iter()
+                    .map(|idx| batch[*idx].request.seed)
+                    .collect::<Vec<_>>();
+                let group_stop_token_sequences = match indexes
+                    .iter()
+                    .map(|idx| {
+                        generation_stop_token_sequences(
+                            &state.cpu_reference,
+                            &batch[*idx].request.stop_sequences,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()
+                {
+                    Ok(ids) => ids,
+                    Err(err) => {
+                        for idx in &indexes {
+                            record_scheduler_sent_error(
+                                &mut outcome,
+                                &batch[*idx].tx,
+                                anyhow!("failed to tokenize stop sequences for CUDA batch: {err}"),
+                            );
+                        }
+                        continue;
+                    }
+                };
+                let max_decode_steps = group_limits.iter().copied().max().unwrap_or(1);
+                let token_capacity = prompt_len
+                    .checked_add(max_decode_steps)
+                    .unwrap_or(usize::MAX);
+                let lease_page_tables =
+                    scheduler_lease_page_tables_for_group(state, &indexes, leases, token_capacity);
+                let paged_storage = match state.kv_cache_mode {
+                    CudaKvCacheMode::Legacy => CudaSchedulerPagedBatchStorage::None,
+                    CudaKvCacheMode::Paged if lease_page_tables.is_some() => {
+                        CudaSchedulerPagedBatchStorage::LeaseBacked
+                    }
+                    CudaKvCacheMode::Paged => CudaSchedulerPagedBatchStorage::Internal,
+                };
+                let shared_prefix_reused_tokens = record_scheduler_shared_prefix_reuse(
+                    &mut outcome,
+                    &encoded,
+                    &indexes,
+                    prompt_len,
+                    paged_storage,
+                );
+                let model = match state.gpu_model.lock() {
+                    Ok(model) => model,
+                    Err(_) => {
+                        let err = anyhow!("CUDA gpu model lock poisoned");
+                        for idx in &indexes {
+                            record_scheduler_sent_error(
+                                &mut outcome,
+                                &batch[*idx].tx,
+                                anyhow!("{}", err),
+                            );
+                        }
+                        continue;
+                    }
+                };
+                let started = Instant::now();
+                let is_group_cancelled = |group_idx: usize| {
+                    indexes
+                        .get(group_idx)
+                        .is_none_or(|idx| batch[*idx].tx.is_closed())
+                };
+                let result = match sampling_key {
+                    CudaSchedulerSamplingKey::Greedy => match state.kv_cache_mode {
+                        CudaKvCacheMode::Legacy => model
+                            .generate_greedy_tokens_batch_with_limits_and_cancellation(
+                                &group_inputs,
+                                &group_limits,
+                                state.qwen.eos_token_id,
+                                &group_stop_token_sequences,
+                                is_group_cancelled,
+                            ),
+                        CudaKvCacheMode::Paged => {
+                            if let Some(page_tables) = &lease_page_tables {
+                                model
+                                    .generate_greedy_tokens_batch_paged_with_page_tables_and_cancellation(
+                                        &group_inputs,
+                                        &group_limits,
+                                        state.qwen.eos_token_id,
+                                        state.kv_page_size,
+                                        &page_tables.tables,
+                                        page_tables.physical_page_count,
+                                        &group_stop_token_sequences,
+                                        is_group_cancelled,
+                                    )
+                            } else {
+                                model
+                                    .generate_greedy_tokens_batch_paged_with_limits_and_cancellation(
+                                        &group_inputs,
+                                        &group_limits,
+                                        state.qwen.eos_token_id,
+                                        state.kv_page_size,
+                                        &group_stop_token_sequences,
+                                        is_group_cancelled,
+                                    )
+                            }
+                        }
+                    },
+                    CudaSchedulerSamplingKey::Sampled {
+                        temperature_bits,
+                        top_p_bits,
+                        top_k,
+                    } => match state.kv_cache_mode {
+                        CudaKvCacheMode::Legacy => model
+                            .generate_sampled_tokens_batch_with_limits_and_cancellation(
+                                &group_inputs,
+                                &group_limits,
+                                state.qwen.eos_token_id,
+                                f32::from_bits(temperature_bits),
+                                f32::from_bits(top_p_bits),
+                                top_k,
+                                &group_seeds,
+                                &group_stop_token_sequences,
+                                is_group_cancelled,
+                            ),
+                        CudaKvCacheMode::Paged => {
+                            if let Some(page_tables) = &lease_page_tables {
+                                model
+                                    .generate_sampled_tokens_batch_paged_with_page_tables_and_cancellation(
+                                        &group_inputs,
+                                        &group_limits,
+                                        state.qwen.eos_token_id,
+                                        f32::from_bits(temperature_bits),
+                                        f32::from_bits(top_p_bits),
+                                        top_k,
+                                        &group_seeds,
+                                        state.kv_page_size,
+                                        &page_tables.tables,
+                                        page_tables.physical_page_count,
+                                        &group_stop_token_sequences,
+                                        is_group_cancelled,
+                                    )
+                            } else {
+                                model
+                                    .generate_sampled_tokens_batch_paged_with_limits_and_cancellation(
+                                        &group_inputs,
+                                        &group_limits,
+                                        state.qwen.eos_token_id,
+                                        f32::from_bits(temperature_bits),
+                                        f32::from_bits(top_p_bits),
+                                        top_k,
+                                        &group_seeds,
+                                        state.kv_page_size,
+                                        &group_stop_token_sequences,
+                                        is_group_cancelled,
+                                    )
+                            }
+                        }
+                    },
+                };
+                let elapsed = started.elapsed();
+                match result {
+                    Ok(generated) => {
+                        let decode_tokens = generated.iter().map(Vec::len).sum::<usize>();
+                        let logical_prefill_tokens =
+                            usize_to_u64(prompt_len.saturating_mul(indexes.len()));
+                        let timing = scheduler_token_timing(
+                            logical_prefill_tokens.saturating_sub(shared_prefix_reused_tokens),
+                            usize_to_u64(decode_tokens),
+                            elapsed,
+                        );
+                        add_scheduler_token_timing(&mut outcome, timing);
+                        record_batched_scheduler_outcome(
+                            &mut outcome,
+                            sampling_key,
+                            paged_storage,
+                            indexes.len(),
+                        );
+                        for (idx, generated) in indexes.iter().copied().zip(generated) {
+                            if batch[idx].tx.is_closed() {
+                                outcome.cancelled_requests =
+                                    outcome.cancelled_requests.saturating_add(1);
+                                continue;
+                            }
+                            let generation = match cuda_generation_from_tokens(
+                                &state.cpu_reference,
+                                &encoded[idx],
+                                generated,
+                                &batch[idx].request.stop_sequences,
+                            ) {
+                                Ok(generation) => generation,
+                                Err(err) => {
+                                    record_scheduler_sent_error(&mut outcome, &batch[idx].tx, err);
+                                    continue;
+                                }
+                            };
+                            if send_generation_events(&batch[idx].tx, generation).is_err() {
+                                outcome.cancelled_requests =
+                                    outcome.cancelled_requests.saturating_add(1);
+                            } else {
+                                outcome.completed_requests =
+                                    outcome.completed_requests.saturating_add(1);
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        for idx in &indexes {
+                            record_scheduler_sent_error(
+                                &mut outcome,
+                                &batch[*idx].tx,
+                                anyhow!("{}", err),
+                            );
+                        }
+                    }
+                };
+            } else {
+                let idx = indexes[0];
+                let dispatch = send_single_scheduler_job(state, &batch[idx]);
+                add_scheduler_token_timing(&mut outcome, dispatch.timing);
+                record_scheduler_dispatch_lifecycle(&mut outcome, dispatch);
+                record_scheduler_fallback(
+                    &mut outcome,
+                    CudaSchedulerFallbackReason::BucketSingleton,
+                    1,
+                );
+            }
+        }
+    }
+    outcome
+}
+
+#[cfg(test)]
+fn scheduler_token_budget_chunks<F>(
+    indexes: &[usize],
+    prompt_len: usize,
+    max_batched_tokens: usize,
+    mut max_tokens_for_index: F,
+) -> Vec<Vec<usize>>
+where
+    F: FnMut(usize) -> usize,
+{
+    let limit = max_batched_tokens.max(1);
+    let mut chunks = Vec::new();
+    let mut current = Vec::new();
+    let mut current_tokens = 0usize;
+    for &idx in indexes {
+        let token_budget = prompt_len
+            .max(1)
+            .saturating_add(max_tokens_for_index(idx).max(1));
+        if !current.is_empty() && current_tokens.saturating_add(token_budget) > limit {
+            chunks.push(std::mem::take(&mut current));
+            current_tokens = 0;
+        }
+        current.push(idx);
+        current_tokens = current_tokens.saturating_add(token_budget);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn scheduler_token_budget_chunks_with_prefix_reuse<F, G>(
+    encoded: &[Vec<u32>],
+    indexes: &[usize],
+    prompt_len: usize,
+    max_batched_tokens: usize,
+    mut can_reuse_shared_prefix: G,
+    mut max_tokens_for_index: F,
+) -> Vec<Vec<usize>>
+where
+    F: FnMut(usize) -> usize,
+    G: FnMut(&[usize], &[usize]) -> bool,
+{
+    let limit = max_batched_tokens.max(1);
+    let mut chunks = Vec::new();
+    let mut current = Vec::new();
+    let mut current_decode_limits = Vec::new();
+    for &idx in indexes {
+        let decode_limit = max_tokens_for_index(idx).max(1);
+        let mut candidate = current.clone();
+        candidate.push(idx);
+        let mut candidate_decode_limits = current_decode_limits.clone();
+        candidate_decode_limits.push(decode_limit);
+        let token_budget = scheduler_chunk_token_budget_with_prefix_reuse(
+            encoded,
+            &candidate,
+            &candidate_decode_limits,
+            prompt_len,
+            can_reuse_shared_prefix(&candidate, &candidate_decode_limits),
+        );
+        if !current.is_empty() && token_budget > limit {
+            chunks.push(std::mem::take(&mut current));
+            current_decode_limits.clear();
+        }
+        current.push(idx);
+        current_decode_limits.push(decode_limit);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn scheduler_chunk_token_budget_with_prefix_reuse(
+    encoded: &[Vec<u32>],
+    indexes: &[usize],
+    decode_limits: &[usize],
+    prompt_len: usize,
+    allow_shared_prefix_reuse: bool,
+) -> usize {
+    let prompt_tokens = prompt_len.max(1).saturating_mul(indexes.len());
+    let decode_tokens = decode_limits
+        .iter()
+        .fold(0usize, |sum, limit| sum.saturating_add((*limit).max(1)));
+    let reused_tokens = if allow_shared_prefix_reuse {
+        scheduler_shared_prefix_reused_token_count(encoded, indexes, prompt_len)
+    } else {
+        0
+    };
+    prompt_tokens
+        .saturating_add(decode_tokens)
+        .saturating_sub(reused_tokens)
+}
+
+fn scheduler_lease_page_tables_for_group(
+    state: &CudaSchedulerState,
+    indexes: &[usize],
+    leases: &[CudaPagedKvCacheLease],
+    token_capacity: usize,
+) -> Option<CudaSchedulerLeasePageTables> {
+    if state.kv_cache_mode != CudaKvCacheMode::Paged {
+        return None;
+    }
+    let kv_pages = state.kv_pages.as_ref()?;
+    let pages_per_request = div_ceil_usize(token_capacity.max(1), state.kv_page_size).ok()?;
+    let mut tables = Vec::with_capacity(indexes.len());
+    for idx in indexes {
+        let lease = leases.get(*idx)?;
+        if lease.pages.len() < pages_per_request {
+            return None;
+        }
+        tables.push(lease.pages[..pages_per_request].to_vec());
+    }
+    Some(CudaSchedulerLeasePageTables {
+        tables,
+        physical_page_count: kv_pages.pages_total,
+    })
+}
+
+fn scheduler_sampling_key(request: &GenerationRequest) -> CudaSchedulerSamplingKey {
+    if request_uses_greedy_cuda_defaults(request) {
+        CudaSchedulerSamplingKey::Greedy
+    } else {
+        CudaSchedulerSamplingKey::Sampled {
+            temperature_bits: request.temperature.to_bits(),
+            top_p_bits: request.top_p.to_bits(),
+            top_k: request.top_k,
+        }
+    }
+}
+
+fn retain_open_scheduler_indexes(
+    batch: &[CudaSchedulerJob],
+    indexes: &[usize],
+    outcome: &mut CudaSchedulerBatchOutcome,
+) -> Vec<usize> {
+    let mut retained = Vec::with_capacity(indexes.len());
+    for idx in indexes {
+        if batch[*idx].tx.is_closed() {
+            outcome.cancelled_requests = outcome.cancelled_requests.saturating_add(1);
+        } else {
+            retained.push(*idx);
+        }
+    }
+    retained
+}
+
+fn record_scheduler_fallback(
+    outcome: &mut CudaSchedulerBatchOutcome,
+    reason: CudaSchedulerFallbackReason,
+    count: usize,
+) {
+    outcome.fallback_requests = outcome.fallback_requests.saturating_add(count);
+    match reason {
+        CudaSchedulerFallbackReason::SingleRequest => {
+            outcome.fallback_single_request = outcome.fallback_single_request.saturating_add(count);
+        }
+        CudaSchedulerFallbackReason::Multimodal => {
+            outcome.fallback_multimodal_requests =
+                outcome.fallback_multimodal_requests.saturating_add(count);
+        }
+        CudaSchedulerFallbackReason::Tokenizer => {
+            outcome.fallback_tokenizer_requests =
+                outcome.fallback_tokenizer_requests.saturating_add(count);
+        }
+        CudaSchedulerFallbackReason::BucketSingleton => {
+            outcome.fallback_bucket_requests =
+                outcome.fallback_bucket_requests.saturating_add(count);
+        }
+        CudaSchedulerFallbackReason::Other => {
+            outcome.fallback_other_requests = outcome.fallback_other_requests.saturating_add(count);
+        }
+    }
+}
+
+fn record_batched_scheduler_outcome(
+    outcome: &mut CudaSchedulerBatchOutcome,
+    sampling_key: CudaSchedulerSamplingKey,
+    paged_storage: CudaSchedulerPagedBatchStorage,
+    count: usize,
+) {
+    outcome.gpu_batched_batches = outcome.gpu_batched_batches.saturating_add(1);
+    outcome.gpu_batched_requests = outcome.gpu_batched_requests.saturating_add(count);
+    match paged_storage {
+        CudaSchedulerPagedBatchStorage::None => {}
+        CudaSchedulerPagedBatchStorage::LeaseBacked => {
+            outcome.paged_lease_batched_requests =
+                outcome.paged_lease_batched_requests.saturating_add(count);
+        }
+        CudaSchedulerPagedBatchStorage::Internal => {
+            outcome.paged_internal_batched_requests = outcome
+                .paged_internal_batched_requests
+                .saturating_add(count);
+        }
+    }
+    match sampling_key {
+        CudaSchedulerSamplingKey::Greedy => {
+            outcome.greedy_batched_requests = outcome.greedy_batched_requests.saturating_add(count);
+        }
+        CudaSchedulerSamplingKey::Sampled { .. } => {
+            outcome.sampled_batched_requests =
+                outcome.sampled_batched_requests.saturating_add(count);
+        }
+    }
+}
+
+fn record_scheduler_dispatch_lifecycle(
+    outcome: &mut CudaSchedulerBatchOutcome,
+    dispatch: CudaSchedulerDispatch,
+) {
+    if dispatch.completed {
+        outcome.completed_requests = outcome.completed_requests.saturating_add(1);
+    }
+    if dispatch.errored {
+        outcome.errored_requests = outcome.errored_requests.saturating_add(1);
+    }
+    if dispatch.cancelled {
+        outcome.cancelled_requests = outcome.cancelled_requests.saturating_add(1);
+    }
+}
+
+fn record_scheduler_sent_error(
+    outcome: &mut CudaSchedulerBatchOutcome,
+    tx: &tokio::sync::mpsc::Sender<Result<GenerationEvent>>,
+    err: anyhow::Error,
+) {
+    if send_scheduler_error(tx, err).is_err() {
+        outcome.cancelled_requests = outcome.cancelled_requests.saturating_add(1);
+    } else {
+        outcome.errored_requests = outcome.errored_requests.saturating_add(1);
+    }
+}
+
+fn record_scheduler_shared_prefix_reuse(
+    outcome: &mut CudaSchedulerBatchOutcome,
+    encoded: &[Vec<u32>],
+    indexes: &[usize],
+    prompt_len: usize,
+    paged_storage: CudaSchedulerPagedBatchStorage,
+) -> u64 {
+    if paged_storage != CudaSchedulerPagedBatchStorage::LeaseBacked {
+        return 0;
+    }
+    let reused_tokens = usize_to_u64(scheduler_shared_prefix_reused_token_count(
+        encoded, indexes, prompt_len,
+    ));
+    if reused_tokens == 0 {
+        return 0;
+    }
+    outcome.shared_prefix_batches = outcome.shared_prefix_batches.saturating_add(1);
+    outcome.shared_prefix_requests = outcome.shared_prefix_requests.saturating_add(indexes.len());
+    outcome.shared_prefix_tokens = outcome.shared_prefix_tokens.saturating_add(reused_tokens);
+    reused_tokens
+}
+
+fn scheduler_shared_prefix_reused_token_count(
+    encoded: &[Vec<u32>],
+    indexes: &[usize],
+    prompt_len: usize,
+) -> usize {
+    let shared_tokens = scheduler_shared_prefix_len(encoded, indexes);
+    if shared_tokens == 0 || shared_tokens >= prompt_len {
+        0
+    } else {
+        shared_tokens.saturating_mul(indexes.len().saturating_sub(1))
+    }
+}
+
+fn scheduler_shared_prefix_len(encoded: &[Vec<u32>], indexes: &[usize]) -> usize {
+    if indexes.len() < 2 {
+        return 0;
+    }
+    let Some(first) = indexes.first().and_then(|idx| encoded.get(*idx)) else {
+        return 0;
+    };
+    let mut shared = first.len();
+    for idx in indexes.iter().skip(1) {
+        let Some(tokens) = encoded.get(*idx) else {
+            return 0;
+        };
+        shared = shared.min(tokens.len());
+        for pos in 0..shared {
+            if first[pos] != tokens[pos] {
+                shared = pos;
+                break;
+            }
+        }
+        if shared == 0 {
+            break;
+        }
+    }
+    shared
+}
+
+fn add_scheduler_token_timing(
+    outcome: &mut CudaSchedulerBatchOutcome,
+    timing: CudaSchedulerTokenTiming,
+) {
+    outcome.prefill_tokens = outcome.prefill_tokens.saturating_add(timing.prefill_tokens);
+    outcome.decode_tokens = outcome.decode_tokens.saturating_add(timing.decode_tokens);
+    outcome.prefill_micros = outcome.prefill_micros.saturating_add(timing.prefill_micros);
+    outcome.decode_micros = outcome.decode_micros.saturating_add(timing.decode_micros);
+}
+
+fn scheduler_token_timing(
+    prefill_tokens: u64,
+    decode_tokens: u64,
+    elapsed: Duration,
+) -> CudaSchedulerTokenTiming {
+    let total_tokens = prefill_tokens.saturating_add(decode_tokens);
+    if total_tokens == 0 {
+        return CudaSchedulerTokenTiming::default();
+    }
+    let elapsed_micros = duration_micros_u64(elapsed).max(1);
+    let (prefill_micros, decode_micros) = match (prefill_tokens > 0, decode_tokens > 0) {
+        (true, true) => {
+            let mut prefill_micros = ((u128::from(elapsed_micros)
+                .saturating_mul(u128::from(prefill_tokens)))
+                / u128::from(total_tokens))
+            .min(u128::from(u64::MAX)) as u64;
+            if prefill_micros == 0 {
+                prefill_micros = 1;
+            }
+            let mut decode_micros = elapsed_micros.saturating_sub(prefill_micros);
+            if decode_micros == 0 {
+                decode_micros = 1;
+            }
+            (prefill_micros, decode_micros)
+        }
+        (true, false) => (elapsed_micros, 0),
+        (false, true) => (0, elapsed_micros),
+        (false, false) => (0, 0),
+    };
+    CudaSchedulerTokenTiming {
+        prefill_tokens,
+        decode_tokens,
+        prefill_micros,
+        decode_micros,
+    }
+}
+
+fn duration_micros_u64(duration: Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn scheduler_tokens_per_second(tokens: u64, micros: u64) -> u64 {
+    if tokens == 0 || micros == 0 {
+        return 0;
+    }
+    ((u128::from(tokens).saturating_mul(1_000_000)) / u128::from(micros)).min(u128::from(u64::MAX))
+        as u64
+}
+
+fn ratio_per_mille(numerator: u64, denominator: u64) -> u64 {
+    if numerator == 0 || denominator == 0 {
+        return 0;
+    }
+    ((u128::from(numerator).saturating_mul(1_000)) / u128::from(denominator))
+        .min(u128::from(u64::MAX)) as u64
+}
+
+fn average_u64(total: u64, count: u64) -> u64 {
+    if total == 0 || count == 0 {
+        return 0;
+    }
+    total / count
+}
+
+fn kv_cache_pressure_label(snapshot: &CudaPagedKvCacheSnapshot) -> &'static str {
+    if snapshot.pages_total == 0 {
+        return "unavailable";
+    }
+    if snapshot.pages_free == 0 {
+        return "exhausted";
+    }
+    if ratio_per_mille(snapshot.pages_used as u64, snapshot.pages_total as u64) >= 900 {
+        return "high";
+    }
+    "normal"
+}
+
+fn usize_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn send_single_scheduler_job(
+    state: &CudaSchedulerState,
+    job: &CudaSchedulerJob,
+) -> CudaSchedulerDispatch {
+    if job.tx.is_closed() {
+        return CudaSchedulerDispatch {
+            cancelled: true,
+            ..CudaSchedulerDispatch::default()
+        };
+    }
+    let started = Instant::now();
+    let result = generate_events_gpu_from_with_cancellation(
+        &state.gpu_model,
+        &state.cpu_reference,
+        &state.qwen,
+        &job.request,
+        state.max_output_tokens,
+        state.kv_cache_mode,
+        state.kv_page_size,
+        || job.tx.is_closed(),
+    )
+    .map(|generation| {
+        let timing = scheduler_token_timing(
+            generation.output.prompt_tokens,
+            generation.output.completion_tokens,
+            started.elapsed(),
+        );
+        (generation_events(generation), timing)
+    });
+    match result {
+        Ok((events, timing)) => {
+            if send_scheduler_events(&job.tx, events).is_err() {
+                CudaSchedulerDispatch {
+                    timing,
+                    cancelled: true,
+                    ..CudaSchedulerDispatch::default()
+                }
+            } else {
+                CudaSchedulerDispatch {
+                    timing,
+                    completed: true,
+                    ..CudaSchedulerDispatch::default()
+                }
+            }
+        }
+        Err(err) => {
+            let cancelled = send_scheduler_error(&job.tx, err).is_err();
+            CudaSchedulerDispatch {
+                cancelled,
+                errored: !cancelled,
+                ..CudaSchedulerDispatch::default()
+            }
+        }
+    }
+}
+
+fn send_single_scheduler_multimodal_job(
+    state: &CudaSchedulerState,
+    job: &CudaSchedulerJob,
+) -> CudaSchedulerDispatch {
+    if job.tx.is_closed() {
+        return CudaSchedulerDispatch {
+            cancelled: true,
+            ..CudaSchedulerDispatch::default()
+        };
+    }
+    record_multimodal_request_metrics(&state.multimodal_stats, &job.request);
+    let started = Instant::now();
+    let result = project_media_inputs_with_stats(
+        state.mmproj.as_ref(),
+        &state.multimodal_stats,
+        &job.request.media_inputs,
+    )
+    .and_then(|projection| {
+        generate_events_gpu_with_visual_prefix_from(
+            &state.gpu_model,
+            &state.cpu_reference,
+            &state.qwen,
+            &job.request,
+            state.max_output_tokens,
+            state.kv_cache_mode,
+            state.kv_page_size,
+            projection,
+            &state.multimodal_stats,
+        )
+    })
+    .map(|generation| {
+        let timing = scheduler_token_timing(
+            generation.output.prompt_tokens,
+            generation.output.completion_tokens,
+            started.elapsed(),
+        );
+        (generation_events(generation), timing)
+    });
+    match result {
+        Ok((events, timing)) => {
+            if send_scheduler_events(&job.tx, events).is_err() {
+                CudaSchedulerDispatch {
+                    timing,
+                    cancelled: true,
+                    ..CudaSchedulerDispatch::default()
+                }
+            } else {
+                CudaSchedulerDispatch {
+                    timing,
+                    completed: true,
+                    ..CudaSchedulerDispatch::default()
+                }
+            }
+        }
+        Err(err) => {
+            let cancelled = send_scheduler_error(&job.tx, err).is_err();
+            CudaSchedulerDispatch {
+                cancelled,
+                errored: !cancelled,
+                ..CudaSchedulerDispatch::default()
+            }
+        }
+    }
+}
+
+fn record_multimodal_request_metrics(stats: &CudaMultimodalStats, request: &GenerationRequest) {
+    stats.multimodal_requests.fetch_add(1, Ordering::Relaxed);
+    stats.multimodal_media_inputs.fetch_add(
+        u64::try_from(request.media_inputs.len()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+}
+
+fn record_scheduler_queue_wait(
+    stats: &CudaSchedulerStats,
+    batch: &[CudaSchedulerJob],
+    observed_at: Instant,
+) {
+    if batch.is_empty() {
+        return;
+    }
+    let mut total_micros = 0u64;
+    let mut max_micros = 0u64;
+    for job in batch {
+        let wait_micros =
+            duration_micros_u64(observed_at.saturating_duration_since(job.submitted_at));
+        total_micros = total_micros.saturating_add(wait_micros);
+        max_micros = max_micros.max(wait_micros);
+    }
+    stats.queue_waited_requests.fetch_add(
+        u64::try_from(batch.len()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+    stats
+        .queue_wait_micros
+        .fetch_add(total_micros, Ordering::Relaxed);
+    update_atomic_max_u64(&stats.max_queue_wait_micros, max_micros);
+}
+
+fn record_scheduler_idle_wait(
+    stats: &CudaSchedulerStats,
+    idle_started: Instant,
+    observed_at: Instant,
+) {
+    let idle_micros = duration_micros_u64(observed_at.saturating_duration_since(idle_started));
+    stats.idle_wakeups.fetch_add(1, Ordering::Relaxed);
+    stats.idle_micros.fetch_add(idle_micros, Ordering::Relaxed);
+    update_atomic_max_u64(&stats.max_idle_micros, idle_micros);
+}
+
+fn send_generation_events(
+    tx: &tokio::sync::mpsc::Sender<Result<GenerationEvent>>,
+    generation: CudaGeneration,
+) -> Result<(), ()> {
+    send_scheduler_events(tx, generation_events(generation))
+}
+
+fn send_scheduler_events(
+    tx: &tokio::sync::mpsc::Sender<Result<GenerationEvent>>,
+    events: Vec<GenerationEvent>,
+) -> Result<(), ()> {
+    for event in events {
+        tx.blocking_send(Ok(event)).map_err(|_| ())?;
+    }
+    Ok(())
+}
+
+fn send_scheduler_error(
+    tx: &tokio::sync::mpsc::Sender<Result<GenerationEvent>>,
+    err: anyhow::Error,
+) -> Result<(), ()> {
+    tx.blocking_send(Err(err)).map_err(|_| ())
+}
+
+fn generation_events(generation: CudaGeneration) -> Vec<GenerationEvent> {
+    let mut events = generation
+        .deltas
+        .into_iter()
+        .map(|(token_id, text)| GenerationEvent::TokenDelta { token_id, text })
+        .collect::<Vec<_>>();
+    events.push(GenerationEvent::Finished {
+        output: generation.output,
+    });
+    events
+}
+
+fn cuda_generation_from_tokens(
+    cpu_reference: &qwen_cpu::QwenCpuReference,
+    prompt_tokens: &[u32],
+    generated: Vec<u32>,
+    stop_sequences: &[String],
+) -> Result<CudaGeneration> {
+    cuda_generation_from_tokens_with_prompt_count_and_stops(
+        cpu_reference,
+        prompt_tokens.len(),
+        generated,
+        stop_sequences,
+    )
+}
+
+fn cuda_generation_from_tokens_with_prompt_count_and_stops(
+    cpu_reference: &qwen_cpu::QwenCpuReference,
+    prompt_count: usize,
+    generated: Vec<u32>,
+    stop_sequences: &[String],
+) -> Result<CudaGeneration> {
+    let stop_token_sequences = generation_stop_token_sequences(cpu_reference, stop_sequences)?;
+    let (generated, completion_tokens) =
+        trim_generated_tokens_at_stop(generated, &stop_token_sequences);
+    let mut deltas = Vec::new();
+    let mut previous_text = String::new();
+    for (idx, next) in generated.iter().copied().enumerate() {
+        let current_text = cpu_reference.tokenizer().decode(&generated[..=idx])?;
+        let delta = current_text
+            .strip_prefix(&previous_text)
+            .unwrap_or(&current_text)
+            .to_string();
+        previous_text = current_text;
+        if !delta.is_empty() {
+            deltas.push((next, delta));
+        }
+    }
+
+    Ok(CudaGeneration {
+        deltas,
+        output: GenerationOutput {
+            text: cpu_reference.tokenizer().decode(&generated)?,
+            prompt_tokens: prompt_count as u64,
+            completion_tokens: completion_tokens as u64,
+        },
+    })
+}
+
+fn generation_stop_token_sequences(
+    cpu_reference: &qwen_cpu::QwenCpuReference,
+    stop_sequences: &[String],
+) -> Result<Vec<Vec<u32>>> {
+    let mut token_sequences = Vec::new();
+    for stop in stop_sequences {
+        if stop.is_empty() {
+            continue;
+        }
+        let tokens = cpu_reference.tokenizer().encode(stop)?;
+        if tokens.is_empty() {
+            continue;
+        }
+        if cpu_reference.tokenizer().decode(&tokens)? == *stop {
+            token_sequences.push(tokens);
+        }
+    }
+    Ok(token_sequences)
+}
+
+fn trim_generated_tokens_at_stop(
+    generated: Vec<u32>,
+    stop_token_sequences: &[Vec<u32>],
+) -> (Vec<u32>, usize) {
+    let Some((start, stop_len)) = generated_stop_match(&generated, stop_token_sequences) else {
+        let completion_tokens = generated.len();
+        return (generated, completion_tokens);
+    };
+    let completion_tokens = start.saturating_add(stop_len);
+    (generated[..start].to_vec(), completion_tokens)
+}
+
+fn generated_stop_match(
+    generated: &[u32],
+    stop_token_sequences: &[Vec<u32>],
+) -> Option<(usize, usize)> {
+    let mut best = None;
+    for stop in stop_token_sequences {
+        if stop.is_empty() || stop.len() > generated.len() {
+            continue;
+        }
+        for start in 0..=generated.len() - stop.len() {
+            if generated[start..start + stop.len()] != stop[..] {
+                continue;
+            }
+            match best {
+                Some((best_start, best_len))
+                    if best_start < start || (best_start == start && best_len <= stop.len()) => {}
+                _ => best = Some((start, stop.len())),
+            }
+            break;
+        }
+    }
+    best
+}
+
+fn generated_ends_with_stop_sequence(generated: &[u32], stop_token_sequences: &[Vec<u32>]) -> bool {
+    stop_token_sequences.iter().any(|stop| {
+        !stop.is_empty()
+            && stop.len() <= generated.len()
+            && generated[generated.len() - stop.len()..] == stop[..]
+    })
+}
+
+fn update_atomic_max(target: &AtomicUsize, value: usize) {
+    let mut current = target.load(Ordering::Relaxed);
+    while value > current {
+        match target.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(next) => current = next,
+        }
+    }
+}
+
+fn update_atomic_max_u64(target: &AtomicU64, value: u64) {
+    let mut current = target.load(Ordering::Relaxed);
+    while value > current {
+        match target.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(next) => current = next,
+        }
+    }
+}
+
+fn try_acquire_scheduler_slot(
+    target: &AtomicUsize,
+    limit: usize,
+) -> std::result::Result<usize, usize> {
+    let limit = limit.max(1);
+    let mut current = target.load(Ordering::Relaxed);
+    loop {
+        if current >= limit {
+            return Err(current);
+        }
+        let next = current.saturating_add(1);
+        match target.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Ok(next),
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn release_scheduler_slots(target: &AtomicUsize, count: usize) {
+    if count == 0 {
+        return;
+    }
+    let mut current = target.load(Ordering::Relaxed);
+    loop {
+        let next = current.saturating_sub(count);
+        match target.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+#[async_trait]
+impl InferenceBackend for CudaBackend {
+    fn model(&self) -> &ModelInfo {
+        &self.model
+    }
+
+    fn chat_template(&self) -> Option<&str> {
+        self.chat_template.as_deref()
+    }
+
+    fn health(&self) -> BackendHealth {
+        let scheduler = self
+            .scheduler
+            .as_ref()
+            .map(|scheduler| scheduler.snapshot());
+        let attention = self.attention_health_status();
+        BackendHealth {
+            backend: "cuda".to_string(),
+            ready: true,
+            family: self.qwen.family.label().to_string(),
+            quantization: format!(
+                "{}; execution={}; {}; {}; kv-cache={}; gpu-features={}; prefix-cache={}; attention={}; attention-detail={}; sampling={}; batch=max_size={},max_active_requests={},max_batched_tokens={},max_wait_us={},max_wait_us_cap={}; scheduler={}; multimodal-batching={}; multimodal-metrics={}; multimodal={}",
+                self.qwen.quantization_label(),
+                self.execution.label(),
+                self.runtime_status(),
+                self.gpu_status(),
+                self.kv_cache_status(),
+                self.gpu_feature_status(),
+                self.prefix_cache_status(scheduler),
+                attention.status,
+                attention.detail,
+                if self.execution == CudaExecution::Gpu {
+                    "batched"
+                } else {
+                    "single"
+                },
+                self.config.max_batch_size,
+                self.config.max_active_requests,
+                self.config.max_batched_tokens,
+                self.config.max_wait_us,
+                CUDA_SCHEDULER_MAX_WAIT_US,
+                match scheduler {
+                    Some(snapshot) => {
+                        let prefill_tps = scheduler_tokens_per_second(
+                            snapshot.prefill_tokens,
+                            snapshot.prefill_micros,
+                        );
+                        let decode_tps = scheduler_tokens_per_second(
+                            snapshot.decode_tokens,
+                            snapshot.decode_micros,
+                        );
+                        let admission_handled_pages = snapshot
+                            .admission_granted_pages
+                            .saturating_add(snapshot.admission_rejected_pages);
+                        let admission_page_grant_per_mille = ratio_per_mille(
+                            snapshot.admission_granted_pages,
+                            admission_handled_pages,
+                        );
+                        let admission_page_reject_per_mille = ratio_per_mille(
+                            snapshot.admission_rejected_pages,
+                            admission_handled_pages,
+                        );
+                        let admission_requested_pages_avg = average_u64(
+                            snapshot.admission_requested_pages,
+                            snapshot.admission_page_requests,
+                        );
+                        let capacity_rejected_active_requests_avg = average_u64(
+                            snapshot.capacity_rejected_active_requests_total,
+                            snapshot.capacity_rejected_requests,
+                        );
+                        format!(
+                            "enabled,mode={},continuous_kv_backend={},total_batches={},total_requests={},gpu_batched_batches={},gpu_batched_requests={},paged_lease_batched_requests={},paged_internal_batched_requests={},greedy_batched_requests={},sampled_batched_requests={},shared_prefix_batches={},shared_prefix_requests={},shared_prefix_tokens_total={},fallback_requests={},fallback_single_request={},fallback_moe_requests={},fallback_multimodal_requests={},fallback_tokenizer_requests={},fallback_bucket_requests={},fallback_other_requests={},batch_plan_eligible_requests={},batch_plan_ineligible_requests={},token_budget_split_groups={},token_budget_split_requests={},token_budget_split_chunks={},continuous_step_admissions={},continuous_admitted_requests={},continuous_decode_iterations={},continuous_prefill_batches={},continuous_prefill_requests={},continuous_append_decode_batches={},continuous_append_decode_requests={},continuous_mid_decode_retirements={},continuous_mid_decode_cancellations={},completed_requests={},errored_requests={},cancelled_requests={},capacity_rejected_requests={},capacity_max_active_rejected_requests={},capacity_rejected_active_requests_total={},capacity_rejected_active_requests_max={},capacity_rejected_active_requests_avg={},admission_rejected_requests={},admission_errored_requests={},admission_cancelled_requests={},admission_context_rejected_requests={},admission_invalid_request_rejected_requests={},admission_memory_rejected_requests={},admission_other_rejected_requests={},admission_requested_pages={},admission_granted_pages={},admission_rejected_pages={},admission_page_requests={},admission_requested_pages_max={},admission_requested_pages_avg={},admission_granted_pages_max={},admission_rejected_pages_max={},admission_page_grant_per_mille={},admission_page_reject_per_mille={},max_observed={},peak_pending={},pending={},queued_requests={},queue_waited_requests={},queue_wait_micros_total={},queue_wait_micros_max={},peak_inflight_requests={},inflight_requests={},active={},active_requests={},prefill_tokens_total={},decode_tokens_total={},prefill_micros_total={},decode_micros_total={},tokens_per_sec_prefill={},tokens_per_sec_decode={},idle_wakeups={},idle_micros_total={},idle_micros_max={}",
+                            self.scheduler_mode(),
+                            self.continuous_kv_backend(),
+                            snapshot.total_batches,
+                            snapshot.total_requests,
+                            snapshot.gpu_batched_batches,
+                            snapshot.gpu_batched_requests,
+                            snapshot.paged_lease_batched_requests,
+                            snapshot.paged_internal_batched_requests,
+                            snapshot.greedy_batched_requests,
+                            snapshot.sampled_batched_requests,
+                            snapshot.shared_prefix_batches,
+                            snapshot.shared_prefix_requests,
+                            snapshot.shared_prefix_tokens,
+                            snapshot.fallback_requests,
+                            snapshot.fallback_single_request,
+                            snapshot.fallback_moe_requests,
+                            snapshot.fallback_multimodal_requests,
+                            snapshot.fallback_tokenizer_requests,
+                            snapshot.fallback_bucket_requests,
+                            snapshot.fallback_other_requests,
+                            snapshot.batch_plan_eligible_requests,
+                            snapshot.batch_plan_ineligible_requests,
+                            snapshot.token_budget_split_groups,
+                            snapshot.token_budget_split_requests,
+                            snapshot.token_budget_split_chunks,
+                            snapshot.continuous_step_admissions,
+                            snapshot.continuous_admitted_requests,
+                            snapshot.continuous_decode_iterations,
+                            snapshot.continuous_prefill_batches,
+                            snapshot.continuous_prefill_requests,
+                            snapshot.continuous_append_decode_batches,
+                            snapshot.continuous_append_decode_requests,
+                            snapshot.continuous_mid_decode_retirements,
+                            snapshot.continuous_mid_decode_cancellations,
+                            snapshot.completed_requests,
+                            snapshot.errored_requests,
+                            snapshot.cancelled_requests,
+                            snapshot.capacity_rejected_requests,
+                            snapshot.capacity_max_active_rejected_requests,
+                            snapshot.capacity_rejected_active_requests_total,
+                            snapshot.capacity_rejected_active_requests_max,
+                            capacity_rejected_active_requests_avg,
+                            snapshot.admission_rejected_requests,
+                            snapshot.admission_errored_requests,
+                            snapshot.admission_cancelled_requests,
+                            snapshot.admission_context_rejected_requests,
+                            snapshot.admission_invalid_request_rejected_requests,
+                            snapshot.admission_memory_rejected_requests,
+                            snapshot.admission_other_rejected_requests,
+                            snapshot.admission_requested_pages,
+                            snapshot.admission_granted_pages,
+                            snapshot.admission_rejected_pages,
+                            snapshot.admission_page_requests,
+                            snapshot.admission_requested_pages_max,
+                            admission_requested_pages_avg,
+                            snapshot.admission_granted_pages_max,
+                            snapshot.admission_rejected_pages_max,
+                            admission_page_grant_per_mille,
+                            admission_page_reject_per_mille,
+                            snapshot.max_observed_batch,
+                            snapshot.peak_pending_requests,
+                            snapshot.pending_requests,
+                            snapshot.pending_requests,
+                            snapshot.queue_waited_requests,
+                            snapshot.queue_wait_micros,
+                            snapshot.max_queue_wait_micros,
+                            snapshot.peak_inflight_requests,
+                            snapshot.inflight_requests,
+                            snapshot.active_batch_size,
+                            snapshot.inflight_requests,
+                            snapshot.prefill_tokens,
+                            snapshot.decode_tokens,
+                            snapshot.prefill_micros,
+                            snapshot.decode_micros,
+                            prefill_tps,
+                            decode_tps,
+                            snapshot.idle_wakeups,
+                            snapshot.idle_micros,
+                            snapshot.max_idle_micros
+                        )
+                    }
+                    None => "disabled".to_string(),
+                },
+                self.multimodal_batching_status(),
+                self.multimodal_metrics_status(),
+                self.multimodal_status()
+            ),
+            context_length: Some(self.qwen.context_length),
+            memory_estimate_bytes: Some(self.qwen.total_tensor_bytes),
+        }
+    }
+
+    fn multimodal_support(&self) -> MultimodalSupport {
+        match &self.mmproj {
+            Some(_) if self.supports_multimodal_generation() => {
+                MultimodalSupport::image_video_generation(self.multimodal_status())
+            }
+            Some(_) => {
+                MultimodalSupport::image_video_inputs_without_generation(self.multimodal_status())
+            }
+            None => MultimodalSupport::text_only(),
+        }
+    }
+
+    fn sampling_defaults(&self) -> SamplingDefaults {
+        match self.execution {
+            CudaExecution::Gpu => SamplingDefaults {
+                temperature: 0.0,
+                top_p: 1.0,
+            },
+            CudaExecution::CpuReference => SamplingDefaults::default(),
+        }
+    }
+
+    async fn stream_generate(&self, request: GenerationRequest) -> Result<GenerationStream> {
+        validate_generation_sampling_parameters(&request)?;
+        validate_generation_max_tokens(&request, self.model.max_output_tokens)?;
+        if self.execution == CudaExecution::Gpu {
+            let scheduler = self
+                .scheduler
+                .as_ref()
+                .ok_or_else(|| anyhow!("CUDA generation scheduler is unavailable"))?;
+            return scheduler.submit(request).await;
+        }
+
+        let events = generation_events(self.generate_events(&request)?)
+            .into_iter()
+            .map(Ok)
+            .collect::<Vec<_>>();
+        Ok(Box::pin(stream::iter(events)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+
+    #[cfg(feature = "native-cuda")]
+    use anyhow::Result;
+    use anyhow::anyhow;
+    use futures_util::StreamExt;
+    #[cfg(feature = "native-cuda")]
+    use hi_local_core::backend::{GenerationOutput, GenerationStream};
+    use hi_local_core::backend::{
+        GenerationRequest, ImageInput, ImageSource, InferenceBackend, MultimodalInput,
+    };
+    #[cfg(feature = "native-cuda")]
+    use hi_local_core::backend::{VideoInput, VideoSource};
+
+    #[cfg(feature = "native-cuda")]
+    const LLAMA3_CHAT_TEMPLATE: &str = "{{ bos_token }}{% for message in messages %}<|start_header_id|>{{ message['role'] }}<|end_header_id|>\n\n{{ message['content'] }}<|eot_id|>{% endfor %}{% if add_generation_prompt %}<|start_header_id|>assistant<|end_header_id|>\n\n{% endif %}";
+
+    #[cfg(not(feature = "native-cuda"))]
+    use super::runtime::CudaRuntime;
+    use super::{CudaBackend, CudaExecution};
+
+    #[cfg(not(feature = "native-cuda"))]
+    #[test]
+    fn probe_reports_missing_native_feature() {
+        let err = CudaRuntime::probe().unwrap_err().to_string();
+        assert!(err.contains("built without native-cuda"));
+    }
+
+    #[cfg(not(feature = "native-cuda"))]
+    #[test]
+    fn kernel_module_reports_native_cuda_disabled() {
+        assert!(!crate::kernels::native_cuda_kernels_enabled());
+    }
+
+    #[test]
+    fn qwen_vl_image_preprocess_decodes_and_extracts_patches() {
+        let bytes = rgb_png_bytes(1, 1, &[255, 0, 128]);
+        let info = crate::gpu::CudaVisionEncoderInfo {
+            tensor_count: 0,
+            total_tensor_bytes: 0,
+            architecture: "qwen2vl".to_string(),
+            variant: "qwen2-vl".to_string(),
+            patch_size: 1,
+            temporal_patch_size: 2,
+            tokens_per_second: 1,
+            spatial_merge_size: 1,
+            min_pixels: 1,
+            max_pixels: 1,
+            image_mean: [0.0, 0.0, 0.0],
+            image_std: [1.0, 1.0, 1.0],
+            hidden_dim: 4,
+            feed_forward_dim: 4,
+            output_dim: 2,
+            block_count: 1,
+            head_count: 1,
+            total_device_bytes: 0,
+            matrix_count: 0,
+            vector_count: 0,
+            uses_window_attention: false,
+        };
+
+        let (patches, grid) = super::image_bytes_to_qwen_vl_patches(&bytes, &info).unwrap();
+
+        assert_eq!(grid, [1, 1, 1]);
+        assert_close_vec(
+            &patches,
+            &[1.0, 1.0, 0.0, 0.0, 128.0 / 255.0, 128.0 / 255.0],
+        );
+    }
+
+    #[test]
+    fn qwen_vl_language_media_positions_follow_grid_order() {
+        let positions = super::qwen_vl_language_media_positions([1, 2, 2], 1).unwrap();
+
+        assert_eq!(positions, vec![[0, 0, 0], [0, 0, 1], [0, 1, 0], [0, 1, 1]]);
+    }
+
+    #[test]
+    fn qwen_vl_language_video_positions_apply_temporal_interval() {
+        let positions = super::qwen_vl_language_media_positions([3, 1, 1], 4).unwrap();
+
+        assert_eq!(positions, vec![[0, 0, 0], [4, 0, 0], [8, 0, 0]]);
+    }
+
+    #[test]
+    fn scheduler_batch_respects_max_size() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(1usize).unwrap();
+        tx.send(2usize).unwrap();
+        tx.send(3usize).unwrap();
+
+        let first = rx.recv().unwrap();
+        let batch = super::recv_scheduler_batch(&rx, first, 2, 100_000);
+
+        assert_eq!(batch, vec![1, 2]);
+        assert_eq!(rx.try_recv().unwrap(), 3);
+    }
+
+    #[test]
+    fn scheduler_batch_can_skip_waiting() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send("first").unwrap();
+        tx.send("second").unwrap();
+
+        let first = rx.recv().unwrap();
+        let batch = super::recv_scheduler_batch(&rx, first, 8, 0);
+
+        assert_eq!(batch, vec!["first", "second"]);
+    }
+
+    #[test]
+    fn scheduler_batch_handles_unrepresentable_wait_deadline() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send(2usize).unwrap();
+
+        let batch = super::recv_scheduler_batch(&rx, 1usize, 4, u64::MAX);
+
+        assert_eq!(batch, vec![1, 2]);
+    }
+
+    #[test]
+    fn scheduler_shared_prefix_len_counts_common_tokens() {
+        let encoded = vec![
+            vec![1, 2, 3, 4],
+            vec![1, 2, 9, 4],
+            vec![1, 2, 3],
+            vec![7, 2, 3],
+        ];
+
+        assert_eq!(super::scheduler_shared_prefix_len(&encoded, &[0, 1, 2]), 2);
+        assert_eq!(super::scheduler_shared_prefix_len(&encoded, &[0, 3]), 0);
+        assert_eq!(super::scheduler_shared_prefix_len(&encoded, &[0]), 0);
+        assert_eq!(super::scheduler_shared_prefix_len(&encoded, &[0, 99]), 0);
+    }
+
+    #[test]
+    fn scheduler_shared_prefix_reuse_counts_only_lease_backed_partial_prefixes() {
+        let encoded = vec![vec![1, 2, 3], vec![1, 2, 4], vec![1, 2, 5]];
+        let mut outcome = super::CudaSchedulerBatchOutcome::default();
+        let skipped = super::record_scheduler_shared_prefix_reuse(
+            &mut outcome,
+            &encoded,
+            &[0, 1, 2],
+            3,
+            super::CudaSchedulerPagedBatchStorage::Internal,
+        );
+        assert_eq!(skipped, 0);
+        assert_eq!(outcome.shared_prefix_batches, 0);
+
+        let reused = super::record_scheduler_shared_prefix_reuse(
+            &mut outcome,
+            &encoded,
+            &[0, 1, 2],
+            3,
+            super::CudaSchedulerPagedBatchStorage::LeaseBacked,
+        );
+        assert_eq!(reused, 4);
+        assert_eq!(outcome.shared_prefix_batches, 1);
+        assert_eq!(outcome.shared_prefix_requests, 3);
+        assert_eq!(outcome.shared_prefix_tokens, 4);
+
+        let identical = vec![vec![1, 2], vec![1, 2]];
+        let mut identical_outcome = super::CudaSchedulerBatchOutcome::default();
+        let identical_reused = super::record_scheduler_shared_prefix_reuse(
+            &mut identical_outcome,
+            &identical,
+            &[0, 1],
+            2,
+            super::CudaSchedulerPagedBatchStorage::LeaseBacked,
+        );
+        assert_eq!(identical_reused, 0);
+        assert_eq!(identical_outcome.shared_prefix_batches, 0);
+    }
+
+    #[test]
+    fn scheduler_slots_enforce_limit_and_release_saturates() {
+        let slots = std::sync::atomic::AtomicUsize::new(0);
+
+        assert_eq!(super::try_acquire_scheduler_slot(&slots, 2), Ok(1));
+        assert_eq!(super::try_acquire_scheduler_slot(&slots, 2), Ok(2));
+        assert_eq!(super::try_acquire_scheduler_slot(&slots, 2), Err(2));
+
+        super::release_scheduler_slots(&slots, 1);
+        assert_eq!(super::try_acquire_scheduler_slot(&slots, 2), Ok(2));
+        super::release_scheduler_slots(&slots, 8);
+        assert_eq!(slots.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn scheduler_drops_cancelled_jobs_before_gpu_work() {
+        let (open_tx, _open_rx) = tokio::sync::mpsc::channel(1);
+        let (closed_tx, closed_rx) = tokio::sync::mpsc::channel(1);
+        drop(closed_rx);
+        let request = GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens: 1,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+
+        let (retained, cancelled) = super::retain_open_scheduler_jobs(vec![
+            super::CudaSchedulerJob {
+                request: request.clone(),
+                tx: open_tx,
+                submitted_at: std::time::Instant::now(),
+            },
+            super::CudaSchedulerJob {
+                request,
+                tx: closed_tx,
+                submitted_at: std::time::Instant::now(),
+            },
+        ]);
+
+        assert_eq!(retained.len(), 1);
+        assert_eq!(cancelled, 1);
+    }
+
+    #[test]
+    fn scheduler_drops_cancelled_admission_leases_immediately() {
+        let manager =
+            std::sync::Arc::new(super::CudaPagedKvCacheManager::new(16, 2, 256, 512).unwrap());
+        let open_lease = manager.allocate_for_tokens(1).unwrap();
+        let closed_lease = manager.allocate_for_tokens(1).unwrap();
+        assert_eq!(manager.snapshot().pages_free, 0);
+
+        let (open_tx, _open_rx) = tokio::sync::mpsc::channel(1);
+        let (closed_tx, closed_rx) = tokio::sync::mpsc::channel(1);
+        drop(closed_rx);
+        let request = GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens: 1,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+        let mut batch = vec![
+            super::CudaSchedulerJob {
+                request: request.clone(),
+                tx: open_tx,
+                submitted_at: std::time::Instant::now(),
+            },
+            super::CudaSchedulerJob {
+                request,
+                tx: closed_tx,
+                submitted_at: std::time::Instant::now(),
+            },
+        ];
+        let mut leases = vec![open_lease, closed_lease];
+
+        let cancelled = super::retain_open_scheduler_admission(&mut batch, &mut leases);
+
+        assert_eq!(cancelled, 1);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(leases.len(), 1);
+        assert_eq!(manager.snapshot().pages_free, 1);
+        drop(leases);
+        assert_eq!(manager.snapshot().pages_free, 2);
+    }
+
+    #[test]
+    fn scheduler_retains_mixed_admission_leases_by_text_order() {
+        let manager =
+            std::sync::Arc::new(super::CudaPagedKvCacheManager::new(16, 2, 256, 512).unwrap());
+        let open_lease = manager.allocate_for_tokens(1).unwrap();
+        let closed_lease = manager.allocate_for_tokens(1).unwrap();
+        assert_eq!(manager.snapshot().pages_free, 0);
+
+        let (media_tx, _media_rx) = tokio::sync::mpsc::channel(1);
+        let (open_tx, _open_rx) = tokio::sync::mpsc::channel(1);
+        let (closed_tx, closed_rx) = tokio::sync::mpsc::channel(1);
+        drop(closed_rx);
+        let text_request = GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens: 1,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+        let image_request = GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens: 1,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: vec![MultimodalInput::Image(ImageInput {
+                source: ImageSource::Data {
+                    media_type: "image/png".to_string(),
+                    bytes: tiny_png_bytes(),
+                },
+                detail: None,
+            })],
+        };
+        let mut batch = vec![
+            super::CudaSchedulerJob {
+                request: image_request,
+                tx: media_tx,
+                submitted_at: std::time::Instant::now(),
+            },
+            super::CudaSchedulerJob {
+                request: text_request.clone(),
+                tx: open_tx,
+                submitted_at: std::time::Instant::now(),
+            },
+            super::CudaSchedulerJob {
+                request: text_request,
+                tx: closed_tx,
+                submitted_at: std::time::Instant::now(),
+            },
+        ];
+        let mut leases = vec![open_lease, closed_lease];
+
+        let cancelled = super::retain_open_scheduler_admission(&mut batch, &mut leases);
+
+        assert_eq!(cancelled, 1);
+        assert_eq!(batch.len(), 2);
+        assert!(!batch[0].request.media_inputs.is_empty());
+        assert!(batch[1].request.media_inputs.is_empty());
+        assert_eq!(leases.len(), 1);
+        assert_eq!(manager.snapshot().pages_free, 1);
+        drop(leases);
+        assert_eq!(manager.snapshot().pages_free, 2);
+    }
+
+    #[test]
+    fn scheduler_records_queue_wait_metrics() {
+        let stats = super::new_cuda_scheduler_stats();
+        let observed_at = std::time::Instant::now();
+        let request = GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens: 1,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+        let (tx_a, _rx_a) = tokio::sync::mpsc::channel(1);
+        let (tx_b, _rx_b) = tokio::sync::mpsc::channel(1);
+        let batch = vec![
+            super::CudaSchedulerJob {
+                request: request.clone(),
+                tx: tx_a,
+                submitted_at: observed_at - std::time::Duration::from_micros(7),
+            },
+            super::CudaSchedulerJob {
+                request,
+                tx: tx_b,
+                submitted_at: observed_at - std::time::Duration::from_micros(13),
+            },
+        ];
+
+        super::record_scheduler_queue_wait(&stats, &batch, observed_at);
+        super::record_scheduler_queue_wait(&stats, &[], observed_at);
+
+        assert_eq!(
+            stats
+                .queue_waited_requests
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            stats
+                .queue_wait_micros
+                .load(std::sync::atomic::Ordering::Relaxed),
+            20
+        );
+        assert_eq!(
+            stats
+                .max_queue_wait_micros
+                .load(std::sync::atomic::Ordering::Relaxed),
+            13
+        );
+    }
+
+    #[test]
+    fn scheduler_records_idle_wait_metrics() {
+        let stats = super::new_cuda_scheduler_stats();
+        let observed_at = std::time::Instant::now();
+
+        super::record_scheduler_idle_wait(
+            &stats,
+            observed_at - std::time::Duration::from_micros(11),
+            observed_at,
+        );
+        super::record_scheduler_idle_wait(
+            &stats,
+            observed_at - std::time::Duration::from_micros(23),
+            observed_at,
+        );
+
+        assert_eq!(
+            stats
+                .idle_wakeups
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
+        );
+        assert_eq!(
+            stats.idle_micros.load(std::sync::atomic::Ordering::Relaxed),
+            34
+        );
+        assert_eq!(
+            stats
+                .max_idle_micros
+                .load(std::sync::atomic::Ordering::Relaxed),
+            23
+        );
+    }
+
+    #[test]
+    fn scheduler_token_timing_splits_elapsed_and_reports_rate() {
+        let timing = super::scheduler_token_timing(4, 2, std::time::Duration::from_micros(12));
+
+        assert_eq!(timing.prefill_tokens, 4);
+        assert_eq!(timing.decode_tokens, 2);
+        assert_eq!(timing.prefill_micros, 8);
+        assert_eq!(timing.decode_micros, 4);
+        assert_eq!(super::scheduler_tokens_per_second(2, 4), 500_000);
+        assert_eq!(super::scheduler_tokens_per_second(0, 4), 0);
+    }
+
+    #[test]
+    fn scheduler_admission_rejection_reasons_classify_known_errors() {
+        let mut counts = super::CudaSchedulerAdmissionReasonCounts::default();
+        super::record_scheduler_admission_rejection(
+            &mut counts,
+            super::scheduler_admission_rejection_reason(&anyhow!(
+                "context_length_exceeded: prompt length 128 exceeds qwen context length 64"
+            )),
+        );
+        super::record_scheduler_admission_rejection(
+            &mut counts,
+            super::scheduler_admission_rejection_reason(&anyhow!(
+                "invalid_request_parameter: max_tokens must be greater than 0"
+            )),
+        );
+        super::record_scheduler_admission_rejection(
+            &mut counts,
+            super::scheduler_admission_rejection_reason(&anyhow!(
+                "insufficient_gpu_memory: CUDA paged KV cache requires 2 page(s)"
+            )),
+        );
+        super::record_scheduler_admission_rejection(
+            &mut counts,
+            super::scheduler_admission_rejection_reason(&anyhow!(
+                "tokenizer failed before admission"
+            )),
+        );
+
+        assert_eq!(counts.context_length, 1);
+        assert_eq!(counts.invalid_request, 1);
+        assert_eq!(counts.insufficient_gpu_memory, 1);
+        assert_eq!(counts.other, 1);
+    }
+
+    #[test]
+    fn ratio_and_kv_pressure_metrics_are_stable() {
+        assert_eq!(super::ratio_per_mille(1, 4), 250);
+        assert_eq!(super::ratio_per_mille(0, 4), 0);
+        assert_eq!(super::ratio_per_mille(1, 0), 0);
+        assert_eq!(super::average_u64(5, 2), 2);
+        assert_eq!(super::average_u64(5, 0), 0);
+
+        let normal = super::CudaPagedKvCacheSnapshot {
+            page_size: 16,
+            pages_total: 10,
+            pages_free: 2,
+            pages_used: 8,
+            peak_pages_used: 9,
+            bytes_per_page: 1,
+            bytes_total: 10,
+            total_allocations: 1,
+            failed_allocations: 0,
+        };
+        assert_eq!(super::kv_cache_pressure_label(&normal), "normal");
+
+        let high = super::CudaPagedKvCacheSnapshot {
+            pages_free: 1,
+            pages_used: 9,
+            ..normal
+        };
+        assert_eq!(super::kv_cache_pressure_label(&high), "high");
+
+        let exhausted = super::CudaPagedKvCacheSnapshot {
+            pages_free: 0,
+            pages_used: 10,
+            ..normal
+        };
+        assert_eq!(super::kv_cache_pressure_label(&exhausted), "exhausted");
+    }
+
+    #[test]
+    fn attention_health_selects_tiled_paged_for_supported_paged_kv() {
+        let health = super::cuda_attention_health_status(
+            super::CudaExecution::Gpu,
+            super::CudaKvCacheMode::Paged,
+            true,
+            Some((128, 128)),
+            false,
+        );
+
+        assert_eq!(health.status, "tiled-paged");
+        assert!(health.detail.contains("mode=tiled-paged"));
+        assert!(health.detail.contains("head_dim=128"));
+        assert!(health.detail.contains("decode=tiled-paged("));
+        assert!(health.detail.contains("decode_fallback=paged("));
+        assert!(health.detail.contains("fallback_reason=none"));
+        assert!(health.detail.contains("fallback_reason=wide-head"));
+    }
+
+    #[test]
+    fn attention_health_selects_flash_online_for_supported_legacy_kv() {
+        let health = super::cuda_attention_health_status(
+            super::CudaExecution::Gpu,
+            super::CudaKvCacheMode::Legacy,
+            false,
+            Some((128, 128)),
+            false,
+        );
+
+        assert_eq!(health.status, "flash-online");
+        assert!(health.detail.contains("mode=flash-online"));
+        assert!(health.detail.contains("kv_cache=legacy"));
+        assert!(health.detail.contains("decode=flash-online("));
+        assert!(health.detail.contains("prefill=tiled-contiguous("));
+    }
+
+    #[test]
+    fn attention_health_records_wide_head_generic_cuda_paths() {
+        let health = super::cuda_attention_health_status(
+            super::CudaExecution::Gpu,
+            super::CudaKvCacheMode::Paged,
+            true,
+            Some((super::CUDA_ATTENTION_FAST_HEAD_DIM_MAX + 2, 128)),
+            true,
+        );
+
+        assert_eq!(health.status, "paged-generic");
+        assert!(health.detail.contains("mode=paged-generic"));
+        assert!(health.detail.contains("decode=paged-generic("));
+        assert!(health.detail.contains("fallback_from=tiled-paged"));
+        assert!(health.detail.contains("prefill=contiguous-generic("));
+        assert!(
+            health
+                .detail
+                .contains("prompt_embeddings=contiguous-generic")
+        );
+        assert!(health.detail.contains("fallback_reason=wide-head"));
+    }
+
+    #[test]
+    fn attention_health_records_cpu_reference_fallback_reasons() {
+        let health = super::cuda_attention_health_status(
+            super::CudaExecution::CpuReference,
+            super::CudaKvCacheMode::Paged,
+            false,
+            Some((128, 128)),
+            true,
+        );
+
+        assert_eq!(health.status, "legacy");
+        assert!(health.detail.contains("mode=disabled"));
+        assert!(health.detail.contains("fallback_reason=cpu-reference"));
+    }
+
+    #[test]
+    fn scheduler_token_budget_chunks_include_decode_limits() {
+        let indexes = vec![0usize, 1, 2, 3];
+        let decode_limits = [1usize, 3, 1, 1];
+
+        let chunks = super::scheduler_token_budget_chunks(&indexes, 2, 6, |idx| decode_limits[idx]);
+
+        assert_eq!(chunks, vec![vec![0], vec![1], vec![2, 3]]);
+    }
+
+    #[test]
+    fn scheduler_token_budget_chunks_account_for_reused_prefix_tokens() {
+        let encoded = vec![vec![1, 2, 3], vec![1, 2, 4], vec![1, 2, 5]];
+        let indexes = vec![0usize, 1, 2];
+        let decode_limits = [1usize, 1, 1];
+
+        let no_reuse = super::scheduler_token_budget_chunks_with_prefix_reuse(
+            &encoded,
+            &indexes,
+            3,
+            7,
+            |_, _| false,
+            |idx| decode_limits[idx],
+        );
+        assert_eq!(no_reuse, vec![vec![0], vec![1], vec![2]]);
+
+        let with_reuse = super::scheduler_token_budget_chunks_with_prefix_reuse(
+            &encoded,
+            &indexes,
+            3,
+            7,
+            |_, _| true,
+            |idx| decode_limits[idx],
+        );
+        assert_eq!(with_reuse, vec![vec![0, 1], vec![2]]);
+    }
+
+    #[test]
+    fn generated_stop_match_uses_earliest_token_sequence() {
+        let generated = vec![1, 2, 3, 4];
+        let stops = vec![vec![3], vec![2, 3], vec![1, 2, 3]];
+
+        assert_eq!(
+            super::generated_stop_match(&generated, &stops),
+            Some((0, 3))
+        );
+        let (trimmed, completion_tokens) = super::trim_generated_tokens_at_stop(generated, &stops);
+        assert_eq!(trimmed, Vec::<u32>::new());
+        assert_eq!(completion_tokens, 3);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn health_counter(health: &str, name: &str) -> Option<u64> {
+        let needle = format!("{name}=");
+        health
+            .split(|ch| ch == ',' || ch == ';')
+            .find_map(|field| field.trim().strip_prefix(&needle)?.parse().ok())
+    }
+
+    #[cfg(feature = "native-cuda")]
+    async fn wait_for_health_counter_at_least(backend: &CudaBackend, name: &str, expected: u64) {
+        for _ in 0..50 {
+            let health = backend.health();
+            if health_counter(&health.quantization, name).unwrap_or(0) >= expected {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[test]
+    fn paged_kv_allocator_allocates_frees_reuses_and_reports_exhaustion() {
+        let manager =
+            std::sync::Arc::new(super::CudaPagedKvCacheManager::new(16, 2, 256, 512).unwrap());
+
+        let lease = manager.allocate_for_tokens(17).unwrap();
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.pages_total, 2);
+        assert_eq!(snapshot.pages_free, 0);
+        assert_eq!(snapshot.pages_used, 2);
+        assert_eq!(snapshot.peak_pages_used, 2);
+        assert_eq!(snapshot.total_allocations, 1);
+
+        let err = manager.allocate_for_tokens(1).unwrap_err().to_string();
+        assert!(err.contains("insufficient_gpu_memory"));
+        assert_eq!(manager.snapshot().failed_allocations, 1);
+        assert_eq!(manager.pages_for_tokens(1).unwrap(), 1);
+        assert_eq!(manager.pages_for_tokens(17).unwrap(), 2);
+
+        drop(lease);
+        let snapshot = manager.snapshot();
+        assert_eq!(snapshot.pages_free, 2);
+        assert_eq!(snapshot.pages_used, 0);
+
+        let _reused = manager.allocate_for_tokens(1).unwrap();
+        assert_eq!(manager.snapshot().pages_free, 1);
+    }
+
+    #[test]
+    fn paged_kv_allocator_sizes_pages_from_qwen_metadata() {
+        let path = tempfile_path("paged-kv-sizing");
+        write_reference_qwen(&path);
+        let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+        let qwen = gguf.qwen_config().unwrap();
+
+        let manager = super::CudaPagedKvCacheManager::for_qwen(&qwen, 256, 16).unwrap();
+        let snapshot = manager.snapshot();
+
+        assert_eq!(snapshot.page_size, 16);
+        assert_eq!(snapshot.pages_total, 16);
+        assert_eq!(snapshot.pages_free, 16);
+        assert_eq!(snapshot.bytes_per_page, 256);
+        assert_eq!(snapshot.bytes_total, 4096);
+    }
+
+    #[test]
+    fn cuda_backend_config_validates_kv_page_size() {
+        let config = super::CudaBackendConfig {
+            kv_page_size: 12,
+            ..super::CudaBackendConfig::default()
+        };
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("--kv-page-size must be one of 8, 16, 32, or 64"));
+    }
+
+    #[test]
+    fn cuda_backend_config_validates_max_wait_us() {
+        let config = super::CudaBackendConfig {
+            max_wait_us: super::CUDA_SCHEDULER_MAX_WAIT_US + 1,
+            ..super::CudaBackendConfig::default()
+        };
+
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("--max-wait-us must be less than or equal to 60000000"));
+    }
+
+    #[test]
+    fn generation_context_budget_rejects_prompt_plus_max_tokens_over_context() {
+        let path = tempfile_path("generation-context-budget");
+        write_reference_qwen(&path);
+        let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+        let qwen = gguf.qwen_config().unwrap();
+
+        super::validate_generation_context_budget(&qwen, 127, 1).unwrap();
+        let err = super::validate_generation_context_budget(&qwen, 128, 1)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("context_length_exceeded"));
+        assert!(err.contains("prompt length 128 plus max_tokens 1"));
+    }
+
+    #[test]
+    fn generation_max_tokens_rejects_zero() {
+        let request = GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens: 0,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+
+        let err = super::generation_max_tokens_usize(&request)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid_request_parameter"));
+        assert!(err.contains("max_tokens"));
+    }
+
+    #[test]
+    fn generation_max_tokens_rejects_model_output_limit() {
+        let request = GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens: 3,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+
+        let err = super::validate_generation_max_tokens(&request, 2)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid_request_parameter"));
+        assert!(err.contains("max_tokens 3"));
+        assert!(err.contains("max_output_tokens 2"));
+    }
+
+    #[test]
+    fn generation_sampling_parameters_reject_invalid_values() {
+        let request = |temperature, top_p, top_k| GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens: 1,
+            temperature,
+            top_p,
+            top_k,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+
+        super::validate_generation_sampling_parameters(&request(0.0, 1.0, None)).unwrap();
+        super::validate_generation_sampling_parameters(&request(0.7, 0.8, Some(1))).unwrap();
+        let err = super::validate_generation_sampling_parameters(&request(-0.1, 1.0, None))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid_sampling_parameter"));
+        assert!(err.contains("temperature"));
+        let err = super::validate_generation_sampling_parameters(&request(0.7, 1.1, None))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid_sampling_parameter"));
+        assert!(err.contains("top_p"));
+        let err = super::validate_generation_sampling_parameters(&request(0.7, 0.8, Some(0)))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid_sampling_parameter"));
+        assert!(err.contains("top_k"));
+    }
+
+    #[tokio::test]
+    async fn cuda_backend_generates_with_cpu_reference_execution() {
+        let path = tempfile_path("backend-generate");
+        write_reference_qwen(&path);
+
+        let backend = CudaBackend::load_with_execution(
+            &path,
+            Some("tiny-cuda".to_string()),
+            CudaExecution::CpuReference,
+        )
+        .unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(health.backend, "cuda");
+        assert!(health.quantization.contains("execution=cpu-reference"));
+        assert!(health.quantization.contains("kv-cache=disabled"));
+        assert!(health.quantization.contains("attention=legacy"));
+        assert!(
+            health
+                .quantization
+                .contains("attention-detail=mode=disabled,head_dim=2")
+        );
+        assert!(
+            health
+                .quantization
+                .contains("fallback_reason=cpu-reference")
+        );
+        assert!(health.quantization.contains("scheduler=disabled"));
+        assert!(
+            health
+                .quantization
+                .contains("multimodal-batching=text-only")
+        );
+        assert!(health.quantization.contains("vision_batched_requests=0"));
+        assert!(
+            health
+                .quantization
+                .contains("multimodal_decode_batched_requests=0")
+        );
+        #[cfg(feature = "native-cuda")]
+        assert!(
+            health
+                .quantization
+                .contains("gpu-weights=loaded(tensors=11,bytes=92)")
+        );
+        #[cfg(not(feature = "native-cuda"))]
+        assert!(health.quantization.contains("gpu-weights=unavailable("));
+
+        let request = GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens: 1,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+        let output = backend.generate(request.clone()).await.unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+
+        let mut stream = backend.stream_generate(request).await.unwrap();
+        let first = stream.next().await.unwrap().unwrap();
+        match first {
+            super::GenerationEvent::TokenDelta { token_id, text } => {
+                assert_eq!(token_id, 0);
+                assert_eq!(text, "a");
+            }
+            super::GenerationEvent::Finished { .. } => panic!("expected token delta first"),
+        }
+        assert!(matches!(
+            stream.next().await.unwrap().unwrap(),
+            super::GenerationEvent::Finished { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn cuda_backend_applies_stop_sequences_with_cpu_reference_execution() {
+        let path = tempfile_path("backend-stop-sequences-cpu");
+        write_reference_qwen(&path);
+
+        let backend = CudaBackend::load_with_execution(
+            &path,
+            Some("tiny-cuda".to_string()),
+            CudaExecution::CpuReference,
+        )
+        .unwrap();
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 2,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: vec!["a".to_string()],
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(output.text, "");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[tokio::test]
+    async fn cuda_backend_rejects_context_budget_with_cpu_reference_execution() {
+        let path = tempfile_path("backend-context-budget");
+        write_reference_qwen(&path);
+
+        let backend = CudaBackend::load_with_execution(
+            &path,
+            Some("tiny-cuda".to_string()),
+            CudaExecution::CpuReference,
+        )
+        .unwrap();
+        let request = GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens: 128,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+
+        let err = backend.generate(request).await.unwrap_err().to_string();
+        assert!(err.contains("context_length_exceeded"));
+        assert!(err.contains("qwen context length 128"));
+    }
+
+    #[tokio::test]
+    async fn cuda_backend_rejects_zero_max_tokens_with_cpu_reference_execution() {
+        let path = tempfile_path("backend-zero-max-tokens");
+        write_reference_qwen(&path);
+
+        let backend = CudaBackend::load_with_execution(
+            &path,
+            Some("tiny-cuda".to_string()),
+            CudaExecution::CpuReference,
+        )
+        .unwrap();
+        let request = GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens: 0,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+
+        let err = backend.generate(request).await.unwrap_err().to_string();
+        assert!(err.contains("invalid_request_parameter"));
+        assert!(err.contains("max_tokens"));
+    }
+
+    #[tokio::test]
+    async fn cuda_backend_rejects_max_tokens_above_model_limit_with_cpu_reference_execution() {
+        let path = tempfile_path("backend-max-tokens-above-model-limit");
+        write_reference_qwen(&path);
+
+        let backend = CudaBackend::load_with_execution(
+            &path,
+            Some("tiny-cuda".to_string()),
+            CudaExecution::CpuReference,
+        )
+        .unwrap();
+        let request = GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens: hi_local_core::model::DEFAULT_MAX_OUTPUT_TOKENS + 1,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+
+        let err = backend.generate(request).await.unwrap_err().to_string();
+        assert!(err.contains("invalid_request_parameter"));
+        assert!(err.contains("max_output_tokens"));
+    }
+
+    #[tokio::test]
+    async fn cuda_backend_rejects_invalid_sampling_parameters_with_cpu_reference_execution() {
+        let path = tempfile_path("backend-invalid-sampling");
+        write_reference_qwen(&path);
+
+        let backend = CudaBackend::load_with_execution(
+            &path,
+            Some("tiny-cuda".to_string()),
+            CudaExecution::CpuReference,
+        )
+        .unwrap();
+        let request = GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens: 1,
+            temperature: -0.1,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+
+        let err = match backend.stream_generate(request).await {
+            Ok(_) => panic!("invalid sampling parameters should be rejected"),
+            Err(err) => err.to_string(),
+        };
+        assert!(err.contains("invalid_sampling_parameter"));
+        assert!(err.contains("temperature"));
+    }
+
+    #[tokio::test]
+    async fn cuda_backend_accepts_mmproj_path_but_cpu_reference_rejects_image_generation() {
+        let path = tempfile_path("backend-mmproj-model");
+        let mmproj_path = tempfile_path("backend-mmproj-projector");
+        write_reference_qwen(&path);
+        #[cfg(feature = "native-cuda")]
+        write_qwen2vl_vision_gguf(&mmproj_path, 2);
+        #[cfg(not(feature = "native-cuda"))]
+        write_reference_qwen(&mmproj_path);
+
+        let backend = CudaBackend::load_with_config(
+            &path,
+            Some("tiny-cuda".to_string()),
+            CudaExecution::CpuReference,
+            super::CudaBackendConfig {
+                max_batch_size: 8,
+                max_wait_us: 2000,
+                mmproj_path: Some(mmproj_path),
+                ..super::CudaBackendConfig::default()
+            },
+        )
+        .unwrap();
+        let health = backend.health();
+        assert!(health.quantization.contains("multimodal=mmproj-loaded("));
+        assert!(
+            health
+                .quantization
+                .contains("multimodal-batching=unsupported(multimodal-generation-unavailable)")
+        );
+        #[cfg(feature = "native-cuda")]
+        assert!(
+            health
+                .quantization
+                .contains("vision-encoder=loaded(variant=qwen2-vl")
+        );
+        #[cfg(not(feature = "native-cuda"))]
+        assert!(health.quantization.contains("vision-encoder=unavailable("));
+        let multimodal = backend.multimodal_support();
+        assert!(multimodal.image_inputs);
+        assert!(multimodal.video_inputs);
+        assert!(!multimodal.generation);
+
+        let err = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: vec![MultimodalInput::Image(ImageInput {
+                    source: ImageSource::Data {
+                        media_type: "image/png".to_string(),
+                        bytes: tiny_png_bytes(),
+                    },
+                    detail: None,
+                })],
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        #[cfg(feature = "native-cuda")]
+        assert!(err.contains(
+            "multimodal generation requires execution=gpu; cpu-reference remains text-only debug mode"
+        ));
+        #[cfg(not(feature = "native-cuda"))]
+        assert!(err.contains("CUDA Qwen-VL vision encoder is unavailable"));
+        let health = backend.health();
+        assert!(health.quantization.contains("multimodal_requests=1"));
+        assert!(health.quantization.contains("multimodal_media_inputs=1"));
+        assert!(health.quantization.contains("vision_batched_requests=0"));
+        assert!(
+            health
+                .quantization
+                .contains("multimodal_decode_batched_requests=0")
+        );
+        #[cfg(feature = "native-cuda")]
+        {
+            assert!(health.quantization.contains("vision_legacy_requests=1"));
+            assert!(health.quantization.contains("vision_legacy_batches=1"));
+            assert!(health.quantization.contains("vision_legacy_media_inputs=1"));
+            assert!(
+                health
+                    .quantization
+                    .contains("multimodal_decode_legacy_requests=0")
+            );
+        }
+        #[cfg(not(feature = "native-cuda"))]
+        {
+            assert!(health.quantization.contains("vision_legacy_requests=0"));
+            assert!(health.quantization.contains("vision_legacy_batches=0"));
+        }
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_gpu_image_request_rejects_projector_embedding_dim_mismatch() {
+        let path = tempfile_path("backend-mmproj-gpu-model");
+        let mmproj_path = tempfile_path("backend-mmproj-gpu-projector");
+        write_reference_qwen(&path);
+        write_qwen2vl_vision_gguf(&mmproj_path, 3);
+
+        let backend = CudaBackend::load_with_config(
+            &path,
+            Some("tiny-cuda".to_string()),
+            CudaExecution::Gpu,
+            super::CudaBackendConfig {
+                max_batch_size: 8,
+                max_wait_us: 2000,
+                mmproj_path: Some(mmproj_path),
+                ..super::CudaBackendConfig::default()
+            },
+        )
+        .unwrap();
+        let mut stream = backend
+            .stream_generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: vec![MultimodalInput::Image(ImageInput {
+                    source: ImageSource::Data {
+                        media_type: "image/png".to_string(),
+                        bytes: tiny_png_bytes(),
+                    },
+                    detail: None,
+                })],
+            })
+            .await
+            .unwrap();
+        let err = match stream.next().await {
+            Some(Err(err)) => err.to_string(),
+            Some(Ok(event)) => panic!("image request unexpectedly produced event: {event:?}"),
+            None => panic!("image request stream ended before projector error"),
+        };
+        assert!(
+            err.contains("projected visual embedding dim 3 does not match Qwen embedding dim 2")
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_gpu_batches_vision_projection_stage_for_image_requests() {
+        let path = tempfile_path("backend-mmproj-gpu-vision-batch-model");
+        let mmproj_path = tempfile_path("backend-mmproj-gpu-vision-batch-projector");
+        write_reference_qwen(&path);
+        write_qwen2vl_vision_gguf(&mmproj_path, 2);
+
+        let backend = CudaBackend::load_with_config(
+            &path,
+            Some("tiny-cuda".to_string()),
+            CudaExecution::Gpu,
+            super::CudaBackendConfig {
+                max_batch_size: 8,
+                max_wait_us: 2000,
+                mmproj_path: Some(mmproj_path),
+                ..super::CudaBackendConfig::default()
+            },
+        )
+        .unwrap();
+        let image = MultimodalInput::Image(ImageInput {
+            source: ImageSource::Data {
+                media_type: "image/png".to_string(),
+                bytes: tiny_png_bytes(),
+            },
+            detail: None,
+        });
+        let projections = backend
+            .project_media_input_batches(&[vec![image.clone()], vec![image]])
+            .unwrap();
+        assert_eq!(projections.len(), 2);
+        for projection in &projections {
+            assert_eq!(projection.media_count, 1);
+            assert_eq!(projection.projected_rows, 1);
+            assert_eq!(projection.projected_dim, 2);
+            assert_eq!(projection.items.len(), 1);
+            assert_eq!(projection.embeddings.len(), 2);
+        }
+        assert_close_vec(&projections[0].embeddings, &projections[1].embeddings);
+
+        let health = backend.health();
+        assert_eq!(
+            health_counter(&health.quantization, "vision_batched_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "vision_batched_batches"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "vision_legacy_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "multimodal_decode_batched_requests"),
+            Some(0)
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_gpu_image_request_uses_prefix_embeddings_for_generation() {
+        let path = tempfile_path("backend-mmproj-gpu-prefix-model");
+        let mmproj_path = tempfile_path("backend-mmproj-gpu-prefix-projector");
+        write_reference_qwen(&path);
+        write_qwen2vl_vision_gguf(&mmproj_path, 2);
+
+        let backend = CudaBackend::load_with_config(
+            &path,
+            Some("tiny-cuda".to_string()),
+            CudaExecution::Gpu,
+            super::CudaBackendConfig {
+                max_batch_size: 8,
+                max_wait_us: 2000,
+                mmproj_path: Some(mmproj_path),
+                ..super::CudaBackendConfig::default()
+            },
+        )
+        .unwrap();
+        let health = backend.health();
+        assert!(health.quantization.contains("vision=qwen2-vl"));
+        assert!(health.quantization.contains("generation=enabled"));
+        assert!(
+            health
+                .quantization
+                .contains("multimodal-batching=enabled(vision_stage=batching-enabled,decode=prefix-batched|mrope-batched,fallback=no-placeholder-mrope-rejected)")
+        );
+        let multimodal = backend.multimodal_support();
+        assert!(multimodal.image_inputs);
+        assert!(multimodal.video_inputs);
+        assert!(multimodal.generation);
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: vec![MultimodalInput::Image(ImageInput {
+                    source: ImageSource::Data {
+                        media_type: "image/png".to_string(),
+                        bytes: tiny_png_bytes(),
+                    },
+                    detail: None,
+                })],
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 2);
+        assert_eq!(output.completion_tokens, 1);
+
+        let sampled = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 1.0,
+                top_p: 1.0,
+                top_k: Some(1),
+                seed: Some(7),
+                stop_sequences: Vec::new(),
+                media_inputs: vec![MultimodalInput::Image(ImageInput {
+                    source: ImageSource::Data {
+                        media_type: "image/png".to_string(),
+                        bytes: tiny_png_bytes(),
+                    },
+                    detail: None,
+                })],
+            })
+            .await
+            .unwrap();
+        assert_eq!(sampled.text, "a");
+        assert_eq!(sampled.prompt_tokens, 2);
+        assert_eq!(sampled.completion_tokens, 1);
+
+        let stopped = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 4,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: vec!["aa".to_string()],
+                media_inputs: vec![MultimodalInput::Image(ImageInput {
+                    source: ImageSource::Data {
+                        media_type: "image/png".to_string(),
+                        bytes: tiny_png_bytes(),
+                    },
+                    detail: None,
+                })],
+            })
+            .await
+            .unwrap();
+        assert_eq!(stopped.text, "");
+        assert_eq!(stopped.prompt_tokens, 2);
+        assert_eq!(stopped.completion_tokens, 2);
+
+        let batched_vision = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: vec![
+                    MultimodalInput::Image(ImageInput {
+                        source: ImageSource::Data {
+                            media_type: "image/png".to_string(),
+                            bytes: tiny_png_bytes(),
+                        },
+                        detail: None,
+                    }),
+                    MultimodalInput::Image(ImageInput {
+                        source: ImageSource::Data {
+                            media_type: "image/png".to_string(),
+                            bytes: tiny_png_bytes(),
+                        },
+                        detail: None,
+                    }),
+                ],
+            })
+            .await
+            .unwrap();
+        assert_eq!(batched_vision.text, "a");
+        assert_eq!(batched_vision.prompt_tokens, 3);
+        assert_eq!(batched_vision.completion_tokens, 1);
+
+        wait_for_health_counter_at_least(&backend, "fallback_requests", 4).await;
+        let health = backend.health();
+        assert_eq!(
+            health_counter(&health.quantization, "multimodal_requests"),
+            Some(4)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "multimodal_media_inputs"),
+            Some(5)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "vision_legacy_requests"),
+            Some(3)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "vision_legacy_batches"),
+            Some(3)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "vision_legacy_media_inputs"),
+            Some(3)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "vision_legacy_projected_rows"),
+            Some(3)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "multimodal_decode_legacy_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "multimodal_decode_paged_requests"),
+            Some(4)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "vision_batched_requests"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "vision_batched_batches"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "multimodal_decode_batched_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "total_requests"),
+            Some(4)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "fallback_requests"),
+            Some(4)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "fallback_multimodal_requests"),
+            Some(4)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "multimodal_fallback_requests"),
+            Some(4)
+        );
+        assert_eq!(
+            health_counter(
+                &health.quantization,
+                "multimodal_fallback_decode_group_singleton_requests"
+            ),
+            Some(4)
+        );
+        assert_eq!(
+            health_counter(
+                &health.quantization,
+                "multimodal_fallback_mixed_batch_requests"
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(
+                &health.quantization,
+                "multimodal_fallback_token_budget_requests"
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "batch_plan_ineligible_requests"),
+            Some(4)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "gpu_batched_requests"),
+            Some(0)
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cuda_gpu_scheduler_batches_concurrent_image_prefix_decode() {
+        let path = tempfile_path("backend-mmproj-gpu-scheduler-vision-batch-model");
+        let mmproj_path = tempfile_path("backend-mmproj-gpu-scheduler-vision-batch-projector");
+        write_reference_qwen(&path);
+        write_qwen2vl_vision_gguf(&mmproj_path, 2);
+
+        let backend = std::sync::Arc::new(
+            CudaBackend::load_with_config(
+                &path,
+                Some("tiny-cuda".to_string()),
+                CudaExecution::Gpu,
+                super::CudaBackendConfig {
+                    max_batch_size: 2,
+                    max_active_requests: 2,
+                    max_wait_us: 100_000,
+                    kv_cache_mode: super::CudaKvCacheMode::Paged,
+                    kv_page_size: 8,
+                    mmproj_path: Some(mmproj_path),
+                    ..super::CudaBackendConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        let request = GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens: 1,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: vec![MultimodalInput::Image(ImageInput {
+                source: ImageSource::Data {
+                    media_type: "image/png".to_string(),
+                    bytes: tiny_png_bytes(),
+                },
+                detail: None,
+            })],
+        };
+
+        let left = {
+            let backend = backend.clone();
+            let request = request.clone();
+            tokio::spawn(async move { backend.generate(request).await.unwrap() })
+        };
+        let right = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(request).await.unwrap() })
+        };
+
+        let left = left.await.unwrap();
+        let right = right.await.unwrap();
+        assert_eq!(left.text, "a");
+        assert_eq!(right.text, "a");
+        assert_eq!(left.prompt_tokens, 2);
+        assert_eq!(right.prompt_tokens, 2);
+        assert_eq!(left.completion_tokens, 1);
+        assert_eq!(right.completion_tokens, 1);
+
+        let health = backend.health();
+        assert!(health.quantization.contains("mode=continuous-iteration"));
+        assert!(health.quantization.contains(
+            "multimodal-paged-kv=enabled(scope=single-and-batched-prompt-embeddings,batched_backend=scheduler-leased,fallback_reason=none)"
+        ));
+        assert!(health.quantization.contains(
+            "multimodal_backend=paged(prompt_embeddings=single-paged|batched-lease-backed,fallback_reason=none)"
+        ));
+        assert!(
+            health
+                .quantization
+                .contains("continuous_kv_backend=append-only-paged")
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "multimodal_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "multimodal_media_inputs"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "vision_batched_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "vision_batched_batches"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "vision_legacy_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "multimodal_decode_legacy_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "multimodal_decode_paged_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "multimodal_decode_batched_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "total_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "fallback_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "fallback_multimodal_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "multimodal_fallback_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "batch_plan_eligible_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "batch_plan_ineligible_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "gpu_batched_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "paged_lease_batched_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "paged_internal_batched_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "token_budget_split_groups"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "token_budget_split_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "token_budget_split_chunks"),
+            Some(0)
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn cuda_gpu_scheduler_splits_mixed_text_and_image_batch() {
+        let path = tempfile_path("backend-mmproj-gpu-scheduler-mixed-batch-model");
+        let mmproj_path = tempfile_path("backend-mmproj-gpu-scheduler-mixed-batch-projector");
+        write_reference_qwen(&path);
+        write_qwen2vl_vision_gguf(&mmproj_path, 2);
+
+        let backend = std::sync::Arc::new(
+            CudaBackend::load_with_config(
+                &path,
+                Some("tiny-cuda".to_string()),
+                CudaExecution::Gpu,
+                super::CudaBackendConfig {
+                    max_batch_size: 3,
+                    max_active_requests: 3,
+                    max_batched_tokens: 9,
+                    kv_cache_mode: super::CudaKvCacheMode::Paged,
+                    kv_page_size: 8,
+                    max_wait_us: 100_000,
+                    mmproj_path: Some(mmproj_path),
+                    ..super::CudaBackendConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        let text_request = GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens: 1,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+        let image_request = GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens: 1,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: vec![MultimodalInput::Image(ImageInput {
+                source: ImageSource::Data {
+                    media_type: "image/png".to_string(),
+                    bytes: tiny_png_bytes(),
+                },
+                detail: None,
+            })],
+        };
+
+        let left_text = {
+            let backend = backend.clone();
+            let request = text_request.clone();
+            tokio::spawn(async move { backend.generate(request).await.unwrap() })
+        };
+        let right_text = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(text_request).await.unwrap() })
+        };
+        let image = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(image_request).await.unwrap() })
+        };
+
+        let left_text = left_text.await.unwrap();
+        let right_text = right_text.await.unwrap();
+        let image = image.await.unwrap();
+        assert_eq!(left_text.text, "a");
+        assert_eq!(right_text.text, "a");
+        assert_eq!(image.text, "a");
+        assert_eq!(left_text.prompt_tokens, 1);
+        assert_eq!(right_text.prompt_tokens, 1);
+        assert_eq!(image.prompt_tokens, 2);
+        assert_eq!(left_text.completion_tokens, 1);
+        assert_eq!(right_text.completion_tokens, 1);
+        assert_eq!(image.completion_tokens, 1);
+
+        let health = backend.health();
+        assert!(health.quantization.contains("mode=continuous-iteration"));
+        assert_eq!(
+            health_counter(&health.quantization, "total_requests"),
+            Some(3)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "gpu_batched_batches"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "gpu_batched_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "paged_lease_batched_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "paged_internal_batched_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "fallback_requests"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "fallback_single_request"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "fallback_multimodal_requests"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "multimodal_fallback_requests"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(
+                &health.quantization,
+                "multimodal_fallback_mixed_batch_requests"
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(
+                &health.quantization,
+                "multimodal_fallback_decode_group_singleton_requests"
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "token_budget_split_groups"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "token_budget_split_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "token_budget_split_chunks"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "batch_plan_eligible_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "batch_plan_ineligible_requests"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "multimodal_requests"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "vision_legacy_requests"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "multimodal_decode_legacy_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "multimodal_decode_paged_requests"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "vision_batched_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "completed_requests"),
+            Some(3)
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cuda_gpu_scheduler_batches_mrope_image_placeholder_decode() {
+        let path = tempfile_path("backend-mmproj-gpu-scheduler-mrope-vision-batch-model");
+        let mmproj_path =
+            tempfile_path("backend-mmproj-gpu-scheduler-mrope-vision-batch-projector");
+        write_reference_qwen_vl(&path);
+        write_qwen2vl_vision_gguf(&mmproj_path, 2);
+
+        let backend = std::sync::Arc::new(
+            CudaBackend::load_with_config(
+                &path,
+                Some("tiny-cuda-vl".to_string()),
+                CudaExecution::Gpu,
+                super::CudaBackendConfig {
+                    max_batch_size: 2,
+                    max_active_requests: 2,
+                    max_wait_us: 100_000,
+                    kv_cache_mode: super::CudaKvCacheMode::Legacy,
+                    mmproj_path: Some(mmproj_path),
+                    ..super::CudaBackendConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        let request = GenerationRequest {
+            prompt: "a<|image_pad|>".to_string(),
+            max_tokens: 1,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: vec![MultimodalInput::Image(ImageInput {
+                source: ImageSource::Data {
+                    media_type: "image/png".to_string(),
+                    bytes: tiny_png_bytes(),
+                },
+                detail: None,
+            })],
+        };
+
+        let left = {
+            let backend = backend.clone();
+            let request = request.clone();
+            tokio::spawn(async move { backend.generate(request).await.unwrap() })
+        };
+        let right = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(request).await.unwrap() })
+        };
+
+        let left = left.await.unwrap();
+        let right = right.await.unwrap();
+        assert_eq!(left.prompt_tokens, 2);
+        assert_eq!(right.prompt_tokens, 2);
+        assert_eq!(left.completion_tokens, 1);
+        assert_eq!(right.completion_tokens, 1);
+
+        let health = backend.health();
+        assert!(health.quantization.contains("attention=flash-online"));
+        assert!(health.quantization.contains(
+            "multimodal=tiled-contiguous(prompt_embeddings=tiled-contiguous,fallback_reason=none)"
+        ));
+        assert_eq!(
+            health_counter(&health.quantization, "multimodal_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "vision_batched_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "vision_batched_batches"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "multimodal_decode_batched_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "multimodal_decode_legacy_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "fallback_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "batch_plan_eligible_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "batch_plan_ineligible_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "gpu_batched_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "token_budget_split_groups"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "token_budget_split_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "token_budget_split_chunks"),
+            Some(0)
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cuda_gpu_scheduler_batches_mrope_image_placeholder_decode_paged_kv() {
+        let path = tempfile_path("backend-mmproj-gpu-scheduler-mrope-paged-vision-batch-model");
+        let mmproj_path =
+            tempfile_path("backend-mmproj-gpu-scheduler-mrope-paged-vision-batch-projector");
+        write_reference_qwen_vl(&path);
+        write_qwen2vl_vision_gguf(&mmproj_path, 2);
+
+        let backend = std::sync::Arc::new(
+            CudaBackend::load_with_config(
+                &path,
+                Some("tiny-cuda-vl".to_string()),
+                CudaExecution::Gpu,
+                super::CudaBackendConfig {
+                    max_batch_size: 2,
+                    max_active_requests: 2,
+                    max_wait_us: 100_000,
+                    kv_cache_mode: super::CudaKvCacheMode::Paged,
+                    kv_page_size: 8,
+                    mmproj_path: Some(mmproj_path),
+                    ..super::CudaBackendConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        let request = GenerationRequest {
+            prompt: "a<|image_pad|>".to_string(),
+            max_tokens: 2,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: vec![MultimodalInput::Image(ImageInput {
+                source: ImageSource::Data {
+                    media_type: "image/png".to_string(),
+                    bytes: tiny_png_bytes(),
+                },
+                detail: None,
+            })],
+        };
+
+        let left = {
+            let backend = backend.clone();
+            let request = request.clone();
+            tokio::spawn(async move { backend.generate(request).await.unwrap() })
+        };
+        let right = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(request).await.unwrap() })
+        };
+
+        let left = left.await.unwrap();
+        let right = right.await.unwrap();
+        assert_eq!(left.prompt_tokens, 2);
+        assert_eq!(right.prompt_tokens, 2);
+        assert_eq!(left.completion_tokens, 2);
+        assert_eq!(right.completion_tokens, 2);
+
+        let health = backend.health();
+        assert!(health.quantization.contains("attention=tiled-paged"));
+        assert!(health.quantization.contains(
+            "multimodal=tiled-paged(prompt_embeddings=tiled-paged,prefill=tiled-contiguous,decode=tiled-paged,fallback_reason=none)"
+        ));
+        assert!(health.quantization.contains(
+            "multimodal-paged-kv=enabled(scope=single-and-batched-prompt-embeddings,batched_backend=scheduler-leased,fallback_reason=none)"
+        ));
+        assert_eq!(
+            health_counter(&health.quantization, "multimodal_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "vision_batched_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "vision_batched_batches"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "multimodal_decode_batched_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "multimodal_decode_legacy_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "multimodal_decode_paged_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "paged_lease_batched_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "paged_internal_batched_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "fallback_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "gpu_batched_requests"),
+            Some(2)
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cuda_gpu_scheduler_keeps_different_mrope_video_positions_out_of_decode_batch() {
+        let path = tempfile_path("backend-mmproj-gpu-scheduler-mrope-video-split-model");
+        let mmproj_path = tempfile_path("backend-mmproj-gpu-scheduler-mrope-video-split-projector");
+        write_reference_qwen_vl_with_video(&path);
+        write_qwen25vl_vision_gguf(&mmproj_path, 2);
+
+        let backend = std::sync::Arc::new(
+            CudaBackend::load_with_config(
+                &path,
+                Some("tiny-cuda-vl-video".to_string()),
+                CudaExecution::Gpu,
+                super::CudaBackendConfig {
+                    max_batch_size: 2,
+                    max_active_requests: 2,
+                    max_wait_us: 100_000,
+                    kv_cache_mode: super::CudaKvCacheMode::Legacy,
+                    mmproj_path: Some(mmproj_path),
+                    ..super::CudaBackendConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        let request = |fps: f32| {
+            let frame = || ImageInput {
+                source: ImageSource::Data {
+                    media_type: "image/png".to_string(),
+                    bytes: tiny_png_bytes(),
+                },
+                detail: None,
+            };
+            GenerationRequest {
+                prompt: "a<|video_pad|>".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: vec![MultimodalInput::Video(VideoInput {
+                    source: VideoSource::Frames(vec![frame(), frame(), frame(), frame()]),
+                    detail: None,
+                    fps: Some(fps),
+                    nframes: Some(4),
+                    min_frames: Some(4),
+                    max_frames: Some(4),
+                })],
+            }
+        };
+
+        let slow_video = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(request(1.0)).await.unwrap() })
+        };
+        let fast_video = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(request(2.0)).await.unwrap() })
+        };
+
+        let slow_video = slow_video.await.unwrap();
+        let fast_video = fast_video.await.unwrap();
+        assert_eq!(slow_video.prompt_tokens, 289);
+        assert_eq!(fast_video.prompt_tokens, 289);
+        assert_eq!(slow_video.completion_tokens, 1);
+        assert_eq!(fast_video.completion_tokens, 1);
+
+        wait_for_health_counter_at_least(&backend, "fallback_requests", 2).await;
+        let health = backend.health();
+        assert_eq!(
+            health_counter(&health.quantization, "multimodal_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "vision_batched_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "vision_batched_batches"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "multimodal_decode_batched_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "multimodal_decode_legacy_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "fallback_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "fallback_multimodal_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "multimodal_fallback_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(
+                &health.quantization,
+                "multimodal_fallback_decode_group_singleton_requests"
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "batch_plan_eligible_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "batch_plan_ineligible_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "gpu_batched_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "completed_requests"),
+            Some(2)
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn cuda_gpu_scheduler_groups_compatible_image_prefix_decode() {
+        let path = tempfile_path("backend-mmproj-gpu-scheduler-vision-group-model");
+        let mmproj_path = tempfile_path("backend-mmproj-gpu-scheduler-vision-group-projector");
+        write_reference_qwen(&path);
+        write_qwen2vl_vision_gguf(&mmproj_path, 2);
+
+        let backend = std::sync::Arc::new(
+            CudaBackend::load_with_config(
+                &path,
+                Some("tiny-cuda".to_string()),
+                CudaExecution::Gpu,
+                super::CudaBackendConfig {
+                    max_batch_size: 3,
+                    max_active_requests: 3,
+                    max_wait_us: 100_000,
+                    kv_cache_mode: super::CudaKvCacheMode::Legacy,
+                    mmproj_path: Some(mmproj_path),
+                    ..super::CudaBackendConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        let request = |prompt: &str| GenerationRequest {
+            prompt: prompt.to_string(),
+            max_tokens: 1,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: vec![MultimodalInput::Image(ImageInput {
+                source: ImageSource::Data {
+                    media_type: "image/png".to_string(),
+                    bytes: tiny_png_bytes(),
+                },
+                detail: None,
+            })],
+        };
+
+        let left = {
+            let backend = backend.clone();
+            let request = request("a");
+            tokio::spawn(async move { backend.generate(request).await.unwrap() })
+        };
+        let right = {
+            let backend = backend.clone();
+            let request = request("a");
+            tokio::spawn(async move { backend.generate(request).await.unwrap() })
+        };
+        let singleton = {
+            let backend = backend.clone();
+            let request = request("aa");
+            tokio::spawn(async move { backend.generate(request).await.unwrap() })
+        };
+
+        let left = left.await.unwrap();
+        let right = right.await.unwrap();
+        let singleton = singleton.await.unwrap();
+        assert_eq!(left.prompt_tokens, 2);
+        assert_eq!(right.prompt_tokens, 2);
+        assert_eq!(singleton.prompt_tokens, 3);
+        assert_eq!(left.completion_tokens, 1);
+        assert_eq!(right.completion_tokens, 1);
+        assert_eq!(singleton.completion_tokens, 1);
+
+        let health = backend.health();
+        assert_eq!(
+            health_counter(&health.quantization, "multimodal_requests"),
+            Some(3)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "multimodal_media_inputs"),
+            Some(3)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "vision_batched_requests"),
+            Some(3)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "vision_batched_batches"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "vision_legacy_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "multimodal_decode_batched_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "multimodal_decode_legacy_requests"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "multimodal_decode_paged_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "total_requests"),
+            Some(3)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "fallback_requests"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "fallback_multimodal_requests"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "multimodal_fallback_requests"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(
+                &health.quantization,
+                "multimodal_fallback_decode_group_singleton_requests"
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "batch_plan_eligible_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "batch_plan_ineligible_requests"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "gpu_batched_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "token_budget_split_groups"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "token_budget_split_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "token_budget_split_chunks"),
+            Some(0)
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn cuda_gpu_scheduler_chunks_image_prefix_decode_by_token_budget() {
+        let path = tempfile_path("backend-mmproj-gpu-scheduler-vision-budget-model");
+        let mmproj_path = tempfile_path("backend-mmproj-gpu-scheduler-vision-budget-projector");
+        write_reference_qwen(&path);
+        write_qwen2vl_vision_gguf(&mmproj_path, 2);
+
+        let backend = std::sync::Arc::new(
+            CudaBackend::load_with_config(
+                &path,
+                Some("tiny-cuda".to_string()),
+                CudaExecution::Gpu,
+                super::CudaBackendConfig {
+                    max_batch_size: 3,
+                    max_active_requests: 3,
+                    max_batched_tokens: 6,
+                    max_wait_us: 100_000,
+                    kv_cache_mode: super::CudaKvCacheMode::Legacy,
+                    mmproj_path: Some(mmproj_path),
+                    ..super::CudaBackendConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        let request = GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens: 1,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: vec![MultimodalInput::Image(ImageInput {
+                source: ImageSource::Data {
+                    media_type: "image/png".to_string(),
+                    bytes: tiny_png_bytes(),
+                },
+                detail: None,
+            })],
+        };
+
+        let first = {
+            let backend = backend.clone();
+            let request = request.clone();
+            tokio::spawn(async move { backend.generate(request).await.unwrap() })
+        };
+        let second = {
+            let backend = backend.clone();
+            let request = request.clone();
+            tokio::spawn(async move { backend.generate(request).await.unwrap() })
+        };
+        let third = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(request).await.unwrap() })
+        };
+
+        assert_eq!(first.await.unwrap().completion_tokens, 1);
+        assert_eq!(second.await.unwrap().completion_tokens, 1);
+        assert_eq!(third.await.unwrap().completion_tokens, 1);
+
+        let health = backend.health();
+        assert_eq!(
+            health_counter(&health.quantization, "multimodal_requests"),
+            Some(3)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "vision_batched_requests"),
+            Some(3)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "vision_batched_batches"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "multimodal_decode_batched_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "multimodal_decode_legacy_requests"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "total_requests"),
+            Some(3)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "fallback_requests"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "fallback_multimodal_requests"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "multimodal_fallback_requests"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(
+                &health.quantization,
+                "multimodal_fallback_token_budget_requests"
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "token_budget_split_groups"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "token_budget_split_requests"),
+            Some(3)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "token_budget_split_chunks"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(
+                &health.quantization,
+                "multimodal_fallback_decode_group_singleton_requests"
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "batch_plan_eligible_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "batch_plan_ineligible_requests"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "gpu_batched_batches"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "gpu_batched_requests"),
+            Some(2)
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_gpu_execution() {
+        let path = tempfile_path("backend-generate-gpu");
+        write_reference_qwen(&path);
+
+        let backend = CudaBackend::load(&path, Some("tiny-cuda".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(backend.execution(), CudaExecution::Gpu);
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("kv-cache=paged("));
+        assert!(
+            health
+                .quantization
+                .contains("gpu-features=text-continuous=enabled")
+        );
+        assert!(
+            health
+                .quantization
+                .contains("moe-text-batching=not-applicable")
+        );
+        assert!(
+            health
+                .quantization
+                .contains("multimodal-paged-kv=disabled(reason=text-only)")
+        );
+        assert!(health.quantization.contains("pages_total="));
+        assert!(health.quantization.contains("pages_free="));
+        assert!(health.quantization.contains("pages_free_per_mille="));
+        assert!(health.quantization.contains("pages_used_per_mille="));
+        assert!(health.quantization.contains("peak_pages_used_per_mille="));
+        assert!(health.quantization.contains("pressure="));
+        assert!(health.quantization.contains("scheduler=enabled"));
+        assert!(health.quantization.contains("max_wait_us_cap=60000000"));
+        assert!(
+            health
+                .quantization
+                .contains("admission_page_grant_per_mille=")
+        );
+        assert!(
+            health
+                .quantization
+                .contains("admission_page_reject_per_mille=")
+        );
+        assert!(health.quantization.contains("admission_page_requests="));
+        assert!(
+            health
+                .quantization
+                .contains("admission_requested_pages_max=")
+        );
+        assert!(
+            health
+                .quantization
+                .contains("admission_requested_pages_avg=")
+        );
+        assert!(health.quantization.contains("admission_granted_pages_max="));
+        assert!(
+            health
+                .quantization
+                .contains("admission_rejected_pages_max=")
+        );
+        assert!(
+            health
+                .quantization
+                .contains("admission_context_rejected_requests=")
+        );
+        assert!(
+            health
+                .quantization
+                .contains("admission_invalid_request_rejected_requests=")
+        );
+        assert!(
+            health
+                .quantization
+                .contains("admission_memory_rejected_requests=")
+        );
+        assert!(
+            health
+                .quantization
+                .contains("admission_other_rejected_requests=")
+        );
+        assert!(
+            health
+                .quantization
+                .contains("capacity_max_active_rejected_requests=")
+        );
+        assert!(
+            health
+                .quantization
+                .contains("capacity_rejected_active_requests_total=")
+        );
+        assert!(
+            health
+                .quantization
+                .contains("capacity_rejected_active_requests_max=")
+        );
+        assert!(
+            health
+                .quantization
+                .contains("capacity_rejected_active_requests_avg=")
+        );
+        assert!(health.quantization.contains("token_budget_split_groups="));
+        assert!(health.quantization.contains("token_budget_split_requests="));
+        assert!(health.quantization.contains("token_budget_split_chunks="));
+        assert!(health.quantization.contains("queue_waited_requests="));
+        assert!(health.quantization.contains("queue_wait_micros_total="));
+        assert!(health.quantization.contains("queue_wait_micros_max="));
+        assert!(health.quantization.contains("idle_wakeups="));
+        assert!(health.quantization.contains("idle_micros_total="));
+        assert!(health.quantization.contains("idle_micros_max="));
+        assert!(health.quantization.contains(
+            "prefix-cache=enabled(scope=batch,backend=paged-shared-prefix,batches=0,requests=0,tokens_total=0)"
+        ));
+        assert_eq!(
+            health_counter(&health.quantization, "admission_cancelled_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "admission_errored_requests"),
+            Some(0)
+        );
+        assert!(
+            health
+                .quantization
+                .contains("multimodal-batching=text-only")
+        );
+        assert!(health.quantization.contains("vision_batched_requests=0"));
+        assert!(
+            health
+                .quantization
+                .contains("multimodal_fallback_requests=0")
+        );
+        assert!(
+            health
+                .quantization
+                .contains("multimodal_fallback_mixed_batch_requests=0")
+        );
+        assert!(
+            health
+                .quantization
+                .contains("multimodal_fallback_token_budget_requests=0")
+        );
+        assert!(
+            health
+                .quantization
+                .contains("gpu-weights=loaded(tensors=11,bytes=92)")
+        );
+
+        let request = GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens: 1,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+        let output = backend.generate(request.clone()).await.unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+        let health = backend.health();
+        assert!(health.quantization.contains("total_requests=1"));
+        assert!(health.quantization.contains("max_observed=1"));
+        assert!(health.quantization.contains("mode=continuous-iteration"));
+        assert_eq!(
+            health_counter(&health.quantization, "fallback_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "fallback_single_request"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "fallback_bucket_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "batch_plan_eligible_requests"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "batch_plan_ineligible_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "gpu_batched_requests"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "continuous_admitted_requests"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "continuous_decode_iterations"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "prefill_tokens_total"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "decode_tokens_total"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "completed_requests"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "errored_requests"),
+            Some(0)
+        );
+        assert!(health_counter(&health.quantization, "tokens_per_sec_prefill").unwrap_or(0) > 0);
+        assert!(health_counter(&health.quantization, "tokens_per_sec_decode").unwrap_or(0) > 0);
+        assert!(
+            health
+                .quantization
+                .contains("kernel_backend=paged-single-text")
+        );
+        assert!(health.quantization.contains("attention=tiled-paged"));
+        assert!(health.quantization.contains(
+            "attention-detail=mode=tiled-paged,head_dim=2,head_dim_max=256,kv_cache=paged,decode=tiled-paged(paths=single-text|batched-text,fallback_reason=none)"
+        ));
+
+        let mut stream = backend.stream_generate(request).await.unwrap();
+        let first = stream.next().await.unwrap().unwrap();
+        match first {
+            super::GenerationEvent::TokenDelta { token_id, text } => {
+                assert_eq!(token_id, 0);
+                assert_eq!(text, "a");
+            }
+            super::GenerationEvent::Finished { .. } => panic!("expected token delta first"),
+        }
+        assert!(matches!(
+            stream.next().await.unwrap().unwrap(),
+            super::GenerationEvent::Finished { .. }
+        ));
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_equal_custom_kv_gpu_execution() {
+        let path = tempfile_path("backend-generate-custom-kv-gpu");
+        write_reference_qwen_equal_custom_kv(&path);
+
+        let backend = CudaBackend::load(&path, Some("tiny-custom-kv".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(backend.qwen_config().embedding_length, 4);
+        assert_eq!(backend.qwen_config().attention_key_length, Some(2));
+        assert_eq!(backend.qwen_config().attention_value_length, Some(2));
+        assert_eq!(backend.qwen_config().attention_head_dim(), Some(2));
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+        assert!(health.quantization.contains("head_dim=2"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_unequal_custom_kv_gpu_execution() {
+        let path = tempfile_path("backend-generate-unequal-custom-kv-gpu");
+        write_reference_qwen_unequal_custom_kv(&path);
+
+        let backend = CudaBackend::load(&path, Some("tiny-unequal-custom-kv".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(backend.qwen_config().embedding_length, 4);
+        assert_eq!(backend.qwen_config().attention_key_length, Some(2));
+        assert_eq!(backend.qwen_config().attention_value_length, Some(3));
+        assert_eq!(backend.qwen_config().attention_key_head_dim(), Some(2));
+        assert_eq!(backend.qwen_config().attention_value_head_dim(), Some(3));
+        assert_eq!(backend.qwen_config().attention_head_dim(), None);
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+        assert!(health.quantization.contains("head_dim=qk:2,v:3"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_qwen_moe_packed_gate_up_gpu_execution() {
+        let path = tempfile_path("backend-generate-qwen-moe-packed-gate-up-gpu");
+        write_reference_qwen_moe_packed_gate_up(&path);
+
+        let backend =
+            CudaBackend::load(&path, Some("tiny-qwen-moe-packed-gate-up".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Qwen3
+        );
+        assert_eq!(backend.qwen_config().architecture, "qwen3moe");
+        assert_eq!(backend.qwen_config().expert_feed_forward_length, Some(2));
+        assert_eq!(backend.qwen_config().expert_count, Some(2));
+        assert_eq!(backend.qwen_config().expert_used_count, Some(1));
+        assert!(health.quantization.contains("execution=gpu"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_qwen_next_dense_gpu_execution() {
+        let path = tempfile_path("backend-generate-qwen-next-dense-gpu");
+        write_reference_qwen_next_dense(&path);
+
+        let backend = CudaBackend::load(&path, Some("tiny-qwen-next".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Qwen3
+        );
+        assert_eq!(backend.qwen_config().architecture, "qwen3next");
+        assert_eq!(backend.qwen_config().default_rope_freq_base(), 1_000_000.0);
+        assert_eq!(backend.qwen_config().expert_count, None);
+        assert_eq!(health.family, "qwen3");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_qwen_next_attention_head_norm_alias_gpu_execution() {
+        let path = tempfile_path("backend-generate-qwen-next-head-norm-alias-gpu");
+        write_reference_qwen_next_attention_head_norm_aliases(&path);
+
+        let backend =
+            CudaBackend::load(&path, Some("tiny-qwen-next-head-norm-aliases".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Qwen3
+        );
+        assert_eq!(backend.qwen_config().architecture, "qwen3next");
+        assert_eq!(health.family, "qwen3");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_qwen_next_gated_attention_gpu_execution() {
+        let path = tempfile_path("backend-generate-qwen-next-gated-attention-gpu");
+        write_reference_qwen_next_gated_attention(&path);
+
+        let backend =
+            CudaBackend::load(&path, Some("tiny-qwen-next-gated-attention".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Qwen3
+        );
+        assert_eq!(backend.qwen_config().architecture, "qwen3next");
+        assert_eq!(health.family, "qwen3");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_qwen_next_ssm_metadata_dense_gpu_execution() {
+        let path = tempfile_path("backend-generate-qwen-next-ssm-metadata-dense-gpu");
+        write_reference_qwen_next_ssm_metadata_dense(&path);
+
+        let backend =
+            CudaBackend::load(&path, Some("tiny-qwen-next-ssm-metadata-dense".to_string()))
+                .unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Qwen3
+        );
+        assert_eq!(backend.qwen_config().architecture, "qwen3next");
+        assert_eq!(backend.qwen_config().default_rope_freq_base(), 1_000_000.0);
+        assert_eq!(backend.qwen_config().expert_count, None);
+        assert_eq!(health.family, "qwen3");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_qwen_next_ssm_metadata_packed_gpu_execution() {
+        let path = tempfile_path("backend-generate-qwen-next-ssm-metadata-packed-gpu");
+        write_reference_qwen_next_ssm_metadata_packed(&path);
+
+        let backend = CudaBackend::load(
+            &path,
+            Some("tiny-qwen-next-ssm-metadata-packed".to_string()),
+        )
+        .unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Qwen3
+        );
+        assert_eq!(backend.qwen_config().architecture, "qwen3next");
+        assert_eq!(backend.qwen_config().default_rope_freq_base(), 1_000_000.0);
+        assert_eq!(backend.qwen_config().expert_count, None);
+        assert_eq!(health.family, "qwen3");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_qwen_next_ssm_metadata_hf_packed_alias_gpu_execution() {
+        let path = tempfile_path("backend-generate-qwen-next-ssm-metadata-hf-packed-alias-gpu");
+        write_reference_qwen_next_ssm_metadata_hf_packed_aliases(&path);
+
+        let backend = CudaBackend::load(
+            &path,
+            Some("tiny-qwen-next-ssm-metadata-hf-packed-alias".to_string()),
+        )
+        .unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Qwen3
+        );
+        assert_eq!(backend.qwen_config().architecture, "qwen3next");
+        assert_eq!(backend.qwen_config().default_rope_freq_base(), 1_000_000.0);
+        assert_eq!(backend.qwen_config().expert_count, None);
+        assert_eq!(health.family, "qwen3");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_qwen_next_recurrent_ssm_gpu_execution() {
+        let path = tempfile_path("backend-qwen-next-recurrent-ssm-gpu");
+        write_reference_qwen_next_recurrent_ssm(&path);
+
+        let backend =
+            CudaBackend::load(&path, Some("tiny-qwen-next-recurrent-ssm".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Qwen3
+        );
+        assert_eq!(backend.qwen_config().architecture, "qwen3next");
+        assert!(backend.qwen_config().recurrent_ssm_tensor_layout);
+        assert_eq!(backend.qwen_config().ssm_state_size, Some(2));
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("text-continuous=enabled"));
+        assert!(health.quantization.contains("mode=continuous-iteration"));
+        assert!(
+            health
+                .quantization
+                .contains("continuous_kv_backend=recompute-state-recurrent-ssm")
+        );
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 2,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "aa");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 2);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_qwen_next_recurrent_ssm_optimized_gpu_execution() {
+        let path = tempfile_path("backend-qwen-next-recurrent-ssm-optimized-gpu");
+        write_reference_qwen_next_recurrent_ssm_optimized(&path);
+
+        let backend = CudaBackend::load(
+            &path,
+            Some("tiny-qwen-next-recurrent-ssm-optimized".to_string()),
+        )
+        .unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(backend.qwen_config().architecture, "qwen3next");
+        assert!(backend.qwen_config().recurrent_ssm_tensor_layout);
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("text-continuous=enabled"));
+        assert!(health.quantization.contains("mode=continuous-iteration"));
+        assert!(
+            health
+                .quantization
+                .contains("continuous_kv_backend=recompute-state-recurrent-ssm")
+        );
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 2,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "aa");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 2);
+
+        let (first, second) = tokio::join!(
+            backend.generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 2,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            }),
+            backend.generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 2,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+        );
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert_eq!(first.text, "aa");
+        assert_eq!(second.text, "aa");
+        let health = backend.health();
+        assert!(
+            health_counter(&health.quantization, "continuous_admitted_requests").unwrap_or(0) >= 3,
+            "{}",
+            health.quantization
+        );
+        assert!(
+            health_counter(&health.quantization, "continuous_append_decode_batches").unwrap_or(0)
+                > 0,
+            "{}",
+            health.quantization
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_recurrent_ssm_paged_text_generation_replays_recorded_state_contexts() {
+        use hi_gguf::GgufFile;
+
+        let path = tempfile_path("gpu-qwen-next-recurrent-ssm-batch-fallbacks");
+        write_reference_qwen_next_recurrent_ssm_optimized(&path);
+        let gguf = GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+        assert!(model.supports_batched_text_generation());
+        let inputs = vec![vec![0], vec![1]];
+        let limits = vec![2, 1];
+        let expected = vec![
+            model
+                .generate_greedy_tokens(&inputs[0], limits[0], None)
+                .unwrap(),
+            model
+                .generate_greedy_tokens(&inputs[1], limits[1], None)
+                .unwrap(),
+        ];
+
+        assert_eq!(
+            model
+                .generate_greedy_tokens_batch_with_limits(&inputs, &limits, None)
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            model
+                .generate_greedy_tokens_batch_paged_with_limits(&inputs, &limits, None, 1)
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            model
+                .generate_greedy_tokens_batch_paged_with_page_tables(
+                    &inputs,
+                    &limits,
+                    None,
+                    1,
+                    &[vec![0, 1, 2], vec![3, 4, 5]],
+                    6,
+                )
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            model
+                .generate_sampled_tokens_batch_with_limits(
+                    &inputs,
+                    &limits,
+                    None,
+                    1.0,
+                    0.0,
+                    None,
+                    &[Some(7), Some(11)],
+                )
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            model
+                .generate_sampled_tokens_batch_paged_with_limits(
+                    &inputs,
+                    &limits,
+                    None,
+                    1.0,
+                    0.0,
+                    None,
+                    &[Some(7), Some(11)],
+                    1,
+                )
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            model
+                .generate_sampled_tokens_batch_paged_with_page_tables(
+                    &inputs,
+                    &limits,
+                    None,
+                    1.0,
+                    0.0,
+                    None,
+                    &[Some(7), Some(11)],
+                    1,
+                    &[vec![0, 1, 2], vec![3, 4, 5]],
+                    6,
+                )
+                .unwrap(),
+            expected
+        );
+        let short_page_tables = vec![vec![0], vec![3, 4, 5]];
+        let short_table_err = model
+            .generate_greedy_tokens_batch_paged_with_page_tables(
+                &inputs,
+                &limits,
+                None,
+                1,
+                &short_page_tables,
+                6,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(short_table_err.contains("page table 0 has 1 page(s), expected at least 3"));
+        let bad_page_tables = vec![vec![0, 1, 6], vec![3, 4, 5]];
+        let bad_page_err = model
+            .generate_sampled_tokens_batch_paged_with_page_tables(
+                &inputs,
+                &limits,
+                None,
+                1.0,
+                0.0,
+                None,
+                &[Some(7), Some(11)],
+                1,
+                &bad_page_tables,
+                6,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(bad_page_err.contains("page index 6 exceeds physical page count 6"));
+
+        let page_tables = vec![vec![0, 1, 2], vec![3, 4, 5]];
+        let expected_next = inputs
+            .iter()
+            .map(|input| model.greedy_next_token(input).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            model
+                .greedy_next_tokens_batch_paged_with_page_tables(&inputs, 1, &page_tables, 6)
+                .unwrap(),
+            expected_next
+        );
+        assert_eq!(
+            model
+                .prefill_greedy_next_tokens_batch_paged_with_page_tables(
+                    &inputs,
+                    1,
+                    &page_tables,
+                    6,
+                )
+                .unwrap(),
+            expected_next
+        );
+        assert_eq!(
+            model
+                .sampled_next_tokens_batch_paged_with_page_tables(
+                    &inputs,
+                    1.0,
+                    0.0,
+                    None,
+                    &[0.25, 0.75],
+                    1,
+                    &page_tables,
+                    6,
+                )
+                .unwrap(),
+            expected_next
+        );
+        assert_eq!(
+            model
+                .prefill_sampled_next_tokens_batch_paged_with_page_tables(
+                    &inputs,
+                    1.0,
+                    0.0,
+                    None,
+                    &[0.25, 0.75],
+                    1,
+                    &page_tables,
+                    6,
+                )
+                .unwrap(),
+            expected_next
+        );
+        let append_contexts = inputs
+            .iter()
+            .zip(expected_next.iter().copied())
+            .map(|(input, token)| {
+                let mut context = input.clone();
+                context.push(token);
+                context
+            })
+            .collect::<Vec<_>>();
+        let expected_append = append_contexts
+            .iter()
+            .map(|input| model.greedy_next_token(input).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            model
+                .decode_greedy_next_tokens_batch_paged_with_page_tables(
+                    &[expected_next[0], expected_next[1]],
+                    1,
+                    1,
+                    &page_tables,
+                    6,
+                )
+                .unwrap(),
+            expected_append
+        );
+
+        assert_eq!(
+            model
+                .prefill_sampled_next_tokens_batch_paged_with_page_tables(
+                    &inputs,
+                    1.0,
+                    0.0,
+                    None,
+                    &[0.25, 0.75],
+                    1,
+                    &page_tables,
+                    6,
+                )
+                .unwrap(),
+            expected_next
+        );
+        assert_eq!(
+            model
+                .decode_sampled_next_tokens_batch_paged_with_page_tables(
+                    &[expected_next[0], expected_next[1]],
+                    1,
+                    1.0,
+                    0.0,
+                    None,
+                    &[0.25, 0.75],
+                    1,
+                    &page_tables,
+                    6,
+                )
+                .unwrap(),
+            expected_append
+        );
+
+        let unknown_page_tables = vec![vec![6, 7, 8], vec![9, 10, 11]];
+        let append_err = model
+            .decode_greedy_next_tokens_batch_paged_with_page_tables(
+                &[expected_next[0], expected_next[1]],
+                1,
+                1,
+                &unknown_page_tables,
+                12,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(append_err.contains("requires a recorded recurrent context"));
+
+        let mut cancellation_checks = vec![0usize; 2];
+        let cancelled = model
+            .generate_greedy_tokens_batch_paged_with_limits_and_cancellation(
+                &inputs,
+                &[2, 2],
+                None,
+                1,
+                &[],
+                |idx| {
+                    cancellation_checks[idx] += 1;
+                    idx == 1 && cancellation_checks[idx] > 1
+                },
+            )
+            .unwrap();
+        assert_eq!(cancelled[0], expected[0]);
+        assert_eq!(cancelled[1], expected[1]);
+        assert!(cancellation_checks[1] >= 2);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_qwen_ssm_metadata_dense_gpu_execution() {
+        let path = tempfile_path("backend-generate-qwen-ssm-metadata-dense-gpu");
+        write_reference_qwen_ssm_metadata_dense(&path);
+
+        let backend =
+            CudaBackend::load(&path, Some("tiny-qwen-ssm-metadata-dense".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Qwen2
+        );
+        assert_eq!(backend.qwen_config().architecture, "qwen2");
+        assert_eq!(backend.qwen_config().default_rope_freq_base(), 1_000_000.0);
+        assert_eq!(backend.qwen_config().expert_count, None);
+        assert_eq!(health.family, "qwen2");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_qwen_ssm_sidecar_dense_gpu_execution() {
+        let path = tempfile_path("backend-generate-qwen-ssm-sidecar-dense-gpu");
+        write_reference_qwen_ssm_sidecar_dense(&path);
+
+        let backend =
+            CudaBackend::load(&path, Some("tiny-qwen-ssm-sidecar-dense".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Qwen2
+        );
+        assert_eq!(backend.qwen_config().architecture, "qwen2");
+        assert_eq!(health.family, "qwen2");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_qwen_ssm_metadata_packed_gpu_execution() {
+        let path = tempfile_path("backend-generate-qwen-ssm-metadata-packed-gpu");
+        write_reference_qwen_ssm_metadata_packed(&path);
+
+        let backend =
+            CudaBackend::load(&path, Some("tiny-qwen-ssm-metadata-packed".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Qwen2
+        );
+        assert_eq!(backend.qwen_config().architecture, "qwen2");
+        assert_eq!(backend.qwen_config().default_rope_freq_base(), 1_000_000.0);
+        assert_eq!(backend.qwen_config().expert_count, None);
+        assert_eq!(health.family, "qwen2");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_qwen_ssm_metadata_hf_packed_alias_gpu_execution() {
+        let path = tempfile_path("backend-generate-qwen-ssm-metadata-hf-packed-alias-gpu");
+        write_reference_qwen_ssm_metadata_hf_packed_aliases(&path);
+
+        let backend = CudaBackend::load(
+            &path,
+            Some("tiny-qwen-ssm-metadata-hf-packed-alias".to_string()),
+        )
+        .unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Qwen2
+        );
+        assert_eq!(backend.qwen_config().architecture, "qwen2");
+        assert_eq!(backend.qwen_config().default_rope_freq_base(), 1_000_000.0);
+        assert_eq!(backend.qwen_config().expert_count, None);
+        assert_eq!(health.family, "qwen2");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_gpu_attention_health_and_generation_report_wide_head_generic_cuda() {
+        let path = tempfile_path("backend-wide-head-attention-health");
+        write_reference_qwen_wide_head(&path);
+
+        let backend = CudaBackend::load_with_config(
+            &path,
+            Some("tiny-cuda-wide-head".to_string()),
+            CudaExecution::Gpu,
+            super::CudaBackendConfig {
+                kv_cache_mode: super::CudaKvCacheMode::Paged,
+                kv_page_size: 8,
+                ..super::CudaBackendConfig::default()
+            },
+        )
+        .unwrap();
+
+        let health = backend.health();
+        assert!(health.quantization.contains("attention=paged-generic"));
+        assert!(health.quantization.contains("mode=paged-generic"));
+        assert!(health.quantization.contains("head_dim=258"));
+        assert!(health.quantization.contains("decode=paged-generic("));
+        assert!(health.quantization.contains("fallback_from=tiled-paged"));
+        assert!(health.quantization.contains("prefill=contiguous-generic("));
+        assert!(health.quantization.contains("fallback_reason=wide-head"));
+        assert!(
+            health
+                .quantization
+                .contains("attention-fast-head-dim-max=256")
+        );
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_llama_gpu_execution() {
+        let path = tempfile_path("backend-generate-llama-gpu");
+        write_reference_llama(&path);
+
+        let backend = CudaBackend::load(&path, Some("tiny-llama".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Llama
+        );
+        assert!(backend.model().chat_template);
+        assert_eq!(backend.chat_template(), Some(LLAMA3_CHAT_TEMPLATE));
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_batches_qwen_moe_prefix_embeddings_across_kv_modes() {
+        use hi_gguf::GgufFile;
+
+        let path = tempfile_path("gpu-qwen-moe-prefix-embedding-batches");
+        write_reference_qwen_moe_packed_gate_up(&path);
+        let gguf = GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+        assert!(model.supports_batched_text_generation());
+        assert!(model.supports_batched_multimodal_generation());
+
+        let prefix_embeddings = vec![vec![1.0f32, 0.0], vec![0.0, 1.0]];
+        let inputs = vec![vec![1], vec![0]];
+        let limits = vec![2, 1];
+        let expected = vec![
+            model
+                .generate_greedy_tokens_with_prefix_embeddings(
+                    &prefix_embeddings[0],
+                    1,
+                    &inputs[0],
+                    limits[0],
+                    None,
+                )
+                .unwrap(),
+            model
+                .generate_greedy_tokens_with_prefix_embeddings(
+                    &prefix_embeddings[1],
+                    1,
+                    &inputs[1],
+                    limits[1],
+                    None,
+                )
+                .unwrap(),
+        ];
+
+        assert_eq!(
+            model
+                .generate_greedy_tokens_batch_with_prefix_embeddings_and_limits_and_cancellation(
+                    &prefix_embeddings,
+                    1,
+                    &inputs,
+                    &limits,
+                    None,
+                    &[],
+                    |_| false,
+                )
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            model
+                .generate_greedy_tokens_batch_with_prefix_embeddings_paged_and_limits_and_cancellation(
+                    &prefix_embeddings,
+                    1,
+                    &inputs,
+                    &limits,
+                    None,
+                    1,
+                    &[],
+                    |_| false,
+                )
+                .unwrap(),
+            expected
+        );
+
+        let page_tables = vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]];
+        assert_eq!(
+            model
+                .generate_greedy_tokens_batch_with_prefix_embeddings_paged_page_tables_and_limits_and_cancellation(
+                    &prefix_embeddings,
+                    1,
+                    &inputs,
+                    &limits,
+                    None,
+                    1,
+                    &page_tables,
+                    8,
+                    &[],
+                    |_| false,
+                )
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            model
+                .generate_sampled_tokens_batch_with_prefix_embeddings_and_limits_and_cancellation(
+                    &prefix_embeddings,
+                    1,
+                    &inputs,
+                    &limits,
+                    None,
+                    1.0,
+                    0.0,
+                    None,
+                    &[Some(7), Some(11)],
+                    &[],
+                    |_| false,
+                )
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            model
+                .generate_sampled_tokens_batch_with_prefix_embeddings_paged_page_tables_and_limits_and_cancellation(
+                    &prefix_embeddings,
+                    1,
+                    &inputs,
+                    &limits,
+                    None,
+                    1.0,
+                    0.0,
+                    None,
+                    &[Some(7), Some(11)],
+                    1,
+                    &page_tables,
+                    8,
+                    &[],
+                    |_| false,
+                )
+                .unwrap(),
+            expected
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_mistral_gpu_execution() {
+        let path = tempfile_path("backend-generate-mistral-gpu");
+        write_reference_mistral(&path);
+
+        let backend = CudaBackend::load(&path, Some("tiny-mistral".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Mistral
+        );
+        assert_eq!(backend.qwen_config().architecture, "mistral");
+        assert_eq!(backend.qwen_config().default_rope_freq_base(), 10_000.0);
+        assert_eq!(health.family, "mistral");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_mistral_dense_alias_gpu_execution() {
+        let path = tempfile_path("backend-generate-mistral-dense-alias-gpu");
+        write_reference_mistral_dense_aliases(&path);
+
+        let backend = CudaBackend::load(&path, Some("tiny-mistral-aliases".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Mistral
+        );
+        assert_eq!(backend.qwen_config().architecture, "mistral");
+        assert_eq!(health.family, "mistral");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_mistral_feed_forward_hf_alias_gpu_execution() {
+        let path = tempfile_path("backend-generate-mistral-feed-forward-hf-alias-gpu");
+        write_reference_mistral_feed_forward_hf_aliases(&path);
+
+        let backend = CudaBackend::load(
+            &path,
+            Some("tiny-mistral-feed-forward-hf-aliases".to_string()),
+        )
+        .unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Mistral
+        );
+        assert_eq!(backend.qwen_config().architecture, "mistral");
+        assert_eq!(health.family, "mistral");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_mistral_attn_container_split_alias_gpu_execution() {
+        let path = tempfile_path("backend-generate-mistral-attn-container-split-alias-gpu");
+        write_reference_mistral_attn_container_split_aliases(&path);
+
+        let backend = CudaBackend::load(
+            &path,
+            Some("tiny-mistral-attn-container-split-aliases".to_string()),
+        )
+        .unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Mistral
+        );
+        assert_eq!(backend.qwen_config().architecture, "mistral");
+        assert_eq!(health.family, "mistral");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_mistral_ffn_container_alias_gpu_execution() {
+        let path = tempfile_path("backend-generate-mistral-ffn-container-alias-gpu");
+        write_reference_mistral_ffn_container_aliases(&path);
+
+        let backend = CudaBackend::load(
+            &path,
+            Some("tiny-mistral-ffn-container-aliases".to_string()),
+        )
+        .unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Mistral
+        );
+        assert_eq!(backend.qwen_config().architecture, "mistral");
+        assert_eq!(health.family, "mistral");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_mistral_packed_alias_gpu_execution() {
+        let path = tempfile_path("backend-generate-mistral-packed-alias-gpu");
+        write_reference_mistral_packed_aliases(&path);
+
+        let backend =
+            CudaBackend::load(&path, Some("tiny-mistral-packed-aliases".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Mistral
+        );
+        assert_eq!(backend.qwen_config().architecture, "mistral");
+        assert_eq!(health.family, "mistral");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_mistral_alternate_packed_alias_gpu_execution() {
+        let path = tempfile_path("backend-generate-mistral-alternate-packed-alias-gpu");
+        write_reference_mistral_alternate_packed_aliases(&path);
+
+        let backend = CudaBackend::load(
+            &path,
+            Some("tiny-mistral-alternate-packed-aliases".to_string()),
+        )
+        .unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Mistral
+        );
+        assert_eq!(backend.qwen_config().architecture, "mistral");
+        assert_eq!(health.family, "mistral");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_mistral_attn_qkv_alias_gpu_execution() {
+        let path = tempfile_path("backend-generate-mistral-attn-qkv-alias-gpu");
+        write_reference_mistral_attn_qkv_aliases(&path);
+
+        let backend =
+            CudaBackend::load(&path, Some("tiny-mistral-attn-qkv-aliases".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Mistral
+        );
+        assert_eq!(backend.qwen_config().architecture, "mistral");
+        assert_eq!(health.family, "mistral");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_mistral_transformer_h_packed_alias_gpu_execution() {
+        let path = tempfile_path("backend-generate-mistral-transformer-h-packed-alias-gpu");
+        write_reference_mistral_transformer_h_packed_aliases(&path);
+
+        let backend = CudaBackend::load(
+            &path,
+            Some("tiny-mistral-transformer-h-packed-aliases".to_string()),
+        )
+        .unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Mistral
+        );
+        assert_eq!(backend.qwen_config().architecture, "mistral");
+        assert_eq!(health.family, "mistral");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_mistral_model_layers_alias_gpu_execution() {
+        let path = tempfile_path("backend-generate-mistral-model-layers-alias-gpu");
+        write_reference_mistral_model_layers_packed_aliases(&path);
+
+        let backend =
+            CudaBackend::load(&path, Some("tiny-mistral-model-layers-aliases".to_string()))
+                .unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Mistral
+        );
+        assert_eq!(backend.qwen_config().architecture, "mistral");
+        assert_eq!(health.family, "mistral");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_mistral_language_model_wrapper_alias_gpu_execution() {
+        let path = tempfile_path("backend-generate-mistral-language-model-wrapper-alias-gpu");
+        write_reference_mistral_language_model_wrapper_aliases(&path);
+
+        let backend = CudaBackend::load(
+            &path,
+            Some("tiny-mistral-language-model-wrapper-aliases".to_string()),
+        )
+        .unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Mistral
+        );
+        assert_eq!(backend.qwen_config().architecture, "mistral");
+        assert_eq!(backend.qwen_config().default_rope_freq_base(), 10_000.0);
+        assert_eq!(health.family, "mistral");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_mixtral_moe_gpu_execution() {
+        let path = tempfile_path("backend-generate-mixtral-moe-gpu");
+        write_reference_mixtral_moe(&path);
+
+        let backend = CudaBackend::load(&path, Some("tiny-mixtral".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Mixtral
+        );
+        assert_eq!(backend.qwen_config().architecture, "mixtral");
+        assert_eq!(backend.qwen_config().expert_feed_forward_length, Some(2));
+        assert_eq!(backend.qwen_config().expert_count, Some(2));
+        assert_eq!(backend.qwen_config().expert_used_count, Some(1));
+        assert_eq!(backend.qwen_config().default_rope_freq_base(), 10_000.0);
+        assert_eq!(health.family, "mixtral");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+        assert!(
+            health
+                .quantization
+                .contains("moe-text-batching=continuous-iteration")
+        );
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_mixtral_per_expert_moe_gpu_execution() {
+        let path = tempfile_path("backend-generate-mixtral-per-expert-moe-gpu");
+        write_reference_mixtral_per_expert_moe(&path);
+
+        let backend =
+            CudaBackend::load(&path, Some("tiny-mixtral-per-expert".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Mixtral
+        );
+        assert_eq!(backend.qwen_config().architecture, "mixtral");
+        assert_eq!(backend.qwen_config().expert_feed_forward_length, Some(2));
+        assert_eq!(backend.qwen_config().expert_count, Some(2));
+        assert_eq!(backend.qwen_config().expert_used_count, Some(1));
+        assert_eq!(health.family, "mixtral");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+        assert!(
+            health
+                .quantization
+                .contains("moe-text-batching=continuous-iteration")
+        );
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_mixtral_per_expert_packed_gate_up_moe_gpu_execution() {
+        let path = tempfile_path("backend-generate-mixtral-per-expert-packed-gate-up-moe-gpu");
+        write_reference_mixtral_per_expert_packed_gate_up_moe(&path);
+
+        let backend = CudaBackend::load(
+            &path,
+            Some("tiny-mixtral-per-expert-packed-gate-up".to_string()),
+        )
+        .unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Mixtral
+        );
+        assert_eq!(backend.qwen_config().architecture, "mixtral");
+        assert_eq!(backend.qwen_config().expert_feed_forward_length, Some(2));
+        assert_eq!(backend.qwen_config().expert_count, Some(2));
+        assert_eq!(backend.qwen_config().expert_used_count, Some(1));
+        assert_eq!(health.family, "mixtral");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+        assert!(
+            health
+                .quantization
+                .contains("moe-text-batching=continuous-iteration")
+        );
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_mixtral_alias_per_expert_moe_gpu_execution() {
+        let path = tempfile_path("backend-generate-mixtral-alias-per-expert-moe-gpu");
+        write_reference_mixtral_alias_per_expert_moe(&path);
+
+        let backend =
+            CudaBackend::load(&path, Some("tiny-mixtral-alias-per-expert".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Mixtral
+        );
+        assert_eq!(backend.qwen_config().architecture, "mixtral");
+        assert_eq!(backend.qwen_config().expert_feed_forward_length, Some(2));
+        assert_eq!(backend.qwen_config().expert_count, Some(2));
+        assert_eq!(backend.qwen_config().expert_used_count, Some(1));
+        assert_eq!(health.family, "mixtral");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+        assert!(
+            health
+                .quantization
+                .contains("moe-text-batching=continuous-iteration")
+        );
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_mixtral_router_alias_per_expert_moe_gpu_execution() {
+        let path = tempfile_path("backend-generate-mixtral-router-alias-per-expert-moe-gpu");
+        write_reference_mixtral_router_alias_per_expert_moe(&path);
+
+        let backend = CudaBackend::load(
+            &path,
+            Some("tiny-mixtral-router-alias-per-expert".to_string()),
+        )
+        .unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Mixtral
+        );
+        assert_eq!(backend.qwen_config().architecture, "mixtral");
+        assert_eq!(backend.qwen_config().expert_feed_forward_length, Some(2));
+        assert_eq!(backend.qwen_config().expert_count, Some(2));
+        assert_eq!(backend.qwen_config().expert_used_count, Some(1));
+        assert_eq!(health.family, "mixtral");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+        assert!(
+            health
+                .quantization
+                .contains("moe-text-batching=continuous-iteration")
+        );
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_mixtral_output_router_bias_alias_gpu_execution() {
+        let path = tempfile_path("backend-generate-mixtral-output-router-bias-alias-gpu");
+        write_reference_mixtral_output_router_bias_aliases(&path);
+
+        let backend = CudaBackend::load(
+            &path,
+            Some("tiny-mixtral-output-router-bias-alias".to_string()),
+        )
+        .unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Mixtral
+        );
+        assert_eq!(backend.qwen_config().architecture, "mixtral");
+        assert_eq!(backend.qwen_config().expert_feed_forward_length, Some(2));
+        assert_eq!(backend.qwen_config().expert_count, Some(2));
+        assert_eq!(backend.qwen_config().expert_used_count, Some(1));
+        assert_eq!(health.family, "mixtral");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+        assert!(
+            health
+                .quantization
+                .contains("moe-text-batching=continuous-iteration")
+        );
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_mixtral_moe_expert_bias_alias_gpu_execution() {
+        let path = tempfile_path("backend-generate-mixtral-moe-expert-bias-alias-gpu");
+        write_reference_mixtral_moe_expert_bias_aliases(&path);
+
+        let backend = CudaBackend::load(
+            &path,
+            Some("tiny-mixtral-moe-expert-bias-alias".to_string()),
+        )
+        .unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Mixtral
+        );
+        assert_eq!(backend.qwen_config().architecture, "mixtral");
+        assert_eq!(backend.qwen_config().expert_feed_forward_length, Some(2));
+        assert_eq!(backend.qwen_config().expert_count, Some(2));
+        assert_eq!(backend.qwen_config().expert_used_count, Some(1));
+        assert_eq!(health.family, "mixtral");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+        assert!(
+            health
+                .quantization
+                .contains("moe-text-batching=continuous-iteration")
+        );
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_mixtral_feed_forward_kind_first_moe_gpu_execution() {
+        let path = tempfile_path("backend-generate-mixtral-feed-forward-kind-first-moe-gpu");
+        write_reference_mixtral_feed_forward_kind_first_moe(&path);
+
+        let backend = CudaBackend::load(
+            &path,
+            Some("tiny-mixtral-feed-forward-kind-first".to_string()),
+        )
+        .unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Mixtral
+        );
+        assert_eq!(backend.qwen_config().architecture, "mixtral");
+        assert_eq!(backend.qwen_config().expert_feed_forward_length, Some(2));
+        assert_eq!(backend.qwen_config().expert_count, Some(2));
+        assert_eq!(backend.qwen_config().expert_used_count, Some(1));
+        assert_eq!(health.family, "mixtral");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+        assert!(
+            health
+                .quantization
+                .contains("moe-text-batching=continuous-iteration")
+        );
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_mixtral_mlp_block_sparse_moe_gpu_execution() {
+        let path = tempfile_path("backend-generate-mixtral-mlp-block-sparse-moe-gpu");
+        write_reference_mixtral_mlp_block_sparse_moe(&path);
+
+        let backend =
+            CudaBackend::load(&path, Some("tiny-mixtral-mlp-block-sparse-moe".to_string()))
+                .unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Mixtral
+        );
+        assert_eq!(backend.qwen_config().architecture, "mixtral");
+        assert_eq!(backend.qwen_config().expert_feed_forward_length, Some(2));
+        assert_eq!(backend.qwen_config().expert_count, Some(2));
+        assert_eq!(backend.qwen_config().expert_used_count, Some(1));
+        assert_eq!(health.family, "mixtral");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_mixtral_plural_shared_expert_alias_gpu_execution() {
+        let path = tempfile_path("backend-generate-mixtral-shared-experts-plural-gpu");
+        write_reference_mixtral_shared_experts_plural(&path);
+
+        let backend = CudaBackend::load(
+            &path,
+            Some("tiny-mixtral-shared-experts-plural".to_string()),
+        )
+        .unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Mixtral
+        );
+        assert_eq!(backend.qwen_config().architecture, "mixtral");
+        assert_eq!(backend.qwen_config().expert_feed_forward_length, Some(2));
+        assert_eq!(backend.qwen_config().expert_count, Some(2));
+        assert_eq!(backend.qwen_config().expert_used_count, Some(1));
+        assert_eq!(health.family, "mixtral");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+        assert!(
+            health
+                .quantization
+                .contains("moe-text-batching=continuous-iteration")
+        );
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_mixtral_packed_shared_expert_gpu_execution() {
+        let path = tempfile_path("backend-generate-mixtral-packed-shared-expert-gpu");
+        write_reference_mixtral_packed_shared_expert(&path);
+
+        let backend =
+            CudaBackend::load(&path, Some("tiny-mixtral-packed-shared-expert".to_string()))
+                .unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Mixtral
+        );
+        assert_eq!(backend.qwen_config().architecture, "mixtral");
+        assert_eq!(backend.qwen_config().expert_feed_forward_length, Some(2));
+        assert_eq!(backend.qwen_config().expert_count, Some(2));
+        assert_eq!(backend.qwen_config().expert_used_count, Some(1));
+        assert_eq!(health.family, "mixtral");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_mixtral_shared_expert_gate_gpu_execution() {
+        let path = tempfile_path("backend-generate-mixtral-shared-expert-gate-gpu");
+        write_reference_mixtral_shared_expert_gate(&path);
+
+        let backend =
+            CudaBackend::load(&path, Some("tiny-mixtral-shared-expert-gate".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Mixtral
+        );
+        assert_eq!(backend.qwen_config().architecture, "mixtral");
+        assert_eq!(backend.qwen_config().expert_feed_forward_length, Some(2));
+        assert_eq!(backend.qwen_config().expert_count, Some(2));
+        assert_eq!(backend.qwen_config().expert_used_count, Some(1));
+        assert_eq!(health.family, "mixtral");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+        assert!(
+            health
+                .quantization
+                .contains("moe-text-batching=continuous-iteration")
+        );
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_deepseek_dense_gpu_execution() {
+        let path = tempfile_path("backend-generate-deepseek-dense-gpu");
+        write_reference_deepseek_dense(&path);
+
+        let backend = CudaBackend::load(&path, Some("tiny-deepseek".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::DeepSeek
+        );
+        assert_eq!(backend.qwen_config().architecture, "deepseek");
+        assert_eq!(backend.qwen_config().default_rope_freq_base(), 10_000.0);
+        assert_eq!(backend.qwen_config().expert_count, None);
+        assert_eq!(health.family, "deepseek");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_deepseek_mla_metadata_split_gpu_execution() {
+        let path = tempfile_path("backend-generate-deepseek-mla-metadata-split-gpu");
+        write_reference_deepseek_mla_metadata_split(&path);
+
+        let backend =
+            CudaBackend::load(&path, Some("tiny-deepseek-mla-split".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::DeepSeek
+        );
+        assert_eq!(backend.qwen_config().architecture, "deepseek2");
+        assert_eq!(backend.qwen_config().default_rope_freq_base(), 10_000.0);
+        assert_eq!(backend.qwen_config().expert_count, None);
+        assert_eq!(health.family, "deepseek");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_deepseek_mla_sidecar_split_gpu_execution() {
+        let path = tempfile_path("backend-generate-deepseek-mla-sidecar-split-gpu");
+        write_reference_deepseek_mla_sidecar_split(&path);
+
+        let backend =
+            CudaBackend::load(&path, Some("tiny-deepseek-mla-sidecar".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::DeepSeek
+        );
+        assert_eq!(backend.qwen_config().architecture, "deepseek2");
+        assert_eq!(health.family, "deepseek");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_deepseek_true_mla_gpu_execution() {
+        let path = tempfile_path("backend-generate-deepseek-true-mla-gpu");
+        write_reference_deepseek_true_mla(&path);
+
+        let backend = CudaBackend::load(&path, Some("tiny-deepseek-true-mla".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::DeepSeek
+        );
+        assert!(backend.qwen_config().attention_mla_tensor_layout);
+        assert_eq!(backend.qwen_config().attention_q_lora_rank, Some(1));
+        assert_eq!(backend.qwen_config().attention_kv_lora_rank, Some(1));
+        assert_eq!(health.family, "deepseek");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_deepseek_true_mla_attention_alias_gpu_execution() {
+        let path = tempfile_path("backend-generate-deepseek-true-mla-attention-alias-gpu");
+        write_reference_deepseek_true_mla_attention_aliases(&path);
+
+        let backend = CudaBackend::load(
+            &path,
+            Some("tiny-deepseek-true-mla-attention-aliases".to_string()),
+        )
+        .unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::DeepSeek
+        );
+        assert!(backend.qwen_config().attention_mla_tensor_layout);
+        assert_eq!(backend.qwen_config().attention_q_lora_rank, Some(1));
+        assert_eq!(backend.qwen_config().attention_kv_lora_rank, Some(1));
+        assert_eq!(health.family, "deepseek");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_deepseek_true_mla_self_attn_alias_gpu_execution() {
+        let path = tempfile_path("backend-generate-deepseek-true-mla-self-attn-alias-gpu");
+        write_reference_deepseek_true_mla_self_attn_aliases(&path);
+
+        let backend = CudaBackend::load(
+            &path,
+            Some("tiny-deepseek-true-mla-self-attn-aliases".to_string()),
+        )
+        .unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::DeepSeek
+        );
+        assert!(backend.qwen_config().attention_mla_tensor_layout);
+        assert_eq!(backend.qwen_config().attention_q_lora_rank, Some(1));
+        assert_eq!(backend.qwen_config().attention_kv_lora_rank, Some(1));
+        assert_eq!(health.family, "deepseek");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_legacy_batched_decode_generates_with_deepseek_true_mla() {
+        let path = tempfile_path("gpu-deepseek-true-mla-legacy-batch");
+        write_reference_deepseek_true_mla(&path);
+        let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+        assert!(model.supports_batched_text_generation());
+        let inputs = vec![vec![0], vec![1]];
+        let limits = vec![2, 1];
+        let expected = vec![
+            model
+                .generate_greedy_tokens(&inputs[0], limits[0], None)
+                .unwrap(),
+            model
+                .generate_greedy_tokens(&inputs[1], limits[1], None)
+                .unwrap(),
+        ];
+
+        assert_eq!(
+            model
+                .generate_greedy_tokens_batch_with_limits(&inputs, &limits, None)
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            model
+                .generate_sampled_tokens_batch_with_limits(
+                    &inputs,
+                    &limits,
+                    None,
+                    1.0,
+                    0.0,
+                    None,
+                    &[Some(7), Some(11)],
+                )
+                .unwrap(),
+            expected
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_generates_with_deepseek_true_mla_mrope_prompt_positions() {
+        let path = tempfile_path("gpu-generate-deepseek-true-mla-mrope");
+        write_reference_deepseek_true_mla_mrope(&path);
+        let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+        let prompt_embeddings = vec![1.0f32, 0.0, 1.0, 0.0];
+        let position_ids = vec![[0u32, 0, 0], [1, 2, 3]];
+
+        let generated = model
+            .generate_greedy_tokens_with_prompt_embeddings_and_positions(
+                &prompt_embeddings,
+                2,
+                &position_ids,
+                4,
+                2,
+                None,
+            )
+            .unwrap();
+        assert_eq!(generated, vec![0, 0]);
+
+        let paged_generated = model
+            .generate_greedy_tokens_with_prompt_embeddings_and_positions_paged_and_stop_sequences(
+                &prompt_embeddings,
+                2,
+                &position_ids,
+                4,
+                2,
+                None,
+                1,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(paged_generated, generated);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_batches_deepseek_true_mla_mrope_prompt_embeddings_across_kv_modes() {
+        let path = tempfile_path("gpu-batch-deepseek-true-mla-mrope");
+        write_reference_deepseek_true_mla_mrope(&path);
+        let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+        assert!(model.supports_batched_text_generation());
+        assert!(model.supports_batched_multimodal_generation());
+
+        let prompt_embeddings = vec![vec![1.0f32, 0.0, 1.0, 0.0], vec![0.0, 1.0, 1.0, 0.0]];
+        let position_ids = vec![vec![[0u32, 0, 0], [1, 2, 3]], vec![[2u32, 1, 0], [3, 2, 1]]];
+        let next_rope_positions = vec![4, 5];
+        let limits = vec![2, 1];
+        let seeds = vec![Some(7), Some(11)];
+        let page_tables = vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]];
+
+        let expected = vec![
+            model
+                .generate_greedy_tokens_with_prompt_embeddings_and_positions(
+                    &prompt_embeddings[0],
+                    2,
+                    &position_ids[0],
+                    next_rope_positions[0],
+                    limits[0],
+                    None,
+                )
+                .unwrap(),
+            model
+                .generate_greedy_tokens_with_prompt_embeddings_and_positions(
+                    &prompt_embeddings[1],
+                    2,
+                    &position_ids[1],
+                    next_rope_positions[1],
+                    limits[1],
+                    None,
+                )
+                .unwrap(),
+        ];
+        let expected_sampled = vec![
+            model
+                .generate_sampled_tokens_with_prompt_embeddings_and_positions(
+                    &prompt_embeddings[0],
+                    2,
+                    &position_ids[0],
+                    next_rope_positions[0],
+                    limits[0],
+                    None,
+                    1.0,
+                    0.0,
+                    None,
+                    seeds[0],
+                )
+                .unwrap(),
+            model
+                .generate_sampled_tokens_with_prompt_embeddings_and_positions(
+                    &prompt_embeddings[1],
+                    2,
+                    &position_ids[1],
+                    next_rope_positions[1],
+                    limits[1],
+                    None,
+                    1.0,
+                    0.0,
+                    None,
+                    seeds[1],
+                )
+                .unwrap(),
+        ];
+
+        assert_eq!(
+            model
+                .generate_greedy_tokens_batch_with_prompt_embeddings_positions_and_limits_and_cancellation(
+                    &prompt_embeddings,
+                    2,
+                    &position_ids,
+                    &next_rope_positions,
+                    &limits,
+                    None,
+                    &[],
+                    |_| false,
+                )
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            model
+                .generate_greedy_tokens_batch_with_prompt_embeddings_positions_paged_and_limits_and_cancellation(
+                    &prompt_embeddings,
+                    2,
+                    &position_ids,
+                    &next_rope_positions,
+                    &limits,
+                    None,
+                    1,
+                    &[],
+                    |_| false,
+                )
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            model
+                .generate_greedy_tokens_batch_with_prompt_embeddings_positions_paged_page_tables_and_limits_and_cancellation(
+                    &prompt_embeddings,
+                    2,
+                    &position_ids,
+                    &next_rope_positions,
+                    &limits,
+                    None,
+                    1,
+                    &page_tables,
+                    8,
+                    &[],
+                    |_| false,
+                )
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            model
+                .generate_sampled_tokens_batch_with_prompt_embeddings_positions_and_limits_and_cancellation(
+                    &prompt_embeddings,
+                    2,
+                    &position_ids,
+                    &next_rope_positions,
+                    &limits,
+                    None,
+                    1.0,
+                    0.0,
+                    None,
+                    &seeds,
+                    &[],
+                    |_| false,
+                )
+                .unwrap(),
+            expected_sampled
+        );
+        assert_eq!(
+            model
+                .generate_sampled_tokens_batch_with_prompt_embeddings_positions_paged_and_limits_and_cancellation(
+                    &prompt_embeddings,
+                    2,
+                    &position_ids,
+                    &next_rope_positions,
+                    &limits,
+                    None,
+                    1.0,
+                    0.0,
+                    None,
+                    &seeds,
+                    1,
+                    &[],
+                    |_| false,
+                )
+                .unwrap(),
+            expected_sampled
+        );
+        assert_eq!(
+            model
+                .generate_sampled_tokens_batch_with_prompt_embeddings_positions_paged_page_tables_and_limits_and_cancellation(
+                    &prompt_embeddings,
+                    2,
+                    &position_ids,
+                    &next_rope_positions,
+                    &limits,
+                    None,
+                    1.0,
+                    0.0,
+                    None,
+                    &seeds,
+                    1,
+                    &page_tables,
+                    8,
+                    &[],
+                    |_| false,
+                )
+                .unwrap(),
+            expected_sampled
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_deepseek_mla_metadata_packed_gpu_execution() {
+        let path = tempfile_path("backend-generate-deepseek-mla-metadata-packed-gpu");
+        write_reference_deepseek_mla_metadata_packed(&path);
+
+        let backend =
+            CudaBackend::load(&path, Some("tiny-deepseek-mla-packed".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::DeepSeek
+        );
+        assert_eq!(backend.qwen_config().architecture, "deepseek2");
+        assert_eq!(backend.qwen_config().default_rope_freq_base(), 10_000.0);
+        assert_eq!(backend.qwen_config().expert_count, None);
+        assert_eq!(health.family, "deepseek");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_glm_dense_gpu_execution() {
+        let path = tempfile_path("backend-generate-glm-dense-gpu");
+        write_reference_glm_dense(&path);
+
+        let backend = CudaBackend::load(&path, Some("tiny-glm".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::GlmFlash
+        );
+        assert_eq!(backend.qwen_config().architecture, "glm4");
+        assert_eq!(backend.qwen_config().default_rope_freq_base(), 1_000_000.0);
+        assert_eq!(backend.qwen_config().expert_count, None);
+        assert_eq!(health.family, "glm-flash");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_glm_transformer_alias_gpu_execution() {
+        let path = tempfile_path("backend-generate-glm-transformer-alias-gpu");
+        write_reference_glm_transformer_aliases(&path);
+
+        let backend =
+            CudaBackend::load(&path, Some("tiny-glm-transformer-aliases".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::GlmFlash
+        );
+        assert_eq!(backend.qwen_config().architecture, "glm4");
+        assert_eq!(backend.qwen_config().default_rope_freq_base(), 1_000_000.0);
+        assert_eq!(health.family, "glm-flash");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_glm_gpt_neox_alias_gpu_execution() {
+        let path = tempfile_path("backend-generate-glm-gpt-neox-alias-gpu");
+        write_reference_glm_gpt_neox_aliases(&path);
+
+        let backend =
+            CudaBackend::load(&path, Some("tiny-glm-gpt-neox-aliases".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::GlmFlash
+        );
+        assert_eq!(backend.qwen_config().architecture, "glm4");
+        assert_eq!(backend.qwen_config().default_rope_freq_base(), 1_000_000.0);
+        assert_eq!(health.family, "glm-flash");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_glm_model_transformer_w_alias_gpu_execution() {
+        let path = tempfile_path("backend-generate-glm-model-transformer-w-alias-gpu");
+        write_reference_glm_model_transformer_w_aliases(&path);
+
+        let backend = CudaBackend::load(
+            &path,
+            Some("tiny-glm-model-transformer-w-aliases".to_string()),
+        )
+        .unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::GlmFlash
+        );
+        assert_eq!(backend.qwen_config().architecture, "glm4");
+        assert_eq!(backend.qwen_config().default_rope_freq_base(), 1_000_000.0);
+        assert_eq!(health.family, "glm-flash");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_glm_mla_metadata_split_gpu_execution() {
+        let path = tempfile_path("backend-generate-glm-mla-metadata-split-gpu");
+        write_reference_glm_mla_metadata_split(&path);
+
+        let backend = CudaBackend::load(&path, Some("tiny-glm-mla-split".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::GlmFlash
+        );
+        assert_eq!(backend.qwen_config().architecture, "glm4");
+        assert_eq!(backend.qwen_config().default_rope_freq_base(), 1_000_000.0);
+        assert_eq!(backend.qwen_config().expert_count, None);
+        assert_eq!(health.family, "glm-flash");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_glm_mla_sidecar_split_gpu_execution() {
+        let path = tempfile_path("backend-generate-glm-mla-sidecar-split-gpu");
+        write_reference_glm_mla_sidecar_split(&path);
+
+        let backend = CudaBackend::load(&path, Some("tiny-glm-mla-sidecar".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::GlmFlash
+        );
+        assert_eq!(backend.qwen_config().architecture, "glm4");
+        assert_eq!(health.family, "glm-flash");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_glm_true_mla_gpu_execution() {
+        let path = tempfile_path("backend-generate-glm-true-mla-gpu");
+        write_reference_glm_true_mla(&path);
+
+        let backend = CudaBackend::load(&path, Some("tiny-glm-true-mla".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::GlmFlash
+        );
+        assert!(backend.qwen_config().attention_mla_tensor_layout);
+        assert_eq!(backend.qwen_config().attention_q_lora_rank, Some(1));
+        assert_eq!(backend.qwen_config().attention_kv_lora_rank, Some(1));
+        assert_eq!(health.family, "glm-flash");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_glm_true_mla_self_attention_alias_gpu_execution() {
+        let path = tempfile_path("backend-generate-glm-true-mla-self-attention-alias-gpu");
+        write_reference_glm_true_mla_self_attention_aliases(&path);
+
+        let backend = CudaBackend::load(
+            &path,
+            Some("tiny-glm-true-mla-self-attention-aliases".to_string()),
+        )
+        .unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::GlmFlash
+        );
+        assert!(backend.qwen_config().attention_mla_tensor_layout);
+        assert_eq!(backend.qwen_config().attention_q_lora_rank, Some(1));
+        assert_eq!(backend.qwen_config().attention_kv_lora_rank, Some(1));
+        assert_eq!(health.family, "glm-flash");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_glm_true_mla_attention_alias_gpu_execution() {
+        let path = tempfile_path("backend-generate-glm-true-mla-attention-alias-gpu");
+        write_reference_glm_true_mla_attention_aliases(&path);
+
+        let backend = CudaBackend::load(
+            &path,
+            Some("tiny-glm-true-mla-attention-aliases".to_string()),
+        )
+        .unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::GlmFlash
+        );
+        assert!(backend.qwen_config().attention_mla_tensor_layout);
+        assert_eq!(backend.qwen_config().attention_q_lora_rank, Some(1));
+        assert_eq!(backend.qwen_config().attention_kv_lora_rank, Some(1));
+        assert_eq!(health.family, "glm-flash");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_glm_true_mla_self_attn_alias_gpu_execution() {
+        let path = tempfile_path("backend-generate-glm-true-mla-self-attn-alias-gpu");
+        write_reference_glm_true_mla_self_attn_aliases(&path);
+
+        let backend = CudaBackend::load(
+            &path,
+            Some("tiny-glm-true-mla-self-attn-aliases".to_string()),
+        )
+        .unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::GlmFlash
+        );
+        assert!(backend.qwen_config().attention_mla_tensor_layout);
+        assert_eq!(backend.qwen_config().attention_q_lora_rank, Some(1));
+        assert_eq!(backend.qwen_config().attention_kv_lora_rank, Some(1));
+        assert_eq!(health.family, "glm-flash");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_glm_mla_metadata_packed_gpu_execution() {
+        let path = tempfile_path("backend-generate-glm-mla-metadata-packed-gpu");
+        write_reference_glm_mla_metadata_packed(&path);
+
+        let backend = CudaBackend::load(&path, Some("tiny-glm-mla-packed".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::GlmFlash
+        );
+        assert_eq!(backend.qwen_config().architecture, "glm4");
+        assert_eq!(backend.qwen_config().default_rope_freq_base(), 1_000_000.0);
+        assert_eq!(backend.qwen_config().expert_count, None);
+        assert_eq!(health.family, "glm-flash");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_glm_flash_dense_gpu_execution() {
+        let path = tempfile_path("backend-generate-glm-flash-dense-gpu");
+        write_reference_glm_flash_dense(&path);
+
+        let backend = CudaBackend::load(&path, Some("tiny-glm-flash".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::GlmFlash
+        );
+        assert_eq!(backend.qwen_config().architecture, "glm4flash");
+        assert_eq!(backend.qwen_config().default_rope_freq_base(), 1_000_000.0);
+        assert_eq!(backend.qwen_config().expert_count, None);
+        assert_eq!(health.family, "glm-flash");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_glm_flash_moe_gpu_execution() {
+        let path = tempfile_path("backend-generate-glm-flash-moe-gpu");
+        write_reference_glm_flash_moe(&path);
+
+        let backend = CudaBackend::load(&path, Some("tiny-glm-flash-moe".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::GlmFlash
+        );
+        assert_eq!(backend.qwen_config().architecture, "glm4flash");
+        assert_eq!(backend.qwen_config().expert_feed_forward_length, Some(2));
+        assert_eq!(backend.qwen_config().expert_count, Some(2));
+        assert_eq!(backend.qwen_config().expert_used_count, Some(1));
+        assert_eq!(backend.qwen_config().default_rope_freq_base(), 1_000_000.0);
+        assert_eq!(health.family, "glm-flash");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+        assert!(
+            health
+                .quantization
+                .contains("moe-text-batching=continuous-iteration")
+        );
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_glm_moe_gpu_execution() {
+        let path = tempfile_path("backend-generate-glm-moe-gpu");
+        write_reference_glm_moe(&path);
+
+        let backend = CudaBackend::load(&path, Some("tiny-glm-moe".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::GlmFlash
+        );
+        assert_eq!(backend.qwen_config().architecture, "glm4moe");
+        assert_eq!(backend.qwen_config().expert_feed_forward_length, Some(2));
+        assert_eq!(backend.qwen_config().expert_count, Some(2));
+        assert_eq!(backend.qwen_config().expert_used_count, Some(1));
+        assert_eq!(backend.qwen_config().default_rope_freq_base(), 1_000_000.0);
+        assert_eq!(health.family, "glm-flash");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+        assert!(
+            health
+                .quantization
+                .contains("moe-text-batching=continuous-iteration")
+        );
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_deepseek_moe_gpu_execution() {
+        let path = tempfile_path("backend-generate-deepseek-moe-gpu");
+        write_reference_deepseek_moe(&path);
+
+        let backend = CudaBackend::load(&path, Some("tiny-deepseek-moe".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::DeepSeek
+        );
+        assert_eq!(backend.qwen_config().architecture, "deepseek");
+        assert_eq!(backend.qwen_config().expert_feed_forward_length, Some(2));
+        assert_eq!(backend.qwen_config().expert_count, Some(2));
+        assert_eq!(backend.qwen_config().expert_used_count, Some(1));
+        assert_eq!(backend.qwen_config().default_rope_freq_base(), 10_000.0);
+        assert_eq!(health.family, "deepseek");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_gemma_gpu_execution() {
+        let path = tempfile_path("backend-generate-gemma-gpu");
+        write_reference_gemma(&path);
+
+        let backend = CudaBackend::load(&path, Some("tiny-gemma".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Gemma
+        );
+        assert_eq!(backend.qwen_config().architecture, "gemma");
+        assert_eq!(backend.qwen_config().default_rope_freq_base(), 10_000.0);
+        assert_eq!(health.family, "gemma");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_gemma_pre_feedforward_alias_gpu_execution() {
+        let path = tempfile_path("backend-generate-gemma-pre-feedforward-alias-gpu");
+        write_reference_gemma_pre_feedforward_aliases(&path);
+
+        let backend = CudaBackend::load(
+            &path,
+            Some("tiny-gemma-pre-feedforward-aliases".to_string()),
+        )
+        .unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Gemma
+        );
+        assert_eq!(backend.qwen_config().architecture, "gemma");
+        assert_eq!(health.family, "gemma");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_gemma_post_feedforward_alias_gpu_execution() {
+        let path = tempfile_path("backend-generate-gemma-post-feedforward-alias-gpu");
+        write_reference_gemma_post_feedforward_aliases(&path);
+
+        let backend = CudaBackend::load(
+            &path,
+            Some("tiny-gemma-post-feedforward-aliases".to_string()),
+        )
+        .unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Gemma
+        );
+        assert_eq!(backend.qwen_config().architecture, "gemma");
+        assert_eq!(health.family, "gemma");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_gemma_dense_bias_alias_gpu_execution() {
+        let path = tempfile_path("backend-generate-gemma-dense-bias-alias-gpu");
+        write_reference_gemma_dense_bias_aliases(&path);
+
+        let backend =
+            CudaBackend::load(&path, Some("tiny-gemma-dense-bias-aliases".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Gemma
+        );
+        assert_eq!(backend.qwen_config().architecture, "gemma");
+        assert_eq!(health.family, "gemma");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_phi_gpu_execution() {
+        let path = tempfile_path("backend-generate-phi-gpu");
+        write_reference_phi(&path);
+
+        let backend = CudaBackend::load(&path, Some("tiny-phi".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Phi
+        );
+        assert_eq!(backend.qwen_config().architecture, "phi3");
+        assert_eq!(backend.qwen_config().default_rope_freq_base(), 10_000.0);
+        assert_eq!(health.family, "phi");
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(health.quantization.contains("attention=tiled-paged"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_phi_packed_gpu_execution() {
+        let path = tempfile_path("backend-generate-phi-packed-gpu");
+        write_reference_phi_packed(&path);
+
+        let backend = CudaBackend::load(&path, Some("tiny-phi-packed".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Phi
+        );
+        assert_eq!(backend.qwen_config().architecture, "phi3");
+        assert_eq!(health.family, "phi");
+        assert!(health.quantization.contains("execution=gpu"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_phi_packed_qkv_bias_gpu_execution() {
+        let path = tempfile_path("backend-generate-phi-packed-qkv-bias-gpu");
+        write_reference_phi_packed_qkv_bias(&path);
+
+        let backend =
+            CudaBackend::load(&path, Some("tiny-phi-packed-qkv-bias".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Phi
+        );
+        assert_eq!(backend.qwen_config().architecture, "phi3");
+        assert_eq!(health.family, "phi");
+        assert!(health.quantization.contains("execution=gpu"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_phi_split_qkv_bias_gpu_execution() {
+        let path = tempfile_path("backend-generate-phi-split-qkv-bias-gpu");
+        write_reference_phi_split_qkv_bias(&path);
+
+        let backend =
+            CudaBackend::load(&path, Some("tiny-phi-split-qkv-bias".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Phi
+        );
+        assert_eq!(backend.qwen_config().architecture, "phi3");
+        assert_eq!(health.family, "phi");
+        assert!(health.quantization.contains("execution=gpu"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_phi_packed_alias_gpu_execution() {
+        let path = tempfile_path("backend-generate-phi-packed-alias-gpu");
+        write_reference_phi_packed_aliases(&path);
+
+        let backend = CudaBackend::load(&path, Some("tiny-phi-packed-alias".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Phi
+        );
+        assert_eq!(backend.qwen_config().architecture, "phi3");
+        assert_eq!(health.family, "phi");
+        assert!(health.quantization.contains("execution=gpu"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_phi_hf_gate_up_packed_alias_gpu_execution() {
+        let path = tempfile_path("backend-generate-phi-hf-gate-up-packed-alias-gpu");
+        write_reference_phi_hf_gate_up_packed_aliases(&path);
+
+        let backend =
+            CudaBackend::load(&path, Some("tiny-phi-hf-gate-up-packed-alias".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Phi
+        );
+        assert_eq!(backend.qwen_config().architecture, "phi3");
+        assert_eq!(health.family, "phi");
+        assert!(health.quantization.contains("execution=gpu"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_phi_query_key_value_packed_alias_gpu_execution() {
+        let path = tempfile_path("backend-generate-phi-query-key-value-packed-alias-gpu");
+        write_reference_phi_query_key_value_packed_aliases(&path);
+
+        let backend = CudaBackend::load(
+            &path,
+            Some("tiny-phi-query-key-value-packed-alias".to_string()),
+        )
+        .unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Phi
+        );
+        assert_eq!(backend.qwen_config().architecture, "phi3");
+        assert_eq!(health.family, "phi");
+        assert!(health.quantization.contains("execution=gpu"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_phi_packed_ffn_named_variants_gpu_execution() {
+        let variants: &[(&str, fn(&Path))] = &[
+            ("ffn-gate-up", write_reference_phi_packed_ffn_gate_up),
+            ("ffn-up-gate", write_reference_phi_packed_ffn_up_gate),
+        ];
+
+        for (name, write_fixture) in variants {
+            let path = tempfile_path(&format!("backend-generate-phi-{name}-gpu"));
+            write_fixture(&path);
+
+            let backend = CudaBackend::load(&path, Some(format!("tiny-phi-{name}"))).unwrap();
+
+            let health = backend.health();
+            assert!(health.ready);
+            assert_eq!(
+                backend.model().family,
+                hi_local_core::model::ModelFamily::Phi
+            );
+            assert_eq!(backend.qwen_config().architecture, "phi3");
+            assert_eq!(health.family, "phi");
+            assert!(health.quantization.contains("execution=gpu"));
+
+            let output = backend
+                .generate(GenerationRequest {
+                    prompt: "a".to_string(),
+                    max_tokens: 1,
+                    temperature: 0.0,
+                    top_p: 1.0,
+                    top_k: None,
+                    seed: None,
+                    stop_sequences: Vec::new(),
+                    media_inputs: Vec::new(),
+                })
+                .await
+                .unwrap();
+            assert_eq!(output.text, "a");
+            assert_eq!(output.prompt_tokens, 1);
+            assert_eq!(output.completion_tokens, 1);
+        }
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test]
+    async fn cuda_backend_generates_with_phi_mixer_packed_qkv_gpu_execution() {
+        let path = tempfile_path("backend-generate-phi-mixer-packed-qkv-gpu");
+        write_reference_phi_mixer_packed_qkv(&path);
+
+        let backend =
+            CudaBackend::load(&path, Some("tiny-phi-mixer-packed-qkv".to_string())).unwrap();
+
+        let health = backend.health();
+        assert!(health.ready);
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::Phi
+        );
+        assert_eq!(backend.qwen_config().architecture, "phi3");
+        assert_eq!(health.family, "phi");
+        assert!(health.quantization.contains("execution=gpu"));
+
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(output.text, "a");
+        assert_eq!(output.prompt_tokens, 1);
+        assert_eq!(output.completion_tokens, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cuda_gpu_scheduler_batches_concurrent_requests() {
+        let path = tempfile_path("backend-scheduler-gpu");
+        write_reference_qwen(&path);
+
+        let backend = std::sync::Arc::new(
+            CudaBackend::load_with_config(
+                &path,
+                Some("tiny-cuda".to_string()),
+                CudaExecution::Gpu,
+                super::CudaBackendConfig {
+                    max_batch_size: 2,
+                    max_active_requests: 2,
+                    max_batched_tokens: 9,
+                    kv_page_size: 8,
+                    max_wait_us: 100_000,
+                    mmproj_path: None,
+                    ..super::CudaBackendConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        let request = GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens: 1,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+
+        let left = {
+            let backend = backend.clone();
+            let request = request.clone();
+            tokio::spawn(async move { backend.generate(request).await.unwrap() })
+        };
+        let right = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(request).await.unwrap() })
+        };
+
+        assert_eq!(left.await.unwrap().text, "a");
+        assert_eq!(right.await.unwrap().text, "a");
+        let health = backend.health();
+        assert!(health.quantization.contains("total_requests=2"));
+        assert!(health.quantization.contains("gpu_batched_batches=1"));
+        assert!(health.quantization.contains("gpu_batched_requests=2"));
+        assert!(
+            health
+                .quantization
+                .contains("paged_lease_batched_requests=2")
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "batch_plan_eligible_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "batch_plan_ineligible_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "prefill_tokens_total"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "decode_tokens_total"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "completed_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "errored_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "shared_prefix_batches"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "shared_prefix_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "shared_prefix_tokens_total"),
+            Some(0)
+        );
+        assert!(health_counter(&health.quantization, "tokens_per_sec_prefill").unwrap_or(0) > 0);
+        assert!(health_counter(&health.quantization, "tokens_per_sec_decode").unwrap_or(0) > 0);
+        assert!(health.quantization.contains("max_observed=2"));
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cuda_gpu_scheduler_batches_dense_llama_requests() {
+        let path = tempfile_path("backend-scheduler-gpu-llama");
+        write_reference_llama(&path);
+
+        let backend = std::sync::Arc::new(
+            CudaBackend::load_with_config(
+                &path,
+                Some("tiny-llama".to_string()),
+                CudaExecution::Gpu,
+                super::CudaBackendConfig {
+                    max_batch_size: 2,
+                    max_active_requests: 2,
+                    max_batched_tokens: 9,
+                    kv_page_size: 8,
+                    max_wait_us: 100_000,
+                    mmproj_path: None,
+                    ..super::CudaBackendConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        let request = GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens: 1,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+
+        let left = {
+            let backend = backend.clone();
+            let request = request.clone();
+            tokio::spawn(async move { backend.generate(request).await.unwrap() })
+        };
+        let right = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(request).await.unwrap() })
+        };
+
+        assert_eq!(left.await.unwrap().text, "a");
+        assert_eq!(right.await.unwrap().text, "a");
+        let health = backend.health();
+        assert_eq!(health.family, "llama");
+        assert!(health.quantization.contains("mode=continuous-iteration"));
+        assert!(health.quantization.contains("gpu_batched_batches=1"));
+        assert!(health.quantization.contains("gpu_batched_requests=2"));
+        assert!(
+            health
+                .quantization
+                .contains("paged_lease_batched_requests=2")
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "batch_plan_eligible_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "fallback_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "fallback_moe_requests"),
+            Some(0)
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cuda_gpu_scheduler_batches_mixtral_moe_requests() {
+        let path = tempfile_path("backend-scheduler-gpu-mixtral-moe");
+        write_reference_mixtral_moe(&path);
+
+        let backend = std::sync::Arc::new(
+            CudaBackend::load_with_config(
+                &path,
+                Some("tiny-mixtral".to_string()),
+                CudaExecution::Gpu,
+                super::CudaBackendConfig {
+                    max_batch_size: 2,
+                    max_active_requests: 2,
+                    max_batched_tokens: 9,
+                    kv_page_size: 8,
+                    max_wait_us: 100_000,
+                    mmproj_path: None,
+                    ..super::CudaBackendConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        let request = GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens: 1,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+
+        let left = {
+            let backend = backend.clone();
+            let request = request.clone();
+            tokio::spawn(async move { backend.generate(request).await.unwrap() })
+        };
+        let right = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(request).await.unwrap() })
+        };
+
+        assert_eq!(left.await.unwrap().completion_tokens, 1);
+        assert_eq!(right.await.unwrap().completion_tokens, 1);
+        let health = backend.health();
+        assert_eq!(health.family, "mixtral");
+        assert!(health.quantization.contains("mode=continuous-iteration"));
+        assert!(health.quantization.contains("gpu_batched_batches=1"));
+        assert!(health.quantization.contains("gpu_batched_requests=2"));
+        assert!(
+            health
+                .quantization
+                .contains("paged_lease_batched_requests=2")
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "batch_plan_eligible_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "fallback_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "fallback_moe_requests"),
+            Some(0)
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cuda_gpu_scheduler_batches_mixtral_per_expert_moe_requests() {
+        let path = tempfile_path("backend-scheduler-gpu-mixtral-per-expert-moe");
+        write_reference_mixtral_per_expert_moe(&path);
+
+        let backend = std::sync::Arc::new(
+            CudaBackend::load_with_config(
+                &path,
+                Some("tiny-mixtral-per-expert".to_string()),
+                CudaExecution::Gpu,
+                super::CudaBackendConfig {
+                    max_batch_size: 2,
+                    max_active_requests: 2,
+                    max_batched_tokens: 9,
+                    kv_page_size: 8,
+                    max_wait_us: 100_000,
+                    mmproj_path: None,
+                    ..super::CudaBackendConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        let request = GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens: 1,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+
+        let left = {
+            let backend = backend.clone();
+            let request = request.clone();
+            tokio::spawn(async move { backend.generate(request).await.unwrap() })
+        };
+        let right = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(request).await.unwrap() })
+        };
+
+        assert_eq!(left.await.unwrap().completion_tokens, 1);
+        assert_eq!(right.await.unwrap().completion_tokens, 1);
+        let health = backend.health();
+        assert_eq!(health.family, "mixtral");
+        assert!(health.quantization.contains("mode=continuous-iteration"));
+        assert!(health.quantization.contains("gpu_batched_batches=1"));
+        assert!(health.quantization.contains("gpu_batched_requests=2"));
+        assert!(
+            health
+                .quantization
+                .contains("paged_lease_batched_requests=2")
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "batch_plan_eligible_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "fallback_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "fallback_moe_requests"),
+            Some(0)
+        );
+        drop(backend);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cuda_gpu_scheduler_batches_sampled_deepseek_moe_requests() {
+        let path = tempfile_path("backend-scheduler-gpu-deepseek-moe-sampled");
+        write_reference_deepseek_moe(&path);
+
+        let backend = std::sync::Arc::new(
+            CudaBackend::load_with_config(
+                &path,
+                Some("tiny-deepseek-moe".to_string()),
+                CudaExecution::Gpu,
+                super::CudaBackendConfig {
+                    max_batch_size: 2,
+                    max_active_requests: 2,
+                    max_batched_tokens: 9,
+                    kv_page_size: 8,
+                    max_wait_us: 100_000,
+                    mmproj_path: None,
+                    ..super::CudaBackendConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        let request = |seed| GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens: 1,
+            temperature: 0.7,
+            top_p: 1.0,
+            top_k: Some(1),
+            seed: Some(seed),
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+
+        let left = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(request(17)).await.unwrap() })
+        };
+        let right = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(request(23)).await.unwrap() })
+        };
+
+        assert_eq!(left.await.unwrap().completion_tokens, 1);
+        assert_eq!(right.await.unwrap().completion_tokens, 1);
+        let health = backend.health();
+        assert_eq!(health.family, "deepseek");
+        assert!(health.quantization.contains("mode=continuous-iteration"));
+        assert!(health.quantization.contains("sampled_batched_requests=2"));
+        assert!(
+            health
+                .quantization
+                .contains("paged_lease_batched_requests=2")
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "batch_plan_eligible_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "fallback_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "fallback_moe_requests"),
+            Some(0)
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cuda_gpu_scheduler_batches_sampled_dense_mistral_requests() {
+        let path = tempfile_path("backend-scheduler-gpu-mistral-sampled");
+        write_reference_mistral(&path);
+
+        let backend = std::sync::Arc::new(
+            CudaBackend::load_with_config(
+                &path,
+                Some("tiny-mistral".to_string()),
+                CudaExecution::Gpu,
+                super::CudaBackendConfig {
+                    max_batch_size: 2,
+                    max_active_requests: 2,
+                    max_wait_us: 100_000,
+                    mmproj_path: None,
+                    ..super::CudaBackendConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        let request = |seed| GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens: 1,
+            temperature: 0.8,
+            top_p: 1.0,
+            top_k: Some(1),
+            seed: Some(seed),
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+
+        let left = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(request(7)).await.unwrap() })
+        };
+        let right = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(request(11)).await.unwrap() })
+        };
+
+        assert_eq!(left.await.unwrap().completion_tokens, 1);
+        assert_eq!(right.await.unwrap().completion_tokens, 1);
+        let health = backend.health();
+        assert_eq!(health.family, "mistral");
+        assert!(health.quantization.contains("sampled_batched_requests=2"));
+        assert!(
+            health
+                .quantization
+                .contains("paged_lease_batched_requests=2")
+        );
+        assert!(health.quantization.contains("sampling=batched"));
+        assert_eq!(
+            health_counter(&health.quantization, "batch_plan_eligible_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "fallback_requests"),
+            Some(0)
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cuda_gpu_scheduler_batches_remaining_dense_family_fixtures() {
+        let cases: [(&str, fn(&Path), &str, &str); 8] = [
+            (
+                "qwen-next-dense",
+                write_reference_qwen_next_dense,
+                "tiny-qwen-next",
+                "qwen3",
+            ),
+            (
+                "deepseek-dense",
+                write_reference_deepseek_dense,
+                "tiny-deepseek",
+                "deepseek",
+            ),
+            (
+                "glm-dense",
+                write_reference_glm_dense,
+                "tiny-glm",
+                "glm-flash",
+            ),
+            (
+                "glm-flash-dense",
+                write_reference_glm_flash_dense,
+                "tiny-glm-flash",
+                "glm-flash",
+            ),
+            (
+                "glm-flash-moe",
+                write_reference_glm_flash_moe,
+                "tiny-glm-flash-moe",
+                "glm-flash",
+            ),
+            (
+                "glm-moe",
+                write_reference_glm_moe,
+                "tiny-glm-moe",
+                "glm-flash",
+            ),
+            ("gemma", write_reference_gemma, "tiny-gemma", "gemma"),
+            ("phi", write_reference_phi, "tiny-phi", "phi"),
+        ];
+
+        for (case_name, write_fixture, model_name, family) in cases {
+            let path = tempfile_path(&format!("backend-scheduler-gpu-{case_name}"));
+            write_fixture(&path);
+            let backend = std::sync::Arc::new(
+                CudaBackend::load_with_config(
+                    &path,
+                    Some(model_name.to_string()),
+                    CudaExecution::Gpu,
+                    super::CudaBackendConfig {
+                        max_batch_size: 2,
+                        max_active_requests: 2,
+                        max_batched_tokens: 9,
+                        kv_page_size: 8,
+                        max_wait_us: 100_000,
+                        mmproj_path: None,
+                        ..super::CudaBackendConfig::default()
+                    },
+                )
+                .unwrap(),
+            );
+            let request = GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 1,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            };
+
+            let left = {
+                let backend = backend.clone();
+                let request = request.clone();
+                tokio::spawn(async move { backend.generate(request).await.unwrap() })
+            };
+            let right = {
+                let backend = backend.clone();
+                tokio::spawn(async move { backend.generate(request).await.unwrap() })
+            };
+
+            assert_eq!(left.await.unwrap().completion_tokens, 1);
+            assert_eq!(right.await.unwrap().completion_tokens, 1);
+            let health = backend.health();
+            assert_eq!(health.family, family, "{case_name}");
+            assert!(
+                health.quantization.contains("mode=continuous-iteration"),
+                "{case_name}: {}",
+                health.quantization
+            );
+            assert!(
+                health.quantization.contains("gpu_batched_requests=2"),
+                "{case_name}: {}",
+                health.quantization
+            );
+            assert!(
+                health
+                    .quantization
+                    .contains("paged_lease_batched_requests=2"),
+                "{case_name}: {}",
+                health.quantization
+            );
+            assert_eq!(
+                health_counter(&health.quantization, "batch_plan_eligible_requests"),
+                Some(2),
+                "{case_name}"
+            );
+            assert_eq!(
+                health_counter(&health.quantization, "fallback_requests"),
+                Some(0),
+                "{case_name}"
+            );
+        }
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cuda_gpu_scheduler_applies_stop_sequences_to_batched_outputs() {
+        let path = tempfile_path("backend-scheduler-gpu-stop-sequences");
+        write_reference_qwen(&path);
+
+        let backend = std::sync::Arc::new(
+            CudaBackend::load_with_config(
+                &path,
+                Some("tiny-cuda".to_string()),
+                CudaExecution::Gpu,
+                super::CudaBackendConfig {
+                    max_batch_size: 2,
+                    max_active_requests: 2,
+                    max_wait_us: 100_000,
+                    mmproj_path: None,
+                    ..super::CudaBackendConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        let request = GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens: 2,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: vec!["a".to_string()],
+            media_inputs: Vec::new(),
+        };
+
+        let left = {
+            let backend = backend.clone();
+            let request = request.clone();
+            tokio::spawn(async move { backend.generate(request).await.unwrap() })
+        };
+        let right = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(request).await.unwrap() })
+        };
+
+        let left = left.await.unwrap();
+        let right = right.await.unwrap();
+        assert_eq!(left.text, "");
+        assert_eq!(right.text, "");
+        assert_eq!(left.completion_tokens, 1);
+        assert_eq!(right.completion_tokens, 1);
+        let health = backend.health();
+        assert_eq!(
+            health_counter(&health.quantization, "gpu_batched_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "decode_tokens_total"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "completed_requests"),
+            Some(2)
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cuda_gpu_scheduler_applies_multi_token_stop_sequences_inside_batch() {
+        let path = tempfile_path("backend-scheduler-gpu-multi-token-stop-sequences");
+        write_reference_qwen(&path);
+
+        let backend = std::sync::Arc::new(
+            CudaBackend::load_with_config(
+                &path,
+                Some("tiny-cuda".to_string()),
+                CudaExecution::Gpu,
+                super::CudaBackendConfig {
+                    max_batch_size: 2,
+                    max_active_requests: 2,
+                    max_wait_us: 100_000,
+                    mmproj_path: None,
+                    ..super::CudaBackendConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        let request = GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens: 4,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: vec!["aa".to_string()],
+            media_inputs: Vec::new(),
+        };
+
+        let left = {
+            let backend = backend.clone();
+            let request = request.clone();
+            tokio::spawn(async move { backend.generate(request).await.unwrap() })
+        };
+        let right = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(request).await.unwrap() })
+        };
+
+        let left = left.await.unwrap();
+        let right = right.await.unwrap();
+        assert_eq!(left.text, "");
+        assert_eq!(right.text, "");
+        assert_eq!(left.completion_tokens, 2);
+        assert_eq!(right.completion_tokens, 2);
+        let health = backend.health();
+        assert_eq!(
+            health_counter(&health.quantization, "gpu_batched_requests"),
+            Some(4)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "decode_tokens_total"),
+            Some(4)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "completed_requests"),
+            Some(2)
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cuda_gpu_scheduler_records_shared_prefix_reuse_for_lease_backed_batch() {
+        let path = tempfile_path("backend-scheduler-gpu-shared-prefix");
+        write_reference_qwen(&path);
+
+        let backend = std::sync::Arc::new(
+            CudaBackend::load_with_config(
+                &path,
+                Some("tiny-cuda".to_string()),
+                CudaExecution::Gpu,
+                super::CudaBackendConfig {
+                    max_batch_size: 2,
+                    max_active_requests: 2,
+                    max_wait_us: 100_000,
+                    mmproj_path: None,
+                    ..super::CudaBackendConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        let request = |prompt: &str| GenerationRequest {
+            prompt: prompt.to_string(),
+            max_tokens: 1,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+
+        let left = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(request("aaaab")).await.unwrap() })
+        };
+        let right = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(request("aaaac")).await.unwrap() })
+        };
+
+        assert_eq!(left.await.unwrap().completion_tokens, 1);
+        assert_eq!(right.await.unwrap().completion_tokens, 1);
+        let health = backend.health();
+        assert_eq!(
+            health_counter(&health.quantization, "gpu_batched_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "paged_lease_batched_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "shared_prefix_batches"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "shared_prefix_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "shared_prefix_tokens_total"),
+            Some(4)
+        );
+        assert!(health.quantization.contains(
+            "prefix-cache=enabled(scope=batch,backend=paged-shared-prefix,batches=1,requests=2,tokens_total=4)"
+        ));
+        assert_eq!(
+            health_counter(&health.quantization, "prefill_tokens_total"),
+            Some(6)
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cuda_gpu_scheduler_splits_shared_prefix_when_leases_cannot_cover_group() {
+        let path = tempfile_path("backend-scheduler-gpu-shared-prefix-lease-gate");
+        write_reference_qwen(&path);
+
+        let backend = std::sync::Arc::new(
+            CudaBackend::load_with_config(
+                &path,
+                Some("tiny-cuda".to_string()),
+                CudaExecution::Gpu,
+                super::CudaBackendConfig {
+                    max_batch_size: 2,
+                    max_active_requests: 2,
+                    max_batched_tokens: 17,
+                    kv_page_size: 8,
+                    max_wait_us: 100_000,
+                    mmproj_path: None,
+                    ..super::CudaBackendConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        let request = |prompt: &str, max_tokens| GenerationRequest {
+            prompt: prompt.to_string(),
+            max_tokens,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+
+        let short = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(request("aaaab", 1)).await.unwrap() })
+        };
+        let long = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(request("aaaac", 8)).await.unwrap() })
+        };
+
+        assert_eq!(short.await.unwrap().completion_tokens, 1);
+        assert!(long.await.unwrap().completion_tokens >= 1);
+        let health = backend.health();
+        assert_eq!(
+            health_counter(&health.quantization, "batch_plan_eligible_requests"),
+            Some(2)
+        );
+        assert!(health_counter(&health.quantization, "gpu_batched_requests").unwrap_or(0) >= 2);
+        assert!(
+            health_counter(&health.quantization, "paged_lease_batched_requests").unwrap_or(0) >= 2
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "fallback_bucket_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "shared_prefix_batches"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "shared_prefix_tokens_total"),
+            Some(4)
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn cuda_gpu_scheduler_length_buckets_mixed_prompt_batches() {
+        let path = tempfile_path("backend-scheduler-gpu-buckets");
+        write_reference_qwen(&path);
+
+        let backend = std::sync::Arc::new(
+            CudaBackend::load_with_config(
+                &path,
+                Some("tiny-cuda".to_string()),
+                CudaExecution::Gpu,
+                super::CudaBackendConfig {
+                    max_batch_size: 3,
+                    max_active_requests: 3,
+                    max_wait_us: 100_000,
+                    mmproj_path: None,
+                    ..super::CudaBackendConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        let request = |prompt: &str| GenerationRequest {
+            prompt: prompt.to_string(),
+            max_tokens: 1,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+
+        let left = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(request("a")).await.unwrap() })
+        };
+        let middle = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(request("b")).await.unwrap() })
+        };
+        let right = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(request("ab")).await.unwrap() })
+        };
+
+        assert_eq!(left.await.unwrap().completion_tokens, 1);
+        assert_eq!(middle.await.unwrap().completion_tokens, 1);
+        assert_eq!(right.await.unwrap().completion_tokens, 1);
+        let health = backend.health();
+        assert!(health.quantization.contains("total_requests=3"));
+        assert!(health.quantization.contains("gpu_batched_batches=2"));
+        assert!(health.quantization.contains("gpu_batched_requests=3"));
+        assert_eq!(
+            health_counter(&health.quantization, "fallback_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "fallback_bucket_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "fallback_single_request"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "batch_plan_eligible_requests"),
+            Some(3)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "batch_plan_ineligible_requests"),
+            Some(0)
+        );
+        assert!(health.quantization.contains("max_observed=3"));
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cuda_gpu_scheduler_batches_same_prompt_length_with_different_limits() {
+        let path = tempfile_path("backend-scheduler-gpu-variable-limits");
+        write_reference_qwen(&path);
+
+        let backend = std::sync::Arc::new(
+            CudaBackend::load_with_config(
+                &path,
+                Some("tiny-cuda".to_string()),
+                CudaExecution::Gpu,
+                super::CudaBackendConfig {
+                    max_batch_size: 2,
+                    max_active_requests: 2,
+                    max_wait_us: 100_000,
+                    mmproj_path: None,
+                    ..super::CudaBackendConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        let request = |max_tokens| GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+
+        let short = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(request(1)).await.unwrap() })
+        };
+        let long = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(request(2)).await.unwrap() })
+        };
+
+        assert_eq!(short.await.unwrap().completion_tokens, 1);
+        assert_eq!(long.await.unwrap().completion_tokens, 2);
+        let health = backend.health();
+        assert!(health.quantization.contains("mode=continuous-iteration"));
+        assert!(health.quantization.contains("total_requests=2"));
+        assert!(health.quantization.contains("gpu_batched_batches=2"));
+        assert!(health.quantization.contains("gpu_batched_requests=3"));
+        assert!(
+            health
+                .quantization
+                .contains("paged_lease_batched_requests=3")
+        );
+        assert!(
+            health
+                .quantization
+                .contains("continuous_kv_backend=append-only-paged")
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "continuous_prefill_batches"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "continuous_prefill_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "continuous_append_decode_batches"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "continuous_append_decode_requests"),
+            Some(1)
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn cuda_gpu_scheduler_splits_batches_by_token_budget() {
+        let path = tempfile_path("backend-scheduler-gpu-token-budget");
+        write_reference_qwen(&path);
+
+        let backend = std::sync::Arc::new(
+            CudaBackend::load_with_config(
+                &path,
+                Some("tiny-cuda".to_string()),
+                CudaExecution::Gpu,
+                super::CudaBackendConfig {
+                    max_batch_size: 3,
+                    max_active_requests: 3,
+                    max_batched_tokens: 4,
+                    max_wait_us: 100_000,
+                    kv_cache_mode: super::CudaKvCacheMode::Legacy,
+                    mmproj_path: None,
+                    ..super::CudaBackendConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        let request = || GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens: 1,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+
+        let left = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(request()).await.unwrap() })
+        };
+        let middle = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(request()).await.unwrap() })
+        };
+        let right = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(request()).await.unwrap() })
+        };
+
+        assert_eq!(left.await.unwrap().completion_tokens, 1);
+        assert_eq!(middle.await.unwrap().completion_tokens, 1);
+        assert_eq!(right.await.unwrap().completion_tokens, 1);
+        let health = backend.health();
+        assert!(health.quantization.contains("kv-cache=legacy"));
+        assert!(health.quantization.contains("total_requests=3"));
+        assert!(health.quantization.contains("gpu_batched_batches=1"));
+        assert_eq!(
+            health_counter(&health.quantization, "gpu_batched_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "fallback_bucket_requests"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "token_budget_split_groups"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "token_budget_split_requests"),
+            Some(3)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "token_budget_split_chunks"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "batch_plan_eligible_requests"),
+            Some(3)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "completed_requests"),
+            Some(3)
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cuda_gpu_scheduler_counts_token_budget_split_batches() {
+        let path = tempfile_path("backend-scheduler-gpu-token-budget-batches");
+        write_reference_qwen(&path);
+
+        let backend = std::sync::Arc::new(
+            CudaBackend::load_with_config(
+                &path,
+                Some("tiny-cuda".to_string()),
+                CudaExecution::Gpu,
+                super::CudaBackendConfig {
+                    max_batch_size: 4,
+                    max_active_requests: 4,
+                    max_batched_tokens: 4,
+                    max_wait_us: 100_000,
+                    kv_cache_mode: super::CudaKvCacheMode::Legacy,
+                    mmproj_path: None,
+                    ..super::CudaBackendConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        let request = || GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens: 1,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+
+        let first = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(request()).await.unwrap() })
+        };
+        let second = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(request()).await.unwrap() })
+        };
+        let third = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(request()).await.unwrap() })
+        };
+        let fourth = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(request()).await.unwrap() })
+        };
+
+        assert_eq!(first.await.unwrap().completion_tokens, 1);
+        assert_eq!(second.await.unwrap().completion_tokens, 1);
+        assert_eq!(third.await.unwrap().completion_tokens, 1);
+        assert_eq!(fourth.await.unwrap().completion_tokens, 1);
+        let health = backend.health();
+        assert!(health.quantization.contains("total_batches=1"));
+        assert_eq!(
+            health_counter(&health.quantization, "gpu_batched_batches"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "gpu_batched_requests"),
+            Some(4)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "fallback_bucket_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "token_budget_split_groups"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "token_budget_split_requests"),
+            Some(4)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "token_budget_split_chunks"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "completed_requests"),
+            Some(4)
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cuda_gpu_scheduler_batches_sampled_requests() {
+        let path = tempfile_path("backend-scheduler-gpu-sampled");
+        write_reference_qwen(&path);
+
+        let backend = std::sync::Arc::new(
+            CudaBackend::load_with_config(
+                &path,
+                Some("tiny-cuda".to_string()),
+                CudaExecution::Gpu,
+                super::CudaBackendConfig {
+                    max_batch_size: 2,
+                    max_active_requests: 2,
+                    max_wait_us: 100_000,
+                    mmproj_path: None,
+                    ..super::CudaBackendConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        let request = |seed| GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens: 1,
+            temperature: 0.8,
+            top_p: 1.0,
+            top_k: Some(1),
+            seed: Some(seed),
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+
+        let left = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(request(7)).await.unwrap() })
+        };
+        let right = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(request(11)).await.unwrap() })
+        };
+
+        assert_eq!(left.await.unwrap().completion_tokens, 1);
+        assert_eq!(right.await.unwrap().completion_tokens, 1);
+        let health = backend.health();
+        assert!(health.quantization.contains("sampled_batched_requests=2"));
+        assert!(
+            health
+                .quantization
+                .contains("paged_lease_batched_requests=2")
+        );
+        assert!(health.quantization.contains("sampling=batched"));
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cuda_gpu_scheduler_top_p_zero_samples_top_candidate_in_batch() {
+        let path = tempfile_path("backend-scheduler-gpu-top-p-zero");
+        write_reference_qwen(&path);
+
+        let backend = std::sync::Arc::new(
+            CudaBackend::load_with_config(
+                &path,
+                Some("tiny-cuda".to_string()),
+                CudaExecution::Gpu,
+                super::CudaBackendConfig {
+                    max_batch_size: 2,
+                    max_active_requests: 2,
+                    max_wait_us: 100_000,
+                    mmproj_path: None,
+                    ..super::CudaBackendConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        let greedy_request = || GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens: 2,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+        let sampled_request = |seed| GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens: 2,
+            temperature: 1.0,
+            top_p: 0.0,
+            top_k: None,
+            seed: Some(seed),
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+
+        let greedy = backend.generate(greedy_request()).await.unwrap();
+        let left = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(sampled_request(7)).await.unwrap() })
+        };
+        let right = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(sampled_request(11)).await.unwrap() })
+        };
+        let left = left.await.unwrap();
+        let right = right.await.unwrap();
+
+        assert_eq!(left.text, greedy.text);
+        assert_eq!(left.completion_tokens, greedy.completion_tokens);
+        assert_eq!(right.text, greedy.text);
+        assert_eq!(right.completion_tokens, greedy.completion_tokens);
+        let health = backend.health();
+        assert_eq!(
+            health_counter(&health.quantization, "sampled_batched_requests"),
+            Some(4)
+        );
+        assert!(health.quantization.contains("sampling=batched"));
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cuda_gpu_scheduler_seeded_sampling_is_stable_inside_batch() {
+        let path = tempfile_path("backend-scheduler-gpu-seeded-sampled-stability");
+        write_reference_qwen(&path);
+
+        let solo_backend = CudaBackend::load_with_config(
+            &path,
+            Some("tiny-cuda".to_string()),
+            CudaExecution::Gpu,
+            super::CudaBackendConfig {
+                max_batch_size: 1,
+                max_active_requests: 1,
+                max_wait_us: 0,
+                mmproj_path: None,
+                ..super::CudaBackendConfig::default()
+            },
+        )
+        .unwrap();
+        let batched_backend = std::sync::Arc::new(
+            CudaBackend::load_with_config(
+                &path,
+                Some("tiny-cuda".to_string()),
+                CudaExecution::Gpu,
+                super::CudaBackendConfig {
+                    max_batch_size: 2,
+                    max_active_requests: 2,
+                    max_wait_us: 100_000,
+                    mmproj_path: None,
+                    ..super::CudaBackendConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        let request = |seed| GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens: 2,
+            temperature: 1.0,
+            top_p: 0.9,
+            top_k: None,
+            seed: Some(seed),
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+
+        let solo = solo_backend.generate(request(7)).await.unwrap();
+        let target = {
+            let backend = batched_backend.clone();
+            tokio::spawn(async move { backend.generate(request(7)).await.unwrap() })
+        };
+        let neighbor = {
+            let backend = batched_backend.clone();
+            tokio::spawn(async move { backend.generate(request(11)).await.unwrap() })
+        };
+        let batched = target.await.unwrap();
+        let _neighbor = neighbor.await.unwrap();
+
+        assert_eq!(solo.text, batched.text);
+        assert_eq!(solo.prompt_tokens, batched.prompt_tokens);
+        assert_eq!(solo.completion_tokens, batched.completion_tokens);
+        let health = batched_backend.health();
+        assert!(health.quantization.contains("sampled_batched_requests=4"));
+        assert!(health.quantization.contains("sampling=batched"));
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cuda_gpu_scheduler_counts_cancelled_stream_before_dispatch() {
+        let path = tempfile_path("backend-scheduler-gpu-cancelled");
+        write_reference_qwen(&path);
+
+        let backend = CudaBackend::load_with_config(
+            &path,
+            Some("tiny-cuda".to_string()),
+            CudaExecution::Gpu,
+            super::CudaBackendConfig {
+                max_batch_size: 2,
+                max_active_requests: 2,
+                max_wait_us: 200_000,
+                mmproj_path: None,
+                ..super::CudaBackendConfig::default()
+            },
+        )
+        .unwrap();
+        let stream = backend
+            .stream_generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 2,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+        drop(stream);
+
+        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+
+        let health = backend.health();
+        assert_eq!(
+            health_counter(&health.quantization, "cancelled_requests"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "total_requests"),
+            Some(0)
+        );
+        assert!(health.quantization.contains("pages_used=0"));
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn cuda_gpu_scheduler_admission_skips_closed_jobs_before_kv_allocation() {
+        let path = tempfile_path("backend-scheduler-gpu-admission-cancelled");
+        write_reference_qwen(&path);
+
+        let backend = CudaBackend::load_with_config(
+            &path,
+            Some("tiny-cuda".to_string()),
+            CudaExecution::Gpu,
+            super::CudaBackendConfig {
+                max_batch_size: 1,
+                max_active_requests: 1,
+                max_wait_us: 0,
+                kv_cache_mode: super::CudaKvCacheMode::Paged,
+                kv_page_size: 64,
+                mmproj_path: None,
+                ..super::CudaBackendConfig::default()
+            },
+        )
+        .unwrap();
+        let kv_pages = std::sync::Arc::new(
+            super::CudaPagedKvCacheManager::for_qwen(&backend.qwen, 128, 64).unwrap(),
+        );
+        let state = super::CudaSchedulerState {
+            qwen: backend.qwen.clone(),
+            max_output_tokens: backend.model.max_output_tokens,
+            cpu_reference: backend.cpu_reference.clone(),
+            gpu_model: backend.gpu_model.as_ref().unwrap().clone(),
+            kv_pages: Some(kv_pages.clone()),
+            kv_cache_mode: super::CudaKvCacheMode::Paged,
+            kv_page_size: 64,
+            mmproj: None,
+            multimodal_stats: backend.multimodal_stats.clone(),
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+        let admission = super::admit_scheduler_batch(
+            &state,
+            vec![super::CudaSchedulerJob {
+                request: GenerationRequest {
+                    prompt: "a".to_string(),
+                    max_tokens: 64,
+                    temperature: 0.0,
+                    top_p: 1.0,
+                    top_k: None,
+                    seed: None,
+                    stop_sequences: Vec::new(),
+                    media_inputs: Vec::new(),
+                },
+                tx,
+                submitted_at: std::time::Instant::now(),
+            }],
+        );
+
+        assert!(admission.batch.is_empty());
+        assert!(admission.leases.is_empty());
+        assert_eq!(admission.cancelled_requests, 1);
+        assert_eq!(admission.rejected_requests, 0);
+        assert_eq!(admission.errored_requests, 0);
+        assert_eq!(admission.requested_pages, 0);
+        assert_eq!(admission.granted_pages, 0);
+        assert_eq!(admission.rejected_pages, 0);
+        let snapshot = kv_pages.snapshot();
+        assert_eq!(snapshot.pages_free, snapshot.pages_total);
+        assert_eq!(snapshot.total_allocations, 0);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cuda_gpu_scheduler_counts_cancelled_singleton_after_dispatch() {
+        let path = tempfile_path("backend-scheduler-gpu-cancelled-singleton");
+        write_reference_qwen(&path);
+
+        let backend = CudaBackend::load_with_config(
+            &path,
+            Some("tiny-cuda".to_string()),
+            CudaExecution::Gpu,
+            super::CudaBackendConfig {
+                max_batch_size: 1,
+                max_active_requests: 1,
+                max_wait_us: 0,
+                mmproj_path: None,
+                ..super::CudaBackendConfig::default()
+            },
+        )
+        .unwrap();
+        let gpu_model = backend.gpu_model.as_ref().unwrap().clone();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let lock_thread = std::thread::spawn(move || {
+            let _guard = gpu_model.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        locked_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+
+        let stream = backend
+            .stream_generate(GenerationRequest {
+                prompt: "a".to_string(),
+                max_tokens: 32,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        let mut saw_active = false;
+        for _ in 0..100 {
+            let active_requests = backend
+                .scheduler
+                .as_ref()
+                .map(|scheduler| scheduler.snapshot().active_batch_size)
+                .unwrap_or(0);
+            if active_requests >= 1 {
+                saw_active = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(saw_active);
+
+        drop(stream);
+        release_tx.send(()).unwrap();
+        lock_thread.join().unwrap();
+        wait_for_health_counter_at_least(&backend, "cancelled_requests", 1).await;
+
+        let health = backend.health();
+        assert_eq!(
+            health_counter(&health.quantization, "cancelled_requests"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "completed_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "fallback_single_request"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "continuous_mid_decode_cancellations"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "inflight_requests"),
+            Some(0)
+        );
+        assert!(health.quantization.contains("pages_used=0"));
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cuda_gpu_scheduler_rejects_when_max_active_requests_exceeded() {
+        let path = tempfile_path("backend-scheduler-gpu-over-capacity");
+        write_reference_qwen(&path);
+
+        let backend = CudaBackend::load_with_config(
+            &path,
+            Some("tiny-cuda".to_string()),
+            CudaExecution::Gpu,
+            super::CudaBackendConfig {
+                max_batch_size: 1,
+                max_active_requests: 1,
+                max_wait_us: 0,
+                mmproj_path: None,
+                ..super::CudaBackendConfig::default()
+            },
+        )
+        .unwrap();
+        let request = GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens: 64,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+
+        let first_stream = backend.stream_generate(request.clone()).await.unwrap();
+        let err = match backend.stream_generate(request).await {
+            Ok(_) => panic!("second stream should be rejected by max_active_requests"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(err.contains("scheduler_over_capacity"));
+        let health = backend.health();
+        assert_eq!(
+            health_counter(&health.quantization, "capacity_rejected_requests"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(
+                &health.quantization,
+                "capacity_max_active_rejected_requests"
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(
+                &health.quantization,
+                "capacity_rejected_active_requests_total"
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(
+                &health.quantization,
+                "capacity_rejected_active_requests_max"
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(
+                &health.quantization,
+                "capacity_rejected_active_requests_avg"
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "peak_inflight_requests"),
+            Some(1)
+        );
+        drop(first_stream);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cuda_gpu_scheduler_rejects_when_paged_kv_pages_are_exhausted() {
+        let path = tempfile_path("backend-scheduler-gpu-paged-kv-exhaustion");
+        write_reference_qwen(&path);
+
+        let backend = std::sync::Arc::new(
+            CudaBackend::load_with_config(
+                &path,
+                Some("tiny-cuda".to_string()),
+                CudaExecution::Gpu,
+                super::CudaBackendConfig {
+                    max_batch_size: 2,
+                    max_active_requests: 2,
+                    max_batched_tokens: 128,
+                    max_wait_us: 500_000,
+                    kv_cache_mode: super::CudaKvCacheMode::Paged,
+                    kv_page_size: 64,
+                    mmproj_path: None,
+                    ..super::CudaBackendConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        let request = GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens: 64,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+
+        let left_stream = backend.stream_generate(request.clone()).await.unwrap();
+        let right_stream = backend.stream_generate(request).await.unwrap();
+        let (left, right) = tokio::join!(
+            collect_generation_stream(left_stream),
+            collect_generation_stream(right_stream)
+        );
+
+        let results = vec![left, right];
+        let ok_count = results.iter().filter(|result| result.is_ok()).count();
+        let err = results
+            .iter()
+            .find_map(|result| result.as_ref().err())
+            .map(|err| err.to_string())
+            .unwrap_or_default();
+
+        assert_eq!(ok_count, 1);
+        assert!(err.contains("insufficient_gpu_memory"));
+        let health = backend.health();
+        assert!(health.quantization.contains("kv-cache=paged("));
+        assert!(health.quantization.contains("allocation_failures=1"));
+        assert!(
+            health
+                .quantization
+                .contains("admission_rejected_requests=1")
+        );
+        assert!(health.quantization.contains("admission_errored_requests=1"));
+        assert_eq!(
+            health_counter(&health.quantization, "admission_requested_pages"),
+            Some(4)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "admission_granted_pages"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "admission_rejected_pages"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "admission_page_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "admission_requested_pages_max"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "admission_requested_pages_avg"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "admission_granted_pages_max"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "admission_rejected_pages_max"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "admission_memory_rejected_requests"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "admission_context_rejected_requests"),
+            Some(0)
+        );
+        assert!(health_counter(&health.quantization, "peak_pending").is_some());
+        assert!(health.quantization.contains("pages_free=2"));
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cuda_gpu_scheduler_rejects_context_budget_before_kv_allocation() {
+        let path = tempfile_path("backend-scheduler-gpu-context-budget");
+        write_reference_qwen(&path);
+
+        let backend = CudaBackend::load_with_config(
+            &path,
+            Some("tiny-cuda".to_string()),
+            CudaExecution::Gpu,
+            super::CudaBackendConfig {
+                max_batch_size: 1,
+                max_active_requests: 1,
+                max_wait_us: 0,
+                kv_cache_mode: super::CudaKvCacheMode::Paged,
+                kv_page_size: 16,
+                mmproj_path: None,
+                ..super::CudaBackendConfig::default()
+            },
+        )
+        .unwrap();
+        let request = GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens: 128,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+
+        let stream = backend.stream_generate(request).await.unwrap();
+        let err = collect_generation_stream(stream)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("context_length_exceeded"));
+        let health = backend.health();
+        assert_eq!(
+            health_counter(&health.quantization, "admission_rejected_requests"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "admission_errored_requests"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "admission_context_rejected_requests"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "admission_memory_rejected_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "errored_requests"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "cancelled_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "completed_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "admission_requested_pages"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "admission_granted_pages"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "admission_page_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "admission_requested_pages_max"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "admission_requested_pages_avg"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "admission_granted_pages_max"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "admission_rejected_pages_max"),
+            Some(0)
+        );
+        assert!(health.quantization.contains("allocation_failures=0"));
+        assert!(health.quantization.contains("pages_used=0"));
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cuda_gpu_legacy_scheduler_rejects_context_budget_before_gpu_work() {
+        let path = tempfile_path("backend-scheduler-gpu-legacy-context-budget");
+        write_reference_qwen(&path);
+
+        let backend = CudaBackend::load_with_config(
+            &path,
+            Some("tiny-cuda".to_string()),
+            CudaExecution::Gpu,
+            super::CudaBackendConfig {
+                max_batch_size: 1,
+                max_active_requests: 1,
+                max_wait_us: 0,
+                kv_cache_mode: super::CudaKvCacheMode::Legacy,
+                mmproj_path: None,
+                ..super::CudaBackendConfig::default()
+            },
+        )
+        .unwrap();
+        let request = GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens: 128,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+
+        let stream = backend.stream_generate(request).await.unwrap();
+        let err = collect_generation_stream(stream)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("context_length_exceeded"));
+        let health = backend.health();
+        assert!(health.quantization.contains("kv-cache=legacy"));
+        assert!(health.quantization.contains("attention=flash-online"));
+        assert!(health.quantization.contains(
+            "attention-detail=mode=flash-online,head_dim=2,head_dim_max=256,kv_cache=legacy,decode=flash-online(paths=single-text|batched-text,fallback_reason=none)"
+        ));
+        assert_eq!(
+            health_counter(&health.quantization, "admission_rejected_requests"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "admission_errored_requests"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "admission_context_rejected_requests"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "errored_requests"),
+            Some(1)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "completed_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "gpu_batched_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "total_batches"),
+            Some(0)
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cuda_gpu_scheduler_rejects_invalid_sampling_before_slot_acquisition() {
+        let path = tempfile_path("backend-scheduler-gpu-invalid-sampling");
+        write_reference_qwen(&path);
+
+        let backend = CudaBackend::load_with_config(
+            &path,
+            Some("tiny-cuda".to_string()),
+            CudaExecution::Gpu,
+            super::CudaBackendConfig {
+                max_batch_size: 1,
+                max_active_requests: 1,
+                max_wait_us: 0,
+                kv_cache_mode: super::CudaKvCacheMode::Paged,
+                kv_page_size: 16,
+                mmproj_path: None,
+                ..super::CudaBackendConfig::default()
+            },
+        )
+        .unwrap();
+        let request = GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens: 1,
+            temperature: -0.1,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+
+        let err = match backend.stream_generate(request).await {
+            Ok(_) => panic!("invalid sampling parameters should be rejected before scheduling"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(err.contains("invalid_sampling_parameter"));
+        let health = backend.health();
+        assert_eq!(
+            health_counter(&health.quantization, "capacity_rejected_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "admission_rejected_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "inflight_requests"),
+            Some(0)
+        );
+        assert!(health.quantization.contains("allocation_failures=0"));
+        assert!(health.quantization.contains("pages_used=0"));
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cuda_gpu_scheduler_rejects_zero_max_tokens_before_slot_acquisition() {
+        let path = tempfile_path("backend-scheduler-gpu-zero-max-tokens");
+        write_reference_qwen(&path);
+
+        let backend = CudaBackend::load_with_config(
+            &path,
+            Some("tiny-cuda".to_string()),
+            CudaExecution::Gpu,
+            super::CudaBackendConfig {
+                max_batch_size: 1,
+                max_active_requests: 1,
+                max_wait_us: 0,
+                kv_cache_mode: super::CudaKvCacheMode::Paged,
+                kv_page_size: 16,
+                mmproj_path: None,
+                ..super::CudaBackendConfig::default()
+            },
+        )
+        .unwrap();
+        let request = GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens: 0,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+
+        let err = match backend.stream_generate(request).await {
+            Ok(_) => panic!("zero max_tokens should be rejected before scheduling"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(err.contains("invalid_request_parameter"));
+        assert!(err.contains("max_tokens"));
+        let health = backend.health();
+        assert_eq!(
+            health_counter(&health.quantization, "capacity_rejected_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "admission_rejected_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "inflight_requests"),
+            Some(0)
+        );
+        assert!(health.quantization.contains("allocation_failures=0"));
+        assert!(health.quantization.contains("pages_used=0"));
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cuda_gpu_scheduler_rejects_max_tokens_above_model_limit_before_slot_acquisition() {
+        let path = tempfile_path("backend-scheduler-gpu-max-tokens-above-model-limit");
+        write_reference_qwen(&path);
+
+        let backend = CudaBackend::load_with_config(
+            &path,
+            Some("tiny-cuda".to_string()),
+            CudaExecution::Gpu,
+            super::CudaBackendConfig {
+                max_batch_size: 1,
+                max_active_requests: 1,
+                max_wait_us: 0,
+                kv_cache_mode: super::CudaKvCacheMode::Paged,
+                kv_page_size: 16,
+                mmproj_path: None,
+                ..super::CudaBackendConfig::default()
+            },
+        )
+        .unwrap();
+        let request = GenerationRequest {
+            prompt: "a".to_string(),
+            max_tokens: hi_local_core::model::DEFAULT_MAX_OUTPUT_TOKENS + 1,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+
+        let err = match backend.stream_generate(request).await {
+            Ok(_) => panic!("over-limit max_tokens should be rejected before scheduling"),
+            Err(err) => err.to_string(),
+        };
+
+        assert!(err.contains("invalid_request_parameter"));
+        assert!(err.contains("max_output_tokens"));
+        let health = backend.health();
+        assert_eq!(
+            health_counter(&health.quantization, "capacity_rejected_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "admission_rejected_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "inflight_requests"),
+            Some(0)
+        );
+        assert!(health.quantization.contains("allocation_failures=0"));
+        assert!(health.quantization.contains("pages_used=0"));
+    }
+
+    #[cfg(feature = "native-cuda")]
+    async fn collect_generation_stream(mut stream: GenerationStream) -> Result<GenerationOutput> {
+        let mut final_output = None;
+        while let Some(event) = stream.next().await {
+            match event? {
+                super::GenerationEvent::TokenDelta { .. } => {}
+                super::GenerationEvent::Finished { output } => final_output = Some(output),
+            }
+        }
+        final_output.ok_or_else(|| anyhow!("generation stream ended without Finished event"))
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_qwen_weights_to_device() {
+        use hi_gguf::{GgufFile, GgufTensorType};
+
+        let path = tempfile_path("gpu-weights");
+        write_reference_qwen(&path);
+        let gguf = GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+        assert_eq!(model.info().tensor_count, 11);
+        assert_eq!(model.info().total_device_bytes, 92);
+        assert_eq!(model.info().largest_tensor_bytes, 12);
+        assert_eq!(model.info().dtype_summary, vec!["F16", "F32"]);
+        assert_eq!(model.info().matrix_count, 8);
+        assert_eq!(model.info().total_matrix_bytes, 68);
+        assert_eq!(model.info().quantized_matrix_count, 0);
+        assert_eq!(model.info().vector_count, 3);
+        assert_eq!(model.info().total_vector_bytes, 24);
+        assert!(model.has_tensor("token_embd.weight"));
+        let embd = model.tensor("token_embd.weight").unwrap();
+        assert_eq!(embd.shape, vec![2, 3]);
+        assert_eq!(embd.dtype, GgufTensorType::F16);
+        assert_eq!(embd.bytes, 12);
+        assert!(model.has_matrix("token_embd.weight"));
+        let embd_matrix = model.matrix("token_embd.weight").unwrap();
+        assert_eq!(embd_matrix.rows, 3);
+        assert_eq!(embd_matrix.cols, 2);
+        assert_eq!(embd_matrix.dtype, GgufTensorType::F16);
+        assert_eq!(
+            embd_matrix.copy_to_host_u16().unwrap(),
+            vec![
+                f16_bits(1.0),
+                f16_bits(0.0),
+                f16_bits(0.0),
+                f16_bits(1.0),
+                f16_bits(1.0),
+                f16_bits(1.0)
+            ]
+        );
+        assert_close_vec(
+            &model.embed_tokens_host(&[0, 1, 2]).unwrap(),
+            &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+        );
+        let q_matrix = model.matrix("blk.0.attn_q.weight").unwrap();
+        assert_eq!(q_matrix.rows, 2);
+        assert_eq!(q_matrix.cols, 2);
+        assert_eq!(q_matrix.copy_to_host_u16().unwrap(), vec![0, 0, 0, 0]);
+
+        let projected = model
+            .project_f32_host("token_embd.weight", &[1.0, 2.0, 3.0, 4.0], 2)
+            .unwrap();
+        assert_close_vec(&projected, &[1.0, 2.0, 3.0, 3.0, 4.0, 7.0]);
+
+        assert!(model.has_vector("output_norm.weight"));
+        let output_norm = model.vector("output_norm.weight").unwrap();
+        assert_eq!(output_norm.len, 2);
+        assert_eq!(output_norm.source_dtype, GgufTensorType::F32);
+        assert_close_vec(&output_norm.copy_to_host_f32().unwrap(), &[1.0, 1.0]);
+        let normalized = model
+            .rms_norm_f32_host("output_norm.weight", &[3.0, 4.0], 1, 0.0)
+            .unwrap();
+        let scale = ((9.0f32 + 16.0) / 2.0).sqrt().recip();
+        assert_close_vec(&normalized, &[3.0 * scale, 4.0 * scale]);
+
+        let chained = model
+            .embed_norm_project_host(&[0, 2], "output_norm.weight", "token_embd.weight", 0.0)
+            .unwrap();
+        let sqrt_two_f16 = 1.4140625f32;
+        assert_close_vec(&chained, &[sqrt_two_f16, 0.0, sqrt_two_f16, 1.0, 1.0, 2.0]);
+
+        let cpu = crate::qwen_cpu::QwenCpuReference::load(&path).unwrap();
+        assert_close_vec(
+            &model.last_logits_host(&[0]).unwrap(),
+            &cpu.last_logits(&[0]).unwrap(),
+        );
+        let cpu_logits = cpu.forward(&[0, 1]).unwrap();
+        let cpu_logits = cpu_logits.into_iter().flatten().collect::<Vec<_>>();
+        assert_close_vec(
+            &model.full_context_logits_host(&[0, 1]).unwrap(),
+            &cpu_logits,
+        );
+        let full_logits = model.full_context_logits_host(&[0, 1]).unwrap();
+        assert_close_vec(
+            &model.kv_decode_logits_host(&[0], 1).unwrap(),
+            &full_logits[3..],
+        );
+        assert_close_vec(
+            &model.paged_kv_decode_logits_host(&[0], 1, 1).unwrap(),
+            &full_logits[3..],
+        );
+        assert_eq!(
+            model.greedy_next_token(&[0]).unwrap(),
+            cpu.greedy_next_token(&[0]).unwrap()
+        );
+        assert_eq!(
+            model.generate_greedy_tokens(&[1], 2, None).unwrap(),
+            cpu.generate_greedy(&[1], 2).unwrap()
+        );
+        assert_eq!(
+            model
+                .generate_sampled_tokens(&[1], 2, None, 1.0, 1.0, Some(1), Some(7))
+                .unwrap(),
+            cpu.generate_greedy(&[1], 2).unwrap()
+        );
+        assert_eq!(
+            model
+                .generate_greedy_tokens_paged(&[1], 2, None, 1)
+                .unwrap(),
+            cpu.generate_greedy(&[1], 2).unwrap()
+        );
+        assert_eq!(
+            model
+                .generate_sampled_tokens_paged(&[1], 2, None, 1.0, 1.0, Some(1), Some(7), 1)
+                .unwrap(),
+            cpu.generate_greedy(&[1], 2).unwrap()
+        );
+        let first_generated = cpu.generate_greedy(&[1], 1).unwrap();
+        let stop_ids = first_generated.clone();
+        assert_eq!(
+            model
+                .generate_greedy_tokens_with_stop_ids(&[1], 2, None, &stop_ids)
+                .unwrap(),
+            first_generated
+        );
+        assert_eq!(
+            model
+                .generate_greedy_tokens_paged_with_stop_ids(&[1], 2, None, 1, &stop_ids)
+                .unwrap(),
+            first_generated
+        );
+        assert_eq!(
+            model
+                .generate_sampled_tokens_with_stop_ids(
+                    &[1],
+                    2,
+                    None,
+                    1.0,
+                    1.0,
+                    Some(1),
+                    Some(7),
+                    &stop_ids,
+                )
+                .unwrap(),
+            first_generated
+        );
+        assert_eq!(
+            model
+                .generate_sampled_tokens_paged_with_stop_ids(
+                    &[1],
+                    2,
+                    None,
+                    1.0,
+                    1.0,
+                    Some(1),
+                    Some(7),
+                    1,
+                    &stop_ids,
+                )
+                .unwrap(),
+            first_generated
+        );
+        let two_generated = cpu.generate_greedy(&[1], 2).unwrap();
+        let two_token_stop_sequences = vec![two_generated.clone()];
+        assert_eq!(
+            model
+                .generate_greedy_tokens_with_stop_sequences(
+                    &[1],
+                    4,
+                    None,
+                    &two_token_stop_sequences,
+                )
+                .unwrap(),
+            two_generated
+        );
+        assert_eq!(
+            model
+                .generate_greedy_tokens_paged_with_stop_sequences(
+                    &[1],
+                    4,
+                    None,
+                    1,
+                    &two_token_stop_sequences,
+                )
+                .unwrap(),
+            two_generated
+        );
+        assert_eq!(
+            model
+                .generate_sampled_tokens_with_stop_sequences(
+                    &[1],
+                    4,
+                    None,
+                    1.0,
+                    1.0,
+                    Some(1),
+                    Some(7),
+                    &two_token_stop_sequences,
+                )
+                .unwrap(),
+            two_generated
+        );
+        assert_eq!(
+            model
+                .generate_sampled_tokens_paged_with_stop_sequences(
+                    &[1],
+                    4,
+                    None,
+                    1.0,
+                    1.0,
+                    Some(1),
+                    Some(7),
+                    1,
+                    &two_token_stop_sequences,
+                )
+                .unwrap(),
+            two_generated
+        );
+        let assert_invalid_max_tokens = |err: anyhow::Error| {
+            let err = err.to_string();
+            assert!(err.contains("invalid_request_parameter"));
+            assert!(err.contains("max_tokens"));
+            assert!(err.contains("greater than 0"));
+        };
+        assert_invalid_max_tokens(model.generate_greedy_tokens(&[1], 0, None).unwrap_err());
+        assert_invalid_max_tokens(
+            model
+                .generate_greedy_tokens_paged(&[1], 0, None, 1)
+                .unwrap_err(),
+        );
+        assert_invalid_max_tokens(
+            model
+                .generate_sampled_tokens(&[1], 0, None, 1.0, 1.0, Some(1), Some(7))
+                .unwrap_err(),
+        );
+        assert_invalid_max_tokens(
+            model
+                .generate_sampled_tokens_paged(&[1], 0, None, 1.0, 1.0, Some(1), Some(7), 1)
+                .unwrap_err(),
+        );
+        let prompt_embeddings = vec![1.0f32, 0.0];
+        let position_ids = vec![[0u32, 0, 0]];
+        assert_invalid_max_tokens(
+            model
+                .generate_greedy_tokens_with_prompt_embeddings(&prompt_embeddings, 1, 0, None)
+                .unwrap_err(),
+        );
+        assert_invalid_max_tokens(
+            model
+                .generate_greedy_tokens_with_prompt_embeddings_and_positions(
+                    &prompt_embeddings,
+                    1,
+                    &position_ids,
+                    1,
+                    0,
+                    None,
+                )
+                .unwrap_err(),
+        );
+        assert_invalid_max_tokens(
+            model
+                .generate_greedy_tokens_with_prefix_embeddings(&prompt_embeddings, 1, &[1], 0, None)
+                .unwrap_err(),
+        );
+        assert_invalid_max_tokens(
+            model
+                .generate_sampled_tokens_with_prompt_embeddings(
+                    &prompt_embeddings,
+                    1,
+                    0,
+                    None,
+                    1.0,
+                    1.0,
+                    Some(1),
+                    Some(7),
+                )
+                .unwrap_err(),
+        );
+        assert_invalid_max_tokens(
+            model
+                .generate_sampled_tokens_with_prompt_embeddings_and_positions(
+                    &prompt_embeddings,
+                    1,
+                    &position_ids,
+                    1,
+                    0,
+                    None,
+                    1.0,
+                    1.0,
+                    Some(1),
+                    Some(7),
+                )
+                .unwrap_err(),
+        );
+        assert_invalid_max_tokens(
+            model
+                .generate_sampled_tokens_with_prefix_embeddings(
+                    &prompt_embeddings,
+                    1,
+                    &[1],
+                    0,
+                    None,
+                    1.0,
+                    1.0,
+                    Some(1),
+                    Some(7),
+                )
+                .unwrap_err(),
+        );
+        let prompt_stop = model
+            .generate_greedy_tokens_with_prompt_embeddings(&prompt_embeddings, 1, 2, None)
+            .unwrap();
+        let prompt_stop_sequences = vec![prompt_stop.clone()];
+        assert_eq!(
+            model
+                .generate_greedy_tokens_with_prompt_embeddings_and_stop_sequences(
+                    &prompt_embeddings,
+                    1,
+                    4,
+                    None,
+                    &prompt_stop_sequences,
+                )
+                .unwrap(),
+            prompt_stop
+        );
+        assert_eq!(
+            model
+                .generate_sampled_tokens_with_prompt_embeddings_and_stop_sequences(
+                    &prompt_embeddings,
+                    1,
+                    4,
+                    None,
+                    1.0,
+                    1.0,
+                    Some(1),
+                    Some(7),
+                    &prompt_stop_sequences,
+                )
+                .unwrap(),
+            prompt_stop
+        );
+        let prefix_stop = model
+            .generate_greedy_tokens_with_prefix_embeddings(&prompt_embeddings, 1, &[1], 2, None)
+            .unwrap();
+        let prefix_stop_sequences = vec![prefix_stop.clone()];
+        assert_eq!(
+            model
+                .generate_greedy_tokens_with_prefix_embeddings_and_stop_sequences(
+                    &prompt_embeddings,
+                    1,
+                    &[1],
+                    4,
+                    None,
+                    &prefix_stop_sequences,
+                )
+                .unwrap(),
+            prefix_stop
+        );
+        assert_eq!(
+            model
+                .generate_sampled_tokens_with_prefix_embeddings_and_stop_sequences(
+                    &prompt_embeddings,
+                    1,
+                    &[1],
+                    4,
+                    None,
+                    1.0,
+                    1.0,
+                    Some(1),
+                    Some(7),
+                    &prefix_stop_sequences,
+                )
+                .unwrap(),
+            prefix_stop
+        );
+        let full_prompt = vec![1u32; 128];
+        let assert_single_context_budget = |err: anyhow::Error| {
+            let err = err.to_string();
+            assert!(err.contains("context_length_exceeded"));
+            assert!(err.contains("prompt length 128 plus max_tokens 1"));
+            assert!(err.contains("qwen context length 128"));
+        };
+        assert_single_context_budget(
+            model
+                .generate_greedy_tokens(&full_prompt, 1, None)
+                .unwrap_err(),
+        );
+        assert_single_context_budget(
+            model
+                .generate_greedy_tokens_paged(&full_prompt, 1, None, 1)
+                .unwrap_err(),
+        );
+        assert_single_context_budget(
+            model
+                .generate_sampled_tokens(&full_prompt, 1, None, 1.0, 1.0, Some(1), Some(7))
+                .unwrap_err(),
+        );
+        assert_single_context_budget(
+            model
+                .generate_sampled_tokens_paged(&full_prompt, 1, None, 1.0, 1.0, Some(1), Some(7), 1)
+                .unwrap_err(),
+        );
+        let batch_inputs = vec![vec![1], vec![1]];
+        assert_invalid_max_tokens(
+            model
+                .generate_greedy_tokens_batch(&batch_inputs, 0, None)
+                .unwrap_err(),
+        );
+        let batch_limits = vec![2, 1];
+        let overflow_limits = vec![128, 128];
+        let assert_context_budget = |err: anyhow::Error| {
+            let err = err.to_string();
+            assert!(err.contains("context_length_exceeded"));
+            assert!(err.contains("plus max_tokens 128"));
+            assert!(err.contains("qwen context length 128"));
+        };
+        assert_context_budget(
+            model
+                .generate_greedy_tokens_batch_with_limits(&batch_inputs, &overflow_limits, None)
+                .unwrap_err(),
+        );
+        assert_context_budget(
+            model
+                .generate_sampled_tokens_batch_with_limits(
+                    &batch_inputs,
+                    &overflow_limits,
+                    None,
+                    1.0,
+                    1.0,
+                    Some(1),
+                    &[Some(7), Some(11)],
+                )
+                .unwrap_err(),
+        );
+        assert_context_budget(
+            model
+                .generate_greedy_tokens_batch_paged_with_limits(
+                    &batch_inputs,
+                    &overflow_limits,
+                    None,
+                    1,
+                )
+                .unwrap_err(),
+        );
+        assert_context_budget(
+            model
+                .generate_sampled_tokens_batch_paged_with_limits(
+                    &batch_inputs,
+                    &overflow_limits,
+                    None,
+                    1.0,
+                    1.0,
+                    Some(1),
+                    &[Some(7), Some(11)],
+                    1,
+                )
+                .unwrap_err(),
+        );
+        assert_eq!(
+            model
+                .generate_greedy_tokens_batch_paged_with_limits(
+                    &batch_inputs,
+                    &batch_limits,
+                    None,
+                    1
+                )
+                .unwrap(),
+            vec![cpu.generate_greedy(&[1], 2).unwrap(), vec![1]]
+        );
+        assert_eq!(
+            model
+                .generate_sampled_tokens_batch_paged_with_limits(
+                    &batch_inputs,
+                    &batch_limits,
+                    None,
+                    1.0,
+                    1.0,
+                    Some(1),
+                    &[Some(7), Some(11)],
+                    1
+                )
+                .unwrap(),
+            vec![cpu.generate_greedy(&[1], 2).unwrap(), vec![1]]
+        );
+        let leased_page_tables = vec![vec![2, 1, 0], vec![5, 4, 3]];
+        assert_context_budget(
+            model
+                .generate_greedy_tokens_batch_paged_with_page_tables(
+                    &batch_inputs,
+                    &overflow_limits,
+                    None,
+                    1,
+                    &leased_page_tables,
+                    6,
+                )
+                .unwrap_err(),
+        );
+        assert_context_budget(
+            model
+                .generate_sampled_tokens_batch_paged_with_page_tables(
+                    &batch_inputs,
+                    &overflow_limits,
+                    None,
+                    1.0,
+                    1.0,
+                    Some(1),
+                    &[Some(7), Some(11)],
+                    1,
+                    &leased_page_tables,
+                    6,
+                )
+                .unwrap_err(),
+        );
+        assert_eq!(
+            model
+                .generate_greedy_tokens_batch_paged_with_page_tables(
+                    &batch_inputs,
+                    &batch_limits,
+                    None,
+                    1,
+                    &leased_page_tables,
+                    6
+                )
+                .unwrap(),
+            vec![cpu.generate_greedy(&[1], 2).unwrap(), vec![1]]
+        );
+        assert_eq!(
+            model
+                .generate_sampled_tokens_batch_paged_with_page_tables(
+                    &batch_inputs,
+                    &batch_limits,
+                    None,
+                    1.0,
+                    1.0,
+                    Some(1),
+                    &[Some(7), Some(11)],
+                    1,
+                    &leased_page_tables,
+                    6
+                )
+                .unwrap(),
+            vec![cpu.generate_greedy(&[1], 2).unwrap(), vec![1]]
+        );
+        let shared_prefix_inputs = vec![vec![0, 1], vec![0, 2]];
+        let shared_prefix_limits = vec![2, 2];
+        let shared_prefix_page_tables = vec![vec![2, 0, 1, 3], vec![7, 5, 6, 4]];
+        let expected_shared_prefix = model
+            .generate_greedy_tokens_batch_with_limits(
+                &shared_prefix_inputs,
+                &shared_prefix_limits,
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            model
+                .generate_greedy_tokens_batch_paged_with_page_tables(
+                    &shared_prefix_inputs,
+                    &shared_prefix_limits,
+                    None,
+                    1,
+                    &shared_prefix_page_tables,
+                    8
+                )
+                .unwrap(),
+            expected_shared_prefix
+        );
+        assert_eq!(
+            model
+                .generate_sampled_tokens_batch_paged_with_page_tables(
+                    &shared_prefix_inputs,
+                    &shared_prefix_limits,
+                    None,
+                    1.0,
+                    1.0,
+                    Some(1),
+                    &[Some(7), Some(11)],
+                    1,
+                    &shared_prefix_page_tables,
+                    8
+                )
+                .unwrap(),
+            expected_shared_prefix
+        );
+        let mut cancellation_checks = vec![0usize; 2];
+        let cancellation_limits = vec![2, 2];
+        let cancelled_batch = model
+            .generate_greedy_tokens_batch_paged_with_limits_and_cancellation(
+                &batch_inputs,
+                &cancellation_limits,
+                None,
+                1,
+                &[],
+                |idx| {
+                    cancellation_checks[idx] += 1;
+                    idx == 1 && cancellation_checks[idx] > 1
+                },
+            )
+            .unwrap();
+        assert_eq!(cancelled_batch[0], cpu.generate_greedy(&[1], 2).unwrap());
+        assert_eq!(cancelled_batch[1], vec![1]);
+        assert!(cancellation_checks[1] >= 2);
+        let mut single_greedy_checks = 0usize;
+        let cancelled_single_greedy = model
+            .generate_greedy_tokens_paged_with_stop_sequences_and_cancellation(
+                &[1],
+                4,
+                None,
+                1,
+                &[],
+                || {
+                    single_greedy_checks += 1;
+                    single_greedy_checks > 1
+                },
+            )
+            .unwrap();
+        assert_eq!(cancelled_single_greedy, vec![1]);
+        assert!(single_greedy_checks >= 2);
+        let mut single_sampled_checks = 0usize;
+        let cancelled_single_sampled = model
+            .generate_sampled_tokens_paged_with_stop_sequences_and_cancellation(
+                &[1],
+                4,
+                None,
+                1.0,
+                1.0,
+                Some(1),
+                Some(7),
+                1,
+                &[],
+                || {
+                    single_sampled_checks += 1;
+                    single_sampled_checks > 1
+                },
+            )
+            .unwrap();
+        assert_eq!(cancelled_single_sampled, vec![1]);
+        assert!(single_sampled_checks >= 2);
+        let first_top_p = model
+            .generate_sampled_tokens(&[1], 2, None, 1.0, 0.9, None, Some(7))
+            .unwrap();
+        let second_top_p = model
+            .generate_sampled_tokens(&[1], 2, None, 1.0, 0.9, None, Some(7))
+            .unwrap();
+        assert_eq!(first_top_p, second_top_p);
+        let paged_top_p = model
+            .generate_sampled_tokens_paged(&[1], 2, None, 1.0, 0.9, None, Some(7), 1)
+            .unwrap();
+        assert_eq!(first_top_p, paged_top_p);
+        let top_p_zero_expected = model.generate_greedy_tokens(&[1], 2, None).unwrap();
+        let legacy_top_p_zero = model
+            .generate_sampled_tokens(&[1], 2, None, 1.0, 0.0, None, Some(7))
+            .unwrap();
+        assert_eq!(legacy_top_p_zero, top_p_zero_expected);
+        let paged_top_p_zero = model
+            .generate_sampled_tokens_paged(&[1], 2, None, 1.0, 0.0, None, Some(11), 1)
+            .unwrap();
+        assert_eq!(paged_top_p_zero, top_p_zero_expected);
+        let top_p_zero_batch_inputs = vec![vec![1], vec![1]];
+        let top_p_zero_batch_limits = vec![2, 2];
+        let top_p_zero_batch_expected =
+            vec![top_p_zero_expected.clone(), top_p_zero_expected.clone()];
+        assert_eq!(
+            model
+                .generate_sampled_tokens_batch_with_limits(
+                    &top_p_zero_batch_inputs,
+                    &top_p_zero_batch_limits,
+                    None,
+                    1.0,
+                    0.0,
+                    None,
+                    &[Some(7), Some(11)],
+                )
+                .unwrap(),
+            top_p_zero_batch_expected
+        );
+        assert_eq!(
+            model
+                .generate_sampled_tokens_batch_paged_with_limits(
+                    &top_p_zero_batch_inputs,
+                    &top_p_zero_batch_limits,
+                    None,
+                    1.0,
+                    0.0,
+                    None,
+                    &[Some(7), Some(11)],
+                    1,
+                )
+                .unwrap(),
+            top_p_zero_batch_expected
+        );
+        let batch_inputs = vec![vec![0], vec![1], vec![0]];
+        let batch_limits = vec![2, 2, 2];
+        let batch_seeds = vec![Some(3), Some(7), Some(11)];
+        let legacy_batch_top_p = model
+            .generate_sampled_tokens_batch_with_limits(
+                &batch_inputs,
+                &batch_limits,
+                None,
+                1.0,
+                0.9,
+                None,
+                &batch_seeds,
+            )
+            .unwrap();
+        assert_eq!(legacy_batch_top_p[1], first_top_p);
+        let paged_batch_top_p = model
+            .generate_sampled_tokens_batch_paged_with_limits(
+                &batch_inputs,
+                &batch_limits,
+                None,
+                1.0,
+                0.9,
+                None,
+                &batch_seeds,
+                1,
+            )
+            .unwrap();
+        assert_eq!(paged_batch_top_p[1], first_top_p);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_qwen_next_attention_head_norm_aliases_to_logical_vectors() {
+        use hi_gguf::GgufFile;
+
+        let path = tempfile_path("gpu-qwen-next-head-norm-aliases");
+        write_reference_qwen_next_attention_head_norm_aliases(&path);
+        let gguf = GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+        assert!(model.has_tensor("blk.0.self_attention.q_layernorm.weight"));
+        assert!(model.has_tensor("blk.0.attention.k_norm.weight"));
+        assert!(model.has_vector("blk.0.attn_q_norm.weight"));
+        assert!(model.has_vector("blk.0.attn_k_norm.weight"));
+        assert_close_vec(
+            &model
+                .vector("blk.0.attn_q_norm.weight")
+                .unwrap()
+                .copy_to_host_f32()
+                .unwrap(),
+            &[1.0, 1.0],
+        );
+        assert_close_vec(
+            &model
+                .vector("blk.0.attn_k_norm.weight")
+                .unwrap()
+                .copy_to_host_f32()
+                .unwrap(),
+            &[1.0, 1.0],
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_qwen_next_recurrent_ssm_to_logical_tensors() {
+        let path = tempfile_path("gpu-qwen-next-recurrent-ssm");
+        write_reference_qwen_next_recurrent_ssm(&path);
+        let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+        assert_eq!(model.info().tensor_count, 14);
+        assert!(model.has_tensor("blk.0.attn_post_norm.weight"));
+        assert!(model.has_matrix("blk.0.ssm_in.weight"));
+        assert!(model.has_matrix("blk.0.ssm_conv1d.weight"));
+        assert!(model.has_matrix("blk.0.ssm_ba.weight"));
+        assert!(model.has_matrix("blk.0.ssm_out.weight"));
+        assert!(model.has_matrix("blk.0.ffn_gate.weight"));
+        assert!(model.has_matrix("blk.0.ffn_up.weight"));
+        assert!(model.has_matrix("blk.0.ffn_down.weight"));
+        assert!(model.has_vector("blk.0.ffn_norm.weight"));
+        assert!(model.has_vector("blk.0.ssm_dt.bias"));
+        assert!(model.has_vector("blk.0.ssm_a"));
+        assert!(model.has_vector("blk.0.ssm_norm.weight"));
+        assert_eq!(
+            model
+                .matrix("blk.0.ssm_in.weight")
+                .unwrap()
+                .copy_to_host_u16()
+                .unwrap(),
+            f16_values(&[0.0; 16])
+        );
+        assert_close_vec(
+            &model
+                .vector("blk.0.ssm_dt.bias")
+                .unwrap()
+                .copy_to_host_f32()
+                .unwrap(),
+            &[0.0],
+        );
+        assert_close_vec(
+            &model
+                .vector("blk.0.ssm_norm.weight")
+                .unwrap()
+                .copy_to_host_f32()
+                .unwrap(),
+            &[1.0, 1.0],
+        );
+
+        let cpu = crate::qwen_cpu::QwenCpuReference::load(&path).unwrap();
+        assert_close_vec(
+            &model.last_logits_host(&[0]).unwrap(),
+            &cpu.last_logits(&[0]).unwrap(),
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_qwen_next_optimized_recurrent_ssm_to_logical_tensors() {
+        let path = tempfile_path("gpu-qwen-next-recurrent-ssm-optimized");
+        write_reference_qwen_next_recurrent_ssm_optimized(&path);
+        let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+        assert_eq!(model.info().tensor_count, 15);
+        assert!(model.has_matrix("blk.0.attn_qkv.weight"));
+        assert!(model.has_matrix("blk.0.attn_gate.weight"));
+        assert!(model.has_matrix("blk.0.ssm_conv1d.weight"));
+        assert!(model.has_matrix("blk.0.ssm_ba.weight"));
+        assert!(model.has_matrix("blk.0.ssm_out.weight"));
+        assert!(model.has_vector("blk.0.ffn_norm.weight"));
+        assert!(model.has_vector("blk.0.ssm_dt.bias"));
+        assert!(model.has_vector("blk.0.ssm_a"));
+        assert!(model.has_vector("blk.0.ssm_norm.weight"));
+        assert_eq!(
+            model
+                .matrix("blk.0.attn_qkv.weight")
+                .unwrap()
+                .copy_to_host_u16()
+                .unwrap(),
+            f16_values(&[0.0; 12])
+        );
+        assert_eq!(
+            model
+                .matrix("blk.0.attn_gate.weight")
+                .unwrap()
+                .copy_to_host_u16()
+                .unwrap(),
+            f16_values(&[0.0; 4])
+        );
+
+        let cpu = crate::qwen_cpu::QwenCpuReference::load(&path).unwrap();
+        assert_close_vec(
+            &model.last_logits_host(&[0]).unwrap(),
+            &cpu.last_logits(&[0]).unwrap(),
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_deepseek_true_mla_aliases_to_logical_tensors() {
+        let cases: [(&str, fn(&Path), usize, [&str; 2]); 2] = [
+            (
+                "attention-aliases",
+                write_reference_deepseek_true_mla_attention_aliases,
+                15,
+                [
+                    "transformer.encoder.layers.0.attention.q_a_proj.weight",
+                    "transformer.encoder.layers.0.attention.kv_a_proj_with_mqa.weight",
+                ],
+            ),
+            (
+                "self-attn-aliases",
+                write_reference_deepseek_true_mla_self_attn_aliases,
+                15,
+                [
+                    "model.layers.0.self_attn.q_a_proj.weight",
+                    "model.layers.0.self_attn.kv_a_proj.weight",
+                ],
+            ),
+        ];
+
+        for (case_name, write_fixture, expected_tensor_count, raw_tensors) in cases {
+            let path = tempfile_path(&format!("gpu-deepseek-true-mla-{case_name}"));
+            write_fixture(&path);
+            let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+            let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+            assert_eq!(model.info().tensor_count, expected_tensor_count);
+            for raw_tensor in raw_tensors {
+                assert!(
+                    model.has_tensor(raw_tensor),
+                    "{case_name} missing raw tensor {raw_tensor}"
+                );
+            }
+            assert!(model.has_matrix("token_embd.weight"));
+            assert!(model.has_matrix("output.weight"));
+            assert!(model.has_matrix("blk.0.attn_q_a.weight"));
+            assert!(model.has_matrix("blk.0.attn_q_b.weight"));
+            assert!(model.has_matrix("blk.0.attn_kv_a_mqa.weight"));
+            assert!(model.has_matrix("blk.0.attn_kv_b.weight"));
+            assert!(model.has_matrix("blk.0.attn_output.weight"));
+            assert!(model.has_vector("blk.0.attn_q_a_norm.weight"));
+            assert!(model.has_vector("blk.0.attn_kv_a_norm.weight"));
+            assert_eq!(
+                model
+                    .matrix("blk.0.attn_q_a.weight")
+                    .unwrap()
+                    .copy_to_host_u16()
+                    .unwrap(),
+                f16_values(&[0.0; 2])
+            );
+            assert_close_vec(
+                &model
+                    .vector("blk.0.attn_q_a_norm.weight")
+                    .unwrap()
+                    .copy_to_host_f32()
+                    .unwrap(),
+                &[1.0],
+            );
+            assert_close_vec(
+                &model
+                    .vector("blk.0.attn_kv_a_norm.weight")
+                    .unwrap()
+                    .copy_to_host_f32()
+                    .unwrap(),
+                &[1.0],
+            );
+
+            let cpu = crate::qwen_cpu::QwenCpuReference::load(&path).unwrap();
+            assert_close_vec(
+                &model.last_logits_host(&[0]).unwrap(),
+                &cpu.last_logits(&[0]).unwrap(),
+            );
+        }
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_qwen_ssm_metadata_fallback_layouts_to_logical_tensors() {
+        let cases: [(&str, fn(&Path), usize); 4] = [
+            (
+                "metadata-dense",
+                write_reference_qwen_ssm_metadata_dense,
+                11,
+            ),
+            ("sidecar-dense", write_reference_qwen_ssm_sidecar_dense, 12),
+            (
+                "metadata-packed",
+                write_reference_qwen_ssm_metadata_packed,
+                8,
+            ),
+            (
+                "metadata-hf-packed-aliases",
+                write_reference_qwen_ssm_metadata_hf_packed_aliases,
+                8,
+            ),
+        ];
+
+        for (case_name, write_fixture, expected_tensor_count) in cases {
+            let path = tempfile_path(&format!("gpu-qwen-ssm-{case_name}"));
+            write_fixture(&path);
+            let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+            let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+            assert_eq!(model.info().tensor_count, expected_tensor_count);
+            assert!(model.has_matrix("token_embd.weight"));
+            assert!(model.has_vector("output_norm.weight"));
+            assert!(model.has_vector("blk.0.attn_norm.weight"));
+            assert!(model.has_vector("blk.0.ffn_norm.weight"));
+            assert!(model.has_matrix("blk.0.attn_output.weight"));
+            assert!(model.has_matrix("blk.0.ffn_down.weight"));
+
+            if matches!(case_name, "metadata-packed" | "metadata-hf-packed-aliases") {
+                match case_name {
+                    "metadata-hf-packed-aliases" => {
+                        assert!(model.has_tensor("blk.0.attention.qkv_proj.weight"));
+                        assert!(model.has_tensor("blk.0.mlp.gate_up_proj.weight"));
+                    }
+                    _ => {
+                        assert!(model.has_tensor("blk.0.self_attn.W_pack.weight"));
+                        assert!(model.has_tensor("blk.0.mlp.w1w3.weight"));
+                    }
+                }
+                assert!(model.has_matrix("blk.0.attn_q.weight"));
+                assert!(model.has_matrix("blk.0.attn_k.weight"));
+                assert!(model.has_matrix("blk.0.attn_v.weight"));
+                assert!(model.has_matrix("blk.0.ffn_gate.weight"));
+                assert!(model.has_matrix("blk.0.ffn_up.weight"));
+                assert_eq!(
+                    model
+                        .matrix("blk.0.attn_q.weight")
+                        .unwrap()
+                        .copy_to_host_u16()
+                        .unwrap(),
+                    f16_values(&[1.0, 2.0, 3.0, 4.0])
+                );
+                assert_eq!(
+                    model
+                        .matrix("blk.0.ffn_up.weight")
+                        .unwrap()
+                        .copy_to_host_u16()
+                        .unwrap(),
+                    f16_values(&[5.0, 6.0, 7.0, 8.0])
+                );
+            } else {
+                assert!(model.has_matrix("blk.0.attn_q.weight"));
+                assert!(model.has_matrix("blk.0.attn_k.weight"));
+                assert!(model.has_matrix("blk.0.attn_v.weight"));
+                assert!(model.has_matrix("blk.0.ffn_gate.weight"));
+                assert!(model.has_matrix("blk.0.ffn_up.weight"));
+                if case_name == "sidecar-dense" {
+                    assert!(model.has_tensor("blk.0.ssm_in.weight"));
+                }
+            }
+
+            let cpu = crate::qwen_cpu::QwenCpuReference::load(&path).unwrap();
+            assert_close_vec(
+                &model.last_logits_host(&[0]).unwrap(),
+                &cpu.last_logits(&[0]).unwrap(),
+            );
+        }
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_glm_mla_layouts_to_logical_tensors() {
+        let cases: [(&str, fn(&Path), usize); 7] = [
+            ("metadata-split", write_reference_glm_mla_metadata_split, 11),
+            ("sidecar-split", write_reference_glm_mla_sidecar_split, 12),
+            ("true-mla", write_reference_glm_true_mla, 14),
+            (
+                "true-mla-self-attention-aliases",
+                write_reference_glm_true_mla_self_attention_aliases,
+                15,
+            ),
+            (
+                "true-mla-attention-aliases",
+                write_reference_glm_true_mla_attention_aliases,
+                15,
+            ),
+            (
+                "true-mla-self-attn-aliases",
+                write_reference_glm_true_mla_self_attn_aliases,
+                15,
+            ),
+            (
+                "metadata-packed",
+                write_reference_glm_mla_metadata_packed,
+                8,
+            ),
+        ];
+
+        for (case_name, write_fixture, expected_tensor_count) in cases {
+            let path = tempfile_path(&format!("gpu-glm-mla-{case_name}"));
+            write_fixture(&path);
+            let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+            let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+            assert_eq!(model.info().tensor_count, expected_tensor_count);
+            assert!(model.has_matrix("token_embd.weight"));
+            assert!(model.has_vector("output_norm.weight"));
+            assert!(model.has_vector("blk.0.attn_norm.weight"));
+            assert!(model.has_vector("blk.0.ffn_norm.weight"));
+            assert!(model.has_matrix("blk.0.attn_output.weight"));
+            assert!(model.has_matrix("blk.0.ffn_down.weight"));
+
+            match case_name {
+                "true-mla"
+                | "true-mla-self-attention-aliases"
+                | "true-mla-attention-aliases"
+                | "true-mla-self-attn-aliases" => {
+                    match case_name {
+                        "true-mla-self-attention-aliases" => {
+                            assert!(model.has_tensor(
+                                "transformer.encoder.layers.0.self_attention.q_a_proj.weight"
+                            ));
+                            assert!(model.has_tensor(
+                                "transformer.encoder.layers.0.self_attention.kv_a_proj_with_mqa.weight"
+                            ));
+                            assert!(model.has_matrix("output.weight"));
+                        }
+                        "true-mla-attention-aliases" => {
+                            assert!(model.has_tensor(
+                                "transformer.encoder.layers.0.attention.q_a_proj.weight"
+                            ));
+                            assert!(model.has_tensor(
+                                "transformer.encoder.layers.0.attention.kv_a_proj_with_mqa.weight"
+                            ));
+                            assert!(model.has_matrix("output.weight"));
+                        }
+                        "true-mla-self-attn-aliases" => {
+                            assert!(model.has_tensor("model.layers.0.self_attn.q_a_proj.weight"));
+                            assert!(model.has_tensor("model.layers.0.self_attn.kv_a_proj.weight"));
+                            assert!(model.has_matrix("output.weight"));
+                        }
+                        _ => {
+                            assert!(model.has_tensor("blk.0.attn_q_a_proj.weight"));
+                            assert!(model.has_tensor("blk.0.attn_kv_a_proj_with_mqa.weight"));
+                        }
+                    }
+                    assert!(model.has_matrix("blk.0.attn_q_a.weight"));
+                    assert!(model.has_matrix("blk.0.attn_q_b.weight"));
+                    assert!(model.has_matrix("blk.0.attn_kv_a_mqa.weight"));
+                    assert!(model.has_matrix("blk.0.attn_kv_b.weight"));
+                    assert!(model.has_vector("blk.0.attn_q_a_norm.weight"));
+                    assert!(model.has_vector("blk.0.attn_kv_a_norm.weight"));
+                    assert_eq!(
+                        model
+                            .matrix("blk.0.attn_q_a.weight")
+                            .unwrap()
+                            .copy_to_host_u16()
+                            .unwrap(),
+                        f16_values(&[0.0; 2])
+                    );
+                    assert_close_vec(
+                        &model
+                            .vector("blk.0.attn_q_a_norm.weight")
+                            .unwrap()
+                            .copy_to_host_f32()
+                            .unwrap(),
+                        &[1.0],
+                    );
+                    assert_close_vec(
+                        &model
+                            .vector("blk.0.attn_kv_a_norm.weight")
+                            .unwrap()
+                            .copy_to_host_f32()
+                            .unwrap(),
+                        &[1.0],
+                    );
+                }
+                "metadata-packed" => {
+                    assert!(model.has_tensor("blk.0.self_attn.W_pack.weight"));
+                    assert!(model.has_tensor("blk.0.mlp.w1w3.weight"));
+                    assert!(model.has_matrix("blk.0.attn_q.weight"));
+                    assert!(model.has_matrix("blk.0.attn_k.weight"));
+                    assert!(model.has_matrix("blk.0.attn_v.weight"));
+                    assert!(model.has_matrix("blk.0.ffn_gate.weight"));
+                    assert!(model.has_matrix("blk.0.ffn_up.weight"));
+                    assert_eq!(
+                        model
+                            .matrix("blk.0.attn_q.weight")
+                            .unwrap()
+                            .copy_to_host_u16()
+                            .unwrap(),
+                        f16_values(&[1.0, 2.0, 3.0, 4.0])
+                    );
+                    assert_eq!(
+                        model
+                            .matrix("blk.0.ffn_up.weight")
+                            .unwrap()
+                            .copy_to_host_u16()
+                            .unwrap(),
+                        f16_values(&[5.0, 6.0, 7.0, 8.0])
+                    );
+                }
+                _ => {
+                    assert!(model.has_matrix("blk.0.attn_q.weight"));
+                    assert!(model.has_matrix("blk.0.attn_k.weight"));
+                    assert!(model.has_matrix("blk.0.attn_v.weight"));
+                    assert!(model.has_matrix("blk.0.ffn_gate.weight"));
+                    assert!(model.has_matrix("blk.0.ffn_up.weight"));
+                    if case_name == "sidecar-split" {
+                        assert!(model.has_tensor("blk.0.attn_kv_a_proj_with_mqa.weight"));
+                    }
+                }
+            }
+
+            let cpu = crate::qwen_cpu::QwenCpuReference::load(&path).unwrap();
+            assert_close_vec(
+                &model.last_logits_host(&[0]).unwrap(),
+                &cpu.last_logits(&[0]).unwrap(),
+            );
+        }
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_qwen_next_ssm_metadata_layouts_to_logical_tensors() {
+        let cases: [(&str, fn(&Path), usize); 3] = [
+            (
+                "metadata-dense",
+                write_reference_qwen_next_ssm_metadata_dense,
+                11,
+            ),
+            (
+                "metadata-packed",
+                write_reference_qwen_next_ssm_metadata_packed,
+                8,
+            ),
+            (
+                "metadata-hf-packed-aliases",
+                write_reference_qwen_next_ssm_metadata_hf_packed_aliases,
+                8,
+            ),
+        ];
+
+        for (case_name, write_fixture, expected_tensor_count) in cases {
+            let path = tempfile_path(&format!("gpu-qwen-next-ssm-{case_name}"));
+            write_fixture(&path);
+            let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+            let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+            assert_eq!(model.info().tensor_count, expected_tensor_count);
+            assert!(model.has_matrix("token_embd.weight"));
+            assert!(model.has_vector("output_norm.weight"));
+            assert!(model.has_vector("blk.0.attn_norm.weight"));
+            assert!(model.has_vector("blk.0.ffn_norm.weight"));
+            assert!(model.has_matrix("blk.0.attn_output.weight"));
+            assert!(model.has_matrix("blk.0.ffn_down.weight"));
+
+            if matches!(case_name, "metadata-packed" | "metadata-hf-packed-aliases") {
+                match case_name {
+                    "metadata-hf-packed-aliases" => {
+                        assert!(model.has_tensor("blk.0.attention.qkv_proj.weight"));
+                        assert!(model.has_tensor("blk.0.mlp.gate_up_proj.weight"));
+                    }
+                    _ => {
+                        assert!(model.has_tensor("blk.0.self_attn.W_pack.weight"));
+                        assert!(model.has_tensor("blk.0.mlp.w1w3.weight"));
+                    }
+                }
+                assert_eq!(
+                    model
+                        .matrix("blk.0.attn_q.weight")
+                        .unwrap()
+                        .copy_to_host_u16()
+                        .unwrap(),
+                    f16_values(&[1.0, 2.0, 3.0, 4.0])
+                );
+                assert_eq!(
+                    model
+                        .matrix("blk.0.ffn_up.weight")
+                        .unwrap()
+                        .copy_to_host_u16()
+                        .unwrap(),
+                    f16_values(&[5.0, 6.0, 7.0, 8.0])
+                );
+            }
+
+            assert!(model.has_matrix("blk.0.attn_q.weight"));
+            assert!(model.has_matrix("blk.0.attn_k.weight"));
+            assert!(model.has_matrix("blk.0.attn_v.weight"));
+            assert!(model.has_matrix("blk.0.ffn_gate.weight"));
+            assert!(model.has_matrix("blk.0.ffn_up.weight"));
+
+            let cpu = crate::qwen_cpu::QwenCpuReference::load(&path).unwrap();
+            assert_close_vec(
+                &model.last_logits_host(&[0]).unwrap(),
+                &cpu.last_logits(&[0]).unwrap(),
+            );
+        }
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_deepseek_mla_metadata_layouts_to_logical_tensors() {
+        let cases: [(&str, fn(&Path), usize); 3] = [
+            (
+                "metadata-split",
+                write_reference_deepseek_mla_metadata_split,
+                11,
+            ),
+            (
+                "sidecar-split",
+                write_reference_deepseek_mla_sidecar_split,
+                12,
+            ),
+            (
+                "metadata-packed",
+                write_reference_deepseek_mla_metadata_packed,
+                8,
+            ),
+        ];
+
+        for (case_name, write_fixture, expected_tensor_count) in cases {
+            let path = tempfile_path(&format!("gpu-deepseek-mla-{case_name}"));
+            write_fixture(&path);
+            let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+            let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+            assert_eq!(model.info().tensor_count, expected_tensor_count);
+            assert!(model.has_matrix("token_embd.weight"));
+            assert!(model.has_vector("output_norm.weight"));
+            assert!(model.has_vector("blk.0.attn_norm.weight"));
+            assert!(model.has_vector("blk.0.ffn_norm.weight"));
+            assert!(model.has_matrix("blk.0.attn_output.weight"));
+            assert!(model.has_matrix("blk.0.ffn_down.weight"));
+
+            if case_name == "metadata-packed" {
+                assert!(model.has_tensor("blk.0.self_attn.W_pack.weight"));
+                assert!(model.has_tensor("blk.0.mlp.w1w3.weight"));
+                assert_eq!(
+                    model
+                        .matrix("blk.0.attn_q.weight")
+                        .unwrap()
+                        .copy_to_host_u16()
+                        .unwrap(),
+                    f16_values(&[1.0, 2.0, 3.0, 4.0])
+                );
+                assert_eq!(
+                    model
+                        .matrix("blk.0.ffn_up.weight")
+                        .unwrap()
+                        .copy_to_host_u16()
+                        .unwrap(),
+                    f16_values(&[5.0, 6.0, 7.0, 8.0])
+                );
+            } else if case_name == "sidecar-split" {
+                assert!(model.has_tensor("blk.0.attn_kv_a_mqa.weight"));
+            }
+
+            assert!(model.has_matrix("blk.0.attn_q.weight"));
+            assert!(model.has_matrix("blk.0.attn_k.weight"));
+            assert!(model.has_matrix("blk.0.attn_v.weight"));
+            assert!(model.has_matrix("blk.0.ffn_gate.weight"));
+            assert!(model.has_matrix("blk.0.ffn_up.weight"));
+
+            let cpu = crate::qwen_cpu::QwenCpuReference::load(&path).unwrap();
+            assert_close_vec(
+                &model.last_logits_host(&[0]).unwrap(),
+                &cpu.last_logits(&[0]).unwrap(),
+            );
+        }
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_custom_kv_attention_lengths_to_logical_matrices() {
+        let cases: [(&str, fn(&Path), u32, Option<u32>); 2] = [
+            ("equal", write_reference_qwen_equal_custom_kv, 2, Some(2)),
+            ("unequal", write_reference_qwen_unequal_custom_kv, 3, None),
+        ];
+
+        for (case_name, write_fixture, expected_value_head_dim, expected_head_dim) in cases {
+            let path = tempfile_path(&format!("gpu-qwen-custom-kv-{case_name}"));
+            write_fixture(&path);
+            let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+            let config = gguf.qwen_config().unwrap();
+            let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+            assert_eq!(config.attention_key_length, Some(2));
+            assert_eq!(config.attention_value_length, Some(expected_value_head_dim));
+            assert_eq!(config.attention_key_head_dim(), Some(2));
+            assert_eq!(
+                config.attention_value_head_dim(),
+                Some(expected_value_head_dim)
+            );
+            assert_eq!(config.attention_head_dim(), expected_head_dim);
+            assert_eq!(model.info().tensor_count, 11);
+            assert!(model.has_matrix("blk.0.attn_q.weight"));
+            assert!(model.has_matrix("blk.0.attn_k.weight"));
+            assert!(model.has_matrix("blk.0.attn_v.weight"));
+            assert!(model.has_matrix("blk.0.attn_output.weight"));
+
+            let k = model.matrix("blk.0.attn_k.weight").unwrap();
+            assert_eq!(k.rows, 2);
+            assert_eq!(k.cols, 4);
+            let v = model.matrix("blk.0.attn_v.weight").unwrap();
+            assert_eq!(v.rows, usize::try_from(expected_value_head_dim).unwrap());
+            assert_eq!(v.cols, 4);
+            let output = model.matrix("blk.0.attn_output.weight").unwrap();
+            assert_eq!(output.rows, 4);
+            assert_eq!(
+                output.cols,
+                usize::try_from(expected_value_head_dim).unwrap()
+            );
+
+            let cpu = crate::qwen_cpu::QwenCpuReference::load(&path).unwrap();
+            assert_close_vec(
+                &model.last_logits_host(&[0]).unwrap(),
+                &cpu.last_logits(&[0]).unwrap(),
+            );
+        }
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_gemma_alias_layouts_to_logical_tensors() {
+        let cases: [(&str, fn(&Path), usize); 3] = [
+            (
+                "pre-feedforward",
+                write_reference_gemma_pre_feedforward_aliases,
+                11,
+            ),
+            (
+                "post-feedforward",
+                write_reference_gemma_post_feedforward_aliases,
+                11,
+            ),
+            ("dense-bias", write_reference_gemma_dense_bias_aliases, 15),
+        ];
+
+        for (case_name, write_fixture, expected_tensor_count) in cases {
+            let path = tempfile_path(&format!("gpu-gemma-{case_name}-aliases"));
+            write_fixture(&path);
+            let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+            let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+            assert_eq!(model.info().tensor_count, expected_tensor_count);
+            assert!(model.has_matrix("token_embd.weight"));
+            assert!(model.has_vector("output_norm.weight"));
+            assert!(model.has_vector("blk.0.attn_norm.weight"));
+            assert!(model.has_vector("blk.0.ffn_norm.weight"));
+            assert!(model.has_matrix("blk.0.attn_q.weight"));
+            assert!(model.has_matrix("blk.0.attn_k.weight"));
+            assert!(model.has_matrix("blk.0.attn_v.weight"));
+            assert!(model.has_matrix("blk.0.attn_output.weight"));
+            assert!(model.has_matrix("blk.0.ffn_gate.weight"));
+            assert!(model.has_matrix("blk.0.ffn_up.weight"));
+            assert!(model.has_matrix("blk.0.ffn_down.weight"));
+
+            match case_name {
+                "pre-feedforward" => {
+                    assert!(model.has_tensor("model.layers.0.pre_feedforward_layernorm.weight"));
+                }
+                "post-feedforward" => {
+                    assert!(model.has_tensor("model.layers.0.post_feedforward_layernorm.weight"));
+                    assert!(model.has_tensor("model.layers.0.self_attn.out.weight"));
+                    assert!(model.has_tensor("model.layers.0.mlp.proj.weight"));
+                }
+                "dense-bias" => {
+                    assert!(model.has_vector("blk.0.attn_output.bias"));
+                    assert!(model.has_vector("blk.0.ffn_gate.bias"));
+                    assert!(model.has_vector("blk.0.ffn_up.bias"));
+                    assert!(model.has_vector("blk.0.ffn_down.bias"));
+                }
+                _ => unreachable!(),
+            }
+
+            let cpu = crate::qwen_cpu::QwenCpuReference::load(&path).unwrap();
+            assert_close_vec(
+                &model.last_logits_host(&[0]).unwrap(),
+                &cpu.last_logits(&[0]).unwrap(),
+            );
+        }
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_f32_qwen_matrices_to_device() {
+        use hi_gguf::{GgufFile, GgufTensorType};
+
+        let path = tempfile_path("gpu-f32-weights");
+        write_reference_qwen_f32_matrices(&path);
+        let gguf = GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+        assert_eq!(model.info().tensor_count, 11);
+        assert_eq!(model.info().dtype_summary, vec!["F32"]);
+        assert_eq!(model.info().matrix_count, 8);
+        assert_eq!(model.info().quantized_matrix_count, 0);
+        assert!(model.info().total_matrix_bytes > 68);
+
+        let embd_matrix = model.matrix("token_embd.weight").unwrap();
+        assert_eq!(embd_matrix.rows, 3);
+        assert_eq!(embd_matrix.cols, 2);
+        assert_eq!(embd_matrix.dtype, GgufTensorType::F32);
+        assert_close_vec(
+            &embd_matrix.copy_to_host_f32().unwrap(),
+            &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+        );
+        assert_close_vec(
+            &model.embed_tokens_host(&[0, 1, 2]).unwrap(),
+            &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+        );
+
+        let projected = model
+            .project_f32_host("token_embd.weight", &[1.0, 2.0, 3.0, 4.0], 2)
+            .unwrap();
+        assert_close_vec(&projected, &[1.0, 2.0, 3.0, 3.0, 4.0, 7.0]);
+
+        let cpu = crate::qwen_cpu::QwenCpuReference::load(&path).unwrap();
+        assert_close_vec(
+            &model.last_logits_host(&[0]).unwrap(),
+            &cpu.last_logits(&[0]).unwrap(),
+        );
+        let cpu_logits = cpu.forward(&[0, 1]).unwrap();
+        let cpu_logits = cpu_logits.into_iter().flatten().collect::<Vec<_>>();
+        assert_close_vec(
+            &model.full_context_logits_host(&[0, 1]).unwrap(),
+            &cpu_logits,
+        );
+        assert_eq!(
+            model.generate_greedy_tokens(&[1], 2, None).unwrap(),
+            cpu.generate_greedy(&[1], 2).unwrap()
+        );
+        assert_eq!(
+            model
+                .generate_greedy_tokens_paged(&[1], 2, None, 1)
+                .unwrap(),
+            cpu.generate_greedy(&[1], 2).unwrap()
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_phi_packed_weights_to_logical_matrices() {
+        let path = tempfile_path("gpu-phi-packed-weights");
+        write_reference_phi_packed(&path);
+        let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+        assert_eq!(model.info().tensor_count, 8);
+        assert_eq!(model.info().matrix_count, 8);
+        assert!(model.has_matrix("blk.0.attn_q.weight"));
+        assert!(model.has_matrix("blk.0.attn_k.weight"));
+        assert!(model.has_matrix("blk.0.attn_v.weight"));
+        assert!(model.has_matrix("blk.0.ffn_gate.weight"));
+        assert!(model.has_matrix("blk.0.ffn_up.weight"));
+
+        assert_eq!(
+            model
+                .matrix("blk.0.attn_q.weight")
+                .unwrap()
+                .copy_to_host_u16()
+                .unwrap(),
+            f16_values(&[1.0, 2.0, 3.0, 4.0])
+        );
+        assert_eq!(
+            model
+                .matrix("blk.0.attn_k.weight")
+                .unwrap()
+                .copy_to_host_u16()
+                .unwrap(),
+            f16_values(&[5.0, 6.0, 7.0, 8.0])
+        );
+        assert_eq!(
+            model
+                .matrix("blk.0.attn_v.weight")
+                .unwrap()
+                .copy_to_host_u16()
+                .unwrap(),
+            f16_values(&[9.0, 10.0, 11.0, 12.0])
+        );
+        assert_eq!(
+            model
+                .matrix("blk.0.ffn_gate.weight")
+                .unwrap()
+                .copy_to_host_u16()
+                .unwrap(),
+            f16_values(&[1.0, 2.0, 3.0, 4.0])
+        );
+        assert_eq!(
+            model
+                .matrix("blk.0.ffn_up.weight")
+                .unwrap()
+                .copy_to_host_u16()
+                .unwrap(),
+            f16_values(&[5.0, 6.0, 7.0, 8.0])
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_phi_packed_ffn_named_variants_to_logical_matrices() {
+        let cases: [(&str, fn(&Path)); 2] = [
+            ("ffn-gate-up", write_reference_phi_packed_ffn_gate_up),
+            ("ffn-up-gate", write_reference_phi_packed_ffn_up_gate),
+        ];
+
+        for (case_name, write_fixture) in cases {
+            let path = tempfile_path(&format!("gpu-phi-packed-{case_name}"));
+            write_fixture(&path);
+            let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+            let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+            assert_eq!(model.info().tensor_count, 8);
+            assert!(model.has_matrix("blk.0.ffn_gate.weight"));
+            assert!(model.has_matrix("blk.0.ffn_up.weight"));
+            assert_eq!(
+                model
+                    .matrix("blk.0.ffn_gate.weight")
+                    .unwrap()
+                    .copy_to_host_u16()
+                    .unwrap(),
+                f16_values(&[1.0, 2.0, 3.0, 4.0])
+            );
+            assert_eq!(
+                model
+                    .matrix("blk.0.ffn_up.weight")
+                    .unwrap()
+                    .copy_to_host_u16()
+                    .unwrap(),
+                f16_values(&[5.0, 6.0, 7.0, 8.0])
+            );
+        }
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_mistral_packed_aliases_to_logical_matrices_and_vectors() {
+        let path = tempfile_path("gpu-mistral-packed-aliases");
+        write_reference_mistral_packed_aliases(&path);
+        let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+        assert_eq!(model.info().tensor_count, 10);
+        assert!(model.has_matrix("blk.0.attn_q.weight"));
+        assert!(model.has_matrix("blk.0.attn_k.weight"));
+        assert!(model.has_matrix("blk.0.attn_v.weight"));
+        assert!(model.has_matrix("blk.0.ffn_gate.weight"));
+        assert!(model.has_matrix("blk.0.ffn_up.weight"));
+        assert!(model.has_vector("blk.0.attn_q.bias"));
+        assert!(model.has_vector("blk.0.attn_k.bias"));
+        assert!(model.has_vector("blk.0.attn_v.bias"));
+        assert_eq!(
+            model
+                .matrix("blk.0.attn_q.weight")
+                .unwrap()
+                .copy_to_host_u16()
+                .unwrap(),
+            f16_values(&[1.0, 2.0, 3.0, 4.0])
+        );
+        assert_eq!(
+            model
+                .matrix("blk.0.attn_k.weight")
+                .unwrap()
+                .copy_to_host_u16()
+                .unwrap(),
+            f16_values(&[5.0, 6.0, 7.0, 8.0])
+        );
+        assert_eq!(
+            model
+                .matrix("blk.0.attn_v.weight")
+                .unwrap()
+                .copy_to_host_u16()
+                .unwrap(),
+            f16_values(&[9.0, 10.0, 11.0, 12.0])
+        );
+        assert_eq!(
+            model
+                .matrix("blk.0.ffn_gate.weight")
+                .unwrap()
+                .copy_to_host_u16()
+                .unwrap(),
+            f16_values(&[1.0, 2.0, 3.0, 4.0])
+        );
+        assert_eq!(
+            model
+                .matrix("blk.0.ffn_up.weight")
+                .unwrap()
+                .copy_to_host_u16()
+                .unwrap(),
+            f16_values(&[5.0, 6.0, 7.0, 8.0])
+        );
+        assert_close_vec(
+            &model
+                .vector("blk.0.attn_q.bias")
+                .unwrap()
+                .copy_to_host_f32()
+                .unwrap(),
+            &[1.0, 2.0],
+        );
+        assert_close_vec(
+            &model
+                .vector("blk.0.attn_v.bias")
+                .unwrap()
+                .copy_to_host_f32()
+                .unwrap(),
+            &[5.0, 6.0],
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_dense_and_packed_bias_aliases_to_logical_vectors() {
+        let gemma_path = tempfile_path("gpu-gemma-dense-bias-aliases");
+        write_reference_gemma_dense_bias_aliases_with_values(
+            &gemma_path,
+            &[0.25, -0.5],
+            &[1.0, 2.0],
+            &[3.0, 4.0],
+            &[5.0, 6.0],
+        );
+        let gemma = hi_gguf::GgufFile::open(&gemma_path).unwrap();
+        let gemma_model = crate::gpu::CudaQwenGpuModel::from_gguf(&gemma).unwrap();
+
+        assert!(gemma_model.has_vector("blk.0.attn_output.bias"));
+        assert!(gemma_model.has_vector("blk.0.ffn_gate.bias"));
+        assert!(gemma_model.has_vector("blk.0.ffn_up.bias"));
+        assert!(gemma_model.has_vector("blk.0.ffn_down.bias"));
+        assert_close_vec(
+            &gemma_model
+                .vector("blk.0.attn_output.bias")
+                .unwrap()
+                .copy_to_host_f32()
+                .unwrap(),
+            &[0.25, -0.5],
+        );
+        assert_close_vec(
+            &gemma_model
+                .vector("blk.0.ffn_gate.bias")
+                .unwrap()
+                .copy_to_host_f32()
+                .unwrap(),
+            &[1.0, 2.0],
+        );
+        assert_close_vec(
+            &gemma_model
+                .vector("blk.0.ffn_up.bias")
+                .unwrap()
+                .copy_to_host_f32()
+                .unwrap(),
+            &[3.0, 4.0],
+        );
+        assert_close_vec(
+            &gemma_model
+                .vector("blk.0.ffn_down.bias")
+                .unwrap()
+                .copy_to_host_f32()
+                .unwrap(),
+            &[5.0, 6.0],
+        );
+
+        let mistral_path = tempfile_path("gpu-mistral-packed-bias-aliases");
+        write_reference_mistral_packed_bias_aliases(&mistral_path);
+        let mistral = hi_gguf::GgufFile::open(&mistral_path).unwrap();
+        let mistral_model = crate::gpu::CudaQwenGpuModel::from_gguf(&mistral).unwrap();
+
+        assert!(mistral_model.has_vector("blk.0.attn_output.bias"));
+        assert!(mistral_model.has_vector("blk.0.ffn_gate.bias"));
+        assert!(mistral_model.has_vector("blk.0.ffn_up.bias"));
+        assert_close_vec(
+            &mistral_model
+                .vector("blk.0.attn_output.bias")
+                .unwrap()
+                .copy_to_host_f32()
+                .unwrap(),
+            &[11.0, 12.0],
+        );
+        assert_close_vec(
+            &mistral_model
+                .vector("blk.0.ffn_gate.bias")
+                .unwrap()
+                .copy_to_host_f32()
+                .unwrap(),
+            &[7.0, 8.0],
+        );
+        assert_close_vec(
+            &mistral_model
+                .vector("blk.0.ffn_up.bias")
+                .unwrap()
+                .copy_to_host_f32()
+                .unwrap(),
+            &[9.0, 10.0],
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_output_and_router_bias_aliases_to_logical_vectors() {
+        let path = tempfile_path("gpu-mixtral-output-router-bias-aliases");
+        write_reference_mixtral_output_router_bias_aliases(&path);
+        let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+        assert!(model.has_vector("output.bias"));
+        assert!(model.has_vector("blk.0.ffn_gate_inp.bias"));
+        assert_close_vec(
+            &model
+                .vector("output.bias")
+                .unwrap()
+                .copy_to_host_f32()
+                .unwrap(),
+            &[0.25, -0.5, 1.0],
+        );
+        assert_close_vec(
+            &model
+                .vector("blk.0.ffn_gate_inp.bias")
+                .unwrap()
+                .copy_to_host_f32()
+                .unwrap(),
+            &[2.0, 4.0],
+        );
+
+        let cpu = crate::qwen_cpu::QwenCpuReference::load(&path).unwrap();
+        assert_close_vec(
+            &model.last_logits_host(&[0]).unwrap(),
+            &cpu.last_logits(&[0]).unwrap(),
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_packed_moe_expert_biases_to_logical_vectors() {
+        let path = tempfile_path("gpu-mixtral-packed-moe-expert-biases");
+        write_reference_mixtral_packed_moe_expert_biases(&path);
+        let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+        assert!(model.has_vector("blk.0.ffn_gate_exps.0.bias"));
+        assert!(model.has_vector("blk.0.ffn_up_exps.1.bias"));
+        assert!(model.has_vector("blk.0.ffn_down_exps.0.bias"));
+        assert_close_vec(
+            &model
+                .vector("blk.0.ffn_gate_exps.0.bias")
+                .unwrap()
+                .copy_to_host_f32()
+                .unwrap(),
+            &[2.0, -2.0],
+        );
+        assert_close_vec(
+            &model
+                .vector("blk.0.ffn_up_exps.0.bias")
+                .unwrap()
+                .copy_to_host_f32()
+                .unwrap(),
+            &[3.0, 4.0],
+        );
+        assert_close_vec(
+            &model
+                .vector("blk.0.ffn_down_exps.0.bias")
+                .unwrap()
+                .copy_to_host_f32()
+                .unwrap(),
+            &[0.5, -0.25],
+        );
+
+        let cpu = crate::qwen_cpu::QwenCpuReference::load(&path).unwrap();
+        assert_close_vec(
+            &model.last_logits_host(&[0]).unwrap(),
+            &cpu.last_logits(&[0]).unwrap(),
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_per_expert_moe_bias_aliases_to_logical_vectors() {
+        let path = tempfile_path("gpu-mixtral-per-expert-moe-bias-aliases");
+        write_reference_mixtral_moe_expert_bias_aliases(&path);
+        let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+        assert_eq!(model.info().tensor_count, 21);
+        assert!(model.has_vector("blk.0.ffn_gate_exps.0.bias"));
+        assert!(model.has_vector("blk.0.ffn_up_exps.0.bias"));
+        assert!(model.has_vector("blk.0.ffn_down_exps.0.bias"));
+        assert!(model.has_vector("blk.0.ffn_gate_exps.1.bias"));
+        assert!(model.has_vector("blk.0.ffn_up_exps.1.bias"));
+        assert!(model.has_vector("blk.0.ffn_down_exps.1.bias"));
+        assert_close_vec(
+            &model
+                .vector("blk.0.ffn_gate_exps.0.bias")
+                .unwrap()
+                .copy_to_host_f32()
+                .unwrap(),
+            &[2.0, -2.0],
+        );
+        assert_close_vec(
+            &model
+                .vector("blk.0.ffn_up_exps.0.bias")
+                .unwrap()
+                .copy_to_host_f32()
+                .unwrap(),
+            &[3.0, 4.0],
+        );
+        assert_close_vec(
+            &model
+                .vector("blk.0.ffn_down_exps.0.bias")
+                .unwrap()
+                .copy_to_host_f32()
+                .unwrap(),
+            &[0.5, -0.25],
+        );
+        assert_close_vec(
+            &model
+                .vector("blk.0.ffn_gate_exps.1.bias")
+                .unwrap()
+                .copy_to_host_f32()
+                .unwrap(),
+            &[0.25, 0.5],
+        );
+        assert_close_vec(
+            &model
+                .vector("blk.0.ffn_up_exps.1.bias")
+                .unwrap()
+                .copy_to_host_f32()
+                .unwrap(),
+            &[0.75, 1.0],
+        );
+        assert_close_vec(
+            &model
+                .vector("blk.0.ffn_down_exps.1.bias")
+                .unwrap()
+                .copy_to_host_f32()
+                .unwrap(),
+            &[1.5, -1.5],
+        );
+
+        let cpu = crate::qwen_cpu::QwenCpuReference::load(&path).unwrap();
+        assert_close_vec(
+            &model.last_logits_host(&[0]).unwrap(),
+            &cpu.last_logits(&[0]).unwrap(),
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_mistral_model_layers_aliases_to_logical_matrices_and_vectors() {
+        let dense_path = tempfile_path("gpu-mistral-model-layers-dense-aliases");
+        write_reference_mistral_model_layers_dense_aliases(&dense_path);
+        let dense = hi_gguf::GgufFile::open(&dense_path).unwrap();
+        let dense_model = crate::gpu::CudaQwenGpuModel::from_gguf(&dense).unwrap();
+
+        assert_eq!(dense_model.info().tensor_count, 12);
+        assert!(dense_model.has_matrix("blk.0.attn_q.weight"));
+        assert!(dense_model.has_matrix("blk.0.attn_k.weight"));
+        assert!(dense_model.has_matrix("blk.0.attn_v.weight"));
+        assert!(dense_model.has_matrix("blk.0.attn_output.weight"));
+        assert!(dense_model.has_matrix("blk.0.ffn_gate.weight"));
+        assert!(dense_model.has_matrix("blk.0.ffn_up.weight"));
+        assert!(dense_model.has_matrix("blk.0.ffn_down.weight"));
+
+        let packed_path = tempfile_path("gpu-mistral-model-layers-packed-aliases");
+        write_reference_mistral_model_layers_packed_aliases(&packed_path);
+        let packed = hi_gguf::GgufFile::open(&packed_path).unwrap();
+        let packed_model = crate::gpu::CudaQwenGpuModel::from_gguf(&packed).unwrap();
+
+        assert_eq!(packed_model.info().tensor_count, 10);
+        assert!(packed_model.has_matrix("blk.0.attn_q.weight"));
+        assert!(packed_model.has_matrix("blk.0.attn_k.weight"));
+        assert!(packed_model.has_matrix("blk.0.attn_v.weight"));
+        assert!(packed_model.has_matrix("blk.0.ffn_gate.weight"));
+        assert!(packed_model.has_matrix("blk.0.ffn_up.weight"));
+        assert!(packed_model.has_vector("blk.0.attn_q.bias"));
+        assert!(packed_model.has_vector("blk.0.attn_k.bias"));
+        assert!(packed_model.has_vector("blk.0.attn_v.bias"));
+        assert_eq!(
+            packed_model
+                .matrix("blk.0.attn_q.weight")
+                .unwrap()
+                .copy_to_host_u16()
+                .unwrap(),
+            f16_values(&[1.0, 2.0, 3.0, 4.0])
+        );
+        assert_eq!(
+            packed_model
+                .matrix("blk.0.ffn_up.weight")
+                .unwrap()
+                .copy_to_host_u16()
+                .unwrap(),
+            f16_values(&[5.0, 6.0, 7.0, 8.0])
+        );
+        assert_close_vec(
+            &packed_model
+                .vector("blk.0.attn_k.bias")
+                .unwrap()
+                .copy_to_host_f32()
+                .unwrap(),
+            &[3.0, 4.0],
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_mistral_feed_forward_hf_aliases_to_logical_matrices() {
+        let path = tempfile_path("gpu-mistral-feed-forward-hf-aliases");
+        write_reference_mistral_feed_forward_hf_aliases(&path);
+        let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+        assert_eq!(model.info().tensor_count, 12);
+        assert!(model.has_matrix("blk.0.ffn_gate.weight"));
+        assert!(model.has_matrix("blk.0.ffn_up.weight"));
+        assert!(model.has_matrix("blk.0.ffn_down.weight"));
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_mistral_attn_container_split_aliases_to_logical_matrices() {
+        let path = tempfile_path("gpu-mistral-attn-container-split-aliases");
+        write_reference_mistral_attn_container_split_aliases(&path);
+        let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+        assert_eq!(model.info().tensor_count, 12);
+        assert!(model.has_tensor("blk.0.attn.q_proj.weight"));
+        assert!(model.has_tensor("blk.0.attn.o_proj.weight"));
+        assert!(model.has_matrix("blk.0.attn_q.weight"));
+        assert!(model.has_matrix("blk.0.attn_k.weight"));
+        assert!(model.has_matrix("blk.0.attn_v.weight"));
+        assert!(model.has_matrix("blk.0.attn_output.weight"));
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_mistral_ffn_container_aliases_to_logical_matrices() {
+        let path = tempfile_path("gpu-mistral-ffn-container-aliases");
+        write_reference_mistral_ffn_container_aliases(&path);
+        let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+        assert_eq!(model.info().tensor_count, 12);
+        assert!(model.has_tensor("blk.0.ffn.gate_proj.weight"));
+        assert!(model.has_matrix("blk.0.ffn_gate.weight"));
+        assert!(model.has_matrix("blk.0.ffn_up.weight"));
+        assert!(model.has_matrix("blk.0.ffn_down.weight"));
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_mistral_attn_qkv_aliases_to_logical_matrices_and_vectors() {
+        let path = tempfile_path("gpu-mistral-attn-qkv-aliases");
+        write_reference_mistral_attn_qkv_aliases(&path);
+        let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+        assert_eq!(model.info().tensor_count, 10);
+        assert!(model.has_tensor("blk.0.attn.qkv.weight"));
+        assert!(model.has_matrix("blk.0.attn_q.weight"));
+        assert!(model.has_matrix("blk.0.attn_k.weight"));
+        assert!(model.has_matrix("blk.0.attn_v.weight"));
+        assert!(model.has_matrix("blk.0.attn_output.weight"));
+        assert!(model.has_vector("blk.0.attn_q.bias"));
+        assert!(model.has_vector("blk.0.attn_k.bias"));
+        assert!(model.has_vector("blk.0.attn_v.bias"));
+        assert_eq!(
+            model
+                .matrix("blk.0.attn_q.weight")
+                .unwrap()
+                .copy_to_host_u16()
+                .unwrap(),
+            f16_values(&[1.0, 2.0, 3.0, 4.0])
+        );
+        assert_eq!(
+            model
+                .matrix("blk.0.attn_v.weight")
+                .unwrap()
+                .copy_to_host_u16()
+                .unwrap(),
+            f16_values(&[9.0, 10.0, 11.0, 12.0])
+        );
+        assert_close_vec(
+            &model
+                .vector("blk.0.attn_k.bias")
+                .unwrap()
+                .copy_to_host_f32()
+                .unwrap(),
+            &[3.0, 4.0],
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_mistral_language_model_wrapper_aliases_to_logical_matrices() {
+        let path = tempfile_path("gpu-mistral-language-model-wrapper-aliases");
+        write_reference_mistral_language_model_wrapper_aliases(&path);
+        let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+        assert_eq!(model.info().tensor_count, 12);
+        assert!(model.has_matrix("token_embd.weight"));
+        assert!(model.has_matrix("output.weight"));
+        assert!(model.has_vector("output_norm.weight"));
+        assert!(model.has_matrix("blk.0.attn_q.weight"));
+        assert!(model.has_matrix("blk.0.attn_k.weight"));
+        assert!(model.has_matrix("blk.0.attn_v.weight"));
+        assert!(model.has_matrix("blk.0.attn_output.weight"));
+        assert!(model.has_matrix("blk.0.ffn_gate.weight"));
+        assert!(model.has_matrix("blk.0.ffn_up.weight"));
+        assert!(model.has_matrix("blk.0.ffn_down.weight"));
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_glm_transformer_aliases_to_logical_matrices_and_vectors() {
+        let path = tempfile_path("gpu-glm-transformer-aliases");
+        write_reference_glm_transformer_aliases(&path);
+        let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+        assert_eq!(model.info().tensor_count, 10);
+        assert!(model.has_matrix("token_embd.weight"));
+        assert!(model.has_matrix("output.weight"));
+        assert!(model.has_vector("output_norm.weight"));
+        assert!(model.has_matrix("blk.0.attn_q.weight"));
+        assert!(model.has_matrix("blk.0.attn_k.weight"));
+        assert!(model.has_matrix("blk.0.attn_v.weight"));
+        assert!(model.has_matrix("blk.0.attn_output.weight"));
+        assert!(model.has_matrix("blk.0.ffn_gate.weight"));
+        assert!(model.has_matrix("blk.0.ffn_up.weight"));
+        assert!(model.has_matrix("blk.0.ffn_down.weight"));
+        assert!(model.has_vector("blk.0.attn_q.bias"));
+        assert!(model.has_vector("blk.0.attn_k.bias"));
+        assert!(model.has_vector("blk.0.attn_v.bias"));
+        assert_eq!(
+            model
+                .matrix("blk.0.attn_q.weight")
+                .unwrap()
+                .copy_to_host_u16()
+                .unwrap(),
+            f16_values(&[1.0, 2.0, 3.0, 4.0])
+        );
+        assert_eq!(
+            model
+                .matrix("blk.0.attn_v.weight")
+                .unwrap()
+                .copy_to_host_u16()
+                .unwrap(),
+            f16_values(&[9.0, 10.0, 11.0, 12.0])
+        );
+        assert_eq!(
+            model
+                .matrix("blk.0.ffn_gate.weight")
+                .unwrap()
+                .copy_to_host_u16()
+                .unwrap(),
+            f16_values(&[1.0, 2.0, 3.0, 4.0])
+        );
+        assert_eq!(
+            model
+                .matrix("blk.0.ffn_up.weight")
+                .unwrap()
+                .copy_to_host_u16()
+                .unwrap(),
+            f16_values(&[5.0, 6.0, 7.0, 8.0])
+        );
+        assert_close_vec(
+            &model
+                .vector("blk.0.attn_k.bias")
+                .unwrap()
+                .copy_to_host_f32()
+                .unwrap(),
+            &[3.0, 4.0],
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_glm_gpt_neox_aliases_to_logical_matrices_and_vectors() {
+        let path = tempfile_path("gpu-glm-gpt-neox-aliases");
+        write_reference_glm_gpt_neox_aliases(&path);
+        let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+        assert_eq!(model.info().tensor_count, 10);
+        assert!(model.has_matrix("token_embd.weight"));
+        assert!(model.has_matrix("output.weight"));
+        assert!(model.has_vector("output_norm.weight"));
+        assert!(model.has_matrix("blk.0.attn_q.weight"));
+        assert!(model.has_matrix("blk.0.attn_k.weight"));
+        assert!(model.has_matrix("blk.0.attn_v.weight"));
+        assert!(model.has_matrix("blk.0.attn_output.weight"));
+        assert!(model.has_matrix("blk.0.ffn_gate.weight"));
+        assert!(model.has_matrix("blk.0.ffn_up.weight"));
+        assert!(model.has_matrix("blk.0.ffn_down.weight"));
+        assert!(model.has_vector("blk.0.attn_q.bias"));
+        assert!(model.has_vector("blk.0.attn_k.bias"));
+        assert!(model.has_vector("blk.0.attn_v.bias"));
+        assert_eq!(
+            model
+                .matrix("blk.0.attn_q.weight")
+                .unwrap()
+                .copy_to_host_u16()
+                .unwrap(),
+            f16_values(&[1.0, 2.0, 3.0, 4.0])
+        );
+        assert_eq!(
+            model
+                .matrix("blk.0.attn_v.weight")
+                .unwrap()
+                .copy_to_host_u16()
+                .unwrap(),
+            f16_values(&[9.0, 10.0, 11.0, 12.0])
+        );
+        assert_eq!(
+            model
+                .matrix("blk.0.ffn_gate.weight")
+                .unwrap()
+                .copy_to_host_u16()
+                .unwrap(),
+            f16_values(&[1.0, 2.0, 3.0, 4.0])
+        );
+        assert_eq!(
+            model
+                .matrix("blk.0.ffn_up.weight")
+                .unwrap()
+                .copy_to_host_u16()
+                .unwrap(),
+            f16_values(&[5.0, 6.0, 7.0, 8.0])
+        );
+        assert_close_vec(
+            &model
+                .vector("blk.0.attn_v.bias")
+                .unwrap()
+                .copy_to_host_f32()
+                .unwrap(),
+            &[5.0, 6.0],
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_glm_model_transformer_w_aliases_to_logical_matrices() {
+        let path = tempfile_path("gpu-glm-model-transformer-w-aliases");
+        write_reference_glm_model_transformer_w_aliases(&path);
+        let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+        assert_eq!(model.info().tensor_count, 12);
+        assert!(model.has_matrix("blk.0.attn_q.weight"));
+        assert!(model.has_matrix("blk.0.attn_k.weight"));
+        assert!(model.has_matrix("blk.0.attn_v.weight"));
+        assert!(model.has_matrix("blk.0.attn_output.weight"));
+        assert!(model.has_matrix("blk.0.ffn_gate.weight"));
+        assert!(model.has_matrix("blk.0.ffn_up.weight"));
+        assert!(model.has_matrix("blk.0.ffn_down.weight"));
+        assert_eq!(
+            model
+                .matrix("blk.0.attn_q.weight")
+                .unwrap()
+                .copy_to_host_u16()
+                .unwrap(),
+            f16_values(&[0.0, 0.0, 0.0, 0.0])
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_mistral_alternate_packed_aliases_to_logical_matrices() {
+        let path = tempfile_path("gpu-mistral-alternate-packed-aliases");
+        write_reference_mistral_alternate_packed_aliases(&path);
+        let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+        assert_eq!(model.info().tensor_count, 10);
+        assert!(model.has_matrix("blk.0.attn_q.weight"));
+        assert!(model.has_matrix("blk.0.attn_k.weight"));
+        assert!(model.has_matrix("blk.0.attn_v.weight"));
+        assert!(model.has_matrix("blk.0.ffn_gate.weight"));
+        assert!(model.has_matrix("blk.0.ffn_up.weight"));
+        assert_eq!(
+            model
+                .matrix("blk.0.attn_q.weight")
+                .unwrap()
+                .copy_to_host_u16()
+                .unwrap(),
+            f16_values(&[1.0, 2.0, 3.0, 4.0])
+        );
+        assert_eq!(
+            model
+                .matrix("blk.0.ffn_up.weight")
+                .unwrap()
+                .copy_to_host_u16()
+                .unwrap(),
+            f16_values(&[5.0, 6.0, 7.0, 8.0])
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_mistral_transformer_h_packed_aliases_to_logical_matrices() {
+        let path = tempfile_path("gpu-mistral-transformer-h-packed-aliases");
+        write_reference_mistral_transformer_h_packed_aliases(&path);
+        let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+        assert_eq!(model.info().tensor_count, 10);
+        assert!(model.has_matrix("blk.0.attn_q.weight"));
+        assert!(model.has_matrix("blk.0.attn_k.weight"));
+        assert!(model.has_matrix("blk.0.attn_v.weight"));
+        assert!(model.has_matrix("blk.0.attn_output.weight"));
+        assert!(model.has_matrix("blk.0.ffn_gate.weight"));
+        assert!(model.has_matrix("blk.0.ffn_up.weight"));
+        assert!(model.has_matrix("blk.0.ffn_down.weight"));
+        assert_eq!(
+            model
+                .matrix("blk.0.attn_q.weight")
+                .unwrap()
+                .copy_to_host_u16()
+                .unwrap(),
+            f16_values(&[1.0, 2.0, 3.0, 4.0])
+        );
+        assert_eq!(
+            model
+                .matrix("blk.0.attn_output.weight")
+                .unwrap()
+                .copy_to_host_u16()
+                .unwrap(),
+            f16_values(&[0.0, 0.0, 0.0, 0.0])
+        );
+        assert_eq!(
+            model
+                .matrix("blk.0.ffn_down.weight")
+                .unwrap()
+                .copy_to_host_u16()
+                .unwrap(),
+            f16_values(&[0.0, 0.0, 0.0, 0.0])
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_phi_packed_aliases_to_logical_matrices_and_vectors() {
+        let cases: [(&str, fn(&Path), [&str; 2], usize, bool); 3] = [
+            (
+                "self-attn-qkv-proj",
+                write_reference_phi_packed_aliases,
+                [
+                    "blk.0.self_attn.qkv_proj.weight",
+                    "blk.0.mlp.up_gate_proj.weight",
+                ],
+                9,
+                true,
+            ),
+            (
+                "self-attn-qkv-proj-gate-up",
+                write_reference_phi_hf_gate_up_packed_aliases,
+                [
+                    "blk.0.self_attn.qkv_proj.weight",
+                    "blk.0.mlp.gate_up_proj.weight",
+                ],
+                8,
+                false,
+            ),
+            (
+                "query-key-value",
+                write_reference_phi_query_key_value_packed_aliases,
+                [
+                    "blk.0.query_key_value.weight",
+                    "blk.0.mlp.up_gate_proj.weight",
+                ],
+                9,
+                true,
+            ),
+        ];
+
+        for (case_name, write_fixture, raw_tensors, expected_tensor_count, has_qkv_bias) in cases {
+            let path = tempfile_path(&format!("gpu-phi-packed-aliases-{case_name}"));
+            write_fixture(&path);
+            let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+            let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+            assert_eq!(model.info().tensor_count, expected_tensor_count);
+            for raw_tensor in raw_tensors {
+                assert!(
+                    model.has_tensor(raw_tensor),
+                    "{case_name} missing raw tensor {raw_tensor}"
+                );
+            }
+            assert!(model.has_matrix("blk.0.attn_q.weight"));
+            assert!(model.has_matrix("blk.0.attn_k.weight"));
+            assert!(model.has_matrix("blk.0.attn_v.weight"));
+            assert!(model.has_matrix("blk.0.ffn_gate.weight"));
+            assert!(model.has_matrix("blk.0.ffn_up.weight"));
+            if has_qkv_bias {
+                assert!(model.has_vector("blk.0.attn_q.bias"));
+                assert!(model.has_vector("blk.0.attn_k.bias"));
+                assert!(model.has_vector("blk.0.attn_v.bias"));
+            }
+            assert_eq!(
+                model
+                    .matrix("blk.0.attn_q.weight")
+                    .unwrap()
+                    .copy_to_host_u16()
+                    .unwrap(),
+                f16_values(&[1.0, 2.0, 3.0, 4.0])
+            );
+            assert_eq!(
+                model
+                    .matrix("blk.0.ffn_gate.weight")
+                    .unwrap()
+                    .copy_to_host_u16()
+                    .unwrap(),
+                f16_values(&[1.0, 2.0, 3.0, 4.0])
+            );
+            assert_eq!(
+                model
+                    .matrix("blk.0.ffn_up.weight")
+                    .unwrap()
+                    .copy_to_host_u16()
+                    .unwrap(),
+                f16_values(&[5.0, 6.0, 7.0, 8.0])
+            );
+            if has_qkv_bias {
+                assert_close_vec(
+                    &model
+                        .vector("blk.0.attn_q.bias")
+                        .unwrap()
+                        .copy_to_host_f32()
+                        .unwrap(),
+                    &[1.0, 2.0],
+                );
+                assert_close_vec(
+                    &model
+                        .vector("blk.0.attn_v.bias")
+                        .unwrap()
+                        .copy_to_host_f32()
+                        .unwrap(),
+                    &[5.0, 6.0],
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_phi_packed_qkv_bias_to_logical_vectors() {
+        let path = tempfile_path("gpu-phi-packed-qkv-bias");
+        write_reference_phi_packed_qkv_bias(&path);
+        let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+        assert_eq!(model.info().tensor_count, 9);
+        assert!(model.has_vector("blk.0.attn_qkv.bias"));
+        assert!(model.has_vector("blk.0.attn_q.bias"));
+        assert!(model.has_vector("blk.0.attn_k.bias"));
+        assert!(model.has_vector("blk.0.attn_v.bias"));
+        assert_close_vec(
+            &model
+                .vector("blk.0.attn_q.bias")
+                .unwrap()
+                .copy_to_host_f32()
+                .unwrap(),
+            &[1.0, 2.0],
+        );
+        assert_close_vec(
+            &model
+                .vector("blk.0.attn_k.bias")
+                .unwrap()
+                .copy_to_host_f32()
+                .unwrap(),
+            &[3.0, 4.0],
+        );
+        assert_close_vec(
+            &model
+                .vector("blk.0.attn_v.bias")
+                .unwrap()
+                .copy_to_host_f32()
+                .unwrap(),
+            &[5.0, 6.0],
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_phi_split_qkv_biases_to_logical_vectors() {
+        let path = tempfile_path("gpu-phi-split-qkv-bias");
+        write_reference_phi_split_qkv_bias(&path);
+        let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+        assert_eq!(model.info().tensor_count, 14);
+        assert!(model.has_matrix("blk.0.attn_q.weight"));
+        assert!(model.has_matrix("blk.0.attn_k.weight"));
+        assert!(model.has_matrix("blk.0.attn_v.weight"));
+        assert!(model.has_vector("blk.0.attn_q.bias"));
+        assert!(model.has_vector("blk.0.attn_k.bias"));
+        assert!(model.has_vector("blk.0.attn_v.bias"));
+        assert_close_vec(
+            &model
+                .vector("blk.0.attn_q.bias")
+                .unwrap()
+                .copy_to_host_f32()
+                .unwrap(),
+            &[1.0, 2.0],
+        );
+        assert_close_vec(
+            &model
+                .vector("blk.0.attn_k.bias")
+                .unwrap()
+                .copy_to_host_f32()
+                .unwrap(),
+            &[3.0, 4.0],
+        );
+        assert_close_vec(
+            &model
+                .vector("blk.0.attn_v.bias")
+                .unwrap()
+                .copy_to_host_f32()
+                .unwrap(),
+            &[5.0, 6.0],
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_qwen_moe_packed_gate_up_to_logical_matrices() {
+        let cases: [(&str, fn(&Path)); 2] = [
+            ("gate-up", write_reference_qwen_moe_packed_gate_up),
+            ("up-gate", write_reference_qwen_moe_packed_up_gate),
+        ];
+
+        for (case_name, write_fixture) in cases {
+            let path = tempfile_path(&format!("gpu-qwen-moe-packed-{case_name}"));
+            write_fixture(&path);
+            let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+            let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+            assert_eq!(model.info().tensor_count, 11);
+            assert!(model.has_matrix("blk.0.ffn_gate_exps.0.weight"));
+            assert!(model.has_matrix("blk.0.ffn_up_exps.0.weight"));
+            assert!(model.has_matrix("blk.0.ffn_gate_exps.1.weight"));
+            assert!(model.has_matrix("blk.0.ffn_up_exps.1.weight"));
+            assert_eq!(
+                model
+                    .matrix("blk.0.ffn_gate_exps.0.weight")
+                    .unwrap()
+                    .copy_to_host_u16()
+                    .unwrap(),
+                f16_values(&[1.0, 2.0, 3.0, 4.0])
+            );
+            assert_eq!(
+                model
+                    .matrix("blk.0.ffn_up_exps.0.weight")
+                    .unwrap()
+                    .copy_to_host_u16()
+                    .unwrap(),
+                f16_values(&[5.0, 6.0, 7.0, 8.0])
+            );
+            assert_eq!(
+                model
+                    .matrix("blk.0.ffn_gate_exps.1.weight")
+                    .unwrap()
+                    .copy_to_host_u16()
+                    .unwrap(),
+                f16_values(&[5.0, 6.0, 7.0, 8.0])
+            );
+            assert_eq!(
+                model
+                    .matrix("blk.0.ffn_up_exps.1.weight")
+                    .unwrap()
+                    .copy_to_host_u16()
+                    .unwrap(),
+                f16_values(&[9.0, 10.0, 11.0, 12.0])
+            );
+        }
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_mixtral_per_expert_packed_gate_up_to_logical_matrices() {
+        let path = tempfile_path("gpu-mixtral-per-expert-packed-gate-up");
+        write_reference_mixtral_per_expert_packed_gate_up_moe(&path);
+        let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+        assert_eq!(model.info().tensor_count, 13);
+        assert!(model.has_tensor("blk.0.block_sparse_moe.experts.0.gate_up_proj.weight"));
+        assert!(model.has_matrix("blk.0.ffn_gate_exps.0.weight"));
+        assert!(model.has_matrix("blk.0.ffn_up_exps.0.weight"));
+        assert!(model.has_matrix("blk.0.ffn_down_exps.0.weight"));
+        assert!(model.has_matrix("blk.0.ffn_gate_exps.1.weight"));
+        assert!(model.has_matrix("blk.0.ffn_up_exps.1.weight"));
+        assert!(model.has_matrix("blk.0.ffn_down_exps.1.weight"));
+        assert_eq!(
+            model
+                .matrix("blk.0.ffn_gate_exps.0.weight")
+                .unwrap()
+                .copy_to_host_u16()
+                .unwrap(),
+            f16_values(&[1.0, 2.0, 3.0, 4.0])
+        );
+        assert_eq!(
+            model
+                .matrix("blk.0.ffn_up_exps.0.weight")
+                .unwrap()
+                .copy_to_host_u16()
+                .unwrap(),
+            f16_values(&[5.0, 6.0, 7.0, 8.0])
+        );
+        assert_eq!(
+            model
+                .matrix("blk.0.ffn_gate_exps.1.weight")
+                .unwrap()
+                .copy_to_host_u16()
+                .unwrap(),
+            f16_values(&[5.0, 6.0, 7.0, 8.0])
+        );
+        assert_eq!(
+            model
+                .matrix("blk.0.ffn_up_exps.1.weight")
+                .unwrap()
+                .copy_to_host_u16()
+                .unwrap(),
+            f16_values(&[9.0, 10.0, 11.0, 12.0])
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_moe_plural_shared_expert_aliases_to_logical_matrices() {
+        let path = tempfile_path("gpu-mixtral-shared-experts-plural");
+        write_reference_mixtral_shared_experts_plural(&path);
+        let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+        assert_eq!(model.info().tensor_count, 18);
+        assert!(model.has_matrix("blk.0.ffn_gate_shexp.weight"));
+        assert!(model.has_matrix("blk.0.ffn_up_shexp.weight"));
+        assert!(model.has_matrix("blk.0.ffn_down_shexp.weight"));
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_packed_shared_expert_aliases_to_logical_matrices() {
+        let path = tempfile_path("gpu-mixtral-packed-shared-expert");
+        write_reference_mixtral_packed_shared_expert(&path);
+        let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+        assert_eq!(model.info().tensor_count, 17);
+        assert!(model.has_tensor("blk.0.block_sparse_moe.shared_experts.gate_up_proj.weight"));
+        assert!(model.has_matrix("blk.0.ffn_gate_shexp.weight"));
+        assert!(model.has_matrix("blk.0.ffn_up_shexp.weight"));
+        assert!(model.has_matrix("blk.0.ffn_down_shexp.weight"));
+        assert_eq!(
+            model
+                .matrix("blk.0.ffn_gate_shexp.weight")
+                .unwrap()
+                .copy_to_host_u16()
+                .unwrap(),
+            f16_values(&[1.0, 2.0, 3.0, 4.0])
+        );
+        assert_eq!(
+            model
+                .matrix("blk.0.ffn_up_shexp.weight")
+                .unwrap()
+                .copy_to_host_u16()
+                .unwrap(),
+            f16_values(&[5.0, 6.0, 7.0, 8.0])
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_shared_expert_gate_to_logical_matrix_and_vector() {
+        let path = tempfile_path("gpu-mixtral-shared-expert-gate");
+        write_reference_mixtral_shared_expert_gate(&path);
+        let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+        assert!(model.has_matrix("blk.0.ffn_gate_inp_shexp.weight"));
+        assert!(model.has_vector("blk.0.ffn_gate_inp_shexp.bias"));
+        assert_eq!(
+            model
+                .matrix("blk.0.ffn_gate_inp_shexp.weight")
+                .unwrap()
+                .copy_to_host_u16()
+                .unwrap(),
+            f16_values(&[4.0, 0.0])
+        );
+        assert_close_vec(
+            &model
+                .vector("blk.0.ffn_gate_inp_shexp.bias")
+                .unwrap()
+                .copy_to_host_f32()
+                .unwrap(),
+            &[1.0],
+        );
+
+        let cpu = crate::qwen_cpu::QwenCpuReference::load(&path).unwrap();
+        assert_close_vec(
+            &model.last_logits_host(&[0]).unwrap(),
+            &cpu.last_logits(&[0]).unwrap(),
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_mixtral_feed_forward_kind_first_experts_to_logical_matrices() {
+        let path = tempfile_path("gpu-mixtral-feed-forward-kind-first-experts");
+        write_reference_mixtral_feed_forward_kind_first_moe(&path);
+        let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+        assert_eq!(model.info().tensor_count, 15);
+        assert!(model.has_matrix("blk.0.ffn_gate_exps.0.weight"));
+        assert!(model.has_matrix("blk.0.ffn_up_exps.0.weight"));
+        assert!(model.has_matrix("blk.0.ffn_down_exps.0.weight"));
+        assert!(model.has_matrix("blk.0.ffn_gate_exps.1.weight"));
+        assert!(model.has_matrix("blk.0.ffn_up_exps.1.weight"));
+        assert!(model.has_matrix("blk.0.ffn_down_exps.1.weight"));
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_mixtral_mlp_block_sparse_moe_to_logical_matrices() {
+        let path = tempfile_path("gpu-mixtral-mlp-block-sparse-moe");
+        write_reference_mixtral_mlp_block_sparse_moe(&path);
+        let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+        assert_eq!(model.info().tensor_count, 15);
+        assert!(model.has_tensor("blk.0.mlp.block_sparse_moe.gate.weight"));
+        assert!(model.has_tensor("blk.0.mlp.block_sparse_moe.experts.0.w1.weight"));
+        assert!(model.has_matrix("blk.0.ffn_gate_inp.weight"));
+        assert!(model.has_matrix("blk.0.ffn_gate_exps.0.weight"));
+        assert!(model.has_matrix("blk.0.ffn_up_exps.1.weight"));
+        assert!(model.has_matrix("blk.0.ffn_down_exps.1.weight"));
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cublas_matmul_runs_on_device() {
+        use crate::runtime::{Cublas, DeviceBuffer, GemmDType, Stream};
+
+        let stream = Stream::create().unwrap();
+        let cublas = Cublas::create().unwrap();
+        cublas.set_stream(&stream).unwrap();
+
+        let a = DeviceBuffer::alloc(6 * std::mem::size_of::<f32>()).unwrap();
+        let b = DeviceBuffer::alloc(6 * std::mem::size_of::<f32>()).unwrap();
+        let out = DeviceBuffer::alloc(4 * std::mem::size_of::<f32>()).unwrap();
+        a.copy_from_host(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0])
+            .unwrap();
+        b.copy_from_host(&[7.0f32, 8.0, 9.0, 10.0, 11.0, 12.0])
+            .unwrap();
+
+        cublas.matmul_f32_row_major(&a, &b, &out, 2, 2, 3).unwrap();
+        stream.synchronize().unwrap();
+
+        assert_close_vec(
+            &out.copy_to_host::<f32>(4).unwrap(),
+            &[58.0, 64.0, 139.0, 154.0],
+        );
+
+        let rhs_f32 = DeviceBuffer::alloc(6 * std::mem::size_of::<f32>()).unwrap();
+        let rhs_f32_out = DeviceBuffer::alloc(4 * std::mem::size_of::<f32>()).unwrap();
+        rhs_f32
+            .copy_from_host(&[7.0f32, 9.0, 11.0, 8.0, 10.0, 12.0])
+            .unwrap();
+        cublas
+            .matmul_f32_rhs_transposed_row_major(&a, &rhs_f32, &rhs_f32_out, 2, 2, 3)
+            .unwrap();
+        stream.synchronize().unwrap();
+        assert_close_vec(
+            &rhs_f32_out.copy_to_host::<f32>(4).unwrap(),
+            &[58.0, 64.0, 139.0, 154.0],
+        );
+
+        let a_half = DeviceBuffer::alloc(6 * std::mem::size_of::<u16>()).unwrap();
+        let b_half = DeviceBuffer::alloc(6 * std::mem::size_of::<u16>()).unwrap();
+        let half_out = DeviceBuffer::alloc(4 * std::mem::size_of::<f32>()).unwrap();
+        a_half
+            .copy_from_host(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0].map(f16_bits).as_slice())
+            .unwrap();
+        b_half
+            .copy_from_host(
+                &[7.0f32, 8.0, 9.0, 10.0, 11.0, 12.0]
+                    .map(f16_bits)
+                    .as_slice(),
+            )
+            .unwrap();
+        cublas
+            .matmul_mixed_row_major(&a_half, &b_half, &half_out, 2, 2, 3, GemmDType::F16)
+            .unwrap();
+        stream.synchronize().unwrap();
+        assert_close_vec(
+            &half_out.copy_to_host::<f32>(4).unwrap(),
+            &[58.0, 64.0, 139.0, 154.0],
+        );
+
+        let a_bf16 = DeviceBuffer::alloc(6 * std::mem::size_of::<u16>()).unwrap();
+        let b_bf16 = DeviceBuffer::alloc(6 * std::mem::size_of::<u16>()).unwrap();
+        let bf16_out = DeviceBuffer::alloc(4 * std::mem::size_of::<f32>()).unwrap();
+        a_bf16
+            .copy_from_host(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0].map(bf16_bits).as_slice())
+            .unwrap();
+        b_bf16
+            .copy_from_host(
+                &[7.0f32, 8.0, 9.0, 10.0, 11.0, 12.0]
+                    .map(bf16_bits)
+                    .as_slice(),
+            )
+            .unwrap();
+        cublas
+            .matmul_mixed_row_major(&a_bf16, &b_bf16, &bf16_out, 2, 2, 3, GemmDType::BF16)
+            .unwrap();
+        stream.synchronize().unwrap();
+        assert_close_vec(
+            &bf16_out.copy_to_host::<f32>(4).unwrap(),
+            &[58.0, 64.0, 139.0, 154.0],
+        );
+
+        let rhs_half = DeviceBuffer::alloc(6 * std::mem::size_of::<u16>()).unwrap();
+        let rhs_half_out = DeviceBuffer::alloc(4 * std::mem::size_of::<f32>()).unwrap();
+        rhs_half
+            .copy_from_host(
+                &[7.0f32, 9.0, 11.0, 8.0, 10.0, 12.0]
+                    .map(f16_bits)
+                    .as_slice(),
+            )
+            .unwrap();
+        let mixed_err = cublas
+            .matmul_mixed_rhs_transposed_row_major(
+                &a,
+                &rhs_half,
+                &rhs_half_out,
+                2,
+                2,
+                3,
+                GemmDType::F32,
+                GemmDType::F16,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(mixed_err.contains("requires matching lhs/rhs dtypes"));
+        cublas
+            .matmul_mixed_rhs_transposed_row_major(
+                &a_half,
+                &rhs_half,
+                &rhs_half_out,
+                2,
+                2,
+                3,
+                GemmDType::F16,
+                GemmDType::F16,
+            )
+            .unwrap();
+        stream.synchronize().unwrap();
+        assert_close_vec(
+            &rhs_half_out.copy_to_host::<f32>(4).unwrap(),
+            &[58.0, 64.0, 139.0, 154.0],
+        );
+
+        let rhs_bf16 = DeviceBuffer::alloc(6 * std::mem::size_of::<u16>()).unwrap();
+        let rhs_bf16_out = DeviceBuffer::alloc(4 * std::mem::size_of::<f32>()).unwrap();
+        rhs_bf16
+            .copy_from_host(
+                &[7.0f32, 9.0, 11.0, 8.0, 10.0, 12.0]
+                    .map(bf16_bits)
+                    .as_slice(),
+            )
+            .unwrap();
+        cublas
+            .matmul_mixed_rhs_transposed_row_major(
+                &a_bf16,
+                &rhs_bf16,
+                &rhs_bf16_out,
+                2,
+                2,
+                3,
+                GemmDType::BF16,
+                GemmDType::BF16,
+            )
+            .unwrap();
+        stream.synchronize().unwrap();
+        assert_close_vec(
+            &rhs_bf16_out.copy_to_host::<f32>(4).unwrap(),
+            &[58.0, 64.0, 139.0, 154.0],
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_kernels_run_on_device() {
+        use crate::runtime::{DeviceBuffer, Stream};
+
+        let stream = Stream::create().unwrap();
+
+        let left = DeviceBuffer::alloc(3 * std::mem::size_of::<f32>()).unwrap();
+        let right = DeviceBuffer::alloc(3 * std::mem::size_of::<f32>()).unwrap();
+        let out = DeviceBuffer::alloc(3 * std::mem::size_of::<f32>()).unwrap();
+        left.copy_from_host(&[1.0f32, 2.0, 3.0]).unwrap();
+        right.copy_from_host(&[4.0f32, 5.0, 6.0]).unwrap();
+        crate::kernels::launch_add(&left, &right, &out, 3, &stream).unwrap();
+        stream.synchronize().unwrap();
+        assert_close_vec(&out.copy_to_host::<f32>(3).unwrap(), &[5.0, 7.0, 9.0]);
+
+        let rows = DeviceBuffer::alloc(6 * std::mem::size_of::<f32>()).unwrap();
+        let row = DeviceBuffer::alloc(3 * std::mem::size_of::<f32>()).unwrap();
+        let accum = DeviceBuffer::alloc(6 * std::mem::size_of::<f32>()).unwrap();
+        rows.copy_from_host(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0])
+            .unwrap();
+        accum.memset_zero_async(&stream).unwrap();
+        crate::kernels::launch_copy_row_f32(&rows, &row, 1, 2, 3, &stream).unwrap();
+        crate::kernels::launch_add_scaled_row_in_place(&accum, &row, 0, 2, 3, 0.5, &stream)
+            .unwrap();
+        stream.synchronize().unwrap();
+        assert_close_vec(&row.copy_to_host::<f32>(3).unwrap(), &[4.0, 5.0, 6.0]);
+        assert_close_vec(
+            &accum.copy_to_host::<f32>(6).unwrap(),
+            &[2.0, 2.5, 3.0, 0.0, 0.0, 0.0],
+        );
+
+        let router = DeviceBuffer::alloc(6 * std::mem::size_of::<f32>()).unwrap();
+        let route_ids = DeviceBuffer::alloc(4 * std::mem::size_of::<u32>()).unwrap();
+        let route_weights = DeviceBuffer::alloc(4 * std::mem::size_of::<f32>()).unwrap();
+        router
+            .copy_from_host(&[0.0f32, 1.0, 3.0, 5.0, 5.0, 1.0])
+            .unwrap();
+        crate::kernels::launch_moe_topk_router(
+            &router,
+            &route_ids,
+            &route_weights,
+            2,
+            3,
+            2,
+            false,
+            &stream,
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+        assert_eq!(route_ids.copy_to_host::<u32>(4).unwrap(), vec![2, 1, 0, 1]);
+        let denom0 = 0.0f32.exp() + 1.0f32.exp() + 3.0f32.exp();
+        let denom1 = 5.0f32.exp() + 5.0f32.exp() + 1.0f32.exp();
+        assert_close_vec(
+            &route_weights.copy_to_host::<f32>(4).unwrap(),
+            &[
+                3.0f32.exp() / denom0,
+                1.0f32.exp() / denom0,
+                5.0f32.exp() / denom1,
+                5.0f32.exp() / denom1,
+            ],
+        );
+        crate::kernels::launch_moe_topk_router(
+            &router,
+            &route_ids,
+            &route_weights,
+            2,
+            3,
+            2,
+            true,
+            &stream,
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+        let selected0 = 3.0f32.exp() + 1.0f32.exp();
+        assert_close_vec(
+            &route_weights.copy_to_host::<f32>(4).unwrap(),
+            &[3.0f32.exp() / selected0, 1.0f32.exp() / selected0, 0.5, 0.5],
+        );
+
+        let cast_input = DeviceBuffer::alloc(4 * std::mem::size_of::<f32>()).unwrap();
+        let cast_f16 = DeviceBuffer::alloc(4 * std::mem::size_of::<u16>()).unwrap();
+        let cast_bf16 = DeviceBuffer::alloc(4 * std::mem::size_of::<u16>()).unwrap();
+        cast_input
+            .copy_from_host(&[1.0f32, 2.0, 3.0, 12.0])
+            .unwrap();
+        crate::kernels::launch_cast_f32_to_f16(&cast_input, &cast_f16, 4, &stream).unwrap();
+        crate::kernels::launch_cast_f32_to_bf16(&cast_input, &cast_bf16, 4, &stream).unwrap();
+        stream.synchronize().unwrap();
+        assert_eq!(
+            cast_f16.copy_to_host::<u16>(4).unwrap(),
+            vec![f16_bits(1.0), f16_bits(2.0), f16_bits(3.0), f16_bits(12.0)]
+        );
+        assert_eq!(
+            cast_bf16.copy_to_host::<u16>(4).unwrap(),
+            vec![
+                bf16_bits(1.0),
+                bf16_bits(2.0),
+                bf16_bits(3.0),
+                bf16_bits(12.0)
+            ]
+        );
+
+        let rms_in = DeviceBuffer::alloc(2 * std::mem::size_of::<f32>()).unwrap();
+        let rms_weight = DeviceBuffer::alloc(2 * std::mem::size_of::<f32>()).unwrap();
+        let rms_out = DeviceBuffer::alloc(2 * std::mem::size_of::<f32>()).unwrap();
+        rms_in.copy_from_host(&[3.0f32, 4.0]).unwrap();
+        rms_weight.copy_from_host(&[1.0f32, 1.0]).unwrap();
+        crate::kernels::launch_rms_norm(&rms_in, &rms_weight, &rms_out, 1, 2, 0.0, &stream)
+            .unwrap();
+        stream.synchronize().unwrap();
+        let scale = ((9.0f32 + 16.0) / 2.0).sqrt().recip();
+        assert_close_vec(
+            &rms_out.copy_to_host::<f32>(2).unwrap(),
+            &[3.0 * scale, 4.0 * scale],
+        );
+
+        let rope = DeviceBuffer::alloc(2 * std::mem::size_of::<f32>()).unwrap();
+        rope.copy_from_host(&[1.0f32, 0.0]).unwrap();
+        crate::kernels::launch_rope_with_offset(&rope, 1, 1, 2, 10_000.0, 1.0, 1, false, &stream)
+            .unwrap();
+        stream.synchronize().unwrap();
+        let (sin_one, cos_one) = 1.0f32.sin_cos();
+        assert_close_vec(&rope.copy_to_host::<f32>(2).unwrap(), &[cos_one, sin_one]);
+
+        let q8_raw = DeviceBuffer::alloc(34).unwrap();
+        let q8_out = DeviceBuffer::alloc(32 * std::mem::size_of::<f32>()).unwrap();
+        let mut q8 = Vec::new();
+        q8.extend_from_slice(&f16_bits(0.5).to_le_bytes());
+        q8.extend((0..32).map(|idx| idx as i8 as u8));
+        q8_raw.copy_from_host(&q8).unwrap();
+        crate::kernels::launch_dequantize_matrix(&q8_raw, &q8_out, 32, 8, &stream).unwrap();
+        stream.synchronize().unwrap();
+        assert_close_vec(
+            &q8_out.copy_to_host::<f32>(32).unwrap()[0..4],
+            &[0.0, 0.5, 1.0, 1.5],
+        );
+
+        let q8_1_raw = DeviceBuffer::alloc(36).unwrap();
+        let q8_1_out = DeviceBuffer::alloc(32 * std::mem::size_of::<f32>()).unwrap();
+        let mut q8_1 = Vec::new();
+        q8_1.extend_from_slice(&f16_bits(0.5).to_le_bytes());
+        q8_1.extend_from_slice(&f16_bits(1.0).to_le_bytes());
+        q8_1.extend((0..32).map(|idx| idx as i8 as u8));
+        q8_1_raw.copy_from_host(&q8_1).unwrap();
+        crate::kernels::launch_dequantize_matrix(&q8_1_raw, &q8_1_out, 32, 9, &stream).unwrap();
+        stream.synchronize().unwrap();
+        assert_close_vec(
+            &q8_1_out.copy_to_host::<f32>(32).unwrap()[0..4],
+            &[0.0, 0.5, 1.0, 1.5],
+        );
+
+        let q4_raw = DeviceBuffer::alloc(18).unwrap();
+        let q4_out = DeviceBuffer::alloc(32 * std::mem::size_of::<f32>()).unwrap();
+        let mut q4 = Vec::new();
+        q4.extend_from_slice(&f16_bits(1.0).to_le_bytes());
+        q4.extend([0x8f; 16]);
+        q4_raw.copy_from_host(&q4).unwrap();
+        crate::kernels::launch_dequantize_matrix(&q4_raw, &q4_out, 32, 2, &stream).unwrap();
+        stream.synchronize().unwrap();
+        let q4 = q4_out.copy_to_host::<f32>(32).unwrap();
+        assert_close_vec(&[q4[0], q4[16]], &[7.0, 0.0]);
+
+        let q4_1_raw = DeviceBuffer::alloc(20).unwrap();
+        let q4_1_out = DeviceBuffer::alloc(32 * std::mem::size_of::<f32>()).unwrap();
+        let mut q4_1 = Vec::new();
+        q4_1.extend_from_slice(&f16_bits(0.5).to_le_bytes());
+        q4_1.extend_from_slice(&f16_bits(1.0).to_le_bytes());
+        q4_1.extend([0x8f; 16]);
+        q4_1_raw.copy_from_host(&q4_1).unwrap();
+        crate::kernels::launch_dequantize_matrix(&q4_1_raw, &q4_1_out, 32, 3, &stream).unwrap();
+        stream.synchronize().unwrap();
+        let q4_1 = q4_1_out.copy_to_host::<f32>(32).unwrap();
+        assert_close_vec(&[q4_1[0], q4_1[16]], &[8.5, 5.0]);
+
+        let q1_raw = DeviceBuffer::alloc(18).unwrap();
+        let q1_out = DeviceBuffer::alloc(128 * std::mem::size_of::<f32>()).unwrap();
+        let mut q1 = vec![0u8; 18];
+        q1[0..2].copy_from_slice(&f16_bits(0.5).to_le_bytes());
+        q1[2] = 0b1010_0101;
+        q1_raw.copy_from_host(&q1).unwrap();
+        crate::kernels::launch_dequantize_matrix(&q1_raw, &q1_out, 128, 41, &stream).unwrap();
+        stream.synchronize().unwrap();
+        let q1 = q1_out.copy_to_host::<f32>(128).unwrap();
+        assert_close_vec(
+            &[q1[0], q1[1], q1[2], q1[3], q1[4], q1[7]],
+            &[0.5, -0.5, 0.5, -0.5, -0.5, 0.5],
+        );
+
+        let mxfp4_raw = DeviceBuffer::alloc(17).unwrap();
+        let mxfp4_out = DeviceBuffer::alloc(32 * std::mem::size_of::<f32>()).unwrap();
+        let mut mxfp4 = vec![0u8; 17];
+        mxfp4[0] = 128;
+        mxfp4[1] = 0x91;
+        mxfp4[2] = 0x5f;
+        mxfp4_raw.copy_from_host(&mxfp4).unwrap();
+        crate::kernels::launch_dequantize_matrix(&mxfp4_raw, &mxfp4_out, 32, 39, &stream).unwrap();
+        stream.synchronize().unwrap();
+        let mxfp4 = mxfp4_out.copy_to_host::<f32>(32).unwrap();
+        assert_close_vec(
+            &[mxfp4[0], mxfp4[1], mxfp4[16], mxfp4[17]],
+            &[1.0, -12.0, -1.0, 6.0],
+        );
+
+        let nvfp4_raw = DeviceBuffer::alloc(36).unwrap();
+        let nvfp4_out = DeviceBuffer::alloc(64 * std::mem::size_of::<f32>()).unwrap();
+        let mut nvfp4 = vec![0u8; 36];
+        nvfp4[0] = 0x38;
+        nvfp4[1] = 0x40;
+        nvfp4[4] = 0x95;
+        nvfp4[5] = 0x2f;
+        nvfp4[12] = 0x41;
+        nvfp4_raw.copy_from_host(&nvfp4).unwrap();
+        crate::kernels::launch_dequantize_matrix(&nvfp4_raw, &nvfp4_out, 64, 40, &stream).unwrap();
+        stream.synchronize().unwrap();
+        let nvfp4 = nvfp4_out.copy_to_host::<f32>(64).unwrap();
+        assert_close_vec(
+            &[nvfp4[0], nvfp4[1], nvfp4[8], nvfp4[9], nvfp4[16], nvfp4[24]],
+            &[3.0, -6.0, -0.5, 1.0, 1.0, 4.0],
+        );
+
+        let iq2xxs_raw = DeviceBuffer::alloc(66).unwrap();
+        let iq2xxs_out = DeviceBuffer::alloc(256 * std::mem::size_of::<f32>()).unwrap();
+        let mut iq2xxs = vec![0u8; 66];
+        iq2xxs[0..2].copy_from_slice(&f16_bits(0.5).to_le_bytes());
+        iq2xxs[2..4].copy_from_slice(&0x0100u16.to_le_bytes());
+        iq2xxs[6..8].copy_from_slice(&0x0001u16.to_le_bytes());
+        iq2xxs[8..10].copy_from_slice(&0x1000u16.to_le_bytes());
+        iq2xxs_raw.copy_from_host(&iq2xxs).unwrap();
+        crate::kernels::launch_dequantize_matrix(&iq2xxs_raw, &iq2xxs_out, 256, 16, &stream)
+            .unwrap();
+        stream.synchronize().unwrap();
+        let iq2xxs = iq2xxs_out.copy_to_host::<f32>(256).unwrap();
+        assert_close_vec(
+            &[iq2xxs[0], iq2xxs[1], iq2xxs[7], iq2xxs[8], iq2xxs[9]],
+            &[-1.5, 1.5, -1.5, 8.0625, 1.5],
+        );
+
+        let iq2xs_raw = DeviceBuffer::alloc(74).unwrap();
+        let iq2xs_out = DeviceBuffer::alloc(256 * std::mem::size_of::<f32>()).unwrap();
+        let mut iq2xs = vec![0u8; 74];
+        iq2xs[0..2].copy_from_slice(&f16_bits(0.5).to_le_bytes());
+        iq2xs[2..4].copy_from_slice(&0x0200u16.to_le_bytes());
+        iq2xs[4..6].copy_from_slice(&0x0001u16.to_le_bytes());
+        iq2xs[66] = 0x31;
+        iq2xs_raw.copy_from_host(&iq2xs).unwrap();
+        crate::kernels::launch_dequantize_matrix(&iq2xs_raw, &iq2xs_out, 256, 17, &stream).unwrap();
+        stream.synchronize().unwrap();
+        let iq2xs = iq2xs_out.copy_to_host::<f32>(256).unwrap();
+        assert_close_vec(
+            &[iq2xs[0], iq2xs[1], iq2xs[7], iq2xs[8], iq2xs[9]],
+            &[-1.5, 1.5, -1.5, 8.0625, 1.5],
+        );
+
+        let iq3xxs_raw = DeviceBuffer::alloc(98).unwrap();
+        let iq3xxs_out = DeviceBuffer::alloc(256 * std::mem::size_of::<f32>()).unwrap();
+        let mut iq3xxs = vec![0u8; 98];
+        iq3xxs[0..2].copy_from_slice(&f16_bits(0.5).to_le_bytes());
+        iq3xxs[3] = 1;
+        iq3xxs[66..70].copy_from_slice(&0x1000_0001u32.to_le_bytes());
+        iq3xxs_raw.copy_from_host(&iq3xxs).unwrap();
+        crate::kernels::launch_dequantize_matrix(&iq3xxs_raw, &iq3xxs_out, 256, 18, &stream)
+            .unwrap();
+        stream.synchronize().unwrap();
+        let iq3xxs = iq3xxs_out.copy_to_host::<f32>(256).unwrap();
+        assert_close_vec(
+            &[iq3xxs[0], iq3xxs[1], iq3xxs[3], iq3xxs[4], iq3xxs[7]],
+            &[-1.5, 1.5, 1.5, 7.5, -1.5],
+        );
+
+        let iq1s_raw = DeviceBuffer::alloc(50).unwrap();
+        let iq1s_out = DeviceBuffer::alloc(256 * std::mem::size_of::<f32>()).unwrap();
+        let mut iq1s = vec![0u8; 50];
+        iq1s[0..2].copy_from_slice(&f16_bits(0.5).to_le_bytes());
+        iq1s[3] = 1;
+        iq1s[34..36].copy_from_slice(&0x9000u16.to_le_bytes());
+        iq1s_raw.copy_from_host(&iq1s).unwrap();
+        crate::kernels::launch_dequantize_matrix(&iq1s_raw, &iq1s_out, 256, 19, &stream).unwrap();
+        stream.synchronize().unwrap();
+        let iq1s = iq1s_out.copy_to_host::<f32>(256).unwrap();
+        assert_close_vec(
+            &[iq1s[0], iq1s[1], iq1s[8], iq1s[9]],
+            &[-1.6875, -1.6875, 1.3125, -1.6875],
+        );
+
+        let iq2s_raw = DeviceBuffer::alloc(82).unwrap();
+        let iq2s_out = DeviceBuffer::alloc(256 * std::mem::size_of::<f32>()).unwrap();
+        let mut iq2s = vec![0u8; 82];
+        iq2s[0..2].copy_from_slice(&f16_bits(0.5).to_le_bytes());
+        iq2s[3] = 1;
+        iq2s[34] = 0x81;
+        iq2s[66] = 1;
+        iq2s[74] = 0x10;
+        iq2s_raw.copy_from_host(&iq2s).unwrap();
+        crate::kernels::launch_dequantize_matrix(&iq2s_raw, &iq2s_out, 256, 22, &stream).unwrap();
+        stream.synchronize().unwrap();
+        let iq2s = iq2s_out.copy_to_host::<f32>(256).unwrap();
+        assert_close_vec(
+            &[iq2s[0], iq2s[1], iq2s[5], iq2s[7], iq2s[8]],
+            &[-4.6875, 4.6875, 1.5, -1.5, 8.0625],
+        );
+
+        let iq1m_raw = DeviceBuffer::alloc(56).unwrap();
+        let iq1m_out = DeviceBuffer::alloc(256 * std::mem::size_of::<f32>()).unwrap();
+        let mut iq1m = vec![0u8; 56];
+        iq1m[1] = 1;
+        iq1m[32] = 0x09;
+        let scale_bits = f16_bits(0.5);
+        let iq1m_sc = [
+            ((scale_bits & 0x000f) << 12) | 0x0001,
+            (scale_bits & 0x00f0) << 8,
+            (scale_bits & 0x0f00) << 4,
+            scale_bits & 0xf000,
+        ];
+        for (idx, scale) in iq1m_sc.iter().enumerate() {
+            iq1m[48 + 2 * idx..50 + 2 * idx].copy_from_slice(&scale.to_le_bytes());
+        }
+        iq1m_raw.copy_from_host(&iq1m).unwrap();
+        crate::kernels::launch_dequantize_matrix(&iq1m_raw, &iq1m_out, 256, 29, &stream).unwrap();
+        stream.synchronize().unwrap();
+        let iq1m = iq1m_out.copy_to_host::<f32>(256).unwrap();
+        assert_close_vec(
+            &[iq1m[0], iq1m[1], iq1m[2], iq1m[7], iq1m[8]],
+            &[-1.6875, -0.1875, 1.3125, -1.6875, 1.6875],
+        );
+
+        let iq3s_raw = DeviceBuffer::alloc(110).unwrap();
+        let iq3s_out = DeviceBuffer::alloc(256 * std::mem::size_of::<f32>()).unwrap();
+        let mut iq3s = vec![0u8; 110];
+        iq3s[0..2].copy_from_slice(&f16_bits(0.5).to_le_bytes());
+        iq3s[3] = 1;
+        iq3s[66] = 1;
+        iq3s[74] = 0x81;
+        iq3s[106] = 0x31;
+        iq3s_raw.copy_from_host(&iq3s).unwrap();
+        crate::kernels::launch_dequantize_matrix(&iq3s_raw, &iq3s_out, 256, 21, &stream).unwrap();
+        stream.synchronize().unwrap();
+        let iq3s = iq3s_out.copy_to_host::<f32>(256).unwrap();
+        assert_close_vec(
+            &[iq3s[0], iq3s[1], iq3s[2], iq3s[4], iq3s[7]],
+            &[-10.5, 7.5, 13.5, 4.5, -1.5],
+        );
+
+        let iq4_raw = DeviceBuffer::alloc(18).unwrap();
+        let iq4_out = DeviceBuffer::alloc(32 * std::mem::size_of::<f32>()).unwrap();
+        let mut iq4 = Vec::new();
+        iq4.extend_from_slice(&f16_bits(0.5).to_le_bytes());
+        iq4.extend([0xf0; 16]);
+        iq4_raw.copy_from_host(&iq4).unwrap();
+        crate::kernels::launch_dequantize_matrix(&iq4_raw, &iq4_out, 32, 20, &stream).unwrap();
+        stream.synchronize().unwrap();
+        let iq4 = iq4_out.copy_to_host::<f32>(32).unwrap();
+        assert_close_vec(&[iq4[0], iq4[16]], &[-63.5, 56.5]);
+
+        let iq4xs_raw = DeviceBuffer::alloc(136).unwrap();
+        let iq4xs_out = DeviceBuffer::alloc(256 * std::mem::size_of::<f32>()).unwrap();
+        let mut iq4xs = vec![0u8; 136];
+        iq4xs[0..2].copy_from_slice(&f16_bits(0.5).to_le_bytes());
+        iq4xs[2..4].copy_from_slice(&0x0006u16.to_le_bytes());
+        iq4xs[4] = 0xf1;
+        iq4xs[8] = 0xf0;
+        iq4xs[24] = 0x80;
+        iq4xs_raw.copy_from_host(&iq4xs).unwrap();
+        crate::kernels::launch_dequantize_matrix(&iq4xs_raw, &iq4xs_out, 256, 23, &stream).unwrap();
+        stream.synchronize().unwrap();
+        let iq4xs = iq4xs_out.copy_to_host::<f32>(256).unwrap();
+        assert_close_vec(
+            &[iq4xs[0], iq4xs[16], iq4xs[32], iq4xs[48]],
+            &[-63.5, 56.5, 63.5, -0.5],
+        );
+
+        let tq1_raw = DeviceBuffer::alloc(54).unwrap();
+        let tq1_out = DeviceBuffer::alloc(256 * std::mem::size_of::<f32>()).unwrap();
+        let mut tq1 = vec![0u8; 54];
+        tq1[0] = 0;
+        tq1[1] = 86;
+        tq1[2] = 171;
+        tq1[32] = 86;
+        tq1[48] = 171;
+        tq1[52..54].copy_from_slice(&f16_bits(0.5).to_le_bytes());
+        tq1_raw.copy_from_host(&tq1).unwrap();
+        crate::kernels::launch_dequantize_matrix(&tq1_raw, &tq1_out, 256, 34, &stream).unwrap();
+        stream.synchronize().unwrap();
+        let tq1 = tq1_out.copy_to_host::<f32>(256).unwrap();
+        assert_close_vec(
+            &[tq1[0], tq1[1], tq1[2], tq1[160], tq1[240]],
+            &[-0.5, 0.0, 0.5, 0.0, 0.5],
+        );
+
+        let tq2_raw = DeviceBuffer::alloc(66).unwrap();
+        let tq2_out = DeviceBuffer::alloc(256 * std::mem::size_of::<f32>()).unwrap();
+        let mut tq2 = vec![0u8; 66];
+        tq2[0] = 0b11_10_01_00;
+        tq2[32] = 0b10_01_00_11;
+        tq2[64..66].copy_from_slice(&f16_bits(0.5).to_le_bytes());
+        tq2_raw.copy_from_host(&tq2).unwrap();
+        crate::kernels::launch_dequantize_matrix(&tq2_raw, &tq2_out, 256, 35, &stream).unwrap();
+        stream.synchronize().unwrap();
+        let tq2 = tq2_out.copy_to_host::<f32>(256).unwrap();
+        assert_close_vec(
+            &[
+                tq2[0], tq2[32], tq2[64], tq2[96], tq2[128], tq2[160], tq2[192], tq2[224],
+            ],
+            &[-0.5, 0.0, 0.5, 1.0, 1.0, -0.5, 0.0, 0.5],
+        );
+
+        let q5_raw = DeviceBuffer::alloc(22).unwrap();
+        let q5_out = DeviceBuffer::alloc(32 * std::mem::size_of::<f32>()).unwrap();
+        let mut q5 = Vec::new();
+        q5.extend_from_slice(&f16_bits(1.0).to_le_bytes());
+        q5.extend_from_slice(&0x0001_0000u32.to_le_bytes());
+        q5.extend([0x8f; 16]);
+        q5_raw.copy_from_host(&q5).unwrap();
+        crate::kernels::launch_dequantize_matrix(&q5_raw, &q5_out, 32, 6, &stream).unwrap();
+        stream.synchronize().unwrap();
+        let q5 = q5_out.copy_to_host::<f32>(32).unwrap();
+        assert_close_vec(&[q5[0], q5[16]], &[-1.0, 8.0]);
+
+        let q5_1_raw = DeviceBuffer::alloc(24).unwrap();
+        let q5_1_out = DeviceBuffer::alloc(32 * std::mem::size_of::<f32>()).unwrap();
+        let mut q5_1 = Vec::new();
+        q5_1.extend_from_slice(&f16_bits(0.5).to_le_bytes());
+        q5_1.extend_from_slice(&f16_bits(1.0).to_le_bytes());
+        q5_1.extend_from_slice(&0x0001_0000u32.to_le_bytes());
+        q5_1.extend([0x8f; 16]);
+        q5_1_raw.copy_from_host(&q5_1).unwrap();
+        crate::kernels::launch_dequantize_matrix(&q5_1_raw, &q5_1_out, 32, 7, &stream).unwrap();
+        stream.synchronize().unwrap();
+        let q5_1 = q5_1_out.copy_to_host::<f32>(32).unwrap();
+        assert_close_vec(&[q5_1[0], q5_1[16]], &[8.5, 13.0]);
+
+        let q2k_raw = DeviceBuffer::alloc(84).unwrap();
+        let q2k_out = DeviceBuffer::alloc(256 * std::mem::size_of::<f32>()).unwrap();
+        let mut q2k = vec![0u8; 84];
+        q2k[0..16].fill(0x11);
+        q2k[0] = 0x21;
+        q2k[16] = 0xe4;
+        q2k[48] = 0x03;
+        q2k[80..82].copy_from_slice(&f16_bits(1.0).to_le_bytes());
+        q2k[82..84].copy_from_slice(&f16_bits(0.5).to_le_bytes());
+        q2k_raw.copy_from_host(&q2k).unwrap();
+        crate::kernels::launch_dequantize_matrix(&q2k_raw, &q2k_out, 256, 10, &stream).unwrap();
+        stream.synchronize().unwrap();
+        let q2k = q2k_out.copy_to_host::<f32>(256).unwrap();
+        assert_close_vec(
+            &[q2k[0], q2k[32], q2k[64], q2k[96], q2k[128]],
+            &[-1.0, 0.5, 1.5, 2.5, 2.5],
+        );
+
+        let q3k_raw = DeviceBuffer::alloc(110).unwrap();
+        let q3k_out = DeviceBuffer::alloc(256 * std::mem::size_of::<f32>()).unwrap();
+        let mut q3k = vec![0u8; 110];
+        q3k[0] = 0b0001_0001;
+        q3k[32] = 0b0000_0111;
+        q3k[48] = 0b0000_0010;
+        q3k[64] = 0b0000_0010;
+        q3k[96..104].fill(0x11);
+        q3k[104..108].fill(0xaa);
+        q3k[108..110].copy_from_slice(&f16_bits(1.0).to_le_bytes());
+        q3k_raw.copy_from_host(&q3k).unwrap();
+        crate::kernels::launch_dequantize_matrix(&q3k_raw, &q3k_out, 256, 11, &stream).unwrap();
+        stream.synchronize().unwrap();
+        let q3k = q3k_out.copy_to_host::<f32>(256).unwrap();
+        assert_close_vec(
+            &[q3k[0], q3k[16], q3k[32], q3k[128]],
+            &[3.0, -2.0, -3.0, 2.0],
+        );
+
+        let q5k_raw = DeviceBuffer::alloc(176).unwrap();
+        let q5k_out = DeviceBuffer::alloc(256 * std::mem::size_of::<f32>()).unwrap();
+        let mut q5k = vec![0u8; 176];
+        q5k[0..2].copy_from_slice(&f16_bits(1.0).to_le_bytes());
+        q5k[2..4].copy_from_slice(&f16_bits(0.5).to_le_bytes());
+        q5k[4..16].fill(1);
+        q5k[16] = 0b0000_0101;
+        q5k[48..176].fill(0x21);
+        q5k_raw.copy_from_host(&q5k).unwrap();
+        crate::kernels::launch_dequantize_matrix(&q5k_raw, &q5k_out, 256, 13, &stream).unwrap();
+        stream.synchronize().unwrap();
+        let q5k = q5k_out.copy_to_host::<f32>(256).unwrap();
+        assert_close_vec(&[q5k[0], q5k[32], q5k[64]], &[16.5, 1.5, 16.5]);
+
+        let q6_raw = DeviceBuffer::alloc(210).unwrap();
+        let q6_out = DeviceBuffer::alloc(256 * std::mem::size_of::<f32>()).unwrap();
+        let mut q6 = vec![0u8; 210];
+        q6[0] = 0xff;
+        q6[32] = 0xff;
+        q6[128] = 0xff;
+        q6[192..208].fill(1);
+        q6[208..210].copy_from_slice(&f16_bits(1.0).to_le_bytes());
+        q6_raw.copy_from_host(&q6).unwrap();
+        crate::kernels::launch_dequantize_matrix(&q6_raw, &q6_out, 256, 14, &stream).unwrap();
+        stream.synchronize().unwrap();
+        let q6 = q6_out.copy_to_host::<f32>(256).unwrap();
+        assert_close_vec(
+            &[q6[0], q6[32], q6[64], q6[96], q6[1]],
+            &[31.0, 31.0, 31.0, 31.0, -32.0],
+        );
+
+        let q8k_raw = DeviceBuffer::alloc(292).unwrap();
+        let q8k_out = DeviceBuffer::alloc(256 * std::mem::size_of::<f32>()).unwrap();
+        let mut q8k = vec![0u8; 292];
+        q8k[0..4].copy_from_slice(&0.5f32.to_le_bytes());
+        q8k[4] = 0;
+        q8k[5] = 2;
+        q8k[6] = 255;
+        q8k[259] = 4;
+        q8k[260..292].fill(0xff);
+        q8k_raw.copy_from_host(&q8k).unwrap();
+        crate::kernels::launch_dequantize_matrix(&q8k_raw, &q8k_out, 256, 15, &stream).unwrap();
+        stream.synchronize().unwrap();
+        let q8k = q8k_out.copy_to_host::<f32>(256).unwrap();
+        assert_close_vec(&[q8k[0], q8k[1], q8k[2], q8k[255]], &[0.0, 1.0, -0.5, 2.0]);
+
+        let q = DeviceBuffer::alloc(4 * std::mem::size_of::<f32>()).unwrap();
+        let k = DeviceBuffer::alloc(4 * std::mem::size_of::<f32>()).unwrap();
+        let v = DeviceBuffer::alloc(4 * std::mem::size_of::<f32>()).unwrap();
+        let attn_out = DeviceBuffer::alloc(4 * std::mem::size_of::<f32>()).unwrap();
+        let flash_attn_out = DeviceBuffer::alloc(4 * std::mem::size_of::<f32>()).unwrap();
+        let tiled_attn_out = DeviceBuffer::alloc(4 * std::mem::size_of::<f32>()).unwrap();
+        q.copy_from_host(&[0.0f32; 4]).unwrap();
+        k.copy_from_host(&[0.0f32; 4]).unwrap();
+        v.copy_from_host(&[2.0f32, 0.0, 0.0, 2.0]).unwrap();
+        crate::kernels::launch_causal_attention(&q, &k, &v, &attn_out, 2, 1, 1, 2, 2, &stream)
+            .unwrap();
+        crate::kernels::launch_flash_causal_attention(
+            &q,
+            &k,
+            &v,
+            &flash_attn_out,
+            2,
+            1,
+            1,
+            2,
+            2,
+            &stream,
+        )
+        .unwrap();
+        crate::kernels::launch_tiled_causal_attention(
+            &q,
+            &k,
+            &v,
+            &tiled_attn_out,
+            2,
+            1,
+            1,
+            2,
+            2,
+            &stream,
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+        assert_close_vec(
+            &attn_out.copy_to_host::<f32>(4).unwrap(),
+            &[2.0, 0.0, 1.0, 1.0],
+        );
+        assert_close_vec(
+            &flash_attn_out.copy_to_host::<f32>(4).unwrap(),
+            &[2.0, 0.0, 1.0, 1.0],
+        );
+        assert_close_vec(
+            &tiled_attn_out.copy_to_host::<f32>(4).unwrap(),
+            &[2.0, 0.0, 1.0, 1.0],
+        );
+        let q_batched = DeviceBuffer::alloc(8 * std::mem::size_of::<f32>()).unwrap();
+        let k_batched = DeviceBuffer::alloc(8 * std::mem::size_of::<f32>()).unwrap();
+        let v_batched = DeviceBuffer::alloc(8 * std::mem::size_of::<f32>()).unwrap();
+        let batched_attn_out = DeviceBuffer::alloc(8 * std::mem::size_of::<f32>()).unwrap();
+        let tiled_batched_attn_out = DeviceBuffer::alloc(8 * std::mem::size_of::<f32>()).unwrap();
+        q_batched.copy_from_host(&[0.0f32; 8]).unwrap();
+        k_batched.copy_from_host(&[0.0f32; 8]).unwrap();
+        v_batched
+            .copy_from_host(&[2.0f32, 0.0, 0.0, 2.0, 4.0, 0.0, 0.0, 4.0])
+            .unwrap();
+        crate::kernels::launch_causal_attention_batched(
+            &q_batched,
+            &k_batched,
+            &v_batched,
+            &batched_attn_out,
+            2,
+            2,
+            1,
+            1,
+            2,
+            2,
+            &stream,
+        )
+        .unwrap();
+        crate::kernels::launch_tiled_causal_attention_batched(
+            &q_batched,
+            &k_batched,
+            &v_batched,
+            &tiled_batched_attn_out,
+            2,
+            2,
+            1,
+            1,
+            2,
+            2,
+            &stream,
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+        let expected_batched_attn = [2.0, 0.0, 1.0, 1.0, 4.0, 0.0, 2.0, 2.0];
+        assert_close_vec(
+            &batched_attn_out.copy_to_host::<f32>(8).unwrap(),
+            &expected_batched_attn,
+        );
+        assert_close_vec(
+            &tiled_batched_attn_out.copy_to_host::<f32>(8).unwrap(),
+            &expected_batched_attn,
+        );
+
+        let cache_k = DeviceBuffer::alloc(8 * std::mem::size_of::<f32>()).unwrap();
+        let cache_v = DeviceBuffer::alloc(8 * std::mem::size_of::<f32>()).unwrap();
+        let cached_out = DeviceBuffer::alloc(2 * std::mem::size_of::<f32>()).unwrap();
+        cache_k.memset_zero_async(&stream).unwrap();
+        cache_v.memset_zero_async(&stream).unwrap();
+        crate::kernels::launch_write_kv_cache(&k, &cache_k, 2, 1, 2, 4, 0, &stream).unwrap();
+        crate::kernels::launch_write_kv_cache(&v, &cache_v, 2, 1, 2, 4, 0, &stream).unwrap();
+        crate::kernels::launch_cached_decode_attention(
+            &q,
+            &cache_k,
+            &cache_v,
+            &cached_out,
+            1,
+            4,
+            1,
+            1,
+            2,
+            2,
+            &stream,
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+        assert_close_vec(&cached_out.copy_to_host::<f32>(2).unwrap(), &[1.0, 1.0]);
+
+        let page_table = DeviceBuffer::alloc(2 * std::mem::size_of::<u32>()).unwrap();
+        let paged_k = DeviceBuffer::alloc(4 * std::mem::size_of::<f32>()).unwrap();
+        let paged_v = DeviceBuffer::alloc(4 * std::mem::size_of::<f32>()).unwrap();
+        let paged_out = DeviceBuffer::alloc(2 * std::mem::size_of::<f32>()).unwrap();
+        let flash_paged_out = DeviceBuffer::alloc(2 * std::mem::size_of::<f32>()).unwrap();
+        let tiled_paged_out = DeviceBuffer::alloc(2 * std::mem::size_of::<f32>()).unwrap();
+        page_table.copy_from_host(&[1u32, 0]).unwrap();
+        paged_k.copy_from_host(&[0.0f32; 4]).unwrap();
+        paged_v.copy_from_host(&[0.0f32, 2.0, 2.0, 0.0]).unwrap();
+        crate::kernels::launch_paged_decode_attention(
+            &q,
+            &paged_k,
+            &paged_v,
+            &page_table,
+            &paged_out,
+            1,
+            1,
+            2,
+            1,
+            1,
+            2,
+            2,
+            &stream,
+        )
+        .unwrap();
+        crate::kernels::launch_flash_paged_decode_attention(
+            &q,
+            &paged_k,
+            &paged_v,
+            &page_table,
+            &flash_paged_out,
+            1,
+            1,
+            2,
+            1,
+            1,
+            2,
+            2,
+            &stream,
+        )
+        .unwrap();
+        crate::kernels::launch_tiled_paged_decode_attention(
+            &q,
+            &paged_k,
+            &paged_v,
+            &page_table,
+            &tiled_paged_out,
+            1,
+            1,
+            2,
+            1,
+            1,
+            2,
+            2,
+            &stream,
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+        assert_close_vec(&paged_out.copy_to_host::<f32>(2).unwrap(), &[1.0, 1.0]);
+        assert_close_vec(
+            &flash_paged_out.copy_to_host::<f32>(2).unwrap(),
+            &[1.0, 1.0],
+        );
+        assert_close_vec(
+            &tiled_paged_out.copy_to_host::<f32>(2).unwrap(),
+            &[1.0, 1.0],
+        );
+
+        let wide_head_dim = super::CUDA_ATTENTION_FAST_HEAD_DIM_MAX + 2;
+        let wide_q = DeviceBuffer::alloc(wide_head_dim * std::mem::size_of::<f32>()).unwrap();
+        let wide_cache_k =
+            DeviceBuffer::alloc(2 * wide_head_dim * std::mem::size_of::<f32>()).unwrap();
+        let wide_cache_v =
+            DeviceBuffer::alloc(2 * wide_head_dim * std::mem::size_of::<f32>()).unwrap();
+        let wide_cached_out =
+            DeviceBuffer::alloc(wide_head_dim * std::mem::size_of::<f32>()).unwrap();
+        wide_q.copy_from_host(&vec![0.0f32; wide_head_dim]).unwrap();
+        wide_cache_k
+            .copy_from_host(&vec![0.0f32; 2 * wide_head_dim])
+            .unwrap();
+        let mut wide_cache_values = vec![2.0f32; 2 * wide_head_dim];
+        wide_cache_values[wide_head_dim..].fill(0.0);
+        wide_cache_v.copy_from_host(&wide_cache_values).unwrap();
+        crate::kernels::launch_cached_decode_attention(
+            &wide_q,
+            &wide_cache_k,
+            &wide_cache_v,
+            &wide_cached_out,
+            1,
+            2,
+            1,
+            1,
+            wide_head_dim,
+            wide_head_dim,
+            &stream,
+        )
+        .unwrap();
+
+        let wide_page_table = DeviceBuffer::alloc(2 * std::mem::size_of::<u32>()).unwrap();
+        let wide_paged_k =
+            DeviceBuffer::alloc(2 * wide_head_dim * std::mem::size_of::<f32>()).unwrap();
+        let wide_paged_v =
+            DeviceBuffer::alloc(2 * wide_head_dim * std::mem::size_of::<f32>()).unwrap();
+        let wide_paged_out =
+            DeviceBuffer::alloc(wide_head_dim * std::mem::size_of::<f32>()).unwrap();
+        wide_page_table.copy_from_host(&[1u32, 0]).unwrap();
+        wide_paged_k
+            .copy_from_host(&vec![0.0f32; 2 * wide_head_dim])
+            .unwrap();
+        let mut wide_paged_values = vec![0.0f32; 2 * wide_head_dim];
+        wide_paged_values[wide_head_dim..].fill(2.0);
+        wide_paged_v.copy_from_host(&wide_paged_values).unwrap();
+        crate::kernels::launch_paged_decode_attention(
+            &wide_q,
+            &wide_paged_k,
+            &wide_paged_v,
+            &wide_page_table,
+            &wide_paged_out,
+            1,
+            1,
+            2,
+            1,
+            1,
+            wide_head_dim,
+            wide_head_dim,
+            &stream,
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+        assert_close_vec(
+            &wide_paged_out.copy_to_host::<f32>(wide_head_dim).unwrap(),
+            &wide_cached_out.copy_to_host::<f32>(wide_head_dim).unwrap(),
+        );
+
+        let prefix_pages = DeviceBuffer::alloc(8 * std::mem::size_of::<f32>()).unwrap();
+        let prefix_table = DeviceBuffer::alloc(4 * std::mem::size_of::<u32>()).unwrap();
+        prefix_pages
+            .copy_from_host(&[12.0f32, 13.0, 10.0, 11.0, 0.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        prefix_table.copy_from_host(&[1u32, 0, 3, 2]).unwrap();
+        crate::kernels::launch_copy_paged_kv_cache_prefix_batched(
+            &prefix_pages,
+            &prefix_table,
+            2,
+            2,
+            1,
+            2,
+            1,
+            2,
+            &stream,
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+        assert_close_vec(
+            &prefix_pages.copy_to_host::<f32>(8).unwrap(),
+            &[12.0, 13.0, 10.0, 11.0, 12.0, 13.0, 10.0, 11.0],
+        );
+
+        let gate = DeviceBuffer::alloc(2 * std::mem::size_of::<f32>()).unwrap();
+        let up = DeviceBuffer::alloc(2 * std::mem::size_of::<f32>()).unwrap();
+        let silu_out = DeviceBuffer::alloc(2 * std::mem::size_of::<f32>()).unwrap();
+        gate.copy_from_host(&[0.0f32, 1.0]).unwrap();
+        up.copy_from_host(&[2.0f32, 2.0]).unwrap();
+        crate::kernels::launch_silu_mul(&gate, &up, &silu_out, 2, &stream).unwrap();
+        stream.synchronize().unwrap();
+        let silu_one = 1.0f32 / (1.0 + (-1.0f32).exp());
+        assert_close_vec(
+            &silu_out.copy_to_host::<f32>(2).unwrap(),
+            &[0.0, 2.0 * silu_one],
+        );
+
+        let gelu_in = DeviceBuffer::alloc(2 * std::mem::size_of::<f32>()).unwrap();
+        let gelu_out = DeviceBuffer::alloc(2 * std::mem::size_of::<f32>()).unwrap();
+        gelu_in.copy_from_host(&[0.0f32, 1.0]).unwrap();
+        crate::kernels::launch_gelu(&gelu_in, &gelu_out, 2, &stream).unwrap();
+        stream.synchronize().unwrap();
+        let gelu_one = 0.5f32 * (1.0 + (0.7978845608028654f32 * (1.0 + 0.044715)).tanh());
+        assert_close_vec(&gelu_out.copy_to_host::<f32>(2).unwrap(), &[0.0, gelu_one]);
+
+        let logits = DeviceBuffer::alloc(3 * std::mem::size_of::<f32>()).unwrap();
+        let token = DeviceBuffer::alloc(std::mem::size_of::<u32>()).unwrap();
+        logits.copy_from_host(&[0.5f32, 9.0, 9.0]).unwrap();
+        crate::kernels::launch_argmax(&logits, &token, 3, &stream).unwrap();
+        stream.synchronize().unwrap();
+        assert_eq!(token.copy_to_host::<u32>(1).unwrap(), vec![1]);
+
+        crate::kernels::launch_sample_last_row(
+            &logits, &token, 1, 3, 0.0, 1.0, None, 0.99, &stream,
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+        assert_eq!(token.copy_to_host::<u32>(1).unwrap(), vec![1]);
+
+        let sample_logits = DeviceBuffer::alloc(4 * std::mem::size_of::<f32>()).unwrap();
+        sample_logits
+            .copy_from_host(&[0.0f32, 1.0, 2.0, 3.0])
+            .unwrap();
+        crate::kernels::launch_sample_last_row(
+            &sample_logits,
+            &token,
+            1,
+            4,
+            1.0,
+            1.0,
+            Some(2),
+            0.0,
+            &stream,
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+        assert_eq!(token.copy_to_host::<u32>(1).unwrap(), vec![3]);
+
+        crate::kernels::launch_sample_last_row(
+            &sample_logits,
+            &token,
+            1,
+            4,
+            1.0,
+            1.0,
+            Some(2),
+            0.99,
+            &stream,
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+        assert_eq!(token.copy_to_host::<u32>(1).unwrap(), vec![2]);
+
+        crate::kernels::launch_sample_last_row(
+            &sample_logits,
+            &token,
+            1,
+            4,
+            1.0,
+            0.5,
+            None,
+            0.99,
+            &stream,
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+        assert_eq!(token.copy_to_host::<u32>(1).unwrap(), vec![3]);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_dequant_matches_cpu_for_all_supported_quant_fixtures() {
+        use crate::runtime::{DeviceBuffer, Stream};
+
+        let stream = Stream::create().unwrap();
+
+        for fixture in all_supported_cuda_quant_fixtures() {
+            let expected =
+                hi_gguf::dequantize_tensor_as_f32(&fixture.bytes, fixture.dtype, fixture.elements)
+                    .unwrap();
+            let raw = DeviceBuffer::alloc(fixture.bytes.len()).unwrap();
+            let out = DeviceBuffer::alloc(fixture.elements * std::mem::size_of::<f32>()).unwrap();
+            raw.copy_from_host(&fixture.bytes).unwrap();
+            crate::kernels::launch_dequantize_matrix(
+                &raw,
+                &out,
+                fixture.elements,
+                fixture.raw_type,
+                &stream,
+            )
+            .unwrap();
+            stream.synchronize().unwrap();
+            let actual = out.copy_to_host::<f32>(fixture.elements).unwrap();
+            assert_quant_close(fixture.name, &actual, &expected);
+        }
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_mmproj_projector() {
+        let path = tempfile_path("mmproj-projector");
+        write_mmproj_gguf(&path);
+        let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+        let projector = crate::gpu::CudaMmprojProjector::from_gguf(&gguf).unwrap();
+        let info = projector.info();
+        assert_eq!(info.layout, "linear");
+        assert_eq!(info.layer_count, 1);
+        assert_eq!(info.input_dim, 2);
+        assert_eq!(info.output_dim, 3);
+        assert_eq!(info.bias_count, 1);
+        let projected = projector
+            .project_features_host(&[1.0f32, 2.0, 3.0, 4.0], 2)
+            .unwrap();
+        assert_close_vec(&projected, &[5.5, 10.5, 18.0, 11.5, 24.5, 40.0]);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_mmproj_projector_alias_layouts() {
+        let linear_path = tempfile_path("mmproj-model-multi-modal-linear");
+        write_mmproj_gguf_from_tensors(
+            &linear_path,
+            vec![
+                tensor_f32(
+                    "model.multi_modal_projector.linear.weight",
+                    vec![2, 3],
+                    &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                ),
+                tensor_f32(
+                    "model.multi_modal_projector.linear.bias",
+                    vec![3],
+                    &[0.5, -0.5, 1.0],
+                ),
+            ],
+        );
+        let linear = hi_gguf::GgufFile::open(&linear_path).unwrap();
+        let linear_projector = crate::gpu::CudaMmprojProjector::from_gguf(&linear).unwrap();
+        let info = linear_projector.info();
+        assert_eq!(info.layout, "linear");
+        assert_eq!(info.layer_count, 1);
+        assert_eq!(info.input_dim, 2);
+        assert_eq!(info.output_dim, 3);
+        assert_eq!(info.bias_count, 1);
+        assert_close_vec(
+            &linear_projector
+                .project_features_host(&[1.0f32, 2.0], 1)
+                .unwrap(),
+            &[5.5, 10.5, 18.0],
+        );
+
+        let mlp_path = tempfile_path("mmproj-multi-modal-linear-mlp");
+        write_mmproj_gguf_from_tensors(
+            &mlp_path,
+            vec![
+                tensor_f32(
+                    "multi_modal_projector.linear_1.weight",
+                    vec![2, 2],
+                    &[1.0, 0.0, 0.0, 1.0],
+                ),
+                tensor_f32("multi_modal_projector.linear_1.bias", vec![2], &[0.0, 0.0]),
+                tensor_f32(
+                    "multi_modal_projector.linear_2.weight",
+                    vec![2, 2],
+                    &[1.0, 0.0, 0.0, 1.0],
+                ),
+                tensor_f32(
+                    "multi_modal_projector.linear_2.bias",
+                    vec![2],
+                    &[0.25, -0.25],
+                ),
+            ],
+        );
+        let mlp = hi_gguf::GgufFile::open(&mlp_path).unwrap();
+        let mlp_projector = crate::gpu::CudaMmprojProjector::from_gguf(&mlp).unwrap();
+        let info = mlp_projector.info();
+        assert_eq!(info.layout, "mlp-gelu");
+        assert_eq!(info.layer_count, 2);
+        assert_eq!(info.input_dim, 2);
+        assert_eq!(info.output_dim, 2);
+        assert_eq!(info.hidden_dim, Some(2));
+        assert_eq!(info.bias_count, 2);
+        let gelu = |x: f32| {
+            0.5f32 * x * (1.0 + (0.7978845608028654f32 * (x + 0.044715f32 * x * x * x)).tanh())
+        };
+        assert_close_vec(
+            &mlp_projector
+                .project_features_host(&[1.0f32, 2.0, 3.0, 4.0], 2)
+                .unwrap(),
+            &[
+                gelu(1.0) + 0.25,
+                gelu(2.0) - 0.25,
+                gelu(3.0) + 0.25,
+                gelu(4.0) - 0.25,
+            ],
+        );
+
+        for (fixture_name, first, second) in [
+            (
+                "mmproj-model-mm-projector-linear-n",
+                "model.mm_projector.linear_1.weight",
+                "model.mm_projector.linear_2.weight",
+            ),
+            (
+                "mmproj-multi-modal-fc",
+                "multi_modal_projector.fc1.weight",
+                "multi_modal_projector.fc2.weight",
+            ),
+        ] {
+            let path = tempfile_path(fixture_name);
+            let first_bias = first.replace(".weight", ".bias");
+            let second_bias = second.replace(".weight", ".bias");
+            write_mmproj_gguf_from_tensors(
+                &path,
+                vec![
+                    tensor_f32(first, vec![2, 2], &[1.0, 0.0, 0.0, 1.0]),
+                    tensor_f32(&first_bias, vec![2], &[0.0, 0.0]),
+                    tensor_f32(second, vec![2, 2], &[1.0, 0.0, 0.0, 1.0]),
+                    tensor_f32(&second_bias, vec![2], &[0.5, -0.5]),
+                ],
+            );
+            let gguf = hi_gguf::GgufFile::open(&path).unwrap();
+            let projector = crate::gpu::CudaMmprojProjector::from_gguf(&gguf).unwrap();
+            let info = projector.info();
+            assert_eq!(info.layout, "mlp-gelu");
+            assert_eq!(info.layer_count, 2);
+            assert_eq!(info.input_dim, 2);
+            assert_eq!(info.output_dim, 2);
+            assert_eq!(info.hidden_dim, Some(2));
+            assert_eq!(info.bias_count, 2);
+            assert_close_vec(
+                &projector.project_features_host(&[1.0f32, 2.0], 1).unwrap(),
+                &[gelu(1.0) + 0.5, gelu(2.0) - 0.5],
+            );
+        }
+
+        let visual_projection_path = tempfile_path("mmproj-visual-projection-linear");
+        write_mmproj_gguf_from_tensors(
+            &visual_projection_path,
+            vec![
+                tensor_f32(
+                    "visual_projection.weight",
+                    vec![2, 3],
+                    &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                ),
+                tensor_f32("visual_projection.bias", vec![3], &[0.5, -0.5, 1.0]),
+                tensor_f32("unused.rank2.weight", vec![1, 1], &[0.0]),
+            ],
+        );
+        let visual_projection = hi_gguf::GgufFile::open(&visual_projection_path).unwrap();
+        let visual_projector =
+            crate::gpu::CudaMmprojProjector::from_gguf(&visual_projection).unwrap();
+        let info = visual_projector.info();
+        assert_eq!(info.layout, "linear");
+        assert_eq!(info.layer_count, 1);
+        assert_eq!(info.input_dim, 2);
+        assert_eq!(info.output_dim, 3);
+        assert_eq!(info.bias_count, 1);
+        assert_close_vec(
+            &visual_projector
+                .project_features_host(&[1.0f32, 2.0], 1)
+                .unwrap(),
+            &[5.5, 10.5, 18.0],
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_loads_mmproj_projector_sequential_layouts() {
+        let gelu = |x: f32| {
+            0.5f32 * x * (1.0 + (0.7978845608028654f32 * (x + 0.044715f32 * x * x * x)).tanh())
+        };
+
+        let numbered_path = tempfile_path("mmproj-model-sequential-numbered");
+        write_mmproj_gguf_from_tensors(
+            &numbered_path,
+            vec![
+                tensor_f32(
+                    "model.mm_projector.0.weight",
+                    vec![2, 2],
+                    &[1.0, 0.0, 0.0, 1.0],
+                ),
+                tensor_f32("model.mm_projector.0.bias", vec![2], &[0.0, 0.0]),
+                tensor_f32(
+                    "model.mm_projector.2.weight",
+                    vec![2, 2],
+                    &[1.0, 0.0, 0.0, 1.0],
+                ),
+                tensor_f32("model.mm_projector.2.bias", vec![2], &[0.0, 0.0]),
+                tensor_f32(
+                    "model.mm_projector.4.weight",
+                    vec![2, 2],
+                    &[1.0, 0.0, 0.0, 1.0],
+                ),
+                tensor_f32("model.mm_projector.4.bias", vec![2], &[0.1, -0.1]),
+            ],
+        );
+        let numbered = hi_gguf::GgufFile::open(&numbered_path).unwrap();
+        let numbered_projector = crate::gpu::CudaMmprojProjector::from_gguf(&numbered).unwrap();
+        let info = numbered_projector.info();
+        assert_eq!(info.layout, "mlp-gelu");
+        assert_eq!(info.layer_count, 3);
+        assert_eq!(info.input_dim, 2);
+        assert_eq!(info.output_dim, 2);
+        assert_eq!(info.hidden_dim, Some(2));
+        assert_eq!(info.bias_count, 3);
+        assert_close_vec(
+            &numbered_projector
+                .project_features_host(&[1.0f32, 2.0, 3.0, 4.0], 2)
+                .unwrap(),
+            &[
+                gelu(gelu(1.0)) + 0.1,
+                gelu(gelu(2.0)) - 0.1,
+                gelu(gelu(3.0)) + 0.1,
+                gelu(gelu(4.0)) - 0.1,
+            ],
+        );
+
+        let linear_n_path = tempfile_path("mmproj-linear-n-sequential");
+        write_mmproj_gguf_from_tensors(
+            &linear_n_path,
+            vec![
+                tensor_f32(
+                    "multi_modal_projector.linear_1.weight",
+                    vec![2, 2],
+                    &[1.0, 0.0, 0.0, 1.0],
+                ),
+                tensor_f32(
+                    "multi_modal_projector.linear_2.weight",
+                    vec![2, 2],
+                    &[1.0, 0.0, 0.0, 1.0],
+                ),
+                tensor_f32(
+                    "multi_modal_projector.linear_3.weight",
+                    vec![2, 2],
+                    &[1.0, 0.0, 0.0, 1.0],
+                ),
+                tensor_f32(
+                    "multi_modal_projector.linear_3.bias",
+                    vec![2],
+                    &[0.25, -0.25],
+                ),
+            ],
+        );
+        let linear_n = hi_gguf::GgufFile::open(&linear_n_path).unwrap();
+        let linear_n_projector = crate::gpu::CudaMmprojProjector::from_gguf(&linear_n).unwrap();
+        let info = linear_n_projector.info();
+        assert_eq!(info.layout, "mlp-gelu");
+        assert_eq!(info.layer_count, 3);
+        assert_eq!(info.input_dim, 2);
+        assert_eq!(info.output_dim, 2);
+        assert_eq!(info.hidden_dim, Some(2));
+        assert_eq!(info.bias_count, 1);
+        assert_close_vec(
+            &linear_n_projector
+                .project_features_host(&[1.0f32, 2.0], 1)
+                .unwrap(),
+            &[gelu(gelu(1.0)) + 0.25, gelu(gelu(2.0)) - 0.25],
+        );
+
+        let contiguous_path = tempfile_path("mmproj-projector-contiguous-numbered");
+        write_mmproj_gguf_from_tensors(
+            &contiguous_path,
+            vec![
+                tensor_f32(
+                    "model.projector.0.weight",
+                    vec![2, 2],
+                    &[1.0, 0.0, 0.0, 1.0],
+                ),
+                tensor_f32(
+                    "model.projector.1.weight",
+                    vec![2, 2],
+                    &[1.0, 0.0, 0.0, 1.0],
+                ),
+                tensor_f32(
+                    "model.projector.2.weight",
+                    vec![2, 2],
+                    &[1.0, 0.0, 0.0, 1.0],
+                ),
+                tensor_f32("model.projector.2.bias", vec![2], &[0.5, -0.5]),
+            ],
+        );
+        let contiguous = hi_gguf::GgufFile::open(&contiguous_path).unwrap();
+        let contiguous_projector = crate::gpu::CudaMmprojProjector::from_gguf(&contiguous).unwrap();
+        let info = contiguous_projector.info();
+        assert_eq!(info.layout, "mlp-gelu");
+        assert_eq!(info.layer_count, 3);
+        assert_eq!(info.input_dim, 2);
+        assert_eq!(info.output_dim, 2);
+        assert_eq!(info.hidden_dim, Some(2));
+        assert_eq!(info.bias_count, 1);
+        assert_close_vec(
+            &contiguous_projector
+                .project_features_host(&[1.0f32, 2.0], 1)
+                .unwrap(),
+            &[gelu(gelu(1.0)) + 0.5, gelu(gelu(2.0)) - 0.5],
+        );
+    }
+
+    fn write_reference_qwen(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_gate.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_up.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_qwen_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_qwen_moe_packed_gate_up(path: &Path) {
+        write_reference_qwen_moe_packed(path, "blk.0.ffn_gate_up_exps.weight", true);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_qwen_moe_packed_up_gate(path: &Path) {
+        write_reference_qwen_moe_packed(path, "blk.0.ffn_up_gate_exps.weight", false);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_qwen_moe_packed(path: &Path, packed_name: &str, gate_first: bool) {
+        let packed_values = if gate_first {
+            [
+                1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+            ]
+        } else {
+            [
+                5.0, 6.0, 7.0, 8.0, 1.0, 2.0, 3.0, 4.0, 9.0, 10.0, 11.0, 12.0, 5.0, 6.0, 7.0, 8.0,
+            ]
+        };
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_gate_inp.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16(packed_name, vec![2, 4, 2], &packed_values),
+            tensor_f16("blk.0.ffn_down_exps.weight", vec![2, 2, 2], &[0.0; 8]),
+        ];
+        write_qwen_moe_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_qwen_equal_custom_kv(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![4, 3],
+                &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![4], &[1.0, 1.0, 1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![4], &[1.0, 1.0, 1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![4], &[1.0, 1.0, 1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![4, 2], &[0.0; 8]),
+            tensor_f16("blk.0.attn_k.weight", vec![4, 2], &[0.0; 8]),
+            tensor_f16("blk.0.attn_v.weight", vec![4, 2], &[0.0; 8]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 4], &[0.0; 8]),
+            tensor_f16("blk.0.ffn_gate.weight", vec![4, 4], &[0.0; 16]),
+            tensor_f16("blk.0.ffn_up.weight", vec![4, 4], &[0.0; 16]),
+            tensor_f16("blk.0.ffn_down.weight", vec![4, 4], &[0.0; 16]),
+        ];
+        write_qwen_custom_kv_gguf(path, tensors, 2, "cpu-reference-qwen-equal-custom-kv");
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_qwen_unequal_custom_kv(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![4, 3],
+                &[1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![4], &[1.0, 1.0, 1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![4], &[1.0, 1.0, 1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![4], &[1.0, 1.0, 1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![4, 2], &[0.0; 8]),
+            tensor_f16("blk.0.attn_k.weight", vec![4, 2], &[0.0; 8]),
+            tensor_f16("blk.0.attn_v.weight", vec![4, 3], &[0.0; 12]),
+            tensor_f16("blk.0.attn_output.weight", vec![3, 4], &[0.0; 12]),
+            tensor_f16("blk.0.ffn_gate.weight", vec![4, 4], &[0.0; 16]),
+            tensor_f16("blk.0.ffn_up.weight", vec![4, 4], &[0.0; 16]),
+            tensor_f16("blk.0.ffn_down.weight", vec![4, 4], &[0.0; 16]),
+        ];
+        write_qwen_custom_kv_gguf(path, tensors, 3, "cpu-reference-qwen-unequal-custom-kv");
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_qwen_ssm_metadata_dense(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_gate.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_up.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_qwen_ssm_metadata_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_qwen_ssm_sidecar_dense(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ssm_in.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_gate.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_up.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_qwen_ssm_metadata_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_qwen_ssm_metadata_packed(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16(
+                "blk.0.self_attn.W_pack.weight",
+                vec![2, 6],
+                &[
+                    1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+                ],
+            ),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16(
+                "blk.0.mlp.w1w3.weight",
+                vec![2, 4],
+                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            ),
+            tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_qwen_ssm_metadata_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_qwen_ssm_metadata_hf_packed_aliases(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16(
+                "blk.0.attention.qkv_proj.weight",
+                vec![2, 6],
+                &[
+                    1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+                ],
+            ),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16(
+                "blk.0.mlp.gate_up_proj.weight",
+                vec![2, 4],
+                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            ),
+            tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_qwen_ssm_metadata_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_qwen_next_dense(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_gate.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_up.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_qwen_next_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_qwen_next_attention_head_norm_aliases(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f32(
+                "blk.0.self_attention.q_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f32("blk.0.attention.k_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.ffn_gate.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_up.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_qwen_next_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_qwen_next_gated_attention(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![2, 4], &[0.0; 8]),
+            tensor_f16("blk.0.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_gate.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_up.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_qwen_next_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_qwen_next_ssm_metadata_dense(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_gate.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_up.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_qwen_next_ssm_metadata_dense_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_qwen_next_ssm_metadata_packed(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16(
+                "blk.0.self_attn.W_pack.weight",
+                vec![2, 6],
+                &[
+                    1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+                ],
+            ),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16(
+                "blk.0.mlp.w1w3.weight",
+                vec![2, 4],
+                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            ),
+            tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_qwen_next_ssm_metadata_dense_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_qwen_next_ssm_metadata_hf_packed_aliases(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16(
+                "blk.0.attention.qkv_proj.weight",
+                vec![2, 6],
+                &[
+                    1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+                ],
+            ),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16(
+                "blk.0.mlp.gate_up_proj.weight",
+                vec![2, 4],
+                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            ),
+            tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_qwen_next_ssm_metadata_dense_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_qwen_next_recurrent_ssm(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_post_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.ssm_in.weight", vec![2, 8], &[0.0; 16]),
+            tensor_f16("blk.0.ssm_conv1d.weight", vec![1, 6], &[0.0; 6]),
+            tensor_f32("blk.0.ssm_dt.bias", vec![1], &[0.0]),
+            tensor_f32("blk.0.ssm_a", vec![1], &[0.0]),
+            tensor_f16("blk.0.ssm_ba.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f32("blk.0.ssm_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.ssm_out.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_gate.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_up.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_qwen_next_recurrent_ssm_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_qwen_next_recurrent_ssm_optimized(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_post_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_qkv.weight", vec![2, 6], &[0.0; 12]),
+            tensor_f16("blk.0.attn_gate.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ssm_conv1d.weight", vec![1, 6], &[0.0; 6]),
+            tensor_f32("blk.0.ssm_dt.bias", vec![1], &[0.0]),
+            tensor_f32("blk.0.ssm_a", vec![1], &[0.0]),
+            tensor_f16("blk.0.ssm_ba.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f32("blk.0.ssm_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.ssm_out.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_gate.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_up.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_qwen_next_recurrent_ssm_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_qwen_f32_matrices(path: &Path) {
+        let tensors = vec![
+            tensor_f32(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_q.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f32("blk.0.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f32("blk.0.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f32("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f32("blk.0.ffn_gate.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f32("blk.0.ffn_up.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f32("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_qwen_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_qwen_wide_head(path: &Path) {
+        let embed = super::CUDA_ATTENTION_FAST_HEAD_DIM_MAX + 2;
+        let vocab = 3usize;
+        let mut token_embedding = vec![0.0f32; embed * vocab];
+        token_embedding[0] = 1.0;
+        token_embedding[embed + 1] = 1.0;
+        token_embedding[2 * embed] = 1.0;
+        let norm = vec![1.0f32; embed];
+        let matrix = vec![0.0f32; embed * embed];
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![embed as u64, vocab as u64],
+                &token_embedding,
+            ),
+            tensor_f32("output_norm.weight", vec![embed as u64], &norm),
+            tensor_f32("blk.0.attn_norm.weight", vec![embed as u64], &norm),
+            tensor_f32("blk.0.ffn_norm.weight", vec![embed as u64], &norm),
+            tensor_f16(
+                "blk.0.attn_q.weight",
+                vec![embed as u64, embed as u64],
+                &matrix,
+            ),
+            tensor_f16(
+                "blk.0.attn_k.weight",
+                vec![embed as u64, embed as u64],
+                &matrix,
+            ),
+            tensor_f16(
+                "blk.0.attn_v.weight",
+                vec![embed as u64, embed as u64],
+                &matrix,
+            ),
+            tensor_f16(
+                "blk.0.attn_output.weight",
+                vec![embed as u64, embed as u64],
+                &matrix,
+            ),
+            tensor_f16(
+                "blk.0.ffn_gate.weight",
+                vec![embed as u64, embed as u64],
+                &matrix,
+            ),
+            tensor_f16(
+                "blk.0.ffn_up.weight",
+                vec![embed as u64, embed as u64],
+                &matrix,
+            ),
+            tensor_f16(
+                "blk.0.ffn_down.weight",
+                vec![embed as u64, embed as u64],
+                &matrix,
+            ),
+        ];
+        write_qwen_gguf_with_dims(path, tensors, embed as u32, embed as u32, 1, 1, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_qwen_vl(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 4],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_gate.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_up.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_qwen_vl_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_qwen_vl_with_video(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 5],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_gate.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_up.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_qwen_vl_video_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_llama(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_gate.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_up.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_llama_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_mistral(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_gate.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_up.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_mistral_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_mistral_dense_aliases(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "model.embed_tokens.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f16(
+                "lm_head.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.input_layernorm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32(
+                "blk.0.post_attention_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f16("blk.0.self_attn.q_proj.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.self_attn.k_proj.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.self_attn.v_proj.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.self_attn.o_proj.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.mlp.gate_proj.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.mlp.up_proj.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.mlp.down_proj.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_mistral_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_mistral_model_layers_dense_aliases(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "model.embed_tokens.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f16(
+                "lm_head.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("model.norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32(
+                "model.layers.0.input_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f32(
+                "model.layers.0.post_attention_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f16(
+                "model.layers.0.self_attn.q_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "model.layers.0.self_attn.k_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "model.layers.0.self_attn.v_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "model.layers.0.self_attn.o_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16("model.layers.0.mlp.gate_proj.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("model.layers.0.mlp.up_proj.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("model.layers.0.mlp.down_proj.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_mistral_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_mistral_feed_forward_hf_aliases(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "model.embed_tokens.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f16(
+                "lm_head.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("model.norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32(
+                "model.layers.0.input_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f32(
+                "model.layers.0.post_attention_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f16(
+                "model.layers.0.self_attn.q_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "model.layers.0.self_attn.k_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "model.layers.0.self_attn.v_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "model.layers.0.self_attn.o_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "model.layers.0.feed_forward.gate_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "model.layers.0.feed_forward.up_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "model.layers.0.feed_forward.down_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+        ];
+        write_mistral_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_mistral_attn_container_split_aliases(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "model.embed_tokens.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f16(
+                "lm_head.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("model.norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.input_layernorm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32(
+                "blk.0.post_attention_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f16("blk.0.attn.q_proj.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn.k_proj.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn.v_proj.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn.o_proj.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.mlp.gate_proj.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.mlp.up_proj.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.mlp.down_proj.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_mistral_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_mistral_ffn_container_aliases(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "model.embed_tokens.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f16(
+                "lm_head.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("model.norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.input_layernorm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32(
+                "blk.0.post_attention_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f16("blk.0.self_attn.q_proj.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.self_attn.k_proj.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.self_attn.v_proj.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.self_attn.o_proj.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn.gate_proj.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn.up_proj.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn.down_proj.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_mistral_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_mistral_language_model_wrapper_aliases(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "language_model.model.embed_tokens.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f16(
+                "language_model.lm_head.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("language_model.model.norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32(
+                "language_model.model.layers.0.input_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f32(
+                "language_model.model.layers.0.post_attention_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f16(
+                "language_model.model.layers.0.self_attn.q_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "language_model.model.layers.0.self_attn.k_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "language_model.model.layers.0.self_attn.v_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "language_model.model.layers.0.self_attn.o_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "language_model.model.layers.0.mlp.gate_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "language_model.model.layers.0.mlp.up_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "language_model.model.layers.0.mlp.down_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+        ];
+        write_mistral_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_mistral_packed_aliases(path: &Path) {
+        write_reference_mistral_packed_aliases_with_names(
+            path,
+            "blk.0.self_attn.qkv_proj.weight",
+            "blk.0.self_attn.qkv_proj.bias",
+            "blk.0.mlp.gate_up_proj.weight",
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_mistral_alternate_packed_aliases(path: &Path) {
+        write_reference_mistral_packed_aliases_with_names(
+            path,
+            "blk.0.self_attn.W_pack.weight",
+            "blk.0.self_attn.W_pack.bias",
+            "blk.0.mlp.w1w3.weight",
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_mistral_attn_qkv_aliases(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "model.embed_tokens.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f16(
+                "lm_head.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.input_layernorm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32(
+                "blk.0.post_attention_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f16(
+                "blk.0.attn.qkv.weight",
+                vec![2, 6],
+                &[
+                    1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+                ],
+            ),
+            tensor_f32(
+                "blk.0.attn.qkv.bias",
+                vec![6],
+                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            ),
+            tensor_f16("blk.0.attn.out_proj.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16(
+                "blk.0.mlp.gate_up_proj.weight",
+                vec![2, 4],
+                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            ),
+            tensor_f16("blk.0.mlp.down_proj.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_mistral_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_mistral_transformer_h_packed_aliases(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "transformer.wte.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f16(
+                "lm_head.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("transformer.ln_f.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("transformer.h.0.ln_1.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("transformer.h.0.ln_2.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16(
+                "transformer.h.0.attn.c_attn.weight",
+                vec![2, 6],
+                &[
+                    1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+                ],
+            ),
+            tensor_f32(
+                "transformer.h.0.attn.c_attn.bias",
+                vec![6],
+                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            ),
+            tensor_f16("transformer.h.0.attn.c_proj.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16(
+                "transformer.h.0.mlp.fc1.weight",
+                vec![2, 4],
+                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            ),
+            tensor_f16("transformer.h.0.mlp.fc2.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_mistral_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_mistral_model_layers_packed_aliases(path: &Path) {
+        write_reference_mistral_packed_aliases_with_names(
+            path,
+            "model.layers.0.self_attn.qkv_proj.weight",
+            "model.layers.0.self_attn.qkv_proj.bias",
+            "model.layers.0.mlp.gate_up_proj.weight",
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_mistral_packed_bias_aliases(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "model.embed_tokens.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f16(
+                "lm_head.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.input_layernorm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32(
+                "blk.0.post_attention_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f16(
+                "blk.0.self_attn.qkv_proj.weight",
+                vec![2, 6],
+                &[
+                    1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+                ],
+            ),
+            tensor_f32(
+                "blk.0.self_attn.qkv_proj.bias",
+                vec![6],
+                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            ),
+            tensor_f16("blk.0.self_attn.o_proj.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f32("blk.0.self_attn.o_proj.bias", vec![2], &[11.0, 12.0]),
+            tensor_f16(
+                "blk.0.mlp.gate_up_proj.weight",
+                vec![2, 4],
+                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            ),
+            tensor_f32(
+                "blk.0.mlp.gate_up_proj.bias",
+                vec![4],
+                &[7.0, 8.0, 9.0, 10.0],
+            ),
+            tensor_f16("blk.0.mlp.down_proj.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_mistral_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_mistral_packed_aliases_with_names(
+        path: &Path,
+        qkv_weight: &str,
+        qkv_bias: &str,
+        ffn_weight: &str,
+    ) {
+        let tensors = vec![
+            tensor_f16(
+                "model.embed_tokens.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f16(
+                "lm_head.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.input_layernorm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32(
+                "blk.0.post_attention_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f16(
+                qkv_weight,
+                vec![2, 6],
+                &[
+                    1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+                ],
+            ),
+            tensor_f32(qkv_bias, vec![6], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+            tensor_f16("blk.0.self_attn.o_proj.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16(
+                ffn_weight,
+                vec![2, 4],
+                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            ),
+            tensor_f16("blk.0.mlp.down_proj.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_mistral_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_mixtral_moe(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_gate_inp.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_gate_exps.weight", vec![2, 2, 2], &[0.0; 8]),
+            tensor_f16("blk.0.ffn_up_exps.weight", vec![2, 2, 2], &[0.0; 8]),
+            tensor_f16("blk.0.ffn_down_exps.weight", vec![2, 2, 2], &[0.0; 8]),
+        ];
+        write_mixtral_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_mixtral_per_expert_moe(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_gate_inp.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_gate.0.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_up.0.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_down.0.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_gate.1.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_up.1.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_down.1.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_mixtral_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_mixtral_per_expert_packed_gate_up_moe(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.block_sparse_moe.gate.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.0.gate_up_proj.weight",
+                vec![2, 4],
+                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.0.w2.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.1.gate_up_proj.weight",
+                vec![2, 4],
+                &[5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.1.w2.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+        ];
+        write_mixtral_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_mixtral_alias_per_expert_moe(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.block_sparse_moe.gate.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.0.w1.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.0.w3.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.0.w2.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.1.w1.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.1.w3.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.1.w2.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+        ];
+        write_mixtral_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_mixtral_moe_expert_bias_aliases(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.block_sparse_moe.gate.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.0.w1.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f32(
+                "blk.0.block_sparse_moe.experts.0.w1.bias",
+                vec![2],
+                &[2.0, -2.0],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.0.w3.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f32(
+                "blk.0.block_sparse_moe.experts.0.w3.bias",
+                vec![2],
+                &[3.0, 4.0],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.0.w2.weight",
+                vec![2, 2],
+                &[1.0, 0.0, 0.0, 1.0],
+            ),
+            tensor_f32(
+                "blk.0.block_sparse_moe.experts.0.w2.bias",
+                vec![2],
+                &[0.5, -0.25],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.1.w1.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f32(
+                "blk.0.block_sparse_moe.experts.1.w1.bias",
+                vec![2],
+                &[0.25, 0.5],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.1.w3.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f32(
+                "blk.0.block_sparse_moe.experts.1.w3.bias",
+                vec![2],
+                &[0.75, 1.0],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.1.w2.weight",
+                vec![2, 2],
+                &[10.0, 0.0, 0.0, 10.0],
+            ),
+            tensor_f32(
+                "blk.0.block_sparse_moe.experts.1.w2.bias",
+                vec![2],
+                &[1.5, -1.5],
+            ),
+        ];
+        write_mixtral_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_mixtral_router_alias_per_expert_moe(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16(
+                "blk.0.block_sparse_moe.router.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.0.w1.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.0.w3.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.0.w2.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.1.w1.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.1.w3.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.1.w2.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+        ];
+        write_mixtral_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_mixtral_output_router_bias_aliases(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("lm_head.bias", vec![3], &[0.25, -0.5, 1.0]),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16(
+                "blk.0.block_sparse_moe.router.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f32("blk.0.block_sparse_moe.router.bias", vec![2], &[2.0, 4.0]),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.0.w1.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.0.w3.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.0.w2.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.1.w1.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.1.w3.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.1.w2.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+        ];
+        write_mixtral_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_mixtral_packed_moe_expert_biases(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_gate_inp.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f32("blk.0.ffn_gate_inp.bias", vec![2], &[5.0, 0.0]),
+            tensor_f16("blk.0.ffn_gate_up_exps.weight", vec![2, 4, 2], &[0.0; 16]),
+            tensor_f32(
+                "blk.0.ffn_gate_up_exps.bias",
+                vec![4, 2],
+                &[2.0, -2.0, 3.0, 4.0, 0.5, 0.75, 1.0, 1.25],
+            ),
+            tensor_f16(
+                "blk.0.ffn_down_exps.weight",
+                vec![2, 2, 2],
+                &[1.0, 0.0, 0.0, 1.0, 10.0, 0.0, 0.0, 10.0],
+            ),
+            tensor_f32(
+                "blk.0.ffn_down_exps.bias",
+                vec![2, 2],
+                &[0.5, -0.25, 1.0, -1.0],
+            ),
+        ];
+        write_mixtral_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_mixtral_feed_forward_kind_first_moe(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16(
+                "blk.0.feed_forward.block_sparse_moe.gate.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.feed_forward.block_sparse_moe.experts.w1.0.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.feed_forward.block_sparse_moe.experts.w3.0.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.feed_forward.block_sparse_moe.experts.w2.0.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.feed_forward.block_sparse_moe.experts.w1.1.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.feed_forward.block_sparse_moe.experts.w3.1.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.feed_forward.block_sparse_moe.experts.w2.1.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+        ];
+        write_mixtral_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_mixtral_mlp_block_sparse_moe(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16(
+                "blk.0.mlp.block_sparse_moe.gate.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.mlp.block_sparse_moe.experts.0.w1.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.mlp.block_sparse_moe.experts.0.w3.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.mlp.block_sparse_moe.experts.0.w2.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.mlp.block_sparse_moe.experts.1.w1.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.mlp.block_sparse_moe.experts.1.w3.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.mlp.block_sparse_moe.experts.1.w2.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+        ];
+        write_mixtral_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_mixtral_shared_experts_plural(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.block_sparse_moe.gate.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.0.w1.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.0.w3.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.0.w2.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.1.w1.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.1.w3.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.1.w2.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.shared_experts.w1.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.shared_experts.w3.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.shared_experts.w2.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+        ];
+        write_mixtral_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_mixtral_shared_expert_gate(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.block_sparse_moe.gate.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.0.w1.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.0.w3.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.0.w2.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.1.w1.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.1.w3.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.1.w2.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.shared_experts.w1.weight",
+                vec![2, 2],
+                &[1.0, 0.0, 0.0, 1.0],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.shared_experts.w3.weight",
+                vec![2, 2],
+                &[1.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.shared_experts.w2.weight",
+                vec![2, 2],
+                &[1.0, 0.0, 0.0, 1.0],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.shared_expert_gate.weight",
+                vec![2, 1],
+                &[4.0, 0.0],
+            ),
+            tensor_f32(
+                "blk.0.block_sparse_moe.shared_expert_gate.bias",
+                vec![1],
+                &[1.0],
+            ),
+        ];
+        write_mixtral_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_mixtral_packed_shared_expert(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.block_sparse_moe.gate.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.0.w1.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.0.w3.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.0.w2.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.1.w1.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.1.w3.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.experts.1.w2.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.shared_experts.gate_up_proj.weight",
+                vec![2, 4],
+                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            ),
+            tensor_f16(
+                "blk.0.block_sparse_moe.shared_experts.w2.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+        ];
+        write_mixtral_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_deepseek_dense(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_gate.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_up.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_deepseek_gguf(path, tensors, false);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_deepseek_mla_metadata_split(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_gate.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_up.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_deepseek_mla_metadata_split_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_deepseek_mla_sidecar_split(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_kv_a_mqa.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_gate.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_up.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_deepseek_mla_metadata_split_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_deepseek_true_mla(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q_a.weight", vec![2, 1], &[0.0; 2]),
+            tensor_f32("blk.0.attn_q_a_norm.weight", vec![1], &[1.0]),
+            tensor_f16("blk.0.attn_q_b.weight", vec![1, 2], &[0.0; 2]),
+            tensor_f16("blk.0.attn_kv_a_mqa.weight", vec![2, 3], &[0.0; 6]),
+            tensor_f32("blk.0.attn_kv_a_norm.weight", vec![1], &[1.0]),
+            tensor_f16("blk.0.attn_kv_b.weight", vec![1, 2], &[0.0; 2]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_gate.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_up.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_deepseek_true_mla_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_deepseek_true_mla_attention_aliases(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "transformer.embedding.word_embeddings.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f16(
+                "transformer.output_layer.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32(
+                "transformer.encoder.final_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f32(
+                "transformer.encoder.layers.0.input_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f32(
+                "transformer.encoder.layers.0.post_attention_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f16(
+                "transformer.encoder.layers.0.attention.q_a_proj.weight",
+                vec![2, 1],
+                &[0.0; 2],
+            ),
+            tensor_f32(
+                "transformer.encoder.layers.0.attention.q_a_layernorm.weight",
+                vec![1],
+                &[1.0],
+            ),
+            tensor_f16(
+                "transformer.encoder.layers.0.attention.q_b_proj.weight",
+                vec![1, 2],
+                &[0.0; 2],
+            ),
+            tensor_f16(
+                "transformer.encoder.layers.0.attention.kv_a_proj_with_mqa.weight",
+                vec![2, 3],
+                &[0.0; 6],
+            ),
+            tensor_f32(
+                "transformer.encoder.layers.0.attention.kv_a_layernorm.weight",
+                vec![1],
+                &[1.0],
+            ),
+            tensor_f16(
+                "transformer.encoder.layers.0.attention.kv_b_proj.weight",
+                vec![1, 2],
+                &[0.0; 2],
+            ),
+            tensor_f16(
+                "transformer.encoder.layers.0.attention.dense.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "transformer.encoder.layers.0.mlp.gate_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "transformer.encoder.layers.0.mlp.up_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "transformer.encoder.layers.0.mlp.down_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+        ];
+        write_deepseek_true_mla_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_deepseek_true_mla_self_attn_aliases(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "model.embed_tokens.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f16(
+                "model.lm_head.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("model.norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32(
+                "model.layers.0.input_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f32(
+                "model.layers.0.post_attention_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f16(
+                "model.layers.0.self_attn.q_a_proj.weight",
+                vec![2, 1],
+                &[0.0; 2],
+            ),
+            tensor_f32("model.layers.0.self_attn.q_a_norm.weight", vec![1], &[1.0]),
+            tensor_f16(
+                "model.layers.0.self_attn.q_b_proj.weight",
+                vec![1, 2],
+                &[0.0; 2],
+            ),
+            tensor_f16(
+                "model.layers.0.self_attn.kv_a_proj.weight",
+                vec![2, 3],
+                &[0.0; 6],
+            ),
+            tensor_f32("model.layers.0.self_attn.kv_a_norm.weight", vec![1], &[1.0]),
+            tensor_f16(
+                "model.layers.0.self_attn.kv_b_proj.weight",
+                vec![1, 2],
+                &[0.0; 2],
+            ),
+            tensor_f16(
+                "model.layers.0.self_attn.o_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16("model.layers.0.mlp.gate_proj.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("model.layers.0.mlp.up_proj.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("model.layers.0.mlp.down_proj.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_deepseek_true_mla_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_deepseek_true_mla_mrope(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q_a.weight", vec![2, 1], &[0.0; 2]),
+            tensor_f32("blk.0.attn_q_a_norm.weight", vec![1], &[1.0]),
+            tensor_f16("blk.0.attn_q_b.weight", vec![1, 2], &[0.0; 2]),
+            tensor_f16("blk.0.attn_kv_a_mqa.weight", vec![2, 3], &[0.0; 6]),
+            tensor_f32("blk.0.attn_kv_a_norm.weight", vec![1], &[1.0]),
+            tensor_f16("blk.0.attn_kv_b.weight", vec![1, 2], &[0.0; 2]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_gate.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_up.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_deepseek_true_mla_gguf_with_mrope(path, tensors, Some([1, 0, 0, 0]));
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_deepseek_mla_metadata_packed(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16(
+                "blk.0.self_attn.W_pack.weight",
+                vec![2, 6],
+                &[
+                    1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+                ],
+            ),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16(
+                "blk.0.mlp.w1w3.weight",
+                vec![2, 4],
+                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            ),
+            tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_deepseek_mla_metadata_split_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_glm_dense(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_gate.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_up.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_glm_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_glm_transformer_aliases(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "transformer.embedding.word_embeddings.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f16(
+                "transformer.output_layer.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32(
+                "transformer.encoder.final_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f32(
+                "transformer.encoder.layers.0.input_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f32(
+                "transformer.encoder.layers.0.post_attention_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f16(
+                "transformer.encoder.layers.0.self_attention.query_key_value.weight",
+                vec![2, 6],
+                &[
+                    1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+                ],
+            ),
+            tensor_f32(
+                "transformer.encoder.layers.0.self_attention.query_key_value.bias",
+                vec![6],
+                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            ),
+            tensor_f16(
+                "transformer.encoder.layers.0.self_attention.dense.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "transformer.encoder.layers.0.mlp.dense_h_to_4h.weight",
+                vec![2, 4],
+                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            ),
+            tensor_f16(
+                "transformer.encoder.layers.0.mlp.dense_4h_to_h.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+        ];
+        write_glm_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_glm_gpt_neox_aliases(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "gpt_neox.embed_in.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f16(
+                "gpt_neox.embed_out.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("gpt_neox.final_layer_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32(
+                "gpt_neox.layers.0.input_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f32(
+                "gpt_neox.layers.0.post_attention_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f16(
+                "gpt_neox.layers.0.attention.query_key_value.weight",
+                vec![2, 6],
+                &[
+                    1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+                ],
+            ),
+            tensor_f32(
+                "gpt_neox.layers.0.attention.query_key_value.bias",
+                vec![6],
+                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            ),
+            tensor_f16(
+                "gpt_neox.layers.0.attention.dense.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "gpt_neox.layers.0.mlp.dense_h_to_4h.weight",
+                vec![2, 4],
+                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            ),
+            tensor_f16(
+                "gpt_neox.layers.0.mlp.dense_4h_to_h.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+        ];
+        write_glm_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_glm_model_transformer_w_aliases(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "model.transformer.wte.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f16(
+                "model.transformer.lm_head.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32(
+                "model.transformer.final_layer_norm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f32(
+                "model.transformer.layers.0.pre_attention_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f32(
+                "model.transformer.layers.0.pre_feedforward_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f16(
+                "model.transformer.layers.0.self_attention.Wq.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "model.transformer.layers.0.self_attention.Wk.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "model.transformer.layers.0.self_attention.Wv.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "model.transformer.layers.0.self_attention.Wo.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "model.transformer.layers.0.mlp.w1.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "model.transformer.layers.0.mlp.w3.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "model.transformer.layers.0.mlp.w2.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+        ];
+        write_glm_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_glm_mla_metadata_split(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_gate.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_up.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_glm_mla_metadata_split_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_glm_mla_sidecar_split(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16(
+                "blk.0.attn_kv_a_proj_with_mqa.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16("blk.0.ffn_gate.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_up.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_glm_mla_metadata_split_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_glm_true_mla(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q_a_proj.weight", vec![2, 1], &[0.0; 2]),
+            tensor_f32("blk.0.attn_q_a_layernorm.weight", vec![1], &[1.0]),
+            tensor_f16("blk.0.attn_q_b_proj.weight", vec![1, 2], &[0.0; 2]),
+            tensor_f16(
+                "blk.0.attn_kv_a_proj_with_mqa.weight",
+                vec![2, 3],
+                &[0.0; 6],
+            ),
+            tensor_f32("blk.0.attn_kv_a_layernorm.weight", vec![1], &[1.0]),
+            tensor_f16("blk.0.attn_kv_b_proj.weight", vec![1, 2], &[0.0; 2]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_gate.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_up.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_glm_true_mla_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_glm_true_mla_self_attention_aliases(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "transformer.embedding.word_embeddings.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f16(
+                "transformer.output_layer.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32(
+                "transformer.encoder.final_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f32(
+                "transformer.encoder.layers.0.input_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f32(
+                "transformer.encoder.layers.0.post_attention_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f16(
+                "transformer.encoder.layers.0.self_attention.q_a_proj.weight",
+                vec![2, 1],
+                &[0.0; 2],
+            ),
+            tensor_f32(
+                "transformer.encoder.layers.0.self_attention.q_a_layernorm.weight",
+                vec![1],
+                &[1.0],
+            ),
+            tensor_f16(
+                "transformer.encoder.layers.0.self_attention.q_b_proj.weight",
+                vec![1, 2],
+                &[0.0; 2],
+            ),
+            tensor_f16(
+                "transformer.encoder.layers.0.self_attention.kv_a_proj_with_mqa.weight",
+                vec![2, 3],
+                &[0.0; 6],
+            ),
+            tensor_f32(
+                "transformer.encoder.layers.0.self_attention.kv_a_layernorm.weight",
+                vec![1],
+                &[1.0],
+            ),
+            tensor_f16(
+                "transformer.encoder.layers.0.self_attention.kv_b_proj.weight",
+                vec![1, 2],
+                &[0.0; 2],
+            ),
+            tensor_f16(
+                "transformer.encoder.layers.0.self_attention.dense.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "transformer.encoder.layers.0.mlp.gate_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "transformer.encoder.layers.0.mlp.up_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "transformer.encoder.layers.0.mlp.down_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+        ];
+        write_glm_true_mla_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_glm_true_mla_attention_aliases(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "transformer.embedding.word_embeddings.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f16(
+                "transformer.output_layer.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32(
+                "transformer.encoder.final_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f32(
+                "transformer.encoder.layers.0.input_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f32(
+                "transformer.encoder.layers.0.post_attention_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f16(
+                "transformer.encoder.layers.0.attention.q_a_proj.weight",
+                vec![2, 1],
+                &[0.0; 2],
+            ),
+            tensor_f32(
+                "transformer.encoder.layers.0.attention.q_a_layernorm.weight",
+                vec![1],
+                &[1.0],
+            ),
+            tensor_f16(
+                "transformer.encoder.layers.0.attention.q_b_proj.weight",
+                vec![1, 2],
+                &[0.0; 2],
+            ),
+            tensor_f16(
+                "transformer.encoder.layers.0.attention.kv_a_proj_with_mqa.weight",
+                vec![2, 3],
+                &[0.0; 6],
+            ),
+            tensor_f32(
+                "transformer.encoder.layers.0.attention.kv_a_layernorm.weight",
+                vec![1],
+                &[1.0],
+            ),
+            tensor_f16(
+                "transformer.encoder.layers.0.attention.kv_b_proj.weight",
+                vec![1, 2],
+                &[0.0; 2],
+            ),
+            tensor_f16(
+                "transformer.encoder.layers.0.attention.dense.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "transformer.encoder.layers.0.mlp.gate_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "transformer.encoder.layers.0.mlp.up_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "transformer.encoder.layers.0.mlp.down_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+        ];
+        write_glm_true_mla_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_glm_true_mla_self_attn_aliases(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "model.embed_tokens.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f16(
+                "model.lm_head.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("model.norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32(
+                "model.layers.0.input_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f32(
+                "model.layers.0.post_attention_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f16(
+                "model.layers.0.self_attn.q_a_proj.weight",
+                vec![2, 1],
+                &[0.0; 2],
+            ),
+            tensor_f32(
+                "model.layers.0.self_attn.q_a_layernorm.weight",
+                vec![1],
+                &[1.0],
+            ),
+            tensor_f16(
+                "model.layers.0.self_attn.q_b_proj.weight",
+                vec![1, 2],
+                &[0.0; 2],
+            ),
+            tensor_f16(
+                "model.layers.0.self_attn.kv_a_proj.weight",
+                vec![2, 3],
+                &[0.0; 6],
+            ),
+            tensor_f32(
+                "model.layers.0.self_attn.kv_a_layernorm.weight",
+                vec![1],
+                &[1.0],
+            ),
+            tensor_f16(
+                "model.layers.0.self_attn.kv_b_proj.weight",
+                vec![1, 2],
+                &[0.0; 2],
+            ),
+            tensor_f16(
+                "model.layers.0.self_attn.o_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16("model.layers.0.mlp.gate_proj.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("model.layers.0.mlp.up_proj.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("model.layers.0.mlp.down_proj.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_glm_true_mla_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_glm_mla_metadata_packed(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16(
+                "blk.0.self_attn.W_pack.weight",
+                vec![2, 6],
+                &[
+                    1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+                ],
+            ),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16(
+                "blk.0.mlp.w1w3.weight",
+                vec![2, 4],
+                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            ),
+            tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_glm_mla_metadata_split_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_glm_flash_dense(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_gate.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_up.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_glm_flash_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_glm_flash_moe(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_gate_inp.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_gate_exps.weight", vec![2, 2, 2], &[0.0; 8]),
+            tensor_f16("blk.0.ffn_up_exps.weight", vec![2, 2, 2], &[0.0; 8]),
+            tensor_f16("blk.0.ffn_down_exps.weight", vec![2, 2, 2], &[0.0; 8]),
+        ];
+        write_glm_flash_moe_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_glm_moe(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_gate_inp.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_gate_exps.weight", vec![2, 2, 2], &[0.0; 8]),
+            tensor_f16("blk.0.ffn_up_exps.weight", vec![2, 2, 2], &[0.0; 8]),
+            tensor_f16("blk.0.ffn_down_exps.weight", vec![2, 2, 2], &[0.0; 8]),
+        ];
+        write_glm_moe_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_deepseek_moe(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_gate_inp.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_gate_exps.weight", vec![2, 2, 2], &[0.0; 8]),
+            tensor_f16("blk.0.ffn_up_exps.weight", vec![2, 2, 2], &[0.0; 8]),
+            tensor_f16("blk.0.ffn_down_exps.weight", vec![2, 2, 2], &[0.0; 8]),
+        ];
+        write_deepseek_gguf(path, tensors, true);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_gemma(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_gate.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_up.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_gemma_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_gemma_pre_feedforward_aliases(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "model.embed_tokens.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("model.norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32(
+                "model.layers.0.input_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f32(
+                "model.layers.0.pre_feedforward_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f16(
+                "model.layers.0.self_attn.q_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "model.layers.0.self_attn.k_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "model.layers.0.self_attn.v_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "model.layers.0.self_attn.o_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16("model.layers.0.mlp.gate_proj.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("model.layers.0.mlp.up_proj.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("model.layers.0.mlp.down_proj.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_gemma_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_gemma_post_feedforward_aliases(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "model.embed_tokens.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("model.norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32(
+                "model.layers.0.input_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f32(
+                "model.layers.0.post_feedforward_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f16(
+                "model.layers.0.self_attn.q_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "model.layers.0.self_attn.k_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "model.layers.0.self_attn.v_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16("model.layers.0.self_attn.out.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("model.layers.0.mlp.gate_proj.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("model.layers.0.mlp.up_proj.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("model.layers.0.mlp.proj.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_gemma_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_gemma_dense_bias_aliases(path: &Path) {
+        write_reference_gemma_dense_bias_aliases_with_values(
+            path,
+            &[0.0, 0.0],
+            &[0.0, 0.0],
+            &[0.0, 0.0],
+            &[0.0, 0.0],
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_gemma_dense_bias_aliases_with_values(
+        path: &Path,
+        attn_output_bias: &[f32; 2],
+        gate_bias: &[f32; 2],
+        up_bias: &[f32; 2],
+        down_bias: &[f32; 2],
+    ) {
+        let tensors = vec![
+            tensor_f16(
+                "model.embed_tokens.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("model.norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32(
+                "model.layers.0.input_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f32(
+                "model.layers.0.post_feedforward_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f16(
+                "model.layers.0.self_attn.q_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "model.layers.0.self_attn.k_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "model.layers.0.self_attn.v_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f16(
+                "model.layers.0.self_attn.o_proj.weight",
+                vec![2, 2],
+                &[0.0; 4],
+            ),
+            tensor_f32(
+                "model.layers.0.self_attn.o_proj.bias",
+                vec![2],
+                attn_output_bias,
+            ),
+            tensor_f16("model.layers.0.mlp.gate_proj.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f32("model.layers.0.mlp.gate_proj.bias", vec![2], gate_bias),
+            tensor_f16("model.layers.0.mlp.up_proj.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f32("model.layers.0.mlp.up_proj.bias", vec![2], up_bias),
+            tensor_f16("model.layers.0.mlp.down_proj.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f32("model.layers.0.mlp.down_proj.bias", vec![2], down_bias),
+        ];
+        write_gemma_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_phi(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_gate.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_up.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_phi_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_phi_packed(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16(
+                "blk.0.attn_qkv.weight",
+                vec![2, 6],
+                &[
+                    1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+                ],
+            ),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16(
+                "blk.0.ffn_gate.weight",
+                vec![2, 4],
+                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            ),
+            tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_phi_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_phi_packed_ffn_gate_up(path: &Path) {
+        let tensors = phi_packed_with_ffn_tensor(
+            "blk.0.ffn_gate_up.weight",
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+        );
+        write_phi_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_phi_packed_ffn_up_gate(path: &Path) {
+        let tensors = phi_packed_with_ffn_tensor(
+            "blk.0.ffn_up_gate.weight",
+            &[5.0, 6.0, 7.0, 8.0, 1.0, 2.0, 3.0, 4.0],
+        );
+        write_phi_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn phi_packed_with_ffn_tensor(name: &str, ffn_values: &[f32; 8]) -> Vec<TestTensor> {
+        vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16(
+                "blk.0.attn_qkv.weight",
+                vec![2, 6],
+                &[
+                    1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+                ],
+            ),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16(name, vec![2, 4], ffn_values),
+            tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ]
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_phi_packed_qkv_bias(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16(
+                "blk.0.attn_qkv.weight",
+                vec![2, 6],
+                &[
+                    1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+                ],
+            ),
+            tensor_f32(
+                "blk.0.attn_qkv.bias",
+                vec![6],
+                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            ),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16(
+                "blk.0.ffn_gate.weight",
+                vec![2, 4],
+                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            ),
+            tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_phi_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_phi_split_qkv_bias(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_q.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f32("blk.0.attn_q.bias", vec![2], &[1.0, 2.0]),
+            tensor_f16("blk.0.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f32("blk.0.attn_k.bias", vec![2], &[3.0, 4.0]),
+            tensor_f16("blk.0.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f32("blk.0.attn_v.bias", vec![2], &[5.0, 6.0]),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_gate.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_up.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_phi_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_phi_packed_aliases(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16(
+                "blk.0.self_attn.qkv_proj.weight",
+                vec![2, 6],
+                &[
+                    1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+                ],
+            ),
+            tensor_f32(
+                "blk.0.self_attn.qkv_proj.bias",
+                vec![6],
+                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            ),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16(
+                "blk.0.mlp.up_gate_proj.weight",
+                vec![2, 4],
+                &[5.0, 6.0, 7.0, 8.0, 1.0, 2.0, 3.0, 4.0],
+            ),
+            tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_phi_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_phi_hf_gate_up_packed_aliases(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16(
+                "blk.0.self_attn.qkv_proj.weight",
+                vec![2, 6],
+                &[
+                    1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+                ],
+            ),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16(
+                "blk.0.mlp.gate_up_proj.weight",
+                vec![2, 4],
+                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            ),
+            tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_phi_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_phi_query_key_value_packed_aliases(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16(
+                "blk.0.query_key_value.weight",
+                vec![2, 6],
+                &[
+                    1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+                ],
+            ),
+            tensor_f32(
+                "blk.0.query_key_value.bias",
+                vec![6],
+                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            ),
+            tensor_f16("blk.0.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16(
+                "blk.0.mlp.up_gate_proj.weight",
+                vec![2, 4],
+                &[5.0, 6.0, 7.0, 8.0, 1.0, 2.0, 3.0, 4.0],
+            ),
+            tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_phi_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_phi_mixer_packed_qkv(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.input_layernorm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32(
+                "blk.0.post_attention_layernorm.weight",
+                vec![2],
+                &[1.0, 1.0],
+            ),
+            tensor_f16(
+                "blk.0.mixer.Wqkv.weight",
+                vec![2, 6],
+                &[
+                    1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+                ],
+            ),
+            tensor_f32(
+                "blk.0.mixer.Wqkv.bias",
+                vec![6],
+                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            ),
+            tensor_f16("blk.0.mixer.out_proj.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16(
+                "blk.0.mlp.fc1.weight",
+                vec![2, 4],
+                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            ),
+            tensor_f16("blk.0.mlp.fc2.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_phi_gguf(path, tensors);
+    }
+
+    fn write_qwen_gguf(path: &Path, tensors: Vec<TestTensor>) {
+        write_qwen_gguf_with_dims(path, tensors, 2, 2, 1, 1, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_qwen_moe_gguf(path: &Path, tensors: Vec<TestTensor>) {
+        let mut data = Vec::new();
+        let tensors = tensors
+            .into_iter()
+            .map(|mut tensor| {
+                pad_to_alignment(&mut data, 32);
+                tensor.offset = data.len() as u64;
+                data.extend_from_slice(&tensor.bytes);
+                tensor
+            })
+            .collect::<Vec<_>>();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        write_u32(&mut bytes, 3);
+        write_u64(&mut bytes, tensors.len() as u64);
+        write_u64(&mut bytes, 16);
+
+        write_kv_string(&mut bytes, "general.architecture", "qwen3moe");
+        write_kv_string(&mut bytes, "general.name", "cpu-reference-qwen-moe");
+        write_kv_u32(&mut bytes, "general.alignment", 32);
+        write_kv_u32(&mut bytes, "general.file_type", 1);
+        write_kv_u32(&mut bytes, "qwen3moe.context_length", 128);
+        write_kv_u32(&mut bytes, "qwen3moe.embedding_length", 2);
+        write_kv_u32(&mut bytes, "qwen3moe.expert_feed_forward_length", 2);
+        write_kv_u32(&mut bytes, "qwen3moe.block_count", 1);
+        write_kv_u32(&mut bytes, "qwen3moe.attention.head_count", 1);
+        write_kv_u32(&mut bytes, "qwen3moe.attention.head_count_kv", 1);
+        write_kv_f32(
+            &mut bytes,
+            "qwen3moe.attention.layer_norm_rms_epsilon",
+            1.0e-6,
+        );
+        write_kv_f32(&mut bytes, "qwen3moe.rope.freq_base", 1_000_000.0);
+        write_kv_u32(&mut bytes, "qwen3moe.expert_count", 2);
+        write_kv_u32(&mut bytes, "qwen3moe.expert_used_count", 1);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.eos_token_id", 2);
+        write_kv_string_array(&mut bytes, "tokenizer.ggml.tokens", &["a", "b", "c"]);
+
+        for tensor in tensors {
+            write_string(&mut bytes, &tensor.name);
+            write_u32(&mut bytes, tensor.dims.len() as u32);
+            for dim in tensor.dims {
+                write_u64(&mut bytes, dim);
+            }
+            write_u32(&mut bytes, tensor.dtype);
+            write_u64(&mut bytes, tensor.offset);
+        }
+
+        pad_to_alignment(&mut bytes, 32);
+        bytes.extend(data);
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_qwen_next_gguf(path: &Path, tensors: Vec<TestTensor>) {
+        let mut data = Vec::new();
+        let tensors = tensors
+            .into_iter()
+            .map(|mut tensor| {
+                pad_to_alignment(&mut data, 32);
+                tensor.offset = data.len() as u64;
+                data.extend_from_slice(&tensor.bytes);
+                tensor
+            })
+            .collect::<Vec<_>>();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        write_u32(&mut bytes, 3);
+        write_u64(&mut bytes, tensors.len() as u64);
+        write_u64(&mut bytes, 15);
+
+        write_kv_string(&mut bytes, "general.architecture", "qwen3next");
+        write_kv_string(&mut bytes, "general.name", "cpu-reference-qwen-next");
+        write_kv_u32(&mut bytes, "general.alignment", 32);
+        write_kv_u32(&mut bytes, "general.file_type", 1);
+        write_kv_u32(&mut bytes, "qwen3next.context_length", 128);
+        write_kv_u32(&mut bytes, "qwen3next.embedding_length", 2);
+        write_kv_u32(&mut bytes, "qwen3next.feed_forward_length", 2);
+        write_kv_u32(&mut bytes, "qwen3next.block_count", 1);
+        write_kv_u32(&mut bytes, "qwen3next.attention.head_count", 1);
+        write_kv_u32(&mut bytes, "qwen3next.attention.head_count_kv", 1);
+        write_kv_f32(
+            &mut bytes,
+            "qwen3next.attention.layer_norm_rms_epsilon",
+            1.0e-6,
+        );
+        write_kv_f32(&mut bytes, "qwen3next.rope.freq_base", 1_000_000.0);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.eos_token_id", 2);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.unknown_token_id", 2);
+        write_kv_string_array(&mut bytes, "tokenizer.ggml.tokens", &["a", "b", "c"]);
+
+        for tensor in tensors {
+            write_string(&mut bytes, &tensor.name);
+            write_u32(&mut bytes, tensor.dims.len() as u32);
+            for dim in tensor.dims {
+                write_u64(&mut bytes, dim);
+            }
+            write_u32(&mut bytes, tensor.dtype);
+            write_u64(&mut bytes, tensor.offset);
+        }
+
+        pad_to_alignment(&mut bytes, 32);
+        bytes.extend(data);
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_qwen_next_ssm_metadata_dense_gguf(path: &Path, tensors: Vec<TestTensor>) {
+        let mut data = Vec::new();
+        let tensors = tensors
+            .into_iter()
+            .map(|mut tensor| {
+                pad_to_alignment(&mut data, 32);
+                tensor.offset = data.len() as u64;
+                data.extend_from_slice(&tensor.bytes);
+                tensor
+            })
+            .collect::<Vec<_>>();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        write_u32(&mut bytes, 3);
+        write_u64(&mut bytes, tensors.len() as u64);
+        write_u64(&mut bytes, 16);
+
+        write_kv_string(&mut bytes, "general.architecture", "qwen3next");
+        write_kv_string(
+            &mut bytes,
+            "general.name",
+            "cpu-reference-qwen-next-ssm-metadata-dense",
+        );
+        write_kv_u32(&mut bytes, "general.alignment", 32);
+        write_kv_u32(&mut bytes, "general.file_type", 1);
+        write_kv_u32(&mut bytes, "qwen3next.context_length", 128);
+        write_kv_u32(&mut bytes, "qwen3next.embedding_length", 2);
+        write_kv_u32(&mut bytes, "qwen3next.feed_forward_length", 2);
+        write_kv_u32(&mut bytes, "qwen3next.block_count", 1);
+        write_kv_u32(&mut bytes, "qwen3next.attention.head_count", 1);
+        write_kv_u32(&mut bytes, "qwen3next.attention.head_count_kv", 1);
+        write_kv_f32(
+            &mut bytes,
+            "qwen3next.attention.layer_norm_rms_epsilon",
+            1.0e-6,
+        );
+        write_kv_f32(&mut bytes, "qwen3next.rope.freq_base", 1_000_000.0);
+        write_kv_u32(&mut bytes, "qwen3next.ssm.state_size", 16);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.eos_token_id", 2);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.unknown_token_id", 2);
+        write_kv_string_array(&mut bytes, "tokenizer.ggml.tokens", &["a", "b", "c"]);
+
+        for tensor in tensors {
+            write_string(&mut bytes, &tensor.name);
+            write_u32(&mut bytes, tensor.dims.len() as u32);
+            for dim in tensor.dims {
+                write_u64(&mut bytes, dim);
+            }
+            write_u32(&mut bytes, tensor.dtype);
+            write_u64(&mut bytes, tensor.offset);
+        }
+
+        pad_to_alignment(&mut bytes, 32);
+        bytes.extend(data);
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_qwen_next_recurrent_ssm_gguf(path: &Path, tensors: Vec<TestTensor>) {
+        let mut data = Vec::new();
+        let tensors = tensors
+            .into_iter()
+            .map(|mut tensor| {
+                pad_to_alignment(&mut data, 32);
+                tensor.offset = data.len() as u64;
+                data.extend_from_slice(&tensor.bytes);
+                tensor
+            })
+            .collect::<Vec<_>>();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        write_u32(&mut bytes, 3);
+        write_u64(&mut bytes, tensors.len() as u64);
+        write_u64(&mut bytes, 20);
+
+        write_kv_string(&mut bytes, "general.architecture", "qwen3next");
+        write_kv_string(
+            &mut bytes,
+            "general.name",
+            "cpu-reference-qwen-next-recurrent-ssm",
+        );
+        write_kv_u32(&mut bytes, "general.alignment", 32);
+        write_kv_u32(&mut bytes, "general.file_type", 1);
+        write_kv_u32(&mut bytes, "qwen3next.context_length", 128);
+        write_kv_u32(&mut bytes, "qwen3next.embedding_length", 2);
+        write_kv_u32(&mut bytes, "qwen3next.feed_forward_length", 2);
+        write_kv_u32(&mut bytes, "qwen3next.block_count", 1);
+        write_kv_u32(&mut bytes, "qwen3next.attention.head_count", 1);
+        write_kv_u32(&mut bytes, "qwen3next.attention.head_count_kv", 1);
+        write_kv_f32(
+            &mut bytes,
+            "qwen3next.attention.layer_norm_rms_epsilon",
+            1.0e-6,
+        );
+        write_kv_f32(&mut bytes, "qwen3next.rope.freq_base", 1_000_000.0);
+        write_kv_u32(&mut bytes, "qwen3next.ssm.conv_kernel", 1);
+        write_kv_u32(&mut bytes, "qwen3next.ssm.inner_size", 2);
+        write_kv_u32(&mut bytes, "qwen3next.ssm.state_size", 2);
+        write_kv_u32(&mut bytes, "qwen3next.ssm.time_step_rank", 1);
+        write_kv_u32(&mut bytes, "qwen3next.ssm.group_count", 1);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.eos_token_id", 2);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.unknown_token_id", 2);
+        write_kv_string_array(&mut bytes, "tokenizer.ggml.tokens", &["a", "b", "c"]);
+
+        for tensor in tensors {
+            write_string(&mut bytes, &tensor.name);
+            write_u32(&mut bytes, tensor.dims.len() as u32);
+            for dim in tensor.dims {
+                write_u64(&mut bytes, dim);
+            }
+            write_u32(&mut bytes, tensor.dtype);
+            write_u64(&mut bytes, tensor.offset);
+        }
+
+        pad_to_alignment(&mut bytes, 32);
+        bytes.extend(data);
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_qwen_ssm_metadata_gguf(path: &Path, tensors: Vec<TestTensor>) {
+        let mut data = Vec::new();
+        let tensors = tensors
+            .into_iter()
+            .map(|mut tensor| {
+                pad_to_alignment(&mut data, 32);
+                tensor.offset = data.len() as u64;
+                data.extend_from_slice(&tensor.bytes);
+                tensor
+            })
+            .collect::<Vec<_>>();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        write_u32(&mut bytes, 3);
+        write_u64(&mut bytes, tensors.len() as u64);
+        write_u64(&mut bytes, 16);
+
+        write_kv_string(&mut bytes, "general.architecture", "qwen2");
+        write_kv_string(
+            &mut bytes,
+            "general.name",
+            "cpu-reference-qwen-ssm-metadata",
+        );
+        write_kv_u32(&mut bytes, "general.alignment", 32);
+        write_kv_u32(&mut bytes, "general.file_type", 1);
+        write_kv_u32(&mut bytes, "qwen2.context_length", 128);
+        write_kv_u32(&mut bytes, "qwen2.embedding_length", 2);
+        write_kv_u32(&mut bytes, "qwen2.feed_forward_length", 2);
+        write_kv_u32(&mut bytes, "qwen2.block_count", 1);
+        write_kv_u32(&mut bytes, "qwen2.attention.head_count", 1);
+        write_kv_u32(&mut bytes, "qwen2.attention.head_count_kv", 1);
+        write_kv_f32(&mut bytes, "qwen2.attention.layer_norm_rms_epsilon", 1.0e-6);
+        write_kv_f32(&mut bytes, "qwen2.rope.freq_base", 1_000_000.0);
+        write_kv_u32(&mut bytes, "qwen2.ssm.state_size", 16);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.eos_token_id", 2);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.unknown_token_id", 2);
+        write_kv_string_array(&mut bytes, "tokenizer.ggml.tokens", &["a", "b", "c"]);
+
+        for tensor in tensors {
+            write_string(&mut bytes, &tensor.name);
+            write_u32(&mut bytes, tensor.dims.len() as u32);
+            for dim in tensor.dims {
+                write_u64(&mut bytes, dim);
+            }
+            write_u32(&mut bytes, tensor.dtype);
+            write_u64(&mut bytes, tensor.offset);
+        }
+
+        pad_to_alignment(&mut bytes, 32);
+        bytes.extend(data);
+        fs::write(path, bytes).unwrap();
+    }
+
+    fn write_qwen_gguf_with_dims(
+        path: &Path,
+        tensors: Vec<TestTensor>,
+        embedding_length: u32,
+        feed_forward_length: u32,
+        block_count: u32,
+        attention_head_count: u32,
+        attention_head_count_kv: u32,
+    ) {
+        let mut data = Vec::new();
+        let tensors = tensors
+            .into_iter()
+            .map(|mut tensor| {
+                pad_to_alignment(&mut data, 32);
+                tensor.offset = data.len() as u64;
+                data.extend_from_slice(&tensor.bytes);
+                tensor
+            })
+            .collect::<Vec<_>>();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        write_u32(&mut bytes, 3);
+        write_u64(&mut bytes, tensors.len() as u64);
+        write_u64(&mut bytes, 15);
+
+        write_kv_string(&mut bytes, "general.architecture", "qwen2");
+        write_kv_string(&mut bytes, "general.name", "cpu-reference-qwen");
+        write_kv_u32(&mut bytes, "general.alignment", 32);
+        write_kv_u32(&mut bytes, "general.file_type", 1);
+        write_kv_u32(&mut bytes, "qwen2.context_length", 128);
+        write_kv_u32(&mut bytes, "qwen2.embedding_length", embedding_length);
+        write_kv_u32(&mut bytes, "qwen2.feed_forward_length", feed_forward_length);
+        write_kv_u32(&mut bytes, "qwen2.block_count", block_count);
+        write_kv_u32(
+            &mut bytes,
+            "qwen2.attention.head_count",
+            attention_head_count,
+        );
+        write_kv_u32(
+            &mut bytes,
+            "qwen2.attention.head_count_kv",
+            attention_head_count_kv,
+        );
+        write_kv_f32(&mut bytes, "qwen2.attention.layer_norm_rms_epsilon", 1.0e-6);
+        write_kv_f32(&mut bytes, "qwen2.rope.freq_base", 1_000_000.0);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.eos_token_id", 2);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.unknown_token_id", 2);
+        write_kv_string_array(&mut bytes, "tokenizer.ggml.tokens", &["a", "b", "c"]);
+
+        for tensor in tensors {
+            write_string(&mut bytes, &tensor.name);
+            write_u32(&mut bytes, tensor.dims.len() as u32);
+            for dim in tensor.dims {
+                write_u64(&mut bytes, dim);
+            }
+            write_u32(&mut bytes, tensor.dtype);
+            write_u64(&mut bytes, tensor.offset);
+        }
+
+        pad_to_alignment(&mut bytes, 32);
+        bytes.extend(data);
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_qwen_custom_kv_gguf(
+        path: &Path,
+        tensors: Vec<TestTensor>,
+        value_head_dim: u32,
+        name: &str,
+    ) {
+        let mut data = Vec::new();
+        let tensors = tensors
+            .into_iter()
+            .map(|mut tensor| {
+                pad_to_alignment(&mut data, 32);
+                tensor.offset = data.len() as u64;
+                data.extend_from_slice(&tensor.bytes);
+                tensor
+            })
+            .collect::<Vec<_>>();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        write_u32(&mut bytes, 3);
+        write_u64(&mut bytes, tensors.len() as u64);
+        write_u64(&mut bytes, 17);
+
+        write_kv_string(&mut bytes, "general.architecture", "qwen2");
+        write_kv_string(&mut bytes, "general.name", name);
+        write_kv_u32(&mut bytes, "general.alignment", 32);
+        write_kv_u32(&mut bytes, "general.file_type", 1);
+        write_kv_u32(&mut bytes, "qwen2.context_length", 128);
+        write_kv_u32(&mut bytes, "qwen2.embedding_length", 4);
+        write_kv_u32(&mut bytes, "qwen2.feed_forward_length", 4);
+        write_kv_u32(&mut bytes, "qwen2.block_count", 1);
+        write_kv_u32(&mut bytes, "qwen2.attention.head_count", 1);
+        write_kv_u32(&mut bytes, "qwen2.attention.head_count_kv", 1);
+        write_kv_u32(&mut bytes, "qwen2.attention.key_length", 2);
+        write_kv_u32(&mut bytes, "qwen2.attention.value_length", value_head_dim);
+        write_kv_f32(&mut bytes, "qwen2.attention.layer_norm_rms_epsilon", 1.0e-6);
+        write_kv_f32(&mut bytes, "qwen2.rope.freq_base", 1_000_000.0);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.eos_token_id", 2);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.unknown_token_id", 2);
+        write_kv_string_array(&mut bytes, "tokenizer.ggml.tokens", &["a", "b", "c"]);
+
+        for tensor in tensors {
+            write_string(&mut bytes, &tensor.name);
+            write_u32(&mut bytes, tensor.dims.len() as u32);
+            for dim in tensor.dims {
+                write_u64(&mut bytes, dim);
+            }
+            write_u32(&mut bytes, tensor.dtype);
+            write_u64(&mut bytes, tensor.offset);
+        }
+
+        pad_to_alignment(&mut bytes, 32);
+        bytes.extend(data);
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_qwen_vl_gguf(path: &Path, tensors: Vec<TestTensor>) {
+        write_qwen_vl_gguf_with_tokens(path, tensors, &["a", "b", "c", "<|image_pad|>"]);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_qwen_vl_video_gguf(path: &Path, tensors: Vec<TestTensor>) {
+        write_qwen_vl_gguf_with_tokens(
+            path,
+            tensors,
+            &["a", "b", "c", "<|image_pad|>", "<|video_pad|>"],
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_qwen_vl_gguf_with_tokens(path: &Path, tensors: Vec<TestTensor>, tokens: &[&str]) {
+        let mut data = Vec::new();
+        let tensors = tensors
+            .into_iter()
+            .map(|mut tensor| {
+                pad_to_alignment(&mut data, 32);
+                tensor.offset = data.len() as u64;
+                data.extend_from_slice(&tensor.bytes);
+                tensor
+            })
+            .collect::<Vec<_>>();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        write_u32(&mut bytes, 3);
+        write_u64(&mut bytes, tensors.len() as u64);
+        write_u64(&mut bytes, 16);
+
+        write_kv_string(&mut bytes, "general.architecture", "qwen2");
+        write_kv_string(&mut bytes, "general.name", "cpu-reference-qwen-vl");
+        write_kv_u32(&mut bytes, "general.alignment", 32);
+        write_kv_u32(&mut bytes, "general.file_type", 1);
+        write_kv_u32(&mut bytes, "qwen2.context_length", 512);
+        write_kv_u32(&mut bytes, "qwen2.embedding_length", 2);
+        write_kv_u32(&mut bytes, "qwen2.feed_forward_length", 2);
+        write_kv_u32(&mut bytes, "qwen2.block_count", 1);
+        write_kv_u32(&mut bytes, "qwen2.attention.head_count", 1);
+        write_kv_u32(&mut bytes, "qwen2.attention.head_count_kv", 1);
+        write_kv_f32(&mut bytes, "qwen2.attention.layer_norm_rms_epsilon", 1.0e-6);
+        write_kv_f32(&mut bytes, "qwen2.rope.freq_base", 1_000_000.0);
+        write_kv_i32_array(&mut bytes, "qwen2.rope.dimension_sections", &[1, 0, 0, 0]);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.eos_token_id", 2);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.unknown_token_id", 2);
+        write_kv_string_array(&mut bytes, "tokenizer.ggml.tokens", tokens);
+
+        for tensor in tensors {
+            write_string(&mut bytes, &tensor.name);
+            write_u32(&mut bytes, tensor.dims.len() as u32);
+            for dim in tensor.dims {
+                write_u64(&mut bytes, dim);
+            }
+            write_u32(&mut bytes, tensor.dtype);
+            write_u64(&mut bytes, tensor.offset);
+        }
+
+        pad_to_alignment(&mut bytes, 32);
+        bytes.extend(data);
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_llama_gguf(path: &Path, tensors: Vec<TestTensor>) {
+        let mut data = Vec::new();
+        let tensors = tensors
+            .into_iter()
+            .map(|mut tensor| {
+                pad_to_alignment(&mut data, 32);
+                tensor.offset = data.len() as u64;
+                data.extend_from_slice(&tensor.bytes);
+                tensor
+            })
+            .collect::<Vec<_>>();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        write_u32(&mut bytes, 3);
+        write_u64(&mut bytes, tensors.len() as u64);
+        write_u64(&mut bytes, 15);
+
+        write_kv_string(&mut bytes, "general.architecture", "llama");
+        write_kv_string(&mut bytes, "general.name", "cpu-reference-llama");
+        write_kv_u32(&mut bytes, "general.alignment", 32);
+        write_kv_u32(&mut bytes, "general.file_type", 1);
+        write_kv_u32(&mut bytes, "llama.context_length", 128);
+        write_kv_u32(&mut bytes, "llama.embedding_length", 2);
+        write_kv_u32(&mut bytes, "llama.feed_forward_length", 2);
+        write_kv_u32(&mut bytes, "llama.block_count", 1);
+        write_kv_u32(&mut bytes, "llama.attention.head_count", 1);
+        write_kv_u32(&mut bytes, "llama.attention.head_count_kv", 1);
+        write_kv_f32(&mut bytes, "llama.attention.layer_norm_rms_epsilon", 1.0e-6);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.eos_token_id", 2);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.unknown_token_id", 2);
+        write_kv_string_array(&mut bytes, "tokenizer.ggml.tokens", &["a", "b", "c"]);
+        write_kv_string(&mut bytes, "tokenizer.chat_template", LLAMA3_CHAT_TEMPLATE);
+
+        for tensor in tensors {
+            write_string(&mut bytes, &tensor.name);
+            write_u32(&mut bytes, tensor.dims.len() as u32);
+            for dim in tensor.dims {
+                write_u64(&mut bytes, dim);
+            }
+            write_u32(&mut bytes, tensor.dtype);
+            write_u64(&mut bytes, tensor.offset);
+        }
+
+        pad_to_alignment(&mut bytes, 32);
+        bytes.extend(data);
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_mistral_gguf(path: &Path, tensors: Vec<TestTensor>) {
+        let mut data = Vec::new();
+        let tensors = tensors
+            .into_iter()
+            .map(|mut tensor| {
+                pad_to_alignment(&mut data, 32);
+                tensor.offset = data.len() as u64;
+                data.extend_from_slice(&tensor.bytes);
+                tensor
+            })
+            .collect::<Vec<_>>();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        write_u32(&mut bytes, 3);
+        write_u64(&mut bytes, tensors.len() as u64);
+        write_u64(&mut bytes, 14);
+
+        write_kv_string(&mut bytes, "general.architecture", "mistral");
+        write_kv_string(&mut bytes, "general.name", "cpu-reference-mistral");
+        write_kv_u32(&mut bytes, "general.alignment", 32);
+        write_kv_u32(&mut bytes, "general.file_type", 1);
+        write_kv_u32(&mut bytes, "mistral.context_length", 128);
+        write_kv_u32(&mut bytes, "mistral.embedding_length", 2);
+        write_kv_u32(&mut bytes, "mistral.feed_forward_length", 2);
+        write_kv_u32(&mut bytes, "mistral.block_count", 1);
+        write_kv_u32(&mut bytes, "mistral.attention.head_count", 1);
+        write_kv_u32(&mut bytes, "mistral.attention.head_count_kv", 1);
+        write_kv_f32(
+            &mut bytes,
+            "mistral.attention.layer_norm_rms_epsilon",
+            1.0e-6,
+        );
+        write_kv_u32(&mut bytes, "tokenizer.ggml.eos_token_id", 2);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.unknown_token_id", 2);
+        write_kv_string_array(&mut bytes, "tokenizer.ggml.tokens", &["a", "b", "c"]);
+
+        for tensor in tensors {
+            write_string(&mut bytes, &tensor.name);
+            write_u32(&mut bytes, tensor.dims.len() as u32);
+            for dim in tensor.dims {
+                write_u64(&mut bytes, dim);
+            }
+            write_u32(&mut bytes, tensor.dtype);
+            write_u64(&mut bytes, tensor.offset);
+        }
+
+        pad_to_alignment(&mut bytes, 32);
+        bytes.extend(data);
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_mixtral_gguf(path: &Path, tensors: Vec<TestTensor>) {
+        let mut data = Vec::new();
+        let tensors = tensors
+            .into_iter()
+            .map(|mut tensor| {
+                pad_to_alignment(&mut data, 32);
+                tensor.offset = data.len() as u64;
+                data.extend_from_slice(&tensor.bytes);
+                tensor
+            })
+            .collect::<Vec<_>>();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        write_u32(&mut bytes, 3);
+        write_u64(&mut bytes, tensors.len() as u64);
+        write_u64(&mut bytes, 16);
+
+        write_kv_string(&mut bytes, "general.architecture", "mixtral");
+        write_kv_string(&mut bytes, "general.name", "cpu-reference-mixtral");
+        write_kv_u32(&mut bytes, "general.alignment", 32);
+        write_kv_u32(&mut bytes, "general.file_type", 1);
+        write_kv_u32(&mut bytes, "mixtral.context_length", 128);
+        write_kv_u32(&mut bytes, "mixtral.embedding_length", 2);
+        write_kv_u32(&mut bytes, "mixtral.feed_forward_length", 2);
+        write_kv_u32(&mut bytes, "mixtral.block_count", 1);
+        write_kv_u32(&mut bytes, "mixtral.attention.head_count", 1);
+        write_kv_u32(&mut bytes, "mixtral.attention.head_count_kv", 1);
+        write_kv_f32(
+            &mut bytes,
+            "mixtral.attention.layer_norm_rms_epsilon",
+            1.0e-6,
+        );
+        write_kv_u32(&mut bytes, "mixtral.expert_count", 2);
+        write_kv_u32(&mut bytes, "mixtral.expert_used_count", 1);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.eos_token_id", 2);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.unknown_token_id", 2);
+        write_kv_string_array(&mut bytes, "tokenizer.ggml.tokens", &["a", "b", "c"]);
+
+        for tensor in tensors {
+            write_string(&mut bytes, &tensor.name);
+            write_u32(&mut bytes, tensor.dims.len() as u32);
+            for dim in tensor.dims {
+                write_u64(&mut bytes, dim);
+            }
+            write_u32(&mut bytes, tensor.dtype);
+            write_u64(&mut bytes, tensor.offset);
+        }
+
+        pad_to_alignment(&mut bytes, 32);
+        bytes.extend(data);
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_deepseek_gguf(path: &Path, tensors: Vec<TestTensor>, moe: bool) {
+        let mut data = Vec::new();
+        let tensors = tensors
+            .into_iter()
+            .map(|mut tensor| {
+                pad_to_alignment(&mut data, 32);
+                tensor.offset = data.len() as u64;
+                data.extend_from_slice(&tensor.bytes);
+                tensor
+            })
+            .collect::<Vec<_>>();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        write_u32(&mut bytes, 3);
+        write_u64(&mut bytes, tensors.len() as u64);
+        write_u64(&mut bytes, if moe { 16 } else { 14 });
+
+        write_kv_string(&mut bytes, "general.architecture", "deepseek");
+        write_kv_string(&mut bytes, "general.name", "cpu-reference-deepseek");
+        write_kv_u32(&mut bytes, "general.alignment", 32);
+        write_kv_u32(&mut bytes, "general.file_type", 1);
+        write_kv_u32(&mut bytes, "deepseek.context_length", 128);
+        write_kv_u32(&mut bytes, "deepseek.embedding_length", 2);
+        write_kv_u32(&mut bytes, "deepseek.feed_forward_length", 2);
+        write_kv_u32(&mut bytes, "deepseek.block_count", 1);
+        write_kv_u32(&mut bytes, "deepseek.attention.head_count", 1);
+        write_kv_u32(&mut bytes, "deepseek.attention.head_count_kv", 1);
+        write_kv_f32(
+            &mut bytes,
+            "deepseek.attention.layer_norm_rms_epsilon",
+            1.0e-6,
+        );
+        if moe {
+            write_kv_u32(&mut bytes, "deepseek.expert_count", 2);
+            write_kv_u32(&mut bytes, "deepseek.expert_used_count", 1);
+        }
+        write_kv_u32(&mut bytes, "tokenizer.ggml.eos_token_id", 2);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.unknown_token_id", 2);
+        write_kv_string_array(&mut bytes, "tokenizer.ggml.tokens", &["a", "b", "c"]);
+
+        for tensor in tensors {
+            write_string(&mut bytes, &tensor.name);
+            write_u32(&mut bytes, tensor.dims.len() as u32);
+            for dim in tensor.dims {
+                write_u64(&mut bytes, dim);
+            }
+            write_u32(&mut bytes, tensor.dtype);
+            write_u64(&mut bytes, tensor.offset);
+        }
+
+        pad_to_alignment(&mut bytes, 32);
+        bytes.extend(data);
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_deepseek_mla_metadata_split_gguf(path: &Path, tensors: Vec<TestTensor>) {
+        let mut data = Vec::new();
+        let tensors = tensors
+            .into_iter()
+            .map(|mut tensor| {
+                pad_to_alignment(&mut data, 32);
+                tensor.offset = data.len() as u64;
+                data.extend_from_slice(&tensor.bytes);
+                tensor
+            })
+            .collect::<Vec<_>>();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        write_u32(&mut bytes, 3);
+        write_u64(&mut bytes, tensors.len() as u64);
+        write_u64(&mut bytes, 15);
+
+        write_kv_string(&mut bytes, "general.architecture", "deepseek2");
+        write_kv_string(
+            &mut bytes,
+            "general.name",
+            "cpu-reference-deepseek-mla-split",
+        );
+        write_kv_u32(&mut bytes, "general.alignment", 32);
+        write_kv_u32(&mut bytes, "general.file_type", 1);
+        write_kv_u32(&mut bytes, "deepseek2.context_length", 128);
+        write_kv_u32(&mut bytes, "deepseek2.embedding_length", 2);
+        write_kv_u32(&mut bytes, "deepseek2.feed_forward_length", 2);
+        write_kv_u32(&mut bytes, "deepseek2.block_count", 1);
+        write_kv_u32(&mut bytes, "deepseek2.attention.head_count", 1);
+        write_kv_u32(&mut bytes, "deepseek2.attention.head_count_kv", 1);
+        write_kv_f32(
+            &mut bytes,
+            "deepseek2.attention.layer_norm_rms_epsilon",
+            1.0e-6,
+        );
+        write_kv_u32(&mut bytes, "deepseek2.attention.q_lora_rank", 1);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.eos_token_id", 2);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.unknown_token_id", 2);
+        write_kv_string_array(&mut bytes, "tokenizer.ggml.tokens", &["a", "b", "c"]);
+
+        for tensor in tensors {
+            write_string(&mut bytes, &tensor.name);
+            write_u32(&mut bytes, tensor.dims.len() as u32);
+            for dim in tensor.dims {
+                write_u64(&mut bytes, dim);
+            }
+            write_u32(&mut bytes, tensor.dtype);
+            write_u64(&mut bytes, tensor.offset);
+        }
+
+        pad_to_alignment(&mut bytes, 32);
+        bytes.extend(data);
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_deepseek_true_mla_gguf(path: &Path, tensors: Vec<TestTensor>) {
+        write_deepseek_true_mla_gguf_with_mrope(path, tensors, None);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_deepseek_true_mla_gguf_with_mrope(
+        path: &Path,
+        tensors: Vec<TestTensor>,
+        rope_dimension_sections: Option<[i32; 4]>,
+    ) {
+        let mut data = Vec::new();
+        let tensors = tensors
+            .into_iter()
+            .map(|mut tensor| {
+                pad_to_alignment(&mut data, 32);
+                tensor.offset = data.len() as u64;
+                data.extend_from_slice(&tensor.bytes);
+                tensor
+            })
+            .collect::<Vec<_>>();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        write_u32(&mut bytes, 3);
+        write_u64(&mut bytes, tensors.len() as u64);
+        write_u64(
+            &mut bytes,
+            if rope_dimension_sections.is_some() {
+                20
+            } else {
+                19
+            },
+        );
+
+        write_kv_string(&mut bytes, "general.architecture", "deepseek2");
+        write_kv_string(
+            &mut bytes,
+            "general.name",
+            "cpu-reference-deepseek-true-mla",
+        );
+        write_kv_u32(&mut bytes, "general.alignment", 32);
+        write_kv_u32(&mut bytes, "general.file_type", 1);
+        write_kv_u32(&mut bytes, "deepseek2.context_length", 128);
+        write_kv_u32(&mut bytes, "deepseek2.embedding_length", 2);
+        write_kv_u32(&mut bytes, "deepseek2.feed_forward_length", 2);
+        write_kv_u32(&mut bytes, "deepseek2.block_count", 1);
+        write_kv_u32(&mut bytes, "deepseek2.attention.head_count", 1);
+        write_kv_u32(&mut bytes, "deepseek2.attention.head_count_kv", 1);
+        write_kv_f32(
+            &mut bytes,
+            "deepseek2.attention.layer_norm_rms_epsilon",
+            1.0e-6,
+        );
+        write_kv_u32(&mut bytes, "deepseek2.attention.q_lora_rank", 1);
+        write_kv_u32(&mut bytes, "deepseek2.attention.kv_lora_rank", 1);
+        write_kv_u32(&mut bytes, "deepseek2.attention.qk_nope_head_dim", 0);
+        write_kv_u32(&mut bytes, "deepseek2.attention.qk_rope_head_dim", 2);
+        write_kv_u32(&mut bytes, "deepseek2.attention.v_head_dim", 2);
+        if let Some(sections) = rope_dimension_sections {
+            write_kv_i32_array(&mut bytes, "deepseek2.rope.dimension_sections", &sections);
+        }
+        write_kv_u32(&mut bytes, "tokenizer.ggml.eos_token_id", 2);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.unknown_token_id", 2);
+        write_kv_string_array(&mut bytes, "tokenizer.ggml.tokens", &["a", "b", "c"]);
+
+        for tensor in tensors {
+            write_string(&mut bytes, &tensor.name);
+            write_u32(&mut bytes, tensor.dims.len() as u32);
+            for dim in tensor.dims {
+                write_u64(&mut bytes, dim);
+            }
+            write_u32(&mut bytes, tensor.dtype);
+            write_u64(&mut bytes, tensor.offset);
+        }
+
+        pad_to_alignment(&mut bytes, 32);
+        bytes.extend(data);
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_glm_gguf(path: &Path, tensors: Vec<TestTensor>) {
+        let mut data = Vec::new();
+        let tensors = tensors
+            .into_iter()
+            .map(|mut tensor| {
+                pad_to_alignment(&mut data, 32);
+                tensor.offset = data.len() as u64;
+                data.extend_from_slice(&tensor.bytes);
+                tensor
+            })
+            .collect::<Vec<_>>();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        write_u32(&mut bytes, 3);
+        write_u64(&mut bytes, tensors.len() as u64);
+        write_u64(&mut bytes, 14);
+
+        write_kv_string(&mut bytes, "general.architecture", "glm4");
+        write_kv_string(&mut bytes, "general.name", "cpu-reference-glm");
+        write_kv_u32(&mut bytes, "general.alignment", 32);
+        write_kv_u32(&mut bytes, "general.file_type", 1);
+        write_kv_u32(&mut bytes, "glm4.context_length", 128);
+        write_kv_u32(&mut bytes, "glm4.embedding_length", 2);
+        write_kv_u32(&mut bytes, "glm4.feed_forward_length", 2);
+        write_kv_u32(&mut bytes, "glm4.block_count", 1);
+        write_kv_u32(&mut bytes, "glm4.attention.head_count", 1);
+        write_kv_u32(&mut bytes, "glm4.attention.head_count_kv", 1);
+        write_kv_f32(&mut bytes, "glm4.attention.layer_norm_rms_epsilon", 1.0e-6);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.eos_token_id", 2);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.unknown_token_id", 2);
+        write_kv_string_array(&mut bytes, "tokenizer.ggml.tokens", &["a", "b", "c"]);
+
+        for tensor in tensors {
+            write_string(&mut bytes, &tensor.name);
+            write_u32(&mut bytes, tensor.dims.len() as u32);
+            for dim in tensor.dims {
+                write_u64(&mut bytes, dim);
+            }
+            write_u32(&mut bytes, tensor.dtype);
+            write_u64(&mut bytes, tensor.offset);
+        }
+
+        pad_to_alignment(&mut bytes, 32);
+        bytes.extend(data);
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_glm_mla_metadata_split_gguf(path: &Path, tensors: Vec<TestTensor>) {
+        let mut data = Vec::new();
+        let tensors = tensors
+            .into_iter()
+            .map(|mut tensor| {
+                pad_to_alignment(&mut data, 32);
+                tensor.offset = data.len() as u64;
+                data.extend_from_slice(&tensor.bytes);
+                tensor
+            })
+            .collect::<Vec<_>>();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        write_u32(&mut bytes, 3);
+        write_u64(&mut bytes, tensors.len() as u64);
+        write_u64(&mut bytes, 15);
+
+        write_kv_string(&mut bytes, "general.architecture", "glm4");
+        write_kv_string(&mut bytes, "general.name", "cpu-reference-glm-mla-split");
+        write_kv_u32(&mut bytes, "general.alignment", 32);
+        write_kv_u32(&mut bytes, "general.file_type", 1);
+        write_kv_u32(&mut bytes, "glm4.context_length", 128);
+        write_kv_u32(&mut bytes, "glm4.embedding_length", 2);
+        write_kv_u32(&mut bytes, "glm4.feed_forward_length", 2);
+        write_kv_u32(&mut bytes, "glm4.block_count", 1);
+        write_kv_u32(&mut bytes, "glm4.attention.head_count", 1);
+        write_kv_u32(&mut bytes, "glm4.attention.head_count_kv", 1);
+        write_kv_f32(&mut bytes, "glm4.attention.layer_norm_rms_epsilon", 1.0e-6);
+        write_kv_u32(&mut bytes, "glm4.attention.q_lora_rank", 1);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.eos_token_id", 2);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.unknown_token_id", 2);
+        write_kv_string_array(&mut bytes, "tokenizer.ggml.tokens", &["a", "b", "c"]);
+
+        for tensor in tensors {
+            write_string(&mut bytes, &tensor.name);
+            write_u32(&mut bytes, tensor.dims.len() as u32);
+            for dim in tensor.dims {
+                write_u64(&mut bytes, dim);
+            }
+            write_u32(&mut bytes, tensor.dtype);
+            write_u64(&mut bytes, tensor.offset);
+        }
+
+        pad_to_alignment(&mut bytes, 32);
+        bytes.extend(data);
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_glm_true_mla_gguf(path: &Path, tensors: Vec<TestTensor>) {
+        let mut data = Vec::new();
+        let tensors = tensors
+            .into_iter()
+            .map(|mut tensor| {
+                pad_to_alignment(&mut data, 32);
+                tensor.offset = data.len() as u64;
+                data.extend_from_slice(&tensor.bytes);
+                tensor
+            })
+            .collect::<Vec<_>>();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        write_u32(&mut bytes, 3);
+        write_u64(&mut bytes, tensors.len() as u64);
+        write_u64(&mut bytes, 19);
+
+        write_kv_string(&mut bytes, "general.architecture", "glm4");
+        write_kv_string(&mut bytes, "general.name", "cpu-reference-glm-true-mla");
+        write_kv_u32(&mut bytes, "general.alignment", 32);
+        write_kv_u32(&mut bytes, "general.file_type", 1);
+        write_kv_u32(&mut bytes, "glm4.context_length", 128);
+        write_kv_u32(&mut bytes, "glm4.embedding_length", 2);
+        write_kv_u32(&mut bytes, "glm4.feed_forward_length", 2);
+        write_kv_u32(&mut bytes, "glm4.block_count", 1);
+        write_kv_u32(&mut bytes, "glm4.attention.head_count", 1);
+        write_kv_u32(&mut bytes, "glm4.attention.head_count_kv", 1);
+        write_kv_f32(&mut bytes, "glm4.attention.layer_norm_rms_epsilon", 1.0e-6);
+        write_kv_u32(&mut bytes, "glm4.attention.q_lora_rank", 1);
+        write_kv_u32(&mut bytes, "glm4.attention.kv_lora_rank", 1);
+        write_kv_u32(&mut bytes, "glm4.attention.qk_nope_head_dim", 0);
+        write_kv_u32(&mut bytes, "glm4.attention.qk_rope_head_dim", 2);
+        write_kv_u32(&mut bytes, "glm4.attention.v_head_dim", 2);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.eos_token_id", 2);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.unknown_token_id", 2);
+        write_kv_string_array(&mut bytes, "tokenizer.ggml.tokens", &["a", "b", "c"]);
+
+        for tensor in tensors {
+            write_string(&mut bytes, &tensor.name);
+            write_u32(&mut bytes, tensor.dims.len() as u32);
+            for dim in tensor.dims {
+                write_u64(&mut bytes, dim);
+            }
+            write_u32(&mut bytes, tensor.dtype);
+            write_u64(&mut bytes, tensor.offset);
+        }
+
+        pad_to_alignment(&mut bytes, 32);
+        bytes.extend(data);
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_glm_flash_gguf(path: &Path, tensors: Vec<TestTensor>) {
+        let mut data = Vec::new();
+        let tensors = tensors
+            .into_iter()
+            .map(|mut tensor| {
+                pad_to_alignment(&mut data, 32);
+                tensor.offset = data.len() as u64;
+                data.extend_from_slice(&tensor.bytes);
+                tensor
+            })
+            .collect::<Vec<_>>();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        write_u32(&mut bytes, 3);
+        write_u64(&mut bytes, tensors.len() as u64);
+        write_u64(&mut bytes, 14);
+
+        write_kv_string(&mut bytes, "general.architecture", "glm4flash");
+        write_kv_string(&mut bytes, "general.name", "cpu-reference-glm-flash");
+        write_kv_u32(&mut bytes, "general.alignment", 32);
+        write_kv_u32(&mut bytes, "general.file_type", 1);
+        write_kv_u32(&mut bytes, "glm4flash.context_length", 128);
+        write_kv_u32(&mut bytes, "glm4flash.embedding_length", 2);
+        write_kv_u32(&mut bytes, "glm4flash.feed_forward_length", 2);
+        write_kv_u32(&mut bytes, "glm4flash.block_count", 1);
+        write_kv_u32(&mut bytes, "glm4flash.attention.head_count", 1);
+        write_kv_u32(&mut bytes, "glm4flash.attention.head_count_kv", 1);
+        write_kv_f32(
+            &mut bytes,
+            "glm4flash.attention.layer_norm_rms_epsilon",
+            1.0e-6,
+        );
+        write_kv_u32(&mut bytes, "tokenizer.ggml.eos_token_id", 2);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.unknown_token_id", 2);
+        write_kv_string_array(&mut bytes, "tokenizer.ggml.tokens", &["a", "b", "c"]);
+
+        for tensor in tensors {
+            write_string(&mut bytes, &tensor.name);
+            write_u32(&mut bytes, tensor.dims.len() as u32);
+            for dim in tensor.dims {
+                write_u64(&mut bytes, dim);
+            }
+            write_u32(&mut bytes, tensor.dtype);
+            write_u64(&mut bytes, tensor.offset);
+        }
+
+        pad_to_alignment(&mut bytes, 32);
+        bytes.extend(data);
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_glm_flash_moe_gguf(path: &Path, tensors: Vec<TestTensor>) {
+        let mut data = Vec::new();
+        let tensors = tensors
+            .into_iter()
+            .map(|mut tensor| {
+                pad_to_alignment(&mut data, 32);
+                tensor.offset = data.len() as u64;
+                data.extend_from_slice(&tensor.bytes);
+                tensor
+            })
+            .collect::<Vec<_>>();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        write_u32(&mut bytes, 3);
+        write_u64(&mut bytes, tensors.len() as u64);
+        write_u64(&mut bytes, 16);
+
+        write_kv_string(&mut bytes, "general.architecture", "glm4flash");
+        write_kv_string(&mut bytes, "general.name", "cpu-reference-glm-flash-moe");
+        write_kv_u32(&mut bytes, "general.alignment", 32);
+        write_kv_u32(&mut bytes, "general.file_type", 1);
+        write_kv_u32(&mut bytes, "glm4flash.context_length", 128);
+        write_kv_u32(&mut bytes, "glm4flash.embedding_length", 2);
+        write_kv_u32(&mut bytes, "glm4flash.feed_forward_length", 2);
+        write_kv_u32(&mut bytes, "glm4flash.block_count", 1);
+        write_kv_u32(&mut bytes, "glm4flash.attention.head_count", 1);
+        write_kv_u32(&mut bytes, "glm4flash.attention.head_count_kv", 1);
+        write_kv_f32(
+            &mut bytes,
+            "glm4flash.attention.layer_norm_rms_epsilon",
+            1.0e-6,
+        );
+        write_kv_u32(&mut bytes, "glm4flash.expert_count", 2);
+        write_kv_u32(&mut bytes, "glm4flash.expert_used_count", 1);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.eos_token_id", 2);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.unknown_token_id", 2);
+        write_kv_string_array(&mut bytes, "tokenizer.ggml.tokens", &["a", "b", "c"]);
+
+        for tensor in tensors {
+            write_string(&mut bytes, &tensor.name);
+            write_u32(&mut bytes, tensor.dims.len() as u32);
+            for dim in tensor.dims {
+                write_u64(&mut bytes, dim);
+            }
+            write_u32(&mut bytes, tensor.dtype);
+            write_u64(&mut bytes, tensor.offset);
+        }
+
+        pad_to_alignment(&mut bytes, 32);
+        bytes.extend(data);
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_glm_moe_gguf(path: &Path, tensors: Vec<TestTensor>) {
+        let mut data = Vec::new();
+        let tensors = tensors
+            .into_iter()
+            .map(|mut tensor| {
+                pad_to_alignment(&mut data, 32);
+                tensor.offset = data.len() as u64;
+                data.extend_from_slice(&tensor.bytes);
+                tensor
+            })
+            .collect::<Vec<_>>();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        write_u32(&mut bytes, 3);
+        write_u64(&mut bytes, tensors.len() as u64);
+        write_u64(&mut bytes, 16);
+
+        write_kv_string(&mut bytes, "general.architecture", "glm4moe");
+        write_kv_string(&mut bytes, "general.name", "cpu-reference-glm-moe");
+        write_kv_u32(&mut bytes, "general.alignment", 32);
+        write_kv_u32(&mut bytes, "general.file_type", 1);
+        write_kv_u32(&mut bytes, "glm4moe.context_length", 128);
+        write_kv_u32(&mut bytes, "glm4moe.embedding_length", 2);
+        write_kv_u32(&mut bytes, "glm4moe.feed_forward_length", 2);
+        write_kv_u32(&mut bytes, "glm4moe.block_count", 1);
+        write_kv_u32(&mut bytes, "glm4moe.attention.head_count", 1);
+        write_kv_u32(&mut bytes, "glm4moe.attention.head_count_kv", 1);
+        write_kv_f32(
+            &mut bytes,
+            "glm4moe.attention.layer_norm_rms_epsilon",
+            1.0e-6,
+        );
+        write_kv_u32(&mut bytes, "glm4moe.expert_count", 2);
+        write_kv_u32(&mut bytes, "glm4moe.expert_used_count", 1);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.eos_token_id", 2);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.unknown_token_id", 2);
+        write_kv_string_array(&mut bytes, "tokenizer.ggml.tokens", &["a", "b", "c"]);
+
+        for tensor in tensors {
+            write_string(&mut bytes, &tensor.name);
+            write_u32(&mut bytes, tensor.dims.len() as u32);
+            for dim in tensor.dims {
+                write_u64(&mut bytes, dim);
+            }
+            write_u32(&mut bytes, tensor.dtype);
+            write_u64(&mut bytes, tensor.offset);
+        }
+
+        pad_to_alignment(&mut bytes, 32);
+        bytes.extend(data);
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_gemma_gguf(path: &Path, tensors: Vec<TestTensor>) {
+        let mut data = Vec::new();
+        let tensors = tensors
+            .into_iter()
+            .map(|mut tensor| {
+                pad_to_alignment(&mut data, 32);
+                tensor.offset = data.len() as u64;
+                data.extend_from_slice(&tensor.bytes);
+                tensor
+            })
+            .collect::<Vec<_>>();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        write_u32(&mut bytes, 3);
+        write_u64(&mut bytes, tensors.len() as u64);
+        write_u64(&mut bytes, 14);
+
+        write_kv_string(&mut bytes, "general.architecture", "gemma");
+        write_kv_string(&mut bytes, "general.name", "cpu-reference-gemma");
+        write_kv_u32(&mut bytes, "general.alignment", 32);
+        write_kv_u32(&mut bytes, "general.file_type", 1);
+        write_kv_u32(&mut bytes, "gemma.context_length", 128);
+        write_kv_u32(&mut bytes, "gemma.embedding_length", 2);
+        write_kv_u32(&mut bytes, "gemma.feed_forward_length", 2);
+        write_kv_u32(&mut bytes, "gemma.block_count", 1);
+        write_kv_u32(&mut bytes, "gemma.attention.head_count", 1);
+        write_kv_u32(&mut bytes, "gemma.attention.head_count_kv", 1);
+        write_kv_f32(&mut bytes, "gemma.attention.layer_norm_rms_epsilon", 1.0e-6);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.eos_token_id", 2);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.unknown_token_id", 2);
+        write_kv_string_array(&mut bytes, "tokenizer.ggml.tokens", &["a", "b", "c"]);
+
+        for tensor in tensors {
+            write_string(&mut bytes, &tensor.name);
+            write_u32(&mut bytes, tensor.dims.len() as u32);
+            for dim in tensor.dims {
+                write_u64(&mut bytes, dim);
+            }
+            write_u32(&mut bytes, tensor.dtype);
+            write_u64(&mut bytes, tensor.offset);
+        }
+
+        pad_to_alignment(&mut bytes, 32);
+        bytes.extend(data);
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_phi_gguf(path: &Path, tensors: Vec<TestTensor>) {
+        let mut data = Vec::new();
+        let tensors = tensors
+            .into_iter()
+            .map(|mut tensor| {
+                pad_to_alignment(&mut data, 32);
+                tensor.offset = data.len() as u64;
+                data.extend_from_slice(&tensor.bytes);
+                tensor
+            })
+            .collect::<Vec<_>>();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        write_u32(&mut bytes, 3);
+        write_u64(&mut bytes, tensors.len() as u64);
+        write_u64(&mut bytes, 14);
+
+        write_kv_string(&mut bytes, "general.architecture", "phi3");
+        write_kv_string(&mut bytes, "general.name", "cpu-reference-phi");
+        write_kv_u32(&mut bytes, "general.alignment", 32);
+        write_kv_u32(&mut bytes, "general.file_type", 1);
+        write_kv_u32(&mut bytes, "phi3.context_length", 128);
+        write_kv_u32(&mut bytes, "phi3.embedding_length", 2);
+        write_kv_u32(&mut bytes, "phi3.feed_forward_length", 2);
+        write_kv_u32(&mut bytes, "phi3.block_count", 1);
+        write_kv_u32(&mut bytes, "phi3.attention.head_count", 1);
+        write_kv_u32(&mut bytes, "phi3.attention.head_count_kv", 1);
+        write_kv_f32(&mut bytes, "phi3.attention.layer_norm_rms_epsilon", 1.0e-6);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.eos_token_id", 2);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.unknown_token_id", 2);
+        write_kv_string_array(&mut bytes, "tokenizer.ggml.tokens", &["a", "b", "c"]);
+
+        for tensor in tensors {
+            write_string(&mut bytes, &tensor.name);
+            write_u32(&mut bytes, tensor.dims.len() as u32);
+            for dim in tensor.dims {
+                write_u64(&mut bytes, dim);
+            }
+            write_u32(&mut bytes, tensor.dtype);
+            write_u64(&mut bytes, tensor.offset);
+        }
+
+        pad_to_alignment(&mut bytes, 32);
+        bytes.extend(data);
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_mmproj_gguf(path: &Path) {
+        let tensors = vec![
+            tensor_f32(
+                "mm_projector.weight",
+                vec![2, 3],
+                &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            ),
+            tensor_f32("mm_projector.bias", vec![3], &[0.5, -0.5, 1.0]),
+        ];
+        write_mmproj_gguf_from_tensors(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_qwen2vl_vision_gguf(path: &Path, output_dim: usize) {
+        let hidden_dim = 4usize;
+        let patch_dim = 6usize;
+        let feed_forward_dim = 4usize;
+        let tensors = vec![
+            tensor_f16(
+                "v.patch_embd.weight",
+                vec![patch_dim as u64, hidden_dim as u64],
+                &[0.0; 24],
+            ),
+            tensor_f32("v.blk.0.ln1.weight", vec![hidden_dim as u64], &[1.0; 4]),
+            tensor_f32("v.blk.0.ln2.weight", vec![hidden_dim as u64], &[1.0; 4]),
+            tensor_f16(
+                "v.blk.0.attn_q.weight",
+                vec![hidden_dim as u64, hidden_dim as u64],
+                &[0.0; 16],
+            ),
+            tensor_f16(
+                "v.blk.0.attn_k.weight",
+                vec![hidden_dim as u64, hidden_dim as u64],
+                &[0.0; 16],
+            ),
+            tensor_f16(
+                "v.blk.0.attn_v.weight",
+                vec![hidden_dim as u64, hidden_dim as u64],
+                &[0.0; 16],
+            ),
+            tensor_f16(
+                "v.blk.0.attn_out.weight",
+                vec![hidden_dim as u64, hidden_dim as u64],
+                &[0.0; 16],
+            ),
+            tensor_f16(
+                "v.blk.0.ffn_up.weight",
+                vec![hidden_dim as u64, feed_forward_dim as u64],
+                &[0.0; 16],
+            ),
+            tensor_f16(
+                "v.blk.0.ffn_down.weight",
+                vec![feed_forward_dim as u64, hidden_dim as u64],
+                &[0.0; 16],
+            ),
+            tensor_f32("v.post_ln.weight", vec![hidden_dim as u64], &[1.0; 4]),
+            tensor_f16(
+                "mm.0.weight",
+                vec![hidden_dim as u64, hidden_dim as u64],
+                &[0.0; 16],
+            ),
+            tensor_f16(
+                "mm.2.weight",
+                vec![hidden_dim as u64, output_dim as u64],
+                &vec![0.0; hidden_dim * output_dim],
+            ),
+        ];
+        write_qwen_vl_vision_gguf_from_tensors(
+            path,
+            tensors,
+            output_dim,
+            "qwen2vl",
+            "qwen2vl_merger",
+            None,
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_qwen25vl_vision_gguf(path: &Path, output_dim: usize) {
+        let hidden_dim = 4usize;
+        let patch_dim = 6usize;
+        let feed_forward_dim = 4usize;
+        let tensors = vec![
+            tensor_f16(
+                "v.patch_embd.weight",
+                vec![patch_dim as u64, hidden_dim as u64],
+                &[0.0; 24],
+            ),
+            tensor_f32("v.blk.0.ln1.weight", vec![hidden_dim as u64], &[1.0; 4]),
+            tensor_f32("v.blk.0.ln2.weight", vec![hidden_dim as u64], &[1.0; 4]),
+            tensor_f16(
+                "v.blk.0.attn_q.weight",
+                vec![hidden_dim as u64, hidden_dim as u64],
+                &[0.0; 16],
+            ),
+            tensor_f16(
+                "v.blk.0.attn_k.weight",
+                vec![hidden_dim as u64, hidden_dim as u64],
+                &[0.0; 16],
+            ),
+            tensor_f16(
+                "v.blk.0.attn_v.weight",
+                vec![hidden_dim as u64, hidden_dim as u64],
+                &[0.0; 16],
+            ),
+            tensor_f16(
+                "v.blk.0.attn_out.weight",
+                vec![hidden_dim as u64, hidden_dim as u64],
+                &[0.0; 16],
+            ),
+            tensor_f16(
+                "v.blk.0.ffn_gate.weight",
+                vec![hidden_dim as u64, feed_forward_dim as u64],
+                &[0.0; 16],
+            ),
+            tensor_f16(
+                "v.blk.0.ffn_up.weight",
+                vec![hidden_dim as u64, feed_forward_dim as u64],
+                &[0.0; 16],
+            ),
+            tensor_f16(
+                "v.blk.0.ffn_down.weight",
+                vec![feed_forward_dim as u64, hidden_dim as u64],
+                &[0.0; 16],
+            ),
+            tensor_f32("v.post_ln.weight", vec![hidden_dim as u64], &[1.0; 4]),
+            tensor_f16(
+                "mm.0.weight",
+                vec![hidden_dim as u64, hidden_dim as u64],
+                &[0.0; 16],
+            ),
+            tensor_f16(
+                "mm.2.weight",
+                vec![hidden_dim as u64, output_dim as u64],
+                &vec![0.0; hidden_dim * output_dim],
+            ),
+        ];
+        write_qwen_vl_vision_gguf_from_tensors(
+            path,
+            tensors,
+            output_dim,
+            "qwen2.5vl",
+            "qwen2.5vl_merger",
+            Some(4),
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_qwen_vl_vision_gguf_from_tensors(
+        path: &Path,
+        tensors: Vec<TestTensor>,
+        output_dim: usize,
+        architecture: &str,
+        projector_type: &str,
+        tokens_per_second: Option<u32>,
+    ) {
+        let mut data = Vec::new();
+        let tensors = tensors
+            .into_iter()
+            .map(|mut tensor| {
+                pad_to_alignment(&mut data, 32);
+                tensor.offset = data.len() as u64;
+                data.extend_from_slice(&tensor.bytes);
+                tensor
+            })
+            .collect::<Vec<_>>();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        write_u32(&mut bytes, 3);
+        write_u64(&mut bytes, tensors.len() as u64);
+        write_u64(&mut bytes, 15 + u64::from(tokens_per_second.is_some()));
+
+        write_kv_string(&mut bytes, "general.architecture", architecture);
+        write_kv_string(&mut bytes, "general.name", "test-qwen2vl-vision");
+        write_kv_u32(&mut bytes, "general.alignment", 32);
+        write_kv_u32(&mut bytes, "general.file_type", 1);
+        write_kv_string(&mut bytes, "clip.projector_type", projector_type);
+        write_kv_u32(&mut bytes, "clip.vision.patch_size", 1);
+        write_kv_u32(&mut bytes, "clip.vision.temporal_patch_size", 2);
+        write_kv_u32(&mut bytes, "clip.vision.spatial_merge_size", 1);
+        write_kv_u32(&mut bytes, "clip.vision.embedding_length", 4);
+        write_kv_u32(&mut bytes, "clip.vision.feed_forward_length", 4);
+        write_kv_u32(&mut bytes, "clip.vision.projection_dim", output_dim as u32);
+        write_kv_u32(&mut bytes, "clip.vision.block_count", 1);
+        write_kv_u32(&mut bytes, "clip.vision.attention.head_count", 1);
+        write_kv_u32(&mut bytes, "clip.vision.image_min_pixels", 1);
+        write_kv_u32(&mut bytes, "clip.vision.image_max_pixels", 1);
+        if let Some(tokens_per_second) = tokens_per_second {
+            write_kv_u32(
+                &mut bytes,
+                "clip.vision.tokens_per_second",
+                tokens_per_second,
+            );
+        }
+
+        for tensor in tensors {
+            write_string(&mut bytes, &tensor.name);
+            write_u32(&mut bytes, tensor.dims.len() as u32);
+            for dim in tensor.dims {
+                write_u64(&mut bytes, dim);
+            }
+            write_u32(&mut bytes, tensor.dtype);
+            write_u64(&mut bytes, tensor.offset);
+        }
+
+        pad_to_alignment(&mut bytes, 32);
+        bytes.extend(data);
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_mmproj_gguf_from_tensors(path: &Path, tensors: Vec<TestTensor>) {
+        let mut data = Vec::new();
+        let tensors = tensors
+            .into_iter()
+            .map(|mut tensor| {
+                pad_to_alignment(&mut data, 32);
+                tensor.offset = data.len() as u64;
+                data.extend_from_slice(&tensor.bytes);
+                tensor
+            })
+            .collect::<Vec<_>>();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        write_u32(&mut bytes, 3);
+        write_u64(&mut bytes, tensors.len() as u64);
+        write_u64(&mut bytes, 3);
+
+        write_kv_string(&mut bytes, "general.architecture", "clip");
+        write_kv_string(&mut bytes, "general.name", "test-mmproj");
+        write_kv_u32(&mut bytes, "general.alignment", 32);
+
+        for tensor in tensors {
+            write_string(&mut bytes, &tensor.name);
+            write_u32(&mut bytes, tensor.dims.len() as u32);
+            for dim in tensor.dims {
+                write_u64(&mut bytes, dim);
+            }
+            write_u32(&mut bytes, tensor.dtype);
+            write_u64(&mut bytes, tensor.offset);
+        }
+
+        pad_to_alignment(&mut bytes, 32);
+        bytes.extend(data);
+        fs::write(path, bytes).unwrap();
+    }
+
+    struct TestTensor {
+        name: String,
+        dims: Vec<u64>,
+        dtype: u32,
+        offset: u64,
+        bytes: Vec<u8>,
+    }
+
+    fn tensor_f32(name: &str, dims: Vec<u64>, values: &[f32]) -> TestTensor {
+        TestTensor {
+            name: name.to_string(),
+            dims,
+            dtype: 0,
+            offset: 0,
+            bytes: values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect::<Vec<_>>(),
+        }
+    }
+
+    fn tensor_f16(name: &str, dims: Vec<u64>, values: &[f32]) -> TestTensor {
+        TestTensor {
+            name: name.to_string(),
+            dims,
+            dtype: 1,
+            offset: 0,
+            bytes: values
+                .iter()
+                .flat_map(|value| f16_bits(*value).to_le_bytes())
+                .collect::<Vec<_>>(),
+        }
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn f16_values(values: &[f32]) -> Vec<u16> {
+        values.iter().map(|value| f16_bits(*value)).collect()
+    }
+
+    #[cfg(feature = "native-cuda")]
+    struct QuantFixture {
+        name: &'static str,
+        raw_type: i32,
+        dtype: hi_gguf::GgufTensorType,
+        elements: usize,
+        bytes: Vec<u8>,
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn all_supported_cuda_quant_fixtures() -> Vec<QuantFixture> {
+        let mut q4 = Vec::new();
+        q4.extend_from_slice(&f16_bits(1.0).to_le_bytes());
+        q4.extend([0x8f; 16]);
+
+        let mut q4_1 = Vec::new();
+        q4_1.extend_from_slice(&f16_bits(0.5).to_le_bytes());
+        q4_1.extend_from_slice(&f16_bits(1.0).to_le_bytes());
+        q4_1.extend([0x8f; 16]);
+
+        let mut q5 = Vec::new();
+        q5.extend_from_slice(&f16_bits(1.0).to_le_bytes());
+        q5.extend_from_slice(&0x0001_0000u32.to_le_bytes());
+        q5.extend([0x8f; 16]);
+
+        let mut q5_1 = Vec::new();
+        q5_1.extend_from_slice(&f16_bits(0.5).to_le_bytes());
+        q5_1.extend_from_slice(&f16_bits(1.0).to_le_bytes());
+        q5_1.extend_from_slice(&0x0001_0000u32.to_le_bytes());
+        q5_1.extend([0x8f; 16]);
+
+        let mut q8 = Vec::new();
+        q8.extend_from_slice(&f16_bits(0.5).to_le_bytes());
+        q8.extend((0..32).map(|idx| idx as i8 as u8));
+
+        let mut q8_1 = Vec::new();
+        q8_1.extend_from_slice(&f16_bits(0.5).to_le_bytes());
+        q8_1.extend_from_slice(&f16_bits(1.0).to_le_bytes());
+        q8_1.extend((0..32).map(|idx| idx as i8 as u8));
+
+        let mut q1 = vec![0u8; 18];
+        q1[0..2].copy_from_slice(&f16_bits(0.5).to_le_bytes());
+        q1[2] = 0b1010_0101;
+
+        let mut mxfp4 = vec![0u8; 17];
+        mxfp4[0] = 128;
+        mxfp4[1] = 0x91;
+        mxfp4[2] = 0x5f;
+
+        let mut nvfp4 = vec![0u8; 36];
+        nvfp4[0] = 0x38;
+        nvfp4[1] = 0x40;
+        nvfp4[4] = 0x95;
+        nvfp4[5] = 0x2f;
+        nvfp4[12] = 0x41;
+
+        let mut q2k = vec![0u8; 84];
+        q2k[0..16].fill(0x11);
+        q2k[0] = 0x21;
+        q2k[16] = 0xe4;
+        q2k[48] = 0x03;
+        q2k[80..82].copy_from_slice(&f16_bits(1.0).to_le_bytes());
+        q2k[82..84].copy_from_slice(&f16_bits(0.5).to_le_bytes());
+
+        let mut q3k = vec![0u8; 110];
+        q3k[0] = 0b0001_0001;
+        q3k[32] = 0b0000_0111;
+        q3k[48] = 0b0000_0010;
+        q3k[64] = 0b0000_0010;
+        q3k[96..104].fill(0x11);
+        q3k[104..108].fill(0xaa);
+        q3k[108..110].copy_from_slice(&f16_bits(1.0).to_le_bytes());
+
+        let mut q4k = vec![0u8; 144];
+        q4k[0..2].copy_from_slice(&f16_bits(1.0).to_le_bytes());
+        q4k[2..4].copy_from_slice(&f16_bits(0.0).to_le_bytes());
+        q4k[4..16].fill(1);
+        q4k[16..144].fill(0x21);
+
+        let mut q5k = vec![0u8; 176];
+        q5k[0..2].copy_from_slice(&f16_bits(1.0).to_le_bytes());
+        q5k[2..4].copy_from_slice(&f16_bits(0.5).to_le_bytes());
+        q5k[4..16].fill(1);
+        q5k[16] = 0b0000_0101;
+        q5k[48..176].fill(0x21);
+
+        let mut q6k = vec![0u8; 210];
+        q6k[0] = 0xff;
+        q6k[32] = 0xff;
+        q6k[128] = 0xff;
+        q6k[192..208].fill(1);
+        q6k[208..210].copy_from_slice(&f16_bits(1.0).to_le_bytes());
+
+        let mut q8k = vec![0u8; 292];
+        q8k[0..4].copy_from_slice(&0.5f32.to_le_bytes());
+        q8k[4] = 0;
+        q8k[5] = 2;
+        q8k[6] = 255;
+        q8k[259] = 4;
+        q8k[260..292].fill(0xff);
+
+        let mut iq2xxs = vec![0u8; 66];
+        iq2xxs[0..2].copy_from_slice(&f16_bits(0.5).to_le_bytes());
+        iq2xxs[2..4].copy_from_slice(&0x0100u16.to_le_bytes());
+        iq2xxs[6..8].copy_from_slice(&0x0001u16.to_le_bytes());
+        iq2xxs[8..10].copy_from_slice(&0x1000u16.to_le_bytes());
+
+        let mut iq2xs = vec![0u8; 74];
+        iq2xs[0..2].copy_from_slice(&f16_bits(0.5).to_le_bytes());
+        iq2xs[2..4].copy_from_slice(&0x0200u16.to_le_bytes());
+        iq2xs[4..6].copy_from_slice(&0x0001u16.to_le_bytes());
+        iq2xs[66] = 0x31;
+
+        let mut iq3xxs = vec![0u8; 98];
+        iq3xxs[0..2].copy_from_slice(&f16_bits(0.5).to_le_bytes());
+        iq3xxs[3] = 1;
+        iq3xxs[66..70].copy_from_slice(&0x1000_0001u32.to_le_bytes());
+
+        let mut iq1s = vec![0u8; 50];
+        iq1s[0..2].copy_from_slice(&f16_bits(0.5).to_le_bytes());
+        iq1s[3] = 1;
+        iq1s[34..36].copy_from_slice(&0x9000u16.to_le_bytes());
+
+        let mut iq2s = vec![0u8; 82];
+        iq2s[0..2].copy_from_slice(&f16_bits(0.5).to_le_bytes());
+        iq2s[3] = 1;
+        iq2s[34] = 0x81;
+        iq2s[66] = 1;
+        iq2s[74] = 0x10;
+
+        let mut iq3s = vec![0u8; 110];
+        iq3s[0..2].copy_from_slice(&f16_bits(0.5).to_le_bytes());
+        iq3s[3] = 1;
+        iq3s[66] = 1;
+        iq3s[74] = 0x81;
+        iq3s[106] = 0x31;
+
+        let mut iq4nl = Vec::new();
+        iq4nl.extend_from_slice(&f16_bits(0.5).to_le_bytes());
+        iq4nl.extend([0xf0; 16]);
+
+        let mut iq4xs = vec![0u8; 136];
+        iq4xs[0..2].copy_from_slice(&f16_bits(0.5).to_le_bytes());
+        iq4xs[2..4].copy_from_slice(&0x0006u16.to_le_bytes());
+        iq4xs[4] = 0xf1;
+        iq4xs[8] = 0xf0;
+        iq4xs[24] = 0x80;
+
+        let mut iq1m = vec![0u8; 56];
+        iq1m[1] = 1;
+        iq1m[32] = 0x09;
+        let scale_bits = f16_bits(0.5);
+        let iq1m_sc = [
+            ((scale_bits & 0x000f) << 12) | 0x0001,
+            (scale_bits & 0x00f0) << 8,
+            (scale_bits & 0x0f00) << 4,
+            scale_bits & 0xf000,
+        ];
+        for (idx, scale) in iq1m_sc.iter().enumerate() {
+            iq1m[48 + 2 * idx..50 + 2 * idx].copy_from_slice(&scale.to_le_bytes());
+        }
+
+        let mut tq1 = vec![0u8; 54];
+        tq1[0] = 0;
+        tq1[1] = 86;
+        tq1[2] = 171;
+        tq1[32] = 86;
+        tq1[48] = 171;
+        tq1[52..54].copy_from_slice(&f16_bits(0.5).to_le_bytes());
+
+        let mut tq2 = vec![0u8; 66];
+        tq2[0] = 0b11_10_01_00;
+        tq2[32] = 0b10_01_00_11;
+        tq2[64..66].copy_from_slice(&f16_bits(0.5).to_le_bytes());
+
+        vec![
+            QuantFixture {
+                name: "Q4_0",
+                raw_type: 2,
+                dtype: hi_gguf::GgufTensorType::Q4_0,
+                elements: 32,
+                bytes: q4,
+            },
+            QuantFixture {
+                name: "Q4_1",
+                raw_type: 3,
+                dtype: hi_gguf::GgufTensorType::Q4_1,
+                elements: 32,
+                bytes: q4_1,
+            },
+            QuantFixture {
+                name: "Q5_0",
+                raw_type: 6,
+                dtype: hi_gguf::GgufTensorType::Q5_0,
+                elements: 32,
+                bytes: q5,
+            },
+            QuantFixture {
+                name: "Q5_1",
+                raw_type: 7,
+                dtype: hi_gguf::GgufTensorType::Q5_1,
+                elements: 32,
+                bytes: q5_1,
+            },
+            QuantFixture {
+                name: "Q8_0",
+                raw_type: 8,
+                dtype: hi_gguf::GgufTensorType::Q8_0,
+                elements: 32,
+                bytes: q8,
+            },
+            QuantFixture {
+                name: "Q8_1",
+                raw_type: 9,
+                dtype: hi_gguf::GgufTensorType::Q8_1,
+                elements: 32,
+                bytes: q8_1,
+            },
+            QuantFixture {
+                name: "Q1_0",
+                raw_type: 41,
+                dtype: hi_gguf::GgufTensorType::Q1_0,
+                elements: 128,
+                bytes: q1,
+            },
+            QuantFixture {
+                name: "Q2_K",
+                raw_type: 10,
+                dtype: hi_gguf::GgufTensorType::Q2_K,
+                elements: 256,
+                bytes: q2k,
+            },
+            QuantFixture {
+                name: "Q3_K",
+                raw_type: 11,
+                dtype: hi_gguf::GgufTensorType::Q3_K,
+                elements: 256,
+                bytes: q3k,
+            },
+            QuantFixture {
+                name: "Q4_K",
+                raw_type: 12,
+                dtype: hi_gguf::GgufTensorType::Q4_K,
+                elements: 256,
+                bytes: q4k,
+            },
+            QuantFixture {
+                name: "Q5_K",
+                raw_type: 13,
+                dtype: hi_gguf::GgufTensorType::Q5_K,
+                elements: 256,
+                bytes: q5k,
+            },
+            QuantFixture {
+                name: "Q6_K",
+                raw_type: 14,
+                dtype: hi_gguf::GgufTensorType::Q6_K,
+                elements: 256,
+                bytes: q6k,
+            },
+            QuantFixture {
+                name: "Q8_K",
+                raw_type: 15,
+                dtype: hi_gguf::GgufTensorType::Q8_K,
+                elements: 256,
+                bytes: q8k,
+            },
+            QuantFixture {
+                name: "IQ2_XXS",
+                raw_type: 16,
+                dtype: hi_gguf::GgufTensorType::IQ2_XXS,
+                elements: 256,
+                bytes: iq2xxs,
+            },
+            QuantFixture {
+                name: "IQ2_XS",
+                raw_type: 17,
+                dtype: hi_gguf::GgufTensorType::IQ2_XS,
+                elements: 256,
+                bytes: iq2xs,
+            },
+            QuantFixture {
+                name: "IQ3_XXS",
+                raw_type: 18,
+                dtype: hi_gguf::GgufTensorType::IQ3_XXS,
+                elements: 256,
+                bytes: iq3xxs,
+            },
+            QuantFixture {
+                name: "IQ1_S",
+                raw_type: 19,
+                dtype: hi_gguf::GgufTensorType::IQ1_S,
+                elements: 256,
+                bytes: iq1s,
+            },
+            QuantFixture {
+                name: "IQ2_S",
+                raw_type: 22,
+                dtype: hi_gguf::GgufTensorType::IQ2_S,
+                elements: 256,
+                bytes: iq2s,
+            },
+            QuantFixture {
+                name: "IQ3_S",
+                raw_type: 21,
+                dtype: hi_gguf::GgufTensorType::IQ3_S,
+                elements: 256,
+                bytes: iq3s,
+            },
+            QuantFixture {
+                name: "IQ4_NL",
+                raw_type: 20,
+                dtype: hi_gguf::GgufTensorType::IQ4_NL,
+                elements: 32,
+                bytes: iq4nl,
+            },
+            QuantFixture {
+                name: "IQ4_XS",
+                raw_type: 23,
+                dtype: hi_gguf::GgufTensorType::IQ4_XS,
+                elements: 256,
+                bytes: iq4xs,
+            },
+            QuantFixture {
+                name: "IQ1_M",
+                raw_type: 29,
+                dtype: hi_gguf::GgufTensorType::IQ1_M,
+                elements: 256,
+                bytes: iq1m,
+            },
+            QuantFixture {
+                name: "MXFP4",
+                raw_type: 39,
+                dtype: hi_gguf::GgufTensorType::MXFP4,
+                elements: 32,
+                bytes: mxfp4,
+            },
+            QuantFixture {
+                name: "NVFP4",
+                raw_type: 40,
+                dtype: hi_gguf::GgufTensorType::NVFP4,
+                elements: 64,
+                bytes: nvfp4,
+            },
+            QuantFixture {
+                name: "TQ1_0",
+                raw_type: 34,
+                dtype: hi_gguf::GgufTensorType::TQ1_0,
+                elements: 256,
+                bytes: tq1,
+            },
+            QuantFixture {
+                name: "TQ2_0",
+                raw_type: 35,
+                dtype: hi_gguf::GgufTensorType::TQ2_0,
+                elements: 256,
+                bytes: tq2,
+            },
+        ]
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn assert_quant_close(label: &str, actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len(), "{label}: length mismatch");
+        for (idx, (actual, expected)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 5.0e-4,
+                "{label}[{idx}]: actual {actual} expected {expected}"
+            );
+        }
+    }
+
+    fn f16_bits(value: f32) -> u16 {
+        match value {
+            0.0 => 0x0000,
+            0.5 => 0x3800,
+            1.0 => 0x3c00,
+            -1.0 => 0xbc00,
+            2.0 => 0x4000,
+            -2.0 => 0xc000,
+            3.0 => 0x4200,
+            4.0 => 0x4400,
+            5.0 => 0x4500,
+            6.0 => 0x4600,
+            7.0 => 0x4700,
+            8.0 => 0x4800,
+            9.0 => 0x4880,
+            10.0 => 0x4900,
+            11.0 => 0x4980,
+            12.0 => 0x4a00,
+            _ => panic!("test fixture only supports simple f16 values, got {value}"),
+        }
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn bf16_bits(value: f32) -> u16 {
+        (value.to_bits() >> 16) as u16
+    }
+
+    fn write_kv_string(bytes: &mut Vec<u8>, key: &str, value: &str) {
+        write_string(bytes, key);
+        write_u32(bytes, 8);
+        write_string(bytes, value);
+    }
+
+    fn write_kv_string_array(bytes: &mut Vec<u8>, key: &str, values: &[&str]) {
+        write_string(bytes, key);
+        write_u32(bytes, 9);
+        write_u32(bytes, 8);
+        write_u64(bytes, values.len() as u64);
+        for value in values {
+            write_string(bytes, value);
+        }
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_kv_i32_array(bytes: &mut Vec<u8>, key: &str, values: &[i32]) {
+        write_string(bytes, key);
+        write_u32(bytes, 9);
+        write_u32(bytes, 5);
+        write_u64(bytes, values.len() as u64);
+        for value in values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+
+    fn write_kv_u32(bytes: &mut Vec<u8>, key: &str, value: u32) {
+        write_string(bytes, key);
+        write_u32(bytes, 4);
+        write_u32(bytes, value);
+    }
+
+    fn write_kv_f32(bytes: &mut Vec<u8>, key: &str, value: f32) {
+        write_string(bytes, key);
+        write_u32(bytes, 6);
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_string(bytes: &mut Vec<u8>, value: &str) {
+        write_u64(bytes, value.len() as u64);
+        bytes.extend_from_slice(value.as_bytes());
+    }
+
+    fn write_u32(bytes: &mut Vec<u8>, value: u32) {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn write_u64(bytes: &mut Vec<u8>, value: u64) {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+
+    fn tiny_png_bytes() -> Vec<u8> {
+        rgb_png_bytes(1, 1, &[0, 0, 0])
+    }
+
+    fn rgb_png_bytes(width: u32, height: u32, rgb: &[u8]) -> Vec<u8> {
+        let image = image::RgbImage::from_raw(width, height, rgb.to_vec()).unwrap();
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        bytes.into_inner()
+    }
+
+    fn pad_to_alignment(bytes: &mut Vec<u8>, alignment: usize) {
+        let remainder = bytes.len() % alignment;
+        if remainder != 0 {
+            bytes.extend(vec![0; alignment - remainder]);
+        }
+    }
+
+    fn tempfile_path(name: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "hi-cuda-backend-{name}-{}.gguf",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        path
+    }
+
+    fn assert_close_vec(actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert!(
+                (actual - expected).abs() <= 5.0e-4,
+                "actual {actual} expected {expected}"
+            );
+        }
+    }
+}

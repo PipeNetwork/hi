@@ -1,9 +1,10 @@
+use std::pin::Pin;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
+use futures_util::Stream;
+use tokio::sync::{Mutex, mpsc};
 
 use crate::config::{MlxModelConfig, load_model_config};
 use crate::generate::TokenizerRuntime;
@@ -11,46 +12,16 @@ use crate::manifest::{ModelInfo, inspect_model};
 use crate::models::NativeRuntime;
 use crate::weights::WeightCatalog;
 
-#[derive(Clone, Debug)]
-pub struct GenerationRequest {
-    pub prompt: String,
-    pub max_tokens: u32,
-    pub temperature: f32,
-    pub top_p: f32,
-}
-
-#[derive(Clone, Debug)]
-pub struct GenerationOutput {
-    pub text: String,
-    pub prompt_tokens: u64,
-    pub completion_tokens: u64,
-}
-
-#[async_trait]
-pub trait InferenceBackend: Send + Sync {
-    fn model(&self) -> &ModelInfo;
-
-    fn health(&self) -> BackendHealth;
-
-    async fn generate(&self, request: GenerationRequest) -> Result<GenerationOutput>;
-}
-
-pub type SharedBackend = Arc<dyn InferenceBackend>;
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BackendHealth {
-    pub ready: bool,
-    pub family: String,
-    pub quantization: String,
-    pub context_length: Option<u32>,
-    pub memory_estimate_bytes: Option<u64>,
-}
+pub use hi_local_core::backend::{
+    BackendHealth, GenerationEvent, GenerationOutput, GenerationRequest, GenerationStream,
+    InferenceBackend, SharedBackend,
+};
 
 pub struct MlxBackend {
     model: ModelInfo,
     config: MlxModelConfig,
     weights: WeightCatalog,
-    runtime: Mutex<NativeRuntime>,
+    runtime: Arc<Mutex<NativeRuntime>>,
 }
 
 impl MlxBackend {
@@ -67,7 +38,7 @@ impl MlxBackend {
             model,
             config,
             weights,
-            runtime: Mutex::new(runtime),
+            runtime: Arc::new(Mutex::new(runtime)),
         })
     }
 }
@@ -80,6 +51,7 @@ impl InferenceBackend for MlxBackend {
 
     fn health(&self) -> BackendHealth {
         BackendHealth {
+            backend: "mlx".to_string(),
             ready: true,
             family: self.config.family.label().to_string(),
             quantization: self.config.quantization_label(),
@@ -88,9 +60,22 @@ impl InferenceBackend for MlxBackend {
         }
     }
 
-    async fn generate(&self, request: GenerationRequest) -> Result<GenerationOutput> {
-        let mut runtime = self.runtime.lock().await;
-        runtime.generate(request)
+    async fn stream_generate(&self, request: GenerationRequest) -> Result<GenerationStream> {
+        let runtime = Arc::clone(&self.runtime);
+        let (tx, rx) = mpsc::channel(8);
+        tokio::task::spawn_blocking(move || {
+            let result = {
+                let mut runtime = runtime.blocking_lock();
+                runtime.stream_generate(request, |event| {
+                    tx.blocking_send(Ok(event))
+                        .map_err(|_| anyhow!("generation stream receiver dropped"))
+                })
+            };
+            if let Err(err) = result {
+                let _ = tx.blocking_send(Err(err));
+            }
+        });
+        Ok(receiver_stream(rx))
     }
 }
 
@@ -141,6 +126,7 @@ impl InferenceBackend for MockBackend {
 
     fn health(&self) -> BackendHealth {
         BackendHealth {
+            backend: "mlx".to_string(),
             ready: true,
             family: self.model.family.label().to_string(),
             quantization: "mock".to_string(),
@@ -149,21 +135,114 @@ impl InferenceBackend for MockBackend {
         }
     }
 
-    async fn generate(&self, request: GenerationRequest) -> Result<GenerationOutput> {
+    async fn stream_generate(&self, request: GenerationRequest) -> Result<GenerationStream> {
         *self.last_prompt.lock().await = Some(request.prompt.clone());
         let text = self.output.lock().await.clone();
-        Ok(GenerationOutput {
-            prompt_tokens: (request.prompt.len() / 4).max(1) as u64,
-            completion_tokens: (text.len() / 4).max(1) as u64,
-            text,
-        })
+        let prompt_tokens = (request.prompt.len() / 4).max(1) as u64;
+        let completion_tokens = (text.len() / 4).max(1) as u64;
+        let mut events = split_stream_text(&text)
+            .into_iter()
+            .map(|piece| {
+                Ok(GenerationEvent::TokenDelta {
+                    token_id: 0,
+                    text: piece,
+                })
+            })
+            .collect::<Vec<_>>();
+        events.push(Ok(GenerationEvent::Finished {
+            output: GenerationOutput {
+                prompt_tokens,
+                completion_tokens,
+                text,
+            },
+        }));
+        Ok(Box::pin(futures_util::stream::iter(events)))
     }
+}
+
+fn receiver_stream<T: Send + 'static>(
+    rx: mpsc::Receiver<T>,
+) -> Pin<Box<dyn Stream<Item = T> + Send>> {
+    Box::pin(futures_util::stream::unfold(rx, |mut rx| async {
+        rx.recv().await.map(|item| (item, rx))
+    }))
+}
+
+#[cfg(test)]
+fn split_stream_text(text: &str) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        current.push(ch);
+        if current.len() >= 512 {
+            out.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
+    use futures_util::StreamExt;
+
+    use super::*;
+    use crate::manifest::{inspect_model, test_support};
+
     #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
     static MLX_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[tokio::test]
+    async fn mock_stream_emits_delta_before_finish() {
+        let backend = MockBackend::new(test_model(), "streamed text");
+        let mut stream = backend
+            .stream_generate(GenerationRequest {
+                prompt: "hello".to_string(),
+                max_tokens: 4,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        let first = stream.next().await.unwrap().unwrap();
+        match first {
+            GenerationEvent::TokenDelta { text, .. } => assert_eq!(text, "streamed text"),
+            GenerationEvent::Finished { .. } => panic!("first stream event must be a delta"),
+        }
+
+        let second = stream.next().await.unwrap().unwrap();
+        assert!(matches!(second, GenerationEvent::Finished { .. }));
+    }
+
+    #[tokio::test]
+    async fn generate_collects_the_stream_output() {
+        let backend = MockBackend::new(test_model(), "collected text");
+        let output = backend
+            .generate(GenerationRequest {
+                prompt: "hello".to_string(),
+                max_tokens: 4,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(output.text, "collected text");
+    }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
     #[tokio::test]
@@ -233,6 +312,9 @@ mod tests {
                 max_tokens: 4,
                 temperature: 0.0,
                 top_p: 1.0,
+                top_k: None,
+                seed: None,
+                image_inputs: Vec::new(),
             },
         )
         .await
@@ -378,6 +460,9 @@ mod tests {
                 max_tokens: 2,
                 temperature: 0.0,
                 top_p: 1.0,
+                top_k: None,
+                seed: None,
+                image_inputs: Vec::new(),
             },
         )
         .await
@@ -544,6 +629,9 @@ mod tests {
                 max_tokens: 2,
                 temperature: 0.0,
                 top_p: 1.0,
+                top_k: None,
+                seed: None,
+                image_inputs: Vec::new(),
             },
         )
         .await
@@ -689,6 +777,9 @@ mod tests {
                 max_tokens: 2,
                 temperature: 0.0,
                 top_p: 1.0,
+                top_k: None,
+                seed: None,
+                image_inputs: Vec::new(),
             },
         )
         .await
@@ -837,6 +928,9 @@ mod tests {
                 max_tokens: 2,
                 temperature: 0.0,
                 top_p: 1.0,
+                top_k: None,
+                seed: None,
+                image_inputs: Vec::new(),
             },
         )
         .await
@@ -1014,6 +1108,9 @@ mod tests {
                 max_tokens: 2,
                 temperature: 0.0,
                 top_p: 1.0,
+                top_k: None,
+                seed: None,
+                image_inputs: Vec::new(),
             },
         )
         .await
@@ -1140,5 +1237,23 @@ mod tests {
             ));
             path
         }
+    }
+
+    fn test_model() -> ModelInfo {
+        let dir = tempfile_path("backend-model");
+        test_support::write_qwen_fixture(&dir);
+        inspect_model(&dir, None).unwrap()
+    }
+
+    fn tempfile_path(name: &str) -> std::path::PathBuf {
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "hi-mlx-{name}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        path
     }
 }

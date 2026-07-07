@@ -1,0 +1,2084 @@
+#[cfg(feature = "native-cuda")]
+mod native {
+    use std::ffi::c_void;
+    use std::os::raw::{c_float, c_int};
+
+    use anyhow::{Result, bail};
+
+    use crate::runtime::{DeviceBuffer, Stream, check_last_error};
+
+    unsafe extern "C" {
+        fn hi_cuda_launch_rms_norm(
+            input: *const c_void,
+            weight: *const c_void,
+            output: *mut c_void,
+            rows: c_int,
+            cols: c_int,
+            eps: c_float,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_layer_norm(
+            input: *const c_void,
+            weight: *const c_void,
+            bias: *const c_void,
+            output: *mut c_void,
+            rows: c_int,
+            cols: c_int,
+            eps: c_float,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_silu_mul(
+            gate: *const c_void,
+            up: *const c_void,
+            output: *mut c_void,
+            len: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_gelu(
+            input: *const c_void,
+            output: *mut c_void,
+            len: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_add(
+            left: *const c_void,
+            right: *const c_void,
+            output: *mut c_void,
+            len: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_add_rowwise(
+            input: *const c_void,
+            bias: *const c_void,
+            output: *mut c_void,
+            rows: c_int,
+            cols: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_copy_row_f32(
+            input: *const c_void,
+            output: *mut c_void,
+            row: c_int,
+            rows: c_int,
+            cols: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_add_scaled_row_in_place(
+            output: *mut c_void,
+            row_values: *const c_void,
+            row: c_int,
+            rows: c_int,
+            cols: c_int,
+            scale: c_float,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_moe_topk_router(
+            scores: *const c_void,
+            output_ids: *mut c_void,
+            output_weights: *mut c_void,
+            rows: c_int,
+            experts: c_int,
+            top_k: c_int,
+            norm_topk: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_cast_f32_to_f16(
+            input: *const c_void,
+            output: *mut c_void,
+            len: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_cast_f32_to_bf16(
+            input: *const c_void,
+            output: *mut c_void,
+            len: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_gather_rows_f16_to_f32(
+            matrix: *const c_void,
+            row_ids: *const c_void,
+            output: *mut c_void,
+            row_count: c_int,
+            cols: c_int,
+            matrix_rows: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_gather_rows_bf16_to_f32(
+            matrix: *const c_void,
+            row_ids: *const c_void,
+            output: *mut c_void,
+            row_count: c_int,
+            cols: c_int,
+            matrix_rows: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_gather_rows_f32_to_f32(
+            matrix: *const c_void,
+            row_ids: *const c_void,
+            output: *mut c_void,
+            row_count: c_int,
+            cols: c_int,
+            matrix_rows: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_dequantize_matrix(
+            input: *const c_void,
+            output: *mut c_void,
+            elements: c_int,
+            quant_type: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_rope(
+            values: *mut c_void,
+            seq_len: c_int,
+            heads: c_int,
+            head_dim: c_int,
+            base: c_float,
+            scale: c_float,
+            split_half: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_rope_with_offset(
+            values: *mut c_void,
+            seq_len: c_int,
+            heads: c_int,
+            head_dim: c_int,
+            base: c_float,
+            scale: c_float,
+            position_offset: c_int,
+            split_half: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_rope_batched_with_offset(
+            values: *mut c_void,
+            batch_count: c_int,
+            seq_len: c_int,
+            heads: c_int,
+            head_dim: c_int,
+            base: c_float,
+            scale: c_float,
+            position_offset: c_int,
+            split_half: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_mrope(
+            values: *mut c_void,
+            pos_t: *const c_void,
+            pos_h: *const c_void,
+            pos_w: *const c_void,
+            seq_len: c_int,
+            heads: c_int,
+            head_dim: c_int,
+            base: c_float,
+            scale: c_float,
+            section_t: c_int,
+            section_h: c_int,
+            section_w: c_int,
+            section_e: c_int,
+            split_half: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_vision_rope(
+            values: *mut c_void,
+            pos_h: *const c_void,
+            pos_w: *const c_void,
+            seq_len: c_int,
+            heads: c_int,
+            head_dim: c_int,
+            base: c_float,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_write_kv_cache(
+            values: *const c_void,
+            cache: *mut c_void,
+            row_count: c_int,
+            kv_heads: c_int,
+            head_dim: c_int,
+            max_seq: c_int,
+            start_pos: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_write_kv_cache_batched(
+            values: *const c_void,
+            cache: *mut c_void,
+            batch_count: c_int,
+            row_count: c_int,
+            kv_heads: c_int,
+            head_dim: c_int,
+            max_seq: c_int,
+            start_pos: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_write_paged_kv_cache(
+            values: *const c_void,
+            pages: *mut c_void,
+            page_table: *const c_void,
+            row_count: c_int,
+            kv_heads: c_int,
+            head_dim: c_int,
+            page_size: c_int,
+            page_table_len: c_int,
+            start_pos: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_write_paged_kv_cache_batched(
+            values: *const c_void,
+            pages: *mut c_void,
+            page_table: *const c_void,
+            batch_count: c_int,
+            row_count: c_int,
+            kv_heads: c_int,
+            head_dim: c_int,
+            page_size: c_int,
+            page_table_len: c_int,
+            start_pos: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_copy_paged_kv_cache_prefix_batched(
+            pages: *mut c_void,
+            page_table: *const c_void,
+            batch_count: c_int,
+            token_count: c_int,
+            kv_heads: c_int,
+            head_dim: c_int,
+            page_size: c_int,
+            page_table_len: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_causal_attention(
+            q: *const c_void,
+            k: *const c_void,
+            v: *const c_void,
+            output: *mut c_void,
+            seq_len: c_int,
+            heads: c_int,
+            kv_heads: c_int,
+            qk_head_dim: c_int,
+            v_head_dim: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_causal_attention_batched(
+            q: *const c_void,
+            k: *const c_void,
+            v: *const c_void,
+            output: *mut c_void,
+            batch_count: c_int,
+            seq_len: c_int,
+            heads: c_int,
+            kv_heads: c_int,
+            qk_head_dim: c_int,
+            v_head_dim: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_flash_causal_attention(
+            q: *const c_void,
+            k: *const c_void,
+            v: *const c_void,
+            output: *mut c_void,
+            seq_len: c_int,
+            heads: c_int,
+            kv_heads: c_int,
+            qk_head_dim: c_int,
+            v_head_dim: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_tiled_causal_attention(
+            q: *const c_void,
+            k: *const c_void,
+            v: *const c_void,
+            output: *mut c_void,
+            seq_len: c_int,
+            heads: c_int,
+            kv_heads: c_int,
+            qk_head_dim: c_int,
+            v_head_dim: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_flash_causal_attention_batched(
+            q: *const c_void,
+            k: *const c_void,
+            v: *const c_void,
+            output: *mut c_void,
+            batch_count: c_int,
+            seq_len: c_int,
+            heads: c_int,
+            kv_heads: c_int,
+            qk_head_dim: c_int,
+            v_head_dim: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_tiled_causal_attention_batched(
+            q: *const c_void,
+            k: *const c_void,
+            v: *const c_void,
+            output: *mut c_void,
+            batch_count: c_int,
+            seq_len: c_int,
+            heads: c_int,
+            kv_heads: c_int,
+            qk_head_dim: c_int,
+            v_head_dim: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_full_attention(
+            q: *const c_void,
+            k: *const c_void,
+            v: *const c_void,
+            output: *mut c_void,
+            seq_len: c_int,
+            heads: c_int,
+            kv_heads: c_int,
+            head_dim: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_window_attention(
+            q: *const c_void,
+            k: *const c_void,
+            v: *const c_void,
+            window_start: *const c_void,
+            window_end: *const c_void,
+            output: *mut c_void,
+            seq_len: c_int,
+            heads: c_int,
+            kv_heads: c_int,
+            head_dim: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_cached_decode_attention(
+            q: *const c_void,
+            k_cache: *const c_void,
+            v_cache: *const c_void,
+            output: *mut c_void,
+            position: c_int,
+            max_seq: c_int,
+            heads: c_int,
+            kv_heads: c_int,
+            qk_head_dim: c_int,
+            v_head_dim: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_flash_cached_decode_attention(
+            q: *const c_void,
+            k_cache: *const c_void,
+            v_cache: *const c_void,
+            output: *mut c_void,
+            position: c_int,
+            max_seq: c_int,
+            heads: c_int,
+            kv_heads: c_int,
+            qk_head_dim: c_int,
+            v_head_dim: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_paged_decode_attention(
+            q: *const c_void,
+            k_pages: *const c_void,
+            v_pages: *const c_void,
+            page_table: *const c_void,
+            output: *mut c_void,
+            position: c_int,
+            page_size: c_int,
+            page_table_len: c_int,
+            heads: c_int,
+            kv_heads: c_int,
+            qk_head_dim: c_int,
+            v_head_dim: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_flash_paged_decode_attention(
+            q: *const c_void,
+            k_pages: *const c_void,
+            v_pages: *const c_void,
+            page_table: *const c_void,
+            output: *mut c_void,
+            position: c_int,
+            page_size: c_int,
+            page_table_len: c_int,
+            heads: c_int,
+            kv_heads: c_int,
+            qk_head_dim: c_int,
+            v_head_dim: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_tiled_paged_decode_attention(
+            q: *const c_void,
+            k_pages: *const c_void,
+            v_pages: *const c_void,
+            page_table: *const c_void,
+            output: *mut c_void,
+            position: c_int,
+            page_size: c_int,
+            page_table_len: c_int,
+            heads: c_int,
+            kv_heads: c_int,
+            qk_head_dim: c_int,
+            v_head_dim: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_paged_decode_attention_batched(
+            q: *const c_void,
+            k_pages: *const c_void,
+            v_pages: *const c_void,
+            page_table: *const c_void,
+            output: *mut c_void,
+            batch_count: c_int,
+            position: c_int,
+            page_size: c_int,
+            page_table_len: c_int,
+            heads: c_int,
+            kv_heads: c_int,
+            qk_head_dim: c_int,
+            v_head_dim: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_flash_paged_decode_attention_batched(
+            q: *const c_void,
+            k_pages: *const c_void,
+            v_pages: *const c_void,
+            page_table: *const c_void,
+            output: *mut c_void,
+            batch_count: c_int,
+            position: c_int,
+            page_size: c_int,
+            page_table_len: c_int,
+            heads: c_int,
+            kv_heads: c_int,
+            qk_head_dim: c_int,
+            v_head_dim: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_tiled_paged_decode_attention_batched(
+            q: *const c_void,
+            k_pages: *const c_void,
+            v_pages: *const c_void,
+            page_table: *const c_void,
+            output: *mut c_void,
+            batch_count: c_int,
+            position: c_int,
+            page_size: c_int,
+            page_table_len: c_int,
+            heads: c_int,
+            kv_heads: c_int,
+            qk_head_dim: c_int,
+            v_head_dim: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_cached_decode_attention_batched(
+            q: *const c_void,
+            k_cache: *const c_void,
+            v_cache: *const c_void,
+            output: *mut c_void,
+            batch_count: c_int,
+            position: c_int,
+            max_seq: c_int,
+            heads: c_int,
+            kv_heads: c_int,
+            qk_head_dim: c_int,
+            v_head_dim: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_flash_cached_decode_attention_batched(
+            q: *const c_void,
+            k_cache: *const c_void,
+            v_cache: *const c_void,
+            output: *mut c_void,
+            batch_count: c_int,
+            position: c_int,
+            max_seq: c_int,
+            heads: c_int,
+            kv_heads: c_int,
+            qk_head_dim: c_int,
+            v_head_dim: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_argmax(
+            logits: *const c_void,
+            output_token: *mut c_void,
+            len: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_argmax_last_row(
+            logits: *const c_void,
+            output_token: *mut c_void,
+            rows: c_int,
+            cols: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_argmax_batched_last_token(
+            logits: *const c_void,
+            output_tokens: *mut c_void,
+            batch_count: c_int,
+            seq_len: c_int,
+            cols: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_sample_last_row(
+            logits: *const c_void,
+            output_token: *mut c_void,
+            rows: c_int,
+            cols: c_int,
+            temperature: c_float,
+            top_p: c_float,
+            top_k: c_int,
+            sample: c_float,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_sample_batched_last_token(
+            logits: *const c_void,
+            output_tokens: *mut c_void,
+            samples: *const c_void,
+            batch_count: c_int,
+            seq_len: c_int,
+            cols: c_int,
+            temperature: c_float,
+            top_p: c_float,
+            top_k: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+    }
+
+    pub fn launch_rms_norm(
+        input: &DeviceBuffer,
+        weight: &DeviceBuffer,
+        output: &DeviceBuffer,
+        rows: usize,
+        cols: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(rows, "rms_norm rows")?;
+        ensure_len(cols, "rms_norm cols")?;
+        launch_status(unsafe {
+            hi_cuda_launch_rms_norm(
+                input.as_ptr(),
+                weight.as_ptr(),
+                output.as_mut_ptr(),
+                rows as c_int,
+                cols as c_int,
+                eps,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_rms_norm")
+    }
+
+    pub fn launch_layer_norm(
+        input: &DeviceBuffer,
+        weight: &DeviceBuffer,
+        bias: &DeviceBuffer,
+        output: &DeviceBuffer,
+        rows: usize,
+        cols: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(rows, "layer_norm rows")?;
+        ensure_len(cols, "layer_norm cols")?;
+        launch_status(unsafe {
+            hi_cuda_launch_layer_norm(
+                input.as_ptr(),
+                weight.as_ptr(),
+                bias.as_ptr(),
+                output.as_mut_ptr(),
+                rows as c_int,
+                cols as c_int,
+                eps,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_layer_norm")
+    }
+
+    pub fn launch_silu_mul(
+        gate: &DeviceBuffer,
+        up: &DeviceBuffer,
+        output: &DeviceBuffer,
+        len: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(len, "silu_mul len")?;
+        launch_status(unsafe {
+            hi_cuda_launch_silu_mul(
+                gate.as_ptr(),
+                up.as_ptr(),
+                output.as_mut_ptr(),
+                len as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_silu_mul")
+    }
+
+    pub fn launch_gelu(
+        input: &DeviceBuffer,
+        output: &DeviceBuffer,
+        len: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(len, "gelu len")?;
+        launch_status(unsafe {
+            hi_cuda_launch_gelu(
+                input.as_ptr(),
+                output.as_mut_ptr(),
+                len as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_gelu")
+    }
+
+    pub fn launch_add(
+        left: &DeviceBuffer,
+        right: &DeviceBuffer,
+        output: &DeviceBuffer,
+        len: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(len, "add len")?;
+        launch_status(unsafe {
+            hi_cuda_launch_add(
+                left.as_ptr(),
+                right.as_ptr(),
+                output.as_mut_ptr(),
+                len as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_add")
+    }
+
+    pub fn launch_add_rowwise(
+        input: &DeviceBuffer,
+        bias: &DeviceBuffer,
+        output: &DeviceBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(rows, "add_rowwise rows")?;
+        ensure_len(cols, "add_rowwise cols")?;
+        launch_status(unsafe {
+            hi_cuda_launch_add_rowwise(
+                input.as_ptr(),
+                bias.as_ptr(),
+                output.as_mut_ptr(),
+                rows as c_int,
+                cols as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_add_rowwise")
+    }
+
+    pub fn launch_copy_row_f32(
+        input: &DeviceBuffer,
+        output: &DeviceBuffer,
+        row: usize,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(row, "copy_row row")?;
+        ensure_len(rows, "copy_row rows")?;
+        ensure_len(cols, "copy_row cols")?;
+        launch_status(unsafe {
+            hi_cuda_launch_copy_row_f32(
+                input.as_ptr(),
+                output.as_mut_ptr(),
+                row as c_int,
+                rows as c_int,
+                cols as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_copy_row_f32")
+    }
+
+    pub fn launch_add_scaled_row_in_place(
+        output: &DeviceBuffer,
+        row_values: &DeviceBuffer,
+        row: usize,
+        rows: usize,
+        cols: usize,
+        scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(row, "add_scaled_row row")?;
+        ensure_len(rows, "add_scaled_row rows")?;
+        ensure_len(cols, "add_scaled_row cols")?;
+        launch_status(unsafe {
+            hi_cuda_launch_add_scaled_row_in_place(
+                output.as_mut_ptr(),
+                row_values.as_ptr(),
+                row as c_int,
+                rows as c_int,
+                cols as c_int,
+                scale,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_add_scaled_row_in_place")
+    }
+
+    pub fn launch_moe_topk_router(
+        scores: &DeviceBuffer,
+        output_ids: &DeviceBuffer,
+        output_weights: &DeviceBuffer,
+        rows: usize,
+        experts: usize,
+        top_k: usize,
+        norm_topk: bool,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(rows, "moe_topk rows")?;
+        ensure_len(experts, "moe_topk experts")?;
+        ensure_len(top_k, "moe_topk top_k")?;
+        launch_status(unsafe {
+            hi_cuda_launch_moe_topk_router(
+                scores.as_ptr(),
+                output_ids.as_mut_ptr(),
+                output_weights.as_mut_ptr(),
+                rows as c_int,
+                experts as c_int,
+                top_k as c_int,
+                if norm_topk { 1 } else { 0 },
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_moe_topk_router")
+    }
+
+    pub fn launch_cast_f32_to_f16(
+        input: &DeviceBuffer,
+        output: &DeviceBuffer,
+        len: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(len, "cast_f32_to_f16 len")?;
+        launch_status(unsafe {
+            hi_cuda_launch_cast_f32_to_f16(
+                input.as_ptr(),
+                output.as_mut_ptr(),
+                len as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_cast_f32_to_f16")
+    }
+
+    pub fn launch_cast_f32_to_bf16(
+        input: &DeviceBuffer,
+        output: &DeviceBuffer,
+        len: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(len, "cast_f32_to_bf16 len")?;
+        launch_status(unsafe {
+            hi_cuda_launch_cast_f32_to_bf16(
+                input.as_ptr(),
+                output.as_mut_ptr(),
+                len as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_cast_f32_to_bf16")
+    }
+
+    pub fn launch_gather_rows_f16_to_f32(
+        matrix: &DeviceBuffer,
+        row_ids: &DeviceBuffer,
+        output: &DeviceBuffer,
+        row_count: usize,
+        cols: usize,
+        matrix_rows: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(row_count, "gather row_count")?;
+        ensure_len(cols, "gather cols")?;
+        ensure_len(matrix_rows, "gather matrix_rows")?;
+        launch_status(unsafe {
+            hi_cuda_launch_gather_rows_f16_to_f32(
+                matrix.as_ptr(),
+                row_ids.as_ptr(),
+                output.as_mut_ptr(),
+                row_count as c_int,
+                cols as c_int,
+                matrix_rows as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_gather_rows_f16_to_f32")
+    }
+
+    pub fn launch_gather_rows_bf16_to_f32(
+        matrix: &DeviceBuffer,
+        row_ids: &DeviceBuffer,
+        output: &DeviceBuffer,
+        row_count: usize,
+        cols: usize,
+        matrix_rows: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(row_count, "gather row_count")?;
+        ensure_len(cols, "gather cols")?;
+        ensure_len(matrix_rows, "gather matrix_rows")?;
+        launch_status(unsafe {
+            hi_cuda_launch_gather_rows_bf16_to_f32(
+                matrix.as_ptr(),
+                row_ids.as_ptr(),
+                output.as_mut_ptr(),
+                row_count as c_int,
+                cols as c_int,
+                matrix_rows as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_gather_rows_bf16_to_f32")
+    }
+
+    pub fn launch_gather_rows_f32_to_f32(
+        matrix: &DeviceBuffer,
+        row_ids: &DeviceBuffer,
+        output: &DeviceBuffer,
+        row_count: usize,
+        cols: usize,
+        matrix_rows: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(row_count, "gather row_count")?;
+        ensure_len(cols, "gather cols")?;
+        ensure_len(matrix_rows, "gather matrix_rows")?;
+        launch_status(unsafe {
+            hi_cuda_launch_gather_rows_f32_to_f32(
+                matrix.as_ptr(),
+                row_ids.as_ptr(),
+                output.as_mut_ptr(),
+                row_count as c_int,
+                cols as c_int,
+                matrix_rows as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_gather_rows_f32_to_f32")
+    }
+
+    pub fn launch_dequantize_matrix(
+        input: &DeviceBuffer,
+        output: &DeviceBuffer,
+        elements: usize,
+        quant_type: i32,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(elements, "dequantize elements")?;
+        launch_status(unsafe {
+            hi_cuda_launch_dequantize_matrix(
+                input.as_ptr(),
+                output.as_mut_ptr(),
+                elements as c_int,
+                quant_type as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_dequantize_matrix")
+    }
+
+    pub fn launch_rope(
+        values: &DeviceBuffer,
+        seq_len: usize,
+        heads: usize,
+        head_dim: usize,
+        base: f32,
+        scale: f32,
+        split_half: bool,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(seq_len, "rope seq_len")?;
+        ensure_len(heads, "rope heads")?;
+        ensure_len(head_dim, "rope head_dim")?;
+        launch_status(unsafe {
+            hi_cuda_launch_rope(
+                values.as_mut_ptr(),
+                seq_len as c_int,
+                heads as c_int,
+                head_dim as c_int,
+                base,
+                scale,
+                if split_half { 1 } else { 0 },
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_rope")
+    }
+
+    pub fn launch_rope_with_offset(
+        values: &DeviceBuffer,
+        seq_len: usize,
+        heads: usize,
+        head_dim: usize,
+        base: f32,
+        scale: f32,
+        position_offset: usize,
+        split_half: bool,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(seq_len, "rope seq_len")?;
+        ensure_len(heads, "rope heads")?;
+        ensure_len(head_dim, "rope head_dim")?;
+        ensure_len(position_offset, "rope position_offset")?;
+        launch_status(unsafe {
+            hi_cuda_launch_rope_with_offset(
+                values.as_mut_ptr(),
+                seq_len as c_int,
+                heads as c_int,
+                head_dim as c_int,
+                base,
+                scale,
+                position_offset as c_int,
+                if split_half { 1 } else { 0 },
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_rope_with_offset")
+    }
+
+    pub fn launch_rope_batched_with_offset(
+        values: &DeviceBuffer,
+        batch_count: usize,
+        seq_len: usize,
+        heads: usize,
+        head_dim: usize,
+        base: f32,
+        scale: f32,
+        position_offset: usize,
+        split_half: bool,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(batch_count, "rope batch_count")?;
+        ensure_len(seq_len, "rope seq_len")?;
+        ensure_len(heads, "rope heads")?;
+        ensure_len(head_dim, "rope head_dim")?;
+        ensure_len(position_offset, "rope position_offset")?;
+        launch_status(unsafe {
+            hi_cuda_launch_rope_batched_with_offset(
+                values.as_mut_ptr(),
+                batch_count as c_int,
+                seq_len as c_int,
+                heads as c_int,
+                head_dim as c_int,
+                base,
+                scale,
+                position_offset as c_int,
+                if split_half { 1 } else { 0 },
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_rope_batched_with_offset")
+    }
+
+    pub fn launch_vision_rope(
+        values: &DeviceBuffer,
+        pos_h: &DeviceBuffer,
+        pos_w: &DeviceBuffer,
+        seq_len: usize,
+        heads: usize,
+        head_dim: usize,
+        base: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(seq_len, "vision_rope seq_len")?;
+        ensure_len(heads, "vision_rope heads")?;
+        ensure_len(head_dim, "vision_rope head_dim")?;
+        launch_status(unsafe {
+            hi_cuda_launch_vision_rope(
+                values.as_mut_ptr(),
+                pos_h.as_ptr(),
+                pos_w.as_ptr(),
+                seq_len as c_int,
+                heads as c_int,
+                head_dim as c_int,
+                base,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_vision_rope")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_mrope(
+        values: &DeviceBuffer,
+        pos_t: &DeviceBuffer,
+        pos_h: &DeviceBuffer,
+        pos_w: &DeviceBuffer,
+        seq_len: usize,
+        heads: usize,
+        head_dim: usize,
+        base: f32,
+        scale: f32,
+        sections: [usize; 4],
+        split_half: bool,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(seq_len, "mrope seq_len")?;
+        ensure_len(heads, "mrope heads")?;
+        ensure_len(head_dim, "mrope head_dim")?;
+        for section in sections {
+            ensure_len(section, "mrope section")?;
+        }
+        launch_status(unsafe {
+            hi_cuda_launch_mrope(
+                values.as_mut_ptr(),
+                pos_t.as_ptr(),
+                pos_h.as_ptr(),
+                pos_w.as_ptr(),
+                seq_len as c_int,
+                heads as c_int,
+                head_dim as c_int,
+                base,
+                scale,
+                sections[0] as c_int,
+                sections[1] as c_int,
+                sections[2] as c_int,
+                sections[3] as c_int,
+                if split_half { 1 } else { 0 },
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_mrope")
+    }
+
+    pub fn launch_write_kv_cache(
+        values: &DeviceBuffer,
+        cache: &DeviceBuffer,
+        row_count: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        start_pos: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(row_count, "kv_cache row_count")?;
+        ensure_len(kv_heads, "kv_cache kv_heads")?;
+        ensure_len(head_dim, "kv_cache head_dim")?;
+        ensure_len(max_seq, "kv_cache max_seq")?;
+        ensure_len(start_pos, "kv_cache start_pos")?;
+        launch_status(unsafe {
+            hi_cuda_launch_write_kv_cache(
+                values.as_ptr(),
+                cache.as_mut_ptr(),
+                row_count as c_int,
+                kv_heads as c_int,
+                head_dim as c_int,
+                max_seq as c_int,
+                start_pos as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_write_kv_cache")
+    }
+
+    pub fn launch_write_kv_cache_batched(
+        values: &DeviceBuffer,
+        cache: &DeviceBuffer,
+        batch_count: usize,
+        row_count: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        start_pos: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(batch_count, "kv_cache batch_count")?;
+        ensure_len(row_count, "kv_cache row_count")?;
+        ensure_len(kv_heads, "kv_cache kv_heads")?;
+        ensure_len(head_dim, "kv_cache head_dim")?;
+        ensure_len(max_seq, "kv_cache max_seq")?;
+        ensure_len(start_pos, "kv_cache start_pos")?;
+        launch_status(unsafe {
+            hi_cuda_launch_write_kv_cache_batched(
+                values.as_ptr(),
+                cache.as_mut_ptr(),
+                batch_count as c_int,
+                row_count as c_int,
+                kv_heads as c_int,
+                head_dim as c_int,
+                max_seq as c_int,
+                start_pos as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_write_kv_cache_batched")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_write_paged_kv_cache(
+        values: &DeviceBuffer,
+        pages: &DeviceBuffer,
+        page_table: &DeviceBuffer,
+        row_count: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        page_size: usize,
+        page_table_len: usize,
+        start_pos: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(row_count, "paged_kv_cache row_count")?;
+        ensure_len(kv_heads, "paged_kv_cache kv_heads")?;
+        ensure_len(head_dim, "paged_kv_cache head_dim")?;
+        ensure_len(page_size, "paged_kv_cache page_size")?;
+        ensure_len(page_table_len, "paged_kv_cache page_table_len")?;
+        ensure_len(start_pos, "paged_kv_cache start_pos")?;
+        launch_status(unsafe {
+            hi_cuda_launch_write_paged_kv_cache(
+                values.as_ptr(),
+                pages.as_mut_ptr(),
+                page_table.as_ptr(),
+                row_count as c_int,
+                kv_heads as c_int,
+                head_dim as c_int,
+                page_size as c_int,
+                page_table_len as c_int,
+                start_pos as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_write_paged_kv_cache")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_write_paged_kv_cache_batched(
+        values: &DeviceBuffer,
+        pages: &DeviceBuffer,
+        page_table: &DeviceBuffer,
+        batch_count: usize,
+        row_count: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        page_size: usize,
+        page_table_len: usize,
+        start_pos: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(batch_count, "paged_kv_cache batch_count")?;
+        ensure_len(row_count, "paged_kv_cache row_count")?;
+        ensure_len(kv_heads, "paged_kv_cache kv_heads")?;
+        ensure_len(head_dim, "paged_kv_cache head_dim")?;
+        ensure_len(page_size, "paged_kv_cache page_size")?;
+        ensure_len(page_table_len, "paged_kv_cache page_table_len")?;
+        ensure_len(start_pos, "paged_kv_cache start_pos")?;
+        launch_status(unsafe {
+            hi_cuda_launch_write_paged_kv_cache_batched(
+                values.as_ptr(),
+                pages.as_mut_ptr(),
+                page_table.as_ptr(),
+                batch_count as c_int,
+                row_count as c_int,
+                kv_heads as c_int,
+                head_dim as c_int,
+                page_size as c_int,
+                page_table_len as c_int,
+                start_pos as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_write_paged_kv_cache_batched")
+    }
+
+    pub fn launch_copy_paged_kv_cache_prefix_batched(
+        pages: &DeviceBuffer,
+        page_table: &DeviceBuffer,
+        batch_count: usize,
+        token_count: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        page_size: usize,
+        page_table_len: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(batch_count, "copy_paged_kv_prefix batch_count")?;
+        ensure_len(token_count, "copy_paged_kv_prefix token_count")?;
+        ensure_len(kv_heads, "copy_paged_kv_prefix kv_heads")?;
+        ensure_len(head_dim, "copy_paged_kv_prefix head_dim")?;
+        ensure_len(page_size, "copy_paged_kv_prefix page_size")?;
+        ensure_len(page_table_len, "copy_paged_kv_prefix page_table_len")?;
+        launch_status(unsafe {
+            hi_cuda_launch_copy_paged_kv_cache_prefix_batched(
+                pages.as_mut_ptr(),
+                page_table.as_ptr(),
+                batch_count as c_int,
+                token_count as c_int,
+                kv_heads as c_int,
+                head_dim as c_int,
+                page_size as c_int,
+                page_table_len as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_copy_paged_kv_cache_prefix_batched")
+    }
+
+    pub fn launch_causal_attention(
+        q: &DeviceBuffer,
+        k: &DeviceBuffer,
+        v: &DeviceBuffer,
+        output: &DeviceBuffer,
+        seq_len: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        v_head_dim: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(seq_len, "attention seq_len")?;
+        ensure_len(heads, "attention heads")?;
+        ensure_len(kv_heads, "attention kv_heads")?;
+        ensure_len(head_dim, "attention head_dim")?;
+        ensure_len(v_head_dim, "attention v_head_dim")?;
+        launch_status(unsafe {
+            hi_cuda_launch_causal_attention(
+                q.as_ptr(),
+                k.as_ptr(),
+                v.as_ptr(),
+                output.as_mut_ptr(),
+                seq_len as c_int,
+                heads as c_int,
+                kv_heads as c_int,
+                head_dim as c_int,
+                v_head_dim as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_causal_attention")
+    }
+
+    pub fn launch_flash_causal_attention(
+        q: &DeviceBuffer,
+        k: &DeviceBuffer,
+        v: &DeviceBuffer,
+        output: &DeviceBuffer,
+        seq_len: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        v_head_dim: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(seq_len, "flash_attention seq_len")?;
+        ensure_len(heads, "flash_attention heads")?;
+        ensure_len(kv_heads, "flash_attention kv_heads")?;
+        ensure_len(head_dim, "flash_attention head_dim")?;
+        ensure_len(v_head_dim, "flash_attention v_head_dim")?;
+        launch_status(unsafe {
+            hi_cuda_launch_flash_causal_attention(
+                q.as_ptr(),
+                k.as_ptr(),
+                v.as_ptr(),
+                output.as_mut_ptr(),
+                seq_len as c_int,
+                heads as c_int,
+                kv_heads as c_int,
+                head_dim as c_int,
+                v_head_dim as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_flash_causal_attention")
+    }
+
+    pub fn launch_tiled_causal_attention(
+        q: &DeviceBuffer,
+        k: &DeviceBuffer,
+        v: &DeviceBuffer,
+        output: &DeviceBuffer,
+        seq_len: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        v_head_dim: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(seq_len, "tiled_attention seq_len")?;
+        ensure_len(heads, "tiled_attention heads")?;
+        ensure_len(kv_heads, "tiled_attention kv_heads")?;
+        ensure_len(head_dim, "tiled_attention head_dim")?;
+        ensure_len(v_head_dim, "tiled_attention v_head_dim")?;
+        launch_status(unsafe {
+            hi_cuda_launch_tiled_causal_attention(
+                q.as_ptr(),
+                k.as_ptr(),
+                v.as_ptr(),
+                output.as_mut_ptr(),
+                seq_len as c_int,
+                heads as c_int,
+                kv_heads as c_int,
+                head_dim as c_int,
+                v_head_dim as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_tiled_causal_attention")
+    }
+
+    pub fn launch_causal_attention_batched(
+        q: &DeviceBuffer,
+        k: &DeviceBuffer,
+        v: &DeviceBuffer,
+        output: &DeviceBuffer,
+        batch_count: usize,
+        seq_len: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        v_head_dim: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(batch_count, "attention batch_count")?;
+        ensure_len(seq_len, "attention seq_len")?;
+        ensure_len(heads, "attention heads")?;
+        ensure_len(kv_heads, "attention kv_heads")?;
+        ensure_len(head_dim, "attention head_dim")?;
+        ensure_len(v_head_dim, "attention v_head_dim")?;
+        launch_status(unsafe {
+            hi_cuda_launch_causal_attention_batched(
+                q.as_ptr(),
+                k.as_ptr(),
+                v.as_ptr(),
+                output.as_mut_ptr(),
+                batch_count as c_int,
+                seq_len as c_int,
+                heads as c_int,
+                kv_heads as c_int,
+                head_dim as c_int,
+                v_head_dim as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_causal_attention_batched")
+    }
+
+    pub fn launch_flash_causal_attention_batched(
+        q: &DeviceBuffer,
+        k: &DeviceBuffer,
+        v: &DeviceBuffer,
+        output: &DeviceBuffer,
+        batch_count: usize,
+        seq_len: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        v_head_dim: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(batch_count, "flash_attention batch_count")?;
+        ensure_len(seq_len, "flash_attention seq_len")?;
+        ensure_len(heads, "flash_attention heads")?;
+        ensure_len(kv_heads, "flash_attention kv_heads")?;
+        ensure_len(head_dim, "flash_attention head_dim")?;
+        ensure_len(v_head_dim, "flash_attention v_head_dim")?;
+        launch_status(unsafe {
+            hi_cuda_launch_flash_causal_attention_batched(
+                q.as_ptr(),
+                k.as_ptr(),
+                v.as_ptr(),
+                output.as_mut_ptr(),
+                batch_count as c_int,
+                seq_len as c_int,
+                heads as c_int,
+                kv_heads as c_int,
+                head_dim as c_int,
+                v_head_dim as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_flash_causal_attention_batched")
+    }
+
+    pub fn launch_tiled_causal_attention_batched(
+        q: &DeviceBuffer,
+        k: &DeviceBuffer,
+        v: &DeviceBuffer,
+        output: &DeviceBuffer,
+        batch_count: usize,
+        seq_len: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        v_head_dim: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(batch_count, "tiled_attention batch_count")?;
+        ensure_len(seq_len, "tiled_attention seq_len")?;
+        ensure_len(heads, "tiled_attention heads")?;
+        ensure_len(kv_heads, "tiled_attention kv_heads")?;
+        ensure_len(head_dim, "tiled_attention head_dim")?;
+        ensure_len(v_head_dim, "tiled_attention v_head_dim")?;
+        launch_status(unsafe {
+            hi_cuda_launch_tiled_causal_attention_batched(
+                q.as_ptr(),
+                k.as_ptr(),
+                v.as_ptr(),
+                output.as_mut_ptr(),
+                batch_count as c_int,
+                seq_len as c_int,
+                heads as c_int,
+                kv_heads as c_int,
+                head_dim as c_int,
+                v_head_dim as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_tiled_causal_attention_batched")
+    }
+
+    pub fn launch_full_attention(
+        q: &DeviceBuffer,
+        k: &DeviceBuffer,
+        v: &DeviceBuffer,
+        output: &DeviceBuffer,
+        seq_len: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(seq_len, "full_attention seq_len")?;
+        ensure_len(heads, "full_attention heads")?;
+        ensure_len(kv_heads, "full_attention kv_heads")?;
+        ensure_len(head_dim, "full_attention head_dim")?;
+        launch_status(unsafe {
+            hi_cuda_launch_full_attention(
+                q.as_ptr(),
+                k.as_ptr(),
+                v.as_ptr(),
+                output.as_mut_ptr(),
+                seq_len as c_int,
+                heads as c_int,
+                kv_heads as c_int,
+                head_dim as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_full_attention")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_window_attention(
+        q: &DeviceBuffer,
+        k: &DeviceBuffer,
+        v: &DeviceBuffer,
+        window_start: &DeviceBuffer,
+        window_end: &DeviceBuffer,
+        output: &DeviceBuffer,
+        seq_len: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(seq_len, "window_attention seq_len")?;
+        ensure_len(heads, "window_attention heads")?;
+        ensure_len(kv_heads, "window_attention kv_heads")?;
+        ensure_len(head_dim, "window_attention head_dim")?;
+        launch_status(unsafe {
+            hi_cuda_launch_window_attention(
+                q.as_ptr(),
+                k.as_ptr(),
+                v.as_ptr(),
+                window_start.as_ptr(),
+                window_end.as_ptr(),
+                output.as_mut_ptr(),
+                seq_len as c_int,
+                heads as c_int,
+                kv_heads as c_int,
+                head_dim as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_window_attention")
+    }
+
+    pub fn launch_cached_decode_attention(
+        q: &DeviceBuffer,
+        k_cache: &DeviceBuffer,
+        v_cache: &DeviceBuffer,
+        output: &DeviceBuffer,
+        position: usize,
+        max_seq: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        v_head_dim: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(position, "cached_attention position")?;
+        ensure_len(max_seq, "cached_attention max_seq")?;
+        ensure_len(heads, "cached_attention heads")?;
+        ensure_len(kv_heads, "cached_attention kv_heads")?;
+        ensure_len(head_dim, "cached_attention head_dim")?;
+        ensure_len(v_head_dim, "cached_attention v_head_dim")?;
+        launch_status(unsafe {
+            hi_cuda_launch_cached_decode_attention(
+                q.as_ptr(),
+                k_cache.as_ptr(),
+                v_cache.as_ptr(),
+                output.as_mut_ptr(),
+                position as c_int,
+                max_seq as c_int,
+                heads as c_int,
+                kv_heads as c_int,
+                head_dim as c_int,
+                v_head_dim as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_cached_decode_attention")
+    }
+
+    pub fn launch_flash_cached_decode_attention(
+        q: &DeviceBuffer,
+        k_cache: &DeviceBuffer,
+        v_cache: &DeviceBuffer,
+        output: &DeviceBuffer,
+        position: usize,
+        max_seq: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        v_head_dim: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(position, "flash_cached_attention position")?;
+        ensure_len(max_seq, "flash_cached_attention max_seq")?;
+        ensure_len(heads, "flash_cached_attention heads")?;
+        ensure_len(kv_heads, "flash_cached_attention kv_heads")?;
+        ensure_len(head_dim, "flash_cached_attention head_dim")?;
+        ensure_len(v_head_dim, "flash_cached_attention v_head_dim")?;
+        launch_status(unsafe {
+            hi_cuda_launch_flash_cached_decode_attention(
+                q.as_ptr(),
+                k_cache.as_ptr(),
+                v_cache.as_ptr(),
+                output.as_mut_ptr(),
+                position as c_int,
+                max_seq as c_int,
+                heads as c_int,
+                kv_heads as c_int,
+                head_dim as c_int,
+                v_head_dim as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_flash_cached_decode_attention")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_paged_decode_attention(
+        q: &DeviceBuffer,
+        k_pages: &DeviceBuffer,
+        v_pages: &DeviceBuffer,
+        page_table: &DeviceBuffer,
+        output: &DeviceBuffer,
+        position: usize,
+        page_size: usize,
+        page_table_len: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        v_head_dim: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(position, "paged_attention position")?;
+        ensure_len(page_size, "paged_attention page_size")?;
+        ensure_len(page_table_len, "paged_attention page_table_len")?;
+        ensure_len(heads, "paged_attention heads")?;
+        ensure_len(kv_heads, "paged_attention kv_heads")?;
+        ensure_len(head_dim, "paged_attention head_dim")?;
+        ensure_len(v_head_dim, "paged_attention v_head_dim")?;
+        launch_status(unsafe {
+            hi_cuda_launch_paged_decode_attention(
+                q.as_ptr(),
+                k_pages.as_ptr(),
+                v_pages.as_ptr(),
+                page_table.as_ptr(),
+                output.as_mut_ptr(),
+                position as c_int,
+                page_size as c_int,
+                page_table_len as c_int,
+                heads as c_int,
+                kv_heads as c_int,
+                head_dim as c_int,
+                v_head_dim as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_paged_decode_attention")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_flash_paged_decode_attention(
+        q: &DeviceBuffer,
+        k_pages: &DeviceBuffer,
+        v_pages: &DeviceBuffer,
+        page_table: &DeviceBuffer,
+        output: &DeviceBuffer,
+        position: usize,
+        page_size: usize,
+        page_table_len: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        v_head_dim: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(position, "flash_paged_attention position")?;
+        ensure_len(page_size, "flash_paged_attention page_size")?;
+        ensure_len(page_table_len, "flash_paged_attention page_table_len")?;
+        ensure_len(heads, "flash_paged_attention heads")?;
+        ensure_len(kv_heads, "flash_paged_attention kv_heads")?;
+        ensure_len(head_dim, "flash_paged_attention head_dim")?;
+        ensure_len(v_head_dim, "flash_paged_attention v_head_dim")?;
+        launch_status(unsafe {
+            hi_cuda_launch_flash_paged_decode_attention(
+                q.as_ptr(),
+                k_pages.as_ptr(),
+                v_pages.as_ptr(),
+                page_table.as_ptr(),
+                output.as_mut_ptr(),
+                position as c_int,
+                page_size as c_int,
+                page_table_len as c_int,
+                heads as c_int,
+                kv_heads as c_int,
+                head_dim as c_int,
+                v_head_dim as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_flash_paged_decode_attention")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_tiled_paged_decode_attention(
+        q: &DeviceBuffer,
+        k_pages: &DeviceBuffer,
+        v_pages: &DeviceBuffer,
+        page_table: &DeviceBuffer,
+        output: &DeviceBuffer,
+        position: usize,
+        page_size: usize,
+        page_table_len: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        v_head_dim: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(position, "tiled_paged_attention position")?;
+        ensure_len(page_size, "tiled_paged_attention page_size")?;
+        ensure_len(page_table_len, "tiled_paged_attention page_table_len")?;
+        ensure_len(heads, "tiled_paged_attention heads")?;
+        ensure_len(kv_heads, "tiled_paged_attention kv_heads")?;
+        ensure_len(head_dim, "tiled_paged_attention head_dim")?;
+        ensure_len(v_head_dim, "tiled_paged_attention v_head_dim")?;
+        launch_status(unsafe {
+            hi_cuda_launch_tiled_paged_decode_attention(
+                q.as_ptr(),
+                k_pages.as_ptr(),
+                v_pages.as_ptr(),
+                page_table.as_ptr(),
+                output.as_mut_ptr(),
+                position as c_int,
+                page_size as c_int,
+                page_table_len as c_int,
+                heads as c_int,
+                kv_heads as c_int,
+                head_dim as c_int,
+                v_head_dim as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_tiled_paged_decode_attention")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_paged_decode_attention_batched(
+        q: &DeviceBuffer,
+        k_pages: &DeviceBuffer,
+        v_pages: &DeviceBuffer,
+        page_table: &DeviceBuffer,
+        output: &DeviceBuffer,
+        batch_count: usize,
+        position: usize,
+        page_size: usize,
+        page_table_len: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        v_head_dim: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(batch_count, "paged_attention batch_count")?;
+        ensure_len(position, "paged_attention position")?;
+        ensure_len(page_size, "paged_attention page_size")?;
+        ensure_len(page_table_len, "paged_attention page_table_len")?;
+        ensure_len(heads, "paged_attention heads")?;
+        ensure_len(kv_heads, "paged_attention kv_heads")?;
+        ensure_len(head_dim, "paged_attention head_dim")?;
+        ensure_len(v_head_dim, "paged_attention v_head_dim")?;
+        launch_status(unsafe {
+            hi_cuda_launch_paged_decode_attention_batched(
+                q.as_ptr(),
+                k_pages.as_ptr(),
+                v_pages.as_ptr(),
+                page_table.as_ptr(),
+                output.as_mut_ptr(),
+                batch_count as c_int,
+                position as c_int,
+                page_size as c_int,
+                page_table_len as c_int,
+                heads as c_int,
+                kv_heads as c_int,
+                head_dim as c_int,
+                v_head_dim as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_paged_decode_attention_batched")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_flash_paged_decode_attention_batched(
+        q: &DeviceBuffer,
+        k_pages: &DeviceBuffer,
+        v_pages: &DeviceBuffer,
+        page_table: &DeviceBuffer,
+        output: &DeviceBuffer,
+        batch_count: usize,
+        position: usize,
+        page_size: usize,
+        page_table_len: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        v_head_dim: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(batch_count, "flash_paged_attention batch_count")?;
+        ensure_len(position, "flash_paged_attention position")?;
+        ensure_len(page_size, "flash_paged_attention page_size")?;
+        ensure_len(page_table_len, "flash_paged_attention page_table_len")?;
+        ensure_len(heads, "flash_paged_attention heads")?;
+        ensure_len(kv_heads, "flash_paged_attention kv_heads")?;
+        ensure_len(head_dim, "flash_paged_attention head_dim")?;
+        ensure_len(v_head_dim, "flash_paged_attention v_head_dim")?;
+        launch_status(unsafe {
+            hi_cuda_launch_flash_paged_decode_attention_batched(
+                q.as_ptr(),
+                k_pages.as_ptr(),
+                v_pages.as_ptr(),
+                page_table.as_ptr(),
+                output.as_mut_ptr(),
+                batch_count as c_int,
+                position as c_int,
+                page_size as c_int,
+                page_table_len as c_int,
+                heads as c_int,
+                kv_heads as c_int,
+                head_dim as c_int,
+                v_head_dim as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_flash_paged_decode_attention_batched")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_tiled_paged_decode_attention_batched(
+        q: &DeviceBuffer,
+        k_pages: &DeviceBuffer,
+        v_pages: &DeviceBuffer,
+        page_table: &DeviceBuffer,
+        output: &DeviceBuffer,
+        batch_count: usize,
+        position: usize,
+        page_size: usize,
+        page_table_len: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        v_head_dim: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(batch_count, "tiled_paged_attention batch_count")?;
+        ensure_len(position, "tiled_paged_attention position")?;
+        ensure_len(page_size, "tiled_paged_attention page_size")?;
+        ensure_len(page_table_len, "tiled_paged_attention page_table_len")?;
+        ensure_len(heads, "tiled_paged_attention heads")?;
+        ensure_len(kv_heads, "tiled_paged_attention kv_heads")?;
+        ensure_len(head_dim, "tiled_paged_attention head_dim")?;
+        ensure_len(v_head_dim, "tiled_paged_attention v_head_dim")?;
+        launch_status(unsafe {
+            hi_cuda_launch_tiled_paged_decode_attention_batched(
+                q.as_ptr(),
+                k_pages.as_ptr(),
+                v_pages.as_ptr(),
+                page_table.as_ptr(),
+                output.as_mut_ptr(),
+                batch_count as c_int,
+                position as c_int,
+                page_size as c_int,
+                page_table_len as c_int,
+                heads as c_int,
+                kv_heads as c_int,
+                head_dim as c_int,
+                v_head_dim as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_tiled_paged_decode_attention_batched")
+    }
+
+    pub fn launch_cached_decode_attention_batched(
+        q: &DeviceBuffer,
+        k_cache: &DeviceBuffer,
+        v_cache: &DeviceBuffer,
+        output: &DeviceBuffer,
+        batch_count: usize,
+        position: usize,
+        max_seq: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        v_head_dim: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(batch_count, "cached_attention batch_count")?;
+        ensure_len(position, "cached_attention position")?;
+        ensure_len(max_seq, "cached_attention max_seq")?;
+        ensure_len(heads, "cached_attention heads")?;
+        ensure_len(kv_heads, "cached_attention kv_heads")?;
+        ensure_len(head_dim, "cached_attention head_dim")?;
+        ensure_len(v_head_dim, "cached_attention v_head_dim")?;
+        launch_status(unsafe {
+            hi_cuda_launch_cached_decode_attention_batched(
+                q.as_ptr(),
+                k_cache.as_ptr(),
+                v_cache.as_ptr(),
+                output.as_mut_ptr(),
+                batch_count as c_int,
+                position as c_int,
+                max_seq as c_int,
+                heads as c_int,
+                kv_heads as c_int,
+                head_dim as c_int,
+                v_head_dim as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_cached_decode_attention_batched")
+    }
+
+    pub fn launch_flash_cached_decode_attention_batched(
+        q: &DeviceBuffer,
+        k_cache: &DeviceBuffer,
+        v_cache: &DeviceBuffer,
+        output: &DeviceBuffer,
+        batch_count: usize,
+        position: usize,
+        max_seq: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        v_head_dim: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(batch_count, "flash_cached_attention batch_count")?;
+        ensure_len(position, "flash_cached_attention position")?;
+        ensure_len(max_seq, "flash_cached_attention max_seq")?;
+        ensure_len(heads, "flash_cached_attention heads")?;
+        ensure_len(kv_heads, "flash_cached_attention kv_heads")?;
+        ensure_len(head_dim, "flash_cached_attention head_dim")?;
+        ensure_len(v_head_dim, "flash_cached_attention v_head_dim")?;
+        launch_status(unsafe {
+            hi_cuda_launch_flash_cached_decode_attention_batched(
+                q.as_ptr(),
+                k_cache.as_ptr(),
+                v_cache.as_ptr(),
+                output.as_mut_ptr(),
+                batch_count as c_int,
+                position as c_int,
+                max_seq as c_int,
+                heads as c_int,
+                kv_heads as c_int,
+                head_dim as c_int,
+                v_head_dim as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_flash_cached_decode_attention_batched")
+    }
+
+    pub fn launch_argmax(
+        logits: &DeviceBuffer,
+        output_token: &DeviceBuffer,
+        len: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(len, "argmax len")?;
+        launch_status(unsafe {
+            hi_cuda_launch_argmax(
+                logits.as_ptr(),
+                output_token.as_mut_ptr(),
+                len as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_argmax")
+    }
+
+    pub fn launch_argmax_last_row(
+        logits: &DeviceBuffer,
+        output_token: &DeviceBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(rows, "argmax_last_row rows")?;
+        ensure_len(cols, "argmax_last_row cols")?;
+        launch_status(unsafe {
+            hi_cuda_launch_argmax_last_row(
+                logits.as_ptr(),
+                output_token.as_mut_ptr(),
+                rows as c_int,
+                cols as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_argmax_last_row")
+    }
+
+    pub fn launch_argmax_batched_last_token(
+        logits: &DeviceBuffer,
+        output_tokens: &DeviceBuffer,
+        batch_count: usize,
+        seq_len: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(batch_count, "argmax_batched batch_count")?;
+        ensure_len(seq_len, "argmax_batched seq_len")?;
+        ensure_len(cols, "argmax_batched cols")?;
+        launch_status(unsafe {
+            hi_cuda_launch_argmax_batched_last_token(
+                logits.as_ptr(),
+                output_tokens.as_mut_ptr(),
+                batch_count as c_int,
+                seq_len as c_int,
+                cols as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_argmax_batched_last_token")
+    }
+
+    pub fn launch_sample_last_row(
+        logits: &DeviceBuffer,
+        output_token: &DeviceBuffer,
+        rows: usize,
+        cols: usize,
+        temperature: f32,
+        top_p: f32,
+        top_k: Option<u32>,
+        sample: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(rows, "sample_last_row rows")?;
+        ensure_len(cols, "sample_last_row cols")?;
+        let top_k = match top_k {
+            Some(value) => {
+                if value > c_int::MAX as u32 {
+                    bail!("sample_last_row top_k {value} exceeds CUDA launch i32 limit");
+                }
+                value as c_int
+            }
+            None => 0,
+        };
+        launch_status(unsafe {
+            hi_cuda_launch_sample_last_row(
+                logits.as_ptr(),
+                output_token.as_mut_ptr(),
+                rows as c_int,
+                cols as c_int,
+                temperature,
+                top_p,
+                top_k,
+                sample,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_sample_last_row")
+    }
+
+    pub fn launch_sample_batched_last_token(
+        logits: &DeviceBuffer,
+        output_tokens: &DeviceBuffer,
+        samples: &DeviceBuffer,
+        batch_count: usize,
+        seq_len: usize,
+        cols: usize,
+        temperature: f32,
+        top_p: f32,
+        top_k: Option<u32>,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(batch_count, "sample_batched batch_count")?;
+        ensure_len(seq_len, "sample_batched seq_len")?;
+        ensure_len(cols, "sample_batched cols")?;
+        let top_k = match top_k {
+            Some(value) => {
+                if value > c_int::MAX as u32 {
+                    bail!("sample_batched top_k {value} exceeds CUDA launch i32 limit");
+                }
+                value as c_int
+            }
+            None => 0,
+        };
+        launch_status(unsafe {
+            hi_cuda_launch_sample_batched_last_token(
+                logits.as_ptr(),
+                output_tokens.as_mut_ptr(),
+                samples.as_ptr(),
+                batch_count as c_int,
+                seq_len as c_int,
+                cols as c_int,
+                temperature,
+                top_p,
+                top_k,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_sample_batched_last_token")
+    }
+
+    fn ensure_len(value: usize, label: &str) -> Result<()> {
+        if value > c_int::MAX as usize {
+            bail!("{label} {value} exceeds CUDA launch i32 limit");
+        }
+        Ok(())
+    }
+
+    fn launch_status(status: c_int) -> Result<()> {
+        if status == 0 {
+            Ok(())
+        } else {
+            bail!("hi-cuda kernel launcher rejected arguments with status {status}");
+        }
+    }
+}
+
+#[cfg(feature = "native-cuda")]
+pub use native::*;
+
+pub fn native_cuda_kernels_enabled() -> bool {
+    cfg!(feature = "native-cuda")
+}

@@ -148,7 +148,7 @@ impl Lcg {
 #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
 pub mod mlx {
     use anyhow::Result;
-    use mlx_rs::ops::indexing::IndexOp;
+    use mlx_rs::ops::indexing::{IndexOp, argmax};
     use mlx_rs::{Array, transforms};
 
     use super::LogitsProcessor;
@@ -170,6 +170,18 @@ pub mod mlx {
         previous_tokens: &[u32],
     ) -> Result<Option<u32>> {
         Ok(processor.sample(&last_token_logits(logits)?, previous_tokens))
+    }
+
+    pub fn greedy_next_token(logits: &Array) -> Result<Option<u32>> {
+        let shape = logits.shape();
+        if shape.is_empty() || shape[shape.len() - 1] == 0 {
+            return Ok(None);
+        }
+        let seq = shape[shape.len() - 2];
+        let last = logits.index((.., seq - 1, ..)).reshape(&[-1])?;
+        let index = argmax(&last, false)?;
+        transforms::eval([&index])?;
+        Ok(Some(index.item::<u32>()))
     }
 }
 
