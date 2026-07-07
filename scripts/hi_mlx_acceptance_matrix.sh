@@ -16,13 +16,20 @@ HI_BIN="${HI_BIN:-$ROOT/target/debug/hi}"
 SKIP_OVERSIZE="${HI_MLX_SKIP_OVERSIZE:-1}"
 MEMORY_LIMIT_FRACTION="${HI_MLX_MEMORY_LIMIT_FRACTION:-0.85}"
 
+# Default matrix. Small, runnable models across the supported arch families, plus newer variants
+# that probe the family-detection edges. Override by passing repos as args.
+#
+# Verified 2026-07 (family detection is a loose substring match, so "detected" != "runs"):
+#   works : qwen2, qwen3, qwen3_5 (Mamba/SSM hybrid VL, Qwen35Like), glm4 (GQA, Glm4Like),
+#           glm4_moe_lite (GLM-x-Flash, MLA), deepseek_v2/v3/v4 (MLA)
 REPOS=(
-  "mlx-community/Qwen3-0.6B-4bit"
-  "mlx-community/DeepSeek-V3-4bit"
-  "mlx-community/DeepSeek-V3.2-4bit"
-  "mlx-community/DeepSeek-V4-Flash-4bit"
-  "mlx-community/GLM-4.7-Flash-4bit"
-  "mlx-community/GLM-4.7-Flash-8bit"
+  "mlx-community/Qwen3-0.6B-4bit"                                          # qwen3          — works
+  "Jackrong/MLX-Qwen3.5-9B-Claude-4.6-Opus-Reasoning-Distilled-v2-4bit"    # qwen3_5 SSM VL — works (Qwen35Like)
+  "mlx-community/GLM-4-9B-0414-4bit"                                       # glm4 GQA       — works (Glm4Like)
+  "mlx-community/GLM-4.7-Flash-4bit"                                       # glm4_moe_lite  — works
+  # large / MLA (skipped by the oversize guard unless you have the RAM; big downloads):
+  # "mlx-community/DeepSeek-V4-Flash-4bit"
+  # "mlx-community/GLM-4.7-Flash-8bit"
 )
 
 usage() {
@@ -218,12 +225,25 @@ validate_nonstream() {
   local path="$1"
   python3 - "$path" <<'PY'
 import json, sys
+from collections import Counter
 with open(sys.argv[1], "r", encoding="utf-8") as f:
     body = json.load(f)
-choice = body["choices"][0]
-content = choice["message"].get("content")
-if not isinstance(content, str) or not content.strip():
-    raise SystemExit(f"assistant content is empty: {body}")
+msg = body["choices"][0]["message"]
+# Reasoning models put their answer in `reasoning` until they finish thinking, so accept either.
+text = ((msg.get("content") or "") + " " + (msg.get("reasoning") or "")).strip()
+if not text:
+    raise SystemExit(f"assistant produced no text: {body}")
+
+# Coherence gate: catch degenerate output (repeated tokens/chars) that a broken arch or bad chat
+# template produces but a structural "200 OK / non-empty" check would happily pass.
+compact = "".join(text.split())
+if len(compact) >= 8 and len(set(compact)) <= 2:
+    raise SystemExit(f"degenerate output (<=2 distinct chars): {text[:120]!r}")
+if compact and Counter(compact).most_common(1)[0][1] / len(compact) > 0.6:
+    raise SystemExit(f"degenerate output (one char >60%): {text[:120]!r}")
+words = text.split()
+if len(words) >= 6 and len(set(words)) <= 2:
+    raise SystemExit(f"degenerate output (<=2 distinct words): {text[:120]!r}")
 PY
 }
 

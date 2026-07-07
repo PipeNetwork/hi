@@ -30,6 +30,7 @@ pub enum ModelFamily {
     Phi,
     DeepSeek,
     GlmFlash,
+    Hy3,
 }
 
 impl ModelFamily {
@@ -44,6 +45,7 @@ impl ModelFamily {
             Self::Phi => "phi",
             Self::DeepSeek => "deepseek",
             Self::GlmFlash => "glm-flash",
+            Self::Hy3 => "hy3",
         }
     }
 
@@ -53,7 +55,9 @@ impl ModelFamily {
 
     pub fn from_gguf_architecture(architecture: &str) -> Option<Self> {
         let arch = architecture.to_ascii_lowercase();
-        if arch.contains("qwen3") {
+        if arch.contains("hy_v3") || arch.contains("hyv3") || arch.contains("hunyuan") {
+            Some(Self::Hy3)
+        } else if arch.contains("qwen3") {
             Some(Self::Qwen3)
         } else if arch.contains("qwen") {
             Some(Self::Qwen2)

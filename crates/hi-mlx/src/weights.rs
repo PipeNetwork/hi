@@ -78,7 +78,8 @@ impl WeightCatalog {
         config.quantization.validate_supported()?;
         let required = ["model.embed_tokens.weight", "model.norm.weight"];
         for key in required {
-            if !self.has(key) {
+            // VL models (Qwen3.5) still carry the `language_model.` prefix at validation time.
+            if !self.has(key) && !self.has(&format!("language_model.{key}")) {
                 bail!(
                     "bad model path {}: missing required tensor {key}",
                     self.root.display()
@@ -86,14 +87,28 @@ impl WeightCatalog {
             }
         }
         match config.family {
-            crate::manifest::ModelFamily::Qwen2 | crate::manifest::ModelFamily::Qwen3 => {
-                self.require_any(
-                    "qwen attention projection",
-                    &[
-                        "model.layers.0.self_attn.q_proj.weight",
-                        "model.layers.0.self_attn.q_proj.scales",
-                    ],
-                )?;
+            crate::manifest::ModelFamily::Qwen2
+            | crate::manifest::ModelFamily::Qwen3
+            | crate::manifest::ModelFamily::Hy3 => {
+                if config.linear_num_value_heads.is_some() {
+                    // Qwen3.5 gated-delta-net hybrid: layer 0 is a linear-attn (SSM) layer, and the
+                    // weights may still carry the VL `language_model.` prefix at this point.
+                    self.require_any(
+                        "Qwen3.5 linear-attn projection",
+                        &[
+                            "model.layers.0.linear_attn.conv1d.weight",
+                            "language_model.model.layers.0.linear_attn.conv1d.weight",
+                        ],
+                    )?;
+                } else {
+                    self.require_any(
+                        "qwen attention projection",
+                        &[
+                            "model.layers.0.self_attn.q_proj.weight",
+                            "model.layers.0.self_attn.q_proj.scales",
+                        ],
+                    )?;
+                }
             }
             crate::manifest::ModelFamily::DeepSeek | crate::manifest::ModelFamily::GlmFlash => {
                 if config.is_deepseek_v4()
@@ -114,6 +129,17 @@ impl WeightCatalog {
                     if config.is_deepseek_v4() {
                         self.validate_deepseek_v4_compressed_attention(config)?;
                     }
+                } else if self.has("model.layers.0.self_attn.q_proj.weight")
+                    || self.has("model.layers.0.self_attn.q_proj.scales")
+                {
+                    // Standard GQA GLM-4 (Glm4Like), not MLA.
+                    self.require_any(
+                        "GLM-4 attention projection",
+                        &[
+                            "model.layers.0.self_attn.q_proj.weight",
+                            "model.layers.0.self_attn.q_proj.scales",
+                        ],
+                    )?;
                 } else {
                     self.require_any(
                         "MLA attention projection",
@@ -350,6 +376,19 @@ pub mod mlx {
             let loaded = Array::load_safetensors(&path)
                 .with_context(|| format!("loading safetensors shard {}", path.display()))?;
             for (key, value) in loaded {
+                // VL models (e.g. Qwen3.5) nest the language model under `language_model.`; strip it
+                // and drop the vision tower / MTP heads we don't run.
+                let key = key
+                    .strip_prefix("language_model.")
+                    .map(str::to_string)
+                    .unwrap_or(key);
+                if key.starts_with("visual.")
+                    || key.starts_with("vision_")
+                    || key.contains(".mtp.")
+                    || key.starts_with("mtp.")
+                {
+                    continue;
+                }
                 arrays.insert(key, value);
             }
         }

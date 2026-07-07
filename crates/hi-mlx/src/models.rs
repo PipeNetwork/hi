@@ -76,6 +76,43 @@ impl NativeRuntime {
             on_event,
         )
     }
+
+    pub fn from_path(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let config = crate::config::load_model_config(path)?;
+        let weights = crate::weights::WeightCatalog::load(path)?;
+        weights.validate_for_config(&config)?;
+        let tokenizer = crate::generate::TokenizerRuntime::load(path)?;
+        Self::load(config, weights, tokenizer)
+    }
+
+    /// Whether this model can be a speculative-decoding *target* (needs KV-cache rollback).
+    pub fn supports_speculative(&self) -> bool {
+        self.model.supports_rollback()
+    }
+
+    /// Greedy speculative decoding using `draft` as the proposal model. Output is identical to this
+    /// (target) model's greedy decode.
+    pub fn speculative_generate<F>(
+        &mut self,
+        draft: &mut NativeRuntime,
+        request: GenerationRequest,
+        k: usize,
+        on_event: F,
+    ) -> Result<(GenerationOutput, native::SpecStats)>
+    where
+        F: FnMut(GenerationEvent) -> Result<()>,
+    {
+        native::speculative_generate(
+            &self.config,
+            self.model.as_mut(),
+            draft.model.as_mut(),
+            &self.tokenizer,
+            request,
+            k,
+            on_event,
+        )
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
@@ -83,6 +120,13 @@ pub trait CausalLm {
     fn forward(&mut self, input_ids: &[u32]) -> Result<mlx_rs::Array>;
     fn reset_cache(&mut self);
     fn prepare_cache(&mut self, _capacity: i32) {}
+    /// Roll the KV cache back to `to_offset` (drop everything after). Used by speculative decoding to
+    /// discard rejected draft tokens. Default is a no-op; only models with a rollback-safe KV cache
+    /// (not the SSM state models) override it, so `speculative_generate` checks `supports_rollback`.
+    fn rollback_cache(&mut self, _to_offset: i32) {}
+    fn supports_rollback(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
@@ -94,12 +138,16 @@ mod native {
     use mlx_rs::fast::{
         ScaledDotProductAttentionMask, layer_norm, rms_norm, rope, scaled_dot_product_attention,
     };
-    use mlx_rs::ops::indexing::{IndexOp, TryIndexMutOp, put_along_axis, take_along_axis};
-    use mlx_rs::ops::{
-        argpartition_axis, broadcast_to, concatenate_axis, cos, dequantize, einsum, matmul,
-        maximum, mean_axis, minimum, rsqrt, sigmoid, sin, softmax_axis, split_sections, stack_axis,
-        sum_axis, which, zeros_dtype,
+    use mlx_rs::ops::indexing::{
+        IndexOp, TryIndexMutOp, argmax_axis, put_along_axis, take_along_axis,
     };
+    use mlx_rs::ops::{
+        argpartition_axis, broadcast_to, concatenate_axis, conv1d, cos, dequantize, einsum, exp,
+        identity, matmul, maximum, mean_axis, minimum, rsqrt, sigmoid, sin, softmax_axis,
+        split_sections, stack_axis, sum_axis, tril, which, zeros_dtype,
+    };
+    use mlx_rs::nn::{silu, softplus};
+    use mlx_rs::transforms::compile::{CallMut, Compile};
     use mlx_rs::{Array, Stream, transforms};
 
     use super::CausalLm;
@@ -118,11 +166,24 @@ mod native {
             return Ok(Box::new(DeepSeekV4Like::new(config.clone(), arrays)?));
         }
         match config.family {
-            ModelFamily::Qwen2 | ModelFamily::Qwen3 => {
-                Ok(Box::new(QwenLike::new(config.clone(), arrays)?))
+            ModelFamily::Qwen2 | ModelFamily::Qwen3 | ModelFamily::Hy3 => {
+                // Qwen3.5 gated-delta-net hybrid (linear-attn heads present) uses its own path.
+                if config.linear_num_value_heads.is_some() {
+                    Ok(Box::new(Qwen35Like::new(config.clone(), arrays)?))
+                } else {
+                    Ok(Box::new(QwenLike::new(config.clone(), arrays)?))
+                }
             }
             ModelFamily::DeepSeek | ModelFamily::GlmFlash => {
-                Ok(Box::new(MlaLike::new(config.clone(), arrays)?))
+                // Standard GQA GLM-4 uses q/k/v_proj (no MLA `kv_a_proj`); route it to Glm4Like.
+                if config.family == ModelFamily::GlmFlash
+                    && arrays.contains_key("model.layers.0.self_attn.q_proj.weight")
+                    && !arrays.contains_key("model.layers.0.self_attn.kv_a_proj_with_mqa.weight")
+                {
+                    Ok(Box::new(Glm4Like::new(config.clone(), arrays)?))
+                } else {
+                    Ok(Box::new(MlaLike::new(config.clone(), arrays)?))
+                }
             }
             ModelFamily::Llama
             | ModelFamily::Mistral
@@ -213,6 +274,146 @@ mod native {
         Ok(output)
     }
 
+    // Per-position greedy token (argmax over vocab) for a [1, seq, vocab] logits tensor. The argmax
+    // runs on the GPU so only `seq` integers cross to the CPU, not the full seq×vocab logits.
+    fn argmax_rows(logits: &Array) -> Result<Vec<u32>> {
+        let shape = logits.shape();
+        let seq = shape[shape.len() - 2];
+        let vocab = shape[shape.len() - 1];
+        let am = argmax_axis(&logits.reshape(&[seq, vocab])?, 1, false)?.as_type::<i32>()?;
+        transforms::eval([&am])?;
+        Ok(am.as_slice::<i32>().iter().map(|&x| x as u32).collect())
+    }
+
+    pub struct SpecStats {
+        pub rounds: usize,
+        pub proposed: usize,
+        pub accepted: usize,
+    }
+
+    // Greedy speculative decoding: a small draft model proposes `k` tokens each round, the target
+    // verifies them in a single forward (one weight read), accepts the longest matching prefix, and
+    // appends the target's own correction/bonus token. Output is identical to the target's greedy
+    // decode. Draft + target MUST share a tokenizer.
+    pub fn speculative_generate<F>(
+        config: &MlxModelConfig,
+        target: &mut dyn CausalLm,
+        draft: &mut dyn CausalLm,
+        tokenizer: &TokenizerRuntime,
+        request: GenerationRequest,
+        k: usize,
+        mut on_event: F,
+    ) -> Result<(GenerationOutput, SpecStats)>
+    where
+        F: FnMut(GenerationEvent) -> Result<()>,
+    {
+        if !target.supports_rollback() {
+            bail!(
+                "speculative decoding needs a rollback-capable target (Qwen2/Qwen3 attention); \
+                 this target model does not support KV-cache rollback"
+            );
+        }
+        let k = k.max(1);
+        let prompt_tokens = tokenizer.encode(&request.prompt)?;
+        if prompt_tokens.is_empty() {
+            bail!("prompt encoded to zero tokens");
+        }
+        let max_tokens = request.max_tokens.max(1) as usize;
+        target.reset_cache();
+        draft.reset_cache();
+        let cap = (prompt_tokens.len() + max_tokens + k + 4).min(i32::MAX as usize) as i32;
+        target.prepare_cache(cap);
+        draft.prepare_cache(cap);
+
+        // Prefill both models. Target uses the "anchor" trick: the last committed token is kept OUT
+        // of the KV cache and prepended to each verify forward, so the correction token folds into the
+        // next round's verify — one target weight-read per round instead of two.
+        let logits_t = prefill_logits(target, &prompt_tokens, prefill_chunk_size())?;
+        let logits_d = prefill_logits(draft, &prompt_tokens, prefill_chunk_size())?;
+        let _ = &logits_t;
+        let mut d_next = *argmax_rows(&logits_d)?.last().unwrap();
+        let mut m = prompt_tokens.len() as i32; // committed length
+        // Pull the last prompt token back out of the target cache to seed the anchor.
+        target.rollback_cache(m - 1);
+        let mut anchor = *prompt_tokens.last().unwrap();
+
+        let mut generated: Vec<u32> = Vec::new();
+        let mut decoded_text = String::new();
+        let (mut rounds, mut proposed, mut accepted) = (0usize, 0usize, 0usize);
+        let mut stop = false;
+
+        while generated.len() < max_tokens && !stop {
+            rounds += 1;
+            // 1. Draft proposes k tokens greedily (draft cache: m -> m+k).
+            let mut drafts: Vec<u32> = Vec::with_capacity(k);
+            let mut d = d_next;
+            for i in 0..k {
+                drafts.push(d);
+                let dl = draft.forward(&[d])?;
+                if i + 1 < k {
+                    d = *argmax_rows(&dl)?.last().unwrap();
+                }
+            }
+            proposed += k;
+
+            // 2. Target verifies [anchor, d_1..d_k] in ONE forward (cache: m-1 -> m+k).
+            let mut vin = Vec::with_capacity(k + 1);
+            vin.push(anchor);
+            vin.extend_from_slice(&drafts);
+            let tl = target.forward(&vin)?;
+            let ta = argmax_rows(&tl)?; // ta[0]=target token at pos m, ta[j]=token at pos m+j
+
+            // 3. Accept longest prefix: d_{i+1} accepted iff drafts[i] == ta[i].
+            let mut n = 0usize;
+            while n < k && drafts[n] == ta[n] {
+                n += 1;
+            }
+            accepted += n;
+            let correction = ta[n]; // target's token at the divergence (or the bonus if n==k)
+
+            // 4. Commit accepted drafts + the correction/bonus token.
+            let mut to_commit: Vec<u32> = drafts[..n].to_vec();
+            to_commit.push(correction);
+            for &tok in &to_commit {
+                generated.push(tok);
+                let current_text = tokenizer.decode(&generated)?;
+                let delta = decoded_delta(&decoded_text, &current_text, tokenizer, tok)?;
+                decoded_text = current_text;
+                on_event(GenerationEvent::TokenDelta {
+                    token_id: tok,
+                    text: delta,
+                })?;
+                if generated.len() >= max_tokens || hit_stop(&generated, &config.eos_token_ids) {
+                    stop = true;
+                    break;
+                }
+            }
+            if stop {
+                break;
+            }
+
+            // 5. Target: keep [anchor, d_1..d_n] (cache -> m+n); the correction becomes the new anchor
+            //    (processed for free in the next verify). Draft: keep d_1..d_n, then process correction.
+            target.rollback_cache(m + n as i32);
+            anchor = correction;
+            draft.rollback_cache(m + n as i32);
+            let nld = draft.forward(&[correction])?;
+            d_next = *argmax_rows(&nld)?.last().unwrap();
+            m += n as i32 + 1;
+        }
+
+        let text = tokenizer.decode(&generated)?;
+        let output = GenerationOutput {
+            prompt_tokens: prompt_tokens.len() as u64,
+            completion_tokens: generated.len() as u64,
+            text,
+        };
+        on_event(GenerationEvent::Finished {
+            output: output.clone(),
+        })?;
+        Ok((output, SpecStats { rounds, proposed, accepted }))
+    }
+
     fn prefill_logits(
         model: &mut dyn CausalLm,
         prompt_tokens: &[u32],
@@ -278,6 +479,12 @@ mod native {
             self.value = None;
             self.offset = 0;
             self.start = 0;
+        }
+
+        // Roll the write position back; the dense (fixed-capacity) buffer keeps its storage and the
+        // stale positions past `to_offset` are overwritten by the next update.
+        fn rollback(&mut self, to_offset: i32) {
+            self.offset = to_offset.max(0);
         }
 
         fn prepare_capacity(&mut self, capacity: i32) {
@@ -1356,6 +1563,25 @@ mod native {
                 _ => matmul(x, &weight.t()).map_err(Into::into),
             }
         }
+
+        /// Batched forward over all routed experts at once. `rhs_indices` selects the expert
+        /// weight for each output position (see `gather_qmm_mode`).
+        fn gather(&self, x: &Array, rhs_indices: &Array) -> Result<Array> {
+            match &self.scales {
+                Some(scales) => gather_qmm_mode(
+                    x,
+                    &self.weight,
+                    scales,
+                    self.biases.as_ref(),
+                    rhs_indices,
+                    true,
+                    self.group_size,
+                    self.bits,
+                    &self.mode,
+                ),
+                None => bail!("hi-mlx batched MoE requires quantized expert weights"),
+            }
+        }
     }
 
     struct SwitchMlp {
@@ -1382,6 +1608,15 @@ mod native {
             let gate = sigmoid(&gate_pre)? * gate_pre;
             let up = self.up_proj.forward_expert(x, expert)?;
             self.down_proj.forward_expert(&(gate * up), expert)
+        }
+
+        /// Batched SwiGLU over every routed expert at once. `x` is the expanded token tensor
+        /// `[.., 1, 1, d]` and `inds` is `[.., top_k]`; returns `[.., top_k, 1, d]`.
+        fn forward_batched(&self, x: &Array, inds: &Array) -> Result<Array> {
+            let gate_pre = self.gate_proj.gather(x, inds)?;
+            let gate = sigmoid(&gate_pre)? * gate_pre;
+            let up = self.up_proj.gather(x, inds)?;
+            self.down_proj.gather(&(gate * up), inds)
         }
 
         fn forward_expert_limited(&self, x: &Array, expert: i32, limit: f32) -> Result<Array> {
@@ -2707,6 +2942,13 @@ mod native {
         shared_expert_gate: Option<Linear>,
         top_k: usize,
         norm_topk_prob: bool,
+        // Hy3 (hy_v3) routing: sigmoid scores, expert-bias used only for top-k selection while
+        // the routed weights use the bias-free sigmoid scores, then scaled by routed_scaling_factor.
+        sigmoid_routing: bool,
+        expert_bias: Option<Vec<f32>>,
+        routed_scaling_factor: f32,
+        // Read once at load (not per forward) — env lookups per layer/token tank throughput.
+        compile_moe: bool,
     }
 
     impl QwenMoe {
@@ -2715,6 +2957,15 @@ mod native {
             arrays: &HashMap<String, Array>,
             config: &MlxModelConfig,
         ) -> Result<Self> {
+            let expert_bias = match arrays.get(&format!("{prefix}.gate.e_score_correction_bias")) {
+                Some(b) => {
+                    let b = b.as_type::<f32>()?;
+                    transforms::eval([&b])?;
+                    Some(b.as_slice::<f32>().to_vec())
+                }
+                None => None,
+            };
+            let compile_moe = std::env::var_os("HI_MLX_COMPILE_MOE").is_some();
             Ok(Self {
                 gate: Linear::load(&format!("{prefix}.gate"), arrays, config)?,
                 switch_mlp: SwitchMlp::load(&format!("{prefix}.switch_mlp"), arrays, config)?,
@@ -2742,12 +2993,26 @@ mod native {
                 },
                 top_k: config.num_experts_per_tok.unwrap_or(1) as usize,
                 norm_topk_prob: config.norm_topk_prob,
+                sigmoid_routing: config.family == ModelFamily::Hy3,
+                expert_bias,
+                routed_scaling_factor: config.routed_scaling_factor,
+                compile_moe,
             })
         }
 
+        /// Router: scores experts, selects top-k, and returns per-token `(expert, weight)` pairs.
+        /// The selection is done on the CPU after a single readback of the small [experts] score
+        /// vector — cheaper here than an on-device argpartition per layer, because hi-mlx runs
+        /// eagerly (uncompiled), so a standalone argpartition kernel ×80 layers costs more than the
+        /// readback. The expensive expert matmuls still run batched on the GPU (see `forward`).
         fn route(&self, x: &Array) -> Result<Vec<Vec<(i32, f32)>>> {
             let logits = self.gate.forward(x)?;
-            let scores = softmax_axis(&logits, -1, Some(true))?.as_type::<f32>()?;
+            // Hy3 scores experts with sigmoid; Qwen with softmax over the router logits.
+            let scores = if self.sigmoid_routing {
+                sigmoid(&logits.as_type::<f32>()?)?
+            } else {
+                softmax_axis(&logits, -1, Some(true))?.as_type::<f32>()?
+            };
             transforms::eval([&scores])?;
             let shape = scores.shape();
             let (b, l, experts) = (shape[0], shape[1], shape[2]);
@@ -2760,12 +3025,22 @@ mod native {
             for token in 0..l as usize {
                 let start = token * experts;
                 let raw = &raw_scores[start..start + experts];
-                let mut ranked = raw.iter().copied().enumerate().collect::<Vec<_>>();
+                // Rank by the selection score (Hy3 adds the expert bias); the routed weights below
+                // still use the bias-free score.
+                let mut ranked = (0..experts)
+                    .map(|i| {
+                        let sel = match &self.expert_bias {
+                            Some(bias) => raw[i] + bias[i],
+                            None => raw[i],
+                        };
+                        (i, sel)
+                    })
+                    .collect::<Vec<_>>();
                 ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-                ranked.truncate(self.top_k.min(ranked.len()));
+                ranked.truncate(self.top_k.min(experts));
                 let mut selected = ranked
                     .into_iter()
-                    .map(|(idx, score)| (idx as i32, score))
+                    .map(|(idx, _)| (idx as i32, raw[idx]))
                     .collect::<Vec<_>>();
                 if self.norm_topk_prob && selected.len() > 1 {
                     let denom = selected.iter().map(|(_, score)| *score).sum::<f32>();
@@ -2775,33 +3050,142 @@ mod native {
                         }
                     }
                 }
+                if self.sigmoid_routing && self.routed_scaling_factor != 1.0 {
+                    for (_, score) in &mut selected {
+                        *score *= self.routed_scaling_factor;
+                    }
+                }
                 routes.push(selected);
             }
             Ok(routes)
         }
 
-        fn forward(&self, x: &Array) -> Result<Array> {
+        /// Eager fallback: CPU route + batched gather-matmul experts (used when the layer isn't the
+        /// fully-quantized Hy3 shape the compiled path expects).
+        fn forward_cpu(&self, x: &Array) -> Result<Array> {
             let shape = x.shape();
             let (b, l, d) = (shape[0], shape[1], shape[2]);
             if b != 1 {
                 bail!("hi-mlx Qwen MoE generation currently supports batch size 1, got {b}");
             }
             let routes = self.route(x)?;
-            let mut outputs = Vec::with_capacity(l as usize);
-            for token_idx in 0..l {
-                let token = x.index((0, token_idx, ..)).reshape(&[1, 1, d])?;
-                let mut acc = Array::zeros::<f32>(&[1, 1, d])?;
-                for (expert, score) in &routes[token_idx as usize] {
-                    acc = acc + self.switch_mlp.forward_expert(&token, *expert)? * *score;
+            let top_k = self.top_k as i32;
+            // Batched gather-qmm needs quantized expert weights; fall back to the per-expert loop
+            // for dense (unquantized) experts.
+            let mut y = if self.switch_mlp.gate_proj.scales.is_some() {
+                let mut idx_v = Vec::with_capacity(l as usize * self.top_k);
+                let mut wts_v = Vec::with_capacity(l as usize * self.top_k);
+                for token in &routes {
+                    for (expert, weight) in token {
+                        idx_v.push(*expert as u32);
+                        wts_v.push(*weight);
+                    }
                 }
-                outputs.push(acc);
+                let inds = Array::from_slice(&idx_v, &[l, top_k]);
+                let weights = Array::from_slice(&wts_v, &[l, top_k, 1]);
+                let xe = x.reshape(&[l, 1, 1, d])?;
+                let expert_out = self
+                    .switch_mlp
+                    .forward_batched(&xe, &inds)?
+                    .reshape(&[l, top_k, d])?
+                    .as_type::<f32>()?;
+                sum_axis(&(expert_out * weights), 1, Some(false))?.reshape(&[1, l, d])?
+            } else {
+                let mut outputs = Vec::with_capacity(l as usize);
+                for token_idx in 0..l {
+                    let token = x.index((0, token_idx, ..)).reshape(&[1, 1, d])?;
+                    let mut acc = Array::zeros::<f32>(&[1, 1, d])?;
+                    for (expert, score) in &routes[token_idx as usize] {
+                        acc = acc + self.switch_mlp.forward_expert(&token, *expert)? * *score;
+                    }
+                    outputs.push(acc);
+                }
+                concatenate_axis(&outputs, 1)?
+            };
+            if let Some(shared) = &self.shared_expert {
+                let shared_out = shared.forward(x)?.as_type::<f32>()?;
+                y = match &self.shared_expert_gate {
+                    Some(gate) => y + (sigmoid(&gate.forward(x)?)?.as_type::<f32>()? * shared_out),
+                    None => y + shared_out,
+                };
             }
-            let mut y = concatenate_axis(&outputs, 1)?;
-            if let (Some(shared), Some(shared_gate)) =
-                (&self.shared_expert, &self.shared_expert_gate)
-            {
-                y = y + sigmoid(&shared_gate.forward(x)?)? * shared.forward(x)?;
+            Ok(y)
+        }
+
+        fn forward(&self, x: &Array) -> Result<Array> {
+            if x.shape()[0] != 1 {
+                bail!(
+                    "hi-mlx Qwen MoE generation currently supports batch size 1, got {}",
+                    x.shape()[0]
+                );
             }
+            // The compiled MoE (below) is numerically correct and proves MLX can fuse the router +
+            // gather-qmm experts, but mlx_rs's `compile` re-traces on every call in this structure
+            // (its TypeId cache doesn't hit when each layer passes different weight arrays), which is
+            // slower than the eager batched path. Until the compiled closure is cached at load, the
+            // batched path is the fast default; opt into the compiled path with HI_MLX_COMPILE_MOE=1.
+            if !self.compile_moe {
+                return self.forward_cpu(x);
+            }
+            // Only the fully-quantized Hy3 MoE shape (dense gate, quantized experts + always-on
+            // quantized shared expert, expert bias, sigmoid routing) takes the compiled path.
+            let compiled_ready = matches!(&self.gate, Linear::Dense { .. })
+                && self.switch_mlp.gate_proj.scales.is_some()
+                && self.expert_bias.is_some()
+                && self.shared_expert.is_some()
+                && self.shared_expert_gate.is_none()
+                && self.sigmoid_routing;
+            if !compiled_ready {
+                return self.forward_cpu(x);
+            }
+            let Linear::Dense { weight: gate_w, .. } = &self.gate else {
+                unreachable!()
+            };
+            let shared = self.shared_expert.as_ref().unwrap();
+            let sl = |l: &SwitchLinear| -> (Array, Array, Array) {
+                (
+                    l.weight.clone(),
+                    l.scales.clone().expect("quantized switch expert"),
+                    l.biases.clone().expect("affine switch expert biases"),
+                )
+            };
+            let ql = |l: &Linear| -> (Array, Array, Array) {
+                match l {
+                    Linear::Quantized {
+                        weight, scales, biases, ..
+                    } => (
+                        weight.clone(),
+                        scales.clone(),
+                        biases.clone().expect("affine shared-expert biases"),
+                    ),
+                    _ => panic!("shared expert must be quantized"),
+                }
+            };
+            let sw = &self.switch_mlp;
+            let (sgw, sgs, sgb) = sl(&sw.gate_proj);
+            let (suw, sus, sub) = sl(&sw.up_proj);
+            let (sdw, sds, sdb) = sl(&sw.down_proj);
+            let (hgw, hgs, hgb) = ql(&shared.gate_proj);
+            let (huw, hus, hub) = ql(&shared.up_proj);
+            let (hdw, hds, hdb) = ql(&shared.down_proj);
+            let bias_vec = self.expert_bias.as_ref().unwrap();
+            let expert_bias = Array::from_slice(bias_vec, &[bias_vec.len() as i32]);
+            let inputs = vec![
+                x.clone(),
+                gate_w.clone(),
+                expert_bias,
+                sgw, sgs, sgb, suw, sus, sub, sdw, sds, sdb,
+                hgw, hgs, hgb, huw, hus, hub, hdw, hds, hdb,
+            ];
+            let top_k = self.top_k as i32;
+            let group_size = sw.gate_proj.group_size;
+            let bits = sw.gate_proj.bits;
+            let norm = self.norm_topk_prob;
+            let scaling = self.routed_scaling_factor;
+            // Reuse the cached compiled MoE (compiled once, kept alive), then materialize to chunk
+            // the per-token graph the way the eager router's score readback used to.
+            let y = run_moe_compiled(inputs.as_slice(), top_k, group_size, bits, norm, scaling)?;
+            transforms::eval([&y])?;
             Ok(y)
         }
     }
@@ -2882,6 +3266,7 @@ mod native {
 
     impl QwenLike {
         fn new(config: MlxModelConfig, mut arrays: HashMap<String, Array>) -> Result<Self> {
+            remap_hy3_moe_weights(&config, &mut arrays)?;
             prepare_qwen_moe_weights(&config, &mut arrays)?;
             let layers = (0..config.num_hidden_layers)
                 .map(|idx| QwenBlock::load(idx, &arrays, &config))
@@ -2901,6 +3286,854 @@ mod native {
     }
 
     impl CausalLm for QwenLike {
+        fn forward(&mut self, input_ids: &[u32]) -> Result<Array> {
+            let ids = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
+            let mut h = self.embed_tokens.forward(&ids)?;
+            for layer in &mut self.layers {
+                h = layer.forward(h)?;
+            }
+            h = self.norm.forward(&h)?;
+            let logits = match &self.lm_head {
+                Some(head) => head.forward(&h)?,
+                None => self.embed_tokens.as_linear(&h)?,
+            };
+            transforms::eval([&logits])?;
+            Ok(logits)
+        }
+
+        fn reset_cache(&mut self) {
+            for layer in &mut self.layers {
+                layer.attention.cache.reset();
+            }
+        }
+
+        fn prepare_cache(&mut self, capacity: i32) {
+            for layer in &mut self.layers {
+                layer.attention.cache.prepare_capacity(capacity);
+            }
+        }
+
+        fn rollback_cache(&mut self, to_offset: i32) {
+            for layer in &mut self.layers {
+                layer.attention.cache.rollback(to_offset);
+            }
+        }
+
+        fn supports_rollback(&self) -> bool {
+            true
+        }
+    }
+
+    // Hy3 (hy_v3) stores its MoE router/shared-expert weights under different names than the
+    // Qwen MoE loader expects. Rename them in place so the shared QwenFfn MoE path can load them.
+    // The routed experts (`switch_mlp.*`) already match and are left untouched.
+    fn remap_hy3_moe_weights(
+        config: &MlxModelConfig,
+        arrays: &mut HashMap<String, Array>,
+    ) -> Result<()> {
+        if config.family != ModelFamily::Hy3 {
+            return Ok(());
+        }
+        for layer in 0..config.num_hidden_layers {
+            let p = format!("model.layers.{layer}.mlp");
+            let gp = format!("{p}.router.gate");
+            // The router gate is stored quantized (often at a different bit width than the rest of
+            // the model, e.g. 8-bit vs 4-bit). QwenFfn's gate does a plain dense matmul, so
+            // dequantize it to a dense bf16 weight using the gate's own per-tensor quant spec.
+            if let Some(weight) = arrays.remove(&format!("{gp}.weight")) {
+                let scales = arrays.remove(&format!("{gp}.scales"));
+                let biases = arrays.remove(&format!("{gp}.biases"));
+                let dense = match (scales, config.quantization.standard_mlx_for(&gp)?) {
+                    (Some(scales), Some((bits, group_size))) => dequantize_mode(
+                        &weight,
+                        &scales,
+                        biases.as_ref(),
+                        group_size as i32,
+                        bits as i32,
+                        "affine",
+                    )?,
+                    _ => weight,
+                };
+                transforms::eval([&dense])?;
+                arrays.insert(format!("{p}.gate.weight"), dense);
+            }
+            if let Some(v) = arrays.remove(&format!("{p}.router.expert_bias")) {
+                arrays.insert(format!("{p}.gate.e_score_correction_bias"), v);
+            }
+            for proj in ["gate_proj", "up_proj", "down_proj"] {
+                for suffix in ["weight", "scales", "biases"] {
+                    if let Some(v) = arrays.remove(&format!("{p}.shared_mlp.{proj}.{suffix}")) {
+                        arrays.insert(format!("{p}.shared_expert.{proj}.{suffix}"), v);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // ---------------------- Qwen3.5 (qwen3_5) gated-delta-net hybrid ----------------------
+    // Hybrid: full-attention layers every `full_attention_interval` interleaved with gated-delta-net
+    // (Mamba-style SSM) layers. Ported from mlx_lm's qwen3_5. The SSM runs in f32 for stability and
+    // keeps its own conv + recurrent state (no KV cache).
+    fn raw_array(arrays: &HashMap<String, Array>, key: &str) -> Result<Array> {
+        arrays
+            .get(key)
+            .cloned()
+            .ok_or_else(|| anyhow!("hi-mlx Qwen3.5: missing tensor {key}"))
+    }
+
+    struct Qwen35Attention {
+        q_proj: Linear,
+        k_proj: Linear,
+        v_proj: Linear,
+        o_proj: Linear,
+        q_norm: Option<RmsNorm>,
+        k_norm: Option<RmsNorm>,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        rot_dims: i32,
+        rope_theta: f32,
+        cache: Cache,
+    }
+
+    impl Qwen35Attention {
+        fn load(
+            prefix: &str,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+        ) -> Result<Self> {
+            let head_dim = config.attention_head_dim() as i32;
+            let prf = config.partial_rotary_factor.unwrap_or(1.0);
+            // Qwen3.5's checkpoint head counts don't match config (head_dim ≠ hidden/heads); derive
+            // them from the projection output dims.
+            let q_out = raw_array(arrays, &format!("{prefix}.q_proj.weight"))?.shape()[0];
+            let k_out = raw_array(arrays, &format!("{prefix}.k_proj.weight"))?.shape()[0];
+            Ok(Self {
+                q_proj: Linear::load(&format!("{prefix}.q_proj"), arrays, config)?,
+                k_proj: Linear::load(&format!("{prefix}.k_proj"), arrays, config)?,
+                v_proj: Linear::load(&format!("{prefix}.v_proj"), arrays, config)?,
+                o_proj: Linear::load(&format!("{prefix}.o_proj"), arrays, config)?,
+                q_norm: RmsNorm::load(&format!("{prefix}.q_norm.weight"), arrays, config.rms_norm_eps)
+                    .ok(),
+                k_norm: RmsNorm::load(&format!("{prefix}.k_norm.weight"), arrays, config.rms_norm_eps)
+                    .ok(),
+                // Gated attention: q_proj packs [queries; gate] → 2× the query width.
+                n_heads: q_out / (2 * head_dim),
+                n_kv_heads: k_out / head_dim,
+                head_dim,
+                rot_dims: ((head_dim as f32) * prf) as i32,
+                rope_theta: config.rope_theta,
+                cache: Cache::new(),
+            })
+        }
+
+        fn forward(&mut self, x: &Array) -> Result<Array> {
+            let shape = x.shape();
+            let (b, l) = (shape[0], shape[1]);
+            // Gated attention: q_proj → [queries | gate], each n_heads × head_dim.
+            let qg = self
+                .q_proj
+                .forward(x)?
+                .reshape(&[b, l, self.n_heads, 2 * self.head_dim])?;
+            let mut qparts = split_sections(&qg, &[self.head_dim], -1)?;
+            let gate = qparts.remove(1); // [b,l,n_heads,head_dim]
+            let mut q = qparts.remove(0);
+            let mut k = self
+                .k_proj
+                .forward(x)?
+                .reshape(&[b, l, self.n_kv_heads, self.head_dim])?;
+            if let Some(n) = &self.q_norm {
+                q = n.forward(&q)?;
+            }
+            if let Some(n) = &self.k_norm {
+                k = n.forward(&k)?;
+            }
+            q = q.transpose_axes(&[0, 2, 1, 3])?;
+            k = k.transpose_axes(&[0, 2, 1, 3])?;
+            let v = self
+                .v_proj
+                .forward(x)?
+                .reshape(&[b, l, self.n_kv_heads, self.head_dim])?
+                .transpose_axes(&[0, 2, 1, 3])?;
+            let offset = self.cache.offset;
+            q = rope(q, self.rot_dims, false, self.rope_theta, 1.0, offset, None)?;
+            k = rope(k, self.rot_dims, false, self.rope_theta, 1.0, offset, None)?;
+            let (k, v) = self.cache.update(k, v)?;
+            let scale = (self.head_dim as f32).powf(-0.5);
+            let output = if l > 1 && offset == 0 {
+                scaled_dot_product_attention(
+                    &q,
+                    &k,
+                    &v,
+                    scale,
+                    ScaledDotProductAttentionMask::Causal,
+                    None::<&Array>,
+                )?
+            } else if l > 1 {
+                let mask = causal_attention_mask(l, k.shape()[2], offset);
+                scaled_dot_product_attention(
+                    &q,
+                    &k,
+                    &v,
+                    scale,
+                    ScaledDotProductAttentionMask::Array(&mask),
+                    None::<&Array>,
+                )?
+            } else {
+                scaled_dot_product_attention(&q, &k, &v, scale, None, None::<&Array>)?
+            };
+            let output = output.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
+                b,
+                l,
+                self.n_heads * self.head_dim,
+            ])?;
+            // Output gate: out * sigmoid(gate).
+            let gate = gate.reshape(&[b, l, self.n_heads * self.head_dim])?;
+            let output = output * sigmoid(&gate)?;
+            self.o_proj.forward(&output)
+        }
+    }
+
+    struct GatedDeltaNet {
+        in_proj_qkv: Linear,
+        in_proj_z: Linear,
+        in_proj_b: Linear,
+        in_proj_a: Linear,
+        conv1d_weight: Array,
+        a_log: Array,
+        dt_bias: Array,
+        norm_weight: Array,
+        qk_ones: Array,
+        out_proj: Linear,
+        num_v_heads: i32,
+        num_k_heads: i32,
+        head_k_dim: i32,
+        head_v_dim: i32,
+        key_dim: i32,
+        value_dim: i32,
+        conv_dim: i32,
+        conv_kernel: i32,
+        eps: f32,
+        conv_state: Option<Array>,
+        ssm_state: Option<Array>,
+    }
+
+    impl GatedDeltaNet {
+        fn load(
+            prefix: &str,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+        ) -> Result<Self> {
+            let num_v_heads = config.linear_num_value_heads.unwrap_or(0) as i32;
+            let num_k_heads = config.linear_num_key_heads.unwrap_or(0) as i32;
+            let head_k_dim = config.linear_key_head_dim.unwrap_or(0) as i32;
+            let head_v_dim = config.linear_value_head_dim.unwrap_or(0) as i32;
+            let conv_kernel = config.linear_conv_kernel_dim.unwrap_or(4) as i32;
+            let key_dim = num_k_heads * head_k_dim;
+            let value_dim = num_v_heads * head_v_dim;
+            let conv_dim = key_dim * 2 + value_dim;
+            Ok(Self {
+                in_proj_qkv: Linear::load(&format!("{prefix}.in_proj_qkv"), arrays, config)?,
+                in_proj_z: Linear::load(&format!("{prefix}.in_proj_z"), arrays, config)?,
+                in_proj_b: Linear::load(&format!("{prefix}.in_proj_b"), arrays, config)?,
+                in_proj_a: Linear::load(&format!("{prefix}.in_proj_a"), arrays, config)?,
+                conv1d_weight: raw_array(arrays, &format!("{prefix}.conv1d.weight"))?
+                    .as_type::<f32>()?,
+                a_log: raw_array(arrays, &format!("{prefix}.A_log"))?.as_type::<f32>()?,
+                dt_bias: raw_array(arrays, &format!("{prefix}.dt_bias"))?.as_type::<f32>()?,
+                norm_weight: raw_array(arrays, &format!("{prefix}.norm.weight"))?.as_type::<f32>()?,
+                qk_ones: Array::ones::<f32>(&[head_k_dim])?,
+                out_proj: Linear::load(&format!("{prefix}.out_proj"), arrays, config)?,
+                num_v_heads,
+                num_k_heads,
+                head_k_dim,
+                head_v_dim,
+                key_dim,
+                value_dim,
+                conv_dim,
+                conv_kernel,
+                eps: config.rms_norm_eps,
+                conv_state: None,
+                ssm_state: None,
+            })
+        }
+
+        fn forward(&mut self, x: &Array) -> Result<Array> {
+            let dtype = x.dtype();
+            let shape = x.shape();
+            let s = shape[1];
+            let (hv, hk, dv) = (self.num_v_heads, self.head_k_dim, self.head_v_dim);
+            let qkv = self.in_proj_qkv.forward(x)?.as_type::<f32>()?;
+            let z = self
+                .in_proj_z
+                .forward(x)?
+                .as_type::<f32>()?
+                .reshape(&[1, s, hv, dv])?;
+            let bb = self.in_proj_b.forward(x)?.as_type::<f32>()?;
+            let aa = self.in_proj_a.forward(x)?.as_type::<f32>()?;
+
+            // Causal depthwise conv1d over [conv_state | qkv]; carry the last kernel-1 frames.
+            let keep = self.conv_kernel - 1;
+            let conv_state = match self.conv_state.take() {
+                Some(st) => st,
+                None => Array::zeros::<f32>(&[1, keep, self.conv_dim])?,
+            };
+            let conv_in = concatenate_axis(&[&conv_state, &qkv], 1)?;
+            let clen = conv_in.shape()[1];
+            self.conv_state = Some(conv_in.index((.., (clen - keep)..clen, ..)));
+            let conv_out = conv1d(&conv_in, &self.conv1d_weight, 1, 0, 1, self.conv_dim)?;
+            let conv_out = silu(&conv_out)?;
+
+            let mut parts = split_sections(&conv_out, &[self.key_dim, 2 * self.key_dim], -1)?;
+            let v = parts.remove(2).reshape(&[1, s, hv, dv])?;
+            let k = parts.remove(1).reshape(&[1, s, self.num_k_heads, hk])?;
+            let q = parts.remove(0).reshape(&[1, s, self.num_k_heads, hk])?;
+
+            // Weightless RMSNorm over head dim, with the mlx_lm scaling.
+            let inv = (hk as f32).powf(-0.5);
+            let q = rms_norm(&q, &self.qk_ones, 1e-6)? * (inv * inv);
+            let k = rms_norm(&k, &self.qk_ones, 1e-6)? * inv;
+            // GQA: repeat q,k heads up to num_v_heads.
+            let rep = self.num_v_heads / self.num_k_heads;
+            let q = broadcast_to(
+                &q.reshape(&[1, s, self.num_k_heads, 1, hk])?,
+                &[1, s, self.num_k_heads, rep, hk],
+            )?
+            .reshape(&[1, s, hv, hk])?;
+            let k = broadcast_to(
+                &k.reshape(&[1, s, self.num_k_heads, 1, hk])?,
+                &[1, s, self.num_k_heads, rep, hk],
+            )?
+            .reshape(&[1, s, hv, hk])?;
+
+            let beta = sigmoid(&bb)?;
+            // g = exp(-exp(A_log) * softplus(a + dt_bias))
+            let neg_a = exp(&self.a_log)? * -1.0;
+            let g = exp(&(neg_a * softplus(&(aa + &self.dt_bias))?))?;
+
+            // Decode (single token) uses the cheap recurrent step; prefill uses the chunk-parallel
+            // scan (far fewer sequential ops). Both update self.ssm_state identically.
+            let out = if s > 1 {
+                self.scan_chunked(&q, &k, &v, &g, &beta, s)?
+            } else {
+                self.scan_recurrent(&q, &k, &v, &g, &beta, s)?
+            };
+            // Gated RMSNorm (Qwen3-Next style): norm the SSM output first, THEN gate by silu(z).
+            let normed = rms_norm(&out, &self.norm_weight, self.eps)?;
+            let gated = silu(&z)? * normed;
+            let out = gated.reshape(&[1, s, self.value_dim])?.as_dtype(dtype)?;
+            self.out_proj.forward(&out)
+        }
+
+        // Per-token recurrent step (used for decode, S==1). q,k: [1,S,Hv,Dk]; v: [1,S,Hv,Dv];
+        // g,beta: [1,S,Hv]. Updates self.ssm_state; returns y [1,S,Hv,Dv].
+        fn scan_recurrent(
+            &mut self,
+            q: &Array,
+            k: &Array,
+            v: &Array,
+            g: &Array,
+            beta: &Array,
+            s: i32,
+        ) -> Result<Array> {
+            let (hv, hk, dv) = (self.num_v_heads, self.head_k_dim, self.head_v_dim);
+            let mut state = match self.ssm_state.take() {
+                Some(st) => st,
+                None => Array::zeros::<f32>(&[1, hv, dv, hk])?,
+            };
+            // Fast path for decode (single token): the inputs are already one step, so skip the
+            // per-token slicing / Vec / concatenate — fewer graph nodes per layer per token.
+            if s == 1 {
+                let qt = q.reshape(&[1, hv, 1, hk])?;
+                let kt = k.reshape(&[1, hv, 1, hk])?;
+                let vt = v.reshape(&[1, hv, dv])?;
+                let gt = g.reshape(&[1, hv, 1, 1])?;
+                let betat = beta.reshape(&[1, hv, 1])?;
+                state = state * gt;
+                let kv_mem = sum_axis(&(state.clone() * &kt), -1, false)?;
+                let delta = (vt - kv_mem) * betat;
+                state = state + (kt * delta.reshape(&[1, hv, dv, 1])?);
+                let yt = sum_axis(&(state.clone() * qt), -1, false)?;
+                self.ssm_state = Some(state);
+                return Ok(yt.reshape(&[1, 1, hv, dv])?);
+            }
+            let mut ys: Vec<Array> = Vec::with_capacity(s as usize);
+            for t in 0..s {
+                let qt = q.index((.., t..(t + 1), .., ..)).reshape(&[1, hv, 1, hk])?;
+                let kt = k.index((.., t..(t + 1), .., ..)).reshape(&[1, hv, 1, hk])?;
+                let vt = v.index((.., t..(t + 1), .., ..)).reshape(&[1, hv, dv])?;
+                let gt = g.index((.., t..(t + 1), ..)).reshape(&[1, hv, 1, 1])?;
+                let betat = beta.index((.., t..(t + 1), ..)).reshape(&[1, hv, 1])?;
+                state = state * gt;
+                let kv_mem = sum_axis(&(state.clone() * &kt), -1, false)?;
+                let delta = (vt - kv_mem) * betat;
+                let delta_e = delta.reshape(&[1, hv, dv, 1])?;
+                state = state + (kt.clone() * delta_e);
+                let yt = sum_axis(&(state.clone() * qt), -1, false)?;
+                ys.push(yt.reshape(&[1, 1, hv, dv])?);
+            }
+            self.ssm_state = Some(state);
+            if ys.len() == 1 {
+                Ok(ys.remove(0))
+            } else {
+                Ok(concatenate_axis(&ys.iter().collect::<Vec<_>>(), 1)?)
+            }
+        }
+
+        // Chunk-parallel gated delta-rule scan (prefill). Precomputes the intra-chunk WY/UT quantities
+        // batched over all chunks (with a Newton-Schulz unit-lower-triangular inverse), then a short
+        // sequential scan over chunks. Mathematically identical to scan_recurrent (verified for C=1).
+        fn scan_chunked(
+            &mut self,
+            q: &Array,
+            k: &Array,
+            v: &Array,
+            g: &Array,
+            beta: &Array,
+            s: i32,
+        ) -> Result<Array> {
+            let (hv, hk, dv) = (self.num_v_heads, self.head_k_dim, self.head_v_dim);
+            let cs: i32 = 64;
+            let nc = (s + cs - 1) / cs;
+            let sp = nc * cs;
+            let pad = sp - s;
+            // Pad the sequence to a multiple of the chunk size (g padded with 1 → no decay; beta with
+            // 0 → padded steps contribute nothing; outputs sliced off at the end).
+            let (q, k, v, g, beta) = if pad > 0 {
+                let zq = Array::zeros::<f32>(&[1, pad, hv, hk])?;
+                let zv = Array::zeros::<f32>(&[1, pad, hv, dv])?;
+                let zb = Array::zeros::<f32>(&[1, pad, hv])?;
+                let og = Array::ones::<f32>(&[1, pad, hv])?;
+                (
+                    concatenate_axis(&[q, &zq], 1)?,
+                    concatenate_axis(&[k, &zq], 1)?,
+                    concatenate_axis(&[v, &zv], 1)?,
+                    concatenate_axis(&[g, &og], 1)?,
+                    concatenate_axis(&[beta, &zb], 1)?,
+                )
+            } else {
+                (q.clone(), k.clone(), v.clone(), g.clone(), beta.clone())
+            };
+            // [1,sp,Hv,D] -> [nc,Hv,cs,D]
+            let q = q.reshape(&[nc, cs, hv, hk])?.transpose_axes(&[0, 2, 1, 3])?;
+            let k = k.reshape(&[nc, cs, hv, hk])?.transpose_axes(&[0, 2, 1, 3])?;
+            let v = v.reshape(&[nc, cs, hv, dv])?.transpose_axes(&[0, 2, 1, 3])?;
+            let g = g.reshape(&[nc, cs, hv])?.transpose_axes(&[0, 2, 1])?;
+            let beta = beta.reshape(&[nc, cs, hv])?.transpose_axes(&[0, 2, 1])?;
+
+            let ltri = tril(Array::ones::<f32>(&[cs, cs])?, 0)?; // lower incl diag (for cumsum)
+            let eye = identity::<f32>(cs)?;
+            // Additive masks: 0 on the kept triangle, -1e9 elsewhere. Added to the (finite) log-decay
+            // differences *before* exp, so masked-out entries become exp(-1e9)=0 with no inf·0 = NaN.
+            let (mut pen_incl, mut pen_strict) =
+                (vec![0f32; (cs * cs) as usize], vec![0f32; (cs * cs) as usize]);
+            for t in 0..cs {
+                for j in 0..cs {
+                    let idx = (t * cs + j) as usize;
+                    if t < j {
+                        pen_incl[idx] = -1e9;
+                    }
+                    if t <= j {
+                        pen_strict[idx] = -1e9;
+                    }
+                }
+            }
+            let pen_incl = Array::from_slice(&pen_incl, &[cs, cs]);
+            let pen_strict = Array::from_slice(&pen_strict, &[cs, cs]);
+            // Cumulative within-chunk log-decay lg_t = sum_{i<=t} log g_i (finite; never underflows).
+            let logg = g.log()?.reshape(&[nc, hv, cs, 1])?;
+            let lg = matmul(&ltri, &logg)?.reshape(&[nc, hv, cs])?;
+            let gamma_e = exp(&lg)?.reshape(&[nc, hv, cs, 1])?; // gamma_t in [0,1]
+            let lg_last = lg.index((.., .., (cs - 1)..cs)).reshape(&[nc, hv, 1])?;
+            let gamma_last = exp(&lg_last)?.reshape(&[nc, hv, 1, 1])?;
+
+            let kbar = k.clone() * gamma_e.clone(); // gamma_t k_t  (bounded, gamma<=1)
+            let qbar = q.clone() * gamma_e.clone();
+            let beta_e = beta.reshape(&[nc, hv, cs, 1])?;
+
+            // Decay-ratio matrices D[t,j] = exp(lg_t - lg_j), masked (no k/gamma division).
+            let diff = lg.reshape(&[nc, hv, cs, 1])? - lg.reshape(&[nc, hv, 1, cs])?;
+            let d_incl = exp(&(diff.clone() + pen_incl))?; // lower incl diag, in (0,1]
+            let d_strict = exp(&(diff + pen_strict))?; // strictly lower
+            // A[t,j] = beta_t (k_t.k_j)(gamma_t/gamma_j), strictly lower-triangular.
+            let kk = matmul(&k, &k.swap_axes(-1, -2)?)?;
+            let a = beta_e.clone() * (kk * d_strict);
+            // (I + A)^{-1} via Newton-Schulz (A strictly-lower nilpotent → exact in ceil(log2 cs) iters).
+            let mmat = eye.clone() + a;
+            let two_eye = eye.clone() * 2.0;
+            let mut tinv = broadcast_to(&eye, &[nc, hv, cs, cs])?;
+            let iters = (cs as f32).log2().ceil() as i32;
+            for _ in 0..iters {
+                let r = two_eye.clone() - matmul(&mmat, &tinv)?;
+                tinv = matmul(&tinv, &r)?;
+            }
+            let w_all = matmul(&tinv, &(beta_e.clone() * v.clone()))?; // [nc,hv,cs,dv]
+            let p_all = matmul(&tinv, &(beta_e.clone() * kbar.clone()))?; // [nc,hv,cs,hk]
+            // intra attention (q_t.k_j)(gamma_t/gamma_j), lower incl diag.
+            let qk_all = matmul(&q, &k.swap_axes(-1, -2)?)? * d_incl;
+            // Kfinal_j = (gamma_C/gamma_j) k_j = k_j * exp(lg_last - lg_j).
+            let d_last = exp(&(lg_last.clone() - lg.clone()))?.reshape(&[nc, hv, cs, 1])?;
+            let kfinal_all = k.clone() * d_last;
+
+            let mut state = match self.ssm_state.take() {
+                Some(st) => st.reshape(&[hv, dv, hk])?,
+                None => Array::zeros::<f32>(&[hv, dv, hk])?,
+            };
+            let mut ys: Vec<Array> = Vec::with_capacity(nc as usize);
+            for c in 0..nc {
+                let w_c = w_all.index((c..(c + 1), .., .., ..)).reshape(&[hv, cs, dv])?;
+                let p_c = p_all.index((c..(c + 1), .., .., ..)).reshape(&[hv, cs, hk])?;
+                let qk_c = qk_all.index((c..(c + 1), .., .., ..)).reshape(&[hv, cs, cs])?;
+                let qbar_c = qbar.index((c..(c + 1), .., .., ..)).reshape(&[hv, cs, hk])?;
+                let kfinal_c = kfinal_all
+                    .index((c..(c + 1), .., .., ..))
+                    .reshape(&[hv, cs, hk])?;
+                let gl_c = gamma_last.index((c..(c + 1), .., .., ..)).reshape(&[hv, 1, 1])?;
+                let state_t = state.swap_axes(-1, -2)?; // [hv,hk,dv]
+                let u_c = w_c - matmul(&p_c, &state_t)?; // [hv,cs,dv]
+                let y_c = matmul(&qbar_c, &state_t)? + matmul(&qk_c, &u_c)?;
+                state = (gl_c * state.clone()) + matmul(&u_c.swap_axes(-1, -2)?, &kfinal_c)?;
+                ys.push(y_c.swap_axes(0, 1)?.reshape(&[1, cs, hv, dv])?);
+            }
+            self.ssm_state = Some(state.reshape(&[1, hv, dv, hk])?);
+            let out = concatenate_axis(&ys.iter().collect::<Vec<_>>(), 1)?; // [1,sp,hv,dv]
+            Ok(out.index((.., 0..s, .., ..))) // unpad
+        }
+
+        fn reset(&mut self) {
+            self.conv_state = None;
+            self.ssm_state = None;
+        }
+    }
+
+    enum Qwen35Mixer {
+        Attn(Qwen35Attention),
+        Linear(Box<GatedDeltaNet>),
+    }
+
+    struct Qwen35Layer {
+        input_layernorm: RmsNorm,
+        post_attention_layernorm: RmsNorm,
+        mixer: Qwen35Mixer,
+        mlp: Mlp,
+    }
+
+    impl Qwen35Layer {
+        fn load(
+            idx: u32,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+        ) -> Result<Self> {
+            let p = format!("model.layers.{idx}");
+            let interval = config.full_attention_interval.unwrap_or(4);
+            let is_linear = (idx + 1) % interval != 0;
+            let mixer = if is_linear {
+                Qwen35Mixer::Linear(Box::new(GatedDeltaNet::load(
+                    &format!("{p}.linear_attn"),
+                    arrays,
+                    config,
+                )?))
+            } else {
+                Qwen35Mixer::Attn(Qwen35Attention::load(
+                    &format!("{p}.self_attn"),
+                    arrays,
+                    config,
+                )?)
+            };
+            Ok(Self {
+                input_layernorm: RmsNorm::load(
+                    &format!("{p}.input_layernorm.weight"),
+                    arrays,
+                    config.rms_norm_eps,
+                )?,
+                post_attention_layernorm: RmsNorm::load(
+                    &format!("{p}.post_attention_layernorm.weight"),
+                    arrays,
+                    config.rms_norm_eps,
+                )?,
+                mixer,
+                mlp: Mlp::load(&format!("{p}.mlp"), arrays, config)?,
+            })
+        }
+
+        fn forward(&mut self, x: Array) -> Result<Array> {
+            let h = self.input_layernorm.forward(&x)?;
+            let h = match &mut self.mixer {
+                Qwen35Mixer::Attn(a) => a.forward(&h)?,
+                Qwen35Mixer::Linear(l) => l.forward(&h)?,
+            };
+            let x = x + h;
+            let h = self.post_attention_layernorm.forward(&x)?;
+            let h = self.mlp.forward(&h)?;
+            Ok(x + h)
+        }
+    }
+
+    struct Qwen35Like {
+        embed_tokens: Embedding,
+        layers: Vec<Qwen35Layer>,
+        norm: RmsNorm,
+        lm_head: Option<Linear>,
+    }
+
+    impl Qwen35Like {
+        fn new(config: MlxModelConfig, arrays: HashMap<String, Array>) -> Result<Self> {
+            let layers = (0..config.num_hidden_layers)
+                .map(|idx| Qwen35Layer::load(idx, &arrays, &config))
+                .collect::<Result<Vec<_>>>()?;
+            let lm_head = if config.tie_word_embeddings {
+                None
+            } else {
+                Some(Linear::load("lm_head", &arrays, &config)?)
+            };
+            Ok(Self {
+                embed_tokens: Embedding::load("model.embed_tokens", &arrays, &config)?,
+                norm: RmsNorm::load("model.norm.weight", &arrays, config.rms_norm_eps)?,
+                layers,
+                lm_head,
+            })
+        }
+    }
+
+    impl CausalLm for Qwen35Like {
+        fn forward(&mut self, input_ids: &[u32]) -> Result<Array> {
+            let ids = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
+            let mut h = self.embed_tokens.forward(&ids)?;
+            for layer in &mut self.layers {
+                h = layer.forward(h)?;
+            }
+            h = self.norm.forward(&h)?;
+            let logits = match &self.lm_head {
+                Some(head) => head.forward(&h)?,
+                None => self.embed_tokens.as_linear(&h)?,
+            };
+            transforms::eval([&logits])?;
+            Ok(logits)
+        }
+
+        fn reset_cache(&mut self) {
+            for layer in &mut self.layers {
+                match &mut layer.mixer {
+                    Qwen35Mixer::Attn(a) => a.cache.reset(),
+                    Qwen35Mixer::Linear(l) => l.reset(),
+                }
+            }
+        }
+
+        fn prepare_cache(&mut self, capacity: i32) {
+            for layer in &mut self.layers {
+                if let Qwen35Mixer::Attn(a) = &mut layer.mixer {
+                    a.cache.prepare_capacity(capacity);
+                }
+            }
+        }
+    }
+
+    // ---------------------- GLM-4 (glm4, GQA) ----------------------
+    // Standard GQA GLM-4 (e.g. GLM-4-9B-0414): partial rotary, a fused `gate_up_proj` MLP, sandwich
+    // norms (extra post_self_attn + post_mlp layernorms), and QKV biases. Distinct from the
+    // MLA-based GLM-*-Flash variants, which stay on the MlaLike path.
+    struct Glm4Attention {
+        q_proj: Linear,
+        k_proj: Linear,
+        v_proj: Linear,
+        o_proj: Linear,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        rot_dims: i32,
+        rope_theta: f32,
+        cache: Cache,
+    }
+
+    impl Glm4Attention {
+        fn load(
+            prefix: &str,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+        ) -> Result<Self> {
+            let head_dim = config.attention_head_dim() as i32;
+            let prf = config.partial_rotary_factor.unwrap_or(1.0);
+            Ok(Self {
+                q_proj: Linear::load(&format!("{prefix}.q_proj"), arrays, config)?,
+                k_proj: Linear::load(&format!("{prefix}.k_proj"), arrays, config)?,
+                v_proj: Linear::load(&format!("{prefix}.v_proj"), arrays, config)?,
+                o_proj: Linear::load(&format!("{prefix}.o_proj"), arrays, config)?,
+                n_heads: config.num_attention_heads as i32,
+                n_kv_heads: config.num_key_value_heads as i32,
+                head_dim,
+                rot_dims: ((head_dim as f32) * prf) as i32,
+                rope_theta: config.rope_theta,
+                cache: Cache::new(),
+            })
+        }
+
+        fn forward(&mut self, x: &Array) -> Result<Array> {
+            let shape = x.shape();
+            let (b, l) = (shape[0], shape[1]);
+            let mut q = self
+                .q_proj
+                .forward(x)?
+                .reshape(&[b, l, self.n_heads, self.head_dim])?
+                .transpose_axes(&[0, 2, 1, 3])?;
+            let mut k = self
+                .k_proj
+                .forward(x)?
+                .reshape(&[b, l, self.n_kv_heads, self.head_dim])?
+                .transpose_axes(&[0, 2, 1, 3])?;
+            let v = self
+                .v_proj
+                .forward(x)?
+                .reshape(&[b, l, self.n_kv_heads, self.head_dim])?
+                .transpose_axes(&[0, 2, 1, 3])?;
+            let offset = self.cache.offset;
+            // Partial rotary: only the first `rot_dims` of each head are rotated.
+            q = rope(q, self.rot_dims, false, self.rope_theta, 1.0, offset, None)?;
+            k = rope(k, self.rot_dims, false, self.rope_theta, 1.0, offset, None)?;
+            let (k, v) = self.cache.update(k, v)?;
+            let scale = (self.head_dim as f32).powf(-0.5);
+            let output = if l > 1 && offset == 0 {
+                scaled_dot_product_attention(
+                    &q,
+                    &k,
+                    &v,
+                    scale,
+                    ScaledDotProductAttentionMask::Causal,
+                    None::<&Array>,
+                )?
+            } else if l > 1 {
+                let mask = causal_attention_mask(l, k.shape()[2], offset);
+                scaled_dot_product_attention(
+                    &q,
+                    &k,
+                    &v,
+                    scale,
+                    ScaledDotProductAttentionMask::Array(&mask),
+                    None::<&Array>,
+                )?
+            } else {
+                scaled_dot_product_attention(&q, &k, &v, scale, None, None::<&Array>)?
+            };
+            let output = output.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
+                b,
+                l,
+                self.n_heads * self.head_dim,
+            ])?;
+            self.o_proj.forward(&output)
+        }
+    }
+
+    struct Glm4Mlp {
+        gate_up_proj: Linear,
+        down_proj: Linear,
+        intermediate: i32,
+    }
+
+    impl Glm4Mlp {
+        fn load(
+            prefix: &str,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+        ) -> Result<Self> {
+            Ok(Self {
+                gate_up_proj: Linear::load(&format!("{prefix}.gate_up_proj"), arrays, config)?,
+                down_proj: Linear::load(&format!("{prefix}.down_proj"), arrays, config)?,
+                intermediate: config.intermediate_size.unwrap_or(0) as i32,
+            })
+        }
+
+        fn forward(&self, x: &Array) -> Result<Array> {
+            // Fused gate_up: first `intermediate` cols are the gate, the rest are up.
+            let gu = self.gate_up_proj.forward(x)?;
+            let mut parts = split_sections(&gu, &[self.intermediate], -1)?;
+            let up = parts.remove(1);
+            let gate = parts.remove(0);
+            let hidden = (sigmoid(&gate)? * gate) * up;
+            self.down_proj.forward(&hidden)
+        }
+    }
+
+    struct Glm4Block {
+        input_layernorm: RmsNorm,
+        post_attention_layernorm: RmsNorm,
+        post_self_attn_layernorm: RmsNorm,
+        post_mlp_layernorm: RmsNorm,
+        attention: Glm4Attention,
+        mlp: Glm4Mlp,
+    }
+
+    impl Glm4Block {
+        fn load(
+            idx: u32,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+        ) -> Result<Self> {
+            let p = format!("model.layers.{idx}");
+            Ok(Self {
+                input_layernorm: RmsNorm::load(
+                    &format!("{p}.input_layernorm.weight"),
+                    arrays,
+                    config.rms_norm_eps,
+                )?,
+                post_attention_layernorm: RmsNorm::load(
+                    &format!("{p}.post_attention_layernorm.weight"),
+                    arrays,
+                    config.rms_norm_eps,
+                )?,
+                post_self_attn_layernorm: RmsNorm::load(
+                    &format!("{p}.post_self_attn_layernorm.weight"),
+                    arrays,
+                    config.rms_norm_eps,
+                )?,
+                post_mlp_layernorm: RmsNorm::load(
+                    &format!("{p}.post_mlp_layernorm.weight"),
+                    arrays,
+                    config.rms_norm_eps,
+                )?,
+                attention: Glm4Attention::load(&format!("{p}.self_attn"), arrays, config)?,
+                mlp: Glm4Mlp::load(&format!("{p}.mlp"), arrays, config)?,
+            })
+        }
+
+        fn forward(&mut self, x: Array) -> Result<Array> {
+            // GLM-4 sandwich norm: post-norm the attn and mlp sublayer outputs before the residual.
+            let h = self.attention.forward(&self.input_layernorm.forward(&x)?)?;
+            let h = self.post_self_attn_layernorm.forward(&h)?;
+            let x = x + h;
+            let h = self.mlp.forward(&self.post_attention_layernorm.forward(&x)?)?;
+            let h = self.post_mlp_layernorm.forward(&h)?;
+            Ok(x + h)
+        }
+    }
+
+    struct Glm4Like {
+        embed_tokens: Embedding,
+        layers: Vec<Glm4Block>,
+        norm: RmsNorm,
+        lm_head: Option<Linear>,
+    }
+
+    impl Glm4Like {
+        fn new(config: MlxModelConfig, arrays: HashMap<String, Array>) -> Result<Self> {
+            let layers = (0..config.num_hidden_layers)
+                .map(|idx| Glm4Block::load(idx, &arrays, &config))
+                .collect::<Result<Vec<_>>>()?;
+            let lm_head = if config.tie_word_embeddings {
+                None
+            } else {
+                Some(Linear::load("lm_head", &arrays, &config)?)
+            };
+            Ok(Self {
+                embed_tokens: Embedding::load("model.embed_tokens", &arrays, &config)?,
+                norm: RmsNorm::load("model.norm.weight", &arrays, config.rms_norm_eps)?,
+                layers,
+                lm_head,
+            })
+        }
+    }
+
+    impl CausalLm for Glm4Like {
         fn forward(&mut self, input_ids: &[u32]) -> Result<Array> {
             let ids = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
             let mut h = self.embed_tokens.forward(&ids)?;
@@ -3151,6 +4384,131 @@ mod native {
         Ok(unsafe { Array::from_ptr(out) })
     }
 
+    /// Batched gather + quantized matmul: for each output position i, computes
+    /// `x[i] @ w[rhs_indices[i]].T`. Used to run all routed experts of a MoE layer in a few
+    /// batched kernels instead of one quantized_matmul per (token, expert).
+    fn gather_qmm_mode(
+        x: &Array,
+        weight: &Array,
+        scales: &Array,
+        biases: Option<&Array>,
+        rhs_indices: &Array,
+        transpose: bool,
+        group_size: i32,
+        bits: i32,
+        mode: &str,
+    ) -> Result<Array> {
+        let mode = CString::new(mode)?;
+        let stream = Stream::default();
+        let mut out = empty_array();
+        let status = unsafe {
+            mlx_sys::mlx_gather_qmm(
+                &mut out as *mut _,
+                x.as_ptr(),
+                weight.as_ptr(),
+                scales.as_ptr(),
+                biases.map(Array::as_ptr).unwrap_or_else(empty_array),
+                empty_array(),   // lhs_indices: null → broadcast x's batch dims
+                rhs_indices.as_ptr(),
+                transpose,
+                optional_int(group_size),
+                optional_int(bits),
+                mode.as_ptr(),
+                false,           // sorted_indices
+                stream.as_ptr(),
+            )
+        };
+        if status != 0 {
+            unsafe { mlx_sys::mlx_array_free(out) };
+            bail!("MLX gather_qmm failed for {bits}-bit {mode:?} weights");
+        }
+        Ok(unsafe { Array::from_ptr(out) })
+    }
+
+    /// The full Hy3-style MoE forward as a single pure function of `[x, gate_w, expert_bias,
+    /// switch(gate/up/down × w/s/b), shared(gate/up/down × w/s/b)]` (21 arrays). Written to be
+    /// wrapped in `compile` so MLX fuses the router (sigmoid + argpartition + gather) and the
+    /// expert/shared matmuls into a handful of kernels instead of ~hundreds of eager launches.
+    #[allow(clippy::too_many_arguments)]
+    fn moe_compiled(
+        a: &[Array],
+        top_k: i32,
+        group_size: i32,
+        bits: i32,
+        norm: bool,
+        scaling: f32,
+    ) -> Result<Array> {
+        let x = &a[0];
+        let shape = x.shape();
+        let (l, d) = (shape[1], shape[2]);
+        // Router: dense gate, sigmoid scores, expert-bias for selection, bias-free weights.
+        let logits = matmul(x, &a[1].t())?;
+        let orig = sigmoid(&logits.as_type::<f32>()?)?;
+        let sel = &orig + &a[2];
+        let part = argpartition_axis(&sel, -top_k, -1)?;
+        let inds = part.index((.., .., (-top_k)..));
+        let mut w = take_along_axis(&orig, &inds, -1)?;
+        if norm {
+            let denom = sum_axis(&w, -1, Some(true))? + 1e-20;
+            w = &w / &denom;
+        }
+        if scaling != 1.0 {
+            w = w * scaling;
+        }
+        // Routed experts via batched gather-qmm SwiGLU.
+        let inds_r = inds.reshape(&[l, top_k])?;
+        let xe = x.reshape(&[l, 1, 1, d])?;
+        let gp = gather_qmm_mode(&xe, &a[3], &a[4], Some(&a[5]), &inds_r, true, group_size, bits, "affine")?;
+        let gp = sigmoid(&gp)? * gp;
+        let up = gather_qmm_mode(&xe, &a[6], &a[7], Some(&a[8]), &inds_r, true, group_size, bits, "affine")?;
+        let down = gather_qmm_mode(&(gp * up), &a[9], &a[10], Some(&a[11]), &inds_r, true, group_size, bits, "affine")?;
+        let eo = down.reshape(&[l, top_k, d])?.as_type::<f32>()?;
+        let wr = w.reshape(&[l, top_k, 1])?;
+        let mut y = sum_axis(&(eo * wr), 1, Some(false))?.reshape(&[1, l, d])?;
+        // Always-on shared expert (quantized SwiGLU MLP).
+        let sg = quantized_matmul_mode(x, &a[12], &a[13], Some(&a[14]), true, group_size, bits, "affine")?;
+        let sg = sigmoid(&sg)? * sg;
+        let su = quantized_matmul_mode(x, &a[15], &a[16], Some(&a[17]), true, group_size, bits, "affine")?;
+        let sd = quantized_matmul_mode(&(sg * su), &a[18], &a[19], Some(&a[20]), true, group_size, bits, "affine")?;
+        y = y + sd.as_type::<f32>()?;
+        Ok(y)
+    }
+
+    thread_local! {
+        // Tracks whether the MLX compile-cache entry for the MoE closure has been warmed on this
+        // thread, so we only leak one `Compiled` (see below) instead of one per call.
+        static MOE_CACHE_WARM: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Run the MoE through its compiled+fused graph. `Compiled::drop` calls
+    /// `mlx_detail_compile_erase(id)`, which would evict the cached kernel every call and force a
+    /// full re-trace; the MLX cache is keyed by the closure's TypeId, so we warm it once and
+    /// `mem::forget` that first `Compiled` to keep the entry alive. Later calls build a fresh
+    /// (same-TypeId) `Compiled` that hits the warm cache, and are dropped normally — except we also
+    /// forget them so their `Drop` can't erase the shared entry.
+    fn run_moe_compiled(
+        inputs: &[Array],
+        top_k: i32,
+        group_size: i32,
+        bits: i32,
+        norm: bool,
+        scaling: f32,
+    ) -> Result<Array> {
+        let f = move |a: &[Array]| -> Vec<Array> {
+            vec![
+                moe_compiled(a, top_k, group_size, bits, norm, scaling)
+                    .expect("compiled MoE forward"),
+            ]
+        };
+        let mut compiled = f.compile(false);
+        let out = compiled
+            .call_mut(inputs)
+            .map_err(|e| anyhow!("compiled MoE: {e}"))?;
+        std::mem::forget(compiled);
+        MOE_CACHE_WARM.with(|w| w.set(true));
+        Ok(out.into_iter().next().expect("compiled MoE output"))
+    }
+
     fn dequantize_mode(
         weight: &Array,
         scales: &Array,
@@ -3171,6 +4529,7 @@ mod native {
                 optional_int(group_size),
                 optional_int(bits),
                 mode.as_ptr(),
+                empty_array(), // global_scale (null) — added in mlx-c 0.6.0
                 optional_dtype_none(),
                 stream.as_ptr(),
             )

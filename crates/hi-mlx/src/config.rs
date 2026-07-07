@@ -22,6 +22,14 @@ pub struct MlxModelConfig {
     pub num_attention_heads: u32,
     pub num_key_value_heads: u32,
     pub head_dim: Option<u32>,
+    pub partial_rotary_factor: Option<f32>,
+    // Qwen3.5 gated-delta-net (linear attention) hybrid fields.
+    pub linear_num_value_heads: Option<u32>,
+    pub linear_num_key_heads: Option<u32>,
+    pub linear_key_head_dim: Option<u32>,
+    pub linear_value_head_dim: Option<u32>,
+    pub linear_conv_kernel_dim: Option<u32>,
+    pub full_attention_interval: Option<u32>,
     pub qk_nope_head_dim: Option<u32>,
     pub qk_rope_head_dim: Option<u32>,
     pub v_head_dim: Option<u32>,
@@ -87,6 +95,9 @@ impl MlxModelConfig {
     pub fn is_qwen_moe_layer(&self, layer_idx: u32) -> bool {
         if self.n_routed_experts.unwrap_or(0) == 0 {
             return false;
+        }
+        if self.family == ModelFamily::Hy3 {
+            return layer_idx >= self.first_k_dense_replace;
         }
         if self.model_type.contains("qwen3") {
             !self.mlp_only_layers.contains(&layer_idx)
@@ -204,7 +215,9 @@ impl QuantizationSpec {
 
     fn mlx_supported(&self, prefix: &str) -> Result<Self> {
         match self.mode {
-            QuantizationMode::Affine if matches!(self.bits, 4 | 8) => Ok(self.clone()),
+            // MLX affine quantization supports these bit-widths; hi-mlx passes `bits` straight to the
+            // MLX quantized ops, so dynamic/mixed-bit builds (e.g. GLM-5.2 3.5bpw: 3/4/6-bit) work.
+            QuantizationMode::Affine if matches!(self.bits, 2 | 3 | 4 | 5 | 6 | 8) => Ok(self.clone()),
             QuantizationMode::Other(ref mode)
                 if mode == "mxfp4" && self.bits == 4 && self.group_size == 32 =>
             {
@@ -241,6 +254,21 @@ pub fn load_model_config(path: impl AsRef<Path>) -> Result<MlxModelConfig> {
 }
 
 pub fn parse_model_config(path: &Path, raw: Value) -> Result<MlxModelConfig> {
+    // VL / multimodal configs (e.g. Qwen3.5) nest the text-model fields under `text_config`. Hoist
+    // them to the top level (without clobbering top-level `model_type`/`architectures`/quantization)
+    // so the rest of the parser finds `hidden_size`, `num_hidden_layers`, etc.
+    let raw = match raw.get("text_config").and_then(Value::as_object).cloned() {
+        Some(text_config) => {
+            let mut merged = raw.clone();
+            if let Some(obj) = merged.as_object_mut() {
+                for (k, v) in text_config {
+                    obj.entry(k).or_insert(v);
+                }
+            }
+            merged
+        }
+        None => raw,
+    };
     let model_type = str_field(&raw, "model_type").unwrap_or_default();
     let family = detect_family(&model_type, &raw).ok_or_else(|| {
         let found = if model_type.is_empty() {
@@ -271,6 +299,19 @@ pub fn parse_model_config(path: &Path, raw: Value) -> Result<MlxModelConfig> {
         num_attention_heads,
         num_key_value_heads: u32_field(&raw, "num_key_value_heads").unwrap_or(num_attention_heads),
         head_dim: u32_field(&raw, "head_dim"),
+        partial_rotary_factor: f32_field(&raw, "partial_rotary_factor")
+            .or_else(|| {
+                raw.get("rope_parameters")
+                    .and_then(|p| p.get("partial_rotary_factor"))
+                    .and_then(Value::as_f64)
+                    .map(|v| v as f32)
+            }),
+        linear_num_value_heads: u32_field(&raw, "linear_num_value_heads"),
+        linear_num_key_heads: u32_field(&raw, "linear_num_key_heads"),
+        linear_key_head_dim: u32_field(&raw, "linear_key_head_dim"),
+        linear_value_head_dim: u32_field(&raw, "linear_value_head_dim"),
+        linear_conv_kernel_dim: u32_field(&raw, "linear_conv_kernel_dim"),
+        full_attention_interval: u32_field(&raw, "full_attention_interval"),
         qk_nope_head_dim: u32_field(&raw, "qk_nope_head_dim"),
         qk_rope_head_dim: u32_field(&raw, "qk_rope_head_dim"),
         v_head_dim: u32_field(&raw, "v_head_dim"),
@@ -290,7 +331,15 @@ pub fn parse_model_config(path: &Path, raw: Value) -> Result<MlxModelConfig> {
         vocab_size: required_u32(&raw, "vocab_size")?,
         context_length,
         rms_norm_eps: f32_field(&raw, "rms_norm_eps").unwrap_or(1e-6),
-        rope_theta: f32_field(&raw, "rope_theta").unwrap_or(1_000_000.0),
+        rope_theta: f32_field(&raw, "rope_theta")
+            .or_else(|| {
+                // Hy3 (hy_v3) nests rope_theta under `rope_parameters` instead of top-level.
+                raw.get("rope_parameters")
+                    .and_then(|p| p.get("rope_theta"))
+                    .and_then(Value::as_f64)
+                    .map(|v| v as f32)
+            })
+            .unwrap_or(1_000_000.0),
         rope_scaling: raw.get("rope_scaling").filter(|v| !v.is_null()).cloned(),
         attention_bias: bool_field(&raw, "attention_bias").unwrap_or(false),
         tie_word_embeddings: bool_field(&raw, "tie_word_embeddings").unwrap_or(true),
@@ -306,7 +355,9 @@ pub fn parse_model_config(path: &Path, raw: Value) -> Result<MlxModelConfig> {
         n_group: u32_field(&raw, "n_group").unwrap_or(1),
         topk_group: u32_field(&raw, "topk_group").unwrap_or(1),
         norm_topk_prob: bool_field(&raw, "norm_topk_prob").unwrap_or(true),
-        routed_scaling_factor: f32_field(&raw, "routed_scaling_factor").unwrap_or(1.0),
+        routed_scaling_factor: f32_field(&raw, "routed_scaling_factor")
+            .or_else(|| f32_field(&raw, "router_scaling_factor")) // Hy3 (hy_v3) key
+            .unwrap_or(1.0),
         num_hash_layers: u32_field(&raw, "num_hash_layers").unwrap_or(0),
         topk_method: str_field(&raw, "topk_method"),
         scoring_func: str_field(&raw, "scoring_func"),
@@ -358,6 +409,10 @@ pub fn detect_family(model_type: &str, config: &Value) -> Option<ModelFamily> {
             model_type.as_str(),
             "deepseek_v2" | "deepseek_v3" | "deepseek_v31" | "deepseek_v32" | "deepseek_v4"
         )
+        // GLM-5.2 (`glm_moe_dsa`) is DeepSeek-V3.2 architecturally: MLA + DeepSeek Sparse Attention
+        // (the lightning indexer) + sigmoid/noaux MoE. Route it through the DeepSeek path.
+        || matches!(model_type.as_str(), "glm_moe_dsa" | "glm_moe_dsa_mtp")
+        || haystack.contains("glm_moe_dsa")
     {
         return Some(ModelFamily::DeepSeek);
     }
@@ -371,11 +426,18 @@ pub fn detect_family(model_type: &str, config: &Value) -> Option<ModelFamily> {
     {
         return Some(ModelFamily::GlmFlash);
     }
+    if matches!(model_type.as_str(), "hy_v3" | "hyv3")
+        || haystack.contains("hy_v3")
+        || haystack.contains("hyv3")
+        || haystack.contains("hunyuan")
+    {
+        return Some(ModelFamily::Hy3);
+    }
     None
 }
 
 pub fn supported_model_families() -> &'static str {
-    "qwen2/qwen2_moe, qwen3/qwen3_moe/qwen3_next, deepseek_v2/deepseek_v3/deepseek_v32/deepseek_v4, glm4/glm4_moe/glm4_moe_lite Flash"
+    "qwen2/qwen2_moe, qwen3/qwen3_moe/qwen3_next, deepseek_v2/deepseek_v3/deepseek_v32/deepseek_v4, glm4/glm4_moe/glm4_moe_lite Flash, hy_v3 (Hunyuan-3)"
 }
 
 pub fn architecture_strings(config: &Value) -> Vec<String> {

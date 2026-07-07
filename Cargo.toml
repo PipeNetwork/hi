@@ -35,3 +35,12 @@ hi-agent = { path = "crates/hi-agent" }
 hi-tui = { path = "crates/hi-tui" }
 hi-lsp = { path = "crates/hi-lsp" }
 hi-local-core = { path = "crates/hi-local-core" }
+
+# Bump the vendored MLX C++ source (built by pmetal-mlx-sys) from v0.30.6 to v0.31.2 to fix
+# bf16 Metal-kernel JIT compilation against the Metal Toolchain 17C / macOS 26 (matches the
+# working pip MLX 0.31.2). See vendor/pmetal-mlx-sys.
+[patch.crates-io]
+pmetal-mlx-sys = { path = "vendor/pmetal-mlx-sys" }
+# pmetal-mlx-rs 0.25.8 calls mlx_quantize/mlx_dequantize with the pre-0.6.0 arg count; the
+# vendored copy adds the `global_scale` param that mlx-c 0.6.0 introduced.
+pmetal-mlx-rs = { path = "vendor/pmetal-mlx-rs" }
