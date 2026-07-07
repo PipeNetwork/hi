@@ -5944,6 +5944,89 @@ mod native {
             Ok((logits, logits_seq_len))
         }
 
+        /// Prefill only the divergent suffix `input_ids[reuse_tokens..]`, reusing
+        /// KV already resident in the first `reuse_tokens` positions of
+        /// `page_table` (written by a prior request whose prompt shared this
+        /// prefix). This mirrors the suffix loop of
+        /// `full_context_logits_device_batched_paged_cache_with_shared_prefix`,
+        /// except the prefix KV is pre-populated in the pages rather than
+        /// recomputed here — so an agent loop pays O(suffix) instead of
+        /// O(prompt) each turn. Single sequence (batch of one) only.
+        pub fn prefill_greedy_next_tokens_paged_reusing_prefix(
+            &self,
+            input_ids: &[u32],
+            reuse_tokens: usize,
+            page_size: usize,
+            page_table: &[usize],
+            physical_page_count: usize,
+        ) -> Result<Vec<u32>> {
+            let label = "CUDA paged greedy prefix-reuse prefill";
+            if self.config.recurrent_ssm_tensor_layout {
+                bail!("{label} is not supported for recurrent SSM layouts");
+            }
+            if !self.supports_batched_text_generation() {
+                bail!("{label} currently supports loaded decoder model layouts only");
+            }
+            let dims = self.qwen_dims()?;
+            let prompt_len = input_ids.len();
+            if reuse_tokens == 0 || reuse_tokens >= prompt_len {
+                bail!(
+                    "{label} requires 0 < reuse_tokens ({reuse_tokens}) < prompt_len ({prompt_len})"
+                );
+            }
+            if prompt_len > dims.context {
+                bail!(
+                    "input length {prompt_len} exceeds qwen context length {}",
+                    dims.context
+                );
+            }
+
+            let token_capacity = prompt_len.min(dims.context);
+            let mut pool_slot = self.paged_batch_pool.borrow_mut();
+            let recreate_pool = pool_slot
+                .as_ref()
+                .is_none_or(|pool| !pool.can_cover(&dims, page_size, physical_page_count));
+            if recreate_pool {
+                *pool_slot = Some(CudaPagedBatchDevicePool::new(
+                    self.config.block_count,
+                    &dims,
+                    page_size,
+                    physical_page_count,
+                    &self.stream,
+                )?);
+            }
+            let pool = pool_slot
+                .as_ref()
+                .ok_or_else(|| anyhow!("CUDA paged batch device pool was not initialized"))?;
+
+            let page_tables = vec![page_table.to_vec()];
+            let mut cache = CudaPagedBatchKvCache::new_with_page_tables_from_pool(
+                &dims,
+                1,
+                page_size,
+                token_capacity,
+                &page_tables,
+                pool,
+                &self.stream,
+            )?;
+            // Append the suffix one position at a time, attending to the reused
+            // prefix KV through the page table (paged attention reads physical
+            // pages by index, regardless of which request wrote them). RoPE
+            // positions stay consistent because the reused K was stored with its
+            // original position's rotation.
+            let mut logits = None;
+            for position in reuse_tokens..prompt_len {
+                logits = Some(self.decode_batch_logits_paged_device(
+                    std::slice::from_ref(&input_ids[position]),
+                    position,
+                    &mut cache,
+                )?);
+            }
+            let logits = logits
+                .ok_or_else(|| anyhow!("{label} produced no suffix logits"))?;
+            self.argmax_batched_last_token(&logits, 1, 1)
+        }
+
         fn decode_logits_batch_paged_with_page_tables(
             &self,
             token_ids: &[u32],
@@ -20202,6 +20285,19 @@ mod non_native {
             _inputs: &[Vec<u32>],
             _page_size: usize,
             _page_tables: &[Vec<usize>],
+            _physical_page_count: usize,
+        ) -> Result<Vec<u32>> {
+            bail!(
+                "hi-cuda was built without native-cuda support; GPU Qwen paged generation is unavailable"
+            )
+        }
+
+        pub fn prefill_greedy_next_tokens_paged_reusing_prefix(
+            &self,
+            _input_ids: &[u32],
+            _reuse_tokens: usize,
+            _page_size: usize,
+            _page_table: &[usize],
             _physical_page_count: usize,
         ) -> Result<Vec<u32>> {
             bail!(
