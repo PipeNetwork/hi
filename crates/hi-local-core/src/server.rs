@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
@@ -15,7 +16,6 @@ use futures_util::StreamExt;
 use futures_util::future::{self, Either};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
 
 use crate::backend::{
     GenerationEvent, GenerationRequest, GenerationStream, ImageInput, ImageSource, ImageUrlKind,
@@ -766,163 +766,181 @@ fn streaming_response_from_stream_future(
     stop_sequences: Vec<String>,
     stream_future: GenerationStreamFuture,
 ) -> Response {
-    let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(16);
-    tokio::spawn(async move {
-        if !send_sse_json(
-            &tx,
-            json!({
-                "id": id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {"role": "assistant"},
-                    "finish_reason": null,
-                }]
-            }),
-        )
-        .await
-        {
-            return;
-        }
+    let mut pending = VecDeque::new();
+    pending.push_back(sse_json_event(json!({
+        "id": id,
+        "object": "chat.completion.chunk",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "delta": {"role": "assistant"},
+            "finish_reason": null,
+        }]
+    })));
+    let tool_mode = !tools.is_empty();
+    let state = OpenAiSseState {
+        id,
+        model,
+        tools,
+        created,
+        include_usage,
+        tool_mode,
+        buffered_text: String::new(),
+        final_usage: None,
+        stop_filter: StopStreamFilter::new(stop_sequences),
+        stream_future: Some(stream_future),
+        stream: None,
+        pending,
+        finished: false,
+    };
+    let events = futures_util::stream::unfold(state, |mut state| async move {
+        state.next_event().await.map(|event| (event, state))
+    });
+    Sse::new(events).into_response()
+}
 
-        let tool_mode = !tools.is_empty();
-        let mut buffered_text = String::new();
-        let mut final_usage = None;
-        let mut stop_filter = StopStreamFilter::new(stop_sequences);
-        let mut stopped_by_sequence = false;
-        let mut stream = match stream_future.await {
-            Ok(stream) => stream,
-            Err(err) => {
-                send_generation_error(&tx, err.to_string()).await;
-                send_done(&tx).await;
-                return;
+struct OpenAiSseState {
+    id: String,
+    model: String,
+    tools: Vec<Tool>,
+    created: u64,
+    include_usage: bool,
+    tool_mode: bool,
+    buffered_text: String,
+    final_usage: Option<Value>,
+    stop_filter: StopStreamFilter,
+    stream_future: Option<GenerationStreamFuture>,
+    stream: Option<GenerationStream>,
+    pending: VecDeque<Result<Event, Infallible>>,
+    finished: bool,
+}
+
+impl OpenAiSseState {
+    async fn next_event(&mut self) -> Option<Result<Event, Infallible>> {
+        loop {
+            if let Some(event) = self.pending.pop_front() {
+                return Some(event);
             }
-        };
-
-        while let Some(event) = stream.next().await {
-            match event {
-                Ok(GenerationEvent::TokenDelta { text, .. }) => {
-                    let pieces = stop_filter.push(&text);
-                    if tool_mode {
-                        for piece in pieces {
-                            buffered_text.push_str(&piece);
-                        }
-                    } else {
-                        for piece in pieces {
-                            if !piece.is_empty()
-                                && !send_sse_json(
-                                    &tx,
-                                    json!({
-                                        "id": id,
-                                        "object": "chat.completion.chunk",
-                                        "created": created,
-                                        "model": model,
-                                        "choices": [{
-                                            "index": 0,
-                                            "delta": {"content": piece},
-                                            "finish_reason": null,
-                                        }]
-                                    }),
-                                )
-                                .await
-                            {
-                                return;
-                            }
-                        }
+            if self.finished {
+                return None;
+            }
+            if self.stream.is_none() {
+                let Some(stream_future) = self.stream_future.take() else {
+                    self.queue_finish();
+                    continue;
+                };
+                match stream_future.await {
+                    Ok(stream) => {
+                        self.stream = Some(stream);
                     }
-                    if stop_filter.stopped() {
-                        stopped_by_sequence = true;
-                        break;
+                    Err(err) => {
+                        self.pending
+                            .push_back(generation_error_event(err.to_string()));
+                        self.pending.push_back(done_event());
+                        self.finished = true;
+                        continue;
                     }
                 }
-                Ok(GenerationEvent::Finished { output }) => {
-                    final_usage = Some(json!({
+            }
+
+            let event = {
+                let stream = self.stream.as_mut().expect("stream was initialized");
+                stream.next().await
+            };
+            match event {
+                Some(Ok(GenerationEvent::TokenDelta { text, .. })) => {
+                    self.queue_token_delta(text);
+                    if self.stop_filter.stopped() {
+                        self.stream.take();
+                        self.queue_finish();
+                    }
+                }
+                Some(Ok(GenerationEvent::Finished { output })) => {
+                    self.final_usage = Some(json!({
                         "prompt_tokens": output.prompt_tokens,
                         "completion_tokens": output.completion_tokens,
                         "total_tokens": output.prompt_tokens + output.completion_tokens,
                     }));
-                    if tool_mode {
-                        buffered_text = truncate_at_stop(&output.text, stop_filter.stops());
-                    } else if !stop_filter.stopped() {
-                        for piece in stop_filter.finish() {
-                            if !piece.is_empty()
-                                && !send_sse_json(
-                                    &tx,
-                                    json!({
-                                        "id": id,
-                                        "object": "chat.completion.chunk",
-                                        "created": created,
-                                        "model": model,
-                                        "choices": [{
-                                            "index": 0,
-                                            "delta": {"content": piece},
-                                            "finish_reason": null,
-                                        }]
-                                    }),
-                                )
-                                .await
-                            {
-                                return;
-                            }
+                    if self.tool_mode {
+                        self.buffered_text =
+                            truncate_at_stop(&output.text, self.stop_filter.stops());
+                    } else if !self.stop_filter.stopped() {
+                        for piece in self.stop_filter.finish() {
+                            self.queue_content_piece(piece);
                         }
                     }
+                    self.stream.take();
+                    self.queue_finish();
                 }
-                Err(err) => {
-                    send_generation_error(&tx, err.to_string()).await;
-                    send_done(&tx).await;
-                    return;
+                Some(Err(err)) => {
+                    self.stream.take();
+                    self.pending
+                        .push_back(generation_error_event(err.to_string()));
+                    self.pending.push_back(done_event());
+                    self.finished = true;
+                }
+                None => {
+                    self.stream.take();
+                    self.queue_finish();
                 }
             }
         }
-        if stopped_by_sequence {
-            drop(stream);
-        }
+    }
 
-        let finish_reason = if tool_mode {
-            match parse_tool_calls(&buffered_text, &tools) {
+    fn queue_token_delta(&mut self, text: String) {
+        let pieces = self.stop_filter.push(&text);
+        if self.tool_mode {
+            for piece in pieces {
+                self.buffered_text.push_str(&piece);
+            }
+        } else {
+            for piece in pieces {
+                self.queue_content_piece(piece);
+            }
+        }
+    }
+
+    fn queue_content_piece(&mut self, piece: String) {
+        if piece.is_empty() {
+            return;
+        }
+        self.pending.push_back(sse_json_event(json!({
+            "id": self.id,
+            "object": "chat.completion.chunk",
+            "created": self.created,
+            "model": self.model,
+            "choices": [{
+                "index": 0,
+                "delta": {"content": piece},
+                "finish_reason": null,
+            }]
+        })));
+    }
+
+    fn queue_finish(&mut self) {
+        if self.finished {
+            return;
+        }
+        let finish_reason = if self.tool_mode {
+            match parse_tool_calls(&self.buffered_text, &self.tools) {
                 Some(calls) => {
-                    if !send_sse_json(
-                        &tx,
-                        json!({
-                            "id": id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {"tool_calls": calls},
-                                "finish_reason": null,
-                            }]
-                        }),
-                    )
-                    .await
-                    {
-                        return;
-                    }
+                    self.pending.push_back(sse_json_event(json!({
+                        "id": self.id,
+                        "object": "chat.completion.chunk",
+                        "created": self.created,
+                        "model": self.model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"tool_calls": calls},
+                            "finish_reason": null,
+                        }]
+                    })));
                     "tool_calls"
                 }
                 None => {
-                    for piece in split_stream_text(&buffered_text) {
-                        if !send_sse_json(
-                            &tx,
-                            json!({
-                                "id": id,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": model,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {"content": piece},
-                                    "finish_reason": null,
-                                }]
-                            }),
-                        )
-                        .await
-                        {
-                            return;
-                        }
+                    for piece in split_stream_text(&self.buffered_text) {
+                        self.queue_content_piece(piece);
                     }
                     "stop"
                 }
@@ -931,35 +949,27 @@ fn streaming_response_from_stream_future(
             "stop"
         };
 
-        if !send_sse_json(&tx, finish_chunk(&id, &model, created, finish_reason)).await {
-            return;
-        }
-        if include_usage {
-            if let Some(usage) = final_usage {
-                if !send_sse_json(
-                    &tx,
-                    json!({
-                        "id": id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model,
-                        "choices": [],
-                        "usage": usage,
-                    }),
-                )
-                .await
-                {
-                    return;
-                }
+        self.pending.push_back(sse_json_event(finish_chunk(
+            &self.id,
+            &self.model,
+            self.created,
+            finish_reason,
+        )));
+        if self.include_usage {
+            if let Some(usage) = self.final_usage.take() {
+                self.pending.push_back(sse_json_event(json!({
+                    "id": self.id,
+                    "object": "chat.completion.chunk",
+                    "created": self.created,
+                    "model": self.model,
+                    "choices": [],
+                    "usage": usage,
+                })));
             }
         }
-        send_done(&tx).await;
-    });
-
-    let events = futures_util::stream::unfold(rx, |mut rx| async {
-        rx.recv().await.map(|event| (event, rx))
-    });
-    Sse::new(events).into_response()
+        self.pending.push_back(done_event());
+        self.finished = true;
+    }
 }
 
 fn finish_chunk(id: &str, model: &str, created: u64, reason: &str) -> Value {
@@ -1605,29 +1615,23 @@ fn parse_data_video_url(
     })
 }
 
-async fn send_sse_json(tx: &mpsc::Sender<Result<Event, Infallible>>, value: Value) -> bool {
-    tx.send(Ok(Event::default().data(value.to_string())))
-        .await
-        .is_ok()
+fn sse_json_event(value: Value) -> Result<Event, Infallible> {
+    Ok(Event::default().data(value.to_string()))
 }
 
-async fn send_generation_error(tx: &mpsc::Sender<Result<Event, Infallible>>, message: String) {
+fn generation_error_event(message: String) -> Result<Event, Infallible> {
     let (code, error_type) = generation_error_code_and_type(&message);
-    let _ = send_sse_json(
-        tx,
-        json!({
+    sse_json_event(json!({
             "error": {
                 "message": message,
                 "type": error_type,
                 "code": code,
             }
-        }),
-    )
-    .await;
+    }))
 }
 
-async fn send_done(tx: &mpsc::Sender<Result<Event, Infallible>>) {
-    let _ = tx.send(Ok(Event::default().data("[DONE]"))).await;
+fn done_event() -> Result<Event, Infallible> {
+    Ok(Event::default().data("[DONE]"))
 }
 
 fn model_card(model: &ModelInfo, backend: &str) -> Value {
@@ -2213,7 +2217,7 @@ mod tests {
     #[tokio::test]
     async fn health_returns_multimodal_metrics_object() {
         let backend = Arc::new(MockBackend::new(test_model(), "hello").with_quantization(
-            "Q4_0; execution=gpu; multimodal-metrics=enabled,vision_batched_requests=5,vision_batched_batches=2,multimodal_decode_batched_requests=4,vision_legacy_requests=7,vision_legacy_batches=3,vision_legacy_media_inputs=9,vision_legacy_projected_rows=128,multimodal_decode_legacy_requests=6,multimodal_decode_paged_requests=22,multimodal_requests=11,multimodal_media_inputs=13,multimodal_fallback_requests=14,multimodal_fallback_direct_requests=15,multimodal_fallback_mixed_batch_requests=16,multimodal_fallback_decode_group_singleton_requests=17,multimodal_fallback_projection_failed_requests=18,multimodal_fallback_projection_mismatch_requests=19,multimodal_fallback_incompatible_prompt_requests=20,multimodal_fallback_token_budget_requests=21; scheduler=disabled",
+            "Q4_0; execution=gpu; multimodal-metrics=enabled,vision_batched_requests=5,vision_batched_batches=2,multimodal_decode_batched_requests=4,multimodal_decode_ragged_batched_requests=3,vision_legacy_requests=7,vision_legacy_batches=3,vision_legacy_media_inputs=9,vision_legacy_projected_rows=128,multimodal_decode_legacy_requests=6,multimodal_decode_paged_requests=22,multimodal_requests=11,multimodal_media_inputs=13,multimodal_fallback_requests=14,multimodal_fallback_direct_requests=15,multimodal_fallback_mixed_batch_requests=16,multimodal_fallback_decode_group_singleton_requests=17,multimodal_fallback_projection_failed_requests=18,multimodal_fallback_projection_mismatch_requests=19,multimodal_fallback_incompatible_prompt_requests=20,multimodal_fallback_token_budget_requests=21; scheduler=disabled",
         ));
         let app = app(backend);
 
@@ -2234,6 +2238,10 @@ mod tests {
         assert_eq!(
             body["multimodal_metrics"]["multimodal_decode_batched_requests"],
             4
+        );
+        assert_eq!(
+            body["multimodal_metrics"]["multimodal_decode_ragged_batched_requests"],
+            3
         );
         assert_eq!(body["multimodal_metrics"]["vision_legacy_requests"], 7);
         assert_eq!(body["multimodal_metrics"]["vision_legacy_batches"], 3);
@@ -2281,7 +2289,7 @@ mod tests {
     #[tokio::test]
     async fn health_returns_cuda_runtime_metric_objects() {
         let backend = Arc::new(MockBackend::new(test_model(), "hello").with_quantization(
-            "Q4_0; execution=gpu; cuda-runtime=available(devices=1,runtime=13000,driver=13010); gpu-weights=loaded(tensors=11,bytes=92); gpu-matrices=loaded(count=10,bytes=80,quantized=4); gpu-vectors=loaded(count=1,bytes=12); attention=tiled-paged; attention-detail=mode=tiled-paged,head_dim=128,head_dim_max=256,kv_cache=paged,decode=tiled-paged(paths=single-text|batched-text,fallback_reason=none),decode_fallback=paged(head_dim_min=257,fallback_reason=wide-head),prefill=tiled-contiguous(paths=text|batched-text|multimodal,fallback_reason=none),prefill_fallback=legacy(head_dim_min=257,fallback_reason=wide-head),multimodal=tiled-contiguous(prompt_embeddings=tiled-contiguous,fallback_reason=none); sampling=batched; batch=max_size=8,max_active_requests=4,max_batched_tokens=8192,max_wait_us=2500,max_wait_us_cap=60000000; multimodal-batching=enabled(vision_stage=batching-enabled,decode=prefix-batched|mrope-batched,fallback=no-placeholder-mrope-legacy); multimodal=text-only",
+            "Q4_0; execution=gpu; cuda-runtime=available(devices=1,runtime=13000,driver=13010); gpu-weights=loaded(tensors=11,bytes=92); gpu-matrices=loaded(count=10,bytes=80,quantized=4); gpu-vectors=loaded(count=1,bytes=12); attention=tiled-paged; attention-detail=mode=tiled-paged,head_dim=128,head_dim_max=512,wide_kernel=tiled-wide,wide_head_dim_max=512,kv_cache=paged,decode=tiled-paged(paths=single-text|batched-text,fallback_reason=none),decode_fallback=paged(head_dim_min=513,fallback_reason=wide-head),prefill=tiled-contiguous(paths=text|batched-text|multimodal,fallback_reason=none),prefill_fallback=legacy(head_dim_min=513,fallback_reason=wide-head),multimodal=tiled-contiguous(prompt_embeddings=tiled-contiguous,fallback_reason=none); sampling=batched; batch=max_size=8,max_active_requests=4,max_batched_tokens=8192,max_wait_us=2500,max_wait_us_cap=60000000; multimodal-batching=enabled(vision_stage=batching-enabled,decode=ragged-paged|mrope-ragged-paged,fallback=projection-failed|unsupported-decoder-layout|page-exhaustion|malformed-or-no-placeholder); multimodal=text-only",
         ));
         let app = app(backend);
 
@@ -2314,11 +2322,13 @@ mod tests {
         assert_eq!(body["attention"]["status"], "tiled-paged");
         assert_eq!(
             body["attention"]["detail"],
-            "mode=tiled-paged,head_dim=128,head_dim_max=256,kv_cache=paged,decode=tiled-paged(paths=single-text|batched-text,fallback_reason=none),decode_fallback=paged(head_dim_min=257,fallback_reason=wide-head),prefill=tiled-contiguous(paths=text|batched-text|multimodal,fallback_reason=none),prefill_fallback=legacy(head_dim_min=257,fallback_reason=wide-head),multimodal=tiled-contiguous(prompt_embeddings=tiled-contiguous,fallback_reason=none)"
+            "mode=tiled-paged,head_dim=128,head_dim_max=512,wide_kernel=tiled-wide,wide_head_dim_max=512,kv_cache=paged,decode=tiled-paged(paths=single-text|batched-text,fallback_reason=none),decode_fallback=paged(head_dim_min=513,fallback_reason=wide-head),prefill=tiled-contiguous(paths=text|batched-text|multimodal,fallback_reason=none),prefill_fallback=legacy(head_dim_min=513,fallback_reason=wide-head),multimodal=tiled-contiguous(prompt_embeddings=tiled-contiguous,fallback_reason=none)"
         );
         assert_eq!(body["attention"]["mode"], "tiled-paged");
         assert_eq!(body["attention"]["head_dim"], 128);
-        assert_eq!(body["attention"]["head_dim_max"], 256);
+        assert_eq!(body["attention"]["head_dim_max"], 512);
+        assert_eq!(body["attention"]["wide_kernel"], "tiled-wide");
+        assert_eq!(body["attention"]["wide_head_dim_max"], 512);
         assert_eq!(body["attention"]["kv_cache"], "paged");
         assert_eq!(body["attention"]["decode"]["status"], "tiled-paged");
         assert_eq!(
@@ -2327,7 +2337,7 @@ mod tests {
         );
         assert_eq!(body["attention"]["decode"]["fallback_reason"], "none");
         assert_eq!(body["attention"]["decode_fallback"]["status"], "paged");
-        assert_eq!(body["attention"]["decode_fallback"]["head_dim_min"], 257);
+        assert_eq!(body["attention"]["decode_fallback"]["head_dim_min"], 513);
         assert_eq!(
             body["attention"]["decode_fallback"]["fallback_reason"],
             "wide-head"
@@ -2339,7 +2349,7 @@ mod tests {
         );
         assert_eq!(body["attention"]["prefill"]["fallback_reason"], "none");
         assert_eq!(body["attention"]["prefill_fallback"]["status"], "legacy");
-        assert_eq!(body["attention"]["prefill_fallback"]["head_dim_min"], 257);
+        assert_eq!(body["attention"]["prefill_fallback"]["head_dim_min"], 513);
         assert_eq!(
             body["attention"]["prefill_fallback"]["fallback_reason"],
             "wide-head"
@@ -2363,7 +2373,7 @@ mod tests {
         assert_eq!(body["multimodal_batching"]["status"], "enabled");
         assert_eq!(
             body["multimodal_batching"]["decode"],
-            "prefix-batched|mrope-batched"
+            "ragged-paged|mrope-ragged-paged"
         );
         assert_eq!(
             body["multimodal_batching"]["vision_stage"],
@@ -2371,7 +2381,7 @@ mod tests {
         );
         assert_eq!(
             body["multimodal_batching"]["fallback"],
-            "no-placeholder-mrope-legacy"
+            "projection-failed|unsupported-decoder-layout|page-exhaustion|malformed-or-no-placeholder"
         );
         assert_eq!(body["multimodal_projector"]["status"], "text-only");
     }
@@ -2379,7 +2389,7 @@ mod tests {
     #[tokio::test]
     async fn health_returns_attention_fallback_reason() {
         let backend = Arc::new(MockBackend::new(test_model(), "hello").with_quantization(
-            "Q4_0; execution=gpu; attention=flash-online; attention-detail=mode=flash-online,head_dim=128,head_dim_max=256,kv_cache=legacy,decode=flash-online(paths=single-text|batched-text,fallback_reason=none),decode_fallback=legacy(head_dim_min=257,fallback_reason=wide-head),prefill=tiled-contiguous(paths=text|batched-text|multimodal,fallback_reason=none),prefill_fallback=legacy(head_dim_min=257,fallback_reason=wide-head),multimodal=text-only(prompt_embeddings=unavailable,fallback_reason=no-mmproj)",
+            "Q4_0; execution=gpu; attention=flash-online; attention-detail=mode=flash-online,head_dim=128,head_dim_max=512,wide_kernel=tiled-wide,wide_head_dim_max=512,kv_cache=legacy,decode=flash-online(paths=single-text|batched-text,fallback_reason=none),decode_fallback=legacy(head_dim_min=513,fallback_reason=wide-head),prefill=tiled-contiguous(paths=text|batched-text|multimodal,fallback_reason=none),prefill_fallback=legacy(head_dim_min=513,fallback_reason=wide-head),multimodal=text-only(prompt_embeddings=unavailable,fallback_reason=no-mmproj)",
         ));
         let app = app(backend);
 
@@ -2397,7 +2407,9 @@ mod tests {
         assert_eq!(body["attention"]["status"], "flash-online");
         assert_eq!(body["attention"]["mode"], "flash-online");
         assert_eq!(body["attention"]["head_dim"], 128);
-        assert_eq!(body["attention"]["head_dim_max"], 256);
+        assert_eq!(body["attention"]["head_dim_max"], 512);
+        assert_eq!(body["attention"]["wide_kernel"], "tiled-wide");
+        assert_eq!(body["attention"]["wide_head_dim_max"], 512);
         assert_eq!(body["attention"]["kv_cache"], "legacy");
         assert_eq!(body["attention"]["decode"]["status"], "flash-online");
         assert_eq!(body["attention"]["decode"]["fallback_reason"], "none");
@@ -3253,6 +3265,49 @@ mod tests {
         assert!(!body.contains("tail"));
         assert!(body.contains(r#""finish_reason":"stop""#));
         assert!(body.contains("data: [DONE]"));
+        assert!(dropped_before_finished.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn streaming_completion_drops_backend_stream_when_response_body_drops() {
+        let dropped_before_finished = Arc::new(AtomicBool::new(false));
+        let backend = Arc::new(DropTrackingBackend {
+            model: test_model(),
+            dropped_before_finished: dropped_before_finished.clone(),
+        });
+        let request = GenerationRequest {
+            prompt: "hi".to_string(),
+            max_tokens: 8,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+        let stream_future: GenerationStreamFuture =
+            Box::pin(async move { backend.stream_generate(request).await });
+        let mut state = OpenAiSseState {
+            id: "chatcmpl-test".to_string(),
+            model: "test-model".to_string(),
+            tools: Vec::new(),
+            created: 0,
+            include_usage: false,
+            tool_mode: false,
+            buffered_text: String::new(),
+            final_usage: None,
+            stop_filter: StopStreamFilter::new(Vec::new()),
+            stream_future: Some(stream_future),
+            stream: None,
+            pending: std::collections::VecDeque::new(),
+            finished: false,
+        };
+
+        let event = state.next_event().await.unwrap().unwrap();
+        assert!(format!("{event:?}").contains("alpha"));
+        assert!(!dropped_before_finished.load(Ordering::SeqCst));
+
+        drop(state);
         assert!(dropped_before_finished.load(Ordering::SeqCst));
     }
 

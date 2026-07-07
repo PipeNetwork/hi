@@ -1,7 +1,8 @@
 use std::pin::Pin;
+use std::process::Command;
 use std::sync::Arc;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use futures_util::Stream;
 use tokio::sync::{Mutex, mpsc};
@@ -24,6 +25,11 @@ pub struct MlxBackend {
     runtime: Arc<Mutex<NativeRuntime>>,
 }
 
+const OVERSIZE_MODEL_ENV: &str = "HI_MLX_ALLOW_OVERSIZE_MODEL";
+const MEMORY_LIMIT_BYTES_ENV: &str = "HI_MLX_MEMORY_LIMIT_BYTES";
+const MEMORY_LIMIT_FRACTION_ENV: &str = "HI_MLX_MEMORY_LIMIT_FRACTION";
+const DEFAULT_MEMORY_LIMIT_FRACTION: f64 = 0.85;
+
 impl MlxBackend {
     pub fn load(path: impl AsRef<std::path::Path>, model_id: Option<String>) -> Result<Self> {
         ensure_native_generation_available()?;
@@ -32,6 +38,7 @@ impl MlxBackend {
         let config = load_model_config(path)?;
         let weights = WeightCatalog::load(path)?;
         weights.validate_for_config(&config)?;
+        validate_memory_admission(weights.estimated_bytes)?;
         let tokenizer = TokenizerRuntime::load(path)?;
         let runtime = NativeRuntime::load(config.clone(), weights.clone(), tokenizer)?;
         Ok(Self {
@@ -41,6 +48,85 @@ impl MlxBackend {
             runtime: Arc::new(Mutex::new(runtime)),
         })
     }
+}
+
+fn validate_memory_admission(estimated_bytes: u64) -> Result<()> {
+    if env_truthy(OVERSIZE_MODEL_ENV) {
+        return Ok(());
+    }
+    let Some(limit) = configured_memory_limit_bytes()? else {
+        return Ok(());
+    };
+    check_estimated_memory(estimated_bytes, limit)
+}
+
+fn configured_memory_limit_bytes() -> Result<Option<u64>> {
+    if let Some(raw) = std::env::var_os(MEMORY_LIMIT_BYTES_ENV) {
+        let raw = raw.to_string_lossy();
+        let value = raw
+            .trim()
+            .parse::<u64>()
+            .with_context(|| format!("parsing {MEMORY_LIMIT_BYTES_ENV}={raw:?}"))?;
+        return Ok((value > 0).then_some(value));
+    }
+    let Some(host_bytes) = host_memory_bytes() else {
+        return Ok(None);
+    };
+    let fraction = std::env::var(MEMORY_LIMIT_FRACTION_ENV)
+        .ok()
+        .map(|raw| {
+            raw.parse::<f64>()
+                .with_context(|| format!("parsing {MEMORY_LIMIT_FRACTION_ENV}={raw:?}"))
+        })
+        .transpose()?
+        .unwrap_or(DEFAULT_MEMORY_LIMIT_FRACTION);
+    if !fraction.is_finite() || fraction <= 0.0 {
+        bail!("{MEMORY_LIMIT_FRACTION_ENV} must be a positive finite number");
+    }
+    Ok(Some(((host_bytes as f64) * fraction.min(1.0)) as u64))
+}
+
+fn check_estimated_memory(estimated_bytes: u64, limit_bytes: u64) -> Result<()> {
+    if estimated_bytes <= limit_bytes {
+        return Ok(());
+    }
+    bail!(
+        "insufficient MLX unified memory: model shards require {} but the configured safe limit is {}; set {OVERSIZE_MODEL_ENV}=1 to override",
+        format_bytes(estimated_bytes),
+        format_bytes(limit_bytes)
+    )
+}
+
+fn env_truthy(key: &str) -> bool {
+    std::env::var(key)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn host_memory_bytes() -> Option<u64> {
+    let output = Command::new("sysctl")
+        .args(["-n", "hw.memsize"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    std::str::from_utf8(&output.stdout)
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+    format!("{:.2} GiB ({bytes} bytes)", bytes as f64 / GIB)
 }
 
 #[async_trait]
@@ -244,6 +330,19 @@ mod tests {
         assert_eq!(output.text, "collected text");
     }
 
+    #[test]
+    fn memory_admission_rejects_models_over_limit() {
+        let err = check_estimated_memory(120, 100).unwrap_err();
+
+        assert!(err.to_string().contains("insufficient MLX unified memory"));
+        assert!(err.to_string().contains(OVERSIZE_MODEL_ENV));
+    }
+
+    #[test]
+    fn memory_admission_allows_models_under_limit() {
+        check_estimated_memory(100, 120).unwrap();
+    }
+
     #[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
     #[tokio::test]
     async fn native_backend_generates_from_tiny_compressed_deepseek_v4_fixture() {
@@ -314,7 +413,8 @@ mod tests {
                 top_p: 1.0,
                 top_k: None,
                 seed: None,
-                image_inputs: Vec::new(),
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
             },
         )
         .await
@@ -462,7 +562,8 @@ mod tests {
                 top_p: 1.0,
                 top_k: None,
                 seed: None,
-                image_inputs: Vec::new(),
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
             },
         )
         .await
@@ -631,7 +732,8 @@ mod tests {
                 top_p: 1.0,
                 top_k: None,
                 seed: None,
-                image_inputs: Vec::new(),
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
             },
         )
         .await
@@ -779,7 +881,8 @@ mod tests {
                 top_p: 1.0,
                 top_k: None,
                 seed: None,
-                image_inputs: Vec::new(),
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
             },
         )
         .await
@@ -930,7 +1033,8 @@ mod tests {
                 top_p: 1.0,
                 top_k: None,
                 seed: None,
-                image_inputs: Vec::new(),
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
             },
         )
         .await
@@ -1110,7 +1214,8 @@ mod tests {
                 top_p: 1.0,
                 top_k: None,
                 seed: None,
-                image_inputs: Vec::new(),
+                stop_sequences: Vec::new(),
+                media_inputs: Vec::new(),
             },
         )
         .await

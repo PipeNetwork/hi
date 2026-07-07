@@ -94,7 +94,7 @@ mod native {
 
     use super::{CudaMmprojProjectorInfo, CudaQwenGpuModelInfo, CudaVisionEncoderInfo};
 
-    const FLASH_ONLINE_MAX_HEAD_DIM: usize = 256;
+    const FLASH_ONLINE_MAX_HEAD_DIM: usize = 512;
 
     fn retain_uncancelled_batch_rows<F>(active: &mut [bool], is_cancelled: &mut F) -> bool
     where
@@ -115,6 +115,120 @@ mod native {
             .iter()
             .map(|seed| StdRng::seed_from_u64(seed.unwrap_or_else(|| rand::random::<u64>())))
             .collect()
+    }
+
+    fn sampled_selection_needs_host_rank(temperature: f32, top_p: f32, top_k: Option<u32>) -> bool {
+        temperature.is_finite()
+            && temperature > 0.0
+            && ((top_p.is_finite() && top_p < 1.0) || top_k.is_some_and(|value| value > 0))
+    }
+
+    fn argmax_host(logits: &[f32]) -> Result<u32> {
+        let (idx, _) = logits
+            .iter()
+            .copied()
+            .enumerate()
+            .max_by(|(left_id, left), (right_id, right)| {
+                left.total_cmp(right).then_with(|| right_id.cmp(left_id))
+            })
+            .ok_or_else(|| anyhow!("cannot sample from empty logits"))?;
+        u32::try_from(idx).context("sampled token index does not fit u32")
+    }
+
+    fn sample_host_ranked_logits_with_uniform(
+        logits: &[f32],
+        temperature: f32,
+        top_p: f32,
+        top_k: Option<u32>,
+        sample: f32,
+    ) -> Result<u32> {
+        if logits.is_empty() {
+            bail!("cannot sample from empty logits");
+        }
+        if !temperature.is_finite() || temperature <= 0.0 {
+            return argmax_host(logits);
+        }
+
+        let mut scaled = logits
+            .iter()
+            .copied()
+            .map(|logit| {
+                if logit.is_finite() {
+                    logit / temperature
+                } else {
+                    f32::NEG_INFINITY
+                }
+            })
+            .collect::<Vec<_>>();
+        let max = scaled
+            .iter()
+            .copied()
+            .fold(f32::NEG_INFINITY, |acc, value| acc.max(value));
+        if !max.is_finite() {
+            return argmax_host(logits);
+        }
+        for value in &mut scaled {
+            *value = (*value - max).exp();
+        }
+
+        let mut ranked = scaled.iter().copied().enumerate().collect::<Vec<_>>();
+        ranked.sort_by(|(left_id, left), (right_id, right)| {
+            right.total_cmp(left).then_with(|| left_id.cmp(right_id))
+        });
+        if let Some(top_k) = top_k.and_then(|value| usize::try_from(value).ok()) {
+            if top_k > 0 {
+                ranked.truncate(top_k.min(ranked.len()));
+            }
+        }
+
+        let cutoff = if top_p.is_finite() {
+            top_p.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let total = ranked.iter().map(|(_, weight)| *weight).sum::<f32>();
+        if total <= 0.0 || !total.is_finite() {
+            return argmax_host(logits);
+        }
+
+        let mut candidates = Vec::new();
+        let mut cumulative_probability = 0.0f32;
+        for (idx, weight) in ranked {
+            if weight <= 0.0 {
+                continue;
+            }
+            candidates.push((idx, weight));
+            cumulative_probability += weight / total;
+            if cutoff < 1.0 && cumulative_probability >= cutoff {
+                break;
+            }
+        }
+        if candidates.is_empty() {
+            return argmax_host(logits);
+        }
+
+        let candidate_total = candidates.iter().map(|(_, weight)| *weight).sum::<f32>();
+        if candidate_total <= 0.0 || !candidate_total.is_finite() {
+            return argmax_host(logits);
+        }
+        let sample = if sample.is_finite() {
+            sample.clamp(0.0, 0.99999994)
+        } else {
+            0.0
+        };
+        let target = sample * candidate_total;
+        let mut cumulative = 0.0f32;
+        let last_idx = candidates
+            .last()
+            .map(|(idx, _)| *idx)
+            .ok_or_else(|| anyhow!("cannot sample from empty candidates"))?;
+        for (idx, weight) in candidates {
+            cumulative += weight;
+            if target < cumulative {
+                return u32::try_from(idx).context("sampled token index does not fit u32");
+            }
+        }
+        u32::try_from(last_idx).context("sampled token index does not fit u32")
     }
 
     fn validate_batched_generation_context_budget(
@@ -3001,6 +3115,9 @@ mod native {
                 | GgufTensorType::NVFP4
                 | GgufTensorType::Q1_0
                 | GgufTensorType::Q4_0
+                | GgufTensorType::Q4_0_4_4
+                | GgufTensorType::Q4_0_4_8
+                | GgufTensorType::Q4_0_8_8
                 | GgufTensorType::Q4_1
                 | GgufTensorType::Q5_0
                 | GgufTensorType::Q5_1
@@ -3013,6 +3130,9 @@ mod native {
                 | GgufTensorType::IQ2_S
                 | GgufTensorType::IQ3_S
                 | GgufTensorType::IQ4_NL
+                | GgufTensorType::IQ4_NL_4_4
+                | GgufTensorType::IQ4_NL_4_8
+                | GgufTensorType::IQ4_NL_8_8
                 | GgufTensorType::IQ4_XS
                 | GgufTensorType::IQ1_M
                 | GgufTensorType::Q2_K
@@ -9427,6 +9547,25 @@ mod native {
             top_k: Option<u32>,
             rng: &mut R,
         ) -> Result<u32> {
+            let sample = rng.gen_range(0.0f32..1.0f32);
+            if sampled_selection_needs_host_rank(temperature, top_p, top_k) {
+                if logits.rows == 0 || logits.cols == 0 {
+                    bail!(
+                        "CUDA sampled token selection requires non-empty logits, got {}x{}",
+                        logits.rows,
+                        logits.cols
+                    );
+                }
+                let row = self.copy_row_f32_device(logits, logits.rows - 1)?;
+                let row = row.copy_to_host()?;
+                return sample_host_ranked_logits_with_uniform(
+                    &row,
+                    temperature,
+                    top_p,
+                    top_k,
+                    sample,
+                );
+            }
             let token = DeviceBuffer::alloc(std::mem::size_of::<u32>())
                 .context("allocating CUDA sampled token")?;
             crate::kernels::launch_sample_last_row(
@@ -9437,7 +9576,7 @@ mod native {
                 temperature,
                 top_p,
                 top_k,
-                rng.gen_range(0.0f32..1.0f32),
+                sample,
                 &self.stream,
             )?;
             self.stream.synchronize()?;
@@ -9456,6 +9595,24 @@ mod native {
             top_k: Option<u32>,
             sample: f32,
         ) -> Result<u32> {
+            if sampled_selection_needs_host_rank(temperature, top_p, top_k) {
+                if logits.rows == 0 || logits.cols == 0 {
+                    bail!(
+                        "CUDA sampled token selection requires non-empty logits, got {}x{}",
+                        logits.rows,
+                        logits.cols
+                    );
+                }
+                let row = self.copy_row_f32_device(logits, logits.rows - 1)?;
+                let row = row.copy_to_host()?;
+                return sample_host_ranked_logits_with_uniform(
+                    &row,
+                    temperature,
+                    top_p,
+                    top_k,
+                    sample,
+                );
+            }
             let token = DeviceBuffer::alloc(std::mem::size_of::<u32>())
                 .context("allocating CUDA sampled token")?;
             crate::kernels::launch_sample_last_row(
@@ -9524,6 +9681,31 @@ mod native {
                     "CUDA batched sampler got {} random samples for {batch_count} requests",
                     samples.len()
                 );
+            }
+            if batch_count == 0 || seq_len == 0 || logits.cols == 0 {
+                bail!(
+                    "CUDA batched sampled token selection requires non-empty logits, got batch={batch_count}, seq_len={seq_len}, cols={}",
+                    logits.cols
+                );
+            }
+            if sampled_selection_needs_host_rank(temperature, top_p, top_k) {
+                let mut tokens = Vec::with_capacity(batch_count);
+                for (batch, sample) in samples.iter().copied().enumerate() {
+                    let row_idx = batch
+                        .checked_mul(seq_len)
+                        .and_then(|offset| offset.checked_add(seq_len - 1))
+                        .context("CUDA batched sampler row index overflows usize")?;
+                    let row = self.copy_row_f32_device(logits, row_idx)?;
+                    let row = row.copy_to_host()?;
+                    tokens.push(sample_host_ranked_logits_with_uniform(
+                        &row,
+                        temperature,
+                        top_p,
+                        top_k,
+                        sample,
+                    )?);
+                }
+                return Ok(tokens);
             }
             let tokens = DeviceBuffer::alloc(batch_count * std::mem::size_of::<u32>())
                 .context("allocating CUDA batched sampled tokens")?;
@@ -14116,6 +14298,9 @@ mod native {
                 GgufTensorType::MXFP4 => Ok(39),
                 GgufTensorType::NVFP4 => Ok(40),
                 GgufTensorType::Q4_0 => Ok(2),
+                GgufTensorType::Q4_0_4_4 => Ok(31),
+                GgufTensorType::Q4_0_4_8 => Ok(32),
+                GgufTensorType::Q4_0_8_8 => Ok(33),
                 GgufTensorType::Q4_1 => Ok(3),
                 GgufTensorType::Q1_0 => Ok(41),
                 GgufTensorType::Q5_0 => Ok(6),
@@ -14129,6 +14314,9 @@ mod native {
                 GgufTensorType::IQ2_S => Ok(22),
                 GgufTensorType::IQ3_S => Ok(21),
                 GgufTensorType::IQ4_NL => Ok(20),
+                GgufTensorType::IQ4_NL_4_4 => Ok(36),
+                GgufTensorType::IQ4_NL_4_8 => Ok(37),
+                GgufTensorType::IQ4_NL_8_8 => Ok(38),
                 GgufTensorType::IQ4_XS => Ok(23),
                 GgufTensorType::IQ1_M => Ok(29),
                 GgufTensorType::Q2_K => Ok(10),
@@ -14160,6 +14348,9 @@ mod native {
                 | GgufTensorType::NVFP4
                 | GgufTensorType::Q1_0
                 | GgufTensorType::Q4_0
+                | GgufTensorType::Q4_0_4_4
+                | GgufTensorType::Q4_0_4_8
+                | GgufTensorType::Q4_0_8_8
                 | GgufTensorType::Q4_1
                 | GgufTensorType::Q5_0
                 | GgufTensorType::Q5_1
@@ -14172,6 +14363,9 @@ mod native {
                 | GgufTensorType::IQ2_S
                 | GgufTensorType::IQ3_S
                 | GgufTensorType::IQ4_NL
+                | GgufTensorType::IQ4_NL_4_4
+                | GgufTensorType::IQ4_NL_4_8
+                | GgufTensorType::IQ4_NL_8_8
                 | GgufTensorType::IQ4_XS
                 | GgufTensorType::IQ1_M
                 | GgufTensorType::Q2_K

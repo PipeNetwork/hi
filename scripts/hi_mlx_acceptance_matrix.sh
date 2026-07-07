@@ -13,6 +13,8 @@ RUN_ID="$(date +%Y%m%d-%H%M%S)"
 ARTIFACT_DIR="$ARTIFACT_ROOT/$RUN_ID"
 BIN="${HI_MLX_BIN:-$ROOT/target/debug/hi-mlx}"
 HI_BIN="${HI_BIN:-$ROOT/target/debug/hi}"
+SKIP_OVERSIZE="${HI_MLX_SKIP_OVERSIZE:-1}"
+MEMORY_LIMIT_FRACTION="${HI_MLX_MEMORY_LIMIT_FRACTION:-0.85}"
 
 REPOS=(
   "mlx-community/Qwen3-0.6B-4bit"
@@ -46,6 +48,9 @@ Environment:
   HI_MLX_TOOL_MAX_TOKENS         Default: 256
   HI_MLX_HEALTH_TIMEOUT          Default: 900 seconds
   HI_MLX_ACCEPTANCE_ARTIFACTS    Default: target/hi-mlx-acceptance
+  HI_MLX_SKIP_OVERSIZE           Default: 1; skip repos above the safe MLX memory budget
+  HI_MLX_MEMORY_LIMIT_BYTES      Optional explicit safe memory budget
+  HI_MLX_MEMORY_LIMIT_FRACTION   Default: 0.85 of hw.memsize when bytes is unset
   HI_BIN                         Default: target/debug/hi
 
 Examples:
@@ -130,6 +135,7 @@ download_repo() {
 wait_for_health() {
   local base_url="$1"
   local out="$2"
+  local pid="$3"
   local deadline=$((SECONDS + HEALTH_TIMEOUT))
   local last="$out.health.last.json"
   while ((SECONDS < deadline)); do
@@ -148,6 +154,10 @@ PY
         return 0
       fi
     fi
+    if ! kill -0 "$pid" >/dev/null 2>&1; then
+      echo "hi-mlx exited before becoming healthy at $base_url" >&2
+      return 1
+    fi
     sleep 2
   done
   echo "timed out waiting for healthy hi-mlx at $base_url" >&2
@@ -156,6 +166,42 @@ PY
     echo >&2
   fi
   return 1
+}
+
+oversize_skip_reason() {
+  local inspect_json="$1"
+  local host_bytes=""
+  local fraction="$MEMORY_LIMIT_FRACTION"
+  if [[ -n "${HI_MLX_MEMORY_LIMIT_BYTES:-}" ]]; then
+    host_bytes="$HI_MLX_MEMORY_LIMIT_BYTES"
+    fraction="1.0"
+  elif command -v sysctl >/dev/null 2>&1; then
+    host_bytes="$(sysctl -n hw.memsize 2>/dev/null || true)"
+  fi
+  if [[ -z "$host_bytes" ]]; then
+    return 1
+  fi
+  python3 - "$inspect_json" "$host_bytes" "$fraction" <<'PY'
+import json, math, sys
+path, host_raw, fraction_raw = sys.argv[1:]
+try:
+    host = int(host_raw)
+    fraction = float(fraction_raw)
+except ValueError:
+    raise SystemExit(1)
+if host <= 0 or not math.isfinite(fraction) or fraction <= 0:
+    raise SystemExit(1)
+with open(path, "r", encoding="utf-8") as f:
+    info = json.load(f)
+estimate = sum(int(shard.get("bytes") or 0) for shard in info.get("weight_shards") or [])
+limit = int(host * min(fraction, 1.0))
+if estimate <= limit:
+    raise SystemExit(1)
+gib = 1024 ** 3
+print(
+    f"requires {estimate / gib:.2f} GiB of shards; safe MLX budget is {limit / gib:.2f} GiB"
+)
+PY
 }
 
 post_json() {
@@ -255,6 +301,7 @@ if ((run_unit)); then
 fi
 
 failures=0
+skipped=0
 for idx in "${!REPOS[@]}"; do
   repo="${REPOS[$idx]}"
   safe="$(safe_path "$repo")"
@@ -288,6 +335,14 @@ for idx in "${!REPOS[@]}"; do
     failures=$((failures + 1))
     continue
   fi
+  if [[ "$SKIP_OVERSIZE" != "0" ]]; then
+    skip_reason="$(oversize_skip_reason "$out/inspect.json" || true)"
+    if [[ -n "$skip_reason" ]]; then
+      log "skip: $repo ($skip_reason)"
+      skipped=$((skipped + 1))
+      continue
+    fi
+  fi
 
   log "serve on $base_url"
   cleanup
@@ -296,7 +351,7 @@ for idx in "${!REPOS[@]}"; do
     >"$out/serve.log" 2>&1 &
   cleanup_pid="$!"
 
-  if ! wait_for_health "$base_url" "$out"; then
+  if ! wait_for_health "$base_url" "$out" "$cleanup_pid"; then
     tail -200 "$out/serve.log" >&2 || true
     failures=$((failures + 1))
     cleanup
@@ -409,4 +464,8 @@ if ((failures)); then
   exit 1
 fi
 
-log "PASS: all repos. Artifacts: $ARTIFACT_DIR"
+if ((skipped)); then
+  log "PASS: runnable repos passed; skipped $skipped oversize repo(s). Artifacts: $ARTIFACT_DIR"
+else
+  log "PASS: all repos. Artifacts: $ARTIFACT_DIR"
+fi

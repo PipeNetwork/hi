@@ -2025,7 +2025,7 @@ __global__ void cached_decode_attention_batched_kernel(
   }
 }
 
-constexpr int HI_CUDA_FLASH_MAX_HEAD_DIM = 256;
+constexpr int HI_CUDA_FLASH_MAX_HEAD_DIM = 512;
 
 __global__ void flash_causal_attention_kernel(
     const float* q,
@@ -3647,7 +3647,10 @@ extern "C" int hi_cuda_launch_dequantize_matrix(
     return 0;
   }
   if ((quant_type == 2 || quant_type == 3 || quant_type == 6 || quant_type == 7 ||
-       quant_type == 8 || quant_type == 9 || quant_type == 20 || quant_type == 39) &&
+       quant_type == 8 || quant_type == 9 || quant_type == 20 ||
+       quant_type == 31 || quant_type == 32 || quant_type == 33 ||
+       quant_type == 36 || quant_type == 37 || quant_type == 38 ||
+       quant_type == 39) &&
       elements % 32 != 0) {
     return 1;
   }
@@ -3669,6 +3672,9 @@ extern "C" int hi_cuda_launch_dequantize_matrix(
   dim3 grid((elements + block.x - 1) / block.x);
   switch (quant_type) {
     case 2:
+    case 31:
+    case 32:
+    case 33:
       dequantize_q4_0_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
           static_cast<const uint8_t*>(input),
           static_cast<float*>(output),
@@ -3723,6 +3729,9 @@ extern "C" int hi_cuda_launch_dequantize_matrix(
           elements);
       return 0;
     case 20:
+    case 36:
+    case 37:
+    case 38:
       dequantize_iq4_nl_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
           static_cast<const uint8_t*>(input),
           static_cast<float*>(output),

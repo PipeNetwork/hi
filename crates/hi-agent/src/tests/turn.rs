@@ -2092,7 +2092,7 @@ async fn dynamic_max_steps_apply_only_without_explicit_override() {
 
     first_agent.run_turn("answer once", &mut ui).await.unwrap();
 
-    assert_eq!(first_agent.last_turn_telemetry().effective_max_steps, 20);
+    assert_eq!(first_agent.last_turn_telemetry().effective_max_steps, 200);
 
     let inspected_path = temp_file("dynamic-read-only-steps");
     std::fs::write(&inspected_path, "pub fn reviewed() {}\n").unwrap();

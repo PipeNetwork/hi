@@ -101,6 +101,37 @@ OpenAI-compatible endpoints vary in how much of Chat Completions they implement.
 | `HI_TUI_WATCHDOG_SECS` | Soft TUI "still waiting" notice (does not mark the model degraded) | 180s |
 | `HI_DEBUG_STREAM` | `1` dumps raw provider bytes for diagnosing one that returns nothing | off |
 
+## Local model sidecars
+
+`hi-local` serves GGUF and MLX models through the same OpenAI-compatible `/v1/chat/completions`, `/v1/models`, and `/health` API that `hi --provider openai` can use.
+
+```bash
+# CUDA GGUF backend on NVIDIA/Linux
+cargo run -p hi-local -- serve /models/tinyllama/model.gguf \
+  --backend cuda --host 127.0.0.1 --port 8080 --model-id local/tinyllama
+
+HI_API_KEY=local HI_BASE_URL=http://127.0.0.1:8080/v1 \
+  hi --provider openai -m local/tinyllama "write a short haiku"
+
+# MLX backend on Apple Silicon macOS
+cargo run -p hi-local -- serve ~/.hi/models/mlx-community_Qwen3-0.6B-4bit \
+  --backend mlx --port 8081 --model-id mlx-community/Qwen3-0.6B-4bit
+```
+
+The CUDA backend supports GGUF inspection/loading, CPU-reference parity paths, paged KV cache serving, continuous batching, multimodal Qwen2.5-VL projector smoke coverage, and GGUF quantized tensor dequantization including the specialized `Q4_0_*` and `IQ4_NL_*` variants. Real CUDA fixture files stay outside git; populate a fixture directory with:
+
+```bash
+HI_CUDA_FIXTURES_DIR=/models/hi-cuda docs/fetch-cuda-fixtures.sh
+```
+
+Use `HI_CUDA_FIXTURE_MANIFEST=<path>` for private/local fixture manifests, or set explicit smoke paths such as `HI_CUDA_SMOKE_TEXT_GGUF`. See `docs/cuda-gpu-llm-fixtures.md` for the full matrix.
+
+The MLX backend is Apple-Silicon-only and rejects models whose shard size exceeds the configured safe unified-memory budget before starting Metal work. Override deliberately with `HI_MLX_ALLOW_OVERSIZE_MODEL=1`; tune the guard with `HI_MLX_MEMORY_LIMIT_BYTES` or `HI_MLX_MEMORY_LIMIT_FRACTION`. The acceptance matrix skips oversize repos by default:
+
+```bash
+scripts/hi_mlx_acceptance_matrix.sh --no-download
+```
+
 ## Verification-in-the-loop
 
 The headline feature. After the model stops, `hi` runs a check; if it fails, the output is fed back and the model iterates (up to `--max-verify` rounds, default 2).
@@ -113,7 +144,7 @@ hi --auto-verify "..."     # detects a test pipeline: cargo check+test, go build
 
 `--auto-verify` doesn't just find a test command — it builds a **multi-stage pipeline** per project: `cargo check` then `cargo test`, `go build` then `go test`, `tsc` then `npm test` (when a tsconfig is present), `ruff check` then `pytest` (when ruff is configured), or `make test`. Faster, localizable errors land before the slower test stage.
 
-A `--max-steps` cap (default 500) stops runaway tool loops. Each turn prints `[N in · N out · N total · k/k ctx]`.
+A `--max-steps` cap stops runaway tool loops. When it is not set explicitly, the turn loop uses dynamic caps: 200 model/tool steps for general turns, 120 for implementation-intent turns, 80 for read-only review/status turns, and 200 when long-horizon mode is active. Each turn prints `[N in · N out · N total · k/k ctx]`.
 
 ## Best-of-N
 
@@ -187,6 +218,11 @@ A cargo workspace:
 | `hi-agent` | the agent loop, verify-loop, sessions, the `Ui` trait |
 | `hi-tui` | full-screen terminal UI (transcript, spinner, queue, slash commands) |
 | `hi-cli` | the `hi` binary: config, sessions, best-of-N, slash commands |
+| `hi-local-core` | shared OpenAI-compatible local serving API and request/response plumbing |
+| `hi-local` | local sidecar binary for GGUF/CUDA and MLX serving |
+| `hi-gguf` | GGUF metadata, tensor, and quantization decoding |
+| `hi-cuda` | CUDA GGUF inference, scheduler, paged KV, quantized dequantization, multimodal smoke support |
+| `hi-mlx` | Apple Silicon MLX inference sidecar and acceptance matrix support |
 | `hi-eval` | the benchmark runner (see below) |
 
 Richer capabilities come from **subprocess CLI tools** the model invokes via `bash` rather than a plugin runtime.
@@ -227,10 +263,14 @@ The headline Fusion comparison needs an OpenRouter key and is not yet run.
 
 - `cargo fmt --all`
 - `cargo test --workspace`
+- `cargo test -p hi-mlx`
+- `cargo test -p hi-cuda`
+- On CUDA hardware: `cargo test -p hi-cuda --features native-cuda`
+- On Apple Silicon: `scripts/hi_mlx_acceptance_matrix.sh --no-download`
 - `cargo install --path crates/hi-cli --locked`
 - Smoke an OpenAI-compatible endpoint with `--compat auto` and `--tool-mode auto`
 - Validate eval tasks with `cargo run -p hi-eval -- --validate bench/spec`
 
 ## Status
 
-Early but functional. The multi-provider core, full-screen TUI, sessions, verify-loop, best-of-N, compatibility fallbacks, changed-file reporting, and eval harness are built and tested (`cargo fmt --all` and `cargo test --workspace`). The TUI's rendering is verified via ratatui's TestBackend; its live key/scroll behavior is best confirmed in a real terminal. Cargo install is the first release target; binary archives and Homebrew can follow later.
+Early but functional. The multi-provider core, full-screen TUI, sessions, verify-loop, best-of-N, compatibility fallbacks, changed-file reporting, eval harness, and local CUDA/MLX sidecars are built and tested (`cargo fmt --all` and targeted package/native smoke tests). The TUI's rendering is verified via ratatui's TestBackend; its live key/scroll behavior is best confirmed in a real terminal. Cargo install is the first release target; binary archives and Homebrew can follow later.

@@ -1,0 +1,2 @@
+# relative_path	url	sha256	family	architecture	quant_type
+tinyllama/model.gguf	https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf	9fecc3b3cd76bba89d504f29b616eedf7da85b96540e490ca5824d3f7d2776a0	llama	llama	Q4_K_M

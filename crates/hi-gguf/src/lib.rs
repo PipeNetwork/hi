@@ -240,6 +240,9 @@ pub enum GgufTensorType {
     F16,
     Q4_0,
     Q4_1,
+    Q4_0_4_4,
+    Q4_0_4_8,
+    Q4_0_8_8,
     Q5_0,
     Q5_1,
     Q8_0,
@@ -251,6 +254,9 @@ pub enum GgufTensorType {
     IQ2_S,
     IQ3_S,
     IQ4_NL,
+    IQ4_NL_4_4,
+    IQ4_NL_4_8,
+    IQ4_NL_8_8,
     IQ4_XS,
     IQ1_M,
     I8,
@@ -304,8 +310,14 @@ impl GgufTensorType {
             28 => Ok(Self::F64),
             29 => Ok(Self::IQ1_M),
             30 => Ok(Self::BF16),
+            31 => Ok(Self::Q4_0_4_4),
+            32 => Ok(Self::Q4_0_4_8),
+            33 => Ok(Self::Q4_0_8_8),
             34 => Ok(Self::TQ1_0),
             35 => Ok(Self::TQ2_0),
+            36 => Ok(Self::IQ4_NL_4_4),
+            37 => Ok(Self::IQ4_NL_4_8),
+            38 => Ok(Self::IQ4_NL_8_8),
             39 => Ok(Self::MXFP4),
             40 => Ok(Self::NVFP4),
             41 => Ok(Self::Q1_0),
@@ -325,6 +337,9 @@ impl GgufTensorType {
             | Self::NVFP4
             | Self::Q1_0
             | Self::Q4_0
+            | Self::Q4_0_4_4
+            | Self::Q4_0_4_8
+            | Self::Q4_0_8_8
             | Self::Q4_1
             | Self::Q5_0
             | Self::Q5_1
@@ -337,6 +352,9 @@ impl GgufTensorType {
             | Self::IQ2_S
             | Self::IQ3_S
             | Self::IQ4_NL
+            | Self::IQ4_NL_4_4
+            | Self::IQ4_NL_4_8
+            | Self::IQ4_NL_8_8
             | Self::IQ4_XS
             | Self::IQ1_M
             | Self::Q2_K
@@ -356,6 +374,9 @@ impl GgufTensorType {
             Self::F16 => "F16",
             Self::Q4_0 => "Q4_0",
             Self::Q4_1 => "Q4_1",
+            Self::Q4_0_4_4 => "Q4_0_4_4",
+            Self::Q4_0_4_8 => "Q4_0_4_8",
+            Self::Q4_0_8_8 => "Q4_0_8_8",
             Self::Q5_0 => "Q5_0",
             Self::Q5_1 => "Q5_1",
             Self::Q8_0 => "Q8_0",
@@ -367,6 +388,9 @@ impl GgufTensorType {
             Self::IQ2_S => "IQ2_S",
             Self::IQ3_S => "IQ3_S",
             Self::IQ4_NL => "IQ4_NL",
+            Self::IQ4_NL_4_4 => "IQ4_NL_4_4",
+            Self::IQ4_NL_4_8 => "IQ4_NL_4_8",
+            Self::IQ4_NL_8_8 => "IQ4_NL_8_8",
             Self::IQ4_XS => "IQ4_XS",
             Self::IQ1_M => "IQ1_M",
             Self::I8 => "I8",
@@ -396,6 +420,9 @@ impl GgufTensorType {
                 | Self::NVFP4
                 | Self::Q1_0
                 | Self::Q4_0
+                | Self::Q4_0_4_4
+                | Self::Q4_0_4_8
+                | Self::Q4_0_8_8
                 | Self::Q4_1
                 | Self::Q5_0
                 | Self::Q5_1
@@ -408,6 +435,9 @@ impl GgufTensorType {
                 | Self::IQ2_S
                 | Self::IQ3_S
                 | Self::IQ4_NL
+                | Self::IQ4_NL_4_4
+                | Self::IQ4_NL_4_8
+                | Self::IQ4_NL_8_8
                 | Self::IQ4_XS
                 | Self::IQ1_M
                 | Self::Q2_K
@@ -425,11 +455,17 @@ impl GgufTensorType {
         match self {
             Self::Q4_0
             | Self::Q4_1
+            | Self::Q4_0_4_4
+            | Self::Q4_0_4_8
+            | Self::Q4_0_8_8
             | Self::Q5_0
             | Self::Q5_1
             | Self::Q8_0
             | Self::Q8_1
             | Self::IQ4_NL
+            | Self::IQ4_NL_4_4
+            | Self::IQ4_NL_4_8
+            | Self::IQ4_NL_8_8
             | Self::MXFP4 => Some(32),
             Self::NVFP4 => Some(64),
             Self::Q1_0 => Some(128),
@@ -465,7 +501,7 @@ impl GgufTensorType {
             Self::MXFP4 => Some(17),
             Self::NVFP4 => Some(36),
             Self::Q1_0 => Some(18),
-            Self::Q4_0 => Some(18),
+            Self::Q4_0 | Self::Q4_0_4_4 | Self::Q4_0_4_8 | Self::Q4_0_8_8 => Some(18),
             Self::Q4_1 => Some(20),
             Self::Q5_0 => Some(22),
             Self::Q5_1 => Some(24),
@@ -477,7 +513,7 @@ impl GgufTensorType {
             Self::IQ1_S => Some(50),
             Self::IQ2_S => Some(82),
             Self::IQ3_S => Some(110),
-            Self::IQ4_NL => Some(18),
+            Self::IQ4_NL | Self::IQ4_NL_4_4 | Self::IQ4_NL_4_8 | Self::IQ4_NL_8_8 => Some(18),
             Self::IQ4_XS => Some(136),
             Self::IQ1_M => Some(56),
             Self::Q2_K => Some(84),
@@ -515,6 +551,9 @@ impl GgufTensorType {
             | Self::NVFP4
             | Self::Q1_0
             | Self::Q4_0
+            | Self::Q4_0_4_4
+            | Self::Q4_0_4_8
+            | Self::Q4_0_8_8
             | Self::Q4_1
             | Self::Q5_0
             | Self::Q5_1
@@ -527,6 +566,9 @@ impl GgufTensorType {
             | Self::IQ2_S
             | Self::IQ3_S
             | Self::IQ4_NL
+            | Self::IQ4_NL_4_4
+            | Self::IQ4_NL_4_8
+            | Self::IQ4_NL_8_8
             | Self::IQ4_XS
             | Self::IQ1_M
             | Self::Q2_K
@@ -556,19 +598,13 @@ impl GgufTensorType {
 
 fn unsupported_tensor_type_name(raw: u32) -> Option<&'static str> {
     match raw {
-        31 => Some("Q4_0_4_4"),
-        32 => Some("Q4_0_4_8"),
-        33 => Some("Q4_0_8_8"),
-        36 => Some("IQ4_NL_4_4"),
-        37 => Some("IQ4_NL_4_8"),
-        38 => Some("IQ4_NL_8_8"),
-        other if other > 32 => Some("future GGUF tensor type"),
+        other if other > 41 => Some("future GGUF tensor type"),
         _ => None,
     }
 }
 
 fn supported_tensor_type_list() -> &'static str {
-    "F32, F16, BF16, I8, I16, I32, I64, F64, Q8_0, Q8_1, Q5_0, Q5_1, Q4_0, Q4_1, MXFP4, NVFP4, Q1_0, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S, IQ2_S, IQ3_S, IQ4_NL, IQ4_XS, IQ1_M, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, TQ1_0, and TQ2_0"
+    "F32, F16, BF16, I8, I16, I32, I64, F64, Q8_0, Q8_1, Q5_0, Q5_1, Q4_0, Q4_1, Q4_0_4_4, Q4_0_4_8, Q4_0_8_8, MXFP4, NVFP4, Q1_0, IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S, IQ2_S, IQ3_S, IQ4_NL, IQ4_NL_4_4, IQ4_NL_4_8, IQ4_NL_8_8, IQ4_XS, IQ1_M, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, TQ1_0, and TQ2_0"
 }
 
 fn tensor_type_label(raw: u32) -> String {
@@ -613,7 +649,10 @@ pub fn dequantize_tensor_as_f32(
         GgufTensorType::MXFP4 => dequantize_mxfp4(bytes, element_count),
         GgufTensorType::NVFP4 => dequantize_nvfp4(bytes, element_count),
         GgufTensorType::Q1_0 => dequantize_q1_0(bytes, element_count),
-        GgufTensorType::Q4_0 => dequantize_q4_0(bytes, element_count),
+        GgufTensorType::Q4_0
+        | GgufTensorType::Q4_0_4_4
+        | GgufTensorType::Q4_0_4_8
+        | GgufTensorType::Q4_0_8_8 => dequantize_q4_0(bytes, element_count),
         GgufTensorType::Q4_1 => dequantize_q4_1(bytes, element_count),
         GgufTensorType::Q5_0 => dequantize_q5_0(bytes, element_count),
         GgufTensorType::Q5_1 => dequantize_q5_1(bytes, element_count),
@@ -625,7 +664,10 @@ pub fn dequantize_tensor_as_f32(
         GgufTensorType::IQ1_S => dequantize_iq1_s(bytes, element_count),
         GgufTensorType::IQ2_S => dequantize_iq2_s(bytes, element_count),
         GgufTensorType::IQ3_S => dequantize_iq3_s(bytes, element_count),
-        GgufTensorType::IQ4_NL => dequantize_iq4_nl(bytes, element_count),
+        GgufTensorType::IQ4_NL
+        | GgufTensorType::IQ4_NL_4_4
+        | GgufTensorType::IQ4_NL_4_8
+        | GgufTensorType::IQ4_NL_8_8 => dequantize_iq4_nl(bytes, element_count),
         GgufTensorType::IQ4_XS => dequantize_iq4_xs(bytes, element_count),
         GgufTensorType::IQ1_M => dequantize_iq1_m(bytes, element_count),
         GgufTensorType::Q2_K => dequantize_q2_k(bytes, element_count),
@@ -8149,15 +8191,7 @@ mod tests {
 
     #[test]
     fn rejects_unsupported_tensor_type() {
-        let cases = [
-            (31, "Q4_0_4_4"),
-            (32, "Q4_0_4_8"),
-            (33, "Q4_0_8_8"),
-            (36, "IQ4_NL_4_4"),
-            (37, "IQ4_NL_4_8"),
-            (38, "IQ4_NL_8_8"),
-            (42, "future GGUF tensor type"),
-        ];
+        let cases = [(42, "future GGUF tensor type")];
 
         for (raw, label) in cases {
             let path = tempfile_path(&format!("unsupported-dtype-{raw}"));
@@ -8270,9 +8304,17 @@ mod tests {
         let mut q4 = Vec::new();
         q4.extend_from_slice(&f16_bits(1.0).to_le_bytes());
         q4.extend([0x8f; 16]);
-        let q4 = dequantize_tensor_as_f32(&q4, GgufTensorType::Q4_0, 32).unwrap();
+        let q4_bytes = q4.clone();
+        let q4 = dequantize_tensor_as_f32(&q4_bytes, GgufTensorType::Q4_0, 32).unwrap();
         assert_eq!(q4[0], 7.0);
         assert_eq!(q4[16], 0.0);
+        for dtype in [
+            GgufTensorType::Q4_0_4_4,
+            GgufTensorType::Q4_0_4_8,
+            GgufTensorType::Q4_0_8_8,
+        ] {
+            assert_eq!(dequantize_tensor_as_f32(&q4_bytes, dtype, 32).unwrap(), q4);
+        }
 
         let mut q4_1 = Vec::new();
         q4_1.extend_from_slice(&f16_bits(0.5).to_le_bytes());
@@ -8411,9 +8453,20 @@ mod tests {
         let mut iq4 = Vec::new();
         iq4.extend_from_slice(&f16_bits(0.5).to_le_bytes());
         iq4.extend([0xf0; 16]);
-        let iq4 = dequantize_tensor_as_f32(&iq4, GgufTensorType::IQ4_NL, 32).unwrap();
+        let iq4_bytes = iq4.clone();
+        let iq4 = dequantize_tensor_as_f32(&iq4_bytes, GgufTensorType::IQ4_NL, 32).unwrap();
         assert_eq!(iq4[0], -63.5);
         assert_eq!(iq4[16], 56.5);
+        for dtype in [
+            GgufTensorType::IQ4_NL_4_4,
+            GgufTensorType::IQ4_NL_4_8,
+            GgufTensorType::IQ4_NL_8_8,
+        ] {
+            assert_eq!(
+                dequantize_tensor_as_f32(&iq4_bytes, dtype, 32).unwrap(),
+                iq4
+            );
+        }
 
         let mut iq4xs = vec![0u8; 136];
         iq4xs[0..2].copy_from_slice(&f16_bits(0.5).to_le_bytes());

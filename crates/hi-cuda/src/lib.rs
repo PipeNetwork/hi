@@ -28,7 +28,7 @@ pub mod kernels;
 pub mod qwen_cpu;
 pub mod runtime;
 
-const CUDA_ATTENTION_FAST_HEAD_DIM_MAX: usize = 256;
+const CUDA_ATTENTION_FAST_HEAD_DIM_MAX: usize = 512;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CudaExecution {
@@ -127,12 +127,16 @@ fn cuda_attention_health_status(
         kv_cache_mode,
         paged_kv_available,
     );
+    let wide_kernel_detail = format!(
+        ",wide_kernel=tiled-wide,wide_head_dim_max={}",
+        CUDA_ATTENTION_FAST_HEAD_DIM_MAX
+    );
 
     if execution != CudaExecution::Gpu {
         return CudaAttentionHealth {
             status: "legacy",
             detail: format!(
-                "mode=disabled,head_dim={head_dim_label},head_dim_max={},kv_cache=disabled,decode=legacy(paths=single-text|batched-text,fallback_reason=cpu-reference),prefill=legacy(paths=text|batched-text|multimodal,fallback_reason=cpu-reference),multimodal=disabled(prompt_embeddings=unavailable,fallback_reason=cpu-reference)",
+                "mode=disabled,head_dim={head_dim_label},head_dim_max={}{wide_kernel_detail},kv_cache=disabled,decode=legacy(paths=single-text|batched-text,fallback_reason=cpu-reference),prefill=legacy(paths=text|batched-text|multimodal,fallback_reason=cpu-reference),multimodal=disabled(prompt_embeddings=unavailable,fallback_reason=cpu-reference)",
                 CUDA_ATTENTION_FAST_HEAD_DIM_MAX
             ),
         };
@@ -142,7 +146,7 @@ fn cuda_attention_health_status(
         return CudaAttentionHealth {
             status: "legacy",
             detail: format!(
-                "mode=legacy,head_dim=unknown,head_dim_max={},kv_cache={},decode=legacy(paths=single-text|batched-text,fallback_reason=invalid-head-dim),prefill=legacy(paths=text|batched-text|multimodal,fallback_reason=invalid-head-dim),multimodal=legacy(prompt_embeddings=legacy,fallback_reason=invalid-head-dim)",
+                "mode=legacy,head_dim=unknown,head_dim_max={}{wide_kernel_detail},kv_cache={},decode=legacy(paths=single-text|batched-text,fallback_reason=invalid-head-dim),prefill=legacy(paths=text|batched-text|multimodal,fallback_reason=invalid-head-dim),multimodal=legacy(prompt_embeddings=legacy,fallback_reason=invalid-head-dim)",
                 CUDA_ATTENTION_FAST_HEAD_DIM_MAX,
                 kv_cache_mode.label(),
             ),
@@ -153,7 +157,7 @@ fn cuda_attention_health_status(
         (CudaKvCacheMode::Paged, true, true) => CudaAttentionHealth {
             status: "tiled-paged",
             detail: format!(
-                "mode=tiled-paged,head_dim={head_dim_label},head_dim_max={},kv_cache=paged,decode=tiled-paged(paths=single-text|batched-text,fallback_reason=none),decode_fallback=paged(head_dim_min={},fallback_reason=wide-head),prefill=tiled-contiguous(paths=text|batched-text|multimodal,fallback_reason=none),prefill_fallback=legacy(head_dim_min={},fallback_reason=wide-head),multimodal={multimodal}",
+                "mode=tiled-paged,head_dim={head_dim_label},head_dim_max={}{wide_kernel_detail},kv_cache=paged,decode=tiled-paged(paths=single-text|batched-text,fallback_reason=none),decode_fallback=paged(head_dim_min={},fallback_reason=wide-head),prefill=tiled-contiguous(paths=text|batched-text|multimodal,fallback_reason=none),prefill_fallback=legacy(head_dim_min={},fallback_reason=wide-head),multimodal={multimodal}",
                 CUDA_ATTENTION_FAST_HEAD_DIM_MAX,
                 CUDA_ATTENTION_FAST_HEAD_DIM_MAX + 1,
                 CUDA_ATTENTION_FAST_HEAD_DIM_MAX + 1,
@@ -162,14 +166,14 @@ fn cuda_attention_health_status(
         (CudaKvCacheMode::Paged, true, false) => CudaAttentionHealth {
             status: "paged-generic",
             detail: format!(
-                "mode=paged-generic,head_dim={head_dim_label},head_dim_max={},kv_cache=paged,decode=paged-generic(paths=single-text|batched-text,fallback_from=tiled-paged,fallback_reason=wide-head),prefill=contiguous-generic(paths=text|batched-text|multimodal,fallback_from=tiled-contiguous,fallback_reason=wide-head),multimodal={multimodal}",
+                "mode=paged-generic,head_dim={head_dim_label},head_dim_max={}{wide_kernel_detail},kv_cache=paged,decode=paged-generic(paths=single-text|batched-text,fallback_from=tiled-paged,fallback_reason=wide-head),prefill=contiguous-generic(paths=text|batched-text|multimodal,fallback_from=tiled-contiguous,fallback_reason=wide-head),multimodal={multimodal}",
                 CUDA_ATTENTION_FAST_HEAD_DIM_MAX
             ),
         },
         (CudaKvCacheMode::Paged, false, true) => CudaAttentionHealth {
             status: "flash-online",
             detail: format!(
-                "mode=flash-online,head_dim={head_dim_label},head_dim_max={},kv_cache=paged-unavailable,decode=flash-online(paths=single-text|batched-text,fallback_reason=paged-kv-unavailable),decode_fallback=legacy(head_dim_min={},fallback_reason=wide-head),prefill=tiled-contiguous(paths=text|batched-text|multimodal,fallback_reason=paged-kv-unavailable),prefill_fallback=legacy(head_dim_min={},fallback_reason=wide-head),multimodal={multimodal}",
+                "mode=flash-online,head_dim={head_dim_label},head_dim_max={}{wide_kernel_detail},kv_cache=paged-unavailable,decode=flash-online(paths=single-text|batched-text,fallback_reason=paged-kv-unavailable),decode_fallback=legacy(head_dim_min={},fallback_reason=wide-head),prefill=tiled-contiguous(paths=text|batched-text|multimodal,fallback_reason=paged-kv-unavailable),prefill_fallback=legacy(head_dim_min={},fallback_reason=wide-head),multimodal={multimodal}",
                 CUDA_ATTENTION_FAST_HEAD_DIM_MAX,
                 CUDA_ATTENTION_FAST_HEAD_DIM_MAX + 1,
                 CUDA_ATTENTION_FAST_HEAD_DIM_MAX + 1,
@@ -178,14 +182,14 @@ fn cuda_attention_health_status(
         (CudaKvCacheMode::Paged, false, false) => CudaAttentionHealth {
             status: "contiguous-generic",
             detail: format!(
-                "mode=contiguous-generic,head_dim={head_dim_label},head_dim_max={},kv_cache=paged-unavailable,decode=contiguous-generic(paths=single-text|batched-text,fallback_reason=paged-kv-unavailable|wide-head),prefill=contiguous-generic(paths=text|batched-text|multimodal,fallback_reason=paged-kv-unavailable|wide-head),multimodal={multimodal}",
+                "mode=contiguous-generic,head_dim={head_dim_label},head_dim_max={}{wide_kernel_detail},kv_cache=paged-unavailable,decode=contiguous-generic(paths=single-text|batched-text,fallback_reason=paged-kv-unavailable|wide-head),prefill=contiguous-generic(paths=text|batched-text|multimodal,fallback_reason=paged-kv-unavailable|wide-head),multimodal={multimodal}",
                 CUDA_ATTENTION_FAST_HEAD_DIM_MAX
             ),
         },
         (CudaKvCacheMode::Legacy, _, true) => CudaAttentionHealth {
             status: "flash-online",
             detail: format!(
-                "mode=flash-online,head_dim={head_dim_label},head_dim_max={},kv_cache=legacy,decode=flash-online(paths=single-text|batched-text,fallback_reason=none),decode_fallback=legacy(head_dim_min={},fallback_reason=wide-head),prefill=tiled-contiguous(paths=text|batched-text|multimodal,fallback_reason=none),prefill_fallback=legacy(head_dim_min={},fallback_reason=wide-head),multimodal={multimodal}",
+                "mode=flash-online,head_dim={head_dim_label},head_dim_max={}{wide_kernel_detail},kv_cache=legacy,decode=flash-online(paths=single-text|batched-text,fallback_reason=none),decode_fallback=legacy(head_dim_min={},fallback_reason=wide-head),prefill=tiled-contiguous(paths=text|batched-text|multimodal,fallback_reason=none),prefill_fallback=legacy(head_dim_min={},fallback_reason=wide-head),multimodal={multimodal}",
                 CUDA_ATTENTION_FAST_HEAD_DIM_MAX,
                 CUDA_ATTENTION_FAST_HEAD_DIM_MAX + 1,
                 CUDA_ATTENTION_FAST_HEAD_DIM_MAX + 1,
@@ -194,7 +198,7 @@ fn cuda_attention_health_status(
         (CudaKvCacheMode::Legacy, _, false) => CudaAttentionHealth {
             status: "contiguous-generic",
             detail: format!(
-                "mode=contiguous-generic,head_dim={head_dim_label},head_dim_max={},kv_cache=legacy,decode=contiguous-generic(paths=single-text|batched-text,fallback_from=flash-online,fallback_reason=wide-head),prefill=contiguous-generic(paths=text|batched-text|multimodal,fallback_from=tiled-contiguous,fallback_reason=wide-head),multimodal={multimodal}",
+                "mode=contiguous-generic,head_dim={head_dim_label},head_dim_max={}{wide_kernel_detail},kv_cache=legacy,decode=contiguous-generic(paths=single-text|batched-text,fallback_from=flash-online,fallback_reason=wide-head),prefill=contiguous-generic(paths=text|batched-text|multimodal,fallback_from=tiled-contiguous,fallback_reason=wide-head),multimodal={multimodal}",
                 CUDA_ATTENTION_FAST_HEAD_DIM_MAX
             ),
         },
@@ -270,6 +274,7 @@ struct CudaMultimodalStats {
     vision_batched_requests: AtomicU64,
     vision_batched_batches: AtomicU64,
     multimodal_decode_batched_requests: AtomicU64,
+    multimodal_decode_ragged_batched_requests: AtomicU64,
     vision_legacy_requests: AtomicU64,
     vision_legacy_batches: AtomicU64,
     vision_legacy_media_inputs: AtomicU64,
@@ -293,6 +298,7 @@ struct CudaMultimodalStatsSnapshot {
     vision_batched_requests: u64,
     vision_batched_batches: u64,
     multimodal_decode_batched_requests: u64,
+    multimodal_decode_ragged_batched_requests: u64,
     vision_legacy_requests: u64,
     vision_legacy_batches: u64,
     vision_legacy_media_inputs: u64,
@@ -329,6 +335,9 @@ impl CudaMultimodalStats {
             vision_batched_batches: self.vision_batched_batches.load(Ordering::Relaxed),
             multimodal_decode_batched_requests: self
                 .multimodal_decode_batched_requests
+                .load(Ordering::Relaxed),
+            multimodal_decode_ragged_batched_requests: self
+                .multimodal_decode_ragged_batched_requests
                 .load(Ordering::Relaxed),
             vision_legacy_requests: self.vision_legacy_requests.load(Ordering::Relaxed),
             vision_legacy_batches: self.vision_legacy_batches.load(Ordering::Relaxed),
@@ -971,7 +980,7 @@ impl CudaBackend {
         match &self.mmproj {
             None => "text-only",
             Some(_) if self.supports_multimodal_generation() => {
-                "enabled(vision_stage=batching-enabled,decode=prefix-batched|mrope-batched,fallback=no-placeholder-mrope-rejected)"
+                "enabled(vision_stage=batching-enabled,decode=ragged-paged|mrope-ragged-paged,fallback=projection-failed|unsupported-decoder-layout|page-exhaustion|malformed-or-no-placeholder)"
             }
             Some(_) => "unsupported(multimodal-generation-unavailable)",
         }
@@ -990,10 +999,11 @@ impl CudaBackend {
     fn multimodal_metrics_status(&self) -> String {
         let snapshot = self.multimodal_stats.snapshot();
         format!(
-            "enabled,vision_batched_requests={},vision_batched_batches={},multimodal_decode_batched_requests={},vision_legacy_requests={},vision_legacy_batches={},vision_legacy_media_inputs={},vision_legacy_projected_rows={},multimodal_decode_legacy_requests={},multimodal_decode_paged_requests={},multimodal_requests={},multimodal_media_inputs={},multimodal_fallback_requests={},multimodal_fallback_direct_requests={},multimodal_fallback_mixed_batch_requests={},multimodal_fallback_decode_group_singleton_requests={},multimodal_fallback_projection_failed_requests={},multimodal_fallback_projection_mismatch_requests={},multimodal_fallback_incompatible_prompt_requests={},multimodal_fallback_token_budget_requests={}",
+            "enabled,vision_batched_requests={},vision_batched_batches={},multimodal_decode_batched_requests={},multimodal_decode_ragged_batched_requests={},vision_legacy_requests={},vision_legacy_batches={},vision_legacy_media_inputs={},vision_legacy_projected_rows={},multimodal_decode_legacy_requests={},multimodal_decode_paged_requests={},multimodal_requests={},multimodal_media_inputs={},multimodal_fallback_requests={},multimodal_fallback_direct_requests={},multimodal_fallback_mixed_batch_requests={},multimodal_fallback_decode_group_singleton_requests={},multimodal_fallback_projection_failed_requests={},multimodal_fallback_projection_mismatch_requests={},multimodal_fallback_incompatible_prompt_requests={},multimodal_fallback_token_budget_requests={}",
             snapshot.vision_batched_requests,
             snapshot.vision_batched_batches,
             snapshot.multimodal_decode_batched_requests,
+            snapshot.multimodal_decode_ragged_batched_requests,
             snapshot.vision_legacy_requests,
             snapshot.vision_legacy_batches,
             snapshot.vision_legacy_media_inputs,
@@ -1028,7 +1038,7 @@ impl CudaBackend {
         if self.scheduler_mode() != "continuous-iteration" {
             "fallback"
         } else if self.qwen.recurrent_ssm_tensor_layout {
-            "recompute-state-recurrent-ssm"
+            "persistent-recurrent-ssm"
         } else {
             "append-only-paged"
         }
@@ -5863,6 +5873,23 @@ fn process_multimodal_prefix_decode_candidate_batch(
     let uses_mrope_prompt_embeddings = candidates
         .iter()
         .any(|candidate| candidate.prompt_embeddings.is_some());
+    let first_prompt_rows = candidates.first().map(|candidate| {
+        candidate
+            .prompt_embeddings
+            .as_ref()
+            .map(|prompt_embeddings| prompt_embeddings.rows)
+            .unwrap_or_else(|| candidate.prompt_tokens.len().saturating_add(prefix_rows))
+    });
+    let ragged_prompt_rows = first_prompt_rows.is_some_and(|first_prompt_rows| {
+        candidates.iter().any(|candidate| {
+            candidate
+                .prompt_embeddings
+                .as_ref()
+                .map(|prompt_embeddings| prompt_embeddings.rows)
+                .unwrap_or_else(|| candidate.prompt_tokens.len().saturating_add(prefix_rows))
+                != first_prompt_rows
+        })
+    });
     let paged_storage = match state.kv_cache_mode {
         CudaKvCacheMode::Legacy => CudaSchedulerPagedBatchStorage::None,
         CudaKvCacheMode::Paged if lease_backed_pages.is_some() => {
@@ -6128,6 +6155,12 @@ fn process_multimodal_prefix_decode_candidate_batch(
                 .multimodal_stats
                 .multimodal_decode_batched_requests
                 .fetch_add(usize_to_u64(candidates.len()), Ordering::Relaxed);
+            if ragged_prompt_rows {
+                state
+                    .multimodal_stats
+                    .multimodal_decode_ragged_batched_requests
+                    .fetch_add(usize_to_u64(candidates.len()), Ordering::Relaxed);
+            }
             let decode_tokens = generated.iter().map(Vec::len).sum::<usize>();
             let timing = scheduler_token_timing(
                 usize_to_u64(prompt_count.saturating_mul(candidates.len())),
@@ -8670,7 +8703,7 @@ mod tests {
         assert!(
             health
                 .quantization
-                .contains("multimodal-batching=enabled(vision_stage=batching-enabled,decode=prefix-batched|mrope-batched,fallback=no-placeholder-mrope-rejected)")
+                .contains("multimodal-batching=enabled(vision_stage=batching-enabled,decode=ragged-paged|mrope-ragged-paged,fallback=projection-failed|unsupported-decoder-layout|page-exhaustion|malformed-or-no-placeholder)")
         );
         let multimodal = backend.multimodal_support();
         assert!(multimodal.image_inputs);
@@ -9264,6 +9297,7 @@ mod tests {
         assert_eq!(left.completion_tokens, 1);
         assert_eq!(right.completion_tokens, 1);
 
+        wait_for_health_counter_at_least(&backend, "batch_plan_eligible_requests", 2).await;
         let health = backend.health();
         assert!(health.quantization.contains("attention=flash-online"));
         assert!(health.quantization.contains(
@@ -9379,6 +9413,7 @@ mod tests {
         assert_eq!(left.completion_tokens, 2);
         assert_eq!(right.completion_tokens, 2);
 
+        wait_for_health_counter_at_least(&backend, "gpu_batched_requests", 2).await;
         let health = backend.health();
         assert!(health.quantization.contains("attention=tiled-paged"));
         assert!(health.quantization.contains(
@@ -10071,7 +10106,7 @@ mod tests {
         );
         assert!(health.quantization.contains("attention=tiled-paged"));
         assert!(health.quantization.contains(
-            "attention-detail=mode=tiled-paged,head_dim=2,head_dim_max=256,kv_cache=paged,decode=tiled-paged(paths=single-text|batched-text,fallback_reason=none)"
+            "attention-detail=mode=tiled-paged,head_dim=2,head_dim_max=512,wide_kernel=tiled-wide,wide_head_dim_max=512,kv_cache=paged,decode=tiled-paged(paths=single-text|batched-text,fallback_reason=none)"
         ));
 
         let mut stream = backend.stream_generate(request).await.unwrap();
@@ -10468,7 +10503,7 @@ mod tests {
         assert!(
             health
                 .quantization
-                .contains("continuous_kv_backend=recompute-state-recurrent-ssm")
+                .contains("continuous_kv_backend=persistent-recurrent-ssm")
         );
 
         let output = backend
@@ -10511,7 +10546,7 @@ mod tests {
         assert!(
             health
                 .quantization
-                .contains("continuous_kv_backend=recompute-state-recurrent-ssm")
+                .contains("continuous_kv_backend=persistent-recurrent-ssm")
         );
 
         let output = backend
@@ -11019,7 +11054,10 @@ mod tests {
         let health = backend.health();
         assert!(health.quantization.contains("attention=paged-generic"));
         assert!(health.quantization.contains("mode=paged-generic"));
-        assert!(health.quantization.contains("head_dim=258"));
+        assert!(health.quantization.contains(&format!(
+            "head_dim={}",
+            super::CUDA_ATTENTION_FAST_HEAD_DIM_MAX + 2
+        )));
         assert!(health.quantization.contains("decode=paged-generic("));
         assert!(health.quantization.contains("fallback_from=tiled-paged"));
         assert!(health.quantization.contains("prefill=contiguous-generic("));
@@ -11027,7 +11065,7 @@ mod tests {
         assert!(
             health
                 .quantization
-                .contains("attention-fast-head-dim-max=256")
+                .contains("attention-fast-head-dim-max=512")
         );
 
         let output = backend
@@ -15725,7 +15763,7 @@ mod tests {
         assert!(health.quantization.contains("kv-cache=legacy"));
         assert!(health.quantization.contains("attention=flash-online"));
         assert!(health.quantization.contains(
-            "attention-detail=mode=flash-online,head_dim=2,head_dim_max=256,kv_cache=legacy,decode=flash-online(paths=single-text|batched-text,fallback_reason=none)"
+            "attention-detail=mode=flash-online,head_dim=2,head_dim_max=512,wide_kernel=tiled-wide,wide_head_dim_max=512,kv_cache=legacy,decode=flash-online(paths=single-text|batched-text,fallback_reason=none)"
         ));
         assert_eq!(
             health_counter(&health.quantization, "admission_rejected_requests"),
@@ -24809,6 +24847,27 @@ mod tests {
                 raw_type: 2,
                 dtype: hi_gguf::GgufTensorType::Q4_0,
                 elements: 32,
+                bytes: q4.clone(),
+            },
+            QuantFixture {
+                name: "Q4_0_4_4",
+                raw_type: 31,
+                dtype: hi_gguf::GgufTensorType::Q4_0_4_4,
+                elements: 32,
+                bytes: q4.clone(),
+            },
+            QuantFixture {
+                name: "Q4_0_4_8",
+                raw_type: 32,
+                dtype: hi_gguf::GgufTensorType::Q4_0_4_8,
+                elements: 32,
+                bytes: q4.clone(),
+            },
+            QuantFixture {
+                name: "Q4_0_8_8",
+                raw_type: 33,
+                dtype: hi_gguf::GgufTensorType::Q4_0_8_8,
+                elements: 32,
                 bytes: q4,
             },
             QuantFixture {
@@ -24941,6 +25000,27 @@ mod tests {
                 name: "IQ4_NL",
                 raw_type: 20,
                 dtype: hi_gguf::GgufTensorType::IQ4_NL,
+                elements: 32,
+                bytes: iq4nl.clone(),
+            },
+            QuantFixture {
+                name: "IQ4_NL_4_4",
+                raw_type: 36,
+                dtype: hi_gguf::GgufTensorType::IQ4_NL_4_4,
+                elements: 32,
+                bytes: iq4nl.clone(),
+            },
+            QuantFixture {
+                name: "IQ4_NL_4_8",
+                raw_type: 37,
+                dtype: hi_gguf::GgufTensorType::IQ4_NL_4_8,
+                elements: 32,
+                bytes: iq4nl.clone(),
+            },
+            QuantFixture {
+                name: "IQ4_NL_8_8",
+                raw_type: 38,
+                dtype: hi_gguf::GgufTensorType::IQ4_NL_8_8,
                 elements: 32,
                 bytes: iq4nl,
             },

@@ -262,7 +262,7 @@ fn effective_max_steps_for_turn(
     } else if read_only_intent.is_some() {
         80
     } else {
-        20
+        200
     }
 }
 
