@@ -533,7 +533,8 @@ impl CudaPagedKvCacheManager {
             .checked_mul(kv_heads)
             .and_then(|value| value.checked_mul(qk_head_dim.checked_add(v_head_dim)?))
             .and_then(|value| value.checked_mul(page_size))
-            .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+            // KV pages are stored as f16 (kv_t = __half in kernels.cu).
+            .and_then(|value| value.checked_mul(std::mem::size_of::<u16>()))
             .context("CUDA paged KV page byte count overflows usize")?;
         let bytes_total = bytes_per_page
             .checked_mul(pages_total)

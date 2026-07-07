@@ -15449,10 +15449,10 @@ mod native {
                 .and_then(|value| value.checked_mul(dims.v_head_dim))
                 .context("CUDA paged KV value cache element count overflows usize")?;
             let key_bytes = key_elements
-                .checked_mul(std::mem::size_of::<f32>())
+                .checked_mul(std::mem::size_of::<u16>()) // f16 KV pages (kv_t = __half)
                 .context("CUDA paged KV key cache byte count overflows usize")?;
             let value_bytes = value_elements
-                .checked_mul(std::mem::size_of::<f32>())
+                .checked_mul(std::mem::size_of::<u16>()) // f16 KV pages (kv_t = __half)
                 .context("CUDA paged KV value cache byte count overflows usize")?;
             let page_table = (0..page_table_len)
                 .map(|page| u32::try_from(page).context("CUDA KV page index does not fit u32"))
@@ -15556,10 +15556,10 @@ mod native {
                 .and_then(|value| value.checked_mul(dims.v_head_dim))
                 .context("CUDA paged batch device value pool element count overflows usize")?;
             let key_bytes = key_elements
-                .checked_mul(std::mem::size_of::<f32>())
+                .checked_mul(std::mem::size_of::<u16>()) // f16 KV pages (kv_t = __half)
                 .context("CUDA paged batch device key pool byte count overflows usize")?;
             let value_bytes = value_elements
-                .checked_mul(std::mem::size_of::<f32>())
+                .checked_mul(std::mem::size_of::<u16>()) // f16 KV pages (kv_t = __half)
                 .context("CUDA paged batch device value pool byte count overflows usize")?;
             let mut layers = Vec::with_capacity(layer_count);
             for _ in 0..layer_count {
@@ -15655,10 +15655,10 @@ mod native {
                 .and_then(|value| value.checked_mul(dims.v_head_dim))
                 .context("CUDA paged batch KV value cache element count overflows usize")?;
             let key_bytes = key_elements
-                .checked_mul(std::mem::size_of::<f32>())
+                .checked_mul(std::mem::size_of::<u16>()) // f16 KV pages (kv_t = __half)
                 .context("CUDA paged batch KV key cache byte count overflows usize")?;
             let value_bytes = value_elements
-                .checked_mul(std::mem::size_of::<f32>())
+                .checked_mul(std::mem::size_of::<u16>()) // f16 KV pages (kv_t = __half)
                 .context("CUDA paged batch KV value cache byte count overflows usize")?;
             let mut page_table = Vec::with_capacity(physical_pages);
             for batch in 0..batch_count {
