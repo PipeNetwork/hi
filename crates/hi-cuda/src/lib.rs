@@ -25,6 +25,7 @@ use rand::{Rng, SeedableRng};
 
 pub mod gpu;
 pub mod kernels;
+mod prefix_cache;
 pub mod qwen_cpu;
 pub mod runtime;
 
@@ -724,6 +725,7 @@ impl CudaBackend {
                     kv_page_size: config.kv_page_size,
                     mmproj: mmproj.clone(),
                     multimodal_stats: multimodal_stats.clone(),
+                    prefix_probe: Mutex::new(Vec::new()),
                 },
                 config.max_batch_size,
                 config.max_active_requests,
@@ -2716,6 +2718,11 @@ struct CudaSchedulerState {
     kv_page_size: usize,
     mmproj: Option<CudaMmprojInfo>,
     multimodal_stats: Arc<CudaMultimodalStats>,
+    /// Token ids of the most recently admitted prompt, used by the opt-in
+    /// cross-request prefix cache (`HI_CUDA_PREFIX_CACHE`) to measure how much
+    /// of each new prompt could reuse the prior request's KV. Groundwork for
+    /// reusing the prefix's physical KV pages; currently measurement-only.
+    prefix_probe: Mutex<Vec<u32>>,
 }
 
 #[derive(Clone, Debug)]
@@ -3933,6 +3940,38 @@ fn admit_continuous_ready_jobs(
     }
 }
 
+/// Whether the opt-in cross-request prefix KV cache is enabled
+/// (`HI_CUDA_PREFIX_CACHE=1`).
+fn prefix_cache_enabled() -> bool {
+    std::env::var("HI_CUDA_PREFIX_CACHE")
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+}
+
+/// Groundwork for the cross-request prefix cache: measure how many leading
+/// tokens of `prompt_tokens` could reuse the previously admitted prompt's KV
+/// (whole-page granularity), report it, then remember this prompt for the next
+/// request. Measurement-only for now — it does not yet skip the prefix prefill.
+fn measure_prefix_reuse(state: &CudaSchedulerState, prompt_tokens: &[u32]) {
+    if !prefix_cache_enabled() {
+        return;
+    }
+    let Ok(mut probe) = state.prefix_probe.lock() else {
+        return;
+    };
+    let reuse = prefix_cache::reusable_prefix_tokens(prompt_tokens, &probe, state.kv_page_size);
+    if reuse > 0 {
+        eprintln!(
+            "prefix-cache: {reuse}/{} prompt tokens could reuse the prior request's KV \
+             (measurement only; page_size={})",
+            prompt_tokens.len(),
+            state.kv_page_size
+        );
+    }
+    probe.clear();
+    probe.extend_from_slice(prompt_tokens);
+}
+
 fn admit_continuous_text_job(
     state: &CudaSchedulerState,
     stats: &CudaSchedulerStats,
@@ -3970,6 +4009,8 @@ fn admit_continuous_text_job(
             return None;
         }
     };
+
+    measure_prefix_reuse(state, &prompt_tokens);
 
     let token_budget = match prompt_tokens.len().checked_add(max_tokens) {
         Some(token_budget) => token_budget,
@@ -16149,6 +16190,7 @@ mod tests {
             kv_page_size: 64,
             mmproj: None,
             multimodal_stats: backend.multimodal_stats.clone(),
+            prefix_probe: super::Mutex::new(Vec::new()),
         };
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(rx);
