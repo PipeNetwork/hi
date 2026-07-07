@@ -12,7 +12,7 @@ use tokio::io::BufReader;
 use tokio::process::{Child, ChildStdout};
 use tokio::sync::Mutex;
 
-use crate::protocol::{REQUEST_TIMEOUT, read_message, write_message};
+use crate::protocol::{read_message, request_timeout, write_message};
 
 /// Diagnostics pushed by the server via `textDocument/publishDiagnostics`,
 /// keyed by document URI. Updated as notifications arrive during requests.
@@ -95,7 +95,7 @@ impl LspClient {
             let mut stdin = self.stdin.lock().await;
             write_message(&mut stdin, &body.to_string()).await?;
         }
-        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        let deadline = Instant::now() + request_timeout();
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {

@@ -244,6 +244,26 @@ fn normalize_chat_template_role(role: &str) -> &str {
     }
 }
 
+/// Render one tool call in Qwen2.5/Qwen3's native `<tool_call>` format. Accepts
+/// either the OpenAI shape (`{"function":{"name","arguments"}}`, where
+/// `arguments` is a JSON *string*) or a bare `{"name","arguments"}` object, and
+/// emits `<tool_call>\n{"name": …, "arguments": {…}}\n</tool_call>` with the
+/// arguments as a JSON object (matching what the model was trained to produce).
+fn render_qwen_tool_call(tool_call: &Value) -> String {
+    let function = tool_call.get("function").unwrap_or(tool_call);
+    let name = function.get("name").and_then(Value::as_str).unwrap_or("");
+    let arguments = match function.get("arguments").cloned().unwrap_or(Value::Null) {
+        // OpenAI encodes arguments as a JSON string; Qwen wants the object.
+        Value::String(text) => serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text)),
+        other => other,
+    };
+    format!(
+        "<tool_call>\n{{\"name\": {}, \"arguments\": {}}}\n</tool_call>",
+        json!(name),
+        arguments
+    )
+}
+
 pub fn build_chatml_prompt(
     messages: &[ChatMessage],
     tools: &[Tool],
@@ -256,11 +276,34 @@ pub fn build_chatml_prompt(
         out.push_str(&tool_block);
         out.push_str("\n<|im_end|>\n");
     }
-    for message in messages {
+    let mut index = 0;
+    while index < messages.len() {
+        let message = &messages[index];
+        // Qwen has no ChatML `tool` role: tool results live inside a *user* turn,
+        // each wrapped in <tool_response>…</tool_response>, with consecutive tool
+        // messages grouped under one user turn. Rendering them as `<|im_start|>tool`
+        // (an unknown role) is what made the model ignore the result and re-emit
+        // the tool call.
+        if message.role == "tool" {
+            out.push_str("<|im_start|>user");
+            loop {
+                out.push_str("\n<tool_response>\n");
+                out.push_str(&messages[index].content_text());
+                out.push_str("\n</tool_response>");
+                if messages.get(index + 1).is_some_and(|m| m.role == "tool") {
+                    index += 1;
+                } else {
+                    break;
+                }
+            }
+            out.push_str("<|im_end|>\n");
+            index += 1;
+            continue;
+        }
+
         let role = match message.role.as_str() {
             "system" => "system",
             "assistant" => "assistant",
-            "tool" => "tool",
             _ => "user",
         };
         out.push_str("<|im_start|>");
@@ -268,12 +311,15 @@ pub fn build_chatml_prompt(
         out.push('\n');
         out.push_str(&message.content_text());
         if role == "assistant" && !message.tool_calls.is_empty() {
-            if !message.content_text().is_empty() {
-                out.push('\n');
+            for tool_call in &message.tool_calls {
+                if !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push_str(&render_qwen_tool_call(tool_call));
             }
-            out.push_str(&json!(message.tool_calls).to_string());
         }
-        out.push_str("\n<|im_end|>\n");
+        out.push_str("<|im_end|>\n");
+        index += 1;
     }
     out.push_str("<|im_start|>assistant\n");
     out
@@ -459,13 +505,24 @@ fn tool_instructions(tools: &[Tool], tool_choice: &Value) -> String {
         return String::new();
     }
     let mut out = String::new();
-    out.push_str("You have access to tools. When a tool is needed, respond with a JSON object ");
-    out.push_str(r#"like {"name":"tool_name","arguments":{...}} and no extra prose."#);
+    out.push_str("You have access to tools. To call one, emit a JSON object ");
+    out.push_str(r#"{"name": "tool_name", "arguments": {...}} wrapped in <tool_call></tool_call> tags. "#);
+    out.push_str(
+        "A tool's result is returned to you inside <tool_response></tool_response> tags; once you \
+         have it, answer the user directly in plain text instead of calling the tool again.",
+    );
     if tool_choice == "required" {
         out.push_str(" You must call a tool.");
     }
-    out.push_str("\n\n<tools>\n");
-    out.push_str(&serde_json::to_string_pretty(tools).unwrap_or_else(|_| "[]".to_string()));
+    // Emit each tool as compact JSON on its own line — matching Qwen2.5's native
+    // template (`{{ tool | tojson }}` per tool) and avoiding the pretty-printer's
+    // indentation/newline tokens, which balloon the prompt (re-prefilled every
+    // turn) for no benefit.
+    out.push_str("\n\n<tools>");
+    for tool in tools {
+        out.push('\n');
+        out.push_str(&serde_json::to_string(tool).unwrap_or_else(|_| "{}".to_string()));
+    }
     out.push_str("\n</tools>");
     out
 }
@@ -498,8 +555,64 @@ mod tests {
         let prompt = build_prompt(ModelFamily::Qwen3, &messages, &tools, &json!("required"));
 
         assert!(prompt.contains("<tools>"));
-        assert!(prompt.contains("\"name\": \"read\""));
+        // Tools are emitted as compact JSON (no space after the colon).
+        assert!(prompt.contains("\"name\":\"read\""));
         assert!(prompt.contains("You must call a tool"));
+        assert!(prompt.ends_with("<|im_start|>assistant\n"));
+    }
+
+    #[test]
+    fn chatml_renders_tool_turns_in_qwen_native_format() {
+        let tools = vec![Tool {
+            kind: "function".to_string(),
+            function: FunctionDef {
+                name: "read_file".to_string(),
+                description: Some("Read a file".to_string()),
+                parameters: json!({"type":"object"}),
+            },
+        }];
+        let messages = vec![
+            ChatMessage {
+                role: "user".to_string(),
+                content: Some(json!("read config.txt")),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+            },
+            ChatMessage {
+                role: "assistant".to_string(),
+                content: None,
+                tool_call_id: None,
+                // OpenAI shape: arguments is a JSON *string*.
+                tool_calls: vec![json!({
+                    "id": "c1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{\"path\":\"config.txt\"}"}
+                })],
+            },
+            ChatMessage {
+                role: "tool".to_string(),
+                content: Some(json!("port = 8443")),
+                tool_call_id: Some("c1".to_string()),
+                tool_calls: Vec::new(),
+            },
+        ];
+
+        let prompt = build_prompt(ModelFamily::Qwen2, &messages, &tools, &Value::Null);
+
+        // Assistant call uses <tool_call> tags with arguments as an object.
+        assert!(
+            prompt.contains("<tool_call>\n{\"name\": \"read_file\", \"arguments\": {\"path\":\"config.txt\"}}\n</tool_call>"),
+            "assistant tool call not in Qwen format:\n{prompt}"
+        );
+        // Tool result is a <tool_response> inside a user turn — never a `tool` role.
+        assert!(
+            prompt.contains("<|im_start|>user\n<tool_response>\nport = 8443\n</tool_response><|im_end|>"),
+            "tool result not wrapped as <tool_response> in a user turn:\n{prompt}"
+        );
+        assert!(
+            !prompt.contains("<|im_start|>tool"),
+            "must not emit an <|im_start|>tool role that Qwen never saw in training:\n{prompt}"
+        );
         assert!(prompt.ends_with("<|im_start|>assistant\n"));
     }
 

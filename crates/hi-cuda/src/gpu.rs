@@ -2689,6 +2689,15 @@ mod native {
     // mutex before exposing it through the HTTP backend trait.
     unsafe impl Send for CudaQwenGpuModel {}
 
+    /// Whether to convert quantized weights to resident FP16 at load
+    /// (`HI_CUDA_WEIGHTS_F16=1`). Off by default so models that only fit
+    /// quantized keep the low-VRAM path; on, decode skips per-token dequant.
+    fn weights_f16_enabled() -> bool {
+        std::env::var("HI_CUDA_WEIGHTS_F16")
+            .ok()
+            .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+    }
+
     impl CudaQwenGpuModel {
         pub fn from_gguf(gguf: &GgufFile) -> Result<Self> {
             let config = gguf.qwen_config()?;
@@ -2718,12 +2727,23 @@ mod native {
                 );
             }
 
+            // Opt-in (HI_CUDA_WEIGHTS_F16=1): convert quantized weights to a
+            // resident FP16 copy at load so decode skips the per-token
+            // dequant-to-f32 and runs the FP16 GEMM directly. Large decode
+            // speedup at the cost of ~2 bytes/param VRAM; leave off for models
+            // that only fit quantized.
+            let weights_f16 = weights_f16_enabled();
             let mut matrices = BTreeMap::new();
             let mut total_matrix_bytes = 0usize;
             let mut quantized_matrix_count = 0usize;
             for spec in qwen_matrix_specs(gguf, &config)? {
-                let matrix = GpuMatrix::load(gguf, &spec)
+                let mut matrix = GpuMatrix::load(gguf, &spec)
                     .with_context(|| format!("loading CUDA matrix {}", spec.name))?;
+                if weights_f16 && matrix.is_quantized() {
+                    matrix = matrix
+                        .into_f16(&stream)
+                        .with_context(|| format!("converting CUDA matrix {} to f16", spec.name))?;
+                }
                 if matrix.is_quantized() {
                     quantized_matrix_count += 1;
                 }
@@ -5338,6 +5358,7 @@ mod native {
                 batch_count,
                 prompt_len,
                 &mut cache,
+                false,
             )?;
             let mut generated = vec![Vec::new(); batch_count];
             let mut active = vec![true; batch_count];
@@ -5922,6 +5943,89 @@ mod native {
                     pool,
                 )?;
             Ok((logits, logits_seq_len))
+        }
+
+        /// Prefill only the divergent suffix `input_ids[reuse_tokens..]`, reusing
+        /// KV already resident in the first `reuse_tokens` positions of
+        /// `page_table` (written by a prior request whose prompt shared this
+        /// prefix). This mirrors the suffix loop of
+        /// `full_context_logits_device_batched_paged_cache_with_shared_prefix`,
+        /// except the prefix KV is pre-populated in the pages rather than
+        /// recomputed here — so an agent loop pays O(suffix) instead of
+        /// O(prompt) each turn. Single sequence (batch of one) only.
+        pub fn prefill_greedy_next_tokens_paged_reusing_prefix(
+            &self,
+            input_ids: &[u32],
+            reuse_tokens: usize,
+            page_size: usize,
+            page_table: &[usize],
+            physical_page_count: usize,
+        ) -> Result<Vec<u32>> {
+            let label = "CUDA paged greedy prefix-reuse prefill";
+            if self.config.recurrent_ssm_tensor_layout {
+                bail!("{label} is not supported for recurrent SSM layouts");
+            }
+            if !self.supports_batched_text_generation() {
+                bail!("{label} currently supports loaded decoder model layouts only");
+            }
+            let dims = self.qwen_dims()?;
+            let prompt_len = input_ids.len();
+            if reuse_tokens == 0 || reuse_tokens >= prompt_len {
+                bail!(
+                    "{label} requires 0 < reuse_tokens ({reuse_tokens}) < prompt_len ({prompt_len})"
+                );
+            }
+            if prompt_len > dims.context {
+                bail!(
+                    "input length {prompt_len} exceeds qwen context length {}",
+                    dims.context
+                );
+            }
+
+            let token_capacity = prompt_len.min(dims.context);
+            let mut pool_slot = self.paged_batch_pool.borrow_mut();
+            let recreate_pool = pool_slot
+                .as_ref()
+                .is_none_or(|pool| !pool.can_cover(&dims, page_size, physical_page_count));
+            if recreate_pool {
+                *pool_slot = Some(CudaPagedBatchDevicePool::new(
+                    self.config.block_count,
+                    &dims,
+                    page_size,
+                    physical_page_count,
+                    &self.stream,
+                )?);
+            }
+            let pool = pool_slot
+                .as_ref()
+                .ok_or_else(|| anyhow!("CUDA paged batch device pool was not initialized"))?;
+
+            let page_tables = vec![page_table.to_vec()];
+            let mut cache = CudaPagedBatchKvCache::new_with_page_tables_from_pool(
+                &dims,
+                1,
+                page_size,
+                token_capacity,
+                &page_tables,
+                pool,
+                &self.stream,
+            )?;
+            // Append the suffix one position at a time, attending to the reused
+            // prefix KV through the page table (paged attention reads physical
+            // pages by index, regardless of which request wrote them). RoPE
+            // positions stay consistent because the reused K was stored with its
+            // original position's rotation.
+            let mut logits = None;
+            for position in reuse_tokens..prompt_len {
+                logits = Some(self.decode_batch_logits_paged_device(
+                    std::slice::from_ref(&input_ids[position]),
+                    position,
+                    &mut cache,
+                )?);
+            }
+            let logits = logits
+                .ok_or_else(|| anyhow!("{label} produced no suffix logits"))?;
+            self.argmax_batched_last_token(&logits, 1, 1)
         }
 
         fn decode_logits_batch_paged_with_page_tables(
@@ -9120,6 +9224,7 @@ mod native {
                 batch_count,
                 prompt_len,
                 &mut cache,
+                false,
             )?;
             let mut generated = vec![Vec::new(); batch_count];
             let mut active = vec![true; batch_count];
@@ -11877,13 +11982,18 @@ mod native {
                     pool,
                     &self.stream,
                 )?;
+                // Prefill only needs the last position's logits to pick the
+                // first generated token; project just that row (returned as
+                // logits_seq_len = 1) to avoid a vocab-wide buffer per prompt
+                // token.
                 let logits = self.full_context_logits_device_batched_paged_cache(
                     &flat,
                     batch_count,
                     prompt_len,
                     &mut cache,
+                    true,
                 )?;
-                return Ok((cache, logits, prompt_len));
+                return Ok((cache, logits, 1));
             }
 
             let prefix_page_tables = vec![page_tables[0].clone()];
@@ -11897,11 +12007,14 @@ mod native {
                     pool,
                     &self.stream,
                 )?;
+                // Only the KV matters here (logits discarded), so project the
+                // cheap last row.
                 let _ = self.full_context_logits_device_batched_paged_cache(
                     &inputs[0][..shared_prefix_len],
                     1,
                     shared_prefix_len,
                     &mut prefix_cache,
+                    true,
                 )?;
             }
 
@@ -11943,6 +12056,7 @@ mod native {
             batch_count: usize,
             seq_len: usize,
             cache: &mut CudaPagedBatchKvCache,
+            last_row_only: bool,
         ) -> Result<GpuF32Tensor> {
             let dims = self.qwen_dims()?;
             if batch_count == 0 || seq_len == 0 {
@@ -12024,7 +12138,11 @@ mod native {
             }
 
             let normed = self.rms_norm_f32_device("output_norm.weight", &hidden, eps)?;
-            self.output_logits_f32_device(&normed)
+            if last_row_only {
+                self.output_logits_last_row_f32_device(&normed, batch_count, seq_len)
+            } else {
+                self.output_logits_f32_device(&normed)
+            }
         }
 
         fn full_context_logits_device_with_cache(
@@ -14064,6 +14182,73 @@ mod native {
             };
             let logits = self.project_f32_device(head, normed)?;
             self.add_optional_rowwise_f32_device(logits, "output.bias")
+        }
+
+        /// Project only the final position of each sequence through the lm_head,
+        /// returning `[batch_count, vocab]` logits. Prefill only needs the last
+        /// position to pick the first generated token, so projecting all
+        /// `batch_count * seq_len` rows wastes a huge output buffer (vocab-wide
+        /// per prompt token — e.g. ~4 GB for a 6.7k-token prompt) and can OOM.
+        /// This gathers the `seq_len-1` row of each sequence first, then
+        /// projects `batch_count` rows.
+        fn output_logits_last_row_f32_device(
+            &self,
+            normed: &GpuF32Tensor,
+            batch_count: usize,
+            seq_len: usize,
+        ) -> Result<GpuF32Tensor> {
+            if batch_count == 0 || seq_len == 0 {
+                bail!("CUDA last-row logits require a non-empty batch and sequence");
+            }
+            let expected_rows = batch_count
+                .checked_mul(seq_len)
+                .context("CUDA last-row logits row count overflows usize")?;
+            if normed.rows != expected_rows {
+                bail!(
+                    "CUDA last-row logits got {} rows; expected batch {batch_count} x seq {seq_len}",
+                    normed.rows
+                );
+            }
+            // Fast path: a single-sequence prompt's last row is already the tail
+            // of `normed`; still gather so the projection sees exactly one row.
+            let row_ids = (0..batch_count)
+                .map(|batch| {
+                    let last = batch
+                        .checked_mul(seq_len)
+                        .and_then(|base| base.checked_add(seq_len - 1))
+                        .context("CUDA last-row index overflows usize")?;
+                    u32::try_from(last).context("CUDA last-row index does not fit u32")
+                })
+                .collect::<Result<Vec<u32>>>()?;
+            let cols = normed.cols;
+            let ids = DeviceBuffer::alloc(std::mem::size_of_val(row_ids.as_slice()))
+                .context("allocating CUDA last-row gather ids")?;
+            ids.copy_from_host(&row_ids)
+                .context("copying CUDA last-row gather ids")?;
+            let output_elements = batch_count
+                .checked_mul(cols)
+                .context("CUDA last-row gather output overflows usize")?;
+            let last = DeviceBuffer::alloc(output_elements * std::mem::size_of::<f32>())
+                .context("allocating CUDA last-row gather output")?;
+            // launch_gather_rows_f32_to_f32(matrix, ids, output, row_count, cols,
+            // matrix_rows): row_count is the number of *output* rows (one per
+            // sequence) and matrix_rows bounds the source.
+            crate::kernels::launch_gather_rows_f32_to_f32(
+                &normed.buffer,
+                &ids,
+                &last,
+                batch_count,
+                cols,
+                normed.rows,
+                &self.stream,
+            )?;
+            self.stream.synchronize()?;
+            let last_rows = GpuF32Tensor {
+                rows: batch_count,
+                cols,
+                buffer: last,
+            };
+            self.output_logits_f32_device(&last_rows)
         }
 
         fn add_f32_device(
@@ -16437,6 +16622,48 @@ mod native {
                 GgufTensorType::TQ2_0 => Ok(35),
                 other => bail!("matrix dtype {} is not quantized", other.label()),
             }
+        }
+
+        /// Convert a quantized weight matrix into a resident FP16 copy, so the
+        /// decode path skips the per-token dequant-to-f32 and runs the existing
+        /// FP16 GEMM directly. A no-op for already-float matrices. Trades ~2
+        /// bytes/param of VRAM for a large decode speedup; opt-in at load time.
+        fn into_f16(self, stream: &Stream) -> Result<Self> {
+            if !self.is_quantized() {
+                return Ok(self);
+            }
+            let elements = self
+                .rows
+                .checked_mul(self.cols)
+                .context("CUDA f16 weight element count overflows usize")?;
+            let quant_type = self.quant_type_id()?;
+            // Dequantize into an f32 scratch, then narrow to f16 in place. Both
+            // kernels preserve the [rows, cols] row-major layout the FP16 GEMM
+            // expects, so the converted matrix is a drop-in for a native-f16 one.
+            let f32_scratch = DeviceBuffer::alloc(elements * std::mem::size_of::<f32>())
+                .context("allocating f32 scratch for f16 weight conversion")?;
+            crate::kernels::launch_dequantize_matrix(
+                &self.buffer,
+                &f32_scratch,
+                elements,
+                quant_type,
+                stream,
+            )?;
+            let f16_bytes = elements
+                .checked_mul(std::mem::size_of::<u16>())
+                .context("CUDA f16 weight byte count overflows usize")?;
+            let f16_buffer =
+                DeviceBuffer::alloc(f16_bytes).context("allocating f16 weight buffer")?;
+            crate::kernels::launch_cast_f32_to_f16(&f32_scratch, &f16_buffer, elements, stream)?;
+            // Finish the conversion before f32_scratch is freed on drop.
+            stream.synchronize()?;
+            Ok(Self {
+                rows: self.rows,
+                cols: self.cols,
+                dtype: GgufTensorType::F16,
+                bytes: f16_bytes,
+                buffer: f16_buffer,
+            })
         }
 
         fn gemm_dtype(&self) -> Result<GemmDType> {
@@ -20140,6 +20367,19 @@ mod non_native {
             _inputs: &[Vec<u32>],
             _page_size: usize,
             _page_tables: &[Vec<usize>],
+            _physical_page_count: usize,
+        ) -> Result<Vec<u32>> {
+            bail!(
+                "hi-cuda was built without native-cuda support; GPU Qwen paged generation is unavailable"
+            )
+        }
+
+        pub fn prefill_greedy_next_tokens_paged_reusing_prefix(
+            &self,
+            _input_ids: &[u32],
+            _reuse_tokens: usize,
+            _page_size: usize,
+            _page_table: &[usize],
             _physical_page_count: usize,
         ) -> Result<Vec<u32>> {
             bail!(

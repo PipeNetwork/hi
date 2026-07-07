@@ -274,7 +274,7 @@ impl crate::Agent {
     ) -> u32 {
         let arguments = serde_json::json!({
             "command": implementation_preflight_command(),
-            "timeout": 30,
+            "timeout": 120,
         })
         .to_string();
         let id = format!("hi_implementation_preflight_{}", self.messages.len());
@@ -363,7 +363,7 @@ impl crate::Agent {
         tracker.preferred_validation = Some("cargo test".to_string());
         let arguments = serde_json::json!({
             "command": "cargo test",
-            "timeout": 180,
+            "timeout": 600,
         })
         .to_string();
         let id = format!(

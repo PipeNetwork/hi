@@ -25,9 +25,12 @@ use crate::types::{
     Usage, estimate_messages_tokens,
 };
 
-const MAX_CAPACITY_HTTP_RETRIES: u32 = 2;
+// Capacity (429) retries: a local single-slot server (`--max-active-requests 1`)
+// 429s whenever a second request overlaps, so the budget is sized to ride out a
+// busy local sidecar rather than a brief cloud throttle.
+const MAX_CAPACITY_HTTP_RETRIES: u32 = 5;
 const DEFAULT_CAPACITY_RETRY_SECS: u64 = 2;
-const MAX_CAPACITY_RETRY_SECS: u64 = 10;
+const MAX_CAPACITY_RETRY_SECS: u64 = 30;
 
 pub struct OpenAiProvider {
     http: reqwest::Client,
