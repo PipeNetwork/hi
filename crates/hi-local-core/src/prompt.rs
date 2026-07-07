@@ -13,6 +13,7 @@ pub fn build_prompt(
         ModelFamily::Qwen2 | ModelFamily::Qwen3 => {
             build_chatml_prompt(messages, tools, tool_choice)
         }
+        ModelFamily::Hy3 => build_hy3_prompt(messages, tools, tool_choice),
         ModelFamily::Llama | ModelFamily::Mistral | ModelFamily::Mixtral => {
             build_llama_prompt(messages, tools, tool_choice)
         }
@@ -451,6 +452,55 @@ fn build_glm_prompt(messages: &[ChatMessage], tools: &[Tool], tool_choice: &Valu
         out.push('\n');
     }
     out.push_str("<|assistant|>\n");
+    out
+}
+
+/// Hy3 (Hunyuan-3) prompt format. Uses Hunyuan special tokens rather than ChatML:
+/// `<｜hy_begin_of_sentence｜>{system}<｜hy_User｜>{user}<｜hy_Assistant｜>…`, and the model
+/// ends its turn with `<｜hy_eos｜>` (token 120025, read into eos_token_ids from config.json).
+fn build_hy3_prompt(messages: &[ChatMessage], tools: &[Tool], tool_choice: &Value) -> String {
+    const BOS: &str = "<｜hy_begin_of_sentence:opensource｜>";
+    const USER: &str = "<｜hy_User:opensource｜>";
+    const ASSISTANT: &str = "<｜hy_Assistant:opensource｜>";
+    const EOS: &str = "<｜hy_eos:opensource｜>";
+
+    // System prompt is emitted once, right after BOS.
+    let mut system = String::new();
+    for message in messages {
+        if message.role == "system" {
+            system.push_str(&message.content_text());
+        }
+    }
+    let tool_block = tool_instructions(tools, tool_choice);
+    if !tool_block.is_empty() {
+        if !system.is_empty() {
+            system.push('\n');
+        }
+        system.push_str(&tool_block);
+    }
+
+    let mut out = String::new();
+    out.push_str(BOS);
+    out.push_str(&system);
+    for message in messages {
+        match message.role.as_str() {
+            "system" => {} // folded into the system prompt above
+            "assistant" => {
+                out.push_str(ASSISTANT);
+                out.push_str(&message.content_text());
+                if !message.tool_calls.is_empty() {
+                    out.push_str(&json!(message.tool_calls).to_string());
+                }
+                out.push_str(EOS);
+            }
+            _ => {
+                // user + tool responses both open a user turn
+                out.push_str(USER);
+                out.push_str(&message.content_text());
+            }
+        }
+    }
+    out.push_str(ASSISTANT);
     out
 }
 

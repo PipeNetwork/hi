@@ -25,6 +25,12 @@ enum Command {
         port: u16,
         #[arg(long)]
         model_id: Option<String>,
+        /// Optional draft model for greedy speculative decoding (must share the target's tokenizer).
+        #[arg(long)]
+        draft: Option<PathBuf>,
+        /// Speculative decoding lookahead (drafts proposed per round).
+        #[arg(long, default_value_t = 3)]
+        spec_k: usize,
     },
     /// Inspect one local MLX model directory.
     Inspect {
@@ -36,6 +42,17 @@ enum Command {
     List {
         #[arg(default_value = ".hi/models")]
         root: PathBuf,
+    },
+    /// Benchmark greedy speculative decoding (draft proposes, target verifies) vs target-only greedy.
+    Spec {
+        target_path: PathBuf,
+        draft_path: PathBuf,
+        #[arg(long, default_value = "Write a short paragraph about the ocean.")]
+        prompt: String,
+        #[arg(long, default_value_t = 200)]
+        max_tokens: u32,
+        #[arg(long, default_value_t = 4)]
+        k: usize,
     },
 }
 
@@ -57,12 +74,14 @@ async fn run(cli: Cli) -> Result<()> {
             host,
             port,
             model_id,
+            draft,
+            spec_k,
         } => {
             if !platform_supported() {
                 bail!("MLX inference requires Apple Silicon macOS");
             }
             let backend = Arc::new(
-                MlxBackend::load(&model_path, model_id)
+                MlxBackend::load_with_draft(&model_path, model_id, draft.as_ref(), spec_k)
                     .with_context(|| format!("loading MLX model from {}", model_path.display()))?,
             );
             let addr: SocketAddr = format!("{host}:{port}")
@@ -71,6 +90,12 @@ async fn run(cli: Cli) -> Result<()> {
             let listener = tokio::net::TcpListener::bind(addr)
                 .await
                 .with_context(|| format!("binding {addr}"))?;
+            if let Some(draft) = &draft {
+                tracing::info!(
+                    "speculative decoding enabled (draft {}, k={spec_k})",
+                    draft.display()
+                );
+            }
             tracing::info!("serving {} on http://{addr}/v1", backend.model().id);
             axum::serve(listener, hi_mlx::server::app(backend)).await?;
         }
@@ -91,6 +116,62 @@ async fn run(cli: Cli) -> Result<()> {
                     println!("{mark}\t{}\t{}", model.path.display(), model.summary);
                 }
             }
+        }
+        Command::Spec {
+            target_path,
+            draft_path,
+            prompt,
+            max_tokens,
+            k,
+        } => {
+            if !platform_supported() {
+                bail!("MLX inference requires Apple Silicon macOS");
+            }
+            use hi_mlx::backend::GenerationRequest;
+            use hi_mlx::models::NativeRuntime;
+            let req = |p: &str| GenerationRequest {
+                prompt: p.to_string(),
+                max_tokens,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: None,
+                seed: None,
+                stop_sequences: vec![],
+                media_inputs: vec![],
+            };
+            let mut target = NativeRuntime::from_path(&target_path)
+                .with_context(|| format!("loading target {}", target_path.display()))?;
+            let mut draft = NativeRuntime::from_path(&draft_path)
+                .with_context(|| format!("loading draft {}", draft_path.display()))?;
+
+            let t0 = std::time::Instant::now();
+            let (spec_out, stats) =
+                target.speculative_generate(&mut draft, req(&prompt), k, |_| Ok(()))?;
+            let spec_dt = t0.elapsed().as_secs_f64();
+            let spec_tps = spec_out.completion_tokens as f64 / spec_dt.max(1e-6);
+            let accept_rate = stats.accepted as f64 / stats.proposed.max(1) as f64 * 100.0;
+            let avg_per_round = spec_out.completion_tokens as f64 / stats.rounds.max(1) as f64;
+
+            let t1 = std::time::Instant::now();
+            let base_out = target.generate(req(&prompt))?;
+            let base_dt = t1.elapsed().as_secs_f64();
+            let base_tps = base_out.completion_tokens as f64 / base_dt.max(1e-6);
+
+            println!("=== speculative (k={k}) ===\n{}", spec_out.text.trim());
+            println!(
+                "\n--- speculative: {} tok, {spec_dt:.1}s => {spec_tps:.1} tok/s | \
+                 accept {accept_rate:.0}% | {avg_per_round:.2} tok/round over {} rounds ---",
+                spec_out.completion_tokens, stats.rounds
+            );
+            println!(
+                "--- target greedy: {} tok, {base_dt:.1}s => {base_tps:.1} tok/s ---",
+                base_out.completion_tokens
+            );
+            println!(
+                "=== SPEEDUP {:.2}x  |  output identical to greedy: {} ===",
+                spec_tps / base_tps.max(1e-6),
+                spec_out.text == base_out.text
+            );
         }
     }
     Ok(())

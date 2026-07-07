@@ -23,6 +23,8 @@ pub struct MlxBackend {
     config: MlxModelConfig,
     weights: WeightCatalog,
     runtime: Arc<Mutex<NativeRuntime>>,
+    draft: Option<Arc<Mutex<NativeRuntime>>>,
+    spec_k: usize,
 }
 
 const OVERSIZE_MODEL_ENV: &str = "HI_MLX_ALLOW_OVERSIZE_MODEL";
@@ -32,6 +34,16 @@ const DEFAULT_MEMORY_LIMIT_FRACTION: f64 = 0.85;
 
 impl MlxBackend {
     pub fn load(path: impl AsRef<std::path::Path>, model_id: Option<String>) -> Result<Self> {
+        Self::load_with_draft(path, model_id, None::<std::path::PathBuf>, 3)
+    }
+
+    /// Load a target model, optionally with a draft model for greedy speculative decoding.
+    pub fn load_with_draft(
+        path: impl AsRef<std::path::Path>,
+        model_id: Option<String>,
+        draft_path: Option<impl AsRef<std::path::Path>>,
+        spec_k: usize,
+    ) -> Result<Self> {
         ensure_native_generation_available()?;
         let path = path.as_ref();
         let model = inspect_model(path, model_id)?;
@@ -41,11 +53,29 @@ impl MlxBackend {
         validate_memory_admission(weights.estimated_bytes)?;
         let tokenizer = TokenizerRuntime::load(path)?;
         let runtime = NativeRuntime::load(config.clone(), weights.clone(), tokenizer)?;
+        let draft = match draft_path {
+            Some(dp) => {
+                let dp = dp.as_ref();
+                let draft = NativeRuntime::from_path(dp)
+                    .with_context(|| format!("loading draft model {}", dp.display()))?;
+                if !runtime.supports_speculative() {
+                    bail!(
+                        "speculative decoding target must support KV-cache rollback \
+                         (Qwen2/Qwen3 attention); {} does not",
+                        path.display()
+                    );
+                }
+                Some(Arc::new(Mutex::new(draft)))
+            }
+            None => None,
+        };
         Ok(Self {
             model,
             config,
             weights,
             runtime: Arc::new(Mutex::new(runtime)),
+            draft,
+            spec_k: spec_k.max(1),
         })
     }
 }
@@ -148,14 +178,27 @@ impl InferenceBackend for MlxBackend {
 
     async fn stream_generate(&self, request: GenerationRequest) -> Result<GenerationStream> {
         let runtime = Arc::clone(&self.runtime);
+        let draft = self.draft.clone();
+        let spec_k = self.spec_k;
+        // Speculative decoding is greedy-only; sampling requests fall back to the normal loop.
+        let greedy = request.temperature <= f32::EPSILON;
         let (tx, rx) = mpsc::channel(8);
         tokio::task::spawn_blocking(move || {
+            let send = |event| {
+                tx.blocking_send(Ok(event))
+                    .map_err(|_| anyhow!("generation stream receiver dropped"))
+            };
             let result = {
                 let mut runtime = runtime.blocking_lock();
-                runtime.stream_generate(request, |event| {
-                    tx.blocking_send(Ok(event))
-                        .map_err(|_| anyhow!("generation stream receiver dropped"))
-                })
+                match draft.as_ref() {
+                    Some(draft) if greedy => {
+                        let mut draft = draft.blocking_lock();
+                        runtime
+                            .speculative_generate(&mut draft, request, spec_k, send)
+                            .map(|(output, _stats)| output)
+                    }
+                    _ => runtime.stream_generate(request, send),
+                }
             };
             if let Err(err) = result {
                 let _ = tx.blocking_send(Err(err));

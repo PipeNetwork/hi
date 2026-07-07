@@ -132,6 +132,16 @@ The MLX backend is Apple-Silicon-only and rejects models whose shard size exceed
 scripts/hi_mlx_acceptance_matrix.sh --no-download
 ```
 
+On a very new Metal Toolchain (Metal 4 / macOS 26) the from-source MLX build hits
+a `bfloat16_t` runtime-JIT error for **every** model (not just new ones); link a
+prebuilt MLX instead with
+`HI_MLX_SYSTEM_MLX_PREFIX=<mlx-install-dir> cargo build --release -p hi-mlx`.
+On older macOS this isn't needed. Separately, `hi-mlx` supports Hy3 / Hunyuan-3
+(`hy_v3`). See [`docs/hy_v3-and-prebuilt-mlx.md`](docs/hy_v3-and-prebuilt-mlx.md)
+— its "Which of this do you actually need?" table spells out that the Metal-4
+fix and the Hy3 support are independent — plus an honest write-up of the MoE
+decode-speed investigation.
+
 ## Verification-in-the-loop
 
 The headline feature. After the model stops, `hi` runs a check; if it fails, the output is fed back and the model iterates (up to `--max-verify` rounds, default 2).

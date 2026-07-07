@@ -159,7 +159,7 @@ fn read_json_optional(path: &Path) -> Result<Option<Value>> {
 }
 
 pub fn supported_model_families() -> &'static str {
-    "qwen2/qwen2_moe, qwen3/qwen3_moe/qwen3_next, deepseek_v2/deepseek_v3/deepseek_v32/deepseek_v4/deepseek*, glm4/glm4_moe/glm4_moe_lite Flash"
+    "qwen2/qwen2_moe, qwen3/qwen3_moe/qwen3_next, deepseek_v2/deepseek_v3/deepseek_v32/deepseek_v4/deepseek*, glm4/glm4_moe/glm4_moe_lite Flash, hy_v3 (Hunyuan-3)"
 }
 
 fn model_family(model_type: &str, config: &Value) -> Option<ModelFamily> {
@@ -188,6 +188,9 @@ fn model_family(model_type: &str, config: &Value) -> Option<ModelFamily> {
             model_type.as_str(),
             "deepseek_v2" | "deepseek_v3" | "deepseek_v31" | "deepseek_v32" | "deepseek_v4"
         )
+        // GLM-5.2 (glm_moe_dsa): DeepSeek-V3.2 arch (MLA + DSA indexer + sigmoid/noaux MoE).
+        || matches!(model_type.as_str(), "glm_moe_dsa" | "glm_moe_dsa_mtp")
+        || haystack.contains("glm_moe_dsa")
     {
         return Some(ModelFamily::DeepSeek);
     }
@@ -200,6 +203,13 @@ fn model_family(model_type: &str, config: &Value) -> Option<ModelFamily> {
         )
     {
         return Some(ModelFamily::GlmFlash);
+    }
+    if matches!(model_type.as_str(), "hy_v3" | "hyv3")
+        || haystack.contains("hy_v3")
+        || haystack.contains("hyv3")
+        || haystack.contains("hunyuan")
+    {
+        return Some(ModelFamily::Hy3);
     }
     None
 }
