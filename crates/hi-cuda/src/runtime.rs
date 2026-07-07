@@ -29,7 +29,7 @@ impl CudaRuntime {
 }
 
 #[cfg(feature = "native-cuda")]
-pub use imp::{Cublas, CublasLt, DeviceBuffer, GemmDType, Stream, check_last_error};
+pub use imp::{Cublas, CublasLt, DeviceBuffer, GemmDType, Stream, check_last_error, free_memory_bytes};
 
 #[cfg(not(feature = "native-cuda"))]
 mod imp {
@@ -71,6 +71,7 @@ mod imp {
         fn cudaGetErrorString(error: CudaError) -> *const c_char;
         fn cudaMalloc(ptr: *mut *mut c_void, size: usize) -> CudaError;
         fn cudaFree(ptr: *mut c_void) -> CudaError;
+        fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> CudaError;
         fn cudaMemcpy(dst: *mut c_void, src: *const c_void, count: usize, kind: c_int)
         -> CudaError;
         fn cudaMemcpyAsync(
@@ -644,6 +645,18 @@ mod imp {
                 let _ = unsafe { cublasLtDestroy(self.raw) };
             }
         }
+    }
+
+    /// Free device memory (bytes) currently available on the active CUDA device.
+    /// Used to decide whether an FP16 weight copy fits before converting.
+    pub fn free_memory_bytes() -> Result<usize> {
+        let mut free: usize = 0;
+        let mut total: usize = 0;
+        cuda_check(
+            unsafe { cudaMemGetInfo(&mut free, &mut total) },
+            "cudaMemGetInfo",
+        )?;
+        Ok(free)
     }
 
     fn cuda_check(code: CudaError, operation: &str) -> Result<()> {

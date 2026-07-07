@@ -2689,13 +2689,32 @@ mod native {
     // mutex before exposing it through the HTTP backend trait.
     unsafe impl Send for CudaQwenGpuModel {}
 
-    /// Whether to convert quantized weights to resident FP16 at load
-    /// (`HI_CUDA_WEIGHTS_F16=1`). Off by default so models that only fit
-    /// quantized keep the low-VRAM path; on, decode skips per-token dequant.
-    fn weights_f16_enabled() -> bool {
-        std::env::var("HI_CUDA_WEIGHTS_F16")
+    /// Decide whether to convert quantized weights to a resident FP16 copy at
+    /// load. `HI_CUDA_WEIGHTS_F16` forces the choice (`1`/`0`); unset means
+    /// **auto** — enable FP16 (a large decode speedup) when the FP16 weights fit
+    /// in ~80% of free VRAM, leaving room for the KV cache, activations, and
+    /// prefill scratch, and otherwise keep the low-VRAM quantized path so large
+    /// models still load.
+    fn weights_f16_choice(specs: &[MatrixSpec]) -> bool {
+        match std::env::var("HI_CUDA_WEIGHTS_F16")
             .ok()
-            .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("1" | "true" | "yes" | "on") => return true,
+            Some("0" | "false" | "no" | "off") => return false,
+            _ => {}
+        }
+        let f16_bytes = specs.iter().fold(0usize, |total, spec| {
+            total.saturating_add(spec.rows.saturating_mul(spec.cols).saturating_mul(2))
+        });
+        match crate::runtime::free_memory_bytes() {
+            // Enable FP16 only if the weights leave ~20% of free VRAM for the KV
+            // cache, activations, and transient prefill scratch.
+            Ok(free) => f16_bytes.saturating_mul(5) <= free.saturating_mul(4),
+            // Can't measure free memory — stay on the safe quantized path.
+            Err(_) => false,
+        }
     }
 
     impl CudaQwenGpuModel {
@@ -2727,16 +2746,18 @@ mod native {
                 );
             }
 
-            // Opt-in (HI_CUDA_WEIGHTS_F16=1): convert quantized weights to a
-            // resident FP16 copy at load so decode skips the per-token
-            // dequant-to-f32 and runs the FP16 GEMM directly. Large decode
-            // speedup at the cost of ~2 bytes/param VRAM; leave off for models
-            // that only fit quantized.
-            let weights_f16 = weights_f16_enabled();
+            // Convert quantized weights to a resident FP16 copy at load so decode
+            // skips the per-token dequant-to-f32 and runs the FP16 GEMM directly
+            // — a large decode speedup at the cost of ~2 bytes/param VRAM. On by
+            // default when the FP16 weights fit (auto), overridable via
+            // HI_CUDA_WEIGHTS_F16; large models that only fit quantized stay
+            // quantized.
+            let matrix_specs = qwen_matrix_specs(gguf, &config)?;
+            let weights_f16 = weights_f16_choice(&matrix_specs);
             let mut matrices = BTreeMap::new();
             let mut total_matrix_bytes = 0usize;
             let mut quantized_matrix_count = 0usize;
-            for spec in qwen_matrix_specs(gguf, &config)? {
+            for spec in matrix_specs {
                 let mut matrix = GpuMatrix::load(gguf, &spec)
                     .with_context(|| format!("loading CUDA matrix {}", spec.name))?;
                 if weights_f16 && matrix.is_quantized() {

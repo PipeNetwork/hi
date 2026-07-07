@@ -3988,9 +3988,15 @@ fn admit_continuous_ready_jobs(
 /// Whether the opt-in cross-request prefix KV cache is enabled
 /// (`HI_CUDA_PREFIX_CACHE=1`).
 fn prefix_cache_enabled() -> bool {
-    std::env::var("HI_CUDA_PREFIX_CACHE")
-        .ok()
-        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+    // On by default (pure upside for sequential agent turns, graceful fallback
+    // otherwise); set HI_CUDA_PREFIX_CACHE=0 to disable.
+    !matches!(
+        std::env::var("HI_CUDA_PREFIX_CACHE")
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("0" | "false" | "no" | "off")
+    )
 }
 
 /// Acquire the KV lease for a new request, reusing a retained prefix's pages
