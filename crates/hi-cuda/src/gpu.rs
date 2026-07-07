@@ -2689,6 +2689,15 @@ mod native {
     // mutex before exposing it through the HTTP backend trait.
     unsafe impl Send for CudaQwenGpuModel {}
 
+    /// Whether to convert quantized weights to resident FP16 at load
+    /// (`HI_CUDA_WEIGHTS_F16=1`). Off by default so models that only fit
+    /// quantized keep the low-VRAM path; on, decode skips per-token dequant.
+    fn weights_f16_enabled() -> bool {
+        std::env::var("HI_CUDA_WEIGHTS_F16")
+            .ok()
+            .is_some_and(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+    }
+
     impl CudaQwenGpuModel {
         pub fn from_gguf(gguf: &GgufFile) -> Result<Self> {
             let config = gguf.qwen_config()?;
@@ -2718,12 +2727,23 @@ mod native {
                 );
             }
 
+            // Opt-in (HI_CUDA_WEIGHTS_F16=1): convert quantized weights to a
+            // resident FP16 copy at load so decode skips the per-token
+            // dequant-to-f32 and runs the FP16 GEMM directly. Large decode
+            // speedup at the cost of ~2 bytes/param VRAM; leave off for models
+            // that only fit quantized.
+            let weights_f16 = weights_f16_enabled();
             let mut matrices = BTreeMap::new();
             let mut total_matrix_bytes = 0usize;
             let mut quantized_matrix_count = 0usize;
             for spec in qwen_matrix_specs(gguf, &config)? {
-                let matrix = GpuMatrix::load(gguf, &spec)
+                let mut matrix = GpuMatrix::load(gguf, &spec)
                     .with_context(|| format!("loading CUDA matrix {}", spec.name))?;
+                if weights_f16 && matrix.is_quantized() {
+                    matrix = matrix
+                        .into_f16(&stream)
+                        .with_context(|| format!("converting CUDA matrix {} to f16", spec.name))?;
+                }
                 if matrix.is_quantized() {
                     quantized_matrix_count += 1;
                 }
@@ -16437,6 +16457,48 @@ mod native {
                 GgufTensorType::TQ2_0 => Ok(35),
                 other => bail!("matrix dtype {} is not quantized", other.label()),
             }
+        }
+
+        /// Convert a quantized weight matrix into a resident FP16 copy, so the
+        /// decode path skips the per-token dequant-to-f32 and runs the existing
+        /// FP16 GEMM directly. A no-op for already-float matrices. Trades ~2
+        /// bytes/param of VRAM for a large decode speedup; opt-in at load time.
+        fn into_f16(self, stream: &Stream) -> Result<Self> {
+            if !self.is_quantized() {
+                return Ok(self);
+            }
+            let elements = self
+                .rows
+                .checked_mul(self.cols)
+                .context("CUDA f16 weight element count overflows usize")?;
+            let quant_type = self.quant_type_id()?;
+            // Dequantize into an f32 scratch, then narrow to f16 in place. Both
+            // kernels preserve the [rows, cols] row-major layout the FP16 GEMM
+            // expects, so the converted matrix is a drop-in for a native-f16 one.
+            let f32_scratch = DeviceBuffer::alloc(elements * std::mem::size_of::<f32>())
+                .context("allocating f32 scratch for f16 weight conversion")?;
+            crate::kernels::launch_dequantize_matrix(
+                &self.buffer,
+                &f32_scratch,
+                elements,
+                quant_type,
+                stream,
+            )?;
+            let f16_bytes = elements
+                .checked_mul(std::mem::size_of::<u16>())
+                .context("CUDA f16 weight byte count overflows usize")?;
+            let f16_buffer =
+                DeviceBuffer::alloc(f16_bytes).context("allocating f16 weight buffer")?;
+            crate::kernels::launch_cast_f32_to_f16(&f32_scratch, &f16_buffer, elements, stream)?;
+            // Finish the conversion before f32_scratch is freed on drop.
+            stream.synchronize()?;
+            Ok(Self {
+                rows: self.rows,
+                cols: self.cols,
+                dtype: GgufTensorType::F16,
+                bytes: f16_bytes,
+                buffer: f16_buffer,
+            })
         }
 
         fn gemm_dtype(&self) -> Result<GemmDType> {
