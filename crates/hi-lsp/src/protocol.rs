@@ -43,9 +43,22 @@ pub async fn write_message(stdin: &mut ChildStdin, body: &str) -> std::io::Resul
     Ok(())
 }
 
-/// A timeout for LSP requests. Servers can be slow (rust-analyzer cold start),
-/// but we don't want to hang a turn forever.
-pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default timeout for LSP requests. Servers can be slow (rust-analyzer cold
+/// start / indexing a large workspace), but we don't want to hang a turn
+/// forever. Overridable via `HI_LSP_TIMEOUT_SECS`.
+pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 120;
+
+/// The effective LSP request timeout: `HI_LSP_TIMEOUT_SECS` if set to a
+/// positive integer, else [`DEFAULT_REQUEST_TIMEOUT_SECS`]. Read per call so
+/// the env var takes effect without a rebuild.
+pub fn request_timeout() -> Duration {
+    let secs = std::env::var("HI_LSP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
 
 #[cfg(test)]
 mod tests {

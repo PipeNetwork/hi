@@ -22,7 +22,21 @@ const DEFAULT_BASH_TIMEOUT_SECS: u64 = 600;
 /// Hard ceiling on any per-command timeout (model- or env-supplied) so a bad
 /// value can't reintroduce an unbounded stall.
 const MAX_BASH_TIMEOUT_SECS: u64 = 3600;
-const CHECK_TIMEOUT: Duration = Duration::from_secs(300);
+/// Default wall-clock limit for a single verification command (compile/test
+/// gate). Overridable via `HI_VERIFY_TIMEOUT_SECS`; sized to fit a real
+/// `cargo test`/build on a mid-size project rather than a toy check.
+const DEFAULT_CHECK_TIMEOUT_SECS: u64 = 600;
+
+/// The effective verification timeout: `HI_VERIFY_TIMEOUT_SECS` if set to a
+/// positive integer, else [`DEFAULT_CHECK_TIMEOUT_SECS`].
+fn check_timeout() -> Duration {
+    let secs = std::env::var("HI_VERIFY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(DEFAULT_CHECK_TIMEOUT_SECS);
+    Duration::from_secs(secs)
+}
 const MAX_UNTRACKED_DIFF_ENTRIES: usize = 200;
 const HF_AGENT_ENV_VAR: &str = "AI_AGENT";
 const HF_AGENT_ID: &str = "hi";
@@ -74,7 +88,8 @@ pub async fn run_check(command: &str) -> (bool, String) {
         .arg("-c")
         .arg(command);
     let future = cmd.output();
-    match tokio::time::timeout(CHECK_TIMEOUT, future).await {
+    let timeout = check_timeout();
+    match tokio::time::timeout(timeout, future).await {
         Ok(Ok(output)) => {
             let mut text = String::new();
             text.push_str(&String::from_utf8_lossy(&output.stdout));
@@ -90,7 +105,7 @@ pub async fn run_check(command: &str) -> (bool, String) {
         Ok(Err(err)) => (false, format!("failed to run verification: {err}")),
         Err(_) => (
             false,
-            format!("verification timed out after {}s", CHECK_TIMEOUT.as_secs()),
+            format!("verification timed out after {}s", timeout.as_secs()),
         ),
     }
 }
