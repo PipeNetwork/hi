@@ -5358,6 +5358,7 @@ mod native {
                 batch_count,
                 prompt_len,
                 &mut cache,
+                false,
             )?;
             let mut generated = vec![Vec::new(); batch_count];
             let mut active = vec![true; batch_count];
@@ -9223,6 +9224,7 @@ mod native {
                 batch_count,
                 prompt_len,
                 &mut cache,
+                false,
             )?;
             let mut generated = vec![Vec::new(); batch_count];
             let mut active = vec![true; batch_count];
@@ -11980,13 +11982,18 @@ mod native {
                     pool,
                     &self.stream,
                 )?;
+                // Prefill only needs the last position's logits to pick the
+                // first generated token; project just that row (returned as
+                // logits_seq_len = 1) to avoid a vocab-wide buffer per prompt
+                // token.
                 let logits = self.full_context_logits_device_batched_paged_cache(
                     &flat,
                     batch_count,
                     prompt_len,
                     &mut cache,
+                    true,
                 )?;
-                return Ok((cache, logits, prompt_len));
+                return Ok((cache, logits, 1));
             }
 
             let prefix_page_tables = vec![page_tables[0].clone()];
@@ -12000,11 +12007,14 @@ mod native {
                     pool,
                     &self.stream,
                 )?;
+                // Only the KV matters here (logits discarded), so project the
+                // cheap last row.
                 let _ = self.full_context_logits_device_batched_paged_cache(
                     &inputs[0][..shared_prefix_len],
                     1,
                     shared_prefix_len,
                     &mut prefix_cache,
+                    true,
                 )?;
             }
 
@@ -12046,6 +12056,7 @@ mod native {
             batch_count: usize,
             seq_len: usize,
             cache: &mut CudaPagedBatchKvCache,
+            last_row_only: bool,
         ) -> Result<GpuF32Tensor> {
             let dims = self.qwen_dims()?;
             if batch_count == 0 || seq_len == 0 {
@@ -12127,7 +12138,11 @@ mod native {
             }
 
             let normed = self.rms_norm_f32_device("output_norm.weight", &hidden, eps)?;
-            self.output_logits_f32_device(&normed)
+            if last_row_only {
+                self.output_logits_last_row_f32_device(&normed, batch_count, seq_len)
+            } else {
+                self.output_logits_f32_device(&normed)
+            }
         }
 
         fn full_context_logits_device_with_cache(
@@ -14167,6 +14182,73 @@ mod native {
             };
             let logits = self.project_f32_device(head, normed)?;
             self.add_optional_rowwise_f32_device(logits, "output.bias")
+        }
+
+        /// Project only the final position of each sequence through the lm_head,
+        /// returning `[batch_count, vocab]` logits. Prefill only needs the last
+        /// position to pick the first generated token, so projecting all
+        /// `batch_count * seq_len` rows wastes a huge output buffer (vocab-wide
+        /// per prompt token — e.g. ~4 GB for a 6.7k-token prompt) and can OOM.
+        /// This gathers the `seq_len-1` row of each sequence first, then
+        /// projects `batch_count` rows.
+        fn output_logits_last_row_f32_device(
+            &self,
+            normed: &GpuF32Tensor,
+            batch_count: usize,
+            seq_len: usize,
+        ) -> Result<GpuF32Tensor> {
+            if batch_count == 0 || seq_len == 0 {
+                bail!("CUDA last-row logits require a non-empty batch and sequence");
+            }
+            let expected_rows = batch_count
+                .checked_mul(seq_len)
+                .context("CUDA last-row logits row count overflows usize")?;
+            if normed.rows != expected_rows {
+                bail!(
+                    "CUDA last-row logits got {} rows; expected batch {batch_count} x seq {seq_len}",
+                    normed.rows
+                );
+            }
+            // Fast path: a single-sequence prompt's last row is already the tail
+            // of `normed`; still gather so the projection sees exactly one row.
+            let row_ids = (0..batch_count)
+                .map(|batch| {
+                    let last = batch
+                        .checked_mul(seq_len)
+                        .and_then(|base| base.checked_add(seq_len - 1))
+                        .context("CUDA last-row index overflows usize")?;
+                    u32::try_from(last).context("CUDA last-row index does not fit u32")
+                })
+                .collect::<Result<Vec<u32>>>()?;
+            let cols = normed.cols;
+            let ids = DeviceBuffer::alloc(std::mem::size_of_val(row_ids.as_slice()))
+                .context("allocating CUDA last-row gather ids")?;
+            ids.copy_from_host(&row_ids)
+                .context("copying CUDA last-row gather ids")?;
+            let output_elements = batch_count
+                .checked_mul(cols)
+                .context("CUDA last-row gather output overflows usize")?;
+            let last = DeviceBuffer::alloc(output_elements * std::mem::size_of::<f32>())
+                .context("allocating CUDA last-row gather output")?;
+            // launch_gather_rows_f32_to_f32(matrix, ids, output, row_count, cols,
+            // matrix_rows): row_count is the number of *output* rows (one per
+            // sequence) and matrix_rows bounds the source.
+            crate::kernels::launch_gather_rows_f32_to_f32(
+                &normed.buffer,
+                &ids,
+                &last,
+                batch_count,
+                cols,
+                normed.rows,
+                &self.stream,
+            )?;
+            self.stream.synchronize()?;
+            let last_rows = GpuF32Tensor {
+                rows: batch_count,
+                cols,
+                buffer: last,
+            };
+            self.output_logits_f32_device(&last_rows)
         }
 
         fn add_f32_device(
