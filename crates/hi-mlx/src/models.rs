@@ -2960,10 +2960,16 @@ mod native {
                             &format!("{prefix}.experts.{expert}.{projection}.{suffix}"),
                         )?);
                     }
+                    let stacked = stack_axis(&parts, 0)?;
+                    transforms::eval([&stacked])?;
+                    drop(parts);
                     arrays.insert(
                         format!("{prefix}.switch_mlp.{projection}.{suffix}"),
-                        stack_axis(&parts, 0)?,
+                        stacked,
                     );
+                    for expert in 0..num_experts {
+                        arrays.remove(&format!("{prefix}.experts.{expert}.{projection}.{suffix}"));
+                    }
                 }
             }
         }
@@ -3008,8 +3014,12 @@ mod native {
             let reshaped = weight.reshape(&[heads, head_dim, -1])?;
             let embed_q = reshaped.index((.., ..qk_nope, ..)).swap_axes(-1, -2)?;
             let unembed_out = reshaped.index((.., qk_nope.., ..));
+            transforms::eval([&embed_q, &unembed_out])?;
             arrays.insert(format!("{prefix}.embed_q.weight"), embed_q);
             arrays.insert(format!("{prefix}.unembed_out.weight"), unembed_out);
+            for suffix in ["weight", "scales", "biases", "bias"] {
+                arrays.remove(&format!("{prefix}.kv_b_proj.{suffix}"));
+            }
         }
         Ok(())
     }

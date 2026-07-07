@@ -19747,6 +19747,19 @@ mod tests {
                 bf16_bits(12.0)
             ]
         );
+        let cast_f16_back = DeviceBuffer::alloc(4 * std::mem::size_of::<f32>()).unwrap();
+        let cast_bf16_back = DeviceBuffer::alloc(4 * std::mem::size_of::<f32>()).unwrap();
+        crate::kernels::launch_cast_f16_to_f32(&cast_f16, &cast_f16_back, 4, &stream).unwrap();
+        crate::kernels::launch_cast_bf16_to_f32(&cast_bf16, &cast_bf16_back, 4, &stream).unwrap();
+        stream.synchronize().unwrap();
+        assert_close_vec(
+            &cast_f16_back.copy_to_host::<f32>(4).unwrap(),
+            &[1.0, 2.0, 3.0, 12.0],
+        );
+        assert_close_vec(
+            &cast_bf16_back.copy_to_host::<f32>(4).unwrap(),
+            &[1.0, 2.0, 3.0, 12.0],
+        );
 
         let rms_in = DeviceBuffer::alloc(2 * std::mem::size_of::<f32>()).unwrap();
         let rms_weight = DeviceBuffer::alloc(2 * std::mem::size_of::<f32>()).unwrap();
@@ -19761,6 +19774,104 @@ mod tests {
             &rms_out.copy_to_host::<f32>(2).unwrap(),
             &[3.0 * scale, 4.0 * scale],
         );
+
+        let qkv_values = [0.7f32, -0.2, 0.3, 0.9, 0.5, -0.4, 0.8, 0.1];
+        let gate_values = [0.6f32, -0.1, 0.2, 0.4];
+        let conv_weight_values = [0.5f32, -0.25, 0.75, 0.3, 0.9, -0.6, 0.4, 0.2];
+        let ba_values = [0.2f32, -0.3, 0.1, 0.4];
+        let dt_bias_values = [0.05f32, -0.02];
+        let a_log_values = [0.1f32, -0.2];
+        let norm_weight_values = [1.1f32, 0.7];
+        let qkv = DeviceBuffer::alloc(qkv_values.len() * std::mem::size_of::<f32>()).unwrap();
+        let gate = DeviceBuffer::alloc(gate_values.len() * std::mem::size_of::<f32>()).unwrap();
+        let conv_weight =
+            DeviceBuffer::alloc(conv_weight_values.len() * std::mem::size_of::<f32>()).unwrap();
+        let ba = DeviceBuffer::alloc(ba_values.len() * std::mem::size_of::<f32>()).unwrap();
+        let dt_bias =
+            DeviceBuffer::alloc(dt_bias_values.len() * std::mem::size_of::<f32>()).unwrap();
+        let a_log = DeviceBuffer::alloc(a_log_values.len() * std::mem::size_of::<f32>()).unwrap();
+        let norm_weight =
+            DeviceBuffer::alloc(norm_weight_values.len() * std::mem::size_of::<f32>()).unwrap();
+        let conv_ring = DeviceBuffer::alloc(8 * std::mem::size_of::<f32>()).unwrap();
+        let recurrent_state = DeviceBuffer::alloc(8 * std::mem::size_of::<f32>()).unwrap();
+        let ssm_scratch = DeviceBuffer::alloc(12 * std::mem::size_of::<f32>()).unwrap();
+        let ssm_out = DeviceBuffer::alloc(4 * std::mem::size_of::<f32>()).unwrap();
+        qkv.copy_from_host(&qkv_values).unwrap();
+        gate.copy_from_host(&gate_values).unwrap();
+        conv_weight.copy_from_host(&conv_weight_values).unwrap();
+        ba.copy_from_host(&ba_values).unwrap();
+        dt_bias.copy_from_host(&dt_bias_values).unwrap();
+        a_log.copy_from_host(&a_log_values).unwrap();
+        norm_weight.copy_from_host(&norm_weight_values).unwrap();
+        conv_ring.memset_zero_async(&stream).unwrap();
+        recurrent_state.memset_zero_async(&stream).unwrap();
+        crate::kernels::launch_qwen_ssm_streaming_step(
+            &qkv,
+            Some(&gate),
+            &conv_weight,
+            &ba,
+            &dt_bias,
+            &a_log,
+            &norm_weight,
+            &conv_ring,
+            &recurrent_state,
+            &ssm_scratch,
+            &ssm_out,
+            0,
+            0,
+            1,
+            8,
+            2,
+            2,
+            1,
+            2,
+            false,
+            1.0e-6,
+            &stream,
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+        let silu = |value: f32| value / (1.0 + (-value).exp());
+        let sigmoid = |value: f32| 1.0 / (1.0 + (-value).exp());
+        let conv = qkv_values
+            .iter()
+            .zip(conv_weight_values.iter())
+            .map(|(value, weight)| silu(value * weight))
+            .collect::<Vec<_>>();
+        let q_norm = {
+            let inv = (conv[0] * conv[0] + conv[1] * conv[1] + 1.0e-6)
+                .sqrt()
+                .recip();
+            [conv[0] * inv, conv[1] * inv]
+        };
+        let k_norm = {
+            let inv = (conv[2] * conv[2] + conv[3] * conv[3] + 1.0e-6)
+                .sqrt()
+                .recip();
+            [conv[2] * inv, conv[3] * inv]
+        };
+        let dot = q_norm[0] * k_norm[0] + q_norm[1] * k_norm[1];
+        let q_scale = 1.0f32 / 2.0f32.sqrt();
+        let mut expected_ssm = Vec::new();
+        for head in 0..2 {
+            let beta = sigmoid(ba_values[head]);
+            let mut core = [0.0f32; 2];
+            for value_dim in 0..2 {
+                core[value_dim] = conv[4 + head * 2 + value_dim] * beta * dot * q_scale;
+            }
+            let scale = ((core[0] * core[0] + core[1] * core[1]) / 2.0 + 1.0e-6)
+                .sqrt()
+                .recip();
+            for value_dim in 0..2 {
+                expected_ssm.push(
+                    core[value_dim]
+                        * scale
+                        * norm_weight_values[value_dim]
+                        * silu(gate_values[head * 2 + value_dim]),
+                );
+            }
+        }
+        assert_close_vec(&ssm_out.copy_to_host::<f32>(4).unwrap(), &expected_ssm);
 
         let rope = DeviceBuffer::alloc(2 * std::mem::size_of::<f32>()).unwrap();
         rope.copy_from_host(&[1.0f32, 0.0]).unwrap();

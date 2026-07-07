@@ -363,7 +363,6 @@ mod native {
         recurrent_page_states: RefCell<BTreeMap<usize, RecurrentSsmRequestState>>,
     }
 
-    #[derive(Clone)]
     struct RecurrentSsmRequestState {
         page_key: usize,
         tokens: Vec<u32>,
@@ -371,12 +370,13 @@ mod native {
         layers: BTreeMap<usize, RecurrentSsmLayerState>,
     }
 
-    #[derive(Clone)]
     struct RecurrentSsmLayerState {
-        conv_ring: Vec<f32>,
+        conv_ring: DeviceBuffer,
         conv_next: usize,
         conv_len: usize,
-        recurrent: Vec<f32>,
+        recurrent: DeviceBuffer,
+        conv_elements: usize,
+        recurrent_elements: usize,
     }
 
     impl RecurrentSsmRequestState {
@@ -391,7 +391,7 @@ mod native {
     }
 
     impl RecurrentSsmLayerState {
-        fn new(ssm: &QwenSsmDims) -> Result<Self> {
+        fn new(ssm: &QwenSsmDims, stream: &Stream) -> Result<Self> {
             let conv_len = ssm
                 .conv_kernel
                 .checked_mul(ssm.conv_dim)
@@ -401,11 +401,20 @@ mod native {
                 .checked_mul(ssm.state_size)
                 .and_then(|value| value.checked_mul(ssm.head_v_dim))
                 .context("CUDA recurrent SSM matrix state size overflows usize")?;
+            let conv_ring = DeviceBuffer::alloc(conv_len * std::mem::size_of::<f32>())
+                .context("allocating CUDA recurrent SSM convolution state")?;
+            let recurrent = DeviceBuffer::alloc(recurrent_len * std::mem::size_of::<f32>())
+                .context("allocating CUDA recurrent SSM matrix state")?;
+            conv_ring.memset_zero_async(stream)?;
+            recurrent.memset_zero_async(stream)?;
+            stream.synchronize()?;
             Ok(Self {
-                conv_ring: vec![0.0; conv_len],
+                conv_ring,
                 conv_next: 0,
                 conv_len: 0,
-                recurrent: vec![0.0; recurrent_len],
+                recurrent,
+                conv_elements: conv_len,
+                recurrent_elements: recurrent_len,
             })
         }
     }
@@ -2691,20 +2700,12 @@ mod native {
             let cublas_lt = CublasLt::create()?;
 
             let mut tensors = BTreeMap::new();
-            let mut total_device_bytes = 0usize;
             let mut largest_tensor_bytes = 0usize;
             let mut dtypes = BTreeSet::new();
             for info in gguf.tensors() {
-                let view = gguf.tensor_view(info)?;
-                let bytes = view.bytes.len();
-                let buffer = DeviceBuffer::alloc(bytes)
-                    .with_context(|| format!("allocating CUDA tensor {}", info.name))?;
-                buffer
-                    .copy_from_host(view.bytes)
-                    .with_context(|| format!("copying tensor {} to CUDA device", info.name))?;
-                total_device_bytes = total_device_bytes
-                    .checked_add(bytes)
-                    .context("CUDA tensor byte total overflows usize")?;
+                let bytes = usize::try_from(info.byte_len()?).with_context(|| {
+                    format!("tensor {} byte length does not fit usize", info.name)
+                })?;
                 largest_tensor_bytes = largest_tensor_bytes.max(bytes);
                 dtypes.insert(info.dtype.label().to_string());
                 tensors.insert(
@@ -2713,7 +2714,6 @@ mod native {
                         shape: info.dimensions.clone(),
                         dtype: info.dtype,
                         bytes,
-                        buffer,
                     },
                 );
             }
@@ -2768,6 +2768,9 @@ mod native {
                 vectors.insert(spec.name, vector);
             }
             stream.synchronize()?;
+            let total_device_bytes = total_matrix_bytes
+                .checked_add(total_vector_bytes)
+                .context("CUDA retained device byte total overflows usize")?;
 
             let info = CudaQwenGpuModelInfo {
                 tensor_count: tensors.len(),
@@ -2991,6 +2994,53 @@ mod native {
             )?;
             self.stream.synchronize()?;
             Ok(output)
+        }
+
+        fn matrix_f32_device_owned(
+            &self,
+            matrix_name: &str,
+            matrix: &GpuMatrix,
+        ) -> Result<Option<DeviceBuffer>> {
+            let elements = matrix
+                .rows
+                .checked_mul(matrix.cols)
+                .context("CUDA matrix f32 element count overflows usize")?;
+            if matrix.is_quantized() {
+                return self
+                    .dequantize_matrix_f32_device(matrix)
+                    .with_context(|| format!("dequantizing CUDA matrix {matrix_name}"))
+                    .map(Some);
+            }
+            match matrix.dtype {
+                GgufTensorType::F32 => Ok(None),
+                GgufTensorType::F16 | GgufTensorType::BF16 => {
+                    let output = DeviceBuffer::alloc(elements * std::mem::size_of::<f32>())
+                        .with_context(|| {
+                            format!("allocating CUDA f32 cast matrix {matrix_name}")
+                        })?;
+                    match matrix.dtype {
+                        GgufTensorType::F16 => crate::kernels::launch_cast_f16_to_f32(
+                            &matrix.buffer,
+                            &output,
+                            elements,
+                            &self.stream,
+                        )?,
+                        GgufTensorType::BF16 => crate::kernels::launch_cast_bf16_to_f32(
+                            &matrix.buffer,
+                            &output,
+                            elements,
+                            &self.stream,
+                        )?,
+                        _ => unreachable!("matrix dtype was matched above"),
+                    }
+                    self.stream.synchronize()?;
+                    Ok(Some(output))
+                }
+                other => bail!(
+                    "CUDA matrix {matrix_name} dtype {} cannot be cast to f32",
+                    other.label()
+                ),
+            }
         }
 
         fn matrix_f32_host(&self, matrix_name: &str) -> Result<Vec<f32>> {
@@ -6268,14 +6318,36 @@ mod native {
                 keys.push((idx, key));
             }
 
-            let mut decoded_states = Vec::with_capacity(batch_count);
             {
                 let states = self.recurrent_page_states.borrow();
                 for (idx, key) in keys.iter().copied() {
-                    let state = states.get(&key).cloned().ok_or_else(|| {
+                    let state = states.get(&key).ok_or_else(|| {
                     anyhow!(
                         "{label} requires a persistent recurrent state for request {idx}; call prefill/next-token with the same page table before append decode"
                     )
+                    })?;
+                    if state.page_key != key {
+                        bail!(
+                            "{label} recurrent state for request {idx} is owned by page key {}, expected {key}",
+                            state.page_key
+                        );
+                    }
+                    if state.seq_len != position {
+                        bail!(
+                            "{label} recurrent state for request {idx} has length {}; expected decode position {position}",
+                            state.seq_len
+                        );
+                    }
+                }
+            }
+            let mut decoded_states = Vec::with_capacity(batch_count);
+            {
+                let mut states = self.recurrent_page_states.borrow_mut();
+                for (idx, key) in keys.iter().copied() {
+                    let state = states.remove(&key).ok_or_else(|| {
+                        anyhow!(
+                            "{label} persistent recurrent state for request {idx} disappeared before decode"
+                        )
                     })?;
                     decoded_states.push((idx, key, state));
                 }
@@ -6292,19 +6364,7 @@ mod native {
                 None
             };
             let mut tokens = Vec::with_capacity(batch_count);
-            for (idx, key, state) in &mut decoded_states {
-                if state.page_key != *key {
-                    bail!(
-                        "{label} recurrent state for request {idx} is owned by page key {}, expected {key}",
-                        state.page_key
-                    );
-                }
-                if state.seq_len != position {
-                    bail!(
-                        "{label} recurrent state for request {idx} has length {}; expected decode position {position}",
-                        state.seq_len
-                    );
-                }
+            for (idx, _key, state) in &mut decoded_states {
                 let logits = if let Some(pool_guard) = pool_guard.as_ref() {
                     let request_page_tables = [page_tables[*idx].clone()];
                     let mut cache = CudaPagedBatchKvCache::new_with_page_tables_from_pool(
@@ -13504,7 +13564,7 @@ mod native {
                     if !state.layers.contains_key(&layer_idx) {
                         state
                             .layers
-                            .insert(layer_idx, RecurrentSsmLayerState::new(&ssm)?);
+                            .insert(layer_idx, RecurrentSsmLayerState::new(&ssm, &self.stream)?);
                     }
                     let layer_state = state
                         .layers
@@ -13596,7 +13656,7 @@ mod native {
                 );
             }
 
-            let (mixed_qkv_host, z_host) = if self.has_matrix(&format!("{prefix}.ssm_in.weight")) {
+            let (qkv, gate, packed_qkvz) = if self.has_matrix(&format!("{prefix}.ssm_in.weight")) {
                 let qkvz =
                     self.project_f32_device(&format!("{prefix}.ssm_in.weight"), attn_input)?;
                 if qkvz.cols != ssm.qkvz_dim {
@@ -13606,8 +13666,7 @@ mod native {
                         ssm.qkvz_dim
                     );
                 }
-                let qkvz_host = qkvz.copy_to_host()?;
-                split_qwen_ssm_qkvz_host(&qkvz_host, 1, &ssm)?
+                (qkvz, None, true)
             } else {
                 let qkv =
                     self.project_f32_device(&format!("{prefix}.attn_qkv.weight"), attn_input)?;
@@ -13627,18 +13686,28 @@ mod native {
                         ssm.value_dim
                     );
                 }
-                (qkv.copy_to_host()?, gate.copy_to_host()?)
+                (qkv, Some(gate), false)
             };
 
             let conv_weight_name = format!("{prefix}.ssm_conv1d.weight");
-            let conv_weight = self.matrix_f32_host(&conv_weight_name)?;
-            let conv = qwen_ssm_depthwise_conv_step_host(
-                &mixed_qkv_host,
-                &conv_weight,
-                &ssm,
-                &conv_weight_name,
-                state,
-            )?;
+            let conv_weight_matrix = self
+                .matrix(&conv_weight_name)
+                .ok_or_else(|| anyhow!("CUDA matrix {conv_weight_name} is missing"))?;
+            if conv_weight_matrix.rows != ssm.conv_dim || conv_weight_matrix.cols != ssm.conv_kernel
+            {
+                bail!(
+                    "CUDA recurrent SSM conv weight {conv_weight_name} has shape {}x{}; expected {}x{}",
+                    conv_weight_matrix.rows,
+                    conv_weight_matrix.cols,
+                    ssm.conv_dim,
+                    ssm.conv_kernel
+                );
+            }
+            let conv_weight_owned =
+                self.matrix_f32_device_owned(&conv_weight_name, conv_weight_matrix)?;
+            let conv_weight = conv_weight_owned
+                .as_ref()
+                .unwrap_or(&conv_weight_matrix.buffer);
 
             let ba = self.project_f32_device(&format!("{prefix}.ssm_ba.weight"), attn_input)?;
             if ba.cols != ssm.ba_dim {
@@ -13648,37 +13717,116 @@ mod native {
                     ssm.ba_dim
                 );
             }
-            let ba_host = ba.copy_to_host()?;
             let dt_bias = self
                 .vector(&format!("{prefix}.ssm_dt.bias"))
-                .ok_or_else(|| anyhow!("CUDA vector {prefix}.ssm_dt.bias is missing"))?
-                .copy_to_host_f32()?;
+                .ok_or_else(|| anyhow!("CUDA vector {prefix}.ssm_dt.bias is missing"))?;
+            if dt_bias.len != ssm.time_step_rank {
+                bail!(
+                    "CUDA recurrent SSM {prefix}.ssm_dt.bias has length {}; expected {}",
+                    dt_bias.len,
+                    ssm.time_step_rank
+                );
+            }
             let a_log = self
                 .vector(&format!("{prefix}.ssm_a"))
-                .ok_or_else(|| anyhow!("CUDA vector {prefix}.ssm_a is missing"))?
-                .copy_to_host_f32()?;
+                .ok_or_else(|| anyhow!("CUDA vector {prefix}.ssm_a is missing"))?;
+            if a_log.len != ssm.time_step_rank {
+                bail!(
+                    "CUDA recurrent SSM {prefix}.ssm_a has length {}; expected {}",
+                    a_log.len,
+                    ssm.time_step_rank
+                );
+            }
             let norm_weight = self
                 .vector(&format!("{prefix}.ssm_norm.weight"))
-                .ok_or_else(|| anyhow!("CUDA vector {prefix}.ssm_norm.weight is missing"))?
-                .copy_to_host_f32()?;
+                .ok_or_else(|| anyhow!("CUDA vector {prefix}.ssm_norm.weight is missing"))?;
+            if norm_weight.len != ssm.head_v_dim {
+                bail!(
+                    "CUDA recurrent SSM {prefix}.ssm_norm.weight has length {}; expected {}",
+                    norm_weight.len,
+                    ssm.head_v_dim
+                );
+            }
+            let expected_conv_elements = ssm
+                .conv_kernel
+                .checked_mul(ssm.conv_dim)
+                .context("CUDA recurrent SSM conv state element count overflows usize")?;
+            if state.conv_elements != expected_conv_elements {
+                bail!(
+                    "CUDA recurrent SSM conv state for {prefix} has {} values; expected {expected_conv_elements}",
+                    state.conv_elements
+                );
+            }
+            let expected_recurrent_elements = ssm
+                .time_step_rank
+                .checked_mul(ssm.state_size)
+                .and_then(|value| value.checked_mul(ssm.head_v_dim))
+                .context("CUDA recurrent SSM matrix state element count overflows usize")?;
+            if state.recurrent_elements != expected_recurrent_elements {
+                bail!(
+                    "CUDA recurrent SSM matrix state for {prefix} has {} values; expected {expected_recurrent_elements}",
+                    state.recurrent_elements
+                );
+            }
+            if state.conv_next >= ssm.conv_kernel {
+                bail!(
+                    "CUDA recurrent SSM streaming conv write cursor {} exceeds kernel {}",
+                    state.conv_next,
+                    ssm.conv_kernel
+                );
+            }
+            if state.conv_len > ssm.conv_kernel {
+                bail!(
+                    "CUDA recurrent SSM streaming conv length {} exceeds kernel {}",
+                    state.conv_len,
+                    ssm.conv_kernel
+                );
+            }
 
-            let core = qwen_ssm_gated_delta_step_host(
-                &conv,
-                &ba_host,
-                &dt_bias,
-                &a_log,
-                &ssm,
-                prefix,
-                &mut state.recurrent,
+            let scratch_elements = ssm
+                .conv_dim
+                .checked_add(
+                    ssm.key_dim
+                        .checked_mul(2)
+                        .context("CUDA recurrent SSM scratch key dimension overflows usize")?,
+                )
+                .context("CUDA recurrent SSM scratch element count overflows usize")?;
+            let scratch = DeviceBuffer::alloc(scratch_elements * std::mem::size_of::<f32>())
+                .context("allocating CUDA recurrent SSM step scratch")?;
+            let normed_buffer = DeviceBuffer::alloc(ssm.value_dim * std::mem::size_of::<f32>())
+                .context("allocating CUDA recurrent SSM state gated RMSNorm")?;
+            crate::kernels::launch_qwen_ssm_streaming_step(
+                &qkv.buffer,
+                gate.as_ref().map(|tensor| &tensor.buffer),
+                conv_weight,
+                &ba.buffer,
+                &dt_bias.buffer,
+                &a_log.buffer,
+                &norm_weight.buffer,
+                &state.conv_ring,
+                &state.recurrent,
+                &scratch,
+                &normed_buffer,
+                state.conv_next,
+                state.conv_len,
+                ssm.conv_kernel,
+                ssm.conv_dim,
+                ssm.state_size,
+                ssm.time_step_rank,
+                ssm.group_count,
+                ssm.head_v_dim,
+                packed_qkvz,
+                eps,
+                &self.stream,
             )?;
-            let normed =
-                qwen_ssm_gated_rms_norm_host(&core, &z_host, &norm_weight, 1, &ssm, eps, prefix)?;
-            let normed = self.f32_tensor_from_host(
-                &normed,
-                1,
-                ssm.value_dim,
-                "CUDA recurrent SSM state gated RMSNorm",
-            )?;
+            self.stream.synchronize()?;
+            state.conv_len = state.conv_len.saturating_add(1).min(ssm.conv_kernel);
+            state.conv_next = (state.conv_next + 1) % ssm.conv_kernel;
+            let normed = GpuF32Tensor {
+                rows: 1,
+                cols: ssm.value_dim,
+                buffer: normed_buffer,
+            };
             self.project_f32_device(&format!("{prefix}.ssm_out.weight"), &normed)
         }
 
@@ -16089,8 +16237,6 @@ mod native {
         pub shape: Vec<u64>,
         pub dtype: GgufTensorType,
         pub bytes: usize,
-        #[allow(dead_code)]
-        buffer: DeviceBuffer,
     }
 
     impl fmt::Debug for GpuTensor {
@@ -16926,76 +17072,6 @@ mod native {
         Ok(output)
     }
 
-    fn qwen_ssm_depthwise_conv_step_host(
-        mixed_qkv: &[f32],
-        conv_weight: &[f32],
-        ssm: &QwenSsmDims,
-        weight_name: &str,
-        state: &mut RecurrentSsmLayerState,
-    ) -> Result<Vec<f32>> {
-        if mixed_qkv.len() != ssm.conv_dim {
-            bail!(
-                "CUDA recurrent SSM streaming conv input has {} values; expected one row x {}",
-                mixed_qkv.len(),
-                ssm.conv_dim
-            );
-        }
-        let expected_weight = ssm
-            .conv_dim
-            .checked_mul(ssm.conv_kernel)
-            .context("CUDA recurrent SSM streaming conv weight element count overflows usize")?;
-        if conv_weight.len() != expected_weight {
-            bail!(
-                "CUDA recurrent SSM conv weight {weight_name} has {} values; expected {} x {} = {expected_weight}",
-                conv_weight.len(),
-                ssm.conv_dim,
-                ssm.conv_kernel
-            );
-        }
-        let expected_ring = ssm
-            .conv_kernel
-            .checked_mul(ssm.conv_dim)
-            .context("CUDA recurrent SSM streaming conv ring size overflows usize")?;
-        if state.conv_ring.len() != expected_ring {
-            bail!(
-                "CUDA recurrent SSM streaming conv ring has {} values; expected {expected_ring}",
-                state.conv_ring.len()
-            );
-        }
-        if state.conv_next >= ssm.conv_kernel {
-            bail!(
-                "CUDA recurrent SSM streaming conv write cursor {} exceeds kernel {}",
-                state.conv_next,
-                ssm.conv_kernel
-            );
-        }
-
-        let current_slot = state.conv_next;
-        let ring_row = current_slot
-            .checked_mul(ssm.conv_dim)
-            .context("CUDA recurrent SSM streaming conv ring row overflows usize")?;
-        state.conv_ring[ring_row..ring_row + ssm.conv_dim].copy_from_slice(mixed_qkv);
-        state.conv_len = state.conv_len.saturating_add(1).min(ssm.conv_kernel);
-
-        let mut output = vec![0.0; ssm.conv_dim];
-        for channel in 0..ssm.conv_dim {
-            let mut sum = 0.0f32;
-            for kernel in 0..ssm.conv_kernel {
-                let relative = ssm.conv_kernel - 1 - kernel;
-                if relative >= state.conv_len {
-                    continue;
-                }
-                let slot = (current_slot + ssm.conv_kernel - relative) % ssm.conv_kernel;
-                sum += conv_weight[channel * ssm.conv_kernel + kernel]
-                    * state.conv_ring[slot * ssm.conv_dim + channel];
-            }
-            output[channel] = silu_scalar(sum);
-        }
-
-        state.conv_next = (state.conv_next + 1) % ssm.conv_kernel;
-        Ok(output)
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn qwen_ssm_gated_delta_host(
         conv: &[f32],
@@ -17115,125 +17191,6 @@ mod native {
                     }
                     output[v_start + value_dim] = sum;
                 }
-            }
-        }
-        Ok(output)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn qwen_ssm_gated_delta_step_host(
-        conv: &[f32],
-        mixed_ba: &[f32],
-        dt_bias: &[f32],
-        a_log: &[f32],
-        ssm: &QwenSsmDims,
-        prefix: &str,
-        state: &mut [f32],
-    ) -> Result<Vec<f32>> {
-        if conv.len() != ssm.conv_dim {
-            bail!(
-                "CUDA recurrent SSM streaming delta input for {prefix} has {} values; expected {}",
-                conv.len(),
-                ssm.conv_dim
-            );
-        }
-        if mixed_ba.len() != ssm.ba_dim {
-            bail!(
-                "CUDA recurrent SSM streaming ba input for {prefix} has {} values; expected {}",
-                mixed_ba.len(),
-                ssm.ba_dim
-            );
-        }
-        if dt_bias.len() != ssm.time_step_rank {
-            bail!(
-                "CUDA recurrent SSM {prefix}.ssm_dt.bias has length {}; expected {}",
-                dt_bias.len(),
-                ssm.time_step_rank
-            );
-        }
-        if a_log.len() != ssm.time_step_rank {
-            bail!(
-                "CUDA recurrent SSM {prefix}.ssm_a has length {}; expected {}",
-                a_log.len(),
-                ssm.time_step_rank
-            );
-        }
-        let expected_state = ssm
-            .time_step_rank
-            .checked_mul(ssm.state_size)
-            .and_then(|value| value.checked_mul(ssm.head_v_dim))
-            .context("CUDA recurrent SSM streaming state element count overflows usize")?;
-        if state.len() != expected_state {
-            bail!(
-                "CUDA recurrent SSM streaming state for {prefix} has {} values; expected {expected_state}",
-                state.len()
-            );
-        }
-
-        let mut query = vec![0.0; ssm.key_dim];
-        let mut key = vec![0.0; ssm.key_dim];
-        let mut value = vec![0.0; ssm.value_dim];
-        query.copy_from_slice(&conv[..ssm.key_dim]);
-        key.copy_from_slice(&conv[ssm.key_dim..2 * ssm.key_dim]);
-        value.copy_from_slice(&conv[2 * ssm.key_dim..ssm.conv_dim]);
-        for group in 0..ssm.group_count {
-            let start = group * ssm.state_size;
-            l2_normalize_host(&mut query[start..start + ssm.state_size]);
-            l2_normalize_host(&mut key[start..start + ssm.state_size]);
-        }
-
-        let repeat = ssm.time_step_rank / ssm.group_count;
-        let group_ba_dim = repeat
-            .checked_mul(2)
-            .context("CUDA recurrent SSM streaming grouped ba dimension overflows usize")?;
-        let q_scale = 1.0f32 / (ssm.state_size as f32).sqrt();
-        let mut output = vec![0.0; ssm.value_dim];
-        let mut kv_mem = vec![0.0; ssm.head_v_dim];
-        let mut delta = vec![0.0; ssm.head_v_dim];
-
-        for head in 0..ssm.time_step_rank {
-            let group = head / repeat;
-            let local_head = head % repeat;
-            let q_start = group * ssm.state_size;
-            let k_start = group * ssm.state_size;
-            let v_start = head * ssm.head_v_dim;
-            let ba_group = group * group_ba_dim;
-            let beta = sigmoid(mixed_ba[ba_group + local_head]);
-            let alpha = mixed_ba[ba_group + repeat + local_head];
-            let decay = (-a_log[head].exp() * softplus(alpha + dt_bias[head])).exp();
-            let state_start = head * ssm.state_size * ssm.head_v_dim;
-
-            for state_dim in 0..ssm.state_size {
-                for value_dim in 0..ssm.head_v_dim {
-                    state[state_start + state_dim * ssm.head_v_dim + value_dim] *= decay;
-                }
-            }
-            kv_mem.fill(0.0);
-            for state_dim in 0..ssm.state_size {
-                let key_value = key[k_start + state_dim];
-                for value_dim in 0..ssm.head_v_dim {
-                    kv_mem[value_dim] +=
-                        state[state_start + state_dim * ssm.head_v_dim + value_dim] * key_value;
-                }
-            }
-            for value_dim in 0..ssm.head_v_dim {
-                delta[value_dim] = (value[v_start + value_dim] - kv_mem[value_dim]) * beta;
-            }
-            for state_dim in 0..ssm.state_size {
-                let key_value = key[k_start + state_dim];
-                for value_dim in 0..ssm.head_v_dim {
-                    state[state_start + state_dim * ssm.head_v_dim + value_dim] +=
-                        key_value * delta[value_dim];
-                }
-            }
-            for value_dim in 0..ssm.head_v_dim {
-                let mut sum = 0.0f32;
-                for state_dim in 0..ssm.state_size {
-                    sum += state[state_start + state_dim * ssm.head_v_dim + value_dim]
-                        * query[q_start + state_dim]
-                        * q_scale;
-                }
-                output[v_start + value_dim] = sum;
             }
         }
         Ok(output)

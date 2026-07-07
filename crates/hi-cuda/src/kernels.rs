@@ -72,6 +72,30 @@ mod native {
             scale: c_float,
             stream: *mut c_void,
         ) -> c_int;
+        fn hi_cuda_launch_qwen_ssm_streaming_step(
+            qkv: *const c_void,
+            gate: *const c_void,
+            conv_weight: *const c_void,
+            ba: *const c_void,
+            dt_bias: *const c_void,
+            a_log: *const c_void,
+            norm_weight: *const c_void,
+            conv_ring: *mut c_void,
+            recurrent_state: *mut c_void,
+            scratch: *mut c_void,
+            output: *mut c_void,
+            conv_next: c_int,
+            conv_len: c_int,
+            conv_kernel: c_int,
+            conv_dim: c_int,
+            state_size: c_int,
+            time_step_rank: c_int,
+            group_count: c_int,
+            head_v_dim: c_int,
+            packed_qkvz: c_int,
+            eps: c_float,
+            stream: *mut c_void,
+        ) -> c_int;
         fn hi_cuda_launch_moe_topk_router(
             scores: *const c_void,
             output_ids: *mut c_void,
@@ -89,6 +113,18 @@ mod native {
             stream: *mut c_void,
         ) -> c_int;
         fn hi_cuda_launch_cast_f32_to_bf16(
+            input: *const c_void,
+            output: *mut c_void,
+            len: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_cast_f16_to_f32(
+            input: *const c_void,
+            output: *mut c_void,
+            len: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_cast_bf16_to_f32(
             input: *const c_void,
             output: *mut c_void,
             len: c_int,
@@ -777,6 +813,68 @@ mod native {
         check_last_error("hi_cuda_launch_add_scaled_row_in_place")
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_qwen_ssm_streaming_step(
+        qkv: &DeviceBuffer,
+        gate: Option<&DeviceBuffer>,
+        conv_weight: &DeviceBuffer,
+        ba: &DeviceBuffer,
+        dt_bias: &DeviceBuffer,
+        a_log: &DeviceBuffer,
+        norm_weight: &DeviceBuffer,
+        conv_ring: &DeviceBuffer,
+        recurrent_state: &DeviceBuffer,
+        scratch: &DeviceBuffer,
+        output: &DeviceBuffer,
+        conv_next: usize,
+        conv_len: usize,
+        conv_kernel: usize,
+        conv_dim: usize,
+        state_size: usize,
+        time_step_rank: usize,
+        group_count: usize,
+        head_v_dim: usize,
+        packed_qkvz: bool,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(conv_next, "qwen_ssm conv_next")?;
+        ensure_len(conv_len, "qwen_ssm conv_len")?;
+        ensure_len(conv_kernel, "qwen_ssm conv_kernel")?;
+        ensure_len(conv_dim, "qwen_ssm conv_dim")?;
+        ensure_len(state_size, "qwen_ssm state_size")?;
+        ensure_len(time_step_rank, "qwen_ssm time_step_rank")?;
+        ensure_len(group_count, "qwen_ssm group_count")?;
+        ensure_len(head_v_dim, "qwen_ssm head_v_dim")?;
+        launch_status(unsafe {
+            hi_cuda_launch_qwen_ssm_streaming_step(
+                qkv.as_ptr(),
+                gate.map_or(std::ptr::null(), DeviceBuffer::as_ptr),
+                conv_weight.as_ptr(),
+                ba.as_ptr(),
+                dt_bias.as_ptr(),
+                a_log.as_ptr(),
+                norm_weight.as_ptr(),
+                conv_ring.as_mut_ptr(),
+                recurrent_state.as_mut_ptr(),
+                scratch.as_mut_ptr(),
+                output.as_mut_ptr(),
+                conv_next as c_int,
+                conv_len as c_int,
+                conv_kernel as c_int,
+                conv_dim as c_int,
+                state_size as c_int,
+                time_step_rank as c_int,
+                group_count as c_int,
+                head_v_dim as c_int,
+                if packed_qkvz { 1 } else { 0 },
+                eps,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_qwen_ssm_streaming_step")
+    }
+
     pub fn launch_moe_topk_router(
         scores: &DeviceBuffer,
         output_ids: &DeviceBuffer,
@@ -839,6 +937,42 @@ mod native {
             )
         })?;
         check_last_error("hi_cuda_launch_cast_f32_to_bf16")
+    }
+
+    pub fn launch_cast_f16_to_f32(
+        input: &DeviceBuffer,
+        output: &DeviceBuffer,
+        len: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(len, "cast_f16_to_f32 len")?;
+        launch_status(unsafe {
+            hi_cuda_launch_cast_f16_to_f32(
+                input.as_ptr(),
+                output.as_mut_ptr(),
+                len as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_cast_f16_to_f32")
+    }
+
+    pub fn launch_cast_bf16_to_f32(
+        input: &DeviceBuffer,
+        output: &DeviceBuffer,
+        len: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(len, "cast_bf16_to_f32 len")?;
+        launch_status(unsafe {
+            hi_cuda_launch_cast_bf16_to_f32(
+                input.as_ptr(),
+                output.as_mut_ptr(),
+                len as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_cast_bf16_to_f32")
     }
 
     pub fn launch_gather_rows_f16_to_f32(

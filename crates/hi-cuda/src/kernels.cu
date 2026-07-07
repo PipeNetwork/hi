@@ -6,6 +6,24 @@
 
 namespace {
 
+__device__ __forceinline__ float hi_sigmoidf(float x) {
+  return 1.0f / (1.0f + expf(-x));
+}
+
+__device__ __forceinline__ float hi_siluf(float x) {
+  return x * hi_sigmoidf(x);
+}
+
+__device__ __forceinline__ float hi_softplusf(float x) {
+  if (x > 20.0f) {
+    return x;
+  }
+  if (x < -20.0f) {
+    return expf(x);
+  }
+  return log1pf(expf(x));
+}
+
 __global__ void rms_norm_kernel(
     const float* input,
     const float* weight,
@@ -69,8 +87,232 @@ __global__ void silu_mul_kernel(
     return;
   }
   float value = gate[idx];
-  float silu = value / (1.0f + expf(-value));
-  output[idx] = silu * up[idx];
+  output[idx] = hi_siluf(value) * up[idx];
+}
+
+__global__ void cast_f16_to_f32_kernel(
+    const uint16_t* input,
+    float* output,
+    int len) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= len) {
+    return;
+  }
+  const __half* halves = reinterpret_cast<const __half*>(input);
+  output[idx] = __half2float(halves[idx]);
+}
+
+__global__ void cast_bf16_to_f32_kernel(
+    const uint16_t* input,
+    float* output,
+    int len) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= len) {
+    return;
+  }
+  const __nv_bfloat16* values = reinterpret_cast<const __nv_bfloat16*>(input);
+  output[idx] = __bfloat162float(values[idx]);
+}
+
+__device__ float qwen_ssm_mixed_qkv_value(
+    const float* qkv,
+    int channel,
+    int packed_qkvz,
+    int state_size,
+    int time_step_rank,
+    int group_count,
+    int head_v_dim,
+    int key_dim,
+    int value_dim) {
+  if (!packed_qkvz) {
+    return qkv[channel];
+  }
+  int repeat = time_step_rank / group_count;
+  int value_group_dim = repeat * head_v_dim;
+  int source_group_dim = state_size * 2 + value_group_dim * 2;
+  if (channel < key_dim) {
+    int group = channel / state_size;
+    int local = channel % state_size;
+    return qkv[group * source_group_dim + local];
+  }
+  if (channel < 2 * key_dim) {
+    int k_channel = channel - key_dim;
+    int group = k_channel / state_size;
+    int local = k_channel % state_size;
+    return qkv[group * source_group_dim + state_size + local];
+  }
+  int value_channel = channel - 2 * key_dim;
+  int group = value_channel / value_group_dim;
+  int local = value_channel % value_group_dim;
+  return qkv[group * source_group_dim + 2 * state_size + local];
+}
+
+__device__ float qwen_ssm_gate_value(
+    const float* qkv,
+    const float* gate,
+    int value_channel,
+    int packed_qkvz,
+    int state_size,
+    int time_step_rank,
+    int group_count,
+    int head_v_dim) {
+  if (!packed_qkvz) {
+    return gate[value_channel];
+  }
+  int repeat = time_step_rank / group_count;
+  int value_group_dim = repeat * head_v_dim;
+  int source_group_dim = state_size * 2 + value_group_dim * 2;
+  int group = value_channel / value_group_dim;
+  int local = value_channel % value_group_dim;
+  return qkv[group * source_group_dim + 2 * state_size + value_group_dim + local];
+}
+
+__global__ void qwen_ssm_streaming_step_kernel(
+    const float* qkv,
+    const float* gate,
+    const float* conv_weight,
+    const float* ba,
+    const float* dt_bias,
+    const float* a_log,
+    const float* norm_weight,
+    float* conv_ring,
+    float* recurrent_state,
+    float* scratch,
+    float* output,
+    int conv_next,
+    int conv_len,
+    int conv_kernel,
+    int conv_dim,
+    int state_size,
+    int time_step_rank,
+    int group_count,
+    int head_v_dim,
+    int packed_qkvz,
+    float eps) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+  int key_dim = group_count * state_size;
+  int value_dim = time_step_rank * head_v_dim;
+  int repeat = time_step_rank / group_count;
+  int group_ba_dim = repeat * 2;
+  int current_slot = conv_next;
+  int new_conv_len = conv_len + 1;
+  if (new_conv_len > conv_kernel) {
+    new_conv_len = conv_kernel;
+  }
+
+  float* conv = scratch;
+  float* query = scratch + conv_dim;
+  float* key = scratch + conv_dim + key_dim;
+
+  for (int channel = 0; channel < conv_dim; ++channel) {
+    conv_ring[current_slot * conv_dim + channel] =
+        qwen_ssm_mixed_qkv_value(
+            qkv,
+            channel,
+            packed_qkvz,
+            state_size,
+            time_step_rank,
+            group_count,
+            head_v_dim,
+            key_dim,
+            value_dim);
+  }
+
+  for (int channel = 0; channel < conv_dim; ++channel) {
+    float sum = 0.0f;
+    for (int kernel = 0; kernel < conv_kernel; ++kernel) {
+      int relative = conv_kernel - 1 - kernel;
+      if (relative >= new_conv_len) {
+        continue;
+      }
+      int slot = (current_slot + conv_kernel - relative) % conv_kernel;
+      sum += conv_weight[channel * conv_kernel + kernel]
+          * conv_ring[slot * conv_dim + channel];
+    }
+    conv[channel] = hi_siluf(sum);
+  }
+
+  for (int group = 0; group < group_count; ++group) {
+    float query_norm = 0.0f;
+    float key_norm = 0.0f;
+    int start = group * state_size;
+    for (int state_dim = 0; state_dim < state_size; ++state_dim) {
+      float q = conv[start + state_dim];
+      float k = conv[key_dim + start + state_dim];
+      query_norm += q * q;
+      key_norm += k * k;
+    }
+    float inv_query = rsqrtf(query_norm + 1.0e-6f);
+    float inv_key = rsqrtf(key_norm + 1.0e-6f);
+    for (int state_dim = 0; state_dim < state_size; ++state_dim) {
+      query[start + state_dim] = conv[start + state_dim] * inv_query;
+      key[start + state_dim] = conv[key_dim + start + state_dim] * inv_key;
+    }
+  }
+
+  float q_scale = rsqrtf(static_cast<float>(state_size));
+  for (int head = 0; head < time_step_rank; ++head) {
+    int group = head / repeat;
+    int local_head = head % repeat;
+    int q_start = group * state_size;
+    int k_start = group * state_size;
+    int v_start = head * head_v_dim;
+    int ba_group = group * group_ba_dim;
+    float beta = hi_sigmoidf(ba[ba_group + local_head]);
+    float alpha = ba[ba_group + repeat + local_head];
+    float decay = expf(-expf(a_log[head]) * hi_softplusf(alpha + dt_bias[head]));
+    int state_start = head * state_size * head_v_dim;
+
+    for (int state_dim = 0; state_dim < state_size; ++state_dim) {
+      for (int value_dim = 0; value_dim < head_v_dim; ++value_dim) {
+        recurrent_state[state_start + state_dim * head_v_dim + value_dim] *= decay;
+      }
+    }
+
+    for (int value_dim = 0; value_dim < head_v_dim; ++value_dim) {
+      float kv_mem = 0.0f;
+      for (int state_dim = 0; state_dim < state_size; ++state_dim) {
+        kv_mem += recurrent_state[state_start + state_dim * head_v_dim + value_dim]
+            * key[k_start + state_dim];
+      }
+      float value = conv[2 * key_dim + v_start + value_dim];
+      float delta = (value - kv_mem) * beta;
+      for (int state_dim = 0; state_dim < state_size; ++state_dim) {
+        recurrent_state[state_start + state_dim * head_v_dim + value_dim] +=
+            key[k_start + state_dim] * delta;
+      }
+      float core = 0.0f;
+      for (int state_dim = 0; state_dim < state_size; ++state_dim) {
+        core += recurrent_state[state_start + state_dim * head_v_dim + value_dim]
+            * query[q_start + state_dim]
+            * q_scale;
+      }
+      output[v_start + value_dim] = core;
+    }
+
+    float variance = 0.0f;
+    for (int value_dim = 0; value_dim < head_v_dim; ++value_dim) {
+      float value = output[v_start + value_dim];
+      variance += value * value;
+    }
+    float scale = rsqrtf(variance / static_cast<float>(head_v_dim) + eps);
+    for (int value_dim = 0; value_dim < head_v_dim; ++value_dim) {
+      int value_channel = v_start + value_dim;
+      float z = qwen_ssm_gate_value(
+          qkv,
+          gate,
+          value_channel,
+          packed_qkvz,
+          state_size,
+          time_step_rank,
+          group_count,
+          head_v_dim);
+      output[value_channel] =
+          output[value_channel] * scale * norm_weight[value_dim] * hi_siluf(z);
+    }
+  }
 }
 
 __global__ void gelu_kernel(
@@ -3633,6 +3875,48 @@ extern "C" int hi_cuda_launch_gelu(
   return 0;
 }
 
+extern "C" int hi_cuda_launch_cast_f16_to_f32(
+    const void* input,
+    void* output,
+    int len,
+    void* stream) {
+  if (input == nullptr || output == nullptr || !valid_common(output, len) ||
+      stream == nullptr) {
+    return 1;
+  }
+  if (len == 0) {
+    return 0;
+  }
+  dim3 block(256);
+  dim3 grid((len + block.x - 1) / block.x);
+  cast_f16_to_f32_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint16_t*>(input),
+      static_cast<float*>(output),
+      len);
+  return 0;
+}
+
+extern "C" int hi_cuda_launch_cast_bf16_to_f32(
+    const void* input,
+    void* output,
+    int len,
+    void* stream) {
+  if (input == nullptr || output == nullptr || !valid_common(output, len) ||
+      stream == nullptr) {
+    return 1;
+  }
+  if (len == 0) {
+    return 0;
+  }
+  dim3 block(256);
+  dim3 grid((len + block.x - 1) / block.x);
+  cast_bf16_to_f32_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint16_t*>(input),
+      static_cast<float*>(output),
+      len);
+  return 0;
+}
+
 extern "C" int hi_cuda_launch_add(
     const void* left,
     const void* right,
@@ -3679,6 +3963,74 @@ extern "C" int hi_cuda_launch_add_rowwise(
       static_cast<float*>(output),
       rows,
       cols);
+  return 0;
+}
+
+extern "C" int hi_cuda_launch_qwen_ssm_streaming_step(
+    const void* qkv,
+    const void* gate,
+    const void* conv_weight,
+    const void* ba,
+    const void* dt_bias,
+    const void* a_log,
+    const void* norm_weight,
+    void* conv_ring,
+    void* recurrent_state,
+    void* scratch,
+    void* output,
+    int conv_next,
+    int conv_len,
+    int conv_kernel,
+    int conv_dim,
+    int state_size,
+    int time_step_rank,
+    int group_count,
+    int head_v_dim,
+    int packed_qkvz,
+    float eps,
+    void* stream) {
+  if (qkv == nullptr || conv_weight == nullptr || ba == nullptr ||
+      dt_bias == nullptr || a_log == nullptr || norm_weight == nullptr ||
+      conv_ring == nullptr || recurrent_state == nullptr || scratch == nullptr ||
+      output == nullptr || stream == nullptr) {
+    return 1;
+  }
+  if (!packed_qkvz && gate == nullptr) {
+    return 1;
+  }
+  if (conv_next < 0 || conv_len < 0 || conv_kernel <= 0 || conv_dim <= 0 ||
+      state_size <= 0 || time_step_rank <= 0 || group_count <= 0 ||
+      head_v_dim <= 0 || conv_next >= conv_kernel || conv_len > conv_kernel ||
+      time_step_rank % group_count != 0) {
+    return 2;
+  }
+  int key_dim = group_count * state_size;
+  int value_dim = time_step_rank * head_v_dim;
+  if (conv_dim != 2 * key_dim + value_dim) {
+    return 3;
+  }
+  qwen_ssm_streaming_step_kernel<<<1, 1, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const float*>(qkv),
+      static_cast<const float*>(gate),
+      static_cast<const float*>(conv_weight),
+      static_cast<const float*>(ba),
+      static_cast<const float*>(dt_bias),
+      static_cast<const float*>(a_log),
+      static_cast<const float*>(norm_weight),
+      static_cast<float*>(conv_ring),
+      static_cast<float*>(recurrent_state),
+      static_cast<float*>(scratch),
+      static_cast<float*>(output),
+      conv_next,
+      conv_len,
+      conv_kernel,
+      conv_dim,
+      state_size,
+      time_step_rank,
+      group_count,
+      head_v_dim,
+      packed_qkvz,
+      eps);
   return 0;
 }
 
