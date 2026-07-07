@@ -514,8 +514,15 @@ fn tool_instructions(tools: &[Tool], tool_choice: &Value) -> String {
     if tool_choice == "required" {
         out.push_str(" You must call a tool.");
     }
-    out.push_str("\n\n<tools>\n");
-    out.push_str(&serde_json::to_string_pretty(tools).unwrap_or_else(|_| "[]".to_string()));
+    // Emit each tool as compact JSON on its own line — matching Qwen2.5's native
+    // template (`{{ tool | tojson }}` per tool) and avoiding the pretty-printer's
+    // indentation/newline tokens, which balloon the prompt (re-prefilled every
+    // turn) for no benefit.
+    out.push_str("\n\n<tools>");
+    for tool in tools {
+        out.push('\n');
+        out.push_str(&serde_json::to_string(tool).unwrap_or_else(|_| "{}".to_string()));
+    }
     out.push_str("\n</tools>");
     out
 }
@@ -548,7 +555,8 @@ mod tests {
         let prompt = build_prompt(ModelFamily::Qwen3, &messages, &tools, &json!("required"));
 
         assert!(prompt.contains("<tools>"));
-        assert!(prompt.contains("\"name\": \"read\""));
+        // Tools are emitted as compact JSON (no space after the colon).
+        assert!(prompt.contains("\"name\":\"read\""));
         assert!(prompt.contains("You must call a tool"));
         assert!(prompt.ends_with("<|im_start|>assistant\n"));
     }
