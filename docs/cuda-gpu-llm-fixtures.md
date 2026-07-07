@@ -8,7 +8,7 @@ The default path is the checked-in fixture manifest plus downloader:
 HI_CUDA_FIXTURES_DIR=/models/hi-cuda docs/fetch-cuda-fixtures.sh
 ```
 
-Set `HI_CUDA_FIXTURE_MANIFEST=<path>` to use a local or private manifest with the same tab-separated columns: relative path, URL, SHA-256, expected family, architecture, and quant type.
+Set `HI_CUDA_FIXTURE_MANIFEST=<path>` to use a local or private manifest with the same tab-separated columns: relative path, URL, SHA-256, expected family, architecture, and quant type. The public manifest intentionally favors small/public fixtures: TinyLlama, Qwen2.5 0.5B, Qwen2.5-VL 3B, Phi-3 IQ4_NL, and public Q4_0 interleaved quant files. Public `IQ4_NL_4_4`, `IQ4_NL_4_8`, and `IQ4_NL_8_8` GGUFs were not available when this manifest was pinned; add them through a private manifest when testing those exact raw ids against real model files.
 
 ## Directory Layout
 
@@ -74,7 +74,7 @@ Use real GGUFs that match the directory family, model architecture, and quant ty
 - GLM dense split-attention GGUF.
 - Qwen2.5-VL language GGUF plus matching `mmproj.gguf` for image/video requests.
 
-Synthetic loader fixtures cover every tensor type hi-local accepts: dense numeric tensors, classic Q-quants, K-quants, IQ quants, TQ quants, MXFP4, NVFP4, and the specialized raw GGUF ids `Q4_0_4_4`, `Q4_0_4_8`, `Q4_0_8_8`, `IQ4_NL_4_4`, `IQ4_NL_4_8`, and `IQ4_NL_8_8`. Native CUDA parity tests compare every supported quantized GPU dequantizer against the CPU GGUF dequantizer; the specialized variants are treated as layout aliases of `Q4_0` and `IQ4_NL`.
+Synthetic loader fixtures cover every tensor type hi-local accepts: dense numeric tensors, classic Q-quants, K-quants, IQ quants, TQ quants, MXFP4, NVFP4, and the specialized raw GGUF ids `Q4_0_4_4`, `Q4_0_4_8`, `Q4_0_8_8`, `IQ4_NL_4_4`, `IQ4_NL_4_8`, and `IQ4_NL_8_8`. Native CUDA parity tests compare every supported quantized GPU dequantizer against the CPU GGUF dequantizer; the specialized variants are treated as layout aliases of `Q4_0` and `IQ4_NL`. The checked-in public manifest includes real `Q4_0_4_4`, `Q4_0_4_8`, `Q4_0_8_8`, and canonical `IQ4_NL` files; exact real `IQ4_NL_*_*` rows can be supplied by `HI_CUDA_FIXTURE_MANIFEST` when those GGUFs are available.
 
 Dense CUDA matrix fixtures may use FP16, BF16, or F32 storage. Native tests cover F32 matrix loading, F32 token embedding gather, F32 projection parity against the CPU GGUF reference, and matching-dtype cuBLAS projection GEMMs for FP16/BF16 matrix weights.
 

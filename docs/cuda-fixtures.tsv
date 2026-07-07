@@ -1,2 +1,11 @@
 # relative_path	url	sha256	family	architecture	quant_type
 tinyllama/model.gguf	https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf	9fecc3b3cd76bba89d504f29b616eedf7da85b96540e490ca5824d3f7d2776a0	llama	llama	Q4_K_M
+qwen25/model.gguf	https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf	74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db	qwen	qwen2	Q4_K_M
+qwen25-vl/model.gguf	https://huggingface.co/RzZ/Qwen2.5-VL-3B-GGUF/resolve/main/qwen25vl-3b-instruct.gguf	95cb7b09969bb3896b9c26070b187d5fbbd2426023a584b2a6a35ff56d32e3ad	qwen	qwen2.5-vl	Q4_K_M
+qwen25-vl/mmproj.gguf	https://huggingface.co/RzZ/Qwen2.5-VL-3B-GGUF/resolve/main/mmproj-qwen25vl-3b-instruct.gguf	492cbaa3115b442c1572ba8f41687f4651042bb7d782322dfa259faf5d7da314	qwen-mmproj	qwen2.5-vl-mmproj	F16
+qwen25-vl/vision.gguf	https://huggingface.co/RzZ/Qwen2.5-VL-3B-GGUF/resolve/main/qwen25vl-vision.gguf	8709ec12b5e17c9027ac6e614e22abedbbe99f6ec58ef5688be61662d01469d1	qwen-vision	qwen2.5-vl-vision	F16
+phi/model.gguf	https://huggingface.co/SixOpen/Phi-3-mini-4k-instruct-IQ4_NL-imat.gguf/resolve/main/phi-3-mini-4k-instruct-iq4_nl-imat.gguf	bdaefdecd4e2e9d912ff42a84c604e6e9fe308bfcb0053e962685b8e7b0e7cf8	phi	phi3	IQ4_NL
+quant/IQ4_NL/model.gguf	https://huggingface.co/SixOpen/Phi-3-mini-4k-instruct-IQ4_NL-imat.gguf/resolve/main/phi-3-mini-4k-instruct-iq4_nl-imat.gguf	bdaefdecd4e2e9d912ff42a84c604e6e9fe308bfcb0053e962685b8e7b0e7cf8	phi	phi3	IQ4_NL
+quant/Q4_0_4_4/model.gguf	https://huggingface.co/bartowski/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/Qwen2.5-0.5B-Instruct-Q4_0_4_4.gguf	9f2c0af1a4a2a1f1b4ad51d2aa3fb09913ba8821f3aef71541fef56b3c7da8d0	qwen	qwen2	Q4_0_4_4
+quant/Q4_0_4_8/model.gguf	https://huggingface.co/bartowski/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/Qwen2.5-0.5B-Instruct-Q4_0_4_8.gguf	23b29ad0785bc79f3d10e1bc4d1dae8a40599f60d7abb7bdfde6bc0ad71642f6	qwen	qwen2	Q4_0_4_8
+quant/Q4_0_8_8/model.gguf	https://huggingface.co/bartowski/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/Qwen2.5-0.5B-Instruct-Q4_0_8_8.gguf	af7a55e4493e2cba03f7b217f24abfd962e516eb3ea1a2a89073aca0c1403a3d	qwen	qwen2	Q4_0_8_8

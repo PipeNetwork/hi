@@ -161,6 +161,18 @@ mod native {
             split_half: c_int,
             stream: *mut c_void,
         ) -> c_int;
+        fn hi_cuda_launch_rope_batched_positions(
+            values: *mut c_void,
+            positions: *const c_void,
+            batch_count: c_int,
+            seq_len: c_int,
+            heads: c_int,
+            head_dim: c_int,
+            base: c_float,
+            scale: c_float,
+            split_half: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
         fn hi_cuda_launch_mrope(
             values: *mut c_void,
             pos_t: *const c_void,
@@ -232,6 +244,19 @@ mod native {
             page_size: c_int,
             page_table_len: c_int,
             start_pos: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_write_paged_kv_cache_batched_positions(
+            values: *const c_void,
+            pages: *mut c_void,
+            page_table: *const c_void,
+            positions: *const c_void,
+            batch_count: c_int,
+            row_count: c_int,
+            kv_heads: c_int,
+            head_dim: c_int,
+            page_size: c_int,
+            page_table_len: c_int,
             stream: *mut c_void,
         ) -> c_int;
         fn hi_cuda_launch_copy_paged_kv_cache_prefix_batched(
@@ -431,6 +456,22 @@ mod native {
             v_head_dim: c_int,
             stream: *mut c_void,
         ) -> c_int;
+        fn hi_cuda_launch_paged_decode_attention_batched_positions(
+            q: *const c_void,
+            k_pages: *const c_void,
+            v_pages: *const c_void,
+            page_table: *const c_void,
+            positions: *const c_void,
+            output: *mut c_void,
+            batch_count: c_int,
+            page_size: c_int,
+            page_table_len: c_int,
+            heads: c_int,
+            kv_heads: c_int,
+            qk_head_dim: c_int,
+            v_head_dim: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
         fn hi_cuda_launch_flash_paged_decode_attention_batched(
             q: *const c_void,
             k_pages: *const c_void,
@@ -455,6 +496,22 @@ mod native {
             output: *mut c_void,
             batch_count: c_int,
             position: c_int,
+            page_size: c_int,
+            page_table_len: c_int,
+            heads: c_int,
+            kv_heads: c_int,
+            qk_head_dim: c_int,
+            v_head_dim: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_tiled_paged_decode_attention_batched_positions(
+            q: *const c_void,
+            k_pages: *const c_void,
+            v_pages: *const c_void,
+            page_table: *const c_void,
+            positions: *const c_void,
+            output: *mut c_void,
+            batch_count: c_int,
             page_size: c_int,
             page_table_len: c_int,
             heads: c_int,
@@ -975,6 +1032,40 @@ mod native {
         check_last_error("hi_cuda_launch_rope_batched_with_offset")
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_rope_batched_positions(
+        values: &DeviceBuffer,
+        positions: &DeviceBuffer,
+        batch_count: usize,
+        seq_len: usize,
+        heads: usize,
+        head_dim: usize,
+        base: f32,
+        scale: f32,
+        split_half: bool,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(batch_count, "rope positions batch_count")?;
+        ensure_len(seq_len, "rope positions seq_len")?;
+        ensure_len(heads, "rope positions heads")?;
+        ensure_len(head_dim, "rope positions head_dim")?;
+        launch_status(unsafe {
+            hi_cuda_launch_rope_batched_positions(
+                values.as_mut_ptr(),
+                positions.as_ptr(),
+                batch_count as c_int,
+                seq_len as c_int,
+                heads as c_int,
+                head_dim as c_int,
+                base,
+                scale,
+                if split_half { 1 } else { 0 },
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_rope_batched_positions")
+    }
+
     pub fn launch_vision_rope(
         values: &DeviceBuffer,
         pos_h: &DeviceBuffer,
@@ -1182,6 +1273,44 @@ mod native {
             )
         })?;
         check_last_error("hi_cuda_launch_write_paged_kv_cache_batched")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_write_paged_kv_cache_batched_positions(
+        values: &DeviceBuffer,
+        pages: &DeviceBuffer,
+        page_table: &DeviceBuffer,
+        positions: &DeviceBuffer,
+        batch_count: usize,
+        row_count: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        page_size: usize,
+        page_table_len: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(batch_count, "paged_kv_cache positions batch_count")?;
+        ensure_len(row_count, "paged_kv_cache positions row_count")?;
+        ensure_len(kv_heads, "paged_kv_cache positions kv_heads")?;
+        ensure_len(head_dim, "paged_kv_cache positions head_dim")?;
+        ensure_len(page_size, "paged_kv_cache positions page_size")?;
+        ensure_len(page_table_len, "paged_kv_cache positions page_table_len")?;
+        launch_status(unsafe {
+            hi_cuda_launch_write_paged_kv_cache_batched_positions(
+                values.as_ptr(),
+                pages.as_mut_ptr(),
+                page_table.as_ptr(),
+                positions.as_ptr(),
+                batch_count as c_int,
+                row_count as c_int,
+                kv_heads as c_int,
+                head_dim as c_int,
+                page_size as c_int,
+                page_table_len as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_write_paged_kv_cache_batched_positions")
     }
 
     pub fn launch_copy_paged_kv_cache_prefix_batched(
@@ -1836,6 +1965,99 @@ mod native {
             )
         })?;
         check_last_error("hi_cuda_launch_tiled_paged_decode_attention_batched")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_paged_decode_attention_batched_positions(
+        q: &DeviceBuffer,
+        k_pages: &DeviceBuffer,
+        v_pages: &DeviceBuffer,
+        page_table: &DeviceBuffer,
+        positions: &DeviceBuffer,
+        output: &DeviceBuffer,
+        batch_count: usize,
+        page_size: usize,
+        page_table_len: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        v_head_dim: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(batch_count, "paged_attention positions batch_count")?;
+        ensure_len(page_size, "paged_attention positions page_size")?;
+        ensure_len(page_table_len, "paged_attention positions page_table_len")?;
+        ensure_len(heads, "paged_attention positions heads")?;
+        ensure_len(kv_heads, "paged_attention positions kv_heads")?;
+        ensure_len(head_dim, "paged_attention positions head_dim")?;
+        ensure_len(v_head_dim, "paged_attention positions v_head_dim")?;
+        launch_status(unsafe {
+            hi_cuda_launch_paged_decode_attention_batched_positions(
+                q.as_ptr(),
+                k_pages.as_ptr(),
+                v_pages.as_ptr(),
+                page_table.as_ptr(),
+                positions.as_ptr(),
+                output.as_mut_ptr(),
+                batch_count as c_int,
+                page_size as c_int,
+                page_table_len as c_int,
+                heads as c_int,
+                kv_heads as c_int,
+                head_dim as c_int,
+                v_head_dim as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_paged_decode_attention_batched_positions")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_tiled_paged_decode_attention_batched_positions(
+        q: &DeviceBuffer,
+        k_pages: &DeviceBuffer,
+        v_pages: &DeviceBuffer,
+        page_table: &DeviceBuffer,
+        positions: &DeviceBuffer,
+        output: &DeviceBuffer,
+        batch_count: usize,
+        page_size: usize,
+        page_table_len: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        v_head_dim: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(batch_count, "tiled_paged_attention positions batch_count")?;
+        ensure_len(page_size, "tiled_paged_attention positions page_size")?;
+        ensure_len(
+            page_table_len,
+            "tiled_paged_attention positions page_table_len",
+        )?;
+        ensure_len(heads, "tiled_paged_attention positions heads")?;
+        ensure_len(kv_heads, "tiled_paged_attention positions kv_heads")?;
+        ensure_len(head_dim, "tiled_paged_attention positions head_dim")?;
+        ensure_len(v_head_dim, "tiled_paged_attention positions v_head_dim")?;
+        launch_status(unsafe {
+            hi_cuda_launch_tiled_paged_decode_attention_batched_positions(
+                q.as_ptr(),
+                k_pages.as_ptr(),
+                v_pages.as_ptr(),
+                page_table.as_ptr(),
+                positions.as_ptr(),
+                output.as_mut_ptr(),
+                batch_count as c_int,
+                page_size as c_int,
+                page_table_len as c_int,
+                heads as c_int,
+                kv_heads as c_int,
+                head_dim as c_int,
+                v_head_dim as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_tiled_paged_decode_attention_batched_positions")
     }
 
     pub fn launch_cached_decode_attention_batched(

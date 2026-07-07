@@ -53,7 +53,7 @@ pub struct CudaVisionEncoderInfo {
 
 #[cfg(feature = "native-cuda")]
 mod native {
-    use std::cell::RefCell;
+    use std::cell::{RefCell, RefMut};
     use std::collections::{BTreeMap, BTreeSet};
     use std::fmt;
 
@@ -360,7 +360,54 @@ mod native {
         matrices: BTreeMap<String, GpuMatrix>,
         vectors: BTreeMap<String, GpuVector>,
         paged_batch_pool: RefCell<Option<CudaPagedBatchDevicePool>>,
-        recurrent_page_contexts: RefCell<BTreeMap<usize, Vec<u32>>>,
+        recurrent_page_states: RefCell<BTreeMap<usize, RecurrentSsmRequestState>>,
+    }
+
+    #[derive(Clone)]
+    struct RecurrentSsmRequestState {
+        page_key: usize,
+        tokens: Vec<u32>,
+        seq_len: usize,
+        layers: BTreeMap<usize, RecurrentSsmLayerState>,
+    }
+
+    #[derive(Clone)]
+    struct RecurrentSsmLayerState {
+        conv_ring: Vec<f32>,
+        conv_next: usize,
+        conv_len: usize,
+        recurrent: Vec<f32>,
+    }
+
+    impl RecurrentSsmRequestState {
+        fn new(page_key: usize) -> Self {
+            Self {
+                page_key,
+                tokens: Vec::new(),
+                seq_len: 0,
+                layers: BTreeMap::new(),
+            }
+        }
+    }
+
+    impl RecurrentSsmLayerState {
+        fn new(ssm: &QwenSsmDims) -> Result<Self> {
+            let conv_len = ssm
+                .conv_kernel
+                .checked_mul(ssm.conv_dim)
+                .context("CUDA recurrent SSM convolution state size overflows usize")?;
+            let recurrent_len = ssm
+                .time_step_rank
+                .checked_mul(ssm.state_size)
+                .and_then(|value| value.checked_mul(ssm.head_v_dim))
+                .context("CUDA recurrent SSM matrix state size overflows usize")?;
+            Ok(Self {
+                conv_ring: vec![0.0; conv_len],
+                conv_next: 0,
+                conv_len: 0,
+                recurrent: vec![0.0; recurrent_len],
+            })
+        }
     }
 
     pub struct CudaMmprojProjector {
@@ -2744,7 +2791,7 @@ mod native {
                 matrices,
                 vectors,
                 paged_batch_pool: RefCell::new(None),
-                recurrent_page_contexts: RefCell::new(BTreeMap::new()),
+                recurrent_page_states: RefCell::new(BTreeMap::new()),
             })
         }
 
@@ -5518,7 +5565,9 @@ mod native {
                 )?;
                 self.remember_recurrent_page_contexts(
                     inputs,
+                    page_size,
                     page_tables,
+                    physical_page_count,
                     "CUDA continuous paged greedy decode",
                 )?;
                 return self.recurrent_ssm_greedy_next_tokens_full_context(inputs);
@@ -5555,7 +5604,9 @@ mod native {
                 )?;
                 self.remember_recurrent_page_contexts(
                     inputs,
+                    page_size,
                     page_tables,
+                    physical_page_count,
                     "CUDA continuous paged sampled decode",
                 )?;
                 return self.recurrent_ssm_sampled_next_tokens_full_context(
@@ -5601,7 +5652,9 @@ mod native {
                 )?;
                 self.remember_recurrent_page_contexts(
                     inputs,
+                    page_size,
                     page_tables,
+                    physical_page_count,
                     "CUDA continuous paged greedy prefill",
                 )?;
                 return self.recurrent_ssm_greedy_next_tokens_full_context(inputs);
@@ -5638,7 +5691,9 @@ mod native {
                 )?;
                 self.remember_recurrent_page_contexts(
                     inputs,
+                    page_size,
                     page_tables,
+                    physical_page_count,
                     "CUDA continuous paged sampled prefill",
                 )?;
                 return self.recurrent_ssm_sampled_next_tokens_full_context(
@@ -5676,15 +5731,15 @@ mod native {
             physical_page_count: usize,
         ) -> Result<Vec<u32>> {
             if self.config.recurrent_ssm_tensor_layout {
-                let inputs = self.recurrent_ssm_append_decode_contexts(
+                return self.recurrent_ssm_decode_next_tokens_from_states(
                     token_ids,
                     position,
                     page_size,
                     page_tables,
                     physical_page_count,
                     "CUDA continuous paged greedy append decode",
-                )?;
-                return self.recurrent_ssm_greedy_next_tokens_full_context(&inputs);
+                    |model, logits, _| model.argmax_last_row(logits),
+                );
             }
             let logits = self.decode_logits_batch_paged_with_page_tables(
                 token_ids,
@@ -5711,20 +5766,29 @@ mod native {
             physical_page_count: usize,
         ) -> Result<Vec<u32>> {
             if self.config.recurrent_ssm_tensor_layout {
-                let inputs = self.recurrent_ssm_append_decode_contexts(
+                if samples.len() != token_ids.len() {
+                    bail!(
+                        "CUDA continuous paged sampled append decode got {} random samples for {} requests",
+                        samples.len(),
+                        token_ids.len()
+                    );
+                }
+                return self.recurrent_ssm_decode_next_tokens_from_states(
                     token_ids,
                     position,
                     page_size,
                     page_tables,
                     physical_page_count,
                     "CUDA continuous paged sampled append decode",
-                )?;
-                return self.recurrent_ssm_sampled_next_tokens_full_context(
-                    &inputs,
-                    temperature,
-                    top_p,
-                    top_k,
-                    samples,
+                    |model, logits, idx| {
+                        model.sample_last_row_with_sample(
+                            logits,
+                            temperature,
+                            top_p,
+                            top_k,
+                            samples[idx],
+                        )
+                    },
                 );
             }
             let logits = self.decode_logits_batch_paged_with_page_tables(
@@ -6036,10 +6100,43 @@ mod native {
             })
         }
 
+        fn recurrent_ssm_attention_layer_count(&self) -> usize {
+            (0..self.config.block_count)
+                .filter(|layer| {
+                    let prefix = format!("blk.{layer}");
+                    !self.layer_uses_recurrent_ssm(&prefix)
+                })
+                .count()
+        }
+
+        fn recurrent_ssm_prepare_paged_pool(
+            &self,
+            dims: &QwenDims,
+            page_size: usize,
+            physical_page_count: usize,
+        ) -> Result<RefMut<'_, Option<CudaPagedBatchDevicePool>>> {
+            let mut pool_slot = self.paged_batch_pool.borrow_mut();
+            let recreate_pool = pool_slot
+                .as_ref()
+                .is_none_or(|pool| !pool.can_cover(dims, page_size, physical_page_count));
+            if recreate_pool {
+                *pool_slot = Some(CudaPagedBatchDevicePool::new(
+                    self.config.block_count,
+                    dims,
+                    page_size,
+                    physical_page_count,
+                    &self.stream,
+                )?);
+            }
+            Ok(pool_slot)
+        }
+
         fn remember_recurrent_page_contexts(
             &self,
             inputs: &[Vec<u32>],
+            page_size: usize,
             page_tables: &[Vec<usize>],
+            physical_page_count: usize,
             label: &str,
         ) -> Result<()> {
             if page_tables.len() != inputs.len() {
@@ -6049,15 +6146,76 @@ mod native {
                     inputs.len()
                 );
             }
-            let mut contexts = self.recurrent_page_contexts.borrow_mut();
-            for (input, page_table) in inputs.iter().zip(page_tables) {
+            let dims = self.qwen_dims()?;
+            let attention_layers = self.recurrent_ssm_attention_layer_count();
+            let pool_guard = if attention_layers > 0 {
+                let token_capacity = inputs.iter().map(Vec::len).max().unwrap_or(0).max(1);
+                Some(self.recurrent_ssm_prepare_paged_pool(
+                    &dims,
+                    page_size,
+                    physical_page_count,
+                )?)
+                .map(|guard| (guard, token_capacity))
+            } else {
+                None
+            };
+            let mut prepared = Vec::with_capacity(inputs.len());
+            for (idx, (input, page_table)) in inputs.iter().zip(page_tables).enumerate() {
                 let key = self.recurrent_page_context_key(label, page_table)?;
-                contexts.insert(key, input.clone());
+                let mut state = RecurrentSsmRequestState::new(key);
+                if let Some((pool_guard, token_capacity)) = pool_guard.as_ref() {
+                    let request_page_tables = [page_table.clone()];
+                    let mut cache = CudaPagedBatchKvCache::new_with_page_tables_from_pool(
+                        &dims,
+                        1,
+                        page_size,
+                        *token_capacity,
+                        &request_page_tables,
+                        pool_guard.as_ref().ok_or_else(|| {
+                            anyhow!("{label} recurrent SSM paged pool is missing")
+                        })?,
+                        &self.stream,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "{label} building recurrent SSM attention KV cache for request {idx}"
+                        )
+                    })?;
+                    self.prefill_recurrent_ssm_state(input, &mut state, Some(&mut cache), label)?;
+                } else {
+                    self.prefill_recurrent_ssm_state(input, &mut state, None, label)?;
+                }
+                prepared.push((key, state));
+            }
+            drop(pool_guard);
+            let mut states = self.recurrent_page_states.borrow_mut();
+            for (key, state) in prepared {
+                states.insert(key, state);
             }
             Ok(())
         }
 
-        fn recurrent_ssm_append_decode_contexts(
+        pub fn forget_recurrent_page_contexts(
+            &self,
+            page_tables: &[Vec<usize>],
+            label: &str,
+        ) -> Result<usize> {
+            let mut states = self.recurrent_page_states.borrow_mut();
+            let mut removed = 0usize;
+            for page_table in page_tables {
+                let key = self.recurrent_page_context_key(label, page_table)?;
+                if states.remove(&key).is_some() {
+                    removed = removed.saturating_add(1);
+                }
+            }
+            Ok(removed)
+        }
+
+        pub fn recurrent_page_context_count(&self) -> usize {
+            self.recurrent_page_states.borrow().len()
+        }
+
+        fn recurrent_ssm_decode_next_tokens_from_states<F>(
             &self,
             token_ids: &[u32],
             position: usize,
@@ -6065,7 +6223,11 @@ mod native {
             page_tables: &[Vec<usize>],
             physical_page_count: usize,
             label: &str,
-        ) -> Result<Vec<Vec<u32>>> {
+            mut select: F,
+        ) -> Result<Vec<u32>>
+        where
+            F: FnMut(&Self, &GpuF32Tensor, usize) -> Result<u32>,
+        {
             let dims = self.qwen_dims()?;
             let batch_count = token_ids.len();
             if batch_count == 0 {
@@ -6096,27 +6258,94 @@ mod native {
                 dims.context,
             )?;
 
-            let mut contexts = self.recurrent_page_contexts.borrow_mut();
-            let mut decoded_contexts = Vec::with_capacity(batch_count);
-            for (idx, (token_id, page_table)) in
-                token_ids.iter().copied().zip(page_tables).enumerate()
-            {
+            let mut keys = Vec::with_capacity(batch_count);
+            let mut seen = BTreeSet::new();
+            for (idx, page_table) in page_tables.iter().enumerate() {
                 let key = self.recurrent_page_context_key(label, page_table)?;
-                let context = contexts.get_mut(&key).ok_or_else(|| {
+                if !seen.insert(key) {
+                    bail!("{label} got duplicate recurrent page ownership key {key}");
+                }
+                keys.push((idx, key));
+            }
+
+            let mut decoded_states = Vec::with_capacity(batch_count);
+            {
+                let states = self.recurrent_page_states.borrow();
+                for (idx, key) in keys.iter().copied() {
+                    let state = states.get(&key).cloned().ok_or_else(|| {
                     anyhow!(
-                        "{label} requires a recorded recurrent context for request {idx}; call prefill/next-token with the same page table before append decode"
+                        "{label} requires a persistent recurrent state for request {idx}; call prefill/next-token with the same page table before append decode"
                     )
-                })?;
-                if context.len() != position {
+                    })?;
+                    decoded_states.push((idx, key, state));
+                }
+            }
+
+            let attention_layers = self.recurrent_ssm_attention_layer_count();
+            let pool_guard = if attention_layers > 0 {
+                Some(self.recurrent_ssm_prepare_paged_pool(
+                    &dims,
+                    page_size,
+                    physical_page_count,
+                )?)
+            } else {
+                None
+            };
+            let mut tokens = Vec::with_capacity(batch_count);
+            for (idx, key, state) in &mut decoded_states {
+                if state.page_key != *key {
                     bail!(
-                        "{label} recurrent context for request {idx} has length {}; expected decode position {position}",
-                        context.len()
+                        "{label} recurrent state for request {idx} is owned by page key {}, expected {key}",
+                        state.page_key
                     );
                 }
-                context.push(token_id);
-                decoded_contexts.push(context.clone());
+                if state.seq_len != position {
+                    bail!(
+                        "{label} recurrent state for request {idx} has length {}; expected decode position {position}",
+                        state.seq_len
+                    );
+                }
+                let logits = if let Some(pool_guard) = pool_guard.as_ref() {
+                    let request_page_tables = [page_tables[*idx].clone()];
+                    let mut cache = CudaPagedBatchKvCache::new_with_page_tables_from_pool(
+                        &dims,
+                        1,
+                        page_size,
+                        token_capacity,
+                        &request_page_tables,
+                        pool_guard.as_ref().ok_or_else(|| {
+                            anyhow!("{label} recurrent SSM paged pool is missing")
+                        })?,
+                        &self.stream,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "{label} reopening recurrent SSM attention KV cache for request {idx}"
+                        )
+                    })?;
+                    self.recurrent_ssm_decode_one_logits_with_state(
+                        token_ids[*idx],
+                        state,
+                        Some(&mut cache),
+                        label,
+                    )?
+                } else {
+                    self.recurrent_ssm_decode_one_logits_with_state(
+                        token_ids[*idx],
+                        state,
+                        None,
+                        label,
+                    )?
+                };
+                tokens.push(select(self, &logits, *idx)?);
             }
-            Ok(decoded_contexts)
+
+            drop(pool_guard);
+            let mut states = self.recurrent_page_states.borrow_mut();
+            for (_, key, state) in decoded_states {
+                states.insert(key, state);
+            }
+            Ok(tokens)
         }
 
         fn recurrent_ssm_greedy_next_tokens_full_context(
@@ -7229,6 +7458,458 @@ mod native {
             )
         }
 
+        #[allow(clippy::too_many_arguments)]
+        pub fn generate_greedy_tokens_batch_with_prefix_embeddings_ragged_paged_page_tables_and_limits_and_cancellation<
+            F,
+        >(
+            &self,
+            prefix_embeddings_per_request: &[Vec<f32>],
+            prefix_rows_per_request: &[usize],
+            inputs: &[Vec<u32>],
+            max_tokens_per_request: &[usize],
+            eos_token_id: Option<u32>,
+            page_size: usize,
+            page_tables: &[Vec<usize>],
+            physical_page_count: usize,
+            stop_token_sequences_per_request: &[Vec<Vec<u32>>],
+            mut is_cancelled: F,
+        ) -> Result<Vec<Vec<u32>>>
+        where
+            F: FnMut(usize) -> bool,
+        {
+            if inputs.is_empty() {
+                bail!(
+                    "CUDA lease-backed paged ragged multimodal greedy generation requires at least one request"
+                );
+            }
+            if !self.supports_batched_multimodal_generation() {
+                bail!(
+                    "CUDA lease-backed paged ragged multimodal greedy generation currently supports batched text-compatible decoder model layouts only"
+                );
+            }
+            let dims = self.qwen_dims()?;
+            let batch_count = inputs.len();
+            validate_batched_stop_token_sequences(
+                "CUDA lease-backed paged ragged multimodal greedy generation",
+                stop_token_sequences_per_request,
+                batch_count,
+            )?;
+            if page_tables.len() != batch_count
+                || prefix_embeddings_per_request.len() != batch_count
+                || prefix_rows_per_request.len() != batch_count
+                || max_tokens_per_request.len() != batch_count
+            {
+                bail!(
+                    "CUDA lease-backed paged ragged multimodal greedy generation got mismatched batch metadata for {batch_count} request(s)"
+                );
+            }
+            if max_tokens_per_request.iter().any(|limit| *limit == 0) {
+                bail!(
+                    "CUDA lease-backed paged ragged multimodal greedy generation requires positive token limits"
+                );
+            }
+
+            let mut prompt_lens = Vec::with_capacity(batch_count);
+            let mut token_capacity = 0usize;
+            for (((input, prefix_embeddings), prefix_rows), max_tokens) in inputs
+                .iter()
+                .zip(prefix_embeddings_per_request)
+                .zip(prefix_rows_per_request)
+                .zip(max_tokens_per_request)
+            {
+                if input.is_empty() {
+                    bail!(
+                        "CUDA lease-backed paged ragged multimodal greedy generation requires non-empty prompts"
+                    );
+                }
+                self.validate_prefix_embeddings(prefix_embeddings, *prefix_rows, dims.embed)?;
+                let prompt_len = prefix_rows.checked_add(input.len()).context(
+                    "CUDA lease-backed paged ragged multimodal prompt length overflows usize",
+                )?;
+                validate_batched_generation_context_budget(
+                    "CUDA lease-backed paged ragged multimodal greedy generation",
+                    prompt_len,
+                    *max_tokens,
+                    dims.context,
+                )?;
+                prompt_lens.push(prompt_len);
+                token_capacity = token_capacity.max(prompt_len.checked_add(*max_tokens).context(
+                    "CUDA lease-backed paged ragged multimodal greedy token capacity overflows usize",
+                )?);
+            }
+            if token_capacity == 0 || token_capacity > dims.context {
+                bail!(
+                    "CUDA lease-backed paged ragged multimodal token capacity {token_capacity} exceeds qwen context length {}",
+                    dims.context
+                );
+            }
+            let max_decode_steps = max_tokens_per_request.iter().copied().max().unwrap_or(1);
+
+            let mut pool_slot = self.paged_batch_pool.borrow_mut();
+            let recreate_pool = pool_slot
+                .as_ref()
+                .is_none_or(|pool| !pool.can_cover(&dims, page_size, physical_page_count));
+            if recreate_pool {
+                *pool_slot = Some(CudaPagedBatchDevicePool::new(
+                    self.config.block_count,
+                    &dims,
+                    page_size,
+                    physical_page_count,
+                    &self.stream,
+                )?);
+            }
+            let pool = pool_slot
+                .as_ref()
+                .ok_or_else(|| anyhow!("CUDA paged batch device pool was not initialized"))?;
+            pool.zero(&self.stream)?;
+
+            let mut initial_logits = Vec::with_capacity(batch_count);
+            for idx in 0..batch_count {
+                let token_embeddings = self.embed_tokens_device(&inputs[idx])?.copy_to_host()?;
+                let prompt_len = prompt_lens[idx];
+                let total_values = prompt_len.checked_mul(dims.embed).context(
+                    "CUDA lease-backed paged ragged multimodal hidden value count overflows usize",
+                )?;
+                let mut hidden_host = Vec::with_capacity(total_values);
+                hidden_host.extend_from_slice(&prefix_embeddings_per_request[idx]);
+                hidden_host.extend_from_slice(&token_embeddings);
+                if hidden_host.len() != total_values {
+                    bail!(
+                        "CUDA lease-backed paged ragged multimodal hidden build produced {} values; expected {total_values}",
+                        hidden_host.len()
+                    );
+                }
+                let hidden = self.f32_tensor_from_host(
+                    &hidden_host,
+                    prompt_len,
+                    dims.embed,
+                    "CUDA lease-backed paged ragged multimodal prompt embeddings",
+                )?;
+                let request_page_tables = [page_tables[idx].clone()];
+                let mut prefill_cache = CudaPagedBatchKvCache::new_with_page_tables_from_pool(
+                    &dims,
+                    1,
+                    page_size,
+                    token_capacity,
+                    &request_page_tables,
+                    pool,
+                    &self.stream,
+                )?;
+                initial_logits.push(
+                    self.full_context_logits_from_hidden_device_batched_paged_cache(
+                        hidden,
+                        1,
+                        prompt_len,
+                        &mut prefill_cache,
+                    )?,
+                );
+            }
+
+            let mut cache = CudaPagedBatchKvCache::new_with_page_tables_from_pool(
+                &dims,
+                batch_count,
+                page_size,
+                token_capacity,
+                page_tables,
+                pool,
+                &self.stream,
+            )?;
+            let mut generated = vec![Vec::new(); batch_count];
+            let mut active = vec![true; batch_count];
+            let mut next_positions = prompt_lens;
+            let mut logits: Option<GpuF32Tensor> = None;
+
+            for step in 0..max_decode_steps {
+                if !retain_uncancelled_batch_rows(&mut active, &mut is_cancelled) {
+                    break;
+                }
+                let batch_tokens = if step == 0 {
+                    let mut tokens = Vec::with_capacity(batch_count);
+                    for logits in &initial_logits {
+                        tokens.push(self.argmax_last_row(logits)?);
+                    }
+                    tokens
+                } else {
+                    let logits = logits
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("CUDA ragged multimodal decode logits missing"))?;
+                    self.argmax_batched_last_token(logits, batch_count, 1)?
+                };
+                let mut any_active = false;
+                for (idx, token) in batch_tokens.iter().copied().enumerate() {
+                    if !active[idx] {
+                        continue;
+                    }
+                    generated[idx].push(token);
+                    if is_row_stop_sequence(
+                        token,
+                        &generated[idx],
+                        eos_token_id,
+                        stop_token_sequences_per_request,
+                        idx,
+                    ) || generated[idx].len() >= max_tokens_per_request[idx]
+                    {
+                        active[idx] = false;
+                    }
+                    any_active |= active[idx];
+                }
+                if !any_active || step + 1 == max_decode_steps {
+                    break;
+                }
+                let mut next_tokens = batch_tokens;
+                for (idx, active) in active.iter().copied().enumerate() {
+                    if !active {
+                        next_tokens[idx] = eos_token_id.unwrap_or(next_tokens[idx]);
+                    }
+                }
+                let decoded = self.decode_batch_logits_paged_device_with_positions(
+                    &next_tokens,
+                    &next_positions,
+                    &mut cache,
+                )?;
+                for (idx, active) in active.iter().copied().enumerate() {
+                    if active {
+                        next_positions[idx] = next_positions[idx]
+                            .checked_add(1)
+                            .context("CUDA ragged multimodal decode position overflows usize")?;
+                    }
+                }
+                logits = Some(decoded);
+            }
+
+            Ok(generated)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn generate_greedy_tokens_batch_with_prompt_embeddings_positions_ragged_paged_page_tables_and_limits_and_cancellation<
+            F,
+        >(
+            &self,
+            prompt_embeddings_per_request: &[Vec<f32>],
+            prompt_rows_per_request: &[usize],
+            position_ids_per_request: &[Vec<[u32; 3]>],
+            next_rope_positions: &[usize],
+            max_tokens_per_request: &[usize],
+            eos_token_id: Option<u32>,
+            page_size: usize,
+            page_tables: &[Vec<usize>],
+            physical_page_count: usize,
+            stop_token_sequences_per_request: &[Vec<Vec<u32>>],
+            mut is_cancelled: F,
+        ) -> Result<Vec<Vec<u32>>>
+        where
+            F: FnMut(usize) -> bool,
+        {
+            if prompt_embeddings_per_request.is_empty() {
+                bail!(
+                    "CUDA lease-backed paged ragged multimodal MRoPE greedy generation requires at least one request"
+                );
+            }
+            if !self.supports_batched_multimodal_generation() {
+                bail!(
+                    "CUDA lease-backed paged ragged multimodal MRoPE greedy generation currently supports batched text-compatible decoder model layouts only"
+                );
+            }
+            let dims = self.qwen_dims()?;
+            let batch_count = prompt_embeddings_per_request.len();
+            validate_batched_stop_token_sequences(
+                "CUDA lease-backed paged ragged multimodal MRoPE greedy generation",
+                stop_token_sequences_per_request,
+                batch_count,
+            )?;
+            if page_tables.len() != batch_count
+                || prompt_rows_per_request.len() != batch_count
+                || position_ids_per_request.len() != batch_count
+                || next_rope_positions.len() != batch_count
+                || max_tokens_per_request.len() != batch_count
+            {
+                bail!(
+                    "CUDA lease-backed paged ragged multimodal MRoPE greedy generation got mismatched batch metadata for {batch_count} request(s)"
+                );
+            }
+            if max_tokens_per_request.iter().any(|limit| *limit == 0) {
+                bail!(
+                    "CUDA lease-backed paged ragged multimodal MRoPE greedy generation requires positive token limits"
+                );
+            }
+
+            let mut prompt_lens = Vec::with_capacity(batch_count);
+            let mut token_capacity = 0usize;
+            for (((embeddings, prompt_rows), position_ids), max_tokens) in
+                prompt_embeddings_per_request
+                    .iter()
+                    .zip(prompt_rows_per_request)
+                    .zip(position_ids_per_request)
+                    .zip(max_tokens_per_request)
+            {
+                if *prompt_rows == 0 {
+                    bail!(
+                        "CUDA lease-backed paged ragged multimodal MRoPE greedy generation requires non-empty prompts"
+                    );
+                }
+                self.validate_prompt_embeddings(embeddings, *prompt_rows, dims.embed)?;
+                if position_ids.len() != *prompt_rows {
+                    bail!(
+                        "CUDA lease-backed paged ragged multimodal MRoPE greedy generation got {} position row(s); expected {prompt_rows}",
+                        position_ids.len()
+                    );
+                }
+                validate_batched_generation_context_budget(
+                    "CUDA lease-backed paged ragged multimodal MRoPE greedy generation",
+                    *prompt_rows,
+                    *max_tokens,
+                    dims.context,
+                )?;
+                prompt_lens.push(*prompt_rows);
+                token_capacity = token_capacity.max(prompt_rows.checked_add(*max_tokens).context(
+                    "CUDA lease-backed paged ragged multimodal MRoPE greedy token capacity overflows usize",
+                )?);
+            }
+            for next_rope_position in next_rope_positions {
+                if *next_rope_position > dims.context {
+                    bail!(
+                        "multimodal next RoPE position {next_rope_position} exceeds qwen context length {}",
+                        dims.context
+                    );
+                }
+            }
+            if token_capacity == 0 || token_capacity > dims.context {
+                bail!(
+                    "CUDA lease-backed paged ragged multimodal MRoPE token capacity {token_capacity} exceeds qwen context length {}",
+                    dims.context
+                );
+            }
+            let max_decode_steps = max_tokens_per_request.iter().copied().max().unwrap_or(1);
+
+            let mut pool_slot = self.paged_batch_pool.borrow_mut();
+            let recreate_pool = pool_slot
+                .as_ref()
+                .is_none_or(|pool| !pool.can_cover(&dims, page_size, physical_page_count));
+            if recreate_pool {
+                *pool_slot = Some(CudaPagedBatchDevicePool::new(
+                    self.config.block_count,
+                    &dims,
+                    page_size,
+                    physical_page_count,
+                    &self.stream,
+                )?);
+            }
+            let pool = pool_slot
+                .as_ref()
+                .ok_or_else(|| anyhow!("CUDA paged batch device pool was not initialized"))?;
+            pool.zero(&self.stream)?;
+
+            let mut initial_logits = Vec::with_capacity(batch_count);
+            for idx in 0..batch_count {
+                let hidden = self.f32_tensor_from_host(
+                    &prompt_embeddings_per_request[idx],
+                    prompt_lens[idx],
+                    dims.embed,
+                    "CUDA lease-backed paged ragged multimodal MRoPE prompt embeddings",
+                )?;
+                let request_page_tables = [page_tables[idx].clone()];
+                let mut prefill_cache = CudaPagedBatchKvCache::new_with_page_tables_from_pool(
+                    &dims,
+                    1,
+                    page_size,
+                    token_capacity,
+                    &request_page_tables,
+                    pool,
+                    &self.stream,
+                )?;
+                initial_logits.push(
+                    self.full_context_logits_from_hidden_device_batched_paged_cache_with_position_ids(
+                        hidden,
+                        1,
+                        prompt_lens[idx],
+                        &position_ids_per_request[idx],
+                        &mut prefill_cache,
+                    )?,
+                );
+            }
+
+            let mut cache = CudaPagedBatchKvCache::new_with_page_tables_from_pool(
+                &dims,
+                batch_count,
+                page_size,
+                token_capacity,
+                page_tables,
+                pool,
+                &self.stream,
+            )?;
+            let mut generated = vec![Vec::new(); batch_count];
+            let mut active = vec![true; batch_count];
+            let mut next_cache_positions = prompt_lens;
+            let mut next_rope_positions = next_rope_positions.to_vec();
+            let mut logits: Option<GpuF32Tensor> = None;
+
+            for step in 0..max_decode_steps {
+                if !retain_uncancelled_batch_rows(&mut active, &mut is_cancelled) {
+                    break;
+                }
+                let batch_tokens = if step == 0 {
+                    let mut tokens = Vec::with_capacity(batch_count);
+                    for logits in &initial_logits {
+                        tokens.push(self.argmax_last_row(logits)?);
+                    }
+                    tokens
+                } else {
+                    let logits = logits.as_ref().ok_or_else(|| {
+                        anyhow!("CUDA ragged multimodal MRoPE decode logits missing")
+                    })?;
+                    self.argmax_batched_last_token(logits, batch_count, 1)?
+                };
+                let mut any_active = false;
+                for (idx, token) in batch_tokens.iter().copied().enumerate() {
+                    if !active[idx] {
+                        continue;
+                    }
+                    generated[idx].push(token);
+                    if is_row_stop_sequence(
+                        token,
+                        &generated[idx],
+                        eos_token_id,
+                        stop_token_sequences_per_request,
+                        idx,
+                    ) || generated[idx].len() >= max_tokens_per_request[idx]
+                    {
+                        active[idx] = false;
+                    }
+                    any_active |= active[idx];
+                }
+                if !any_active || step + 1 == max_decode_steps {
+                    break;
+                }
+                let mut next_tokens = batch_tokens;
+                for (idx, active) in active.iter().copied().enumerate() {
+                    if !active {
+                        next_tokens[idx] = eos_token_id.unwrap_or(next_tokens[idx]);
+                    }
+                }
+                let decoded = self
+                    .decode_batch_logits_paged_device_with_cache_and_mrope_positions(
+                        &next_tokens,
+                        &next_cache_positions,
+                        &next_rope_positions,
+                        &mut cache,
+                    )?;
+                for (idx, active) in active.iter().copied().enumerate() {
+                    if active {
+                        next_cache_positions[idx] =
+                            next_cache_positions[idx].checked_add(1).context(
+                                "CUDA ragged multimodal MRoPE decode position overflows usize",
+                            )?;
+                        next_rope_positions[idx] = next_rope_positions[idx]
+                            .checked_add(1)
+                            .context("next MRoPE decode position overflows usize")?;
+                    }
+                }
+                logits = Some(decoded);
+            }
+
+            Ok(generated)
+        }
+
         #[cfg(feature = "native-cuda")]
         #[allow(clippy::too_many_arguments)]
         pub fn generate_greedy_tokens_batch_with_prompt_embeddings_positions_paged_page_tables_and_limits_and_cancellation<
@@ -7556,6 +8237,510 @@ mod native {
                     self.decode_batch_logits_paged_device(next_tokens, next_position, &mut cache)
                 },
             )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn generate_sampled_tokens_batch_with_prefix_embeddings_ragged_paged_page_tables_and_limits_and_cancellation<
+            F,
+        >(
+            &self,
+            prefix_embeddings_per_request: &[Vec<f32>],
+            prefix_rows_per_request: &[usize],
+            inputs: &[Vec<u32>],
+            max_tokens_per_request: &[usize],
+            eos_token_id: Option<u32>,
+            temperature: f32,
+            top_p: f32,
+            top_k: Option<u32>,
+            seeds: &[Option<u64>],
+            page_size: usize,
+            page_tables: &[Vec<usize>],
+            physical_page_count: usize,
+            stop_token_sequences_per_request: &[Vec<Vec<u32>>],
+            mut is_cancelled: F,
+        ) -> Result<Vec<Vec<u32>>>
+        where
+            F: FnMut(usize) -> bool,
+        {
+            if inputs.is_empty() {
+                bail!(
+                    "CUDA lease-backed paged ragged multimodal sampled generation requires at least one request"
+                );
+            }
+            if !self.supports_batched_multimodal_generation() {
+                bail!(
+                    "CUDA lease-backed paged ragged multimodal sampled generation currently supports batched text-compatible decoder model layouts only"
+                );
+            }
+            let dims = self.qwen_dims()?;
+            let batch_count = inputs.len();
+            validate_batched_stop_token_sequences(
+                "CUDA lease-backed paged ragged multimodal sampled generation",
+                stop_token_sequences_per_request,
+                batch_count,
+            )?;
+            if page_tables.len() != batch_count
+                || prefix_embeddings_per_request.len() != batch_count
+                || prefix_rows_per_request.len() != batch_count
+                || max_tokens_per_request.len() != batch_count
+                || seeds.len() != batch_count
+            {
+                bail!(
+                    "CUDA lease-backed paged ragged multimodal sampled generation got mismatched batch metadata for {batch_count} request(s)"
+                );
+            }
+            if max_tokens_per_request.iter().any(|limit| *limit == 0) {
+                bail!(
+                    "CUDA lease-backed paged ragged multimodal sampled generation requires positive token limits"
+                );
+            }
+
+            let mut prompt_lens = Vec::with_capacity(batch_count);
+            let mut token_capacity = 0usize;
+            for (((input, prefix_embeddings), prefix_rows), max_tokens) in inputs
+                .iter()
+                .zip(prefix_embeddings_per_request)
+                .zip(prefix_rows_per_request)
+                .zip(max_tokens_per_request)
+            {
+                if input.is_empty() {
+                    bail!(
+                        "CUDA lease-backed paged ragged multimodal sampled generation requires non-empty prompts"
+                    );
+                }
+                self.validate_prefix_embeddings(prefix_embeddings, *prefix_rows, dims.embed)?;
+                let prompt_len = prefix_rows.checked_add(input.len()).context(
+                    "CUDA lease-backed paged ragged multimodal prompt length overflows usize",
+                )?;
+                validate_batched_generation_context_budget(
+                    "CUDA lease-backed paged ragged multimodal sampled generation",
+                    prompt_len,
+                    *max_tokens,
+                    dims.context,
+                )?;
+                prompt_lens.push(prompt_len);
+                token_capacity = token_capacity.max(prompt_len.checked_add(*max_tokens).context(
+                    "CUDA lease-backed paged ragged multimodal sampled token capacity overflows usize",
+                )?);
+            }
+            if token_capacity == 0 || token_capacity > dims.context {
+                bail!(
+                    "CUDA lease-backed paged ragged multimodal token capacity {token_capacity} exceeds qwen context length {}",
+                    dims.context
+                );
+            }
+            let max_decode_steps = max_tokens_per_request.iter().copied().max().unwrap_or(1);
+            let mut rngs = per_request_sample_rngs(seeds);
+
+            let mut pool_slot = self.paged_batch_pool.borrow_mut();
+            let recreate_pool = pool_slot
+                .as_ref()
+                .is_none_or(|pool| !pool.can_cover(&dims, page_size, physical_page_count));
+            if recreate_pool {
+                *pool_slot = Some(CudaPagedBatchDevicePool::new(
+                    self.config.block_count,
+                    &dims,
+                    page_size,
+                    physical_page_count,
+                    &self.stream,
+                )?);
+            }
+            let pool = pool_slot
+                .as_ref()
+                .ok_or_else(|| anyhow!("CUDA paged batch device pool was not initialized"))?;
+            pool.zero(&self.stream)?;
+
+            let mut initial_logits = Vec::with_capacity(batch_count);
+            for idx in 0..batch_count {
+                let token_embeddings = self.embed_tokens_device(&inputs[idx])?.copy_to_host()?;
+                let prompt_len = prompt_lens[idx];
+                let total_values = prompt_len.checked_mul(dims.embed).context(
+                    "CUDA lease-backed paged ragged multimodal hidden value count overflows usize",
+                )?;
+                let mut hidden_host = Vec::with_capacity(total_values);
+                hidden_host.extend_from_slice(&prefix_embeddings_per_request[idx]);
+                hidden_host.extend_from_slice(&token_embeddings);
+                if hidden_host.len() != total_values {
+                    bail!(
+                        "CUDA lease-backed paged ragged multimodal hidden build produced {} values; expected {total_values}",
+                        hidden_host.len()
+                    );
+                }
+                let hidden = self.f32_tensor_from_host(
+                    &hidden_host,
+                    prompt_len,
+                    dims.embed,
+                    "CUDA lease-backed paged ragged multimodal prompt embeddings",
+                )?;
+                let request_page_tables = [page_tables[idx].clone()];
+                let mut prefill_cache = CudaPagedBatchKvCache::new_with_page_tables_from_pool(
+                    &dims,
+                    1,
+                    page_size,
+                    token_capacity,
+                    &request_page_tables,
+                    pool,
+                    &self.stream,
+                )?;
+                initial_logits.push(
+                    self.full_context_logits_from_hidden_device_batched_paged_cache(
+                        hidden,
+                        1,
+                        prompt_len,
+                        &mut prefill_cache,
+                    )?,
+                );
+            }
+
+            let mut cache = CudaPagedBatchKvCache::new_with_page_tables_from_pool(
+                &dims,
+                batch_count,
+                page_size,
+                token_capacity,
+                page_tables,
+                pool,
+                &self.stream,
+            )?;
+            let mut generated = vec![Vec::new(); batch_count];
+            let mut active = vec![true; batch_count];
+            let mut next_positions = prompt_lens;
+            let mut logits: Option<GpuF32Tensor> = None;
+
+            for step in 0..max_decode_steps {
+                if !retain_uncancelled_batch_rows(&mut active, &mut is_cancelled) {
+                    break;
+                }
+                let batch_tokens = if step == 0 {
+                    let mut tokens = vec![eos_token_id.unwrap_or(0); batch_count];
+                    for idx in 0..batch_count {
+                        if active[idx] {
+                            tokens[idx] = self.sample_last_row(
+                                &initial_logits[idx],
+                                temperature,
+                                top_p,
+                                top_k,
+                                &mut rngs[idx],
+                            )?;
+                        }
+                    }
+                    tokens
+                } else {
+                    let logits = logits
+                        .as_ref()
+                        .ok_or_else(|| anyhow!("CUDA ragged multimodal decode logits missing"))?;
+                    let samples = rngs
+                        .iter_mut()
+                        .map(|rng| rng.gen_range(0.0f32..1.0f32))
+                        .collect::<Vec<_>>();
+                    self.sample_batched_last_token(
+                        logits,
+                        batch_count,
+                        1,
+                        temperature,
+                        top_p,
+                        top_k,
+                        &samples,
+                    )?
+                };
+                let mut any_active = false;
+                for (idx, token) in batch_tokens.iter().copied().enumerate() {
+                    if !active[idx] {
+                        continue;
+                    }
+                    generated[idx].push(token);
+                    if is_row_stop_sequence(
+                        token,
+                        &generated[idx],
+                        eos_token_id,
+                        stop_token_sequences_per_request,
+                        idx,
+                    ) || generated[idx].len() >= max_tokens_per_request[idx]
+                    {
+                        active[idx] = false;
+                    }
+                    any_active |= active[idx];
+                }
+                if !any_active || step + 1 == max_decode_steps {
+                    break;
+                }
+                let mut next_tokens = batch_tokens;
+                for (idx, active) in active.iter().copied().enumerate() {
+                    if !active {
+                        next_tokens[idx] = eos_token_id.unwrap_or(next_tokens[idx]);
+                    }
+                }
+                let decoded = self.decode_batch_logits_paged_device_with_positions(
+                    &next_tokens,
+                    &next_positions,
+                    &mut cache,
+                )?;
+                for (idx, active) in active.iter().copied().enumerate() {
+                    if active {
+                        next_positions[idx] = next_positions[idx]
+                            .checked_add(1)
+                            .context("CUDA ragged multimodal decode position overflows usize")?;
+                    }
+                }
+                logits = Some(decoded);
+            }
+
+            Ok(generated)
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn generate_sampled_tokens_batch_with_prompt_embeddings_positions_ragged_paged_page_tables_and_limits_and_cancellation<
+            F,
+        >(
+            &self,
+            prompt_embeddings_per_request: &[Vec<f32>],
+            prompt_rows_per_request: &[usize],
+            position_ids_per_request: &[Vec<[u32; 3]>],
+            next_rope_positions: &[usize],
+            max_tokens_per_request: &[usize],
+            eos_token_id: Option<u32>,
+            temperature: f32,
+            top_p: f32,
+            top_k: Option<u32>,
+            seeds: &[Option<u64>],
+            page_size: usize,
+            page_tables: &[Vec<usize>],
+            physical_page_count: usize,
+            stop_token_sequences_per_request: &[Vec<Vec<u32>>],
+            mut is_cancelled: F,
+        ) -> Result<Vec<Vec<u32>>>
+        where
+            F: FnMut(usize) -> bool,
+        {
+            if prompt_embeddings_per_request.is_empty() {
+                bail!(
+                    "CUDA lease-backed paged ragged multimodal MRoPE sampled generation requires at least one request"
+                );
+            }
+            if !self.supports_batched_multimodal_generation() {
+                bail!(
+                    "CUDA lease-backed paged ragged multimodal MRoPE sampled generation currently supports batched text-compatible decoder model layouts only"
+                );
+            }
+            let dims = self.qwen_dims()?;
+            let batch_count = prompt_embeddings_per_request.len();
+            validate_batched_stop_token_sequences(
+                "CUDA lease-backed paged ragged multimodal MRoPE sampled generation",
+                stop_token_sequences_per_request,
+                batch_count,
+            )?;
+            if page_tables.len() != batch_count
+                || prompt_rows_per_request.len() != batch_count
+                || position_ids_per_request.len() != batch_count
+                || next_rope_positions.len() != batch_count
+                || max_tokens_per_request.len() != batch_count
+                || seeds.len() != batch_count
+            {
+                bail!(
+                    "CUDA lease-backed paged ragged multimodal MRoPE sampled generation got mismatched batch metadata for {batch_count} request(s)"
+                );
+            }
+            if max_tokens_per_request.iter().any(|limit| *limit == 0) {
+                bail!(
+                    "CUDA lease-backed paged ragged multimodal MRoPE sampled generation requires positive token limits"
+                );
+            }
+
+            let mut prompt_lens = Vec::with_capacity(batch_count);
+            let mut token_capacity = 0usize;
+            for (((embeddings, prompt_rows), position_ids), max_tokens) in
+                prompt_embeddings_per_request
+                    .iter()
+                    .zip(prompt_rows_per_request)
+                    .zip(position_ids_per_request)
+                    .zip(max_tokens_per_request)
+            {
+                if *prompt_rows == 0 {
+                    bail!(
+                        "CUDA lease-backed paged ragged multimodal MRoPE sampled generation requires non-empty prompts"
+                    );
+                }
+                self.validate_prompt_embeddings(embeddings, *prompt_rows, dims.embed)?;
+                if position_ids.len() != *prompt_rows {
+                    bail!(
+                        "CUDA lease-backed paged ragged multimodal MRoPE sampled generation got {} position row(s); expected {prompt_rows}",
+                        position_ids.len()
+                    );
+                }
+                validate_batched_generation_context_budget(
+                    "CUDA lease-backed paged ragged multimodal MRoPE sampled generation",
+                    *prompt_rows,
+                    *max_tokens,
+                    dims.context,
+                )?;
+                prompt_lens.push(*prompt_rows);
+                token_capacity = token_capacity.max(prompt_rows.checked_add(*max_tokens).context(
+                    "CUDA lease-backed paged ragged multimodal MRoPE sampled token capacity overflows usize",
+                )?);
+            }
+            for next_rope_position in next_rope_positions {
+                if *next_rope_position > dims.context {
+                    bail!(
+                        "multimodal next RoPE position {next_rope_position} exceeds qwen context length {}",
+                        dims.context
+                    );
+                }
+            }
+            if token_capacity == 0 || token_capacity > dims.context {
+                bail!(
+                    "CUDA lease-backed paged ragged multimodal MRoPE token capacity {token_capacity} exceeds qwen context length {}",
+                    dims.context
+                );
+            }
+            let max_decode_steps = max_tokens_per_request.iter().copied().max().unwrap_or(1);
+            let mut rngs = per_request_sample_rngs(seeds);
+
+            let mut pool_slot = self.paged_batch_pool.borrow_mut();
+            let recreate_pool = pool_slot
+                .as_ref()
+                .is_none_or(|pool| !pool.can_cover(&dims, page_size, physical_page_count));
+            if recreate_pool {
+                *pool_slot = Some(CudaPagedBatchDevicePool::new(
+                    self.config.block_count,
+                    &dims,
+                    page_size,
+                    physical_page_count,
+                    &self.stream,
+                )?);
+            }
+            let pool = pool_slot
+                .as_ref()
+                .ok_or_else(|| anyhow!("CUDA paged batch device pool was not initialized"))?;
+            pool.zero(&self.stream)?;
+
+            let mut initial_logits = Vec::with_capacity(batch_count);
+            for idx in 0..batch_count {
+                let hidden = self.f32_tensor_from_host(
+                    &prompt_embeddings_per_request[idx],
+                    prompt_lens[idx],
+                    dims.embed,
+                    "CUDA lease-backed paged ragged multimodal MRoPE prompt embeddings",
+                )?;
+                let request_page_tables = [page_tables[idx].clone()];
+                let mut prefill_cache = CudaPagedBatchKvCache::new_with_page_tables_from_pool(
+                    &dims,
+                    1,
+                    page_size,
+                    token_capacity,
+                    &request_page_tables,
+                    pool,
+                    &self.stream,
+                )?;
+                initial_logits.push(
+                    self.full_context_logits_from_hidden_device_batched_paged_cache_with_position_ids(
+                        hidden,
+                        1,
+                        prompt_lens[idx],
+                        &position_ids_per_request[idx],
+                        &mut prefill_cache,
+                    )?,
+                );
+            }
+
+            let mut cache = CudaPagedBatchKvCache::new_with_page_tables_from_pool(
+                &dims,
+                batch_count,
+                page_size,
+                token_capacity,
+                page_tables,
+                pool,
+                &self.stream,
+            )?;
+            let mut generated = vec![Vec::new(); batch_count];
+            let mut active = vec![true; batch_count];
+            let mut next_cache_positions = prompt_lens;
+            let mut next_rope_positions = next_rope_positions.to_vec();
+            let mut logits: Option<GpuF32Tensor> = None;
+
+            for step in 0..max_decode_steps {
+                if !retain_uncancelled_batch_rows(&mut active, &mut is_cancelled) {
+                    break;
+                }
+                let batch_tokens = if step == 0 {
+                    let mut tokens = vec![eos_token_id.unwrap_or(0); batch_count];
+                    for idx in 0..batch_count {
+                        if active[idx] {
+                            tokens[idx] = self.sample_last_row(
+                                &initial_logits[idx],
+                                temperature,
+                                top_p,
+                                top_k,
+                                &mut rngs[idx],
+                            )?;
+                        }
+                    }
+                    tokens
+                } else {
+                    let logits = logits.as_ref().ok_or_else(|| {
+                        anyhow!("CUDA ragged multimodal MRoPE decode logits missing")
+                    })?;
+                    let samples = rngs
+                        .iter_mut()
+                        .map(|rng| rng.gen_range(0.0f32..1.0f32))
+                        .collect::<Vec<_>>();
+                    self.sample_batched_last_token(
+                        logits,
+                        batch_count,
+                        1,
+                        temperature,
+                        top_p,
+                        top_k,
+                        &samples,
+                    )?
+                };
+                let mut any_active = false;
+                for (idx, token) in batch_tokens.iter().copied().enumerate() {
+                    if !active[idx] {
+                        continue;
+                    }
+                    generated[idx].push(token);
+                    if is_row_stop_sequence(
+                        token,
+                        &generated[idx],
+                        eos_token_id,
+                        stop_token_sequences_per_request,
+                        idx,
+                    ) || generated[idx].len() >= max_tokens_per_request[idx]
+                    {
+                        active[idx] = false;
+                    }
+                    any_active |= active[idx];
+                }
+                if !any_active || step + 1 == max_decode_steps {
+                    break;
+                }
+                let mut next_tokens = batch_tokens;
+                for (idx, active) in active.iter().copied().enumerate() {
+                    if !active {
+                        next_tokens[idx] = eos_token_id.unwrap_or(next_tokens[idx]);
+                    }
+                }
+                let decoded = self
+                    .decode_batch_logits_paged_device_with_cache_and_mrope_positions(
+                        &next_tokens,
+                        &next_cache_positions,
+                        &next_rope_positions,
+                        &mut cache,
+                    )?;
+                for (idx, active) in active.iter().copied().enumerate() {
+                    if active {
+                        next_cache_positions[idx] =
+                            next_cache_positions[idx].checked_add(1).context(
+                                "CUDA ragged multimodal MRoPE decode position overflows usize",
+                            )?;
+                        next_rope_positions[idx] = next_rope_positions[idx]
+                            .checked_add(1)
+                            .context("next MRoPE decode position overflows usize")?;
+                    }
+                }
+                logits = Some(decoded);
+            }
+
+            Ok(generated)
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -11529,6 +12714,185 @@ mod native {
             self.output_logits_f32_device(&normed)
         }
 
+        fn decode_batch_logits_paged_device_with_cache_and_mrope_positions(
+            &self,
+            token_ids: &[u32],
+            cache_positions: &[usize],
+            rope_positions: &[usize],
+            cache: &mut CudaPagedBatchKvCache,
+        ) -> Result<GpuF32Tensor> {
+            let dims = self.qwen_dims()?;
+            let batch_count = token_ids.len();
+            if batch_count == 0 {
+                bail!("CUDA paged ragged MRoPE decode requires at least one token");
+            }
+            if cache_positions.len() != batch_count || rope_positions.len() != batch_count {
+                bail!(
+                    "CUDA paged ragged MRoPE decode got {} cache position(s) and {} RoPE position(s) for {batch_count} token(s)",
+                    cache_positions.len(),
+                    rope_positions.len()
+                );
+            }
+            let cache_max_seq = cache.layer(0)?.max_seq;
+            let mut cache_positions_u32 = Vec::with_capacity(batch_count);
+            let mut position_ids = Vec::with_capacity(batch_count);
+            for (cache_position, rope_position) in cache_positions.iter().zip(rope_positions) {
+                if *cache_position >= dims.context {
+                    bail!(
+                        "decode position {cache_position} exceeds qwen context length {}",
+                        dims.context
+                    );
+                }
+                if *cache_position >= cache_max_seq {
+                    bail!(
+                        "decode position {cache_position} exceeds paged KV cache sequence capacity {cache_max_seq}"
+                    );
+                }
+                if *rope_position > dims.context {
+                    bail!(
+                        "decode RoPE position {rope_position} exceeds qwen context length {}",
+                        dims.context
+                    );
+                }
+                cache_positions_u32.push(
+                    u32::try_from(*cache_position)
+                        .context("CUDA paged ragged MRoPE cache position does not fit u32")?,
+                );
+                let rope_position = u32::try_from(*rope_position)
+                    .context("CUDA paged ragged MRoPE decode position does not fit u32")?;
+                position_ids.push([rope_position, rope_position, rope_position]);
+            }
+            let position_bytes = cache_positions_u32
+                .len()
+                .checked_mul(std::mem::size_of::<u32>())
+                .context("CUDA paged ragged MRoPE cache position byte count overflows usize")?;
+            let cache_positions_device = DeviceBuffer::alloc(position_bytes)
+                .context("allocating CUDA paged ragged MRoPE cache positions")?;
+            cache_positions_device
+                .copy_from_host(&cache_positions_u32)
+                .context("copying CUDA paged ragged MRoPE cache positions")?;
+            let mrope_positions = self.mrope_positions_device(&position_ids, batch_count)?;
+            let mrope_head_dim = if self.config.attention_mla_tensor_layout {
+                qwen_mla_dims(&self.config)?
+                    .map(|mla| mla.qk_rope_head_dim)
+                    .unwrap_or(dims.head_dim)
+            } else {
+                dims.head_dim
+            };
+            let mrope_sections = self.mrope_sections(mrope_head_dim)?.ok_or_else(|| {
+                anyhow!(
+                    "CUDA paged ragged MRoPE decode requires GGUF rope.dimension_sections metadata"
+                )
+            })?;
+
+            let mut hidden = self.embed_tokens_device(token_ids)?;
+            let eps = self.config.rms_norm_eps.unwrap_or(1.0e-6);
+            let rope_base = self
+                .config
+                .rope_freq_base
+                .unwrap_or_else(|| self.config.default_rope_freq_base());
+            let rope_scale = self.config.rope_freq_scale.unwrap_or(1.0);
+
+            for layer in 0..self.config.block_count {
+                let layer_idx =
+                    usize::try_from(layer).context("qwen layer index does not fit usize")?;
+                let prefix = format!("blk.{layer}");
+                self.ensure_layer_runtime_supported(&prefix)?;
+                let attn_input =
+                    self.rms_norm_f32_device(&format!("{prefix}.attn_norm.weight"), &hidden, eps)?;
+
+                let (q, k, v, gate) = if self.layer_uses_mla_attention(&prefix) {
+                    self.attention_qkv_f32_device(
+                        &prefix,
+                        &attn_input,
+                        &dims,
+                        eps,
+                        rope_base,
+                        rope_scale,
+                        QwenRopeLayout::Mrope {
+                            positions: &mrope_positions,
+                            sections: mrope_sections,
+                        },
+                    )?
+                } else {
+                    let (q, gate) =
+                        self.dense_attention_q_f32_device(&prefix, &attn_input, &dims, eps)?;
+                    self.apply_mrope_f32_device(
+                        &q,
+                        &mrope_positions,
+                        dims.heads,
+                        dims.head_dim,
+                        rope_base,
+                        rope_scale,
+                        mrope_sections,
+                        true,
+                    )?;
+
+                    let k =
+                        self.project_f32_device(&format!("{prefix}.attn_k.weight"), &attn_input)?;
+                    let k =
+                        self.add_optional_rowwise_f32_device(k, &format!("{prefix}.attn_k.bias"))?;
+                    let k = self.optional_head_rms_norm_f32_device(
+                        k,
+                        &format!("{prefix}.attn_k_norm.weight"),
+                        batch_count,
+                        dims.kv_heads,
+                        dims.head_dim,
+                        eps,
+                    )?;
+                    self.apply_mrope_f32_device(
+                        &k,
+                        &mrope_positions,
+                        dims.kv_heads,
+                        dims.head_dim,
+                        rope_base,
+                        rope_scale,
+                        mrope_sections,
+                        true,
+                    )?;
+
+                    let v =
+                        self.project_f32_device(&format!("{prefix}.attn_v.weight"), &attn_input)?;
+                    let v =
+                        self.add_optional_rowwise_f32_device(v, &format!("{prefix}.attn_v.bias"))?;
+                    (q, k, v, gate)
+                };
+                cache.write_layer_batched_positions(
+                    layer_idx,
+                    &k,
+                    &v,
+                    batch_count,
+                    1,
+                    &cache_positions_device,
+                    dims.kv_heads,
+                    dims.head_dim,
+                    dims.v_head_dim,
+                    &self.stream,
+                )?;
+                let attn = self.paged_decode_attention_batched_positions_f32_device(
+                    &q,
+                    cache.layer(layer_idx)?,
+                    &cache_positions_device,
+                    batch_count,
+                    dims.heads,
+                    dims.kv_heads,
+                    dims.head_dim,
+                    dims.v_head_dim,
+                )?;
+                let attn_out =
+                    self.attention_output_projection_f32_device(&prefix, &attn, gate.as_ref())?;
+                hidden = self.add_f32_device(&hidden, &attn_out)?;
+
+                let mlp_input =
+                    self.rms_norm_f32_device(&format!("{prefix}.ffn_norm.weight"), &hidden, eps)?;
+                let mlp_out = self.ffn_f32_device(&prefix, &mlp_input)?;
+                hidden = self.add_f32_device(&hidden, &mlp_out)?;
+            }
+
+            let normed = self.rms_norm_f32_device("output_norm.weight", &hidden, eps)?;
+            self.output_logits_f32_device(&normed)
+        }
+
         fn decode_batch_logits_paged_device(
             &self,
             token_ids: &[u32],
@@ -11592,6 +12956,118 @@ mod native {
                     cache.layer(layer_idx)?,
                     batch_count,
                     position,
+                    dims.heads,
+                    dims.kv_heads,
+                    dims.head_dim,
+                    dims.v_head_dim,
+                )?;
+                let attn_out =
+                    self.attention_output_projection_f32_device(&prefix, &attn, gate.as_ref())?;
+                hidden = self.add_f32_device(&hidden, &attn_out)?;
+
+                let mlp_input =
+                    self.rms_norm_f32_device(&format!("{prefix}.ffn_norm.weight"), &hidden, eps)?;
+                let mlp_out = self.ffn_f32_device(&prefix, &mlp_input)?;
+                hidden = self.add_f32_device(&hidden, &mlp_out)?;
+            }
+
+            let normed = self.rms_norm_f32_device("output_norm.weight", &hidden, eps)?;
+            self.output_logits_f32_device(&normed)
+        }
+
+        fn decode_batch_logits_paged_device_with_positions(
+            &self,
+            token_ids: &[u32],
+            positions: &[usize],
+            cache: &mut CudaPagedBatchKvCache,
+        ) -> Result<GpuF32Tensor> {
+            let dims = self.qwen_dims()?;
+            let batch_count = token_ids.len();
+            if batch_count == 0 {
+                bail!("CUDA paged ragged batched decode requires at least one token");
+            }
+            if positions.len() != batch_count {
+                bail!(
+                    "CUDA paged ragged batched decode got {} positions for {batch_count} token(s)",
+                    positions.len()
+                );
+            }
+            let cache_max_seq = cache.layer(0)?.max_seq;
+            let mut positions_u32 = Vec::with_capacity(batch_count);
+            for position in positions {
+                if *position >= dims.context {
+                    bail!(
+                        "decode position {position} exceeds qwen context length {}",
+                        dims.context
+                    );
+                }
+                if *position >= cache_max_seq {
+                    bail!(
+                        "decode position {position} exceeds paged KV cache sequence capacity {cache_max_seq}"
+                    );
+                }
+                positions_u32.push(
+                    u32::try_from(*position)
+                        .context("CUDA paged ragged decode position does not fit u32")?,
+                );
+            }
+            let position_bytes = positions_u32
+                .len()
+                .checked_mul(std::mem::size_of::<u32>())
+                .context("CUDA paged ragged decode position byte count overflows usize")?;
+            let positions_device = DeviceBuffer::alloc(position_bytes)
+                .context("allocating CUDA paged ragged decode positions")?;
+            positions_device
+                .copy_from_host(&positions_u32)
+                .context("copying CUDA paged ragged decode positions")?;
+
+            let mut hidden = self.embed_tokens_device(token_ids)?;
+            let eps = self.config.rms_norm_eps.unwrap_or(1.0e-6);
+            let rope_base = self
+                .config
+                .rope_freq_base
+                .unwrap_or_else(|| self.config.default_rope_freq_base());
+            let rope_scale = self.config.rope_freq_scale.unwrap_or(1.0);
+
+            for layer in 0..self.config.block_count {
+                let layer_idx =
+                    usize::try_from(layer).context("qwen layer index does not fit usize")?;
+                let prefix = format!("blk.{layer}");
+                self.ensure_layer_runtime_supported(&prefix)?;
+                let attn_input =
+                    self.rms_norm_f32_device(&format!("{prefix}.attn_norm.weight"), &hidden, eps)?;
+
+                let (q, k, v, gate) = self.attention_qkv_f32_device(
+                    &prefix,
+                    &attn_input,
+                    &dims,
+                    eps,
+                    rope_base,
+                    rope_scale,
+                    QwenRopeLayout::BatchedPositions {
+                        positions: &positions_device,
+                        host_positions: positions,
+                        batch_count,
+                        seq_len: 1,
+                    },
+                )?;
+                cache.write_layer_batched_positions(
+                    layer_idx,
+                    &k,
+                    &v,
+                    batch_count,
+                    1,
+                    &positions_device,
+                    dims.kv_heads,
+                    dims.head_dim,
+                    dims.v_head_dim,
+                    &self.stream,
+                )?;
+                let attn = self.paged_decode_attention_batched_positions_f32_device(
+                    &q,
+                    cache.layer(layer_idx)?,
+                    &positions_device,
+                    batch_count,
                     dims.heads,
                     dims.kv_heads,
                     dims.head_dim,
@@ -11745,6 +13221,22 @@ mod native {
                         position_offset,
                         true,
                     )?,
+                    QwenRopeLayout::BatchedPositions {
+                        positions,
+                        batch_count,
+                        seq_len,
+                        ..
+                    } => self.apply_rope_batched_positions_f32_device(
+                        &q,
+                        positions,
+                        batch_count,
+                        seq_len,
+                        dims.heads,
+                        dims.head_dim,
+                        rope_base,
+                        rope_scale,
+                        true,
+                    )?,
                     QwenRopeLayout::Mrope {
                         positions,
                         sections,
@@ -11798,6 +13290,22 @@ mod native {
                         rope_base,
                         rope_scale,
                         position_offset,
+                        true,
+                    )?,
+                    QwenRopeLayout::BatchedPositions {
+                        positions,
+                        batch_count,
+                        seq_len,
+                        ..
+                    } => self.apply_rope_batched_positions_f32_device(
+                        &k,
+                        positions,
+                        batch_count,
+                        seq_len,
+                        dims.kv_heads,
+                        dims.head_dim,
+                        rope_base,
+                        rope_scale,
                         true,
                     )?,
                     QwenRopeLayout::Mrope {
@@ -11934,6 +13442,244 @@ mod native {
                 "CUDA MLA v compose",
             )?;
             Ok((q, k, v, None))
+        }
+
+        fn prefill_recurrent_ssm_state(
+            &self,
+            input: &[u32],
+            state: &mut RecurrentSsmRequestState,
+            mut cache: Option<&mut CudaPagedBatchKvCache<'_>>,
+            label: &str,
+        ) -> Result<()> {
+            if input.is_empty() {
+                bail!("{label} requires non-empty recurrent SSM prompts");
+            }
+            if state.seq_len != 0 || !state.tokens.is_empty() || !state.layers.is_empty() {
+                bail!("{label} recurrent SSM state must be empty before prefill");
+            }
+            for token_id in input.iter().copied() {
+                let _ = self.recurrent_ssm_decode_one_logits_with_state(
+                    token_id,
+                    state,
+                    cache.as_deref_mut(),
+                    label,
+                )?;
+            }
+            Ok(())
+        }
+
+        fn recurrent_ssm_decode_one_logits_with_state(
+            &self,
+            token_id: u32,
+            state: &mut RecurrentSsmRequestState,
+            mut cache: Option<&mut CudaPagedBatchKvCache<'_>>,
+            label: &str,
+        ) -> Result<GpuF32Tensor> {
+            let dims = self.qwen_dims()?;
+            if state.seq_len >= dims.context {
+                bail!(
+                    "{label} recurrent SSM state length {} exceeds qwen context length {}",
+                    state.seq_len + 1,
+                    dims.context
+                );
+            }
+            let ssm = qwen_ssm_dims(&self.config)?
+                .ok_or_else(|| anyhow!("recurrent SSM tensor layout missing SSM metadata"))?;
+            let mut hidden = self.embed_tokens_device(&[token_id])?;
+            let eps = self.config.rms_norm_eps.unwrap_or(1.0e-6);
+            let rope_base = self
+                .config
+                .rope_freq_base
+                .unwrap_or_else(|| self.config.default_rope_freq_base());
+            let rope_scale = self.config.rope_freq_scale.unwrap_or(1.0);
+
+            for layer in 0..self.config.block_count {
+                let layer_idx =
+                    usize::try_from(layer).context("qwen layer index does not fit usize")?;
+                let prefix = format!("blk.{layer}");
+                let attn_input =
+                    self.rms_norm_f32_device(&format!("{prefix}.attn_norm.weight"), &hidden, eps)?;
+
+                if self.layer_uses_recurrent_ssm(&prefix) {
+                    if !state.layers.contains_key(&layer_idx) {
+                        state
+                            .layers
+                            .insert(layer_idx, RecurrentSsmLayerState::new(&ssm)?);
+                    }
+                    let layer_state = state
+                        .layers
+                        .get_mut(&layer_idx)
+                        .ok_or_else(|| anyhow!("{label} recurrent SSM layer state is missing"))?;
+                    let ssm_out =
+                        self.recurrent_ssm_step_f32_device(&prefix, &attn_input, eps, layer_state)?;
+                    hidden = self.add_f32_device(&hidden, &ssm_out)?;
+                } else {
+                    self.ensure_layer_runtime_supported(&prefix)?;
+                    let cache_position = state.seq_len;
+                    let cache = cache.as_deref_mut().ok_or_else(|| {
+                        anyhow!(
+                            "{label} persistent recurrent SSM decode requires paged KV state for attention layer {prefix}"
+                        )
+                    })?;
+                    let (q, k, v, gate) = self.attention_qkv_f32_device(
+                        &prefix,
+                        &attn_input,
+                        &dims,
+                        eps,
+                        rope_base,
+                        rope_scale,
+                        QwenRopeLayout::Single {
+                            seq_len: 1,
+                            position_offset: cache_position,
+                        },
+                    )?;
+                    cache.write_layer_batched(
+                        layer_idx,
+                        &k,
+                        &v,
+                        1,
+                        1,
+                        cache_position,
+                        dims.kv_heads,
+                        dims.head_dim,
+                        dims.v_head_dim,
+                        &self.stream,
+                    )?;
+                    let attn = self.paged_decode_attention_batched_f32_device(
+                        &q,
+                        cache.layer(layer_idx)?,
+                        1,
+                        cache_position,
+                        dims.heads,
+                        dims.kv_heads,
+                        dims.head_dim,
+                        dims.v_head_dim,
+                    )?;
+                    let attn_out =
+                        self.attention_output_projection_f32_device(&prefix, &attn, gate.as_ref())?;
+                    hidden = self.add_f32_device(&hidden, &attn_out)?;
+                }
+
+                let mlp_input =
+                    self.rms_norm_f32_device(&format!("{prefix}.ffn_norm.weight"), &hidden, eps)?;
+                let mlp_out = self.ffn_f32_device(&prefix, &mlp_input)?;
+                hidden = self.add_f32_device(&hidden, &mlp_out)?;
+            }
+
+            state.tokens.push(token_id);
+            state.seq_len = state.seq_len.saturating_add(1);
+            let normed = self.rms_norm_f32_device("output_norm.weight", &hidden, eps)?;
+            self.output_logits_f32_device(&normed)
+        }
+
+        fn recurrent_ssm_step_f32_device(
+            &self,
+            prefix: &str,
+            attn_input: &GpuF32Tensor,
+            eps: f32,
+            state: &mut RecurrentSsmLayerState,
+        ) -> Result<GpuF32Tensor> {
+            let dims = self.qwen_dims()?;
+            let ssm = qwen_ssm_dims(&self.config)?
+                .ok_or_else(|| anyhow!("recurrent SSM tensor layout missing SSM metadata"))?;
+            if attn_input.rows != 1 {
+                bail!(
+                    "CUDA recurrent SSM state update for {prefix} expects one row, got {}",
+                    attn_input.rows
+                );
+            }
+            if attn_input.cols != dims.embed {
+                bail!(
+                    "CUDA recurrent SSM input cols {} do not match embedding dim {} for {prefix}",
+                    attn_input.cols,
+                    dims.embed
+                );
+            }
+
+            let (mixed_qkv_host, z_host) = if self.has_matrix(&format!("{prefix}.ssm_in.weight")) {
+                let qkvz =
+                    self.project_f32_device(&format!("{prefix}.ssm_in.weight"), attn_input)?;
+                if qkvz.cols != ssm.qkvz_dim {
+                    bail!(
+                        "CUDA recurrent SSM projection {prefix}.ssm_in.weight produced {} columns; expected {}",
+                        qkvz.cols,
+                        ssm.qkvz_dim
+                    );
+                }
+                let qkvz_host = qkvz.copy_to_host()?;
+                split_qwen_ssm_qkvz_host(&qkvz_host, 1, &ssm)?
+            } else {
+                let qkv =
+                    self.project_f32_device(&format!("{prefix}.attn_qkv.weight"), attn_input)?;
+                if qkv.cols != ssm.conv_dim {
+                    bail!(
+                        "CUDA recurrent SSM projection {prefix}.attn_qkv.weight produced {} columns; expected {}",
+                        qkv.cols,
+                        ssm.conv_dim
+                    );
+                }
+                let gate =
+                    self.project_f32_device(&format!("{prefix}.attn_gate.weight"), attn_input)?;
+                if gate.cols != ssm.value_dim {
+                    bail!(
+                        "CUDA recurrent SSM projection {prefix}.attn_gate.weight produced {} columns; expected {}",
+                        gate.cols,
+                        ssm.value_dim
+                    );
+                }
+                (qkv.copy_to_host()?, gate.copy_to_host()?)
+            };
+
+            let conv_weight_name = format!("{prefix}.ssm_conv1d.weight");
+            let conv_weight = self.matrix_f32_host(&conv_weight_name)?;
+            let conv = qwen_ssm_depthwise_conv_step_host(
+                &mixed_qkv_host,
+                &conv_weight,
+                &ssm,
+                &conv_weight_name,
+                state,
+            )?;
+
+            let ba = self.project_f32_device(&format!("{prefix}.ssm_ba.weight"), attn_input)?;
+            if ba.cols != ssm.ba_dim {
+                bail!(
+                    "CUDA recurrent SSM projection {prefix}.ssm_ba.weight produced {} columns; expected {}",
+                    ba.cols,
+                    ssm.ba_dim
+                );
+            }
+            let ba_host = ba.copy_to_host()?;
+            let dt_bias = self
+                .vector(&format!("{prefix}.ssm_dt.bias"))
+                .ok_or_else(|| anyhow!("CUDA vector {prefix}.ssm_dt.bias is missing"))?
+                .copy_to_host_f32()?;
+            let a_log = self
+                .vector(&format!("{prefix}.ssm_a"))
+                .ok_or_else(|| anyhow!("CUDA vector {prefix}.ssm_a is missing"))?
+                .copy_to_host_f32()?;
+            let norm_weight = self
+                .vector(&format!("{prefix}.ssm_norm.weight"))
+                .ok_or_else(|| anyhow!("CUDA vector {prefix}.ssm_norm.weight is missing"))?
+                .copy_to_host_f32()?;
+
+            let core = qwen_ssm_gated_delta_step_host(
+                &conv,
+                &ba_host,
+                &dt_bias,
+                &a_log,
+                &ssm,
+                prefix,
+                &mut state.recurrent,
+            )?;
+            let normed =
+                qwen_ssm_gated_rms_norm_host(&core, &z_host, &norm_weight, 1, &ssm, eps, prefix)?;
+            let normed = self.f32_tensor_from_host(
+                &normed,
+                1,
+                ssm.value_dim,
+                "CUDA recurrent SSM state gated RMSNorm",
+            )?;
+            self.project_f32_device(&format!("{prefix}.ssm_out.weight"), &normed)
         }
 
         fn recurrent_ssm_f32_device(
@@ -12573,6 +14319,43 @@ mod native {
             self.stream.synchronize()
         }
 
+        #[allow(clippy::too_many_arguments)]
+        fn apply_rope_batched_positions_f32_device(
+            &self,
+            input: &GpuF32Tensor,
+            positions: &DeviceBuffer,
+            batch_count: usize,
+            seq_len: usize,
+            heads: usize,
+            head_dim: usize,
+            base: f32,
+            scale: f32,
+            split_half: bool,
+        ) -> Result<()> {
+            if input.rows != batch_count * seq_len || input.cols != heads * head_dim {
+                bail!(
+                    "CUDA batched positioned RoPE input shape {}x{} does not match expected {}x{}",
+                    input.rows,
+                    input.cols,
+                    batch_count * seq_len,
+                    heads * head_dim
+                );
+            }
+            crate::kernels::launch_rope_batched_positions(
+                &input.buffer,
+                positions,
+                batch_count,
+                seq_len,
+                heads,
+                head_dim,
+                base,
+                scale,
+                split_half,
+                &self.stream,
+            )?;
+            self.stream.synchronize()
+        }
+
         fn causal_attention_f32_device(
             &self,
             q: &GpuF32Tensor,
@@ -12889,6 +14672,81 @@ mod native {
                     &output,
                     batch_count,
                     position,
+                    cache.page_size,
+                    cache.page_table_len,
+                    heads,
+                    kv_heads,
+                    head_dim,
+                    v_head_dim,
+                    &self.stream,
+                )?;
+            }
+            self.stream.synchronize()?;
+            Ok(GpuF32Tensor {
+                rows: batch_count,
+                cols: heads * v_head_dim,
+                buffer: output,
+            })
+        }
+
+        fn paged_decode_attention_batched_positions_f32_device(
+            &self,
+            q: &GpuF32Tensor,
+            cache: &CudaPagedBatchLayerKvCache,
+            positions: &DeviceBuffer,
+            batch_count: usize,
+            heads: usize,
+            kv_heads: usize,
+            head_dim: usize,
+            v_head_dim: usize,
+        ) -> Result<GpuF32Tensor> {
+            if q.rows != batch_count || q.cols != heads * head_dim {
+                bail!(
+                    "CUDA paged batched positioned attention q shape {}x{} is invalid",
+                    q.rows,
+                    q.cols
+                );
+            }
+            if cache.batch_count != batch_count {
+                bail!(
+                    "CUDA paged batched positioned attention cache batch {} does not match q batch {batch_count}",
+                    cache.batch_count
+                );
+            }
+            let output_elements = batch_count
+                .checked_mul(heads)
+                .and_then(|value| value.checked_mul(v_head_dim))
+                .context(
+                    "CUDA paged batched positioned attention output element count overflows usize",
+                )?;
+            let output = DeviceBuffer::alloc(output_elements * std::mem::size_of::<f32>())
+                .context("allocating CUDA paged batched positioned attention output")?;
+            if head_dim <= FLASH_ONLINE_MAX_HEAD_DIM {
+                crate::kernels::launch_tiled_paged_decode_attention_batched_positions(
+                    &q.buffer,
+                    cache.key_pages.as_buffer(),
+                    cache.value_pages.as_buffer(),
+                    &cache.page_table,
+                    positions,
+                    &output,
+                    batch_count,
+                    cache.page_size,
+                    cache.page_table_len,
+                    heads,
+                    kv_heads,
+                    head_dim,
+                    v_head_dim,
+                    &self.stream,
+                )?;
+            } else {
+                crate::kernels::launch_paged_decode_attention_batched_positions(
+                    &q.buffer,
+                    cache.key_pages.as_buffer(),
+                    cache.value_pages.as_buffer(),
+                    &cache.page_table,
+                    positions,
+                    &output,
+                    batch_count,
                     cache.page_size,
                     cache.page_table_len,
                     heads,
@@ -13611,6 +15469,37 @@ mod native {
             )
         }
 
+        #[allow(clippy::too_many_arguments)]
+        fn write_layer_batched_positions(
+            &mut self,
+            idx: usize,
+            key: &GpuF32Tensor,
+            value: &GpuF32Tensor,
+            batch_count: usize,
+            row_count: usize,
+            positions: &DeviceBuffer,
+            kv_heads: usize,
+            head_dim: usize,
+            v_head_dim: usize,
+            stream: &Stream,
+        ) -> Result<()> {
+            let layer = self
+                .layers
+                .get_mut(idx)
+                .ok_or_else(|| anyhow!("CUDA paged batch KV cache layer {idx} is missing"))?;
+            layer.write_batched_positions(
+                key,
+                value,
+                batch_count,
+                row_count,
+                positions,
+                kv_heads,
+                head_dim,
+                v_head_dim,
+                stream,
+            )
+        }
+
         fn copy_prefix_from_first_batch(
             &self,
             token_count: usize,
@@ -13898,7 +15787,7 @@ mod native {
                 batch_count,
                 row_count,
                 kv_heads,
-                v_head_dim,
+                head_dim,
                 self.page_size,
                 self.page_table_len,
                 start_pos,
@@ -13911,10 +15800,83 @@ mod native {
                 batch_count,
                 row_count,
                 kv_heads,
-                head_dim,
+                v_head_dim,
                 self.page_size,
                 self.page_table_len,
                 start_pos,
+                stream,
+            )?;
+            stream.synchronize()
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn write_batched_positions(
+            &mut self,
+            key: &GpuF32Tensor,
+            value: &GpuF32Tensor,
+            batch_count: usize,
+            row_count: usize,
+            positions: &DeviceBuffer,
+            kv_heads: usize,
+            head_dim: usize,
+            v_head_dim: usize,
+            stream: &Stream,
+        ) -> Result<()> {
+            if key.rows != value.rows {
+                bail!(
+                    "CUDA paged batch positioned KV cache write row mismatch: key {}, value {}",
+                    key.rows,
+                    value.rows
+                );
+            }
+            if batch_count != self.batch_count {
+                bail!(
+                    "CUDA paged batch positioned KV cache write got batch {batch_count}; expected {}",
+                    self.batch_count
+                );
+            }
+            if key.rows != batch_count * row_count || key.cols != kv_heads * head_dim {
+                bail!(
+                    "CUDA paged batch positioned KV cache key tensor shape {}x{} does not match batch {batch_count} x rows {row_count} x kv shape {}x{}",
+                    key.rows,
+                    key.cols,
+                    kv_heads,
+                    head_dim
+                );
+            }
+            if value.rows != batch_count * row_count || value.cols != kv_heads * v_head_dim {
+                bail!(
+                    "CUDA paged batch positioned KV cache value tensor shape {}x{} does not match batch {batch_count} x rows {row_count} x kv shape {}x{}",
+                    value.rows,
+                    value.cols,
+                    kv_heads,
+                    v_head_dim
+                );
+            }
+            crate::kernels::launch_write_paged_kv_cache_batched_positions(
+                &key.buffer,
+                self.key_pages.as_buffer(),
+                &self.page_table,
+                positions,
+                batch_count,
+                row_count,
+                kv_heads,
+                head_dim,
+                self.page_size,
+                self.page_table_len,
+                stream,
+            )?;
+            crate::kernels::launch_write_paged_kv_cache_batched_positions(
+                &value.buffer,
+                self.value_pages.as_buffer(),
+                &self.page_table,
+                positions,
+                batch_count,
+                row_count,
+                kv_heads,
+                v_head_dim,
+                self.page_size,
+                self.page_table_len,
                 stream,
             )?;
             stream.synchronize()
@@ -13946,7 +15908,7 @@ mod native {
                 self.batch_count,
                 token_count,
                 kv_heads,
-                v_head_dim,
+                head_dim,
                 self.page_size,
                 self.page_table_len,
                 stream,
@@ -13957,7 +15919,7 @@ mod native {
                 self.batch_count,
                 token_count,
                 kv_heads,
-                head_dim,
+                v_head_dim,
                 self.page_size,
                 self.page_table_len,
                 stream,
@@ -14103,7 +16065,7 @@ mod native {
                 batch_count,
                 row_count,
                 kv_heads,
-                v_head_dim,
+                head_dim,
                 self.max_seq,
                 start_pos,
                 stream,
@@ -14114,7 +16076,7 @@ mod native {
                 batch_count,
                 row_count,
                 kv_heads,
-                head_dim,
+                v_head_dim,
                 self.max_seq,
                 start_pos,
                 stream,
@@ -14645,6 +16607,12 @@ mod native {
             seq_len: usize,
             position_offset: usize,
         },
+        BatchedPositions {
+            positions: &'a DeviceBuffer,
+            host_positions: &'a [usize],
+            batch_count: usize,
+            seq_len: usize,
+        },
         Mrope {
             positions: &'a MropePositionsDevice,
             sections: [usize; 4],
@@ -14656,6 +16624,11 @@ mod native {
             match self {
                 Self::Single { seq_len, .. } => seq_len,
                 Self::Batched {
+                    batch_count,
+                    seq_len,
+                    ..
+                } => batch_count * seq_len,
+                Self::BatchedPositions {
                     batch_count,
                     seq_len,
                     ..
@@ -14674,6 +16647,11 @@ mod native {
                     position_offset,
                     ..
                 } => position_offset + row % seq_len,
+                Self::BatchedPositions {
+                    host_positions,
+                    seq_len,
+                    ..
+                } => host_positions[row / seq_len] + row % seq_len,
                 Self::Mrope { positions, .. } => positions.host[row][0] as usize,
             }
         }
@@ -14948,6 +16926,76 @@ mod native {
         Ok(output)
     }
 
+    fn qwen_ssm_depthwise_conv_step_host(
+        mixed_qkv: &[f32],
+        conv_weight: &[f32],
+        ssm: &QwenSsmDims,
+        weight_name: &str,
+        state: &mut RecurrentSsmLayerState,
+    ) -> Result<Vec<f32>> {
+        if mixed_qkv.len() != ssm.conv_dim {
+            bail!(
+                "CUDA recurrent SSM streaming conv input has {} values; expected one row x {}",
+                mixed_qkv.len(),
+                ssm.conv_dim
+            );
+        }
+        let expected_weight = ssm
+            .conv_dim
+            .checked_mul(ssm.conv_kernel)
+            .context("CUDA recurrent SSM streaming conv weight element count overflows usize")?;
+        if conv_weight.len() != expected_weight {
+            bail!(
+                "CUDA recurrent SSM conv weight {weight_name} has {} values; expected {} x {} = {expected_weight}",
+                conv_weight.len(),
+                ssm.conv_dim,
+                ssm.conv_kernel
+            );
+        }
+        let expected_ring = ssm
+            .conv_kernel
+            .checked_mul(ssm.conv_dim)
+            .context("CUDA recurrent SSM streaming conv ring size overflows usize")?;
+        if state.conv_ring.len() != expected_ring {
+            bail!(
+                "CUDA recurrent SSM streaming conv ring has {} values; expected {expected_ring}",
+                state.conv_ring.len()
+            );
+        }
+        if state.conv_next >= ssm.conv_kernel {
+            bail!(
+                "CUDA recurrent SSM streaming conv write cursor {} exceeds kernel {}",
+                state.conv_next,
+                ssm.conv_kernel
+            );
+        }
+
+        let current_slot = state.conv_next;
+        let ring_row = current_slot
+            .checked_mul(ssm.conv_dim)
+            .context("CUDA recurrent SSM streaming conv ring row overflows usize")?;
+        state.conv_ring[ring_row..ring_row + ssm.conv_dim].copy_from_slice(mixed_qkv);
+        state.conv_len = state.conv_len.saturating_add(1).min(ssm.conv_kernel);
+
+        let mut output = vec![0.0; ssm.conv_dim];
+        for channel in 0..ssm.conv_dim {
+            let mut sum = 0.0f32;
+            for kernel in 0..ssm.conv_kernel {
+                let relative = ssm.conv_kernel - 1 - kernel;
+                if relative >= state.conv_len {
+                    continue;
+                }
+                let slot = (current_slot + ssm.conv_kernel - relative) % ssm.conv_kernel;
+                sum += conv_weight[channel * ssm.conv_kernel + kernel]
+                    * state.conv_ring[slot * ssm.conv_dim + channel];
+            }
+            output[channel] = silu_scalar(sum);
+        }
+
+        state.conv_next = (state.conv_next + 1) % ssm.conv_kernel;
+        Ok(output)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn qwen_ssm_gated_delta_host(
         conv: &[f32],
@@ -15067,6 +17115,125 @@ mod native {
                     }
                     output[v_start + value_dim] = sum;
                 }
+            }
+        }
+        Ok(output)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn qwen_ssm_gated_delta_step_host(
+        conv: &[f32],
+        mixed_ba: &[f32],
+        dt_bias: &[f32],
+        a_log: &[f32],
+        ssm: &QwenSsmDims,
+        prefix: &str,
+        state: &mut [f32],
+    ) -> Result<Vec<f32>> {
+        if conv.len() != ssm.conv_dim {
+            bail!(
+                "CUDA recurrent SSM streaming delta input for {prefix} has {} values; expected {}",
+                conv.len(),
+                ssm.conv_dim
+            );
+        }
+        if mixed_ba.len() != ssm.ba_dim {
+            bail!(
+                "CUDA recurrent SSM streaming ba input for {prefix} has {} values; expected {}",
+                mixed_ba.len(),
+                ssm.ba_dim
+            );
+        }
+        if dt_bias.len() != ssm.time_step_rank {
+            bail!(
+                "CUDA recurrent SSM {prefix}.ssm_dt.bias has length {}; expected {}",
+                dt_bias.len(),
+                ssm.time_step_rank
+            );
+        }
+        if a_log.len() != ssm.time_step_rank {
+            bail!(
+                "CUDA recurrent SSM {prefix}.ssm_a has length {}; expected {}",
+                a_log.len(),
+                ssm.time_step_rank
+            );
+        }
+        let expected_state = ssm
+            .time_step_rank
+            .checked_mul(ssm.state_size)
+            .and_then(|value| value.checked_mul(ssm.head_v_dim))
+            .context("CUDA recurrent SSM streaming state element count overflows usize")?;
+        if state.len() != expected_state {
+            bail!(
+                "CUDA recurrent SSM streaming state for {prefix} has {} values; expected {expected_state}",
+                state.len()
+            );
+        }
+
+        let mut query = vec![0.0; ssm.key_dim];
+        let mut key = vec![0.0; ssm.key_dim];
+        let mut value = vec![0.0; ssm.value_dim];
+        query.copy_from_slice(&conv[..ssm.key_dim]);
+        key.copy_from_slice(&conv[ssm.key_dim..2 * ssm.key_dim]);
+        value.copy_from_slice(&conv[2 * ssm.key_dim..ssm.conv_dim]);
+        for group in 0..ssm.group_count {
+            let start = group * ssm.state_size;
+            l2_normalize_host(&mut query[start..start + ssm.state_size]);
+            l2_normalize_host(&mut key[start..start + ssm.state_size]);
+        }
+
+        let repeat = ssm.time_step_rank / ssm.group_count;
+        let group_ba_dim = repeat
+            .checked_mul(2)
+            .context("CUDA recurrent SSM streaming grouped ba dimension overflows usize")?;
+        let q_scale = 1.0f32 / (ssm.state_size as f32).sqrt();
+        let mut output = vec![0.0; ssm.value_dim];
+        let mut kv_mem = vec![0.0; ssm.head_v_dim];
+        let mut delta = vec![0.0; ssm.head_v_dim];
+
+        for head in 0..ssm.time_step_rank {
+            let group = head / repeat;
+            let local_head = head % repeat;
+            let q_start = group * ssm.state_size;
+            let k_start = group * ssm.state_size;
+            let v_start = head * ssm.head_v_dim;
+            let ba_group = group * group_ba_dim;
+            let beta = sigmoid(mixed_ba[ba_group + local_head]);
+            let alpha = mixed_ba[ba_group + repeat + local_head];
+            let decay = (-a_log[head].exp() * softplus(alpha + dt_bias[head])).exp();
+            let state_start = head * ssm.state_size * ssm.head_v_dim;
+
+            for state_dim in 0..ssm.state_size {
+                for value_dim in 0..ssm.head_v_dim {
+                    state[state_start + state_dim * ssm.head_v_dim + value_dim] *= decay;
+                }
+            }
+            kv_mem.fill(0.0);
+            for state_dim in 0..ssm.state_size {
+                let key_value = key[k_start + state_dim];
+                for value_dim in 0..ssm.head_v_dim {
+                    kv_mem[value_dim] +=
+                        state[state_start + state_dim * ssm.head_v_dim + value_dim] * key_value;
+                }
+            }
+            for value_dim in 0..ssm.head_v_dim {
+                delta[value_dim] = (value[v_start + value_dim] - kv_mem[value_dim]) * beta;
+            }
+            for state_dim in 0..ssm.state_size {
+                let key_value = key[k_start + state_dim];
+                for value_dim in 0..ssm.head_v_dim {
+                    state[state_start + state_dim * ssm.head_v_dim + value_dim] +=
+                        key_value * delta[value_dim];
+                }
+            }
+            for value_dim in 0..ssm.head_v_dim {
+                let mut sum = 0.0f32;
+                for state_dim in 0..ssm.state_size {
+                    sum += state[state_start + state_dim * ssm.head_v_dim + value_dim]
+                        * query[q_start + state_dim]
+                        * q_scale;
+                }
+                output[v_start + value_dim] = sum;
             }
         }
         Ok(output)
@@ -17661,6 +19828,18 @@ mod non_native {
             &self.info
         }
 
+        pub fn forget_recurrent_page_contexts(
+            &self,
+            _page_tables: &[Vec<usize>],
+            _label: &str,
+        ) -> Result<usize> {
+            Ok(0)
+        }
+
+        pub fn recurrent_page_context_count(&self) -> usize {
+            0
+        }
+
         pub fn full_context_logits_host(&self, _token_ids: &[u32]) -> Result<Vec<f32>> {
             bail!("hi-cuda was built without native-cuda support; GPU Qwen forward is unavailable")
         }
@@ -18506,6 +20685,55 @@ mod non_native {
         }
 
         #[allow(clippy::too_many_arguments)]
+        pub fn generate_greedy_tokens_batch_with_prefix_embeddings_ragged_paged_page_tables_and_limits_and_cancellation<
+            F,
+        >(
+            &self,
+            _prefix_embeddings_per_request: &[Vec<f32>],
+            _prefix_rows_per_request: &[usize],
+            _inputs: &[Vec<u32>],
+            _max_tokens_per_request: &[usize],
+            _eos_token_id: Option<u32>,
+            _page_size: usize,
+            _page_tables: &[Vec<usize>],
+            _physical_page_count: usize,
+            _stop_token_sequences_per_request: &[Vec<Vec<u32>>],
+            _is_cancelled: F,
+        ) -> Result<Vec<Vec<u32>>>
+        where
+            F: FnMut(usize) -> bool,
+        {
+            bail!(
+                "hi-cuda was built without native-cuda support; GPU Qwen paged ragged multimodal generation is unavailable"
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn generate_greedy_tokens_batch_with_prompt_embeddings_positions_ragged_paged_page_tables_and_limits_and_cancellation<
+            F,
+        >(
+            &self,
+            _prompt_embeddings_per_request: &[Vec<f32>],
+            _prompt_rows_per_request: &[usize],
+            _position_ids_per_request: &[Vec<[u32; 3]>],
+            _next_rope_positions: &[usize],
+            _max_tokens_per_request: &[usize],
+            _eos_token_id: Option<u32>,
+            _page_size: usize,
+            _page_tables: &[Vec<usize>],
+            _physical_page_count: usize,
+            _stop_token_sequences_per_request: &[Vec<Vec<u32>>],
+            _is_cancelled: F,
+        ) -> Result<Vec<Vec<u32>>>
+        where
+            F: FnMut(usize) -> bool,
+        {
+            bail!(
+                "hi-cuda was built without native-cuda support; GPU Qwen paged ragged multimodal MRoPE generation is unavailable"
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
         pub fn generate_greedy_tokens_batch_with_prompt_embeddings_positions_paged_page_tables_and_limits_and_cancellation<
             F,
         >(
@@ -18555,6 +20783,63 @@ mod non_native {
         {
             bail!(
                 "hi-cuda was built without native-cuda support; GPU Qwen paged multimodal generation is unavailable"
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn generate_sampled_tokens_batch_with_prefix_embeddings_ragged_paged_page_tables_and_limits_and_cancellation<
+            F,
+        >(
+            &self,
+            _prefix_embeddings_per_request: &[Vec<f32>],
+            _prefix_rows_per_request: &[usize],
+            _inputs: &[Vec<u32>],
+            _max_tokens_per_request: &[usize],
+            _eos_token_id: Option<u32>,
+            _temperature: f32,
+            _top_p: f32,
+            _top_k: Option<u32>,
+            _seeds: &[Option<u64>],
+            _page_size: usize,
+            _page_tables: &[Vec<usize>],
+            _physical_page_count: usize,
+            _stop_token_sequences_per_request: &[Vec<Vec<u32>>],
+            _is_cancelled: F,
+        ) -> Result<Vec<Vec<u32>>>
+        where
+            F: FnMut(usize) -> bool,
+        {
+            bail!(
+                "hi-cuda was built without native-cuda support; GPU Qwen paged ragged multimodal generation is unavailable"
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn generate_sampled_tokens_batch_with_prompt_embeddings_positions_ragged_paged_page_tables_and_limits_and_cancellation<
+            F,
+        >(
+            &self,
+            _prompt_embeddings_per_request: &[Vec<f32>],
+            _prompt_rows_per_request: &[usize],
+            _position_ids_per_request: &[Vec<[u32; 3]>],
+            _next_rope_positions: &[usize],
+            _max_tokens_per_request: &[usize],
+            _eos_token_id: Option<u32>,
+            _temperature: f32,
+            _top_p: f32,
+            _top_k: Option<u32>,
+            _seeds: &[Option<u64>],
+            _page_size: usize,
+            _page_tables: &[Vec<usize>],
+            _physical_page_count: usize,
+            _stop_token_sequences_per_request: &[Vec<Vec<u32>>],
+            _is_cancelled: F,
+        ) -> Result<Vec<Vec<u32>>>
+        where
+            F: FnMut(usize) -> bool,
+        {
+            bail!(
+                "hi-cuda was built without native-cuda support; GPU Qwen paged ragged multimodal MRoPE generation is unavailable"
             )
         }
 

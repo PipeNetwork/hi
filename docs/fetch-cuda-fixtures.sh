@@ -51,6 +51,26 @@ download_to() {
 }
 
 rows=0
+fixture_shas=()
+fixture_paths=()
+
+remember_fixture() {
+  fixture_shas+=("$1")
+  fixture_paths+=("$2")
+}
+
+fixture_for_sha() {
+  local needle="$1"
+  local idx
+  for idx in "${!fixture_shas[@]}"; do
+    if [[ "${fixture_shas[$idx]}" == "$needle" && -f "${fixture_paths[$idx]}" ]]; then
+      printf '%s\n' "${fixture_paths[$idx]}"
+      return 0
+    fi
+  done
+  return 1
+}
+
 while IFS=$'\t' read -r relative_path url sha256 family architecture quant_type extra || [[ -n "${relative_path:-}" ]]; do
   relative_path="${relative_path%$'\r'}"
   url="${url%$'\r'}"
@@ -83,10 +103,23 @@ while IFS=$'\t' read -r relative_path url sha256 family architecture quant_type 
   if [[ -f "$target" ]]; then
     if verify_sha256 "$target" "$sha256"; then
       printf 'ok %s (%s/%s/%s)\n' "$relative_path" "$family" "$architecture" "$quant_type"
+      remember_fixture "$sha256" "$target"
       rows=$((rows + 1))
       continue
     fi
     printf 'replace %s: checksum mismatch on existing file\n' "$relative_path" >&2
+  fi
+
+  source_for_sha="$(fixture_for_sha "$sha256" || true)"
+  if [[ -n "$source_for_sha" ]]; then
+    cp "$source_for_sha" "$target"
+    if verify_sha256 "$target" "$sha256"; then
+      printf 'copied %s (%s/%s/%s)\n' "$relative_path" "$family" "$architecture" "$quant_type"
+      rows=$((rows + 1))
+      continue
+    fi
+    rm -f "$target"
+    die "internal copy failed checksum verification for $relative_path"
   fi
 
   part="$target.part.$$"
@@ -101,6 +134,7 @@ while IFS=$'\t' read -r relative_path url sha256 family architecture quant_type 
     die "checksum mismatch for $relative_path: expected $sha256, got $actual"
   fi
   mv "$part" "$target"
+  remember_fixture "$sha256" "$target"
   printf 'fetched %s (%s/%s/%s)\n' "$relative_path" "$family" "$architecture" "$quant_type"
   rows=$((rows + 1))
 done < "$manifest"

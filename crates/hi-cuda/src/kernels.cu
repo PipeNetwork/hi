@@ -1373,6 +1373,51 @@ __global__ void rope_batched_kernel(
   values[right_idx] = right * c + left * s;
 }
 
+__global__ void rope_batched_positions_kernel(
+    float* values,
+    const uint32_t* positions,
+    int batch_count,
+    int seq_len,
+    int heads,
+    int head_dim,
+    float base,
+    float scale,
+    int split_half) {
+  int pair = blockIdx.x * blockDim.x + threadIdx.x;
+  int pairs_per_token = heads * (head_dim / 2);
+  int total_pairs = batch_count * seq_len * pairs_per_token;
+  if (pair >= total_pairs) {
+    return;
+  }
+
+  int row = pair / pairs_per_token;
+  int batch = row / seq_len;
+  int position = static_cast<int>(positions[batch]) + (row % seq_len);
+  int within = pair % pairs_per_token;
+  int head = within / (head_dim / 2);
+  int pair_in_head = within % (head_dim / 2);
+  int base_idx = (row * heads + head) * head_dim;
+  int left_idx;
+  int right_idx;
+  if (split_half) {
+    left_idx = base_idx + pair_in_head;
+    right_idx = base_idx + pair_in_head + head_dim / 2;
+  } else {
+    left_idx = base_idx + pair_in_head * 2;
+    right_idx = left_idx + 1;
+  }
+
+  float freq = powf(base, -(static_cast<float>(pair_in_head) * 2.0f) /
+                              static_cast<float>(head_dim));
+  float angle = static_cast<float>(position) * scale * freq;
+  float s = sinf(angle);
+  float c = cosf(angle);
+  float left = values[left_idx];
+  float right = values[right_idx];
+  values[left_idx] = left * c - right * s;
+  values[right_idx] = right * c + left * s;
+}
+
 __global__ void mrope_kernel(
     float* values,
     const uint32_t* pos_t,
@@ -1578,6 +1623,41 @@ __global__ void write_paged_kv_cache_batched_kernel(
   int logical_page = logical_pos / page_size;
   int page_offset = logical_pos - logical_page * page_size;
   if (logical_page >= page_table_len) {
+    return;
+  }
+  uint32_t physical_page = page_table[batch * page_table_len + logical_page];
+  int page_idx =
+      ((static_cast<int>(physical_page) * kv_heads + head) * page_size + page_offset) *
+          head_dim +
+      dim;
+  int value_idx = ((batch * row_count + row) * kv_heads + head) * head_dim + dim;
+  pages[page_idx] = values[value_idx];
+}
+
+__global__ void write_paged_kv_cache_batched_positions_kernel(
+    const float* values,
+    float* pages,
+    const uint32_t* page_table,
+    const uint32_t* positions,
+    int batch_count,
+    int row_count,
+    int kv_heads,
+    int head_dim,
+    int page_size,
+    int page_table_len) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = batch_count * row_count * kv_heads * head_dim;
+  if (idx >= total) {
+    return;
+  }
+  int dim = idx % head_dim;
+  int head = (idx / head_dim) % kv_heads;
+  int row = (idx / (head_dim * kv_heads)) % row_count;
+  int batch = idx / (row_count * kv_heads * head_dim);
+  int logical_pos = static_cast<int>(positions[batch]) + row;
+  int logical_page = logical_pos / page_size;
+  int page_offset = logical_pos - logical_page * page_size;
+  if (logical_pos < 0 || logical_page >= page_table_len) {
     return;
   }
   uint32_t physical_page = page_table[batch * page_table_len + logical_page];
@@ -2651,6 +2731,93 @@ __global__ void paged_decode_attention_batched_kernel(
   }
 }
 
+__global__ void paged_decode_attention_batched_positions_kernel(
+    const float* q,
+    const float* k_pages,
+    const float* v_pages,
+    const uint32_t* page_table,
+    const uint32_t* positions,
+    float* output,
+    int batch_count,
+    int page_size,
+    int page_table_len,
+    int heads,
+    int kv_heads,
+    int qk_head_dim,
+    int v_head_dim) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = batch_count * heads;
+  if (idx >= total) {
+    return;
+  }
+
+  int head = idx % heads;
+  int batch = idx / heads;
+  int position = static_cast<int>(positions[batch]);
+  int kv_repeats = heads / kv_heads;
+  int kv_head = head / kv_repeats;
+  const float scale = rsqrtf(static_cast<float>(qk_head_dim));
+  const float* q_vec = q + (batch * heads + head) * qk_head_dim;
+
+  float max_score = -INFINITY;
+  for (int source = 0; source <= position; ++source) {
+    int logical_page = source / page_size;
+    int page_offset = source - logical_page * page_size;
+    if (logical_page >= page_table_len) {
+      continue;
+    }
+    uint32_t physical_page = page_table[batch * page_table_len + logical_page];
+    const float* k_vec =
+        k_pages + ((static_cast<int>(physical_page) * kv_heads + kv_head) * page_size +
+                   page_offset) *
+                      qk_head_dim;
+    float dot = 0.0f;
+    for (int dim = 0; dim < qk_head_dim; ++dim) {
+      dot += q_vec[dim] * k_vec[dim];
+    }
+    max_score = fmaxf(max_score, dot * scale);
+  }
+  float denom = 0.0f;
+  float* out_vec = output + (batch * heads + head) * v_head_dim;
+  for (int dim = 0; dim < v_head_dim; ++dim) {
+    out_vec[dim] = 0.0f;
+  }
+  for (int source = 0; source <= position; ++source) {
+    int logical_page = source / page_size;
+    int page_offset = source - logical_page * page_size;
+    if (logical_page >= page_table_len) {
+      continue;
+    }
+    uint32_t physical_page = page_table[batch * page_table_len + logical_page];
+    const float* k_vec =
+        k_pages + ((static_cast<int>(physical_page) * kv_heads + kv_head) * page_size +
+                   page_offset) *
+                      qk_head_dim;
+    float dot = 0.0f;
+    for (int dim = 0; dim < qk_head_dim; ++dim) {
+      dot += q_vec[dim] * k_vec[dim];
+    }
+    float weight = expf(dot * scale - max_score);
+    const float* v_vec =
+        v_pages + ((static_cast<int>(physical_page) * kv_heads + kv_head) * page_size +
+                   page_offset) *
+                      v_head_dim;
+    for (int dim = 0; dim < v_head_dim; ++dim) {
+      out_vec[dim] += weight * v_vec[dim];
+    }
+    denom += weight;
+  }
+  if (denom == 0.0f || !isfinite(denom)) {
+    for (int dim = 0; dim < v_head_dim; ++dim) {
+      out_vec[dim] = 0.0f;
+    }
+    return;
+  }
+  for (int dim = 0; dim < v_head_dim; ++dim) {
+    out_vec[dim] /= denom;
+  }
+}
+
 __global__ void flash_paged_decode_attention_batched_kernel(
     const float* q,
     const float* k_pages,
@@ -2751,6 +2918,86 @@ __global__ void tiled_paged_decode_attention_batched_kernel(
   extern __shared__ float partial_dot[];
   int head = idx % heads;
   int batch = idx / heads;
+  int kv_repeats = heads / kv_heads;
+  int kv_head = head / kv_repeats;
+  const float scale = rsqrtf(static_cast<float>(qk_head_dim));
+  const float* q_vec = q + (batch * heads + head) * qk_head_dim;
+  float* out_vec = output + (batch * heads + head) * v_head_dim;
+
+  float acc = 0.0f;
+  float max_score = -INFINITY;
+  float denom = 0.0f;
+  for (int source = 0; source <= position; ++source) {
+    int logical_page = source / page_size;
+    int page_offset = source - logical_page * page_size;
+    float dot = 0.0f;
+    const float* v_vec = nullptr;
+    if (logical_page < page_table_len) {
+      uint32_t physical_page = page_table[batch * page_table_len + logical_page];
+      const float* k_vec =
+          k_pages + ((static_cast<int>(physical_page) * kv_heads + kv_head) * page_size +
+                     page_offset) *
+                        qk_head_dim;
+      v_vec =
+          v_pages + ((static_cast<int>(physical_page) * kv_heads + kv_head) * page_size +
+                     page_offset) *
+                        v_head_dim;
+      for (int dim = lane; dim < qk_head_dim; dim += blockDim.x) {
+        dot += q_vec[dim] * k_vec[dim];
+      }
+    }
+    partial_dot[lane] = dot;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+      if (lane < stride) {
+        partial_dot[lane] += partial_dot[lane + stride];
+      }
+      __syncthreads();
+    }
+
+    float score = partial_dot[0] * scale;
+    float next_max = fmaxf(max_score, score);
+    float old_scale = isfinite(max_score) ? expf(max_score - next_max) : 0.0f;
+    float weight = expf(score - next_max);
+    if (lane < v_head_dim && v_vec != nullptr) {
+      acc = acc * old_scale + weight * v_vec[lane];
+    }
+    denom = denom * old_scale + weight;
+    max_score = next_max;
+    __syncthreads();
+  }
+
+  if (lane < v_head_dim) {
+    out_vec[lane] = (denom == 0.0f || !isfinite(denom)) ? 0.0f : acc / denom;
+  }
+}
+
+__global__ void tiled_paged_decode_attention_batched_positions_kernel(
+    const float* q,
+    const float* k_pages,
+    const float* v_pages,
+    const uint32_t* page_table,
+    const uint32_t* positions,
+    float* output,
+    int batch_count,
+    int page_size,
+    int page_table_len,
+    int heads,
+    int kv_heads,
+    int qk_head_dim,
+    int v_head_dim) {
+  int idx = blockIdx.x;
+  int lane = threadIdx.x;
+  int total = batch_count * heads;
+  if (idx >= total || qk_head_dim > HI_CUDA_FLASH_MAX_HEAD_DIM ||
+      v_head_dim > HI_CUDA_FLASH_MAX_HEAD_DIM) {
+    return;
+  }
+
+  extern __shared__ float partial_dot[];
+  int head = idx % heads;
+  int batch = idx / heads;
+  int position = static_cast<int>(positions[batch]);
   int kv_repeats = heads / kv_heads;
   int kv_head = head / kv_repeats;
   const float scale = rsqrtf(static_cast<float>(qk_head_dim));
@@ -3934,6 +4181,38 @@ extern "C" int hi_cuda_launch_rope_batched_with_offset(
   return 0;
 }
 
+extern "C" int hi_cuda_launch_rope_batched_positions(
+    void* values,
+    const void* positions,
+    int batch_count,
+    int seq_len,
+    int heads,
+    int head_dim,
+    float base,
+    float scale,
+    int split_half,
+    void* stream) {
+  if (values == nullptr || positions == nullptr || batch_count <= 0 ||
+      seq_len <= 0 || heads <= 0 || head_dim <= 0 || head_dim % 2 != 0 ||
+      base <= 0.0f || stream == nullptr) {
+    return 1;
+  }
+  int pairs = batch_count * seq_len * heads * (head_dim / 2);
+  dim3 block(256);
+  dim3 grid((pairs + block.x - 1) / block.x);
+  rope_batched_positions_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<float*>(values),
+      static_cast<const uint32_t*>(positions),
+      batch_count,
+      seq_len,
+      heads,
+      head_dim,
+      base,
+      scale,
+      split_half);
+  return 0;
+}
+
 extern "C" int hi_cuda_launch_mrope(
     void* values,
     const void* pos_t,
@@ -4111,6 +4390,41 @@ extern "C" int hi_cuda_launch_write_paged_kv_cache_batched(
       page_size,
       page_table_len,
       start_pos);
+  return 0;
+}
+
+extern "C" int hi_cuda_launch_write_paged_kv_cache_batched_positions(
+    const void* values,
+    void* pages,
+    const void* page_table,
+    const void* positions,
+    int batch_count,
+    int row_count,
+    int kv_heads,
+    int head_dim,
+    int page_size,
+    int page_table_len,
+    void* stream) {
+  if (values == nullptr || pages == nullptr || page_table == nullptr ||
+      positions == nullptr || batch_count <= 0 || row_count <= 0 ||
+      kv_heads <= 0 || head_dim <= 0 || page_size <= 0 ||
+      page_table_len <= 0 || stream == nullptr) {
+    return 1;
+  }
+  int total = batch_count * row_count * kv_heads * head_dim;
+  dim3 block(256);
+  dim3 grid((total + block.x - 1) / block.x);
+  write_paged_kv_cache_batched_positions_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const float*>(values),
+      static_cast<float*>(pages),
+      static_cast<const uint32_t*>(page_table),
+      static_cast<const uint32_t*>(positions),
+      batch_count,
+      row_count,
+      kv_heads,
+      head_dim,
+      page_size,
+      page_table_len);
   return 0;
 }
 
@@ -4746,6 +5060,47 @@ extern "C" int hi_cuda_launch_flash_paged_decode_attention_batched(
   return 0;
 }
 
+extern "C" int hi_cuda_launch_paged_decode_attention_batched_positions(
+    const void* q,
+    const void* k_pages,
+    const void* v_pages,
+    const void* page_table,
+    const void* positions,
+    void* output,
+    int batch_count,
+    int page_size,
+    int page_table_len,
+    int heads,
+    int kv_heads,
+    int qk_head_dim,
+    int v_head_dim,
+    void* stream) {
+  if (q == nullptr || k_pages == nullptr || v_pages == nullptr ||
+      page_table == nullptr || positions == nullptr || output == nullptr ||
+      batch_count <= 0 || page_size <= 0 || page_table_len <= 0 ||
+      heads <= 0 || kv_heads <= 0 || qk_head_dim <= 0 || v_head_dim <= 0 ||
+      heads % kv_heads != 0 || stream == nullptr) {
+    return 1;
+  }
+  dim3 block(128);
+  dim3 grid((batch_count * heads + block.x - 1) / block.x);
+  paged_decode_attention_batched_positions_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const float*>(q),
+      static_cast<const float*>(k_pages),
+      static_cast<const float*>(v_pages),
+      static_cast<const uint32_t*>(page_table),
+      static_cast<const uint32_t*>(positions),
+      static_cast<float*>(output),
+      batch_count,
+      page_size,
+      page_table_len,
+      heads,
+      kv_heads,
+      qk_head_dim,
+      v_head_dim);
+  return 0;
+}
+
 extern "C" int hi_cuda_launch_cached_decode_attention_batched(
     const void* q,
     const void* k_cache,
@@ -4819,6 +5174,50 @@ extern "C" int hi_cuda_launch_tiled_paged_decode_attention_batched(
       static_cast<float*>(output),
       batch_count,
       position,
+      page_size,
+      page_table_len,
+      heads,
+      kv_heads,
+      qk_head_dim,
+	      v_head_dim);
+	  return 0;
+	}
+
+extern "C" int hi_cuda_launch_tiled_paged_decode_attention_batched_positions(
+    const void* q,
+    const void* k_pages,
+    const void* v_pages,
+    const void* page_table,
+    const void* positions,
+    void* output,
+    int batch_count,
+    int page_size,
+    int page_table_len,
+    int heads,
+    int kv_heads,
+    int qk_head_dim,
+    int v_head_dim,
+    void* stream) {
+  if (q == nullptr || k_pages == nullptr || v_pages == nullptr ||
+      page_table == nullptr || positions == nullptr || output == nullptr ||
+      batch_count <= 0 || page_size <= 0 || page_table_len <= 0 ||
+      heads <= 0 || kv_heads <= 0 || qk_head_dim <= 0 || v_head_dim <= 0 ||
+      qk_head_dim > HI_CUDA_FLASH_MAX_HEAD_DIM ||
+      v_head_dim > HI_CUDA_FLASH_MAX_HEAD_DIM || heads % kv_heads != 0 ||
+      stream == nullptr) {
+    return 1;
+  }
+  dim3 block(HI_CUDA_FLASH_MAX_HEAD_DIM);
+  dim3 grid(batch_count * heads);
+  size_t shared_bytes = block.x * sizeof(float);
+  tiled_paged_decode_attention_batched_positions_kernel<<<grid, block, shared_bytes, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const float*>(q),
+      static_cast<const float*>(k_pages),
+      static_cast<const float*>(v_pages),
+      static_cast<const uint32_t*>(page_table),
+      static_cast<const uint32_t*>(positions),
+      static_cast<float*>(output),
+      batch_count,
       page_size,
       page_table_len,
       heads,

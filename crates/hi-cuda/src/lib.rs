@@ -4298,12 +4298,42 @@ fn process_continuous_decode_iteration(
     }
     let total_retired = retired.saturating_add(cancelled);
     if total_retired > 0 {
+        forget_retired_recurrent_state(state, active, &retire);
         release_scheduler_slots(&stats.inflight_requests, total_retired);
         for idx in (0..active.len()).rev() {
             if retire[idx].is_some() {
                 active.remove(idx);
             }
         }
+    }
+}
+
+fn forget_retired_recurrent_state(
+    state: &CudaSchedulerState,
+    active: &[CudaContinuousTextRequest],
+    retire: &[Option<CudaContinuousRetireReason>],
+) {
+    if !state.qwen.recurrent_ssm_tensor_layout {
+        return;
+    }
+    let page_tables = active
+        .iter()
+        .zip(retire)
+        .filter_map(|(request, reason)| {
+            reason
+                .is_some()
+                .then(|| request.lease.pages.first().copied().map(|page| vec![page]))
+                .flatten()
+        })
+        .collect::<Vec<_>>();
+    if page_tables.is_empty() {
+        return;
+    }
+    if let Ok(model) = state.gpu_model.lock() {
+        let _ = model.forget_recurrent_page_contexts(
+            &page_tables,
+            "CUDA continuous recurrent request retirement",
+        );
     }
 }
 
@@ -4414,20 +4444,50 @@ fn process_continuous_decode_chunk(
         }
         CudaContinuousStepPhase::Decode => {
             if state.qwen.recurrent_ssm_tensor_layout {
-                let inputs = indexes
+                let position = match token_count.checked_sub(1) {
+                    Some(position) => position,
+                    None => {
+                        for idx in &indexes {
+                            mark_continuous_error(
+                                active,
+                                retire,
+                                *idx,
+                                anyhow!(
+                                    "CUDA continuous recurrent append decode requires a non-empty context"
+                                ),
+                            );
+                        }
+                        return;
+                    }
+                };
+                let decode_tokens = match indexes
                     .iter()
                     .map(|idx| {
-                        let request = &active[*idx];
-                        let mut context = Vec::with_capacity(request.context_len());
-                        context.extend_from_slice(&request.prompt_tokens);
-                        context.extend_from_slice(&request.generated_tokens);
-                        context
+                        active[*idx]
+                            .generated_tokens
+                            .last()
+                            .copied()
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "CUDA continuous recurrent append decode request has no generated token"
+                                )
+                            })
                     })
-                    .collect::<Vec<_>>();
+                    .collect::<Result<Vec<_>>>()
+                {
+                    Ok(tokens) => tokens,
+                    Err(err) => {
+                        for idx in &indexes {
+                            mark_continuous_error(active, retire, *idx, anyhow!("{err}"));
+                        }
+                        return;
+                    }
+                };
                 match sampling_key {
                     CudaSchedulerSamplingKey::Greedy => model
-                        .greedy_next_tokens_batch_paged_with_page_tables(
-                            &inputs,
+                        .decode_greedy_next_tokens_batch_paged_with_page_tables(
+                            &decode_tokens,
+                            position,
                             state.kv_page_size,
                             &page_tables,
                             kv_pages.pages_total,
@@ -4438,8 +4498,9 @@ fn process_continuous_decode_chunk(
                         top_k,
                     } => {
                         let samples = continuous_sampling_values(active, &indexes);
-                        model.sampled_next_tokens_batch_paged_with_page_tables(
-                            &inputs,
+                        model.decode_sampled_next_tokens_batch_paged_with_page_tables(
+                            &decode_tokens,
+                            position,
                             f32::from_bits(temperature_bits),
                             f32::from_bits(top_p_bits),
                             top_k,
@@ -5595,15 +5656,26 @@ fn process_multimodal_prefix_decode_groups(
             });
     }
 
-    for ((prompt_token_len, prefix_rows, _mrope_key, sampling_key), candidates) in groups {
+    let mut ragged_groups: BTreeMap<
+        (CudaSchedulerSamplingKey, bool),
+        Vec<CudaMultimodalPrefixBatchCandidate>,
+    > = BTreeMap::new();
+    for ((prompt_token_len, prefix_rows, mrope_key, sampling_key), candidates) in groups {
         if candidates.len() < 2 {
-            remaining.extend(candidates.into_iter().map(|candidate| {
-                (
-                    candidate.batch_idx,
-                    candidate.projection,
-                    CudaMultimodalFallbackReason::DecodeGroupSingleton,
-                )
-            }));
+            if mrope_key.is_some() && state.kv_cache_mode != CudaKvCacheMode::Paged {
+                remaining.extend(candidates.into_iter().map(|candidate| {
+                    (
+                        candidate.batch_idx,
+                        candidate.projection,
+                        CudaMultimodalFallbackReason::DecodeGroupSingleton,
+                    )
+                }));
+            } else {
+                ragged_groups
+                    .entry((sampling_key, mrope_key.is_some()))
+                    .or_default()
+                    .extend(candidates);
+            }
             continue;
         }
         let Some(prompt_count) = prompt_token_len.checked_add(prefix_rows) else {
@@ -5642,6 +5714,42 @@ fn process_multimodal_prefix_decode_groups(
                 batch,
                 prompt_token_len,
                 prefix_rows,
+                sampling_key,
+                candidates,
+                outcome,
+            );
+        }
+    }
+
+    for ((sampling_key, _uses_mrope), candidates) in ragged_groups {
+        if candidates.len() < 2 {
+            remaining.extend(candidates.into_iter().map(|candidate| {
+                (
+                    candidate.batch_idx,
+                    candidate.projection,
+                    CudaMultimodalFallbackReason::DecodeGroupSingleton,
+                )
+            }));
+            continue;
+        }
+        let candidate_count = candidates.len();
+        let chunks =
+            multimodal_ragged_candidate_token_budget_chunks(batch, candidates, max_batched_tokens);
+        record_scheduler_token_budget_split(outcome, candidate_count, chunks.len());
+        for candidates in chunks {
+            if candidates.len() < 2 {
+                remaining.extend(candidates.into_iter().map(|candidate| {
+                    (
+                        candidate.batch_idx,
+                        candidate.projection,
+                        CudaMultimodalFallbackReason::TokenBudget,
+                    )
+                }));
+                continue;
+            }
+            process_multimodal_ragged_prefix_decode_candidate_batch(
+                state,
+                batch,
                 sampling_key,
                 candidates,
                 outcome,
@@ -5695,6 +5803,487 @@ fn multimodal_prefix_candidate_token_budget_chunks(
         chunks.push(current);
     }
     chunks
+}
+
+fn multimodal_ragged_candidate_token_budget_chunks(
+    batch: &[CudaSchedulerJob],
+    candidates: Vec<CudaMultimodalPrefixBatchCandidate>,
+    max_batched_tokens: usize,
+) -> Vec<Vec<CudaMultimodalPrefixBatchCandidate>> {
+    let limit = max_batched_tokens.max(1);
+    let mut chunks = Vec::new();
+    let mut current = Vec::new();
+    let mut current_tokens = 0usize;
+    for candidate in candidates {
+        let max_tokens = generation_max_tokens_usize(&batch[candidate.batch_idx].request)
+            .unwrap_or(usize::MAX)
+            .max(1);
+        let prompt_count = multimodal_candidate_prompt_count(&candidate).unwrap_or(usize::MAX);
+        let token_budget = prompt_count.max(1).saturating_add(max_tokens);
+        if !current.is_empty() && current_tokens.saturating_add(token_budget) > limit {
+            chunks.push(std::mem::take(&mut current));
+            current_tokens = 0;
+        }
+        current.push(candidate);
+        current_tokens = current_tokens.saturating_add(token_budget);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn multimodal_candidate_prompt_count(
+    candidate: &CudaMultimodalPrefixBatchCandidate,
+) -> Option<usize> {
+    candidate
+        .prompt_embeddings
+        .as_ref()
+        .map(|prompt_embeddings| prompt_embeddings.rows)
+        .or_else(|| {
+            candidate
+                .prompt_tokens
+                .len()
+                .checked_add(candidate.projection.projected_rows)
+        })
+}
+
+fn process_multimodal_ragged_prefix_decode_candidate_batch(
+    state: &CudaSchedulerState,
+    batch: &[CudaSchedulerJob],
+    sampling_key: CudaSchedulerSamplingKey,
+    candidates: Vec<CudaMultimodalPrefixBatchCandidate>,
+    outcome: &mut CudaSchedulerBatchOutcome,
+) {
+    let candidate_count = candidates.len();
+    state
+        .multimodal_stats
+        .multimodal_decode_batched_requests
+        .fetch_add(usize_to_u64(candidate_count), Ordering::Relaxed);
+    state
+        .multimodal_stats
+        .multimodal_decode_ragged_batched_requests
+        .fetch_add(usize_to_u64(candidate_count), Ordering::Relaxed);
+
+    let Some(kv_pages) = (state.kv_cache_mode == CudaKvCacheMode::Paged)
+        .then(|| state.kv_pages.as_ref())
+        .flatten()
+    else {
+        let paged_storage = match state.kv_cache_mode {
+            CudaKvCacheMode::Legacy => CudaSchedulerPagedBatchStorage::None,
+            CudaKvCacheMode::Paged => CudaSchedulerPagedBatchStorage::Internal,
+        };
+        outcome.batch_plan_eligible_requests = outcome
+            .batch_plan_eligible_requests
+            .saturating_add(candidate_count);
+        record_batched_scheduler_outcome(outcome, sampling_key, paged_storage, candidate_count);
+
+        for candidate in candidates {
+            let idx = candidate.batch_idx;
+            if batch[idx].tx.is_closed() {
+                outcome.cancelled_requests = outcome.cancelled_requests.saturating_add(1);
+                continue;
+            }
+            let started = Instant::now();
+            let result = generate_events_gpu_with_visual_prefix_from(
+                &state.gpu_model,
+                &state.cpu_reference,
+                &state.qwen,
+                &batch[idx].request,
+                state.max_output_tokens,
+                state.kv_cache_mode,
+                state.kv_page_size,
+                candidate.projection,
+                &state.multimodal_stats,
+            )
+            .map(|generation| {
+                let timing = scheduler_token_timing(
+                    generation.output.prompt_tokens,
+                    generation.output.completion_tokens,
+                    started.elapsed(),
+                );
+                (generation, timing)
+            });
+            match result {
+                Ok((generation, timing)) => {
+                    add_scheduler_token_timing(outcome, timing);
+                    if send_generation_events(&batch[idx].tx, generation).is_err() {
+                        outcome.cancelled_requests = outcome.cancelled_requests.saturating_add(1);
+                    } else {
+                        outcome.completed_requests = outcome.completed_requests.saturating_add(1);
+                    }
+                }
+                Err(err) => record_scheduler_sent_error(outcome, &batch[idx].tx, err),
+            }
+        }
+        return;
+    };
+
+    let group_limits = match candidates
+        .iter()
+        .map(|candidate| generation_max_tokens_usize(&batch[candidate.batch_idx].request))
+        .collect::<Result<Vec<_>>>()
+    {
+        Ok(limits) => limits,
+        Err(err) => {
+            for candidate in candidates {
+                record_scheduler_sent_error(
+                    outcome,
+                    &batch[candidate.batch_idx].tx,
+                    anyhow!("{err}"),
+                );
+            }
+            return;
+        }
+    };
+    let group_stop_token_sequences = match candidates
+        .iter()
+        .map(|candidate| {
+            generation_stop_token_sequences(
+                &state.cpu_reference,
+                &batch[candidate.batch_idx].request.stop_sequences,
+            )
+        })
+        .collect::<Result<Vec<_>>>()
+    {
+        Ok(stop_sequences) => stop_sequences,
+        Err(err) => {
+            for candidate in candidates {
+                record_scheduler_sent_error(
+                    outcome,
+                    &batch[candidate.batch_idx].tx,
+                    anyhow!("{err}"),
+                );
+            }
+            return;
+        }
+    };
+    let prompt_counts = match candidates
+        .iter()
+        .map(multimodal_candidate_prompt_count)
+        .collect::<Option<Vec<_>>>()
+    {
+        Some(prompt_counts) => prompt_counts,
+        None => {
+            for candidate in candidates {
+                record_scheduler_sent_error(
+                    outcome,
+                    &batch[candidate.batch_idx].tx,
+                    anyhow!("CUDA ragged batched multimodal prompt length overflows usize"),
+                );
+            }
+            return;
+        }
+    };
+    let uses_mrope_prompt_embeddings = candidates
+        .iter()
+        .any(|candidate| candidate.prompt_embeddings.is_some());
+    if uses_mrope_prompt_embeddings
+        && candidates
+            .iter()
+            .any(|candidate| candidate.prompt_embeddings.is_none())
+    {
+        for candidate in candidates {
+            record_scheduler_sent_error(
+                outcome,
+                &batch[candidate.batch_idx].tx,
+                anyhow!(
+                    "CUDA ragged batched multimodal decode cannot mix MRoPE prompt embeddings and visual prefixes"
+                ),
+            );
+        }
+        return;
+    }
+    let token_capacity = match prompt_counts.iter().zip(&group_limits).try_fold(
+        0usize,
+        |acc, (prompt_count, limit)| {
+            prompt_count
+                .checked_add(*limit)
+                .map(|capacity| acc.max(capacity))
+        },
+    ) {
+        Some(token_capacity) => token_capacity,
+        None => {
+            for candidate in candidates {
+                record_scheduler_sent_error(
+                    outcome,
+                    &batch[candidate.batch_idx].tx,
+                    anyhow!("CUDA ragged batched multimodal token capacity overflows usize"),
+                );
+            }
+            return;
+        }
+    };
+    let pages_needed = match div_ceil_usize(token_capacity.max(1), state.kv_page_size) {
+        Ok(pages_needed) => pages_needed,
+        Err(err) => {
+            for candidate in candidates {
+                record_scheduler_sent_error(
+                    outcome,
+                    &batch[candidate.batch_idx].tx,
+                    anyhow!("CUDA ragged batched multimodal paged KV allocation failed: {err}"),
+                );
+            }
+            return;
+        }
+    };
+    let mut leases = Vec::with_capacity(candidate_count);
+    let mut page_tables = Vec::with_capacity(candidate_count);
+    for candidate in &candidates {
+        match kv_pages.allocate_for_tokens(token_capacity) {
+            Ok(lease) => {
+                if lease.pages.len() < pages_needed {
+                    record_scheduler_sent_error(
+                        outcome,
+                        &batch[candidate.batch_idx].tx,
+                        anyhow!(
+                            "CUDA ragged batched multimodal paged KV lease has {} page(s), expected at least {pages_needed}",
+                            lease.pages.len()
+                        ),
+                    );
+                    return;
+                }
+                page_tables.push(lease.pages[..pages_needed].to_vec());
+                leases.push(lease);
+            }
+            Err(err) => {
+                for candidate in &candidates {
+                    record_scheduler_sent_error(
+                        outcome,
+                        &batch[candidate.batch_idx].tx,
+                        anyhow!("CUDA ragged batched multimodal paged KV allocation failed: {err}"),
+                    );
+                }
+                return;
+            }
+        }
+    }
+
+    let group_seeds = candidates
+        .iter()
+        .map(|candidate| batch[candidate.batch_idx].request.seed)
+        .collect::<Vec<_>>();
+    let started = Instant::now();
+    let model = match state.gpu_model.lock() {
+        Ok(model) => model,
+        Err(_) => {
+            for candidate in &candidates {
+                record_scheduler_sent_error(
+                    outcome,
+                    &batch[candidate.batch_idx].tx,
+                    anyhow!("CUDA gpu model lock poisoned"),
+                );
+            }
+            outcome.batch_plan_eligible_requests = outcome
+                .batch_plan_eligible_requests
+                .saturating_add(candidate_count);
+            return;
+        }
+    };
+    let is_group_cancelled = |group_idx: usize| {
+        candidates
+            .get(group_idx)
+            .is_none_or(|candidate| batch[candidate.batch_idx].tx.is_closed())
+    };
+    let result = if uses_mrope_prompt_embeddings {
+        let prompt_embeddings = candidates
+            .iter()
+            .filter_map(|candidate| {
+                candidate
+                    .prompt_embeddings
+                    .as_ref()
+                    .map(|prompt_embeddings| prompt_embeddings.embeddings.clone())
+            })
+            .collect::<Vec<_>>();
+        let prompt_rows = candidates
+            .iter()
+            .filter_map(|candidate| {
+                candidate
+                    .prompt_embeddings
+                    .as_ref()
+                    .map(|prompt_embeddings| prompt_embeddings.rows)
+            })
+            .collect::<Vec<_>>();
+        let position_ids = candidates
+            .iter()
+            .filter_map(|candidate| {
+                candidate
+                    .prompt_embeddings
+                    .as_ref()
+                    .map(|prompt_embeddings| prompt_embeddings.position_ids.clone())
+            })
+            .collect::<Vec<_>>();
+        let next_rope_positions = candidates
+            .iter()
+            .filter_map(|candidate| {
+                candidate
+                    .prompt_embeddings
+                    .as_ref()
+                    .map(|prompt_embeddings| prompt_embeddings.next_position)
+            })
+            .collect::<Vec<_>>();
+        match sampling_key {
+            CudaSchedulerSamplingKey::Greedy => model
+                .generate_greedy_tokens_batch_with_prompt_embeddings_positions_ragged_paged_page_tables_and_limits_and_cancellation(
+                    &prompt_embeddings,
+                    &prompt_rows,
+                    &position_ids,
+                    &next_rope_positions,
+                    &group_limits,
+                    state.qwen.eos_token_id,
+                    state.kv_page_size,
+                    &page_tables,
+                    kv_pages.pages_total,
+                    &group_stop_token_sequences,
+                    is_group_cancelled,
+                ),
+            CudaSchedulerSamplingKey::Sampled {
+                temperature_bits,
+                top_p_bits,
+                top_k,
+            } => model
+                .generate_sampled_tokens_batch_with_prompt_embeddings_positions_ragged_paged_page_tables_and_limits_and_cancellation(
+                    &prompt_embeddings,
+                    &prompt_rows,
+                    &position_ids,
+                    &next_rope_positions,
+                    &group_limits,
+                    state.qwen.eos_token_id,
+                    f32::from_bits(temperature_bits),
+                    f32::from_bits(top_p_bits),
+                    top_k,
+                    &group_seeds,
+                    state.kv_page_size,
+                    &page_tables,
+                    kv_pages.pages_total,
+                    &group_stop_token_sequences,
+                    is_group_cancelled,
+                ),
+        }
+    } else {
+        let prefix_embeddings = candidates
+            .iter()
+            .map(|candidate| candidate.projection.embeddings.clone())
+            .collect::<Vec<_>>();
+        let prefix_rows = candidates
+            .iter()
+            .map(|candidate| candidate.projection.projected_rows)
+            .collect::<Vec<_>>();
+        let prompt_tokens = candidates
+            .iter()
+            .map(|candidate| candidate.prompt_tokens.clone())
+            .collect::<Vec<_>>();
+        match sampling_key {
+            CudaSchedulerSamplingKey::Greedy => model
+                .generate_greedy_tokens_batch_with_prefix_embeddings_ragged_paged_page_tables_and_limits_and_cancellation(
+                    &prefix_embeddings,
+                    &prefix_rows,
+                    &prompt_tokens,
+                    &group_limits,
+                    state.qwen.eos_token_id,
+                    state.kv_page_size,
+                    &page_tables,
+                    kv_pages.pages_total,
+                    &group_stop_token_sequences,
+                    is_group_cancelled,
+                ),
+            CudaSchedulerSamplingKey::Sampled {
+                temperature_bits,
+                top_p_bits,
+                top_k,
+            } => model
+                .generate_sampled_tokens_batch_with_prefix_embeddings_ragged_paged_page_tables_and_limits_and_cancellation(
+                    &prefix_embeddings,
+                    &prefix_rows,
+                    &prompt_tokens,
+                    &group_limits,
+                    state.qwen.eos_token_id,
+                    f32::from_bits(temperature_bits),
+                    f32::from_bits(top_p_bits),
+                    top_k,
+                    &group_seeds,
+                    state.kv_page_size,
+                    &page_tables,
+                    kv_pages.pages_total,
+                    &group_stop_token_sequences,
+                    is_group_cancelled,
+                ),
+        }
+    };
+    let elapsed = started.elapsed();
+    outcome.batch_plan_eligible_requests = outcome
+        .batch_plan_eligible_requests
+        .saturating_add(candidate_count);
+    match result {
+        Ok(generated) if generated.len() == candidate_count => {
+            let decode_tokens = generated.iter().map(Vec::len).sum::<usize>();
+            let prompt_tokens = prompt_counts.iter().copied().sum::<usize>();
+            add_scheduler_token_timing(
+                outcome,
+                scheduler_token_timing(
+                    usize_to_u64(prompt_tokens),
+                    usize_to_u64(decode_tokens),
+                    elapsed,
+                ),
+            );
+            record_batched_scheduler_outcome(
+                outcome,
+                sampling_key,
+                CudaSchedulerPagedBatchStorage::LeaseBacked,
+                candidate_count,
+            );
+            for ((candidate, generated), prompt_count) in
+                candidates.into_iter().zip(generated).zip(prompt_counts)
+            {
+                let idx = candidate.batch_idx;
+                if batch[idx].tx.is_closed() {
+                    outcome.cancelled_requests = outcome.cancelled_requests.saturating_add(1);
+                    continue;
+                }
+                let generation = match cuda_generation_from_tokens_with_prompt_count_and_stops(
+                    &state.cpu_reference,
+                    prompt_count,
+                    generated,
+                    &batch[idx].request.stop_sequences,
+                ) {
+                    Ok(generation) => generation,
+                    Err(err) => {
+                        record_scheduler_sent_error(outcome, &batch[idx].tx, err);
+                        continue;
+                    }
+                };
+                if send_generation_events(&batch[idx].tx, generation).is_err() {
+                    outcome.cancelled_requests = outcome.cancelled_requests.saturating_add(1);
+                } else {
+                    outcome.completed_requests = outcome.completed_requests.saturating_add(1);
+                }
+            }
+        }
+        Ok(generated) => {
+            for candidate in candidates {
+                record_scheduler_sent_error(
+                    outcome,
+                    &batch[candidate.batch_idx].tx,
+                    anyhow!(
+                        "CUDA ragged batched multimodal decode returned {} output(s) for {} request(s)",
+                        generated.len(),
+                        candidate_count
+                    ),
+                );
+            }
+        }
+        Err(err) => {
+            for candidate in candidates {
+                record_scheduler_sent_error(
+                    outcome,
+                    &batch[candidate.batch_idx].tx,
+                    anyhow!("CUDA ragged batched multimodal decode failed: {err}"),
+                );
+            }
+        }
+    }
+
+    drop(leases);
 }
 
 fn process_multimodal_prefix_decode_candidate_batch(
@@ -7956,6 +8545,64 @@ mod tests {
     }
 
     #[test]
+    fn multimodal_ragged_token_budget_uses_per_request_prompt_lengths() {
+        fn job(max_tokens: u32) -> super::CudaSchedulerJob {
+            let (tx, _rx) = tokio::sync::mpsc::channel(1);
+            super::CudaSchedulerJob {
+                request: GenerationRequest {
+                    prompt: "a".to_string(),
+                    max_tokens,
+                    temperature: 0.0,
+                    top_p: 1.0,
+                    top_k: None,
+                    seed: None,
+                    stop_sequences: Vec::new(),
+                    media_inputs: Vec::new(),
+                },
+                tx,
+                submitted_at: std::time::Instant::now(),
+            }
+        }
+
+        fn candidate(
+            batch_idx: usize,
+            token_rows: usize,
+            projected_rows: usize,
+        ) -> super::CudaMultimodalPrefixBatchCandidate {
+            super::CudaMultimodalPrefixBatchCandidate {
+                batch_idx,
+                prompt_tokens: vec![0; token_rows],
+                projection: super::VisualProjection {
+                    media_count: 1,
+                    projected_rows,
+                    projected_dim: 2,
+                    items: Vec::new(),
+                    embeddings: vec![0.0; projected_rows * 2],
+                },
+                prompt_embeddings: None,
+            }
+        }
+
+        let batch = vec![job(2), job(2)];
+        let combined = super::multimodal_ragged_candidate_token_budget_chunks(
+            &batch,
+            vec![candidate(0, 1, 2), candidate(1, 4, 2)],
+            13,
+        );
+        assert_eq!(combined.len(), 1);
+        assert_eq!(combined[0].len(), 2);
+
+        let split = super::multimodal_ragged_candidate_token_budget_chunks(
+            &batch,
+            vec![candidate(0, 1, 2), candidate(1, 4, 2)],
+            10,
+        );
+        assert_eq!(split.len(), 2);
+        assert_eq!(split[0].len(), 1);
+        assert_eq!(split[1].len(), 1);
+    }
+
+    #[test]
     fn attention_health_selects_tiled_paged_for_supported_paged_kv() {
         let health = super::cuda_attention_health_status(
             super::CudaExecution::Gpu,
@@ -9466,6 +10113,95 @@ mod tests {
 
     #[cfg(feature = "native-cuda")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cuda_gpu_scheduler_batches_ragged_mrope_image_placeholder_decode_paged_kv() {
+        let path =
+            tempfile_path("backend-mmproj-gpu-scheduler-mrope-ragged-paged-vision-batch-model");
+        let mmproj_path =
+            tempfile_path("backend-mmproj-gpu-scheduler-mrope-ragged-paged-vision-batch-projector");
+        write_reference_qwen_vl(&path);
+        write_qwen2vl_vision_gguf(&mmproj_path, 2);
+
+        let backend = std::sync::Arc::new(
+            CudaBackend::load_with_config(
+                &path,
+                Some("tiny-cuda-vl".to_string()),
+                CudaExecution::Gpu,
+                super::CudaBackendConfig {
+                    max_batch_size: 2,
+                    max_active_requests: 2,
+                    max_wait_us: 100_000,
+                    kv_cache_mode: super::CudaKvCacheMode::Paged,
+                    kv_page_size: 8,
+                    mmproj_path: Some(mmproj_path),
+                    ..super::CudaBackendConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        let request = |prompt: &str| GenerationRequest {
+            prompt: prompt.to_string(),
+            max_tokens: 2,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: vec![MultimodalInput::Image(ImageInput {
+                source: ImageSource::Data {
+                    media_type: "image/png".to_string(),
+                    bytes: tiny_png_bytes(),
+                },
+                detail: None,
+            })],
+        };
+
+        let short = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(request("a<|image_pad|>")).await.unwrap() })
+        };
+        let long = {
+            let backend = backend.clone();
+            tokio::spawn(async move { backend.generate(request("aa<|image_pad|>")).await.unwrap() })
+        };
+
+        let short = short.await.unwrap();
+        let long = long.await.unwrap();
+        assert_eq!(short.prompt_tokens, 2);
+        assert_eq!(long.prompt_tokens, 3);
+        assert_eq!(short.completion_tokens, 2);
+        assert_eq!(long.completion_tokens, 2);
+
+        wait_for_health_counter_at_least(&backend, "multimodal_decode_ragged_batched_requests", 2)
+            .await;
+        let health = backend.health();
+        assert!(health.quantization.contains("attention=tiled-paged"));
+        assert_eq!(
+            health_counter(&health.quantization, "multimodal_decode_batched_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(
+                &health.quantization,
+                "multimodal_decode_ragged_batched_requests"
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "paged_lease_batched_requests"),
+            Some(2)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "fallback_requests"),
+            Some(0)
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "gpu_batched_requests"),
+            Some(2)
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cuda_gpu_scheduler_keeps_different_mrope_video_positions_out_of_decode_batch() {
         let path = tempfile_path("backend-mmproj-gpu-scheduler-mrope-video-split-model");
         let mmproj_path = tempfile_path("backend-mmproj-gpu-scheduler-mrope-video-split-projector");
@@ -10608,7 +11344,7 @@ mod tests {
 
     #[cfg(feature = "native-cuda")]
     #[test]
-    fn native_cuda_recurrent_ssm_paged_text_generation_replays_recorded_state_contexts() {
+    fn native_cuda_recurrent_ssm_paged_text_generation_uses_persistent_state_cache() {
         use hi_gguf::GgufFile;
 
         let path = tempfile_path("gpu-qwen-next-recurrent-ssm-batch-fallbacks");
@@ -10752,6 +11488,7 @@ mod tests {
                 .unwrap(),
             expected_next
         );
+        assert_eq!(model.recurrent_page_context_count(), 2);
         assert_eq!(
             model
                 .sampled_next_tokens_batch_paged_with_page_tables(
@@ -10807,6 +11544,7 @@ mod tests {
                 .unwrap(),
             expected_append
         );
+        assert_eq!(model.recurrent_page_context_count(), 2);
 
         assert_eq!(
             model
@@ -10851,7 +11589,14 @@ mod tests {
             )
             .unwrap_err()
             .to_string();
-        assert!(append_err.contains("requires a recorded recurrent context"));
+        assert!(append_err.contains("requires a persistent recurrent state"));
+        assert_eq!(
+            model
+                .forget_recurrent_page_contexts(&page_tables, "test recurrent cleanup")
+                .unwrap(),
+            2
+        );
+        assert_eq!(model.recurrent_page_context_count(), 0);
 
         let mut cancellation_checks = vec![0usize; 2];
         let cancelled = model
@@ -10870,6 +11615,95 @@ mod tests {
         assert_eq!(cancelled[0], expected[0]);
         assert_eq!(cancelled[1], expected[1]);
         assert!(cancellation_checks[1] >= 2);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_recurrent_ssm_paged_text_generation_keeps_attention_kv_for_mixed_layers() {
+        use hi_gguf::GgufFile;
+
+        let path = tempfile_path("gpu-qwen-next-recurrent-ssm-mixed-attention");
+        write_reference_qwen_next_mixed_recurrent_ssm_attention(&path);
+        let gguf = GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+        assert!(model.supports_batched_text_generation());
+        let inputs = vec![vec![0], vec![1]];
+        let limits = vec![3, 2];
+        let expected = vec![
+            model
+                .generate_greedy_tokens(&inputs[0], limits[0], None)
+                .unwrap(),
+            model
+                .generate_greedy_tokens(&inputs[1], limits[1], None)
+                .unwrap(),
+        ];
+        let page_tables = vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]];
+
+        assert_eq!(
+            model
+                .generate_greedy_tokens_batch_paged_with_page_tables(
+                    &inputs,
+                    &limits,
+                    None,
+                    1,
+                    &page_tables,
+                    8,
+                )
+                .unwrap(),
+            expected
+        );
+
+        let expected_next = inputs
+            .iter()
+            .map(|input| model.greedy_next_token(input).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            model
+                .prefill_greedy_next_tokens_batch_paged_with_page_tables(
+                    &inputs,
+                    1,
+                    &page_tables,
+                    8,
+                )
+                .unwrap(),
+            expected_next
+        );
+        assert_eq!(model.recurrent_page_context_count(), 2);
+
+        let append_contexts = inputs
+            .iter()
+            .zip(expected_next.iter().copied())
+            .map(|(input, token)| {
+                let mut context = input.clone();
+                context.push(token);
+                context
+            })
+            .collect::<Vec<_>>();
+        let expected_append = append_contexts
+            .iter()
+            .map(|input| model.greedy_next_token(input).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            model
+                .decode_greedy_next_tokens_batch_paged_with_page_tables(
+                    &[expected_next[0], expected_next[1]],
+                    1,
+                    1,
+                    &page_tables,
+                    8,
+                )
+                .unwrap(),
+            expected_append
+        );
+
+        assert_eq!(
+            model
+                .forget_recurrent_page_contexts(&page_tables, "test recurrent cleanup")
+                .unwrap(),
+            2
+        );
+        assert_eq!(model.recurrent_page_context_count(), 0);
     }
 
     #[cfg(feature = "native-cuda")]
@@ -15660,6 +16494,7 @@ mod tests {
             .to_string();
 
         assert!(err.contains("context_length_exceeded"));
+        wait_for_health_counter_at_least(&backend, "admission_rejected_requests", 1).await;
         let health = backend.health();
         assert_eq!(
             health_counter(&health.quantization, "admission_rejected_requests"),
@@ -15759,6 +16594,7 @@ mod tests {
             .to_string();
 
         assert!(err.contains("context_length_exceeded"));
+        wait_for_health_counter_at_least(&backend, "admission_rejected_requests", 1).await;
         let health = backend.health();
         assert!(health.quantization.contains("kv-cache=legacy"));
         assert!(health.quantization.contains("attention=flash-online"));
@@ -18934,6 +19770,31 @@ mod tests {
         let (sin_one, cos_one) = 1.0f32.sin_cos();
         assert_close_vec(&rope.copy_to_host::<f32>(2).unwrap(), &[cos_one, sin_one]);
 
+        let rope_batched_positions = DeviceBuffer::alloc(4 * std::mem::size_of::<f32>()).unwrap();
+        let rope_positions = DeviceBuffer::alloc(2 * std::mem::size_of::<u32>()).unwrap();
+        rope_batched_positions
+            .copy_from_host(&[1.0f32, 0.0, 1.0, 0.0])
+            .unwrap();
+        rope_positions.copy_from_host(&[0u32, 1]).unwrap();
+        crate::kernels::launch_rope_batched_positions(
+            &rope_batched_positions,
+            &rope_positions,
+            2,
+            1,
+            1,
+            2,
+            10_000.0,
+            1.0,
+            false,
+            &stream,
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+        assert_close_vec(
+            &rope_batched_positions.copy_to_host::<f32>(4).unwrap(),
+            &[1.0, 0.0, cos_one, sin_one],
+        );
+
         let q8_raw = DeviceBuffer::alloc(34).unwrap();
         let q8_out = DeviceBuffer::alloc(32 * std::mem::size_of::<f32>()).unwrap();
         let mut q8 = Vec::new();
@@ -19513,6 +20374,177 @@ mod tests {
             &tiled_paged_out.copy_to_host::<f32>(2).unwrap(),
             &[1.0, 1.0],
         );
+
+        let ragged_positions = DeviceBuffer::alloc(2 * std::mem::size_of::<u32>()).unwrap();
+        let ragged_page_table = DeviceBuffer::alloc(6 * std::mem::size_of::<u32>()).unwrap();
+        let ragged_k_pages = DeviceBuffer::alloc(12 * std::mem::size_of::<f32>()).unwrap();
+        let ragged_v_pages = DeviceBuffer::alloc(12 * std::mem::size_of::<f32>()).unwrap();
+        let ragged_write_pages = DeviceBuffer::alloc(12 * std::mem::size_of::<f32>()).unwrap();
+        let ragged_write_values = DeviceBuffer::alloc(4 * std::mem::size_of::<f32>()).unwrap();
+        let ragged_generic_out = DeviceBuffer::alloc(4 * std::mem::size_of::<f32>()).unwrap();
+        let ragged_tiled_out = DeviceBuffer::alloc(4 * std::mem::size_of::<f32>()).unwrap();
+        ragged_positions.copy_from_host(&[0u32, 2]).unwrap();
+        ragged_page_table
+            .copy_from_host(&[0u32, 1, 2, 3, 4, 5])
+            .unwrap();
+        ragged_k_pages.copy_from_host(&[0.0f32; 12]).unwrap();
+        ragged_v_pages
+            .copy_from_host(&[
+                2.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 2.0, 0.0, 4.0, 4.0,
+            ])
+            .unwrap();
+        crate::kernels::launch_paged_decode_attention_batched_positions(
+            &q_batched,
+            &ragged_k_pages,
+            &ragged_v_pages,
+            &ragged_page_table,
+            &ragged_positions,
+            &ragged_generic_out,
+            2,
+            1,
+            3,
+            1,
+            1,
+            2,
+            2,
+            &stream,
+        )
+        .unwrap();
+        crate::kernels::launch_tiled_paged_decode_attention_batched_positions(
+            &q_batched,
+            &ragged_k_pages,
+            &ragged_v_pages,
+            &ragged_page_table,
+            &ragged_positions,
+            &ragged_tiled_out,
+            2,
+            1,
+            3,
+            1,
+            1,
+            2,
+            2,
+            &stream,
+        )
+        .unwrap();
+        ragged_write_pages.memset_zero_async(&stream).unwrap();
+        ragged_write_values
+            .copy_from_host(&[7.0f32, 8.0, 9.0, 10.0])
+            .unwrap();
+        let ragged_write_positions = DeviceBuffer::alloc(2 * std::mem::size_of::<u32>()).unwrap();
+        ragged_write_positions.copy_from_host(&[1u32, 2]).unwrap();
+        crate::kernels::launch_write_paged_kv_cache_batched_positions(
+            &ragged_write_values,
+            &ragged_write_pages,
+            &ragged_page_table,
+            &ragged_write_positions,
+            2,
+            1,
+            1,
+            2,
+            1,
+            3,
+            &stream,
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+        assert_close_vec(
+            &ragged_generic_out.copy_to_host::<f32>(4).unwrap(),
+            &[2.0, 0.0, 2.0, 2.0],
+        );
+        assert_close_vec(
+            &ragged_tiled_out.copy_to_host::<f32>(4).unwrap(),
+            &[2.0, 0.0, 2.0, 2.0],
+        );
+        assert_close_vec(
+            &ragged_write_pages.copy_to_host::<f32>(12).unwrap(),
+            &[0.0, 0.0, 7.0, 8.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 9.0, 10.0],
+        );
+
+        for fast_wide_head_dim in [257usize, 320, super::CUDA_ATTENTION_FAST_HEAD_DIM_MAX] {
+            let q = DeviceBuffer::alloc(fast_wide_head_dim * std::mem::size_of::<f32>()).unwrap();
+            let k_pages =
+                DeviceBuffer::alloc(2 * fast_wide_head_dim * std::mem::size_of::<f32>()).unwrap();
+            let v_pages =
+                DeviceBuffer::alloc(2 * fast_wide_head_dim * std::mem::size_of::<f32>()).unwrap();
+            let page_table = DeviceBuffer::alloc(2 * std::mem::size_of::<u32>()).unwrap();
+            let generic_out =
+                DeviceBuffer::alloc(fast_wide_head_dim * std::mem::size_of::<f32>()).unwrap();
+            let flash_out =
+                DeviceBuffer::alloc(fast_wide_head_dim * std::mem::size_of::<f32>()).unwrap();
+            let tiled_out =
+                DeviceBuffer::alloc(fast_wide_head_dim * std::mem::size_of::<f32>()).unwrap();
+            q.copy_from_host(&vec![0.0f32; fast_wide_head_dim]).unwrap();
+            k_pages
+                .copy_from_host(&vec![0.0f32; 2 * fast_wide_head_dim])
+                .unwrap();
+            let mut values = vec![2.0f32; 2 * fast_wide_head_dim];
+            values[fast_wide_head_dim..].fill(4.0);
+            v_pages.copy_from_host(&values).unwrap();
+            page_table.copy_from_host(&[0u32, 1]).unwrap();
+            crate::kernels::launch_paged_decode_attention(
+                &q,
+                &k_pages,
+                &v_pages,
+                &page_table,
+                &generic_out,
+                1,
+                1,
+                2,
+                1,
+                1,
+                fast_wide_head_dim,
+                fast_wide_head_dim,
+                &stream,
+            )
+            .unwrap();
+            crate::kernels::launch_flash_paged_decode_attention(
+                &q,
+                &k_pages,
+                &v_pages,
+                &page_table,
+                &flash_out,
+                1,
+                1,
+                2,
+                1,
+                1,
+                fast_wide_head_dim,
+                fast_wide_head_dim,
+                &stream,
+            )
+            .unwrap();
+            crate::kernels::launch_tiled_paged_decode_attention(
+                &q,
+                &k_pages,
+                &v_pages,
+                &page_table,
+                &tiled_out,
+                1,
+                1,
+                2,
+                1,
+                1,
+                fast_wide_head_dim,
+                fast_wide_head_dim,
+                &stream,
+            )
+            .unwrap();
+            stream.synchronize().unwrap();
+            let expected = vec![3.0f32; fast_wide_head_dim];
+            assert_close_vec(
+                &generic_out.copy_to_host::<f32>(fast_wide_head_dim).unwrap(),
+                &expected,
+            );
+            assert_close_vec(
+                &flash_out.copy_to_host::<f32>(fast_wide_head_dim).unwrap(),
+                &expected,
+            );
+            assert_close_vec(
+                &tiled_out.copy_to_host::<f32>(fast_wide_head_dim).unwrap(),
+                &expected,
+            );
+        }
 
         let wide_head_dim = super::CUDA_ATTENTION_FAST_HEAD_DIM_MAX + 2;
         let wide_q = DeviceBuffer::alloc(wide_head_dim * std::mem::size_of::<f32>()).unwrap();
@@ -20428,6 +21460,41 @@ mod tests {
             tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
         ];
         write_qwen_next_recurrent_ssm_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_qwen_next_mixed_recurrent_ssm_attention(path: &Path) {
+        let tensors = vec![
+            tensor_f16(
+                "token_embd.weight",
+                vec![2, 3],
+                &[1.0, 0.0, 0.0, 1.0, 1.0, 1.0],
+            ),
+            tensor_f32("output_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.0.attn_post_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.attn_qkv.weight", vec![2, 6], &[0.0; 12]),
+            tensor_f16("blk.0.attn_gate.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ssm_conv1d.weight", vec![1, 6], &[0.0; 6]),
+            tensor_f32("blk.0.ssm_dt.bias", vec![1], &[0.0]),
+            tensor_f32("blk.0.ssm_a", vec![1], &[0.0]),
+            tensor_f16("blk.0.ssm_ba.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f32("blk.0.ssm_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.0.ssm_out.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_gate.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_up.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.0.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f32("blk.1.attn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f32("blk.1.ffn_norm.weight", vec![2], &[1.0, 1.0]),
+            tensor_f16("blk.1.attn_q.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.1.attn_k.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.1.attn_v.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.1.attn_output.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.1.ffn_gate.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.1.ffn_up.weight", vec![2, 2], &[0.0; 4]),
+            tensor_f16("blk.1.ffn_down.weight", vec![2, 2], &[0.0; 4]),
+        ];
+        write_qwen_next_recurrent_ssm_gguf_with_block_count(path, tensors, 2);
     }
 
     #[cfg(feature = "native-cuda")]
@@ -23306,6 +24373,15 @@ mod tests {
 
     #[cfg(feature = "native-cuda")]
     fn write_qwen_next_recurrent_ssm_gguf(path: &Path, tensors: Vec<TestTensor>) {
+        write_qwen_next_recurrent_ssm_gguf_with_block_count(path, tensors, 1);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_qwen_next_recurrent_ssm_gguf_with_block_count(
+        path: &Path,
+        tensors: Vec<TestTensor>,
+        block_count: u32,
+    ) {
         let mut data = Vec::new();
         let tensors = tensors
             .into_iter()
@@ -23334,7 +24410,7 @@ mod tests {
         write_kv_u32(&mut bytes, "qwen3next.context_length", 128);
         write_kv_u32(&mut bytes, "qwen3next.embedding_length", 2);
         write_kv_u32(&mut bytes, "qwen3next.feed_forward_length", 2);
-        write_kv_u32(&mut bytes, "qwen3next.block_count", 1);
+        write_kv_u32(&mut bytes, "qwen3next.block_count", block_count);
         write_kv_u32(&mut bytes, "qwen3next.attention.head_count", 1);
         write_kv_u32(&mut bytes, "qwen3next.attention.head_count_kv", 1);
         write_kv_f32(
