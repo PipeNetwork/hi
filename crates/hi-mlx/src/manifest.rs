@@ -234,7 +234,10 @@ fn model_family(model_type: &str, config: &Value) -> Option<ModelFamily> {
         return Some(ModelFamily::LongCat);
     }
     // Dense Llama-like variants that run on the Qwen GQA path (QwenLike).
-    if matches!(model_type.as_str(), "internlm3" | "internlm2" | "granite") {
+    if matches!(
+        model_type.as_str(),
+        "internlm3" | "internlm2" | "granite" | "smollm3"
+    ) {
         return Some(ModelFamily::Qwen2);
     }
     None
