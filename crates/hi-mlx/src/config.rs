@@ -23,6 +23,7 @@ pub struct MlxModelConfig {
     pub num_key_value_heads: u32,
     pub head_dim: Option<u32>,
     pub partial_rotary_factor: Option<f32>,
+    pub rotary_dim: Option<u32>,
     // Qwen3.5 gated-delta-net (linear attention) hybrid fields.
     pub linear_num_value_heads: Option<u32>,
     pub linear_num_key_heads: Option<u32>,
@@ -317,6 +318,7 @@ pub fn parse_model_config(path: &Path, raw: Value) -> Result<MlxModelConfig> {
                     .and_then(Value::as_f64)
                     .map(|v| v as f32)
             }),
+        rotary_dim: u32_field(&raw, "rotary_dim"),
         linear_num_value_heads: u32_field(&raw, "linear_num_value_heads"),
         linear_num_key_heads: u32_field(&raw, "linear_num_key_heads"),
         linear_key_head_dim: u32_field(&raw, "linear_key_head_dim"),
@@ -374,7 +376,8 @@ pub fn parse_model_config(path: &Path, raw: Value) -> Result<MlxModelConfig> {
         first_k_dense_replace: u32_field(&raw, "first_k_dense_replace").unwrap_or(0),
         moe_layer_freq: u32_field(&raw, "moe_layer_freq").unwrap_or(1),
         n_routed_experts: u32_field(&raw, "n_routed_experts")
-            .or_else(|| u32_field(&raw, "num_experts")),
+            .or_else(|| u32_field(&raw, "num_experts"))
+            .or_else(|| u32_field(&raw, "num_local_experts")),
         n_shared_experts: u32_field(&raw, "n_shared_experts"),
         num_experts_per_tok: u32_field(&raw, "num_experts_per_tok"),
         decoder_sparse_step: u32_field(&raw, "decoder_sparse_step").unwrap_or(1),
@@ -476,6 +479,10 @@ pub fn detect_family(model_type: &str, config: &Value) -> Option<ModelFamily> {
     // dispatched to Gemma4TextLike in load_model.
     if model_type.starts_with("gemma4") || haystack.contains("gemma4") {
         return Some(ModelFamily::Gemma);
+    }
+    // MiniMax-M3: GQA (partial rotary) + sigmoid/noaux MoE at every layer.
+    if model_type.starts_with("minimax") || haystack.contains("minimax") {
+        return Some(ModelFamily::MiniMax);
     }
     None
 }

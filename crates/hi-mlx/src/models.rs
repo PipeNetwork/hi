@@ -217,6 +217,7 @@ mod native {
                 }
             }
             ModelFamily::NemotronH => Ok(Box::new(NemotronHLike::new(config.clone(), arrays)?)),
+            ModelFamily::MiniMax => Ok(Box::new(MiniMaxLike::new(config.clone(), arrays)?)),
             ModelFamily::Gemma if config.model_type.starts_with("gemma4") => {
                 Ok(Box::new(Gemma4TextLike::new(config.clone(), arrays)?))
             }
@@ -5269,6 +5270,361 @@ mod native {
         fn prepare_cache(&mut self, capacity: i32) {
             for block in &mut self.blocks {
                 block.attn.cache.prepare_capacity(capacity);
+            }
+        }
+    }
+
+    // ---------------------- MiniMax-M3 (minimax_m3) ----------------------
+    // GQA (partial rotary + per-head q/k norms) + a DeepSeek-style sigmoid/noaux MoE (`block_sparse_moe`)
+    // above `first_k_dense_replace` dense layers, each MoE layer with a shared expert. FFNs use the
+    // SwiGLU-OAI (GPT-OSS-style) clamped activation: clamp gate<=limit, up to +/-limit, then
+    // (up+1)*gate*sigmoid(alpha*gate). Routing weights scaled by routed_scaling_factor. `model.` prefix.
+
+    // MiniMax RMSNorms use the Gemma/T5 (1 + weight) convention (stored weights are deviations from 1).
+    fn minimax_norm(key: &str, arrays: &HashMap<String, Array>, eps: f32) -> Result<RmsNorm> {
+        Ok(RmsNorm {
+            weight: raw_array(arrays, key)? + 1.0f32,
+            eps,
+        })
+    }
+
+    // SwiGLU-OAI activation (swiglu_alpha=1.702, swiglu_limit=7.0).
+    fn swiglu_oai(gate: &Array, up: &Array, alpha: f32, limit: f32) -> Result<Array> {
+        let hi = Array::from_f32(limit);
+        let g = minimum(gate, &hi)?;
+        let u = maximum(&minimum(up, &hi)?, &Array::from_f32(-limit))?;
+        let glu = &g * sigmoid(&(&g * alpha))?;
+        Ok((&u + 1.0f32) * glu)
+    }
+
+    struct MiniMaxMlp {
+        gate_proj: Linear,
+        up_proj: Linear,
+        down_proj: Linear,
+        alpha: f32,
+        limit: f32,
+    }
+
+    impl MiniMaxMlp {
+        fn load(
+            prefix: &str,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+        ) -> Result<Self> {
+            Ok(Self {
+                gate_proj: Linear::load(&format!("{prefix}.gate_proj"), arrays, config)?,
+                up_proj: Linear::load(&format!("{prefix}.up_proj"), arrays, config)?,
+                down_proj: Linear::load(&format!("{prefix}.down_proj"), arrays, config)?,
+                alpha: 1.702,
+                limit: config.swiglu_limit.unwrap_or(7.0),
+            })
+        }
+
+        fn forward(&self, x: &Array) -> Result<Array> {
+            let g = self.gate_proj.forward(x)?;
+            let u = self.up_proj.forward(x)?;
+            self.down_proj
+                .forward(&swiglu_oai(&g, &u, self.alpha, self.limit)?)
+        }
+    }
+
+    struct MiniMaxAttention {
+        q_proj: Linear,
+        k_proj: Linear,
+        v_proj: Linear,
+        o_proj: Linear,
+        q_norm: Option<RmsNorm>,
+        k_norm: Option<RmsNorm>,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        rot_dims: i32,
+        rope_theta: f32,
+        cache: Cache,
+    }
+
+    impl MiniMaxAttention {
+        fn load(
+            prefix: &str,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+        ) -> Result<Self> {
+            let head_dim = config.attention_head_dim() as i32;
+            // Per-head q/k RMSNorm over head_dim (when present), (1 + weight) convention.
+            let load_norm = |name: &str| -> Result<Option<RmsNorm>> {
+                if arrays.contains_key(&format!("{prefix}.{name}.weight")) {
+                    Ok(Some(minimax_norm(
+                        &format!("{prefix}.{name}.weight"),
+                        arrays,
+                        config.rms_norm_eps,
+                    )?))
+                } else {
+                    Ok(None)
+                }
+            };
+            Ok(Self {
+                q_proj: Linear::load(&format!("{prefix}.q_proj"), arrays, config)?,
+                k_proj: Linear::load(&format!("{prefix}.k_proj"), arrays, config)?,
+                v_proj: Linear::load(&format!("{prefix}.v_proj"), arrays, config)?,
+                o_proj: Linear::load(&format!("{prefix}.o_proj"), arrays, config)?,
+                q_norm: load_norm("q_norm")?,
+                k_norm: load_norm("k_norm")?,
+                n_heads: config.num_attention_heads as i32,
+                n_kv_heads: config.num_key_value_heads as i32,
+                head_dim,
+                rot_dims: config.rotary_dim.map(|d| d as i32).unwrap_or(head_dim),
+                rope_theta: config.rope_theta,
+                cache: Cache::new(),
+            })
+        }
+
+        fn forward(&mut self, x: &Array) -> Result<Array> {
+            let shape = x.shape();
+            let (b, l) = (shape[0], shape[1]);
+            let mut q = self
+                .q_proj
+                .forward(x)?
+                .reshape(&[b, l, self.n_heads, self.head_dim])?;
+            if let Some(norm) = &self.q_norm {
+                q = norm.forward(&q)?;
+            }
+            let mut q = q.transpose_axes(&[0, 2, 1, 3])?;
+            let mut k = self
+                .k_proj
+                .forward(x)?
+                .reshape(&[b, l, self.n_kv_heads, self.head_dim])?;
+            if let Some(norm) = &self.k_norm {
+                k = norm.forward(&k)?;
+            }
+            let mut k = k.transpose_axes(&[0, 2, 1, 3])?;
+            let v = self
+                .v_proj
+                .forward(x)?
+                .reshape(&[b, l, self.n_kv_heads, self.head_dim])?
+                .transpose_axes(&[0, 2, 1, 3])?;
+            let offset = self.cache.offset;
+            q = rope(&q, self.rot_dims, false, self.rope_theta, 1.0, offset, None)?;
+            k = rope(&k, self.rot_dims, false, self.rope_theta, 1.0, offset, None)?;
+            let (k, v) = self.cache.update(k, v)?;
+            let scale = (self.head_dim as f32).powf(-0.5);
+            let output = if l > 1 && offset == 0 {
+                scaled_dot_product_attention(
+                    &q,
+                    &k,
+                    &v,
+                    scale,
+                    ScaledDotProductAttentionMask::Causal,
+                    None::<&Array>,
+                )?
+            } else if l > 1 {
+                let mask = causal_attention_mask(l, k.shape()[2], offset);
+                scaled_dot_product_attention(
+                    &q,
+                    &k,
+                    &v,
+                    scale,
+                    ScaledDotProductAttentionMask::Array(&mask),
+                    None::<&Array>,
+                )?
+            } else {
+                scaled_dot_product_attention(&q, &k, &v, scale, None, None::<&Array>)?
+            };
+            let output = output
+                .transpose_axes(&[0, 2, 1, 3])?
+                .reshape(&[b, l, self.n_heads * self.head_dim])?;
+            self.o_proj.forward(&output)
+        }
+    }
+
+    struct MiniMaxMoE {
+        gate: Linear,
+        switch_mlp: SwitchMlp,
+        shared: Option<MiniMaxMlp>,
+        expert_bias: Vec<f32>,
+        top_k: usize,
+        alpha: f32,
+        limit: f32,
+        routed_scaling: f32,
+    }
+
+    impl MiniMaxMoE {
+        fn load(
+            prefix: &str,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+        ) -> Result<Self> {
+            let bias = raw_array(arrays, &format!("{prefix}.e_score_correction_bias"))?
+                .as_type::<f32>()?;
+            transforms::eval([&bias])?;
+            let shared = if arrays.contains_key(&format!("{prefix}.shared_experts.gate_proj.weight"))
+            {
+                Some(MiniMaxMlp::load(
+                    &format!("{prefix}.shared_experts"),
+                    arrays,
+                    config,
+                )?)
+            } else {
+                None
+            };
+            Ok(Self {
+                gate: Linear::load(&format!("{prefix}.gate"), arrays, config)?,
+                switch_mlp: SwitchMlp::load(&format!("{prefix}.switch_mlp"), arrays, config)?,
+                shared,
+                expert_bias: bias.as_slice::<f32>().to_vec(),
+                top_k: config.num_experts_per_tok.unwrap_or(1) as usize,
+                alpha: 1.702,
+                limit: config.swiglu_limit.unwrap_or(7.0),
+                routed_scaling: config.routed_scaling_factor,
+            })
+        }
+
+        fn forward(&self, x: &Array) -> Result<Array> {
+            let d = x.shape()[2];
+            let scores = sigmoid(&self.gate.forward(x)?.as_type::<f32>()?)?;
+            transforms::eval([&scores])?;
+            let shape = scores.shape();
+            let (l, n_experts) = (shape[1] as usize, shape[2] as usize);
+            let raw = scores.as_slice::<f32>();
+            let mut idx_v: Vec<u32> = Vec::with_capacity(l * self.top_k);
+            let mut wts_v: Vec<f32> = Vec::with_capacity(l * self.top_k);
+            for token in 0..l {
+                let base = token * n_experts;
+                // Rank by (score + bias); keep the bias-free scores; normalize over the top-k.
+                let mut ranked: Vec<usize> = (0..n_experts).collect();
+                ranked.sort_by(|&a, &b| {
+                    (raw[base + b] + self.expert_bias[b])
+                        .total_cmp(&(raw[base + a] + self.expert_bias[a]))
+                        .then_with(|| a.cmp(&b))
+                });
+                ranked.truncate(self.top_k.min(n_experts));
+                let mut w: Vec<f32> = ranked.iter().map(|&i| raw[base + i]).collect();
+                let denom: f32 = w.iter().sum::<f32>() + 1e-20;
+                for x in &mut w {
+                    *x = *x / denom * self.routed_scaling;
+                }
+                for (k, &e) in ranked.iter().enumerate() {
+                    idx_v.push(e as u32);
+                    wts_v.push(w[k]);
+                }
+            }
+            let top_k = self.top_k as i32;
+            let inds = Array::from_slice(&idx_v, &[l as i32, top_k]);
+            let weights = Array::from_slice(&wts_v, &[l as i32, top_k, 1]);
+            let xe = x.reshape(&[l as i32, 1, 1, d])?;
+            // Batched SwiGLU-OAI experts (clamped, alpha-scaled, (up+1)).
+            let gate_pre = self.switch_mlp.gate_proj.gather(&xe, &inds)?;
+            let up_pre = self.switch_mlp.up_proj.gather(&xe, &inds)?;
+            let act = swiglu_oai(&gate_pre, &up_pre, self.alpha, self.limit)?;
+            let expert_out = self
+                .switch_mlp
+                .down_proj
+                .gather(&act, &inds)?
+                .reshape(&[l as i32, top_k, d])?
+                .as_type::<f32>()?;
+            let mut y = sum_axis(&(expert_out * weights), 1, false)?.reshape(&[1, l as i32, d])?;
+            if let Some(shared) = &self.shared {
+                y = y + shared.forward(x)?.as_type::<f32>()?;
+            }
+            Ok(y)
+        }
+    }
+
+    enum MiniMaxFfn {
+        Dense(MiniMaxMlp),
+        Moe(MiniMaxMoE),
+    }
+
+    struct MiniMaxLayer {
+        input_ln: RmsNorm,
+        post_attn_ln: RmsNorm,
+        attn: MiniMaxAttention,
+        ffn: MiniMaxFfn,
+    }
+
+    impl MiniMaxLayer {
+        fn load(
+            idx: u32,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+        ) -> Result<Self> {
+            let p = format!("model.layers.{idx}");
+            let eps = config.rms_norm_eps;
+            // The first `first_k_dense_replace` layers are a dense MLP; the rest are MoE.
+            let ffn = if arrays.contains_key(&format!("{p}.block_sparse_moe.gate.weight")) {
+                MiniMaxFfn::Moe(MiniMaxMoE::load(
+                    &format!("{p}.block_sparse_moe"),
+                    arrays,
+                    config,
+                )?)
+            } else {
+                MiniMaxFfn::Dense(MiniMaxMlp::load(&format!("{p}.mlp"), arrays, config)?)
+            };
+            Ok(Self {
+                input_ln: minimax_norm(&format!("{p}.input_layernorm.weight"), arrays, eps)?,
+                post_attn_ln: minimax_norm(
+                    &format!("{p}.post_attention_layernorm.weight"),
+                    arrays,
+                    eps,
+                )?,
+                attn: MiniMaxAttention::load(&format!("{p}.self_attn"), arrays, config)?,
+                ffn,
+            })
+        }
+
+        fn forward(&mut self, x: Array) -> Result<Array> {
+            let r = &x + self.attn.forward(&self.input_ln.forward(&x)?)?;
+            let normed = self.post_attn_ln.forward(&r)?;
+            let h = match &self.ffn {
+                MiniMaxFfn::Dense(mlp) => mlp.forward(&normed)?,
+                MiniMaxFfn::Moe(moe) => moe.forward(&normed)?,
+            };
+            Ok(r + h)
+        }
+    }
+
+    struct MiniMaxLike {
+        embed: Embedding,
+        layers: Vec<MiniMaxLayer>,
+        norm: RmsNorm,
+        lm_head: Linear,
+    }
+
+    impl MiniMaxLike {
+        fn new(config: MlxModelConfig, arrays: HashMap<String, Array>) -> Result<Self> {
+            let layers = (0..config.num_hidden_layers)
+                .map(|idx| MiniMaxLayer::load(idx, &arrays, &config))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Self {
+                embed: Embedding::load("model.embed_tokens", &arrays, &config)?,
+                norm: minimax_norm("model.norm.weight", &arrays, config.rms_norm_eps)?,
+                lm_head: Linear::load("lm_head", &arrays, &config)?,
+                layers,
+            })
+        }
+    }
+
+    impl CausalLm for MiniMaxLike {
+        fn forward(&mut self, input_ids: &[u32]) -> Result<Array> {
+            let ids = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
+            let mut h = self.embed.forward(&ids)?;
+            for layer in &mut self.layers {
+                h = layer.forward(h)?;
+            }
+            h = self.norm.forward(&h)?;
+            let logits = self.lm_head.forward(&h)?;
+            transforms::eval([&logits])?;
+            Ok(logits)
+        }
+
+        fn reset_cache(&mut self) {
+            for layer in &mut self.layers {
+                layer.attn.cache.reset();
+            }
+        }
+
+        fn prepare_cache(&mut self, capacity: i32) {
+            for layer in &mut self.layers {
+                layer.attn.cache.prepare_capacity(capacity);
             }
         }
     }

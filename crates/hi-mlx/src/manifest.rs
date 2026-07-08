@@ -225,6 +225,10 @@ fn model_family(model_type: &str, config: &Value) -> Option<ModelFamily> {
     if model_type.starts_with("gemma4") || haystack.contains("gemma4") {
         return Some(ModelFamily::Gemma);
     }
+    // MiniMax-M3: GQA + sigmoid/noaux MoE.
+    if model_type.starts_with("minimax") || haystack.contains("minimax") {
+        return Some(ModelFamily::MiniMax);
+    }
     None
 }
 

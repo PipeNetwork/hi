@@ -164,6 +164,15 @@ impl WeightCatalog {
                     ],
                 )?;
             }
+            crate::manifest::ModelFamily::MiniMax => {
+                self.require_any(
+                    "MiniMax attention projection",
+                    &[
+                        "model.layers.0.self_attn.q_proj.weight",
+                        "model.layers.0.self_attn.q_proj.scales",
+                    ],
+                )?;
+            }
             crate::manifest::ModelFamily::Gemma if config.model_type.starts_with("gemma4") => {
                 self.require_any(
                     "Gemma-4 attention projection",
