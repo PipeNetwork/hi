@@ -69,7 +69,7 @@ fn prompt_choice() -> Option<FeedbackChoice> {
         "2" => Some(FeedbackChoice::Fine),
         "3" => Some(FeedbackChoice::Good),
         "0" | "" => Some(FeedbackChoice::Dismiss),
-        _ => None,
+        _ => Some(FeedbackChoice::Dismiss),
     }
 }
 
