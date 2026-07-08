@@ -53,7 +53,8 @@ pub struct CudaVisionEncoderInfo {
 
 #[cfg(feature = "native-cuda")]
 mod native {
-    use std::cell::{RefCell, RefMut};
+    use std::cell::{Cell, RefCell, RefMut};
+    use std::time::Instant;
     use std::collections::{BTreeMap, BTreeSet};
     use std::fmt;
 
@@ -361,6 +362,32 @@ mod native {
         vectors: BTreeMap<String, GpuVector>,
         paged_batch_pool: RefCell<Option<CudaPagedBatchDevicePool>>,
         recurrent_page_states: RefCell<BTreeMap<usize, RecurrentSsmRequestState>>,
+        // Per-generation forward-pass timing: (prefill_micros, decode_micros,
+        // forward_count). The first forward after a reset is the (batched) prompt
+        // prefill; every later forward is a per-token decode. Fed by ForwardTimer
+        // guards on the forward primitives; read by the generation entry points so
+        // the non-continuous path can report an accurate prefill/decode split
+        // instead of `scheduler_token_timing`'s proportional-by-token-count guess.
+        generation_timing: Cell<(u64, u64, u64)>,
+        // Re-entrancy guard so only the OUTERMOST forward primitive records (many
+        // forward methods delegate to one another; nested timers would double-count).
+        forward_in_progress: Cell<bool>,
+    }
+
+    /// RAII guard: on drop, attributes its lifetime to the model's per-generation
+    /// prefill (first forward) or decode (subsequent) accumulator. Records on every
+    /// exit path including `?`, and only measures time — never affects computation.
+    struct ForwardTimer<'a> {
+        model: &'a CudaQwenGpuModel,
+        started: Instant,
+    }
+
+    impl Drop for ForwardTimer<'_> {
+        fn drop(&mut self) {
+            let micros = u64::try_from(self.started.elapsed().as_micros()).unwrap_or(u64::MAX);
+            self.model.record_forward_micros(micros);
+            self.model.forward_in_progress.set(false);
+        }
     }
 
     struct RecurrentSsmRequestState {
@@ -2718,6 +2745,46 @@ mod native {
     }
 
     impl CudaQwenGpuModel {
+        /// Start a fresh per-generation prefill/decode timing window.
+        pub(crate) fn reset_generation_timing(&self) {
+            self.generation_timing.set((0, 0, 0));
+        }
+
+        /// Attribute one forward pass's elapsed micros: the first forward after a
+        /// reset is the batched prompt prefill; every later one is a decode step.
+        fn record_forward_micros(&self, micros: u64) {
+            let (prefill, decode, count) = self.generation_timing.get();
+            if count == 0 {
+                self.generation_timing
+                    .set((prefill.saturating_add(micros), decode, 1));
+            } else {
+                self.generation_timing
+                    .set((prefill, decode.saturating_add(micros), count + 1));
+            }
+        }
+
+        /// (prefill_micros, decode_micros) accumulated since the last reset.
+        pub(crate) fn take_generation_timing(&self) -> (u64, u64) {
+            let (prefill, decode, _) = self.generation_timing.get();
+            (prefill, decode)
+        }
+
+        /// RAII timer that attributes its scope to the current forward pass. Add
+        /// `let _t = self.forward_timer();` as the first statement of a forward
+        /// primitive to include it in the prefill/decode split. Returns `None` when
+        /// a forward is already being timed (nested delegation) so only the
+        /// outermost call is counted.
+        fn forward_timer(&self) -> Option<ForwardTimer<'_>> {
+            if self.forward_in_progress.get() {
+                return None;
+            }
+            self.forward_in_progress.set(true);
+            Some(ForwardTimer {
+                model: self,
+                started: Instant::now(),
+            })
+        }
+
         pub fn from_gguf(gguf: &GgufFile) -> Result<Self> {
             let config = gguf.qwen_config()?;
             gguf.validate_qwen_tensors()?;
@@ -2836,6 +2903,8 @@ mod native {
                 vectors,
                 paged_batch_pool: RefCell::new(None),
                 recurrent_page_states: RefCell::new(BTreeMap::new()),
+                generation_timing: Cell::new((0, 0, 0)),
+                forward_in_progress: Cell::new(false),
             })
         }
 
@@ -11119,6 +11188,7 @@ mod native {
         }
 
         fn full_context_logits_device(&self, token_ids: &[u32]) -> Result<GpuF32Tensor> {
+            let _t = self.forward_timer();
             self.full_context_logits_device_with_cache(token_ids, None)
         }
 
@@ -11269,6 +11339,7 @@ mod native {
             token_ids: &[u32],
             cache: Option<&mut CudaKvCache>,
         ) -> Result<GpuF32Tensor> {
+            let _t = self.forward_timer();
             let cache = cache.map(|cache| cache as &mut dyn CudaSingleKvCacheWrite);
             self.full_context_logits_device_with_prefix_cache_writer(
                 prefix_embeddings,
@@ -11285,6 +11356,7 @@ mod native {
             token_ids: &[u32],
             cache: &mut CudaPagedKvCache,
         ) -> Result<GpuF32Tensor> {
+            let _t = self.forward_timer();
             self.full_context_logits_device_with_prefix_cache_writer(
                 prefix_embeddings,
                 prefix_rows,
@@ -11300,6 +11372,7 @@ mod native {
             token_ids: &[u32],
             cache: Option<&mut dyn CudaSingleKvCacheWrite>,
         ) -> Result<GpuF32Tensor> {
+            let _t = self.forward_timer();
             let dims = self.qwen_dims()?;
             if token_ids.is_empty() {
                 bail!("CUDA multimodal Qwen forward requires at least one token");
@@ -11574,6 +11647,7 @@ mod native {
             seq_len: usize,
             mut cache: Option<&mut CudaKvCache>,
         ) -> Result<GpuF32Tensor> {
+            let _t = self.forward_timer();
             let dims = self.qwen_dims()?;
             if batch_count == 0 || seq_len == 0 {
                 bail!("CUDA batched Qwen forward requires non-empty batch and sequence");
@@ -12099,6 +12173,7 @@ mod native {
             cache: &mut CudaPagedBatchKvCache,
             last_row_only: bool,
         ) -> Result<GpuF32Tensor> {
+            let _t = self.forward_timer();
             let dims = self.qwen_dims()?;
             if batch_count == 0 || seq_len == 0 {
                 bail!("CUDA paged batched Qwen forward requires non-empty batch and sequence");
@@ -12192,6 +12267,7 @@ mod native {
             token_ids: &[u32],
             mut cache: Option<&mut CudaKvCache>,
         ) -> Result<GpuF32Tensor> {
+            let _t = self.forward_timer();
             let dims = self.qwen_dims()?;
             if token_ids.is_empty() {
                 bail!("CUDA Qwen forward requires at least one token");
@@ -12278,6 +12354,7 @@ mod native {
             token_ids: &[u32],
             cache: &mut CudaPagedKvCache,
         ) -> Result<GpuF32Tensor> {
+            let _t = self.forward_timer();
             let dims = self.qwen_dims()?;
             if token_ids.is_empty() {
                 bail!("CUDA paged Qwen forward requires at least one token");
@@ -12364,6 +12441,7 @@ mod native {
             position: usize,
             cache: &mut CudaKvCache,
         ) -> Result<GpuF32Tensor> {
+            let _t = self.forward_timer();
             self.decode_one_logits_device_with_rope_position(token_id, position, position, cache)
         }
 
@@ -12374,6 +12452,7 @@ mod native {
             rope_position: usize,
             cache: &mut CudaKvCache,
         ) -> Result<GpuF32Tensor> {
+            let _t = self.forward_timer();
             let dims = self.qwen_dims()?;
             if cache_position >= dims.context {
                 bail!(
@@ -12454,6 +12533,7 @@ mod native {
             position: usize,
             cache: &mut CudaPagedKvCache,
         ) -> Result<GpuF32Tensor> {
+            let _t = self.forward_timer();
             self.decode_one_logits_paged_device_with_rope_position(
                 token_id, position, position, cache,
             )
@@ -12466,6 +12546,7 @@ mod native {
             rope_position: usize,
             cache: &mut CudaPagedKvCache,
         ) -> Result<GpuF32Tensor> {
+            let _t = self.forward_timer();
             let dims = self.qwen_dims()?;
             if cache_position >= dims.context {
                 bail!(
@@ -12547,6 +12628,7 @@ mod native {
             position: usize,
             cache: &mut CudaKvCache,
         ) -> Result<GpuF32Tensor> {
+            let _t = self.forward_timer();
             let dims = self.qwen_dims()?;
             let batch_count = token_ids.len();
             if batch_count == 0 {
@@ -12630,6 +12712,7 @@ mod native {
             rope_positions: &[usize],
             cache: &mut CudaKvCache,
         ) -> Result<GpuF32Tensor> {
+            let _t = self.forward_timer();
             let dims = self.qwen_dims()?;
             let batch_count = token_ids.len();
             if batch_count == 0 {
@@ -12786,6 +12869,7 @@ mod native {
             rope_positions: &[usize],
             cache: &mut CudaPagedBatchKvCache,
         ) -> Result<GpuF32Tensor> {
+            let _t = self.forward_timer();
             let dims = self.qwen_dims()?;
             let batch_count = token_ids.len();
             if batch_count == 0 {
@@ -12945,6 +13029,7 @@ mod native {
             rope_positions: &[usize],
             cache: &mut CudaPagedBatchKvCache,
         ) -> Result<GpuF32Tensor> {
+            let _t = self.forward_timer();
             let dims = self.qwen_dims()?;
             let batch_count = token_ids.len();
             if batch_count == 0 {
@@ -13124,6 +13209,7 @@ mod native {
             position: usize,
             cache: &mut CudaPagedBatchKvCache,
         ) -> Result<GpuF32Tensor> {
+            let _t = self.forward_timer();
             let dims = self.qwen_dims()?;
             let batch_count = token_ids.len();
             if batch_count == 0 {
@@ -13207,6 +13293,7 @@ mod native {
             positions: &[usize],
             cache: &mut CudaPagedBatchKvCache,
         ) -> Result<GpuF32Tensor> {
+            let _t = self.forward_timer();
             let dims = self.qwen_dims()?;
             let batch_count = token_ids.len();
             if batch_count == 0 {
