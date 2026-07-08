@@ -85,6 +85,10 @@ fn render_gguf_chat_template(template: &str, messages: &[ChatMessage]) -> Option
     if template.contains("<|START_OF_TURN_TOKEN|>") && template.contains("<|END_OF_TURN_TOKEN|>") {
         return Some(render_cohere_template(messages));
     }
+    // Llama-4: `<|header_start|>{role}<|header_end|>\n\n{content}<|eot|>` turns.
+    if template.contains("<|header_start|>") && template.contains("<|header_end|>") {
+        return Some(render_llama4_template(messages));
+    }
     // Standard Gemma (2/3) format: `<start_of_turn>{role}\n{content}<end_of_turn>`. Its jinja is too
     // complex for the loop renderer; the framing is simple, so use the dedicated builder. Gemma is very
     // BOS-sensitive and the template emits `bos_token` first, so prepend it.
@@ -306,6 +310,27 @@ fn render_cohere_template(messages: &[ChatMessage]) -> String {
         out.push_str("<|END_OF_TURN_TOKEN|>");
     }
     out.push_str("<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>");
+    out
+}
+
+// Llama-4: `<|header_start|>{role}<|header_end|>\n\n{content}<|eot|>` turns, leading begin-of-text and
+// an assistant header generation prompt.
+fn render_llama4_template(messages: &[ChatMessage]) -> String {
+    let mut out = String::from("<|begin_of_text|>");
+    for message in messages {
+        let role = match message.role.as_str() {
+            "assistant" | "ai" | "model" => "assistant",
+            "system" | "developer" | "root" => "system",
+            "tool" => "ipython",
+            _ => "user",
+        };
+        out.push_str("<|header_start|>");
+        out.push_str(role);
+        out.push_str("<|header_end|>\n\n");
+        out.push_str(&message.content_text());
+        out.push_str("<|eot|>");
+    }
+    out.push_str("<|header_start|>assistant<|header_end|>\n\n");
     out
 }
 

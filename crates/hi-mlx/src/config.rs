@@ -546,6 +546,8 @@ pub fn detect_family(model_type: &str, config: &Value) -> Option<ModelFamily> {
             | "nemotron"
             | "gpt_oss"
             | "cohere2"
+            | "llama4"
+            | "llama4_text"
     ) {
         return Some(ModelFamily::Qwen2);
     }

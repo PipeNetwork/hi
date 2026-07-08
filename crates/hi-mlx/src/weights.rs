@@ -265,7 +265,11 @@ impl WeightCatalog {
     }
 
     fn require_any(&self, label: &str, keys: &[&str]) -> Result<()> {
-        if keys.iter().any(|key| self.has(key)) {
+        // VL models (e.g. Llama-4, Qwen3.5) carry the `language_model.` prefix at validation time.
+        if keys
+            .iter()
+            .any(|key| self.has(key) || self.has(&format!("language_model.{key}")))
+        {
             Ok(())
         } else {
             bail!(
