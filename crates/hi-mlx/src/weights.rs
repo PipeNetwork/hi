@@ -188,10 +188,7 @@ impl WeightCatalog {
                     ],
                 )?;
             }
-            crate::manifest::ModelFamily::Gemma
-                if config.model_type.starts_with("gemma4")
-                    || config.model_type.starts_with("gemma3") =>
-            {
+            crate::manifest::ModelFamily::Gemma if config.model_type.starts_with("gemma") => {
                 self.require_any(
                     "Gemma-3/4 attention projection",
                     &[
