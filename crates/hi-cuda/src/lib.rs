@@ -756,6 +756,7 @@ impl CudaBackend {
                     kv_page_size: config.kv_page_size,
                     mmproj: mmproj.clone(),
                     multimodal_stats: multimodal_stats.clone(),
+                    max_active_requests: config.max_active_requests,
                     prefix_cache: Mutex::new(None),
                 },
                 config.max_batch_size,
@@ -1002,10 +1003,12 @@ impl CudaBackend {
             return "disabled(reason=scheduler-unavailable)".to_string();
         };
         format!(
-            "enabled(scope=batch,backend=paged-shared-prefix,batches={},requests={},tokens_total={})",
+            "enabled(scope=batch,backend=paged-shared-prefix,batches={},requests={},tokens_total={},cross_request_reuse_requests={},cross_request_reuse_tokens={})",
             snapshot.shared_prefix_batches,
             snapshot.shared_prefix_requests,
-            snapshot.shared_prefix_tokens
+            snapshot.shared_prefix_tokens,
+            snapshot.retained_prefix_reuse_requests,
+            snapshot.retained_prefix_reuse_tokens
         )
     }
 
@@ -2749,7 +2752,11 @@ struct CudaSchedulerState {
     kv_page_size: usize,
     mmproj: Option<CudaMmprojInfo>,
     multimodal_stats: Arc<CudaMultimodalStats>,
-    /// Opt-in cross-request prefix cache (`HI_CUDA_PREFIX_CACHE`): the token ids
+    /// Max concurrently-admitted requests; the cross-request prefix cache defaults
+    /// on only when this is 1 (single-stream), where retaining pages between
+    /// requests cannot starve a concurrent request.
+    max_active_requests: usize,
+    /// Cross-request prefix cache: the token ids
     /// and physical KV pages of the most recently completed request, so the next
     /// request sharing a page-aligned prefix can reuse that KV and prefill only
     /// the divergent suffix. `None` until the first request retires (or when the
@@ -2792,6 +2799,11 @@ struct CudaSchedulerStats {
     shared_prefix_batches: AtomicU64,
     shared_prefix_requests: AtomicU64,
     shared_prefix_tokens: AtomicU64,
+    // Cross-request retained-prefix cache reuse (distinct from the intra-batch
+    // shared_prefix_* counters above): how many admitted requests reused a
+    // previously-computed prefix, and how many prompt tokens' prefill that skipped.
+    retained_prefix_reuse_requests: AtomicU64,
+    retained_prefix_reuse_tokens: AtomicU64,
     fallback_requests: AtomicU64,
     fallback_single_request: AtomicU64,
     fallback_moe_requests: AtomicU64,
@@ -2865,6 +2877,8 @@ struct CudaSchedulerSnapshot {
     shared_prefix_batches: u64,
     shared_prefix_requests: u64,
     shared_prefix_tokens: u64,
+    retained_prefix_reuse_requests: u64,
+    retained_prefix_reuse_tokens: u64,
     fallback_requests: u64,
     fallback_single_request: u64,
     fallback_moe_requests: u64,
@@ -3140,6 +3154,8 @@ fn new_cuda_scheduler_stats() -> CudaSchedulerStats {
         shared_prefix_batches: AtomicU64::new(0),
         shared_prefix_requests: AtomicU64::new(0),
         shared_prefix_tokens: AtomicU64::new(0),
+        retained_prefix_reuse_requests: AtomicU64::new(0),
+        retained_prefix_reuse_tokens: AtomicU64::new(0),
         fallback_requests: AtomicU64::new(0),
         fallback_single_request: AtomicU64::new(0),
         fallback_moe_requests: AtomicU64::new(0),
@@ -3344,6 +3360,14 @@ impl CudaGenerationScheduler {
             shared_prefix_batches: self.stats.shared_prefix_batches.load(Ordering::Relaxed),
             shared_prefix_requests: self.stats.shared_prefix_requests.load(Ordering::Relaxed),
             shared_prefix_tokens: self.stats.shared_prefix_tokens.load(Ordering::Relaxed),
+            retained_prefix_reuse_requests: self
+                .stats
+                .retained_prefix_reuse_requests
+                .load(Ordering::Relaxed),
+            retained_prefix_reuse_tokens: self
+                .stats
+                .retained_prefix_reuse_tokens
+                .load(Ordering::Relaxed),
             fallback_requests: self.stats.fallback_requests.load(Ordering::Relaxed),
             fallback_single_request: self.stats.fallback_single_request.load(Ordering::Relaxed),
             fallback_moe_requests: self.stats.fallback_moe_requests.load(Ordering::Relaxed),
@@ -3986,19 +4010,25 @@ fn admit_continuous_ready_jobs(
     }
 }
 
-/// Whether the opt-in cross-request prefix KV cache is enabled
-/// (`HI_CUDA_PREFIX_CACHE=1`).
-fn prefix_cache_enabled() -> bool {
-    // Opt-in: the cache retains a completed request's KV pages between requests,
-    // which changes page accounting, so it stays off by default and is enabled
-    // per-deployment with HI_CUDA_PREFIX_CACHE=1.
-    matches!(
-        std::env::var("HI_CUDA_PREFIX_CACHE")
-            .ok()
-            .map(|value| value.trim().to_ascii_lowercase())
-            .as_deref(),
-        Some("1" | "true" | "yes" | "on")
-    )
+/// Whether the cross-request prefix KV cache is enabled for this scheduler.
+///
+/// The cache retains a completed request's KV pages so the next request can reuse
+/// a shared prompt prefix (a large prefill win for the agent loop, which resends a
+/// growing conversation each turn). Retaining pages between requests changes page
+/// accounting, so it is only defaulted **on for single-stream servers**
+/// (`max_active_requests <= 1`), where nothing else contends for those pages. It is
+/// off by default for multi-request servers. Either way `HI_CUDA_PREFIX_CACHE`
+/// forces it explicitly: `1/true/yes/on` enables, `0/false/no/off` disables.
+fn prefix_cache_enabled_for(state: &CudaSchedulerState) -> bool {
+    match std::env::var("HI_CUDA_PREFIX_CACHE")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("1" | "true" | "yes" | "on") => true,
+        Some("0" | "false" | "no" | "off") => false,
+        _ => state.max_active_requests <= 1,
+    }
 }
 
 /// Acquire the KV lease for a new request, reusing a retained prefix's pages
@@ -4033,7 +4063,7 @@ fn acquire_lease_with_prefix_reuse(
 
     // If reuse isn't allowed here (feature off, sampled, or recurrent), free any
     // retained prefix we took and allocate fresh.
-    if !reuse_allowed || !prefix_cache_enabled() {
+    if !reuse_allowed || !prefix_cache_enabled_for(state) {
         if let Some(mut retained) = retained {
             kv_pages.release_pages(&mut retained.pages);
         }
@@ -4079,7 +4109,7 @@ fn acquire_lease_with_prefix_reuse(
 /// covering the final `tokens` are moved out of the lease so `Drop` won't free
 /// them.
 fn retain_prefix_from_request(state: &CudaSchedulerState, request: &mut CudaContinuousTextRequest) {
-    if !prefix_cache_enabled() || state.qwen.recurrent_ssm_tensor_layout {
+    if !prefix_cache_enabled_for(state) || state.qwen.recurrent_ssm_tensor_layout {
         return;
     }
     if !matches!(request.sampling_key, CudaSchedulerSamplingKey::Greedy) {
@@ -4223,11 +4253,16 @@ fn admit_continuous_text_job(
         .fetch_add(usize_to_u64(lease.pages.len()), Ordering::Relaxed);
     update_atomic_max(&stats.admission_granted_pages_max, lease.pages.len());
     if prefix_reuse_tokens > 0 {
-        eprintln!(
-            "prefix-cache: reusing {prefix_reuse_tokens}/{} prompt tokens' KV; prefilling {} suffix tokens",
-            prompt_tokens.len(),
-            prompt_tokens.len() - prefix_reuse_tokens
-        );
+        // Cross-request prefix reuse: this request skipped prefilling its first
+        // `prefix_reuse_tokens` tokens by reusing a retained prefix's KV. Surfaced
+        // in /health so the reuse is observable (it otherwise only ever showed up
+        // in the intra-batch shared_prefix counters, which stay 0 here).
+        stats
+            .retained_prefix_reuse_requests
+            .fetch_add(1, Ordering::Relaxed);
+        stats
+            .retained_prefix_reuse_tokens
+            .fetch_add(usize_to_u64(prefix_reuse_tokens), Ordering::Relaxed);
     }
 
     let rng = match sampling_key {
@@ -10968,7 +11003,7 @@ mod tests {
         assert!(health.quantization.contains("idle_micros_total="));
         assert!(health.quantization.contains("idle_micros_max="));
         assert!(health.quantization.contains(
-            "prefix-cache=enabled(scope=batch,backend=paged-shared-prefix,batches=0,requests=0,tokens_total=0)"
+            "prefix-cache=enabled(scope=batch,backend=paged-shared-prefix,batches=0,requests=0,tokens_total=0,cross_request_reuse_requests=0,cross_request_reuse_tokens=0)"
         ));
         assert_eq!(
             health_counter(&health.quantization, "admission_cancelled_requests"),
@@ -15723,7 +15758,7 @@ mod tests {
             Some(4)
         );
         assert!(health.quantization.contains(
-            "prefix-cache=enabled(scope=batch,backend=paged-shared-prefix,batches=1,requests=2,tokens_total=4)"
+            "prefix-cache=enabled(scope=batch,backend=paged-shared-prefix,batches=1,requests=2,tokens_total=4,cross_request_reuse_requests=0,cross_request_reuse_tokens=0)"
         ));
         assert_eq!(
             health_counter(&health.quantization, "prefill_tokens_total"),
@@ -16387,6 +16422,7 @@ mod tests {
             kv_page_size: 64,
             mmproj: None,
             multimodal_stats: backend.multimodal_stats.clone(),
+            max_active_requests: 1,
             prefix_cache: super::Mutex::new(None),
         };
         let (tx, rx) = tokio::sync::mpsc::channel(1);
