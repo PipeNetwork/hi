@@ -81,6 +81,15 @@ fn render_gguf_chat_template(template: &str, messages: &[ChatMessage]) -> Option
     if template.contains("<|channel|>") && template.contains("<|start|>") {
         return Some(render_gptoss_template(messages));
     }
+    // Standard Gemma (2/3) format: `<start_of_turn>{role}\n{content}<end_of_turn>`. Its jinja is too
+    // complex for the loop renderer; the framing is simple, so use the dedicated builder. Gemma is very
+    // BOS-sensitive and the template emits `bos_token` first, so prepend it.
+    if template.contains("<start_of_turn>") && template.contains("<end_of_turn>") {
+        return Some(format!(
+            "<bos>{}",
+            build_gemma_prompt(messages, &[], &Value::Null)
+        ));
+    }
     if template.contains("<|im_start|>") && template.contains("<|im_end|>") {
         return render_simple_loop_template(&template, messages)
             .or_else(|| Some(build_chatml_prompt(messages, &[], &Value::Null)));

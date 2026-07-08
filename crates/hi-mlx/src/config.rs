@@ -431,7 +431,19 @@ pub fn parse_model_config(path: &Path, raw: Value) -> Result<MlxModelConfig> {
         hc_sinkhorn_iters: u32_field(&raw, "hc_sinkhorn_iters").unwrap_or(20),
         hc_eps: f32_field(&raw, "hc_eps").unwrap_or(1e-6),
         quantization: parse_quantization(&raw),
-        eos_token_ids: token_ids(&raw, "eos_token_id"),
+        eos_token_ids: {
+            let mut ids = token_ids(&raw, "eos_token_id");
+            // Gemma ends a chat turn with <end_of_turn> (106), not <eos>; without it the model runs
+            // past its answer into trailing garbage.
+            if str_field(&raw, "model_type")
+                .unwrap_or_default()
+                .starts_with("gemma")
+                && !ids.contains(&106)
+            {
+                ids.push(106);
+            }
+            ids
+        },
         pad_token_id: u32_field(&raw, "pad_token_id"),
         raw,
     })
@@ -512,7 +524,7 @@ pub fn detect_family(model_type: &str, config: &Value) -> Option<ModelFamily> {
     }
     // Gemma-4 only (older gemma/gemma2/gemma3 remain unsupported); routed via the Gemma family and
     // dispatched to Gemma4TextLike in load_model.
-    if model_type.starts_with("gemma4") || haystack.contains("gemma4") {
+    if model_type.starts_with("gemma") || haystack.contains("gemma") {
         return Some(ModelFamily::Gemma);
     }
     // MiniMax-M3: GQA (partial rotary) + sigmoid/noaux MoE at every layer.

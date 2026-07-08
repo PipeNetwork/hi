@@ -229,7 +229,10 @@ mod native {
             ModelFamily::NemotronH => Ok(Box::new(NemotronHLike::new(config.clone(), arrays)?)),
             ModelFamily::MiniMax => Ok(Box::new(MiniMaxLike::new(config.clone(), arrays)?)),
             ModelFamily::LongCat => Ok(Box::new(LongCatLike::new(config.clone(), arrays)?)),
-            ModelFamily::Gemma if config.model_type.starts_with("gemma4") => {
+            ModelFamily::Gemma
+                if config.model_type.starts_with("gemma4")
+                    || config.model_type.starts_with("gemma3") =>
+            {
                 Ok(Box::new(Gemma4TextLike::new(config.clone(), arrays)?))
             }
             ModelFamily::Llama
@@ -5709,6 +5712,26 @@ mod native {
     // by sqrt(hidden) and tied to the output; final logits are tanh-softcapped. The 31B/26B disable
     // KV-sharing and per-layer-input gating. NOTE: sliding layers use a plain causal mask here, so
     // outputs are exact only for contexts up to `sliding_window` (1024); longer contexts diverge.
+    // Gemma norm weights: Gemma-2/3 store them as deviations (mlx_lm applies `rms_norm(x, 1 + weight)`),
+    // while the pipenetwork Gemma-4 export folds the +1 into the stored weight. Add it back only for the
+    // deviation convention (gemma2/gemma3) — for gemma4 the weight is already the effective scale.
+    fn gemma_norm(
+        key: &str,
+        arrays: &HashMap<String, Array>,
+        config: &MlxModelConfig,
+    ) -> Result<RmsNorm> {
+        let weight = raw_array(arrays, key)?;
+        let weight = if config.model_type.starts_with("gemma4") {
+            weight
+        } else {
+            weight + 1.0f32
+        };
+        Ok(RmsNorm {
+            weight,
+            eps: config.rms_norm_eps,
+        })
+    }
+
     struct Gemma4Attention {
         q_proj: Linear,
         k_proj: Linear,
@@ -5723,6 +5746,9 @@ mod native {
         rope_theta: f32,
         rope_freqs: Option<Array>,
         eps: f32,
+        // sdpa scale: Gemma-4 folds query_pre_attn scaling into q_norm (scale 1.0); Gemma-3 applies
+        // query_pre_attn_scalar^-0.5 here.
+        scale: f32,
         cache: Cache,
     }
 
@@ -5744,8 +5770,15 @@ mod native {
             // RoPE: sliding = full rotary (theta 1e4); full = proportional partial rotary (theta 1e6,
             // 25% of head_dim rotated; freqs = base^(2i/head_dim), inf for the unrotated tail).
             let (rope_theta, rope_freqs) = if is_sliding {
-                (10_000.0f32, None)
-            } else {
+                // Sliding layers: full rotary at the local base (Gemma-3 rope_local_base_freq; 1e4).
+                let local = config
+                    .raw
+                    .get("rope_local_base_freq")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(10_000.0) as f32;
+                (local, None)
+            } else if config.model_type.starts_with("gemma4") {
+                // Gemma-4 full-attention layers: partial rotary (25% of head_dim rotated, theta 1e6).
                 let base = 1_000_000.0f32;
                 let half = head_dim / 2;
                 let rot_half = (head_dim / 4) / 2; // partial_rotary_factor 0.25 -> rotated dims / 2
@@ -5757,6 +5790,9 @@ mod native {
                     freqs.push(f32::INFINITY);
                 }
                 (base, Some(Array::from_slice(&freqs, &[half])))
+            } else {
+                // Gemma-3 full-attention layers: full rotary at rope_theta (1e6).
+                (config.rope_theta, None)
             };
             Ok(Self {
                 q_proj: Linear::load(&format!("{prefix}.q_proj"), arrays, config)?,
@@ -5767,16 +5803,8 @@ mod native {
                     None
                 },
                 o_proj: Linear::load(&format!("{prefix}.o_proj"), arrays, config)?,
-                q_norm: RmsNorm::load(
-                    &format!("{prefix}.q_norm.weight"),
-                    arrays,
-                    config.rms_norm_eps,
-                )?,
-                k_norm: RmsNorm::load(
-                    &format!("{prefix}.k_norm.weight"),
-                    arrays,
-                    config.rms_norm_eps,
-                )?,
+                q_norm: gemma_norm(&format!("{prefix}.q_norm.weight"), arrays, config)?,
+                k_norm: gemma_norm(&format!("{prefix}.k_norm.weight"), arrays, config)?,
                 v_ones: Array::ones::<f32>(&[head_dim])?,
                 n_heads,
                 n_kv_heads,
@@ -5784,6 +5812,17 @@ mod native {
                 rope_theta,
                 rope_freqs,
                 eps: config.rms_norm_eps,
+                scale: if config.model_type.starts_with("gemma4") {
+                    1.0
+                } else {
+                    let s = config
+                        .raw
+                        .get("query_pre_attn_scalar")
+                        .and_then(|v| v.as_f64())
+                        .map(|v| v as f32)
+                        .unwrap_or(head_dim as f32);
+                    s.powf(-0.5)
+                },
                 cache: Cache::new(),
             })
         }
@@ -5838,8 +5877,7 @@ mod native {
             };
             let v = rms_norm(&v_raw, &self.v_ones, self.eps)?.transpose_axes(&[0, 2, 1, 3])?;
             let (k, v) = self.cache.update(k, v)?;
-            // Gemma scales queries via the q/k head-norms, so sdpa uses scale 1.0.
-            let scale = 1.0f32;
+            let scale = self.scale;
             let output = if l > 1 && offset == 0 {
                 scaled_dot_product_attention(
                     &q,
@@ -5904,7 +5942,8 @@ mod native {
         post_ff_ln: RmsNorm,
         attn: Gemma4Attention,
         mlp: Gemma4Mlp,
-        layer_scalar: Array,
+        // Gemma-4 per-layer output scalar; absent in Gemma-3.
+        layer_scalar: Option<Array>,
     }
 
     impl Gemma4Block {
@@ -5917,25 +5956,28 @@ mod native {
             let p = format!("model.layers.{idx}");
             let eps = config.rms_norm_eps;
             Ok(Self {
-                input_ln: RmsNorm::load(&format!("{p}.input_layernorm.weight"), arrays, eps)?,
-                post_attn_ln: RmsNorm::load(
+                input_ln: gemma_norm(&format!("{p}.input_layernorm.weight"), arrays, config)?,
+                post_attn_ln: gemma_norm(
                     &format!("{p}.post_attention_layernorm.weight"),
                     arrays,
-                    eps,
+                    config,
                 )?,
-                pre_ff_ln: RmsNorm::load(
+                pre_ff_ln: gemma_norm(
                     &format!("{p}.pre_feedforward_layernorm.weight"),
                     arrays,
-                    eps,
+                    config,
                 )?,
-                post_ff_ln: RmsNorm::load(
+                post_ff_ln: gemma_norm(
                     &format!("{p}.post_feedforward_layernorm.weight"),
                     arrays,
-                    eps,
+                    config,
                 )?,
                 attn: Gemma4Attention::load(&format!("{p}.self_attn"), arrays, config, is_sliding)?,
                 mlp: Gemma4Mlp::load(&format!("{p}.mlp"), arrays, config)?,
-                layer_scalar: raw_array(arrays, &format!("{p}.layer_scalar"))?.as_type::<f32>()?,
+                layer_scalar: arrays
+                    .get(&format!("{p}.layer_scalar"))
+                    .map(|a| a.as_type::<f32>())
+                    .transpose()?,
             })
         }
 
@@ -5950,7 +5992,10 @@ mod native {
             let ff = self.mlp.forward(&ff)?;
             let ff = self.post_ff_ln.forward(&ff)?;
             let h = residual + ff;
-            Ok(h * &self.layer_scalar)
+            match &self.layer_scalar {
+                Some(s) => Ok(h * s),
+                None => Ok(h),
+            }
         }
     }
 
@@ -5964,11 +6009,28 @@ mod native {
 
     impl Gemma4TextLike {
         fn new(config: MlxModelConfig, arrays: HashMap<String, Array>) -> Result<Self> {
-            if config.layer_types.is_empty() {
-                bail!("gemma4: missing layer_types");
-            }
-            let blocks = config
-                .layer_types
+            // Gemma-3 gives an interval (`sliding_window_pattern`) rather than an explicit list: every
+            // P-th layer is full attention, the rest sliding.
+            let layer_types: Vec<String> = if config.layer_types.is_empty() {
+                let pattern = config
+                    .raw
+                    .get("sliding_window_pattern")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(6)
+                    .max(1) as u32;
+                (0..config.num_hidden_layers)
+                    .map(|i| {
+                        if (i + 1) % pattern == 0 {
+                            "full_attention".to_string()
+                        } else {
+                            "sliding_attention".to_string()
+                        }
+                    })
+                    .collect()
+            } else {
+                config.layer_types.clone()
+            };
+            let blocks = layer_types
                 .iter()
                 .enumerate()
                 .map(|(idx, kind)| {
@@ -5978,7 +6040,7 @@ mod native {
             Ok(Self {
                 embed: Embedding::load("model.embed_tokens", &arrays, &config)?,
                 embed_scale: (config.hidden_size as f32).sqrt(),
-                norm: RmsNorm::load("model.norm.weight", &arrays, config.rms_norm_eps)?,
+                norm: gemma_norm("model.norm.weight", &arrays, &config)?,
                 final_softcap: config.final_logit_softcapping,
                 blocks,
             })
