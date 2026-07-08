@@ -201,6 +201,9 @@ mod native {
             return Ok(Box::new(DeepSeekV4Like::new(config.clone(), arrays)?));
         }
         match config.family {
+            ModelFamily::Qwen2 if config.model_type == "nemotron" => {
+                Ok(Box::new(NemotronLike::new(config.clone(), arrays)?))
+            }
             ModelFamily::Qwen2 | ModelFamily::Qwen3 | ModelFamily::Hy3 => {
                 // Qwen3.5 gated-delta-net hybrid (linear-attn heads present) uses its own path.
                 if config.linear_num_value_heads.is_some() {
@@ -3699,6 +3702,225 @@ mod native {
                 let h = add(x, r);
                 let r = self.ffn.forward(&self.norm2.forward(&h)?)?;
                 Ok(add(h, r))
+            }
+        }
+    }
+
+    // ---------------------- Nemotron (Llama-based, non-H) ----------------------
+    // Standard GQA (partial rotary) + LayerNorm1P (LayerNorm with weight+1) + squared-ReLU MLP
+    // (down_proj(relu(up_proj(x))^2), no gate). Pre-norm, `model.` prefix.
+    fn nemotron_ln1p(prefix: &str, arrays: &HashMap<String, Array>, eps: f32) -> Result<LayerNorm> {
+        Ok(LayerNorm {
+            weight: raw_array(arrays, &format!("{prefix}.weight"))? + 1.0f32,
+            bias: arrays.get(&format!("{prefix}.bias")).cloned(),
+            eps,
+        })
+    }
+
+    struct NemoLmMlp {
+        up_proj: Linear,
+        down_proj: Linear,
+    }
+
+    impl NemoLmMlp {
+        fn load(
+            prefix: &str,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+        ) -> Result<Self> {
+            Ok(Self {
+                up_proj: Linear::load(&format!("{prefix}.up_proj"), arrays, config)?,
+                down_proj: Linear::load(&format!("{prefix}.down_proj"), arrays, config)?,
+            })
+        }
+
+        fn forward(&self, x: &Array) -> Result<Array> {
+            let u = self.up_proj.forward(x)?;
+            let r = maximum(&u, &Array::from_f32(0.0))?;
+            self.down_proj.forward(&(&r * &r))
+        }
+    }
+
+    struct NemoLmAttention {
+        q_proj: Linear,
+        k_proj: Linear,
+        v_proj: Linear,
+        o_proj: Linear,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        rot_dims: i32,
+        scale: f32,
+        rope_theta: f32,
+        cache: Cache,
+    }
+
+    impl NemoLmAttention {
+        fn load(
+            prefix: &str,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+        ) -> Result<Self> {
+            let head_dim = config.attention_head_dim() as i32;
+            let rot_dims = (head_dim as f32 * config.partial_rotary_factor.unwrap_or(1.0)) as i32;
+            Ok(Self {
+                q_proj: Linear::load(&format!("{prefix}.q_proj"), arrays, config)?,
+                k_proj: Linear::load(&format!("{prefix}.k_proj"), arrays, config)?,
+                v_proj: Linear::load(&format!("{prefix}.v_proj"), arrays, config)?,
+                o_proj: Linear::load(&format!("{prefix}.o_proj"), arrays, config)?,
+                n_heads: config.num_attention_heads as i32,
+                n_kv_heads: config.num_key_value_heads as i32,
+                head_dim,
+                rot_dims,
+                scale: (head_dim as f32).powf(-0.5),
+                rope_theta: config.rope_theta,
+                cache: Cache::new(),
+            })
+        }
+
+        fn forward(&mut self, x: &Array) -> Result<Array> {
+            let shape = x.shape();
+            let (b, l) = (shape[0], shape[1]);
+            let mut q = self
+                .q_proj
+                .forward(x)?
+                .reshape(&[b, l, self.n_heads, self.head_dim])?
+                .transpose_axes(&[0, 2, 1, 3])?;
+            let mut k = self
+                .k_proj
+                .forward(x)?
+                .reshape(&[b, l, self.n_kv_heads, self.head_dim])?
+                .transpose_axes(&[0, 2, 1, 3])?;
+            let v = self
+                .v_proj
+                .forward(x)?
+                .reshape(&[b, l, self.n_kv_heads, self.head_dim])?
+                .transpose_axes(&[0, 2, 1, 3])?;
+            let offset = self.cache.offset;
+            q = rope(q, self.rot_dims, false, self.rope_theta, 1.0, offset, None)?;
+            k = rope(k, self.rot_dims, false, self.rope_theta, 1.0, offset, None)?;
+            let (k, v) = self.cache.update(k, v)?;
+            let output = if l > 1 && offset == 0 {
+                scaled_dot_product_attention(
+                    &q,
+                    &k,
+                    &v,
+                    self.scale,
+                    ScaledDotProductAttentionMask::Causal,
+                    None::<&Array>,
+                )?
+            } else if l > 1 {
+                let mask = causal_attention_mask(l, k.shape()[2], offset);
+                scaled_dot_product_attention(
+                    &q,
+                    &k,
+                    &v,
+                    self.scale,
+                    ScaledDotProductAttentionMask::Array(&mask),
+                    None::<&Array>,
+                )?
+            } else {
+                scaled_dot_product_attention(&q, &k, &v, self.scale, None, None::<&Array>)?
+            };
+            let output = output.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
+                b,
+                l,
+                self.n_heads * self.head_dim,
+            ])?;
+            self.o_proj.forward(&output)
+        }
+    }
+
+    struct NemoLmBlock {
+        input_layernorm: LayerNorm,
+        post_attention_layernorm: LayerNorm,
+        attention: NemoLmAttention,
+        mlp: NemoLmMlp,
+    }
+
+    impl NemoLmBlock {
+        fn load(
+            idx: u32,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+        ) -> Result<Self> {
+            let p = format!("model.layers.{idx}");
+            Ok(Self {
+                input_layernorm: nemotron_ln1p(
+                    &format!("{p}.input_layernorm"),
+                    arrays,
+                    config.rms_norm_eps,
+                )?,
+                post_attention_layernorm: nemotron_ln1p(
+                    &format!("{p}.post_attention_layernorm"),
+                    arrays,
+                    config.rms_norm_eps,
+                )?,
+                attention: NemoLmAttention::load(&format!("{p}.self_attn"), arrays, config)?,
+                mlp: NemoLmMlp::load(&format!("{p}.mlp"), arrays, config)?,
+            })
+        }
+
+        fn forward(&mut self, x: Array) -> Result<Array> {
+            let h = &x + self.attention.forward(&self.input_layernorm.forward(&x)?)?;
+            let r = self
+                .mlp
+                .forward(&self.post_attention_layernorm.forward(&h)?)?;
+            Ok(h + r)
+        }
+    }
+
+    struct NemotronLike {
+        embed_tokens: Embedding,
+        layers: Vec<NemoLmBlock>,
+        norm: LayerNorm,
+        lm_head: Option<Linear>,
+    }
+
+    impl NemotronLike {
+        fn new(config: MlxModelConfig, arrays: HashMap<String, Array>) -> Result<Self> {
+            let layers = (0..config.num_hidden_layers)
+                .map(|idx| NemoLmBlock::load(idx, &arrays, &config))
+                .collect::<Result<Vec<_>>>()?;
+            let lm_head = if config.tie_word_embeddings {
+                None
+            } else {
+                Some(Linear::load("lm_head", &arrays, &config)?)
+            };
+            Ok(Self {
+                embed_tokens: Embedding::load("model.embed_tokens", &arrays, &config)?,
+                norm: nemotron_ln1p("model.norm", &arrays, config.rms_norm_eps)?,
+                layers,
+                lm_head,
+            })
+        }
+    }
+
+    impl CausalLm for NemotronLike {
+        fn forward(&mut self, input_ids: &[u32]) -> Result<Array> {
+            let ids = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
+            let mut h = self.embed_tokens.forward(&ids)?;
+            for layer in &mut self.layers {
+                h = layer.forward(h)?;
+            }
+            h = self.norm.forward(&h)?;
+            let logits = match &self.lm_head {
+                Some(head) => head.forward(&h)?,
+                None => self.embed_tokens.as_linear(&h)?,
+            };
+            transforms::eval([&logits])?;
+            Ok(logits)
+        }
+
+        fn reset_cache(&mut self) {
+            for layer in &mut self.layers {
+                layer.attention.cache.reset();
+            }
+        }
+
+        fn prepare_cache(&mut self, capacity: i32) {
+            for layer in &mut self.layers {
+                layer.attention.cache.prepare_capacity(capacity);
             }
         }
     }

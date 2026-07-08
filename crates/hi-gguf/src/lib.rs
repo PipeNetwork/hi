@@ -1348,8 +1348,7 @@ impl QwenGgufConfig {
             rope_freq_scale: gguf.metadata_f32(&format!("{prefix}.rope.freq_scale")),
             rope_dimension_sections,
             rms_norm_eps: gguf.metadata_f32(&format!("{prefix}.attention.layer_norm_rms_epsilon")),
-            attn_logit_softcapping: gguf
-                .metadata_f32(&format!("{prefix}.attn_logit_softcapping")),
+            attn_logit_softcapping: gguf.metadata_f32(&format!("{prefix}.attn_logit_softcapping")),
             final_logit_softcapping: gguf
                 .metadata_f32(&format!("{prefix}.final_logit_softcapping")),
             vocab_size,
@@ -6499,8 +6498,14 @@ mod tests {
         // completed by a later token during streaming (or was cut off at max_tokens).
         assert_eq!(decode_tokenizer_bytes_lenient(&[0x41, 0xE2, 0x80]), "A");
         // A genuinely invalid byte in the middle becomes U+FFFD, decoding continues.
-        assert_eq!(decode_tokenizer_bytes_lenient(&[0x41, 0xFF, 0x42]), "A\u{FFFD}B");
-        assert_eq!(decode_tokenizer_bytes_lenient(b"plain ascii"), "plain ascii");
+        assert_eq!(
+            decode_tokenizer_bytes_lenient(&[0x41, 0xFF, 0x42]),
+            "A\u{FFFD}B"
+        );
+        assert_eq!(
+            decode_tokenizer_bytes_lenient(b"plain ascii"),
+            "plain ascii"
+        );
     }
 
     #[test]
