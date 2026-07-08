@@ -136,6 +136,10 @@ impl MlxModelConfig {
             // ERNIE-4.5: dense layers before moe_layer_start_index, MoE after.
             return layer_idx >= self.first_k_dense_replace;
         }
+        if self.model_type == "dots1" {
+            // dots.llm1: dense layers before first_k_dense_replace, MoE after.
+            return layer_idx >= self.first_k_dense_replace;
+        }
         if self.model_type.contains("qwen3") {
             !self.mlp_only_layers.contains(&layer_idx)
                 && (layer_idx + 1) % self.decoder_sparse_step.max(1) == 0
@@ -568,7 +572,7 @@ pub fn detect_family(model_type: &str, config: &Value) -> Option<ModelFamily> {
         return Some(ModelFamily::Qwen2);
     }
     // Post-norm Llama-likes (OLMo2 / EXAONE-4): per-head qk-norm; QwenBlock detects post-norm weights.
-    if matches!(model_type.as_str(), "exaone4" | "olmo2" | "olmoe") {
+    if matches!(model_type.as_str(), "exaone4" | "olmo2" | "olmoe" | "dots1") {
         return Some(ModelFamily::Qwen3);
     }
     None
