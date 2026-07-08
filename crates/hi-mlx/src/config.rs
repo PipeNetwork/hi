@@ -31,6 +31,13 @@ pub struct MlxModelConfig {
     pub linear_conv_kernel_dim: Option<u32>,
     pub full_attention_interval: Option<u32>,
     pub num_nextn_predict_layers: Option<u32>,
+    // Nemotron-H Mamba2 hybrid fields.
+    pub hybrid_override_pattern: Option<String>,
+    pub ssm_state_size: Option<u32>,
+    pub mamba_conv_kernel: Option<u32>,
+    pub mamba_n_groups: Option<u32>,
+    pub mamba_num_heads: Option<u32>,
+    pub mamba_head_dim: Option<u32>,
     pub qk_nope_head_dim: Option<u32>,
     pub qk_rope_head_dim: Option<u32>,
     pub v_head_dim: Option<u32>,
@@ -313,6 +320,12 @@ pub fn parse_model_config(path: &Path, raw: Value) -> Result<MlxModelConfig> {
         linear_value_head_dim: u32_field(&raw, "linear_value_head_dim"),
         linear_conv_kernel_dim: u32_field(&raw, "linear_conv_kernel_dim"),
         full_attention_interval: u32_field(&raw, "full_attention_interval"),
+        hybrid_override_pattern: str_field(&raw, "hybrid_override_pattern"),
+        ssm_state_size: u32_field(&raw, "ssm_state_size"),
+        mamba_conv_kernel: u32_field(&raw, "conv_kernel"),
+        mamba_n_groups: u32_field(&raw, "n_groups"),
+        mamba_num_heads: u32_field(&raw, "mamba_num_heads"),
+        mamba_head_dim: u32_field(&raw, "mamba_head_dim"),
         num_nextn_predict_layers: u32_field(&raw, "num_nextn_predict_layers"),
         qk_nope_head_dim: u32_field(&raw, "qk_nope_head_dim"),
         qk_rope_head_dim: u32_field(&raw, "qk_rope_head_dim"),
@@ -438,6 +451,13 @@ pub fn detect_family(model_type: &str, config: &Value) -> Option<ModelFamily> {
         || haystack.contains("hunyuan")
     {
         return Some(ModelFamily::Hy3);
+    }
+    // Nemotron-H: Mamba2 + attention + MLP/MoE hybrid (NVIDIA Nemotron-3 Nano/Ultra, TwoTower).
+    if model_type.starts_with("nemotron_h")
+        || haystack.contains("nemotron_h")
+        || haystack.contains("nemotronh")
+    {
+        return Some(ModelFamily::NemotronH);
     }
     None
 }
