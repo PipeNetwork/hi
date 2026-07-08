@@ -132,6 +132,10 @@ impl MlxModelConfig {
             // OLMoE: every layer is a sparse MoE.
             return true;
         }
+        if self.model_type == "ernie4_5_moe" {
+            // ERNIE-4.5: dense layers before moe_layer_start_index, MoE after.
+            return layer_idx >= self.first_k_dense_replace;
+        }
         if self.model_type.contains("qwen3") {
             !self.mlp_only_layers.contains(&layer_idx)
                 && (layer_idx + 1) % self.decoder_sparse_step.max(1) == 0
@@ -411,14 +415,19 @@ pub fn parse_model_config(path: &Path, raw: Value) -> Result<MlxModelConfig> {
         rope_scaling: raw.get("rope_scaling").filter(|v| !v.is_null()).cloned(),
         attention_bias: bool_field(&raw, "attention_bias").unwrap_or(false),
         tie_word_embeddings: bool_field(&raw, "tie_word_embeddings").unwrap_or(true),
-        first_k_dense_replace: u32_field(&raw, "first_k_dense_replace").unwrap_or(0),
+        first_k_dense_replace: u32_field(&raw, "first_k_dense_replace")
+            .or_else(|| u32_field(&raw, "moe_layer_start_index")) // ERNIE-4.5 dense prefix
+            .unwrap_or(0),
         moe_layer_freq: u32_field(&raw, "moe_layer_freq").unwrap_or(1),
         n_routed_experts: u32_field(&raw, "n_routed_experts")
             .or_else(|| u32_field(&raw, "num_experts"))
-            .or_else(|| u32_field(&raw, "num_local_experts")),
-        n_shared_experts: u32_field(&raw, "n_shared_experts"),
+            .or_else(|| u32_field(&raw, "num_local_experts"))
+            .or_else(|| u32_field(&raw, "moe_num_experts")), // ERNIE-4.5
+        n_shared_experts: u32_field(&raw, "n_shared_experts")
+            .or_else(|| u32_field(&raw, "moe_num_shared_experts")), // ERNIE-4.5
         num_experts_per_tok: u32_field(&raw, "num_experts_per_tok")
-            .or_else(|| u32_field(&raw, "moe_topk")), // LongCat-2.0 key
+            .or_else(|| u32_field(&raw, "moe_topk")) // LongCat-2.0 key
+            .or_else(|| u32_field(&raw, "moe_k")), // ERNIE-4.5
         decoder_sparse_step: u32_field(&raw, "decoder_sparse_step").unwrap_or(1),
         mlp_only_layers: u32_list_field(&raw, "mlp_only_layers"),
         shared_expert_intermediate_size: u32_field(&raw, "shared_expert_intermediate_size"),
@@ -552,6 +561,7 @@ pub fn detect_family(model_type: &str, config: &Value) -> Option<ModelFamily> {
             | "cohere2"
             | "llama4"
             | "llama4_text"
+            | "ernie4_5_moe"
     ) {
         return Some(ModelFamily::Qwen2);
     }
