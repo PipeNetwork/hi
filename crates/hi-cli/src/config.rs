@@ -603,7 +603,7 @@ pub fn resolve(cli: &Cli, config: &Config, registry: &Registry) -> Result<Settin
         .or_else(|| profile.and_then(|p| p.compat))
         .unwrap_or_default();
     let minimal_tools = profile.and_then(|p| p.minimal_tools).unwrap_or(false);
-    let curate_skills = profile.and_then(|p| p.curate_skills).unwrap_or(false);
+    let curate_skills = curate_skills_default(provider, profile.and_then(|p| p.curate_skills));
 
     Ok(Settings {
         provider,
@@ -1178,7 +1178,7 @@ pub fn resolve_named_profile(config: &Config, name: &str, registry: &Registry) -
         tool_mode: profile.tool_mode.unwrap_or_default(),
         compat: profile.compat.unwrap_or_default(),
         minimal_tools: profile.minimal_tools.unwrap_or(false),
-        curate_skills: profile.curate_skills.unwrap_or(false),
+        curate_skills: curate_skills_default(provider, profile.curate_skills),
         moa: config.moa.clone(),
     })
 }
@@ -1204,6 +1204,14 @@ fn configured_max_tokens(
     }
 }
 
+/// Whether verifier-gated skill auto-curation is on. An explicit `curate_skills`
+/// in the profile always wins; otherwise it defaults on for the pipenetwork
+/// provider (its coding-agent models are strong enough for the curator to pay
+/// off) and off for every other provider.
+fn curate_skills_default(provider: ProviderName, profile_value: Option<bool>) -> bool {
+    profile_value.unwrap_or(provider == ProviderName::Pipenetwork)
+}
+
 fn max_tokens_is_explicit(
     provider: ProviderName,
     cli_max_tokens: Option<u32>,
@@ -1227,7 +1235,7 @@ mod tests {
     use super::{
         Config, DEFAULT_MAX_TOKENS, LEGACY_PIPENETWORK_DEFAULT_MAX_TOKENS,
         PIPENETWORK_DEFAULT_MAX_TOKENS, Profile, ProviderName, configured_max_tokens,
-        detect_verify_pipeline, max_tokens_is_explicit, save_config_to,
+        curate_skills_default, detect_verify_pipeline, max_tokens_is_explicit, save_config_to,
     };
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -1322,6 +1330,20 @@ mod tests {
             super::ONBOARDING.contains("--plain"),
             "onboarding should point to the actual opt-out flag"
         );
+    }
+
+    #[test]
+    fn curate_skills_defaults_on_for_pipenetwork_only() {
+        // Default: on for pipenetwork, off for other providers.
+        assert!(curate_skills_default(ProviderName::Pipenetwork, None));
+        assert!(!curate_skills_default(ProviderName::Openai, None));
+        assert!(!curate_skills_default(ProviderName::Ollama, None));
+        // An explicit profile setting always wins, both ways.
+        assert!(!curate_skills_default(
+            ProviderName::Pipenetwork,
+            Some(false)
+        ));
+        assert!(curate_skills_default(ProviderName::Openai, Some(true)));
     }
 
     #[test]
