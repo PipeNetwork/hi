@@ -3132,22 +3132,51 @@ mod native {
                     buffer: output,
                 });
             }
+            // Prefill (M>1): dequantize to f16 and use a tensor-core f16 GEMM instead
+            // of the f32 SGEMM (no tensor cores) — the quantized-weight prefill matmul
+            // path. Mirrors the native-f16 weight path; ~tensor-core throughput.
             let dequantized = self
                 .dequantize_matrix_f32_device(matrix)
                 .with_context(|| format!("dequantizing CUDA matrix {matrix_name}"))?;
+            let weight_elements = matrix
+                .rows
+                .checked_mul(matrix.cols)
+                .context("CUDA quantized weight element count overflows usize")?;
+            let weight_f16 = DeviceBuffer::alloc(weight_elements * std::mem::size_of::<u16>())
+                .context("allocating CUDA f16 weight scratch")?;
+            crate::kernels::launch_cast_f32_to_f16(
+                &dequantized,
+                &weight_f16,
+                weight_elements,
+                &self.stream,
+            )?;
+            let input_elements = input
+                .rows
+                .checked_mul(input.cols)
+                .context("CUDA quantized projection input element count overflows usize")?;
+            let input_f16 = DeviceBuffer::alloc(input_elements * std::mem::size_of::<u16>())
+                .context("allocating CUDA f16 input scratch")?;
+            crate::kernels::launch_cast_f32_to_f16(
+                &input.buffer,
+                &input_f16,
+                input_elements,
+                &self.stream,
+            )?;
             let output_elements = input
                 .rows
                 .checked_mul(matrix.rows)
                 .context("CUDA quantized projection output element count overflows usize")?;
             let output = DeviceBuffer::alloc(output_elements * std::mem::size_of::<f32>())
                 .context("allocating CUDA quantized projection output")?;
-            self.cublas.matmul_f32_rhs_transposed_row_major(
-                &input.buffer,
-                &dequantized,
+            self.cublas.matmul_mixed_rhs_transposed_row_major(
+                &input_f16,
+                &weight_f16,
                 &output,
                 input.rows,
                 matrix.rows,
                 matrix.cols,
+                GemmDType::F16,
+                GemmDType::F16,
             )?;
             self.op_barrier()?;
             Ok(GpuF32Tensor {
