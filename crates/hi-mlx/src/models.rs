@@ -91,6 +91,20 @@ impl NativeRuntime {
         self.model.supports_rollback()
     }
 
+    /// Whether this model has a built-in MTP head for self-speculative decoding (GLM-5.2).
+    pub fn supports_mtp(&self) -> bool {
+        self.model.supports_mtp()
+    }
+
+    /// Greedy self-speculative decoding via the model's own MTP head.
+    pub fn mtp_generate<F>(&mut self, request: GenerationRequest, mut on_event: F) -> Result<GenerationOutput>
+    where
+        F: FnMut(GenerationEvent) -> Result<()>,
+    {
+        self.model
+            .mtp_generate(&self.config, &self.tokenizer, &request, &mut on_event)
+    }
+
     /// Greedy speculative decoding using `draft` as the proposal model. Output is identical to this
     /// (target) model's greedy decode.
     pub fn speculative_generate<F>(
@@ -126,6 +140,23 @@ pub trait CausalLm {
     fn rollback_cache(&mut self, _to_offset: i32) {}
     fn supports_rollback(&self) -> bool {
         false
+    }
+    /// Whether this model has a multi-token-prediction head for self-speculative decoding.
+    fn supports_mtp(&self) -> bool {
+        false
+    }
+    /// Greedy self-speculative decoding via the model's own MTP head. Boxed callback keeps the trait
+    /// object-safe. Only implemented by models with an MTP head (GLM-5.2); default errors.
+    fn mtp_generate(
+        &mut self,
+        _config: &MlxModelConfig,
+        _tokenizer: &TokenizerRuntime,
+        _request: &GenerationRequest,
+        _on_event: &mut dyn FnMut(GenerationEvent) -> Result<()>,
+    ) -> Result<GenerationOutput> {
+        Err(anyhow::anyhow!(
+            "MTP self-speculation is not supported by this model"
+        ))
     }
 }
 
@@ -702,6 +733,10 @@ mod native {
             self.offset = 0;
         }
 
+        fn rollback(&mut self, to_offset: i32) {
+            self.offset = to_offset.max(0);
+        }
+
         fn update(&mut self, key: Array) -> Result<Array> {
             if self.capacity.is_some() {
                 return self.update_dense(key);
@@ -770,7 +805,7 @@ mod native {
             let bias = arrays.get(&format!("{prefix}.bias")).cloned();
             match arrays.get(&format!("{prefix}.scales")) {
                 Some(scales) => {
-                    let spec = quant_spec_for(config, prefix)?;
+                    let spec = quant_spec_for(config, prefix, &weight, Some(scales))?;
                     let biases = arrays.get(&format!("{prefix}.biases")).cloned();
                     require_biases_for_affine(prefix, &spec, biases.as_ref())?;
                     Ok(Self::Quantized {
@@ -847,7 +882,7 @@ mod native {
             let weight = take(arrays, &format!("{prefix}.weight"))?;
             match arrays.get(&format!("{prefix}.scales")) {
                 Some(scales) => {
-                    let spec = quant_spec_for(config, prefix)?;
+                    let spec = quant_spec_for(config, prefix, &weight, Some(scales))?;
                     let biases = arrays.get(&format!("{prefix}.biases")).cloned();
                     require_biases_for_affine(prefix, &spec, biases.as_ref())?;
                     Ok(Self::Quantized {
@@ -1127,7 +1162,7 @@ mod native {
             let weight = take(arrays, &format!("{prefix}.weight"))?;
             match arrays.get(&format!("{prefix}.scales")) {
                 Some(scales) => {
-                    let spec = quant_spec_for(config, prefix)?;
+                    let spec = quant_spec_for(config, prefix, &weight, Some(scales))?;
                     let biases = arrays.get(&format!("{prefix}.biases")).cloned();
                     require_biases_for_affine(prefix, &spec, biases.as_ref())?;
                     Ok(Self::Quantized {
@@ -1528,8 +1563,8 @@ mod native {
             config: &MlxModelConfig,
         ) -> Result<Self> {
             let weight = take(arrays, &format!("{prefix}.weight"))?;
-            let spec = quant_spec_for(config, prefix)?;
             let scales = arrays.get(&format!("{prefix}.scales")).cloned();
+            let spec = quant_spec_for(config, prefix, &weight, scales.as_ref())?;
             let biases = arrays.get(&format!("{prefix}.biases")).cloned();
             if scales.is_some() {
                 require_biases_for_affine(prefix, &spec, biases.as_ref())?;
@@ -1872,11 +1907,71 @@ mod native {
         }
     }
 
+    // DeepSeek-V3-style multi-token-prediction head (GLM-5.2 layer 78). Given the trunk's pre-norm
+    // hidden h_i and the embedding of the next token t_{i+1}, it predicts t_{i+2}:
+    //   h' = eh_proj( concat[ hnorm(h_i), enorm(embed(t_{i+1})) ] );  then a full decoder block;
+    //   logits = lm_head( shared_head.norm(block(h')) )   (the trunk lm_head is shared).
+    // Used as the "draft" for self-speculative decoding; the trunk verifies the proposal.
+    struct MtpHead {
+        eh_proj: Linear,
+        enorm: RmsNorm,
+        hnorm: RmsNorm,
+        block: MlaBlock,
+        shared_norm: RmsNorm,
+    }
+
+    impl MtpHead {
+        fn load(
+            idx: u32,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+        ) -> Result<Self> {
+            let p = format!("model.layers.{idx}");
+            Ok(Self {
+                eh_proj: Linear::load(&format!("{p}.eh_proj"), arrays, config)?,
+                enorm: RmsNorm::load(&format!("{p}.enorm.weight"), arrays, config.rms_norm_eps)?,
+                hnorm: RmsNorm::load(&format!("{p}.hnorm.weight"), arrays, config.rms_norm_eps)?,
+                block: MlaBlock::load(idx, arrays, config)?,
+                shared_norm: RmsNorm::load(
+                    &format!("{p}.shared_head.norm.weight"),
+                    arrays,
+                    config.rms_norm_eps,
+                )?,
+            })
+        }
+
+        // h_main: [1,S,hidden] trunk hidden at positions i; next_tokens: [S] the token at i+1 for
+        // each; returns logits [1,S,vocab] predicting the token at i+2. Advances the MTP KV cache.
+        fn forward(
+            &mut self,
+            h_main: &Array,
+            next_tokens: &[u32],
+            embed: &Embedding,
+            lm_head: &Linear,
+        ) -> Result<Array> {
+            let ids = Array::from_slice(next_tokens, &[1, next_tokens.len() as i32]);
+            let e = embed.forward(&ids)?;
+            // GLM-5.2 orders the eh_proj input as [enorm(embed); hnorm(hidden)] (reverse of the
+            // DeepSeek-V3 paper order); HI_MTP_HFIRST switches it for models using the other order.
+            let combined = if std::env::var_os("HI_MTP_HFIRST").is_some() {
+                concatenate_axis(&[self.hnorm.forward(h_main)?, self.enorm.forward(&e)?], -1)?
+            } else {
+                concatenate_axis(&[self.enorm.forward(&e)?, self.hnorm.forward(h_main)?], -1)?
+            };
+            let h = self.eh_proj.forward(&combined)?;
+            let h = self.block.forward(h)?;
+            lm_head.forward(&self.shared_norm.forward(&h)?)
+        }
+    }
+
     struct MlaLike {
         embed_tokens: Embedding,
         layers: Vec<MlaBlock>,
         norm: RmsNorm,
         lm_head: Linear,
+        // Optional multi-token-prediction head (DeepSeek-V3 style) for self-speculative decoding,
+        // loaded from the extra `num_nextn_predict_layers` layer if present (e.g. GLM-5.2 layer 78).
+        mtp: Option<MtpHead>,
     }
 
     impl MlaLike {
@@ -1885,24 +1980,41 @@ mod native {
             let layers = (0..config.num_hidden_layers)
                 .map(|idx| MlaBlock::load(idx, &arrays, &config))
                 .collect::<Result<Vec<_>>>()?;
+            // The MTP head is the first "next-n" layer (index num_hidden_layers). Load it if present.
+            let mtp = if config.num_nextn_predict_layers.unwrap_or(0) >= 1
+                && arrays.contains_key(&format!(
+                    "model.layers.{}.eh_proj.weight",
+                    config.num_hidden_layers
+                )) {
+                Some(MtpHead::load(config.num_hidden_layers, &arrays, &config)?)
+            } else {
+                None
+            };
             Ok(Self {
                 embed_tokens: Embedding::load("model.embed_tokens", &arrays, &config)?,
                 norm: RmsNorm::load("model.norm.weight", &arrays, config.rms_norm_eps)?,
                 layers,
                 lm_head: Linear::load("lm_head", &arrays, &config)?,
+                mtp,
             })
         }
-    }
 
-    impl CausalLm for MlaLike {
-        fn forward(&mut self, input_ids: &[u32]) -> Result<Array> {
+        // Run the trunk; return (logits, pre-final-norm hidden) for all positions. The hidden feeds
+        // the MTP head; logits drive normal generation.
+        fn forward_hidden(&mut self, input_ids: &[u32]) -> Result<(Array, Array)> {
             let ids = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
             let mut h = self.embed_tokens.forward(&ids)?;
             for layer in &mut self.layers {
                 h = layer.forward(h)?;
             }
-            h = self.norm.forward(&h)?;
-            let logits = self.lm_head.forward(&h)?;
+            let logits = self.lm_head.forward(&self.norm.forward(&h)?)?;
+            Ok((logits, h))
+        }
+    }
+
+    impl CausalLm for MlaLike {
+        fn forward(&mut self, input_ids: &[u32]) -> Result<Array> {
+            let (logits, _h) = self.forward_hidden(input_ids)?;
             transforms::eval([&logits])?;
             Ok(logits)
         }
@@ -1910,6 +2022,9 @@ mod native {
         fn reset_cache(&mut self) {
             for layer in &mut self.layers {
                 layer.attention.reset_cache();
+            }
+            if let Some(mtp) = &mut self.mtp {
+                mtp.block.attention.reset_cache();
             }
         }
 
@@ -1920,6 +2035,168 @@ mod native {
                     indexer.cache.prepare_capacity(capacity);
                 }
             }
+            if let Some(mtp) = &mut self.mtp {
+                mtp.block.attention.cache.prepare_capacity(capacity);
+                if let Some(indexer) = &mut mtp.block.attention.indexer {
+                    indexer.cache.prepare_capacity(capacity);
+                }
+            }
+        }
+
+        fn rollback_cache(&mut self, to_offset: i32) {
+            for layer in &mut self.layers {
+                layer.attention.cache.rollback(to_offset);
+                if let Some(indexer) = &mut layer.attention.indexer {
+                    indexer.cache.rollback(to_offset);
+                }
+            }
+            if let Some(mtp) = &mut self.mtp {
+                mtp.block.attention.cache.rollback(to_offset);
+                if let Some(indexer) = &mut mtp.block.attention.indexer {
+                    indexer.cache.rollback(to_offset);
+                }
+            }
+        }
+
+        fn supports_rollback(&self) -> bool {
+            true
+        }
+
+        fn supports_mtp(&self) -> bool {
+            self.mtp.is_some()
+        }
+
+        fn mtp_generate(
+            &mut self,
+            config: &MlxModelConfig,
+            tokenizer: &crate::generate::TokenizerRuntime,
+            request: &GenerationRequest,
+            on_event: &mut dyn FnMut(GenerationEvent) -> Result<()>,
+        ) -> Result<GenerationOutput> {
+            if self.mtp.is_none() {
+                bail!("model has no MTP head");
+            }
+            let prompt_tokens = tokenizer.encode(&request.prompt)?;
+            if prompt_tokens.is_empty() {
+                bail!("prompt encoded to zero tokens");
+            }
+            let max_tokens = request.max_tokens.max(1) as usize;
+            self.reset_cache();
+            let cap = (prompt_tokens.len() + max_tokens + 4).min(i32::MAX as usize) as i32;
+            self.prepare_cache(cap);
+
+            // Prefill the trunk in one pass; keep all-position hidden for the MTP prefill.
+            let (logits0, hidden0) = self.forward_hidden(&prompt_tokens)?;
+            let p = prompt_tokens.len() as i32;
+            let mut t0 = argmax_rows(&logits0.index((.., (p - 1)..p, ..)))?[0];
+            let mut h_last = hidden0.index((.., (p - 1)..p, ..)); // trunk hidden at P-1
+
+            // Prefill the MTP over positions 0..P-2 (h_i paired with prompt[i+1]) -> MTP cache = P-1.
+            if p >= 2 {
+                let h_slice = hidden0.index((.., 0..(p - 1), ..));
+                let next: Vec<u32> = prompt_tokens[1..p as usize].to_vec();
+                let mtp = self.mtp.as_mut().unwrap();
+                let _ = mtp.forward(&h_slice, &next, &self.embed_tokens, &self.lm_head)?;
+            }
+
+            let mut m = p; // committed length; trunk cache = m, MTP cache = m-1
+            let mut generated: Vec<u32> = Vec::new();
+            let mut decoded_text = String::new();
+            let (mut rounds, mut proposed, mut accepted) = (0usize, 0usize, 0usize);
+            let mut stop = false;
+
+            // commit helper: push token, emit delta, return true if generation should stop
+            macro_rules! commit {
+                ($tok:expr) => {{
+                    let tok = $tok;
+                    generated.push(tok);
+                    let current = tokenizer.decode(&generated)?;
+                    let delta = decoded_delta(&decoded_text, &current, tokenizer, tok)?;
+                    decoded_text = current;
+                    on_event(GenerationEvent::TokenDelta { token_id: tok, text: delta })?;
+                    generated.len() >= max_tokens || hit_stop(&generated, &config.eos_token_ids)
+                }};
+            }
+
+            while generated.len() < max_tokens && !stop {
+                rounds += 1;
+                // 1. MTP proposes t1 from (h_last, t0); MTP cache m-1 -> m.
+                let t1 = {
+                    let mtp = self.mtp.as_mut().unwrap();
+                    let ml = mtp.forward(&h_last, &[t0], &self.embed_tokens, &self.lm_head)?;
+                    argmax_rows(&ml)?[0]
+                };
+                proposed += 1;
+
+                // 2. Trunk verifies [t0, t1]; trunk cache m -> m+2.
+                let (tl, th) = self.forward_hidden(&[t0, t1])?;
+                let ta = argmax_rows(&tl)?; // ta[0]=trunk token @ m+1, ta[1]=trunk token @ m+2
+                let th0 = th.index((.., 0..1, ..)); // trunk hidden @ m
+                let th1 = th.index((.., 1..2, ..)); // trunk hidden @ m+1
+
+                if t1 == ta[0] {
+                    // MTP correct: commit t0 and t1.
+                    accepted += 1;
+                    if commit!(t0) {
+                        break;
+                    }
+                    if commit!(t1) {
+                        break;
+                    }
+                    // MTP catch-up over position m (h_m paired with t1); MTP cache m -> m+1.
+                    {
+                        let mtp = self.mtp.as_mut().unwrap();
+                        let _ = mtp.forward(&th0, &[t1], &self.embed_tokens, &self.lm_head)?;
+                    }
+                    t0 = ta[1];
+                    h_last = th1;
+                    m += 2;
+                } else {
+                    // MTP wrong: commit t0 and the trunk's correction c.
+                    let c = ta[0];
+                    if commit!(t0) {
+                        break;
+                    }
+                    if commit!(c) {
+                        break;
+                    }
+                    // MTP catch-up over position m (h_m paired with c); MTP cache m -> m+1.
+                    {
+                        let mtp = self.mtp.as_mut().unwrap();
+                        let _ = mtp.forward(&th0, &[c], &self.embed_tokens, &self.lm_head)?;
+                    }
+                    // Trunk: drop the rejected t1, process c to get the next state.
+                    for layer in &mut self.layers {
+                        layer.attention.cache.rollback(m + 1);
+                        if let Some(indexer) = &mut layer.attention.indexer {
+                            indexer.cache.rollback(m + 1);
+                        }
+                    }
+                    let (lc, hc) = self.forward_hidden(&[c])?;
+                    t0 = argmax_rows(&lc)?[0];
+                    h_last = hc;
+                    m += 2;
+                }
+                stop = generated.len() >= max_tokens;
+            }
+
+            let text = tokenizer.decode(&generated)?;
+            let output = GenerationOutput {
+                prompt_tokens: prompt_tokens.len() as u64,
+                completion_tokens: generated.len() as u64,
+                text,
+            };
+            let rate = if proposed > 0 {
+                accepted as f64 / proposed as f64 * 100.0
+            } else {
+                0.0
+            };
+            tracing::info!(
+                "MTP self-speculation: {} tok over {rounds} rounds, MTP accept {rate:.0}% ({accepted}/{proposed})",
+                generated.len()
+            );
+            on_event(GenerationEvent::Finished { output: output.clone() })?;
+            Ok(output)
         }
     }
 
@@ -1958,7 +2235,7 @@ mod native {
             let bias = arrays.get(&format!("{prefix}.bias")).cloned();
             match arrays.get(&format!("{prefix}.scales")) {
                 Some(scales) => {
-                    let spec = quant_spec_for(config, prefix)?;
+                    let spec = quant_spec_for(config, prefix, &weight, Some(scales))?;
                     let biases = arrays.get(&format!("{prefix}.biases")).cloned();
                     require_biases_for_affine(prefix, &spec, biases.as_ref())?;
                     Ok(Self::Quantized {
@@ -4310,15 +4587,37 @@ mod native {
         }
     }
 
-    fn quant_spec_for(config: &MlxModelConfig, prefix: &str) -> Result<QuantizationSpec> {
-        Ok(config
+    fn quant_spec_for(
+        config: &MlxModelConfig,
+        prefix: &str,
+        weight: &Array,
+        scales: Option<&Array>,
+    ) -> Result<QuantizationSpec> {
+        let mut spec = config
             .quantization
             .mlx_quantization_for(prefix)?
             .unwrap_or(QuantizationSpec {
                 bits: 4,
                 group_size: 64,
                 mode: crate::config::QuantizationMode::Affine,
-            }))
+            });
+        // Dynamic/mixed-bit builds (e.g. GLM-5.2's MTP layer) omit per-tensor quant entries, so the
+        // config default can be wrong. Infer the real bit width from the packing:
+        //   in_packed = in*bits/32, n_groups = in/group_size  =>  bits = 32*in_packed/(n_groups*gs).
+        if spec.mode.as_str() == "affine" {
+            if let Some(scales) = scales {
+                let gs = spec.group_size as i64;
+                let in_packed = *weight.shape().last().unwrap_or(&0) as i64;
+                let n_groups = *scales.shape().last().unwrap_or(&0) as i64;
+                if gs > 0 && n_groups > 0 {
+                    let bits = 32 * in_packed / (n_groups * gs);
+                    if (2..=8).contains(&bits) {
+                        spec.bits = bits as u32;
+                    }
+                }
+            }
+        }
+        Ok(spec)
     }
 
     fn require_biases_for_affine(
