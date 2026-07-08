@@ -379,3 +379,25 @@ higher-agreement draft (e.g. a matched-quantization or distilled draft).
 
 ### Wired into `serve`
 `hi-mlx serve <target> --draft <draft> --spec-k 3` enables speculative decoding for the OpenAI-compatible API: greedy (`temperature=0`) requests use the draft+verify path, sampling requests fall back to the normal loop, and streaming (SSE) works through it. Measured **1.24×** end-to-end on the 32B (35.9 vs ~29 tok/s) for a prime-check prompt. The draft must share the target's tokenizer and the target must support KV-cache rollback (Qwen2/Qwen3; startup errors otherwise).
+
+### GLM-5.2 MTP self-speculation (built from the paper — no reference exists)
+GLM-5.2 ships a DeepSeek-V3-style MTP head (layer 78: `eh_proj`/`enorm`/`hnorm` + a full MLA+MoE
+block + `shared_head.norm`), which no MLX loader runs (they all drop it). Implemented it as a
+self-speculative "draft": the trunk's pre-final-norm hidden `h_i` + `embed(t_{i+1})` → the MTP head
+predicts `t_{i+2}`; the trunk verifies the proposal in one forward, so accepted proposals give two
+tokens per trunk read. `MtpHead` + `MlaLike::{forward_hidden, mtp_generate}`; auto-enabled for greedy
+requests when the head is present (`HI_MLX_DISABLE_MTP=1` to force the plain loop).
+
+Two bugs found (no reference to check against):
+- **Missing per-tensor quant entries.** The dynamic-3.5bpw build's config omits quantization entries
+  for the MTP layer, so hi-mlx defaulted its tensors to 4-bit while they're actually 3/4/6-bit →
+  `quantized_matmul failed`. Fix: **infer bits from the packing** in `quant_spec_for`
+  (`bits = 32·in_packed/(n_groups·group_size)`) rather than trusting the config default. This also
+  hardens every dynamic/mixed-bit model.
+- **eh_proj concat order.** GLM-5.2 orders the eh_proj input as `[enorm(embed); hnorm(hidden)]` — the
+  reverse of the DeepSeek-V3 paper. The paper order gave **0% MTP acceptance** (systematic garbage);
+  flipping it gave **55–70%**. (`HI_MTP_HFIRST=1` selects the paper order for other MTP models.)
+
+Result: **~1.38× decode** on GLM-5.2 (0.25 → ~0.35 tok/s), output identical to greedy. MTP acceptance
+55–70% by content. Still not interactive at 355B, but the mechanism works and is exact. A fused
+verify (fold the rejection-correction into the next round) would push it further.

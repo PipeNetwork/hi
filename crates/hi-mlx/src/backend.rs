@@ -190,14 +190,21 @@ impl InferenceBackend for MlxBackend {
             };
             let result = {
                 let mut runtime = runtime.blocking_lock();
-                match draft.as_ref() {
-                    Some(draft) if greedy => {
+                if greedy {
+                    if let Some(draft) = draft.as_ref() {
                         let mut draft = draft.blocking_lock();
                         runtime
                             .speculative_generate(&mut draft, request, spec_k, send)
                             .map(|(output, _stats)| output)
+                    } else if runtime.supports_mtp() && std::env::var_os("HI_MLX_DISABLE_MTP").is_none()
+                    {
+                        // Model has a built-in MTP head (GLM-5.2): self-speculative decoding.
+                        runtime.mtp_generate(request, send)
+                    } else {
+                        runtime.stream_generate(request, send)
                     }
-                    _ => runtime.stream_generate(request, send),
+                } else {
+                    runtime.stream_generate(request, send)
                 }
             };
             if let Err(err) = result {
