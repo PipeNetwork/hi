@@ -428,6 +428,18 @@ mod native {
             v_head_dim: c_int,
             stream: *mut c_void,
         ) -> c_int;
+        fn hi_cuda_launch_wmma_causal_attention_batched(
+            q: *const c_void,
+            k: *const c_void,
+            v: *const c_void,
+            output: *mut c_void,
+            batch_count: c_int,
+            seq_len: c_int,
+            heads: c_int,
+            kv_heads: c_int,
+            head_dim: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
         fn hi_cuda_launch_full_attention(
             q: *const c_void,
             k: *const c_void,
@@ -1874,6 +1886,42 @@ mod native {
             )
         })?;
         check_last_error("hi_cuda_launch_flashtile_causal_attention_batched")
+    }
+
+    /// Tensor-core (WMMA) flash-attention, causal batched. q/k/v are f16; output f32.
+    /// head_dim multiple of 16, <=128, v_head_dim==head_dim, no window.
+    pub fn launch_wmma_causal_attention_batched(
+        q: &DeviceBuffer,
+        k: &DeviceBuffer,
+        v: &DeviceBuffer,
+        output: &DeviceBuffer,
+        batch_count: usize,
+        seq_len: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(batch_count, "wmma_attention batch_count")?;
+        ensure_len(seq_len, "wmma_attention seq_len")?;
+        ensure_len(heads, "wmma_attention heads")?;
+        ensure_len(kv_heads, "wmma_attention kv_heads")?;
+        ensure_len(head_dim, "wmma_attention head_dim")?;
+        launch_status(unsafe {
+            hi_cuda_launch_wmma_causal_attention_batched(
+                q.as_ptr(),
+                k.as_ptr(),
+                v.as_ptr(),
+                output.as_mut_ptr(),
+                batch_count as c_int,
+                seq_len as c_int,
+                heads as c_int,
+                kv_heads as c_int,
+                head_dim as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_wmma_causal_attention_batched")
     }
 
     pub fn launch_full_attention(
