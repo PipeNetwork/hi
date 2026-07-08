@@ -22,7 +22,10 @@ pub(crate) fn session_id_from_path(path: &Path) -> String {
 }
 
 pub(crate) async fn maybe_prompt_and_submit(settings: &Settings, session_id: &str) {
-    if settings.provider != ProviderName::Pipenetwork || !io::stdin().is_terminal() {
+    if settings.provider != ProviderName::Pipenetwork
+        || !io::stdin().is_terminal()
+        || !io::stdout().is_terminal()
+    {
         return;
     }
 
