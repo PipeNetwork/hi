@@ -404,6 +404,33 @@ fn plain_implementation_prose_does_not_trigger_implementation_mode() {
 }
 
 #[test]
+fn explicit_benchmark_implementation_prompt_enters_implementation_mode() {
+    let prompt = "Implementation task. You are explicitly allowed and expected to edit files in this disposable benchmark workspace, apply patches, and run the verification command. Do not treat this as a read-only review.\n\nA tiny Rust task used to smoke-test PipeBench against the hi coding-agent harness.\n\nImplement `pub fn add(a: i32, b: i32) -> i32` in src/lib.rs.\nKeep the existing test passing. Do not change the test.";
+
+    assert!(
+        classify_implementation_intent(prompt).is_some(),
+        "explicit benchmark implementation prompt should use implementation steering"
+    );
+    assert_eq!(
+        classify_read_only_intent(prompt),
+        None,
+        "do not treat as read-only review must not become a read-only guard"
+    );
+}
+
+#[test]
+fn explicit_no_mutation_still_blocks_implementation_mode() {
+    let prompt =
+        "Implementation task, but do not edit files; inspect only and explain what would change.";
+
+    assert_eq!(classify_implementation_intent(prompt), None);
+    assert_eq!(
+        classify_read_only_intent(prompt),
+        Some(ReviewIntent::Review)
+    );
+}
+
+#[test]
 fn implementation_preflight_detects_rust_validation() {
     let dir = std::env::temp_dir().join(format!(
         "hi-implementation-preflight-{}",

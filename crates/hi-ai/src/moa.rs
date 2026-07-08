@@ -19,7 +19,7 @@ use crate::types::{
 pub const MOA_MODEL_CONSERVATIVE: &str = "moa/conservative";
 pub const MOA_PRESET_CONSERVATIVE: &str = "conservative";
 pub const MOA_AGGREGATOR_CONSERVATIVE: &str = "ipop/coder-balanced";
-pub const MOA_REFERENCE_CONSERVATIVE: &str = "pipe/auto-code";
+pub const MOA_REFERENCE_CONSERVATIVE: &str = "pipe/auto-coder";
 
 const REFERENCE_SYSTEM_PROMPT: &str = "You are a private advisory reference model in a bounded \
 Mixture-of-Agents route. Review the conversation and provide concise implementation guidance, \
@@ -596,7 +596,7 @@ mod tests {
         assert_eq!(
             events,
             vec![
-                "status:MoA reference: pipe/auto-code".to_string(),
+                "status:MoA reference: pipe/auto-coder".to_string(),
                 "status:MoA aggregating: ipop/coder-balanced".to_string(),
                 "text:visible".to_string()
             ]
@@ -648,7 +648,7 @@ mod tests {
         assert!(requests[1].messages.iter().any(|m| {
             m.role == Role::User
                 && m.text()
-                    .contains("Reference `pipe/auto-code` was unavailable")
+                    .contains("Reference `pipe/auto-coder` was unavailable")
         }));
     }
 

@@ -1600,7 +1600,7 @@ mod tests {
                     "default".into(),
                     Profile {
                         provider: Some(ProviderName::Pipenetwork),
-                        model: Some("pipe/auto-code".into()),
+                        model: Some("pipe/auto-coder".into()),
                         api_key: Some("test-key".into()),
                         ..Default::default()
                     },

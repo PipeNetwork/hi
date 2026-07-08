@@ -2,6 +2,7 @@ mod bestof;
 mod commands;
 mod complete;
 mod config;
+mod feedback;
 mod repl;
 mod session;
 mod setup;
@@ -169,6 +170,7 @@ async fn main() -> Result<()> {
 
     // Resolve which session file to use and any history to resume.
     let (session_path, loaded) = resolve_session(&cli)?;
+    let feedback_session_id = feedback::session_id_from_path(&session_path);
 
     let fallbacks = config::resolve_fallbacks(&cli, &file, &registry);
     let provider = build_chain(&settings, fallbacks);
@@ -430,6 +432,7 @@ async fn main() -> Result<()> {
         .await
         {
             Ok(()) => {
+                feedback::maybe_prompt_and_submit(&settings, &feedback_session_id).await;
                 hi_tools::kill_background_processes();
                 return Ok(());
             }
@@ -448,7 +451,7 @@ async fn main() -> Result<()> {
         print_landing(&settings, live_metadata.context_window);
     }
 
-    repl(
+    let repl_result = repl(
         &mut agent,
         &settings,
         &mut file,
@@ -457,7 +460,11 @@ async fn main() -> Result<()> {
         active_profile,
         cli.config.clone(),
     )
-    .await
+    .await;
+    if repl_result.is_ok() {
+        feedback::maybe_prompt_and_submit(&settings, &feedback_session_id).await;
+    }
+    repl_result
 }
 
 pub(crate) fn provider_label(provider: ProviderName) -> &'static str {
@@ -1232,7 +1239,7 @@ mod tests {
             131_072
         );
 
-        let auto_code = pipenetwork_settings("pipe/auto-code", 8192, false);
+        let auto_code = pipenetwork_settings("pipe/auto-coder", 8192, false);
         assert_eq!(
             effective_max_tokens_for_model(&auto_code, Some(16_384)),
             16_384
@@ -1244,7 +1251,7 @@ mod tests {
         let lower = pipenetwork_settings("ipop/coder-balanced", 4096, true);
         assert_eq!(effective_max_tokens_for_model(&lower, Some(131_072)), 4096);
 
-        let too_high = pipenetwork_settings("pipe/auto-code", 65_536, true);
+        let too_high = pipenetwork_settings("pipe/auto-coder", 65_536, true);
         assert_eq!(
             effective_max_tokens_for_model(&too_high, Some(16_384)),
             16_384

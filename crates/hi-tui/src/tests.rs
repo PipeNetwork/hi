@@ -41,7 +41,7 @@ fn selected_model_persists_to_active_profile() {
         provider: "pipenetwork".into(),
         api_key: "test-key".into(),
         store_as_env: false,
-        model: "pipe/auto-code".into(),
+        model: "pipe/auto-coder".into(),
         base_url: String::new(),
     }));
     let loader_state = stored.clone();
@@ -62,11 +62,11 @@ fn selected_model_persists_to_active_profile() {
 
     let mut app = App::new(
         "pipenetwork",
-        "pipe/auto-code",
+        "pipe/auto-coder",
         vec![ProfileInfo {
             name: "default".into(),
             provider: "pipenetwork".into(),
-            model: Some("pipe/auto-code".into()),
+            model: Some("pipe/auto-coder".into()),
             base_url: None,
         }],
         Some("default".into()),
@@ -1153,7 +1153,7 @@ fn failed_turn_is_visible() {
 
 #[test]
 fn tool_protocol_failure_does_not_mark_model_degraded() {
-    let mut app = test_app("pipenetwork", "pipe/auto-code");
+    let mut app = test_app("pipenetwork", "pipe/auto-coder");
     let err: anyhow::Error = hi_ai::ProviderError::new(
         hi_ai::ProviderErrorKind::ToolProtocol,
         "model output did not satisfy the tool protocol",
@@ -1177,12 +1177,12 @@ fn tool_protocol_failure_does_not_mark_model_degraded() {
             .any(|line| line.contains("degraded in-session")),
         "transcript: {lines:?}"
     );
-    assert_eq!(app.model_issues.get("pipe/auto-code"), None);
+    assert_eq!(app.model_issues.get("pipe/auto-coder"), None);
 }
 
 #[test]
 fn route_rejection_failure_does_not_mark_model_degraded() {
-    let mut app = test_app("pipenetwork", "pipe/auto-code");
+    let mut app = test_app("pipenetwork", "pipe/auto-coder");
     let err: anyhow::Error = hi_ai::ProviderError::new(
         hi_ai::ProviderErrorKind::ModelUnavailable,
         "model temporarily unavailable",
@@ -1206,7 +1206,7 @@ fn route_rejection_failure_does_not_mark_model_degraded() {
             .any(|line| line.contains("degraded in-session")),
         "transcript: {lines:?}"
     );
-    assert_eq!(app.model_issues.get("pipe/auto-code"), None);
+    assert_eq!(app.model_issues.get("pipe/auto-coder"), None);
 }
 
 #[test]

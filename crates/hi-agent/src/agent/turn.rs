@@ -1540,7 +1540,8 @@ impl crate::Agent {
                         let force_final_after_nudge = progress_tracker.record_no_progress_nudge(
                             stall_reason,
                             no_progress_signature_for_calls(&calls),
-                        ) && !no_new_after_mutation;
+                        ) && !no_new_after_mutation
+                            && implementation_intent.is_none();
                         let nudge = if stale_background_handle_call {
                             if has_background_output_poll {
                                 ui.nudge(&format!(
@@ -1677,16 +1678,33 @@ If the task is already complete, stop and give your final recap."
                         && !implementation_tracker.mutation_seen
                     {
                         // The model inspected the workspace but kept
-                        // re-reading instead of editing, through the whole
-                        // repeat budget. This is the "explore forever, never
-                        // edit" failure mode: report it as
-                        // implementation-incomplete (matching the no-changes
-                        // path) rather than the generic "stuck repeating"
-                        // notice, so the user knows the issue is that no edit
-                        // was made, not that a command failed.
+                        // repeating non-mutating calls through the repeat
+                        // budget. Route this through the implementation
+                        // repair budget instead of the generic repeat failure:
+                        // a chat-only final answer is not useful until a
+                        // mutation actually exists.
+                        if implementation_tracker.no_change_nudges < 2 {
+                            implementation_tracker.no_change_nudges += 1;
+                            evidence.quality_repair_nudges =
+                                evidence.quality_repair_nudges.saturating_add(1);
+                            let use_text_fallback = implementation_tracker.no_change_nudges >= 2;
+                            force_tools_next = !use_text_fallback;
+                            text_tool_fallback_next = use_text_fallback;
+                            ui.nudge(
+                                "implementation kept repeating without editing; nudging the model to edit or scaffold",
+                            );
+                            let nudge = if use_text_fallback {
+                                implementation_text_tool_nudge(IMPLEMENTATION_NO_CHANGES_NUDGE)
+                            } else {
+                                IMPLEMENTATION_NO_CHANGES_NUDGE.to_string()
+                            };
+                            self.messages.push_nudge(NudgeKind::Continue, nudge);
+                            continue;
+                        }
+
                         stalled_unfinished = true;
                         ui.nudge(
-                            "implementation kept re-reading without editing; no file changes were made",
+                            "implementation kept repeating without editing; no file changes were made",
                         );
                         ui.status(INCOMPLETE_STATUS);
                         break false;
@@ -2791,7 +2809,7 @@ If the task is already complete, stop and give your final recap."
                         let force_final_after_nudge = progress_tracker.record_no_progress_nudge(
                             "repeated idempotent tool output",
                             no_progress_signature_for_calls(&calls),
-                        );
+                        ) && implementation_intent.is_none();
                         ui.nudge(&format!(
                             "the model got the same inspection output again — nudging it to act on already-returned evidence ({repeat_nudges}/{})",
                             self.config.max_repeat_nudges
@@ -2823,6 +2841,26 @@ If the task is already complete, stop and give your final recap."
                         }
                         if implementation_intent.is_some() && !implementation_tracker.mutation_seen
                         {
+                            if implementation_tracker.no_change_nudges < 2 {
+                                implementation_tracker.no_change_nudges += 1;
+                                evidence.quality_repair_nudges =
+                                    evidence.quality_repair_nudges.saturating_add(1);
+                                let use_text_fallback =
+                                    implementation_tracker.no_change_nudges >= 2;
+                                force_tools_next = !use_text_fallback;
+                                text_tool_fallback_next = use_text_fallback;
+                                ui.nudge(
+                                    "implementation repeated equivalent inspection output without editing; nudging the model to edit or scaffold",
+                                );
+                                let nudge = if use_text_fallback {
+                                    implementation_text_tool_nudge(IMPLEMENTATION_NO_CHANGES_NUDGE)
+                                } else {
+                                    IMPLEMENTATION_NO_CHANGES_NUDGE.to_string()
+                                };
+                                self.messages.push_nudge(NudgeKind::Continue, nudge);
+                                continue;
+                            }
+
                             stalled_unfinished = true;
                             ui.nudge(
                                 "implementation repeated equivalent inspection output without editing",

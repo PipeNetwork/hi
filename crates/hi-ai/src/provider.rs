@@ -226,7 +226,7 @@ pub fn effective_coding_agent_max_tokens(
 }
 
 pub fn is_pipenetwork_coding_route(model: &str) -> bool {
-    matches!(model, "ipop/coder-balanced" | "pipe/auto-code")
+    matches!(model, "ipop/coder-balanced" | "pipe/auto-coder")
 }
 
 impl ServedModel {
@@ -516,7 +516,7 @@ mod tests {
         );
         assert_eq!(
             effective_coding_agent_max_tokens(
-                "pipe/auto-code",
+                "pipe/auto-coder",
                 CODING_AGENT_MIN_OUTPUT_TOKENS,
                 false,
                 Some(16_384),
@@ -532,7 +532,7 @@ mod tests {
             4096
         );
         assert_eq!(
-            effective_coding_agent_max_tokens("pipe/auto-code", 65_536, true, Some(16_384)),
+            effective_coding_agent_max_tokens("pipe/auto-coder", 65_536, true, Some(16_384)),
             16_384
         );
     }
