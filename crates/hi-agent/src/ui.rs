@@ -48,6 +48,13 @@ pub trait Ui: Send {
     fn tool_result(&mut self, name: &str, result: &str);
     /// A status note (e.g. verification progress).
     fn status(&mut self, text: &str);
+    /// A prominent notice that the agent is delegating to (or finishing) a
+    /// subagent — louder than an ordinary [`status`](Ui::status) so the user
+    /// clearly sees a nested agent run. Defaults to a plain status; frontends
+    /// override it to stand out.
+    fn subagent_note(&mut self, text: &str) {
+        self.status(text);
+    }
     /// The task plan was created or updated (via the `update_plan` tool). The
     /// full step list is passed each time; a frontend shows it as a live,
     /// in-place checklist rather than a scrolling transcript echo. Defaults to
