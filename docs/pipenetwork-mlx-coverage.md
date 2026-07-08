@@ -16,7 +16,7 @@ Support status for the MLX models published under [huggingface.co/pipenetwork](h
 | `hy_v3` | Hy3-REAP50/62/75 | `QwenLike` + MoE | Hunyuan-3 |
 | `glm_moe_dsa` | GLM-5.2 (4/5/6/8-bit, mixed, nvfp4, REAP25/37/50), Macaron-V1-749B | `MlaLike` (DeepSeek) | DeepSeek-V3.2 arch (MLA + DSA indexer + MoE) |
 | `kimi_k25` | Kimi-K2.7-Code | `MlaLike` (DeepSeek) | thin DeepSeek-V3 wrapper; routed 2026-07 (arch-verified, untested @ ~1T params) |
-| `nemotron_h` (dense) | NVIDIA-Nemotron-3-Nano-4B | `NemotronHLike` | Mamba2 + attention + ReLU² MLP hybrid; built 2026-07, validated on Nano-4B. MoE (`E`) blocks pending → 30B-A3B/550B not yet covered |
+| `nemotron_h` | Nemotron-3-Nano-4B/30B-A3B, Ultra-550B-A55B | `NemotronHLike` | Mamba2 + attention + ReLU² MLP + MoE hybrid; built 2026-07, validated on Nano-4B (dense) and Nano-30B-A3B (MoE). Ultra-550B arch-verified (untested @ 550B). TwoTower is a separate diffusion variant. |
 
 ## ❌ Not yet supported (4 new architectures)
 
@@ -25,7 +25,6 @@ sibling `*-mlx/.venv` checkouts.
 
 | `model_type` | PipeNetwork models | what it is | effort |
 |---|---|---|---|
-| `nemotron_h` (**MoE only**) | Nemotron-3-Nano-30B-A3B, Ultra-550B-A55B, TwoTower-30B | Mamba2 hybrid with MoE `E` blocks | medium — dense path done; add `NemotronHMoE` (SwitchMLP + grouped sigmoid/noaux routing) to the block dispatch |
 | `gemma4` | Gemma-4-26B-A4B (MoE), Gemma-4-31B (dense) | sliding/full attention hybrid + MoE | large — cross-layer **KV-sharing**, dual RoPE per layer-type, `k==v` layers, 4 sandwich norms, logit softcapping, specialized MoE router |
 | `minimax_m3` | MiniMax-M3 | **lightning (linear) attention** hybrid | medium-large — new linear-attention kernel |
 | `longcat2` | LongCat-2.0 (REAP50/62/75/hard) | MLA + custom LongCat MoE + ngram embedding + indexer | large — custom `LongcatFlashMoE` (zero-computation experts) + `NgramEmbedding`; not a DeepSeek wrapper despite the MLA fields |
