@@ -45,6 +45,12 @@ pub fn build_prompt_with_template(
             // GPT-OSS harmony: tools go in a TypeScript functions namespace and calls use the commentary
             // channel — the generic `<tool_call>` instruction doesn't fit, so render it natively.
             return render_gptoss_tools(messages, tools, tool_choice);
+        } else if {
+            let t = normalize_jinja_template(template);
+            t.contains("<|header_start|>") && t.contains("<|eot|>")
+        } {
+            // Llama-4: uses the Llama-3.1 tool prompt + `{"name", "parameters"}` output, not `<tool_call>`.
+            return render_llama4_tools(messages, tools, tool_choice);
         } else if matches!(
             family,
             ModelFamily::Qwen2 | ModelFamily::Qwen3 | ModelFamily::NemotronH | ModelFamily::Gemma
@@ -488,6 +494,55 @@ fn render_llama4_template(messages: &[ChatMessage]) -> String {
         let role = match message.role.as_str() {
             "assistant" | "ai" | "model" => "assistant",
             "system" | "developer" | "root" => "system",
+            "tool" => "ipython",
+            _ => "user",
+        };
+        out.push_str("<|header_start|>");
+        out.push_str(role);
+        out.push_str("<|header_end|>\n\n");
+        out.push_str(&message.content_text());
+        out.push_str("<|eot|>");
+    }
+    out.push_str("<|header_start|>assistant<|header_end|>\n\n");
+    out
+}
+
+// Llama-4 native tool prompt: the Llama-3.1 "respond with JSON `{name, parameters}`" instruction + the
+// tool schemas in the system turn.
+fn render_llama4_tools(messages: &[ChatMessage], tools: &[Tool], tool_choice: &Value) -> String {
+    let mut out = String::from("<|begin_of_text|><|header_start|>system<|header_end|>\n\n");
+    let system = messages
+        .iter()
+        .find(|m| matches!(m.role.as_str(), "system" | "developer" | "root"))
+        .map(|m| m.content_text())
+        .unwrap_or_default();
+    if !system.is_empty() {
+        out.push_str(&system);
+        out.push_str("\n\n");
+    }
+    out.push_str(
+        "You have access to the following functions. To call a function, please respond with JSON \
+         for a function call. Respond in the format {\"name\": function name, \"parameters\": \
+         dictionary of argument name and its value}. Do not use variables.\n\n",
+    );
+    for tool in tools {
+        out.push_str(&serde_json::to_string(tool).unwrap_or_else(|_| "{}".to_string()));
+        out.push_str("\n\n");
+    }
+    if tool_choice == "required" {
+        out.push_str("You must call a function.\n\n");
+    } else if let Some(name) = tool_choice
+        .get("function")
+        .and_then(|f| f.get("name"))
+        .and_then(Value::as_str)
+    {
+        out.push_str(&format!("You must call the {name} function.\n\n"));
+    }
+    out.push_str("<|eot|>");
+    for message in messages {
+        let role = match message.role.as_str() {
+            "assistant" | "ai" | "model" => "assistant",
+            "system" | "developer" | "root" => continue,
             "tool" => "ipython",
             _ => "user",
         };

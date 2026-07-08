@@ -161,16 +161,25 @@ fn parse_json_tool_calls(text: &str, allowed: &[&str]) -> Option<Vec<NormalizedT
     } else {
         vec![&value]
     };
+    // Llama-style calls use `parameters` where OpenAI/hermes use `arguments`.
+    let args_of = |obj: &Value| {
+        obj.get("arguments")
+            .or_else(|| obj.get("parameters"))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
     let mut out = Vec::new();
     for call in calls {
         if let Some(function) = call.get("function") {
             let name = function.get("name").and_then(Value::as_str)?;
-            let arguments = function.get("arguments").cloned().unwrap_or(Value::Null);
-            out.push(normalize(name, arguments, allowed, out.len())?);
+            out.push(normalize(name, args_of(function), allowed, out.len())?);
         } else {
-            let name = call.get("name").and_then(Value::as_str)?;
-            let arguments = call.get("arguments").cloned().unwrap_or(Value::Null);
-            out.push(normalize(name, arguments, allowed, out.len())?);
+            // Llama-4 Scout puts the function name under `type` rather than `name`.
+            let name = call
+                .get("name")
+                .and_then(Value::as_str)
+                .or_else(|| call.get("type").and_then(Value::as_str))?;
+            out.push(normalize(name, args_of(call), allowed, out.len())?);
         }
     }
     (!out.is_empty()).then_some(out)
@@ -348,6 +357,18 @@ mod tests {
     fn harmony_tool_call_is_normalized() {
         let calls = parse_tool_calls(
             "commentary to=functions.read <|constrain|>json<|message|>{\"path\":\"README.md\"}<|call|>",
+            &tools(),
+        )
+        .unwrap();
+
+        assert_eq!(calls[0].function.name, "read");
+        assert_eq!(calls[0].function.arguments, r#"{"path":"README.md"}"#);
+    }
+
+    #[test]
+    fn llama4_type_parameters_tool_call_is_normalized() {
+        let calls = parse_tool_calls(
+            r#"{"type":"read","parameters":{"path":"README.md"}}"#,
             &tools(),
         )
         .unwrap();
