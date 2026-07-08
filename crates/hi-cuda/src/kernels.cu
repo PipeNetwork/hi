@@ -3713,23 +3713,49 @@ __global__ void flash_cached_decode_attention_batched_kernel(
   }
 }
 
+// Parallel last-token argmax: one 256-thread block cooperatively scans `n` logits
+// with a shared-memory value+index reduction (ties resolve to the lowest index,
+// matching the serial reference). Replaces a single-thread scan over the vocab.
+__device__ void block_argmax_last(const float* row, int n, uint32_t* out) {
+  __shared__ float sh_val[256];
+  __shared__ int sh_idx[256];
+  const int t = threadIdx.x;
+  float best = -INFINITY;
+  int best_idx = 0;
+  for (int i = t; i < n; i += blockDim.x) {
+    const float v = row[i];
+    if (v > best) {
+      best = v;
+      best_idx = i;
+    }
+  }
+  sh_val[t] = best;
+  sh_idx[t] = best_idx;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (t < stride) {
+      const float ov = sh_val[t + stride];
+      const int oi = sh_idx[t + stride];
+      if (ov > sh_val[t] || (ov == sh_val[t] && oi < sh_idx[t])) {
+        sh_val[t] = ov;
+        sh_idx[t] = oi;
+      }
+    }
+    __syncthreads();
+  }
+  if (t == 0) {
+    *out = static_cast<uint32_t>(sh_idx[0]);
+  }
+}
+
 __global__ void argmax_kernel(
     const float* logits,
     uint32_t* output_token,
     int len) {
-  if (threadIdx.x != 0 || blockIdx.x != 0 || len <= 0) {
+  if (len <= 0) {
     return;
   }
-  int best_idx = 0;
-  float best = logits[0];
-  for (int idx = 1; idx < len; ++idx) {
-    float value = logits[idx];
-    if (value > best) {
-      best = value;
-      best_idx = idx;
-    }
-  }
-  *output_token = static_cast<uint32_t>(best_idx);
+  block_argmax_last(logits, len, output_token);
 }
 
 __global__ void argmax_last_row_kernel(
@@ -3737,20 +3763,10 @@ __global__ void argmax_last_row_kernel(
     uint32_t* output_token,
     int rows,
     int cols) {
-  if (threadIdx.x != 0 || blockIdx.x != 0 || rows <= 0 || cols <= 0) {
+  if (rows <= 0 || cols <= 0) {
     return;
   }
-  const float* row = logits + (rows - 1) * cols;
-  int best_idx = 0;
-  float best = row[0];
-  for (int idx = 1; idx < cols; ++idx) {
-    float value = row[idx];
-    if (value > best) {
-      best = value;
-      best_idx = idx;
-    }
-  }
-  *output_token = static_cast<uint32_t>(best_idx);
+  block_argmax_last(logits + (rows - 1) * cols, cols, output_token);
 }
 
 __global__ void argmax_batched_last_token_kernel(
@@ -3759,21 +3775,12 @@ __global__ void argmax_batched_last_token_kernel(
     int batch_count,
     int seq_len,
     int cols) {
-  int batch = blockIdx.x * blockDim.x + threadIdx.x;
+  const int batch = blockIdx.x;
   if (batch >= batch_count || seq_len <= 0 || cols <= 0) {
     return;
   }
-  const float* row = logits + (batch * seq_len + (seq_len - 1)) * cols;
-  int best_idx = 0;
-  float best = row[0];
-  for (int idx = 1; idx < cols; ++idx) {
-    float value = row[idx];
-    if (value > best) {
-      best = value;
-      best_idx = idx;
-    }
-  }
-  output_tokens[batch] = static_cast<uint32_t>(best_idx);
+  block_argmax_last(logits + (batch * seq_len + (seq_len - 1)) * cols, cols,
+                    &output_tokens[batch]);
 }
 
 __device__ uint32_t argmax_row_device(const float* row, int cols) {
@@ -6046,7 +6053,7 @@ extern "C" int hi_cuda_launch_argmax(
       stream == nullptr) {
     return 1;
   }
-  argmax_kernel<<<1, 1, 0, static_cast<cudaStream_t>(stream)>>>(
+  argmax_kernel<<<1, 256, 0, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const float*>(logits),
       static_cast<uint32_t*>(output_token),
       len);
@@ -6063,7 +6070,7 @@ extern "C" int hi_cuda_launch_argmax_last_row(
       stream == nullptr) {
     return 1;
   }
-  argmax_last_row_kernel<<<1, 1, 0, static_cast<cudaStream_t>(stream)>>>(
+  argmax_last_row_kernel<<<1, 256, 0, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const float*>(logits),
       static_cast<uint32_t*>(output_token),
       rows,
@@ -6082,8 +6089,8 @@ extern "C" int hi_cuda_launch_argmax_batched_last_token(
       seq_len <= 0 || cols <= 0 || stream == nullptr) {
     return 1;
   }
-  dim3 block(128);
-  dim3 grid((batch_count + block.x - 1) / block.x);
+  dim3 block(256);
+  dim3 grid(batch_count);
   argmax_batched_last_token_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const float*>(logits),
       static_cast<uint32_t*>(output_tokens),
