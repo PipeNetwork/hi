@@ -10,7 +10,7 @@ clap.workspace = true
 hi-cuda = { path = "../hi-cuda" }
 hi-gguf = { path = "../hi-gguf" }
 hi-local-core.workspace = true
-hi-mlx = { path = "../hi-mlx" }
+hi-mlx = { path = "../hi-mlx", optional = true }
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -18,4 +18,7 @@ tracing-subscriber.workspace = true
 
 [features]
 default = []
+# The MLX backend (Apple Silicon macOS only) is opt-in so that Linux/CUDA builds
+# never compile the Apple-only hi-mlx crate.
+mlx = ["dep:hi-mlx", "hi-mlx/mlx"]
 native-cuda = ["hi-cuda/native-cuda"]

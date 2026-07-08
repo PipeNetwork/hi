@@ -1431,6 +1431,8 @@ fn cuda_model_family_label(family: ModelFamily) -> &'static str {
         ModelFamily::Phi => "Phi",
         ModelFamily::DeepSeek => "DeepSeek",
         ModelFamily::GlmFlash => "GLM",
+        ModelFamily::Hy3 => "Hy3",
+        ModelFamily::NemotronH => "NemotronH",
     }
 }
 

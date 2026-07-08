@@ -533,8 +533,7 @@ impl CudaPagedKvCacheManager {
             .checked_mul(kv_heads)
             .and_then(|value| value.checked_mul(qk_head_dim.checked_add(v_head_dim)?))
             .and_then(|value| value.checked_mul(page_size))
-            // KV pages are stored as f16 (kv_t = __half in kernels.cu).
-            .and_then(|value| value.checked_mul(std::mem::size_of::<u16>()))
+            .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
             .context("CUDA paged KV page byte count overflows usize")?;
         let bytes_total = bytes_per_page
             .checked_mul(pages_total)
@@ -3989,14 +3988,15 @@ fn admit_continuous_ready_jobs(
 /// Whether the opt-in cross-request prefix KV cache is enabled
 /// (`HI_CUDA_PREFIX_CACHE=1`).
 fn prefix_cache_enabled() -> bool {
-    // On by default (pure upside for sequential agent turns, graceful fallback
-    // otherwise); set HI_CUDA_PREFIX_CACHE=0 to disable.
-    !matches!(
+    // Opt-in: the cache retains a completed request's KV pages between requests,
+    // which changes page accounting, so it stays off by default and is enabled
+    // per-deployment with HI_CUDA_PREFIX_CACHE=1.
+    matches!(
         std::env::var("HI_CUDA_PREFIX_CACHE")
             .ok()
             .map(|value| value.trim().to_ascii_lowercase())
             .as_deref(),
-        Some("0" | "false" | "no" | "off")
+        Some("1" | "true" | "yes" | "on")
     )
 }
 
