@@ -96,6 +96,10 @@ mod native {
     use super::{CudaMmprojProjectorInfo, CudaQwenGpuModelInfo, CudaVisionEncoderInfo};
 
     const FLASH_ONLINE_MAX_HEAD_DIM: usize = 512;
+    // Flash-attention (shared-memory K/V tiling) prefill path is used for causal
+    // (no sliding window) attention up to this head_dim; larger falls back to the
+    // per-query tiled kernel. Must match HI_CUDA_FLASH_TILE_MAX_HEAD_DIM in kernels.cu.
+    const FLASH_TILE_MAX_HEAD_DIM: usize = 128;
 
     fn retain_uncancelled_batch_rows<F>(active: &mut [bool], is_cancelled: &mut F) -> bool
     where
@@ -15050,7 +15054,27 @@ mod native {
                 .context("CUDA batched attention output element count overflows usize")?;
             let output = DeviceBuffer::alloc(output_elements * std::mem::size_of::<f32>())
                 .context("allocating CUDA batched attention output")?;
-            if head_dim <= FLASH_ONLINE_MAX_HEAD_DIM {
+            if window == 0
+                && head_dim <= FLASH_TILE_MAX_HEAD_DIM
+                && v_head_dim <= FLASH_TILE_MAX_HEAD_DIM
+            {
+                // Flash-attention: shared-memory K/V tiling cuts the O(seq^2) global
+                // reads of the per-query tiled kernel. Causal only; falls through to the
+                // tiled kernel for sliding-window or larger head_dim.
+                crate::kernels::launch_flashtile_causal_attention_batched(
+                    &q.buffer,
+                    &k.buffer,
+                    &v.buffer,
+                    &output,
+                    batch_count,
+                    seq_len,
+                    heads,
+                    kv_heads,
+                    head_dim,
+                    v_head_dim,
+                    &self.stream,
+                )?;
+            } else if head_dim <= FLASH_ONLINE_MAX_HEAD_DIM {
                 crate::kernels::launch_tiled_causal_attention_batched(
                     &q.buffer,
                     &k.buffer,
