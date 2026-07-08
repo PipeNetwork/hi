@@ -210,6 +210,9 @@ mod native {
             ModelFamily::Qwen2 if config.model_type == "cohere2" => {
                 Ok(Box::new(CohereLike::new(config.clone(), arrays)?))
             }
+            ModelFamily::Qwen2 if config.model_type == "phimoe" => {
+                Ok(Box::new(PhiMoeLike::new(config.clone(), arrays)?))
+            }
             ModelFamily::Qwen2 if config.model_type.starts_with("llama4") => {
                 Ok(Box::new(Llama4Like::new(config.clone(), arrays)?))
             }
@@ -3985,6 +3988,296 @@ mod native {
                 Some(head) => head.forward(&h)?,
                 None => self.embed_tokens.as_linear(&h)?,
             };
+            transforms::eval([&logits])?;
+            Ok(logits)
+        }
+
+        fn reset_cache(&mut self) {
+            for layer in &mut self.layers {
+                layer.attention.cache.reset();
+            }
+        }
+
+        fn prepare_cache(&mut self, capacity: i32) {
+            for layer in &mut self.layers {
+                layer.attention.cache.prepare_capacity(capacity);
+            }
+        }
+    }
+
+    // ---------------------- Phi-3.5-MoE (phimoe) ----------------------
+    // GQA with biased q/k/v/o + SuScaledRoPE (LongRoPE: per-dim long_factor freqs + an mscale on q/k) +
+    // LayerNorm (with bias) + top-k-then-softmax MoE (no shared expert). Untied lm_head. Pre-norm.
+    fn phi_surope_freqs(head_dim: i32, base: f32, long_factor: &[f32]) -> Array {
+        let half = (head_dim / 2) as usize;
+        let thetas: Vec<f32> = (0..half)
+            .map(|i| {
+                let lf = long_factor.get(i).copied().unwrap_or(1.0);
+                lf * base.powf((2 * i) as f32 / head_dim as f32)
+            })
+            .collect();
+        Array::from_slice(&thetas, &[half as i32])
+    }
+
+    struct PhiMoeAttention {
+        q_proj: Linear,
+        k_proj: Linear,
+        v_proj: Linear,
+        o_proj: Linear,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        scale: f32,
+        mscale: f32,
+        rope_freqs: Array,
+        cache: Cache,
+    }
+
+    impl PhiMoeAttention {
+        fn load(
+            prefix: &str,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+            rope_freqs: &Array,
+        ) -> Result<Self> {
+            let head_dim = config.attention_head_dim() as i32;
+            let mscale = config
+                .rope_scaling
+                .as_ref()
+                .and_then(|s| s.get("long_mscale"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(1.0) as f32;
+            Ok(Self {
+                q_proj: Linear::load(&format!("{prefix}.q_proj"), arrays, config)?,
+                k_proj: Linear::load(&format!("{prefix}.k_proj"), arrays, config)?,
+                v_proj: Linear::load(&format!("{prefix}.v_proj"), arrays, config)?,
+                o_proj: Linear::load(&format!("{prefix}.o_proj"), arrays, config)?,
+                n_heads: config.num_attention_heads as i32,
+                n_kv_heads: config.num_key_value_heads as i32,
+                head_dim,
+                scale: (head_dim as f32).powf(-0.5),
+                mscale,
+                rope_freqs: rope_freqs.clone(),
+                cache: Cache::new(),
+            })
+        }
+
+        fn forward(&mut self, x: &Array) -> Result<Array> {
+            let shape = x.shape();
+            let (b, l) = (shape[0], shape[1]);
+            let mut q = self
+                .q_proj
+                .forward(x)?
+                .reshape(&[b, l, self.n_heads, self.head_dim])?
+                .transpose_axes(&[0, 2, 1, 3])?;
+            let mut k = self
+                .k_proj
+                .forward(x)?
+                .reshape(&[b, l, self.n_kv_heads, self.head_dim])?
+                .transpose_axes(&[0, 2, 1, 3])?;
+            let v = self
+                .v_proj
+                .forward(x)?
+                .reshape(&[b, l, self.n_kv_heads, self.head_dim])?
+                .transpose_axes(&[0, 2, 1, 3])?;
+            // SuScaledRoPE: scale q/k by mscale, then rope with the long-factor freqs (base unset).
+            if self.mscale != 1.0 {
+                q = q * self.mscale;
+                k = k * self.mscale;
+            }
+            let offset = self.cache.offset;
+            q = rope(
+                q,
+                self.head_dim,
+                false,
+                None::<f32>,
+                1.0,
+                offset,
+                Some(&self.rope_freqs),
+            )?;
+            k = rope(
+                k,
+                self.head_dim,
+                false,
+                None::<f32>,
+                1.0,
+                offset,
+                Some(&self.rope_freqs),
+            )?;
+            let (k, v) = self.cache.update(k, v)?;
+            let output = if l > 1 && offset == 0 {
+                scaled_dot_product_attention(
+                    &q,
+                    &k,
+                    &v,
+                    self.scale,
+                    ScaledDotProductAttentionMask::Causal,
+                    None::<&Array>,
+                )?
+            } else if l > 1 {
+                let mask = causal_attention_mask(l, k.shape()[2], offset);
+                scaled_dot_product_attention(
+                    &q,
+                    &k,
+                    &v,
+                    self.scale,
+                    ScaledDotProductAttentionMask::Array(&mask),
+                    None::<&Array>,
+                )?
+            } else {
+                scaled_dot_product_attention(&q, &k, &v, self.scale, None, None::<&Array>)?
+            };
+            let output = output.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
+                b,
+                l,
+                self.n_heads * self.head_dim,
+            ])?;
+            self.o_proj.forward(&output)
+        }
+    }
+
+    struct PhiMoeMoe {
+        gate: Linear,
+        switch_mlp: SwitchMlp,
+        top_k: usize,
+    }
+
+    impl PhiMoeMoe {
+        fn load(
+            prefix: &str,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+        ) -> Result<Self> {
+            Ok(Self {
+                gate: Linear::load(&format!("{prefix}.gate"), arrays, config)?,
+                switch_mlp: SwitchMlp::load(&format!("{prefix}.switch_mlp"), arrays, config)?,
+                top_k: config.num_experts_per_tok.unwrap_or(2) as usize,
+            })
+        }
+
+        fn forward(&self, x: &Array) -> Result<Array> {
+            let shape = x.shape();
+            let (b, l, d) = (shape[0], shape[1], shape[2]);
+            if b != 1 {
+                bail!("Phi-MoE supports batch size 1, got {b}");
+            }
+            let logits = self.gate.forward(x)?.as_type::<f32>()?;
+            transforms::eval([&logits])?;
+            let n_exp = *logits.shape().last().unwrap() as usize;
+            let raw = logits.as_slice::<f32>();
+            let mut outputs = Vec::with_capacity(l as usize);
+            for token in 0..l as usize {
+                let lg = &raw[token * n_exp..token * n_exp + n_exp];
+                // top-k by gate logit, then softmax over just those k.
+                let mut ranked = (0..n_exp).map(|e| (e, lg[e])).collect::<Vec<_>>();
+                ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                ranked.truncate(self.top_k);
+                let maxl = ranked.iter().map(|&(_, v)| v).fold(f32::MIN, f32::max);
+                let exps: Vec<f32> = ranked.iter().map(|&(_, v)| (v - maxl).exp()).collect();
+                let denom: f32 = exps.iter().sum::<f32>() + 1e-20;
+                let token_x = x.index((0, token as i32, ..)).reshape(&[1, 1, d])?;
+                let mut acc = Array::zeros::<f32>(&[1, 1, d])?;
+                for (k, &(expert, _)) in ranked.iter().enumerate() {
+                    let w = exps[k] / denom;
+                    acc = acc
+                        + self
+                            .switch_mlp
+                            .forward_expert(&token_x, expert as i32)?
+                            .as_type::<f32>()?
+                            * w;
+                }
+                outputs.push(acc);
+            }
+            Ok(concatenate_axis(&outputs, 1)?)
+        }
+    }
+
+    struct PhiMoeBlock {
+        input_layernorm: LayerNorm,
+        post_attention_layernorm: LayerNorm,
+        attention: PhiMoeAttention,
+        moe: PhiMoeMoe,
+    }
+
+    impl PhiMoeBlock {
+        fn load(
+            idx: u32,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+            rope_freqs: &Array,
+        ) -> Result<Self> {
+            let p = format!("model.layers.{idx}");
+            let eps = config.rms_norm_eps;
+            Ok(Self {
+                input_layernorm: LayerNorm::load(&format!("{p}.input_layernorm"), arrays, eps)?,
+                post_attention_layernorm: LayerNorm::load(
+                    &format!("{p}.post_attention_layernorm"),
+                    arrays,
+                    eps,
+                )?,
+                attention: PhiMoeAttention::load(
+                    &format!("{p}.self_attn"),
+                    arrays,
+                    config,
+                    rope_freqs,
+                )?,
+                moe: PhiMoeMoe::load(&format!("{p}.block_sparse_moe"), arrays, config)?,
+            })
+        }
+
+        fn forward(&mut self, x: Array) -> Result<Array> {
+            let h = &x + self.attention.forward(&self.input_layernorm.forward(&x)?)?;
+            let r = self
+                .moe
+                .forward(&self.post_attention_layernorm.forward(&h)?)?;
+            Ok(h + r)
+        }
+    }
+
+    struct PhiMoeLike {
+        embed_tokens: Embedding,
+        layers: Vec<PhiMoeBlock>,
+        norm: LayerNorm,
+        lm_head: Linear,
+    }
+
+    impl PhiMoeLike {
+        fn new(config: MlxModelConfig, arrays: HashMap<String, Array>) -> Result<Self> {
+            let head_dim = config.attention_head_dim() as i32;
+            let long_factor: Vec<f32> = config
+                .rope_scaling
+                .as_ref()
+                .and_then(|s| s.get("long_factor"))
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_f64().map(|f| f as f32))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let rope_freqs = phi_surope_freqs(head_dim, config.rope_theta, &long_factor);
+            let mut layers = Vec::with_capacity(config.num_hidden_layers as usize);
+            for idx in 0..config.num_hidden_layers {
+                layers.push(PhiMoeBlock::load(idx, &arrays, &config, &rope_freqs)?);
+            }
+            Ok(Self {
+                embed_tokens: Embedding::load("model.embed_tokens", &arrays, &config)?,
+                norm: LayerNorm::load("model.norm", &arrays, config.rms_norm_eps)?,
+                lm_head: Linear::load("lm_head", &arrays, &config)?,
+                layers,
+            })
+        }
+    }
+
+    impl CausalLm for PhiMoeLike {
+        fn forward(&mut self, input_ids: &[u32]) -> Result<Array> {
+            let ids = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
+            let mut h = self.embed_tokens.forward(&ids)?;
+            for layer in &mut self.layers {
+                h = layer.forward(h)?;
+            }
+            h = self.norm.forward(&h)?;
+            let logits = self.lm_head.forward(&h)?;
             transforms::eval([&logits])?;
             Ok(logits)
         }

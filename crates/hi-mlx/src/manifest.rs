@@ -247,6 +247,7 @@ fn model_family(model_type: &str, config: &Value) -> Option<ModelFamily> {
             | "llama4"
             | "llama4_text"
             | "ernie4_5_moe"
+            | "phimoe"
     ) {
         return Some(ModelFamily::Qwen2);
     }

@@ -448,12 +448,13 @@ pub fn parse_model_config(path: &Path, raw: Value) -> Result<MlxModelConfig> {
             let mut ids = token_ids(&raw, "eos_token_id");
             // Gemma ends a chat turn with <end_of_turn> (106), not <eos>; without it the model runs
             // past its answer into trailing garbage.
-            if str_field(&raw, "model_type")
-                .unwrap_or_default()
-                .starts_with("gemma")
-                && !ids.contains(&106)
-            {
+            let mt = str_field(&raw, "model_type").unwrap_or_default();
+            if mt.starts_with("gemma") && !ids.contains(&106) {
                 ids.push(106);
+            }
+            // Phi-3 / Phi-MoE end a chat turn with <|end|> (32007), while eos_token_id is <|endoftext|>.
+            if mt == "phimoe" && !ids.contains(&32007) {
+                ids.push(32007);
             }
             ids
         },
@@ -562,6 +563,7 @@ pub fn detect_family(model_type: &str, config: &Value) -> Option<ModelFamily> {
             | "llama4"
             | "llama4_text"
             | "ernie4_5_moe"
+            | "phimoe"
     ) {
         return Some(ModelFamily::Qwen2);
     }
