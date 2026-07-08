@@ -13,6 +13,7 @@ pub fn build_prompt(
         ModelFamily::Qwen2 | ModelFamily::Qwen3 | ModelFamily::NemotronH => {
             build_chatml_prompt(messages, tools, tool_choice)
         }
+        ModelFamily::MiniMax => render_minimax_template(messages),
         ModelFamily::Hy3 => build_hy3_prompt(messages, tools, tool_choice),
         ModelFamily::Llama | ModelFamily::Mistral | ModelFamily::Mixtral => {
             build_llama_prompt(messages, tools, tool_choice)
@@ -49,6 +50,10 @@ fn render_gguf_chat_template(template: &str, messages: &[ChatMessage]) -> Option
     if template.contains("<|turn>") && template.contains("<turn|>") {
         return Some(render_gemma_turn_template(messages));
     }
+    // MiniMax-M3 custom format: `]~b]{role}\n{content}[e~[` framing, `]~b]ai\n</mm:think>` generation.
+    if template.contains("]~b]") && template.contains("[e~[") {
+        return Some(render_minimax_template(messages));
+    }
     if template.contains("<|start_header_id|>")
         && template.contains("<|end_header_id|>")
         && template.contains("<|eot_id|>")
@@ -81,6 +86,41 @@ fn render_gemma_turn_template(messages: &[ChatMessage]) -> String {
     // Generation prompt: open the model turn and prime an empty thought channel (thinking disabled),
     // so the model proceeds straight to its final answer.
     out.push_str("<|turn>model\n<|channel>thought\n<channel|>");
+    out
+}
+
+fn render_minimax_template(messages: &[ChatMessage]) -> String {
+    const BOD: &str = "]~!b[";
+    const BOS: &str = "]~b]";
+    const EOS: &str = "[e~[";
+    let mut out = String::from(BOD);
+    // Developer preamble: the system/developer message, or the default identity.
+    let system = messages
+        .iter()
+        .find(|m| matches!(m.role.as_str(), "system" | "developer" | "root"))
+        .map(|m| m.content_text());
+    out.push_str(BOS);
+    out.push_str("developer\n");
+    out.push_str(&system.unwrap_or_else(|| "You are a helpful assistant.".to_string()));
+    out.push_str(EOS);
+    out.push('\n');
+    for message in messages {
+        let role = match message.role.as_str() {
+            "assistant" | "ai" | "model" => "ai",
+            "system" | "developer" | "root" => continue,
+            "tool" => "tool",
+            _ => "user",
+        };
+        out.push_str(BOS);
+        out.push_str(role);
+        out.push('\n');
+        out.push_str(&message.content_text());
+        out.push_str(EOS);
+        out.push('\n');
+    }
+    // Generation prompt: open the ai turn and skip thinking (go straight to the answer).
+    out.push_str(BOS);
+    out.push_str("ai\n</mm:think>");
     out
 }
 

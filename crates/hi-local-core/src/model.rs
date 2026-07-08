@@ -32,6 +32,7 @@ pub enum ModelFamily {
     GlmFlash,
     Hy3,
     NemotronH,
+    MiniMax,
 }
 
 impl ModelFamily {
@@ -48,6 +49,7 @@ impl ModelFamily {
             Self::GlmFlash => "glm-flash",
             Self::Hy3 => "hy3",
             Self::NemotronH => "nemotron-h",
+            Self::MiniMax => "minimax",
         }
     }
 
