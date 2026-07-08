@@ -14,6 +14,7 @@ pub fn build_prompt(
             build_chatml_prompt(messages, tools, tool_choice)
         }
         ModelFamily::MiniMax => render_minimax_template(messages),
+        ModelFamily::LongCat => render_longcat_template(messages),
         ModelFamily::Hy3 => build_hy3_prompt(messages, tools, tool_choice),
         ModelFamily::Llama | ModelFamily::Mistral | ModelFamily::Mixtral => {
             build_llama_prompt(messages, tools, tool_choice)
@@ -53,6 +54,10 @@ fn render_gguf_chat_template(template: &str, messages: &[ChatMessage]) -> Option
     // MiniMax-M3 custom format: `]~b]{role}\n{content}[e~[` framing, `]~b]ai\n</mm:think>` generation.
     if template.contains("]~b]") && template.contains("[e~[") {
         return Some(render_minimax_template(messages));
+    }
+    // LongCat-2.0 custom format: `<longcat_system|user|assistant>` turns.
+    if template.contains("<longcat_assistant>") && template.contains("<longcat_user>") {
+        return Some(render_longcat_template(messages));
     }
     if template.contains("<|start_header_id|>")
         && template.contains("<|end_header_id|>")
@@ -121,6 +126,34 @@ fn render_minimax_template(messages: &[ChatMessage]) -> String {
     // Generation prompt: open the ai turn and skip thinking (go straight to the answer).
     out.push_str(BOS);
     out.push_str("ai\n</mm:think>");
+    out
+}
+
+// LongCat-2.0: `<longcat_system|user|assistant>` turns; the generation prompt opens the assistant turn
+// with an empty think block (thinking disabled) so the model answers directly.
+fn render_longcat_template(messages: &[ChatMessage]) -> String {
+    let mut out = String::new();
+    for message in messages {
+        match message.role.as_str() {
+            "system" | "developer" | "root" => {
+                out.push_str("<longcat_system>");
+                out.push_str(&message.content_text());
+            }
+            "assistant" | "ai" | "model" => {
+                out.push_str("<longcat_assistant>");
+                out.push_str(&message.content_text());
+            }
+            "tool" => {
+                out.push_str("<longcat_user>");
+                out.push_str(&message.content_text());
+            }
+            _ => {
+                out.push_str("<longcat_user>");
+                out.push_str(&message.content_text());
+            }
+        }
+    }
+    out.push_str("<longcat_assistant><longcat_think>\n\n</longcat_think>\n");
     out
 }
 

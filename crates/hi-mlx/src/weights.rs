@@ -76,11 +76,17 @@ impl WeightCatalog {
 
     pub fn validate_for_config(&self, config: &MlxModelConfig) -> Result<()> {
         config.quantization.validate_supported()?;
-        // Nemotron-H uses `backbone.` naming (embeddings/norm_f) rather than `model.`.
-        let required: &[&str] = if config.family == crate::manifest::ModelFamily::NemotronH {
-            &["backbone.embeddings.weight", "backbone.norm_f.weight"]
-        } else {
-            &["model.embed_tokens.weight", "model.norm.weight"]
+        // Nemotron-H uses `backbone.` naming (embeddings/norm_f) rather than `model.`; LongCat-2.0's
+        // input embedding is the n-gram `ngram_embeddings.word_embeddings` (no `embed_tokens`).
+        let required: &[&str] = match config.family {
+            crate::manifest::ModelFamily::NemotronH => {
+                &["backbone.embeddings.weight", "backbone.norm_f.weight"]
+            }
+            crate::manifest::ModelFamily::LongCat => &[
+                "model.ngram_embeddings.word_embeddings.weight",
+                "model.norm.weight",
+            ],
+            _ => &["model.embed_tokens.weight", "model.norm.weight"],
         };
         for key in required {
             // VL models (Qwen3.5) still carry the `language_model.` prefix at validation time.
@@ -170,6 +176,15 @@ impl WeightCatalog {
                     &[
                         "model.layers.0.self_attn.q_proj.weight",
                         "model.layers.0.self_attn.q_proj.scales",
+                    ],
+                )?;
+            }
+            crate::manifest::ModelFamily::LongCat => {
+                self.require_any(
+                    "LongCat-2.0 MLA projection",
+                    &[
+                        "model.layers.0.self_attn.0.kv_a_proj_with_mqa.weight",
+                        "model.layers.0.self_attn.0.kv_a_proj_with_mqa.scales",
                     ],
                 )?;
             }

@@ -222,6 +222,7 @@ mod native {
             }
             ModelFamily::NemotronH => Ok(Box::new(NemotronHLike::new(config.clone(), arrays)?)),
             ModelFamily::MiniMax => Ok(Box::new(MiniMaxLike::new(config.clone(), arrays)?)),
+            ModelFamily::LongCat => Ok(Box::new(LongCatLike::new(config.clone(), arrays)?)),
             ModelFamily::Gemma if config.model_type.starts_with("gemma4") => {
                 Ok(Box::new(Gemma4TextLike::new(config.clone(), arrays)?))
             }
@@ -1338,6 +1339,56 @@ mod native {
         }
     }
 
+    // deepseek_yarn rope for LongCat-2.0: returns (per-dim rope freqs, attention scale multiplier
+    // mscale^2). Only active for LongCat with a rope_scaling of type deepseek_yarn; otherwise (None, 1).
+    fn longcat_yarn_rope(config: &MlxModelConfig, dim: i32) -> Result<(Option<Array>, f32)> {
+        use crate::manifest::ModelFamily;
+        if config.family != ModelFamily::LongCat {
+            return Ok((None, 1.0));
+        }
+        let Some(rs) = config.rope_scaling.as_ref() else {
+            return Ok((None, 1.0));
+        };
+        let getf = |k: &str, d: f64| rs.get(k).and_then(|v| v.as_f64()).unwrap_or(d);
+        let factor = getf("factor", 1.0);
+        if factor <= 1.0 {
+            return Ok((None, 1.0));
+        }
+        let beta_fast = getf("beta_fast", 32.0);
+        let beta_slow = getf("beta_slow", 1.0);
+        let orig_max = getf("original_max_position_embeddings", 4096.0);
+        let mscale_all_dim = getf("mscale_all_dim", 0.0);
+        let base = config.rope_theta as f64;
+        let half = (dim / 2) as usize;
+        // Standard extrapolation freqs (theta per dim), and interpolated freqs (theta * factor).
+        let theta: Vec<f64> = (0..half)
+            .map(|i| base.powf(2.0 * i as f64 / dim as f64))
+            .collect();
+        // Correction range (in half-dim units) between beta_fast and beta_slow rotations.
+        let find_dim = |num_rot: f64| {
+            dim as f64 * (orig_max / (num_rot * 2.0 * std::f64::consts::PI)).ln()
+                / (2.0 * base.ln())
+        };
+        let low = find_dim(beta_fast).floor().max(0.0);
+        let high = find_dim(beta_slow).ceil().min((half - 1) as f64);
+        let denom = (high - low).max(1e-3);
+        let freqs: Vec<f32> = (0..half)
+            .map(|i| {
+                let inv_extra = 1.0 / theta[i]; // extrapolation inv_freq
+                let inv_inter = inv_extra / factor; // interpolation inv_freq
+                let ramp = (((i as f64) - low) / denom).clamp(0.0, 1.0);
+                let mask = 1.0 - ramp; // 1 at high freq (extrapolate), 0 at low freq (interpolate)
+                let inv = inv_inter * (1.0 - mask) + inv_extra * mask;
+                (1.0 / inv) as f32 // back to theta for mx rope `freqs`
+            })
+            .collect();
+        let mscale = 0.1 * mscale_all_dim * factor.ln() + 1.0;
+        Ok((
+            Some(Array::from_slice(&freqs, &[half as i32])),
+            (mscale * mscale) as f32,
+        ))
+    }
+
     struct MlaAttention {
         q_a_proj: Option<Linear>,
         q_a_layernorm: Option<RmsNorm>,
@@ -1357,6 +1408,10 @@ mod native {
         q_head_dim: i32,
         scale: f32,
         rope_theta: f32,
+        // LongCat-2.0: absorbed-MLA lora scaling + YARN rope freqs (None for other MLA archs).
+        mla_scale_q: Option<f32>,
+        mla_scale_kv: Option<f32>,
+        rope_freqs: Option<Array>,
         cache: Cache,
     }
 
@@ -1401,6 +1456,9 @@ mod native {
                 .ok_or_else(|| anyhow!("config.json missing kv_lora_rank for MLA model"))?
                 as i32;
             let q_head_dim = qk_nope_head_dim + qk_rope_head_dim;
+            let base_scale = (q_head_dim as f32).powf(-0.5);
+            // deepseek_yarn rope: precompute per-dim freqs + attention mscale (LongCat-2.0 only).
+            let (rope_freqs, mscale_sq) = longcat_yarn_rope(config, qk_rope_head_dim)?;
             Ok(Self {
                 q_a_proj,
                 q_a_layernorm,
@@ -1426,8 +1484,15 @@ mod native {
                 v_head_dim,
                 kv_lora_rank,
                 q_head_dim,
-                scale: (q_head_dim as f32).powf(-0.5),
+                scale: base_scale * mscale_sq,
                 rope_theta: config.rope_theta,
+                mla_scale_q: config.mla_scale_q_lora.then(|| {
+                    (config.hidden_size as f32 / config.q_lora_rank.unwrap_or(1) as f32).sqrt()
+                }),
+                mla_scale_kv: config
+                    .mla_scale_kv_lora
+                    .then(|| (config.hidden_size as f32 / kv_lora_rank as f32).sqrt()),
+                rope_freqs,
                 cache: Cache::new(),
             })
         }
@@ -1443,7 +1508,10 @@ mod native {
             ) {
                 (Some(q_proj), _, _, _) => (q_proj.forward(x)?, None),
                 (None, Some(q_a), Some(q_norm), Some(q_b)) => {
-                    let query_latent = q_norm.forward(&q_a.forward(x)?)?;
+                    let mut query_latent = q_norm.forward(&q_a.forward(x)?)?;
+                    if let Some(s) = self.mla_scale_q {
+                        query_latent = query_latent * s;
+                    }
                     (q_b.forward(&query_latent)?, Some(query_latent))
                 }
                 _ => bail!("invalid MLA query projection state"),
@@ -1462,29 +1530,34 @@ mod native {
                 .remove(0)
                 .reshape(&[b, l, 1, self.qk_rope_head_dim])?
                 .transpose_axes(&[0, 2, 1, 3])?;
-            let mut kv_latent = self
-                .kv_a_layernorm
-                .forward(&compressed_kv)?
-                .expand_dims(1)?;
+            let mut kv_latent = self.kv_a_layernorm.forward(&compressed_kv)?;
+            if let Some(s) = self.mla_scale_kv {
+                kv_latent = kv_latent * s;
+            }
+            let mut kv_latent = kv_latent.expand_dims(1)?;
 
             let offset = self.cache.offset;
+            let (rbase, rfreqs) = match &self.rope_freqs {
+                Some(f) => (None, Some(f)),
+                None => (Some(self.rope_theta), None),
+            };
             q_pe = rope(
                 q_pe,
                 self.qk_rope_head_dim,
                 true,
-                self.rope_theta,
+                rbase,
                 1.0,
                 offset,
-                None,
+                rfreqs,
             )?;
             k_pe = rope(
                 k_pe,
                 self.qk_rope_head_dim,
                 true,
-                self.rope_theta,
+                rbase,
                 1.0,
                 offset,
-                None,
+                rfreqs,
             )?;
             let (cached_latent, cached_k_pe) = self.cache.update(kv_latent, k_pe)?;
             kv_latent = cached_latent;
@@ -5725,6 +5798,344 @@ mod native {
         fn prepare_cache(&mut self, capacity: i32) {
             for layer in &mut self.layers {
                 layer.attn.cache.prepare_capacity(capacity);
+            }
+        }
+    }
+
+    // ---------------------- LongCat-2.0 (longcat2) ----------------------
+    // ScMoE decoder: each layer runs 2 absorbed-MLA attentions + 2 dense MLPs, plus one MoE computed on
+    // the first sub-block's post-attn hidden and added as a shortcut. Input is an n-gram hashing
+    // embedding; MoE routing is softmax + 128 identity "zero" experts; attention is the shared
+    // MlaAttention (YARN + mla-lora scaling). Weights under `model.`, untied lm_head.
+
+    struct NgramEmbedding {
+        word_embeddings: Embedding,
+        embedders: Vec<Embedding>,
+        post_projs: Vec<Linear>,
+        emb_vocab: Vec<i64>,
+        vocab_mods: Vec<Vec<i64>>,
+        k: usize,
+        n: usize,
+        norm: f32,
+        eos: i64,
+        context: Vec<u32>,
+    }
+
+    impl NgramEmbedding {
+        fn load(config: &MlxModelConfig, arrays: &HashMap<String, Array>) -> Result<Self> {
+            let k = config.oe_split_num.unwrap_or(1) as usize;
+            let n = config.oe_neighbor_num.unwrap_or(1) as usize;
+            let vocab = config.vocab_size as i64;
+            let m = config
+                .oe_vocab_size_ratio
+                .ok_or_else(|| anyhow!("LongCat config missing oe_vocab_size_ratio"))?
+                as f64
+                * vocab as f64;
+            let num = k * (n - 1);
+            let p = "model.ngram_embeddings";
+            let mut embedders = Vec::with_capacity(num);
+            let mut post_projs = Vec::with_capacity(num);
+            let mut emb_vocab = Vec::with_capacity(num);
+            let mut vocab_mods = Vec::with_capacity(num);
+            for index in 0..num {
+                embedders.push(Embedding::load(
+                    &format!("{p}.embedders.{index}"),
+                    arrays,
+                    config,
+                )?);
+                post_projs.push(Linear::load(
+                    &format!("{p}.post_projs.{index}"),
+                    arrays,
+                    config,
+                )?);
+                let evd = (m + (index * 2 + 1) as f64) as i64;
+                emb_vocab.push(evd);
+            }
+            // vocab_mods[(i,j)]: pm=1; repeat (i-1) times: pm = (pm*vocab) % evd; collect.
+            for i in 2..=n {
+                for j in 0..k {
+                    let index = (i - 2) * k + j;
+                    let evd = emb_vocab[index];
+                    let mut pm: i64 = 1;
+                    let mut mods = Vec::with_capacity(i - 1);
+                    for _ in 0..(i - 1) {
+                        pm = ((pm as i128 * vocab as i128) % evd as i128) as i64;
+                        mods.push(pm);
+                    }
+                    vocab_mods.push(mods);
+                }
+            }
+            Ok(Self {
+                word_embeddings: Embedding::load(&format!("{p}.word_embeddings"), arrays, config)?,
+                embedders,
+                post_projs,
+                emb_vocab,
+                vocab_mods,
+                k,
+                n,
+                norm: (1 + k * (n - 1)) as f32,
+                eos: config.eos_token_ids.first().copied().unwrap_or(2) as i64,
+                context: Vec::new(),
+            })
+        }
+
+        fn forward(&mut self, input_ids: &[u32]) -> Result<Array> {
+            let offset = self.context.len();
+            self.context.extend_from_slice(input_ids);
+            let full = &self.context;
+            let l = input_ids.len();
+            // last EOS position strictly before each absolute index (for n-gram reach masking).
+            let mut last_eos_before = vec![-1i64; full.len()];
+            let mut last = -1i64;
+            for (idx, &tok) in full.iter().enumerate() {
+                last_eos_before[idx] = last;
+                if tok as i64 == self.eos {
+                    last = idx as i64;
+                }
+            }
+            let id_arr = Array::from_slice(input_ids, &[1, l as i32]);
+            let mut x = self.word_embeddings.forward(&id_arr)?;
+            for i in 2..=self.n {
+                for j in 0..self.k {
+                    let index = (i - 2) * self.k + j;
+                    let evd = self.emb_vocab[index];
+                    let mods = &self.vocab_mods[index];
+                    let mut new_ids = vec![0i32; l];
+                    for (p, slot) in new_ids.iter_mut().enumerate() {
+                        let abs = offset + p;
+                        let reach = abs as i64 - last_eos_before[abs];
+                        let mut ng = full[abs] as i128;
+                        for t in 2..=i {
+                            let back = t - 1;
+                            // shift_right by (t-1), zeroed across an EOS within `back` positions.
+                            let sh = if abs >= back && reach > back as i64 {
+                                full[abs - back] as i128
+                            } else {
+                                0
+                            };
+                            ng += sh * mods[t - 2] as i128;
+                        }
+                        *slot = (ng.rem_euclid(evd as i128)) as i32;
+                    }
+                    let new_arr = Array::from_slice(&new_ids, &[1, l as i32]);
+                    let emb = self.embedders[index].forward(&new_arr)?;
+                    x = x + self.post_projs[index].forward(&emb)?;
+                }
+            }
+            Ok(x / self.norm)
+        }
+    }
+
+    struct LongCatMoe {
+        router: Linear,
+        e_score_bias: Vec<f32>,
+        switch_mlp: SwitchMlp,
+        n_routed: i32,
+        top_k: usize,
+        routed_scaling: f32,
+        norm_topk: bool,
+    }
+
+    impl LongCatMoe {
+        fn load(
+            prefix: &str,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+        ) -> Result<Self> {
+            let bias = raw_array(arrays, &format!("{prefix}.router.e_score_correction_bias"))?
+                .as_type::<f32>()?;
+            transforms::eval([&bias])?;
+            Ok(Self {
+                router: Linear::load(&format!("{prefix}.router.classifier"), arrays, config)?,
+                e_score_bias: bias.as_slice::<f32>().to_vec(),
+                switch_mlp: SwitchMlp::load(&format!("{prefix}.switch_mlp"), arrays, config)?,
+                n_routed: config.n_routed_experts.unwrap_or(0) as i32,
+                top_k: config.num_experts_per_tok.unwrap_or(1) as usize,
+                routed_scaling: config.routed_scaling_factor,
+                // LongCat's norm_topk_prob defaults to false (the shared config default is true).
+                norm_topk: config
+                    .raw
+                    .get("norm_topk_prob")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            })
+        }
+
+        fn forward(&self, x: &Array) -> Result<Array> {
+            let shape = x.shape();
+            let (b, l, d) = (shape[0], shape[1], shape[2]);
+            if b != 1 {
+                bail!("LongCat MoE supports batch size 1, got {b}");
+            }
+            let logits = self.router.forward(x)?.as_type::<f32>()?;
+            transforms::eval([&logits])?;
+            let experts = *logits.shape().last().unwrap() as usize;
+            let raw_logits = logits.as_slice::<f32>();
+            let mut outputs = Vec::with_capacity(l as usize);
+            for token in 0..l as usize {
+                let base = token * experts;
+                let lg = &raw_logits[base..base + experts];
+                // softmax over all experts (CPU, numerically stable).
+                let maxl = lg.iter().cloned().fold(f32::MIN, f32::max);
+                let exps: Vec<f32> = lg.iter().map(|&v| (v - maxl).exp()).collect();
+                let denom: f32 = exps.iter().sum::<f32>() + 1e-20;
+                let s: Vec<f32> = exps.iter().map(|e| e / denom).collect();
+                let s = &s[..];
+                // top-k by (score + correction bias)
+                let mut ranked = (0..experts)
+                    .map(|e| (e, s[e] + self.e_score_bias.get(e).copied().unwrap_or(0.0)))
+                    .collect::<Vec<_>>();
+                ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                ranked.truncate(self.top_k);
+                // weights come from the (bias-free) softmax scores at the selected experts
+                let mut weights = ranked.iter().map(|&(e, _)| s[e]).collect::<Vec<_>>();
+                if self.norm_topk && weights.len() > 1 {
+                    let denom = weights.iter().sum::<f32>() + 1e-20;
+                    for w in &mut weights {
+                        *w /= denom;
+                    }
+                }
+                for w in &mut weights {
+                    *w *= self.routed_scaling;
+                }
+                let token_x = x.index((0, token as i32, ..)).reshape(&[1, 1, d])?;
+                let mut acc = Array::zeros::<f32>(&[1, 1, d])?;
+                let mut identity_w = 0.0f32;
+                for (&(expert, _), &w) in ranked.iter().zip(weights.iter()) {
+                    if (expert as i32) < self.n_routed {
+                        acc = acc + self.switch_mlp.forward_expert(&token_x, expert as i32)? * w;
+                    } else {
+                        // identity ("zero") expert: contributes the input scaled by its weight
+                        identity_w += w;
+                    }
+                }
+                if identity_w != 0.0 {
+                    acc = acc + token_x.as_type::<f32>()? * identity_w;
+                }
+                outputs.push(acc);
+            }
+            Ok(concatenate_axis(&outputs, 1)?)
+        }
+    }
+
+    struct LongCatLayer {
+        attn: Vec<MlaAttention>,
+        mlps: Vec<Mlp>,
+        moe: LongCatMoe,
+        input_ln: Vec<RmsNorm>,
+        post_attn_ln: Vec<RmsNorm>,
+    }
+
+    impl LongCatLayer {
+        fn load(
+            layer: u32,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+        ) -> Result<Self> {
+            let p = format!("model.layers.{layer}");
+            let mut attn = Vec::with_capacity(2);
+            let mut mlps = Vec::with_capacity(2);
+            let mut input_ln = Vec::with_capacity(2);
+            let mut post_attn_ln = Vec::with_capacity(2);
+            for i in 0..2 {
+                attn.push(MlaAttention::load(
+                    &format!("{p}.self_attn.{i}"),
+                    arrays,
+                    config,
+                )?);
+                mlps.push(Mlp::load(&format!("{p}.mlps.{i}"), arrays, config)?);
+                input_ln.push(RmsNorm::load(
+                    &format!("{p}.input_layernorm.{i}.weight"),
+                    arrays,
+                    config.rms_norm_eps,
+                )?);
+                post_attn_ln.push(RmsNorm::load(
+                    &format!("{p}.post_attention_layernorm.{i}.weight"),
+                    arrays,
+                    config.rms_norm_eps,
+                )?);
+            }
+            Ok(Self {
+                attn,
+                mlps,
+                moe: LongCatMoe::load(&format!("{p}.mlp"), arrays, config)?,
+                input_ln,
+                post_attn_ln,
+            })
+        }
+
+        fn forward(&mut self, x: Array) -> Result<Array> {
+            let mut h = x;
+            let mut shortcut: Option<Array> = None;
+            for i in 0..2 {
+                let residual = h.clone();
+                let normed = self.input_ln[i].forward(&h)?;
+                let a = self.attn[i].forward(&normed)?;
+                h = residual + a;
+                let residual = h.clone();
+                let normed = self.post_attn_ln[i].forward(&h)?;
+                if i == 0 {
+                    // MoE runs on the first sub-block's post-attn hidden, added back as a shortcut.
+                    shortcut = Some(self.moe.forward(&normed)?);
+                }
+                let m = self.mlps[i].forward(&normed)?;
+                h = residual + m;
+                if i == 1 {
+                    h = h + shortcut.take().unwrap();
+                }
+            }
+            Ok(h)
+        }
+    }
+
+    struct LongCatLike {
+        ngram: NgramEmbedding,
+        layers: Vec<LongCatLayer>,
+        norm: RmsNorm,
+        lm_head: Linear,
+    }
+
+    impl LongCatLike {
+        fn new(config: MlxModelConfig, arrays: HashMap<String, Array>) -> Result<Self> {
+            let mut layers = Vec::with_capacity(config.num_hidden_layers as usize);
+            for layer in 0..config.num_hidden_layers {
+                layers.push(LongCatLayer::load(layer, &arrays, &config)?);
+            }
+            Ok(Self {
+                ngram: NgramEmbedding::load(&config, &arrays)?,
+                layers,
+                norm: RmsNorm::load("model.norm.weight", &arrays, config.rms_norm_eps)?,
+                lm_head: Linear::load("lm_head", &arrays, &config)?,
+            })
+        }
+    }
+
+    impl CausalLm for LongCatLike {
+        fn forward(&mut self, input_ids: &[u32]) -> Result<Array> {
+            let mut h = self.ngram.forward(input_ids)?;
+            for layer in &mut self.layers {
+                h = layer.forward(h)?;
+            }
+            h = self.norm.forward(&h)?;
+            let logits = self.lm_head.forward(&h)?;
+            transforms::eval([&logits])?;
+            Ok(logits)
+        }
+
+        fn reset_cache(&mut self) {
+            self.ngram.context.clear();
+            for layer in &mut self.layers {
+                for a in &mut layer.attn {
+                    a.cache.reset();
+                }
+            }
+        }
+
+        fn prepare_cache(&mut self, capacity: i32) {
+            for layer in &mut self.layers {
+                for a in &mut layer.attn {
+                    a.cache.prepare_capacity(capacity);
+                }
             }
         }
     }
