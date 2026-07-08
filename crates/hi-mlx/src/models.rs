@@ -175,9 +175,9 @@ mod native {
     use mlx_rs::ops::{
         argpartition_axis, broadcast_to, concatenate_axis, conv1d, cos, dequantize, einsum, exp,
         identity, matmul, maximum, mean_axis, minimum, rsqrt, sigmoid, sin, softmax_axis,
-        split_sections, stack_axis, sum_axis, tril, which, zeros_dtype,
+        split_sections, stack_axis, sum_axis, tanh, tril, which, zeros_dtype,
     };
-    use mlx_rs::nn::{silu, softplus};
+    use mlx_rs::nn::{gelu_approximate, silu, softplus};
     use mlx_rs::transforms::compile::{CallMut, Compile};
     use mlx_rs::{Array, Stream, transforms};
 
@@ -217,6 +217,9 @@ mod native {
                 }
             }
             ModelFamily::NemotronH => Ok(Box::new(NemotronHLike::new(config.clone(), arrays)?)),
+            ModelFamily::Gemma if config.model_type.starts_with("gemma4") => {
+                Ok(Box::new(Gemma4TextLike::new(config.clone(), arrays)?))
+            }
             ModelFamily::Llama
             | ModelFamily::Mistral
             | ModelFamily::Mixtral
@@ -4970,6 +4973,302 @@ mod native {
                 if let NemotronMixer::Attn(a) = &mut block.mixer {
                     a.cache.prepare_capacity(capacity);
                 }
+            }
+        }
+    }
+
+    // ---------------------- Gemma-4 (gemma4_text) ----------------------
+    // Per-layer sliding/full attention hybrid: full-attention layers use a wider head_dim, fewer
+    // KV heads, k==v (no v_proj), and a proportional partial-rotary RoPE (theta 1e6, 25% rotated);
+    // sliding layers use full-rotary RoPE (theta 1e4). Each block has q/k head-norms + a weightless
+    // v-norm, four sandwich norms, a GeGLU MLP, and a learned per-layer scalar. Embeddings are scaled
+    // by sqrt(hidden) and tied to the output; final logits are tanh-softcapped. The 31B/26B disable
+    // KV-sharing and per-layer-input gating. NOTE: sliding layers use a plain causal mask here, so
+    // outputs are exact only for contexts up to `sliding_window` (1024); longer contexts diverge.
+    struct Gemma4Attention {
+        q_proj: Linear,
+        k_proj: Linear,
+        v_proj: Option<Linear>,
+        o_proj: Linear,
+        q_norm: RmsNorm,
+        k_norm: RmsNorm,
+        v_ones: Array,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        rope_theta: f32,
+        rope_freqs: Option<Array>,
+        eps: f32,
+        cache: Cache,
+    }
+
+    impl Gemma4Attention {
+        fn load(
+            prefix: &str,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+            is_sliding: bool,
+        ) -> Result<Self> {
+            let n_heads = config.num_attention_heads as i32;
+            let q_out = raw_array(arrays, &format!("{prefix}.q_proj.weight"))?.shape()[0];
+            // Quantized weights are packed on the last axis; head_dim comes from q_out / n_heads.
+            let head_dim = q_out / n_heads;
+            let k_out = raw_array(arrays, &format!("{prefix}.k_proj.weight"))?.shape()[0];
+            let n_kv_heads = (k_out / head_dim).max(1);
+            let has_v = arrays.contains_key(&format!("{prefix}.v_proj.weight"))
+                || arrays.contains_key(&format!("{prefix}.v_proj.scales"));
+            // RoPE: sliding = full rotary (theta 1e4); full = proportional partial rotary (theta 1e6,
+            // 25% of head_dim rotated; freqs = base^(2i/head_dim), inf for the unrotated tail).
+            let (rope_theta, rope_freqs) = if is_sliding {
+                (10_000.0f32, None)
+            } else {
+                let base = 1_000_000.0f32;
+                let half = head_dim / 2;
+                let rot_half = (head_dim / 4) / 2; // partial_rotary_factor 0.25 -> rotated dims / 2
+                let mut freqs = Vec::with_capacity(half as usize);
+                for i in 0..rot_half {
+                    freqs.push(base.powf((2 * i) as f32 / head_dim as f32));
+                }
+                for _ in rot_half..half {
+                    freqs.push(f32::INFINITY);
+                }
+                (base, Some(Array::from_slice(&freqs, &[half])))
+            };
+            Ok(Self {
+                q_proj: Linear::load(&format!("{prefix}.q_proj"), arrays, config)?,
+                k_proj: Linear::load(&format!("{prefix}.k_proj"), arrays, config)?,
+                v_proj: if has_v {
+                    Some(Linear::load(&format!("{prefix}.v_proj"), arrays, config)?)
+                } else {
+                    None
+                },
+                o_proj: Linear::load(&format!("{prefix}.o_proj"), arrays, config)?,
+                q_norm: RmsNorm::load(&format!("{prefix}.q_norm.weight"), arrays, config.rms_norm_eps)?,
+                k_norm: RmsNorm::load(&format!("{prefix}.k_norm.weight"), arrays, config.rms_norm_eps)?,
+                v_ones: Array::ones::<f32>(&[head_dim])?,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                rope_theta,
+                rope_freqs,
+                eps: config.rms_norm_eps,
+                cache: Cache::new(),
+            })
+        }
+
+        fn rope_apply(&self, x: &Array, offset: i32) -> Result<Array> {
+            // MLX rope rejects base+freqs together: pass custom freqs (full layers, base ignored) or
+            // the base theta (sliding layers).
+            match &self.rope_freqs {
+                Some(freqs) => {
+                    Ok(rope(x, self.head_dim, false, None::<f32>, 1.0, offset, Some(freqs))?)
+                }
+                None => Ok(rope(
+                    x,
+                    self.head_dim,
+                    false,
+                    self.rope_theta,
+                    1.0,
+                    offset,
+                    None::<&Array>,
+                )?),
+            }
+        }
+
+        fn forward(&mut self, x: &Array) -> Result<Array> {
+            let shape = x.shape();
+            let (b, l) = (shape[0], shape[1]);
+            let offset = self.cache.offset;
+            let q = self
+                .q_proj
+                .forward(x)?
+                .reshape(&[b, l, self.n_heads, self.head_dim])?;
+            let q = self.q_norm.forward(&q)?.transpose_axes(&[0, 2, 1, 3])?;
+            let q = self.rope_apply(&q, offset)?;
+            let k_raw = self
+                .k_proj
+                .forward(x)?
+                .reshape(&[b, l, self.n_kv_heads, self.head_dim])?;
+            let k = self.k_norm.forward(&k_raw)?.transpose_axes(&[0, 2, 1, 3])?;
+            let k = self.rope_apply(&k, offset)?;
+            // Full-attention layers reuse the K projection as V (k==v), then apply a weightless v-norm.
+            let v_raw = match &self.v_proj {
+                Some(vp) => vp.forward(x)?.reshape(&[b, l, self.n_kv_heads, self.head_dim])?,
+                None => k_raw,
+            };
+            let v = rms_norm(&v_raw, &self.v_ones, self.eps)?.transpose_axes(&[0, 2, 1, 3])?;
+            let (k, v) = self.cache.update(k, v)?;
+            // Gemma scales queries via the q/k head-norms, so sdpa uses scale 1.0.
+            let scale = 1.0f32;
+            let output = if l > 1 && offset == 0 {
+                scaled_dot_product_attention(
+                    &q,
+                    &k,
+                    &v,
+                    scale,
+                    ScaledDotProductAttentionMask::Causal,
+                    None::<&Array>,
+                )?
+            } else if l > 1 {
+                let mask = causal_attention_mask(l, k.shape()[2], offset);
+                scaled_dot_product_attention(
+                    &q,
+                    &k,
+                    &v,
+                    scale,
+                    ScaledDotProductAttentionMask::Array(&mask),
+                    None::<&Array>,
+                )?
+            } else {
+                scaled_dot_product_attention(&q, &k, &v, scale, None, None::<&Array>)?
+            };
+            let output = output
+                .transpose_axes(&[0, 2, 1, 3])?
+                .reshape(&[b, l, self.n_heads * self.head_dim])?;
+            self.o_proj.forward(&output)
+        }
+    }
+
+    struct Gemma4Mlp {
+        gate_proj: Linear,
+        up_proj: Linear,
+        down_proj: Linear,
+    }
+
+    impl Gemma4Mlp {
+        fn load(
+            prefix: &str,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+        ) -> Result<Self> {
+            Ok(Self {
+                gate_proj: Linear::load(&format!("{prefix}.gate_proj"), arrays, config)?,
+                up_proj: Linear::load(&format!("{prefix}.up_proj"), arrays, config)?,
+                down_proj: Linear::load(&format!("{prefix}.down_proj"), arrays, config)?,
+            })
+        }
+
+        fn forward(&self, x: &Array) -> Result<Array> {
+            // GeGLU: down(gelu_approx(gate(x)) * up(x)).
+            let gate = gelu_approximate(&self.gate_proj.forward(x)?)?;
+            self.down_proj.forward(&(gate * self.up_proj.forward(x)?))
+        }
+    }
+
+    struct Gemma4Block {
+        input_ln: RmsNorm,
+        post_attn_ln: RmsNorm,
+        pre_ff_ln: RmsNorm,
+        post_ff_ln: RmsNorm,
+        attn: Gemma4Attention,
+        mlp: Gemma4Mlp,
+        layer_scalar: Array,
+    }
+
+    impl Gemma4Block {
+        fn load(
+            idx: u32,
+            is_sliding: bool,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+        ) -> Result<Self> {
+            let p = format!("model.layers.{idx}");
+            let eps = config.rms_norm_eps;
+            Ok(Self {
+                input_ln: RmsNorm::load(&format!("{p}.input_layernorm.weight"), arrays, eps)?,
+                post_attn_ln: RmsNorm::load(
+                    &format!("{p}.post_attention_layernorm.weight"),
+                    arrays,
+                    eps,
+                )?,
+                pre_ff_ln: RmsNorm::load(
+                    &format!("{p}.pre_feedforward_layernorm.weight"),
+                    arrays,
+                    eps,
+                )?,
+                post_ff_ln: RmsNorm::load(
+                    &format!("{p}.post_feedforward_layernorm.weight"),
+                    arrays,
+                    eps,
+                )?,
+                attn: Gemma4Attention::load(&format!("{p}.self_attn"), arrays, config, is_sliding)?,
+                mlp: Gemma4Mlp::load(&format!("{p}.mlp"), arrays, config)?,
+                layer_scalar: raw_array(arrays, &format!("{p}.layer_scalar"))?.as_type::<f32>()?,
+            })
+        }
+
+        fn forward(&mut self, x: Array) -> Result<Array> {
+            let residual = x.clone();
+            let h = self.input_ln.forward(&x)?;
+            let h = self.attn.forward(&h)?;
+            let h = self.post_attn_ln.forward(&h)?;
+            let h = residual + h;
+            let residual = h.clone();
+            let ff = self.pre_ff_ln.forward(&h)?;
+            let ff = self.mlp.forward(&ff)?;
+            let ff = self.post_ff_ln.forward(&ff)?;
+            let h = residual + ff;
+            Ok(h * &self.layer_scalar)
+        }
+    }
+
+    struct Gemma4TextLike {
+        embed: Embedding,
+        embed_scale: f32,
+        blocks: Vec<Gemma4Block>,
+        norm: RmsNorm,
+        final_softcap: Option<f32>,
+    }
+
+    impl Gemma4TextLike {
+        fn new(config: MlxModelConfig, arrays: HashMap<String, Array>) -> Result<Self> {
+            if config.layer_types.is_empty() {
+                bail!("gemma4: missing layer_types");
+            }
+            let blocks = config
+                .layer_types
+                .iter()
+                .enumerate()
+                .map(|(idx, kind)| {
+                    Gemma4Block::load(idx as u32, kind == "sliding_attention", &arrays, &config)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Self {
+                embed: Embedding::load("model.embed_tokens", &arrays, &config)?,
+                embed_scale: (config.hidden_size as f32).sqrt(),
+                norm: RmsNorm::load("model.norm.weight", &arrays, config.rms_norm_eps)?,
+                final_softcap: config.final_logit_softcapping,
+                blocks,
+            })
+        }
+    }
+
+    impl CausalLm for Gemma4TextLike {
+        fn forward(&mut self, input_ids: &[u32]) -> Result<Array> {
+            let ids = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
+            let mut h = self.embed.forward(&ids)? * self.embed_scale;
+            for block in &mut self.blocks {
+                h = block.forward(h)?;
+            }
+            h = self.norm.forward(&h)?;
+            let mut logits = self.embed.as_linear(&h)?;
+            if let Some(cap) = self.final_softcap {
+                let s = Array::from_f32(cap);
+                logits = tanh(&(logits / &s))? * &s;
+            }
+            transforms::eval([&logits])?;
+            Ok(logits)
+        }
+
+        fn reset_cache(&mut self) {
+            for block in &mut self.blocks {
+                block.attn.cache.reset();
+            }
+        }
+
+        fn prepare_cache(&mut self, capacity: i32) {
+            for block in &mut self.blocks {
+                block.attn.cache.prepare_capacity(capacity);
             }
         }
     }

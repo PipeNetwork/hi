@@ -43,6 +43,12 @@ pub fn build_prompt_with_template(
 
 fn render_gguf_chat_template(template: &str, messages: &[ChatMessage]) -> Option<String> {
     let template = normalize_jinja_template(template);
+    // Custom Gemma-4 channel/turn format (e.g. pipenetwork fine-tunes): `<|turn>{role}\n{content}<turn|>`
+    // with a `<|turn>model\n` generation prompt. Its full jinja is too complex for the loop renderer,
+    // but the message framing is simple, so render it directly.
+    if template.contains("<|turn>") && template.contains("<turn|>") {
+        return Some(render_gemma_turn_template(messages));
+    }
     if template.contains("<|start_header_id|>")
         && template.contains("<|end_header_id|>")
         && template.contains("<|eot_id|>")
@@ -54,6 +60,28 @@ fn render_gguf_chat_template(template: &str, messages: &[ChatMessage]) -> Option
             .or_else(|| Some(build_chatml_prompt(messages, &[], &Value::Null)));
     }
     render_simple_loop_template(&template, messages)
+}
+
+fn render_gemma_turn_template(messages: &[ChatMessage]) -> String {
+    // Leading BOS (the template emits bos_token first) is required — Gemma is sensitive to it.
+    let mut out = String::from("<bos>");
+    for message in messages {
+        let role = match message.role.as_str() {
+            "assistant" | "model" => "model",
+            "system" | "developer" => "system",
+            "tool" => "tool",
+            _ => "user",
+        };
+        out.push_str("<|turn>");
+        out.push_str(role);
+        out.push('\n');
+        out.push_str(&message.content_text());
+        out.push_str("<turn|>\n");
+    }
+    // Generation prompt: open the model turn and prime an empty thought channel (thinking disabled),
+    // so the model proceeds straight to its final answer.
+    out.push_str("<|turn>model\n<|channel>thought\n<channel|>");
+    out
 }
 
 fn normalize_jinja_template(template: &str) -> String {

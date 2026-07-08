@@ -53,6 +53,9 @@ pub struct MlxModelConfig {
     pub o_lora_rank: Option<u32>,
     pub o_groups: Option<u32>,
     pub swiglu_limit: Option<f32>,
+    // Gemma-4 hybrid attention fields.
+    pub layer_types: Vec<String>,
+    pub final_logit_softcapping: Option<f32>,
     pub vocab_size: u32,
     pub context_length: Option<u32>,
     pub rms_norm_eps: f32,
@@ -343,6 +346,16 @@ pub fn parse_model_config(path: &Path, raw: Value) -> Result<MlxModelConfig> {
         o_lora_rank: u32_field(&raw, "o_lora_rank"),
         o_groups: u32_field(&raw, "o_groups"),
         swiglu_limit: f32_field(&raw, "swiglu_limit"),
+        layer_types: raw
+            .get("layer_types")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        final_logit_softcapping: f32_field(&raw, "final_logit_softcapping"),
         vocab_size: required_u32(&raw, "vocab_size")?,
         context_length,
         rms_norm_eps: f32_field(&raw, "rms_norm_eps").unwrap_or(1e-6),
@@ -458,6 +471,11 @@ pub fn detect_family(model_type: &str, config: &Value) -> Option<ModelFamily> {
         || haystack.contains("nemotronh")
     {
         return Some(ModelFamily::NemotronH);
+    }
+    // Gemma-4 only (older gemma/gemma2/gemma3 remain unsupported); routed via the Gemma family and
+    // dispatched to Gemma4TextLike in load_model.
+    if model_type.starts_with("gemma4") || haystack.contains("gemma4") {
+        return Some(ModelFamily::Gemma);
     }
     None
 }
