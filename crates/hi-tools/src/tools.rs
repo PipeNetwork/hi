@@ -2189,7 +2189,10 @@ mod tests {
         }
         // The essentials a small coding agent needs are present.
         for essential in ["read", "list", "grep", "bash", "write", "edit"] {
-            assert!(minimal.contains(&essential), "{essential} missing from minimal");
+            assert!(
+                minimal.contains(&essential),
+                "{essential} missing from minimal"
+            );
         }
     }
 }
