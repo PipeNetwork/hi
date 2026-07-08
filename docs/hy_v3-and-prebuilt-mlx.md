@@ -407,8 +407,9 @@ Speculation (draft or MTP) helps a slow/memory-bound target but *hurts* a fast o
 it's content-dependent (acceptance varies) — a static "big model → on" heuristic mis-fires. So the gate
 **measures**: on the first greedy request per model, it warms the trunk, probes the plain decode rate,
 and (unless the trunk is clearly slow, <8 tok/s, where speculation always wins and the spec probe is
-skipped) probes the spec rate, enabling speculation only if it actually beats plain. The decision is
-cached per model. Crucially it probes on a **prefix of the real request** — acceptance is
+skipped) probes the spec rate, enabling speculation only if it actually beats plain. The decision is cached per model and
+**re-calibrated every `HI_MLX_SPEC_RECAL` greedy requests** (default 64; 0 disables), on that request's
+prompt, so it tracks workload shifts — a session that changes topic can flip acceptance and the decision. Crucially it probes on a **prefix of the real request** — acceptance is
 content-dependent, so a generic probe under-measures it (e.g. Qwen2.5-Coder-32B + 8-bit draft: a
 generic prompt measured spec *slower*, a code prompt measured it faster → enabled). Warmup matters too:
 the first forward compiles Metal shaders, so an un-warmed first probe reads ~5-8× slow and skews the

@@ -18,6 +18,15 @@ pub use hi_local_core::backend::{
     InferenceBackend, SharedBackend,
 };
 
+// Self-calibrating speculation gate. `decision` is None until the first greedy request measures
+// whether speculation beats the plain loop for this model+hardware; `since` counts greedy requests
+// since the last calibration so we can periodically re-measure (workload content shifts acceptance).
+#[derive(Default)]
+struct SpecGate {
+    decision: Option<bool>,
+    since: u32,
+}
+
 pub struct MlxBackend {
     model: ModelInfo,
     config: MlxModelConfig,
@@ -25,9 +34,7 @@ pub struct MlxBackend {
     runtime: Arc<Mutex<NativeRuntime>>,
     draft: Option<Arc<Mutex<NativeRuntime>>>,
     spec_k: usize,
-    // Self-calibrating speculation gate: None until the first greedy request measures whether
-    // speculation actually beats the plain loop for this model+hardware; then cached.
-    spec_gate: Arc<Mutex<Option<bool>>>,
+    spec_gate: Arc<Mutex<SpecGate>>,
 }
 
 const OVERSIZE_MODEL_ENV: &str = "HI_MLX_ALLOW_OVERSIZE_MODEL";
@@ -79,7 +86,7 @@ impl MlxBackend {
             runtime: Arc::new(Mutex::new(runtime)),
             draft,
             spec_k: spec_k.max(1),
-            spec_gate: Arc::new(Mutex::new(None)),
+            spec_gate: Arc::new(Mutex::new(SpecGate::default())),
         })
     }
 }
@@ -266,7 +273,14 @@ impl InferenceBackend for MlxBackend {
                 // Calibrate once per model: measure whether speculation actually beats the plain loop.
                 let use_spec = if spec_eligible {
                     let mut gate = spec_gate.blocking_lock();
-                    if gate.is_none() {
+                    // Calibrate on first use, then re-calibrate every HI_MLX_SPEC_RECAL greedy
+                    // requests (default 64; 0 disables) so the decision tracks workload shifts —
+                    // acceptance is content-dependent, so a session that changes topic can flip it.
+                    let recal = std::env::var("HI_MLX_SPEC_RECAL")
+                        .ok()
+                        .and_then(|v| v.parse::<u32>().ok())
+                        .unwrap_or(64);
+                    if gate.decision.is_none() || (recal > 0 && gate.since >= recal) {
                         let mut dguard = draft.as_ref().map(|d| d.blocking_lock());
                         let decision = calibrate_speculation(
                             &mut runtime,
@@ -274,9 +288,12 @@ impl InferenceBackend for MlxBackend {
                             spec_k,
                             &request.prompt,
                         );
-                        *gate = Some(decision);
+                        gate.decision = Some(decision);
+                        gate.since = 0;
+                    } else {
+                        gate.since += 1;
                     }
-                    gate.unwrap()
+                    gate.decision.unwrap()
                 } else {
                     false
                 };
