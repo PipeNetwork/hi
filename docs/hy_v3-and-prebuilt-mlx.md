@@ -401,3 +401,16 @@ Two bugs found (no reference to check against):
 Result: **~1.38× decode** on GLM-5.2 (0.25 → ~0.35 tok/s), output identical to greedy. MTP acceptance
 55–70% by content. Still not interactive at 355B, but the mechanism works and is exact. A fused
 verify (fold the rejection-correction into the next round) would push it further.
+
+### Self-calibrating speculation gate
+Speculation (draft or MTP) helps a slow/memory-bound target but *hurts* a fast one, and for MoE targets
+it's content-dependent (acceptance varies) — a static "big model → on" heuristic mis-fires. So the gate
+**measures**: on the first greedy request per model, it warms the trunk, probes the plain decode rate,
+and (unless the trunk is clearly slow, <8 tok/s, where speculation always wins and the spec probe is
+skipped) probes the spec rate, enabling speculation only if it actually beats plain. The decision is
+cached per model. Crucially it probes on a **prefix of the real request** — acceptance is
+content-dependent, so a generic probe under-measures it (e.g. Qwen2.5-Coder-32B + 8-bit draft: a
+generic prompt measured spec *slower*, a code prompt measured it faster → enabled). Warmup matters too:
+the first forward compiles Metal shaders, so an un-warmed first probe reads ~5-8× slow and skews the
+comparison. Verified: 7B → disabled (plain 86 vs spec 63), 32B/code → enabled (22 vs 23.5), GLM-5.2 →
+enabled via the slow pre-filter. `HI_MLX_DISABLE_MTP=1` still hard-disables MTP.
