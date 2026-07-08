@@ -1263,6 +1263,7 @@ fn generate_events_gpu_with_visual_prefix_from(
         let model = gpu_model
             .lock()
             .map_err(|_| anyhow!("CUDA gpu model lock poisoned"))?;
+        model.reset_generation_timing();
         let image_token_id = cpu_reference.tokenizer().token_id("<|image_pad|>");
         let video_token_id = cpu_reference.tokenizer().token_id("<|video_pad|>");
         if image_token_id.is_some() || video_token_id.is_some() {
@@ -2683,6 +2684,7 @@ where
         let model = gpu_model
             .lock()
             .map_err(|_| anyhow!("CUDA gpu model lock poisoned"))?;
+        model.reset_generation_timing();
         if request_uses_greedy_cuda_defaults(request) {
             match kv_cache_mode {
                 CudaKvCacheMode::Legacy => model
@@ -5717,7 +5719,8 @@ fn process_multimodal_scheduler_batch(
             &state.multimodal_stats,
         )
         .map(|generation| {
-            let timing = scheduler_token_timing(
+            let timing = scheduler_token_timing_measured(
+                &state.gpu_model,
                 generation.output.prompt_tokens,
                 generation.output.completion_tokens,
                 started.elapsed(),
@@ -6168,7 +6171,8 @@ fn process_multimodal_ragged_prefix_decode_candidate_batch(
                 &state.multimodal_stats,
             )
             .map(|generation| {
-                let timing = scheduler_token_timing(
+                let timing = scheduler_token_timing_measured(
+                    &state.gpu_model,
                     generation.output.prompt_tokens,
                     generation.output.completion_tokens,
                     started.elapsed(),
@@ -7699,6 +7703,34 @@ fn duration_micros_u64(duration: Duration) -> u64 {
     duration.as_micros().min(u128::from(u64::MAX)) as u64
 }
 
+/// Like `scheduler_token_timing`, but uses the GPU model's measured per-generation
+/// prefill/decode forward times (accumulated by `ForwardTimer`) instead of
+/// splitting `elapsed` proportionally by token count. The proportional split wrongly
+/// assumes batched prefill and serial decode cost the same per token, which made the
+/// non-continuous path's `/health` decode metric under-report ~7x. Falls back to the
+/// proportional split when no measurement is available.
+fn scheduler_token_timing_measured(
+    gpu_model: &Arc<Mutex<gpu::CudaQwenGpuModel>>,
+    prefill_tokens: u64,
+    decode_tokens: u64,
+    elapsed: Duration,
+) -> CudaSchedulerTokenTiming {
+    let (prefill_micros, decode_micros) = gpu_model
+        .lock()
+        .map(|model| model.take_generation_timing())
+        .unwrap_or((0, 0));
+    if prefill_micros > 0 && decode_micros > 0 && prefill_tokens > 0 && decode_tokens > 0 {
+        CudaSchedulerTokenTiming {
+            prefill_tokens,
+            decode_tokens,
+            prefill_micros,
+            decode_micros,
+        }
+    } else {
+        scheduler_token_timing(prefill_tokens, decode_tokens, elapsed)
+    }
+}
+
 fn scheduler_tokens_per_second(tokens: u64, micros: u64) -> u64 {
     if tokens == 0 || micros == 0 {
         return 0;
@@ -7761,7 +7793,8 @@ fn send_single_scheduler_job(
         || job.tx.is_closed(),
     )
     .map(|generation| {
-        let timing = scheduler_token_timing(
+        let timing = scheduler_token_timing_measured(
+            &state.gpu_model,
             generation.output.prompt_tokens,
             generation.output.completion_tokens,
             started.elapsed(),
@@ -7826,7 +7859,8 @@ fn send_single_scheduler_multimodal_job(
         )
     })
     .map(|generation| {
-        let timing = scheduler_token_timing(
+        let timing = scheduler_token_timing_measured(
+            &state.gpu_model,
             generation.output.prompt_tokens,
             generation.output.completion_tokens,
             started.elapsed(),
