@@ -439,20 +439,15 @@ fn build_tool_specs() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "read".into(),
-            description: "Read a UTF-8 text file. Lines are returned numbered (`<n>\\t<text>`). Returns at most 2000 lines by default (the whole file for most source files); page with offset/limit instead of assuming you saw everything. Pass `paths` (an array) to read several files in one call — each is returned under a `──── path ────` header, so a whole directory can be pulled at once.".into(),
+            description: "Read a UTF-8 text file. Lines are returned numbered (`<n>\\t<text>`). Returns at most 2000 lines by default (the whole file for most source files); page with offset/limit instead of assuming you saw everything.".into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Path to the file to read. Optional if `paths` is given." },
-                    "paths": {
-                        "type": "array",
-                        "description": "Multiple paths to read in one call. Each file is returned under a header. Prefer this over several single-path `read` calls when reviewing a directory.",
-                        "items": { "type": "string" }
-                    },
+                    "path": { "type": "string", "description": "Path to the file to read." },
                     "offset": { "type": "integer", "description": "1-based line to start at (default: first line)." },
-                    "limit": { "type": "integer", "description": "Maximum number of lines to return per file (default: 2000)." }
+                    "limit": { "type": "integer", "description": "Maximum number of lines to return (default: 2000)." }
                 },
-                "required": []
+                "required": ["path"]
             }),
         },
         ToolSpec {
@@ -685,6 +680,32 @@ fn build_tool_specs() -> Vec<ToolSpec> {
 
 /// The tool specifications advertised to the model, cached once.
 pub static TOOL_SPECS: LazyLock<Vec<ToolSpec>> = LazyLock::new(build_tool_specs);
+
+/// Essential tools kept for small models. A model around 3B can't reliably plan
+/// over the full ~20-tool set — the large, detailed tool schema degrades its
+/// structured-output quality and latency sharply (empirically, tool-calling
+/// slowed ~15x from 6 tools to 21 and eventually produced malformed calls). This
+/// lean file-navigation + edit + shell set keeps such models usable. Enabled per
+/// profile via `minimal_tools = true`.
+const MINIMAL_TOOL_NAMES: &[&str] = &[
+    "update_plan",
+    "read",
+    "list",
+    "grep",
+    "glob",
+    "bash",
+    "write",
+    "edit",
+];
+
+/// The [`MINIMAL_TOOL_NAMES`] subset of [`TOOL_SPECS`], in the same order.
+pub static MINIMAL_TOOL_SPECS: LazyLock<Vec<ToolSpec>> = LazyLock::new(|| {
+    TOOL_SPECS
+        .iter()
+        .filter(|spec| MINIMAL_TOOL_NAMES.contains(&spec.name.as_str()))
+        .cloned()
+        .collect()
+});
 
 /// Whether a tool only observes state, with no side effects — so several can
 /// run concurrently within one round, and it's safe to offer in `ReadOnly`
@@ -1631,9 +1652,9 @@ fn is_env_assignment(tok: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        fast_check_for, foreground_interactive_command_reason, is_filesystem_mutating,
-        is_read_only, render_untracked_files, run_bash_streaming_with_timeout, run_check,
-        target_path, working_tree_diff_plain,
+        MINIMAL_TOOL_SPECS, TOOL_SPECS, fast_check_for, foreground_interactive_command_reason,
+        is_filesystem_mutating, is_read_only, render_untracked_files,
+        run_bash_streaming_with_timeout, run_check, target_path, working_tree_diff_plain,
     };
     use crate::edit::sh_quote;
     use std::sync::{LazyLock, Mutex};
@@ -2140,5 +2161,35 @@ mod tests {
         // Unknown extension → None.
         assert!(fast_check_for("README.md").is_none());
         assert!(fast_check_for("noext").is_none());
+    }
+
+    #[test]
+    fn read_schema_requires_a_single_path() {
+        let read = TOOL_SPECS
+            .iter()
+            .find(|s| s.name == "read")
+            .expect("read tool present");
+        let params = &read.parameters;
+        // `path` is required and unambiguous — no `paths`/empty-required schema
+        // that measurably degrades small-model tool-calling.
+        assert_eq!(params["required"], serde_json::json!(["path"]));
+        let props = params["properties"].as_object().unwrap();
+        assert!(props.contains_key("path"));
+        assert!(!props.contains_key("paths"));
+    }
+
+    #[test]
+    fn minimal_tool_specs_is_a_lean_subset() {
+        let full: Vec<&str> = TOOL_SPECS.iter().map(|s| s.name.as_str()).collect();
+        let minimal: Vec<&str> = MINIMAL_TOOL_SPECS.iter().map(|s| s.name.as_str()).collect();
+        assert!(minimal.len() < full.len());
+        // Every minimal tool exists in the full set, in the same order.
+        for name in &minimal {
+            assert!(full.contains(name), "{name} missing from full specs");
+        }
+        // The essentials a small coding agent needs are present.
+        for essential in ["read", "list", "grep", "bash", "write", "edit"] {
+            assert!(minimal.contains(&essential), "{essential} missing from minimal");
+        }
     }
 }

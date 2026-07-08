@@ -323,6 +323,11 @@ pub struct Profile {
     pub tool_mode: Option<ToolMode>,
     #[serde(default)]
     pub compat: Option<CompatMode>,
+    /// Advertise only the essential tool subset instead of the full set. Small
+    /// (~3B) local models can't reliably plan over the full ~20-tool schema;
+    /// this restores usable tool-calling. Defaults to off.
+    #[serde(default)]
+    pub minimal_tools: Option<bool>,
     /// Other profile names to fall back to, in order, when this one returns
     /// nothing or errors.
     pub fallback: Option<Vec<String>>,
@@ -389,6 +394,7 @@ pub struct Settings {
     pub thinking_budget: Option<u32>,
     pub tool_mode: ToolMode,
     pub compat: CompatMode,
+    pub minimal_tools: bool,
     pub moa: hi_ai::MoaConfig,
 }
 
@@ -591,6 +597,7 @@ pub fn resolve(cli: &Cli, config: &Config, registry: &Registry) -> Result<Settin
         .map(CompatMode::from)
         .or_else(|| profile.and_then(|p| p.compat))
         .unwrap_or_default();
+    let minimal_tools = profile.and_then(|p| p.minimal_tools).unwrap_or(false);
 
     Ok(Settings {
         provider,
@@ -603,6 +610,7 @@ pub fn resolve(cli: &Cli, config: &Config, registry: &Registry) -> Result<Settin
         thinking_budget,
         tool_mode,
         compat,
+        minimal_tools,
         moa: config.moa.clone(),
     })
 }
@@ -1162,6 +1170,7 @@ pub fn resolve_named_profile(config: &Config, name: &str, registry: &Registry) -
         thinking_budget: profile.thinking_budget,
         tool_mode: profile.tool_mode.unwrap_or_default(),
         compat: profile.compat.unwrap_or_default(),
+        minimal_tools: profile.minimal_tools.unwrap_or(false),
         moa: config.moa.clone(),
     })
 }
