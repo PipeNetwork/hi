@@ -415,6 +415,19 @@ mod native {
             window: c_int,
             stream: *mut c_void,
         ) -> c_int;
+        fn hi_cuda_launch_flashtile_causal_attention_batched(
+            q: *const c_void,
+            k: *const c_void,
+            v: *const c_void,
+            output: *mut c_void,
+            batch_count: c_int,
+            seq_len: c_int,
+            heads: c_int,
+            kv_heads: c_int,
+            qk_head_dim: c_int,
+            v_head_dim: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
         fn hi_cuda_launch_full_attention(
             q: *const c_void,
             k: *const c_void,
@@ -1822,6 +1835,45 @@ mod native {
             )
         })?;
         check_last_error("hi_cuda_launch_tiled_causal_attention_batched")
+    }
+
+    /// Flash-attention (shared-memory K/V tiling) causal batched prefill. Causal only
+    /// (no sliding window); head_dim capped at HI_CUDA_FLASH_TILE_MAX_HEAD_DIM.
+    pub fn launch_flashtile_causal_attention_batched(
+        q: &DeviceBuffer,
+        k: &DeviceBuffer,
+        v: &DeviceBuffer,
+        output: &DeviceBuffer,
+        batch_count: usize,
+        seq_len: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        v_head_dim: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(batch_count, "flash_attention batch_count")?;
+        ensure_len(seq_len, "flash_attention seq_len")?;
+        ensure_len(heads, "flash_attention heads")?;
+        ensure_len(kv_heads, "flash_attention kv_heads")?;
+        ensure_len(head_dim, "flash_attention head_dim")?;
+        ensure_len(v_head_dim, "flash_attention v_head_dim")?;
+        launch_status(unsafe {
+            hi_cuda_launch_flashtile_causal_attention_batched(
+                q.as_ptr(),
+                k.as_ptr(),
+                v.as_ptr(),
+                output.as_mut_ptr(),
+                batch_count as c_int,
+                seq_len as c_int,
+                heads as c_int,
+                kv_heads as c_int,
+                head_dim as c_int,
+                v_head_dim as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_flashtile_causal_attention_batched")
     }
 
     pub fn launch_full_attention(
