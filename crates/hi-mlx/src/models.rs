@@ -204,6 +204,9 @@ mod native {
             ModelFamily::Qwen2 if config.model_type == "nemotron" => {
                 Ok(Box::new(NemotronLike::new(config.clone(), arrays)?))
             }
+            ModelFamily::Qwen2 if config.model_type == "gpt_oss" => {
+                Ok(Box::new(GptOssLike::new(config.clone(), arrays)?))
+            }
             ModelFamily::Qwen2 | ModelFamily::Qwen3 | ModelFamily::Hy3 => {
                 // Qwen3.5 gated-delta-net hybrid (linear-attn heads present) uses its own path.
                 if config.linear_num_value_heads.is_some() {
@@ -3702,6 +3705,285 @@ mod native {
                 let h = add(x, r);
                 let r = self.ffn.forward(&self.norm2.forward(&h)?)?;
                 Ok(add(h, r))
+            }
+        }
+    }
+
+    // ---------------------- GPT-OSS (gpt_oss) ----------------------
+    // GQA with attention sinks (per-head learned logit in the softmax denominator) + sliding/full
+    // hybrid attention + YARN rope; MoE with a biased router, top-k-then-softmax routing, and
+    // SwiGLU-OAI experts (separate gate/up/down with bias). Pre-norm RMSNorm, `model.` prefix.
+    struct GptOssAttention {
+        q_proj: Linear,
+        k_proj: Linear,
+        v_proj: Linear,
+        o_proj: Linear,
+        sinks: Array,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        scale: f32,
+        rope_theta: f32,
+        rope_freqs: Option<Array>,
+        cache: Cache,
+    }
+
+    impl GptOssAttention {
+        fn load(
+            prefix: &str,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+            rope_freqs: Option<Array>,
+        ) -> Result<Self> {
+            let head_dim = config.attention_head_dim() as i32;
+            Ok(Self {
+                q_proj: Linear::load(&format!("{prefix}.q_proj"), arrays, config)?,
+                k_proj: Linear::load(&format!("{prefix}.k_proj"), arrays, config)?,
+                v_proj: Linear::load(&format!("{prefix}.v_proj"), arrays, config)?,
+                o_proj: Linear::load(&format!("{prefix}.o_proj"), arrays, config)?,
+                sinks: raw_array(arrays, &format!("{prefix}.sinks"))?.as_type::<f32>()?,
+                n_heads: config.num_attention_heads as i32,
+                n_kv_heads: config.num_key_value_heads as i32,
+                head_dim,
+                scale: (head_dim as f32).powf(-0.5),
+                rope_theta: config.rope_theta,
+                rope_freqs,
+                cache: Cache::new(),
+            })
+        }
+
+        fn forward(&mut self, x: &Array) -> Result<Array> {
+            let shape = x.shape();
+            let (b, l) = (shape[0], shape[1]);
+            let mut q = self
+                .q_proj
+                .forward(x)?
+                .reshape(&[b, l, self.n_heads, self.head_dim])?
+                .transpose_axes(&[0, 2, 1, 3])?;
+            let mut k = self
+                .k_proj
+                .forward(x)?
+                .reshape(&[b, l, self.n_kv_heads, self.head_dim])?
+                .transpose_axes(&[0, 2, 1, 3])?;
+            let v = self
+                .v_proj
+                .forward(x)?
+                .reshape(&[b, l, self.n_kv_heads, self.head_dim])?
+                .transpose_axes(&[0, 2, 1, 3])?;
+            let offset = self.cache.offset;
+            let (rbase, rfreqs) = match &self.rope_freqs {
+                Some(f) => (None, Some(f)),
+                None => (Some(self.rope_theta), None),
+            };
+            q = rope(q, self.head_dim, false, rbase, 1.0, offset, rfreqs)?;
+            k = rope(k, self.head_dim, false, rbase, 1.0, offset, rfreqs)?;
+            let (k, v) = self.cache.update(k, v)?;
+            // Attention sinks: an extra per-head logit in the softmax denominator (mlx sdpa `sinks`).
+            let q = q.as_type::<f32>()?;
+            let k = k.as_type::<f32>()?;
+            let v = v.as_type::<f32>()?;
+            let mask = if l > 1 {
+                Some(causal_attention_mask(l, k.shape()[2], offset))
+            } else {
+                None
+            };
+            let output = scaled_dot_product_attention(
+                &q,
+                &k,
+                &v,
+                self.scale,
+                match &mask {
+                    Some(m) => ScaledDotProductAttentionMask::Array(m),
+                    None => ScaledDotProductAttentionMask::Causal,
+                },
+                Some(&self.sinks),
+            )?;
+            let output = output.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
+                b,
+                l,
+                self.n_heads * self.head_dim,
+            ])?;
+            self.o_proj.forward(&output)
+        }
+    }
+
+    struct GptOssMoe {
+        router: Linear,
+        switch_mlp: SwitchMlp,
+        gate_bias: Array,
+        up_bias: Array,
+        down_bias: Array,
+        top_k: usize,
+        alpha: f32,
+        limit: f32,
+    }
+
+    impl GptOssMoe {
+        fn load(
+            prefix: &str,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+        ) -> Result<Self> {
+            let ep = format!("{prefix}.experts");
+            let gb = raw_array(arrays, &format!("{ep}.gate_proj.bias"))?.as_type::<f32>()?;
+            let ub = raw_array(arrays, &format!("{ep}.up_proj.bias"))?.as_type::<f32>()?;
+            let db = raw_array(arrays, &format!("{ep}.down_proj.bias"))?.as_type::<f32>()?;
+            transforms::eval([&gb, &ub, &db])?;
+            Ok(Self {
+                router: Linear::load(&format!("{prefix}.router"), arrays, config)?,
+                switch_mlp: SwitchMlp::load(&ep, arrays, config)?,
+                gate_bias: gb,
+                up_bias: ub,
+                down_bias: db,
+                top_k: config.num_experts_per_tok.unwrap_or(1) as usize,
+                alpha: 1.702,
+                limit: config.swiglu_limit.unwrap_or(7.0),
+            })
+        }
+
+        fn forward(&self, x: &Array) -> Result<Array> {
+            let shape = x.shape();
+            let (b, l, d) = (shape[0], shape[1], shape[2]);
+            if b != 1 {
+                bail!("GPT-OSS MoE supports batch size 1, got {b}");
+            }
+            let logits = self.router.forward(x)?.as_type::<f32>()?;
+            transforms::eval([&logits])?;
+            let experts = *logits.shape().last().unwrap() as usize;
+            let raw = logits.as_slice::<f32>();
+            let mut outputs = Vec::with_capacity(l as usize);
+            for token in 0..l as usize {
+                let lg = &raw[token * experts..token * experts + experts];
+                // top-k by logit, then softmax over just those k.
+                let mut ranked = (0..experts).map(|e| (e, lg[e])).collect::<Vec<_>>();
+                ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                ranked.truncate(self.top_k);
+                let maxl = ranked.iter().map(|&(_, v)| v).fold(f32::MIN, f32::max);
+                let exps: Vec<f32> = ranked.iter().map(|&(_, v)| (v - maxl).exp()).collect();
+                let denom: f32 = exps.iter().sum::<f32>() + 1e-20;
+                let token_x = x.index((0, token as i32, ..)).reshape(&[1, 1, d])?;
+                let mut acc = Array::zeros::<f32>(&[1, 1, d])?;
+                for (k, &(expert, _)) in ranked.iter().enumerate() {
+                    let w = exps[k] / denom;
+                    let e = expert as i32;
+                    let gate = self.switch_mlp.gate_proj.forward_expert(&token_x, e)?
+                        + self.gate_bias.index(e);
+                    let up = self.switch_mlp.up_proj.forward_expert(&token_x, e)?
+                        + self.up_bias.index(e);
+                    let act = swiglu_oai(&gate, &up, self.alpha, self.limit)?;
+                    let out = self.switch_mlp.down_proj.forward_expert(&act, e)?
+                        + self.down_bias.index(e);
+                    acc = acc + out.as_type::<f32>()? * w;
+                }
+                outputs.push(acc);
+            }
+            Ok(concatenate_axis(&outputs, 1)?)
+        }
+    }
+
+    struct GptOssBlock {
+        input_layernorm: RmsNorm,
+        post_attention_layernorm: RmsNorm,
+        attention: GptOssAttention,
+        moe: GptOssMoe,
+    }
+
+    impl GptOssBlock {
+        fn load(
+            idx: u32,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+            rope_freqs: Option<Array>,
+        ) -> Result<Self> {
+            let p = format!("model.layers.{idx}");
+            Ok(Self {
+                input_layernorm: RmsNorm::load(
+                    &format!("{p}.input_layernorm.weight"),
+                    arrays,
+                    config.rms_norm_eps,
+                )?,
+                post_attention_layernorm: RmsNorm::load(
+                    &format!("{p}.post_attention_layernorm.weight"),
+                    arrays,
+                    config.rms_norm_eps,
+                )?,
+                attention: GptOssAttention::load(
+                    &format!("{p}.self_attn"),
+                    arrays,
+                    config,
+                    rope_freqs,
+                )?,
+                moe: GptOssMoe::load(&format!("{p}.mlp"), arrays, config)?,
+            })
+        }
+
+        fn forward(&mut self, x: Array) -> Result<Array> {
+            let h = &x + self.attention.forward(&self.input_layernorm.forward(&x)?)?;
+            let r = self
+                .moe
+                .forward(&self.post_attention_layernorm.forward(&h)?)?;
+            Ok(h + r)
+        }
+    }
+
+    struct GptOssLike {
+        embed_tokens: Embedding,
+        layers: Vec<GptOssBlock>,
+        norm: RmsNorm,
+        lm_head: Option<Linear>,
+    }
+
+    impl GptOssLike {
+        fn new(config: MlxModelConfig, arrays: HashMap<String, Array>) -> Result<Self> {
+            let (rope_freqs, _) = longcat_yarn_rope(&config, config.attention_head_dim() as i32)?;
+            let mut layers = Vec::with_capacity(config.num_hidden_layers as usize);
+            for idx in 0..config.num_hidden_layers {
+                layers.push(GptOssBlock::load(
+                    idx,
+                    &arrays,
+                    &config,
+                    rope_freqs.clone(),
+                )?);
+            }
+            let lm_head = if config.tie_word_embeddings {
+                None
+            } else {
+                Some(Linear::load("lm_head", &arrays, &config)?)
+            };
+            Ok(Self {
+                embed_tokens: Embedding::load("model.embed_tokens", &arrays, &config)?,
+                norm: RmsNorm::load("model.norm.weight", &arrays, config.rms_norm_eps)?,
+                layers,
+                lm_head,
+            })
+        }
+    }
+
+    impl CausalLm for GptOssLike {
+        fn forward(&mut self, input_ids: &[u32]) -> Result<Array> {
+            let ids = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
+            let mut h = self.embed_tokens.forward(&ids)?;
+            for layer in &mut self.layers {
+                h = layer.forward(h)?;
+            }
+            h = self.norm.forward(&h)?;
+            let logits = match &self.lm_head {
+                Some(head) => head.forward(&h)?,
+                None => self.embed_tokens.as_linear(&h)?,
+            };
+            transforms::eval([&logits])?;
+            Ok(logits)
+        }
+
+        fn reset_cache(&mut self) {
+            for layer in &mut self.layers {
+                layer.attention.cache.reset();
+            }
+        }
+
+        fn prepare_cache(&mut self, capacity: i32) {
+            for layer in &mut self.layers {
+                layer.attention.cache.prepare_capacity(capacity);
             }
         }
     }

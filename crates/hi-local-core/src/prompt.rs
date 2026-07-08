@@ -77,6 +77,10 @@ fn render_gguf_chat_template(template: &str, messages: &[ChatMessage]) -> Option
     if template.contains("<seed:bos>") && template.contains("thinking_budget") {
         return Some(render_seedoss_template(messages));
     }
+    // GPT-OSS harmony format: `<|start|>{role}<|message|>...<|end|>`; prime the `final` channel.
+    if template.contains("<|channel|>") && template.contains("<|start|>") {
+        return Some(render_gptoss_template(messages));
+    }
     if template.contains("<|im_start|>") && template.contains("<|im_end|>") {
         return render_simple_loop_template(&template, messages)
             .or_else(|| Some(build_chatml_prompt(messages, &[], &Value::Null)));
@@ -240,6 +244,35 @@ fn render_seedoss_template(messages: &[ChatMessage]) -> String {
         out.push_str("<seed:eos>");
     }
     out.push_str("<seed:bos>assistant\n");
+    out
+}
+
+// GPT-OSS harmony format: `<|start|>{role}<|message|>...<|end|>`. Prime the assistant `final` channel
+// (low reasoning) so the model returns a direct answer rather than an analysis monologue.
+fn render_gptoss_template(messages: &[ChatMessage]) -> String {
+    let mut out = String::new();
+    let system = messages
+        .iter()
+        .find(|m| matches!(m.role.as_str(), "system" | "developer" | "root"))
+        .map(|m| m.content_text())
+        .unwrap_or_else(|| "You are a helpful assistant.".to_string());
+    out.push_str("<|start|>system<|message|>");
+    out.push_str(&system);
+    out.push_str("\nReasoning: low<|end|>");
+    for message in messages {
+        let role = match message.role.as_str() {
+            "assistant" | "ai" | "model" => "assistant",
+            "system" | "developer" | "root" => continue,
+            "tool" => "tool",
+            _ => "user",
+        };
+        out.push_str("<|start|>");
+        out.push_str(role);
+        out.push_str("<|message|>");
+        out.push_str(&message.content_text());
+        out.push_str("<|end|>");
+    }
+    out.push_str("<|start|>assistant<|channel|>final<|message|>");
     out
 }
 
