@@ -216,6 +216,7 @@ mod native {
                     Ok(Box::new(MlaLike::new(config.clone(), arrays)?))
                 }
             }
+            ModelFamily::NemotronH => Ok(Box::new(NemotronHLike::new(config.clone(), arrays)?)),
             ModelFamily::Llama
             | ModelFamily::Mistral
             | ModelFamily::Mixtral
@@ -4441,6 +4442,395 @@ mod native {
         fn prepare_cache(&mut self, capacity: i32) {
             for layer in &mut self.layers {
                 layer.attention.cache.prepare_capacity(capacity);
+            }
+        }
+    }
+
+    // ---------------------- Nemotron-H (nemotron_h, Mamba2 hybrid) ----------------------
+    // NVIDIA Nemotron-3 (Nano/Ultra) + TwoTower: a per-layer hybrid selected by
+    // `hybrid_override_pattern` — 'M' = Mamba2 SSM, '*' = attention (GQA, NO RoPE; position comes
+    // from the Mamba layers), '-' = dense ReLU^2 MLP, 'E' = MoE. Weights use the `backbone.` prefix.
+    // The Mamba2 mixer runs the SSD recurrence per-token (correctness first, like the qwen3.5 scan).
+    struct NemotronMamba2 {
+        in_proj: Linear,
+        conv1d_weight: Array,
+        conv1d_bias: Option<Array>,
+        a_log: Array,
+        d: Array,
+        dt_bias: Array,
+        norm_weight: Array,
+        norm_ones: Array,
+        out_proj: Linear,
+        num_heads: i32,
+        head_dim: i32,
+        n_groups: i32,
+        state_size: i32,
+        conv_dim: i32,
+        conv_kernel: i32,
+        intermediate: i32,
+        group_size: i32,
+        eps: f32,
+        conv_state: Option<Array>,
+        ssm_state: Option<Array>,
+    }
+
+    impl NemotronMamba2 {
+        fn load(
+            prefix: &str,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+        ) -> Result<Self> {
+            let num_heads = config.mamba_num_heads.unwrap_or(0) as i32;
+            let head_dim = config.mamba_head_dim.unwrap_or(0) as i32;
+            let n_groups = config.mamba_n_groups.unwrap_or(1).max(1) as i32;
+            let state_size = config.ssm_state_size.unwrap_or(128) as i32;
+            let conv_kernel = config.mamba_conv_kernel.unwrap_or(4) as i32;
+            let intermediate = num_heads * head_dim;
+            let conv_dim = intermediate + 2 * n_groups * state_size;
+            let group_size = (intermediate / n_groups).max(1);
+            Ok(Self {
+                in_proj: Linear::load(&format!("{prefix}.in_proj"), arrays, config)?,
+                conv1d_weight: raw_array(arrays, &format!("{prefix}.conv1d.weight"))?
+                    .as_type::<f32>()?,
+                conv1d_bias: match arrays.get(&format!("{prefix}.conv1d.bias")) {
+                    Some(b) => Some(b.as_type::<f32>()?),
+                    None => None,
+                },
+                a_log: raw_array(arrays, &format!("{prefix}.A_log"))?.as_type::<f32>()?,
+                d: raw_array(arrays, &format!("{prefix}.D"))?.as_type::<f32>()?,
+                dt_bias: raw_array(arrays, &format!("{prefix}.dt_bias"))?.as_type::<f32>()?,
+                norm_weight: raw_array(arrays, &format!("{prefix}.norm.weight"))?.as_type::<f32>()?,
+                norm_ones: Array::ones::<f32>(&[group_size])?,
+                out_proj: Linear::load(&format!("{prefix}.out_proj"), arrays, config)?,
+                num_heads,
+                head_dim,
+                n_groups,
+                state_size,
+                conv_dim,
+                conv_kernel,
+                intermediate,
+                group_size,
+                eps: config.rms_norm_eps,
+                conv_state: None,
+                ssm_state: None,
+            })
+        }
+
+        fn forward(&mut self, x: &Array) -> Result<Array> {
+            let dtype = x.dtype();
+            let s = x.shape()[1];
+            let proj = self.in_proj.forward(x)?.as_type::<f32>()?;
+            let parts = split_sections(
+                &proj,
+                &[self.intermediate, self.intermediate + self.conv_dim],
+                -1,
+            )?;
+            let gate = &parts[0];
+            let conv_in = &parts[1];
+            let dt = &parts[2];
+            // Causal depthwise conv over [conv_state | conv_in], carrying the last kernel-1 frames.
+            let keep = self.conv_kernel - 1;
+            let conv_state = match self.conv_state.take() {
+                Some(st) => st,
+                None => Array::zeros::<f32>(&[1, keep, self.conv_dim])?,
+            };
+            let cat = concatenate_axis(&[&conv_state, conv_in], 1)?;
+            let clen = cat.shape()[1];
+            self.conv_state = Some(cat.index((.., (clen - keep)..clen, ..)));
+            let mut conv_out = conv1d(&cat, &self.conv1d_weight, 1, 0, 1, self.conv_dim)?;
+            if let Some(bias) = &self.conv1d_bias {
+                conv_out = conv_out + bias;
+            }
+            let conv_out = silu(&conv_out)?;
+            let cparts = split_sections(
+                &conv_out,
+                &[
+                    self.intermediate,
+                    self.intermediate + self.n_groups * self.state_size,
+                ],
+                -1,
+            )?;
+            let y = self.scan(&cparts[0], &cparts[1], &cparts[2], dt, s)?;
+            // MambaRMSNormGated: silu(gate) * y, then a group-wise (weightless) RMS norm * weight.
+            let y = silu(gate)? * y;
+            let ng = self.intermediate / self.group_size;
+            let y = rms_norm(
+                &y.reshape(&[1, s, ng, self.group_size])?,
+                &self.norm_ones,
+                self.eps,
+            )?
+            .reshape(&[1, s, self.intermediate])?;
+            let y = y * &self.norm_weight;
+            self.out_proj.forward(&y.as_dtype(dtype)?)
+        }
+
+        // SSD recurrence: state[h,dh,ds] = dA[h]*state + dt[h]*x[h,dh]*B[h,ds];
+        //                 y[h,dh] = sum_ds(state*C[h,ds]) + D[h]*x[h,dh].
+        fn scan(
+            &mut self,
+            x_ssm: &Array,
+            bb: &Array,
+            cc: &Array,
+            dt: &Array,
+            s: i32,
+        ) -> Result<Array> {
+            let (h, dh, g, ds) = (self.num_heads, self.head_dim, self.n_groups, self.state_size);
+            let x = x_ssm.reshape(&[1, s, h, dh])?;
+            let bb = bb.reshape(&[1, s, g, ds])?;
+            let cc = cc.reshape(&[1, s, g, ds])?;
+            let dt = softplus(&(dt.reshape(&[1, s, h])? + &self.dt_bias))?;
+            let dt = minimum(&maximum(&dt, &Array::from_f32(0.001))?, &Array::from_f32(100.0))?;
+            let a = exp(&self.a_log)? * -1.0; // [h]
+            let per_group = h / g;
+            let mut state = match self.ssm_state.take() {
+                Some(st) => st,
+                None => Array::zeros::<f32>(&[h, dh, ds])?,
+            };
+            let mut ys: Vec<Array> = Vec::with_capacity(s as usize);
+            for t in 0..s {
+                let dt_h = dt.index((0, t, ..)).reshape(&[h])?;
+                let da = exp(&(&dt_h * &a))?.reshape(&[h, 1, 1])?;
+                let dt_e = dt_h.reshape(&[h, 1, 1])?;
+                let x_hd = x.index((0, t, .., ..)); // [h, dh]
+                let x_e = x_hd.reshape(&[h, dh, 1])?;
+                let b_t = broadcast_to(
+                    &bb.index((0, t, .., ..)).reshape(&[g, 1, ds])?,
+                    &[g, per_group, ds],
+                )?
+                .reshape(&[h, 1, ds])?;
+                let c_t = broadcast_to(
+                    &cc.index((0, t, .., ..)).reshape(&[g, 1, ds])?,
+                    &[g, per_group, ds],
+                )?
+                .reshape(&[h, 1, ds])?;
+                let dbx = (&dt_e * &x_e) * &b_t; // [h,dh,ds]
+                state = &da * &state + dbx;
+                let y_t = sum_axis(&(&state * &c_t), -1, false)? + (self.d.reshape(&[h, 1])? * &x_hd);
+                ys.push(y_t.reshape(&[1, 1, h * dh])?);
+            }
+            self.ssm_state = Some(state);
+            if ys.len() == 1 {
+                Ok(ys.remove(0))
+            } else {
+                Ok(concatenate_axis(&ys.iter().collect::<Vec<_>>(), 1)?)
+            }
+        }
+    }
+
+    struct NemotronAttention {
+        q_proj: Linear,
+        k_proj: Linear,
+        v_proj: Linear,
+        o_proj: Linear,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        cache: Cache,
+    }
+
+    impl NemotronAttention {
+        fn load(
+            prefix: &str,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+        ) -> Result<Self> {
+            Ok(Self {
+                q_proj: Linear::load(&format!("{prefix}.q_proj"), arrays, config)?,
+                k_proj: Linear::load(&format!("{prefix}.k_proj"), arrays, config)?,
+                v_proj: Linear::load(&format!("{prefix}.v_proj"), arrays, config)?,
+                o_proj: Linear::load(&format!("{prefix}.o_proj"), arrays, config)?,
+                n_heads: config.num_attention_heads as i32,
+                n_kv_heads: config.num_key_value_heads as i32,
+                head_dim: config.attention_head_dim() as i32,
+                cache: Cache::new(),
+            })
+        }
+
+        fn forward(&mut self, x: &Array) -> Result<Array> {
+            let shape = x.shape();
+            let (b, l) = (shape[0], shape[1]);
+            let q = self
+                .q_proj
+                .forward(x)?
+                .reshape(&[b, l, self.n_heads, self.head_dim])?
+                .transpose_axes(&[0, 2, 1, 3])?;
+            let k = self
+                .k_proj
+                .forward(x)?
+                .reshape(&[b, l, self.n_kv_heads, self.head_dim])?
+                .transpose_axes(&[0, 2, 1, 3])?;
+            let v = self
+                .v_proj
+                .forward(x)?
+                .reshape(&[b, l, self.n_kv_heads, self.head_dim])?
+                .transpose_axes(&[0, 2, 1, 3])?;
+            let offset = self.cache.offset;
+            let (k, v) = self.cache.update(k, v)?;
+            let scale = (self.head_dim as f32).powf(-0.5);
+            let output = if l > 1 && offset == 0 {
+                scaled_dot_product_attention(
+                    &q,
+                    &k,
+                    &v,
+                    scale,
+                    ScaledDotProductAttentionMask::Causal,
+                    None::<&Array>,
+                )?
+            } else if l > 1 {
+                let mask = causal_attention_mask(l, k.shape()[2], offset);
+                scaled_dot_product_attention(
+                    &q,
+                    &k,
+                    &v,
+                    scale,
+                    ScaledDotProductAttentionMask::Array(&mask),
+                    None::<&Array>,
+                )?
+            } else {
+                scaled_dot_product_attention(&q, &k, &v, scale, None, None::<&Array>)?
+            };
+            let output = output
+                .transpose_axes(&[0, 2, 1, 3])?
+                .reshape(&[b, l, self.n_heads * self.head_dim])?;
+            self.o_proj.forward(&output)
+        }
+    }
+
+    struct NemotronMlp {
+        up_proj: Linear,
+        down_proj: Linear,
+    }
+
+    impl NemotronMlp {
+        fn load(
+            prefix: &str,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+        ) -> Result<Self> {
+            Ok(Self {
+                up_proj: Linear::load(&format!("{prefix}.up_proj"), arrays, config)?,
+                down_proj: Linear::load(&format!("{prefix}.down_proj"), arrays, config)?,
+            })
+        }
+
+        fn forward(&self, x: &Array) -> Result<Array> {
+            // ReLU^2 activation (relu2).
+            let u = self.up_proj.forward(x)?;
+            let a = maximum(&u, &Array::from_f32(0.0))?;
+            self.down_proj.forward(&(&a * &a))
+        }
+    }
+
+    enum NemotronMixer {
+        Mamba(Box<NemotronMamba2>),
+        Attn(NemotronAttention),
+        Mlp(NemotronMlp),
+    }
+
+    struct NemotronBlock {
+        norm: RmsNorm,
+        mixer: NemotronMixer,
+    }
+
+    impl NemotronBlock {
+        fn load(
+            idx: u32,
+            kind: char,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+        ) -> Result<Self> {
+            let p = format!("backbone.layers.{idx}");
+            let norm = RmsNorm::load(&format!("{p}.norm.weight"), arrays, config.rms_norm_eps)?;
+            let mixer = match kind {
+                'M' => NemotronMixer::Mamba(Box::new(NemotronMamba2::load(
+                    &format!("{p}.mixer"),
+                    arrays,
+                    config,
+                )?)),
+                '*' => NemotronMixer::Attn(NemotronAttention::load(
+                    &format!("{p}.mixer"),
+                    arrays,
+                    config,
+                )?),
+                '-' => {
+                    NemotronMixer::Mlp(NemotronMlp::load(&format!("{p}.mixer"), arrays, config)?)
+                }
+                other => bail!(
+                    "nemotron_h block type '{other}' (layer {idx}) is not supported yet (MoE 'E' pending)"
+                ),
+            };
+            Ok(Self { norm, mixer })
+        }
+
+        fn forward(&mut self, x: Array) -> Result<Array> {
+            let h = self.norm.forward(&x)?;
+            let h = match &mut self.mixer {
+                NemotronMixer::Mamba(m) => m.forward(&h)?,
+                NemotronMixer::Attn(a) => a.forward(&h)?,
+                NemotronMixer::Mlp(m) => m.forward(&h)?,
+            };
+            Ok(x + h)
+        }
+    }
+
+    struct NemotronHLike {
+        embed: Embedding,
+        blocks: Vec<NemotronBlock>,
+        norm_f: RmsNorm,
+        lm_head: Linear,
+    }
+
+    impl NemotronHLike {
+        fn new(config: MlxModelConfig, arrays: HashMap<String, Array>) -> Result<Self> {
+            let pattern = config
+                .hybrid_override_pattern
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("nemotron_h: missing hybrid_override_pattern"))?;
+            let blocks = pattern
+                .chars()
+                .enumerate()
+                .map(|(idx, kind)| NemotronBlock::load(idx as u32, kind, &arrays, &config))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Self {
+                embed: Embedding::load("backbone.embeddings", &arrays, &config)?,
+                norm_f: RmsNorm::load("backbone.norm_f.weight", &arrays, config.rms_norm_eps)?,
+                lm_head: Linear::load("lm_head", &arrays, &config)?,
+                blocks,
+            })
+        }
+    }
+
+    impl CausalLm for NemotronHLike {
+        fn forward(&mut self, input_ids: &[u32]) -> Result<Array> {
+            let ids = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
+            let mut h = self.embed.forward(&ids)?;
+            for block in &mut self.blocks {
+                h = block.forward(h)?;
+            }
+            h = self.norm_f.forward(&h)?;
+            let logits = self.lm_head.forward(&h)?;
+            transforms::eval([&logits])?;
+            Ok(logits)
+        }
+
+        fn reset_cache(&mut self) {
+            for block in &mut self.blocks {
+                match &mut block.mixer {
+                    NemotronMixer::Mamba(m) => {
+                        m.conv_state = None;
+                        m.ssm_state = None;
+                    }
+                    NemotronMixer::Attn(a) => a.cache.reset(),
+                    NemotronMixer::Mlp(_) => {}
+                }
+            }
+        }
+
+        fn prepare_cache(&mut self, capacity: i32) {
+            for block in &mut self.blocks {
+                if let NemotronMixer::Attn(a) = &mut block.mixer {
+                    a.cache.prepare_capacity(capacity);
+                }
             }
         }
     }

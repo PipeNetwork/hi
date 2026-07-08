@@ -33,6 +33,7 @@ REPOS=(
   "mlx-community/GLM-4-9B-0414-4bit"                                       # glm4         (GQA, Glm4Like)
   "mlx-community/GLM-4.7-Flash-4bit"                                       # glm4_moe_lite (MLA)
   "avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw"                                 # glm_moe_dsa  (DeepSeek-V3.2-style: MLA + DSA indexer + MoE) — 310GB, run with HI_MLX_MAX_TOKENS=8
+  "pipenetwork/NVIDIA-Nemotron-3-Nano-4B-MLX-8bit"                         # nemotron_h   (Mamba2 + attention + MLP hybrid, dense)
   # large / MLA not held locally (big downloads):
   # "mlx-community/DeepSeek-V4-Flash-4bit"                                 # deepseek_v4 (MLA + lightning indexer)
 )

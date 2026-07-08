@@ -10,7 +10,7 @@ pub fn build_prompt(
     tool_choice: &Value,
 ) -> String {
     match family {
-        ModelFamily::Qwen2 | ModelFamily::Qwen3 => {
+        ModelFamily::Qwen2 | ModelFamily::Qwen3 | ModelFamily::NemotronH => {
             build_chatml_prompt(messages, tools, tool_choice)
         }
         ModelFamily::Hy3 => build_hy3_prompt(messages, tools, tool_choice),

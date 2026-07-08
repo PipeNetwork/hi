@@ -214,6 +214,13 @@ fn model_family(model_type: &str, config: &Value) -> Option<ModelFamily> {
     {
         return Some(ModelFamily::Hy3);
     }
+    // Nemotron-H: Mamba2 + attention + MLP/MoE hybrid.
+    if model_type.starts_with("nemotron_h")
+        || haystack.contains("nemotron_h")
+        || haystack.contains("nemotronh")
+    {
+        return Some(ModelFamily::NemotronH);
+    }
     None
 }
 

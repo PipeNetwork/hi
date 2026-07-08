@@ -76,7 +76,12 @@ impl WeightCatalog {
 
     pub fn validate_for_config(&self, config: &MlxModelConfig) -> Result<()> {
         config.quantization.validate_supported()?;
-        let required = ["model.embed_tokens.weight", "model.norm.weight"];
+        // Nemotron-H uses `backbone.` naming (embeddings/norm_f) rather than `model.`.
+        let required: &[&str] = if config.family == crate::manifest::ModelFamily::NemotronH {
+            &["backbone.embeddings.weight", "backbone.norm_f.weight"]
+        } else {
+            &["model.embed_tokens.weight", "model.norm.weight"]
+        };
         for key in required {
             // VL models (Qwen3.5) still carry the `language_model.` prefix at validation time.
             if !self.has(key) && !self.has(&format!("language_model.{key}")) {
@@ -149,6 +154,15 @@ impl WeightCatalog {
                         ],
                     )?;
                 }
+            }
+            crate::manifest::ModelFamily::NemotronH => {
+                self.require_any(
+                    "Nemotron-H mixer projection",
+                    &[
+                        "backbone.layers.0.mixer.in_proj.weight",
+                        "backbone.layers.0.mixer.in_proj.scales",
+                    ],
+                )?;
             }
             crate::manifest::ModelFamily::Llama
             | crate::manifest::ModelFamily::Mistral

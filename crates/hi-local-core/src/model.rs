@@ -31,6 +31,7 @@ pub enum ModelFamily {
     DeepSeek,
     GlmFlash,
     Hy3,
+    NemotronH,
 }
 
 impl ModelFamily {
@@ -46,6 +47,7 @@ impl ModelFamily {
             Self::DeepSeek => "deepseek",
             Self::GlmFlash => "glm-flash",
             Self::Hy3 => "hy3",
+            Self::NemotronH => "nemotron-h",
         }
     }
 
