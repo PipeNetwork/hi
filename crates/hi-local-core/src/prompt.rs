@@ -73,6 +73,10 @@ fn render_gguf_chat_template(template: &str, messages: &[ChatMessage]) -> Option
     if template.contains("reasoning_mode") && template.contains("<|im_start|>") {
         return Some(render_smollm3_template(messages));
     }
+    // Seed-OSS: `<seed:bos>{role}\n...<seed:eos>` turns; set thinking_budget 0 for direct answers.
+    if template.contains("<seed:bos>") && template.contains("thinking_budget") {
+        return Some(render_seedoss_template(messages));
+    }
     if template.contains("<|im_start|>") && template.contains("<|im_end|>") {
         return render_simple_loop_template(&template, messages)
             .or_else(|| Some(build_chatml_prompt(messages, &[], &Value::Null)));
@@ -203,6 +207,39 @@ fn render_smollm3_template(messages: &[ChatMessage]) -> String {
         out.push_str("<|im_end|>\n");
     }
     out.push_str("<|im_start|>assistant\n<think>\n\n</think>\n");
+    out
+}
+
+// Seed-OSS: `<seed:bos>{role}\n...<seed:eos>` turns. Inject the thinking_budget=0 system instruction so
+// the reasoning model answers directly instead of emitting a `<seed:think>` monologue.
+fn render_seedoss_template(messages: &[ChatMessage]) -> String {
+    const BUDGET0: &str = "\nYou are an intelligent assistant that can answer questions in one step \
+        without the need for reasoning and thinking, that is, your thinking budget is 0. Next, please \
+        skip the thinking process and directly start answering the user's question.";
+    let mut out = String::new();
+    let system = messages
+        .iter()
+        .find(|m| matches!(m.role.as_str(), "system" | "developer" | "root"))
+        .map(|m| m.content_text())
+        .unwrap_or_default();
+    out.push_str("<seed:bos>system\n");
+    out.push_str(&system);
+    out.push_str(BUDGET0);
+    out.push_str("<seed:eos>");
+    for message in messages {
+        let role = match message.role.as_str() {
+            "assistant" | "ai" | "model" => "assistant",
+            "system" | "developer" | "root" => continue,
+            "tool" => "tool",
+            _ => "user",
+        };
+        out.push_str("<seed:bos>");
+        out.push_str(role);
+        out.push('\n');
+        out.push_str(&message.content_text());
+        out.push_str("<seed:eos>");
+    }
+    out.push_str("<seed:bos>assistant\n");
     out
 }
 

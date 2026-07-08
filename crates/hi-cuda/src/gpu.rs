@@ -11642,8 +11642,8 @@ mod native {
                     dims.kv_heads,
                     dims.head_dim,
                     dims.v_head_dim,
-                                    self.layer_attention_window(&prefix),
-)?;
+                    self.layer_attention_window(&prefix),
+                )?;
                 let attn_out =
                     self.attention_output_projection_f32_device(&prefix, &attn, gate.as_ref())?;
                 hidden = self.add_f32_device(&hidden, &attn_out)?;
@@ -11971,8 +11971,8 @@ mod native {
                     dims.kv_heads,
                     dims.head_dim,
                     dims.v_head_dim,
-                                    self.layer_attention_window(&prefix),
-)?;
+                    self.layer_attention_window(&prefix),
+                )?;
                 let attn_out =
                     self.attention_output_projection_f32_device(&prefix, &attn, gate.as_ref())?;
                 hidden = self.add_f32_device(&hidden, &attn_out)?;
@@ -12167,8 +12167,8 @@ mod native {
                     dims.kv_heads,
                     dims.head_dim,
                     dims.v_head_dim,
-                                    self.layer_attention_window(&prefix),
-)?;
+                    self.layer_attention_window(&prefix),
+                )?;
                 let attn_out =
                     self.attention_output_projection_f32_device(&prefix, &attn, gate.as_ref())?;
                 hidden = self.add_f32_device(&hidden, &attn_out)?;
@@ -12922,8 +12922,8 @@ mod native {
                     dims.kv_heads,
                     dims.head_dim,
                     dims.v_head_dim,
-                                    self.layer_attention_window(&prefix),
-)?;
+                    self.layer_attention_window(&prefix),
+                )?;
                 let attn_out =
                     self.attention_output_projection_f32_device(&prefix, &attn, gate.as_ref())?;
                 hidden = self.add_f32_device(&hidden, &attn_out)?;
@@ -13102,8 +13102,8 @@ mod native {
                     dims.kv_heads,
                     dims.head_dim,
                     dims.v_head_dim,
-                                    self.layer_attention_window(&prefix),
-)?;
+                    self.layer_attention_window(&prefix),
+                )?;
                 let attn_out =
                     self.attention_output_projection_f32_device(&prefix, &attn, gate.as_ref())?;
                 hidden = self.add_f32_device(&hidden, &attn_out)?;
@@ -13185,8 +13185,8 @@ mod native {
                     dims.kv_heads,
                     dims.head_dim,
                     dims.v_head_dim,
-                                    self.layer_attention_window(&prefix),
-)?;
+                    self.layer_attention_window(&prefix),
+                )?;
                 let attn_out =
                     self.attention_output_projection_f32_device(&prefix, &attn, gate.as_ref())?;
                 hidden = self.add_f32_device(&hidden, &attn_out)?;
@@ -13298,8 +13298,8 @@ mod native {
                     dims.kv_heads,
                     dims.head_dim,
                     dims.v_head_dim,
-                                    self.layer_attention_window(&prefix),
-)?;
+                    self.layer_attention_window(&prefix),
+                )?;
                 let attn_out =
                     self.attention_output_projection_f32_device(&prefix, &attn, gate.as_ref())?;
                 hidden = self.add_f32_device(&hidden, &attn_out)?;
@@ -13784,8 +13784,8 @@ mod native {
                         dims.kv_heads,
                         dims.head_dim,
                         dims.v_head_dim,
-                                        self.layer_attention_window(&prefix),
-)?;
+                        self.layer_attention_window(&prefix),
+                    )?;
                     let attn_out =
                         self.attention_output_projection_f32_device(&prefix, &attn, gate.as_ref())?;
                     hidden = self.add_f32_device(&hidden, &attn_out)?;
@@ -14224,8 +14224,10 @@ mod native {
             } else {
                 self.project_f32_device(&format!("{prefix}.attn_output.weight"), attn)?
             };
-            let output = self
-                .add_optional_rowwise_f32_device(projected, &format!("{prefix}.attn_output.bias"))?;
+            let output = self.add_optional_rowwise_f32_device(
+                projected,
+                &format!("{prefix}.attn_output.bias"),
+            )?;
             self.apply_gemma_post_attn_norm(prefix, output)
         }
 
@@ -14832,7 +14834,7 @@ mod native {
             kv_heads: usize,
             head_dim: usize,
             v_head_dim: usize,
-        
+
             window: usize,
         ) -> Result<GpuF32Tensor> {
             if q.rows != batch_count * seq_len || q.cols != heads * head_dim {
@@ -14880,7 +14882,9 @@ mod native {
                 )?;
             } else {
                 if window > 0 {
-                    bail!("CUDA sliding-window attention requires the tiled kernel (head_dim <= {FLASH_ONLINE_MAX_HEAD_DIM})");
+                    bail!(
+                        "CUDA sliding-window attention requires the tiled kernel (head_dim <= {FLASH_ONLINE_MAX_HEAD_DIM})"
+                    );
                 }
                 crate::kernels::launch_causal_attention_batched(
                     &q.buffer,
@@ -15045,7 +15049,7 @@ mod native {
             kv_heads: usize,
             head_dim: usize,
             v_head_dim: usize,
-        
+
             window: usize,
         ) -> Result<GpuF32Tensor> {
             if q.rows != batch_count || q.cols != heads * head_dim {
@@ -15087,7 +15091,9 @@ mod native {
                 )?;
             } else {
                 if window > 0 {
-                    bail!("CUDA sliding-window attention requires the tiled kernel (head_dim <= {FLASH_ONLINE_MAX_HEAD_DIM})");
+                    bail!(
+                        "CUDA sliding-window attention requires the tiled kernel (head_dim <= {FLASH_ONLINE_MAX_HEAD_DIM})"
+                    );
                 }
                 crate::kernels::launch_paged_decode_attention_batched(
                     &q.buffer,
@@ -15124,7 +15130,7 @@ mod native {
             kv_heads: usize,
             head_dim: usize,
             v_head_dim: usize,
-        
+
             window: usize,
         ) -> Result<GpuF32Tensor> {
             if q.rows != batch_count || q.cols != heads * head_dim {
@@ -15168,7 +15174,9 @@ mod native {
                 )?;
             } else {
                 if window > 0 {
-                    bail!("CUDA sliding-window attention requires the tiled kernel (head_dim <= {FLASH_ONLINE_MAX_HEAD_DIM})");
+                    bail!(
+                        "CUDA sliding-window attention requires the tiled kernel (head_dim <= {FLASH_ONLINE_MAX_HEAD_DIM})"
+                    );
                 }
                 crate::kernels::launch_paged_decode_attention_batched_positions(
                     &q.buffer,

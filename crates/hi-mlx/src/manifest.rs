@@ -236,7 +236,7 @@ fn model_family(model_type: &str, config: &Value) -> Option<ModelFamily> {
     // Dense Llama-like variants that run on the Qwen GQA path (QwenLike).
     if matches!(
         model_type.as_str(),
-        "internlm3" | "internlm2" | "granite" | "smollm3"
+        "internlm3" | "internlm2" | "granite" | "smollm3" | "seed_oss" | "nemotron"
     ) {
         return Some(ModelFamily::Qwen2);
     }
