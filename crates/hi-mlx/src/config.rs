@@ -128,6 +128,10 @@ impl MlxModelConfig {
         if self.family == ModelFamily::Hy3 {
             return layer_idx >= self.first_k_dense_replace;
         }
+        if self.model_type == "olmoe" {
+            // OLMoE: every layer is a sparse MoE.
+            return true;
+        }
         if self.model_type.contains("qwen3") {
             !self.mlp_only_layers.contains(&layer_idx)
                 && (layer_idx + 1) % self.decoder_sparse_step.max(1) == 0
@@ -552,7 +556,7 @@ pub fn detect_family(model_type: &str, config: &Value) -> Option<ModelFamily> {
         return Some(ModelFamily::Qwen2);
     }
     // Post-norm Llama-likes (OLMo2 / EXAONE-4): per-head qk-norm; QwenBlock detects post-norm weights.
-    if matches!(model_type.as_str(), "exaone4" | "olmo2") {
+    if matches!(model_type.as_str(), "exaone4" | "olmo2" | "olmoe") {
         return Some(ModelFamily::Qwen3);
     }
     None
