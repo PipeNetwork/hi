@@ -1104,7 +1104,7 @@ async fn security_review_prompts_advertise_only_read_only_tools() {
         tool_names: tool_names.clone(),
         modes: modes.clone(),
     };
-    let mut agent = Agent::new(Box::new(provider), config());
+    let mut agent = Agent::new(std::sync::Arc::new(provider), config());
     agent
         .run_turn(
             "review for security issues or unsafe unwraps. then disucss only",
@@ -1411,7 +1411,7 @@ async fn read_only_review_text_final_without_evidence_gets_inspection_nudge() {
         responses: Mutex::new(responses),
         modes: modes.clone(),
     };
-    let mut agent = Agent::new(Box::new(provider), config());
+    let mut agent = Agent::new(std::sync::Arc::new(provider), config());
     let mut ui = RecUi::default();
 
     agent
@@ -2493,7 +2493,7 @@ async fn read_only_review_generic_insufficient_after_read_gets_summary_repair() 
         responses: Mutex::new(responses),
         modes: modes.clone(),
     };
-    let mut agent = Agent::new(Box::new(provider), config());
+    let mut agent = Agent::new(std::sync::Arc::new(provider), config());
     let mut ui = RecUi::default();
 
     agent
@@ -2582,7 +2582,7 @@ async fn inspected_disclaimer_chat_attempts_do_not_share_unrelated_repair_budget
         responses: Mutex::new(responses),
         modes: modes.clone(),
     };
-    let mut agent = Agent::new(Box::new(provider), config());
+    let mut agent = Agent::new(std::sync::Arc::new(provider), config());
     let mut ui = RecUi::default();
 
     agent

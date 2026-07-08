@@ -360,7 +360,7 @@ async fn truncation_during_announced_edit_forces_next_tool_call() {
         responses: Mutex::new(responses),
         modes: modes.clone(),
     };
-    let mut agent = Agent::new(Box::new(provider), cfg);
+    let mut agent = Agent::new(std::sync::Arc::new(provider), cfg);
     let mut ui = RecUi::default();
     agent.run_turn("big task", &mut ui).await.unwrap();
 

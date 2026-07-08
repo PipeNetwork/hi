@@ -332,6 +332,10 @@ pub struct Profile {
     /// reusable technique into a learned skill. Defaults to off.
     #[serde(default)]
     pub curate_skills: Option<bool>,
+    /// Advertise the read-only `explore` subagent tool. Defaults to off (on for
+    /// the pipenetwork provider).
+    #[serde(default)]
+    pub explore_subagents: Option<bool>,
     /// Other profile names to fall back to, in order, when this one returns
     /// nothing or errors.
     pub fallback: Option<Vec<String>>,
@@ -400,6 +404,7 @@ pub struct Settings {
     pub compat: CompatMode,
     pub minimal_tools: bool,
     pub curate_skills: bool,
+    pub explore_subagents: bool,
     pub moa: hi_ai::MoaConfig,
 }
 
@@ -604,6 +609,8 @@ pub fn resolve(cli: &Cli, config: &Config, registry: &Registry) -> Result<Settin
         .unwrap_or_default();
     let minimal_tools = profile.and_then(|p| p.minimal_tools).unwrap_or(false);
     let curate_skills = curate_skills_default(provider, profile.and_then(|p| p.curate_skills));
+    let explore_subagents =
+        explore_subagents_default(provider, profile.and_then(|p| p.explore_subagents));
 
     Ok(Settings {
         provider,
@@ -618,6 +625,7 @@ pub fn resolve(cli: &Cli, config: &Config, registry: &Registry) -> Result<Settin
         compat,
         minimal_tools,
         curate_skills,
+        explore_subagents,
         moa: config.moa.clone(),
     })
 }
@@ -1179,6 +1187,7 @@ pub fn resolve_named_profile(config: &Config, name: &str, registry: &Registry) -
         compat: profile.compat.unwrap_or_default(),
         minimal_tools: profile.minimal_tools.unwrap_or(false),
         curate_skills: curate_skills_default(provider, profile.curate_skills),
+        explore_subagents: explore_subagents_default(provider, profile.explore_subagents),
         moa: config.moa.clone(),
     })
 }
@@ -1212,6 +1221,14 @@ fn curate_skills_default(provider: ProviderName, profile_value: Option<bool>) ->
     profile_value.unwrap_or(provider == ProviderName::Pipenetwork)
 }
 
+/// Whether the read-only `explore` subagent tool is advertised. An explicit
+/// `explore_subagents` in the profile always wins; otherwise on for the
+/// pipenetwork provider and off elsewhere — a spawn tool shouldn't be handed to
+/// weak local models that would misuse it.
+fn explore_subagents_default(provider: ProviderName, profile_value: Option<bool>) -> bool {
+    profile_value.unwrap_or(provider == ProviderName::Pipenetwork)
+}
+
 fn max_tokens_is_explicit(
     provider: ProviderName,
     cli_max_tokens: Option<u32>,
@@ -1235,7 +1252,8 @@ mod tests {
     use super::{
         Config, DEFAULT_MAX_TOKENS, LEGACY_PIPENETWORK_DEFAULT_MAX_TOKENS,
         PIPENETWORK_DEFAULT_MAX_TOKENS, Profile, ProviderName, configured_max_tokens,
-        curate_skills_default, detect_verify_pipeline, max_tokens_is_explicit, save_config_to,
+        curate_skills_default, detect_verify_pipeline, explore_subagents_default,
+        max_tokens_is_explicit, save_config_to,
     };
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -1344,6 +1362,18 @@ mod tests {
             Some(false)
         ));
         assert!(curate_skills_default(ProviderName::Openai, Some(true)));
+    }
+
+    #[test]
+    fn explore_subagents_default_on_for_pipenetwork_only() {
+        assert!(explore_subagents_default(ProviderName::Pipenetwork, None));
+        assert!(!explore_subagents_default(ProviderName::Openai, None));
+        assert!(!explore_subagents_default(ProviderName::Ollama, None));
+        assert!(!explore_subagents_default(
+            ProviderName::Pipenetwork,
+            Some(false)
+        ));
+        assert!(explore_subagents_default(ProviderName::Openai, Some(true)));
     }
 
     #[test]

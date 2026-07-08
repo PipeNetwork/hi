@@ -453,7 +453,9 @@ fn apply_plan_to_goal(goal: &mut Goal, arguments: &str) {
 }
 
 pub struct Agent {
-    pub(crate) provider: Box<dyn Provider>,
+    // `Arc` (not `Box`) so a read-only `explore` subagent can cheaply share the
+    // parent's provider (same HTTP client / connection pool) instead of rebuilding one.
+    pub(crate) provider: Arc<dyn Provider>,
     pub(crate) config: AgentConfig,
     /// Conversation history, shared with in-flight `ChatRequest`s via the
     /// `Arc` inside [`Transcript`]. Mutations go through the `Transcript` API
@@ -478,6 +480,10 @@ pub struct Agent {
     /// Count of skills auto-curated this session (verifier-gated). Capped per
     /// session by [`agent::MAX_AUTO_SKILLS_PER_SESSION`] to bound skill spam.
     pub(crate) auto_skills_written: u32,
+    /// Count of read-only `explore` subagents run this session. Capped per
+    /// session (see `MAX_EXPLORE_SUBAGENTS_PER_SESSION`) to bound cost if the
+    /// model over-delegates.
+    pub(crate) explore_subagents_used: u32,
     pub(crate) last_compat_fallbacks: Vec<String>,
     /// A shared interrupt flag. When set (by the UI on a user action like
     /// pressing Esc during a tool call), the agent skips the remaining tool

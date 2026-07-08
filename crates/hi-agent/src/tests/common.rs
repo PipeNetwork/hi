@@ -225,7 +225,7 @@ pub(crate) fn completion(content: Vec<Content>, input: u64, output: u64) -> Comp
 }
 
 pub(crate) fn agent(responses: Vec<Completion>, cfg: AgentConfig) -> Agent {
-    Agent::new(Box::new(Canned(Mutex::new(responses))), cfg)
+    Agent::new(std::sync::Arc::new(Canned(Mutex::new(responses))), cfg)
 }
 
 pub(crate) fn resumed_agent(
@@ -235,7 +235,7 @@ pub(crate) fn resumed_agent(
     cfg: AgentConfig,
 ) -> Agent {
     Agent::resume(
-        Box::new(Canned(Mutex::new(Vec::new()))),
+        std::sync::Arc::new(Canned(Mutex::new(Vec::new()))),
         cfg,
         history,
         usage,
@@ -255,7 +255,7 @@ pub(crate) fn scripted_agent(
         requests: requests.clone(),
         max_tokens: None,
     };
-    (Agent::new(Box::new(provider), cfg), requests)
+    (Agent::new(std::sync::Arc::new(provider), cfg), requests)
 }
 
 #[allow(clippy::type_complexity)]
@@ -274,7 +274,11 @@ pub(crate) fn scripted_agent_recording_max_tokens(
         requests: requests.clone(),
         max_tokens: Some(max_tokens.clone()),
     };
-    (Agent::new(Box::new(provider), cfg), requests, max_tokens)
+    (
+        Agent::new(std::sync::Arc::new(provider), cfg),
+        requests,
+        max_tokens,
+    )
 }
 
 pub(crate) static VERIFY_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =

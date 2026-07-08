@@ -262,7 +262,7 @@ async fn retry_uses_recovery_sampling() {
     };
     let mut cfg = config();
     cfg.temperature = Some(0.2);
-    let mut agent = Agent::new(Box::new(provider), cfg);
+    let mut agent = Agent::new(std::sync::Arc::new(provider), cfg);
     agent.run_turn("go", &mut NullUi).await.unwrap();
 
     let samples = samples.lock().unwrap();

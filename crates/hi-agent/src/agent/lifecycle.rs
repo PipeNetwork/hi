@@ -21,7 +21,7 @@ use crate::{SessionSink, TurnTelemetry, Ui, VerifyStage};
 
 impl crate::Agent {
     /// Start a fresh session seeded with the system prompt.
-    pub fn new(provider: Box<dyn Provider>, config: AgentConfig) -> Self {
+    pub fn new(provider: Arc<dyn Provider>, config: AgentConfig) -> Self {
         let system = SystemPrompt::new()
             .with_project_context(config.project_context.as_deref())
             .with_finalize(config.finalize)
@@ -33,7 +33,7 @@ impl crate::Agent {
     /// prompt). The loaded messages are treated as already persisted.
     #[allow(clippy::too_many_arguments)]
     pub fn resume(
-        provider: Box<dyn Provider>,
+        provider: Arc<dyn Provider>,
         config: AgentConfig,
         history: Vec<Message>,
         usage: Usage,
@@ -61,7 +61,7 @@ impl crate::Agent {
     }
 
     fn with_messages(
-        provider: Box<dyn Provider>,
+        provider: Arc<dyn Provider>,
         config: AgentConfig,
         messages: Vec<Message>,
         persisted: usize,
@@ -101,6 +101,13 @@ impl crate::Agent {
         }
         let tools = if config.minimal_tools {
             hi_tools::MINIMAL_TOOL_SPECS.clone().into()
+        } else if config.explore_subagents {
+            // Advertise the read-only `explore` subagent tool alongside the full set.
+            // It's kept out of the global TOOL_SPECS so it only appears here, for a
+            // capable parent — and never for a read-only child (depth ≤ 1).
+            let mut specs = TOOL_SPECS.clone();
+            specs.push(hi_tools::explore_tool_spec());
+            specs.into()
         } else {
             TOOL_SPECS.clone().into()
         };
@@ -117,6 +124,7 @@ impl crate::Agent {
             checkpoints: Vec::new(),
             last_changed_files: Vec::new(),
             auto_skills_written: 0,
+            explore_subagents_used: 0,
             last_compat_fallbacks: Vec::new(),
             interrupt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_turn_telemetry: TurnTelemetry::default(),
@@ -168,6 +176,18 @@ impl crate::Agent {
             .rev()
             .find(|m| m.role == Role::User)
             .map(|m| m.text())
+    }
+
+    /// The text of the last assistant message, or `None`. Used to capture a
+    /// read-only `explore` subagent's final answer after its turn completes.
+    pub(crate) fn last_assistant_text(&self) -> Option<String> {
+        self.messages
+            .as_slice()
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Assistant)
+            .map(|m| m.text())
+            .filter(|t| !t.trim().is_empty())
     }
 
     /// Discard messages back to `len` — used to drop an interrupted turn so the
@@ -489,7 +509,7 @@ impl crate::Agent {
 
     /// Update the provider (endpoint + wire format + key) and model for subsequent
     /// turns. Used by `/provider` to use profiles mid-session. The caller
-    /// builds the new `Box<dyn Provider>` (e.g. Anthropic vs OpenAI adapter) and
+    /// builds the new `Arc<dyn Provider>` (e.g. Anthropic vs OpenAI adapter) and
     /// supplies a model id; pricing/context metadata is refreshed from the
     /// registry or the provider's live `/models` response.
     ///
@@ -499,7 +519,7 @@ impl crate::Agent {
     /// a different endpoint.
     pub fn set_provider(
         &mut self,
-        provider: Box<dyn Provider>,
+        provider: Arc<dyn Provider>,
         model: String,
         context_window: Option<u32>,
         requested_max_tokens: u32,

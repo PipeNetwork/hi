@@ -28,7 +28,7 @@ fn verified_turn_agent(response: &str, skills_dir: &std::path::Path) -> Agent {
     let mut cfg = config();
     cfg.curate_skills = true;
     Agent::resume(
-        Box::new(Canned(Mutex::new(vec![completion(
+        std::sync::Arc::new(Canned(Mutex::new(vec![completion(
             vec![Content::Text(response.to_string())],
             1,
             1,

@@ -85,6 +85,7 @@ pub async fn run() -> Result<Settings> {
         compat: hi_ai::CompatMode::Auto,
         minimal_tools: false,
         curate_skills: false,
+        explore_subagents: false,
         moa: hi_ai::MoaConfig::default(),
     })
 }

@@ -171,7 +171,8 @@ async fn main() -> Result<()> {
     let (session_path, loaded) = resolve_session(&cli)?;
 
     let fallbacks = config::resolve_fallbacks(&cli, &file, &registry);
-    let provider = build_chain(&settings, fallbacks);
+    // Arc so the agent can share it with read-only `explore` subagents.
+    let provider: std::sync::Arc<dyn Provider> = build_chain(&settings, fallbacks).into();
     let live_metadata = if settings.provider == ProviderName::Pipenetwork {
         resolve_live_model_metadata(provider.as_ref(), &registry, &settings.model).await
     } else {
@@ -193,6 +194,8 @@ async fn main() -> Result<()> {
         minimal_tools: settings.minimal_tools,
         // Env override lets you flip on skill auto-curation without editing a profile.
         curate_skills: settings.curate_skills || std::env::var_os("HI_CURATE_SKILLS").is_some(),
+        explore_subagents: settings.explore_subagents
+            || std::env::var_os("HI_EXPLORE_SUBAGENTS").is_some(),
         context_window: live_metadata.context_window,
         project_context: load_project_context(),
         verify: resolve_verify(&cli),
@@ -1134,6 +1137,7 @@ mod tests {
             compat: CompatMode::default(),
             minimal_tools: false,
             curate_skills: false,
+            explore_subagents: false,
             moa: hi_ai::MoaConfig::default(),
         }
     }
@@ -1152,6 +1156,7 @@ mod tests {
             compat: CompatMode::default(),
             minimal_tools: false,
             curate_skills: false,
+            explore_subagents: false,
             moa: hi_ai::MoaConfig::default(),
         }
     }

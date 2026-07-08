@@ -400,7 +400,8 @@ pub(crate) async fn repl(
                                 Ok(new_settings) => {
                                     let label = provider_label(new_settings.provider);
                                     let model = new_settings.model.clone();
-                                    let provider = crate::build_chain(&new_settings, Vec::new());
+                                    let provider: std::sync::Arc<dyn hi_ai::Provider> =
+                                        crate::build_chain(&new_settings, Vec::new()).into();
                                     let (_price, window) = registry.metadata(&model);
                                     agent.set_provider(
                                         provider,
@@ -600,7 +601,8 @@ async fn switch_to_mlx_profile(
     };
     config::upsert_profile_as_default(config, &run.profile_name, profile, &path)?;
     let settings = config::resolve_named_profile(config, &run.profile_name, registry)?;
-    let provider = crate::build_chain(&settings, Vec::new());
+    let provider: std::sync::Arc<dyn hi_ai::Provider> =
+        crate::build_chain(&settings, Vec::new()).into();
     let (_price, mut window) = registry.metadata(&settings.model);
     agent.set_provider(
         provider,
