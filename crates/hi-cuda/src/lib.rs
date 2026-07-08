@@ -20568,6 +20568,7 @@ mod tests {
             1,
             2,
             2,
+            0,
             &stream,
         )
         .unwrap();
@@ -20619,6 +20620,7 @@ mod tests {
             1,
             2,
             2,
+            0,
             &stream,
         )
         .unwrap();
@@ -20714,6 +20716,7 @@ mod tests {
             1,
             2,
             2,
+            0,
             &stream,
         )
         .unwrap();
@@ -20779,6 +20782,7 @@ mod tests {
             1,
             2,
             2,
+            0,
             &stream,
         )
         .unwrap();
@@ -20884,6 +20888,7 @@ mod tests {
                 1,
                 fast_wide_head_dim,
                 fast_wide_head_dim,
+                0,
                 &stream,
             )
             .unwrap();

@@ -340,6 +340,37 @@ __global__ void gelu_kernel(
   output[idx] = 0.5f * x * (1.0f + tanhf(inner));
 }
 
+// GeGLU: gelu(gate) * up, using the tanh gelu approximation (gelu_pytorch_tanh)
+// that Gemma uses. Mirrors silu_mul_kernel for SwiGLU models.
+__global__ void gelu_mul_kernel(
+    const float* gate,
+    const float* up,
+    float* output,
+    int len) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= len) {
+    return;
+  }
+  float x = gate[idx];
+  float inner = 0.7978845608028654f * (x + 0.044715f * x * x * x);
+  float gelu = 0.5f * x * (1.0f + tanhf(inner));
+  output[idx] = gelu * up[idx];
+}
+
+// Gemma logit soft-capping: cap * tanh(x / cap). Monotonic in x, so it never
+// changes a greedy argmax; it compresses the distribution for sampling.
+__global__ void softcap_kernel(
+    const float* input,
+    float* output,
+    int len,
+    float cap) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= len) {
+    return;
+  }
+  output[idx] = cap * tanhf(input[idx] / cap);
+}
+
 __global__ void add_kernel(
     const float* left,
     const float* right,
@@ -2429,7 +2460,8 @@ __global__ void tiled_causal_attention_kernel(
     int heads,
     int kv_heads,
     int qk_head_dim,
-    int v_head_dim) {
+    int v_head_dim,
+    int window) {
   int idx = blockIdx.x;
   int lane = threadIdx.x;
   int total = seq_len * heads;
@@ -2450,7 +2482,10 @@ __global__ void tiled_causal_attention_kernel(
   float acc = 0.0f;
   float max_score = -INFINITY;
   float denom = 0.0f;
-  for (int source = 0; source <= target; ++source) {
+  // Sliding-window (Gemma-3 local layers): only attend to the last `window` keys.
+  // window <= 0 means unlimited causal attention.
+  int source_start = (window > 0 && target >= window) ? target - window + 1 : 0;
+  for (int source = source_start; source <= target; ++source) {
     const float* k_vec = k + (source * kv_heads + kv_head) * qk_head_dim;
     float dot = 0.0f;
     for (int dim = lane; dim < qk_head_dim; dim += blockDim.x) {
@@ -2555,7 +2590,8 @@ __global__ void tiled_causal_attention_batched_kernel(
     int heads,
     int kv_heads,
     int qk_head_dim,
-    int v_head_dim) {
+    int v_head_dim,
+    int window) {
   int idx = blockIdx.x;
   int lane = threadIdx.x;
   int total = batch_count * seq_len * heads;
@@ -2578,7 +2614,8 @@ __global__ void tiled_causal_attention_batched_kernel(
   float acc = 0.0f;
   float max_score = -INFINITY;
   float denom = 0.0f;
-  for (int source = 0; source <= target; ++source) {
+  int source_start = (window > 0 && target >= window) ? target - window + 1 : 0;
+  for (int source = source_start; source <= target; ++source) {
     const float* k_vec = k + ((batch * seq_len + source) * kv_heads + kv_head) * qk_head_dim;
     float dot = 0.0f;
     for (int dim = lane; dim < qk_head_dim; dim += blockDim.x) {
@@ -2836,7 +2873,8 @@ __global__ void tiled_paged_decode_attention_kernel(
     int heads,
     int kv_heads,
     int qk_head_dim,
-    int v_head_dim) {
+    int v_head_dim,
+    int window) {
   int head = blockIdx.x;
   int lane = threadIdx.x;
   if (head >= heads || qk_head_dim > HI_CUDA_FLASH_MAX_HEAD_DIM ||
@@ -2854,7 +2892,10 @@ __global__ void tiled_paged_decode_attention_kernel(
   float acc = 0.0f;
   float max_score = -INFINITY;
   float denom = 0.0f;
-  for (int source = 0; source <= position; ++source) {
+  // Sliding-window (Gemma-3 local layers): only attend to the last `window`
+  // positions. window <= 0 means unlimited causal attention.
+  int source_start = (window > 0 && position >= window) ? position - window + 1 : 0;
+  for (int source = source_start; source <= position; ++source) {
     int logical_page = source / page_size;
     int page_offset = source - logical_page * page_size;
     float dot = 0.0f;
@@ -3160,7 +3201,8 @@ __global__ void tiled_paged_decode_attention_batched_kernel(
     int heads,
     int kv_heads,
     int qk_head_dim,
-    int v_head_dim) {
+    int v_head_dim,
+    int window) {
   int idx = blockIdx.x;
   int lane = threadIdx.x;
   int total = batch_count * heads;
@@ -3181,7 +3223,8 @@ __global__ void tiled_paged_decode_attention_batched_kernel(
   float acc = 0.0f;
   float max_score = -INFINITY;
   float denom = 0.0f;
-  for (int source = 0; source <= position; ++source) {
+  int source_start = (window > 0 && position >= window) ? position - window + 1 : 0;
+  for (int source = source_start; source <= position; ++source) {
     int logical_page = source / page_size;
     int page_offset = source - logical_page * page_size;
     float dot = 0.0f;
@@ -3239,7 +3282,8 @@ __global__ void tiled_paged_decode_attention_batched_positions_kernel(
     int heads,
     int kv_heads,
     int qk_head_dim,
-    int v_head_dim) {
+    int v_head_dim,
+    int window) {
   int idx = blockIdx.x;
   int lane = threadIdx.x;
   int total = batch_count * heads;
@@ -3261,7 +3305,8 @@ __global__ void tiled_paged_decode_attention_batched_positions_kernel(
   float acc = 0.0f;
   float max_score = -INFINITY;
   float denom = 0.0f;
-  for (int source = 0; source <= position; ++source) {
+  int source_start = (window > 0 && position >= window) ? position - window + 1 : 0;
+  for (int source = source_start; source <= position; ++source) {
     int logical_page = source / page_size;
     int page_offset = source - logical_page * page_size;
     float dot = 0.0f;
@@ -3884,6 +3929,52 @@ extern "C" int hi_cuda_launch_gelu(
       static_cast<const float*>(input),
       static_cast<float*>(output),
       len);
+  return 0;
+}
+
+extern "C" int hi_cuda_launch_gelu_mul(
+    const void* gate,
+    const void* up,
+    void* output,
+    int len,
+    void* stream) {
+  if (gate == nullptr || up == nullptr || output == nullptr ||
+      !valid_common(output, len) || stream == nullptr) {
+    return 1;
+  }
+  if (len == 0) {
+    return 0;
+  }
+  dim3 block(256);
+  dim3 grid((len + block.x - 1) / block.x);
+  gelu_mul_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const float*>(gate),
+      static_cast<const float*>(up),
+      static_cast<float*>(output),
+      len);
+  return 0;
+}
+
+extern "C" int hi_cuda_launch_softcap(
+    const void* input,
+    void* output,
+    int len,
+    float cap,
+    void* stream) {
+  if (input == nullptr || output == nullptr || !valid_common(output, len) ||
+      stream == nullptr || !(cap > 0.0f)) {
+    return 1;
+  }
+  if (len == 0) {
+    return 0;
+  }
+  dim3 block(256);
+  dim3 grid((len + block.x - 1) / block.x);
+  softcap_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const float*>(input),
+      static_cast<float*>(output),
+      len,
+      cap);
   return 0;
 }
 
@@ -4940,6 +5031,7 @@ extern "C" int hi_cuda_launch_tiled_causal_attention(
     int kv_heads,
     int qk_head_dim,
     int v_head_dim,
+    int window,
     void* stream) {
   if (q == nullptr || k == nullptr || v == nullptr || output == nullptr ||
       seq_len < 0 || heads <= 0 || kv_heads <= 0 || qk_head_dim <= 0 ||
@@ -4964,7 +5056,8 @@ extern "C" int hi_cuda_launch_tiled_causal_attention(
       heads,
       kv_heads,
       qk_head_dim,
-      v_head_dim);
+      v_head_dim,
+      window);
   return 0;
 }
 
@@ -5015,6 +5108,7 @@ extern "C" int hi_cuda_launch_tiled_causal_attention_batched(
     int kv_heads,
     int qk_head_dim,
     int v_head_dim,
+    int window,
     void* stream) {
   if (q == nullptr || k == nullptr || v == nullptr || output == nullptr ||
       batch_count <= 0 || seq_len <= 0 || heads <= 0 || kv_heads <= 0 ||
@@ -5037,7 +5131,8 @@ extern "C" int hi_cuda_launch_tiled_causal_attention_batched(
       heads,
       kv_heads,
       qk_head_dim,
-      v_head_dim);
+      v_head_dim,
+      window);
   return 0;
 }
 
@@ -5308,6 +5403,7 @@ extern "C" int hi_cuda_launch_tiled_paged_decode_attention(
     int kv_heads,
     int qk_head_dim,
     int v_head_dim,
+    int window,
     void* stream) {
   if (q == nullptr || k_pages == nullptr || v_pages == nullptr ||
       page_table == nullptr || output == nullptr || position < 0 ||
@@ -5334,7 +5430,8 @@ extern "C" int hi_cuda_launch_tiled_paged_decode_attention(
       heads,
       kv_heads,
       qk_head_dim,
-      v_head_dim);
+      v_head_dim,
+      window);
   return 0;
 }
 
@@ -5516,6 +5613,7 @@ extern "C" int hi_cuda_launch_tiled_paged_decode_attention_batched(
     int kv_heads,
     int qk_head_dim,
     int v_head_dim,
+    int window,
     void* stream) {
   if (q == nullptr || k_pages == nullptr || v_pages == nullptr ||
       page_table == nullptr || output == nullptr || batch_count <= 0 ||
@@ -5543,7 +5641,8 @@ extern "C" int hi_cuda_launch_tiled_paged_decode_attention_batched(
       heads,
       kv_heads,
       qk_head_dim,
-	      v_head_dim);
+	      v_head_dim,
+      window);
 	  return 0;
 	}
 
@@ -5561,6 +5660,7 @@ extern "C" int hi_cuda_launch_tiled_paged_decode_attention_batched_positions(
     int kv_heads,
     int qk_head_dim,
     int v_head_dim,
+    int window,
     void* stream) {
   if (q == nullptr || k_pages == nullptr || v_pages == nullptr ||
       page_table == nullptr || positions == nullptr || output == nullptr ||
@@ -5587,7 +5687,8 @@ extern "C" int hi_cuda_launch_tiled_paged_decode_attention_batched_positions(
       heads,
       kv_heads,
       qk_head_dim,
-      v_head_dim);
+      v_head_dim,
+      window);
   return 0;
 }
 

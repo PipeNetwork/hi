@@ -1164,6 +1164,9 @@ pub struct QwenGgufConfig {
     pub attention_head_count_kv: u32,
     pub attention_key_length: Option<u32>,
     pub attention_value_length: Option<u32>,
+    /// Sliding-window size for local attention layers (Gemma-2/3). Gemma-3
+    /// interleaves local (windowed) and global (full) attention layers.
+    pub attention_sliding_window: Option<u32>,
     pub attention_q_lora_rank: Option<u32>,
     pub attention_kv_lora_rank: Option<u32>,
     pub attention_qk_rope_head_dim: Option<u32>,
@@ -1187,6 +1190,13 @@ pub struct QwenGgufConfig {
     pub rope_freq_scale: Option<f32>,
     pub rope_dimension_sections: Option<[u32; 4]>,
     pub rms_norm_eps: Option<f32>,
+    /// Gemma-2 attention logit soft-cap (`cap * tanh(score/cap)` on the QK^T
+    /// scores). In practice the scaled scores sit far inside the cap, so this is
+    /// effectively a no-op for coherence; kept for metadata completeness.
+    pub attn_logit_softcapping: Option<f32>,
+    /// Gemma-2 final logit soft-cap applied to the lm_head output. Monotonic, so
+    /// it does not change greedy argmax but compresses the sampling distribution.
+    pub final_logit_softcapping: Option<f32>,
     pub vocab_size: Option<u32>,
     pub eos_token_id: Option<u32>,
     pub bos_token_id: Option<u32>,
@@ -1215,6 +1225,8 @@ impl QwenGgufConfig {
         let attention_head_count = gguf.required_u32(&format!("{prefix}.attention.head_count"))?;
         let attention_key_length = gguf.metadata_u32(&format!("{prefix}.attention.key_length"));
         let attention_value_length = gguf.metadata_u32(&format!("{prefix}.attention.value_length"));
+        let attention_sliding_window =
+            gguf.metadata_u32(&format!("{prefix}.attention.sliding_window"));
         let attention_q_lora_rank = gguf.metadata_u32(&format!("{prefix}.attention.q_lora_rank"));
         let attention_kv_lora_rank = gguf.metadata_u32(&format!("{prefix}.attention.kv_lora_rank"));
         let attention_qk_rope_head_dim =
@@ -1309,6 +1321,7 @@ impl QwenGgufConfig {
             attention_head_count_kv,
             attention_key_length,
             attention_value_length,
+            attention_sliding_window,
             attention_q_lora_rank,
             attention_kv_lora_rank,
             attention_qk_rope_head_dim,
@@ -1335,6 +1348,10 @@ impl QwenGgufConfig {
             rope_freq_scale: gguf.metadata_f32(&format!("{prefix}.rope.freq_scale")),
             rope_dimension_sections,
             rms_norm_eps: gguf.metadata_f32(&format!("{prefix}.attention.layer_norm_rms_epsilon")),
+            attn_logit_softcapping: gguf
+                .metadata_f32(&format!("{prefix}.attn_logit_softcapping")),
+            final_logit_softcapping: gguf
+                .metadata_f32(&format!("{prefix}.final_logit_softcapping")),
             vocab_size,
             eos_token_id: gguf.metadata_u32("tokenizer.ggml.eos_token_id"),
             bos_token_id: gguf.metadata_u32("tokenizer.ggml.bos_token_id"),
@@ -1342,6 +1359,20 @@ impl QwenGgufConfig {
             tensor_dtypes,
             total_tensor_bytes,
         })
+    }
+
+    /// Gemma family (Gemma-1/2/3). Gemma scales token embeddings by sqrt(hidden),
+    /// uses a GeGLU MLP, and (Gemma-2+) adds post-attention/post-FFN norms and
+    /// (Gemma-2) logit soft-capping — all handled specially by the CUDA forward pass.
+    pub fn is_gemma(&self) -> bool {
+        matches!(self.family, ModelFamily::Gemma)
+    }
+
+    /// Gemma-3 specifically. Gemma-3 interleaves local (sliding-window) and global
+    /// (full) attention layers that use *different* RoPE bases (local 10000, global
+    /// `rope.freq_base`), which the CUDA forward pass applies per layer.
+    pub fn is_gemma3(&self) -> bool {
+        self.architecture == "gemma3"
     }
 
     pub fn quantization_label(&self) -> String {
@@ -4374,6 +4405,7 @@ fn dense_packed_ffn_name(
     for prefix in layer_prefix_variants(prefix) {
         let gate_name = format!("{prefix}.ffn_gate.weight");
         let up_name = format!("{prefix}.ffn_up.weight");
+        // Fused gate+up stored under `ffn_gate` (2x width) with no separate `ffn_up`.
         if !tensors.contains_key(up_name.as_str())
             && tensor_matches_matrix_rules(
                 tensors.get(gate_name.as_str()).copied(),
@@ -4382,6 +4414,17 @@ fn dense_packed_ffn_name(
             )
         {
             return Some(gate_name);
+        }
+        // Fused gate+up stored under `ffn_up` (2x width) with no separate `ffn_gate` —
+        // the llama.cpp layout for Phi-3 and similar SwiGLU models.
+        if !tensors.contains_key(gate_name.as_str())
+            && tensor_matches_matrix_rules(
+                tensors.get(up_name.as_str()).copied(),
+                embed,
+                packed_rows,
+            )
+        {
+            return Some(up_name);
         }
     }
     None
@@ -6289,6 +6332,49 @@ fn encode_byte_level_text(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| encoder[*byte as usize]).collect()
 }
 
+/// Decode a byte buffer that a tokenizer reconstructed from byte-fallback or
+/// byte-level tokens, without failing on incomplete UTF-8.
+///
+/// A multi-byte character is often emitted across several tokens, so a partial
+/// tail is expected mid-stream (the server re-decodes the whole token list each
+/// step and diffs for the delta) and also occurs when generation is cut off
+/// mid-character at `max_tokens`. A trailing sequence that is a valid *prefix* of
+/// a UTF-8 character is dropped — during streaming it reappears once its
+/// continuation bytes arrive, and for a truncated final response the partial
+/// character is correctly omitted. Genuinely invalid bytes become U+FFFD, matching
+/// how reference detokenizers (llama.cpp, HF tokenizers) behave, rather than
+/// failing the whole request.
+fn decode_tokenizer_bytes_lenient(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    let mut rest = bytes;
+    loop {
+        match std::str::from_utf8(rest) {
+            Ok(valid) => {
+                out.push_str(valid);
+                break;
+            }
+            Err(error) => {
+                let valid_up_to = error.valid_up_to();
+                out.push_str(
+                    std::str::from_utf8(&rest[..valid_up_to])
+                        .expect("bytes up to valid_up_to are valid UTF-8"),
+                );
+                match error.error_len() {
+                    // Genuinely invalid bytes: emit a replacement and skip them.
+                    Some(invalid_len) => {
+                        out.push('\u{FFFD}');
+                        rest = &rest[valid_up_to + invalid_len..];
+                    }
+                    // Incomplete trailing sequence: drop it (completed by a later
+                    // token during streaming, or cut off at max_tokens).
+                    None => break,
+                }
+            }
+        }
+    }
+    out
+}
+
 fn decode_byte_level_text(text: &str) -> Result<String> {
     let decoder = byte_decoder();
     let mut bytes = Vec::with_capacity(text.len());
@@ -6300,7 +6386,7 @@ fn decode_byte_level_text(text: &str) -> Result<String> {
             bytes.extend_from_slice(ch.encode_utf8(&mut buffer).as_bytes());
         }
     }
-    String::from_utf8(bytes).context("byte-level GGUF tokenizer produced invalid UTF-8")
+    Ok(decode_tokenizer_bytes_lenient(&bytes))
 }
 
 fn sentencepiece_normalize(text: &str) -> String {
@@ -6328,27 +6414,22 @@ fn decode_sentencepiece_text(text: &str) -> Result<String> {
             continue;
         }
         if !bytes.is_empty() {
-            let decoded = String::from_utf8(std::mem::take(&mut bytes))
-                .context("sentencepiece byte fallback produced invalid UTF-8")?;
-            out.push_str(&decoded);
+            out.push_str(&decode_tokenizer_bytes_lenient(&std::mem::take(&mut bytes)));
         }
         let ch = remaining
             .chars()
             .next()
             .expect("remaining string is non-empty");
-        if ch == '\u{2581}' {
-            out.push(' ');
-        } else {
-            out.push(ch);
-        }
+        out.push(ch);
         offset += ch.len_utf8();
     }
     if !bytes.is_empty() {
-        let decoded = String::from_utf8(bytes)
-            .context("sentencepiece byte fallback produced invalid UTF-8")?;
-        out.push_str(&decoded);
+        out.push_str(&decode_tokenizer_bytes_lenient(&bytes));
     }
-    Ok(out)
+    // The SentencePiece space marker ▁ (U+2581) denotes a space in detokenized
+    // output, whether it came from a normal token piece or from byte-fallback
+    // tokens (some models emit U+2581 itself via byte fallback).
+    Ok(out.replace('\u{2581}', " "))
 }
 
 fn byte_fallback_value(token: &str) -> Option<u8> {
@@ -6408,6 +6489,50 @@ mod tests {
     use super::*;
 
     const LLAMA3_CHAT_TEMPLATE: &str = "{{ bos_token }}{% for message in messages %}<|start_header_id|>{{ message['role'] }}<|end_header_id|>\n\n{{ message['content'] }}<|eot_id|>{% endfor %}{% if add_generation_prompt %}<|start_header_id|>assistant<|end_header_id|>\n\n{% endif %}";
+
+    #[test]
+    fn lenient_byte_decode_keeps_complete_and_drops_partial_utf8() {
+        // Complete 3-byte character (U+2019 RIGHT SINGLE QUOTATION MARK).
+        assert_eq!(decode_tokenizer_bytes_lenient(&[0xE2, 0x80, 0x99]), "’");
+        // Incomplete trailing sequence is dropped rather than erroring — it is
+        // completed by a later token during streaming (or was cut off at max_tokens).
+        assert_eq!(decode_tokenizer_bytes_lenient(&[0x41, 0xE2, 0x80]), "A");
+        // A genuinely invalid byte in the middle becomes U+FFFD, decoding continues.
+        assert_eq!(decode_tokenizer_bytes_lenient(&[0x41, 0xFF, 0x42]), "A\u{FFFD}B");
+        assert_eq!(decode_tokenizer_bytes_lenient(b"plain ascii"), "plain ascii");
+    }
+
+    #[test]
+    fn sentencepiece_decode_tolerates_truncated_byte_fallback() {
+        // A full byte-fallback character round-trips (▁ becomes a space).
+        assert_eq!(
+            decode_sentencepiece_text("\u{2581}caf<0xC3><0xA9>").unwrap(),
+            " café"
+        );
+        // Cut off mid-character (only the lead byte of é): the partial char is
+        // dropped and the request no longer fails.
+        assert_eq!(
+            decode_sentencepiece_text("\u{2581}caf<0xC3>").unwrap(),
+            " caf"
+        );
+        // U+2581 emitted via byte-fallback tokens (0xE2 0x96 0x81) must render as a
+        // space, not leak the raw SentencePiece marker glyph into the output.
+        assert_eq!(
+            decode_sentencepiece_text("42<0xE2><0x96><0x81>The").unwrap(),
+            "42 The"
+        );
+    }
+
+    #[test]
+    fn byte_level_decode_tolerates_truncated_multibyte() {
+        // Byte-level tokens whose reconstructed bytes end mid-character must not
+        // error; the incomplete tail is dropped.
+        let encoded = encode_byte_level_text("é".as_bytes()); // two byte-tokens
+        let mut chars = encoded.chars();
+        let partial: String = std::iter::once(chars.next().unwrap()).collect();
+        assert_eq!(decode_byte_level_text(&partial).unwrap(), "");
+        assert_eq!(decode_byte_level_text(&encoded).unwrap(), "é");
+    }
 
     #[test]
     fn parses_header_metadata_tensor_table_and_qwen_config() {
@@ -7490,6 +7615,27 @@ mod tests {
     }
 
     #[test]
+    fn parses_gemma2_config_with_post_norms_and_softcapping() {
+        let path = tempfile_path("tiny-gemma2");
+        write_tiny_gemma2(&path);
+
+        let gguf = GgufFile::open(&path).unwrap();
+        let config = gguf.qwen_config().unwrap();
+        let validation = gguf.validate_qwen_tensors().unwrap();
+
+        assert_eq!(config.architecture, "gemma2");
+        assert_eq!(config.family, ModelFamily::Gemma);
+        assert!(config.is_gemma());
+        assert!(!config.is_gemma3());
+        assert_eq!(config.attention_sliding_window, Some(4096));
+        assert_eq!(config.attn_logit_softcapping, Some(50.0));
+        assert_eq!(config.final_logit_softcapping, Some(30.0));
+        assert!(validation.valid, "{:?}", validation.errors);
+        assert!(gguf.tensor("blk.0.post_attention_norm.weight").is_some());
+        assert!(gguf.tensor("blk.0.post_ffw_norm.weight").is_some());
+    }
+
+    #[test]
     fn parses_gemma_config_with_pre_feedforward_alias_tensor_layout() {
         let path = tempfile_path("tiny-gemma-pre-feedforward-aliases");
         write_tiny_gemma_pre_feedforward_aliases(&path);
@@ -7728,6 +7874,23 @@ mod tests {
         assert_eq!(config.architecture, "phi3");
         assert_eq!(config.family, ModelFamily::Phi);
         assert!(validation.valid, "{:?}", validation.errors);
+    }
+
+    #[test]
+    fn parses_phi_config_with_fused_ffn_up_layout() {
+        // llama.cpp stores Phi-3's SwiGLU gate+up fused under `ffn_up` at 2x width
+        // with no separate `ffn_gate`. It must validate as a packed FFN layout.
+        let path = tempfile_path("tiny-phi-fused-ffn-up");
+        write_tiny_phi_fused_ffn_up(&path);
+
+        let gguf = GgufFile::open(&path).unwrap();
+        let config = gguf.qwen_config().unwrap();
+        let validation = gguf.validate_qwen_tensors().unwrap();
+
+        assert_eq!(config.architecture, "phi3");
+        assert_eq!(config.family, ModelFamily::Phi);
+        assert!(validation.valid, "{:?}", validation.errors);
+        assert!(gguf.tensor("blk.0.ffn_gate.weight").is_none());
     }
 
     #[test]
@@ -11807,6 +11970,72 @@ mod tests {
         fs::write(path, bytes).unwrap();
     }
 
+    fn write_tiny_gemma2(path: &Path) {
+        // Gemma-2 layout: post-attention + post-FFN norms and logit soft-capping.
+        let tensor_specs = [
+            ("token_embd.weight", vec![4, 2]),
+            ("output_norm.weight", vec![4]),
+            ("blk.0.attn_norm.weight", vec![4]),
+            ("blk.0.ffn_norm.weight", vec![4]),
+            ("blk.0.post_attention_norm.weight", vec![4]),
+            ("blk.0.post_ffw_norm.weight", vec![4]),
+            ("blk.0.attn_q.weight", vec![4, 4]),
+            ("blk.0.attn_k.weight", vec![4, 4]),
+            ("blk.0.attn_v.weight", vec![4, 4]),
+            ("blk.0.attn_output.weight", vec![4, 4]),
+            ("blk.0.ffn_gate.weight", vec![4, 8]),
+            ("blk.0.ffn_up.weight", vec![4, 8]),
+            ("blk.0.ffn_down.weight", vec![8, 4]),
+        ];
+        let mut data = Vec::new();
+        let tensor_specs = tensor_specs
+            .into_iter()
+            .map(|(name, dims)| {
+                pad_to_alignment(&mut data, 32);
+                let offset = data.len() as u64;
+                let elements = dims.iter().product::<u64>();
+                data.extend(vec![0; elements as usize * 2]);
+                (name, dims, offset)
+            })
+            .collect::<Vec<_>>();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        write_u32(&mut bytes, 3);
+        write_u64(&mut bytes, tensor_specs.len() as u64);
+        write_u64(&mut bytes, 15);
+
+        write_kv_string(&mut bytes, "general.architecture", "gemma2");
+        write_kv_string(&mut bytes, "general.name", "tiny-gemma2");
+        write_kv_u32(&mut bytes, "general.alignment", 32);
+        write_kv_u32(&mut bytes, "general.file_type", 1);
+        write_kv_u32(&mut bytes, "gemma2.context_length", 16);
+        write_kv_u32(&mut bytes, "gemma2.embedding_length", 4);
+        write_kv_u32(&mut bytes, "gemma2.feed_forward_length", 8);
+        write_kv_u32(&mut bytes, "gemma2.block_count", 1);
+        write_kv_u32(&mut bytes, "gemma2.attention.head_count", 1);
+        write_kv_u32(&mut bytes, "gemma2.attention.head_count_kv", 1);
+        write_kv_u32(&mut bytes, "gemma2.attention.sliding_window", 4096);
+        write_kv_f32(&mut bytes, "gemma2.attn_logit_softcapping", 50.0);
+        write_kv_f32(&mut bytes, "gemma2.final_logit_softcapping", 30.0);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.eos_token_id", 1);
+        write_kv_string_array(&mut bytes, "tokenizer.ggml.tokens", &["hello", "world"]);
+
+        for (name, dims, offset) in tensor_specs {
+            write_string(&mut bytes, name);
+            write_u32(&mut bytes, dims.len() as u32);
+            for dim in dims {
+                write_u64(&mut bytes, dim);
+            }
+            write_u32(&mut bytes, 1);
+            write_u64(&mut bytes, offset);
+        }
+
+        pad_to_alignment(&mut bytes, 32);
+        bytes.extend(data);
+        fs::write(path, bytes).unwrap();
+    }
+
     fn write_tiny_phi(path: &Path) {
         let tensor_specs = [
             ("token_embd.weight", vec![4, 2]),
@@ -11896,6 +12125,22 @@ mod tests {
             ("blk.0.attn_qkv.weight", vec![4, 12]),
             ("blk.0.attn_output.weight", vec![4, 4]),
             ("blk.0.ffn_up_gate.weight", vec![4, 16]),
+            ("blk.0.ffn_down.weight", vec![8, 4]),
+        ];
+        write_tiny_phi_with_tensors(path, &tensor_specs);
+    }
+
+    fn write_tiny_phi_fused_ffn_up(path: &Path) {
+        // Fused gate+up under `ffn_up` at 2x width (16 = 2 * ff where ff = 8),
+        // no separate `ffn_gate` — the llama.cpp Phi-3 layout.
+        let tensor_specs = [
+            ("token_embd.weight", vec![4, 2]),
+            ("output_norm.weight", vec![4]),
+            ("blk.0.attn_norm.weight", vec![4]),
+            ("blk.0.ffn_norm.weight", vec![4]),
+            ("blk.0.attn_qkv.weight", vec![4, 12]),
+            ("blk.0.attn_output.weight", vec![4, 4]),
+            ("blk.0.ffn_up.weight", vec![4, 16]),
             ("blk.0.ffn_down.weight", vec![8, 4]),
         ];
         write_tiny_phi_with_tensors(path, &tensor_specs);

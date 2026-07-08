@@ -1937,7 +1937,11 @@ fn dense_packed_ffn_source(
                 .into_iter()
                 .map(|name| (name, false)),
         )
-        .chain(std::iter::once((format!("{prefix}.ffn_gate.weight"), true)));
+        .chain(std::iter::once((format!("{prefix}.ffn_gate.weight"), true)))
+        // Fused gate+up stored under `ffn_up` at 2x width (llama.cpp Phi-3 layout);
+        // gate is the first half. Only matches when the shape is [2*ff, embed], so a
+        // plain `ffn_up` (ff rows) is skipped and handled by the separate-tensor path.
+        .chain(std::iter::once((format!("{prefix}.ffn_up.weight"), true)));
     for (name, gate_first) in aliases {
         let Some(_) = gguf.tensor(&name) else {
             continue;
