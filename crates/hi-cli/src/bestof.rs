@@ -57,6 +57,10 @@ pub fn run(opts: &BestOf) -> Result<()> {
     );
     let cleanup_paths: Vec<PathBuf> = worktrees.iter().map(|(_, wt, _)| wt.clone()).collect();
 
+    // Durable artifacts dir (survives worktree teardown) for per-candidate reports/logs.
+    let art_dir = artifacts_dir();
+    let _ = std::fs::create_dir_all(&art_dir);
+
     // Spawn all candidate threads at once so they run concurrently. Each thread
     // owns copies of the scalar settings (the borrowed `BestOf` can't cross the
     // thread boundary) and builds its own `BestOf` view over those locals.
@@ -72,6 +76,7 @@ pub fn run(opts: &BestOf) -> Result<()> {
             let prompt = opts.prompt.to_string();
             let max_steps = opts.max_steps;
             let max_verify = opts.max_verify;
+            let art_dir = art_dir.clone();
             std::thread::spawn(move || {
                 let thread_opts = BestOf {
                     exe: &exe,
@@ -85,8 +90,11 @@ pub fn run(opts: &BestOf) -> Result<()> {
                     max_steps,
                     max_verify,
                 };
+                let report_path = art_dir.join(format!("candidate-{i}.report.json"));
+                let log_path = art_dir.join(format!("candidate-{i}.log"));
                 let success =
-                    run_candidate(&thread_opts, &worktree, temperature).unwrap_or(false);
+                    run_candidate(&thread_opts, &worktree, temperature, &report_path, &log_path)
+                        .unwrap_or(false);
                 println!(
                     "\x1b[36m── candidate {}/{} (temp {temperature:.1}) finished ─────────────────\x1b[0m",
                     i + 1,
@@ -170,15 +178,28 @@ pub fn run(opts: &BestOf) -> Result<()> {
         }
     };
 
-    // Clean up every worktree we created.
+    // Clean up every worktree we created (the artifacts dir is separate and kept).
     cleanup(&cleanup_paths);
+    print_candidate_summary(&art_dir, total);
     result
 }
 
-/// Run one candidate `hi` in its worktree, with its own verify-loop. Returns
-/// whether the candidate process itself completed successfully.
-fn run_candidate(opts: &BestOf, worktree: &Path, temperature: f32) -> Result<bool> {
-    let status = Command::new(opts.exe)
+/// Run one candidate `hi` in its worktree, with its own verify-loop. Emits a
+/// machine-readable `--report` and captures the candidate's console output to a
+/// log — both under the durable artifacts dir, so the parallel run stays
+/// inspectable after the worktrees are torn down. Returns whether the candidate
+/// process itself completed successfully.
+fn run_candidate(
+    opts: &BestOf,
+    worktree: &Path,
+    temperature: f32,
+    report_path: &Path,
+    log_path: &Path,
+) -> Result<bool> {
+    // `--report` needs an absolute path: the child runs in the worktree (which is
+    // deleted at cleanup), and the artifacts dir lives outside it.
+    let report = report_path.to_string_lossy().into_owned();
+    let output = Command::new(opts.exe)
         .current_dir(worktree)
         .env("HI_API_KEY", opts.api_key)
         .args([
@@ -195,6 +216,8 @@ fn run_candidate(opts: &BestOf, worktree: &Path, temperature: f32) -> Result<boo
             &temperature.to_string(),
             "--max-verify",
             &opts.max_verify.to_string(),
+            "--report",
+            &report,
         ])
         .args(
             opts.max_steps
@@ -202,9 +225,60 @@ fn run_candidate(opts: &BestOf, worktree: &Path, temperature: f32) -> Result<boo
                 .unwrap_or_default(),
         )
         .arg(opts.prompt)
-        .status()
+        .output()
         .context("failed to launch candidate hi")?;
-    Ok(status.success())
+    // Persist stdout+stderr next to the report. Capturing (vs. inheriting) also
+    // fixes the interleaved-output problem when N candidates run in parallel.
+    if let Some(parent) = log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut log = output.stdout;
+    log.extend_from_slice(&output.stderr);
+    let _ = std::fs::write(log_path, &log);
+    Ok(output.status.success())
+}
+
+/// Durable, project-scoped home for best-of candidate artifacts: a `bestof/<pid>`
+/// sibling of the session store (so it survives worktree teardown, and is
+/// discoverable per project). Falls back to a temp dir if the data root can't be
+/// resolved.
+fn artifacts_dir() -> PathBuf {
+    let pid = std::process::id();
+    crate::session::sessions_dir()
+        .and_then(|dir| dir.parent().map(Path::to_path_buf))
+        .map(|root| root.join("bestof").join(pid.to_string()))
+        .unwrap_or_else(|| std::env::temp_dir().join(format!("hi-bestof-{pid}-artifacts")))
+}
+
+/// Print a one-line-per-candidate summary read back from the reports, so the
+/// parallel run is "explicit and inspectable" without opening each file.
+fn print_candidate_summary(art_dir: &Path, count: u32) {
+    println!(
+        "\x1b[36m── candidate artifacts: {} ──────────────────\x1b[0m",
+        art_dir.display()
+    );
+    for i in 0..count {
+        let report = art_dir.join(format!("candidate-{i}.report.json"));
+        let line = std::fs::read_to_string(&report)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .map(|json| {
+                let verified = json.get("verify_passed").and_then(|v| v.as_bool());
+                let tokens = json.get("total_tokens").and_then(|v| v.as_u64());
+                let files = json
+                    .get("changed_files")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len());
+                format!(
+                    "verify={} · {} tokens · {} files changed",
+                    verified.map(|v| v.to_string()).unwrap_or("?".into()),
+                    tokens.map(|t| t.to_string()).unwrap_or("?".into()),
+                    files.map(|f| f.to_string()).unwrap_or("?".into()),
+                )
+            })
+            .unwrap_or_else(|| "(no report)".to_string());
+        println!("   candidate {}/{}: {line}", i + 1, count);
+    }
 }
 
 /// Spread candidate temperatures across [0.2, 1.0] for diversity.
@@ -346,9 +420,18 @@ mod tests {
             max_verify: 1,
         };
 
+        let tmp = std::env::temp_dir();
+        let report = tmp.join(format!("hi-bestof-test-{}.report.json", std::process::id()));
+        let log = tmp.join(format!("hi-bestof-test-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&log);
         assert!(
-            !run_candidate(&opts, Path::new("."), 0.2).expect("candidate command launches"),
+            !run_candidate(&opts, Path::new("."), 0.2, &report, &log)
+                .expect("candidate command launches"),
             "a failing candidate process must not be considered eligible to win"
         );
+        // Even a failed candidate leaves a durable (possibly empty) log — the run
+        // stays inspectable after the worktrees are gone.
+        assert!(log.exists(), "candidate log must be persisted");
+        let _ = std::fs::remove_file(&log);
     }
 }

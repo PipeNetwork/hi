@@ -5,6 +5,7 @@ pub(crate) use std::sync::Mutex;
 
 mod common;
 mod compaction;
+mod curate;
 mod decision;
 mod finalize;
 mod goal;

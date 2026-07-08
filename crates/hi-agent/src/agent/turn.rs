@@ -3010,6 +3010,18 @@ If the task is already complete, stop and give your final recap."
             ui,
         );
 
+        // Verifier-gated skill auto-curation: after a turn that PASSED verification
+        // and actually changed files, optionally distill a reusable technique into a
+        // learned skill. The ground-truth verifier is the gate (safe with weak local
+        // models); opt-in via `curate_skills`, and capped per session.
+        if self.config.curate_skills
+            && self.last_verify == Some(true)
+            && !self.last_changed_files.is_empty()
+            && self.auto_skills_written < super::MAX_AUTO_SKILLS_PER_SESSION
+        {
+            self.curate_turn_end(turn_start, ui).await;
+        }
+
         // Surface the files this turn changed, so the user sees what was touched
         // without needing /diff. Skipped for read-only/Q&A turns (empty list).
         // Emitted BEFORE the finalize recap so the recap is the last text the

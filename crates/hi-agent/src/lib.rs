@@ -475,6 +475,9 @@ pub struct Agent {
     pub(crate) checkpoints: Vec<String>,
     /// Files whose content or presence changed in the most recent turn.
     pub(crate) last_changed_files: Vec<String>,
+    /// Count of skills auto-curated this session (verifier-gated). Capped per
+    /// session by [`agent::MAX_AUTO_SKILLS_PER_SESSION`] to bound skill spam.
+    pub(crate) auto_skills_written: u32,
     pub(crate) last_compat_fallbacks: Vec<String>,
     /// A shared interrupt flag. When set (by the UI on a user action like
     /// pressing Esc during a tool call), the agent skips the remaining tool

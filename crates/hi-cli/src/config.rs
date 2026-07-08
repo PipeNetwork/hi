@@ -328,6 +328,10 @@ pub struct Profile {
     /// this restores usable tool-calling. Defaults to off.
     #[serde(default)]
     pub minimal_tools: Option<bool>,
+    /// Verifier-gated skill auto-curation: after a verified turn, distill a
+    /// reusable technique into a learned skill. Defaults to off.
+    #[serde(default)]
+    pub curate_skills: Option<bool>,
     /// Other profile names to fall back to, in order, when this one returns
     /// nothing or errors.
     pub fallback: Option<Vec<String>>,
@@ -395,6 +399,7 @@ pub struct Settings {
     pub tool_mode: ToolMode,
     pub compat: CompatMode,
     pub minimal_tools: bool,
+    pub curate_skills: bool,
     pub moa: hi_ai::MoaConfig,
 }
 
@@ -598,6 +603,7 @@ pub fn resolve(cli: &Cli, config: &Config, registry: &Registry) -> Result<Settin
         .or_else(|| profile.and_then(|p| p.compat))
         .unwrap_or_default();
     let minimal_tools = profile.and_then(|p| p.minimal_tools).unwrap_or(false);
+    let curate_skills = profile.and_then(|p| p.curate_skills).unwrap_or(false);
 
     Ok(Settings {
         provider,
@@ -611,6 +617,7 @@ pub fn resolve(cli: &Cli, config: &Config, registry: &Registry) -> Result<Settin
         tool_mode,
         compat,
         minimal_tools,
+        curate_skills,
         moa: config.moa.clone(),
     })
 }
@@ -1171,6 +1178,7 @@ pub fn resolve_named_profile(config: &Config, name: &str, registry: &Registry) -
         tool_mode: profile.tool_mode.unwrap_or_default(),
         compat: profile.compat.unwrap_or_default(),
         minimal_tools: profile.minimal_tools.unwrap_or(false),
+        curate_skills: profile.curate_skills.unwrap_or(false),
         moa: config.moa.clone(),
     })
 }

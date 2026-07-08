@@ -139,6 +139,12 @@ pub struct AgentConfig {
     /// over the full ~20-tool schema; the trimmed set restores usable
     /// tool-calling. Off by default; set per profile with `minimal_tools = true`.
     pub minimal_tools: bool,
+    /// Verifier-gated skill auto-curation: after a turn *passes verification*,
+    /// make one tool-free model call to distill any reusable technique from the
+    /// turn into a learned skill (`.hi/skills/<slug>/SKILL.md`). The verifier is
+    /// the gate, so a weak model can't poison the playbook. Off by default —
+    /// costs one extra model call per verified turn; opt in per profile or CLI.
+    pub curate_skills: bool,
 }
 
 impl Default for AgentConfig {
@@ -178,6 +184,7 @@ impl Default for AgentConfig {
             confirm_edits: false,
             lsp: false,
             minimal_tools: false,
+            curate_skills: false,
         }
     }
 }
