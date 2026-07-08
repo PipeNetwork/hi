@@ -469,7 +469,7 @@ PY
   # dots1), and native-template archs whose tool instruction is folded into a system turn (cohere2/phimoe).
   # The wiring also covers granite/exaone4 (verified on direct prompts) but their 1-2B matrix models are
   # too small to pass reliably at temp 0, so they're skipped here. Also skipped: gemma (small/format),
-  # smollm3 (tiny), seed_oss (reasons first), llama4 (native format) — the model emits an unparsed tool format.
+  # smollm3 (tiny), seed_oss (reasons first), llama4 (Scout-4bit mangles the JSON on some prompts), the model emits an unparsed/unreliable tool format.
   if ((run_tool)) && [[ " qwen2 qwen2_moe qwen3 qwen3_moe qwen3_5 qwen3_5_moe hy_v3 glm4 glm4_moe_lite glm_moe_dsa deepseek_v2 deepseek_v3 deepseek_v4 cohere2 phimoe olmoe ernie4_5_moe dots1 olmo2 gpt_oss " == *" $model_type "* ]]; then
     log "tool call"
     tool_payload="$(python3 - "$repo" "$TOOL_MAX_TOKENS" <<'PY'
