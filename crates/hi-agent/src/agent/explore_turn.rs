@@ -38,6 +38,13 @@ impl crate::Agent {
             );
         }
         self.explore_subagents_used += 1;
+        let n = self.explore_subagents_used;
+        // Prominent callout so the user clearly sees a nested agent run start.
+        let summary: String = task.chars().take(72).collect();
+        let ellipsis = if task.chars().count() > 72 { "…" } else { "" };
+        ui.subagent_note(&format!(
+            "↳ explore subagent {n}/{MAX_EXPLORE_SUBAGENTS_PER_SESSION}: {summary}{ellipsis}"
+        ));
 
         // A read-only, bounded child config derived from the parent's model/token
         // settings. `explore_subagents = false` + `ToolMode::ReadOnly` cap depth at 1.
@@ -69,18 +76,22 @@ impl crate::Agent {
 
         // Share the provider (Arc) — same HTTP client / connection pool, no rebuild.
         let mut child = crate::Agent::new(self.provider.clone(), child_config);
-        let mut child_ui = ExploreUi { parent: ui };
-        // `Box::pin` breaks the async-recursion cycle (`run_turn` → `handle_explore`
-        // → child `run_turn`) that would otherwise make the future infinitely sized.
-        let result =
+        // Scope the child UI (a reborrow of `ui`) so `ui` is free again for the
+        // completion callout below. `Box::pin` breaks the async-recursion cycle
+        // (`run_turn` → `handle_explore` → child `run_turn`) that would otherwise
+        // make the future infinitely sized.
+        let result = {
+            let mut child_ui = ExploreUi { parent: &mut *ui };
             match Box::pin(child.run_turn(&explore_child_prompt(&task), &mut child_ui)).await {
                 Ok(()) => child
                     .last_assistant_text()
                     .unwrap_or_else(|| "(the explore subagent produced no answer)".to_string()),
                 Err(err) => format!("explore subagent error: {err}"),
-            };
+            }
+        };
         // Fold the child's token usage into the parent's session totals.
         self.add_usage(child.totals().clone());
+        ui.subagent_note(&format!("↳ explore subagent {n} done"));
         result
     }
 }

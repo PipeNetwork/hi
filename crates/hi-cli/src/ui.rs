@@ -127,6 +127,13 @@ impl Ui for PlainUi {
         println!("\x1b[34m{text}\x1b[0m");
     }
 
+    fn subagent_note(&mut self, text: &str) {
+        self.begin_output();
+        // Bold magenta so a subagent delegation stands out from the cyan tool
+        // lines and blue status notes around it.
+        println!("\x1b[1;35m{text}\x1b[0m");
+    }
+
     fn plan(&mut self, steps: &[hi_agent::PlanStep]) {
         use hi_agent::PlanStatus;
         self.begin_output();

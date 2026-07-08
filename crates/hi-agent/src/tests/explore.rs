@@ -90,4 +90,11 @@ async fn explore_runs_child_and_returns_answer() {
         "the child's answer should be returned as the explore tool result; got {:?}",
         ui.tool_results
     );
+    // The prominent subagent callout fired (subagent_note falls back to status,
+    // which RecUi records).
+    assert!(
+        ui.statuses.iter().any(|s| s.contains("explore subagent")),
+        "expected a subagent callout in statuses; got {:?}",
+        ui.statuses
+    );
 }
