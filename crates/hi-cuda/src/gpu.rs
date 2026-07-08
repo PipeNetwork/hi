@@ -2745,6 +2745,21 @@ mod native {
     }
 
     impl CudaQwenGpuModel {
+        /// Barrier between two device ops on the model's (single) stream. Ops are
+        /// stream-ordered, so op N+1 already waits for op N without a host round-trip;
+        /// host reads go through the self-synchronizing `copy_to_host`; and intermediate
+        /// buffers free (a synchronizing `cudaFree`) at scope end. So these per-op host
+        /// syncs are redundant and just serialize the pipeline. Skipped unless
+        /// `HI_CUDA_OP_SYNC` is set (opt-in safety fallback to the old behavior).
+        fn op_barrier(&self) -> Result<()> {
+            use std::sync::OnceLock;
+            static FORCE_SYNC: OnceLock<bool> = OnceLock::new();
+            if *FORCE_SYNC.get_or_init(|| std::env::var("HI_CUDA_OP_SYNC").is_ok()) {
+                self.stream.synchronize()?;
+            }
+            Ok(())
+        }
+
         /// Start a fresh per-generation prefill/decode timing window.
         pub(crate) fn reset_generation_timing(&self) {
             self.generation_timing.set((0, 0, 0));
@@ -3009,7 +3024,7 @@ mod native {
                     matrix.rows,
                     matrix.cols,
                 )?;
-                self.stream.synchronize()?;
+                self.op_barrier()?;
                 return Ok(GpuF32Tensor {
                     rows: input.rows,
                     cols: matrix.rows,
@@ -3049,7 +3064,7 @@ mod native {
                 dtype,
                 dtype,
             )?;
-            self.stream.synchronize()?;
+            self.op_barrier()?;
             Ok(GpuF32Tensor {
                 rows: input.rows,
                 cols: matrix.rows,
@@ -3080,7 +3095,7 @@ mod native {
                 matrix.rows,
                 matrix.cols,
             )?;
-            self.stream.synchronize()?;
+            self.op_barrier()?;
             Ok(GpuF32Tensor {
                 rows: input.rows,
                 cols: matrix.rows,
@@ -3102,7 +3117,7 @@ mod native {
                 matrix.quant_type_id()?,
                 &self.stream,
             )?;
-            self.stream.synchronize()?;
+            self.op_barrier()?;
             Ok(output)
         }
 
@@ -3143,7 +3158,7 @@ mod native {
                         )?,
                         _ => unreachable!("matrix dtype was matched above"),
                     }
-                    self.stream.synchronize()?;
+                    self.op_barrier()?;
                     Ok(Some(output))
                 }
                 other => bail!(
@@ -3214,7 +3229,7 @@ mod native {
                 eps,
                 &self.stream,
             )?;
-            self.stream.synchronize()?;
+            self.op_barrier()?;
             output.copy_to_host(input.len())
         }
 
@@ -3249,7 +3264,7 @@ mod native {
                 eps,
                 &self.stream,
             )?;
-            self.stream.synchronize()?;
+            self.op_barrier()?;
             Ok(GpuF32Tensor {
                 rows: input.rows,
                 cols: input.cols,
@@ -3259,7 +3274,7 @@ mod native {
 
         pub fn embed_tokens_host(&self, token_ids: &[u32]) -> Result<Vec<f32>> {
             let tensor = self.embed_tokens_device(token_ids)?;
-            self.stream.synchronize()?;
+            self.op_barrier()?;
             tensor.copy_to_host()
         }
 
@@ -3370,7 +3385,7 @@ mod native {
                     embeddings.dtype.label()
                 ),
             }
-            self.stream.synchronize()?;
+            self.op_barrier()?;
             let tensor = GpuF32Tensor {
                 rows: token_ids.len(),
                 cols: embeddings.cols,
@@ -3411,13 +3426,13 @@ mod native {
 
         pub fn full_context_logits_host(&self, token_ids: &[u32]) -> Result<Vec<f32>> {
             let logits = self.full_context_logits_device(token_ids)?;
-            self.stream.synchronize()?;
+            self.op_barrier()?;
             logits.copy_to_host()
         }
 
         pub fn last_logits_host(&self, token_ids: &[u32]) -> Result<Vec<f32>> {
             let logits = self.full_context_logits_device(token_ids)?;
-            self.stream.synchronize()?;
+            self.op_barrier()?;
             let all = logits.copy_to_host()?;
             let start = (logits.rows - 1)
                 .checked_mul(logits.cols)
@@ -10949,7 +10964,7 @@ mod native {
             let mut cache = CudaKvCache::new(self.config.block_count, &dims, &self.stream)?;
             let _ = self.full_context_logits_device_with_cache(prefix, Some(&mut cache))?;
             let logits = self.decode_one_logits_device(token_id, prefix.len(), &mut cache)?;
-            self.stream.synchronize()?;
+            self.op_barrier()?;
             logits.copy_to_host()
         }
 
@@ -10974,7 +10989,7 @@ mod native {
                 CudaPagedKvCache::new(self.config.block_count, &dims, page_size, &self.stream)?;
             let _ = self.full_context_logits_device_with_paged_cache(prefix, &mut cache)?;
             let logits = self.decode_one_logits_paged_device(token_id, prefix.len(), &mut cache)?;
-            self.stream.synchronize()?;
+            self.op_barrier()?;
             logits.copy_to_host()
         }
 
@@ -10988,7 +11003,7 @@ mod native {
                 logits.cols,
                 &self.stream,
             )?;
-            self.stream.synchronize()?;
+            self.op_barrier()?;
             token
                 .copy_to_host::<u32>(1)?
                 .into_iter()
@@ -11036,7 +11051,7 @@ mod native {
                 sample,
                 &self.stream,
             )?;
-            self.stream.synchronize()?;
+            self.op_barrier()?;
             token
                 .copy_to_host::<u32>(1)?
                 .into_iter()
@@ -11083,7 +11098,7 @@ mod native {
                 sample,
                 &self.stream,
             )?;
-            self.stream.synchronize()?;
+            self.op_barrier()?;
             token
                 .copy_to_host::<u32>(1)?
                 .into_iter()
@@ -11113,7 +11128,7 @@ mod native {
                 logits.cols,
                 &self.stream,
             )?;
-            self.stream.synchronize()?;
+            self.op_barrier()?;
             tokens.copy_to_host(batch_count)
         }
 
@@ -11183,7 +11198,7 @@ mod native {
                 top_k,
                 &self.stream,
             )?;
-            self.stream.synchronize()?;
+            self.op_barrier()?;
             tokens.copy_to_host(batch_count)
         }
 
@@ -14077,7 +14092,7 @@ mod native {
                 eps,
                 &self.stream,
             )?;
-            self.stream.synchronize()?;
+            self.op_barrier()?;
             state.conv_len = state.conv_len.saturating_add(1).min(ssm.conv_kernel);
             state.conv_next = (state.conv_next + 1) % ssm.conv_kernel;
             let normed = GpuF32Tensor {
@@ -14387,7 +14402,7 @@ mod native {
                 normed.rows,
                 &self.stream,
             )?;
-            self.stream.synchronize()?;
+            self.op_barrier()?;
             let last_rows = GpuF32Tensor {
                 rows: batch_count,
                 cols,
@@ -14412,7 +14427,7 @@ mod native {
                 elements,
                 &self.stream,
             )?;
-            self.stream.synchronize()?;
+            self.op_barrier()?;
             Ok(GpuF32Tensor {
                 rows: left.rows,
                 cols: left.cols,
@@ -14446,7 +14461,7 @@ mod native {
                 input.cols,
                 &self.stream,
             )?;
-            self.stream.synchronize()?;
+            self.op_barrier()?;
             Ok(GpuF32Tensor {
                 rows: input.rows,
                 cols: input.cols,
@@ -14586,7 +14601,7 @@ mod native {
                     )?;
                 }
             }
-            self.stream.synchronize()?;
+            self.op_barrier()?;
             Ok(GpuF32Tensor {
                 rows: input.rows,
                 cols: input.cols,
@@ -14625,7 +14640,7 @@ mod native {
                 norm_topk,
                 &self.stream,
             )?;
-            self.stream.synchronize()?;
+            self.op_barrier()?;
             let ids = ids.copy_to_host::<u32>(route_count)?;
             let weights = weights.copy_to_host::<f32>(route_count)?;
             let mut routes = Vec::with_capacity(router.rows);
@@ -14688,7 +14703,7 @@ mod native {
                 eps,
                 &self.stream,
             )?;
-            self.stream.synchronize()?;
+            self.op_barrier()?;
             Ok(GpuF32Tensor {
                 rows: input.rows,
                 cols: input.cols,
@@ -14727,7 +14742,7 @@ mod native {
                 split_half,
                 &self.stream,
             )?;
-            self.stream.synchronize()
+            self.op_barrier()
         }
 
         fn apply_mrope_f32_device(
@@ -14764,7 +14779,7 @@ mod native {
                 split_half,
                 &self.stream,
             )?;
-            self.stream.synchronize()
+            self.op_barrier()
         }
 
         fn apply_rope_batched_f32_device(
@@ -14800,7 +14815,7 @@ mod native {
                 split_half,
                 &self.stream,
             )?;
-            self.stream.synchronize()
+            self.op_barrier()
         }
 
         #[allow(clippy::too_many_arguments)]
@@ -14837,7 +14852,7 @@ mod native {
                 split_half,
                 &self.stream,
             )?;
-            self.stream.synchronize()
+            self.op_barrier()
         }
 
         fn causal_attention_f32_device(
@@ -14902,7 +14917,7 @@ mod native {
                     &self.stream,
                 )?;
             }
-            self.stream.synchronize()?;
+            self.op_barrier()?;
             Ok(GpuF32Tensor {
                 rows: seq_len,
                 cols: heads * v_head_dim,
@@ -14987,7 +15002,7 @@ mod native {
                     &self.stream,
                 )?;
             }
-            self.stream.synchronize()?;
+            self.op_barrier()?;
             Ok(GpuF32Tensor {
                 rows: batch_count * seq_len,
                 cols: heads * v_head_dim,
@@ -15046,7 +15061,7 @@ mod native {
                     &self.stream,
                 )?;
             }
-            self.stream.synchronize()?;
+            self.op_barrier()?;
             Ok(GpuF32Tensor {
                 rows: 1,
                 cols: heads * v_head_dim,
@@ -15118,7 +15133,7 @@ mod native {
                     &self.stream,
                 )?;
             }
-            self.stream.synchronize()?;
+            self.op_barrier()?;
             Ok(GpuF32Tensor {
                 rows: 1,
                 cols: heads * v_head_dim,
@@ -15199,7 +15214,7 @@ mod native {
                     &self.stream,
                 )?;
             }
-            self.stream.synchronize()?;
+            self.op_barrier()?;
             Ok(GpuF32Tensor {
                 rows: batch_count,
                 cols: heads * v_head_dim,
@@ -15282,7 +15297,7 @@ mod native {
                     &self.stream,
                 )?;
             }
-            self.stream.synchronize()?;
+            self.op_barrier()?;
             Ok(GpuF32Tensor {
                 rows: batch_count,
                 cols: heads * v_head_dim,
@@ -15351,7 +15366,7 @@ mod native {
                     &self.stream,
                 )?;
             }
-            self.stream.synchronize()?;
+            self.op_barrier()?;
             Ok(GpuF32Tensor {
                 rows: batch_count,
                 cols: heads * v_head_dim,
@@ -15375,7 +15390,7 @@ mod native {
                 elements,
                 &self.stream,
             )?;
-            self.stream.synchronize()?;
+            self.op_barrier()?;
             Ok(GpuF32Tensor {
                 rows: gate.rows,
                 cols: gate.cols,
@@ -15401,7 +15416,7 @@ mod native {
                 elements,
                 &self.stream,
             )?;
-            self.stream.synchronize()?;
+            self.op_barrier()?;
             Ok(GpuF32Tensor {
                 rows: gate.rows,
                 cols: gate.cols,
@@ -15423,7 +15438,7 @@ mod native {
             let output = DeviceBuffer::alloc(elements * std::mem::size_of::<f32>())
                 .context("allocating CUDA final logit softcap output")?;
             crate::kernels::launch_softcap(&logits.buffer, &output, elements, cap, &self.stream)?;
-            self.stream.synchronize()?;
+            self.op_barrier()?;
             Ok(GpuF32Tensor {
                 rows: logits.rows,
                 cols: logits.cols,
@@ -15561,7 +15576,7 @@ mod native {
                 input.cols,
                 &self.stream,
             )?;
-            self.stream.synchronize()?;
+            self.op_barrier()?;
             Ok(GpuF32Tensor {
                 rows: 1,
                 cols: input.cols,
@@ -15604,7 +15619,7 @@ mod native {
                 scale,
                 &self.stream,
             )?;
-            self.stream.synchronize()
+            self.op_barrier()
         }
     }
 
