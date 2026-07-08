@@ -530,6 +530,10 @@ pub fn detect_family(model_type: &str, config: &Value) -> Option<ModelFamily> {
     ) {
         return Some(ModelFamily::Qwen2);
     }
+    // Post-norm Llama-likes (OLMo2 / EXAONE-4): per-head qk-norm; QwenBlock detects post-norm weights.
+    if matches!(model_type.as_str(), "exaone4" | "olmo2") {
+        return Some(ModelFamily::Qwen3);
+    }
     None
 }
 

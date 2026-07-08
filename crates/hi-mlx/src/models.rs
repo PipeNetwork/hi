@@ -1017,6 +1017,9 @@ mod native {
         rope_theta: f32,
         traditional_rope: bool,
         use_rope: bool,
+        // OLMo2 applies q/k RMSNorm to the full projection (dim = heads*head_dim) before reshape;
+        // Qwen3 applies it per-head (dim = head_dim) after reshape.
+        qk_norm_full: bool,
         cache: Cache,
     }
 
@@ -1055,6 +1058,10 @@ mod native {
                 rope_theta: config.rope_theta,
                 traditional_rope: config.family == ModelFamily::Qwen2,
                 use_rope,
+                qk_norm_full: arrays
+                    .get(&format!("{prefix}.q_norm.weight"))
+                    .map(|w| *w.shape().last().unwrap() > config.attention_head_dim() as i32)
+                    .unwrap_or(false),
                 cache: Cache::new(),
             })
         }
@@ -1062,19 +1069,27 @@ mod native {
         fn forward(&mut self, x: &Array) -> Result<Array> {
             let shape = x.shape();
             let (b, l) = (shape[0], shape[1]);
-            let mut q = self
-                .q_proj
-                .forward(x)?
-                .reshape(&[b, l, self.n_heads, self.head_dim])?;
-            let mut k = self
-                .k_proj
-                .forward(x)?
-                .reshape(&[b, l, self.n_kv_heads, self.head_dim])?;
-            if let Some(norm) = &self.q_norm {
-                q = norm.forward(&q)?;
+            let mut q = self.q_proj.forward(x)?;
+            let mut k = self.k_proj.forward(x)?;
+            // OLMo2: normalize the full projection before splitting into heads.
+            if self.qk_norm_full {
+                if let Some(norm) = &self.q_norm {
+                    q = norm.forward(&q)?;
+                }
+                if let Some(norm) = &self.k_norm {
+                    k = norm.forward(&k)?;
+                }
             }
-            if let Some(norm) = &self.k_norm {
-                k = norm.forward(&k)?;
+            let mut q = q.reshape(&[b, l, self.n_heads, self.head_dim])?;
+            let mut k = k.reshape(&[b, l, self.n_kv_heads, self.head_dim])?;
+            // Qwen3 / EXAONE-4: per-head qk-norm after reshape.
+            if !self.qk_norm_full {
+                if let Some(norm) = &self.q_norm {
+                    q = norm.forward(&q)?;
+                }
+                if let Some(norm) = &self.k_norm {
+                    k = norm.forward(&k)?;
+                }
             }
             q = q.transpose_axes(&[0, 2, 1, 3])?;
             k = k.transpose_axes(&[0, 2, 1, 3])?;
@@ -3617,11 +3632,15 @@ mod native {
     }
 
     struct QwenBlock {
-        input_layernorm: RmsNorm,
-        post_attention_layernorm: RmsNorm,
+        // Pre-norm: norm1 = input_layernorm (on x), norm2 = post_attention_layernorm (on mlp input).
+        // Post-norm (OLMo2/EXAONE-4): norm1 = post_attention_layernorm (on attn output), norm2 =
+        // post_feedforward_layernorm (on mlp output). Detected by the presence of the latter.
+        norm1: RmsNorm,
+        norm2: RmsNorm,
         attention: QwenAttention,
         ffn: QwenFfn,
         residual_multiplier: f32,
+        post_norm: bool,
     }
 
     impl QwenBlock {
@@ -3631,14 +3650,21 @@ mod native {
             config: &MlxModelConfig,
         ) -> Result<Self> {
             let prefix = format!("model.layers.{idx}");
+            let post_norm =
+                arrays.contains_key(&format!("{prefix}.post_feedforward_layernorm.weight"));
+            let (n1, n2) = if post_norm {
+                ("post_attention_layernorm", "post_feedforward_layernorm")
+            } else {
+                ("input_layernorm", "post_attention_layernorm")
+            };
             Ok(Self {
-                input_layernorm: RmsNorm::load(
-                    &format!("{prefix}.input_layernorm.weight"),
+                norm1: RmsNorm::load(
+                    &format!("{prefix}.{n1}.weight"),
                     arrays,
                     config.rms_norm_eps,
                 )?,
-                post_attention_layernorm: RmsNorm::load(
-                    &format!("{prefix}.post_attention_layernorm.weight"),
+                norm2: RmsNorm::load(
+                    &format!("{prefix}.{n2}.weight"),
                     arrays,
                     config.rms_norm_eps,
                 )?,
@@ -3655,17 +3681,25 @@ mod native {
                 )?,
                 ffn: QwenFfn::load(idx, arrays, config)?,
                 residual_multiplier: config.residual_multiplier,
+                post_norm,
             })
         }
 
         fn forward(&mut self, x: Array) -> Result<Array> {
             let m = self.residual_multiplier;
-            let r = self.attention.forward(&self.input_layernorm.forward(&x)?)?;
-            let h = if m != 1.0 { x + r * m } else { x + r };
-            let r = self
-                .ffn
-                .forward(&self.post_attention_layernorm.forward(&h)?)?;
-            Ok(if m != 1.0 { h + r * m } else { h + r })
+            let add = |a: Array, b: Array| if m != 1.0 { a + b * m } else { a + b };
+            if self.post_norm {
+                // norm applied to the sublayer output, then added to the residual.
+                let r = self.norm1.forward(&self.attention.forward(&x)?)?;
+                let h = add(x, r);
+                let r = self.norm2.forward(&self.ffn.forward(&h)?)?;
+                Ok(add(h, r))
+            } else {
+                let r = self.attention.forward(&self.norm1.forward(&x)?)?;
+                let h = add(x, r);
+                let r = self.ffn.forward(&self.norm2.forward(&h)?)?;
+                Ok(add(h, r))
+            }
         }
     }
 
