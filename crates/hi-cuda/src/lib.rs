@@ -533,7 +533,8 @@ impl CudaPagedKvCacheManager {
             .checked_mul(kv_heads)
             .and_then(|value| value.checked_mul(qk_head_dim.checked_add(v_head_dim)?))
             .and_then(|value| value.checked_mul(page_size))
-            .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+            // KV pages are stored as f16 (kv_t = __half in kernels.cu).
+            .and_then(|value| value.checked_mul(std::mem::size_of::<u16>()))
             .context("CUDA paged KV page byte count overflows usize")?;
         let bytes_total = bytes_per_page
             .checked_mul(pages_total)
@@ -9015,8 +9016,10 @@ mod tests {
         assert_eq!(snapshot.page_size, 16);
         assert_eq!(snapshot.pages_total, 16);
         assert_eq!(snapshot.pages_free, 16);
-        assert_eq!(snapshot.bytes_per_page, 256);
-        assert_eq!(snapshot.bytes_total, 4096);
+        // KV pages are f16 (2 bytes/element), so page/total bytes are half the
+        // f32 sizing.
+        assert_eq!(snapshot.bytes_per_page, 128);
+        assert_eq!(snapshot.bytes_total, 2048);
     }
 
     #[test]
@@ -20648,14 +20651,17 @@ mod tests {
         assert_close_vec(&cached_out.copy_to_host::<f32>(2).unwrap(), &[1.0, 1.0]);
 
         let page_table = DeviceBuffer::alloc(2 * std::mem::size_of::<u32>()).unwrap();
-        let paged_k = DeviceBuffer::alloc(4 * std::mem::size_of::<f32>()).unwrap();
-        let paged_v = DeviceBuffer::alloc(4 * std::mem::size_of::<f32>()).unwrap();
+        // KV pages are f16; queries and attention outputs stay f32.
+        let paged_k = DeviceBuffer::alloc(4 * std::mem::size_of::<u16>()).unwrap();
+        let paged_v = DeviceBuffer::alloc(4 * std::mem::size_of::<u16>()).unwrap();
         let paged_out = DeviceBuffer::alloc(2 * std::mem::size_of::<f32>()).unwrap();
         let flash_paged_out = DeviceBuffer::alloc(2 * std::mem::size_of::<f32>()).unwrap();
         let tiled_paged_out = DeviceBuffer::alloc(2 * std::mem::size_of::<f32>()).unwrap();
         page_table.copy_from_host(&[1u32, 0]).unwrap();
-        paged_k.copy_from_host(&[0.0f32; 4]).unwrap();
-        paged_v.copy_from_host(&[0.0f32, 2.0, 2.0, 0.0]).unwrap();
+        paged_k.copy_from_host(&[0.0f32; 4].map(f16_bits)).unwrap();
+        paged_v
+            .copy_from_host(&[0.0f32, 2.0, 2.0, 0.0].map(f16_bits))
+            .unwrap();
         crate::kernels::launch_paged_decode_attention(
             &q,
             &paged_k,
@@ -20717,9 +20723,9 @@ mod tests {
 
         let ragged_positions = DeviceBuffer::alloc(2 * std::mem::size_of::<u32>()).unwrap();
         let ragged_page_table = DeviceBuffer::alloc(6 * std::mem::size_of::<u32>()).unwrap();
-        let ragged_k_pages = DeviceBuffer::alloc(12 * std::mem::size_of::<f32>()).unwrap();
-        let ragged_v_pages = DeviceBuffer::alloc(12 * std::mem::size_of::<f32>()).unwrap();
-        let ragged_write_pages = DeviceBuffer::alloc(12 * std::mem::size_of::<f32>()).unwrap();
+        let ragged_k_pages = DeviceBuffer::alloc(12 * std::mem::size_of::<u16>()).unwrap();
+        let ragged_v_pages = DeviceBuffer::alloc(12 * std::mem::size_of::<u16>()).unwrap();
+        let ragged_write_pages = DeviceBuffer::alloc(12 * std::mem::size_of::<u16>()).unwrap();
         let ragged_write_values = DeviceBuffer::alloc(4 * std::mem::size_of::<f32>()).unwrap();
         let ragged_generic_out = DeviceBuffer::alloc(4 * std::mem::size_of::<f32>()).unwrap();
         let ragged_tiled_out = DeviceBuffer::alloc(4 * std::mem::size_of::<f32>()).unwrap();
@@ -20727,11 +20733,13 @@ mod tests {
         ragged_page_table
             .copy_from_host(&[0u32, 1, 2, 3, 4, 5])
             .unwrap();
-        ragged_k_pages.copy_from_host(&[0.0f32; 12]).unwrap();
+        ragged_k_pages
+            .copy_from_host(&[0.0f32; 12].map(f16_bits))
+            .unwrap();
         ragged_v_pages
-            .copy_from_host(&[
+            .copy_from_host(&f16_values(&[
                 2.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.0, 2.0, 0.0, 4.0, 4.0,
-            ])
+            ]))
             .unwrap();
         crate::kernels::launch_paged_decode_attention_batched_positions(
             &q_batched,
@@ -20796,17 +20804,19 @@ mod tests {
             &ragged_tiled_out.copy_to_host::<f32>(4).unwrap(),
             &[2.0, 0.0, 2.0, 2.0],
         );
-        assert_close_vec(
-            &ragged_write_pages.copy_to_host::<f32>(12).unwrap(),
-            &[0.0, 0.0, 7.0, 8.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 9.0, 10.0],
+        // Pages are f16; the written values are integer-exact, so compare raw
+        // f16 bit patterns.
+        assert_eq!(
+            ragged_write_pages.copy_to_host::<u16>(12).unwrap(),
+            f16_values(&[0.0, 0.0, 7.0, 8.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 9.0, 10.0]),
         );
 
         for fast_wide_head_dim in [257usize, 320, super::CUDA_ATTENTION_FAST_HEAD_DIM_MAX] {
             let q = DeviceBuffer::alloc(fast_wide_head_dim * std::mem::size_of::<f32>()).unwrap();
             let k_pages =
-                DeviceBuffer::alloc(2 * fast_wide_head_dim * std::mem::size_of::<f32>()).unwrap();
+                DeviceBuffer::alloc(2 * fast_wide_head_dim * std::mem::size_of::<u16>()).unwrap();
             let v_pages =
-                DeviceBuffer::alloc(2 * fast_wide_head_dim * std::mem::size_of::<f32>()).unwrap();
+                DeviceBuffer::alloc(2 * fast_wide_head_dim * std::mem::size_of::<u16>()).unwrap();
             let page_table = DeviceBuffer::alloc(2 * std::mem::size_of::<u32>()).unwrap();
             let generic_out =
                 DeviceBuffer::alloc(fast_wide_head_dim * std::mem::size_of::<f32>()).unwrap();
@@ -20816,11 +20826,11 @@ mod tests {
                 DeviceBuffer::alloc(fast_wide_head_dim * std::mem::size_of::<f32>()).unwrap();
             q.copy_from_host(&vec![0.0f32; fast_wide_head_dim]).unwrap();
             k_pages
-                .copy_from_host(&vec![0.0f32; 2 * fast_wide_head_dim])
+                .copy_from_host(&f16_values(&vec![0.0f32; 2 * fast_wide_head_dim]))
                 .unwrap();
             let mut values = vec![2.0f32; 2 * fast_wide_head_dim];
             values[fast_wide_head_dim..].fill(4.0);
-            v_pages.copy_from_host(&values).unwrap();
+            v_pages.copy_from_host(&f16_values(&values)).unwrap();
             page_table.copy_from_host(&[0u32, 1]).unwrap();
             crate::kernels::launch_paged_decode_attention(
                 &q,
@@ -20918,18 +20928,20 @@ mod tests {
 
         let wide_page_table = DeviceBuffer::alloc(2 * std::mem::size_of::<u32>()).unwrap();
         let wide_paged_k =
-            DeviceBuffer::alloc(2 * wide_head_dim * std::mem::size_of::<f32>()).unwrap();
+            DeviceBuffer::alloc(2 * wide_head_dim * std::mem::size_of::<u16>()).unwrap();
         let wide_paged_v =
-            DeviceBuffer::alloc(2 * wide_head_dim * std::mem::size_of::<f32>()).unwrap();
+            DeviceBuffer::alloc(2 * wide_head_dim * std::mem::size_of::<u16>()).unwrap();
         let wide_paged_out =
             DeviceBuffer::alloc(wide_head_dim * std::mem::size_of::<f32>()).unwrap();
         wide_page_table.copy_from_host(&[1u32, 0]).unwrap();
         wide_paged_k
-            .copy_from_host(&vec![0.0f32; 2 * wide_head_dim])
+            .copy_from_host(&f16_values(&vec![0.0f32; 2 * wide_head_dim]))
             .unwrap();
         let mut wide_paged_values = vec![0.0f32; 2 * wide_head_dim];
         wide_paged_values[wide_head_dim..].fill(2.0);
-        wide_paged_v.copy_from_host(&wide_paged_values).unwrap();
+        wide_paged_v
+            .copy_from_host(&f16_values(&wide_paged_values))
+            .unwrap();
         crate::kernels::launch_paged_decode_attention(
             &wide_q,
             &wide_paged_k,
@@ -20952,10 +20964,10 @@ mod tests {
             &wide_cached_out.copy_to_host::<f32>(wide_head_dim).unwrap(),
         );
 
-        let prefix_pages = DeviceBuffer::alloc(8 * std::mem::size_of::<f32>()).unwrap();
+        let prefix_pages = DeviceBuffer::alloc(8 * std::mem::size_of::<u16>()).unwrap();
         let prefix_table = DeviceBuffer::alloc(4 * std::mem::size_of::<u32>()).unwrap();
         prefix_pages
-            .copy_from_host(&[12.0f32, 13.0, 10.0, 11.0, 0.0, 0.0, 0.0, 0.0])
+            .copy_from_host(&f16_values(&[12.0f32, 13.0, 10.0, 11.0, 0.0, 0.0, 0.0, 0.0]))
             .unwrap();
         prefix_table.copy_from_host(&[1u32, 0, 3, 2]).unwrap();
         crate::kernels::launch_copy_paged_kv_cache_prefix_batched(
@@ -20971,9 +20983,9 @@ mod tests {
         )
         .unwrap();
         stream.synchronize().unwrap();
-        assert_close_vec(
-            &prefix_pages.copy_to_host::<f32>(8).unwrap(),
-            &[12.0, 13.0, 10.0, 11.0, 12.0, 13.0, 10.0, 11.0],
+        assert_eq!(
+            prefix_pages.copy_to_host::<u16>(8).unwrap(),
+            f16_values(&[12.0, 13.0, 10.0, 11.0, 12.0, 13.0, 10.0, 11.0]),
         );
 
         let gate = DeviceBuffer::alloc(2 * std::mem::size_of::<f32>()).unwrap();
@@ -26514,6 +26526,7 @@ mod tests {
             10.0 => 0x4900,
             11.0 => 0x4980,
             12.0 => 0x4a00,
+            13.0 => 0x4a80,
             _ => panic!("test fixture only supports simple f16 values, got {value}"),
         }
     }
