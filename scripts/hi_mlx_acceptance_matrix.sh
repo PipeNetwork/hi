@@ -25,6 +25,7 @@ MEMORY_LIMIT_FRACTION="${HI_MLX_MEMORY_LIMIT_FRACTION:-0.85}"
 #           hybrid dense, e.g. Qwen3.5-27B, Qwen35Like), qwen3_5_moe (SSM hybrid + shared-expert MoE),
 #           glm4 (GQA), glm4_moe_lite (MLA), glm_moe_dsa (GLM-5.2), deepseek_v2/v3/v4 (MLA)
 REPOS=(
+  # --- Qwen / GLM core ---
   "mlx-community/Qwen3-0.6B-4bit"                                          # qwen3
   "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit"                           # qwen2
   "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit"                         # qwen3_moe    (128-expert MoE; the popular 30B-A3B)
@@ -32,16 +33,35 @@ REPOS=(
   "Jackrong/MLX-Qwen3.5-35B-A3B-Claude-4.6-Opus-Reasoning-Distilled-4bit"  # qwen3_5_moe  (SSM hybrid + shared-expert MoE)
   "mlx-community/GLM-4-9B-0414-4bit"                                       # glm4         (GQA, Glm4Like)
   "mlx-community/GLM-4.7-Flash-4bit"                                       # glm4_moe_lite (MLA)
-  "pipenetwork/LongCat-2.0-REAP75-MLX-4bit"                                 # longcat2     (ScMoE + absorbed-MLA + n-gram embed + YARN) — 282GB, HI_MLX_MAX_TOKENS=12
-  "pipenetwork/MiniMax-M3-MLX-3bit"                                       # minimax_m3   (GQA + SwiGLU-OAI sigmoid-MoE, (1+weight) norm) — 186GB, HI_MLX_MAX_TOKENS=12
-  "avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw"                                 # glm_moe_dsa  (DeepSeek-V3.2-style: MLA + DSA indexer + MoE) — 310GB, run with HI_MLX_MAX_TOKENS=8
-  "pipenetwork/Hy3-REAP50-MLX-4bit"                                        # hy_v3        (Hunyuan-3 REAP50; QwenLike + MoE) — 85GB
+  # --- dense Llama-likes on QwenLike (config-gated) ---
+  "mlx-community/granite-3.3-2b-instruct-4bit"                             # granite      (scalar multipliers)
+  "mlx-community/SmolLM3-3B-4bit"                                          # smollm3      (per-layer NoPE)
+  "mlx-community/exaone-4.0-1.2b-bf16"                                     # exaone4      (post-norm + per-head qk-norm)
+  "mlx-community/OLMo-2-1124-7B-Instruct-4bit"                            # olmo2        (post-norm + full qk-norm)
+  "mlx-community/Seed-OSS-36B-Instruct-4bit"                               # seed_oss     (drop-in SwiGLU; 19GB)
+  # --- dedicated impls (GQA/MoE variants) ---
+  "mlx-community/Nemotron-Mini-4B-Instruct-4bit-mlx"                       # nemotron     (LayerNorm1P + squared-ReLU + partial rope)
+  "lmstudio-community/gpt-oss-20b-MLX-8bit"                                # gpt_oss      (attention sinks + biased top-k MoE + SwiGLU-OAI; 21GB)
+  "mlx-community/gemma-3-1b-it-4bit"                                       # gemma3       (Gemma4TextLike: 1+weight norm, qpa scale, full rope)
+  "mlx-community/gemma-2-2b-it-4bit"                                       # gemma2       (Gemma4TextLike minus qk-norm)
+  "pipenetwork/Gemma-4-31B-it-MLX-4bit"                                    # gemma4       (sliding/full hybrid, dual RoPE, GeGLU; 16GB)
+  "mlx-community/c4ai-command-r7b-12-2024-4bit"                            # cohere2      (LayerNorm + parallel block + NoPE-on-full + logit_scale)
+  "lmstudio-community/Llama-4-Scout-17B-16E-MLX-text-4bit"                 # llama4       (iRoPE + L2 qk-norm + llama3 rope + top-1 MoE + shared expert; 57GB)
+  # --- MoE variants on QwenLike / dedicated ---
+  "mlx-community/OLMoE-1B-7B-0125-Instruct-4bit"                           # olmoe        (Qwen3-MoE + full qk-norm; individual experts auto-stacked)
+  "mlx-community/ERNIE-4.5-21B-A3B-PT-4bit"                                # ernie4_5_moe (softmax-topk MoE + shared_experts; 11GB) — NOTE: mlx repo omits tokenizer.json; grab from base baidu/ERNIE-4.5-21B-A3B-PT
+  "mlx-community/Phi-3.5-MoE-instruct-4bit"                                # phimoe       (SuScaledRoPE/LongRoPE + LayerNorm + top-2 MoE; 22GB)
+  "mlx-community/dots.llm1.inst-mixed-4-6bit"                              # dots1        (per-head qk-norm + DeepSeek aux-free MoE; mixed 4-6bit per-tensor quant; 80GB)
+  # --- Nemotron-H (Mamba2 hybrid) + PipeNetwork large MoEs ---
   "pipenetwork/NVIDIA-Nemotron-3-Nano-4B-MLX-8bit"                         # nemotron_h   (Mamba2 + attention + MLP hybrid, dense)
-  "pipenetwork/Gemma-4-31B-it-MLX-4bit"                                    # gemma4       (sliding/full hybrid attn, dual RoPE, GeGLU; custom channel/turn chat template)
-  # Too large to run locally (exceed the ~550GB host RAM) — arch-verified against the mlx_lm
-  # reference but not run in the matrix:
-  # "pipenetwork/Kimi-K2.7-Code-MLX-4bit-hiprec"                           # kimi_k25   (~644GB, DeepSeek-V3 wrapper)
-  # "mlx-community/DeepSeek-V4-Flash-4bit"                                 # deepseek_v4 (MLA + lightning indexer)
+  "pipenetwork/Hy3-REAP50-MLX-4bit"                                        # hy_v3        (Hunyuan-3 REAP50; QwenLike + MoE) — 85GB
+  "pipenetwork/MiniMax-M3-MLX-3bit"                                       # minimax_m3   (GQA + SwiGLU-OAI sigmoid-MoE, (1+weight) norm) — 174GB, HI_MLX_MAX_TOKENS=12
+  "pipenetwork/LongCat-2.0-REAP75-MLX-4bit"                                 # longcat2     (ScMoE + absorbed-MLA + n-gram embed + YARN) — 282GB, HI_MLX_MAX_TOKENS=12
+  "avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw"                                 # glm_moe_dsa  (DeepSeek-V3.2-style: MLA + DSA indexer + MoE) — 310GB, HI_MLX_MAX_TOKENS=8
+  # Blocked (not run by the matrix):
+  # - kimi_k25: Kimi-K2.7-Code — tiktoken tokenizer, no tokenizer.json (arch-verified on MlaLike)
+  # - internlm3: mlx-community/internlm3-8b-instruct-4bit — ships only tokenizer.model, no tokenizer.json
+  # - granitemoe: no MLX model published in any quant
 )
 
 usage() {
@@ -367,6 +387,7 @@ for idx in "${!REPOS[@]}"; do
     failures=$((failures + 1))
     continue
   fi
+  model_type="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("model_type",""))' "$out/inspect.json" 2>/dev/null || true)"
   if [[ "$SKIP_OVERSIZE" != "0" ]]; then
     skip_reason="$(oversize_skip_reason "$out/inspect.json" || true)"
     if [[ -n "$skip_reason" ]]; then
@@ -443,7 +464,10 @@ PY
     continue
   fi
 
-  if ((run_tool)); then
+  # The tool-call smoke check only applies to archs hi-mlx renders + parses tool calls for (the Qwen/GLM
+  # hermes-style path). Most expansion archs route to the Qwen path for *text* but emit their own tool
+  # formats, so they'd fail a forced tool call despite generating coherently — skip the check for them.
+  if ((run_tool)) && [[ " qwen2 qwen2_moe qwen3 qwen3_moe qwen3_5 qwen3_5_moe hy_v3 glm4 glm4_moe_lite glm_moe_dsa deepseek_v2 deepseek_v3 deepseek_v4 " == *" $model_type "* ]]; then
     log "tool call"
     tool_payload="$(python3 - "$repo" "$TOOL_MAX_TOKENS" <<'PY'
 import json, sys
@@ -484,6 +508,8 @@ PY
       cleanup_pid=""
       continue
     fi
+  elif ((run_tool)); then
+    log "tool call: skipped ($model_type is not on the hermes-style tool-call path)"
   fi
 
   log "ok: $repo"
