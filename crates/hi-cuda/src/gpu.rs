@@ -3302,11 +3302,29 @@ mod native {
                 ),
             }
             self.stream.synchronize()?;
-            Ok(GpuF32Tensor {
+            let tensor = GpuF32Tensor {
                 rows: token_ids.len(),
                 cols: embeddings.cols,
                 buffer: output,
-            })
+            };
+            if self.config.is_gemma() {
+                // Gemma scales the token embeddings by sqrt(hidden_size) before the
+                // first layer. The residual stream carries this scaled embedding, so
+                // it must be applied (RMSNorm inside each layer would otherwise
+                // normalize the un-scaled magnitude away).
+                let scale = (embeddings.cols as f32).sqrt();
+                let mut host = tensor.copy_to_host()?;
+                for value in host.iter_mut() {
+                    *value *= scale;
+                }
+                return self.f32_tensor_from_host(
+                    &host,
+                    tensor.rows,
+                    tensor.cols,
+                    "CUDA Gemma scaled embedding",
+                );
+            }
+            Ok(tensor)
         }
 
         pub fn embed_norm_project_host(
@@ -11532,6 +11550,7 @@ mod native {
                         dims.kv_heads,
                         dims.head_dim,
                         dims.v_head_dim,
+                        self.layer_attention_window(&prefix),
                     )?;
                     let attn_out =
                         self.attention_output_projection_f32_device(&prefix, &attn, gate.as_ref())?;
@@ -11623,7 +11642,8 @@ mod native {
                     dims.kv_heads,
                     dims.head_dim,
                     dims.v_head_dim,
-                )?;
+                                    self.layer_attention_window(&prefix),
+)?;
                 let attn_out =
                     self.attention_output_projection_f32_device(&prefix, &attn, gate.as_ref())?;
                 hidden = self.add_f32_device(&hidden, &attn_out)?;
@@ -11951,7 +11971,8 @@ mod native {
                     dims.kv_heads,
                     dims.head_dim,
                     dims.v_head_dim,
-                )?;
+                                    self.layer_attention_window(&prefix),
+)?;
                 let attn_out =
                     self.attention_output_projection_f32_device(&prefix, &attn, gate.as_ref())?;
                 hidden = self.add_f32_device(&hidden, &attn_out)?;
@@ -12146,7 +12167,8 @@ mod native {
                     dims.kv_heads,
                     dims.head_dim,
                     dims.v_head_dim,
-                )?;
+                                    self.layer_attention_window(&prefix),
+)?;
                 let attn_out =
                     self.attention_output_projection_f32_device(&prefix, &attn, gate.as_ref())?;
                 hidden = self.add_f32_device(&hidden, &attn_out)?;
@@ -12234,6 +12256,7 @@ mod native {
                         dims.kv_heads,
                         dims.head_dim,
                         dims.v_head_dim,
+                        self.layer_attention_window(&prefix),
                     )?;
                     let attn_out =
                         self.attention_output_projection_f32_device(&prefix, &attn, gate.as_ref())?;
@@ -12318,6 +12341,7 @@ mod native {
                         dims.kv_heads,
                         dims.head_dim,
                         dims.v_head_dim,
+                        self.layer_attention_window(&prefix),
                     )?;
                     let attn_out =
                         self.attention_output_projection_f32_device(&prefix, &attn, gate.as_ref())?;
@@ -12501,6 +12525,7 @@ mod native {
                     dims.kv_heads,
                     dims.head_dim,
                     dims.v_head_dim,
+                    self.layer_attention_window(&prefix),
                 )?;
                 let attn_out =
                     self.attention_output_projection_f32_device(&prefix, &attn, gate.as_ref())?;
@@ -12897,7 +12922,8 @@ mod native {
                     dims.kv_heads,
                     dims.head_dim,
                     dims.v_head_dim,
-                )?;
+                                    self.layer_attention_window(&prefix),
+)?;
                 let attn_out =
                     self.attention_output_projection_f32_device(&prefix, &attn, gate.as_ref())?;
                 hidden = self.add_f32_device(&hidden, &attn_out)?;
@@ -13076,7 +13102,8 @@ mod native {
                     dims.kv_heads,
                     dims.head_dim,
                     dims.v_head_dim,
-                )?;
+                                    self.layer_attention_window(&prefix),
+)?;
                 let attn_out =
                     self.attention_output_projection_f32_device(&prefix, &attn, gate.as_ref())?;
                 hidden = self.add_f32_device(&hidden, &attn_out)?;
@@ -13158,7 +13185,8 @@ mod native {
                     dims.kv_heads,
                     dims.head_dim,
                     dims.v_head_dim,
-                )?;
+                                    self.layer_attention_window(&prefix),
+)?;
                 let attn_out =
                     self.attention_output_projection_f32_device(&prefix, &attn, gate.as_ref())?;
                 hidden = self.add_f32_device(&hidden, &attn_out)?;
@@ -13270,7 +13298,8 @@ mod native {
                     dims.kv_heads,
                     dims.head_dim,
                     dims.v_head_dim,
-                )?;
+                                    self.layer_attention_window(&prefix),
+)?;
                 let attn_out =
                     self.attention_output_projection_f32_device(&prefix, &attn, gate.as_ref())?;
                 hidden = self.add_f32_device(&hidden, &attn_out)?;
@@ -13388,6 +13417,9 @@ mod native {
                     rope.rows()
                 );
             }
+            // Gemma-3 uses a per-layer RoPE base (local layers 10000, global layers
+            // rope.freq_base); every other model keeps the single base passed in.
+            let rope_base = self.layer_rope_base(prefix, rope_base);
             if !self.layer_uses_mla_attention(prefix) {
                 let (q, gate) = self.dense_attention_q_f32_device(prefix, attn_input, dims, eps)?;
                 match rope {
@@ -13752,7 +13784,8 @@ mod native {
                         dims.kv_heads,
                         dims.head_dim,
                         dims.v_head_dim,
-                    )?;
+                                        self.layer_attention_window(&prefix),
+)?;
                     let attn_out =
                         self.attention_output_projection_f32_device(&prefix, &attn, gate.as_ref())?;
                     hidden = self.add_f32_device(&hidden, &attn_out)?;
@@ -14191,7 +14224,9 @@ mod native {
             } else {
                 self.project_f32_device(&format!("{prefix}.attn_output.weight"), attn)?
             };
-            self.add_optional_rowwise_f32_device(projected, &format!("{prefix}.attn_output.bias"))
+            let output = self
+                .add_optional_rowwise_f32_device(projected, &format!("{prefix}.attn_output.bias"))?;
+            self.apply_gemma_post_attn_norm(prefix, output)
         }
 
         fn output_logits_f32_device(&self, normed: &GpuF32Tensor) -> Result<GpuF32Tensor> {
@@ -14201,7 +14236,8 @@ mod native {
                 "token_embd.weight"
             };
             let logits = self.project_f32_device(head, normed)?;
-            self.add_optional_rowwise_f32_device(logits, "output.bias")
+            let logits = self.add_optional_rowwise_f32_device(logits, "output.bias")?;
+            self.apply_final_logit_softcap(logits)
         }
 
         /// Project only the final position of each sequence through the lm_head,
@@ -14330,8 +14366,8 @@ mod native {
         }
 
         fn ffn_f32_device(&self, prefix: &str, input: &GpuF32Tensor) -> Result<GpuF32Tensor> {
-            if self.has_matrix(&format!("{prefix}.ffn_gate_inp.weight")) {
-                self.moe_f32_device(prefix, input)
+            let output = if self.has_matrix(&format!("{prefix}.ffn_gate_inp.weight")) {
+                self.moe_f32_device(prefix, input)?
             } else {
                 let gate = self.project_f32_device(&format!("{prefix}.ffn_gate.weight"), input)?;
                 let gate =
@@ -14339,11 +14375,17 @@ mod native {
                 let up = self.project_f32_device(&format!("{prefix}.ffn_up.weight"), input)?;
                 let up =
                     self.add_optional_rowwise_f32_device(up, &format!("{prefix}.ffn_up.bias"))?;
-                let activated = self.silu_mul_f32_device(&gate, &up)?;
+                // Gemma uses GeGLU (gelu(gate) * up); other dense models use SwiGLU.
+                let activated = if self.config.is_gemma() {
+                    self.gelu_mul_f32_device(&gate, &up)?
+                } else {
+                    self.silu_mul_f32_device(&gate, &up)?
+                };
                 let down =
                     self.project_f32_device(&format!("{prefix}.ffn_down.weight"), &activated)?;
-                self.add_optional_rowwise_f32_device(down, &format!("{prefix}.ffn_down.bias"))
-            }
+                self.add_optional_rowwise_f32_device(down, &format!("{prefix}.ffn_down.bias"))?
+            };
+            self.apply_gemma_post_ffn_norm(prefix, output)
         }
 
         fn moe_f32_device(&self, prefix: &str, input: &GpuF32Tensor) -> Result<GpuF32Tensor> {
@@ -14719,6 +14761,7 @@ mod native {
             kv_heads: usize,
             head_dim: usize,
             v_head_dim: usize,
+            window: usize,
         ) -> Result<GpuF32Tensor> {
             if q.rows != seq_len || q.cols != heads * head_dim {
                 bail!("CUDA attention q shape {}x{} is invalid", q.rows, q.cols);
@@ -14746,9 +14789,17 @@ mod native {
                     kv_heads,
                     head_dim,
                     v_head_dim,
+                    window,
                     &self.stream,
                 )?;
             } else {
+                // Only the tiled kernel implements the sliding window; the wide
+                // head-dim fallback is never used by windowed (Gemma-3) models.
+                if window > 0 {
+                    bail!(
+                        "CUDA sliding-window attention requires head_dim <= {FLASH_ONLINE_MAX_HEAD_DIM}, got {head_dim}"
+                    );
+                }
                 crate::kernels::launch_causal_attention(
                     &q.buffer,
                     &k.buffer,
@@ -14781,6 +14832,8 @@ mod native {
             kv_heads: usize,
             head_dim: usize,
             v_head_dim: usize,
+        
+            window: usize,
         ) -> Result<GpuF32Tensor> {
             if q.rows != batch_count * seq_len || q.cols != heads * head_dim {
                 bail!(
@@ -14822,9 +14875,13 @@ mod native {
                     kv_heads,
                     head_dim,
                     v_head_dim,
+                    window,
                     &self.stream,
                 )?;
             } else {
+                if window > 0 {
+                    bail!("CUDA sliding-window attention requires the tiled kernel (head_dim <= {FLASH_ONLINE_MAX_HEAD_DIM})");
+                }
                 crate::kernels::launch_causal_attention_batched(
                     &q.buffer,
                     &k.buffer,
@@ -14915,6 +14972,7 @@ mod native {
             kv_heads: usize,
             head_dim: usize,
             v_head_dim: usize,
+            window: usize,
         ) -> Result<GpuF32Tensor> {
             if q.rows != 1 || q.cols != heads * head_dim {
                 bail!(
@@ -14942,9 +15000,17 @@ mod native {
                     kv_heads,
                     head_dim,
                     v_head_dim,
+                    window,
                     &self.stream,
                 )?;
             } else {
+                // Only the tiled kernel implements the sliding window; the wide
+                // head-dim fallback is never used by windowed (Gemma-3) models.
+                if window > 0 {
+                    bail!(
+                        "CUDA sliding-window decode requires head_dim <= {FLASH_ONLINE_MAX_HEAD_DIM}, got {head_dim}"
+                    );
+                }
                 crate::kernels::launch_paged_decode_attention(
                     &q.buffer,
                     &cache.key_pages,
@@ -14979,6 +15045,8 @@ mod native {
             kv_heads: usize,
             head_dim: usize,
             v_head_dim: usize,
+        
+            window: usize,
         ) -> Result<GpuF32Tensor> {
             if q.rows != batch_count || q.cols != heads * head_dim {
                 bail!(
@@ -15014,9 +15082,13 @@ mod native {
                     kv_heads,
                     head_dim,
                     v_head_dim,
+                    window,
                     &self.stream,
                 )?;
             } else {
+                if window > 0 {
+                    bail!("CUDA sliding-window attention requires the tiled kernel (head_dim <= {FLASH_ONLINE_MAX_HEAD_DIM})");
+                }
                 crate::kernels::launch_paged_decode_attention_batched(
                     &q.buffer,
                     cache.key_pages.as_buffer(),
@@ -15052,6 +15124,8 @@ mod native {
             kv_heads: usize,
             head_dim: usize,
             v_head_dim: usize,
+        
+            window: usize,
         ) -> Result<GpuF32Tensor> {
             if q.rows != batch_count || q.cols != heads * head_dim {
                 bail!(
@@ -15089,9 +15163,13 @@ mod native {
                     kv_heads,
                     head_dim,
                     v_head_dim,
+                    window,
                     &self.stream,
                 )?;
             } else {
+                if window > 0 {
+                    bail!("CUDA sliding-window attention requires the tiled kernel (head_dim <= {FLASH_ONLINE_MAX_HEAD_DIM})");
+                }
                 crate::kernels::launch_paged_decode_attention_batched_positions(
                     &q.buffer,
                     cache.key_pages.as_buffer(),
@@ -15208,6 +15286,167 @@ mod native {
                 cols: gate.cols,
                 buffer: output,
             })
+        }
+
+        /// GeGLU: `gelu(gate) * up` (Gemma's MLP activation), the tanh-gelu
+        /// counterpart of `silu_mul_f32_device`.
+        fn gelu_mul_f32_device(
+            &self,
+            gate: &GpuF32Tensor,
+            up: &GpuF32Tensor,
+        ) -> Result<GpuF32Tensor> {
+            gate.ensure_same_shape(up, "CUDA GeGLU")?;
+            let elements = gate.element_count()?;
+            let output = DeviceBuffer::alloc(elements * std::mem::size_of::<f32>())
+                .context("allocating CUDA GeGLU output")?;
+            crate::kernels::launch_gelu_mul(
+                &gate.buffer,
+                &up.buffer,
+                &output,
+                elements,
+                &self.stream,
+            )?;
+            self.stream.synchronize()?;
+            Ok(GpuF32Tensor {
+                rows: gate.rows,
+                cols: gate.cols,
+                buffer: output,
+            })
+        }
+
+        /// Apply Gemma logit soft-capping (`cap * tanh(x/cap)`) to the final
+        /// logits when the model declares `final_logit_softcapping`. Monotonic, so
+        /// greedy argmax is unchanged; it shapes the sampling distribution.
+        fn apply_final_logit_softcap(&self, logits: GpuF32Tensor) -> Result<GpuF32Tensor> {
+            let Some(cap) = self.config.final_logit_softcapping else {
+                return Ok(logits);
+            };
+            if !(cap > 0.0) {
+                return Ok(logits);
+            }
+            let elements = logits.element_count()?;
+            let output = DeviceBuffer::alloc(elements * std::mem::size_of::<f32>())
+                .context("allocating CUDA final logit softcap output")?;
+            crate::kernels::launch_softcap(&logits.buffer, &output, elements, cap, &self.stream)?;
+            self.stream.synchronize()?;
+            Ok(GpuF32Tensor {
+                rows: logits.rows,
+                cols: logits.cols,
+                buffer: output,
+            })
+        }
+
+        /// First present Gemma post-norm vector among `aliases` (each is a
+        /// `{prefix}.{alias}.weight` name), or None.
+        fn gemma_post_norm_name(&self, prefix: &str, aliases: &[&str]) -> Option<String> {
+            aliases
+                .iter()
+                .map(|alias| format!("{prefix}.{alias}.weight"))
+                .find(|name| self.has_vector(name))
+        }
+
+        /// Gemma-2 post-attention norm, applied to the attention sub-layer output
+        /// before the residual add (`residual + post_norm(attn(x))`). No-op for
+        /// non-Gemma models and Gemma-1 (which lack the tensor).
+        fn apply_gemma_post_attn_norm(
+            &self,
+            prefix: &str,
+            output: GpuF32Tensor,
+        ) -> Result<GpuF32Tensor> {
+            if !self.config.is_gemma() {
+                return Ok(output);
+            }
+            match self.gemma_post_norm_name(
+                prefix,
+                &[
+                    "post_attention_norm",
+                    "attn_post_norm",
+                    "post_attention_layernorm",
+                    "post_attention_layer_norm",
+                ],
+            ) {
+                Some(name) => {
+                    let eps = self.config.rms_norm_eps.unwrap_or(1.0e-6);
+                    self.rms_norm_f32_device(&name, &output, eps)
+                }
+                None => Ok(output),
+            }
+        }
+
+        /// Gemma-2 post-FFN norm, applied to the MLP sub-layer output before the
+        /// residual add (`residual + post_norm(mlp(x))`).
+        fn apply_gemma_post_ffn_norm(
+            &self,
+            prefix: &str,
+            output: GpuF32Tensor,
+        ) -> Result<GpuF32Tensor> {
+            if !self.config.is_gemma() {
+                return Ok(output);
+            }
+            match self.gemma_post_norm_name(
+                prefix,
+                &[
+                    "post_ffw_norm",
+                    "post_feedforward_norm",
+                    "post_feedforward_layernorm",
+                    "post_feed_forward_norm",
+                    "ffn_post_norm",
+                ],
+            ) {
+                Some(name) => {
+                    let eps = self.config.rms_norm_eps.unwrap_or(1.0e-6);
+                    self.rms_norm_f32_device(&name, &output, eps)
+                }
+                None => Ok(output),
+            }
+        }
+
+        /// RoPE base for the layer named by `prefix` (`blk.{i}`). Gemma-3 interleaves
+        /// local (sliding) and global (full) attention layers with different RoPE
+        /// bases: every 6th layer (index % 6 == 5) is global and uses the model's
+        /// `rope.freq_base`; the other five-of-six local layers use base 10000. All
+        /// other architectures use one base for every layer.
+        fn layer_rope_base(&self, prefix: &str, default_base: f32) -> f32 {
+            const GEMMA3_SLIDING_PATTERN: usize = 6;
+            const GEMMA3_LOCAL_ROPE_BASE: f32 = 10000.0;
+            if !self.config.is_gemma3() {
+                return default_base;
+            }
+            let Some(layer) = prefix
+                .strip_prefix("blk.")
+                .and_then(|index| index.parse::<usize>().ok())
+            else {
+                return default_base;
+            };
+            if layer % GEMMA3_SLIDING_PATTERN != GEMMA3_SLIDING_PATTERN - 1 {
+                GEMMA3_LOCAL_ROPE_BASE
+            } else {
+                default_base
+            }
+        }
+
+        /// Sliding-window size for the layer named by `prefix`. Gemma-3 local
+        /// layers (index % 6 != 5) attend only to the last `attention.sliding_window`
+        /// tokens; global layers and every other architecture use 0 (unlimited).
+        fn layer_attention_window(&self, prefix: &str) -> usize {
+            const GEMMA3_SLIDING_PATTERN: usize = 6;
+            if !self.config.is_gemma3() {
+                return 0;
+            }
+            let Some(window) = self.config.attention_sliding_window else {
+                return 0;
+            };
+            let Some(layer) = prefix
+                .strip_prefix("blk.")
+                .and_then(|index| index.parse::<usize>().ok())
+            else {
+                return 0;
+            };
+            if layer % GEMMA3_SLIDING_PATTERN != GEMMA3_SLIDING_PATTERN - 1 {
+                window as usize
+            } else {
+                0
+            }
         }
 
         fn copy_row_f32_device(&self, input: &GpuF32Tensor, row: usize) -> Result<GpuF32Tensor> {
@@ -18971,7 +19210,11 @@ mod native {
                     .into_iter()
                     .map(|name| (name, false)),
             )
-            .chain(std::iter::once((format!("{prefix}.ffn_gate.weight"), true)));
+            .chain(std::iter::once((format!("{prefix}.ffn_gate.weight"), true)))
+            // Fused gate+up stored under `ffn_up` at 2x width (llama.cpp Phi-3 layout);
+            // gate is the first half. The [2*ff, embed] shape check below rejects a plain
+            // `ffn_up` (ff rows), so separate-tensor models fall through to the else branch.
+            .chain(std::iter::once((format!("{prefix}.ffn_up.weight"), true)));
         for (name, gate_first) in aliases {
             let Some(tensor) = gguf.tensor(&name) else {
                 continue;

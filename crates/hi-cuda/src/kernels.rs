@@ -40,6 +40,20 @@ mod native {
             len: c_int,
             stream: *mut c_void,
         ) -> c_int;
+        fn hi_cuda_launch_gelu_mul(
+            gate: *const c_void,
+            up: *const c_void,
+            output: *mut c_void,
+            len: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_softcap(
+            input: *const c_void,
+            output: *mut c_void,
+            len: c_int,
+            cap: f32,
+            stream: *mut c_void,
+        ) -> c_int;
         fn hi_cuda_launch_add(
             left: *const c_void,
             right: *const c_void,
@@ -353,6 +367,7 @@ mod native {
             kv_heads: c_int,
             qk_head_dim: c_int,
             v_head_dim: c_int,
+            window: c_int,
             stream: *mut c_void,
         ) -> c_int;
         fn hi_cuda_launch_flash_causal_attention_batched(
@@ -379,6 +394,7 @@ mod native {
             kv_heads: c_int,
             qk_head_dim: c_int,
             v_head_dim: c_int,
+            window: c_int,
             stream: *mut c_void,
         ) -> c_int;
         fn hi_cuda_launch_full_attention(
@@ -474,6 +490,7 @@ mod native {
             kv_heads: c_int,
             qk_head_dim: c_int,
             v_head_dim: c_int,
+            window: c_int,
             stream: *mut c_void,
         ) -> c_int;
         fn hi_cuda_launch_paged_decode_attention_batched(
@@ -538,6 +555,7 @@ mod native {
             kv_heads: c_int,
             qk_head_dim: c_int,
             v_head_dim: c_int,
+            window: c_int,
             stream: *mut c_void,
         ) -> c_int;
         fn hi_cuda_launch_tiled_paged_decode_attention_batched_positions(
@@ -554,6 +572,7 @@ mod native {
             kv_heads: c_int,
             qk_head_dim: c_int,
             v_head_dim: c_int,
+            window: c_int,
             stream: *mut c_void,
         ) -> c_int;
         fn hi_cuda_launch_cached_decode_attention_batched(
@@ -718,6 +737,46 @@ mod native {
             )
         })?;
         check_last_error("hi_cuda_launch_gelu")
+    }
+
+    pub fn launch_gelu_mul(
+        gate: &DeviceBuffer,
+        up: &DeviceBuffer,
+        output: &DeviceBuffer,
+        len: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(len, "gelu_mul len")?;
+        launch_status(unsafe {
+            hi_cuda_launch_gelu_mul(
+                gate.as_ptr(),
+                up.as_ptr(),
+                output.as_mut_ptr(),
+                len as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_gelu_mul")
+    }
+
+    pub fn launch_softcap(
+        input: &DeviceBuffer,
+        output: &DeviceBuffer,
+        len: usize,
+        cap: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(len, "softcap len")?;
+        launch_status(unsafe {
+            hi_cuda_launch_softcap(
+                input.as_ptr(),
+                output.as_mut_ptr(),
+                len as c_int,
+                cap,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_softcap")
     }
 
     pub fn launch_add(
@@ -1558,6 +1617,7 @@ mod native {
         kv_heads: usize,
         head_dim: usize,
         v_head_dim: usize,
+        window: usize,
         stream: &Stream,
     ) -> Result<()> {
         ensure_len(seq_len, "tiled_attention seq_len")?;
@@ -1565,6 +1625,7 @@ mod native {
         ensure_len(kv_heads, "tiled_attention kv_heads")?;
         ensure_len(head_dim, "tiled_attention head_dim")?;
         ensure_len(v_head_dim, "tiled_attention v_head_dim")?;
+        ensure_len(window, "tiled_attention window")?;
         launch_status(unsafe {
             hi_cuda_launch_tiled_causal_attention(
                 q.as_ptr(),
@@ -1576,6 +1637,7 @@ mod native {
                 kv_heads as c_int,
                 head_dim as c_int,
                 v_head_dim as c_int,
+                window as c_int,
                 stream.as_raw(),
             )
         })?;
@@ -1667,6 +1729,7 @@ mod native {
         kv_heads: usize,
         head_dim: usize,
         v_head_dim: usize,
+        window: usize,
         stream: &Stream,
     ) -> Result<()> {
         ensure_len(batch_count, "tiled_attention batch_count")?;
@@ -1687,6 +1750,7 @@ mod native {
                 kv_heads as c_int,
                 head_dim as c_int,
                 v_head_dim as c_int,
+                window as c_int,
                 stream.as_raw(),
             )
         })?;
@@ -1934,6 +1998,7 @@ mod native {
         kv_heads: usize,
         head_dim: usize,
         v_head_dim: usize,
+        window: usize,
         stream: &Stream,
     ) -> Result<()> {
         ensure_len(position, "tiled_paged_attention position")?;
@@ -1943,6 +2008,7 @@ mod native {
         ensure_len(kv_heads, "tiled_paged_attention kv_heads")?;
         ensure_len(head_dim, "tiled_paged_attention head_dim")?;
         ensure_len(v_head_dim, "tiled_paged_attention v_head_dim")?;
+        ensure_len(window, "tiled_paged_attention window")?;
         launch_status(unsafe {
             hi_cuda_launch_tiled_paged_decode_attention(
                 q.as_ptr(),
@@ -1957,6 +2023,7 @@ mod native {
                 kv_heads as c_int,
                 head_dim as c_int,
                 v_head_dim as c_int,
+                window as c_int,
                 stream.as_raw(),
             )
         })?;
@@ -2070,6 +2137,7 @@ mod native {
         kv_heads: usize,
         head_dim: usize,
         v_head_dim: usize,
+        window: usize,
         stream: &Stream,
     ) -> Result<()> {
         ensure_len(batch_count, "tiled_paged_attention batch_count")?;
@@ -2095,6 +2163,7 @@ mod native {
                 kv_heads as c_int,
                 head_dim as c_int,
                 v_head_dim as c_int,
+                window as c_int,
                 stream.as_raw(),
             )
         })?;
@@ -2161,6 +2230,7 @@ mod native {
         kv_heads: usize,
         head_dim: usize,
         v_head_dim: usize,
+        window: usize,
         stream: &Stream,
     ) -> Result<()> {
         ensure_len(batch_count, "tiled_paged_attention positions batch_count")?;
@@ -2188,6 +2258,7 @@ mod native {
                 kv_heads as c_int,
                 head_dim as c_int,
                 v_head_dim as c_int,
+                window as c_int,
                 stream.as_raw(),
             )
         })?;
