@@ -1,39 +1,49 @@
 # PipeNetwork MLX model coverage in hi-mlx
 
 Support status for the MLX models published under [huggingface.co/pipenetwork](https://huggingface.co/pipenetwork)
-(72 MLX repos, ~22 distinct base models across 11 architectures). Reviewed 2026-07.
+(72 MLX repos, ~22 distinct base models). Originally reviewed 2026-07; **every PipeNetwork architecture is
+now supported.**
 
-`hi-mlx` support is by **architecture** (`model_type`), so one arch covers every quant/REAP variant of a model.
+`hi-mlx` support is by **architecture** (`model_type`), so one arch covers every quant / REAP / bit-width
+variant of a model. Validation is coherence-gated on device (the acceptance matrix), per-arch below.
 
-## ✅ Supported (7 archs)
+## ✅ Supported architectures (12)
 
-| `model_type` | PipeNetwork models | hi-mlx path | notes |
-|---|---|---|---|
-| `qwen3` | FrogBoss-32B-2510, FrogMini-14B-2510 | `QwenLike` | dense Qwen3 |
-| `qwen3_moe` | Rio-3.1-Open-30B | `QwenLike` + `QwenMoe` | validated (Qwen3-30B-A3B) |
-| `qwen3_5` | Holo-3.1-4B/9B, VISTA-4B/9B | `Qwen35Like` | SSM/gated-delta hybrid, dense |
-| `qwen3_5_moe` | Holo-3.1-35B-A3B, Ornith-1.0-397B, Qwen3.6-35B-A3B | `Qwen35Like` + `QwenFfn` | SSM hybrid + shared-expert MoE; fixed 2026-07 (FFN branch + scan `log(0)` clamp) |
-| `hy_v3` | Hy3-REAP50/62/75 | `QwenLike` + MoE | Hunyuan-3 |
-| `glm_moe_dsa` | GLM-5.2 (4/5/6/8-bit, mixed, nvfp4, REAP25/37/50), Macaron-V1-749B | `MlaLike` (DeepSeek) | DeepSeek-V3.2 arch (MLA + DSA indexer + MoE) |
-| `kimi_k25` | Kimi-K2.7-Code | `MlaLike` (DeepSeek) | thin DeepSeek-V3 wrapper; routed 2026-07 (arch-verified, untested @ ~1T params) |
-| `nemotron_h` | Nemotron-3-Nano-4B/30B-A3B, Ultra-550B-A55B | `NemotronHLike` | Mamba2 + attention + ReLU² MLP + MoE hybrid; built 2026-07, validated on Nano-4B (dense) and Nano-30B-A3B (MoE). Ultra-550B arch-verified (untested @ 550B). TwoTower is a separate diffusion variant. |
-| `gemma4` | Gemma-4-31B (dense), Gemma-4-26B-A4B (MoE) | `Gemma4TextLike` | sliding/full hybrid attn, dual RoPE, k==v, GeGLU, softcap; built 2026-07, validated on 31B. Ships its chat template in a separate `chat_template.jinja` (channel/turn format) — hi-mlx now reads it. 26B MoE untested. |
-| `minimax_m3` | MiniMax-M3 | `MiniMaxLike` | GQA (partial RoPE + per-head qk-norm) + sigmoid-MoE with shared expert + SwiGLU-OAI; **(1+weight) RMSNorm**; built 2026-07, validated on the 3-bit build |
-| `longcat2` | LongCat-2.0 | `LongCatLike` | ScMoE (2 absorbed-MLA attns + 2 dense MLPs + shortcut softmax-MoE w/ 128 identity zero-experts) + n-gram hash embedding + YARN; built 2026-07, validated on REAP75 4-bit |
+| # | `model_type` | PipeNetwork models | hi-mlx path | status & notes |
+|---|---|---|---|---|
+| 1 | `qwen2` / `qwen2_moe` | *(base arch — PipeNetwork's Qwen line is qwen3+)* | `QwenLike` (+ `QwenMoe`) | foundational dense/MoE Qwen2; the base the rest of the Qwen path builds on |
+| 2 | `qwen3` | FrogBoss-32B-2510, FrogMini-14B-2510 | `QwenLike` | dense Qwen3 |
+| 3 | `qwen3_moe` | Rio-3.1-Open-30B | `QwenLike` + `QwenMoe` | validated (Qwen3-30B-A3B) |
+| 4 | `qwen3_5` | Holo-3.1-4B/9B, VISTA-4B/9B | `Qwen35Like` | SSM / gated-delta-net hybrid, dense |
+| 5 | `qwen3_5_moe` | Holo-3.1-35B-A3B, Ornith-1.0-397B, Qwen3.6-35B-A3B | `Qwen35Like` + `QwenFfn` | SSM hybrid + shared-expert MoE; fixed 2026-07 (FFN branch + scan `log(0)` clamp) |
+| 6 | `hy_v3` | Hy3-REAP50/62/75 | `QwenLike` + MoE | Hunyuan-3 |
+| 7 | `glm_moe_dsa` | GLM-5.2 (4/5/6/8-bit, mixed, nvfp4, REAP25/37/50), Macaron-V1-749B | `MlaLike` | DeepSeek-V3.2 arch: MLA (absorbed) + DSA indexer + MoE |
+| 8 | `kimi_k25` | Kimi-K2.7-Code | `MlaLike` | thin DeepSeek-V3 wrapper; routed 2026-07 (arch-verified, untested @ ~1T params) |
+| 9 | `nemotron_h` | Nemotron-3-Nano-4B/30B-A3B, Ultra-550B-A55B | `NemotronHLike` | Mamba2 + attention + ReLU² MLP + MoE hybrid; built 2026-07, validated on Nano-4B (dense) & Nano-30B-A3B (MoE). Ultra-550B arch-verified (untested @ 550B). TwoTower is a separate diffusion variant. |
+| 10 | `gemma4` | Gemma-4-31B (dense), Gemma-4-26B-A4B (MoE) | `Gemma4TextLike` | sliding/full hybrid attn, dual RoPE, k==v, GeGLU, softcap; built 2026-07, validated on 31B. Reads the chat template from a separate `chat_template.jinja` (channel/turn format). 26B MoE untested. |
+| 11 | `minimax_m3` | MiniMax-M3 | `MiniMaxLike` | GQA (partial RoPE + per-head qk-norm) + sigmoid MoE with shared expert + SwiGLU-OAI; **(1+weight) RMSNorm**; built 2026-07, validated on the 3-bit build |
+| 12 | `longcat2` | LongCat-2.0 (REAP50/62/75) | `LongCatLike` | ScMoE (2 absorbed-MLA attns + 2 dense MLPs + shortcut softmax-MoE w/ 128 identity zero-experts) + n-gram hash embedding + YARN rope; built 2026-07, validated on REAP75 4-bit |
 
-## ❌ Not yet supported (4 new architectures)
+**Validation legend:** *validated* = ran coherently on device and passes the acceptance matrix (inspect +
+chat non-streaming + streaming). *arch-verified* = forward implemented + reviewed against the mlx_lm
+reference but not run at full scale (weights too large to load locally).
 
-Each is a genuinely new model implementation (not a routing tweak). mlx_lm references live in the
-sibling `*-mlx/.venv` checkouts.
+## How the hardest ones were cracked
 
-| `model_type` | PipeNetwork models | what it is | effort |
-|---|---|---|---|
+The four newest arches (`nemotron_h`, `gemma4`, `minimax_m3`, `longcat2`) each needed a full new forward,
+not a routing tweak. The repeatable method: **tensor-diff every sub-step against the mlx_lm reference on
+fixed token ids** (embedding → per-layer → attention/MLP/MoE → per-expert → logits) until the diverging op
+is isolated. For an arch the reference can't load (MiniMax-M3), *build* a reference forward in mlx from the
+modeling spec and diff against that. Bugs this caught, worth remembering:
 
-### Recommended build order
-1. **`nemotron_h`** — widest coverage (4 families incl. the 550B/Ultra flagship + TwoTower); the ~2 GB Nano-4B makes iteration cheap.
-2. **`gemma4`** — 2 families, standard-ish attention (no SSM) but many Gemma-specific details; both variants downloadable.
-3. **`minimax_m3`** — 1 family; smallest reference.
-4. **`longcat2`** — 1 family; hardest (custom MoE + ngram).
+- **MiniMax-M3** — `(1 + weight)` RMSNorm convention (stored norm weights are deviations from 1); using
+  weight-only gave input-independent garbage.
+- **LongCat-2.0** — `norm_topk_prob` defaults to `true` in hi-mlx but LongCat omits it and needs `false`;
+  normalizing the top-12 weights inflated the MoE output 2.75×. Also: n-gram hashing embedding (i64
+  modular), absorbed-MLA + DSA indexer reused wholesale from the GLM/DeepSeek path, YARN rope.
+- **Gemma-4** — ships its chat template in a separate `chat_template.jinja` (custom channel/turn format).
 
-Each should be built with on-device verification (coherence-gated, like the acceptance matrix) and is a
-multi-hour effort — pick per deployment priority.
+## CI
+
+`cargo test -p hi-mlx` runs on an Apple-silicon runner on every PR (`.github/workflows/ci.yml`), so all 12
+architectures are compiled and unit-tested on each change — not just locally.
