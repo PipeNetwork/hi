@@ -35,9 +35,12 @@ REPOS=(
   "pipenetwork/LongCat-2.0-REAP75-MLX-4bit"                                 # longcat2     (ScMoE + absorbed-MLA + n-gram embed + YARN) — 282GB, HI_MLX_MAX_TOKENS=12
   "pipenetwork/MiniMax-M3-MLX-3bit"                                       # minimax_m3   (GQA + SwiGLU-OAI sigmoid-MoE, (1+weight) norm) — 186GB, HI_MLX_MAX_TOKENS=12
   "avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw"                                 # glm_moe_dsa  (DeepSeek-V3.2-style: MLA + DSA indexer + MoE) — 310GB, run with HI_MLX_MAX_TOKENS=8
+  "pipenetwork/Hy3-REAP50-MLX-4bit"                                        # hy_v3        (Hunyuan-3 REAP50; QwenLike + MoE) — 85GB
   "pipenetwork/NVIDIA-Nemotron-3-Nano-4B-MLX-8bit"                         # nemotron_h   (Mamba2 + attention + MLP hybrid, dense)
   "pipenetwork/Gemma-4-31B-it-MLX-4bit"                                    # gemma4       (sliding/full hybrid attn, dual RoPE, GeGLU; custom channel/turn chat template)
-  # large / MLA not held locally (big downloads):
+  # Too large to run locally (exceed the ~550GB host RAM) — arch-verified against the mlx_lm
+  # reference but not run in the matrix:
+  # "pipenetwork/Kimi-K2.7-Code-MLX-4bit-hiprec"                           # kimi_k25   (~644GB, DeepSeek-V3 wrapper)
   # "mlx-community/DeepSeek-V4-Flash-4bit"                                 # deepseek_v4 (MLA + lightning indexer)
 )
 
