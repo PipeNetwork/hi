@@ -4018,8 +4018,13 @@ mod native {
             }
             let pen_incl = Array::from_slice(&pen_incl, &[cs, cs]);
             let pen_strict = Array::from_slice(&pen_strict, &[cs, cs]);
-            // Cumulative within-chunk log-decay lg_t = sum_{i<=t} log g_i (finite; never underflows).
-            let logg = g.log()?.reshape(&[nc, hv, cs, 1])?;
+            // Cumulative within-chunk log-decay lg_t = sum_{i<=t} log g_i. g can underflow to exactly
+            // 0 when the per-step decay is extreme (e.g. Qwen3.5-MoE: neg_a*softplus ~ -1000), and
+            // log(0) = -inf then makes the lg_t - lg_j differences below -inf-(-inf) = NaN. Clamp to a
+            // tiny floor: where g underflows the decay is already complete, so exp(-69) ~ 0 is exact.
+            let logg = maximum(&g, &Array::from_f32(1e-30))?
+                .log()?
+                .reshape(&[nc, hv, cs, 1])?;
             let lg = matmul(&ltri, &logg)?.reshape(&[nc, hv, cs])?;
             let gamma_e = exp(&lg)?.reshape(&[nc, hv, cs, 1])?; // gamma_t in [0,1]
             let lg_last = lg.index((.., .., (cs - 1)..cs)).reshape(&[nc, hv, 1])?;
@@ -4093,7 +4098,8 @@ mod native {
         input_layernorm: RmsNorm,
         post_attention_layernorm: RmsNorm,
         mixer: Qwen35Mixer,
-        mlp: Mlp,
+        // Dense (qwen3_5) or shared-expert MoE (qwen3_5_moe) FFN, chosen per layer by QwenFfn::load.
+        ffn: QwenFfn,
     }
 
     impl Qwen35Layer {
@@ -4130,7 +4136,7 @@ mod native {
                     config.rms_norm_eps,
                 )?,
                 mixer,
-                mlp: Mlp::load(&format!("{p}.mlp"), arrays, config)?,
+                ffn: QwenFfn::load(idx, arrays, config)?,
             })
         }
 
@@ -4142,7 +4148,7 @@ mod native {
             };
             let x = x + h;
             let h = self.post_attention_layernorm.forward(&x)?;
-            let h = self.mlp.forward(&h)?;
+            let h = self.ffn.forward(&h)?;
             Ok(x + h)
         }
     }

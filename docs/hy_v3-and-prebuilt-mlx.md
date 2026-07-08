@@ -435,3 +435,23 @@ Fix is a FFN branch in the Qwen3.5 layer (dense `Mlp` vs `QwenMoe`), not a new a
 Aside: the matrix's tool-call smoke step fails for models not tuned for tool-calling (Qwen2.5-Coder-7B
 emits a fenced ```json block; GLM-4-9B-0414 rambles) — model capability, not arch support. The core
 arch gate (inspect + coherent non-stream + streaming chat) passes for all of the above.
+
+### qwen3_5_moe support — closing the SSM-hybrid MoE gap (two bugs)
+The Qwen3.5 *MoE* variant (SSM/gated-delta hybrid **plus** a 256-expert shared-expert MoE, e.g.
+Qwen3.5-35B-A3B) now runs. Two bugs, both found via the acceptance matrix + a NaN-localization probe:
+
+1. **Dense MLP where the layer is MoE.** `Qwen35Layer` hard-built a dense `Mlp`, so the variant failed
+   to load (`missing model.layers.0.mlp.gate_proj.weight`). Fix: swap it for the existing `QwenFfn`
+   enum (`Dense(Mlp)` / `Moe(QwenMoe)`), which dispatches per layer on `is_qwen_moe_layer` — one line,
+   and `QwenMoe` already handles the shared-expert + `shared_expert_gate` layout this model uses.
+
+2. **NaN from `log(0)` in the chunk-parallel scan.** After (1) the model loaded but emitted `!!!!`.
+   A per-layer + per-op probe pinpointed the SSM mixer: the gated-delta decay `g = exp(neg_a·softplus)`
+   **underflows to exactly 0** on this model (`neg_a·softplus ≈ -1000`; the 9B's decays don't), and
+   `scan_chunked` took `g.log()` → `-inf`, so the `lg_t - lg_j` decay differences became `-inf-(-inf)
+   = NaN`. Fix: clamp `g` to a `1e-30` floor before the log — where `g` underflows the decay is already
+   complete, so `exp(-69) ≈ 0` is numerically exact. (The additive-mask trick already handled the
+   masked triangle; this handles the diagonal/kept entries whose own `lg` was `-inf`.)
+
+Verified: Qwen3.5-35B-A3B loads and generates coherently (reasoning `<think>` traces, arithmetic, code).
+The clamp also hardens the dense qwen3_5 path against any future extreme-decay model.
