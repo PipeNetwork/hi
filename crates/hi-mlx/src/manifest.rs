@@ -233,6 +233,10 @@ fn model_family(model_type: &str, config: &Value) -> Option<ModelFamily> {
     if model_type.starts_with("longcat") || haystack.contains("longcat") {
         return Some(ModelFamily::LongCat);
     }
+    // Dense Llama-like variants that run on the Qwen GQA path (QwenLike).
+    if matches!(model_type.as_str(), "internlm3" | "internlm2" | "granite") {
+        return Some(ModelFamily::Qwen2);
+    }
     None
 }
 
