@@ -1013,6 +1013,7 @@ mod native {
         n_heads: i32,
         n_kv_heads: i32,
         head_dim: i32,
+        scale: f32,
         rope_theta: f32,
         traditional_rope: bool,
         cache: Cache,
@@ -1046,6 +1047,9 @@ mod native {
                 n_heads: config.num_attention_heads as i32,
                 n_kv_heads: config.num_key_value_heads as i32,
                 head_dim: config.attention_head_dim() as i32,
+                scale: config
+                    .attention_multiplier
+                    .unwrap_or((config.attention_head_dim() as f32).powf(-0.5)),
                 rope_theta: config.rope_theta,
                 traditional_rope: config.family == ModelFamily::Qwen2,
                 cache: Cache::new(),
@@ -1096,7 +1100,7 @@ mod native {
                 None,
             )?;
             let (k, v) = self.cache.update(k, v)?;
-            let scale = (self.head_dim as f32).powf(-0.5);
+            let scale = self.scale;
             let output = if l > 1 && offset == 0 {
                 scaled_dot_product_attention(
                     &q,
@@ -3612,6 +3616,7 @@ mod native {
         post_attention_layernorm: RmsNorm,
         attention: QwenAttention,
         ffn: QwenFfn,
+        residual_multiplier: f32,
     }
 
     impl QwenBlock {
@@ -3634,16 +3639,18 @@ mod native {
                 )?,
                 attention: QwenAttention::load(&format!("{prefix}.self_attn"), arrays, config)?,
                 ffn: QwenFfn::load(idx, arrays, config)?,
+                residual_multiplier: config.residual_multiplier,
             })
         }
 
         fn forward(&mut self, x: Array) -> Result<Array> {
+            let m = self.residual_multiplier;
             let r = self.attention.forward(&self.input_layernorm.forward(&x)?)?;
-            let h = x + r;
+            let h = if m != 1.0 { x + r * m } else { x + r };
             let r = self
                 .ffn
                 .forward(&self.post_attention_layernorm.forward(&h)?)?;
-            Ok(h + r)
+            Ok(if m != 1.0 { h + r * m } else { h + r })
         }
     }
 
@@ -3652,6 +3659,8 @@ mod native {
         layers: Vec<QwenBlock>,
         norm: RmsNorm,
         lm_head: Option<Linear>,
+        embedding_multiplier: f32,
+        logits_scaling: f32,
     }
 
     impl QwenLike {
@@ -3671,6 +3680,8 @@ mod native {
                 norm: RmsNorm::load("model.norm.weight", &arrays, config.rms_norm_eps)?,
                 layers,
                 lm_head,
+                embedding_multiplier: config.embedding_multiplier,
+                logits_scaling: config.logits_scaling,
             })
         }
     }
@@ -3679,14 +3690,20 @@ mod native {
         fn forward(&mut self, input_ids: &[u32]) -> Result<Array> {
             let ids = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
             let mut h = self.embed_tokens.forward(&ids)?;
+            if self.embedding_multiplier != 1.0 {
+                h = h * self.embedding_multiplier;
+            }
             for layer in &mut self.layers {
                 h = layer.forward(h)?;
             }
             h = self.norm.forward(&h)?;
-            let logits = match &self.lm_head {
+            let mut logits = match &self.lm_head {
                 Some(head) => head.forward(&h)?,
                 None => self.embed_tokens.as_linear(&h)?,
             };
+            if self.logits_scaling != 1.0 {
+                logits = logits / self.logits_scaling;
+            }
             transforms::eval([&logits])?;
             Ok(logits)
         }

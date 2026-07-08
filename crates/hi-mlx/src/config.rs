@@ -64,6 +64,11 @@ pub struct MlxModelConfig {
     pub ffn_hidden_size: Option<u32>,
     pub mla_scale_q_lora: bool,
     pub mla_scale_kv_lora: bool,
+    // Granite-style scalar multipliers (default no-op: 1.0 / None).
+    pub embedding_multiplier: f32,
+    pub residual_multiplier: f32,
+    pub attention_multiplier: Option<f32>,
+    pub logits_scaling: f32,
     // Gemma-4 hybrid attention fields.
     pub layer_types: Vec<String>,
     pub final_logit_softcapping: Option<f32>,
@@ -370,6 +375,10 @@ pub fn parse_model_config(path: &Path, raw: Value) -> Result<MlxModelConfig> {
         ffn_hidden_size: u32_field(&raw, "ffn_hidden_size"),
         mla_scale_q_lora: bool_field(&raw, "mla_scale_q_lora").unwrap_or(false),
         mla_scale_kv_lora: bool_field(&raw, "mla_scale_kv_lora").unwrap_or(false),
+        embedding_multiplier: f32_field(&raw, "embedding_multiplier").unwrap_or(1.0),
+        residual_multiplier: f32_field(&raw, "residual_multiplier").unwrap_or(1.0),
+        attention_multiplier: f32_field(&raw, "attention_multiplier"),
+        logits_scaling: f32_field(&raw, "logits_scaling").unwrap_or(1.0),
         layer_types: raw
             .get("layer_types")
             .and_then(Value::as_array)
@@ -510,6 +519,10 @@ pub fn detect_family(model_type: &str, config: &Value) -> Option<ModelFamily> {
     // LongCat-2.0: MLA + DSA indexer + ScMoE double-attention + ngram embedding.
     if model_type.starts_with("longcat") || haystack.contains("longcat") {
         return Some(ModelFamily::LongCat);
+    }
+    // Dense Llama-like variants that run on the Qwen GQA path (QwenLike).
+    if matches!(model_type.as_str(), "internlm3" | "internlm2" | "granite") {
+        return Some(ModelFamily::Qwen2);
     }
     None
 }

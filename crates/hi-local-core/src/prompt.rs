@@ -59,6 +59,10 @@ fn render_gguf_chat_template(template: &str, messages: &[ChatMessage]) -> Option
     if template.contains("<longcat_assistant>") && template.contains("<longcat_user>") {
         return Some(render_longcat_template(messages));
     }
+    // Granite 3.x: `<|start_of_role|>{role}<|end_of_role|>{content}<|end_of_text|>` turns.
+    if template.contains("<|start_of_role|>") && template.contains("<|end_of_role|>") {
+        return Some(render_granite_template(messages));
+    }
     if template.contains("<|start_header_id|>")
         && template.contains("<|end_header_id|>")
         && template.contains("<|eot_id|>")
@@ -154,6 +158,26 @@ fn render_longcat_template(messages: &[ChatMessage]) -> String {
         }
     }
     out.push_str("<longcat_assistant><longcat_think>\n\n</longcat_think>\n");
+    out
+}
+
+// Granite 3.x: `<|start_of_role|>{role}<|end_of_role|>{content}<|end_of_text|>\n` turns.
+fn render_granite_template(messages: &[ChatMessage]) -> String {
+    let mut out = String::new();
+    for message in messages {
+        let role = match message.role.as_str() {
+            "assistant" | "ai" | "model" => "assistant",
+            "system" | "developer" | "root" => "system",
+            "tool" => "tool",
+            _ => "user",
+        };
+        out.push_str("<|start_of_role|>");
+        out.push_str(role);
+        out.push_str("<|end_of_role|>");
+        out.push_str(&message.content_text());
+        out.push_str("<|end_of_text|>\n");
+    }
+    out.push_str("<|start_of_role|>assistant<|end_of_role|>");
     out
 }
 
