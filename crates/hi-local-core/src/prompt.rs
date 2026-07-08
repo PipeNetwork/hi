@@ -38,6 +38,13 @@ pub fn build_prompt_with_template(
             if let Some(rendered) = render_gguf_chat_template(template, messages) {
                 return rendered;
             }
+        } else if {
+            let t = normalize_jinja_template(template);
+            t.contains("<|channel|>") && t.contains("<|call|>")
+        } {
+            // GPT-OSS harmony: tools go in a TypeScript functions namespace and calls use the commentary
+            // channel — the generic `<tool_call>` instruction doesn't fit, so render it natively.
+            return render_gptoss_tools(messages, tools, tool_choice);
         } else if matches!(
             family,
             ModelFamily::Qwen2 | ModelFamily::Qwen3 | ModelFamily::NemotronH | ModelFamily::Gemma
@@ -342,6 +349,115 @@ fn render_gptoss_template(messages: &[ChatMessage]) -> String {
     }
     out.push_str("<|start|>assistant<|channel|>final<|message|>");
     out
+}
+
+// GPT-OSS harmony tool prompt: tools are declared as a TypeScript `namespace functions` in a developer
+// message, and calls go to the commentary channel (`to=functions.NAME ... <|message|>{json}<|call|>`).
+fn render_gptoss_tools(messages: &[ChatMessage], tools: &[Tool], tool_choice: &Value) -> String {
+    let mut out = String::new();
+    let system = messages
+        .iter()
+        .find(|m| matches!(m.role.as_str(), "system" | "developer" | "root"))
+        .map(|m| m.content_text())
+        .unwrap_or_else(|| "You are a helpful assistant.".to_string());
+    out.push_str("<|start|>system<|message|>");
+    out.push_str(&system);
+    out.push_str("\nReasoning: low<|end|>");
+    // Developer message: the functions namespace.
+    out.push_str(
+        "<|start|>developer<|message|># Tools\n\n## functions\n\nnamespace functions {\n\n",
+    );
+    for tool in tools {
+        if let Some(desc) = &tool.function.description {
+            out.push_str("// ");
+            out.push_str(desc);
+            out.push('\n');
+        }
+        out.push_str("type ");
+        out.push_str(&tool.function.name);
+        out.push_str(" = (_: ");
+        out.push_str(&ts_type(&tool.function.parameters));
+        out.push_str(") => any;\n\n");
+    }
+    out.push_str("} // namespace functions<|end|>");
+    for message in messages {
+        let role = match message.role.as_str() {
+            "assistant" | "ai" | "model" => "assistant",
+            "system" | "developer" | "root" => continue,
+            "tool" => "tool",
+            _ => "user",
+        };
+        out.push_str("<|start|>");
+        out.push_str(role);
+        out.push_str("<|message|>");
+        out.push_str(&message.content_text());
+        out.push_str("<|end|>");
+    }
+    // Forced tool use: prime the commentary channel so the model emits `to=functions.NAME ...`.
+    let forced = tool_choice == "required"
+        || tool_choice
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .is_some();
+    if forced {
+        out.push_str("<|start|>assistant<|channel|>commentary ");
+    } else {
+        out.push_str("<|start|>assistant");
+    }
+    out
+}
+
+// Minimal JSON-schema -> TypeScript type for the harmony functions namespace.
+fn ts_type(schema: &Value) -> String {
+    match schema.get("type").and_then(Value::as_str) {
+        Some("object") => {
+            let required: Vec<&str> = schema
+                .get("required")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).collect())
+                .unwrap_or_default();
+            let fields = schema
+                .get("properties")
+                .and_then(Value::as_object)
+                .map(|props| {
+                    props
+                        .iter()
+                        .map(|(k, v)| {
+                            let opt = if required.contains(&k.as_str()) {
+                                ""
+                            } else {
+                                "?"
+                            };
+                            format!("{k}{opt}: {}", ts_type(v))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_default();
+            format!("{{ {fields} }}")
+        }
+        Some("array") => format!(
+            "{}[]",
+            schema
+                .get("items")
+                .map(ts_type)
+                .unwrap_or_else(|| "any".to_string())
+        ),
+        Some("string") => schema
+            .get("enum")
+            .and_then(Value::as_array)
+            .map(|en| {
+                en.iter()
+                    .filter_map(Value::as_str)
+                    .map(|s| format!("\"{s}\""))
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            })
+            .unwrap_or_else(|| "string".to_string()),
+        Some("integer") | Some("number") => "number".to_string(),
+        Some("boolean") => "boolean".to_string(),
+        _ => "any".to_string(),
+    }
 }
 
 // Cohere Command-R: `<|START_OF_TURN_TOKEN|><|{ROLE}_TOKEN|>{content}<|END_OF_TURN_TOKEN|>` turns, with

@@ -460,6 +460,11 @@ pub fn parse_model_config(path: &Path, raw: Value) -> Result<MlxModelConfig> {
             if mt == "phimoe" && !ids.contains(&32007) {
                 ids.push(32007);
             }
+            // GPT-OSS terminates a tool call with <|call|> (200012); stopping there avoids a hallucinated
+            // response echo after a forced tool call. <|return|>/<|end|> already cover normal turns.
+            if mt == "gpt_oss" && !ids.contains(&200012) {
+                ids.push(200012);
+            }
             ids
         },
         pad_token_id: u32_field(&raw, "pad_token_id"),
