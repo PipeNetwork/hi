@@ -229,10 +229,7 @@ mod native {
             ModelFamily::NemotronH => Ok(Box::new(NemotronHLike::new(config.clone(), arrays)?)),
             ModelFamily::MiniMax => Ok(Box::new(MiniMaxLike::new(config.clone(), arrays)?)),
             ModelFamily::LongCat => Ok(Box::new(LongCatLike::new(config.clone(), arrays)?)),
-            ModelFamily::Gemma
-                if config.model_type.starts_with("gemma4")
-                    || config.model_type.starts_with("gemma3") =>
-            {
+            ModelFamily::Gemma if config.model_type.starts_with("gemma") => {
                 Ok(Box::new(Gemma4TextLike::new(config.clone(), arrays)?))
             }
             ModelFamily::Llama
@@ -5737,8 +5734,9 @@ mod native {
         k_proj: Linear,
         v_proj: Option<Linear>,
         o_proj: Linear,
-        q_norm: RmsNorm,
-        k_norm: RmsNorm,
+        // Gemma-3/4 have per-head qk-norm; Gemma-2 does not.
+        q_norm: Option<RmsNorm>,
+        k_norm: Option<RmsNorm>,
         v_ones: Array,
         n_heads: i32,
         n_kv_heads: i32,
@@ -5803,8 +5801,14 @@ mod native {
                     None
                 },
                 o_proj: Linear::load(&format!("{prefix}.o_proj"), arrays, config)?,
-                q_norm: gemma_norm(&format!("{prefix}.q_norm.weight"), arrays, config)?,
-                k_norm: gemma_norm(&format!("{prefix}.k_norm.weight"), arrays, config)?,
+                q_norm: arrays
+                    .contains_key(&format!("{prefix}.q_norm.weight"))
+                    .then(|| gemma_norm(&format!("{prefix}.q_norm.weight"), arrays, config))
+                    .transpose()?,
+                k_norm: arrays
+                    .contains_key(&format!("{prefix}.k_norm.weight"))
+                    .then(|| gemma_norm(&format!("{prefix}.k_norm.weight"), arrays, config))
+                    .transpose()?,
                 v_ones: Array::ones::<f32>(&[head_dim])?,
                 n_heads,
                 n_kv_heads,
@@ -5860,13 +5864,21 @@ mod native {
                 .q_proj
                 .forward(x)?
                 .reshape(&[b, l, self.n_heads, self.head_dim])?;
-            let q = self.q_norm.forward(&q)?.transpose_axes(&[0, 2, 1, 3])?;
+            let q = match &self.q_norm {
+                Some(n) => n.forward(&q)?,
+                None => q,
+            };
+            let q = q.transpose_axes(&[0, 2, 1, 3])?;
             let q = self.rope_apply(&q, offset)?;
             let k_raw = self
                 .k_proj
                 .forward(x)?
                 .reshape(&[b, l, self.n_kv_heads, self.head_dim])?;
-            let k = self.k_norm.forward(&k_raw)?.transpose_axes(&[0, 2, 1, 3])?;
+            let k = match &self.k_norm {
+                Some(n) => n.forward(&k_raw)?,
+                None => k_raw.clone(),
+            };
+            let k = k.transpose_axes(&[0, 2, 1, 3])?;
             let k = self.rope_apply(&k, offset)?;
             // Full-attention layers reuse the K projection as V (k==v), then apply a weightless v-norm.
             let v_raw = match &self.v_proj {
