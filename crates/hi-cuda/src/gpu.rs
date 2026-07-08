@@ -54,9 +54,9 @@ pub struct CudaVisionEncoderInfo {
 #[cfg(feature = "native-cuda")]
 mod native {
     use std::cell::{Cell, RefCell, RefMut};
-    use std::time::Instant;
     use std::collections::{BTreeMap, BTreeSet};
     use std::fmt;
+    use std::time::Instant;
 
     use anyhow::{Context, Result, anyhow, bail};
     use hi_gguf::{

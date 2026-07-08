@@ -28,7 +28,70 @@ pub fn parse_tool_calls(text: &str, tools: &[Tool]) -> Option<Vec<NormalizedTool
     if let Some(calls) = parse_bracket_tool_calls(text, &allowed) {
         return Some(calls);
     }
-    parse_xml_attr_tool_calls(text, &allowed)
+    if let Some(calls) = parse_xml_attr_tool_calls(text, &allowed) {
+        return Some(calls);
+    }
+    parse_element_tool_calls(text, &allowed)
+}
+
+// OLMo-2-style `<tool_call><get_weather city="Paris"></tool_call>` — a nested element named after the
+// function, with the arguments as XML attributes.
+fn parse_element_tool_calls(text: &str, allowed: &[&str]) -> Option<Vec<NormalizedToolCall>> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(pos) = rest.find("<tool_call>") {
+        let after = &rest[pos + "<tool_call>".len()..];
+        let block_end = after.find("</tool_call>").unwrap_or(after.len());
+        let block = &after[..block_end];
+        rest = &after[block_end..];
+        let Some(lt) = block.find('<') else {
+            continue;
+        };
+        let inner = &block[lt + 1..];
+        let gt = inner.find('>').unwrap_or(inner.len());
+        let elem = inner[..gt].trim();
+        let (name, attrs_str) = match elem.split_once(char::is_whitespace) {
+            Some((n, a)) => (n.trim_end_matches('/'), a),
+            None => (elem.trim_end_matches('/'), ""),
+        };
+        let arguments = Value::Object(parse_xml_attrs(attrs_str));
+        if let Some(call) = normalize(name, arguments, allowed, out.len()) {
+            out.push(call);
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+// Parse `key="value" key2='value2'` attribute pairs into a JSON object. Numeric/boolean values are
+// parsed as such; everything else stays a string.
+fn parse_xml_attrs(s: &str) -> serde_json::Map<String, Value> {
+    let mut map = serde_json::Map::new();
+    let mut rest = s.trim();
+    while let Some(eq) = rest.find('=') {
+        let key = rest[..eq]
+            .rsplit(char::is_whitespace)
+            .next()
+            .unwrap_or("")
+            .trim();
+        let after = rest[eq + 1..].trim_start();
+        let Some(quote) = after.chars().next().filter(|c| *c == '"' || *c == '\'') else {
+            break;
+        };
+        let value_start = &after[quote.len_utf8()..];
+        let Some(end) = value_start.find(quote) else {
+            break;
+        };
+        let raw = &value_start[..end];
+        if !key.is_empty() {
+            let value = serde_json::from_str::<Value>(raw)
+                .ok()
+                .filter(|v| v.is_number() || v.is_boolean())
+                .unwrap_or_else(|| Value::String(raw.to_string()));
+            map.insert(key.to_string(), value);
+        }
+        rest = &value_start[end + quote.len_utf8()..];
+    }
+    map
 }
 
 // GPT-OSS-style `<tool_call name="get_weather" arguments='{"city":"Paris"}'>` (attributes rather than a
@@ -242,6 +305,18 @@ mod tests {
     fn json_tool_call_with_reasoning_prefix_is_normalized() {
         let calls = parse_tool_calls(
             "<think>choosing a tool</think>\n\n{\"name\":\"read\",\"arguments\":{\"path\":\"README.md\"}}",
+            &tools(),
+        )
+        .unwrap();
+
+        assert_eq!(calls[0].function.name, "read");
+        assert_eq!(calls[0].function.arguments, r#"{"path":"README.md"}"#);
+    }
+
+    #[test]
+    fn olmo2_element_tool_call_is_normalized() {
+        let calls = parse_tool_calls(
+            "<tool_call>\n<read path=\"README.md\"></tool_call>\n\n<tool_response>",
             &tools(),
         )
         .unwrap();
