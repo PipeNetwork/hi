@@ -3376,9 +3376,18 @@ mod native {
                 None => None,
             };
             let compile_moe = std::env::var_os("HI_MLX_COMPILE_MOE").is_some();
+            // Experts are usually stacked at `{prefix}.switch_mlp`, but dots.llm1 ships them stacked at
+            // `{prefix}.experts` — load from there directly (renaming would break mixed-quant per-tensor
+            // spec lookup, which is keyed by the original weight prefix).
+            let experts_prefix =
+                if arrays.contains_key(&format!("{prefix}.switch_mlp.gate_proj.weight")) {
+                    format!("{prefix}.switch_mlp")
+                } else {
+                    format!("{prefix}.experts")
+                };
             Ok(Self {
                 gate: Linear::load(&format!("{prefix}.gate"), arrays, config)?,
-                switch_mlp: SwitchMlp::load(&format!("{prefix}.switch_mlp"), arrays, config)?,
+                switch_mlp: SwitchMlp::load(&experts_prefix, arrays, config)?,
                 shared_expert: if arrays
                     .contains_key(&format!("{prefix}.shared_expert.gate_proj.weight"))
                 {
@@ -3411,7 +3420,7 @@ mod native {
                 },
                 top_k: config.num_experts_per_tok.unwrap_or(1) as usize,
                 norm_topk_prob: config.norm_topk_prob,
-                sigmoid_routing: config.family == ModelFamily::Hy3,
+                sigmoid_routing: config.family == ModelFamily::Hy3 || config.model_type == "dots1",
                 expert_bias,
                 routed_scaling_factor: config.routed_scaling_factor,
                 compile_moe,

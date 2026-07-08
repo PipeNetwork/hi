@@ -6,7 +6,7 @@ device: each arch is served and must answer fixed prompts coherently (capital of
 2+2, a haiku) — see `scripts/hi_mlx_acceptance_matrix.sh`.
 
 This started as PipeNetwork-model coverage (the first 12 archs) and has since expanded to the broader
-mlx_lm architecture set. **27 architectures are supported and validated on device**; a few more are
+mlx_lm architecture set. **28 architectures are supported and validated on device**; a few more are
 arch-verified or blocked (see the last section).
 
 ## The delivery pattern
@@ -45,7 +45,7 @@ forward in mlx from the modeling spec and diff against that.
 | `longcat2` | `LongCatLike` | ScMoE (double absorbed-MLA + shortcut softmax-MoE) + n-gram embedding + YARN |
 | `glm4` / `glm4_moe_lite` | `Glm4Like` / `MlaLike` | GQA GLM-4 + MLA lite |
 
-## ✅ Supported — general architectures (15, added this expansion)
+## ✅ Supported — general architectures (16, added this expansion)
 
 | `model_type` | hi-mlx path | validated on | key quirk |
 |---|---|---|---|
@@ -63,6 +63,7 @@ forward in mlx from the modeling spec and diff against that.
 | `olmoe` | `QwenLike` (Qwen3) | OLMoE-1B-7B | Qwen3-MoE + full qk-norm; individual experts auto-stacked |
 | `ernie4_5_moe` | `QwenLike` (Qwen2) | ERNIE-4.5-21B-A3B | softmax-topk MoE + `shared_experts` (plural); dense prefix |
 | `phimoe` | `PhiMoeLike` (dedicated) | Phi-3.5-MoE | **SuScaledRoPE (LongRoPE)** + LayerNorm + biased attn + top-2 MoE |
+| `dots1` (dots.llm1) | `QwenLike` (Qwen3) | dots.llm1 143B (mixed 4-6bit) | per-head qk-norm + DeepSeek aux-free sigmoid MoE (correction bias, `shared_experts`, dense prefix); experts stacked at `mlp.experts`; **mixed per-tensor quant** |
 
 Chat-template family (in `hi-local-core/prompt.rs`, detected by marker substrings): gemma turn/standard,
 minimax, longcat, granite, llama3, smollm3, seed-oss, gpt-oss harmony, cohere command-r, llama-4, phi-3.
@@ -93,12 +94,12 @@ from the turn-end token (Gemma `<end_of_turn>` 106, Phi `<|end|>` 32007).
 | `kimi_k25` | arch-verified | tiktoken tokenizer, **no `tokenizer.json`** (slow tokenizer, can't generate one). Thin DeepSeek-V3 wrapper on the validated `MlaLike` path. *(Correction to an earlier note: the 465 GB quant fits the 550 GB host — the blocker is the tokenizer, not RAM.)* |
 | `internlm3` | routed, unvalidatable | mlx-community repo ships only `tokenizer.model`, no `tokenizer.json`. Runs on the Qwen path once a `tokenizer.json` is added. |
 | `ernie4_5_moe` | **supported** (see above) | the mlx repo omits `tokenizer.json`; grab it from base `baidu/ERNIE-4.5-21B-A3B-PT` to run. |
-| `dots1` (dots.llm1) | not implemented | only MLX model is **mixed-4-6bit**, and hi-mlx does not support mixed quantization. Arch is GQA + per-head qk-norm + DeepSeek-style sigmoid MoE (n_group 1, shared expert) — would ride `QwenLike` + the DeepSeek gate once a uniform-quant model exists (or mixed-quant support is added). |
 | `granitemoe` | not implemented | **no MLX model published**. IBM fused-expert format (`block_sparse_moe.input_linear`/`output_linear` → SwitchGLU) + `router.layer` naming + the Granite scalar multipliers (already in config). Ready to add against a real model. |
 
-Both `dots1` and `granitemoe` were left unimplemented **deliberately**: without a runnable model there is
-no way to validate a new forward, and shipping unverified arch code would misreport coverage. They are
-documented here so the work is scoped when a model appears.
+`granitemoe` is left unimplemented **deliberately**: with no MLX model there is no way to validate a new
+forward, and shipping unverified arch code would misreport coverage. It's documented here so the work is
+scoped when a model appears. (`dots1` was in this bucket until its mixed-quant model was confirmed to
+load — hi-mlx *does* support mixed per-tensor quantization, so it's now validated above.)
 
 ## CI
 
