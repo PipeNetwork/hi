@@ -25,7 +25,46 @@ pub fn parse_tool_calls(text: &str, tools: &[Tool]) -> Option<Vec<NormalizedTool
     if let Some(calls) = parse_json_tool_calls(text, &allowed) {
         return Some(calls);
     }
-    parse_bracket_tool_calls(text, &allowed)
+    if let Some(calls) = parse_bracket_tool_calls(text, &allowed) {
+        return Some(calls);
+    }
+    parse_xml_attr_tool_calls(text, &allowed)
+}
+
+// GPT-OSS-style `<tool_call name="get_weather" arguments='{"city":"Paris"}'>` (attributes rather than a
+// JSON body). Extract each tag's name/arguments attributes.
+fn parse_xml_attr_tool_calls(text: &str, allowed: &[&str]) -> Option<Vec<NormalizedToolCall>> {
+    let mut out = Vec::new();
+    let mut rest = text;
+    while let Some(pos) = rest.find("<tool_call") {
+        let after = &rest[pos + "<tool_call".len()..];
+        let end = after.find('>').unwrap_or(after.len());
+        let tag = &after[..end];
+        rest = &after[end..];
+        let Some(name) = xml_attr(tag, "name") else {
+            continue;
+        };
+        let args = xml_attr(tag, "arguments").unwrap_or("{}");
+        let arguments =
+            serde_json::from_str::<Value>(args).unwrap_or(Value::Object(Default::default()));
+        if let Some(call) = normalize(name, arguments, allowed, out.len()) {
+            out.push(call);
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+fn xml_attr<'a>(tag: &'a str, key: &str) -> Option<&'a str> {
+    let needle = format!("{key}=");
+    let start = tag.find(&needle)? + needle.len();
+    let rest = &tag[start..];
+    let quote = rest.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let inner = &rest[quote.len_utf8()..];
+    let end = inner.find(quote)?;
+    Some(&inner[..end])
 }
 
 fn parse_json_tool_calls(text: &str, allowed: &[&str]) -> Option<Vec<NormalizedToolCall>> {

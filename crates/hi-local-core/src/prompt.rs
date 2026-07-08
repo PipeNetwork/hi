@@ -33,14 +33,61 @@ pub fn build_prompt_with_template(
     tools: &[Tool],
     tool_choice: &Value,
 ) -> String {
-    if tools.is_empty() {
-        if let Some(rendered) =
-            chat_template.and_then(|template| render_gguf_chat_template(template, messages))
+    if let Some(template) = chat_template {
+        if tools.is_empty() {
+            if let Some(rendered) = render_gguf_chat_template(template, messages) {
+                return rendered;
+            }
+        } else if matches!(
+            family,
+            ModelFamily::Qwen2 | ModelFamily::Qwen3 | ModelFamily::NemotronH | ModelFamily::Gemma
+        ) && !normalize_jinja_template(template).contains("<|im_start|>")
         {
-            return rendered;
+            // Expansion archs route to the Qwen/Gemma family for text but carry a non-chatml native
+            // template (granite, cohere, gpt_oss, llama4, phi-moe, gemma2/3…). The family prompt would
+            // hand them chatml/gemma without their real turn format, so render the native template with
+            // the tool instruction folded into a system turn instead. Archs whose family has bespoke
+            // tool rendering (Llama/Phi/DeepSeek/GlmFlash) fall through to build_prompt below.
+            let augmented = inject_tool_system(messages, tools, tool_choice);
+            if let Some(rendered) = render_gguf_chat_template(template, &augmented) {
+                return rendered;
+            }
         }
     }
     build_prompt(family, messages, tools, tool_choice)
+}
+
+// Fold the generic tool instruction (schema + `<tool_call>` output format) into a system turn so
+// archs rendered by their native template — which otherwise ignores `tools` — still see the tools.
+fn inject_tool_system(
+    messages: &[ChatMessage],
+    tools: &[Tool],
+    tool_choice: &Value,
+) -> Vec<ChatMessage> {
+    let block = tool_instructions(tools, tool_choice);
+    if block.is_empty() {
+        return messages.to_vec();
+    }
+    let sys = |content: String| ChatMessage {
+        role: "system".to_string(),
+        content: Some(Value::String(content)),
+        tool_call_id: None,
+        tool_calls: Vec::new(),
+    };
+    let mut out = Vec::with_capacity(messages.len() + 1);
+    let mut injected = false;
+    for message in messages {
+        if !injected && matches!(message.role.as_str(), "system" | "developer" | "root") {
+            out.push(sys(format!("{}\n\n{}", message.content_text(), block)));
+            injected = true;
+        } else {
+            out.push(message.clone());
+        }
+    }
+    if !injected {
+        out.insert(0, sys(block));
+    }
+    out
 }
 
 fn render_gguf_chat_template(template: &str, messages: &[ChatMessage]) -> Option<String> {
@@ -866,6 +913,13 @@ fn tool_instructions(tools: &[Tool], tool_choice: &Value) -> String {
     );
     if tool_choice == "required" {
         out.push_str(" You must call a tool.");
+    } else if let Some(name) = tool_choice
+        .get("function")
+        .and_then(|f| f.get("name"))
+        .and_then(Value::as_str)
+    {
+        // Forced a specific function (OpenAI tool_choice object).
+        out.push_str(&format!(" You must call the {name} tool."));
     }
     // Emit each tool as compact JSON on its own line — matching Qwen2.5's native
     // template (`{{ tool | tojson }}` per tool) and avoiding the pretty-printer's
