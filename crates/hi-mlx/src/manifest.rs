@@ -191,6 +191,9 @@ fn model_family(model_type: &str, config: &Value) -> Option<ModelFamily> {
         // GLM-5.2 (glm_moe_dsa): DeepSeek-V3.2 arch (MLA + DSA indexer + sigmoid/noaux MoE).
         || matches!(model_type.as_str(), "glm_moe_dsa" | "glm_moe_dsa_mtp")
         || haystack.contains("glm_moe_dsa")
+        // Kimi K2/K2.5/K2.7: thin DeepSeek-V3 wrapper.
+        || model_type.starts_with("kimi_k2")
+        || haystack.contains("kimi_k2")
     {
         return Some(ModelFamily::DeepSeek);
     }

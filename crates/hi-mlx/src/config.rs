@@ -415,6 +415,10 @@ pub fn detect_family(model_type: &str, config: &Value) -> Option<ModelFamily> {
         // (the lightning indexer) + sigmoid/noaux MoE. Route it through the DeepSeek path.
         || matches!(model_type.as_str(), "glm_moe_dsa" | "glm_moe_dsa_mtp")
         || haystack.contains("glm_moe_dsa")
+        // Kimi K2/K2.5/K2.7 are a thin DeepSeek-V3 wrapper (MLA + sigmoid/noaux MoE, with a nested
+        // `language_model.` weight prefix that load_arrays already strips). Route through DeepSeek.
+        || model_type.starts_with("kimi_k2")
+        || haystack.contains("kimi_k2")
     {
         return Some(ModelFamily::DeepSeek);
     }
@@ -439,7 +443,7 @@ pub fn detect_family(model_type: &str, config: &Value) -> Option<ModelFamily> {
 }
 
 pub fn supported_model_families() -> &'static str {
-    "qwen2/qwen2_moe, qwen3/qwen3_moe/qwen3_next, deepseek_v2/deepseek_v3/deepseek_v32/deepseek_v4, glm4/glm4_moe/glm4_moe_lite Flash, hy_v3 (Hunyuan-3)"
+    "qwen2/qwen2_moe, qwen3/qwen3_moe/qwen3_next/qwen3_5/qwen3_5_moe, deepseek_v2/deepseek_v3/deepseek_v32/deepseek_v4, glm_moe_dsa (GLM-5.2), kimi_k2* (Kimi K2), glm4/glm4_moe/glm4_moe_lite Flash, hy_v3 (Hunyuan-3)"
 }
 
 pub fn architecture_strings(config: &Value) -> Vec<String> {
