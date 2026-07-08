@@ -134,6 +134,11 @@ pub struct AgentConfig {
     /// to an external language server (rust-analyzer, pyright, etc.). Off by
     /// default; toggle at runtime with `/lsp on` / `/lsp off`.
     pub lsp: bool,
+    /// Advertise only the essential ([`hi_tools::MINIMAL_TOOL_SPECS`]) subset of
+    /// tools instead of the full set. Small (~3B) models can't reliably plan
+    /// over the full ~20-tool schema; the trimmed set restores usable
+    /// tool-calling. Off by default; set per profile with `minimal_tools = true`.
+    pub minimal_tools: bool,
 }
 
 impl Default for AgentConfig {
@@ -172,6 +177,7 @@ impl Default for AgentConfig {
             long_horizon: false,
             confirm_edits: false,
             lsp: false,
+            minimal_tools: false,
         }
     }
 }

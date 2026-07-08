@@ -190,6 +190,7 @@ async fn main() -> Result<()> {
         thinking_budget: settings.thinking_budget,
         tool_mode: settings.tool_mode,
         compat: settings.compat,
+        minimal_tools: settings.minimal_tools,
         context_window: live_metadata.context_window,
         project_context: load_project_context(),
         verify: resolve_verify(&cli),
@@ -1129,6 +1130,7 @@ mod tests {
             thinking_budget: None,
             tool_mode: ToolMode::default(),
             compat: CompatMode::default(),
+            minimal_tools: false,
             moa: hi_ai::MoaConfig::default(),
         }
     }
@@ -1145,6 +1147,7 @@ mod tests {
             thinking_budget: None,
             tool_mode: ToolMode::default(),
             compat: CompatMode::default(),
+            minimal_tools: false,
             moa: hi_ai::MoaConfig::default(),
         }
     }

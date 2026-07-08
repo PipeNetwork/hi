@@ -99,11 +99,16 @@ impl crate::Agent {
         } else {
             hi_tools::set_lsp_manager(mgr);
         }
+        let tools = if config.minimal_tools {
+            hi_tools::MINIMAL_TOOL_SPECS.clone().into()
+        } else {
+            TOOL_SPECS.clone().into()
+        };
         Self {
             provider,
             config,
             messages,
-            tools: TOOL_SPECS.clone().into(),
+            tools,
             session: None,
             persisted,
             totals: Usage::default(),

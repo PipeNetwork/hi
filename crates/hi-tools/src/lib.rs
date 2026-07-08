@@ -33,9 +33,9 @@ pub use lsp::{
 };
 pub use paths::clear_read_cache;
 pub use tools::{
-    TOOL_SPECS, commit, execute, execute_streaming, fast_check_for, is_filesystem_mutating,
-    is_read_only, prepare_verify_workdir, run_check, target_path, working_tree_diff,
-    working_tree_diff_plain,
+    MINIMAL_TOOL_SPECS, TOOL_SPECS, commit, execute, execute_streaming, fast_check_for,
+    is_filesystem_mutating, is_read_only, prepare_verify_workdir, run_check, target_path,
+    working_tree_diff, working_tree_diff_plain,
 };
 pub use web::{run_web_download, run_web_fetch, run_web_search};
 
