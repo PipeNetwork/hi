@@ -2397,7 +2397,7 @@ constexpr int HI_CUDA_FLASH_MAX_HEAD_DIM = 512;
 // on the paged reads; splitting the key range across this many warps issues that
 // many concurrent K/V loads to hide the latency, then a shared-memory flash
 // rescale-merge combines the per-warp partial softmaxes.
-constexpr int HI_CUDA_DECODE_WARPS = 8;
+constexpr int HI_CUDA_DECODE_WARPS = 16;
 
 __global__ void flash_causal_attention_kernel(
     const float* q,
