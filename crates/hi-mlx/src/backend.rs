@@ -25,6 +25,9 @@ pub struct MlxBackend {
     runtime: Arc<Mutex<NativeRuntime>>,
     draft: Option<Arc<Mutex<NativeRuntime>>>,
     spec_k: usize,
+    // Self-calibrating speculation gate: None until the first greedy request measures whether
+    // speculation actually beats the plain loop for this model+hardware; then cached.
+    spec_gate: Arc<Mutex<Option<bool>>>,
 }
 
 const OVERSIZE_MODEL_ENV: &str = "HI_MLX_ALLOW_OVERSIZE_MODEL";
@@ -76,8 +79,74 @@ impl MlxBackend {
             runtime: Arc::new(Mutex::new(runtime)),
             draft,
             spec_k: spec_k.max(1),
+            spec_gate: Arc::new(Mutex::new(None)),
         })
     }
+}
+
+// Measure whether speculation (draft or MTP) actually beats the plain decode loop for this model on
+// this hardware, on a short fixed probe. Very slow models are memory/compute-bound and always benefit,
+// so a fast plain-rate pre-check short-circuits the (costly) spec probe.
+#[cfg(all(target_os = "macos", target_arch = "aarch64", feature = "mlx"))]
+fn calibrate_speculation(
+    runtime: &mut NativeRuntime,
+    mut draft: Option<&mut NativeRuntime>,
+    spec_k: usize,
+    probe_prompt: &str,
+) -> bool {
+    use crate::backend::GenerationRequest;
+    const N: u32 = 12;
+    const SLOW_TPS: f64 = 8.0; // below any spec break-even -> spec always helps
+    // Calibrate on a prefix of the real request so draft/MTP acceptance reflects the actual workload
+    // (acceptance is content-dependent — a generic probe under-measures it).
+    let prompt: String = probe_prompt.chars().take(2000).collect();
+    let req = |n: u32| GenerationRequest {
+        prompt: prompt.clone(),
+        max_tokens: n,
+        temperature: 0.0,
+        top_p: 1.0,
+        top_k: None,
+        seed: None,
+        stop_sequences: vec![],
+        media_inputs: vec![],
+    };
+    let rate = |out: Option<GenerationOutput>, dt: f64| {
+        out.map(|o| o.completion_tokens as f64 / dt.max(1e-6))
+            .unwrap_or(0.0)
+    };
+    // Warm the trunk (first forward compiles Metal shaders / fills caches), then probe the plain rate.
+    let _ = runtime.generate(req(2));
+    let t0 = std::time::Instant::now();
+    let plain_tps = rate(runtime.generate(req(N)).ok(), t0.elapsed().as_secs_f64());
+    if plain_tps > 0.0 && plain_tps < SLOW_TPS {
+        // Very slow (memory/compute-bound) trunk: speculation always helps; skip the slow spec probe.
+        tracing::info!("speculation gate: plain {plain_tps:.1} tok/s (slow) -> ENABLED");
+        return true;
+    }
+    // Warm + probe the spec path.
+    match draft.as_deref_mut() {
+        Some(d) => {
+            let _ = runtime.speculative_generate(d, req(2), spec_k, |_| Ok(()));
+        }
+        None => {
+            let _ = runtime.mtp_generate(req(2), |_| Ok(()));
+        }
+    }
+    let t1 = std::time::Instant::now();
+    let spec = match draft.as_deref_mut() {
+        Some(d) => runtime
+            .speculative_generate(d, req(N), spec_k, |_| Ok(()))
+            .map(|(o, _)| o)
+            .ok(),
+        None => runtime.mtp_generate(req(N), |_| Ok(())).ok(),
+    };
+    let spec_tps = rate(spec, t1.elapsed().as_secs_f64());
+    let enabled = spec_tps > plain_tps * 1.05;
+    tracing::info!(
+        "speculation gate: plain {plain_tps:.1} vs spec {spec_tps:.1} tok/s -> {}",
+        if enabled { "ENABLED" } else { "disabled" }
+    );
+    enabled
 }
 
 fn validate_memory_admission(estimated_bytes: u64) -> Result<()> {
@@ -179,9 +248,11 @@ impl InferenceBackend for MlxBackend {
     async fn stream_generate(&self, request: GenerationRequest) -> Result<GenerationStream> {
         let runtime = Arc::clone(&self.runtime);
         let draft = self.draft.clone();
+        let spec_gate = Arc::clone(&self.spec_gate);
         let spec_k = self.spec_k;
         // Speculative decoding is greedy-only; sampling requests fall back to the normal loop.
         let greedy = request.temperature <= f32::EPSILON;
+        let mtp_ok = std::env::var_os("HI_MLX_DISABLE_MTP").is_none();
         let (tx, rx) = mpsc::channel(8);
         tokio::task::spawn_blocking(move || {
             let send = |event| {
@@ -190,18 +261,33 @@ impl InferenceBackend for MlxBackend {
             };
             let result = {
                 let mut runtime = runtime.blocking_lock();
-                if greedy {
+                let spec_eligible =
+                    greedy && (draft.is_some() || (runtime.supports_mtp() && mtp_ok));
+                // Calibrate once per model: measure whether speculation actually beats the plain loop.
+                let use_spec = if spec_eligible {
+                    let mut gate = spec_gate.blocking_lock();
+                    if gate.is_none() {
+                        let mut dguard = draft.as_ref().map(|d| d.blocking_lock());
+                        let decision = calibrate_speculation(
+                            &mut runtime,
+                            dguard.as_deref_mut(),
+                            spec_k,
+                            &request.prompt,
+                        );
+                        *gate = Some(decision);
+                    }
+                    gate.unwrap()
+                } else {
+                    false
+                };
+                if use_spec {
                     if let Some(draft) = draft.as_ref() {
                         let mut draft = draft.blocking_lock();
                         runtime
                             .speculative_generate(&mut draft, request, spec_k, send)
                             .map(|(output, _stats)| output)
-                    } else if runtime.supports_mtp() && std::env::var_os("HI_MLX_DISABLE_MTP").is_none()
-                    {
-                        // Model has a built-in MTP head (GLM-5.2): self-speculative decoding.
-                        runtime.mtp_generate(request, send)
                     } else {
-                        runtime.stream_generate(request, send)
+                        runtime.mtp_generate(request, send)
                     }
                 } else {
                     runtime.stream_generate(request, send)
