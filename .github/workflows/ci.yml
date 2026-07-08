@@ -26,6 +26,9 @@ jobs:
         with:
           components: rustfmt
       - uses: Swatinem/rust-cache@v2
+      - name: Install test system deps
+        # aria2c is exercised by hi-tools' HuggingFace download tests.
+        run: sudo apt-get update && sudo apt-get install -y aria2
       - name: Format
         run: cargo fmt --all --check
       - name: Test
