@@ -116,6 +116,7 @@ impl crate::Agent {
             context_used: 0,
             checkpoints: Vec::new(),
             last_changed_files: Vec::new(),
+            auto_skills_written: 0,
             last_compat_fallbacks: Vec::new(),
             interrupt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_turn_telemetry: TurnTelemetry::default(),

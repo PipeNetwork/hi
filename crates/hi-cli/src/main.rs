@@ -191,6 +191,8 @@ async fn main() -> Result<()> {
         tool_mode: settings.tool_mode,
         compat: settings.compat,
         minimal_tools: settings.minimal_tools,
+        // Env override lets you flip on skill auto-curation without editing a profile.
+        curate_skills: settings.curate_skills || std::env::var_os("HI_CURATE_SKILLS").is_some(),
         context_window: live_metadata.context_window,
         project_context: load_project_context(),
         verify: resolve_verify(&cli),
@@ -1131,6 +1133,7 @@ mod tests {
             tool_mode: ToolMode::default(),
             compat: CompatMode::default(),
             minimal_tools: false,
+            curate_skills: false,
             moa: hi_ai::MoaConfig::default(),
         }
     }
@@ -1148,6 +1151,7 @@ mod tests {
             tool_mode: ToolMode::default(),
             compat: CompatMode::default(),
             minimal_tools: false,
+            curate_skills: false,
             moa: hi_ai::MoaConfig::default(),
         }
     }

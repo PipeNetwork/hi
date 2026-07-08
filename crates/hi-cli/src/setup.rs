@@ -84,6 +84,7 @@ pub async fn run() -> Result<Settings> {
         tool_mode: hi_ai::ToolMode::Auto,
         compat: hi_ai::CompatMode::Auto,
         minimal_tools: false,
+        curate_skills: false,
         moa: hi_ai::MoaConfig::default(),
     })
 }

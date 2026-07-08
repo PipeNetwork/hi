@@ -93,6 +93,87 @@ pub fn read_skill_in(roots: &SkillRoots, name: &str) -> Result<SkillContent> {
     Err(anyhow!("skill '{name}' not found"))
 }
 
+/// Write a learned skill to `<root>/<slug>/SKILL.md` with frontmatter that round-trips through
+/// [`parse_frontmatter`]. `scope` selects the project or global root. Returns the written path, or
+/// `Ok(None)` if a skill with the same normalized `name` already exists (de-dup: never overwrite an
+/// existing skill — the auto-curator must not clobber user-authored ones). Errors on oversize/I/O.
+pub fn write_skill(
+    roots: &SkillRoots,
+    scope: &str,
+    name: &str,
+    description: &str,
+    body: &str,
+) -> Result<Option<PathBuf>> {
+    let name = sanitize_line(name);
+    if name.is_empty() {
+        return Err(anyhow!("skill name is empty"));
+    }
+    // De-dup by normalized name across both roots (project shadows global anyway).
+    let needle = normalize_name(&name);
+    if list_skills_in(roots)
+        .iter()
+        .any(|s| normalize_name(&s.name) == needle)
+    {
+        return Ok(None);
+    }
+    let scope = if scope == "global" {
+        "global"
+    } else {
+        "project"
+    };
+    let root = if scope == "global" {
+        &roots.global
+    } else {
+        &roots.project
+    };
+    let description = sanitize_line(description);
+    let contents = format!(
+        "---\nname: {name}\ndescription: {description}\nscope: {scope}\n---\n\n{}\n",
+        body.trim()
+    );
+    if contents.len() > MAX_SKILL_BYTES {
+        return Err(anyhow!("skill '{name}' exceeds {MAX_SKILL_BYTES} bytes"));
+    }
+    let dir = root.join(slugify(&name));
+    fs::create_dir_all(&dir).map_err(|err| anyhow!("failed to create skill dir: {err}"))?;
+    // Atomic publish: write a pid-scoped temp file then rename over the target (mirrors
+    // `memory::write_memory`). Unique per-slug paths make cross-writer contention a non-issue.
+    let file = dir.join("SKILL.md");
+    let tmp = dir.join(format!(".SKILL.md.{}.tmp", std::process::id()));
+    fs::write(&tmp, contents.as_bytes()).map_err(|err| anyhow!("failed to write skill: {err}"))?;
+    fs::rename(&tmp, &file).map_err(|err| {
+        let _ = fs::remove_file(&tmp);
+        anyhow!("failed to commit skill: {err}")
+    })?;
+    Ok(Some(file))
+}
+
+/// Collapse a name into a filesystem-safe slug: lowercase, non-alphanumerics become single `-`.
+fn slugify(name: &str) -> String {
+    let mut slug = String::new();
+    let mut prev_dash = false;
+    for ch in name.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            prev_dash = false;
+        } else if !prev_dash {
+            slug.push('-');
+            prev_dash = true;
+        }
+    }
+    let slug = slug.trim_matches('-').to_string();
+    if slug.is_empty() {
+        "skill".to_string()
+    } else {
+        slug
+    }
+}
+
+/// Flatten a frontmatter value to a single trimmed line (frontmatter is line-oriented).
+fn sanitize_line(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Render only compact metadata for startup context. Full skill bodies are not
 /// included here.
 pub fn learned_skills_context() -> Option<String> {
@@ -368,5 +449,45 @@ mod tests {
         assert!(prompt.contains("release-flow"));
         assert!(prompt.contains("# Release"));
         assert!(prompt.contains("Steps"));
+    }
+
+    #[test]
+    fn write_skill_round_trips_and_dedups() {
+        let roots = SkillRoots {
+            project: unique_dir("write-project"),
+            global: unique_dir("write-global"),
+        };
+        // `super::write_skill` is the real writer (the test helper above shadows the name locally).
+        let path = super::write_skill(
+            &roots,
+            "project",
+            "Retry Flaky Test",
+            "Re-run a flaky test to confirm.",
+            "# Retry\n\nsteps here",
+        )
+        .unwrap();
+        assert!(path.is_some());
+        let skills = list_skills_in(&roots);
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "Retry Flaky Test");
+        assert_eq!(skills[0].scope, "project");
+        assert_eq!(skills[0].description, "Re-run a flaky test to confirm.");
+        let content = read_skill_in(&roots, "retry flaky test").unwrap();
+        assert!(content.content.contains("steps here"));
+        // Same normalized name (different casing) is a de-dup no-op.
+        let again = super::write_skill(&roots, "project", "retry flaky test", "dup", "x").unwrap();
+        assert!(again.is_none());
+        assert_eq!(list_skills_in(&roots).len(), 1);
+    }
+
+    #[test]
+    fn write_skill_oversize_is_rejected() {
+        let roots = SkillRoots {
+            project: unique_dir("oversize-project"),
+            global: unique_dir("oversize-global"),
+        };
+        let huge = "x".repeat(MAX_SKILL_BYTES + 1);
+        assert!(super::write_skill(&roots, "project", "big", "big", &huge).is_err());
+        assert!(list_skills_in(&roots).is_empty());
     }
 }
