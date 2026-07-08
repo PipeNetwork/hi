@@ -97,7 +97,11 @@ impl NativeRuntime {
     }
 
     /// Greedy self-speculative decoding via the model's own MTP head.
-    pub fn mtp_generate<F>(&mut self, request: GenerationRequest, mut on_event: F) -> Result<GenerationOutput>
+    pub fn mtp_generate<F>(
+        &mut self,
+        request: GenerationRequest,
+        mut on_event: F,
+    ) -> Result<GenerationOutput>
     where
         F: FnMut(GenerationEvent) -> Result<()>,
     {
@@ -169,6 +173,7 @@ mod native {
     use mlx_rs::fast::{
         ScaledDotProductAttentionMask, layer_norm, rms_norm, rope, scaled_dot_product_attention,
     };
+    use mlx_rs::nn::{gelu_approximate, silu, softplus};
     use mlx_rs::ops::indexing::{
         IndexOp, TryIndexMutOp, argmax_axis, put_along_axis, take_along_axis,
     };
@@ -177,7 +182,6 @@ mod native {
         identity, matmul, maximum, mean_axis, minimum, rsqrt, sigmoid, sin, softmax_axis,
         split_sections, stack_axis, sum_axis, tanh, tril, which, zeros_dtype,
     };
-    use mlx_rs::nn::{gelu_approximate, silu, softplus};
     use mlx_rs::transforms::compile::{CallMut, Compile};
     use mlx_rs::{Array, Stream, transforms};
 
@@ -447,7 +451,14 @@ mod native {
         on_event(GenerationEvent::Finished {
             output: output.clone(),
         })?;
-        Ok((output, SpecStats { rounds, proposed, accepted }))
+        Ok((
+            output,
+            SpecStats {
+                rounds,
+                proposed,
+                accepted,
+            },
+        ))
     }
 
     fn prefill_logits(
@@ -2118,7 +2129,10 @@ mod native {
                     let current = tokenizer.decode(&generated)?;
                     let delta = decoded_delta(&decoded_text, &current, tokenizer, tok)?;
                     decoded_text = current;
-                    on_event(GenerationEvent::TokenDelta { token_id: tok, text: delta })?;
+                    on_event(GenerationEvent::TokenDelta {
+                        token_id: tok,
+                        text: delta,
+                    })?;
                     generated.len() >= max_tokens || hit_stop(&generated, &config.eos_token_ids)
                 }};
             }
@@ -2200,7 +2214,9 @@ mod native {
                 "MTP self-speculation: {} tok over {rounds} rounds, MTP accept {rate:.0}% ({accepted}/{proposed})",
                 generated.len()
             );
-            on_event(GenerationEvent::Finished { output: output.clone() })?;
+            on_event(GenerationEvent::Finished {
+                output: output.clone(),
+            })?;
             Ok(output)
         }
     }
@@ -3434,7 +3450,10 @@ mod native {
             let ql = |l: &Linear| -> (Array, Array, Array) {
                 match l {
                     Linear::Quantized {
-                        weight, scales, biases, ..
+                        weight,
+                        scales,
+                        biases,
+                        ..
                     } => (
                         weight.clone(),
                         scales.clone(),
@@ -3456,8 +3475,24 @@ mod native {
                 x.clone(),
                 gate_w.clone(),
                 expert_bias,
-                sgw, sgs, sgb, suw, sus, sub, sdw, sds, sdb,
-                hgw, hgs, hgb, huw, hus, hub, hdw, hds, hdb,
+                sgw,
+                sgs,
+                sgb,
+                suw,
+                sus,
+                sub,
+                sdw,
+                sds,
+                sdb,
+                hgw,
+                hgs,
+                hgb,
+                huw,
+                hus,
+                hub,
+                hdw,
+                hds,
+                hdb,
             ];
             let top_k = self.top_k as i32;
             let group_size = sw.gate_proj.group_size;
@@ -3696,10 +3731,18 @@ mod native {
                 k_proj: Linear::load(&format!("{prefix}.k_proj"), arrays, config)?,
                 v_proj: Linear::load(&format!("{prefix}.v_proj"), arrays, config)?,
                 o_proj: Linear::load(&format!("{prefix}.o_proj"), arrays, config)?,
-                q_norm: RmsNorm::load(&format!("{prefix}.q_norm.weight"), arrays, config.rms_norm_eps)
-                    .ok(),
-                k_norm: RmsNorm::load(&format!("{prefix}.k_norm.weight"), arrays, config.rms_norm_eps)
-                    .ok(),
+                q_norm: RmsNorm::load(
+                    &format!("{prefix}.q_norm.weight"),
+                    arrays,
+                    config.rms_norm_eps,
+                )
+                .ok(),
+                k_norm: RmsNorm::load(
+                    &format!("{prefix}.k_norm.weight"),
+                    arrays,
+                    config.rms_norm_eps,
+                )
+                .ok(),
                 // Gated attention: q_proj packs [queries; gate] → 2× the query width.
                 n_heads: q_out / (2 * head_dim),
                 n_kv_heads: k_out / head_dim,
@@ -3824,7 +3867,8 @@ mod native {
                     .as_type::<f32>()?,
                 a_log: raw_array(arrays, &format!("{prefix}.A_log"))?.as_type::<f32>()?,
                 dt_bias: raw_array(arrays, &format!("{prefix}.dt_bias"))?.as_type::<f32>()?,
-                norm_weight: raw_array(arrays, &format!("{prefix}.norm.weight"))?.as_type::<f32>()?,
+                norm_weight: raw_array(arrays, &format!("{prefix}.norm.weight"))?
+                    .as_type::<f32>()?,
                 qk_ones: Array::ones::<f32>(&[head_k_dim])?,
                 out_proj: Linear::load(&format!("{prefix}.out_proj"), arrays, config)?,
                 num_v_heads,
@@ -3998,9 +4042,15 @@ mod native {
                 (q.clone(), k.clone(), v.clone(), g.clone(), beta.clone())
             };
             // [1,sp,Hv,D] -> [nc,Hv,cs,D]
-            let q = q.reshape(&[nc, cs, hv, hk])?.transpose_axes(&[0, 2, 1, 3])?;
-            let k = k.reshape(&[nc, cs, hv, hk])?.transpose_axes(&[0, 2, 1, 3])?;
-            let v = v.reshape(&[nc, cs, hv, dv])?.transpose_axes(&[0, 2, 1, 3])?;
+            let q = q
+                .reshape(&[nc, cs, hv, hk])?
+                .transpose_axes(&[0, 2, 1, 3])?;
+            let k = k
+                .reshape(&[nc, cs, hv, hk])?
+                .transpose_axes(&[0, 2, 1, 3])?;
+            let v = v
+                .reshape(&[nc, cs, hv, dv])?
+                .transpose_axes(&[0, 2, 1, 3])?;
             let g = g.reshape(&[nc, cs, hv])?.transpose_axes(&[0, 2, 1])?;
             let beta = beta.reshape(&[nc, cs, hv])?.transpose_axes(&[0, 2, 1])?;
 
@@ -4008,8 +4058,10 @@ mod native {
             let eye = identity::<f32>(cs)?;
             // Additive masks: 0 on the kept triangle, -1e9 elsewhere. Added to the (finite) log-decay
             // differences *before* exp, so masked-out entries become exp(-1e9)=0 with no inf·0 = NaN.
-            let (mut pen_incl, mut pen_strict) =
-                (vec![0f32; (cs * cs) as usize], vec![0f32; (cs * cs) as usize]);
+            let (mut pen_incl, mut pen_strict) = (
+                vec![0f32; (cs * cs) as usize],
+                vec![0f32; (cs * cs) as usize],
+            );
             for t in 0..cs {
                 for j in 0..cs {
                     let idx = (t * cs + j) as usize;
@@ -4069,14 +4121,24 @@ mod native {
             };
             let mut ys: Vec<Array> = Vec::with_capacity(nc as usize);
             for c in 0..nc {
-                let w_c = w_all.index((c..(c + 1), .., .., ..)).reshape(&[hv, cs, dv])?;
-                let p_c = p_all.index((c..(c + 1), .., .., ..)).reshape(&[hv, cs, hk])?;
-                let qk_c = qk_all.index((c..(c + 1), .., .., ..)).reshape(&[hv, cs, cs])?;
-                let qbar_c = qbar.index((c..(c + 1), .., .., ..)).reshape(&[hv, cs, hk])?;
+                let w_c = w_all
+                    .index((c..(c + 1), .., .., ..))
+                    .reshape(&[hv, cs, dv])?;
+                let p_c = p_all
+                    .index((c..(c + 1), .., .., ..))
+                    .reshape(&[hv, cs, hk])?;
+                let qk_c = qk_all
+                    .index((c..(c + 1), .., .., ..))
+                    .reshape(&[hv, cs, cs])?;
+                let qbar_c = qbar
+                    .index((c..(c + 1), .., .., ..))
+                    .reshape(&[hv, cs, hk])?;
                 let kfinal_c = kfinal_all
                     .index((c..(c + 1), .., .., ..))
                     .reshape(&[hv, cs, hk])?;
-                let gl_c = gamma_last.index((c..(c + 1), .., .., ..)).reshape(&[hv, 1, 1])?;
+                let gl_c = gamma_last
+                    .index((c..(c + 1), .., .., ..))
+                    .reshape(&[hv, 1, 1])?;
                 let state_t = state.swap_axes(-1, -2)?; // [hv,hk,dv]
                 let u_c = w_c - matmul(&p_c, &state_t)?; // [hv,cs,dv]
                 let y_c = matmul(&qbar_c, &state_t)? + matmul(&qk_c, &u_c)?;
@@ -4389,7 +4451,9 @@ mod native {
             let h = self.attention.forward(&self.input_layernorm.forward(&x)?)?;
             let h = self.post_self_attn_layernorm.forward(&h)?;
             let x = x + h;
-            let h = self.mlp.forward(&self.post_attention_layernorm.forward(&x)?)?;
+            let h = self
+                .mlp
+                .forward(&self.post_attention_layernorm.forward(&x)?)?;
             let h = self.post_mlp_layernorm.forward(&h)?;
             Ok(x + h)
         }
@@ -4503,7 +4567,8 @@ mod native {
                 a_log: raw_array(arrays, &format!("{prefix}.A_log"))?.as_type::<f32>()?,
                 d: raw_array(arrays, &format!("{prefix}.D"))?.as_type::<f32>()?,
                 dt_bias: raw_array(arrays, &format!("{prefix}.dt_bias"))?.as_type::<f32>()?,
-                norm_weight: raw_array(arrays, &format!("{prefix}.norm.weight"))?.as_type::<f32>()?,
+                norm_weight: raw_array(arrays, &format!("{prefix}.norm.weight"))?
+                    .as_type::<f32>()?,
                 norm_ones: Array::ones::<f32>(&[group_size])?,
                 out_proj: Linear::load(&format!("{prefix}.out_proj"), arrays, config)?,
                 num_heads,
@@ -4578,12 +4643,20 @@ mod native {
             dt: &Array,
             s: i32,
         ) -> Result<Array> {
-            let (h, dh, g, ds) = (self.num_heads, self.head_dim, self.n_groups, self.state_size);
+            let (h, dh, g, ds) = (
+                self.num_heads,
+                self.head_dim,
+                self.n_groups,
+                self.state_size,
+            );
             let x = x_ssm.reshape(&[1, s, h, dh])?;
             let bb = bb.reshape(&[1, s, g, ds])?;
             let cc = cc.reshape(&[1, s, g, ds])?;
             let dt = softplus(&(dt.reshape(&[1, s, h])? + &self.dt_bias))?;
-            let dt = minimum(&maximum(&dt, &Array::from_f32(0.001))?, &Array::from_f32(100.0))?;
+            let dt = minimum(
+                &maximum(&dt, &Array::from_f32(0.001))?,
+                &Array::from_f32(100.0),
+            )?;
             let a = exp(&self.a_log)? * -1.0; // [h]
             let per_group = h / g;
             let mut state = match self.ssm_state.take() {
@@ -4609,7 +4682,8 @@ mod native {
                 .reshape(&[h, 1, ds])?;
                 let dbx = (&dt_e * &x_e) * &b_t; // [h,dh,ds]
                 state = &da * &state + dbx;
-                let y_t = sum_axis(&(&state * &c_t), -1, false)? + (self.d.reshape(&[h, 1])? * &x_hd);
+                let y_t =
+                    sum_axis(&(&state * &c_t), -1, false)? + (self.d.reshape(&[h, 1])? * &x_hd);
                 ys.push(y_t.reshape(&[1, 1, h * dh])?);
             }
             self.ssm_state = Some(state);
@@ -4693,9 +4767,11 @@ mod native {
             } else {
                 scaled_dot_product_attention(&q, &k, &v, scale, None, None::<&Array>)?
             };
-            let output = output
-                .transpose_axes(&[0, 2, 1, 3])?
-                .reshape(&[b, l, self.n_heads * self.head_dim])?;
+            let output = output.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
+                b,
+                l,
+                self.n_heads * self.head_dim,
+            ])?;
             self.o_proj.forward(&output)
         }
     }
@@ -4776,7 +4852,11 @@ mod native {
             Ok(Self {
                 gate: Linear::load(&format!("{prefix}.gate"), arrays, config)?,
                 expert_bias: bias.as_slice::<f32>().to_vec(),
-                switch_mlp: NemotronSwitchMlp::load(&format!("{prefix}.switch_mlp"), arrays, config)?,
+                switch_mlp: NemotronSwitchMlp::load(
+                    &format!("{prefix}.switch_mlp"),
+                    arrays,
+                    config,
+                )?,
                 shared: NemotronMlp::load(&format!("{prefix}.shared_experts"), arrays, config)?,
                 top_k: config.num_experts_per_tok.unwrap_or(1) as usize,
                 n_group: config.n_group.max(1) as usize,
@@ -4807,15 +4887,17 @@ mod native {
                     let per = n_experts / self.n_group;
                     let mut gscore: Vec<(usize, f32)> = (0..self.n_group)
                         .map(|g| {
-                            let mut vals: Vec<f32> =
-                                (0..per).map(|j| sel[g * per + j]).collect();
+                            let mut vals: Vec<f32> = (0..per).map(|j| sel[g * per + j]).collect();
                             vals.sort_by(|a, b| b.total_cmp(a));
                             (g, vals[0] + vals.get(1).copied().unwrap_or(0.0))
                         })
                         .collect();
                     gscore.sort_by(|a, b| b.1.total_cmp(&a.1));
-                    let kept: Vec<usize> =
-                        gscore.iter().take(self.topk_group).map(|(g, _)| *g).collect();
+                    let kept: Vec<usize> = gscore
+                        .iter()
+                        .take(self.topk_group)
+                        .map(|(g, _)| *g)
+                        .collect();
                     for g in 0..self.n_group {
                         if !kept.contains(&g) {
                             for j in 0..per {
@@ -4825,9 +4907,7 @@ mod native {
                     }
                 }
                 let mut ranked: Vec<usize> = (0..n_experts).collect();
-                ranked.sort_by(|&a, &b| {
-                    sel[b].total_cmp(&sel[a]).then_with(|| a.cmp(&b))
-                });
+                ranked.sort_by(|&a, &b| sel[b].total_cmp(&sel[a]).then_with(|| a.cmp(&b)));
                 ranked.truncate(self.top_k.min(n_experts));
                 let mut w: Vec<f32> = ranked.iter().map(|&i| raw[base + i]).collect();
                 if self.norm_topk_prob && w.len() > 1 {
@@ -5044,8 +5124,16 @@ mod native {
                     None
                 },
                 o_proj: Linear::load(&format!("{prefix}.o_proj"), arrays, config)?,
-                q_norm: RmsNorm::load(&format!("{prefix}.q_norm.weight"), arrays, config.rms_norm_eps)?,
-                k_norm: RmsNorm::load(&format!("{prefix}.k_norm.weight"), arrays, config.rms_norm_eps)?,
+                q_norm: RmsNorm::load(
+                    &format!("{prefix}.q_norm.weight"),
+                    arrays,
+                    config.rms_norm_eps,
+                )?,
+                k_norm: RmsNorm::load(
+                    &format!("{prefix}.k_norm.weight"),
+                    arrays,
+                    config.rms_norm_eps,
+                )?,
                 v_ones: Array::ones::<f32>(&[head_dim])?,
                 n_heads,
                 n_kv_heads,
@@ -5061,9 +5149,15 @@ mod native {
             // MLX rope rejects base+freqs together: pass custom freqs (full layers, base ignored) or
             // the base theta (sliding layers).
             match &self.rope_freqs {
-                Some(freqs) => {
-                    Ok(rope(x, self.head_dim, false, None::<f32>, 1.0, offset, Some(freqs))?)
-                }
+                Some(freqs) => Ok(rope(
+                    x,
+                    self.head_dim,
+                    false,
+                    None::<f32>,
+                    1.0,
+                    offset,
+                    Some(freqs),
+                )?),
                 None => Ok(rope(
                     x,
                     self.head_dim,
@@ -5094,7 +5188,9 @@ mod native {
             let k = self.rope_apply(&k, offset)?;
             // Full-attention layers reuse the K projection as V (k==v), then apply a weightless v-norm.
             let v_raw = match &self.v_proj {
-                Some(vp) => vp.forward(x)?.reshape(&[b, l, self.n_kv_heads, self.head_dim])?,
+                Some(vp) => vp
+                    .forward(x)?
+                    .reshape(&[b, l, self.n_kv_heads, self.head_dim])?,
                 None => k_raw,
             };
             let v = rms_norm(&v_raw, &self.v_ones, self.eps)?.transpose_axes(&[0, 2, 1, 3])?;
@@ -5123,9 +5219,11 @@ mod native {
             } else {
                 scaled_dot_product_attention(&q, &k, &v, scale, None, None::<&Array>)?
             };
-            let output = output
-                .transpose_axes(&[0, 2, 1, 3])?
-                .reshape(&[b, l, self.n_heads * self.head_dim])?;
+            let output = output.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
+                b,
+                l,
+                self.n_heads * self.head_dim,
+            ])?;
             self.o_proj.forward(&output)
         }
     }
@@ -5429,9 +5527,11 @@ mod native {
             } else {
                 scaled_dot_product_attention(&q, &k, &v, scale, None, None::<&Array>)?
             };
-            let output = output
-                .transpose_axes(&[0, 2, 1, 3])?
-                .reshape(&[b, l, self.n_heads * self.head_dim])?;
+            let output = output.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
+                b,
+                l,
+                self.n_heads * self.head_dim,
+            ])?;
             self.o_proj.forward(&output)
         }
     }
@@ -5456,16 +5556,16 @@ mod native {
             let bias = raw_array(arrays, &format!("{prefix}.e_score_correction_bias"))?
                 .as_type::<f32>()?;
             transforms::eval([&bias])?;
-            let shared = if arrays.contains_key(&format!("{prefix}.shared_experts.gate_proj.weight"))
-            {
-                Some(MiniMaxMlp::load(
-                    &format!("{prefix}.shared_experts"),
-                    arrays,
-                    config,
-                )?)
-            } else {
-                None
-            };
+            let shared =
+                if arrays.contains_key(&format!("{prefix}.shared_experts.gate_proj.weight")) {
+                    Some(MiniMaxMlp::load(
+                        &format!("{prefix}.shared_experts"),
+                        arrays,
+                        config,
+                    )?)
+                } else {
+                    None
+                };
             Ok(Self {
                 gate: Linear::load(&format!("{prefix}.gate"), arrays, config)?,
                 switch_mlp: SwitchMlp::load(&format!("{prefix}.switch_mlp"), arrays, config)?,
@@ -5783,14 +5883,15 @@ mod native {
         weight: &Array,
         scales: Option<&Array>,
     ) -> Result<QuantizationSpec> {
-        let mut spec = config
-            .quantization
-            .mlx_quantization_for(prefix)?
-            .unwrap_or(QuantizationSpec {
-                bits: 4,
-                group_size: 64,
-                mode: crate::config::QuantizationMode::Affine,
-            });
+        let mut spec =
+            config
+                .quantization
+                .mlx_quantization_for(prefix)?
+                .unwrap_or(QuantizationSpec {
+                    bits: 4,
+                    group_size: 64,
+                    mode: crate::config::QuantizationMode::Affine,
+                });
         // Dynamic/mixed-bit builds (e.g. GLM-5.2's MTP layer) omit per-tensor quant entries, so the
         // config default can be wrong. Infer the real bit width from the packing:
         //   in_packed = in*bits/32, n_groups = in/group_size  =>  bits = 32*in_packed/(n_groups*gs).
@@ -5897,13 +5998,13 @@ mod native {
                 weight.as_ptr(),
                 scales.as_ptr(),
                 biases.map(Array::as_ptr).unwrap_or_else(empty_array),
-                empty_array(),   // lhs_indices: null → broadcast x's batch dims
+                empty_array(), // lhs_indices: null → broadcast x's batch dims
                 rhs_indices.as_ptr(),
                 transpose,
                 optional_int(group_size),
                 optional_int(bits),
                 mode.as_ptr(),
-                false,           // sorted_indices
+                false, // sorted_indices
                 stream.as_ptr(),
             )
         };
@@ -5947,18 +6048,75 @@ mod native {
         // Routed experts via batched gather-qmm SwiGLU.
         let inds_r = inds.reshape(&[l, top_k])?;
         let xe = x.reshape(&[l, 1, 1, d])?;
-        let gp = gather_qmm_mode(&xe, &a[3], &a[4], Some(&a[5]), &inds_r, true, group_size, bits, "affine")?;
+        let gp = gather_qmm_mode(
+            &xe,
+            &a[3],
+            &a[4],
+            Some(&a[5]),
+            &inds_r,
+            true,
+            group_size,
+            bits,
+            "affine",
+        )?;
         let gp = sigmoid(&gp)? * gp;
-        let up = gather_qmm_mode(&xe, &a[6], &a[7], Some(&a[8]), &inds_r, true, group_size, bits, "affine")?;
-        let down = gather_qmm_mode(&(gp * up), &a[9], &a[10], Some(&a[11]), &inds_r, true, group_size, bits, "affine")?;
+        let up = gather_qmm_mode(
+            &xe,
+            &a[6],
+            &a[7],
+            Some(&a[8]),
+            &inds_r,
+            true,
+            group_size,
+            bits,
+            "affine",
+        )?;
+        let down = gather_qmm_mode(
+            &(gp * up),
+            &a[9],
+            &a[10],
+            Some(&a[11]),
+            &inds_r,
+            true,
+            group_size,
+            bits,
+            "affine",
+        )?;
         let eo = down.reshape(&[l, top_k, d])?.as_type::<f32>()?;
         let wr = w.reshape(&[l, top_k, 1])?;
         let mut y = sum_axis(&(eo * wr), 1, Some(false))?.reshape(&[1, l, d])?;
         // Always-on shared expert (quantized SwiGLU MLP).
-        let sg = quantized_matmul_mode(x, &a[12], &a[13], Some(&a[14]), true, group_size, bits, "affine")?;
+        let sg = quantized_matmul_mode(
+            x,
+            &a[12],
+            &a[13],
+            Some(&a[14]),
+            true,
+            group_size,
+            bits,
+            "affine",
+        )?;
         let sg = sigmoid(&sg)? * sg;
-        let su = quantized_matmul_mode(x, &a[15], &a[16], Some(&a[17]), true, group_size, bits, "affine")?;
-        let sd = quantized_matmul_mode(&(sg * su), &a[18], &a[19], Some(&a[20]), true, group_size, bits, "affine")?;
+        let su = quantized_matmul_mode(
+            x,
+            &a[15],
+            &a[16],
+            Some(&a[17]),
+            true,
+            group_size,
+            bits,
+            "affine",
+        )?;
+        let sd = quantized_matmul_mode(
+            &(sg * su),
+            &a[18],
+            &a[19],
+            Some(&a[20]),
+            true,
+            group_size,
+            bits,
+            "affine",
+        )?;
         y = y + sd.as_type::<f32>()?;
         Ok(y)
     }

@@ -1433,6 +1433,9 @@ fn cuda_model_family_label(family: ModelFamily) -> &'static str {
         ModelFamily::GlmFlash => "GLM",
         ModelFamily::Hy3 => "Hy3",
         ModelFamily::NemotronH => "NemotronH",
+        // MLX-only families (never reach the CUDA/GGUF path) — arms kept explicit so a new
+        // ModelFamily variant is a compile error here rather than a silent fallthrough.
+        ModelFamily::MiniMax => "MiniMax",
     }
 }
 

@@ -4117,7 +4117,10 @@ fn retain_prefix_from_request(state: &CudaSchedulerState, request: &mut CudaCont
     if let Some(mut previous) = slot.take() {
         kv_pages.release_pages(&mut previous.pages);
     }
-    *slot = Some(RetainedPrefix { tokens, pages: kept });
+    *slot = Some(RetainedPrefix {
+        tokens,
+        pages: kept,
+    });
 }
 
 fn admit_continuous_text_job(
@@ -4201,16 +4204,20 @@ fn admit_continuous_text_job(
     // Prefix reuse only supports the greedy, non-recurrent decode path.
     let reuse_allowed = matches!(sampling_key, CudaSchedulerSamplingKey::Greedy)
         && !state.qwen.recurrent_ssm_tensor_layout;
-    let (lease, prefix_reuse_tokens) =
-        match acquire_lease_with_prefix_reuse(state, kv_pages, &prompt_tokens, token_budget, reuse_allowed)
-        {
-            Ok(acquired) => acquired,
-            Err(err) => {
-                record_continuous_admission_error(stats, &job.tx, err, Some(pages_needed));
-                release_scheduler_slots(&stats.inflight_requests, 1);
-                return None;
-            }
-        };
+    let (lease, prefix_reuse_tokens) = match acquire_lease_with_prefix_reuse(
+        state,
+        kv_pages,
+        &prompt_tokens,
+        token_budget,
+        reuse_allowed,
+    ) {
+        Ok(acquired) => acquired,
+        Err(err) => {
+            record_continuous_admission_error(stats, &job.tx, err, Some(pages_needed));
+            release_scheduler_slots(&stats.inflight_requests, 1);
+            return None;
+        }
+    };
     stats
         .admission_granted_pages
         .fetch_add(usize_to_u64(lease.pages.len()), Ordering::Relaxed);
@@ -20967,7 +20974,9 @@ mod tests {
         let prefix_pages = DeviceBuffer::alloc(8 * std::mem::size_of::<u16>()).unwrap();
         let prefix_table = DeviceBuffer::alloc(4 * std::mem::size_of::<u32>()).unwrap();
         prefix_pages
-            .copy_from_host(&f16_values(&[12.0f32, 13.0, 10.0, 11.0, 0.0, 0.0, 0.0, 0.0]))
+            .copy_from_host(&f16_values(&[
+                12.0f32, 13.0, 10.0, 11.0, 0.0, 0.0, 0.0, 0.0,
+            ]))
             .unwrap();
         prefix_table.copy_from_host(&[1u32, 0, 3, 2]).unwrap();
         crate::kernels::launch_copy_paged_kv_cache_prefix_batched(

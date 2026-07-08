@@ -624,7 +624,9 @@ fn tool_instructions(tools: &[Tool], tool_choice: &Value) -> String {
     }
     let mut out = String::new();
     out.push_str("You have access to tools. To call one, emit a JSON object ");
-    out.push_str(r#"{"name": "tool_name", "arguments": {...}} wrapped in <tool_call></tool_call> tags. "#);
+    out.push_str(
+        r#"{"name": "tool_name", "arguments": {...}} wrapped in <tool_call></tool_call> tags. "#,
+    );
     out.push_str(
         "A tool's result is returned to you inside <tool_response></tool_response> tags; once you \
          have it, answer the user directly in plain text instead of calling the tool again.",
@@ -724,7 +726,9 @@ mod tests {
         );
         // Tool result is a <tool_response> inside a user turn — never a `tool` role.
         assert!(
-            prompt.contains("<|im_start|>user\n<tool_response>\nport = 8443\n</tool_response><|im_end|>"),
+            prompt.contains(
+                "<|im_start|>user\n<tool_response>\nport = 8443\n</tool_response><|im_end|>"
+            ),
             "tool result not wrapped as <tool_response> in a user turn:\n{prompt}"
         );
         assert!(

@@ -345,9 +345,9 @@ async fn serve(
                     bail!("MLX inference requires Apple Silicon macOS");
                 }
                 let backend = Arc::new(
-                    hi_mlx::backend::MlxBackend::load(&model_path, model_id).with_context(|| {
-                        format!("loading MLX model from {}", model_path.display())
-                    })?,
+                    hi_mlx::backend::MlxBackend::load(&model_path, model_id).with_context(
+                        || format!("loading MLX model from {}", model_path.display()),
+                    )?,
                 );
                 let listener = bind_server_listener(addr).await?;
                 tracing::info!("serving {} on http://{addr}/v1", backend.model().id);
