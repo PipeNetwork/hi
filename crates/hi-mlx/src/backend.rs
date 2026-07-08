@@ -98,7 +98,12 @@ impl MlxBackend {
             }
             None => None,
         };
-        let chat_template = load_chat_template(path);
+        // Cohere2 (Command-R) ships no usable chat template in the MLX repos; inject a marker so the
+        // prompt builder renders the Command-R turn format instead of falling back to ChatML.
+        let chat_template = load_chat_template(path).or_else(|| {
+            (config.model_type == "cohere2")
+                .then(|| "<|START_OF_TURN_TOKEN|><|END_OF_TURN_TOKEN|>".to_string())
+        });
         Ok(Self {
             model,
             config,

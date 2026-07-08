@@ -207,6 +207,9 @@ mod native {
             ModelFamily::Qwen2 if config.model_type == "gpt_oss" => {
                 Ok(Box::new(GptOssLike::new(config.clone(), arrays)?))
             }
+            ModelFamily::Qwen2 if config.model_type == "cohere2" => {
+                Ok(Box::new(CohereLike::new(config.clone(), arrays)?))
+            }
             ModelFamily::Qwen2 | ModelFamily::Qwen3 | ModelFamily::Hy3 => {
                 // Qwen3.5 gated-delta-net hybrid (linear-attn heads present) uses its own path.
                 if config.linear_num_value_heads.is_some() {
@@ -3974,6 +3977,207 @@ mod native {
                 Some(head) => head.forward(&h)?,
                 None => self.embed_tokens.as_linear(&h)?,
             };
+            transforms::eval([&logits])?;
+            Ok(logits)
+        }
+
+        fn reset_cache(&mut self) {
+            for layer in &mut self.layers {
+                layer.attention.cache.reset();
+            }
+        }
+
+        fn prepare_cache(&mut self, capacity: i32) {
+            for layer in &mut self.layers {
+                layer.attention.cache.prepare_capacity(capacity);
+            }
+        }
+    }
+
+    // ---------------------- Cohere2 (Command-R 7B) ----------------------
+    // LayerNorm (no bias) + parallel attention/MLP block (single input norm, both added to the residual)
+    // + NoPE on full-attention layers (rope only on sliding layers) + logit_scale. Tied embeddings, no
+    // embedding scale, `model.` prefix.
+    struct CohereAttention {
+        q_proj: Linear,
+        k_proj: Linear,
+        v_proj: Linear,
+        o_proj: Linear,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        scale: f32,
+        rope_theta: f32,
+        use_rope: bool,
+        cache: Cache,
+    }
+
+    impl CohereAttention {
+        fn load(
+            prefix: &str,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+            layer_idx: u32,
+        ) -> Result<Self> {
+            let head_dim = config.attention_head_dim() as i32;
+            let pattern = config
+                .raw
+                .get("sliding_window_pattern")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(4)
+                .max(1) as u32;
+            // Sliding-window layers use RoPE; the periodic full-attention layers use NoPE.
+            let use_rope = (layer_idx + 1) % pattern != 0;
+            let cache = if use_rope {
+                Cache::with_max_len(config.sliding_window.map(|w| w as i32))
+            } else {
+                Cache::new()
+            };
+            Ok(Self {
+                q_proj: Linear::load(&format!("{prefix}.q_proj"), arrays, config)?,
+                k_proj: Linear::load(&format!("{prefix}.k_proj"), arrays, config)?,
+                v_proj: Linear::load(&format!("{prefix}.v_proj"), arrays, config)?,
+                o_proj: Linear::load(&format!("{prefix}.o_proj"), arrays, config)?,
+                n_heads: config.num_attention_heads as i32,
+                n_kv_heads: config.num_key_value_heads as i32,
+                head_dim,
+                scale: (head_dim as f32).powf(-0.5),
+                rope_theta: config.rope_theta,
+                use_rope,
+                cache,
+            })
+        }
+
+        fn forward(&mut self, x: &Array) -> Result<Array> {
+            let shape = x.shape();
+            let (b, l) = (shape[0], shape[1]);
+            let mut q = self
+                .q_proj
+                .forward(x)?
+                .reshape(&[b, l, self.n_heads, self.head_dim])?
+                .transpose_axes(&[0, 2, 1, 3])?;
+            let mut k = self
+                .k_proj
+                .forward(x)?
+                .reshape(&[b, l, self.n_kv_heads, self.head_dim])?
+                .transpose_axes(&[0, 2, 1, 3])?;
+            let v = self
+                .v_proj
+                .forward(x)?
+                .reshape(&[b, l, self.n_kv_heads, self.head_dim])?
+                .transpose_axes(&[0, 2, 1, 3])?;
+            let offset = self.cache.offset;
+            if self.use_rope {
+                q = rope(q, self.head_dim, true, self.rope_theta, 1.0, offset, None)?;
+                k = rope(k, self.head_dim, true, self.rope_theta, 1.0, offset, None)?;
+            }
+            let (k, v) = self.cache.update(k, v)?;
+            let output = if l > 1 && offset == 0 {
+                scaled_dot_product_attention(
+                    &q,
+                    &k,
+                    &v,
+                    self.scale,
+                    ScaledDotProductAttentionMask::Causal,
+                    None::<&Array>,
+                )?
+            } else if l > 1 {
+                let mask = causal_attention_mask(l, k.shape()[2], offset);
+                scaled_dot_product_attention(
+                    &q,
+                    &k,
+                    &v,
+                    self.scale,
+                    ScaledDotProductAttentionMask::Array(&mask),
+                    None::<&Array>,
+                )?
+            } else {
+                scaled_dot_product_attention(&q, &k, &v, self.scale, None, None::<&Array>)?
+            };
+            let output = output.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
+                b,
+                l,
+                self.n_heads * self.head_dim,
+            ])?;
+            self.o_proj.forward(&output)
+        }
+    }
+
+    struct CohereBlock {
+        input_layernorm: LayerNorm,
+        attention: CohereAttention,
+        mlp: Mlp,
+    }
+
+    impl CohereBlock {
+        fn load(
+            idx: u32,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+        ) -> Result<Self> {
+            let p = format!("model.layers.{idx}");
+            let eps = cohere_norm_eps(config);
+            Ok(Self {
+                input_layernorm: LayerNorm::load(&format!("{p}.input_layernorm"), arrays, eps)?,
+                attention: CohereAttention::load(&format!("{p}.self_attn"), arrays, config, idx)?,
+                mlp: Mlp::load(&format!("{p}.mlp"), arrays, config)?,
+            })
+        }
+
+        fn forward(&mut self, x: Array) -> Result<Array> {
+            // Parallel: attention and MLP both read the single normed input, both add to the residual.
+            let h = self.input_layernorm.forward(&x)?;
+            let attn = self.attention.forward(&h)?;
+            let ff = self.mlp.forward(&h)?;
+            Ok(attn + ff + x)
+        }
+    }
+
+    fn cohere_norm_eps(config: &MlxModelConfig) -> f32 {
+        config
+            .raw
+            .get("layer_norm_eps")
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32)
+            .unwrap_or(1e-5)
+    }
+
+    struct CohereLike {
+        embed_tokens: Embedding,
+        layers: Vec<CohereBlock>,
+        norm: LayerNorm,
+        logit_scale: f32,
+    }
+
+    impl CohereLike {
+        fn new(config: MlxModelConfig, arrays: HashMap<String, Array>) -> Result<Self> {
+            let layers = (0..config.num_hidden_layers)
+                .map(|idx| CohereBlock::load(idx, &arrays, &config))
+                .collect::<Result<Vec<_>>>()?;
+            let logit_scale = config
+                .raw
+                .get("logit_scale")
+                .and_then(|v| v.as_f64())
+                .map(|v| v as f32)
+                .unwrap_or(1.0);
+            Ok(Self {
+                embed_tokens: Embedding::load("model.embed_tokens", &arrays, &config)?,
+                norm: LayerNorm::load("model.norm", &arrays, cohere_norm_eps(&config))?,
+                layers,
+                logit_scale,
+            })
+        }
+    }
+
+    impl CausalLm for CohereLike {
+        fn forward(&mut self, input_ids: &[u32]) -> Result<Array> {
+            let ids = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
+            let mut h = self.embed_tokens.forward(&ids)?;
+            for layer in &mut self.layers {
+                h = layer.forward(h)?;
+            }
+            h = self.norm.forward(&h)?;
+            let logits = self.embed_tokens.as_linear(&h)? * self.logit_scale;
             transforms::eval([&logits])?;
             Ok(logits)
         }

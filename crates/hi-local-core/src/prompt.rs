@@ -81,6 +81,10 @@ fn render_gguf_chat_template(template: &str, messages: &[ChatMessage]) -> Option
     if template.contains("<|channel|>") && template.contains("<|start|>") {
         return Some(render_gptoss_template(messages));
     }
+    // Cohere Command-R: `<|START_OF_TURN_TOKEN|><|{ROLE}_TOKEN|>...<|END_OF_TURN_TOKEN|>` turns.
+    if template.contains("<|START_OF_TURN_TOKEN|>") && template.contains("<|END_OF_TURN_TOKEN|>") {
+        return Some(render_cohere_template(messages));
+    }
     // Standard Gemma (2/3) format: `<start_of_turn>{role}\n{content}<end_of_turn>`. Its jinja is too
     // complex for the loop renderer; the framing is simple, so use the dedicated builder. Gemma is very
     // BOS-sensitive and the template emits `bos_token` first, so prepend it.
@@ -282,6 +286,26 @@ fn render_gptoss_template(messages: &[ChatMessage]) -> String {
         out.push_str("<|end|>");
     }
     out.push_str("<|start|>assistant<|channel|>final<|message|>");
+    out
+}
+
+// Cohere Command-R: `<|START_OF_TURN_TOKEN|><|{ROLE}_TOKEN|>{content}<|END_OF_TURN_TOKEN|>` turns, with
+// a leading BOS and a `<|CHATBOT_TOKEN|>` generation prompt.
+fn render_cohere_template(messages: &[ChatMessage]) -> String {
+    let mut out = String::from("<BOS_TOKEN>");
+    for message in messages {
+        let role = match message.role.as_str() {
+            "assistant" | "ai" | "model" => "CHATBOT",
+            "system" | "developer" | "root" => "SYSTEM",
+            _ => "USER",
+        };
+        out.push_str("<|START_OF_TURN_TOKEN|><|");
+        out.push_str(role);
+        out.push_str("_TOKEN|>");
+        out.push_str(&message.content_text());
+        out.push_str("<|END_OF_TURN_TOKEN|>");
+    }
+    out.push_str("<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>");
     out
 }
 
