@@ -210,6 +210,9 @@ mod native {
             ModelFamily::Qwen2 if config.model_type == "cohere2" => {
                 Ok(Box::new(CohereLike::new(config.clone(), arrays)?))
             }
+            ModelFamily::Qwen2 if config.model_type.starts_with("llama4") => {
+                Ok(Box::new(Llama4Like::new(config.clone(), arrays)?))
+            }
             ModelFamily::Qwen2 | ModelFamily::Qwen3 | ModelFamily::Hy3 => {
                 // Qwen3.5 gated-delta-net hybrid (linear-attn heads present) uses its own path.
                 if config.linear_num_value_heads.is_some() {
@@ -3963,6 +3966,333 @@ mod native {
     }
 
     impl CausalLm for GptOssLike {
+        fn forward(&mut self, input_ids: &[u32]) -> Result<Array> {
+            let ids = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
+            let mut h = self.embed_tokens.forward(&ids)?;
+            for layer in &mut self.layers {
+                h = layer.forward(h)?;
+            }
+            h = self.norm.forward(&h)?;
+            let logits = match &self.lm_head {
+                Some(head) => head.forward(&h)?,
+                None => self.embed_tokens.as_linear(&h)?,
+            };
+            transforms::eval([&logits])?;
+            Ok(logits)
+        }
+
+        fn reset_cache(&mut self) {
+            for layer in &mut self.layers {
+                layer.attention.cache.reset();
+            }
+        }
+
+        fn prepare_cache(&mut self, capacity: i32) {
+            for layer in &mut self.layers {
+                layer.attention.cache.prepare_capacity(capacity);
+            }
+        }
+    }
+
+    // ---------------------- Llama-4 (Scout/Maverick text) ----------------------
+    // iRoPE (RoPE on 3 of every 4 layers, NoPE on the 4th) + weightless L2 qk-norm on the RoPE layers +
+    // llama3 NTK-by-parts rope scaling + top-1 sigmoid MoE with an always-on shared expert. Pre-norm.
+    // Llama-3 rope scaling: returns the per-dim theta values (base^(2i/dim)) after NTK-by-parts rescaling.
+    fn llama3_rope_freqs(head_dim: i32, base: f32, scaling: &serde_json::Value) -> Array {
+        let f = |k: &str, d: f32| -> f32 {
+            scaling.get(k).and_then(|v| v.as_f64()).unwrap_or(d as f64) as f32
+        };
+        let (factor, low, high, orig_max) = (
+            f("factor", 8.0),
+            f("low_freq_factor", 1.0),
+            f("high_freq_factor", 4.0),
+            f("original_max_position_embeddings", 8192.0),
+        );
+        let low_wavelen = orig_max / low;
+        let high_wavelen = orig_max / high;
+        let half = (head_dim / 2) as usize;
+        let mut thetas = Vec::with_capacity(half);
+        for i in 0..half {
+            let theta = base.powf((2 * i) as f32 / head_dim as f32);
+            let inv_freq = 1.0 / theta;
+            let wavelen = 2.0 * std::f32::consts::PI / inv_freq;
+            let new_inv = if wavelen > low_wavelen {
+                inv_freq / factor
+            } else if wavelen < high_wavelen {
+                inv_freq
+            } else {
+                let smooth = (orig_max / wavelen - low) / (high - low);
+                (1.0 - smooth) * inv_freq / factor + smooth * inv_freq
+            };
+            thetas.push(1.0 / new_inv);
+        }
+        Array::from_slice(&thetas, &[half as i32])
+    }
+
+    struct Llama4Attention {
+        q_proj: Linear,
+        k_proj: Linear,
+        v_proj: Linear,
+        o_proj: Linear,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        scale: f32,
+        use_rope: bool,
+        qk_norm: bool,
+        rope_freqs: Array,
+        qk_ones: Array,
+        cache: Cache,
+    }
+
+    impl Llama4Attention {
+        fn load(
+            prefix: &str,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+            layer_idx: u32,
+            rope_freqs: &Array,
+        ) -> Result<Self> {
+            let head_dim = config.attention_head_dim() as i32;
+            // iRoPE: every 4th layer (idx 3, 7, ...) is NoPE.
+            let use_rope = (layer_idx + 1) % 4 != 0;
+            Ok(Self {
+                q_proj: Linear::load(&format!("{prefix}.q_proj"), arrays, config)?,
+                k_proj: Linear::load(&format!("{prefix}.k_proj"), arrays, config)?,
+                v_proj: Linear::load(&format!("{prefix}.v_proj"), arrays, config)?,
+                o_proj: Linear::load(&format!("{prefix}.o_proj"), arrays, config)?,
+                n_heads: config.num_attention_heads as i32,
+                n_kv_heads: config.num_key_value_heads as i32,
+                head_dim,
+                scale: (head_dim as f32).powf(-0.5),
+                use_rope,
+                // qk-norm applies only on RoPE layers (config gate).
+                qk_norm: use_rope
+                    && config
+                        .raw
+                        .get("use_qk_norm")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
+                rope_freqs: rope_freqs.clone(),
+                qk_ones: Array::ones::<f32>(&[head_dim])?,
+                cache: Cache::new(),
+            })
+        }
+
+        fn forward(&mut self, x: &Array) -> Result<Array> {
+            let shape = x.shape();
+            let (b, l) = (shape[0], shape[1]);
+            let mut q = self
+                .q_proj
+                .forward(x)?
+                .reshape(&[b, l, self.n_heads, self.head_dim])?
+                .transpose_axes(&[0, 2, 1, 3])?;
+            let mut k = self
+                .k_proj
+                .forward(x)?
+                .reshape(&[b, l, self.n_kv_heads, self.head_dim])?
+                .transpose_axes(&[0, 2, 1, 3])?;
+            let v = self
+                .v_proj
+                .forward(x)?
+                .reshape(&[b, l, self.n_kv_heads, self.head_dim])?
+                .transpose_axes(&[0, 2, 1, 3])?;
+            let offset = self.cache.offset;
+            if self.use_rope {
+                // Custom (llama3-scaled) freqs: base must be unset (MLX rejects base+freqs together).
+                q = rope(
+                    q,
+                    self.head_dim,
+                    false,
+                    None::<f32>,
+                    1.0,
+                    offset,
+                    Some(&self.rope_freqs),
+                )?;
+                k = rope(
+                    k,
+                    self.head_dim,
+                    false,
+                    None::<f32>,
+                    1.0,
+                    offset,
+                    Some(&self.rope_freqs),
+                )?;
+                if self.qk_norm {
+                    // Weightless L2 norm over head_dim (eps 1e-6), after RoPE.
+                    q = rms_norm(&q, &self.qk_ones, 1e-6)?;
+                    k = rms_norm(&k, &self.qk_ones, 1e-6)?;
+                }
+            }
+            let (k, v) = self.cache.update(k, v)?;
+            let output = if l > 1 && offset == 0 {
+                scaled_dot_product_attention(
+                    &q,
+                    &k,
+                    &v,
+                    self.scale,
+                    ScaledDotProductAttentionMask::Causal,
+                    None::<&Array>,
+                )?
+            } else if l > 1 {
+                let mask = causal_attention_mask(l, k.shape()[2], offset);
+                scaled_dot_product_attention(
+                    &q,
+                    &k,
+                    &v,
+                    self.scale,
+                    ScaledDotProductAttentionMask::Array(&mask),
+                    None::<&Array>,
+                )?
+            } else {
+                scaled_dot_product_attention(&q, &k, &v, self.scale, None, None::<&Array>)?
+            };
+            let output = output.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
+                b,
+                l,
+                self.n_heads * self.head_dim,
+            ])?;
+            self.o_proj.forward(&output)
+        }
+    }
+
+    struct Llama4Moe {
+        router: Linear,
+        experts: SwitchMlp,
+        shared_expert: Mlp,
+    }
+
+    impl Llama4Moe {
+        fn load(
+            prefix: &str,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+        ) -> Result<Self> {
+            Ok(Self {
+                router: Linear::load(&format!("{prefix}.router"), arrays, config)?,
+                experts: SwitchMlp::load(&format!("{prefix}.experts"), arrays, config)?,
+                shared_expert: Mlp::load(&format!("{prefix}.shared_expert"), arrays, config)?,
+            })
+        }
+
+        fn forward(&self, x: &Array) -> Result<Array> {
+            let shape = x.shape();
+            let (b, l, d) = (shape[0], shape[1], shape[2]);
+            if b != 1 {
+                bail!("Llama-4 MoE supports batch size 1, got {b}");
+            }
+            let logits = self.router.forward(x)?.as_type::<f32>()?;
+            transforms::eval([&logits])?;
+            let n_exp = *logits.shape().last().unwrap() as usize;
+            let raw = logits.as_slice::<f32>();
+            let mut outputs = Vec::with_capacity(l as usize);
+            for token in 0..l as usize {
+                let lg = &raw[token * n_exp..token * n_exp + n_exp];
+                // Top-1 routing; the winning logit's sigmoid scales the expert *input*.
+                let top1 = (0..n_exp).max_by(|&a, &b| lg[a].total_cmp(&lg[b])).unwrap();
+                let score = 1.0 / (1.0 + (-lg[top1]).exp());
+                let e = top1 as i32;
+                let xt = x.index((0, token as i32, ..)).reshape(&[1, 1, d])?;
+                let scaled = &xt * score;
+                let gate = self.experts.gate_proj.forward_expert(&scaled, e)?;
+                let up = self.experts.up_proj.forward_expert(&scaled, e)?;
+                let act = silu(&gate)? * up;
+                let expert_out = self.experts.down_proj.forward_expert(&act, e)?;
+                let shared_out = self.shared_expert.forward(&xt)?;
+                outputs.push(expert_out + shared_out);
+            }
+            Ok(concatenate_axis(&outputs, 1)?)
+        }
+    }
+
+    struct Llama4Block {
+        input_layernorm: RmsNorm,
+        post_attention_layernorm: RmsNorm,
+        attention: Llama4Attention,
+        moe: Llama4Moe,
+    }
+
+    impl Llama4Block {
+        fn load(
+            idx: u32,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+            rope_freqs: &Array,
+        ) -> Result<Self> {
+            let p = format!("model.layers.{idx}");
+            Ok(Self {
+                input_layernorm: RmsNorm::load(
+                    &format!("{p}.input_layernorm.weight"),
+                    arrays,
+                    config.rms_norm_eps,
+                )?,
+                post_attention_layernorm: RmsNorm::load(
+                    &format!("{p}.post_attention_layernorm.weight"),
+                    arrays,
+                    config.rms_norm_eps,
+                )?,
+                attention: Llama4Attention::load(
+                    &format!("{p}.self_attn"),
+                    arrays,
+                    config,
+                    idx,
+                    rope_freqs,
+                )?,
+                moe: Llama4Moe::load(&format!("{p}.feed_forward"), arrays, config)?,
+            })
+        }
+
+        fn forward(&mut self, x: Array) -> Result<Array> {
+            let h = &x + self.attention.forward(&self.input_layernorm.forward(&x)?)?;
+            let r = self
+                .moe
+                .forward(&self.post_attention_layernorm.forward(&h)?)?;
+            Ok(h + r)
+        }
+    }
+
+    struct Llama4Like {
+        embed_tokens: Embedding,
+        layers: Vec<Llama4Block>,
+        norm: RmsNorm,
+        lm_head: Option<Linear>,
+    }
+
+    impl Llama4Like {
+        fn new(config: MlxModelConfig, arrays: HashMap<String, Array>) -> Result<Self> {
+            let head_dim = config.attention_head_dim() as i32;
+            let rope_freqs = match &config.rope_scaling {
+                Some(s) => llama3_rope_freqs(head_dim, config.rope_theta, s),
+                None => {
+                    let half = (head_dim / 2) as usize;
+                    let thetas: Vec<f32> = (0..half)
+                        .map(|i| config.rope_theta.powf((2 * i) as f32 / head_dim as f32))
+                        .collect();
+                    Array::from_slice(&thetas, &[half as i32])
+                }
+            };
+            let mut layers = Vec::with_capacity(config.num_hidden_layers as usize);
+            for idx in 0..config.num_hidden_layers {
+                layers.push(Llama4Block::load(idx, &arrays, &config, &rope_freqs)?);
+            }
+            // Llama-4 leaves tie_word_embeddings unset (hi-mlx defaults it true) but ships a separate
+            // lm_head — detect the weight instead of trusting the flag.
+            let lm_head =
+                if arrays.contains_key("lm_head.weight") || arrays.contains_key("lm_head.scales") {
+                    Some(Linear::load("lm_head", &arrays, &config)?)
+                } else {
+                    None
+                };
+            Ok(Self {
+                embed_tokens: Embedding::load("model.embed_tokens", &arrays, &config)?,
+                norm: RmsNorm::load("model.norm.weight", &arrays, config.rms_norm_eps)?,
+                layers,
+                lm_head,
+            })
+        }
+    }
+
+    impl CausalLm for Llama4Like {
         fn forward(&mut self, input_ids: &[u32]) -> Result<Array> {
             let ids = Array::from_slice(input_ids, &[1, input_ids.len() as i32]);
             let mut h = self.embed_tokens.forward(&ids)?;
