@@ -28,10 +28,29 @@ pub fn parse_tool_calls(text: &str, tools: &[Tool]) -> Option<Vec<NormalizedTool
     if let Some(calls) = parse_bracket_tool_calls(text, &allowed) {
         return Some(calls);
     }
+    if let Some(calls) = parse_harmony_tool_calls(text, &allowed) {
+        return Some(calls);
+    }
     if let Some(calls) = parse_xml_attr_tool_calls(text, &allowed) {
         return Some(calls);
     }
     parse_element_tool_calls(text, &allowed)
+}
+
+// GPT-OSS harmony tool call: `...commentary to=functions.get_weather ...<|message|>{json}<|call|>`.
+// The harmony delimiter tokens are dropped on decode, so match `functions.NAME` and take the next JSON
+// object. Only the first call is used (a forced call may be followed by a hallucinated response echo).
+fn parse_harmony_tool_calls(text: &str, allowed: &[&str]) -> Option<Vec<NormalizedToolCall>> {
+    let pos = text.find("functions.")?;
+    let after = &text[pos + "functions.".len()..];
+    let name_end = after
+        .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-'))
+        .unwrap_or(after.len());
+    let name = &after[..name_end];
+    let arguments = find_json_value(&after[name_end..])
+        .and_then(|json| serde_json::from_str::<Value>(json).ok())
+        .unwrap_or(Value::Object(Default::default()));
+    normalize(name, arguments, allowed, 0).map(|call| vec![call])
 }
 
 // OLMo-2-style `<tool_call><get_weather city="Paris"></tool_call>` — a nested element named after the
@@ -317,6 +336,18 @@ mod tests {
     fn olmo2_element_tool_call_is_normalized() {
         let calls = parse_tool_calls(
             "<tool_call>\n<read path=\"README.md\"></tool_call>\n\n<tool_response>",
+            &tools(),
+        )
+        .unwrap();
+
+        assert_eq!(calls[0].function.name, "read");
+        assert_eq!(calls[0].function.arguments, r#"{"path":"README.md"}"#);
+    }
+
+    #[test]
+    fn harmony_tool_call_is_normalized() {
+        let calls = parse_tool_calls(
+            "commentary to=functions.read <|constrain|>json<|message|>{\"path\":\"README.md\"}<|call|>",
             &tools(),
         )
         .unwrap();
