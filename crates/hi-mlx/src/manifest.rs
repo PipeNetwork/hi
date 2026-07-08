@@ -229,6 +229,10 @@ fn model_family(model_type: &str, config: &Value) -> Option<ModelFamily> {
     if model_type.starts_with("minimax") || haystack.contains("minimax") {
         return Some(ModelFamily::MiniMax);
     }
+    // LongCat-2.0: MLA + DSA indexer + ScMoE double-attention + ngram embedding.
+    if model_type.starts_with("longcat") || haystack.contains("longcat") {
+        return Some(ModelFamily::LongCat);
+    }
     None
 }
 

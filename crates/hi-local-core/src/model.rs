@@ -33,6 +33,7 @@ pub enum ModelFamily {
     Hy3,
     NemotronH,
     MiniMax,
+    LongCat,
 }
 
 impl ModelFamily {
@@ -50,6 +51,7 @@ impl ModelFamily {
             Self::Hy3 => "hy3",
             Self::NemotronH => "nemotron-h",
             Self::MiniMax => "minimax",
+            Self::LongCat => "longcat",
         }
     }
 

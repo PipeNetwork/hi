@@ -54,6 +54,16 @@ pub struct MlxModelConfig {
     pub o_lora_rank: Option<u32>,
     pub o_groups: Option<u32>,
     pub swiglu_limit: Option<f32>,
+    // LongCat-2.0 fields: ScMoE (double attention) + softmax MoE with identity zero-experts + n-gram
+    // input embedding + absorbed MLA with mla-lora scaling.
+    pub oe_split_num: Option<u32>,
+    pub oe_neighbor_num: Option<u32>,
+    pub oe_vocab_size_ratio: Option<f32>,
+    pub zero_expert_num: Option<u32>,
+    pub expert_ffn_hidden_size: Option<u32>,
+    pub ffn_hidden_size: Option<u32>,
+    pub mla_scale_q_lora: bool,
+    pub mla_scale_kv_lora: bool,
     // Gemma-4 hybrid attention fields.
     pub layer_types: Vec<String>,
     pub final_logit_softcapping: Option<f32>,
@@ -309,7 +319,9 @@ pub fn parse_model_config(path: &Path, raw: Value) -> Result<MlxModelConfig> {
         hidden_size,
         intermediate_size: u32_field(&raw, "intermediate_size"),
         moe_intermediate_size: u32_field(&raw, "moe_intermediate_size"),
-        num_hidden_layers: required_u32(&raw, "num_hidden_layers")?,
+        num_hidden_layers: u32_field(&raw, "num_hidden_layers")
+            .or_else(|| u32_field(&raw, "num_layers")) // LongCat-2.0 key
+            .ok_or_else(|| anyhow!("config.json missing num_hidden_layers/num_layers"))?,
         num_attention_heads,
         num_key_value_heads: u32_field(&raw, "num_key_value_heads").unwrap_or(num_attention_heads),
         head_dim: u32_field(&raw, "head_dim"),
@@ -349,6 +361,15 @@ pub fn parse_model_config(path: &Path, raw: Value) -> Result<MlxModelConfig> {
         o_lora_rank: u32_field(&raw, "o_lora_rank"),
         o_groups: u32_field(&raw, "o_groups"),
         swiglu_limit: f32_field(&raw, "swiglu_limit"),
+        oe_split_num: u32_field(&raw, "oe_split_num"),
+        oe_neighbor_num: u32_field(&raw, "oe_neighbor_num"),
+        oe_vocab_size_ratio: f32_field(&raw, "ngram_vocab_size_ratio")
+            .or_else(|| f32_field(&raw, "oe_vocab_size_ratio")),
+        zero_expert_num: u32_field(&raw, "zero_expert_num"),
+        expert_ffn_hidden_size: u32_field(&raw, "expert_ffn_hidden_size"),
+        ffn_hidden_size: u32_field(&raw, "ffn_hidden_size"),
+        mla_scale_q_lora: bool_field(&raw, "mla_scale_q_lora").unwrap_or(false),
+        mla_scale_kv_lora: bool_field(&raw, "mla_scale_kv_lora").unwrap_or(false),
         layer_types: raw
             .get("layer_types")
             .and_then(Value::as_array)
@@ -380,7 +401,8 @@ pub fn parse_model_config(path: &Path, raw: Value) -> Result<MlxModelConfig> {
             .or_else(|| u32_field(&raw, "num_experts"))
             .or_else(|| u32_field(&raw, "num_local_experts")),
         n_shared_experts: u32_field(&raw, "n_shared_experts"),
-        num_experts_per_tok: u32_field(&raw, "num_experts_per_tok"),
+        num_experts_per_tok: u32_field(&raw, "num_experts_per_tok")
+            .or_else(|| u32_field(&raw, "moe_topk")), // LongCat-2.0 key
         decoder_sparse_step: u32_field(&raw, "decoder_sparse_step").unwrap_or(1),
         mlp_only_layers: u32_list_field(&raw, "mlp_only_layers"),
         shared_expert_intermediate_size: u32_field(&raw, "shared_expert_intermediate_size"),
@@ -484,6 +506,10 @@ pub fn detect_family(model_type: &str, config: &Value) -> Option<ModelFamily> {
     // MiniMax-M3: GQA (partial rotary) + sigmoid/noaux MoE at every layer.
     if model_type.starts_with("minimax") || haystack.contains("minimax") {
         return Some(ModelFamily::MiniMax);
+    }
+    // LongCat-2.0: MLA + DSA indexer + ScMoE double-attention + ngram embedding.
+    if model_type.starts_with("longcat") || haystack.contains("longcat") {
+        return Some(ModelFamily::LongCat);
     }
     None
 }

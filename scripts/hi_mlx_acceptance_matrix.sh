@@ -32,6 +32,7 @@ REPOS=(
   "Jackrong/MLX-Qwen3.5-35B-A3B-Claude-4.6-Opus-Reasoning-Distilled-4bit"  # qwen3_5_moe  (SSM hybrid + shared-expert MoE)
   "mlx-community/GLM-4-9B-0414-4bit"                                       # glm4         (GQA, Glm4Like)
   "mlx-community/GLM-4.7-Flash-4bit"                                       # glm4_moe_lite (MLA)
+  "pipenetwork/LongCat-2.0-REAP75-MLX-4bit"                                 # longcat2     (ScMoE + absorbed-MLA + n-gram embed + YARN) — 282GB, HI_MLX_MAX_TOKENS=12
   "pipenetwork/MiniMax-M3-MLX-3bit"                                       # minimax_m3   (GQA + SwiGLU-OAI sigmoid-MoE, (1+weight) norm) — 186GB, HI_MLX_MAX_TOKENS=12
   "avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw"                                 # glm_moe_dsa  (DeepSeek-V3.2-style: MLA + DSA indexer + MoE) — 310GB, run with HI_MLX_MAX_TOKENS=8
   "pipenetwork/NVIDIA-Nemotron-3-Nano-4B-MLX-8bit"                         # nemotron_h   (Mamba2 + attention + MLP hybrid, dense)

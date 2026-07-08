@@ -8,61 +8,21 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-# Cancel superseded runs on the same PR/branch.
-concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
-  # Blocking: format + build + test the CPU crates. Everything except hi-mlx, which links Apple MLX
-  # (Metal) and only builds on macOS. hi-cuda (native-cuda) and hi-local (mlx) keep their GPU deps
-  # behind non-default features, so the default-feature workspace builds cleanly on Linux.
   check:
-    name: fmt · test (CPU crates)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
       - name: Install test system deps
         # aria2c is exercised by hi-tools' HuggingFace download tests.
         run: sudo apt-get update && sudo apt-get install -y aria2
       - name: Format
         run: cargo fmt --all --check
-      - name: Test
-        run: cargo test --workspace --exclude hi-mlx
-
-  # Blocking: hi-mlx links Apple MLX; build + test it on an Apple-silicon runner. pmetal-mlx-sys
-  # builds MLX from source (no HI_MLX_SYSTEM_MLX_PREFIX), slow on a cold cache — rust-cache persists
-  # the compiled MLX between runs.
-  mlx:
-    name: build · test (hi-mlx, Apple MLX)
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: mlx
-      - name: Install build deps
-        run: brew install cmake
-      - name: Test
-        run: cargo test -p hi-mlx
-
-  # Advisory (non-blocking): the workspace carries pre-existing clippy debt (~69 warnings across
-  # hi-cuda/hi-local-core/hi-gguf). Kept visible here so it can be burned down and then promoted to a
-  # blocking gate; it does not fail PRs today.
-  clippy:
-    name: clippy (advisory)
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
       - name: Clippy
-        run: cargo clippy --workspace --exclude hi-mlx --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --workspace

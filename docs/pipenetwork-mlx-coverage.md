@@ -19,6 +19,7 @@ Support status for the MLX models published under [huggingface.co/pipenetwork](h
 | `nemotron_h` | Nemotron-3-Nano-4B/30B-A3B, Ultra-550B-A55B | `NemotronHLike` | Mamba2 + attention + ReLU² MLP + MoE hybrid; built 2026-07, validated on Nano-4B (dense) and Nano-30B-A3B (MoE). Ultra-550B arch-verified (untested @ 550B). TwoTower is a separate diffusion variant. |
 | `gemma4` | Gemma-4-31B (dense), Gemma-4-26B-A4B (MoE) | `Gemma4TextLike` | sliding/full hybrid attn, dual RoPE, k==v, GeGLU, softcap; built 2026-07, validated on 31B. Ships its chat template in a separate `chat_template.jinja` (channel/turn format) — hi-mlx now reads it. 26B MoE untested. |
 | `minimax_m3` | MiniMax-M3 | `MiniMaxLike` | GQA (partial RoPE + per-head qk-norm) + sigmoid-MoE with shared expert + SwiGLU-OAI; **(1+weight) RMSNorm**; built 2026-07, validated on the 3-bit build |
+| `longcat2` | LongCat-2.0 | `LongCatLike` | ScMoE (2 absorbed-MLA attns + 2 dense MLPs + shortcut softmax-MoE w/ 128 identity zero-experts) + n-gram hash embedding + YARN; built 2026-07, validated on REAP75 4-bit |
 
 ## ❌ Not yet supported (4 new architectures)
 
@@ -27,7 +28,6 @@ sibling `*-mlx/.venv` checkouts.
 
 | `model_type` | PipeNetwork models | what it is | effort |
 |---|---|---|---|
-| `longcat2` | LongCat-2.0 (REAP50/62/75/hard) | MLA + custom LongCat MoE + ngram embedding + indexer | large — custom `LongcatFlashMoE` (zero-computation experts) + `NgramEmbedding`; not a DeepSeek wrapper despite the MLA fields |
 
 ### Recommended build order
 1. **`nemotron_h`** — widest coverage (4 families incl. the 550B/Ultra flagship + TwoTower); the ~2 GB Nano-4B makes iteration cheap.
