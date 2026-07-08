@@ -221,6 +221,10 @@ fn model_family(model_type: &str, config: &Value) -> Option<ModelFamily> {
     {
         return Some(ModelFamily::NemotronH);
     }
+    // Gemma-4 only (dispatched to Gemma4TextLike in load_model).
+    if model_type.starts_with("gemma4") || haystack.contains("gemma4") {
+        return Some(ModelFamily::Gemma);
+    }
     None
 }
 

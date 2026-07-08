@@ -164,6 +164,17 @@ impl WeightCatalog {
                     ],
                 )?;
             }
+            crate::manifest::ModelFamily::Gemma if config.model_type.starts_with("gemma4") => {
+                self.require_any(
+                    "Gemma-4 attention projection",
+                    &[
+                        "model.layers.0.self_attn.q_proj.weight",
+                        "model.layers.0.self_attn.q_proj.scales",
+                        "language_model.model.layers.0.self_attn.q_proj.weight",
+                        "language_model.model.layers.0.self_attn.q_proj.scales",
+                    ],
+                )?;
+            }
             crate::manifest::ModelFamily::Llama
             | crate::manifest::ModelFamily::Mistral
             | crate::manifest::ModelFamily::Mixtral

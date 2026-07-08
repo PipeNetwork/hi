@@ -35,6 +35,25 @@ pub struct MlxBackend {
     draft: Option<Arc<Mutex<NativeRuntime>>>,
     spec_k: usize,
     spec_gate: Arc<Mutex<SpecGate>>,
+    chat_template: Option<String>,
+}
+
+// Read the model's chat template: tokenizer_config.json's `chat_template` first, else a separate
+// `chat_template.jinja` file (some models — e.g. custom Gemma-4 fine-tunes with a channel/turn format —
+// ship it there and leave tokenizer_config empty).
+fn load_chat_template(path: &std::path::Path) -> Option<String> {
+    if let Ok(text) = std::fs::read_to_string(path.join("tokenizer_config.json")) {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+            if let Some(ct) = v.get("chat_template").and_then(|c| c.as_str()) {
+                if !ct.trim().is_empty() {
+                    return Some(ct.to_string());
+                }
+            }
+        }
+    }
+    std::fs::read_to_string(path.join("chat_template.jinja"))
+        .ok()
+        .filter(|s| !s.trim().is_empty())
 }
 
 const OVERSIZE_MODEL_ENV: &str = "HI_MLX_ALLOW_OVERSIZE_MODEL";
@@ -79,6 +98,7 @@ impl MlxBackend {
             }
             None => None,
         };
+        let chat_template = load_chat_template(path);
         Ok(Self {
             model,
             config,
@@ -87,6 +107,7 @@ impl MlxBackend {
             draft,
             spec_k: spec_k.max(1),
             spec_gate: Arc::new(Mutex::new(SpecGate::default())),
+            chat_template,
         })
     }
 }
@@ -239,6 +260,10 @@ fn format_bytes(bytes: u64) -> String {
 impl InferenceBackend for MlxBackend {
     fn model(&self) -> &ModelInfo {
         &self.model
+    }
+
+    fn chat_template(&self) -> Option<&str> {
+        self.chat_template.as_deref()
     }
 
     fn health(&self) -> BackendHealth {
