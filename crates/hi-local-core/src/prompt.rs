@@ -69,6 +69,10 @@ fn render_gguf_chat_template(template: &str, messages: &[ChatMessage]) -> Option
     {
         return Some(render_llama3_template(&template, messages));
     }
+    // SmolLM3: chatml + a `reasoning_mode` toggle; render with thinking off (empty think block).
+    if template.contains("reasoning_mode") && template.contains("<|im_start|>") {
+        return Some(render_smollm3_template(messages));
+    }
     if template.contains("<|im_start|>") && template.contains("<|im_end|>") {
         return render_simple_loop_template(&template, messages)
             .or_else(|| Some(build_chatml_prompt(messages, &[], &Value::Null)));
@@ -178,6 +182,27 @@ fn render_granite_template(messages: &[ChatMessage]) -> String {
         out.push_str("<|end_of_text|>\n");
     }
     out.push_str("<|start_of_role|>assistant<|end_of_role|>");
+    out
+}
+
+// SmolLM3: chatml turns; the generation prompt primes an empty think block (/no_think) so the reasoning
+// model answers directly instead of leaking a `<think>` monologue.
+fn render_smollm3_template(messages: &[ChatMessage]) -> String {
+    let mut out = String::new();
+    for message in messages {
+        let role = match message.role.as_str() {
+            "assistant" | "ai" | "model" => "assistant",
+            "system" | "developer" | "root" => "system",
+            "tool" => "tool",
+            _ => "user",
+        };
+        out.push_str("<|im_start|>");
+        out.push_str(role);
+        out.push('\n');
+        out.push_str(&message.content_text());
+        out.push_str("<|im_end|>\n");
+    }
+    out.push_str("<|im_start|>assistant\n<think>\n\n</think>\n");
     out
 }
 

@@ -1016,6 +1016,7 @@ mod native {
         scale: f32,
         rope_theta: f32,
         traditional_rope: bool,
+        use_rope: bool,
         cache: Cache,
     }
 
@@ -1024,6 +1025,7 @@ mod native {
             prefix: &str,
             arrays: &HashMap<String, Array>,
             config: &MlxModelConfig,
+            use_rope: bool,
         ) -> Result<Self> {
             let q_norm = RmsNorm::load(
                 &format!("{prefix}.q_norm.weight"),
@@ -1052,6 +1054,7 @@ mod native {
                     .unwrap_or((config.attention_head_dim() as f32).powf(-0.5)),
                 rope_theta: config.rope_theta,
                 traditional_rope: config.family == ModelFamily::Qwen2,
+                use_rope,
                 cache: Cache::new(),
             })
         }
@@ -1081,24 +1084,26 @@ mod native {
                 .reshape(&[b, l, self.n_kv_heads, self.head_dim])?
                 .transpose_axes(&[0, 2, 1, 3])?;
             let offset = self.cache.offset;
-            q = rope(
-                q,
-                self.head_dim,
-                self.traditional_rope,
-                self.rope_theta,
-                1.0,
-                offset,
-                None,
-            )?;
-            k = rope(
-                k,
-                self.head_dim,
-                self.traditional_rope,
-                self.rope_theta,
-                1.0,
-                offset,
-                None,
-            )?;
+            if self.use_rope {
+                q = rope(
+                    q,
+                    self.head_dim,
+                    self.traditional_rope,
+                    self.rope_theta,
+                    1.0,
+                    offset,
+                    None,
+                )?;
+                k = rope(
+                    k,
+                    self.head_dim,
+                    self.traditional_rope,
+                    self.rope_theta,
+                    1.0,
+                    offset,
+                    None,
+                )?;
+            }
             let (k, v) = self.cache.update(k, v)?;
             let scale = self.scale;
             let output = if l > 1 && offset == 0 {
@@ -3637,7 +3642,17 @@ mod native {
                     arrays,
                     config.rms_norm_eps,
                 )?,
-                attention: QwenAttention::load(&format!("{prefix}.self_attn"), arrays, config)?,
+                attention: QwenAttention::load(
+                    &format!("{prefix}.self_attn"),
+                    arrays,
+                    config,
+                    // SmolLM3 NoPE: no_rope_layers[idx] == 0 means skip rope on this layer.
+                    config
+                        .no_rope_layers
+                        .get(idx as usize)
+                        .map(|&v| v != 0)
+                        .unwrap_or(true),
+                )?,
                 ffn: QwenFfn::load(idx, arrays, config)?,
                 residual_multiplier: config.residual_multiplier,
             })

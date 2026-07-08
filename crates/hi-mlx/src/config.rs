@@ -69,6 +69,8 @@ pub struct MlxModelConfig {
     pub residual_multiplier: f32,
     pub attention_multiplier: Option<f32>,
     pub logits_scaling: f32,
+    // SmolLM3 NoPE: per-layer flag (1 = apply rope, 0 = skip). Empty = all layers use rope.
+    pub no_rope_layers: Vec<u32>,
     // Gemma-4 hybrid attention fields.
     pub layer_types: Vec<String>,
     pub final_logit_softcapping: Option<f32>,
@@ -379,6 +381,7 @@ pub fn parse_model_config(path: &Path, raw: Value) -> Result<MlxModelConfig> {
         residual_multiplier: f32_field(&raw, "residual_multiplier").unwrap_or(1.0),
         attention_multiplier: f32_field(&raw, "attention_multiplier"),
         logits_scaling: f32_field(&raw, "logits_scaling").unwrap_or(1.0),
+        no_rope_layers: u32_list_field(&raw, "no_rope_layers"),
         layer_types: raw
             .get("layer_types")
             .and_then(Value::as_array)
@@ -521,7 +524,10 @@ pub fn detect_family(model_type: &str, config: &Value) -> Option<ModelFamily> {
         return Some(ModelFamily::LongCat);
     }
     // Dense Llama-like variants that run on the Qwen GQA path (QwenLike).
-    if matches!(model_type.as_str(), "internlm3" | "internlm2" | "granite") {
+    if matches!(
+        model_type.as_str(),
+        "internlm3" | "internlm2" | "granite" | "smollm3"
+    ) {
         return Some(ModelFamily::Qwen2);
     }
     None
