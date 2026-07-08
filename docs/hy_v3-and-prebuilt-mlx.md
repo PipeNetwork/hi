@@ -415,3 +415,23 @@ generic prompt measured spec *slower*, a code prompt measured it faster → enab
 the first forward compiles Metal shaders, so an un-warmed first probe reads ~5-8× slow and skews the
 comparison. Verified: 7B → disabled (plain 86 vs spec 63), 32B/code → enabled (22 vs 23.5), GLM-5.2 →
 enabled via the slow pre-filter. `HI_MLX_DISABLE_MTP=1` still hard-disables MTP.
+
+### Arch coverage sweep (2026-07) — newest Qwen 27B + 30B-A3B, and a MoE gap
+Ran the expanded acceptance matrix across every supported family. **Works (coherent generation):**
+`qwen2`, `qwen3`, `qwen3_moe`, `qwen3_5`, `glm4`, `glm4_moe_lite`, `glm_moe_dsa` (GLM-5.2). In
+particular, the two most-requested current Qwen models run **out of the box, no code change**:
+
+- **Qwen3-30B-A3B** (`qwen3_moe`, 128-expert MoE) — the popular "30B-A3B". Routes to `QwenLike` +
+  `QwenMoe` (`is_qwen_moe_layer` keys off `decoder_sparse_step`/`mlp_only_layers`). "Paris", `sum(my_list)`.
+- **Qwen3.5-27B** (`qwen3_5`, SSM/gated-delta hybrid dense) — the newest 27B. Routes to `Qwen35Like`
+  (same arch validated earlier on the 9B distill). Coherent reasoning output.
+
+**Known gap — `qwen3_5_moe`** (SSM hybrid *plus* MoE, e.g. the Qwen3.5-35B-A3B distill): fails to load
+with `missing tensor model.layers.0.mlp.gate_proj.weight`. `Qwen35Like` builds a dense `Mlp` per layer,
+but this variant's layers are MoE (`mlp.gate` + `mlp.switch_mlp` + `mlp.shared_expert` +
+`mlp.shared_expert_gate`, 256 experts) — the same structure `QwenMoe` already handles for `qwen3_moe`.
+Fix is a FFN branch in the Qwen3.5 layer (dense `Mlp` vs `QwenMoe`), not a new arch.
+
+Aside: the matrix's tool-call smoke step fails for models not tuned for tool-calling (Qwen2.5-Coder-7B
+emits a fenced ```json block; GLM-4-9B-0414 rambles) — model capability, not arch support. The core
+arch gate (inspect + coherent non-stream + streaming chat) passes for all of the above.

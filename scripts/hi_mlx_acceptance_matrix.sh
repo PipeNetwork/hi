@@ -19,17 +19,25 @@ MEMORY_LIMIT_FRACTION="${HI_MLX_MEMORY_LIMIT_FRACTION:-0.85}"
 # Default matrix. Small, runnable models across the supported arch families, plus newer variants
 # that probe the family-detection edges. Override by passing repos as args.
 #
-# Verified 2026-07 (family detection is a loose substring match, so "detected" != "runs"):
-#   works : qwen2, qwen3, qwen3_5 (Mamba/SSM hybrid VL, Qwen35Like), glm4 (GQA, Glm4Like),
-#           glm4_moe_lite (GLM-x-Flash, MLA), deepseek_v2/v3/v4 (MLA)
+# Verified 2026-07 (family detection is a loose substring match, so "detected" != "runs").
+# One coherent generator per supported arch family; override by passing repos as args.
+#   works : qwen2, qwen3, qwen3_moe (128-expert MoE, e.g. Qwen3-30B-A3B), qwen3_5 (SSM/gated-delta
+#           hybrid dense, e.g. Qwen3.5-27B, Qwen35Like), glm4 (GQA), glm4_moe_lite (MLA),
+#           glm_moe_dsa (GLM-5.2), deepseek_v2/v3/v4 (MLA)
+#   gap   : qwen3_5_moe (SSM hybrid + MoE) — Qwen35Like uses a dense MLP; see the KNOWN GAP line below.
 REPOS=(
-  "mlx-community/Qwen3-0.6B-4bit"                                          # qwen3          — works
-  "Jackrong/MLX-Qwen3.5-9B-Claude-4.6-Opus-Reasoning-Distilled-v2-4bit"    # qwen3_5 SSM VL — works (Qwen35Like)
-  "mlx-community/GLM-4-9B-0414-4bit"                                       # glm4 GQA       — works (Glm4Like)
-  "mlx-community/GLM-4.7-Flash-4bit"                                       # glm4_moe_lite  — works
-  # large / MLA (skipped by the oversize guard unless you have the RAM; big downloads):
-  # "mlx-community/DeepSeek-V4-Flash-4bit"
-  # "mlx-community/GLM-4.7-Flash-8bit"
+  "mlx-community/Qwen3-0.6B-4bit"                                          # qwen3
+  "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit"                           # qwen2
+  "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit"                         # qwen3_moe    (128-expert MoE; the popular 30B-A3B)
+  "Jackrong/MLX-Qwen3.5-9B-Claude-4.6-Opus-Reasoning-Distilled-v2-4bit"    # qwen3_5      (SSM/gated-delta hybrid, dense; Qwen3.5-27B is the same arch)
+  "mlx-community/GLM-4-9B-0414-4bit"                                       # glm4         (GQA, Glm4Like)
+  "mlx-community/GLM-4.7-Flash-4bit"                                       # glm4_moe_lite (MLA)
+  "avlp12/GLM-5.2-Alis-MLX-Dynamic-3.5bpw"                                 # glm_moe_dsa  (DeepSeek-V3.2-style: MLA + DSA indexer + MoE) — 310GB, run with HI_MLX_MAX_TOKENS=8
+  # KNOWN GAP — Qwen35Like uses a dense MLP, so the SSM-hybrid *MoE* variant fails to load
+  # ("missing tensor model.layers.0.mlp.gate_proj.weight"); needs a QwenMoe FFN branch:
+  # "Jackrong/MLX-Qwen3.5-35B-A3B-Claude-4.6-Opus-Reasoning-Distilled-4bit"  # qwen3_5_moe (SSM hybrid + MoE)
+  # large / MLA not held locally (big downloads):
+  # "mlx-community/DeepSeek-V4-Flash-4bit"                                 # deepseek_v4 (MLA + lightning indexer)
 )
 
 usage() {
