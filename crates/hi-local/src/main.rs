@@ -196,9 +196,20 @@ fn inspect(model_path: &Path, model_id: Option<String>) -> Result<()> {
         return Ok(());
     }
     if model_path.is_dir() {
-        let info = hi_mlx::manifest::inspect_model(model_path, model_id)?;
-        println!("{}", serde_json::to_string_pretty(&info)?);
-        return Ok(());
+        #[cfg(feature = "mlx")]
+        {
+            let info = hi_mlx::manifest::inspect_model(model_path, model_id)?;
+            println!("{}", serde_json::to_string_pretty(&info)?);
+            return Ok(());
+        }
+        #[cfg(not(feature = "mlx"))]
+        {
+            let _ = &model_id;
+            bail!(
+                "inspecting an MLX model directory requires the `mlx` feature; \
+                 rebuild hi-local with --features mlx (Apple Silicon macOS only)"
+            );
+        }
     }
     bail!(
         "unsupported model path {}; expected a .gguf file or an MLX model directory",
@@ -321,28 +332,39 @@ async fn serve(
             if mmproj_path.is_some() {
                 bail!("--mmproj-path is only supported with --backend cuda");
             }
-            if !hi_mlx::backend::platform_supported() {
-                bail!("MLX inference requires Apple Silicon macOS");
+            #[cfg(not(feature = "mlx"))]
+            {
+                bail!(
+                    "the MLX backend is not compiled in; rebuild hi-local with \
+                     --features mlx (Apple Silicon macOS only)"
+                );
             }
-            let backend = Arc::new(
-                hi_mlx::backend::MlxBackend::load(&model_path, model_id)
-                    .with_context(|| format!("loading MLX model from {}", model_path.display()))?,
-            );
-            let listener = bind_server_listener(addr).await?;
-            tracing::info!("serving {} on http://{addr}/v1", backend.model().id);
-            axum::serve(
-                listener,
-                hi_local_core::server::app_with_config(
-                    backend,
-                    hi_local_core::server::ServerConfig {
-                        image_url_policy: hi_local_core::server::ImageUrlPolicy {
-                            allow_http_urls: allow_http_image_url,
-                            allow_local_urls: allow_local_image_url,
+            #[cfg(feature = "mlx")]
+            {
+                if !hi_mlx::backend::platform_supported() {
+                    bail!("MLX inference requires Apple Silicon macOS");
+                }
+                let backend = Arc::new(
+                    hi_mlx::backend::MlxBackend::load(&model_path, model_id).with_context(|| {
+                        format!("loading MLX model from {}", model_path.display())
+                    })?,
+                );
+                let listener = bind_server_listener(addr).await?;
+                tracing::info!("serving {} on http://{addr}/v1", backend.model().id);
+                axum::serve(
+                    listener,
+                    hi_local_core::server::app_with_config(
+                        backend,
+                        hi_local_core::server::ServerConfig {
+                            image_url_policy: hi_local_core::server::ImageUrlPolicy {
+                                allow_http_urls: allow_http_image_url,
+                                allow_local_urls: allow_local_image_url,
+                            },
                         },
-                    },
-                ),
-            )
-            .await?;
+                    ),
+                )
+                .await?;
+            }
         }
     }
     Ok(())
