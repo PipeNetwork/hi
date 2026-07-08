@@ -178,6 +178,24 @@ mod native {
             quant_type: c_int,
             stream: *mut c_void,
         ) -> c_int;
+        fn hi_cuda_launch_quantize_q8_row(
+            x: *const c_void,
+            xq: *mut c_void,
+            dx: *mut c_void,
+            xsum: *mut c_void,
+            k: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_q4_0_dp4a_gemv(
+            weight: *const c_void,
+            xq: *const c_void,
+            dx: *const c_void,
+            xsum: *const c_void,
+            y: *mut c_void,
+            rows: c_int,
+            cols: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
         fn hi_cuda_launch_rope(
             values: *mut c_void,
             seq_len: c_int,
@@ -1110,6 +1128,55 @@ mod native {
             )
         })?;
         check_last_error("hi_cuda_launch_gather_rows_f32_to_f32")
+    }
+
+    pub fn launch_quantize_q8_row(
+        x: &DeviceBuffer,
+        xq: &DeviceBuffer,
+        dx: &DeviceBuffer,
+        xsum: &DeviceBuffer,
+        k: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(k, "quantize_q8 k")?;
+        launch_status(unsafe {
+            hi_cuda_launch_quantize_q8_row(
+                x.as_ptr(),
+                xq.as_mut_ptr(),
+                dx.as_mut_ptr(),
+                xsum.as_mut_ptr(),
+                k as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_quantize_q8_row")
+    }
+
+    pub fn launch_q4_0_dp4a_gemv(
+        weight: &DeviceBuffer,
+        xq: &DeviceBuffer,
+        dx: &DeviceBuffer,
+        xsum: &DeviceBuffer,
+        y: &DeviceBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(rows, "q4_0 dp4a rows")?;
+        ensure_len(cols, "q4_0 dp4a cols")?;
+        launch_status(unsafe {
+            hi_cuda_launch_q4_0_dp4a_gemv(
+                weight.as_ptr(),
+                xq.as_ptr(),
+                dx.as_ptr(),
+                xsum.as_ptr(),
+                y.as_mut_ptr(),
+                rows as c_int,
+                cols as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_q4_0_dp4a_gemv")
     }
 
     pub fn launch_dequantize_matrix(

@@ -4644,6 +4644,136 @@ extern "C" int hi_cuda_launch_gather_rows_f32_to_f32(
   return 0;
 }
 
+// Portable signed int8x4 dot-product accumulate (hardware dp4a where available).
+__device__ __forceinline__ int dp4a_i8(int a, int b, int c) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 610
+  return __dp4a(a, b, c);
+#else
+  const int8_t* pa = reinterpret_cast<const int8_t*>(&a);
+  const int8_t* pb = reinterpret_cast<const int8_t*>(&b);
+  return c + static_cast<int>(pa[0]) * static_cast<int>(pb[0]) +
+         static_cast<int>(pa[1]) * static_cast<int>(pb[1]) +
+         static_cast<int>(pa[2]) * static_cast<int>(pb[2]) +
+         static_cast<int>(pa[3]) * static_cast<int>(pb[3]);
+#endif
+}
+
+// Quantize an activation row x[k] to signed int8 blocks of 32: per block store the
+// int8 quants (xq), f32 scale (dx = max|x|/127) and int sum of quants (xsum, to
+// correct the Q4_0 -8 offset in the dp4a dot product).
+__global__ void quantize_q8_row_kernel(
+    const float* __restrict__ x,
+    int8_t* __restrict__ xq,
+    float* __restrict__ dx,
+    int* __restrict__ xsum,
+    int k) {
+  const int block = blockIdx.x;
+  const int lane = threadIdx.x;
+  const int idx = block * 32 + lane;
+  const float v = (idx < k) ? x[idx] : 0.0f;
+  float amax = fabsf(v);
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) {
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+  }
+  const float d = amax / 127.0f;
+  const float inv = (d > 0.0f) ? (1.0f / d) : 0.0f;
+  int q = static_cast<int>(rintf(v * inv));
+  q = max(-127, min(127, q));
+  if (idx < k) {
+    xq[idx] = static_cast<int8_t>(q);
+  }
+  int s = q;
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) {
+    s += __shfl_xor_sync(0xffffffffu, s, o);
+  }
+  if (lane == 0) {
+    dx[block] = d;
+    xsum[block] = s;
+  }
+}
+
+// Q4_0 x Q8 mat-vec via dp4a: y[row] = sum over 32-blocks of
+//   d_w * d_x * (dp4a(q, xq) - 8 * sum(xq)).
+// One warp per row; reads 4-bit weights + int8 activation (both quantized). Weight
+// block layout matches dequantize_q4_0_kernel: byte j = weight j (low nibble) and
+// weight j+16 (high nibble).
+__global__ void q4_0_dp4a_gemv_kernel(
+    const uint8_t* __restrict__ weight,
+    const int8_t* __restrict__ xq,
+    const float* __restrict__ dx,
+    const int* __restrict__ xsum,
+    float* __restrict__ y,
+    int rows,
+    int cols) {
+  const int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+  if (row >= rows) {
+    return;
+  }
+  const int lane = threadIdx.x & 31;
+  const int nblocks = cols / 32;
+  const uint8_t* row_base = weight + static_cast<size_t>(row) * nblocks * 18;
+  float acc = 0.0f;
+  for (int b = lane; b < nblocks; b += 32) {
+    const uint8_t* blk = row_base + static_cast<size_t>(b) * 18;
+    const float dw = __half2float(*reinterpret_cast<const __half*>(blk));
+    const int8_t* xqb = xq + b * 32;
+    int sumi = 0;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const uint8_t* pb = blk + 2 + j * 4;
+      const uint32_t packed = static_cast<uint32_t>(pb[0]) |
+                              (static_cast<uint32_t>(pb[1]) << 8) |
+                              (static_cast<uint32_t>(pb[2]) << 16) |
+                              (static_cast<uint32_t>(pb[3]) << 24);
+      const int lo = static_cast<int>(packed & 0x0F0F0F0Fu);
+      const int hi = static_cast<int>((packed >> 4) & 0x0F0F0F0Fu);
+      const int xlo = *reinterpret_cast<const int*>(xqb + j * 4);
+      const int xhi = *reinterpret_cast<const int*>(xqb + 16 + j * 4);
+      sumi = dp4a_i8(lo, xlo, sumi);
+      sumi = dp4a_i8(hi, xhi, sumi);
+    }
+    acc += dw * dx[b] * (static_cast<float>(sumi) - 8.0f * static_cast<float>(xsum[b]));
+  }
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    acc += __shfl_down_sync(0xffffffffu, acc, offset);
+  }
+  if (lane == 0) {
+    y[row] = acc;
+  }
+}
+
+extern "C" int hi_cuda_launch_quantize_q8_row(
+    const void* x, void* xq, void* dx, void* xsum, int k, void* stream) {
+  if (x == nullptr || xq == nullptr || dx == nullptr || xsum == nullptr || k <= 0 ||
+      k % 32 != 0 || stream == nullptr) {
+    return 1;
+  }
+  quantize_q8_row_kernel<<<k / 32, 32, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const float*>(x), static_cast<int8_t*>(xq),
+      static_cast<float*>(dx), static_cast<int*>(xsum), k);
+  return 0;
+}
+
+extern "C" int hi_cuda_launch_q4_0_dp4a_gemv(
+    const void* weight, const void* xq, const void* dx, const void* xsum, void* y,
+    int rows, int cols, void* stream) {
+  if (weight == nullptr || xq == nullptr || dx == nullptr || xsum == nullptr ||
+      y == nullptr || rows <= 0 || cols <= 0 || cols % 32 != 0 || stream == nullptr) {
+    return 1;
+  }
+  const int warps_per_block = 4;
+  const int grid = (rows + warps_per_block - 1) / warps_per_block;
+  q4_0_dp4a_gemv_kernel<<<grid, warps_per_block * 32, 0,
+                          static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint8_t*>(weight), static_cast<const int8_t*>(xq),
+      static_cast<const float*>(dx), static_cast<const int*>(xsum),
+      static_cast<float*>(y), rows, cols);
+  return 0;
+}
+
 extern "C" int hi_cuda_launch_dequantize_matrix(
     const void* input,
     void* output,
