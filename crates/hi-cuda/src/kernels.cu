@@ -2392,6 +2392,13 @@ __global__ void cached_decode_attention_batched_kernel(
 
 constexpr int HI_CUDA_FLASH_MAX_HEAD_DIM = 512;
 
+// Warps per (head) block in the split-K flash-decode kernels. Decode has one
+// query per head, so a single-warp serial loop over the KV cache is latency-bound
+// on the paged reads; splitting the key range across this many warps issues that
+// many concurrent K/V loads to hide the latency, then a shared-memory flash
+// rescale-merge combines the per-warp partial softmaxes.
+constexpr int HI_CUDA_DECODE_WARPS = 16;
+
 __global__ void flash_causal_attention_kernel(
     const float* q,
     const float* k,
@@ -2916,68 +2923,120 @@ __global__ void tiled_paged_decode_attention_kernel(
     int qk_head_dim,
     int v_head_dim,
     int window) {
-  int head = blockIdx.x;
-  int lane = threadIdx.x;
+  // Split-K flash decode: HI_CUDA_DECODE_WARPS warps per head, each folding a
+  // strided slice of the KV cache into a local online softmax (warp-shuffle dot
+  // reduction, q cached in registers), then a shared-memory flash rescale-merge.
+  // The concurrent per-warp K/V reads hide the paged-read latency that a single
+  // serial warp cannot.
+  const int head = blockIdx.x;
   if (head >= heads || qk_head_dim > HI_CUDA_FLASH_MAX_HEAD_DIM ||
       v_head_dim > HI_CUDA_FLASH_MAX_HEAD_DIM) {
     return;
   }
-
-  extern __shared__ float partial_dot[];
-  int kv_repeats = heads / kv_heads;
-  int kv_head = head / kv_repeats;
+  const int warp_id = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int kv_repeats = heads / kv_heads;
+  const int kv_head = head / kv_repeats;
   const float scale = rsqrtf(static_cast<float>(qk_head_dim));
   const float* q_vec = q + head * qk_head_dim;
   float* out_vec = output + head * v_head_dim;
 
-  float acc = 0.0f;
-  float max_score = -INFINITY;
-  float denom = 0.0f;
+  constexpr int MAX_PER_LANE = HI_CUDA_FLASH_MAX_HEAD_DIM / 32;
+  float q_reg[MAX_PER_LANE];
+  float acc[MAX_PER_LANE];
+#pragma unroll
+  for (int i = 0; i < MAX_PER_LANE; ++i) {
+    const int dim = lane + i * 32;
+    q_reg[i] = (dim < qk_head_dim) ? q_vec[dim] : 0.0f;
+    acc[i] = 0.0f;
+  }
+  float m = -INFINITY;  // running max for this warp's key slice
+  float l = 0.0f;       // running denom
+
   // Sliding-window (Gemma-3 local layers): only attend to the last `window`
   // positions. window <= 0 means unlimited causal attention.
-  int source_start = (window > 0 && position >= window) ? position - window + 1 : 0;
-  for (int source = source_start; source <= position; ++source) {
-    int logical_page = source / page_size;
-    int page_offset = source - logical_page * page_size;
+  const int source_start = (window > 0 && position >= window) ? position - window + 1 : 0;
+  for (int source = source_start + warp_id; source <= position;
+       source += HI_CUDA_DECODE_WARPS) {
+    const int logical_page = source / page_size;
+    const int page_offset = source - logical_page * page_size;
     float dot = 0.0f;
     const kv_t* v_vec = nullptr;
     if (logical_page < page_table_len) {
-      uint32_t physical_page = page_table[logical_page];
+      const uint32_t physical_page = page_table[logical_page];
       const kv_t* k_vec =
           k_pages + ((static_cast<int>(physical_page) * kv_heads + kv_head) * page_size +
-                     page_offset) *
-                        qk_head_dim;
+                     page_offset) * qk_head_dim;
       v_vec =
           v_pages + ((static_cast<int>(physical_page) * kv_heads + kv_head) * page_size +
-                     page_offset) *
-                        v_head_dim;
-      for (int dim = lane; dim < qk_head_dim; dim += blockDim.x) {
-        dot += q_vec[dim] * kv_to_float(k_vec[dim]);
+                     page_offset) * v_head_dim;
+#pragma unroll
+      for (int i = 0; i < MAX_PER_LANE; ++i) {
+        const int dim = lane + i * 32;
+        if (dim < qk_head_dim) {
+          dot += q_reg[i] * kv_to_float(k_vec[dim]);
+        }
       }
     }
-    partial_dot[lane] = dot;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-      if (lane < stride) {
-        partial_dot[lane] += partial_dot[lane + stride];
-      }
-      __syncthreads();
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      dot += __shfl_down_sync(0xffffffffu, dot, offset);
     }
+    const float score = __shfl_sync(0xffffffffu, dot, 0) * scale;
 
-    float score = partial_dot[0] * scale;
-    float next_max = fmaxf(max_score, score);
-    float old_scale = isfinite(max_score) ? expf(max_score - next_max) : 0.0f;
-    float weight = expf(score - next_max);
-    if (lane < v_head_dim && v_vec != nullptr) {
-      acc = acc * old_scale + weight * kv_to_float(v_vec[lane]);
+    const float next_m = fmaxf(m, score);
+    const float rescale = isfinite(m) ? expf(m - next_m) : 0.0f;
+    const float weight = expf(score - next_m);
+    if (v_vec != nullptr) {
+#pragma unroll
+      for (int i = 0; i < MAX_PER_LANE; ++i) {
+        const int dim = lane + i * 32;
+        if (dim < v_head_dim) {
+          acc[i] = acc[i] * rescale + weight * kv_to_float(v_vec[dim]);
+        }
+      }
     }
-    denom = denom * old_scale + weight;
-    max_score = next_max;
-    __syncthreads();
+    l = l * rescale + weight;
+    m = next_m;
   }
 
-  if (lane < v_head_dim) {
-    out_vec[lane] = (denom == 0.0f || !isfinite(denom)) ? 0.0f : acc / denom;
+  // Flash rescale-merge across the warps' partial softmaxes.
+  // Shared layout: [DECODE_WARPS m][DECODE_WARPS l][DECODE_WARPS * v_head_dim acc].
+  extern __shared__ float smem[];
+  float* sh_m = smem;
+  float* sh_l = smem + HI_CUDA_DECODE_WARPS;
+  float* sh_acc = smem + 2 * HI_CUDA_DECODE_WARPS;
+  if (lane == 0) {
+    sh_m[warp_id] = m;
+    sh_l[warp_id] = l;
+  }
+#pragma unroll
+  for (int i = 0; i < MAX_PER_LANE; ++i) {
+    const int dim = lane + i * 32;
+    if (dim < v_head_dim) {
+      sh_acc[warp_id * v_head_dim + dim] = acc[i];
+    }
+  }
+  __syncthreads();
+
+  float global_max = -INFINITY;
+#pragma unroll
+  for (int w = 0; w < HI_CUDA_DECODE_WARPS; ++w) {
+    global_max = fmaxf(global_max, sh_m[w]);
+  }
+  float total = 0.0f;
+#pragma unroll
+  for (int w = 0; w < HI_CUDA_DECODE_WARPS; ++w) {
+    total += sh_l[w] * expf(sh_m[w] - global_max);
+  }
+  const float inv = (total == 0.0f || !isfinite(total)) ? 0.0f : 1.0f / total;
+  for (int dim = threadIdx.x; dim < v_head_dim; dim += blockDim.x) {
+    float a = 0.0f;
+#pragma unroll
+    for (int w = 0; w < HI_CUDA_DECODE_WARPS; ++w) {
+      a += sh_acc[w * v_head_dim + dim] * expf(sh_m[w] - global_max);
+    }
+    out_vec[dim] = a * inv;
   }
 }
 
@@ -3244,69 +3303,116 @@ __global__ void tiled_paged_decode_attention_batched_kernel(
     int qk_head_dim,
     int v_head_dim,
     int window) {
-  int idx = blockIdx.x;
-  int lane = threadIdx.x;
-  int total = batch_count * heads;
+  // Split-K flash decode (batched). See tiled_paged_decode_attention_kernel.
+  const int idx = blockIdx.x;
+  const int total = batch_count * heads;
   if (idx >= total || qk_head_dim > HI_CUDA_FLASH_MAX_HEAD_DIM ||
       v_head_dim > HI_CUDA_FLASH_MAX_HEAD_DIM) {
     return;
   }
-
-  extern __shared__ float partial_dot[];
-  int head = idx % heads;
-  int batch = idx / heads;
-  int kv_repeats = heads / kv_heads;
-  int kv_head = head / kv_repeats;
+  const int warp_id = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int head = idx % heads;
+  const int batch = idx / heads;
+  const int kv_repeats = heads / kv_heads;
+  const int kv_head = head / kv_repeats;
   const float scale = rsqrtf(static_cast<float>(qk_head_dim));
   const float* q_vec = q + (batch * heads + head) * qk_head_dim;
   float* out_vec = output + (batch * heads + head) * v_head_dim;
 
-  float acc = 0.0f;
-  float max_score = -INFINITY;
-  float denom = 0.0f;
-  int source_start = (window > 0 && position >= window) ? position - window + 1 : 0;
-  for (int source = source_start; source <= position; ++source) {
-    int logical_page = source / page_size;
-    int page_offset = source - logical_page * page_size;
+  constexpr int MAX_PER_LANE = HI_CUDA_FLASH_MAX_HEAD_DIM / 32;
+  float q_reg[MAX_PER_LANE];
+  float acc[MAX_PER_LANE];
+#pragma unroll
+  for (int i = 0; i < MAX_PER_LANE; ++i) {
+    const int dim = lane + i * 32;
+    q_reg[i] = (dim < qk_head_dim) ? q_vec[dim] : 0.0f;
+    acc[i] = 0.0f;
+  }
+  float m = -INFINITY;
+  float l = 0.0f;
+
+  const int source_start = (window > 0 && position >= window) ? position - window + 1 : 0;
+  for (int source = source_start + warp_id; source <= position;
+       source += HI_CUDA_DECODE_WARPS) {
+    const int logical_page = source / page_size;
+    const int page_offset = source - logical_page * page_size;
     float dot = 0.0f;
     const kv_t* v_vec = nullptr;
     if (logical_page < page_table_len) {
-      uint32_t physical_page = page_table[batch * page_table_len + logical_page];
+      const uint32_t physical_page = page_table[batch * page_table_len + logical_page];
       const kv_t* k_vec =
           k_pages + ((static_cast<int>(physical_page) * kv_heads + kv_head) * page_size +
-                     page_offset) *
-                        qk_head_dim;
+                     page_offset) * qk_head_dim;
       v_vec =
           v_pages + ((static_cast<int>(physical_page) * kv_heads + kv_head) * page_size +
-                     page_offset) *
-                        v_head_dim;
-      for (int dim = lane; dim < qk_head_dim; dim += blockDim.x) {
-        dot += q_vec[dim] * kv_to_float(k_vec[dim]);
+                     page_offset) * v_head_dim;
+#pragma unroll
+      for (int i = 0; i < MAX_PER_LANE; ++i) {
+        const int dim = lane + i * 32;
+        if (dim < qk_head_dim) {
+          dot += q_reg[i] * kv_to_float(k_vec[dim]);
+        }
       }
     }
-    partial_dot[lane] = dot;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-      if (lane < stride) {
-        partial_dot[lane] += partial_dot[lane + stride];
-      }
-      __syncthreads();
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      dot += __shfl_down_sync(0xffffffffu, dot, offset);
     }
+    const float score = __shfl_sync(0xffffffffu, dot, 0) * scale;
 
-    float score = partial_dot[0] * scale;
-    float next_max = fmaxf(max_score, score);
-    float old_scale = isfinite(max_score) ? expf(max_score - next_max) : 0.0f;
-    float weight = expf(score - next_max);
-    if (lane < v_head_dim && v_vec != nullptr) {
-      acc = acc * old_scale + weight * kv_to_float(v_vec[lane]);
+    const float next_m = fmaxf(m, score);
+    const float rescale = isfinite(m) ? expf(m - next_m) : 0.0f;
+    const float weight = expf(score - next_m);
+    if (v_vec != nullptr) {
+#pragma unroll
+      for (int i = 0; i < MAX_PER_LANE; ++i) {
+        const int dim = lane + i * 32;
+        if (dim < v_head_dim) {
+          acc[i] = acc[i] * rescale + weight * kv_to_float(v_vec[dim]);
+        }
+      }
     }
-    denom = denom * old_scale + weight;
-    max_score = next_max;
-    __syncthreads();
+    l = l * rescale + weight;
+    m = next_m;
   }
 
-  if (lane < v_head_dim) {
-    out_vec[lane] = (denom == 0.0f || !isfinite(denom)) ? 0.0f : acc / denom;
+  extern __shared__ float smem[];
+  float* sh_m = smem;
+  float* sh_l = smem + HI_CUDA_DECODE_WARPS;
+  float* sh_acc = smem + 2 * HI_CUDA_DECODE_WARPS;
+  if (lane == 0) {
+    sh_m[warp_id] = m;
+    sh_l[warp_id] = l;
+  }
+#pragma unroll
+  for (int i = 0; i < MAX_PER_LANE; ++i) {
+    const int dim = lane + i * 32;
+    if (dim < v_head_dim) {
+      sh_acc[warp_id * v_head_dim + dim] = acc[i];
+    }
+  }
+  __syncthreads();
+
+  float global_max = -INFINITY;
+#pragma unroll
+  for (int w = 0; w < HI_CUDA_DECODE_WARPS; ++w) {
+    global_max = fmaxf(global_max, sh_m[w]);
+  }
+  float total_denom = 0.0f;
+#pragma unroll
+  for (int w = 0; w < HI_CUDA_DECODE_WARPS; ++w) {
+    total_denom += sh_l[w] * expf(sh_m[w] - global_max);
+  }
+  const float inv =
+      (total_denom == 0.0f || !isfinite(total_denom)) ? 0.0f : 1.0f / total_denom;
+  for (int dim = threadIdx.x; dim < v_head_dim; dim += blockDim.x) {
+    float a = 0.0f;
+#pragma unroll
+    for (int w = 0; w < HI_CUDA_DECODE_WARPS; ++w) {
+      a += sh_acc[w * v_head_dim + dim] * expf(sh_m[w] - global_max);
+    }
+    out_vec[dim] = a * inv;
   }
 }
 
@@ -3325,70 +3431,117 @@ __global__ void tiled_paged_decode_attention_batched_positions_kernel(
     int qk_head_dim,
     int v_head_dim,
     int window) {
-  int idx = blockIdx.x;
-  int lane = threadIdx.x;
-  int total = batch_count * heads;
+  // Split-K flash decode with per-batch position. See tiled_paged_decode_attention_kernel.
+  const int idx = blockIdx.x;
+  const int total = batch_count * heads;
   if (idx >= total || qk_head_dim > HI_CUDA_FLASH_MAX_HEAD_DIM ||
       v_head_dim > HI_CUDA_FLASH_MAX_HEAD_DIM) {
     return;
   }
-
-  extern __shared__ float partial_dot[];
-  int head = idx % heads;
-  int batch = idx / heads;
-  int position = static_cast<int>(positions[batch]);
-  int kv_repeats = heads / kv_heads;
-  int kv_head = head / kv_repeats;
+  const int warp_id = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int head = idx % heads;
+  const int batch = idx / heads;
+  const int position = static_cast<int>(positions[batch]);
+  const int kv_repeats = heads / kv_heads;
+  const int kv_head = head / kv_repeats;
   const float scale = rsqrtf(static_cast<float>(qk_head_dim));
   const float* q_vec = q + (batch * heads + head) * qk_head_dim;
   float* out_vec = output + (batch * heads + head) * v_head_dim;
 
-  float acc = 0.0f;
-  float max_score = -INFINITY;
-  float denom = 0.0f;
-  int source_start = (window > 0 && position >= window) ? position - window + 1 : 0;
-  for (int source = source_start; source <= position; ++source) {
-    int logical_page = source / page_size;
-    int page_offset = source - logical_page * page_size;
+  constexpr int MAX_PER_LANE = HI_CUDA_FLASH_MAX_HEAD_DIM / 32;
+  float q_reg[MAX_PER_LANE];
+  float acc[MAX_PER_LANE];
+#pragma unroll
+  for (int i = 0; i < MAX_PER_LANE; ++i) {
+    const int dim = lane + i * 32;
+    q_reg[i] = (dim < qk_head_dim) ? q_vec[dim] : 0.0f;
+    acc[i] = 0.0f;
+  }
+  float m = -INFINITY;
+  float l = 0.0f;
+
+  const int source_start = (window > 0 && position >= window) ? position - window + 1 : 0;
+  for (int source = source_start + warp_id; source <= position;
+       source += HI_CUDA_DECODE_WARPS) {
+    const int logical_page = source / page_size;
+    const int page_offset = source - logical_page * page_size;
     float dot = 0.0f;
     const kv_t* v_vec = nullptr;
     if (logical_page < page_table_len) {
-      uint32_t physical_page = page_table[batch * page_table_len + logical_page];
+      const uint32_t physical_page = page_table[batch * page_table_len + logical_page];
       const kv_t* k_vec =
           k_pages + ((static_cast<int>(physical_page) * kv_heads + kv_head) * page_size +
-                     page_offset) *
-                        qk_head_dim;
+                     page_offset) * qk_head_dim;
       v_vec =
           v_pages + ((static_cast<int>(physical_page) * kv_heads + kv_head) * page_size +
-                     page_offset) *
-                        v_head_dim;
-      for (int dim = lane; dim < qk_head_dim; dim += blockDim.x) {
-        dot += q_vec[dim] * kv_to_float(k_vec[dim]);
+                     page_offset) * v_head_dim;
+#pragma unroll
+      for (int i = 0; i < MAX_PER_LANE; ++i) {
+        const int dim = lane + i * 32;
+        if (dim < qk_head_dim) {
+          dot += q_reg[i] * kv_to_float(k_vec[dim]);
+        }
       }
     }
-    partial_dot[lane] = dot;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-      if (lane < stride) {
-        partial_dot[lane] += partial_dot[lane + stride];
-      }
-      __syncthreads();
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      dot += __shfl_down_sync(0xffffffffu, dot, offset);
     }
+    const float score = __shfl_sync(0xffffffffu, dot, 0) * scale;
 
-    float score = partial_dot[0] * scale;
-    float next_max = fmaxf(max_score, score);
-    float old_scale = isfinite(max_score) ? expf(max_score - next_max) : 0.0f;
-    float weight = expf(score - next_max);
-    if (lane < v_head_dim && v_vec != nullptr) {
-      acc = acc * old_scale + weight * kv_to_float(v_vec[lane]);
+    const float next_m = fmaxf(m, score);
+    const float rescale = isfinite(m) ? expf(m - next_m) : 0.0f;
+    const float weight = expf(score - next_m);
+    if (v_vec != nullptr) {
+#pragma unroll
+      for (int i = 0; i < MAX_PER_LANE; ++i) {
+        const int dim = lane + i * 32;
+        if (dim < v_head_dim) {
+          acc[i] = acc[i] * rescale + weight * kv_to_float(v_vec[dim]);
+        }
+      }
     }
-    denom = denom * old_scale + weight;
-    max_score = next_max;
-    __syncthreads();
+    l = l * rescale + weight;
+    m = next_m;
   }
 
-  if (lane < v_head_dim) {
-    out_vec[lane] = (denom == 0.0f || !isfinite(denom)) ? 0.0f : acc / denom;
+  extern __shared__ float smem[];
+  float* sh_m = smem;
+  float* sh_l = smem + HI_CUDA_DECODE_WARPS;
+  float* sh_acc = smem + 2 * HI_CUDA_DECODE_WARPS;
+  if (lane == 0) {
+    sh_m[warp_id] = m;
+    sh_l[warp_id] = l;
+  }
+#pragma unroll
+  for (int i = 0; i < MAX_PER_LANE; ++i) {
+    const int dim = lane + i * 32;
+    if (dim < v_head_dim) {
+      sh_acc[warp_id * v_head_dim + dim] = acc[i];
+    }
+  }
+  __syncthreads();
+
+  float global_max = -INFINITY;
+#pragma unroll
+  for (int w = 0; w < HI_CUDA_DECODE_WARPS; ++w) {
+    global_max = fmaxf(global_max, sh_m[w]);
+  }
+  float total_denom = 0.0f;
+#pragma unroll
+  for (int w = 0; w < HI_CUDA_DECODE_WARPS; ++w) {
+    total_denom += sh_l[w] * expf(sh_m[w] - global_max);
+  }
+  const float inv =
+      (total_denom == 0.0f || !isfinite(total_denom)) ? 0.0f : 1.0f / total_denom;
+  for (int dim = threadIdx.x; dim < v_head_dim; dim += blockDim.x) {
+    float a = 0.0f;
+#pragma unroll
+    for (int w = 0; w < HI_CUDA_DECODE_WARPS; ++w) {
+      a += sh_acc[w * v_head_dim + dim] * expf(sh_m[w] - global_max);
+    }
+    out_vec[dim] = a * inv;
   }
 }
 
@@ -5454,9 +5607,10 @@ extern "C" int hi_cuda_launch_tiled_paged_decode_attention(
       stream == nullptr) {
     return 1;
   }
-  dim3 block(HI_CUDA_FLASH_MAX_HEAD_DIM);
+  dim3 block(HI_CUDA_DECODE_WARPS * 32);
   dim3 grid(heads);
-  size_t shared_bytes = block.x * sizeof(float);
+  size_t shared_bytes =
+      (2 * HI_CUDA_DECODE_WARPS + HI_CUDA_DECODE_WARPS * v_head_dim) * sizeof(float);
   tiled_paged_decode_attention_kernel<<<grid, block, shared_bytes, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const float*>(q),
       static_cast<const kv_t*>(k_pages),
@@ -5664,9 +5818,10 @@ extern "C" int hi_cuda_launch_tiled_paged_decode_attention_batched(
       stream == nullptr) {
     return 1;
   }
-  dim3 block(HI_CUDA_FLASH_MAX_HEAD_DIM);
+  dim3 block(HI_CUDA_DECODE_WARPS * 32);
   dim3 grid(batch_count * heads);
-  size_t shared_bytes = block.x * sizeof(float);
+  size_t shared_bytes =
+      (2 * HI_CUDA_DECODE_WARPS + HI_CUDA_DECODE_WARPS * v_head_dim) * sizeof(float);
   tiled_paged_decode_attention_batched_kernel<<<grid, block, shared_bytes, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const float*>(q),
       static_cast<const kv_t*>(k_pages),
@@ -5710,9 +5865,10 @@ extern "C" int hi_cuda_launch_tiled_paged_decode_attention_batched_positions(
       stream == nullptr) {
     return 1;
   }
-  dim3 block(HI_CUDA_FLASH_MAX_HEAD_DIM);
+  dim3 block(HI_CUDA_DECODE_WARPS * 32);
   dim3 grid(batch_count * heads);
-  size_t shared_bytes = block.x * sizeof(float);
+  size_t shared_bytes =
+      (2 * HI_CUDA_DECODE_WARPS + HI_CUDA_DECODE_WARPS * v_head_dim) * sizeof(float);
   tiled_paged_decode_attention_batched_positions_kernel<<<grid, block, shared_bytes, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const float*>(q),
       static_cast<const kv_t*>(k_pages),
