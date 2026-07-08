@@ -256,6 +256,57 @@ pub(crate) fn contains_any(haystack: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| haystack.contains(needle))
 }
 
+fn without_scoped_no_edit_constraints(normalized: &str) -> String {
+    let mut text = normalized.to_string();
+    for phrase in [
+        "do not change the existing tests",
+        "do not change existing tests",
+        "do not change any tests",
+        "do not change the tests",
+        "do not change tests",
+        "do not change the test",
+        "do not change test",
+        "do not edit the existing tests",
+        "do not edit existing tests",
+        "do not edit any tests",
+        "do not edit the tests",
+        "do not edit tests",
+        "do not edit the test",
+        "do not edit test",
+        "do not modify the existing tests",
+        "do not modify existing tests",
+        "do not modify any tests",
+        "do not modify the tests",
+        "do not modify tests",
+        "do not modify the test",
+        "do not modify test",
+        "don t change the existing tests",
+        "don t change existing tests",
+        "don t change any tests",
+        "don t change the tests",
+        "don t change tests",
+        "don t change the test",
+        "don t change test",
+        "don t edit the existing tests",
+        "don t edit existing tests",
+        "don t edit any tests",
+        "don t edit the tests",
+        "don t edit tests",
+        "don t edit the test",
+        "don t edit test",
+        "don t modify the existing tests",
+        "don t modify existing tests",
+        "don t modify any tests",
+        "don t modify the tests",
+        "don t modify tests",
+        "don t modify the test",
+        "don t modify test",
+    ] {
+        text = text.replace(phrase, "");
+    }
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 pub(crate) fn default_read_only_inspection_cap(intent: ReviewIntent) -> u32 {
     match intent {
         ReviewIntent::Review => super::constants::REVIEW_INSPECTION_CAP,
@@ -428,8 +479,24 @@ pub(crate) fn explicit_status_review_request(normalized: &str) -> bool {
 }
 
 pub(crate) fn explicit_no_mutation_request(normalized: &str) -> bool {
+    let unscoped = without_scoped_no_edit_constraints(normalized);
+    if contains_any(
+        &unscoped,
+        &[
+            "do not treat this as a read only",
+            "do not treat this as read only",
+            "don t treat this as a read only",
+            "don t treat this as read only",
+            "not a read only review",
+            "not read only",
+        ],
+    ) && !explicit_no_edit_instruction(&unscoped)
+    {
+        return false;
+    }
+
     contains_any(
-        normalized,
+        &unscoped,
         &[
             "read only",
             "discuss only",
@@ -475,7 +542,10 @@ pub(crate) fn read_only_turn_prompt(input: &str, intent: ReviewIntent) -> String
 
 pub(crate) fn classify_implementation_intent(input: &str) -> Option<ImplementationIntent> {
     let normalized = normalize_intent_text(input);
-    if normalized.trim().is_empty() || !expanded_build_macro_request(&normalized) {
+    if normalized.trim().is_empty()
+        || !(expanded_build_macro_request(&normalized)
+            || explicit_implementation_task_request(&normalized))
+    {
         return None;
     }
     Some(ImplementationIntent {
@@ -487,6 +557,47 @@ pub(crate) fn classify_implementation_intent(input: &str) -> Option<Implementati
 fn expanded_build_macro_request(normalized: &str) -> bool {
     normalized.starts_with("build ")
         && normalized.contains("implementation requirements inspect the workspace")
+}
+
+fn explicit_implementation_task_request(normalized: &str) -> bool {
+    (normalized.starts_with("implementation task")
+        || normalized.contains(" implementation task ")
+        || normalized.starts_with("benchmark implementation task")
+        || normalized.contains(" disposable benchmark workspace "))
+        && contains_any(
+            normalized,
+            &[
+                "expected to edit",
+                "allowed to edit",
+                "edit files",
+                "apply patches",
+                "change files",
+                "run the verification command",
+                "implement ",
+            ],
+        )
+        && !explicit_no_edit_instruction(normalized)
+}
+
+fn explicit_no_edit_instruction(normalized: &str) -> bool {
+    let unscoped = without_scoped_no_edit_constraints(normalized);
+    contains_any(
+        &unscoped,
+        &[
+            "do not write",
+            "do not edit",
+            "do not modify",
+            "do not change",
+            "don t write",
+            "don t edit",
+            "don t modify",
+            "don t change",
+            "without modifying",
+            "without changing",
+            "no file changes",
+            "no changes",
+        ],
+    )
 }
 
 pub(crate) fn implementation_mentions_tui(normalized: &str) -> bool {

@@ -950,10 +950,11 @@ async fn missing_background_kill_after_prior_mutation_stalls_instead_of_looping(
 #[tokio::test]
 async fn implementation_re_read_exhaustion_reports_incomplete_not_stuck_repeating() {
     // An implementation task where the model reads a file, then keeps
-    // re-reading it through the repeat budget — the "explore forever, never
-    // edit" failure mode. The turn should end with the implementation-incomplete
-    // message (so the user knows no edit was made), NOT the generic "stuck
-    // repeating" notice.
+    // re-reading it through the repeat budget and then ignores the
+    // implementation repair nudges — the "explore forever, never edit" failure
+    // mode. The turn should end with the implementation-incomplete message (so
+    // the user knows no edit was made), NOT the generic "stuck repeating"
+    // notice or a forced chat-only final answer.
     let path = temp_file("impl-reread-exhaust");
     std::fs::write(&path, "fn parse() {}\n").unwrap();
     let p = path.to_string_lossy().to_string();
@@ -968,10 +969,12 @@ async fn implementation_re_read_exhaustion_reports_incomplete_not_stuck_repeatin
             1,
         )
     };
-    // Read once (new evidence), then re-read past the budget. The guard
-    // nudges up to max_repeat_nudges times, then stalls on the next re-read.
+    // Read once (new evidence), then re-read past the repeat and no-change
+    // repair budgets. The guard nudges up to max_repeat_nudges times, spends
+    // the implementation no-change repair budget, then stalls on the next
+    // non-mutating repeat.
     let mut responses = vec![read()];
-    for _ in 0..(config().max_repeat_nudges + 1) {
+    for _ in 0..(config().max_repeat_nudges + 3) {
         responses.push(read());
     }
     let mut agent = agent(responses, config());
@@ -984,10 +987,17 @@ async fn implementation_re_read_exhaustion_reports_incomplete_not_stuck_repeatin
         ui.statuses
             .iter()
             .any(|s| s.contains("turn stopped incomplete")),
-        "expected forced final recovery to stop incomplete, got: {:?}",
+        "expected implementation repair exhaustion to stop incomplete, got: {:?}",
         ui.statuses
     );
-    assert_eq!(agent.last_turn_telemetry().forced_final_answer_attempts, 1);
+    assert_eq!(agent.last_turn_telemetry().forced_final_answer_attempts, 0);
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|s| s.contains("repeating without editing")),
+        "expected implementation-specific repair nudge, got: {:?}",
+        ui.statuses
+    );
     assert!(
         !ui.statuses.iter().any(|s| s.contains("kept re-running")),
         "should not use the generic stuck-repeating notice for an impl task, got: {:?}",
@@ -1222,6 +1232,84 @@ async fn implementation_re_read_nudge_names_inspected_files_and_plan_step() {
         "nudge should name the next plan step, got: {nudge}"
     );
     let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn implementation_repeat_exhaustion_repairs_to_edit_instead_of_forced_final() {
+    let inspect_path = temp_file("impl-repeat-inspect");
+    std::fs::write(&inspect_path, "fn add(a: i32, b: i32) -> i32 { a - b }\n").unwrap();
+    let inspect_path_string = inspect_path.to_string_lossy().to_string();
+    let write_path = temp_file("impl-repeat-write");
+    let write_path_string = write_path.to_string_lossy().to_string();
+    let plan = || {
+        completion(
+            vec![Content::ToolCall {
+                id: "p".into(),
+                name: "update_plan".into(),
+                arguments: serde_json::json!({
+                    "steps": [
+                        {"title": "Inspect the bug", "status": "done"},
+                        {"title": "Fix the arithmetic", "status": "pending"},
+                    ]
+                })
+                .to_string(),
+            }],
+            1,
+            1,
+        )
+    };
+    let read = || {
+        completion(
+            vec![Content::ToolCall {
+                id: "r".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({ "path": inspect_path_string }).to_string(),
+            }],
+            1,
+            1,
+        )
+    };
+    let responses = vec![
+        plan(),
+        read(),
+        read(),
+        read(),
+        read(),
+        write_completion(&write_path_string),
+        completion(vec![Content::Text("Implemented it.".into())], 1, 1),
+        bash_completion("cargo test --help"),
+        completion(
+            vec![Content::Text(format!(
+                "Changed {write_path_string} and validated with cargo test --help."
+            ))],
+            1,
+            1,
+        ),
+    ];
+    let mut agent = agent(responses, config());
+    let mut ui = RecUi::default();
+
+    agent
+        .run_turn("/build parser implementation", &mut ui)
+        .await
+        .unwrap();
+
+    assert_eq!(std::fs::read_to_string(&write_path).unwrap(), "x");
+    assert_eq!(agent.last_turn_telemetry().forced_final_answer_attempts, 0);
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|status| status.contains("repeating without editing")),
+        "expected implementation repeat repair status: {:?}",
+        ui.statuses
+    );
+    assert!(
+        !agent.last_turn_telemetry().stalled_unfinished,
+        "turn should recover by editing and validating, statuses: {:?}",
+        ui.statuses
+    );
+    let _ = std::fs::remove_file(inspect_path);
+    let _ = std::fs::remove_file(write_path);
 }
 
 #[tokio::test]

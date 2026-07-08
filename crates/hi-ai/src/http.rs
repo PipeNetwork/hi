@@ -36,6 +36,9 @@ const BASE_DELAY_MS: u64 = 250;
 /// Cap on a single backoff so the wider budget stays bounded (a few seconds per
 /// wait) instead of exploding exponentially.
 const MAX_DELAY_MS: u64 = 4_000;
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_READ_TIMEOUT_SECS: u64 = 360;
+const MAX_HTTP_TIMEOUT_SECS: u64 = 3_600;
 
 #[derive(Deserialize)]
 struct ModelsList {
@@ -210,11 +213,28 @@ pub fn agent_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .user_agent(format!("hi/{}", env!("CARGO_PKG_VERSION")))
         .default_headers(headers)
+        .connect_timeout(Duration::from_secs(http_timeout_secs(
+            "HI_HTTP_CONNECT_TIMEOUT_SECS",
+            DEFAULT_CONNECT_TIMEOUT_SECS,
+        )))
+        .read_timeout(Duration::from_secs(http_timeout_secs(
+            "HI_HTTP_READ_TIMEOUT_SECS",
+            DEFAULT_READ_TIMEOUT_SECS,
+        )))
         .pool_idle_timeout(Some(Duration::from_secs(90)))
         .pool_max_idle_per_host(4)
         .tcp_keepalive(Some(Duration::from_secs(60)))
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+fn http_timeout_secs(var_name: &str, default_secs: u64) -> u64 {
+    std::env::var(var_name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(|seconds| seconds.min(MAX_HTTP_TIMEOUT_SECS))
+        .unwrap_or(default_secs)
 }
 
 /// Send `builder`, retrying transient failures with exponential backoff.
@@ -314,6 +334,36 @@ mod tests {
     }
 
     #[test]
+    fn http_timeout_env_is_bounded() {
+        unsafe {
+            std::env::remove_var("HI_HTTP_TIMEOUT_TEST");
+        }
+        assert_eq!(http_timeout_secs("HI_HTTP_TIMEOUT_TEST", 123), 123);
+
+        unsafe {
+            std::env::set_var("HI_HTTP_TIMEOUT_TEST", "0");
+        }
+        assert_eq!(http_timeout_secs("HI_HTTP_TIMEOUT_TEST", 123), 123);
+
+        unsafe {
+            std::env::set_var("HI_HTTP_TIMEOUT_TEST", "42");
+        }
+        assert_eq!(http_timeout_secs("HI_HTTP_TIMEOUT_TEST", 123), 42);
+
+        unsafe {
+            std::env::set_var("HI_HTTP_TIMEOUT_TEST", "999999");
+        }
+        assert_eq!(
+            http_timeout_secs("HI_HTTP_TIMEOUT_TEST", 123),
+            MAX_HTTP_TIMEOUT_SECS
+        );
+
+        unsafe {
+            std::env::remove_var("HI_HTTP_TIMEOUT_TEST");
+        }
+    }
+
+    #[test]
     fn parses_openai_style_models_list() {
         // Extra fields (object, created, …) are ignored; only `data[].id` matters.
         let json = r#"{"object":"list","data":[
@@ -333,7 +383,7 @@ mod tests {
              "max_output_tokens":131072,
              "input_token_rate":0.000001,"output_token_rate":0.000002,
              "status":"available","available":true},
-            {"id":"pipe/auto-code","max_completion_tokens":16384},
+            {"id":"pipe/auto-coder","max_completion_tokens":16384},
             {"id":"grok","status":"degraded","available":true},
             {"id":"down","available":false}
         ]}"#;
