@@ -3384,6 +3384,14 @@ mod native {
                         arrays,
                         config,
                     )?)
+                } else if arrays.contains_key(&format!("{prefix}.shared_experts.gate_proj.weight"))
+                {
+                    // ERNIE-4.5 names its shared expert `shared_experts` (plural).
+                    Some(Mlp::load(
+                        &format!("{prefix}.shared_experts"),
+                        arrays,
+                        config,
+                    )?)
                 } else {
                     None
                 },
