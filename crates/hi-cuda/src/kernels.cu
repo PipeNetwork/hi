@@ -2462,59 +2462,81 @@ __global__ void tiled_causal_attention_kernel(
     int qk_head_dim,
     int v_head_dim,
     int window) {
-  int idx = blockIdx.x;
-  int lane = threadIdx.x;
-  int total = seq_len * heads;
+  // One warp (32 threads) per (query, head). The q*k dot is reduced with warp
+  // shuffles (no shared memory / __syncthreads), q is cached in registers, and
+  // the online-softmax output is kept in a per-lane register array. This replaces
+  // a 512-thread block that ran a log2-depth shared-memory tree reduction *per
+  // key*, i.e. ~O(seq^2) __syncthreads that dominated prefill.
+  const int idx = blockIdx.x;
+  const int lane = threadIdx.x;  // 0..31
+  const int total = seq_len * heads;
   if (idx >= total || qk_head_dim > HI_CUDA_FLASH_MAX_HEAD_DIM ||
       v_head_dim > HI_CUDA_FLASH_MAX_HEAD_DIM) {
     return;
   }
 
-  extern __shared__ float partial_dot[];
-  int target = idx / heads;
-  int head = idx % heads;
-  int kv_repeats = heads / kv_heads;
-  int kv_head = head / kv_repeats;
+  const int target = idx / heads;
+  const int head = idx % heads;
+  const int kv_repeats = heads / kv_heads;
+  const int kv_head = head / kv_repeats;
   const float scale = rsqrtf(static_cast<float>(qk_head_dim));
   const float* q_vec = q + (target * heads + head) * qk_head_dim;
   float* out_vec = output + (target * heads + head) * v_head_dim;
 
-  float acc = 0.0f;
+  // Each lane owns dims lane, lane+32, ... of the head. Cache q once.
+  constexpr int MAX_PER_LANE = HI_CUDA_FLASH_MAX_HEAD_DIM / 32;
+  float q_reg[MAX_PER_LANE];
+  float acc[MAX_PER_LANE];
+#pragma unroll
+  for (int i = 0; i < MAX_PER_LANE; ++i) {
+    const int dim = lane + i * 32;
+    q_reg[i] = (dim < qk_head_dim) ? q_vec[dim] : 0.0f;
+    acc[i] = 0.0f;
+  }
   float max_score = -INFINITY;
   float denom = 0.0f;
+
   // Sliding-window (Gemma-3 local layers): only attend to the last `window` keys.
   // window <= 0 means unlimited causal attention.
-  int source_start = (window > 0 && target >= window) ? target - window + 1 : 0;
+  const int source_start = (window > 0 && target >= window) ? target - window + 1 : 0;
   for (int source = source_start; source <= target; ++source) {
     const float* k_vec = k + (source * kv_heads + kv_head) * qk_head_dim;
     float dot = 0.0f;
-    for (int dim = lane; dim < qk_head_dim; dim += blockDim.x) {
-      dot += q_vec[dim] * k_vec[dim];
-    }
-    partial_dot[lane] = dot;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-      if (lane < stride) {
-        partial_dot[lane] += partial_dot[lane + stride];
+#pragma unroll
+    for (int i = 0; i < MAX_PER_LANE; ++i) {
+      const int dim = lane + i * 32;
+      if (dim < qk_head_dim) {
+        dot += q_reg[i] * k_vec[dim];
       }
-      __syncthreads();
     }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      dot += __shfl_down_sync(0xffffffffu, dot, offset);
+    }
+    const float score = __shfl_sync(0xffffffffu, dot, 0) * scale;
 
-    float score = partial_dot[0] * scale;
-    float next_max = fmaxf(max_score, score);
-    float old_scale = isfinite(max_score) ? expf(max_score - next_max) : 0.0f;
-    float weight = expf(score - next_max);
+    const float next_max = fmaxf(max_score, score);
+    const float old_scale = isfinite(max_score) ? expf(max_score - next_max) : 0.0f;
+    const float weight = expf(score - next_max);
     const float* v_vec = v + (source * kv_heads + kv_head) * v_head_dim;
-    if (lane < v_head_dim) {
-      acc = acc * old_scale + weight * v_vec[lane];
+#pragma unroll
+    for (int i = 0; i < MAX_PER_LANE; ++i) {
+      const int dim = lane + i * 32;
+      if (dim < v_head_dim) {
+        acc[i] = acc[i] * old_scale + weight * v_vec[dim];
+      }
     }
     denom = denom * old_scale + weight;
     max_score = next_max;
-    __syncthreads();
   }
 
-  if (lane < v_head_dim) {
-    out_vec[lane] = (denom == 0.0f || !isfinite(denom)) ? 0.0f : acc / denom;
+  const float inv = (denom == 0.0f || !isfinite(denom)) ? 0.0f : 1.0f / denom;
+#pragma unroll
+  for (int i = 0; i < MAX_PER_LANE; ++i) {
+    const int dim = lane + i * 32;
+    if (dim < v_head_dim) {
+      out_vec[dim] = acc[i] * inv;
+    }
   }
 }
 
@@ -2592,59 +2614,78 @@ __global__ void tiled_causal_attention_batched_kernel(
     int qk_head_dim,
     int v_head_dim,
     int window) {
-  int idx = blockIdx.x;
-  int lane = threadIdx.x;
-  int total = batch_count * seq_len * heads;
+  // One warp (32 threads) per (batch, query, head); warp-shuffle dot reduction,
+  // q cached in registers, register-array online softmax — no shared memory or
+  // per-key __syncthreads. See tiled_causal_attention_kernel for the rationale.
+  const int idx = blockIdx.x;
+  const int lane = threadIdx.x;  // 0..31
+  const int total = batch_count * seq_len * heads;
   if (idx >= total || qk_head_dim > HI_CUDA_FLASH_MAX_HEAD_DIM ||
       v_head_dim > HI_CUDA_FLASH_MAX_HEAD_DIM) {
     return;
   }
 
-  extern __shared__ float partial_dot[];
-  int head = idx % heads;
-  int target_global = idx / heads;
-  int target = target_global % seq_len;
-  int batch = target_global / seq_len;
-  int kv_repeats = heads / kv_heads;
-  int kv_head = head / kv_repeats;
+  const int head = idx % heads;
+  const int target_global = idx / heads;
+  const int target = target_global % seq_len;
+  const int batch = target_global / seq_len;
+  const int kv_repeats = heads / kv_heads;
+  const int kv_head = head / kv_repeats;
   const float scale = rsqrtf(static_cast<float>(qk_head_dim));
   const float* q_vec = q + ((batch * seq_len + target) * heads + head) * qk_head_dim;
   float* out_vec = output + ((batch * seq_len + target) * heads + head) * v_head_dim;
 
-  float acc = 0.0f;
+  constexpr int MAX_PER_LANE = HI_CUDA_FLASH_MAX_HEAD_DIM / 32;
+  float q_reg[MAX_PER_LANE];
+  float acc[MAX_PER_LANE];
+#pragma unroll
+  for (int i = 0; i < MAX_PER_LANE; ++i) {
+    const int dim = lane + i * 32;
+    q_reg[i] = (dim < qk_head_dim) ? q_vec[dim] : 0.0f;
+    acc[i] = 0.0f;
+  }
   float max_score = -INFINITY;
   float denom = 0.0f;
-  int source_start = (window > 0 && target >= window) ? target - window + 1 : 0;
+
+  const int source_start = (window > 0 && target >= window) ? target - window + 1 : 0;
   for (int source = source_start; source <= target; ++source) {
     const float* k_vec = k + ((batch * seq_len + source) * kv_heads + kv_head) * qk_head_dim;
     float dot = 0.0f;
-    for (int dim = lane; dim < qk_head_dim; dim += blockDim.x) {
-      dot += q_vec[dim] * k_vec[dim];
-    }
-    partial_dot[lane] = dot;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-      if (lane < stride) {
-        partial_dot[lane] += partial_dot[lane + stride];
+#pragma unroll
+    for (int i = 0; i < MAX_PER_LANE; ++i) {
+      const int dim = lane + i * 32;
+      if (dim < qk_head_dim) {
+        dot += q_reg[i] * k_vec[dim];
       }
-      __syncthreads();
     }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      dot += __shfl_down_sync(0xffffffffu, dot, offset);
+    }
+    const float score = __shfl_sync(0xffffffffu, dot, 0) * scale;
 
-    float score = partial_dot[0] * scale;
-    float next_max = fmaxf(max_score, score);
-    float old_scale = isfinite(max_score) ? expf(max_score - next_max) : 0.0f;
-    float weight = expf(score - next_max);
+    const float next_max = fmaxf(max_score, score);
+    const float old_scale = isfinite(max_score) ? expf(max_score - next_max) : 0.0f;
+    const float weight = expf(score - next_max);
     const float* v_vec = v + ((batch * seq_len + source) * kv_heads + kv_head) * v_head_dim;
-    if (lane < v_head_dim) {
-      acc = acc * old_scale + weight * v_vec[lane];
+#pragma unroll
+    for (int i = 0; i < MAX_PER_LANE; ++i) {
+      const int dim = lane + i * 32;
+      if (dim < v_head_dim) {
+        acc[i] = acc[i] * old_scale + weight * v_vec[dim];
+      }
     }
     denom = denom * old_scale + weight;
     max_score = next_max;
-    __syncthreads();
   }
 
-  if (lane < v_head_dim) {
-    out_vec[lane] = (denom == 0.0f || !isfinite(denom)) ? 0.0f : acc / denom;
+  const float inv = (denom == 0.0f || !isfinite(denom)) ? 0.0f : 1.0f / denom;
+#pragma unroll
+  for (int i = 0; i < MAX_PER_LANE; ++i) {
+    const int dim = lane + i * 32;
+    if (dim < v_head_dim) {
+      out_vec[dim] = acc[i] * inv;
+    }
   }
 }
 
@@ -5044,10 +5085,9 @@ extern "C" int hi_cuda_launch_tiled_causal_attention(
   if (total == 0) {
     return 0;
   }
-  dim3 block(HI_CUDA_FLASH_MAX_HEAD_DIM);
+  dim3 block(32);
   dim3 grid(total);
-  size_t shared_bytes = block.x * sizeof(float);
-  tiled_causal_attention_kernel<<<grid, block, shared_bytes, static_cast<cudaStream_t>(stream)>>>(
+  tiled_causal_attention_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const float*>(q),
       static_cast<const float*>(k),
       static_cast<const float*>(v),
@@ -5118,10 +5158,9 @@ extern "C" int hi_cuda_launch_tiled_causal_attention_batched(
       stream == nullptr) {
     return 1;
   }
-  dim3 block(HI_CUDA_FLASH_MAX_HEAD_DIM);
+  dim3 block(32);
   dim3 grid(batch_count * seq_len * heads);
-  size_t shared_bytes = block.x * sizeof(float);
-  tiled_causal_attention_batched_kernel<<<grid, block, shared_bytes, static_cast<cudaStream_t>(stream)>>>(
+  tiled_causal_attention_batched_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const float*>(q),
       static_cast<const float*>(k),
       static_cast<const float*>(v),
