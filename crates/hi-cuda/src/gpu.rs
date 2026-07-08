@@ -6044,8 +6044,7 @@ mod native {
                     &mut cache,
                 )?);
             }
-            let logits = logits
-                .ok_or_else(|| anyhow!("{label} produced no suffix logits"))?;
+            let logits = logits.ok_or_else(|| anyhow!("{label} produced no suffix logits"))?;
             self.argmax_batched_last_token(&logits, 1, 1)
         }
 

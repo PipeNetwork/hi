@@ -229,7 +229,9 @@ impl QuantizationSpec {
         match self.mode {
             // MLX affine quantization supports these bit-widths; hi-mlx passes `bits` straight to the
             // MLX quantized ops, so dynamic/mixed-bit builds (e.g. GLM-5.2 3.5bpw: 3/4/6-bit) work.
-            QuantizationMode::Affine if matches!(self.bits, 2 | 3 | 4 | 5 | 6 | 8) => Ok(self.clone()),
+            QuantizationMode::Affine if matches!(self.bits, 2 | 3 | 4 | 5 | 6 | 8) => {
+                Ok(self.clone())
+            }
             QuantizationMode::Other(ref mode)
                 if mode == "mxfp4" && self.bits == 4 && self.group_size == 32 =>
             {
@@ -311,13 +313,12 @@ pub fn parse_model_config(path: &Path, raw: Value) -> Result<MlxModelConfig> {
         num_attention_heads,
         num_key_value_heads: u32_field(&raw, "num_key_value_heads").unwrap_or(num_attention_heads),
         head_dim: u32_field(&raw, "head_dim"),
-        partial_rotary_factor: f32_field(&raw, "partial_rotary_factor")
-            .or_else(|| {
-                raw.get("rope_parameters")
-                    .and_then(|p| p.get("partial_rotary_factor"))
-                    .and_then(Value::as_f64)
-                    .map(|v| v as f32)
-            }),
+        partial_rotary_factor: f32_field(&raw, "partial_rotary_factor").or_else(|| {
+            raw.get("rope_parameters")
+                .and_then(|p| p.get("partial_rotary_factor"))
+                .and_then(Value::as_f64)
+                .map(|v| v as f32)
+        }),
         rotary_dim: u32_field(&raw, "rotary_dim"),
         linear_num_value_heads: u32_field(&raw, "linear_num_value_heads"),
         linear_num_key_heads: u32_field(&raw, "linear_num_key_heads"),

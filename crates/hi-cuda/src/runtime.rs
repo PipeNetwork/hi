@@ -29,7 +29,9 @@ impl CudaRuntime {
 }
 
 #[cfg(feature = "native-cuda")]
-pub use imp::{Cublas, CublasLt, DeviceBuffer, GemmDType, Stream, check_last_error, free_memory_bytes};
+pub use imp::{
+    Cublas, CublasLt, DeviceBuffer, GemmDType, Stream, check_last_error, free_memory_bytes,
+};
 
 #[cfg(not(feature = "native-cuda"))]
 mod imp {
