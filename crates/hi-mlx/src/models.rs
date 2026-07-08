@@ -4721,10 +4721,145 @@ mod native {
         }
     }
 
+    // Non-gated ReLU^2 switch experts (Nemotron uses SwitchMLP: fc1 -> relu^2 -> fc2, not SwiGLU).
+    struct NemotronSwitchMlp {
+        fc1: SwitchLinear,
+        fc2: SwitchLinear,
+    }
+
+    impl NemotronSwitchMlp {
+        fn load(
+            prefix: &str,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+        ) -> Result<Self> {
+            Ok(Self {
+                fc1: SwitchLinear::load(&format!("{prefix}.fc1"), arrays, config)?,
+                fc2: SwitchLinear::load(&format!("{prefix}.fc2"), arrays, config)?,
+            })
+        }
+
+        fn forward_batched(&self, x: &Array, inds: &Array) -> Result<Array> {
+            let h = self.fc1.gather(x, inds)?;
+            let r = maximum(&h, &Array::from_f32(0.0))?;
+            self.fc2.gather(&(&r * &r), inds)
+        }
+    }
+
+    // Nemotron-H MoE 'E' block: DeepSeek-style sigmoid + e_score_correction_bias (noaux_tc) grouped
+    // router, ReLU^2 experts, plus one always-on shared expert.
+    struct NemotronHMoE {
+        gate: Linear,
+        expert_bias: Vec<f32>,
+        switch_mlp: NemotronSwitchMlp,
+        shared: NemotronMlp,
+        top_k: usize,
+        n_group: usize,
+        topk_group: usize,
+        norm_topk_prob: bool,
+        routed_scaling_factor: f32,
+    }
+
+    impl NemotronHMoE {
+        fn load(
+            prefix: &str,
+            arrays: &HashMap<String, Array>,
+            config: &MlxModelConfig,
+        ) -> Result<Self> {
+            let bias = raw_array(arrays, &format!("{prefix}.gate.e_score_correction_bias"))?
+                .as_type::<f32>()?;
+            transforms::eval([&bias])?;
+            Ok(Self {
+                gate: Linear::load(&format!("{prefix}.gate"), arrays, config)?,
+                expert_bias: bias.as_slice::<f32>().to_vec(),
+                switch_mlp: NemotronSwitchMlp::load(&format!("{prefix}.switch_mlp"), arrays, config)?,
+                shared: NemotronMlp::load(&format!("{prefix}.shared_experts"), arrays, config)?,
+                top_k: config.num_experts_per_tok.unwrap_or(1) as usize,
+                n_group: config.n_group.max(1) as usize,
+                topk_group: config.topk_group.max(1) as usize,
+                norm_topk_prob: config.norm_topk_prob,
+                routed_scaling_factor: config.routed_scaling_factor,
+            })
+        }
+
+        fn forward(&self, x: &Array) -> Result<Array> {
+            let d = x.shape()[2];
+            let logits = self.gate.forward(x)?;
+            let scores = sigmoid(&logits.as_type::<f32>()?)?;
+            transforms::eval([&scores])?;
+            let shape = scores.shape();
+            let (l, n_experts) = (shape[1] as usize, shape[2] as usize);
+            let raw = scores.as_slice::<f32>();
+            let mut idx_v: Vec<u32> = Vec::with_capacity(l * self.top_k);
+            let mut wts_v: Vec<f32> = Vec::with_capacity(l * self.top_k);
+            for token in 0..l {
+                let base = token * n_experts;
+                let mut sel: Vec<f32> = (0..n_experts)
+                    .map(|i| raw[base + i] + self.expert_bias[i])
+                    .collect();
+                // DeepSeek grouped selection: keep only the top `topk_group` groups (by sum of their
+                // top-2 selection scores), masking the rest before the global top-k.
+                if self.n_group > 1 {
+                    let per = n_experts / self.n_group;
+                    let mut gscore: Vec<(usize, f32)> = (0..self.n_group)
+                        .map(|g| {
+                            let mut vals: Vec<f32> =
+                                (0..per).map(|j| sel[g * per + j]).collect();
+                            vals.sort_by(|a, b| b.total_cmp(a));
+                            (g, vals[0] + vals.get(1).copied().unwrap_or(0.0))
+                        })
+                        .collect();
+                    gscore.sort_by(|a, b| b.1.total_cmp(&a.1));
+                    let kept: Vec<usize> =
+                        gscore.iter().take(self.topk_group).map(|(g, _)| *g).collect();
+                    for g in 0..self.n_group {
+                        if !kept.contains(&g) {
+                            for j in 0..per {
+                                sel[g * per + j] = f32::NEG_INFINITY;
+                            }
+                        }
+                    }
+                }
+                let mut ranked: Vec<usize> = (0..n_experts).collect();
+                ranked.sort_by(|&a, &b| {
+                    sel[b].total_cmp(&sel[a]).then_with(|| a.cmp(&b))
+                });
+                ranked.truncate(self.top_k.min(n_experts));
+                let mut w: Vec<f32> = ranked.iter().map(|&i| raw[base + i]).collect();
+                if self.norm_topk_prob && w.len() > 1 {
+                    let denom: f32 = w.iter().sum::<f32>() + 1e-20;
+                    for x in &mut w {
+                        *x /= denom;
+                    }
+                }
+                for x in &mut w {
+                    *x *= self.routed_scaling_factor;
+                }
+                for (k, &e) in ranked.iter().enumerate() {
+                    idx_v.push(e as u32);
+                    wts_v.push(w[k]);
+                }
+            }
+            let top_k = self.top_k as i32;
+            let inds = Array::from_slice(&idx_v, &[l as i32, top_k]);
+            let weights = Array::from_slice(&wts_v, &[l as i32, top_k, 1]);
+            let xe = x.reshape(&[l as i32, 1, 1, d])?;
+            let expert_out = self
+                .switch_mlp
+                .forward_batched(&xe, &inds)?
+                .reshape(&[l as i32, top_k, d])?
+                .as_type::<f32>()?;
+            let y = sum_axis(&(expert_out * weights), 1, false)?.reshape(&[1, l as i32, d])?;
+            let y = y + self.shared.forward(x)?.as_type::<f32>()?;
+            Ok(y)
+        }
+    }
+
     enum NemotronMixer {
         Mamba(Box<NemotronMamba2>),
         Attn(NemotronAttention),
         Mlp(NemotronMlp),
+        Moe(Box<NemotronHMoE>),
     }
 
     struct NemotronBlock {
@@ -4755,9 +4890,12 @@ mod native {
                 '-' => {
                     NemotronMixer::Mlp(NemotronMlp::load(&format!("{p}.mixer"), arrays, config)?)
                 }
-                other => bail!(
-                    "nemotron_h block type '{other}' (layer {idx}) is not supported yet (MoE 'E' pending)"
-                ),
+                'E' => NemotronMixer::Moe(Box::new(NemotronHMoE::load(
+                    &format!("{p}.mixer"),
+                    arrays,
+                    config,
+                )?)),
+                other => bail!("nemotron_h block type '{other}' (layer {idx}) is not supported"),
             };
             Ok(Self { norm, mixer })
         }
@@ -4768,6 +4906,7 @@ mod native {
                 NemotronMixer::Mamba(m) => m.forward(&h)?,
                 NemotronMixer::Attn(a) => a.forward(&h)?,
                 NemotronMixer::Mlp(m) => m.forward(&h)?,
+                NemotronMixer::Moe(m) => m.forward(&h)?,
             };
             Ok(x + h)
         }
@@ -4821,7 +4960,7 @@ mod native {
                         m.ssm_state = None;
                     }
                     NemotronMixer::Attn(a) => a.cache.reset(),
-                    NemotronMixer::Mlp(_) => {}
+                    NemotronMixer::Mlp(_) | NemotronMixer::Moe(_) => {}
                 }
             }
         }
