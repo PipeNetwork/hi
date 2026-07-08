@@ -22,7 +22,7 @@ fn resume_restores_retained_checkpoint_refs() {
     let checkpoints = (0..55).map(|i| format!("{i:040x}")).collect::<Vec<_>>();
 
     let agent = Agent::resume(
-        Box::new(Canned(Mutex::new(Vec::new()))),
+        std::sync::Arc::new(Canned(Mutex::new(Vec::new()))),
         config(),
         vec![Message::system("system")],
         Usage::default(),
@@ -194,7 +194,7 @@ async fn resume_repairs_provider_invisible_assistant_before_request() {
         ]),
     ];
     let mut agent = Agent::resume(
-        Box::new(provider),
+        std::sync::Arc::new(provider),
         config(),
         history,
         Usage::default(),
@@ -246,7 +246,7 @@ async fn resume_repairs_out_of_order_tool_results_before_request() {
         Message::tool_result("c1", "late result"),
     ];
     let mut agent = Agent::resume(
-        Box::new(provider),
+        std::sync::Arc::new(provider),
         config(),
         history,
         Usage::default(),
@@ -295,7 +295,7 @@ async fn resume_repairs_consecutive_user_messages_before_request() {
         Message::assistant(vec![Content::Text("old answer".into())]),
     ];
     let mut agent = Agent::resume(
-        Box::new(provider),
+        std::sync::Arc::new(provider),
         config(),
         history,
         Usage::default(),
@@ -495,7 +495,7 @@ async fn repeated_no_progress_nudges_force_one_chat_only_final_answer() {
         ]),
         modes: modes.clone(),
     };
-    let mut agent = Agent::new(Box::new(provider), cfg);
+    let mut agent = Agent::new(std::sync::Arc::new(provider), cfg);
     let mut ui = RecUi::default();
 
     agent.run_turn("stop when complete", &mut ui).await.unwrap();
@@ -1994,7 +1994,7 @@ async fn continue_nudge_forces_tool_choice_on_the_next_round() {
         responses: Mutex::new(responses),
         modes: modes.clone(),
     };
-    let mut agent = Agent::new(Box::new(provider), cfg);
+    let mut agent = Agent::new(std::sync::Arc::new(provider), cfg);
     let mut ui = RecUi::default();
     agent.run_turn("review", &mut ui).await.unwrap();
     let modes = modes.lock().unwrap().clone();
@@ -2287,7 +2287,7 @@ async fn read_only_review_sprawl_is_bounded() {
         responses: Mutex::new(responses),
         modes: modes.clone(),
     };
-    let mut agent = Agent::new(Box::new(provider), config());
+    let mut agent = Agent::new(std::sync::Arc::new(provider), config());
     let mut ui = RecUi::default();
     agent.run_turn("/review codebase", &mut ui).await.unwrap();
 
@@ -2362,7 +2362,7 @@ async fn read_only_review_explicit_four_inspection_cap_forces_findings() {
         responses: Mutex::new(responses),
         modes: modes.clone(),
     };
-    let mut agent = Agent::new(Box::new(provider), config());
+    let mut agent = Agent::new(std::sync::Arc::new(provider), config());
     let mut ui = RecUi::default();
     agent
         .run_turn(

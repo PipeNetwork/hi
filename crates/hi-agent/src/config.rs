@@ -145,6 +145,12 @@ pub struct AgentConfig {
     /// the gate, so a weak model can't poison the playbook. Off by default —
     /// costs one extra model call per verified turn; opt in per profile or CLI.
     pub curate_skills: bool,
+    /// Advertise the read-only `explore` subagent tool, which lets the model
+    /// delegate a bounded read-only investigation to a child agent (own context,
+    /// read-only tools, small step budget) and get back a concise answer. Off by
+    /// default and capability-gated (on for the pipenetwork provider) — weak local
+    /// models shouldn't be handed a spawn tool. Children never get it (depth ≤ 1).
+    pub explore_subagents: bool,
 }
 
 impl Default for AgentConfig {
@@ -185,6 +191,7 @@ impl Default for AgentConfig {
             lsp: false,
             minimal_tools: false,
             curate_skills: false,
+            explore_subagents: false,
         }
     }
 }

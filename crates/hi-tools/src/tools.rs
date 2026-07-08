@@ -707,6 +707,28 @@ pub static MINIMAL_TOOL_SPECS: LazyLock<Vec<ToolSpec>> = LazyLock::new(|| {
         .collect()
 });
 
+/// The `explore` read-only subagent tool. Deliberately kept OUT of [`TOOL_SPECS`]
+/// and out of [`is_read_only`]: it's only advertised when the agent explicitly
+/// injects it (for a capable parent via `explore_subagents`), and because it's not
+/// read-only it never survives into a `ReadOnly` child's tool set — so a subagent
+/// cannot spawn another (depth is capped at 1 structurally).
+pub fn explore_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "explore".into(),
+        description: "Delegate a focused, READ-ONLY investigation to a subagent that runs in its own fresh context and returns just a concise answer. Use it to keep your own context clean when a question needs reading or searching across many files — e.g. \"where is X configured and how is it used?\", \"summarize how module Y works\", \"find every call site of Z and what each passes\". The subagent can only read/list/grep/glob and inspect code (no edits, no shell, no spawning). Give it ONE self-contained task with enough detail to answer standalone. Prefer it over reading many files yourself when you only need the conclusion; don't use it for trivial single-file lookups or anything that must change files.".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "A single, self-contained read-only investigation to carry out, with enough context to answer on its own. Be specific about what to find and what to report back."
+                }
+            },
+            "required": ["task"]
+        }),
+    }
+}
+
 /// Whether a tool only observes state, with no side effects — so several can
 /// run concurrently within one round, and it's safe to offer in `ReadOnly`
 /// tool mode. Tools that mutate the filesystem (`write`, `edit`, `multi_edit`,

@@ -595,7 +595,7 @@ pub async fn run(
                                     let model = switched.switched.model.clone();
                                     let (_price, window) = registry.metadata(&model);
                                     agent.set_provider(
-                                        switched.switched.provider,
+                                        switched.switched.provider.into(),
                                         model.clone(),
                                         window,
                                         switched.switched.max_tokens,
@@ -862,7 +862,7 @@ pub async fn run(
                             // Refresh metadata from the registry for this model.
                             let (_price, window) = registry.metadata(&model);
                             agent.set_provider(
-                                switched.provider,
+                                switched.provider.into(),
                                 model.clone(),
                                 window,
                                 switched.max_tokens,

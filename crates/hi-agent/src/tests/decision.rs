@@ -94,7 +94,7 @@ fn resume_restores_decision_log_and_rebuilds_system_prompt() {
         files: vec!["src/m.rs".into()],
     });
     let agent = Agent::resume(
-        Box::new(Canned(Mutex::new(Vec::new()))),
+        std::sync::Arc::new(Canned(Mutex::new(Vec::new()))),
         config(),
         vec![Message::system("old prompt without decisions")],
         Usage::default(),

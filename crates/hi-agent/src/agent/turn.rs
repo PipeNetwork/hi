@@ -2405,6 +2405,27 @@ If the task is already complete, stop and give your final recap."
                         completion_order.push(i);
                         continue;
                     }
+                    if name == "explore" {
+                        // Read-only subagent: runs a bounded child turn (own context,
+                        // read-only tools) sharing this agent's provider, then returns a
+                        // concise answer. Handled here (not in the parallel `execute`
+                        // stream) because it needs `&mut self` and is itself an agent turn.
+                        ui.tool_call(name, arguments);
+                        let content = self.handle_explore(arguments, &mut *ui).await;
+                        emit_tool_output(
+                            &mut *ui,
+                            name,
+                            &hi_tools::ToolOutput {
+                                content: content.clone(),
+                                display: None,
+                                plan: None,
+                            },
+                        );
+                        results[i] = Some((id.clone(), content));
+                        completed[i] = true;
+                        completion_order.push(i);
+                        continue;
+                    }
                     if name != "record_decision" {
                         continue;
                     }
