@@ -593,7 +593,10 @@ pub(crate) fn deepen_review_nudge(intent: ReviewIntent) -> &'static str {
 }
 
 pub(crate) fn read_only_blocks_tool(intent: Option<ReviewIntent>, name: &str) -> bool {
-    intent.is_some() && !hi_tools::is_read_only(name)
+    // `explore` isn't classified read-only (so a read-only child can't spawn one),
+    // but it only ever launches a read-only subagent — so it's allowed to run in a
+    // review turn. A subagent is never advertised `explore`, so it can't reach here.
+    intent.is_some() && !hi_tools::is_read_only(name) && name != "explore"
 }
 
 pub(crate) fn inspection_sprawl_nudge(cap: u32, used: u32) -> String {

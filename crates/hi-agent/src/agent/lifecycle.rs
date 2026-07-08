@@ -101,10 +101,10 @@ impl crate::Agent {
         }
         let tools = if config.minimal_tools {
             hi_tools::MINIMAL_TOOL_SPECS.clone().into()
-        } else if config.explore_subagents {
+        } else if config.explore_subagents && !config.is_subagent {
             // Advertise the read-only `explore` subagent tool alongside the full set.
             // It's kept out of the global TOOL_SPECS so it only appears here, for a
-            // capable parent — and never for a read-only child (depth ≤ 1).
+            // top-level agent — and never for a subagent child (depth ≤ 1).
             let mut specs = TOOL_SPECS.clone();
             specs.push(hi_tools::explore_tool_spec());
             specs.into()

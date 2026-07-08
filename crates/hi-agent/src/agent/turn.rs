@@ -3287,13 +3287,20 @@ If the task is already complete, stop and give your final recap."
         }
     }
 
-    fn request_tools_for(&self, mode: ToolMode) -> Arc<[ToolSpec]> {
+    pub(crate) fn request_tools_for(&self, mode: ToolMode) -> Arc<[ToolSpec]> {
         match mode {
             ToolMode::ChatOnly => Arc::new([]),
+            // `explore` isn't classified read-only (that keeps a read-only *child*
+            // from ever seeing it), but delegating a read-only investigation is
+            // itself read-only — so a top-level agent keeps `explore` in a
+            // read-only/review turn. A subagent never has it in `self.tools`.
             ToolMode::ReadOnly => self
                 .tools
                 .iter()
-                .filter(|tool| hi_tools::is_read_only(&tool.name))
+                .filter(|tool| {
+                    hi_tools::is_read_only(&tool.name)
+                        || (tool.name == "explore" && !self.config.is_subagent)
+                })
                 .cloned()
                 .collect::<Vec<_>>()
                 .into(),

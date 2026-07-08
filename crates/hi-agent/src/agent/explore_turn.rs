@@ -68,6 +68,9 @@ impl crate::Agent {
             max_silent_continues: 0,
             curate_skills: false,
             explore_subagents: false,
+            // Depth guard: a subagent is never advertised `explore`, so it can't
+            // spawn another (depth ≤ 1), even in read-only mode.
+            is_subagent: true,
             long_horizon: false,
             read_only_preflight: false,
             lsp: false,

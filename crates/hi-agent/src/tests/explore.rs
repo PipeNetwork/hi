@@ -20,6 +20,41 @@ fn explore_tool_is_not_read_only_and_not_in_global_set() {
     assert_eq!(hi_tools::explore_tool_spec().name, "explore");
 }
 
+#[test]
+fn read_only_parent_keeps_explore() {
+    // A top-level agent (is_subagent = false) keeps `explore` even in a read-only
+    // / review turn — delegating a read-only investigation is itself read-only.
+    let agent = agent(Vec::new(), explore_config());
+    let auto = agent.request_tools_for(hi_ai::ToolMode::Auto);
+    assert!(
+        auto.iter().any(|t| t.name == "explore"),
+        "auto advertises explore"
+    );
+    let read_only = agent.request_tools_for(hi_ai::ToolMode::ReadOnly);
+    assert!(
+        read_only.iter().any(|t| t.name == "explore"),
+        "a read-only top-level turn must still offer explore"
+    );
+}
+
+#[test]
+fn subagent_never_gets_explore() {
+    // A subagent (is_subagent = true) is never advertised `explore`, in any mode —
+    // so it cannot spawn another (depth ≤ 1).
+    let mut cfg = explore_config();
+    cfg.is_subagent = true;
+    let agent = agent(Vec::new(), cfg);
+    for mode in [hi_ai::ToolMode::Auto, hi_ai::ToolMode::ReadOnly] {
+        assert!(
+            !agent
+                .request_tools_for(mode)
+                .iter()
+                .any(|t| t.name == "explore"),
+            "a subagent must never be offered explore ({mode:?})"
+        );
+    }
+}
+
 #[tokio::test]
 async fn explore_missing_task_errors() {
     let mut agent = agent(Vec::new(), explore_config());
