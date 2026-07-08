@@ -2731,6 +2731,14 @@ mod native {
     /// are kept quantized on the GPU, i.e. when f16 doesn't fit (large models), where
     /// it is ~6x faster than dequantizing each matmul. Small models where f16 fits use
     /// cuBLAS f16 and never hit this path.
+    /// Opt-in (`HI_CUDA_WMMA_ATTN`): tensor-core (WMMA) prefill attention. f16 matmuls
+    /// -> not bit-parity with the f32 kernel, so gated and validated by coherence.
+    fn wmma_attn_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("HI_CUDA_WMMA_ATTN").is_ok())
+    }
+
     fn q4_0_gemv_enabled() -> bool {
         use std::sync::OnceLock;
         static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -15058,22 +15066,39 @@ mod native {
                 && head_dim <= FLASH_TILE_MAX_HEAD_DIM
                 && v_head_dim <= FLASH_TILE_MAX_HEAD_DIM
             {
-                // Flash-attention: shared-memory K/V tiling cuts the O(seq^2) global
-                // reads of the per-query tiled kernel. Causal only; falls through to the
-                // tiled kernel for sliding-window or larger head_dim.
-                crate::kernels::launch_flashtile_causal_attention_batched(
-                    &q.buffer,
-                    &k.buffer,
-                    &v.buffer,
-                    &output,
-                    batch_count,
-                    seq_len,
-                    heads,
-                    kv_heads,
-                    head_dim,
-                    v_head_dim,
-                    &self.stream,
-                )?;
+                if wmma_attn_enabled()
+                    && head_dim % 16 == 0
+                    && v_head_dim == head_dim
+                {
+                    // Tensor-core prefill attention: cast q/k/v to f16 and run WMMA.
+                    let q16 = DeviceBuffer::alloc(q.rows * q.cols * std::mem::size_of::<u16>())
+                        .context("alloc wmma q16")?;
+                    let k16 = DeviceBuffer::alloc(k.rows * k.cols * std::mem::size_of::<u16>())
+                        .context("alloc wmma k16")?;
+                    let v16 = DeviceBuffer::alloc(v.rows * v.cols * std::mem::size_of::<u16>())
+                        .context("alloc wmma v16")?;
+                    crate::kernels::launch_cast_f32_to_f16(&q.buffer, &q16, q.rows * q.cols, &self.stream)?;
+                    crate::kernels::launch_cast_f32_to_f16(&k.buffer, &k16, k.rows * k.cols, &self.stream)?;
+                    crate::kernels::launch_cast_f32_to_f16(&v.buffer, &v16, v.rows * v.cols, &self.stream)?;
+                    crate::kernels::launch_wmma_causal_attention_batched(
+                        &q16, &k16, &v16, &output, batch_count, seq_len, heads, kv_heads,
+                        head_dim, &self.stream,
+                    )?;
+                } else {
+                    crate::kernels::launch_flashtile_causal_attention_batched(
+                        &q.buffer,
+                        &k.buffer,
+                        &v.buffer,
+                        &output,
+                        batch_count,
+                        seq_len,
+                        heads,
+                        kv_heads,
+                        head_dim,
+                        v_head_dim,
+                        &self.stream,
+                    )?;
+                }
             } else if head_dim <= FLASH_ONLINE_MAX_HEAD_DIM {
                 crate::kernels::launch_tiled_causal_attention_batched(
                     &q.buffer,
