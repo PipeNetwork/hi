@@ -332,8 +332,8 @@ pub struct Profile {
     /// reusable technique into a learned skill. Defaults to off.
     #[serde(default)]
     pub curate_skills: Option<bool>,
-    /// Advertise the read-only `explore` subagent tool. Defaults to off (on for
-    /// the pipenetwork provider).
+    /// Advertise the read-only `explore` subagent tool. On by default; set to
+    /// false to disable (e.g. for a very small local model).
     #[serde(default)]
     pub explore_subagents: Option<bool>,
     /// Other profile names to fall back to, in order, when this one returns
@@ -609,8 +609,7 @@ pub fn resolve(cli: &Cli, config: &Config, registry: &Registry) -> Result<Settin
         .unwrap_or_default();
     let minimal_tools = profile.and_then(|p| p.minimal_tools).unwrap_or(false);
     let curate_skills = curate_skills_default(provider, profile.and_then(|p| p.curate_skills));
-    let explore_subagents =
-        explore_subagents_default(provider, profile.and_then(|p| p.explore_subagents));
+    let explore_subagents = explore_subagents_default(profile.and_then(|p| p.explore_subagents));
 
     Ok(Settings {
         provider,
@@ -1187,7 +1186,7 @@ pub fn resolve_named_profile(config: &Config, name: &str, registry: &Registry) -
         compat: profile.compat.unwrap_or_default(),
         minimal_tools: profile.minimal_tools.unwrap_or(false),
         curate_skills: curate_skills_default(provider, profile.curate_skills),
-        explore_subagents: explore_subagents_default(provider, profile.explore_subagents),
+        explore_subagents: explore_subagents_default(profile.explore_subagents),
         moa: config.moa.clone(),
     })
 }
@@ -1221,12 +1220,12 @@ fn curate_skills_default(provider: ProviderName, profile_value: Option<bool>) ->
     profile_value.unwrap_or(provider == ProviderName::Pipenetwork)
 }
 
-/// Whether the read-only `explore` subagent tool is advertised. An explicit
-/// `explore_subagents` in the profile always wins; otherwise on for the
-/// pipenetwork provider and off elsewhere — a spawn tool shouldn't be handed to
-/// weak local models that would misuse it.
-fn explore_subagents_default(provider: ProviderName, profile_value: Option<bool>) -> bool {
-    profile_value.unwrap_or(provider == ProviderName::Pipenetwork)
+/// Whether the read-only `explore` subagent tool is advertised. On by default for
+/// every provider (the tool is read-only, depth-capped at 1, and per-session
+/// budgeted, so it's safe to offer broadly); a profile can set `explore_subagents
+/// = false` to turn it off (e.g. for a very small local model that would misuse it).
+fn explore_subagents_default(profile_value: Option<bool>) -> bool {
+    profile_value.unwrap_or(true)
 }
 
 fn max_tokens_is_explicit(
@@ -1365,15 +1364,11 @@ mod tests {
     }
 
     #[test]
-    fn explore_subagents_default_on_for_pipenetwork_only() {
-        assert!(explore_subagents_default(ProviderName::Pipenetwork, None));
-        assert!(!explore_subagents_default(ProviderName::Openai, None));
-        assert!(!explore_subagents_default(ProviderName::Ollama, None));
-        assert!(!explore_subagents_default(
-            ProviderName::Pipenetwork,
-            Some(false)
-        ));
-        assert!(explore_subagents_default(ProviderName::Openai, Some(true)));
+    fn explore_subagents_default_on_unless_disabled() {
+        // On by default for every provider; an explicit profile setting wins.
+        assert!(explore_subagents_default(None));
+        assert!(!explore_subagents_default(Some(false)));
+        assert!(explore_subagents_default(Some(true)));
     }
 
     #[test]

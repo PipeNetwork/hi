@@ -147,9 +147,10 @@ pub struct AgentConfig {
     pub curate_skills: bool,
     /// Advertise the read-only `explore` subagent tool, which lets the model
     /// delegate a bounded read-only investigation to a child agent (own context,
-    /// read-only tools, small step budget) and get back a concise answer. Off by
-    /// default and capability-gated (on for the pipenetwork provider) — weak local
-    /// models shouldn't be handed a spawn tool. Children never get it (depth ≤ 1).
+    /// read-only tools, small step budget) and get back a concise answer. The CLI
+    /// turns this on by default (it's read-only, depth-capped at 1, and per-session
+    /// budgeted); disable per profile with `explore_subagents = false`. Children
+    /// never get it (depth ≤ 1).
     pub explore_subagents: bool,
 }
 
