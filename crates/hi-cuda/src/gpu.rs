@@ -2722,6 +2722,17 @@ mod native {
     /// in ~80% of free VRAM, leaving room for the KV cache, activations, and
     /// prefill scratch, and otherwise keep the low-VRAM quantized path so large
     /// models still load.
+    /// Whether the fused dp4a Q4_0 GEMV decode path is enabled (default: yes; set
+    /// `HI_CUDA_NO_Q4_GEMV` to fall back to dequant-per-op). Only reached when weights
+    /// are kept quantized on the GPU, i.e. when f16 doesn't fit (large models), where
+    /// it is ~6x faster than dequantizing each matmul. Small models where f16 fits use
+    /// cuBLAS f16 and never hit this path.
+    fn q4_0_gemv_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("HI_CUDA_NO_Q4_GEMV").is_err())
+    }
+
     fn weights_f16_choice(specs: &[MatrixSpec]) -> bool {
         match std::env::var("HI_CUDA_WEIGHTS_F16")
             .ok()
@@ -3078,6 +3089,49 @@ mod native {
             matrix: &GpuMatrix,
             input: &GpuF32Tensor,
         ) -> Result<GpuF32Tensor> {
+            // Single-token decode fast path: quantize the activation to int8 and run a
+            // fused dp4a Q4_0 GEMV, reading 4-bit weights + int8 activation directly.
+            if q4_0_gemv_enabled()
+                && input.rows == 1
+                && matches!(matrix.dtype, GgufTensorType::Q4_0)
+                && matrix.cols % 32 == 0
+            {
+                let k = matrix.cols;
+                let nblocks = k / 32;
+                let xq = DeviceBuffer::alloc(k).context("allocating Q8 activation quants")?;
+                let dx = DeviceBuffer::alloc(nblocks * std::mem::size_of::<f32>())
+                    .context("allocating Q8 activation scales")?;
+                let xsum = DeviceBuffer::alloc(nblocks * std::mem::size_of::<i32>())
+                    .context("allocating Q8 activation sums")?;
+                crate::kernels::launch_quantize_q8_row(
+                    &input.buffer,
+                    &xq,
+                    &dx,
+                    &xsum,
+                    k,
+                    &self.stream,
+                )
+                .with_context(|| format!("Q8 activation quant for {matrix_name}"))?;
+                let output = DeviceBuffer::alloc(matrix.rows * std::mem::size_of::<f32>())
+                    .context("allocating CUDA Q4_0 dp4a GEMV output")?;
+                crate::kernels::launch_q4_0_dp4a_gemv(
+                    &matrix.buffer,
+                    &xq,
+                    &dx,
+                    &xsum,
+                    &output,
+                    matrix.rows,
+                    matrix.cols,
+                    &self.stream,
+                )
+                .with_context(|| format!("CUDA Q4_0 dp4a GEMV for {matrix_name}"))?;
+                self.op_barrier()?;
+                return Ok(GpuF32Tensor {
+                    rows: 1,
+                    cols: matrix.rows,
+                    buffer: output,
+                });
+            }
             let dequantized = self
                 .dequantize_matrix_f32_device(matrix)
                 .with_context(|| format!("dequantizing CUDA matrix {matrix_name}"))?;
@@ -20383,6 +20437,12 @@ mod non_native {
 
         pub fn info(&self) -> &CudaQwenGpuModelInfo {
             &self.info
+        }
+
+        pub(crate) fn reset_generation_timing(&self) {}
+
+        pub(crate) fn take_generation_timing(&self) -> (u64, u64) {
+            (0, 0)
         }
 
         pub fn forget_recurrent_page_contexts(
