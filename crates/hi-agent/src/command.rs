@@ -277,9 +277,16 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "goal",
-        args: "[text|clear]",
-        help: "show, set, or clear the current session goal",
-        arg_values: &[("clear", "clear the current goal")],
+        args: "[text|pause|resume|clear]",
+        help: "set a goal (planner-decomposed), or pause/resume/clear it",
+        arg_values: &[
+            (
+                "pause",
+                "pause the goal — hold progress, stop steering turns",
+            ),
+            ("resume", "resume a paused goal"),
+            ("clear", "clear the current goal"),
+        ],
     },
     CommandSpec {
         name: "context",

@@ -28,6 +28,9 @@ impl crate::Agent {
         let Some(goal) = self.structured_goal.as_mut() else {
             return;
         };
+        if goal.paused {
+            return; // Paused by the user — hold progress, don't advance or retry.
+        }
         if goal.status != GoalStatus::Active {
             return; // Already done or failed — nothing to drive.
         }

@@ -962,11 +962,14 @@ pub async fn run(
                     continue;
                 }
                 // `/goal <objective>`: decompose with the planner behind a spinner
-                // (Esc cancels), then install the structured goal. Read/clear and
-                // the no-planner case stay on the sync handler.
+                // (Esc cancels), then install the structured goal. Read/clear/
+                // pause/resume and the no-planner case stay on the sync handler.
                 Command::Goal(arg)
                     if agent.has_planner()
-                        && !matches!(arg.trim(), "" | "clear" | "off" | "none") =>
+                        && !matches!(
+                            arg.trim(),
+                            "" | "clear" | "off" | "none" | "pause" | "resume"
+                        ) =>
                 {
                     let objective = arg.trim().to_string();
                     app.planning = Some(Instant::now());

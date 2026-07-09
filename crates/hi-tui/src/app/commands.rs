@@ -224,17 +224,41 @@ impl crate::App {
     /// planner-decomposed path is driven from the run loop (it's an async call that
     /// needs the spinner) and lands in [`set_planned_goal`](Self::set_planned_goal).
     pub(crate) fn handle_goal(&mut self, agent: &mut Agent, arg: &str) {
-        let error = match arg.trim() {
-            "" => None, // no argument — just report the current goal
-            "clear" | "off" | "none" => agent
-                .set_transient_goal(None)
-                .err()
-                .map(|err| format!("goal clear failed: {err:#}")),
+        match arg.trim() {
+            // Pause/resume: hold progress, stop/restart steering. Own messaging,
+            // not the goal-set echo.
+            "pause" | "resume" => {
+                let pause = arg.trim() == "pause";
+                let (msg, style) = if agent.set_goal_paused(pause) {
+                    let text = if pause {
+                        "✓ goal paused — resume with /goal resume"
+                    } else {
+                        "✓ goal resumed — steering turns again"
+                    };
+                    (text.to_string(), Style::default().fg(Color::Green))
+                } else {
+                    (format!("no goal to {}", arg.trim()), dim())
+                };
+                self.refresh_goal(agent);
+                self.push(Line::styled(msg, style));
+                self.follow();
+            }
+            "clear" | "off" | "none" => {
+                let error = agent
+                    .set_transient_goal(None)
+                    .err()
+                    .map(|err| format!("goal clear failed: {err:#}"));
+                self.refresh_goal(agent);
+                self.report_goal_result(agent, arg, error);
+            }
+            "" => self.report_goal_result(agent, arg, None), // report current
             // A single sub-goal equal to the objective (no decomposition).
-            goal => Self::apply_goal(agent, goal, vec![goal.to_string()]),
-        };
-        self.refresh_goal(agent);
-        self.report_goal_result(agent, arg, error);
+            goal => {
+                let error = Self::apply_goal(agent, goal, vec![goal.to_string()]);
+                self.refresh_goal(agent);
+                self.report_goal_result(agent, arg, error);
+            }
+        }
     }
 
     /// Install a goal whose sub-goals a planner already decomposed (from the run

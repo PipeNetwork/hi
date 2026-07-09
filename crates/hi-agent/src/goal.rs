@@ -61,6 +61,13 @@ pub struct Goal {
     /// The overall status — `Done` when all sub-goals are done, `Failed` if a
     /// sub-goal failed and the agent gave up, otherwise `Active`.
     pub status: GoalStatus,
+    /// Whether the goal is paused: progress is retained and persisted, but the
+    /// goal stops steering turns (dropped from the system prompt) and the driver
+    /// leaves it alone until resumed. Orthogonal to `status` — a re-derivation of
+    /// status (e.g. `apply_plan_statuses`) never touches it. `/goal resume` clears
+    /// it. `#[serde(default)]` so goals saved before pause/resume load as active.
+    #[serde(default)]
+    pub paused: bool,
 }
 
 /// Default per-sub-goal retry budget: how many times to retry a failing sub-goal
@@ -91,6 +98,7 @@ impl Goal {
             objective: objective.into(),
             sub_goals,
             status: GoalStatus::Active,
+            paused: false,
         }
     }
 
@@ -215,7 +223,9 @@ impl Goal {
     /// statuses, and any retry notes on the active sub-goal (so it doesn't
     /// repeat a failed approach). `None` when there are no sub-goals.
     pub fn prompt_section(&self) -> Option<String> {
-        if self.sub_goals.is_empty() {
+        // A paused goal stops steering: no injection, so the agent treats the turn
+        // as goal-free until `/goal resume`.
+        if self.sub_goals.is_empty() || self.paused {
             return None;
         }
         let mut out =
@@ -354,5 +364,31 @@ mod tests {
     fn prompt_section_none_for_empty_goal() {
         let g = Goal::new("nothing", vec![]);
         assert!(g.prompt_section().is_none());
+    }
+
+    #[test]
+    fn paused_goal_stops_steering_but_keeps_progress() {
+        let mut g = goal();
+        g.advance(); // sub-goal 2 active, 1 done
+        g.paused = true;
+        assert!(
+            g.prompt_section().is_none(),
+            "a paused goal is dropped from the system prompt"
+        );
+        // Progress is retained across the pause.
+        assert_eq!(g.sub_goals[0].status, GoalStatus::Done);
+        assert_eq!(g.active_index(), Some(1));
+        // Resume re-injects with progress intact.
+        g.paused = false;
+        let section = g.prompt_section().expect("resumed goal steers again");
+        assert!(section.contains("refactor the parser"));
+    }
+
+    #[test]
+    fn apply_plan_statuses_preserves_paused_flag() {
+        let mut g = goal();
+        g.paused = true;
+        g.apply_plan_statuses(&["done", "active", "pending"]);
+        assert!(g.paused, "re-deriving status must not clear the pause flag");
     }
 }

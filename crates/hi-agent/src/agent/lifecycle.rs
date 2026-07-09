@@ -647,6 +647,25 @@ impl crate::Agent {
         self.structured_goal.as_ref()
     }
 
+    /// Pause or resume the structured goal without losing progress: a paused goal
+    /// is dropped from the system prompt and the driver leaves it alone, but its
+    /// sub-goal progress is retained and persisted so `/goal resume` picks up
+    /// exactly where it left off. Returns whether there was a goal to update.
+    pub fn set_goal_paused(&mut self, paused: bool) -> bool {
+        let snapshot = match self.structured_goal.as_mut() {
+            Some(goal) => {
+                goal.paused = paused;
+                goal.clone()
+            }
+            None => return false,
+        };
+        if let Some(session) = self.session.as_mut() {
+            let _ = session.record_goal(&snapshot);
+        }
+        self.refresh_system_message();
+        true
+    }
+
     /// Whether long-horizon agency is on (the `long_horizon` config flag), so
     /// frontends can branch `/goal` between the structured goal and the
     /// transient goal string.

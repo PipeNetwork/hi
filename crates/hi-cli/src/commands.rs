@@ -137,6 +137,20 @@ pub(crate) fn handle_command(
                 Ok(()) => println!("\x1b[32m✓ goal cleared\x1b[0m"),
                 Err(err) => eprintln!("\x1b[33mgoal clear failed: {err:#}\x1b[0m"),
             },
+            "pause" => {
+                if agent.set_goal_paused(true) {
+                    println!("\x1b[32m✓ goal paused — resume with /goal resume\x1b[0m");
+                } else {
+                    println!("\x1b[2mno goal to pause\x1b[0m");
+                }
+            }
+            "resume" => {
+                if agent.set_goal_paused(false) {
+                    println!("\x1b[32m✓ goal resumed — steering turns again\x1b[0m");
+                } else {
+                    println!("\x1b[2mno goal to resume\x1b[0m");
+                }
+            }
             goal => {
                 // When long-horizon agency is on, set a structured goal — a
                 // single sub-goal equal to the objective, which the model
