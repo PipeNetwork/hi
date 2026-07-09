@@ -172,6 +172,13 @@ async fn main() -> Result<()> {
         .ok()
         .filter(|s| !s.is_empty())
         .or_else(|| settings.planner_model.clone());
+    // The `/goal team` skeptic model. `HI_SKEPTIC_MODEL` overrides the profile;
+    // `None` (off) unless configured. Deliberately does NOT gate `long_horizon` —
+    // it's a reviewer of the driver, not the driver.
+    let skeptic_model = std::env::var("HI_SKEPTIC_MODEL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| settings.skeptic_model.clone());
     let agent_config = AgentConfig {
         model: settings.model.clone(),
         requested_max_tokens: settings.max_tokens,
@@ -209,6 +216,7 @@ async fn main() -> Result<()> {
         finalize: !cli.no_finalize,
         confirm_edits: cli.confirm_edits,
         planner_model: planner_model.clone(),
+        skeptic_model,
         // `--goal` always steers, even off-pipenetwork (single sub-goal fallback).
         long_horizon: !cli.subagent
             && (planner_model.is_some()
@@ -1291,6 +1299,7 @@ mod tests {
             explore_subagents: false,
             write_subagents: false,
             planner_model: None,
+            skeptic_model: None,
             moa: hi_ai::MoaConfig::default(),
         }
     }
@@ -1312,6 +1321,7 @@ mod tests {
             explore_subagents: false,
             write_subagents: false,
             planner_model: None,
+            skeptic_model: None,
             moa: hi_ai::MoaConfig::default(),
         }
     }

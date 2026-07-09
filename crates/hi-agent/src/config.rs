@@ -133,6 +133,12 @@ pub struct AgentConfig {
     /// then sets a single sub-goal equal to the objective. Defaults to
     /// `pipe/glm-5.2-fast` on the pipenetwork profile.
     pub planner_model: Option<String>,
+    /// The model id used by the `/goal team` skeptic gate to review a turn before
+    /// it advances a sub-goal (a bounded critique call). `None` (the default)
+    /// disables the gate regardless of `/goal team`. Set via `HI_SKEPTIC_MODEL` or
+    /// a profile; a stronger/critical model is the intent (its whole job is to
+    /// catch premature "done").
+    pub skeptic_model: Option<String>,
     /// When true, ask the user to confirm each file edit (write/edit/multi_edit/
     /// apply_patch) before applying it. The UI shows a diff preview and prompts
     /// for y/n. In non-interactive mode, edits are auto-approved.
@@ -211,6 +217,7 @@ impl Default for AgentConfig {
             read_only_preflight: true,
             long_horizon: false,
             planner_model: None,
+            skeptic_model: None,
             confirm_edits: false,
             lsp: false,
             minimal_tools: false,

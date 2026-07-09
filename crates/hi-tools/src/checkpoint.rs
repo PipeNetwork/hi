@@ -92,6 +92,28 @@ pub async fn create(dir: &Path) -> Option<String> {
     (!sha.is_empty()).then_some(sha)
 }
 
+/// A unified diff of the working tree (of the repo containing `dir`) against
+/// checkpoint `target` — everything that changed since that checkpoint, including
+/// new and deleted files. Best-effort: `None` if not in a work tree, git errors,
+/// or nothing changed. Used to show a reviewer what a turn actually did.
+pub async fn diff(dir: &Path, target: &str) -> Option<String> {
+    if !in_work_tree(dir).await {
+        return None;
+    }
+    // Snapshot the current tree (captures untracked files too, via `add -A`) and
+    // diff the checkpoint against it — the same technique `restore` uses, so new
+    // files show up rather than being invisible to a bare `git diff <commit>`.
+    let current = create(dir).await?;
+    let out = git(dir, &["diff", "--no-renames", target, &current])
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let patch = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!patch.is_empty()).then_some(patch)
+}
+
 /// Restore the working tree to checkpoint `target`, undoing every change made
 /// since. Returns the number of files restored or removed.
 pub async fn restore(dir: &Path, target: &str) -> Result<usize> {

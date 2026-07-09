@@ -75,6 +75,18 @@ pub struct Goal {
     /// so it persists with the goal. `#[serde(default)]` for older saved goals.
     #[serde(default)]
     pub step_limit: Option<usize>,
+    /// Whether the `/goal team` skeptic gate is active for this goal: a second
+    /// model reviews each turn before it advances a sub-goal, and can send the work
+    /// back to retry. Toggled by `/goal team on|off`; only takes effect when a
+    /// `skeptic_model` is configured. `#[serde(default)]` so older saved goals load
+    /// with it off (single-agent behaviour).
+    #[serde(default)]
+    pub team: bool,
+    /// How many times the skeptic gate has sent the active work back to retry —
+    /// observability for whether the gate is actually catching things.
+    /// `#[serde(default)]`.
+    #[serde(default)]
+    pub skeptic_objections: u32,
 }
 
 /// Default per-sub-goal retry budget: how many times to retry a failing sub-goal
@@ -120,6 +132,8 @@ impl Goal {
             status: GoalStatus::Active,
             paused: false,
             step_limit: None,
+            team: false,
+            skeptic_objections: 0,
         }
     }
 

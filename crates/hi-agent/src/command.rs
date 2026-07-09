@@ -156,7 +156,9 @@ pub fn goal_arg_is_objective(arg: &str) -> bool {
     !(a.is_empty()
         || matches!(a, "clear" | "off" | "none" | "pause" | "resume")
         || a == "limit"
-        || a.starts_with("limit "))
+        || a.starts_with("limit ")
+        || a == "team"
+        || a.starts_with("team "))
 }
 
 /// Parse a loop interval like `60s`, `90s`, `30m`, `2h`, `1d` into seconds.
@@ -468,6 +470,36 @@ pub fn parse_goal_limit(arg: &str) -> Option<GoalLimitArg> {
             Ok(n) => GoalLimitArg::Set(n),
             Err(_) => GoalLimitArg::Invalid(value.to_string()),
         },
+    })
+}
+
+/// The parsed value of a `/goal team …` subcommand (the skeptic gate).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GoalTeamArg {
+    /// `/goal team on` — enable the skeptic gate for the active goal.
+    On,
+    /// `/goal team off` — disable it.
+    Off,
+    /// `/goal team` — report the current state.
+    Show,
+    /// `/goal team <garbage>` — unrecognized argument.
+    Invalid(String),
+}
+
+/// Parse the argument of a `/goal team …` subcommand. Returns `None` when `arg`
+/// isn't a `team` subcommand at all (so the caller handles other `/goal` forms).
+pub fn parse_goal_team(arg: &str) -> Option<GoalTeamArg> {
+    let a = arg.trim();
+    let rest = if a == "team" {
+        ""
+    } else {
+        a.strip_prefix("team ")?.trim()
+    };
+    Some(match rest {
+        "" => GoalTeamArg::Show,
+        "on" | "yes" | "true" => GoalTeamArg::On,
+        "off" | "no" | "false" => GoalTeamArg::Off,
+        other => GoalTeamArg::Invalid(other.to_string()),
     })
 }
 
@@ -888,8 +920,8 @@ pub fn help_text() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        COMMANDS, Command, GoalLimitArg, expand_prompt_macro, goal_arg_is_objective, help_text,
-        matching, parse, parse_goal_limit,
+        COMMANDS, Command, GoalLimitArg, GoalTeamArg, expand_prompt_macro, goal_arg_is_objective,
+        help_text, matching, parse, parse_goal_limit, parse_goal_team,
     };
 
     #[test]
@@ -1281,7 +1313,8 @@ mod tests {
         assert!(goal_arg_is_objective("port this service to Rust"));
         assert!(goal_arg_is_objective("limitless refactor")); // not a `limit` subcommand
         for control in [
-            "", "  ", "clear", "off", "none", "pause", "resume", "limit", "limit 20",
+            "", "  ", "clear", "off", "none", "pause", "resume", "limit", "limit 20", "team",
+            "team on",
         ] {
             assert!(
                 !goal_arg_is_objective(control),
@@ -1304,6 +1337,21 @@ mod tests {
         // Not a limit subcommand → None (handled elsewhere).
         assert_eq!(parse_goal_limit("port to Rust"), None);
         assert_eq!(parse_goal_limit("limitless"), None);
+    }
+
+    #[test]
+    fn goal_team_subcommand_parsing() {
+        assert_eq!(parse_goal_team("team on"), Some(GoalTeamArg::On));
+        assert_eq!(parse_goal_team("team off"), Some(GoalTeamArg::Off));
+        assert_eq!(parse_goal_team("team"), Some(GoalTeamArg::Show));
+        assert_eq!(parse_goal_team("team yes"), Some(GoalTeamArg::On));
+        assert_eq!(
+            parse_goal_team("team maybe"),
+            Some(GoalTeamArg::Invalid("maybe".into()))
+        );
+        // Not a team subcommand → None (handled elsewhere, e.g. as an objective).
+        assert_eq!(parse_goal_team("teamwork refactor"), None);
+        assert_eq!(parse_goal_team("port to Rust"), None);
     }
 
     #[test]

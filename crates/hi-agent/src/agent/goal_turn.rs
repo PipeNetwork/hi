@@ -14,7 +14,7 @@ impl crate::Agent {
     /// approach). The verify retry itself happens *within* the turn (the 'turn
     /// loop re-runs the model on a verify failure); this hook handles the
     /// goal-level progression once the turn settles.
-    pub(crate) fn goal_turn_end(
+    pub(crate) async fn goal_turn_end(
         &mut self,
         stalled_unfinished: bool,
         stalled_repeating: bool,
@@ -25,14 +25,18 @@ impl crate::Agent {
         if !self.config.long_horizon {
             return;
         }
-        let Some(goal) = self.structured_goal.as_mut() else {
-            return;
-        };
-        if goal.paused {
-            return; // Paused by the user — hold progress, don't advance or retry.
-        }
-        if goal.status != GoalStatus::Active {
-            return; // Already done or failed — nothing to drive.
+        // Early guards — short immutable borrow (the skeptic call below needs
+        // `&mut self`, so we can't hold a `&mut goal` across the whole function).
+        {
+            let Some(goal) = self.structured_goal.as_ref() else {
+                return;
+            };
+            if goal.paused {
+                return; // Paused by the user — hold progress.
+            }
+            if goal.status != GoalStatus::Active {
+                return; // Already done or failed — nothing to drive.
+            }
         }
         let max_retries = DEFAULT_SUBGOAL_RETRIES;
         // A turn that verified clean (or had no verify but made edits without
@@ -55,11 +59,37 @@ impl crate::Agent {
             return;
         }
         if verified_clean || no_verify_clean {
-            // If the model's update_plan already advanced the goal during this
-            // turn (apply_plan_to_goal marked the active sub-goal done and
-            // activated the next), don't advance again — that would skip the
-            // newly-activated sub-goal. Otherwise, advance normally.
-            if !plan_updated_goal {
+            // Skeptic gate: when `/goal team` is on and a skeptic model is
+            // configured, a second model reviews this turn *before* it advances a
+            // sub-goal. An objection sends the sub-goal back to retry (objections
+            // become notes) instead of advancing — fail-open (see `skeptic_gate`).
+            // Only on the normal advance, not when `update_plan` already advanced
+            // (the model's own bookkeeping, which the skeptic didn't drive).
+            let skeptic_objection = if !plan_updated_goal
+                && self.structured_goal.as_ref().is_some_and(|g| g.team)
+                && self.has_skeptic()
+            {
+                self.skeptic_gate().await
+            } else {
+                None
+            };
+            if let Some(objections) = skeptic_objection {
+                if let Some(goal) = self.structured_goal.as_mut() {
+                    goal.skeptic_objections = goal.skeptic_objections.saturating_add(1);
+                    goal.record_failure(
+                        format!("reviewer objected — address then continue:\n{objections}"),
+                        max_retries,
+                    );
+                }
+                let first = objections.lines().next().unwrap_or("see notes");
+                ui.status(&format!("🔍 skeptic objected — retrying: {first}"));
+                self.refresh_system_message();
+                self.persist_goal(ui);
+                return;
+            }
+            // Approve (or gate off): advance as today. If `update_plan` already
+            // advanced the goal this turn, don't advance again (skips a sub-goal).
+            if !plan_updated_goal && let Some(goal) = self.structured_goal.as_mut() {
                 let i = goal.active_index();
                 goal.advance();
                 if let Some(i) = i {
@@ -70,7 +100,10 @@ impl crate::Agent {
                     ));
                 }
             }
-            if goal.status == GoalStatus::Done {
+            if matches!(
+                self.structured_goal.as_ref().map(|g| g.status),
+                Some(GoalStatus::Done)
+            ) {
                 ui.status("✓ long-horizon goal complete");
             }
             self.refresh_system_message();
@@ -91,7 +124,10 @@ impl crate::Agent {
         } else {
             "verification failed and the turn ended without fixing it"
         };
-        let can_retry = goal.record_failure(reason, max_retries);
+        let can_retry = match self.structured_goal.as_mut() {
+            Some(goal) => goal.record_failure(reason, max_retries),
+            None => return,
+        };
         if can_retry {
             ui.status(&format!(
                 "↻ sub-goal failed this turn ({reason}) — will retry next turn, don't repeat the same approach"

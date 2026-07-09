@@ -231,6 +231,12 @@ impl crate::App {
                     self.handle_goal_limit(agent, limit);
                 }
             }
+            // `/goal team on|off` — toggle the skeptic review gate.
+            s if command::parse_goal_team(s).is_some() => {
+                if let Some(team) = command::parse_goal_team(s) {
+                    self.handle_goal_team(agent, team);
+                }
+            }
             // Pause/resume: hold progress, stop/restart steering. Own messaging,
             // not the goal-set echo.
             "pause" | "resume" => {
@@ -302,6 +308,67 @@ impl crate::App {
                 format!(
                     "goal limit: '{value}' isn't a number — use /goal limit <n> or 'limit off'"
                 ),
+                Style::default().fg(Color::Yellow),
+            ),
+        };
+        self.refresh_goal(agent);
+        self.push(Line::styled(msg, style));
+        self.follow();
+    }
+
+    /// `/goal team on|off`: toggle the skeptic review gate for the active goal.
+    fn handle_goal_team(&mut self, agent: &mut Agent, team: command::GoalTeamArg) {
+        use command::GoalTeamArg;
+        let (msg, style) = match team {
+            GoalTeamArg::Show => match agent.structured_goal() {
+                Some(g) if g.team => (
+                    format!(
+                        "goal team: on — a skeptic reviews each advance ({} objection(s) so far)",
+                        g.skeptic_objections
+                    ),
+                    dim(),
+                ),
+                Some(_) => (
+                    "goal team: off — enable with /goal team on".to_string(),
+                    dim(),
+                ),
+                None => (
+                    "no active goal — set one with /goal <text> first".to_string(),
+                    dim(),
+                ),
+            },
+            GoalTeamArg::On => {
+                if !agent.has_skeptic() {
+                    (
+                        "goal team: no skeptic model configured — set HI_SKEPTIC_MODEL first"
+                            .to_string(),
+                        Style::default().fg(Color::Yellow),
+                    )
+                } else if agent.set_goal_team(true) {
+                    (
+                        "✓ goal team on — a skeptic reviews each turn before advancing a sub-goal"
+                            .to_string(),
+                        Style::default().fg(Color::Green),
+                    )
+                } else {
+                    (
+                        "no active goal — set one with /goal <text> first".to_string(),
+                        dim(),
+                    )
+                }
+            }
+            GoalTeamArg::Off => {
+                if agent.set_goal_team(false) {
+                    (
+                        "✓ goal team off — single-agent driving".to_string(),
+                        Style::default().fg(Color::Green),
+                    )
+                } else {
+                    ("no active goal".to_string(), dim())
+                }
+            }
+            GoalTeamArg::Invalid(value) => (
+                format!("goal team: '{value}' — use /goal team on|off"),
                 Style::default().fg(Color::Yellow),
             ),
         };
