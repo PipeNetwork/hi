@@ -28,6 +28,8 @@ use crate::FleetLauncher;
 pub(crate) const LOOP_TTL_SECS: u64 = 7 * 86_400;
 /// A single firing is killed after this long (a watcher turn should be quick).
 const FIRING_TIMEOUT_SECS: u64 = 600;
+/// An on-change trigger command is killed after this long.
+const TRIGGER_TIMEOUT_SECS: u64 = 60;
 /// Max simultaneously-armed loops per project.
 const MAX_LOOPS: usize = 8;
 /// The marker a firing replies with when nothing changed since the last check.
@@ -47,6 +49,21 @@ pub(crate) struct LoopSpec {
     pub(crate) session: PathBuf,
     #[serde(default)]
     pub(crate) firings: u64,
+    /// Held: stops firing but stays resumable (manual, or hit its budget).
+    #[serde(default)]
+    pub(crate) paused: bool,
+    /// Optional token spend cap; the loop auto-pauses once `spent_tokens`
+    /// reaches it.
+    #[serde(default)]
+    pub(crate) token_budget: Option<u64>,
+    /// Cumulative tokens spent across firings (session-cumulative, from the
+    /// child's `--report`). Persisted so the cost survives a restart.
+    #[serde(default)]
+    pub(crate) spent_tokens: u64,
+    /// Optional shell command run (via `sh -c`) after a firing reports a real
+    /// change — a watcher that also *responds*. Off unless explicitly set.
+    #[serde(default)]
+    pub(crate) trigger: Option<String>,
 }
 
 impl LoopSpec {
@@ -94,6 +111,13 @@ pub(crate) struct LoopWatchRow {
     pub(crate) firings: u64,
     /// A firing is currently in flight.
     pub(crate) firing: bool,
+    pub(crate) paused: bool,
+    pub(crate) token_budget: Option<u64>,
+    pub(crate) spent_tokens: u64,
+    /// The configured on-change command, if any.
+    pub(crate) trigger: Option<String>,
+    /// The outcome of the most recent trigger run (for the peek).
+    pub(crate) last_trigger: Option<String>,
     pub(crate) last_summary: Option<String>,
     pub(crate) last_quiet: bool,
     pub(crate) last_fired_ms: u64,
@@ -108,6 +132,8 @@ struct LoopRuntime {
     last_summary: Option<String>,
     last_quiet: bool,
     last_fired_ms: u64,
+    /// Outcome of the most recent on-change trigger run.
+    last_trigger: Option<String>,
     history: VecDeque<HistItem>,
 }
 
@@ -129,6 +155,24 @@ pub(crate) enum LoopCtl {
     /// Fire a loop immediately (its cadence continues unchanged after).
     FireNow {
         id: u64,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Pause (`on: true`) or resume (`on: false`) a loop.
+    Pause {
+        id: u64,
+        on: bool,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Set (`Some`) or clear (`None`) a loop's token budget.
+    Budget {
+        id: u64,
+        tokens: Option<u64>,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Set (`Some`) or clear (`None`) a loop's on-change trigger command.
+    Trigger {
+        id: u64,
+        cmd: Option<String>,
         reply: oneshot::Sender<bool>,
     },
     List {
@@ -198,6 +242,22 @@ pub(crate) fn humanize_secs(secs: u64) -> String {
     }
 }
 
+/// Compact token count for display: `0`, `999`, `1.2k`, `12k`, `1.5m`.
+pub(crate) fn fmt_tokens(n: u64) -> String {
+    if n < 1_000 {
+        n.to_string()
+    } else if n < 1_000_000 {
+        let k = n as f64 / 1_000.0;
+        if k < 10.0 {
+            format!("{k:.1}k")
+        } else {
+            format!("{}k", k.round() as u64)
+        }
+    } else {
+        format!("{:.1}m", n as f64 / 1_000_000.0)
+    }
+}
+
 /// Whether a firing's final reply is the quiet marker (nothing to report).
 pub(crate) fn is_quiet(summary: &str) -> bool {
     let s = summary.trim().trim_end_matches('.').trim();
@@ -217,8 +277,28 @@ pub(crate) fn start(launcher: Arc<FleetLauncher>, loops_file: Option<PathBuf>) -
         pending: pending.clone(),
         snapshot: snapshot.clone(),
     };
-    tokio::spawn(manager(launcher, loops_file, ctl_rx, pending, snapshot));
+    let activity = loops_file
+        .as_ref()
+        .map(|p| crate::activity::activity_path(p));
+    tokio::spawn(manager(
+        launcher, loops_file, activity, ctl_rx, pending, snapshot,
+    ));
     handle
+}
+
+/// Append one loud event to the project's activity feed (best-effort).
+fn record(activity: Option<&std::path::Path>, loop_id: u64, source: &str, text: &str) {
+    if let Some(path) = activity {
+        crate::activity::append(
+            path,
+            &crate::activity::ActivityEntry {
+                at_ms: now_ms(),
+                loop_id,
+                source: source.to_string(),
+                text: text.to_string(),
+            },
+        );
+    }
 }
 
 /// Rebuild the published `/watch` snapshot from persisted specs + live runtime,
@@ -245,6 +325,11 @@ fn publish(
                 expires_ms: l.expires_ms,
                 firings: l.firings,
                 firing: rt.is_some_and(|r| r.firing),
+                paused: l.paused,
+                token_budget: l.token_budget,
+                spent_tokens: l.spent_tokens,
+                trigger: l.trigger.clone(),
+                last_trigger: rt.and_then(|r| r.last_trigger.clone()),
                 last_summary: rt.and_then(|r| r.last_summary.clone()),
                 last_quiet: rt.is_some_and(|r| r.last_quiet),
                 last_fired_ms: rt.map_or(0, |r| r.last_fired_ms),
@@ -260,10 +345,12 @@ fn publish(
 async fn manager(
     launcher: Arc<FleetLauncher>,
     loops_file: Option<PathBuf>,
+    activity: Option<PathBuf>,
     mut ctl: mpsc::UnboundedReceiver<LoopCtl>,
     pending: Arc<Mutex<Vec<LoopLine>>>,
     snapshot: Arc<Mutex<Vec<LoopWatchRow>>>,
 ) {
+    let activity = activity.as_deref();
     let mut runtime: HashMap<u64, LoopRuntime> = HashMap::new();
     let mut state = load(loops_file.as_deref());
     let now = now_ms();
@@ -296,8 +383,10 @@ async fn manager(
     save(loops_file.as_deref(), &state);
     publish(&state, &mut runtime, &snapshot);
 
-    // Firings in flight: (loop id, summary) results come back over a channel.
-    let (done_tx, mut done_rx) = mpsc::unbounded_channel::<(u64, Result<String, String>)>();
+    // Firings in flight: (loop id, outcome) results come back over a channel.
+    let (done_tx, mut done_rx) = mpsc::unbounded_channel::<(u64, Result<FiringOutcome, String>)>();
+    // On-change trigger runs report their outcome line over this channel.
+    let (trig_tx, mut trig_rx) = mpsc::unbounded_channel::<(u64, String)>();
     let mut in_flight: usize = 0;
 
     loop {
@@ -306,6 +395,7 @@ async fn manager(
         let mut fired = false;
         state.loops.retain(|l| {
             if l.expires_ms <= now {
+                record(activity, l.id, &l.name(), "expired after 7 days");
                 pending.lock().unwrap().push((
                     format!("⟳ loop#{} ({}) expired after 7 days", l.id, l.name()),
                     true,
@@ -317,7 +407,7 @@ async fn manager(
             }
         });
         for spec in &mut state.loops {
-            if spec.next_ms <= now && in_flight < 2 {
+            if !spec.paused && spec.next_ms <= now && in_flight < 2 {
                 spec.next_ms = now + spec.interval_secs * 1000;
                 spec.firings += 1;
                 in_flight += 1;
@@ -338,10 +428,18 @@ async fn manager(
         publish(&state, &mut runtime, &snapshot);
 
         // Sleep until the next due time (capped so ctl/expiry stay responsive).
+        // A paused loop never fires, so only its expiry can wake us — otherwise
+        // its stale `next_ms` would pin the sleep to the 250ms floor and spin.
         let next_due = state
             .loops
             .iter()
-            .map(|l| l.next_ms.min(l.expires_ms))
+            .map(|l| {
+                if l.paused {
+                    l.expires_ms
+                } else {
+                    l.next_ms.min(l.expires_ms)
+                }
+            })
             .min()
             .unwrap_or(now + 60_000);
         let sleep_ms = next_due.saturating_sub(now).clamp(250, 30_000);
@@ -368,6 +466,10 @@ async fn manager(
                                         next_ms: now,
                                         session,
                                         firings: 0,
+                                        paused: false,
+                                        token_budget: None,
+                                        spent_tokens: 0,
+                                        trigger: None,
                                     };
                                     state.loops.push(spec.clone());
                                     save(loops_file.as_deref(), &state);
@@ -403,6 +505,64 @@ async fn manager(
                         }
                         let _ = reply.send(ok);
                     }
+                    LoopCtl::Pause { id, on, reply } => {
+                        let mut ok = false;
+                        let now = now_ms();
+                        for l in &mut state.loops {
+                            if l.id == id {
+                                l.paused = on;
+                                // Resuming an overdue loop: fire it soon rather
+                                // than immediately hammering (and never in the past).
+                                if !on && l.next_ms < now {
+                                    l.next_ms = now + 2_000;
+                                }
+                                ok = true;
+                            }
+                        }
+                        if ok {
+                            save(loops_file.as_deref(), &state);
+                            publish(&state, &mut runtime, &snapshot);
+                        }
+                        let _ = reply.send(ok);
+                    }
+                    LoopCtl::Budget { id, tokens, reply } => {
+                        let mut ok = false;
+                        for l in &mut state.loops {
+                            if l.id == id {
+                                l.token_budget = tokens;
+                                // Setting/raising a budget above current spend
+                                // lifts an earlier budget auto-pause.
+                                if l.paused
+                                    && tokens.is_some_and(|b| l.spent_tokens < b)
+                                {
+                                    l.paused = false;
+                                    if l.next_ms < now_ms() {
+                                        l.next_ms = now_ms() + 2_000;
+                                    }
+                                }
+                                ok = true;
+                            }
+                        }
+                        if ok {
+                            save(loops_file.as_deref(), &state);
+                            publish(&state, &mut runtime, &snapshot);
+                        }
+                        let _ = reply.send(ok);
+                    }
+                    LoopCtl::Trigger { id, cmd, reply } => {
+                        let mut ok = false;
+                        for l in &mut state.loops {
+                            if l.id == id {
+                                l.trigger = cmd.clone();
+                                ok = true;
+                            }
+                        }
+                        if ok {
+                            save(loops_file.as_deref(), &state);
+                            publish(&state, &mut runtime, &snapshot);
+                        }
+                        let _ = reply.send(ok);
+                    }
                     LoopCtl::List { reply } => {
                         let _ = reply.send(state.loops.clone());
                     }
@@ -417,21 +577,63 @@ async fn manager(
                     .map(LoopSpec::name)
                     .unwrap_or_else(|| format!("#{id}"));
                 let fired_ms = now_ms();
-                let (line, summary, quiet) = match result {
-                    Ok(summary) => {
-                        let quiet = is_quiet(&summary);
+                let (line, summary, quiet, tokens) = match result {
+                    Ok(outcome) => {
+                        let quiet = is_quiet(&outcome.summary);
                         let text = if quiet {
                             format!("⟳ loop#{id} ({name}): nothing new")
                         } else {
-                            format!("⟳ loop#{id} ({name}): {}", truncate(&summary, 160))
+                            format!("⟳ loop#{id} ({name}): {}", truncate(&outcome.summary, 160))
                         };
-                        ((text, !quiet), summary, quiet)
+                        ((text, !quiet), outcome.summary, quiet, Some(outcome.total_tokens))
                     }
                     Err(err) => {
                         let text = format!("⟳ loop#{id} ({name}) firing failed: {err}");
-                        ((text, true), format!("firing failed: {err}"), false)
+                        ((text, true), format!("firing failed: {err}"), false, None)
                     }
                 };
+                // Fold in the cost and enforce the budget: `total_tokens` is
+                // session-cumulative, so it *is* the loop's running spend.
+                let mut budget_line: Option<LoopLine> = None;
+                if let Some(spent) = tokens {
+                    if let Some(l) = state.loops.iter_mut().find(|l| l.id == id) {
+                        l.spent_tokens = spent;
+                        if let Some(budget) = l.token_budget
+                            && !l.paused
+                            && spent >= budget
+                        {
+                            l.paused = true;
+                            let msg = format!(
+                                "paused — hit token budget ({} / {})",
+                                fmt_tokens(spent),
+                                fmt_tokens(budget),
+                            );
+                            record(activity, id, &name, &msg);
+                            budget_line = Some((format!("⏸ loop#{id} ({name}) {msg}"), true));
+                        }
+                    }
+                    save(loops_file.as_deref(), &state);
+                }
+                // On a genuine loud change (not quiet, not a firing error), record
+                // it to the activity feed and run the loop's on-change trigger.
+                let loud_change = tokens.is_some() && !quiet;
+                if loud_change {
+                    record(activity, id, &name, &summary);
+                }
+                if loud_change
+                    && let Some(cmd) = state
+                        .loops
+                        .iter()
+                        .find(|l| l.id == id)
+                        .and_then(|l| l.trigger.clone())
+                {
+                    let trig = trig_tx.clone();
+                    let (name, summary) = (name.clone(), summary.clone());
+                    tokio::spawn(async move {
+                        let outcome = run_trigger(&cmd, id, &name, &summary).await;
+                        let _ = trig.send((id, outcome));
+                    });
+                }
                 // Record the runtime result for the /watch dashboard + history.
                 let rt = runtime.entry(id).or_default();
                 rt.firing = false;
@@ -443,6 +645,24 @@ async fn manager(
                     rt.history.pop_front();
                 }
                 pending.lock().unwrap().push(line);
+                if let Some(bl) = budget_line {
+                    pending.lock().unwrap().push(bl);
+                }
+                publish(&state, &mut runtime, &snapshot);
+            }
+            Some((id, outcome)) = trig_rx.recv() => {
+                let name = state
+                    .loops
+                    .iter()
+                    .find(|l| l.id == id)
+                    .map(LoopSpec::name)
+                    .unwrap_or_else(|| format!("#{id}"));
+                let failed = !outcome.starts_with("ok");
+                pending
+                    .lock()
+                    .unwrap()
+                    .push((format!("⚡ loop#{id} ({name}) trigger: {outcome}"), failed));
+                runtime.entry(id).or_default().last_trigger = Some(outcome);
                 publish(&state, &mut runtime, &snapshot);
             }
             _ = tokio::time::sleep(Duration::from_millis(sleep_ms)) => {}
@@ -450,9 +670,19 @@ async fn manager(
     }
 }
 
+/// The result of one firing: the child's reply summary plus its
+/// session-cumulative token spend (from the `--report`).
+struct FiringOutcome {
+    summary: String,
+    total_tokens: u64,
+}
+
 /// One firing: a fleet-style child run in the real cwd, resuming the loop's
-/// session. Returns the child's final reply line(s) as the summary.
-async fn run_firing(launcher: &FleetLauncher, spec: &LoopSpec) -> Result<String, String> {
+/// session. Returns the child's final reply line as the summary, plus the
+/// session-cumulative token total read back from its `--report`.
+async fn run_firing(launcher: &FleetLauncher, spec: &LoopSpec) -> Result<FiringOutcome, String> {
+    // One report file per loop, alongside its session, overwritten each firing.
+    let report_path = spec.session.with_extension("report.json");
     let mut cmd = tokio::process::Command::new(&launcher.exe);
     cmd.env("HI_API_KEY", &launcher.api_key)
         .stdin(Stdio::null())
@@ -470,6 +700,7 @@ async fn run_firing(launcher: &FleetLauncher, spec: &LoopSpec) -> Result<String,
             "30",
         ]);
     cmd.arg("--session-file").arg(&spec.session);
+    cmd.arg("--report").arg(&report_path);
     cmd.arg(wrapper_prompt(spec));
 
     let mut child = cmd.spawn().map_err(|e| format!("couldn't launch: {e}"))?;
@@ -516,7 +747,66 @@ async fn run_firing(launcher: &FleetLauncher, spec: &LoopSpec) -> Result<String,
         .find(|l| !l.trim_start().starts_with(['⏺', '✓', '⚙', '›', '↳']))
         .cloned()
         .unwrap_or_else(|| tail.last().cloned().unwrap_or_default());
-    Ok(summary)
+    let total_tokens = read_report_tokens(&report_path);
+    Ok(FiringOutcome {
+        summary,
+        total_tokens,
+    })
+}
+
+/// Read the session-cumulative `total_tokens` from a firing's `--report` JSON
+/// (0 if the file is missing or malformed — cost tracking is best-effort).
+fn read_report_tokens(path: &std::path::Path) -> u64 {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v.get("total_tokens").and_then(serde_json::Value::as_u64))
+        .unwrap_or(0)
+}
+
+/// Run a loop's on-change trigger via `sh -c`, passing the loop id/name and the
+/// firing's summary in the environment. Returns a compact outcome line — one of
+/// `ok`, `ok: <stdout>`, `exit N: <stderr>`, `timed out …`, or `failed …` — so
+/// the transcript and `/watch` can show whether the response actually ran.
+async fn run_trigger(cmd: &str, id: u64, name: &str, summary: &str) -> String {
+    let mut c = tokio::process::Command::new("sh");
+    c.arg("-c")
+        .arg(cmd)
+        .env("HI_LOOP_ID", id.to_string())
+        .env("HI_LOOP_NAME", name)
+        .env("HI_LOOP_SUMMARY", summary)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let first_line = |bytes: &[u8]| {
+        String::from_utf8_lossy(bytes)
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .map(|l| truncate(l.trim(), 100))
+            .unwrap_or_default()
+    };
+    match tokio::time::timeout(Duration::from_secs(TRIGGER_TIMEOUT_SECS), c.output()).await {
+        Ok(Ok(out)) if out.status.success() => {
+            let head = first_line(&out.stdout);
+            if head.is_empty() {
+                "ok".to_string()
+            } else {
+                format!("ok: {head}")
+            }
+        }
+        Ok(Ok(out)) => {
+            let code = out.status.code().unwrap_or(-1);
+            let err = first_line(&out.stderr);
+            if err.is_empty() {
+                format!("exit {code}")
+            } else {
+                format!("exit {code}: {err}")
+            }
+        }
+        Ok(Err(e)) => format!("failed to run: {e}"),
+        Err(_) => format!("timed out after {TRIGGER_TIMEOUT_SECS}s"),
+    }
 }
 
 fn load(path: Option<&std::path::Path>) -> LoopsFile {
@@ -558,6 +848,10 @@ mod tests {
             next_ms: 0,
             session: PathBuf::from("/tmp/loop.jsonl"),
             firings: 0,
+            paused: false,
+            token_budget: None,
+            spent_tokens: 0,
+            trigger: None,
         }
     }
 
@@ -584,6 +878,15 @@ mod tests {
         assert!(later.contains("every 30m"), "{later}");
         assert!(later.contains(QUIET_MARKER));
         assert!(!later.contains("FIRST check"));
+    }
+
+    #[test]
+    fn fmt_tokens_units() {
+        assert_eq!(fmt_tokens(0), "0");
+        assert_eq!(fmt_tokens(999), "999");
+        assert_eq!(fmt_tokens(1_200), "1.2k");
+        assert_eq!(fmt_tokens(12_000), "12k");
+        assert_eq!(fmt_tokens(1_500_000), "1.5m");
     }
 
     #[test]
@@ -739,6 +1042,270 @@ mod tests {
         handle.ctl.send(LoopCtl::Cancel { id, reply: tx }).unwrap();
         assert!(rx.await.unwrap(), "cancel removed the loop");
         wait_until(&handle, |rows| rows.is_empty()).await;
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stub `hi` that writes a `--report` with a fixed token total, so firings
+    /// exercise the cost-tracking + budget path. Returns the script path.
+    fn report_stub(dir: &std::path::Path, tokens: u64) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("stub.sh");
+        let script = format!(
+            "#!/bin/sh\nprev=\nfor a in \"$@\"; do\n  [ \"$prev\" = \"--report\" ] && \
+             printf '{{\"total_tokens\": {tokens}}}' > \"$a\"\n  prev=\"$a\"\ndone\n\
+             printf 'stub check reply\\n'\n"
+        );
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// Drive the manager with a report-writing stub to validate cost tracking,
+    /// budget auto-pause, and manual pause blocking a due firing.
+    #[tokio::test]
+    async fn manager_pause_resume_and_budget_autopause() {
+        let dir = std::env::temp_dir().join(format!("hi-watch-cost-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sess = dir.join("loop.jsonl");
+        let exe = report_stub(&dir, 1_000_000);
+        let launcher = FleetLauncher {
+            exe,
+            provider: "p".into(),
+            model: "m".into(),
+            base_url: "u".into(),
+            api_key: "k".into(),
+            verify: None,
+            max_verify: 0,
+            max_steps: 30,
+            session_path: Box::new(|| Ok(PathBuf::from("/tmp/unused.jsonl"))),
+            sessions: Box::new(Vec::new),
+            resume_info: Box::new(|_| None),
+            loop_session_path: Box::new(move || Ok(sess.clone())),
+            loops_file: None,
+        };
+        let handle = start(Arc::new(launcher), None);
+
+        let (tx, rx) = oneshot::channel();
+        handle
+            .ctl
+            .send(LoopCtl::Create {
+                secs: 60,
+                prompt: "watch prod".into(),
+                reply: tx,
+            })
+            .unwrap();
+        let id = rx.await.unwrap().unwrap().id;
+
+        // First firing records the report's cumulative token spend.
+        wait_until(&handle, |rows| {
+            rows.iter()
+                .find(|r| r.id == id)
+                .is_some_and(|r| r.spent_tokens == 1_000_000)
+        })
+        .await;
+
+        // Set a budget below current spend, then fire: the firing auto-pauses.
+        let (tx, rx) = oneshot::channel();
+        handle
+            .ctl
+            .send(LoopCtl::Budget {
+                id,
+                tokens: Some(500_000),
+                reply: tx,
+            })
+            .unwrap();
+        assert!(rx.await.unwrap());
+        let (tx, rx) = oneshot::channel();
+        handle.ctl.send(LoopCtl::FireNow { id, reply: tx }).unwrap();
+        assert!(rx.await.unwrap());
+        wait_until(&handle, |rows| {
+            rows.iter().find(|r| r.id == id).is_some_and(|r| r.paused)
+        })
+        .await;
+
+        // A paused loop does not fire even when forced due (FireNow).
+        let firings_now = handle
+            .snapshot
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|r| r.id == id)
+            .unwrap()
+            .firings;
+        let (tx, rx) = oneshot::channel();
+        handle.ctl.send(LoopCtl::FireNow { id, reply: tx }).unwrap();
+        assert!(rx.await.unwrap());
+        // Give the manager time to (not) fire.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        {
+            let rows = handle.snapshot.lock().unwrap();
+            let r = rows.iter().find(|r| r.id == id).unwrap();
+            assert!(r.paused, "still paused");
+            assert_eq!(r.firings, firings_now, "paused loop did not fire");
+        }
+
+        // Resume → clears the pause; raising the budget above spend keeps it live.
+        let (tx, rx) = oneshot::channel();
+        handle
+            .ctl
+            .send(LoopCtl::Budget {
+                id,
+                tokens: Some(5_000_000),
+                reply: tx,
+            })
+            .unwrap();
+        assert!(rx.await.unwrap());
+        wait_until(&handle, |rows| {
+            rows.iter().find(|r| r.id == id).is_some_and(|r| !r.paused)
+        })
+        .await;
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A loud firing runs the loop's on-change trigger, with the firing summary
+    /// in `$HI_LOOP_SUMMARY`. (`/bin/echo` firings are loud — they never reply
+    /// the quiet marker.)
+    #[tokio::test]
+    async fn manager_runs_trigger_on_loud_change() {
+        let dir = std::env::temp_dir().join(format!("hi-watch-trig-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sess = dir.join("loop.jsonl");
+        let sentinel = dir.join("fired.txt");
+        let launcher = FleetLauncher {
+            exe: PathBuf::from("/bin/echo"),
+            provider: "p".into(),
+            model: "m".into(),
+            base_url: "u".into(),
+            api_key: "k".into(),
+            verify: None,
+            max_verify: 0,
+            max_steps: 30,
+            session_path: Box::new(|| Ok(PathBuf::from("/tmp/unused.jsonl"))),
+            sessions: Box::new(Vec::new),
+            resume_info: Box::new(|_| None),
+            loop_session_path: Box::new(move || Ok(sess.clone())),
+            loops_file: None,
+        };
+        let handle = start(Arc::new(launcher), None);
+
+        let (tx, rx) = oneshot::channel();
+        handle
+            .ctl
+            .send(LoopCtl::Create {
+                secs: 3600,
+                prompt: "watch the thing".into(),
+                reply: tx,
+            })
+            .unwrap();
+        let id = rx.await.unwrap().unwrap().id;
+        wait_until(&handle, |rows| {
+            rows.iter()
+                .find(|r| r.id == id)
+                .is_some_and(|r| !r.history.is_empty())
+        })
+        .await;
+
+        // Attach a trigger that records $HI_LOOP_SUMMARY, then fire.
+        let cmd = format!(
+            "printf '%s' \"$HI_LOOP_SUMMARY\" > '{}'",
+            sentinel.display()
+        );
+        let (tx, rx) = oneshot::channel();
+        handle
+            .ctl
+            .send(LoopCtl::Trigger {
+                id,
+                cmd: Some(cmd),
+                reply: tx,
+            })
+            .unwrap();
+        assert!(rx.await.unwrap());
+        let (tx, rx) = oneshot::channel();
+        handle.ctl.send(LoopCtl::FireNow { id, reply: tx }).unwrap();
+        assert!(rx.await.unwrap());
+
+        // The trigger runs and reports an ok outcome into the runtime.
+        wait_until(&handle, |rows| {
+            rows.iter()
+                .find(|r| r.id == id)
+                .and_then(|r| r.last_trigger.as_deref())
+                .is_some_and(|t| t.starts_with("ok"))
+        })
+        .await;
+        // …and it actually executed, receiving the summary via the environment.
+        let written = std::fs::read_to_string(&sentinel).unwrap_or_default();
+        assert!(!written.trim().is_empty(), "trigger wrote the summary");
+
+        // Clearing the trigger removes it from the snapshot.
+        let (tx, rx) = oneshot::channel();
+        handle
+            .ctl
+            .send(LoopCtl::Trigger {
+                id,
+                cmd: None,
+                reply: tx,
+            })
+            .unwrap();
+        assert!(rx.await.unwrap());
+        wait_until(&handle, |rows| {
+            rows.iter()
+                .find(|r| r.id == id)
+                .is_some_and(|r| r.trigger.is_none())
+        })
+        .await;
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A loud firing is persisted to the project's activity feed (for /digest).
+    #[tokio::test]
+    async fn manager_records_loud_firing_to_activity() {
+        let dir = std::env::temp_dir().join(format!("hi-watch-act-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sess = dir.join("loop.jsonl");
+        let loops_file = dir.join("loops.json");
+        let launcher = FleetLauncher {
+            exe: PathBuf::from("/bin/echo"),
+            provider: "p".into(),
+            model: "m".into(),
+            base_url: "u".into(),
+            api_key: "k".into(),
+            verify: None,
+            max_verify: 0,
+            max_steps: 30,
+            session_path: Box::new(|| Ok(PathBuf::from("/tmp/unused.jsonl"))),
+            sessions: Box::new(Vec::new),
+            resume_info: Box::new(|_| None),
+            loop_session_path: Box::new(move || Ok(sess.clone())),
+            loops_file: Some(loops_file.clone()),
+        };
+        let handle = start(Arc::new(launcher), Some(loops_file.clone()));
+
+        let (tx, rx) = oneshot::channel();
+        handle
+            .ctl
+            .send(LoopCtl::Create {
+                secs: 3600,
+                prompt: "watch the thing".into(),
+                reply: tx,
+            })
+            .unwrap();
+        let id = rx.await.unwrap().unwrap().id;
+        wait_until(&handle, |rows| {
+            rows.iter()
+                .find(|r| r.id == id)
+                .is_some_and(|r| !r.history.is_empty())
+        })
+        .await;
+
+        // The loud firing landed in activity.jsonl next to loops.json.
+        let entries = crate::activity::load(&crate::activity::activity_path(&loops_file));
+        assert!(
+            entries.iter().any(|e| e.loop_id == id),
+            "loud firing recorded to the activity feed"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -267,6 +267,11 @@ pub(crate) fn handle_command(
                 "\x1b[33m/watch is only available in the full-screen TUI (run hi without --plain)\x1b[0m"
             );
         }
+        Command::Digest => {
+            println!(
+                "\x1b[33m/digest is only available in the full-screen TUI (run hi without --plain)\x1b[0m"
+            );
+        }
         Command::Dashboard(arg) => match arg.trim() {
             "status" | "sessions" | "ls" => {
                 let sessions = crate::session::fleet_sessions();
