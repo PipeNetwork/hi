@@ -20232,6 +20232,203 @@ mod tests {
         }
     }
 
+    /// Paged decode attention (M=1) reads a f16 KV cache through a page table. Both
+    /// the per-batch-positions (live path) and single-position variants must match a
+    /// host softmax reference that walks the same page_table -> physical_page -> offset
+    /// indirection. K/V are round-tripped through f16 so the reference uses the exact
+    /// f16 values the kernel sees. Uses GQA + a non-trivial (non-identity) page table.
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_paged_decode_attention_matches_reference() {
+        use crate::runtime::{DeviceBuffer, Stream};
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        #[allow(clippy::too_many_arguments)]
+        fn paged_ref(
+            q: &[f32],
+            kref: &[f32],
+            vref: &[f32],
+            page_table: &[u32],
+            positions: &[usize],
+            batch: usize,
+            heads: usize,
+            kv_heads: usize,
+            hd: usize,
+            page_size: usize,
+            page_table_len: usize,
+        ) -> Vec<f32> {
+            let scale = 1.0f64 / (hd as f64).sqrt();
+            let kvr = heads / kv_heads;
+            let slot = |phys: usize, kvh: usize, off: usize, d: usize| {
+                ((phys * kv_heads + kvh) * page_size + off) * hd + d
+            };
+            let mut out = vec![0.0f32; batch * heads * hd];
+            for b in 0..batch {
+                for h in 0..heads {
+                    let kvh = h / kvr;
+                    let pos = positions[b];
+                    let mut sc = vec![0.0f64; pos + 1];
+                    let mut mx = f64::NEG_INFINITY;
+                    for (s, sci) in sc.iter_mut().enumerate() {
+                        let phys = page_table[b * page_table_len + s / page_size] as usize;
+                        let off = s % page_size;
+                        let mut dot = 0.0f64;
+                        for d in 0..hd {
+                            dot += f64::from(q[(b * heads + h) * hd + d])
+                                * f64::from(kref[slot(phys, kvh, off, d)]);
+                        }
+                        *sci = dot * scale;
+                        mx = mx.max(*sci);
+                    }
+                    let mut sum = 0.0f64;
+                    for sci in sc.iter_mut() {
+                        *sci = (*sci - mx).exp();
+                        sum += *sci;
+                    }
+                    for d in 0..hd {
+                        let mut acc = 0.0f64;
+                        for (s, &sci) in sc.iter().enumerate() {
+                            let phys = page_table[b * page_table_len + s / page_size] as usize;
+                            acc += sci / sum * f64::from(vref[slot(phys, kvh, s % page_size, d)]);
+                        }
+                        out[(b * heads + h) * hd + d] = acc as f32;
+                    }
+                }
+            }
+            out
+        }
+
+        let stream = Stream::create().unwrap();
+        let mut rng = StdRng::seed_from_u64(0x9a6e_d01);
+        let (batch, heads, kv_heads, hd) = (2usize, 4usize, 2usize, 8usize);
+        let (page_size, page_table_len, num_phys) = (4usize, 2usize, 3usize);
+        let pages_elems = num_phys * kv_heads * page_size * hd;
+        // Non-identity mapping: batch 0 logical [0,1]->phys [2,0]; batch 1 ->[1,0].
+        let page_table: Vec<u32> = vec![2, 0, 1, 0];
+
+        let q: Vec<f32> = (0..batch * heads * hd)
+            .map(|_| rng.gen_range(-1.0f32..1.0))
+            .collect();
+        let kf: Vec<f32> = (0..pages_elems)
+            .map(|_| rng.gen_range(-1.0f32..1.0))
+            .collect();
+        let vf: Vec<f32> = (0..pages_elems)
+            .map(|_| rng.gen_range(-1.0f32..1.0))
+            .collect();
+
+        let q_dev = DeviceBuffer::alloc(q.len() * 4).unwrap();
+        q_dev.copy_from_host(&q).unwrap();
+        let pt_dev = DeviceBuffer::alloc(page_table.len() * 4).unwrap();
+        pt_dev.copy_from_host(&page_table).unwrap();
+
+        // K/V -> f16 pages (what the kernel reads), then f16 -> f32 for the reference.
+        let to_f16_pages = |src: &[f32]| {
+            let f32_dev = DeviceBuffer::alloc(pages_elems * 4).unwrap();
+            f32_dev.copy_from_host(src).unwrap();
+            let f16_dev = DeviceBuffer::alloc(pages_elems * 2).unwrap();
+            crate::kernels::launch_cast_f32_to_f16(&f32_dev, &f16_dev, pages_elems, &stream)
+                .unwrap();
+            let back = DeviceBuffer::alloc(pages_elems * 4).unwrap();
+            crate::kernels::launch_cast_f16_to_f32(&f16_dev, &back, pages_elems, &stream).unwrap();
+            (f16_dev, back)
+        };
+        let (k_pages, k_ref_dev) = to_f16_pages(&kf);
+        let (v_pages, v_ref_dev) = to_f16_pages(&vf);
+
+        let out_pos = DeviceBuffer::alloc(batch * heads * hd * 4).unwrap();
+        let positions: Vec<u32> = vec![6, 2];
+        let pos_dev = DeviceBuffer::alloc(positions.len() * 4).unwrap();
+        pos_dev.copy_from_host(&positions).unwrap();
+        crate::kernels::launch_tiled_paged_decode_attention_batched_positions(
+            &q_dev,
+            &k_pages,
+            &v_pages,
+            &pt_dev,
+            &pos_dev,
+            &out_pos,
+            batch,
+            page_size,
+            page_table_len,
+            heads,
+            kv_heads,
+            hd,
+            hd,
+            0,
+            &stream,
+        )
+        .unwrap();
+
+        let out_np = DeviceBuffer::alloc(batch * heads * hd * 4).unwrap();
+        let single_pos = 5usize;
+        crate::kernels::launch_tiled_paged_decode_attention_batched(
+            &q_dev,
+            &k_pages,
+            &v_pages,
+            &pt_dev,
+            &out_np,
+            batch,
+            single_pos,
+            page_size,
+            page_table_len,
+            heads,
+            kv_heads,
+            hd,
+            hd,
+            0,
+            &stream,
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+
+        let k_ref = k_ref_dev.copy_to_host::<f32>(pages_elems).unwrap();
+        let v_ref = v_ref_dev.copy_to_host::<f32>(pages_elems).unwrap();
+        let out_pos_h = out_pos.copy_to_host::<f32>(batch * heads * hd).unwrap();
+        let out_np_h = out_np.copy_to_host::<f32>(batch * heads * hd).unwrap();
+
+        let pos_usize: Vec<usize> = positions.iter().map(|&p| p as usize).collect();
+        let ref_pos = paged_ref(
+            &q,
+            &k_ref,
+            &v_ref,
+            &page_table,
+            &pos_usize,
+            batch,
+            heads,
+            kv_heads,
+            hd,
+            page_size,
+            page_table_len,
+        );
+        let ref_np = paged_ref(
+            &q,
+            &k_ref,
+            &v_ref,
+            &page_table,
+            &vec![single_pos; batch],
+            batch,
+            heads,
+            kv_heads,
+            hd,
+            page_size,
+            page_table_len,
+        );
+        for i in 0..batch * heads * hd {
+            assert!(
+                (out_pos_h[i] - ref_pos[i]).abs() <= 2.0e-3,
+                "paged positions [{i}]: {} vs {}",
+                out_pos_h[i],
+                ref_pos[i],
+            );
+            assert!(
+                (out_np_h[i] - ref_np[i]).abs() <= 2.0e-3,
+                "paged single-position [{i}]: {} vs {}",
+                out_np_h[i],
+                ref_np[i],
+            );
+        }
+    }
+
     /// The fused dequant->f16 prefill kernels must be byte-identical to the fallback
     /// dequant->f32 + cast_f32_to_f16 (both are __float2half of the same value). This
     /// is an exact check, so it catches any drift in the fused unpack.
