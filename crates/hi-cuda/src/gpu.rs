@@ -366,6 +366,12 @@ mod native {
         vectors: BTreeMap<String, GpuVector>,
         paged_batch_pool: RefCell<Option<CudaPagedBatchDevicePool>>,
         recurrent_page_states: RefCell<BTreeMap<usize, RecurrentSsmRequestState>>,
+        // Decode-path cache of the f16-dequantized output-head weight, keyed by matrix
+        // name. The lm_head never changes but is re-dequantized (e.g. Q6_K) to a
+        // vocab-wide output every token; caching it once removes that. Bounded to the
+        // output head so models with no dp4a-eligible weights don't cache the whole
+        // model in f16.
+        dequant_f16_cache: RefCell<BTreeMap<String, DeviceBuffer>>,
         // Per-generation forward-pass timing: (prefill_micros, decode_micros,
         // forward_count). The first forward after a reset is the (batched) prompt
         // prefill; every later forward is a per-token decode. Fed by ForwardTimer
@@ -2950,6 +2956,7 @@ mod native {
                 matrices,
                 vectors,
                 paged_batch_pool: RefCell::new(None),
+                dequant_f16_cache: RefCell::new(BTreeMap::new()),
                 recurrent_page_states: RefCell::new(BTreeMap::new()),
                 generation_timing: Cell::new((0, 0, 0)),
                 forward_in_progress: Cell::new(false),
@@ -3154,16 +3161,54 @@ mod native {
                     buffer: output,
                 });
             }
-            // Prefill (M>1): dequantize to f16 and use a tensor-core f16 GEMM instead
-            // of the f32 SGEMM (no tensor cores) — the quantized-weight prefill matmul
-            // path. Mirrors the native-f16 weight path; ~tensor-core throughput.
-            let dequantized = self
-                .dequantize_matrix_f32_device(matrix)
-                .with_context(|| format!("dequantizing CUDA matrix {matrix_name}"))?;
+            // Quantized weight matmul via tensor-core f16 GEMM. Dequantizing to f16 is
+            // expensive, so cache the f16 weight and reuse it — weights never change,
+            // avoiding re-dequantizing the Q6_K lm_head every token. Bounded to the
+            // output head (the single weight projecting to a vocab-wide output): a
+            // general per-weight cache would, on models with no dp4a-eligible weights
+            // (e.g. IQ4_NL), cache the whole model in f16 and OOM. Everything else
+            // dequantizes per-op (prefill M>1, and layer weights that miss dp4a).
             let weight_elements = matrix
                 .rows
                 .checked_mul(matrix.cols)
                 .context("CUDA quantized weight element count overflows usize")?;
+            let is_output_head = input.rows == 1
+                && self
+                    .config
+                    .vocab_size
+                    .and_then(|v| usize::try_from(v).ok())
+                    .map(|vocab| matrix.rows == vocab)
+                    .unwrap_or(false);
+            let output = if is_output_head {
+                if !self.dequant_f16_cache.borrow().contains_key(matrix_name) {
+                    let w = self.dequantize_matrix_to_f16(matrix, weight_elements)?;
+                    self.dequant_f16_cache
+                        .borrow_mut()
+                        .insert(matrix_name.to_string(), w);
+                }
+                let cache = self.dequant_f16_cache.borrow();
+                let weight_f16 = cache
+                    .get(matrix_name)
+                    .expect("cached f16 weight just inserted");
+                self.matmul_input_f16_weight(input, weight_f16, matrix)?
+            } else {
+                let weight_f16 = self.dequantize_matrix_to_f16(matrix, weight_elements)?;
+                self.matmul_input_f16_weight(input, &weight_f16, matrix)?
+            };
+            Ok(GpuF32Tensor {
+                rows: input.rows,
+                cols: matrix.rows,
+                buffer: output,
+            })
+        }
+
+        /// Dequantize a quantized weight matrix to f16 (dequant -> f32 -> cast f16).
+        fn dequantize_matrix_to_f16(
+            &self,
+            matrix: &GpuMatrix,
+            weight_elements: usize,
+        ) -> Result<DeviceBuffer> {
+            let dequantized = self.dequantize_matrix_f32_device(matrix)?;
             let weight_f16 = DeviceBuffer::alloc(weight_elements * std::mem::size_of::<u16>())
                 .context("allocating CUDA f16 weight scratch")?;
             crate::kernels::launch_cast_f32_to_f16(
@@ -3172,6 +3217,17 @@ mod native {
                 weight_elements,
                 &self.stream,
             )?;
+            Ok(weight_f16)
+        }
+
+        /// Cast the input to f16 and run the tensor-core f16 GEMM against an already-f16
+        /// weight, returning the f32 output buffer.
+        fn matmul_input_f16_weight(
+            &self,
+            input: &GpuF32Tensor,
+            weight_f16: &DeviceBuffer,
+            matrix: &GpuMatrix,
+        ) -> Result<DeviceBuffer> {
             let input_elements = input
                 .rows
                 .checked_mul(input.cols)
@@ -3192,7 +3248,7 @@ mod native {
                 .context("allocating CUDA quantized projection output")?;
             self.cublas.matmul_mixed_rhs_transposed_row_major(
                 &input_f16,
-                &weight_f16,
+                weight_f16,
                 &output,
                 input.rows,
                 matrix.rows,
@@ -3201,11 +3257,7 @@ mod native {
                 GemmDType::F16,
             )?;
             self.op_barrier()?;
-            Ok(GpuF32Tensor {
-                rows: input.rows,
-                cols: matrix.rows,
-                buffer: output,
-            })
+            Ok(output)
         }
 
         fn dequantize_matrix_f32_device(&self, matrix: &GpuMatrix) -> Result<DeviceBuffer> {
