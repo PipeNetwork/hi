@@ -237,11 +237,12 @@ async fn main() -> Result<()> {
         ),
         None => Agent::new(provider, agent_config),
     };
-    // Attach the write-`delegate` subagent runner — only for a top-level agent
-    // (a subagent can't delegate) when write subagents are enabled. It spawns a
-    // `hi --subagent` child in an isolated worktree and applies only verified diffs.
-    if (settings.write_subagents || std::env::var_os("HI_WRITE_SUBAGENTS").is_some())
-        && !cli.subagent
+    // Attach the write-`delegate` subagent runner for any top-level agent (a
+    // subagent can't delegate), regardless of whether write subagents start on —
+    // so `/delegate on` can enable it at runtime. The tool stays gated by the
+    // `write_subagents` advertisement; the runner just needs to be ready. It spawns
+    // a `hi --subagent` child in an isolated worktree and applies only verified diffs.
+    if !cli.subagent
         && let Ok(exe) = std::env::current_exe()
     {
         let runner = delegate::CliDelegateRunner::new(

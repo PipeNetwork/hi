@@ -99,23 +99,7 @@ impl crate::Agent {
         } else {
             hi_tools::set_lsp_manager(mgr);
         }
-        let tools = if config.minimal_tools {
-            hi_tools::MINIMAL_TOOL_SPECS.clone().into()
-        } else {
-            // The subagent tools (`explore`, `delegate`) are kept out of the global
-            // TOOL_SPECS and injected here only for a top-level agent — never for a
-            // subagent child, so a subagent can't spawn another (depth ≤ 1).
-            let mut specs = TOOL_SPECS.clone();
-            if !config.is_subagent {
-                if config.explore_subagents {
-                    specs.push(hi_tools::explore_tool_spec());
-                }
-                if config.write_subagents {
-                    specs.push(hi_tools::delegate_tool_spec());
-                }
-            }
-            specs.into()
-        };
+        let tools = advertised_tools(&config);
         Self {
             provider,
             config,
@@ -173,6 +157,19 @@ impl crate::Agent {
     /// one, the `delegate` tool reports itself unavailable.
     pub fn set_delegate_runner(&mut self, runner: std::sync::Arc<dyn crate::DelegateRunner>) {
         self.delegate_runner = Some(runner);
+    }
+
+    /// Turn the write-capable `delegate` subagent on/off at runtime (the `/delegate`
+    /// command) — re-advertises the tool set accordingly. A [`DelegateRunner`] must
+    /// be attached for it to actually run.
+    pub fn set_write_subagents(&mut self, on: bool) {
+        self.config.write_subagents = on;
+        self.tools = advertised_tools(&self.config);
+    }
+
+    /// Whether the `delegate` subagent is currently advertised.
+    pub fn write_subagents_enabled(&self) -> bool {
+        self.config.write_subagents
     }
 
     /// The current conversation history (including the system prompt).
@@ -754,4 +751,24 @@ impl crate::Agent {
     pub(crate) fn messages_mut(&mut self) -> &mut Vec<Message> {
         self.messages.mutate_slice()
     }
+}
+
+/// The tool set an agent advertises for its config: the minimal or full set, plus
+/// the `explore`/`delegate` subagent tools when enabled for a top-level agent
+/// (never a subagent — depth ≤ 1). Shared by construction and the runtime
+/// `/delegate` toggle.
+fn advertised_tools(config: &AgentConfig) -> std::sync::Arc<[hi_ai::ToolSpec]> {
+    if config.minimal_tools {
+        return hi_tools::MINIMAL_TOOL_SPECS.clone().into();
+    }
+    let mut specs = TOOL_SPECS.clone();
+    if !config.is_subagent {
+        if config.explore_subagents {
+            specs.push(hi_tools::explore_tool_spec());
+        }
+        if config.write_subagents {
+            specs.push(hi_tools::delegate_tool_spec());
+        }
+    }
+    specs.into()
 }

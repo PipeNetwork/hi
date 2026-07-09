@@ -497,6 +497,29 @@ impl crate::App {
                     }
                 }
             }
+            Command::Delegate(arg) => {
+                let msg = match arg.trim() {
+                    "on" => {
+                        agent.set_write_subagents(true);
+                        "delegate enabled — the model can hand a self-contained subtask to a \
+                         worktree-isolated subagent whose changes are kept only if they verify."
+                            .to_string()
+                    }
+                    "off" => {
+                        agent.set_write_subagents(false);
+                        "delegate disabled.".to_string()
+                    }
+                    _ => format!(
+                        "delegate is {} (off by default; `/delegate on` to enable).",
+                        if agent.write_subagents_enabled() {
+                            "on"
+                        } else {
+                            "off"
+                        }
+                    ),
+                };
+                self.push(Line::styled(msg, dim()));
+            }
             Command::Export(arg) => {
                 let path = if arg.trim().is_empty() {
                     "transcript.md"

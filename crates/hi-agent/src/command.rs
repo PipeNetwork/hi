@@ -21,6 +21,9 @@ pub enum Command {
     Status,
     /// Toggle or query the LSP subsystem. Arg: `on`, `off`, or empty (status).
     Lsp(String),
+    /// Toggle or query the write-capable `delegate` subagent. Arg: `on`, `off`,
+    /// or empty (status).
+    Delegate(String),
     /// Expanded read-only slash prompt macro that should run as a model turn.
     Prompt(String),
     /// Write a debug/event log for the current session.
@@ -115,6 +118,7 @@ pub fn parse(line: &str) -> Option<Command> {
         "mcp" => Command::Mcp,
         "hf" | "hd" | "huggingface" => Command::Hf(arg),
         "lsp" => Command::Lsp(arg),
+        "delegate" | "delegates" => Command::Delegate(arg),
         "exit" | "quit" | "q" => Command::Quit,
         other => Command::Unknown(other.to_string()),
     })
@@ -397,6 +401,16 @@ pub const COMMANDS: &[CommandSpec] = &[
         ],
     },
     CommandSpec {
+        name: "delegate",
+        args: "[on|off|status]",
+        help: "toggle the write-capable delegate subagent (off by default)",
+        arg_values: &[
+            ("on", "let the model delegate implementation subtasks"),
+            ("off", "disable delegate"),
+            ("status", "show whether delegate is on"),
+        ],
+    },
+    CommandSpec {
         name: "status",
         args: "[topic]",
         help: "show runtime status, or discuss codebase status with a topic",
@@ -672,6 +686,13 @@ mod tests {
         assert_eq!(parse("/lsp"), Some(Command::Lsp(String::new())));
         assert_eq!(parse("/lsp on"), Some(Command::Lsp("on".into())));
         assert_eq!(parse("/lsp off"), Some(Command::Lsp("off".into())));
+        // `/delegate` toggles the write subagent.
+        assert_eq!(parse("/delegate"), Some(Command::Delegate(String::new())));
+        assert_eq!(parse("/delegate on"), Some(Command::Delegate("on".into())));
+        assert_eq!(
+            parse("/delegate off"),
+            Some(Command::Delegate("off".into()))
+        );
         assert_eq!(
             parse("/hf search llama"),
             Some(Command::Hf("search llama".into()))
