@@ -116,6 +116,11 @@ pub struct Cli {
     #[arg(long)]
     pub list_sessions: bool,
 
+    /// Run the headless `/loop` daemon: keep this project's loops firing (and
+    /// auto-fixing) in the background, without the TUI, until Ctrl-C.
+    #[arg(long)]
+    pub loops_daemon: bool,
+
     /// Use the plain line-based REPL instead of the full-screen TUI.
     #[arg(long)]
     pub plain: bool,

@@ -219,11 +219,29 @@ real change: `/loop on 3 notify-send "CI is red"`. It runs via `sh -c` only on a
 another `hi -p "…"` to kick off a fix. `/loop on 3 off` clears it. (The command is yours and runs
 with your shell's privileges — treat it like a git hook.)
 
+**Auto-fix — a watcher that repairs.** Take the trigger idea to its conclusion: `/loop fix 3 on`
+makes loop #3, on a loud change, dispatch a **worktree-isolated agent to fix the problem** — and
+merge the fix into your tree **only if it passes your verify command** (`/verify`). It's the fleet's
+detect→fix→verify→merge cycle, driven by a watcher: *"watch CI; when it goes red, an agent fixes it
+and the fix lands only if it's green."* Guardrails are the point — an unverified change is never
+merged (no verify command → the fix is reported but not applied), one fix runs per loop at a time,
+and every attempt (`fixed & merged …` / `changed but NOT merged — …`) lands in the transcript and the
+digest. `/loop fix 3 off` disables it.
+
 **Digest — what changed while you were away.** Loops write every loud event (a change they found, a
-budget pause, an expiry) to a per-project activity feed that survives restarts. `/digest` shows it
-grouped by loop — how many changes each noticed and the most recent, with a `•` on everything new
-since you last looked. Start `hi` after leaving loops running and you'll see a one-line
-`⟳ N loop change(s) since you last looked — /digest to review` nudge.
+budget pause, an expiry) to a per-project activity feed that survives restarts — and so do **fleet
+rows** (verified merges, combined-tree verify failures, goal completions). `/digest` shows the feed
+grouped by source (each loop, each fleet row) — how many changes each produced and the most recent,
+with a `•` on everything new since you last looked. Start `hi` after leaving work running and you'll
+see a one-line `⟳ N loop change(s) since you last looked — /digest to review` nudge. It's one pane
+for everything autonomous that happened.
+
+**Daemon — keep firing when the terminal's closed.** Loops only fire while a `hi` is running. Run
+`hi --loops-daemon` to keep this project's loops firing (and auto-fixing) headless in the background,
+logging each change, until you `Ctrl-C` (or `kill`) it. A per-project lock guarantees exactly one
+firer — the daemon and a TUI never both fire the same loops; whichever starts second reads the shared
+feed instead (`/digest`) and says so. Set your loops up in the TUI, close it, `hi --loops-daemon &`,
+and come back later to `/digest` what it caught.
 
 ## Sessions
 
@@ -249,7 +267,7 @@ Slash commands (TUI or plain REPL):
 | `/diff` | show what files have changed this session (`git diff` + new files) |
 | `/copy [all]` | copy the last assistant response to the terminal clipboard; `all` copies the transcript |
 | `/goal [obj\|pause\|resume\|limit N\|clear]` | set a long-horizon goal: a planner model decomposes it into sub-goals the agent then **drives autonomously turn after turn** (your input always takes priority; Esc pauses). `pause`/`resume` hold and continue; `limit N` caps plan growth (unbounded by default) |
-| `/loop <interval> <prompt>` | the same prompt, on a cadence (60s–7d: `90s`, `30m`, `2h`, `1d`): each firing is a **full agent turn** that remembers previous checks and reports only what changed. `/loop list`, `/loop cancel <id>`, `/loop pause\|resume <id>`, `/loop budget <id> <count\|off>` (token cap → auto-pause), `/loop on <id> <cmd\|off>` (run a shell command on each change, `$HI_LOOP_SUMMARY` in env); loops auto-expire after 7 days |
+| `/loop <interval> <prompt>` | the same prompt, on a cadence (60s–7d: `90s`, `30m`, `2h`, `1d`): each firing is a **full agent turn** that remembers previous checks and reports only what changed. `/loop list`, `/loop cancel <id>`, `/loop pause\|resume <id>`, `/loop budget <id> <count\|off>` (token cap → auto-pause), `/loop on <id> <cmd\|off>` (run a shell command on each change, `$HI_LOOP_SUMMARY` in env), `/loop fix <id> <on\|off>` (dispatch a verify-gated auto-fix on a loud change); loops auto-expire after 7 days |
 | `/watch` | full-screen live dashboard of all active loops: per-loop countdowns, firing spinners, last result, token spend, and recent history — with `f` fire-now, `p` pause, `c` cancel, `n` arm a new loop |
 | `/digest` (`/activity`) | what your loops have noticed, grouped by loop, with what's new since you last looked (a persisted, cross-restart feed of every loud change) |
 | `/dashboard` (`/fleet`) | control a fleet, not an agent: dispatch, monitor, and steer multiple concurrent sessions — each in its own git worktree with verified diffs auto-merging back; `/fleet status` lists this project's resumable fleet sessions ([docs](docs/fleet-dashboard.md)) |

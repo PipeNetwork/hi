@@ -161,11 +161,45 @@ pub async fn run(
     let mut ticker = tokio::time::interval(TICK);
     // The /loop manager: timers + firings in a background task (it never
     // touches the Agent); persisted loops re-arm now. Results drain on ticks.
+    // Only start it if we can take the per-project fire-lock — otherwise a
+    // background daemon (or another TUI) already owns firing, and starting a
+    // second manager would double-fire every loop. Held for the session.
     let fleet_launcher = std::sync::Arc::new(fleet_launcher);
-    app.loops = Some(crate::loops::start(
-        fleet_launcher.clone(),
-        fleet_launcher.loops_file.clone(),
-    ));
+    let _fire_lock;
+    match &fleet_launcher.loops_file {
+        Some(lf) => {
+            let lp = crate::lock::lock_path(lf);
+            match crate::lock::try_acquire(&lp) {
+                Some(guard) => {
+                    _fire_lock = Some(guard);
+                    app.loops = Some(crate::loops::start(
+                        fleet_launcher.clone(),
+                        fleet_launcher.loops_file.clone(),
+                    ));
+                }
+                None => {
+                    _fire_lock = None;
+                    let who = crate::lock::live_holder(&lp)
+                        .map(|p| format!(" (pid {p})"))
+                        .unwrap_or_default();
+                    app.push(Line::styled(
+                        format!(
+                            "⟳ loops are firing in a daemon{who} — /digest shows results; stop it to manage loops here"
+                        ),
+                        Style::default().fg(Color::Cyan),
+                    ));
+                }
+            }
+        }
+        None => {
+            // No persisted loops location: run the manager unlocked.
+            _fire_lock = None;
+            app.loops = Some(crate::loops::start(
+                fleet_launcher.clone(),
+                fleet_launcher.loops_file.clone(),
+            ));
+        }
+    }
     // "While you were away": if loops noticed changes since you last looked,
     // nudge you toward /digest (which shows and then clears the marker).
     if let Some(lf) = &fleet_launcher.loops_file {
@@ -982,6 +1016,14 @@ pub async fn run(
                 }
                 // `/loop`: recurring agent turns on a cadence (manager task).
                 Command::Loop(arg) => {
+                    if app.loops.is_none() {
+                        app.push(Line::styled(
+                            "loops are managed by a background daemon — stop it to manage them here, or use /digest to see what they've noticed".to_string(),
+                            dim(),
+                        ));
+                        app.follow();
+                        continue;
+                    }
                     match command::parse_loop_arg(&arg) {
                         command::LoopArg::Create { secs, prompt } => {
                             if let Some(loops) = &app.loops {
@@ -1072,8 +1114,13 @@ pub async fn run(
                                                 ),
                                                 None => String::new(),
                                             };
-                                            let trig =
-                                                if l.trigger.is_some() { " · ⚡" } else { "" };
+                                            let mut marks = String::new();
+                                            if l.trigger.is_some() {
+                                                marks.push_str(" · ⚡");
+                                            }
+                                            if l.autofix {
+                                                marks.push_str(" · ⚒");
+                                            }
                                             app.push(Line::styled(
                                                 format!(
                                                     "  #{} every {} · {} · {} firing(s){}{} · expires {}h · {}",
@@ -1082,7 +1129,7 @@ pub async fn run(
                                                     next,
                                                     l.firings,
                                                     cost,
-                                                    trig,
+                                                    marks,
                                                     expires_h,
                                                     l.name(),
                                                 ),
@@ -1164,6 +1211,38 @@ pub async fn run(
                                     ),
                                 };
                                 app.push(Line::styled(msg.0, Style::default().fg(msg.1)));
+                            }
+                        }
+                        command::LoopArg::Fix { id, on } => {
+                            if let Some(loops) = &app.loops {
+                                let (tx, rx) = tokio::sync::oneshot::channel();
+                                let _ = loops.ctl.send(crate::loops::LoopCtl::Fix {
+                                    id,
+                                    on,
+                                    reply: tx,
+                                });
+                                let no_verify = on && fleet_launcher.verify.is_none();
+                                let msg = match rx.await {
+                                    Ok(true) if on => (
+                                        format!(
+                                            "✓ loop#{id} auto-fix on — a loud change dispatches a verified fix"
+                                        ),
+                                        Color::Green,
+                                    ),
+                                    Ok(true) => (format!("✓ loop#{id} auto-fix off"), Color::Green),
+                                    _ => (
+                                        format!("no loop#{id} — /loop list shows ids"),
+                                        Color::Yellow,
+                                    ),
+                                };
+                                app.push(Line::styled(msg.0, Style::default().fg(msg.1)));
+                                if no_verify {
+                                    app.push(Line::styled(
+                                        "  note: no verify command set — fixes won't auto-merge until you /verify <cmd>"
+                                            .to_string(),
+                                        dim(),
+                                    ));
+                                }
                             }
                         }
                         command::LoopArg::Invalid(msg) => {
@@ -1274,6 +1353,14 @@ pub async fn run(
                 // over the same terminal/input/ticker; the loop manager keeps
                 // firing throughout, and closing it returns to the chat.
                 Command::Watch => {
+                    if app.loops.is_none() {
+                        app.push(Line::styled(
+                            "loops are managed by a background daemon — /digest shows what they've noticed; stop the daemon to watch them live here".to_string(),
+                            dim(),
+                        ));
+                        app.follow();
+                        continue;
+                    }
                     crate::watch::run_watch(&mut terminal, &mut input_rx, &mut ticker, &mut app)
                         .await?;
                     // Surface anything the loops reported while we were watching.
@@ -1335,10 +1422,7 @@ pub async fn run(
                                     String::new()
                                 };
                                 app.push(Line::styled(
-                                    format!(
-                                        "  loop#{} {} — {} change(s){}",
-                                        g.loop_id, g.source, g.count, fresh_note
-                                    ),
+                                    format!("  {} — {} change(s){}", g.source, g.count, fresh_note),
                                     Style::default().add_modifier(ratatui::style::Modifier::BOLD),
                                 ));
                                 for (at, text, is_fresh) in &g.recent {

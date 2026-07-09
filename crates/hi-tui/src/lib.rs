@@ -8,9 +8,12 @@
 
 mod activity;
 mod app;
+mod daemon;
 mod dashboard;
+mod lock;
 mod loops;
 pub use app::run;
+pub use daemon::run_loops_daemon;
 mod completion;
 mod event;
 mod input;

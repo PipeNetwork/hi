@@ -101,9 +101,9 @@ pub(crate) fn save_seen(path: &Path, at_ms: u64) {
     let _ = std::fs::write(path, at_ms.to_string());
 }
 
-/// One loop's rolled-up activity for the digest.
-pub(crate) struct LoopDigest {
-    pub(crate) loop_id: u64,
+/// One source's rolled-up activity for the digest (a loop, a fleet row, goal…).
+pub(crate) struct SourceDigest {
+    /// The grouping key + display label ("loop#3 check CI", "fleet#5 …", "goal").
     pub(crate) source: String,
     /// Number of events in the window.
     pub(crate) count: usize,
@@ -113,17 +113,19 @@ pub(crate) struct LoopDigest {
     pub(crate) recent: Vec<(u64, String, bool)>,
 }
 
-/// Group the feed by loop for display: only entries at/after `since_ms` are
-/// included; `seen_ms` marks which of those are new. Groups are ordered by most
-/// recent activity first. Returns `(groups, total_in_window, total_fresh)`.
+/// Group the feed by source for display: only entries at/after `since_ms` are
+/// included; `seen_ms` marks which of those are new. Grouping by the `source`
+/// string keeps loops, fleet rows, and goal distinct in one feed. Groups are
+/// ordered by most recent activity first. Returns `(groups, total, total_fresh)`.
 pub(crate) fn digest(
     entries: &[ActivityEntry],
     since_ms: u64,
     seen_ms: u64,
-    recent_per_loop: usize,
-) -> (Vec<LoopDigest>, usize, usize) {
-    let mut order: Vec<u64> = Vec::new();
-    let mut groups: std::collections::HashMap<u64, LoopDigest> = std::collections::HashMap::new();
+    recent_per_source: usize,
+) -> (Vec<SourceDigest>, usize, usize) {
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: std::collections::HashMap<String, SourceDigest> =
+        std::collections::HashMap::new();
     let mut total = 0usize;
     let mut total_fresh = 0usize;
     for e in entries.iter().filter(|e| e.at_ms >= since_ms) {
@@ -132,10 +134,9 @@ pub(crate) fn digest(
         if fresh {
             total_fresh += 1;
         }
-        let g = groups.entry(e.loop_id).or_insert_with(|| {
-            order.push(e.loop_id);
-            LoopDigest {
-                loop_id: e.loop_id,
+        let g = groups.entry(e.source.clone()).or_insert_with(|| {
+            order.push(e.source.clone());
+            SourceDigest {
                 source: e.source.clone(),
                 count: 0,
                 fresh: 0,
@@ -146,17 +147,16 @@ pub(crate) fn digest(
         if fresh {
             g.fresh += 1;
         }
-        g.source = e.source.clone();
         g.recent.push((e.at_ms, e.text.clone(), fresh));
     }
     // Newest-first recents, capped; groups ordered by their latest event.
     for g in groups.values_mut() {
         g.recent.reverse();
-        g.recent.truncate(recent_per_loop);
+        g.recent.truncate(recent_per_source);
     }
-    let mut out: Vec<LoopDigest> = order
+    let mut out: Vec<SourceDigest> = order
         .into_iter()
-        .filter_map(|id| groups.remove(&id))
+        .filter_map(|s| groups.remove(&s))
         .collect();
     out.sort_by(|a, b| {
         let (la, lb) = (
@@ -214,14 +214,37 @@ mod tests {
         assert_eq!(total, 4);
         assert_eq!(fresh, 2);
         // loop#3 sorts first (its latest event 2500 > loop#5's 1500).
-        assert_eq!(groups[0].loop_id, 3);
+        assert_eq!(groups[0].source, "loop#3");
         assert_eq!(groups[0].count, 3);
         assert_eq!(groups[0].fresh, 2);
         // Newest-first recents.
         assert_eq!(groups[0].recent[0].1, "CI red again");
         assert!(groups[0].recent[0].2, "newest is fresh");
-        assert_eq!(groups[1].loop_id, 5);
+        assert_eq!(groups[1].source, "loop#5");
         assert_eq!(groups[1].fresh, 0);
+    }
+
+    #[test]
+    fn digest_keeps_distinct_sources_separate() {
+        // A loop and a fleet row sharing the numeric id 3 must NOT merge — the
+        // whole point of grouping the unified feed by the `source` string.
+        let entries = vec![
+            ActivityEntry {
+                at_ms: 1000,
+                loop_id: 3,
+                source: "loop#3 watch CI".into(),
+                text: "CI red".into(),
+            },
+            ActivityEntry {
+                at_ms: 2000,
+                loop_id: 0,
+                source: "fleet#3 port module".into(),
+                text: "merged 2 files".into(),
+            },
+        ];
+        let (groups, total, _) = digest(&entries, 0, 0, 3);
+        assert_eq!(total, 2);
+        assert_eq!(groups.len(), 2, "loop#3 and fleet#3 stay distinct");
     }
 
     #[test]

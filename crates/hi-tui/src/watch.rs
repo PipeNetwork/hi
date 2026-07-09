@@ -285,6 +285,15 @@ async fn arm_from_compose(ctl: &mpsc::UnboundedSender<LoopCtl>, text: String) ->
                 _ => format!("no loop#{id}"),
             })
         }
+        hi_agent::command::LoopArg::Fix { id, on } => {
+            let (tx, rx) = oneshot::channel();
+            let _ = ctl.send(LoopCtl::Fix { id, on, reply: tx });
+            Some(match (rx.await, on) {
+                (Ok(true), true) => format!("loop#{id} auto-fix on"),
+                (Ok(true), false) => format!("loop#{id} auto-fix off"),
+                _ => format!("no loop#{id}"),
+            })
+        }
         hi_agent::command::LoopArg::List => None,
         hi_agent::command::LoopArg::Invalid(msg) => Some(msg),
     }
@@ -428,6 +437,7 @@ fn render_table(frame: &mut ratatui::Frame, rows: &[LoopWatchRow], selected: usi
         };
 
         let (last, last_style) = match &row.last_summary {
+            _ if row.fixing => ("⚒ fixing…".to_string(), Style::default().fg(Color::Magenta)),
             _ if row.firing => ("checking…".to_string(), Style::default().fg(Color::Yellow)),
             Some(_) if row.last_quiet => ("· nothing new".to_string(), dim()),
             Some(s) => (truncate(s, 60), Style::default().fg(Color::White)),
@@ -459,6 +469,9 @@ fn render_table(frame: &mut ratatui::Frame, rows: &[LoopWatchRow], selected: usi
         ];
         if row.trigger.is_some() {
             spans.push(Span::styled("⚡ ", Style::default().fg(Color::Magenta)));
+        }
+        if row.autofix {
+            spans.push(Span::styled("⚒ ", Style::default().fg(Color::Magenta)));
         }
         spans.push(Span::styled(
             last,
@@ -560,6 +573,25 @@ fn render_peek(
         }
         lines.push(Line::from(trig));
     }
+    // Auto-fix status + its last outcome.
+    if row.autofix {
+        let mut fix = vec![Span::styled(
+            "⚒ auto-fix: on",
+            Style::default().fg(Color::Magenta),
+        )];
+        if row.fixing {
+            fix.push(Span::styled(
+                "  · fixing now…",
+                Style::default().fg(Color::Yellow),
+            ));
+        } else if let Some(out) = &row.last_fix {
+            fix.push(Span::styled(
+                format!("  (last: {})", truncate(out, 44)),
+                dim(),
+            ));
+        }
+        lines.push(Line::from(fix));
+    }
     lines.push(Line::raw(""));
 
     if row.firing {
@@ -619,7 +651,7 @@ fn render_hints(frame: &mut ratatui::Frame, focus: Focus, area: Rect) {
             "↑↓ select · f fire · p pause · c cancel · n arm · PgUp/Dn history · Esc close"
         }
         Focus::Compose => {
-            "type <interval> <prompt> · pause|resume|budget|on <id> … · Enter · Esc/Tab back"
+            "type <interval> <prompt> · pause|resume|budget|on|fix <id> … · Enter · Esc/Tab back"
         }
     };
     frame.render_widget(
@@ -722,6 +754,9 @@ mod tests {
                 spent_tokens: 123_000,
                 trigger: Some("notify-send 'CI red'".into()),
                 last_trigger: Some("ok".into()),
+                autofix: true,
+                fixing: false,
+                last_fix: Some("fixed & merged 1 file(s): parser.rs".into()),
                 last_summary: Some("CI went red: 3 parser test failures".into()),
                 last_quiet: false,
                 last_fired_ms: now.saturating_sub(120_000),
@@ -753,6 +788,9 @@ mod tests {
                 spent_tokens: 0,
                 trigger: None,
                 last_trigger: None,
+                autofix: false,
+                fixing: false,
+                last_fix: None,
                 last_summary: None,
                 last_quiet: false,
                 last_fired_ms: 0,
@@ -791,6 +829,9 @@ mod tests {
         assert!(s.contains("⚡"), "trigger marker\n{s}");
         assert!(s.contains("on change:"), "peek trigger line\n{s}");
         assert!(s.contains("notify-send"), "peek trigger command\n{s}");
+        // Auto-fix marker + peek line.
+        assert!(s.contains("⚒"), "auto-fix marker\n{s}");
+        assert!(s.contains("auto-fix: on"), "peek auto-fix line\n{s}");
         // List-focus hints.
         assert!(s.contains("p pause"), "hints show pause\n{s}");
     }
@@ -813,6 +854,9 @@ mod tests {
             spent_tokens: 200_000,
             trigger: None,
             last_trigger: None,
+            autofix: false,
+            fixing: false,
+            last_fix: None,
             last_summary: Some("build still green".into()),
             last_quiet: true,
             last_fired_ms: now.saturating_sub(60_000),
