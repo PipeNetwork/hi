@@ -289,6 +289,17 @@ async fn main() -> Result<()> {
         max_verify: cli.max_verify,
         max_steps: cli.max_steps.unwrap_or(60),
         session_path: Box::new(session::new_fleet_session_path),
+        sessions: Box::new(|| {
+            session::fleet_sessions()
+                .into_iter()
+                .map(|s| hi_tui::FleetSessionInfo {
+                    id: s.id,
+                    title: s.title,
+                    age: s.age,
+                    lines: s.lines,
+                })
+                .collect()
+        }),
     };
 
     if let Some(mut prompt) = prompt_input {

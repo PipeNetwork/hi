@@ -70,8 +70,9 @@ pub enum Command {
     /// Discover/list/download Hugging Face Hub model artifacts.
     Hf(String),
     /// Open the fleet dashboard: dispatch, monitor, and steer multiple
-    /// concurrent agent sessions from one screen (TUI only).
-    Dashboard,
+    /// concurrent agent sessions from one screen (TUI only). Arg: empty opens
+    /// the dashboard; `status` lists this project's resumable fleet sessions.
+    Dashboard(String),
     Quit,
     /// A `/word` that isn't recognized.
     Unknown(String),
@@ -122,7 +123,7 @@ pub fn parse(line: &str) -> Option<Command> {
         "hf" | "hd" | "huggingface" => Command::Hf(arg),
         "lsp" => Command::Lsp(arg),
         "delegate" | "delegates" => Command::Delegate(arg),
-        "dashboard" | "fleet" => Command::Dashboard,
+        "dashboard" | "fleet" => Command::Dashboard(arg),
         "exit" | "quit" | "q" => Command::Quit,
         other => Command::Unknown(other.to_string()),
     })
@@ -471,9 +472,9 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "dashboard",
-        args: "",
+        args: "[status]",
         help: "control a fleet: dispatch, monitor, and steer multiple agents (TUI)",
-        arg_values: &[],
+        arg_values: &[("status", "list this project's resumable fleet sessions")],
     },
     CommandSpec {
         name: "status",
@@ -755,8 +756,12 @@ mod tests {
         assert_eq!(parse("/lsp on"), Some(Command::Lsp("on".into())));
         assert_eq!(parse("/lsp off"), Some(Command::Lsp("off".into())));
         // `/delegate` toggles the write subagent.
-        assert_eq!(parse("/dashboard"), Some(Command::Dashboard));
-        assert_eq!(parse("/fleet"), Some(Command::Dashboard));
+        assert_eq!(parse("/dashboard"), Some(Command::Dashboard(String::new())));
+        assert_eq!(parse("/fleet"), Some(Command::Dashboard(String::new())));
+        assert_eq!(
+            parse("/fleet status"),
+            Some(Command::Dashboard("status".into()))
+        );
         assert_eq!(parse("/delegate"), Some(Command::Delegate(String::new())));
         assert_eq!(parse("/delegate on"), Some(Command::Delegate("on".into())));
         assert_eq!(

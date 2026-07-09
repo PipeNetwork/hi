@@ -39,7 +39,9 @@ row's own session file — so anything you dispatch is individually resumable la
    current tree (refused while it has unmerged changes).
 
 Failed, killed, or abandoned rows never touch your tree. Worktrees are cleaned on row close
-and TUI exit; sessions always persist.
+and TUI exit; sessions always persist — `/fleet status` lists this project's resumable fleet
+sessions (id, age, size, dispatch prompt), and `hi --resume <id>` reopens any of them as a
+normal chat session. Works in the plain REPL too.
 
 ## Goal-driven rows
 

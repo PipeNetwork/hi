@@ -257,11 +257,26 @@ pub(crate) fn handle_command(
         Command::Delegate(arg) => {
             handle_delegate_command(agent, &arg);
         }
-        Command::Dashboard => {
-            println!(
-                "\x1b[33m/dashboard is only available in the full-screen TUI (run hi without --plain)\x1b[0m"
-            );
-        }
+        Command::Dashboard(arg) => match arg.trim() {
+            "status" | "sessions" | "ls" => {
+                let sessions = crate::session::fleet_sessions();
+                if sessions.is_empty() {
+                    println!("\x1b[2mno fleet sessions in this project yet\x1b[0m");
+                } else {
+                    println!("\x1b[1;35mfleet sessions ({}):\x1b[0m", sessions.len());
+                    for s in sessions.iter().take(20) {
+                        println!(
+                            "\x1b[2m  {}  {:>8} \u{b7} {:>4} lines \u{b7} {}\x1b[0m",
+                            s.id, s.age, s.lines, s.title
+                        );
+                    }
+                    println!("\x1b[2mresume one with: hi --resume <id>\x1b[0m");
+                }
+            }
+            _ => println!(
+                "\x1b[33m/dashboard is only available in the full-screen TUI (run hi without --plain); /fleet status works here\x1b[0m"
+            ),
+        },
     }
     false
 }

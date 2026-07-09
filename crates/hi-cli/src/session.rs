@@ -297,6 +297,83 @@ pub fn new_session_path() -> Result<PathBuf> {
     Ok(dir.join(format!("{millis:013}.jsonl")))
 }
 
+/// A resumable fleet session (for the `/fleet status` view).
+pub struct FleetSessionInfo {
+    /// The resume id (file stem, e.g. `1783605123456-f0`).
+    pub id: String,
+    /// First user prompt, cleaned (the row's dispatch text).
+    pub title: String,
+    /// Humanized age ("3m ago", "2h ago").
+    pub age: String,
+    /// Session length in lines (rough size signal).
+    pub lines: usize,
+}
+
+/// The current project's fleet sessions (dispatched from `/dashboard`), newest
+/// first. Fleet sessions are recognizable by the `-f<n>` stem suffix.
+pub fn fleet_sessions() -> Vec<FleetSessionInfo> {
+    sessions_dir()
+        .map(|dir| fleet_sessions_in(&dir))
+        .unwrap_or_default()
+}
+
+fn fleet_sessions_in(dir: &Path) -> Vec<FleetSessionInfo> {
+    let Ok(read) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut entries: Vec<(PathBuf, SystemTime)> = read
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension().is_some_and(|ext| ext == "jsonl")
+                && p.file_stem()
+                    .and_then(|s| s.to_str())
+                    .is_some_and(is_fleet_stem)
+        })
+        .map(|p| {
+            let modified = fs::metadata(&p)
+                .and_then(|m| m.modified())
+                .unwrap_or(UNIX_EPOCH);
+            (p, modified)
+        })
+        .collect();
+    entries.sort_by_key(|e| std::cmp::Reverse(e.1));
+    let now = SystemTime::now();
+    entries
+        .into_iter()
+        .map(|(path, modified)| {
+            let id = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("?")
+                .to_string();
+            let title = first_user_message(&path)
+                .map(|m| session_title(&m))
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| "(no prompt yet)".to_string());
+            let age = now
+                .duration_since(modified)
+                .map(|d| humanize(d.as_secs()))
+                .unwrap_or_else(|_| "?".into());
+            let lines = fs::read_to_string(&path)
+                .map(|t| t.lines().count())
+                .unwrap_or(0);
+            FleetSessionInfo {
+                id,
+                title,
+                age,
+                lines,
+            }
+        })
+        .collect()
+}
+
+/// Whether a session file stem names a fleet session: `<millis>-f<n>`.
+fn is_fleet_stem(stem: &str) -> bool {
+    stem.rsplit_once("-f")
+        .is_some_and(|(_, n)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+}
+
 /// Path for a fleet-dispatched session. Unlike [`new_session_path`] (millis
 /// only), several fleet agents can be dispatched within the same millisecond,
 /// so a per-process counter suffix keeps the paths (and resume ids) unique
@@ -558,6 +635,52 @@ mod tests {
             .collect();
         let unique: std::collections::HashSet<_> = paths.iter().collect();
         assert_eq!(unique.len(), paths.len(), "collision in {paths:?}");
+    }
+
+    #[test]
+    fn fleet_sessions_lists_only_fleet_stems_newest_first() {
+        let dir = std::env::temp_dir().join(format!("hi-fleet-ls-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let user = |text: &str| serde_json::to_string(&Message::user(text)).unwrap();
+        // A fleet session, an ordinary session, and junk.
+        std::fs::write(
+            dir.join("0000000000001-f0.jsonl"),
+            user("fix the parser") + "\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("0000000000002.jsonl"),
+            user("plain session") + "\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("notes.txt"), "junk").unwrap();
+        std::fs::write(
+            dir.join("0000000000003-f11.jsonl"),
+            user("port the cli") + "\n",
+        )
+        .unwrap();
+        // Nudge mtimes so ordering is deterministic (f11 newer).
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        let f = std::fs::File::options()
+            .append(true)
+            .open(dir.join("0000000000001-f0.jsonl"))
+            .unwrap();
+        f.set_modified(old).unwrap();
+
+        let list = super::fleet_sessions_in(&dir);
+        let ids: Vec<&str> = list.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["0000000000003-f11", "0000000000001-f0"]);
+        assert_eq!(list[0].title, "port the cli");
+        assert_eq!(list[0].lines, 1);
+        assert!(list[1].age.contains("ago") || !list[1].age.is_empty());
+        // Stem filter specifics.
+        assert!(super::is_fleet_stem("0000000000001-f0"));
+        assert!(super::is_fleet_stem("0000000000001-f42"));
+        assert!(!super::is_fleet_stem("0000000000002"));
+        assert!(!super::is_fleet_stem("0000000000002-fx"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

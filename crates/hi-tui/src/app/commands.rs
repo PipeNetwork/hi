@@ -417,7 +417,7 @@ impl crate::App {
         match command {
             Command::Quit => {}
             // Handled inline by the run loop (needs terminal/input/ticker).
-            Command::Dashboard => {}
+            Command::Dashboard(_) => {}
             Command::Help => {
                 for line in command::help_text().lines() {
                     self.push(Line::styled(line.to_string(), dim()));
