@@ -37,6 +37,12 @@ __device__ __forceinline__ float hi_softplusf(float x) {
   return log1pf(expf(x));
 }
 
+// One block per row: all threads cooperate on the sum-of-squares (coalesced
+// strided loads + block reduction), then write the output in parallel. The old
+// one-thread-per-row layout left a single thread doing ~2*cols sequential
+// unhidden global loads at M=1 (decode), which nsys measured at ~163us/call and
+// ~27% of decode time on a 3B model. Reduction order differs from the sequential
+// sum, so results are not bit-identical but the relative FP error is ~1e-6.
 __global__ void rms_norm_kernel(
     const float* input,
     const float* weight,
@@ -44,18 +50,30 @@ __global__ void rms_norm_kernel(
     int rows,
     int cols,
     float eps) {
-  int row = blockIdx.x * blockDim.x + threadIdx.x;
+  int row = blockIdx.x;
   if (row >= rows) {
     return;
   }
-  const float* in = input + row * cols;
-  float* out = output + row * cols;
-  float sum = 0.0f;
-  for (int col = 0; col < cols; ++col) {
-    sum += in[col] * in[col];
+  const float* in = input + static_cast<size_t>(row) * cols;
+  float* out = output + static_cast<size_t>(row) * cols;
+  int tid = threadIdx.x;
+  int nthreads = blockDim.x;
+  float local = 0.0f;
+  for (int col = tid; col < cols; col += nthreads) {
+    float v = in[col];
+    local += v * v;
   }
-  float inv = rsqrtf(sum / static_cast<float>(cols) + eps);
-  for (int col = 0; col < cols; ++col) {
+  __shared__ float sdata[256];
+  sdata[tid] = local;
+  __syncthreads();
+  for (int stride = nthreads >> 1; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      sdata[tid] += sdata[tid + stride];
+    }
+    __syncthreads();
+  }
+  float inv = rsqrtf(sdata[0] / static_cast<float>(cols) + eps);
+  for (int col = tid; col < cols; col += nthreads) {
     out[col] = in[col] * inv * weight[col];
   }
 }
@@ -4163,8 +4181,8 @@ extern "C" int hi_cuda_launch_rms_norm(
   if (rows == 0) {
     return 0;
   }
-  dim3 block(128);
-  dim3 grid((rows + block.x - 1) / block.x);
+  dim3 block(256);
+  dim3 grid(rows);
   rms_norm_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const float*>(input),
       static_cast<const float*>(weight),
