@@ -12,6 +12,7 @@
 //! fire while `hi` is running). The manager is one background task — it never
 //! touches the `Agent`; results drain into the transcript on UI ticks.
 
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -67,6 +68,49 @@ struct LoopsFile {
     next_id: u64,
 }
 
+/// How many recent firings the manager retains per loop for the `/watch` peek.
+const HISTORY_CAP: usize = 30;
+
+/// One recorded firing result (for the `/watch` history panel).
+#[derive(Clone)]
+pub(crate) struct HistItem {
+    pub(crate) at_ms: u64,
+    pub(crate) quiet: bool,
+    pub(crate) summary: String,
+}
+
+/// Live per-loop state the manager publishes for the `/watch` dashboard. Built
+/// from the persisted `LoopSpec` plus the manager's in-memory runtime (whether a
+/// firing is in flight, and the recent result history) — never persisted.
+#[derive(Clone)]
+pub(crate) struct LoopWatchRow {
+    pub(crate) id: u64,
+    pub(crate) name: String,
+    pub(crate) prompt: String,
+    pub(crate) interval_secs: u64,
+    pub(crate) created_ms: u64,
+    pub(crate) next_ms: u64,
+    pub(crate) expires_ms: u64,
+    pub(crate) firings: u64,
+    /// A firing is currently in flight.
+    pub(crate) firing: bool,
+    pub(crate) last_summary: Option<String>,
+    pub(crate) last_quiet: bool,
+    pub(crate) last_fired_ms: u64,
+    /// Recent firings, oldest first.
+    pub(crate) history: Vec<HistItem>,
+}
+
+/// The manager's in-memory runtime for one loop (not persisted).
+#[derive(Default)]
+struct LoopRuntime {
+    firing: bool,
+    last_summary: Option<String>,
+    last_quiet: bool,
+    last_fired_ms: u64,
+    history: VecDeque<HistItem>,
+}
+
 /// A line for the transcript: (text, loud). Loud lines also ping when the
 /// terminal is unfocused.
 pub(crate) type LoopLine = (String, bool);
@@ -82,6 +126,11 @@ pub(crate) enum LoopCtl {
         id: u64,
         reply: oneshot::Sender<bool>,
     },
+    /// Fire a loop immediately (its cadence continues unchanged after).
+    FireNow {
+        id: u64,
+        reply: oneshot::Sender<bool>,
+    },
     List {
         reply: oneshot::Sender<Vec<LoopSpec>>,
     },
@@ -92,6 +141,9 @@ pub(crate) struct LoopsHandle {
     pub(crate) ctl: mpsc::UnboundedSender<LoopCtl>,
     /// Firing results awaiting display; the UI drains this on ticks.
     pub(crate) pending: Arc<Mutex<Vec<LoopLine>>>,
+    /// Live per-loop state for the `/watch` dashboard; the manager keeps it
+    /// current on every state change.
+    pub(crate) snapshot: Arc<Mutex<Vec<LoopWatchRow>>>,
 }
 
 impl LoopsHandle {
@@ -159,12 +211,50 @@ pub(crate) fn is_quiet(summary: &str) -> bool {
 pub(crate) fn start(launcher: Arc<FleetLauncher>, loops_file: Option<PathBuf>) -> LoopsHandle {
     let (ctl_tx, ctl_rx) = mpsc::unbounded_channel();
     let pending: Arc<Mutex<Vec<LoopLine>>> = Arc::new(Mutex::new(Vec::new()));
+    let snapshot: Arc<Mutex<Vec<LoopWatchRow>>> = Arc::new(Mutex::new(Vec::new()));
     let handle = LoopsHandle {
         ctl: ctl_tx,
         pending: pending.clone(),
+        snapshot: snapshot.clone(),
     };
-    tokio::spawn(manager(launcher, loops_file, ctl_rx, pending));
+    tokio::spawn(manager(launcher, loops_file, ctl_rx, pending, snapshot));
     handle
+}
+
+/// Rebuild the published `/watch` snapshot from persisted specs + live runtime,
+/// pruning runtime for loops that no longer exist.
+fn publish(
+    state: &LoopsFile,
+    runtime: &mut HashMap<u64, LoopRuntime>,
+    snapshot: &Arc<Mutex<Vec<LoopWatchRow>>>,
+) {
+    let live: HashSet<u64> = state.loops.iter().map(|l| l.id).collect();
+    runtime.retain(|id, _| live.contains(id));
+    let rows = state
+        .loops
+        .iter()
+        .map(|l| {
+            let rt = runtime.get(&l.id);
+            LoopWatchRow {
+                id: l.id,
+                name: l.name(),
+                prompt: l.prompt.clone(),
+                interval_secs: l.interval_secs,
+                created_ms: l.created_ms,
+                next_ms: l.next_ms,
+                expires_ms: l.expires_ms,
+                firings: l.firings,
+                firing: rt.is_some_and(|r| r.firing),
+                last_summary: rt.and_then(|r| r.last_summary.clone()),
+                last_quiet: rt.is_some_and(|r| r.last_quiet),
+                last_fired_ms: rt.map_or(0, |r| r.last_fired_ms),
+                history: rt
+                    .map(|r| r.history.iter().cloned().collect())
+                    .unwrap_or_default(),
+            }
+        })
+        .collect();
+    *snapshot.lock().unwrap() = rows;
 }
 
 async fn manager(
@@ -172,7 +262,9 @@ async fn manager(
     loops_file: Option<PathBuf>,
     mut ctl: mpsc::UnboundedReceiver<LoopCtl>,
     pending: Arc<Mutex<Vec<LoopLine>>>,
+    snapshot: Arc<Mutex<Vec<LoopWatchRow>>>,
 ) {
+    let mut runtime: HashMap<u64, LoopRuntime> = HashMap::new();
     let mut state = load(loops_file.as_deref());
     let now = now_ms();
     let before = state.loops.len();
@@ -202,6 +294,7 @@ async fn manager(
         ));
     }
     save(loops_file.as_deref(), &state);
+    publish(&state, &mut runtime, &snapshot);
 
     // Firings in flight: (loop id, summary) results come back over a channel.
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<(u64, Result<String, String>)>();
@@ -229,6 +322,7 @@ async fn manager(
                 spec.firings += 1;
                 in_flight += 1;
                 fired = true;
+                runtime.entry(spec.id).or_default().firing = true;
                 let launcher = launcher.clone();
                 let spec_snapshot = spec.clone();
                 let done = done_tx.clone();
@@ -241,6 +335,7 @@ async fn manager(
         if fired {
             save(loops_file.as_deref(), &state);
         }
+        publish(&state, &mut runtime, &snapshot);
 
         // Sleep until the next due time (capped so ctl/expiry stay responsive).
         let next_due = state
@@ -292,6 +387,22 @@ async fn manager(
                         }
                         let _ = reply.send(removed);
                     }
+                    LoopCtl::FireNow { id, reply } => {
+                        // Due it now; the top of the loop fires it this cycle
+                        // (subject to the concurrency cap) and the cadence resumes.
+                        let mut ok = false;
+                        let now = now_ms();
+                        for l in &mut state.loops {
+                            if l.id == id {
+                                l.next_ms = now;
+                                ok = true;
+                            }
+                        }
+                        if ok {
+                            save(loops_file.as_deref(), &state);
+                        }
+                        let _ = reply.send(ok);
+                    }
                     LoopCtl::List { reply } => {
                         let _ = reply.send(state.loops.clone());
                     }
@@ -305,7 +416,8 @@ async fn manager(
                     .find(|l| l.id == id)
                     .map(LoopSpec::name)
                     .unwrap_or_else(|| format!("#{id}"));
-                let line = match result {
+                let fired_ms = now_ms();
+                let (line, summary, quiet) = match result {
                     Ok(summary) => {
                         let quiet = is_quiet(&summary);
                         let text = if quiet {
@@ -313,11 +425,25 @@ async fn manager(
                         } else {
                             format!("⟳ loop#{id} ({name}): {}", truncate(&summary, 160))
                         };
-                        (text, !quiet)
+                        ((text, !quiet), summary, quiet)
                     }
-                    Err(err) => (format!("⟳ loop#{id} ({name}) firing failed: {err}"), true),
+                    Err(err) => {
+                        let text = format!("⟳ loop#{id} ({name}) firing failed: {err}");
+                        ((text, true), format!("firing failed: {err}"), false)
+                    }
                 };
+                // Record the runtime result for the /watch dashboard + history.
+                let rt = runtime.entry(id).or_default();
+                rt.firing = false;
+                rt.last_summary = Some(summary.clone());
+                rt.last_quiet = quiet;
+                rt.last_fired_ms = fired_ms;
+                rt.history.push_back(HistItem { at_ms: fired_ms, quiet, summary });
+                while rt.history.len() > HISTORY_CAP {
+                    rt.history.pop_front();
+                }
                 pending.lock().unwrap().push(line);
+                publish(&state, &mut runtime, &snapshot);
             }
             _ = tokio::time::sleep(Duration::from_millis(sleep_ms)) => {}
         }
@@ -488,5 +614,132 @@ mod tests {
     #[test]
     fn name_truncates_to_first_words() {
         assert_eq!(spec().name(), "check whether the CI…");
+    }
+
+    #[test]
+    fn publish_builds_and_prunes_snapshot() {
+        let mut state = LoopsFile {
+            loops: vec![spec()],
+            next_id: 2,
+        };
+        let mut s2 = spec();
+        s2.id = 2;
+        s2.prompt = "watch prod p99 latency".into();
+        state.loops.push(s2);
+
+        let mut runtime: HashMap<u64, LoopRuntime> = HashMap::new();
+        let rt1 = runtime.entry(1).or_default();
+        rt1.last_summary = Some("CI went red".into());
+        rt1.last_quiet = false;
+        rt1.last_fired_ms = 123;
+        rt1.history.push_back(HistItem {
+            at_ms: 123,
+            quiet: false,
+            summary: "CI went red".into(),
+        });
+        // An orphaned runtime entry (loop no longer exists) must be pruned.
+        runtime.entry(99).or_default().firing = true;
+
+        let snap = Arc::new(Mutex::new(Vec::new()));
+        publish(&state, &mut runtime, &snap);
+
+        assert!(!runtime.contains_key(&99), "orphan runtime pruned");
+        let rows = snap.lock().unwrap();
+        assert_eq!(rows.len(), 2);
+        let r1 = rows.iter().find(|r| r.id == 1).unwrap();
+        assert_eq!(r1.last_summary.as_deref(), Some("CI went red"));
+        assert!(!r1.last_quiet);
+        assert_eq!(r1.history.len(), 1);
+        let r2 = rows.iter().find(|r| r.id == 2).unwrap();
+        assert!(r2.last_summary.is_none(), "unfired loop has no summary");
+        assert_eq!(r2.firings, 0);
+        assert!(r2.history.is_empty());
+    }
+
+    /// Poll the published snapshot until `pred` holds (or time out).
+    async fn wait_until(handle: &LoopsHandle, pred: impl Fn(&[LoopWatchRow]) -> bool) {
+        for _ in 0..200 {
+            if pred(&handle.snapshot.lock().unwrap()) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let n = handle.snapshot.lock().unwrap().len();
+        panic!("condition not met within 5s; snapshot has {n} row(s)");
+    }
+
+    /// Drive the real manager end-to-end with `/bin/echo` standing in for `hi`:
+    /// each firing is a genuine subprocess that exits 0 fast. Validates the whole
+    /// spine `/watch` reads — start → fire → done → runtime → snapshot — plus the
+    /// `FireNow` and `Cancel` controls its keys send.
+    #[tokio::test]
+    async fn manager_fires_records_refires_and_cancels() {
+        let dir = std::env::temp_dir().join(format!("hi-watch-mgr-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sess = dir.join("loop.jsonl");
+        let launcher = FleetLauncher {
+            exe: PathBuf::from("/bin/echo"),
+            provider: "p".into(),
+            model: "m".into(),
+            base_url: "u".into(),
+            api_key: "k".into(),
+            verify: None,
+            max_verify: 0,
+            max_steps: 30,
+            session_path: Box::new(|| Ok(PathBuf::from("/tmp/unused.jsonl"))),
+            sessions: Box::new(Vec::new),
+            resume_info: Box::new(|_| None),
+            loop_session_path: Box::new(move || Ok(sess.clone())),
+            loops_file: None,
+        };
+        let handle = start(Arc::new(launcher), None);
+
+        // Arm a loop — it fires immediately (next_ms = now).
+        let (tx, rx) = oneshot::channel();
+        handle
+            .ctl
+            .send(LoopCtl::Create {
+                secs: 3600,
+                prompt: "watch the thing".into(),
+                reply: tx,
+            })
+            .unwrap();
+        let spec = rx.await.unwrap().unwrap();
+        let id = spec.id;
+
+        // First firing completes and is recorded in the snapshot.
+        wait_until(&handle, |rows| {
+            rows.iter()
+                .find(|r| r.id == id)
+                .is_some_and(|r| !r.firing && !r.history.is_empty())
+        })
+        .await;
+        {
+            let rows = handle.snapshot.lock().unwrap();
+            let r = rows.iter().find(|r| r.id == id).unwrap();
+            assert!(r.firings >= 1, "fired at least once");
+            assert!(r.last_summary.is_some(), "recorded a summary");
+            assert_eq!(r.history.len(), 1);
+            assert_eq!(r.last_fired_ms, r.history[0].at_ms);
+        }
+
+        // FireNow → a second recorded firing without waiting out the cadence.
+        let (tx, rx) = oneshot::channel();
+        handle.ctl.send(LoopCtl::FireNow { id, reply: tx }).unwrap();
+        assert!(rx.await.unwrap(), "FireNow accepted");
+        wait_until(&handle, |rows| {
+            rows.iter()
+                .find(|r| r.id == id)
+                .is_some_and(|r| r.history.len() >= 2)
+        })
+        .await;
+
+        // Cancel → the loop leaves the snapshot.
+        let (tx, rx) = oneshot::channel();
+        handle.ctl.send(LoopCtl::Cancel { id, reply: tx }).unwrap();
+        assert!(rx.await.unwrap(), "cancel removed the loop");
+        wait_until(&handle, |rows| rows.is_empty()).await;
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
