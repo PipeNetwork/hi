@@ -1118,7 +1118,14 @@ pub async fn run(
                                                 marks.push_str(" · ⚡");
                                             }
                                             if l.autofix {
-                                                marks.push_str(" · ⚒");
+                                                marks.push_str(if l.fix_pr {
+                                                    " · ⚒pr"
+                                                } else {
+                                                    " · ⚒"
+                                                });
+                                            }
+                                            if let Some(s) = &l.schedule {
+                                                marks.push_str(&format!(" · ⌚{}", s.label()));
                                             }
                                             app.push(Line::styled(
                                                 format!(
@@ -1212,19 +1219,26 @@ pub async fn run(
                                 app.push(Line::styled(msg.0, Style::default().fg(msg.1)));
                             }
                         }
-                        command::LoopArg::Fix { id, on } => {
+                        command::LoopArg::Fix { id, on, pr } => {
                             if let Some(loops) = &app.loops {
                                 let (tx, rx) = tokio::sync::oneshot::channel();
                                 let _ = loops.ctl.send(crate::loops::LoopCtl::Fix {
                                     id,
                                     on,
+                                    pr,
                                     reply: tx,
                                 });
                                 let no_verify = on && fleet_launcher.verify.is_none();
                                 let msg = match rx.await {
+                                    Ok(true) if on && pr => (
+                                        format!(
+                                            "✓ loop#{id} auto-fix on (PR mode) — a loud change opens a verified fix as a PR"
+                                        ),
+                                        Color::Green,
+                                    ),
                                     Ok(true) if on => (
                                         format!(
-                                            "✓ loop#{id} auto-fix on — a loud change dispatches a verified fix"
+                                            "✓ loop#{id} auto-fix on — a loud change merges a verified fix into your tree"
                                         ),
                                         Color::Green,
                                     ),
@@ -1237,10 +1251,89 @@ pub async fn run(
                                 app.push(Line::styled(msg.0, Style::default().fg(msg.1)));
                                 if no_verify {
                                     app.push(Line::styled(
-                                        "  note: no verify command set — fixes won't auto-merge until you /verify <cmd>"
+                                        "  note: no verify command set — fixes won't land until you /verify <cmd>"
                                             .to_string(),
                                         dim(),
                                     ));
+                                }
+                            }
+                        }
+                        command::LoopArg::Window { id, window } => {
+                            if let Some(loops) = &app.loops {
+                                let (tx, rx) = tokio::sync::oneshot::channel();
+                                let _ = loops.ctl.send(crate::loops::LoopCtl::Window {
+                                    id,
+                                    window,
+                                    reply: tx,
+                                });
+                                let msg = match (rx.await, window) {
+                                    (Ok(true), Some((s, e, wd))) => (
+                                        format!(
+                                            "✓ loop#{id} fires only {s:02}-{e:02}{} (local time)",
+                                            if wd { " weekdays" } else { "" }
+                                        ),
+                                        Color::Green,
+                                    ),
+                                    (Ok(true), None) => (
+                                        format!("✓ loop#{id} window cleared — fires anytime"),
+                                        Color::Green,
+                                    ),
+                                    _ => (
+                                        format!("no loop#{id} — /loop list shows ids"),
+                                        Color::Yellow,
+                                    ),
+                                };
+                                app.push(Line::styled(msg.0, Style::default().fg(msg.1)));
+                            }
+                        }
+                        command::LoopArg::Cost => {
+                            if let Some(loops) = &app.loops {
+                                let (tx, rx) = tokio::sync::oneshot::channel();
+                                let _ = loops.ctl.send(crate::loops::LoopCtl::List { reply: tx });
+                                if let Ok(mut specs) = rx.await {
+                                    let total: u64 = specs.iter().map(|l| l.spent_tokens).sum();
+                                    if specs.is_empty() {
+                                        app.push(Line::styled(
+                                            "no loops — nothing spent yet".to_string(),
+                                            dim(),
+                                        ));
+                                    } else {
+                                        app.push(Line::styled(
+                                            format!(
+                                                "loop spend — {} total across {} loop(s):",
+                                                crate::loops::fmt_tokens(total),
+                                                specs.len()
+                                            ),
+                                            Style::default()
+                                                .fg(Color::Cyan)
+                                                .add_modifier(ratatui::style::Modifier::BOLD),
+                                        ));
+                                        specs.sort_by(|a, b| b.spent_tokens.cmp(&a.spent_tokens));
+                                        for l in specs {
+                                            let budget = l
+                                                .token_budget
+                                                .map(|b| {
+                                                    format!(" / {}", crate::loops::fmt_tokens(b))
+                                                })
+                                                .unwrap_or_default();
+                                            app.push(Line::styled(
+                                                format!(
+                                                    "  #{}  {:>8}{}  · {} firing(s) · {}",
+                                                    l.id,
+                                                    crate::loops::fmt_tokens(l.spent_tokens),
+                                                    budget,
+                                                    l.firings,
+                                                    l.name(),
+                                                ),
+                                                dim(),
+                                            ));
+                                        }
+                                        app.push(Line::styled(
+                                            "  (loops only — fleet/goal spend is per-session)"
+                                                .to_string(),
+                                            dim(),
+                                        ));
+                                    }
                                 }
                             }
                         }

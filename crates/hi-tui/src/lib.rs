@@ -12,6 +12,7 @@ mod daemon;
 mod dashboard;
 mod lock;
 mod loops;
+mod notify;
 pub use app::run;
 pub use daemon::run_loops_daemon;
 mod completion;

@@ -285,16 +285,40 @@ async fn arm_from_compose(ctl: &mpsc::UnboundedSender<LoopCtl>, text: String) ->
                 _ => format!("no loop#{id}"),
             })
         }
-        hi_agent::command::LoopArg::Fix { id, on } => {
+        hi_agent::command::LoopArg::Fix { id, on, pr } => {
             let (tx, rx) = oneshot::channel();
-            let _ = ctl.send(LoopCtl::Fix { id, on, reply: tx });
-            Some(match (rx.await, on) {
-                (Ok(true), true) => format!("loop#{id} auto-fix on"),
-                (Ok(true), false) => format!("loop#{id} auto-fix off"),
+            let _ = ctl.send(LoopCtl::Fix {
+                id,
+                on,
+                pr,
+                reply: tx,
+            });
+            Some(match (rx.await, on, pr) {
+                (Ok(true), true, true) => format!("loop#{id} auto-fix on (PR mode)"),
+                (Ok(true), true, false) => format!("loop#{id} auto-fix on"),
+                (Ok(true), false, _) => format!("loop#{id} auto-fix off"),
                 _ => format!("no loop#{id}"),
             })
         }
-        hi_agent::command::LoopArg::List => None,
+        hi_agent::command::LoopArg::Window { id, window } => {
+            let (tx, rx) = oneshot::channel();
+            let _ = ctl.send(LoopCtl::Window {
+                id,
+                window,
+                reply: tx,
+            });
+            Some(match (rx.await, window) {
+                (Ok(true), Some((s, e, wd))) => {
+                    format!(
+                        "loop#{id} window {s:02}-{e:02}{}",
+                        if wd { " weekdays" } else { "" }
+                    )
+                }
+                (Ok(true), None) => format!("loop#{id} window cleared"),
+                _ => format!("no loop#{id}"),
+            })
+        }
+        hi_agent::command::LoopArg::List | hi_agent::command::LoopArg::Cost => None,
         hi_agent::command::LoopArg::Invalid(msg) => Some(msg),
     }
 }
@@ -517,13 +541,19 @@ fn render_peek(
     ));
     let created_ago = fmt_left(now.saturating_sub(row.created_ms) / 1000);
     let expires_in = fmt_left(row.expires_ms.saturating_sub(now) / 1000);
+    let window = row
+        .window
+        .as_deref()
+        .map(|w| format!(" · only {w}"))
+        .unwrap_or_default();
     lines.push(Line::styled(
         format!(
-            "every {} · {} firing(s) · started {} ago · expires in {}",
+            "every {} · {} firing(s) · started {} ago · expires in {}{}",
             humanize_secs(row.interval_secs),
             row.firings,
             created_ago,
             expires_in,
+            window,
         ),
         dim(),
     ));
@@ -575,10 +605,12 @@ fn render_peek(
     }
     // Auto-fix status + its last outcome.
     if row.autofix {
-        let mut fix = vec![Span::styled(
-            "⚒ auto-fix: on",
-            Style::default().fg(Color::Magenta),
-        )];
+        let label = if row.fix_pr {
+            "⚒ auto-fix: on (PR mode)"
+        } else {
+            "⚒ auto-fix: on (merge mode)"
+        };
+        let mut fix = vec![Span::styled(label, Style::default().fg(Color::Magenta))];
         if row.fixing {
             fix.push(Span::styled(
                 "  · fixing now…",
@@ -651,7 +683,7 @@ fn render_hints(frame: &mut ratatui::Frame, focus: Focus, area: Rect) {
             "↑↓ select · f fire · p pause · c cancel · n arm · PgUp/Dn history · Esc close"
         }
         Focus::Compose => {
-            "type <interval> <prompt> · pause|resume|budget|on|fix <id> … · Enter · Esc/Tab back"
+            "<interval> <prompt> · pause|resume|budget|on|fix|window <id> … · Enter · Esc/Tab back"
         }
     };
     frame.render_widget(
@@ -755,6 +787,8 @@ mod tests {
                 trigger: Some("notify-send 'CI red'".into()),
                 last_trigger: Some("ok".into()),
                 autofix: true,
+                fix_pr: true,
+                window: Some("09-17 weekdays".into()),
                 fixing: false,
                 last_fix: Some("fixed & merged 1 file(s): parser.rs".into()),
                 last_summary: Some("CI went red: 3 parser test failures".into()),
@@ -789,6 +823,8 @@ mod tests {
                 trigger: None,
                 last_trigger: None,
                 autofix: false,
+                fix_pr: false,
+                window: None,
                 fixing: false,
                 last_fix: None,
                 last_summary: None,
@@ -831,7 +867,10 @@ mod tests {
         assert!(s.contains("notify-send"), "peek trigger command\n{s}");
         // Auto-fix marker + peek line.
         assert!(s.contains("⚒"), "auto-fix marker\n{s}");
-        assert!(s.contains("auto-fix: on"), "peek auto-fix line\n{s}");
+        assert!(
+            s.contains("auto-fix: on (PR mode)"),
+            "peek auto-fix PR line\n{s}"
+        );
         // List-focus hints.
         assert!(s.contains("p pause"), "hints show pause\n{s}");
     }
@@ -855,6 +894,8 @@ mod tests {
             trigger: None,
             last_trigger: None,
             autofix: false,
+            fix_pr: false,
+            window: None,
             fixing: false,
             last_fix: None,
             last_summary: Some("build still green".into()),

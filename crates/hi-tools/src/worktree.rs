@@ -164,6 +164,66 @@ pub fn changed_files(worktree: &Path, base: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Commit all of the worktree's changes (minus pycache) onto a fresh `branch`
+/// created from its current base. Used by auto-fix's PR mode to prepare a
+/// reviewable branch instead of merging into the working tree. Uses the repo's
+/// configured author identity.
+pub fn commit_to_branch(worktree: &Path, branch: &str, message: &str) -> Result<()> {
+    let checkout = Command::new("git")
+        .current_dir(worktree)
+        .args(["checkout", "-b", branch])
+        .output()
+        .context("git checkout -b")?;
+    if !checkout.status.success() {
+        bail!(
+            "git checkout -b failed: {}",
+            String::from_utf8_lossy(&checkout.stderr).trim()
+        );
+    }
+    crate::prepare_verify_workdir(worktree);
+    let add = Command::new("git")
+        .current_dir(worktree)
+        .args(["add", "-A", "--", "."])
+        .args(PYCACHE_EXCLUDES)
+        .output()
+        .context("git add")?;
+    if !add.status.success() {
+        bail!(
+            "git add failed: {}",
+            String::from_utf8_lossy(&add.stderr).trim()
+        );
+    }
+    let commit = Command::new("git")
+        .current_dir(worktree)
+        .args(["commit", "-m", message])
+        .output()
+        .context("git commit")?;
+    if !commit.status.success() {
+        bail!(
+            "git commit failed: {}",
+            String::from_utf8_lossy(&commit.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Push a worktree branch to `origin`, setting upstream. Returns an error (with
+/// git's stderr) if there's no remote or the push is rejected.
+pub fn push_branch(worktree: &Path, branch: &str) -> Result<()> {
+    let out = Command::new("git")
+        .current_dir(worktree)
+        .args(["push", "-u", "origin", branch])
+        .output()
+        .context("git push")?;
+    if !out.status.success() {
+        bail!(
+            "git push failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 /// Force-remove the given worktrees.
 pub fn cleanup(worktrees: &[PathBuf]) {
     for path in worktrees {
@@ -345,6 +405,71 @@ mod tests {
 
         cleanup(&[wt]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Auto-fix PR mode's git plumbing over a real repo + local bare remote: a
+    /// worktree change commits onto a fresh branch (minus pycache) and pushes to
+    /// origin. No cwd mutation, no gh, no network.
+    #[test]
+    fn commit_to_branch_and_push_lands_a_fix_branch() {
+        let root = std::env::temp_dir().join(format!("hi-wt-pr-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let bare = root.join("remote.git");
+        let repo = root.join("repo");
+        let git = |args: &[&str], cwd: &Path| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "--bare", "-q", bare.to_str().unwrap()], &root);
+        git(&["init", "-q", "-b", "main", repo.to_str().unwrap()], &root);
+        git(&["config", "user.email", "t@t"], &repo);
+        git(&["config", "user.name", "t"], &repo);
+        git(&["remote", "add", "origin", bare.to_str().unwrap()], &repo);
+        std::fs::write(repo.join("a.py"), "x = 1\n").unwrap();
+        git(&["add", "-A"], &repo);
+        git(&["commit", "-qm", "c1"], &repo);
+
+        let wt = repo.join("wt");
+        git(
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "HEAD"],
+            &repo,
+        );
+        // The fix edits a.py and its test run drops bytecode (must not be committed).
+        std::fs::write(wt.join("a.py"), "x = 2\n").unwrap();
+        std::fs::create_dir_all(wt.join("__pycache__")).unwrap();
+        std::fs::write(wt.join("__pycache__/a.cpython-312.pyc"), b"junk").unwrap();
+
+        commit_to_branch(&wt, "hi-autofix/loop1", "hi auto-fix: a").expect("commit ok");
+        push_branch(&wt, "hi-autofix/loop1").expect("push ok");
+
+        // The branch landed in the bare remote…
+        let show = Command::new("git")
+            .current_dir(&bare)
+            .args(["rev-parse", "--verify", "hi-autofix/loop1"])
+            .output()
+            .unwrap();
+        assert!(show.status.success(), "branch must exist in the remote");
+        // …with the source change but not the pycache.
+        let files = Command::new("git")
+            .current_dir(&bare)
+            .args(["ls-tree", "-r", "--name-only", "hi-autofix/loop1"])
+            .output()
+            .unwrap();
+        let files = String::from_utf8_lossy(&files.stdout);
+        assert!(files.contains("a.py"), "a.py committed: {files}");
+        assert!(!files.contains(".pyc"), "no pycache in the branch: {files}");
+
+        cleanup(&[wt]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// End-to-end reset_to: a worktree with local edits hard-resets onto a new
