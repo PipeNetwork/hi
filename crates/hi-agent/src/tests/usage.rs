@@ -4,10 +4,9 @@ use super::*;
 #[tokio::test]
 async fn usage_line_separates_cumulative_tokens_from_context_fill() {
     // The regression guard: with a window set, the done line shows
-    // cumulative ↑/↓ session tokens (abbreviated, matching the live line)
-    // and a context gauge that is the *last request's* size — distinct
-    // from cumulative input and humanized the same way. Pins against mixing
-    // raw/abbreviated units, rendering a count two ways, or conflating the two.
+    // raw user prompt tokens and current-turn generated output first, with a
+    // context gauge that is the *last request's* full size. This prevents a tiny
+    // prompt from looking like a 20k-token user message.
     let mut cfg = config();
     cfg.context_window = Some(1_000_000);
     let responses = vec![
@@ -27,11 +26,14 @@ async fn usage_line_separates_cumulative_tokens_from_context_fill() {
     agent.run_turn("go", &mut ui).await.unwrap();
     let line = ui.turn_end.expect("turn_end emitted");
 
-    // Cumulative session tokens, arrowed + abbreviated (same shape as the live line).
-    assert!(line.contains("↑20k"), "cumulative input ↑ (8k+12k): {line}");
+    // Primary usage is the raw user prompt, not the full request context.
     assert!(
-        line.contains("↓300"),
-        "cumulative output ↓ (100+200): {line}"
+        line.contains("prompt↑1"),
+        "raw user prompt estimate first: {line}"
+    );
+    assert!(
+        line.contains("gen↓300"),
+        "current-turn generated output (100+200): {line}"
     );
     // The context gauge is the LAST request (12k) over the window — NOT the
     // cumulative input (20k), and abbreviated, not raw.
@@ -41,8 +43,8 @@ async fn usage_line_separates_cumulative_tokens_from_context_fill() {
     );
     // The old, mixed-unit, misleading format is gone.
     assert!(
-        !line.contains(" in ·") && !line.contains("total"),
-        "no raw in/out/total wording: {line}"
+        !line.contains("ctx↑") && !line.contains(" in ·") && !line.contains("total"),
+        "full context is not the primary input counter: {line}"
     );
     assert!(
         !line.contains("20000") && !line.contains("12000"),
@@ -137,9 +139,9 @@ fn usage_summary_includes_rate_limit_buckets_when_reported() {
 }
 
 #[tokio::test]
-async fn emits_running_cumulative_usage_each_round() {
-    // Two rounds (tool call, then text). The UI should see the cumulative
-    // total climb after each round, so it can show usage live mid-turn.
+async fn emits_running_prompt_and_generated_usage_each_round() {
+    // Two rounds (tool call, then text). The UI should see the raw prompt
+    // estimate stay stable while generated output climbs during the turn.
     let responses = vec![
         completion(
             vec![Content::ToolCall {
@@ -155,8 +157,28 @@ async fn emits_running_cumulative_usage_each_round() {
     let mut agent = agent(responses, config());
     let mut ui = RecUi::default();
     agent.run_turn("go", &mut ui).await.unwrap();
-    // Cumulative after round 1 = (5,1); after round 2 = (11,3).
-    assert_eq!(ui.usages, vec![(5, 1), (11, 3)]);
+    assert_eq!(ui.usages, vec![(1, 1), (1, 3)]);
+}
+
+#[tokio::test]
+async fn last_turn_usage_resets_each_turn() {
+    let responses = vec![
+        completion(vec![Content::Text("first".into())], 5, 2),
+        completion(vec![Content::Text("second".into())], 7, 3),
+    ];
+    let mut agent = agent(responses, config());
+
+    agent.run_turn("q1", &mut NullUi).await.unwrap();
+    assert_eq!(agent.totals().input_tokens, 5);
+    assert_eq!(agent.totals().output_tokens, 2);
+    assert_eq!(agent.last_turn_usage().input_tokens, 5);
+    assert_eq!(agent.last_turn_usage().output_tokens, 2);
+
+    agent.run_turn("q2", &mut NullUi).await.unwrap();
+    assert_eq!(agent.totals().input_tokens, 12);
+    assert_eq!(agent.totals().output_tokens, 5);
+    assert_eq!(agent.last_turn_usage().input_tokens, 7);
+    assert_eq!(agent.last_turn_usage().output_tokens, 3);
 }
 
 #[tokio::test]

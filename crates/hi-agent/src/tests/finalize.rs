@@ -234,7 +234,7 @@ async fn does_not_finalize_a_plain_answer() {
 }
 
 #[tokio::test]
-async fn turn_end_reports_cumulative_not_last_round() {
+async fn turn_end_reports_prompt_and_generated_not_context_as_input() {
     // Two rounds (5/1 then 6/2). The done line must show the cumulative
     // session total (11/3/14), matching the live counter — not just the
     // last round (6/2/8).
@@ -254,10 +254,10 @@ async fn turn_end_reports_cumulative_not_last_round() {
     let mut ui = RecUi::default();
     agent.run_turn("go", &mut ui).await.unwrap();
     let summary = ui.turn_end.expect("turn_end emitted");
-    // Cumulative session totals (↑11 ↓3), matching the live counter — not just
-    // the last round (↑6 ↓2).
+    // The primary input is the raw user prompt estimate, not the full request
+    // context. Generated output remains the current-turn total.
     assert!(
-        summary.contains("↑11 ↓3"),
-        "cumulative totals, got: {summary}"
+        summary.contains("prompt↑1 gen↓3"),
+        "turn-local prompt/output, got: {summary}"
     );
 }

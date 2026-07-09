@@ -15475,9 +15475,7 @@ mod native {
                 .context("CUDA batched attention output element count overflows usize")?;
             let output = DeviceBuffer::alloc(output_elements * std::mem::size_of::<f32>())
                 .context("allocating CUDA batched attention output")?;
-            if head_dim <= FLASH_ONLINE_MAX_HEAD_DIM
-                && v_head_dim <= FLASH_ONLINE_MAX_HEAD_DIM
-            {
+            if head_dim <= FLASH_ONLINE_MAX_HEAD_DIM && v_head_dim <= FLASH_ONLINE_MAX_HEAD_DIM {
                 // Flash path covers causal, sliding-window (window>0), and wide heads
                 // (adaptive key-tile). Tensor-core (WMMA) is used only for the common
                 // quantized-model causal case (no window, head_dim<=128, %16); larger

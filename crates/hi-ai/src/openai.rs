@@ -165,16 +165,17 @@ impl Provider for OpenAiProvider {
         let stream = crate::http::debug_tap(resp.bytes_stream())
             .eventsource()
             .map(|res| res.map(|event| event.data).context("error reading stream"));
+        let estimated_input_tokens = estimate_messages_tokens(&request.messages);
         let mut completion = stream::collect_completion(Box::pin(stream), sink)
             .await
             .map_err(|err| {
                 stream::classify_stream_error(err).with_usage(Usage {
-                    input_tokens: estimate_messages_tokens(&request.messages),
-                    output_tokens: request.max_tokens as u64,
+                    input_tokens: estimated_input_tokens,
+                    output_tokens: 0,
                     cache_read_tokens: 0,
                     cache_creation_tokens: 0,
                     input_includes_cache: true,
-                    context_occupancy: estimate_messages_tokens(&request.messages),
+                    context_occupancy: estimated_input_tokens,
                     rate_limits,
                 })
             })?;
@@ -651,6 +652,30 @@ mod tests {
         assert!(
             err.to_string().contains("capacity temporarily unavailable"),
             "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_stream_error_does_not_charge_full_output_budget() {
+        let Some(server) = FakeOpenAiServer::new(vec![Response::sse("data: {malformed-json}\n\n")])
+        else {
+            return;
+        };
+        let provider = OpenAiProvider::new(server.url().to_string(), "test".into());
+        let err = provider
+            .stream(request(vec![], Default::default()), &mut |_| {})
+            .await
+            .unwrap_err();
+        let usage = crate::provider::provider_error_usage(&err);
+
+        assert_eq!(
+            provider_error_kind(&err),
+            Some(ProviderErrorKind::MalformedStream)
+        );
+        assert!(usage.input_tokens > 0, "input estimate should be retained");
+        assert_eq!(
+            usage.output_tokens, 0,
+            "failed stream should not bill the full max_tokens output budget"
         );
     }
 

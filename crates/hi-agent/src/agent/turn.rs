@@ -8,7 +8,8 @@ use anyhow::Result;
 use futures_util::StreamExt;
 use hi_ai::{
     ChatRequest, Content, Message, OutputCapError, ProviderErrorKind, RateLimitBucket,
-    RateLimitState, RequestProfile, Role, StreamEvent, ToolMode, ToolSpec, provider_error_kind,
+    RateLimitState, RequestProfile, Role, StreamEvent, ToolMode, ToolSpec, estimate_text_tokens,
+    provider_error_kind,
 };
 use hi_tools::{PlanStatus, execute, execute_streaming};
 
@@ -581,6 +582,7 @@ impl crate::Agent {
     /// run; if it fails, its output is fed back and the model iterates, up to
     /// `max_verify_iterations` rounds.
     pub async fn run_turn(&mut self, input: &str, ui: &mut dyn Ui) -> Result<()> {
+        let user_prompt_tokens = estimate_text_tokens(input);
         // Reset the per-turn file-read cache. It's invalidated per-key by the
         // edit tools and wholesale after `bash`, but clearing it here restores
         // its documented per-turn contract — so a file changed outside `hi`
@@ -609,6 +611,7 @@ impl crate::Agent {
             expanded_input
         };
         let input = turn_input.as_str();
+        self.reset_last_turn_usage(user_prompt_tokens);
 
         if read_only_intent.is_none() && self.tools_unavailable_for(input) {
             self.last_verify = None;
@@ -3140,8 +3143,8 @@ If the task is already complete, stop and give your final recap."
             self.messages.strip_finalize_pair();
         }
 
-        // Report cumulative session usage — the same number the live working
-        // line and `/tokens` show, so the three never disagree.
+        // Report turn-local user prompt/generated output first; full request
+        // context remains visible as the `ctx` gauge below.
         ui.turn_end(&self.usage_summary(&self.totals));
         // Strip any trailing synthetic nudge so it doesn't absorb the next
         // real prompt via `push_user_or_fold` (which folds a new user message
@@ -3240,24 +3243,27 @@ If the task is already complete, stop and give your final recap."
         self.messages.push_assistant(vec![Content::Text(recap)]);
     }
 
-    /// Format a usage line. `usage` carries the cumulative in/out/total;
-    /// the context gauge instead uses `context_used` (the live conversation
-    /// size), since cumulative input sums re-sent context across rounds and so
-    /// isn't a measure of how full the window is.
+    /// Format a usage line. The primary input number is the raw user prompt
+    /// estimate, not the full request context; the context gauge shows the full
+    /// prompt actually occupying the model window.
     pub(crate) fn usage_summary(&self, usage: &hi_ai::Usage) -> String {
-        // Cumulative session tokens, ↑ sent / ↓ received — these match the
-        // live working line. Abbreviated in the same units as the
-        // context gauge below so the two never read as raw-vs-rounded.
+        // User-facing prompt size first. The full request can include system,
+        // tool, and history context, so putting it first made a short question
+        // like "what's your name?" appear to be a 1.5k-token user prompt.
         let mut summary = format!(
-            "[↑{} ↓{}",
-            humanize_count(usage.input_tokens),
-            humanize_count(usage.output_tokens),
+            "[prompt↑{} gen↓{}",
+            humanize_count(self.last_user_prompt_tokens),
+            humanize_count(self.last_turn_usage.output_tokens),
         );
-        if usage.cache_read_tokens > 0 {
-            summary.push_str(&format!(" ⟲{}", humanize_count(usage.cache_read_tokens)));
+        if self.last_turn_usage.cache_read_tokens > 0 {
+            summary.push_str(&format!(
+                " ⟲{}",
+                humanize_count(self.last_turn_usage.cache_read_tokens)
+            ));
         }
-        // The context gauge is a *point-in-time* measure (the last request's
-        // size), not cumulative input — so it is correctly smaller than ↑.
+        // The context gauge is the point-in-time full request size, which is
+        // the number providers generally bill as input and the number that
+        // drives context-window pressure.
         if let Some(window) = self.config.context_window
             && window > 0
         {
@@ -3267,6 +3273,8 @@ If the task is already complete, stop and give your final recap."
                 humanize_count(self.context_used),
                 humanize_count(u64::from(window)),
             ));
+        } else if self.context_used > 0 {
+            summary.push_str(&format!(" · ctx {}", humanize_count(self.context_used)));
         }
         if let Some(limits) = usage.rate_limits.and_then(rate_limit_summary) {
             summary.push_str(&format!(" · {limits}"));

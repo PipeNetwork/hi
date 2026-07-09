@@ -357,7 +357,13 @@ async fn main() -> Result<()> {
             agent.restore_model_state(state);
         }
         let report_result = if let Some(path) = &report_path {
-            write_report(path, &agent, &report_model, result.as_ref().err())
+            write_report(
+                path,
+                &agent,
+                &report_model,
+                Some(&prompt),
+                result.as_ref().err(),
+            )
         } else {
             Ok(())
         };
@@ -993,15 +999,75 @@ fn write_report(
     path: &std::path::Path,
     agent: &Agent,
     model: &str,
+    user_prompt: Option<&str>,
     error: Option<&anyhow::Error>,
 ) -> Result<()> {
     let totals = agent.totals();
+    let turn = agent.last_turn_usage();
     let tel = agent.last_turn_telemetry();
+    let goal = agent.structured_goal().map(|g| {
+        serde_json::json!({
+            "objective": g.objective,
+            "done": g.sub_goals.iter().filter(|s| s.status == hi_agent::GoalStatus::Done).count(),
+            "total": g.sub_goals.len(),
+            "status": format!("{:?}", g.status),
+            "paused": g.paused,
+        })
+    });
+    let telemetry = serde_json::json!({
+        "effective_max_steps": tel.effective_max_steps,
+        "verify_rounds": tel.verify_rounds,
+        "recovery_retries": tel.recovery_retries,
+        "repeat_nudges": tel.repeat_nudges,
+        "continue_nudges": tel.continue_nudges,
+        "truncation_retries": tel.truncation_retries,
+        "no_progress_streak": tel.no_progress_streak,
+        "forced_final_answer_attempts": tel.forced_final_answer_attempts,
+        "last_progress_reason": tel.last_progress_reason,
+        "last_stall_reason": tel.last_stall_reason,
+        "hit_step_cap": tel.hit_step_cap,
+        "stalled_unfinished": tel.stalled_unfinished,
+        "stalled_repeating": tel.stalled_repeating,
+        "verify_attributions": tel.verify_attributions,
+        "tool_calls": tel.tool_calls,
+        "max_concurrent_batch": tel.max_concurrent_batch,
+        "serial_runs": tel.serial_runs,
+        "tool_timeline": tel.tool_timeline,
+        "progress_events": tel.progress_events,
+        "file_reads": tel.file_reads,
+        "targeted_searches": tel.targeted_searches,
+        "listing_only": tel.listing_only,
+        "first_tool_kind": tel.first_tool_kind,
+        "discovery_depth": tel.discovery_depth,
+        "quality_repair_nudges": tel.quality_repair_nudges,
+        "review_repair_exhaustion_reason": tel.review_repair_exhaustion_reason,
+        "review_repair_counts": tel.review_repair_counts,
+        "review_repair_stopped_by_exhaustion": tel.review_repair_stopped_by_exhaustion,
+        "stopped_by_step_cap": tel.hit_step_cap,
+    });
     let report = serde_json::json!({
         "model": model,
+        // Backward-compatible legacy fields: session-cumulative full-context
+        // input and generated output. Existing eval/fleet/watch callers budget
+        // from `total_tokens`, so do not change these semantics.
         "input_tokens": totals.input_tokens,
         "output_tokens": totals.output_tokens,
         "total_tokens": totals.total(),
+        "usage_scope": "session_cumulative_full_context",
+        "input_token_scope": "full_request_context_not_user_prompt",
+        "output_token_scope": "generated_output",
+        "session_input_tokens": totals.input_tokens,
+        "session_output_tokens": totals.output_tokens,
+        "session_total_tokens": totals.total(),
+        "session_cache_read_tokens": totals.cache_read_tokens,
+        "session_cache_creation_tokens": totals.cache_creation_tokens,
+        "turn_input_tokens": turn.input_tokens,
+        "turn_output_tokens": turn.output_tokens,
+        "turn_total_tokens": turn.total(),
+        "turn_cache_read_tokens": turn.cache_read_tokens,
+        "turn_cache_creation_tokens": turn.cache_creation_tokens,
+        "turn_prompt_estimated_tokens": agent.last_user_prompt_tokens(),
+        "user_prompt_estimated_tokens": user_prompt.map(hi_ai::estimate_text_tokens),
         "verify_passed": agent.last_verify(),
         "provider_error_kind": error.and_then(hi_ai::provider_error_kind).map(|k| k.as_str()),
         "compat_fallbacks_used": agent.last_compat_fallbacks(),
@@ -1009,46 +1075,8 @@ fn write_report(
         "changed_files": agent.last_changed_files(),
         // The long-horizon goal state, when one is active — fleet rows read
         // this to decide auto-continue. Null when no structured goal is set.
-        "goal": agent.structured_goal().map(|g| {
-            serde_json::json!({
-                "objective": g.objective,
-                "done": g.sub_goals.iter().filter(|s| s.status == hi_agent::GoalStatus::Done).count(),
-                "total": g.sub_goals.len(),
-                "status": format!("{:?}", g.status),
-                "paused": g.paused,
-            })
-        }),
-        "telemetry": {
-            "effective_max_steps": tel.effective_max_steps,
-            "verify_rounds": tel.verify_rounds,
-            "recovery_retries": tel.recovery_retries,
-            "repeat_nudges": tel.repeat_nudges,
-            "continue_nudges": tel.continue_nudges,
-            "truncation_retries": tel.truncation_retries,
-            "no_progress_streak": tel.no_progress_streak,
-            "forced_final_answer_attempts": tel.forced_final_answer_attempts,
-            "last_progress_reason": tel.last_progress_reason,
-            "last_stall_reason": tel.last_stall_reason,
-            "hit_step_cap": tel.hit_step_cap,
-            "stalled_unfinished": tel.stalled_unfinished,
-            "stalled_repeating": tel.stalled_repeating,
-            "verify_attributions": tel.verify_attributions,
-            "tool_calls": tel.tool_calls,
-            "max_concurrent_batch": tel.max_concurrent_batch,
-            "serial_runs": tel.serial_runs,
-            "tool_timeline": tel.tool_timeline,
-            "progress_events": tel.progress_events,
-            "file_reads": tel.file_reads,
-            "targeted_searches": tel.targeted_searches,
-            "listing_only": tel.listing_only,
-            "first_tool_kind": tel.first_tool_kind,
-            "discovery_depth": tel.discovery_depth,
-            "quality_repair_nudges": tel.quality_repair_nudges,
-            "review_repair_exhaustion_reason": tel.review_repair_exhaustion_reason,
-            "review_repair_counts": tel.review_repair_counts,
-            "review_repair_stopped_by_exhaustion": tel.review_repair_stopped_by_exhaustion,
-            "stopped_by_step_cap": tel.hit_step_cap,
-        },
+        "goal": goal,
+        "telemetry": telemetry,
     });
     if let Some(parent) = path
         .parent()

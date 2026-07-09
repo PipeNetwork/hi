@@ -113,7 +113,21 @@ fn one_shot_report_creates_parent_directories() {
     let text = std::fs::read_to_string(&report).expect("report should be written");
     let json: serde_json::Value = serde_json::from_str(&text).expect("report json");
     assert_eq!(json["model"], "fake/model");
+    assert_eq!(json["usage_scope"], "session_cumulative_full_context");
+    assert_eq!(
+        json["input_token_scope"],
+        "full_request_context_not_user_prompt"
+    );
+    assert_eq!(json["input_tokens"], 10);
     assert_eq!(json["output_tokens"], 5);
+    assert_eq!(json["session_input_tokens"], 10);
+    assert_eq!(json["session_output_tokens"], 5);
+    assert_eq!(json["session_total_tokens"], 15);
+    assert_eq!(json["turn_input_tokens"], 10);
+    assert_eq!(json["turn_output_tokens"], 5);
+    assert_eq!(json["turn_total_tokens"], 15);
+    assert_eq!(json["turn_prompt_estimated_tokens"], 2);
+    assert_eq!(json["user_prompt_estimated_tokens"], 2);
 }
 
 #[test]

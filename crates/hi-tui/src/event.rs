@@ -22,8 +22,8 @@ pub(crate) enum UiEvent {
     Status(String),
     Plan(Vec<PlanStep>),
     Usage {
-        input: u64,
-        output: u64,
+        prompt: u64,
+        generated: u64,
         ctx_used: u64,
         ctx_window: Option<u32>,
     },
@@ -85,14 +85,14 @@ impl Ui for ChannelUi {
     }
     fn usage(
         &mut self,
-        input_tokens: u64,
-        output_tokens: u64,
+        prompt_tokens: u64,
+        generated_tokens: u64,
         context_used: u64,
         context_window: Option<u32>,
     ) {
         self.send(UiEvent::Usage {
-            input: input_tokens,
-            output: output_tokens,
+            prompt: prompt_tokens,
+            generated: generated_tokens,
             ctx_used: context_used,
             ctx_window: context_window,
         });
