@@ -166,6 +166,28 @@ hi --best-of 3 --auto-verify "implement the spec in README"
 
 It runs N candidates (varied temperature) in isolated **git worktrees**, each with its own verify-loop, stops at the first that passes verification, and applies that candidate's diff back to your working tree. Requires a git repo and `--verify`/`--auto-verify`; run from a clean tree (candidates branch from HEAD).
 
+## Long-horizon goals
+
+`/goal <objective>` is for the tasks you'd normally break into a week of tickets — "port this
+service from Python to Rust," "get coverage above 80% in this crate." A goal isn't a prompt,
+it's a contract: a planner model (glm-5.2 on pipenetwork) decomposes the objective into
+sub-goals, and the agent keeps pulling toward it **turn after turn on its own** — through
+compactions, test failures, and refactors-within-refactors — while you monitor and steer.
+Type at any time to redirect (the drive resumes after); Esc pauses; `/goal resume` continues;
+the plan grows as work is discovered, with no default cap (`/goal limit N` sets one). Goals
+survive session resume, and a pinned checklist + `goal d/t` badge track progress in the TUI.
+
+## Fleet dashboard
+
+`/dashboard` scales that to a fleet: the dispatch box at the bottom always spawns a *new*
+session — type a prompt, hit Enter, and you've launched another agent without leaving the
+screen. Each row works in its **own git worktree**; verified, non-overlapping diffs
+**auto-merge back** (collisions hold visibly, `m` forces). Select a row for a peek panel with
+a live reply input — answer an idle agent with a single keystroke (`1`–`9`) or queue a
+follow-up; `Ctrl+S` dispatches *and* attaches. Prefix a dispatch with `/goal ` and the row
+drives a whole objective autonomously. Every row is its own resumable session. Details:
+[docs/fleet-dashboard.md](docs/fleet-dashboard.md).
+
 ## Sessions
 
 Every session is saved as JSONL under `~/.local/share/hi/sessions/`.
@@ -189,7 +211,9 @@ Slash commands (TUI or plain REPL):
 | `/verify [cmd\|off]` | show, set, or clear the test command turns iterate against — turn the verify-loop on without restarting |
 | `/diff` | show what files have changed this session (`git diff` + new files) |
 | `/copy [all]` | copy the last assistant response to the terminal clipboard; `all` copies the transcript |
-| `/goal [text\|clear]` | show, set, or clear the current session goal injected into future turns |
+| `/goal [obj\|pause\|resume\|limit N\|clear]` | set a long-horizon goal: a planner model decomposes it into sub-goals the agent then **drives autonomously turn after turn** (your input always takes priority; Esc pauses). `pause`/`resume` hold and continue; `limit N` caps plan growth (unbounded by default) |
+| `/dashboard` | control a fleet, not an agent: dispatch, monitor, and steer multiple concurrent sessions — each in its own git worktree with verified diffs auto-merging back ([docs](docs/fleet-dashboard.md)) |
+| `/delegate [on\|off]` | toggle the write-capable delegate subagent: the model can hand a self-contained subtask to a worktree-isolated child whose changes land only if they verify (off by default) |
 | `/init` | scan the repo and write an `HI.md` project guide (loaded as context in future sessions) |
 | `/compact [kind]` | reclaim context — `hybrid` (summarize old turns, keep recent), `full` (summarize everything), or `elide` (drop old tool output, no model call) |
 | `/retry` | re-run your last message (drops the previous attempt — pairs with `/model`) |
@@ -215,7 +239,7 @@ Drop an `HI.md` or `AGENTS.md` in your project and its contents are appended to 
 
 **TUI.** Interactive sessions open a full-screen TUI by default (ratatui): a bordered, scrollable transcript with a title bar showing live token usage, and an input box that turns into a working spinner (with elapsed seconds) while a turn runs. **Keep typing while it works to queue the next command(s)** — they're listed under the prompt and run in order as each turn finishes. Ctrl-C interrupts the current turn (and drops the queue), PgUp/PgDn scrolls, Up/Down recalls history, `/exit` quits. Pass `--plain` (or pipe input) for the line-based REPL.
 
-**Reports.** One-shot automation can write a JSON report with `--report path.json`. Reports include token totals, `verify_passed`, `provider_error_kind`, `compat_fallbacks_used`, `tool_mode_effective`, and `changed_files`.
+**Reports.** One-shot automation can write a JSON report with `--report path.json`. Reports include token totals, `verify_passed`, `provider_error_kind`, `compat_fallbacks_used`, `tool_mode_effective`, `changed_files`, and — when a long-horizon goal is active — a `goal` block (`objective`/`done`/`total`/`status`/`paused`).
 
 ## Architecture
 
