@@ -180,6 +180,26 @@ pub fn parse_loop_interval(s: &str) -> Option<u64> {
     (60..=7 * 86_400).contains(&secs).then_some(secs)
 }
 
+/// Parse a token count like `500k`, `1.5m`, `250000` into a number. Bare
+/// numbers are exact; `k`/`m` are ×1_000 / ×1_000_000 (decimals allowed).
+pub fn parse_token_count(s: &str) -> Option<u64> {
+    let s = s.trim().to_lowercase();
+    if s.is_empty() {
+        return None;
+    }
+    let (num, mult): (&str, u64) = match s.chars().last()? {
+        'k' => (&s[..s.len() - 1], 1_000),
+        'm' => (&s[..s.len() - 1], 1_000_000),
+        c if c.is_ascii_digit() => (s.as_str(), 1),
+        _ => return None,
+    };
+    let n: f64 = num.trim().parse().ok()?;
+    if !n.is_finite() || n < 0.0 {
+        return None;
+    }
+    Some((n * mult as f64).round() as u64)
+}
+
 /// The parsed form of a `/loop` argument.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LoopArg {
@@ -187,10 +207,23 @@ pub enum LoopArg {
     List,
     /// `cancel <id>`.
     Cancel(u64),
+    /// `pause <id>` — hold a loop (stops firing; stays resumable).
+    Pause(u64),
+    /// `resume <id>` — resume a paused loop.
+    Resume(u64),
+    /// `budget <id> <count|off>` — set/clear a token spend cap (auto-pauses).
+    Budget { id: u64, tokens: Option<u64> },
     /// `<interval> <prompt>` — create a loop firing `prompt` every `secs`.
     Create { secs: u64, prompt: String },
     /// Anything unparseable (bad interval / missing prompt / bad id).
     Invalid(String),
+}
+
+/// Parse a bare loop id (tolerating a leading `#`).
+fn parse_loop_id(s: &str) -> Result<u64, String> {
+    let s = s.trim().trim_start_matches('#');
+    s.parse()
+        .map_err(|_| format!("bad loop id '{s}' — /loop list shows ids"))
 }
 
 /// Split a `/loop` argument into its subcommand form.
@@ -200,10 +233,46 @@ pub fn parse_loop_arg(arg: &str) -> LoopArg {
         return LoopArg::List;
     }
     if let Some(rest) = a.strip_prefix("cancel") {
-        let rest = rest.trim().trim_start_matches('#');
-        return match rest.parse() {
+        return match parse_loop_id(rest) {
             Ok(id) => LoopArg::Cancel(id),
-            Err(_) => LoopArg::Invalid(format!("bad loop id '{rest}' — /loop list shows ids")),
+            Err(msg) => LoopArg::Invalid(msg),
+        };
+    }
+    if let Some(rest) = a.strip_prefix("pause") {
+        return match parse_loop_id(rest) {
+            Ok(id) => LoopArg::Pause(id),
+            Err(msg) => LoopArg::Invalid(msg),
+        };
+    }
+    if let Some(rest) = a.strip_prefix("resume") {
+        return match parse_loop_id(rest) {
+            Ok(id) => LoopArg::Resume(id),
+            Err(msg) => LoopArg::Invalid(msg),
+        };
+    }
+    if let Some(rest) = a.strip_prefix("budget") {
+        let rest = rest.trim();
+        let Some((id_str, amount)) = rest.split_once(char::is_whitespace) else {
+            return LoopArg::Invalid(
+                "usage: /loop budget <id> <count|off> — e.g. /loop budget 3 500k".into(),
+            );
+        };
+        let id = match parse_loop_id(id_str) {
+            Ok(id) => id,
+            Err(msg) => return LoopArg::Invalid(msg),
+        };
+        let amount = amount.trim();
+        if matches!(amount, "off" | "none" | "clear" | "0") {
+            return LoopArg::Budget { id, tokens: None };
+        }
+        return match parse_token_count(amount) {
+            Some(tokens) => LoopArg::Budget {
+                id,
+                tokens: Some(tokens),
+            },
+            None => LoopArg::Invalid(format!(
+                "bad token count '{amount}' — use e.g. 500k, 1.5m, or off"
+            )),
         };
     }
     let Some((head, prompt)) = a.split_once(char::is_whitespace) else {
@@ -915,6 +984,33 @@ mod tests {
             LoopArg::Invalid(_)
         ));
         assert!(matches!(parse_loop_arg("cancel abc"), LoopArg::Invalid(_)));
+        // Pause / resume / budget.
+        assert_eq!(parse_loop_arg("pause 3"), LoopArg::Pause(3));
+        assert_eq!(parse_loop_arg("resume #3"), LoopArg::Resume(3));
+        assert_eq!(
+            parse_loop_arg("budget 3 500k"),
+            LoopArg::Budget {
+                id: 3,
+                tokens: Some(500_000)
+            }
+        );
+        assert_eq!(
+            parse_loop_arg("budget 3 off"),
+            LoopArg::Budget {
+                id: 3,
+                tokens: None
+            }
+        );
+        assert!(matches!(
+            parse_loop_arg("budget 3 nope"),
+            LoopArg::Invalid(_)
+        ));
+        assert!(matches!(parse_loop_arg("budget"), LoopArg::Invalid(_)));
+        // Token-count parsing.
+        assert_eq!(super::parse_token_count("500k"), Some(500_000));
+        assert_eq!(super::parse_token_count("1.5m"), Some(1_500_000));
+        assert_eq!(super::parse_token_count("250000"), Some(250_000));
+        assert_eq!(super::parse_token_count("nope"), None);
         // Command parse.
         assert_eq!(parse("/loop"), Some(Command::Loop(String::new())));
         assert_eq!(parse("/watch"), Some(Command::Watch));

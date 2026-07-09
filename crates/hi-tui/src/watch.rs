@@ -27,7 +27,7 @@ use ratatui::widgets::{Block, BorderType, Paragraph, Wrap};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::input::InputLine;
-use crate::loops::{LoopCtl, LoopWatchRow, humanize_secs};
+use crate::loops::{LoopCtl, LoopWatchRow, fmt_tokens, humanize_secs};
 use crate::render::dim;
 use crate::{App, SPINNER};
 
@@ -180,6 +180,22 @@ pub(crate) async fn run_watch(
                                     });
                                 }
                             }
+                            KeyCode::Char('p') => {
+                                if let Some(row) = rows.get(selected) {
+                                    let on = !row.paused;
+                                    let (tx, rx) = oneshot::channel();
+                                    let _ = ctl.send(LoopCtl::Pause {
+                                        id: row.id,
+                                        on,
+                                        reply: tx,
+                                    });
+                                    flash = Some(match rx.await {
+                                        Ok(true) if on => format!("paused loop#{}", row.id),
+                                        Ok(true) => format!("resumed loop#{}", row.id),
+                                        _ => format!("no loop#{}", row.id),
+                                    });
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -219,6 +235,43 @@ async fn arm_from_compose(ctl: &mpsc::UnboundedSender<LoopCtl>, text: String) ->
             let _ = ctl.send(LoopCtl::Cancel { id, reply: tx });
             Some(match rx.await {
                 Ok(true) => format!("cancelled loop#{id}"),
+                _ => format!("no loop#{id}"),
+            })
+        }
+        hi_agent::command::LoopArg::Pause(id) => {
+            let (tx, rx) = oneshot::channel();
+            let _ = ctl.send(LoopCtl::Pause {
+                id,
+                on: true,
+                reply: tx,
+            });
+            Some(match rx.await {
+                Ok(true) => format!("paused loop#{id}"),
+                _ => format!("no loop#{id}"),
+            })
+        }
+        hi_agent::command::LoopArg::Resume(id) => {
+            let (tx, rx) = oneshot::channel();
+            let _ = ctl.send(LoopCtl::Pause {
+                id,
+                on: false,
+                reply: tx,
+            });
+            Some(match rx.await {
+                Ok(true) => format!("resumed loop#{id}"),
+                _ => format!("no loop#{id}"),
+            })
+        }
+        hi_agent::command::LoopArg::Budget { id, tokens } => {
+            let (tx, rx) = oneshot::channel();
+            let _ = ctl.send(LoopCtl::Budget {
+                id,
+                tokens,
+                reply: tx,
+            });
+            Some(match (rx.await, tokens) {
+                (Ok(true), Some(t)) => format!("loop#{id} budget {}", fmt_tokens(t)),
+                (Ok(true), None) => format!("loop#{id} budget cleared"),
                 _ => format!("no loop#{id}"),
             })
         }
@@ -315,8 +368,8 @@ fn render_table(frame: &mut ratatui::Frame, rows: &[LoopWatchRow], selected: usi
     let mut lines: Vec<Line> = Vec::new();
     lines.push(Line::styled(
         format!(
-            "   {:<4} {:<7} {:<11} {:>5}  {}",
-            "id", "every", "next", "fires", "last result"
+            "   {:<4} {:<7} {:<11} {:>5} {:>11}  {}",
+            "id", "every", "next", "fires", "spent", "last result"
         ),
         dim(),
     ));
@@ -330,12 +383,15 @@ fn render_table(frame: &mut ratatui::Frame, rows: &[LoopWatchRow], selected: usi
 
     for (i, row) in rows.iter().enumerate() {
         let sel = i == selected;
-        // Leading glyph: spinner while firing, else a loud/quiet/none marker.
+        // Leading glyph: spinner while firing, ⏸ when paused, else a
+        // loud/quiet/none result marker.
         let (glyph, glyph_style) = if row.firing {
             (
                 SPINNER[frame_tick(row) % SPINNER.len()].to_string(),
                 Style::default().fg(Color::Yellow),
             )
+        } else if row.paused {
+            ("⏸".to_string(), dim())
         } else if row.last_fired_ms == 0 {
             (" ".to_string(), dim())
         } else if row.last_quiet {
@@ -346,25 +402,35 @@ fn render_table(frame: &mut ratatui::Frame, rows: &[LoopWatchRow], selected: usi
 
         let next = if row.firing {
             "firing…".to_string()
+        } else if row.paused {
+            "paused".to_string()
         } else if row.next_ms <= now {
             "due".to_string()
         } else {
             format!("in {}", fmt_left((row.next_ms - now) / 1000))
         };
 
+        // Spend column: `spent/budget` when a budget is set, else spend alone.
+        let spent = match row.token_budget {
+            Some(b) => format!("{}/{}", fmt_tokens(row.spent_tokens), fmt_tokens(b)),
+            None if row.spent_tokens > 0 => fmt_tokens(row.spent_tokens),
+            None => "—".to_string(),
+        };
+
         let (last, last_style) = match &row.last_summary {
             _ if row.firing => ("checking…".to_string(), Style::default().fg(Color::Yellow)),
             Some(_) if row.last_quiet => ("· nothing new".to_string(), dim()),
-            Some(s) => (truncate(s, 64), Style::default().fg(Color::White)),
+            Some(s) => (truncate(s, 60), Style::default().fg(Color::White)),
             None => ("—".to_string(), dim()),
         };
 
         let body = format!(
-            "#{:<3} {:<7} {:<11} {:>5}  ",
+            "#{:<3} {:<7} {:<11} {:>5} {:>11}  ",
             row.id,
             humanize_secs(row.interval_secs),
             next,
             row.firings,
+            spent,
         );
         let row_style = if sel {
             Style::default().add_modifier(Modifier::BOLD)
@@ -433,6 +499,34 @@ fn render_peek(
         ),
         dim(),
     ));
+    // Cost + pause status line.
+    let mut status: Vec<Span> = Vec::new();
+    if row.paused {
+        status.push(Span::styled("⏸ paused", Style::default().fg(Color::Yellow)));
+        status.push(Span::styled("  ·  ", dim()));
+    }
+    match row.token_budget {
+        Some(b) => status.push(Span::styled(
+            format!(
+                "{} / {} tokens",
+                fmt_tokens(row.spent_tokens),
+                fmt_tokens(b)
+            ),
+            if row.spent_tokens >= b {
+                Style::default().fg(Color::Yellow)
+            } else {
+                dim()
+            },
+        )),
+        None => status.push(Span::styled(
+            format!(
+                "{} tokens spent · no budget (p pauses)",
+                fmt_tokens(row.spent_tokens)
+            ),
+            dim(),
+        )),
+    }
+    lines.push(Line::from(status));
     lines.push(Line::raw(""));
 
     if row.firing {
@@ -489,9 +583,11 @@ fn render_peek(
 fn render_hints(frame: &mut ratatui::Frame, focus: Focus, area: Rect) {
     let hint = match focus {
         Focus::List => {
-            "↑↓ select · f fire now · c cancel · n arm a loop · PgUp/PgDn history · Esc close"
+            "↑↓ select · f fire · p pause · c cancel · n arm · PgUp/Dn history · Esc close"
         }
-        Focus::Compose => "type <interval> <prompt> · Enter arms · Esc/Tab back to list",
+        Focus::Compose => {
+            "type <interval> <prompt> (or pause|resume|budget <id> …) · Enter · Esc/Tab back"
+        }
     };
     frame.render_widget(
         Paragraph::new(Line::styled(format!("  {hint}"), dim())),
@@ -588,6 +684,9 @@ mod tests {
                 expires_ms: now + 6 * 86_400_000,
                 firings: 4,
                 firing: false,
+                paused: false,
+                token_budget: Some(500_000),
+                spent_tokens: 123_000,
                 last_summary: Some("CI went red: 3 parser test failures".into()),
                 last_quiet: false,
                 last_fired_ms: now.saturating_sub(120_000),
@@ -614,6 +713,9 @@ mod tests {
                 expires_ms: now + 7 * 86_400_000,
                 firings: 1,
                 firing: true,
+                paused: false,
+                token_budget: None,
+                spent_tokens: 0,
                 last_summary: None,
                 last_quiet: false,
                 last_fired_ms: 0,
@@ -640,13 +742,47 @@ mod tests {
         assert!(s.contains("#2"), "{s}");
         assert!(s.contains("in "), "table shows a countdown\n{s}");
         assert!(s.contains("firing…"), "firing row shows firing…\n{s}");
-        // Selected row 1 → peek shows its prompt + history (loud + quiet).
+        // Cost column: spent/budget for the loop that has one.
+        assert!(s.contains("123k/500k"), "spend/budget column\n{s}");
+        // Selected row 1 → peek shows its prompt + history (loud + quiet) + budget.
         assert!(s.contains("check whether CI on main is green"), "{s}");
         assert!(s.contains("recent checks"), "{s}");
         assert!(s.contains("CI went red"), "{s}");
         assert!(s.contains("nothing new"), "quiet history rendered\n{s}");
+        assert!(s.contains("123k / 500k tokens"), "peek budget line\n{s}");
         // List-focus hints.
-        assert!(s.contains("fire now"), "{s}");
+        assert!(s.contains("p pause"), "hints show pause\n{s}");
+    }
+
+    #[test]
+    fn renders_paused_loop() {
+        let now = now_ms();
+        let rows = vec![LoopWatchRow {
+            id: 7,
+            name: "nightly build".into(),
+            prompt: "watch the nightly build".into(),
+            interval_secs: 3600,
+            created_ms: now,
+            next_ms: now + 3600_000,
+            expires_ms: now + 7 * 86_400_000,
+            firings: 2,
+            firing: false,
+            paused: true,
+            token_budget: Some(200_000),
+            spent_tokens: 200_000,
+            last_summary: Some("build still green".into()),
+            last_quiet: true,
+            last_fired_ms: now.saturating_sub(60_000),
+            history: vec![],
+        }];
+        let mut term = Terminal::new(TestBackend::new(110, 24)).unwrap();
+        let compose = InputLine::default();
+        term.draw(|f| render(f, &rows, 0, Focus::List, &compose, 0, None))
+            .unwrap();
+        let s = dump(&term);
+        assert!(s.contains("paused"), "paused shows in the next column\n{s}");
+        assert!(s.contains("⏸"), "paused glyph\n{s}");
+        assert!(s.contains("200k/200k"), "at-budget spend\n{s}");
     }
 
     #[test]
@@ -662,6 +798,6 @@ mod tests {
             s.contains("30m check the canary"),
             "compose text shown\n{s}"
         );
-        assert!(s.contains("Enter arms"), "compose hints shown\n{s}");
+        assert!(s.contains("Esc/Tab back"), "compose hints shown\n{s}");
     }
 }

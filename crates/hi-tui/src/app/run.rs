@@ -1052,13 +1052,31 @@ pub async fn run(
                                             let due_in = l.next_ms.saturating_sub(now) / 1000;
                                             let expires_h =
                                                 l.expires_ms.saturating_sub(now) / 3_600_000;
+                                            let next = if l.paused {
+                                                "paused".to_string()
+                                            } else {
+                                                format!("next in {due_in}s")
+                                            };
+                                            let cost = match l.token_budget {
+                                                Some(b) => format!(
+                                                    " · {}/{}",
+                                                    crate::loops::fmt_tokens(l.spent_tokens),
+                                                    crate::loops::fmt_tokens(b)
+                                                ),
+                                                None if l.spent_tokens > 0 => format!(
+                                                    " · {} spent",
+                                                    crate::loops::fmt_tokens(l.spent_tokens)
+                                                ),
+                                                None => String::new(),
+                                            };
                                             app.push(Line::styled(
                                                 format!(
-                                                    "  #{} every {} · next in {}s · {} firing(s) · expires {}h · {}",
+                                                    "  #{} every {} · {} · {} firing(s){} · expires {}h · {}",
                                                     l.id,
                                                     crate::loops::humanize_secs(l.interval_secs),
-                                                    due_in,
+                                                    next,
                                                     l.firings,
+                                                    cost,
                                                     expires_h,
                                                     l.name(),
                                                 ),
@@ -1067,6 +1085,54 @@ pub async fn run(
                                         }
                                     }
                                 }
+                            }
+                        }
+                        command::LoopArg::Pause(id) | command::LoopArg::Resume(id) => {
+                            let on =
+                                matches!(command::parse_loop_arg(&arg), command::LoopArg::Pause(_));
+                            if let Some(loops) = &app.loops {
+                                let (tx, rx) = tokio::sync::oneshot::channel();
+                                let _ = loops.ctl.send(crate::loops::LoopCtl::Pause {
+                                    id,
+                                    on,
+                                    reply: tx,
+                                });
+                                let verb = if on { "paused" } else { "resumed" };
+                                let msg = match rx.await {
+                                    Ok(true) => (format!("✓ loop#{id} {verb}"), Color::Green),
+                                    _ => (
+                                        format!("no loop#{id} — /loop list shows ids"),
+                                        Color::Yellow,
+                                    ),
+                                };
+                                app.push(Line::styled(msg.0, Style::default().fg(msg.1)));
+                            }
+                        }
+                        command::LoopArg::Budget { id, tokens } => {
+                            if let Some(loops) = &app.loops {
+                                let (tx, rx) = tokio::sync::oneshot::channel();
+                                let _ = loops.ctl.send(crate::loops::LoopCtl::Budget {
+                                    id,
+                                    tokens,
+                                    reply: tx,
+                                });
+                                let msg = match (rx.await, tokens) {
+                                    (Ok(true), Some(t)) => (
+                                        format!(
+                                            "✓ loop#{id} budget set to {}",
+                                            crate::loops::fmt_tokens(t)
+                                        ),
+                                        Color::Green,
+                                    ),
+                                    (Ok(true), None) => {
+                                        (format!("✓ loop#{id} budget cleared"), Color::Green)
+                                    }
+                                    _ => (
+                                        format!("no loop#{id} — /loop list shows ids"),
+                                        Color::Yellow,
+                                    ),
+                                };
+                                app.push(Line::styled(msg.0, Style::default().fg(msg.1)));
                             }
                         }
                         command::LoopArg::Invalid(msg) => {

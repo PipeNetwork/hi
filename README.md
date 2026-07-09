@@ -202,11 +202,18 @@ ping when you're unfocused). Loops persist per project and re-arm when `hi` rest
 while `hi` is running).
 
 `/watch` opens a **full-screen dashboard of every active loop**: a live table with per-loop
-countdowns to the next firing, a spinner while one is checking, and each loop's last result
-(dim `· nothing new` or a loud one-line change). Select a loop to peek its recent firing history;
-`f` fires the selected loop immediately, `c` cancels it, and `n` arms a new one from the same
-`<interval> <prompt>` box — all without leaving the screen. The loops keep firing in the
-background; Esc returns to the chat.
+countdowns to the next firing, a spinner while one is checking, each loop's last result
+(dim `· nothing new` or a loud one-line change), and its **running token spend**. Select a loop
+to peek its recent firing history; `f` fires the selected loop immediately, `p` pauses/resumes it,
+`c` cancels it, and `n` arms a new one from the same `<interval> <prompt>` box — all without
+leaving the screen. The loops keep firing in the background; Esc returns to the chat.
+
+**Cost guard.** Each firing is a full agent turn, so a fast loop adds up — a `60s` loop is ~10k
+turns over its 7-day life. Every loop tracks its cumulative token spend, and you can cap it:
+`/loop budget 3 500k` auto-**pauses** loop #3 once it has spent 500k tokens (it stays resumable —
+raise the budget or `/loop resume 3` to continue). Pause and resume any loop by hand with
+`/loop pause <id>` / `/loop resume <id>` (or `p` in `/watch`); a paused loop holds its place and
+its cost without firing.
 
 ## Sessions
 
@@ -232,7 +239,7 @@ Slash commands (TUI or plain REPL):
 | `/diff` | show what files have changed this session (`git diff` + new files) |
 | `/copy [all]` | copy the last assistant response to the terminal clipboard; `all` copies the transcript |
 | `/goal [obj\|pause\|resume\|limit N\|clear]` | set a long-horizon goal: a planner model decomposes it into sub-goals the agent then **drives autonomously turn after turn** (your input always takes priority; Esc pauses). `pause`/`resume` hold and continue; `limit N` caps plan growth (unbounded by default) |
-| `/loop <interval> <prompt>` | the same prompt, on a cadence (60s–7d: `90s`, `30m`, `2h`, `1d`): each firing is a **full agent turn** that remembers previous checks and reports only what changed. `/loop list`, `/loop cancel <id>`; loops auto-expire after 7 days |
+| `/loop <interval> <prompt>` | the same prompt, on a cadence (60s–7d: `90s`, `30m`, `2h`, `1d`): each firing is a **full agent turn** that remembers previous checks and reports only what changed. `/loop list`, `/loop cancel <id>`, `/loop pause\|resume <id>`, `/loop budget <id> <count\|off>` (token cap → auto-pause); loops auto-expire after 7 days |
 | `/watch` | full-screen live dashboard of all active loops: per-loop countdowns, firing spinners, last result, and recent history — with `f` fire-now, `c` cancel, `n` arm a new loop |
 | `/dashboard` (`/fleet`) | control a fleet, not an agent: dispatch, monitor, and steer multiple concurrent sessions — each in its own git worktree with verified diffs auto-merging back; `/fleet status` lists this project's resumable fleet sessions ([docs](docs/fleet-dashboard.md)) |
 | `/delegate [on\|off]` | toggle the write-capable delegate subagent: the model can hand a self-contained subtask to a worktree-isolated child whose changes land only if they verify (off by default) |
