@@ -2426,6 +2426,27 @@ If the task is already complete, stop and give your final recap."
                         completion_order.push(i);
                         continue;
                     }
+                    if name == "delegate" {
+                        // Write-capable subagent: runs a child turn that edits + verifies
+                        // in the same tree, checkpoint-guarded so a failed delegation rolls
+                        // back. Like `explore`, handled here because it needs `&mut self`
+                        // and is itself an agent turn.
+                        ui.tool_call(name, arguments);
+                        let content = self.handle_delegate(arguments, &mut *ui).await;
+                        emit_tool_output(
+                            &mut *ui,
+                            name,
+                            &hi_tools::ToolOutput {
+                                content: content.clone(),
+                                display: None,
+                                plan: None,
+                            },
+                        );
+                        results[i] = Some((id.clone(), content));
+                        completed[i] = true;
+                        completion_order.push(i);
+                        continue;
+                    }
                     if name != "record_decision" {
                         continue;
                     }

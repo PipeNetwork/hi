@@ -14,6 +14,7 @@ mod session;
 pub mod skills;
 mod snapshot;
 mod steering;
+mod subagent;
 mod transcript;
 pub mod ui;
 mod verify;
@@ -36,6 +37,7 @@ pub use skills::{
     build_learn_prompt, build_skill_use_prompt, learned_skills_context, list_skills, read_skill,
     skill_roots,
 };
+pub use subagent::{DelegateOutcome, DelegateRunner};
 pub use ui::{Ui, classify_error, tool_label};
 
 use snapshot::SnapshotCache;
@@ -464,6 +466,9 @@ pub struct Agent {
     pub(crate) messages: Transcript,
     pub(crate) tools: Arc<[ToolSpec]>,
     pub(crate) session: Option<Box<dyn SessionSink>>,
+    /// Frontend-supplied runner for the write-capable `delegate` subagent (worktree
+    /// + subprocess + verify + apply-back). `None` → `delegate` is unavailable.
+    pub(crate) delegate_runner: Option<Arc<dyn DelegateRunner>>,
     /// How many messages have already been handed to the session sink.
     pub(crate) persisted: usize,
     /// Running total of tokens across the session.
@@ -484,6 +489,9 @@ pub struct Agent {
     /// session (see `MAX_EXPLORE_SUBAGENTS_PER_SESSION`) to bound cost if the
     /// model over-delegates.
     pub(crate) explore_subagents_used: u32,
+    /// Count of write-capable `delegate` subagents run this session. Capped by
+    /// `MAX_DELEGATE_SUBAGENTS_PER_SESSION`.
+    pub(crate) delegate_subagents_used: u32,
     pub(crate) last_compat_fallbacks: Vec<String>,
     /// A shared interrupt flag. When set (by the UI on a user action like
     /// pressing Esc during a tool call), the agent skips the remaining tool

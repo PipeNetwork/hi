@@ -101,15 +101,20 @@ impl crate::Agent {
         }
         let tools = if config.minimal_tools {
             hi_tools::MINIMAL_TOOL_SPECS.clone().into()
-        } else if config.explore_subagents && !config.is_subagent {
-            // Advertise the read-only `explore` subagent tool alongside the full set.
-            // It's kept out of the global TOOL_SPECS so it only appears here, for a
-            // top-level agent — and never for a subagent child (depth ≤ 1).
-            let mut specs = TOOL_SPECS.clone();
-            specs.push(hi_tools::explore_tool_spec());
-            specs.into()
         } else {
-            TOOL_SPECS.clone().into()
+            // The subagent tools (`explore`, `delegate`) are kept out of the global
+            // TOOL_SPECS and injected here only for a top-level agent — never for a
+            // subagent child, so a subagent can't spawn another (depth ≤ 1).
+            let mut specs = TOOL_SPECS.clone();
+            if !config.is_subagent {
+                if config.explore_subagents {
+                    specs.push(hi_tools::explore_tool_spec());
+                }
+                if config.write_subagents {
+                    specs.push(hi_tools::delegate_tool_spec());
+                }
+            }
+            specs.into()
         };
         Self {
             provider,
@@ -117,6 +122,7 @@ impl crate::Agent {
             messages,
             tools,
             session: None,
+            delegate_runner: None,
             persisted,
             totals: Usage::default(),
             last_verify: None,
@@ -125,6 +131,7 @@ impl crate::Agent {
             last_changed_files: Vec::new(),
             auto_skills_written: 0,
             explore_subagents_used: 0,
+            delegate_subagents_used: 0,
             last_compat_fallbacks: Vec::new(),
             interrupt: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_turn_telemetry: TurnTelemetry::default(),
@@ -160,6 +167,12 @@ impl crate::Agent {
     /// Attach a session sink that records messages produced from here on.
     pub fn set_session(&mut self, session: Box<dyn SessionSink>) {
         self.session = Some(session);
+    }
+
+    /// Attach the runner that executes write-capable `delegate` subagents. Without
+    /// one, the `delegate` tool reports itself unavailable.
+    pub fn set_delegate_runner(&mut self, runner: std::sync::Arc<dyn crate::DelegateRunner>) {
+        self.delegate_runner = Some(runner);
     }
 
     /// The current conversation history (including the system prompt).

@@ -15092,12 +15092,35 @@ mod native {
                         .context("alloc wmma k16")?;
                     let v16 = DeviceBuffer::alloc(v.rows * v.cols * std::mem::size_of::<u16>())
                         .context("alloc wmma v16")?;
-                    crate::kernels::launch_cast_f32_to_f16(&q.buffer, &q16, q.rows * q.cols, &self.stream)?;
-                    crate::kernels::launch_cast_f32_to_f16(&k.buffer, &k16, k.rows * k.cols, &self.stream)?;
-                    crate::kernels::launch_cast_f32_to_f16(&v.buffer, &v16, v.rows * v.cols, &self.stream)?;
+                    crate::kernels::launch_cast_f32_to_f16(
+                        &q.buffer,
+                        &q16,
+                        q.rows * q.cols,
+                        &self.stream,
+                    )?;
+                    crate::kernels::launch_cast_f32_to_f16(
+                        &k.buffer,
+                        &k16,
+                        k.rows * k.cols,
+                        &self.stream,
+                    )?;
+                    crate::kernels::launch_cast_f32_to_f16(
+                        &v.buffer,
+                        &v16,
+                        v.rows * v.cols,
+                        &self.stream,
+                    )?;
                     crate::kernels::launch_wmma_causal_attention_batched(
-                        &q16, &k16, &v16, &output, batch_count, seq_len, heads, kv_heads,
-                        head_dim, &self.stream,
+                        &q16,
+                        &k16,
+                        &v16,
+                        &output,
+                        batch_count,
+                        seq_len,
+                        heads,
+                        kv_heads,
+                        head_dim,
+                        &self.stream,
                     )?;
                 } else {
                     crate::kernels::launch_flashtile_causal_attention_batched(
