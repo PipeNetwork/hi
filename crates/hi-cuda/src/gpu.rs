@@ -2769,6 +2769,15 @@ mod native {
         *ENABLED.get_or_init(|| std::env::var("HI_CUDA_NO_DEQUANT_F16").is_err())
     }
 
+    /// dp4a K-quant decode GEMVs (int8 activation + `__dp4a` + warp-per-row) instead
+    /// of the float per-op GEMVs — ~3x faster (validated on Q4_K). Default on;
+    /// `HI_CUDA_NO_KQUANT_DP4A` reverts to the float GEMVs.
+    fn kquant_dp4a_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("HI_CUDA_NO_KQUANT_DP4A").is_err())
+    }
+
     fn weights_f16_choice(specs: &[MatrixSpec]) -> bool {
         match std::env::var("HI_CUDA_WEIGHTS_F16")
             .ok()
@@ -3231,15 +3240,48 @@ mod native {
             {
                 let output = DeviceBuffer::alloc(matrix.rows * std::mem::size_of::<f32>())
                     .context("allocating CUDA Q4_K GEMV output")?;
-                crate::kernels::launch_q4_k_gemv(
-                    &matrix.buffer,
-                    &input.buffer,
-                    &output,
-                    matrix.rows,
-                    matrix.cols,
-                    &self.stream,
-                )
-                .with_context(|| format!("CUDA Q4_K GEMV for {matrix_name}"))?;
+                if kquant_dp4a_enabled() {
+                    // dp4a path: quantize the activation to int8 (per-32, same as Q4_0)
+                    // and run the __dp4a Q4_K GEMV — ~3-4x faster than the float
+                    // q4_k_gemv, which re-reads block metadata per weight.
+                    let k = matrix.cols;
+                    let nblocks = k / 32;
+                    let xq = DeviceBuffer::alloc(k).context("allocating Q8 activation quants")?;
+                    let dx = DeviceBuffer::alloc(nblocks * std::mem::size_of::<f32>())
+                        .context("allocating Q8 activation scales")?;
+                    let xsum = DeviceBuffer::alloc(nblocks * std::mem::size_of::<i32>())
+                        .context("allocating Q8 activation sums")?;
+                    crate::kernels::launch_quantize_q8_row(
+                        &input.buffer,
+                        &xq,
+                        &dx,
+                        &xsum,
+                        k,
+                        &self.stream,
+                    )
+                    .with_context(|| format!("Q8 activation quant for {matrix_name}"))?;
+                    crate::kernels::launch_q4_k_dp4a_gemv(
+                        &matrix.buffer,
+                        &xq,
+                        &dx,
+                        &xsum,
+                        &output,
+                        matrix.rows,
+                        matrix.cols,
+                        &self.stream,
+                    )
+                    .with_context(|| format!("CUDA Q4_K dp4a GEMV for {matrix_name}"))?;
+                } else {
+                    crate::kernels::launch_q4_k_gemv(
+                        &matrix.buffer,
+                        &input.buffer,
+                        &output,
+                        matrix.rows,
+                        matrix.cols,
+                        &self.stream,
+                    )
+                    .with_context(|| format!("CUDA Q4_K GEMV for {matrix_name}"))?;
+                }
                 self.op_barrier()?;
                 return Ok(GpuF32Tensor {
                     rows: 1,
