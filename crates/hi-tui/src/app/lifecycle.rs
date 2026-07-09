@@ -70,6 +70,8 @@ impl crate::App {
             plan: Vec::new(),
             goal: None,
             goal_drive_stall: 0,
+            fleet: Vec::new(),
+            fleet_next_id: 0,
             usage: (0, 0),
             context_used: 0,
             context_window: None,

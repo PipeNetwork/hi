@@ -69,6 +69,9 @@ pub enum Command {
     Mcp,
     /// Discover/list/download Hugging Face Hub model artifacts.
     Hf(String),
+    /// Open the fleet dashboard: dispatch, monitor, and steer multiple
+    /// concurrent agent sessions from one screen (TUI only).
+    Dashboard,
     Quit,
     /// A `/word` that isn't recognized.
     Unknown(String),
@@ -119,6 +122,7 @@ pub fn parse(line: &str) -> Option<Command> {
         "hf" | "hd" | "huggingface" => Command::Hf(arg),
         "lsp" => Command::Lsp(arg),
         "delegate" | "delegates" => Command::Delegate(arg),
+        "dashboard" | "fleet" => Command::Dashboard,
         "exit" | "quit" | "q" => Command::Quit,
         other => Command::Unknown(other.to_string()),
     })
@@ -466,6 +470,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         ],
     },
     CommandSpec {
+        name: "dashboard",
+        args: "",
+        help: "control a fleet: dispatch, monitor, and steer multiple agents (TUI)",
+        arg_values: &[],
+    },
+    CommandSpec {
         name: "status",
         args: "[topic]",
         help: "show runtime status, or discuss codebase status with a topic",
@@ -745,6 +755,8 @@ mod tests {
         assert_eq!(parse("/lsp on"), Some(Command::Lsp("on".into())));
         assert_eq!(parse("/lsp off"), Some(Command::Lsp("off".into())));
         // `/delegate` toggles the write subagent.
+        assert_eq!(parse("/dashboard"), Some(Command::Dashboard));
+        assert_eq!(parse("/fleet"), Some(Command::Dashboard));
         assert_eq!(parse("/delegate"), Some(Command::Delegate(String::new())));
         assert_eq!(parse("/delegate on"), Some(Command::Delegate("on".into())));
         assert_eq!(

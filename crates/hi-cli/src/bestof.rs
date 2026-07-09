@@ -25,7 +25,7 @@ pub struct BestOf<'a> {
 }
 
 pub fn run(opts: &BestOf) -> Result<()> {
-    if !crate::worktree::in_git_repo() {
+    if !hi_tools::worktree::in_git_repo() {
         bail!("--best-of requires a git repository (candidates run in worktrees)");
     }
     if working_tree_dirty() {
@@ -38,9 +38,9 @@ pub fn run(opts: &BestOf) -> Result<()> {
     let mut worktrees: Vec<(u32, PathBuf, f32)> = Vec::new();
     for i in 0..opts.candidates {
         let temperature = temperature_for(i, opts.candidates);
-        let worktree = crate::worktree::worktree_path("bestof", i);
-        if let Err(err) = crate::worktree::add_worktree(&worktree, "HEAD") {
-            crate::worktree::cleanup(
+        let worktree = hi_tools::worktree::worktree_path("bestof", i);
+        if let Err(err) = hi_tools::worktree::add_worktree(&worktree, "HEAD") {
+            hi_tools::worktree::cleanup(
                 &worktrees
                     .iter()
                     .map(|(_, wt, _)| wt.clone())
@@ -119,7 +119,7 @@ pub fn run(opts: &BestOf) -> Result<()> {
     }
 
     if let Some(err) = join_error {
-        crate::worktree::cleanup(&cleanup_paths);
+        hi_tools::worktree::cleanup(&cleanup_paths);
         return Err(err);
     }
 
@@ -141,7 +141,7 @@ pub fn run(opts: &BestOf) -> Result<()> {
             );
             continue;
         }
-        if crate::worktree::verify_passes(worktree, opts.verify) {
+        if hi_tools::worktree::verify_passes(worktree, opts.verify) {
             println!(
                 "\x1b[32m✓ candidate {}/{} passed verification\x1b[0m",
                 idx + 1,
@@ -159,7 +159,7 @@ pub fn run(opts: &BestOf) -> Result<()> {
 
     let result = match &winner {
         Some((i, worktree)) => {
-            let result = crate::worktree::apply_changes(worktree, "HEAD")
+            let result = hi_tools::worktree::apply_changes(worktree, "HEAD")
                 .map(|_| ())
                 .with_context(|| "applying the winning candidate's changes");
             if result.is_ok() {
@@ -180,7 +180,7 @@ pub fn run(opts: &BestOf) -> Result<()> {
     };
 
     // Clean up every worktree we created (the artifacts dir is separate and kept).
-    crate::worktree::cleanup(&cleanup_paths);
+    hi_tools::worktree::cleanup(&cleanup_paths);
     print_candidate_summary(&art_dir, total);
     result
 }

@@ -36,6 +36,9 @@ impl VerifyStage {
 }
 
 /// Per-session configuration the agent applies to every request.
+/// `Clone` so a fleet/dashboard can stamp out additional agents from the
+/// session's resolved config (tweaking per-agent fields as needed).
+#[derive(Clone)]
 pub struct AgentConfig {
     pub model: String,
     /// The user/config requested output-token cap before live model metadata is

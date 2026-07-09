@@ -297,6 +297,21 @@ pub fn new_session_path() -> Result<PathBuf> {
     Ok(dir.join(format!("{millis:013}.jsonl")))
 }
 
+/// Path for a fleet-dispatched session. Unlike [`new_session_path`] (millis
+/// only), several fleet agents can be dispatched within the same millisecond,
+/// so a per-process counter suffix keeps the paths (and resume ids) unique
+/// while staying time-sortable.
+pub fn new_fleet_session_path() -> Result<PathBuf> {
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let dir = sessions_dir().context("could not determine session directory")?;
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(dir.join(format!("{millis:013}-f{n}.jsonl")))
+}
+
 /// Path for an explicit session id (with or without the `.jsonl` suffix).
 ///
 /// Looks in the current project's session dir first. If the id isn't found
@@ -533,6 +548,17 @@ mod tests {
     use super::{JsonlSession, cwd_digest, load_history, session_title};
     use hi_agent::SessionSink;
     use hi_ai::{Message, Usage};
+
+    #[test]
+    fn fleet_session_paths_are_unique_within_a_burst() {
+        // new_session_path is millis-only; dispatching several fleet agents in
+        // one millisecond must still yield distinct files (counter suffix).
+        let paths: Vec<_> = (0..10)
+            .map(|_| super::new_fleet_session_path().expect("path"))
+            .collect();
+        let unique: std::collections::HashSet<_> = paths.iter().collect();
+        assert_eq!(unique.len(), paths.len(), "collision in {paths:?}");
+    }
 
     #[test]
     fn title_strips_folded_stdin_and_collapses_whitespace() {

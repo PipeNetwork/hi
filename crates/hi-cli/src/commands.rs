@@ -257,6 +257,11 @@ pub(crate) fn handle_command(
         Command::Delegate(arg) => {
             handle_delegate_command(agent, &arg);
         }
+        Command::Dashboard => {
+            println!(
+                "\x1b[33m/dashboard is only available in the full-screen TUI (run hi without --plain)\x1b[0m"
+            );
+        }
     }
     false
 }

@@ -54,6 +54,7 @@ pub async fn run(
     resume_summary: Option<String>,
     mcp_url: Option<String>,
     api_key: String,
+    fleet_launcher: crate::FleetLauncher,
 ) -> Result<()> {
     if !io::stdin().is_terminal() {
         anyhow::bail!("TUI requires an interactive stdin");
@@ -961,6 +962,20 @@ pub async fn run(
                     }
                     continue;
                 }
+                // `/dashboard`: the fleet screen — dispatch, monitor, and steer
+                // multiple concurrent agent sessions. Runs its own select! loop
+                // over the same terminal/input/ticker; rows persist on `app.fleet`.
+                Command::Dashboard => {
+                    crate::dashboard::run_dashboard(
+                        &mut terminal,
+                        &mut input_rx,
+                        &mut ticker,
+                        &mut app,
+                        &fleet_launcher,
+                    )
+                    .await?;
+                    continue;
+                }
                 // `/goal <objective>`: decompose with the planner behind a spinner
                 // (Esc cancels), then install the structured goal. Control
                 // subcommands (clear/pause/resume/limit) and the no-planner case
@@ -1207,6 +1222,8 @@ pub async fn run(
         }
         let _ = std::fs::write(path, app.input.history.join("\n"));
     }
+    // Remove any remaining fleet worktrees (sessions stay on disk, resumable).
+    crate::dashboard::cleanup_fleet(&mut app);
 
     Ok(())
 }

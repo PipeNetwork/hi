@@ -8,7 +8,6 @@ mod repl;
 mod session;
 mod setup;
 mod ui;
-mod worktree;
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -230,8 +229,11 @@ async fn main() -> Result<()> {
         finalize: !cli.no_finalize,
         confirm_edits: cli.confirm_edits,
         planner_model: planner_model.clone(),
+        // `--goal` always steers, even off-pipenetwork (single sub-goal fallback).
         long_horizon: !cli.subagent
-            && (planner_model.is_some() || std::env::var_os("HI_LONG_HORIZON").is_some()),
+            && (planner_model.is_some()
+                || std::env::var_os("HI_LONG_HORIZON").is_some()
+                || cli.goal.is_some()),
         ..AgentConfig::default()
     };
     let resume_summary = loaded.as_ref().and_then(|l| l.resume_summary.clone());
@@ -252,7 +254,7 @@ async fn main() -> Result<()> {
     // so `/delegate on` can enable it at runtime. The tool stays gated by the
     // `write_subagents` advertisement; the runner just needs to be ready. It spawns
     // a `hi --subagent` child in an isolated worktree and applies only verified diffs.
-    if !cli.subagent
+    let delegate_runner: Option<std::sync::Arc<dyn hi_agent::DelegateRunner>> = if !cli.subagent
         && let Ok(exe) = std::env::current_exe()
     {
         let runner = delegate::CliDelegateRunner::new(
@@ -265,11 +267,29 @@ async fn main() -> Result<()> {
             cli.max_steps.unwrap_or(60),
             cli.max_verify,
         );
-        agent.set_delegate_runner(std::sync::Arc::new(runner));
+        Some(std::sync::Arc::new(runner))
+    } else {
+        None
+    };
+    if let Some(runner) = &delegate_runner {
+        agent.set_delegate_runner(runner.clone());
     }
     if !cli.no_save && !cli.subagent {
         agent.set_session(Box::new(JsonlSession::new(session_path)));
     }
+    // The fleet launcher: how `/dashboard` spawns worktree-isolated child `hi`
+    // runs (one per row turn), each appending to a parent-owned session file.
+    let fleet_launcher = hi_tui::FleetLauncher {
+        exe: std::env::current_exe().unwrap_or_else(|_| PathBuf::from("hi")),
+        provider: provider_label(settings.provider).to_string(),
+        model: settings.model.clone(),
+        base_url: settings.base_url.clone(),
+        api_key: settings.api_key.clone(),
+        verify: pipeline_command(&resolve_verify(&cli)),
+        max_verify: cli.max_verify,
+        max_steps: cli.max_steps.unwrap_or(60),
+        session_path: Box::new(session::new_fleet_session_path),
+    };
 
     if let Some(mut prompt) = prompt_input {
         let mut restore_model_state: Option<hi_agent::AgentModelState> = None;
@@ -283,6 +303,30 @@ async fn main() -> Result<()> {
             agent.set_model(hi_ai::MOA_MODEL_CONSERVATIVE.to_string(), None, None);
             report_model = hi_ai::MOA_MODEL_CONSERVATIVE.to_string();
             prompt = arg;
+        }
+        // `--goal <objective>` (fleet rows): install a planner-decomposed goal
+        // before the turn — but never re-plan when the resumed session already
+        // carries one (later fleet turns drive the existing goal).
+        if let Some(objective) = cli.goal.as_deref().map(str::trim).filter(|s| !s.is_empty())
+            && agent.structured_goal().is_none()
+        {
+            if !cli.quiet {
+                println!("\x1b[2mplanning goal with the planner model…\x1b[0m");
+            }
+            let steps = match agent.decompose_goal(objective).await {
+                Ok(steps) if !steps.is_empty() => steps,
+                _ => vec![objective.to_string()],
+            };
+            let goal = hi_agent::Goal::new(objective.to_string(), steps);
+            if agent.set_structured_goal(Some(goal)).unwrap_or(false)
+                && !cli.quiet
+                && let Some(g) = agent.structured_goal()
+            {
+                println!(
+                    "\x1b[2m✓ goal set — {} sub-goal(s)\x1b[0m",
+                    g.sub_goals.len()
+                );
+            }
         }
         let mut plain = PlainUi::new();
         let mut quiet = ui::QuietUi;
@@ -467,6 +511,7 @@ async fn main() -> Result<()> {
             resume_summary.clone(),
             settings.mcp_url.clone(),
             settings.api_key.clone(),
+            fleet_launcher,
         )
         .await
         {
@@ -693,6 +738,25 @@ struct LoadedAgentSession {
 }
 
 fn resolve_session(cli: &Cli) -> Result<(std::path::PathBuf, Option<LoadedAgentSession>)> {
+    // An exact session file (fleet child): create it fresh, or resume it if it
+    // already has history — the dashboard reuses one file across a row's turns.
+    if let Some(path) = &cli.session_file {
+        if path.is_file() {
+            let loaded = session::load_history(path)?;
+            return Ok((
+                path.clone(),
+                Some(LoadedAgentSession {
+                    messages: loaded.messages,
+                    usage: loaded.usage,
+                    checkpoint_refs: loaded.checkpoint_refs,
+                    structured_goal: loaded.goal,
+                    decisions: loaded.decisions,
+                    resume_summary: None,
+                }),
+            ));
+        }
+        return Ok((path.clone(), None));
+    }
     if let Some(id) = &cli.resume {
         let path = session::session_path(id)?;
         let loaded = session::load_history(&path)?;
@@ -933,6 +997,17 @@ fn write_report(
         "compat_fallbacks_used": agent.last_compat_fallbacks(),
         "tool_mode_effective": tool_mode_label(agent.tool_mode()),
         "changed_files": agent.last_changed_files(),
+        // The long-horizon goal state, when one is active — fleet rows read
+        // this to decide auto-continue. Null when no structured goal is set.
+        "goal": agent.structured_goal().map(|g| {
+            serde_json::json!({
+                "objective": g.objective,
+                "done": g.sub_goals.iter().filter(|s| s.status == hi_agent::GoalStatus::Done).count(),
+                "total": g.sub_goals.len(),
+                "status": format!("{:?}", g.status),
+                "paused": g.paused,
+            })
+        }),
         "telemetry": {
             "effective_max_steps": tel.effective_max_steps,
             "verify_rounds": tel.verify_rounds,
