@@ -1050,6 +1050,7 @@ dependencies = [
  "hi-ai",
  "hi-tools",
  "ratatui",
+ "serde",
  "serde_json",
  "tokio",
 ]

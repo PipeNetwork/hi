@@ -323,6 +323,8 @@ async fn main() -> Result<()> {
                 goal_total: goal.as_ref().map(|g| g.total).unwrap_or(0),
             })
         }),
+        loop_session_path: Box::new(session::new_loop_session_path),
+        loops_file: session::loops_file(),
     };
 
     if let Some(mut prompt) = prompt_input {

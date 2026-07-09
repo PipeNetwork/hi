@@ -72,6 +72,7 @@ impl crate::App {
             goal_drive_stall: 0,
             fleet: Vec::new(),
             fleet_next_id: 0,
+            loops: None,
             usage: (0, 0),
             context_used: 0,
             context_window: None,
@@ -123,6 +124,29 @@ impl crate::App {
         };
         if away {
             notify_done();
+        }
+    }
+
+    /// Surface any completed `/loop` firings: quiet checks land dim, changes
+    /// land loud (cyan) and ping the terminal when you're unfocused. Called
+    /// from the UI tick arms so results appear even while idle.
+    pub(crate) fn drain_loops(&mut self) {
+        let Some(loops) = &self.loops else { return };
+        let lines = loops.drain();
+        if lines.is_empty() {
+            return;
+        }
+        let away = self.focus_known && !self.focused;
+        for (text, loud) in lines {
+            let style = if loud {
+                ratatui::style::Style::default().fg(ratatui::style::Color::Cyan)
+            } else {
+                crate::render::dim()
+            };
+            self.push(ratatui::text::Line::styled(text, style));
+            if loud && away {
+                crate::util::notify_done();
+            }
         }
     }
 
