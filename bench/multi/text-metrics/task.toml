@@ -1,0 +1,3 @@
+name = "text-metrics"
+prompt = "Implement the three independent modules of the `metrics` package — tokenize.py, stats.py, and report.py — so that `python3 check.py` passes. check.py shows the exact expected behavior. Edit only files under metrics/."
+verify = "python3 check.py"
