@@ -8,6 +8,7 @@ hi-ai.workspace = true
 hi-tools.workspace = true
 hi-lsp.workspace = true
 anyhow.workspace = true
+async-trait = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
 futures-util.workspace = true

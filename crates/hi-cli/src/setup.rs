@@ -86,6 +86,7 @@ pub async fn run() -> Result<Settings> {
         minimal_tools: false,
         curate_skills: false,
         explore_subagents: false,
+        write_subagents: false,
         moa: hi_ai::MoaConfig::default(),
     })
 }

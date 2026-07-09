@@ -2,11 +2,13 @@ mod bestof;
 mod commands;
 mod complete;
 mod config;
+mod delegate;
 mod feedback;
 mod repl;
 mod session;
 mod setup;
 mod ui;
+mod worktree;
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -198,6 +200,10 @@ async fn main() -> Result<()> {
         curate_skills: settings.curate_skills || std::env::var_os("HI_CURATE_SKILLS").is_some(),
         explore_subagents: settings.explore_subagents
             || std::env::var_os("HI_EXPLORE_SUBAGENTS").is_some(),
+        write_subagents: settings.write_subagents
+            || std::env::var_os("HI_WRITE_SUBAGENTS").is_some(),
+        // `--subagent` marks a delegate child: no explore/delegate offered (depth ≤ 1).
+        is_subagent: cli.subagent,
         context_window: live_metadata.context_window,
         project_context: load_project_context(),
         verify: resolve_verify(&cli),
@@ -231,7 +237,26 @@ async fn main() -> Result<()> {
         ),
         None => Agent::new(provider, agent_config),
     };
-    if !cli.no_save {
+    // Attach the write-`delegate` subagent runner — only for a top-level agent
+    // (a subagent can't delegate) when write subagents are enabled. It spawns a
+    // `hi --subagent` child in an isolated worktree and applies only verified diffs.
+    if (settings.write_subagents || std::env::var_os("HI_WRITE_SUBAGENTS").is_some())
+        && !cli.subagent
+        && let Ok(exe) = std::env::current_exe()
+    {
+        let runner = delegate::CliDelegateRunner::new(
+            exe,
+            provider_label(settings.provider).to_string(),
+            settings.model.clone(),
+            settings.base_url.clone(),
+            settings.api_key.clone(),
+            pipeline_command(&resolve_verify(&cli)),
+            cli.max_steps.unwrap_or(60),
+            cli.max_verify,
+        );
+        agent.set_delegate_runner(std::sync::Arc::new(runner));
+    }
+    if !cli.no_save && !cli.subagent {
         agent.set_session(Box::new(JsonlSession::new(session_path)));
     }
 
@@ -1145,6 +1170,7 @@ mod tests {
             minimal_tools: false,
             curate_skills: false,
             explore_subagents: false,
+            write_subagents: false,
             moa: hi_ai::MoaConfig::default(),
         }
     }
@@ -1164,6 +1190,7 @@ mod tests {
             minimal_tools: false,
             curate_skills: false,
             explore_subagents: false,
+            write_subagents: false,
             moa: hi_ai::MoaConfig::default(),
         }
     }

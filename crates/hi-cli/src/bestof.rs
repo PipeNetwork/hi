@@ -25,7 +25,7 @@ pub struct BestOf<'a> {
 }
 
 pub fn run(opts: &BestOf) -> Result<()> {
-    if !in_git_repo() {
+    if !crate::worktree::in_git_repo() {
         bail!("--best-of requires a git repository (candidates run in worktrees)");
     }
     if working_tree_dirty() {
@@ -38,9 +38,9 @@ pub fn run(opts: &BestOf) -> Result<()> {
     let mut worktrees: Vec<(u32, PathBuf, f32)> = Vec::new();
     for i in 0..opts.candidates {
         let temperature = temperature_for(i, opts.candidates);
-        let worktree = worktree_path(i);
-        if let Err(err) = add_worktree(&worktree) {
-            cleanup(
+        let worktree = crate::worktree::worktree_path("bestof", i);
+        if let Err(err) = crate::worktree::add_worktree(&worktree, "HEAD") {
+            crate::worktree::cleanup(
                 &worktrees
                     .iter()
                     .map(|(_, wt, _)| wt.clone())
@@ -119,7 +119,7 @@ pub fn run(opts: &BestOf) -> Result<()> {
     }
 
     if let Some(err) = join_error {
-        cleanup(&cleanup_paths);
+        crate::worktree::cleanup(&cleanup_paths);
         return Err(err);
     }
 
@@ -141,7 +141,7 @@ pub fn run(opts: &BestOf) -> Result<()> {
             );
             continue;
         }
-        if verify_passes(worktree, opts.verify) {
+        if crate::worktree::verify_passes(worktree, opts.verify) {
             println!(
                 "\x1b[32m✓ candidate {}/{} passed verification\x1b[0m",
                 idx + 1,
@@ -159,8 +159,9 @@ pub fn run(opts: &BestOf) -> Result<()> {
 
     let result = match &winner {
         Some((i, worktree)) => {
-            let result =
-                apply_changes(worktree).with_context(|| "applying the winning candidate's changes");
+            let result = crate::worktree::apply_changes(worktree, "HEAD")
+                .map(|_| ())
+                .with_context(|| "applying the winning candidate's changes");
             if result.is_ok() {
                 println!(
                     "\x1b[32m✓ applied candidate {} to the working tree\x1b[0m",
@@ -179,7 +180,7 @@ pub fn run(opts: &BestOf) -> Result<()> {
     };
 
     // Clean up every worktree we created (the artifacts dir is separate and kept).
-    cleanup(&cleanup_paths);
+    crate::worktree::cleanup(&cleanup_paths);
     print_candidate_summary(&art_dir, total);
     result
 }
@@ -289,112 +290,12 @@ fn temperature_for(index: u32, count: u32) -> f32 {
     0.2 + (index as f32) * (0.8 / (count - 1) as f32)
 }
 
-fn in_git_repo() -> bool {
-    Command::new("git")
-        .args(["rev-parse", "--is-inside-work-tree"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
 fn working_tree_dirty() -> bool {
     Command::new("git")
         .args(["status", "--porcelain"])
         .output()
         .map(|o| !o.stdout.is_empty())
         .unwrap_or(false)
-}
-
-fn worktree_path(index: u32) -> PathBuf {
-    std::env::temp_dir().join(format!("hi-bestof-{}-{index}", std::process::id()))
-}
-
-fn add_worktree(path: &Path) -> Result<()> {
-    let output = Command::new("git")
-        .args(["worktree", "add", "--detach"])
-        .arg(path)
-        .arg("HEAD")
-        .output()
-        .context("running git worktree add")?;
-    if !output.status.success() {
-        bail!(
-            "git worktree add failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(())
-}
-
-/// Ground-truth check: run the verify command in the worktree ourselves.
-fn verify_passes(worktree: &Path, verify: &str) -> bool {
-    hi_tools::prepare_verify_workdir(worktree);
-    Command::new("sh")
-        .arg("-c")
-        .arg(verify)
-        .env("PYTHONDONTWRITEBYTECODE", "1")
-        .current_dir(worktree)
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-/// Apply the worktree's changes (including new files) to the main working tree.
-fn apply_changes(worktree: &Path) -> Result<()> {
-    // Stage everything so the diff captures new/deleted files too.
-    let add = Command::new("git")
-        .current_dir(worktree)
-        .args(["add", "-A"])
-        .output()
-        .context("git add in worktree")?;
-    if !add.status.success() {
-        bail!(
-            "git add failed: {}",
-            String::from_utf8_lossy(&add.stderr).trim()
-        );
-    }
-
-    let diff = Command::new("git")
-        .current_dir(worktree)
-        .args(["diff", "--cached", "HEAD"])
-        .output()
-        .context("git diff in worktree")?;
-    if !diff.status.success() {
-        bail!(
-            "git diff failed: {}",
-            String::from_utf8_lossy(&diff.stderr).trim()
-        );
-    }
-    if diff.stdout.is_empty() {
-        return Ok(()); // nothing changed
-    }
-
-    // Apply the patch in the main repo via stdin.
-    use std::io::Write;
-    let mut child = Command::new("git")
-        .args(["apply", "--whitespace=nowarn"])
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .context("spawning git apply")?;
-    child
-        .stdin
-        .take()
-        .context("git apply stdin")?
-        .write_all(&diff.stdout)
-        .context("writing patch to git apply")?;
-    let status = child.wait().context("waiting for git apply")?;
-    if !status.success() {
-        bail!("git apply failed (working tree may conflict with the patch)");
-    }
-    Ok(())
-}
-
-fn cleanup(worktrees: &[PathBuf]) {
-    for path in worktrees {
-        let _ = Command::new("git")
-            .args(["worktree", "remove", "--force"])
-            .arg(path)
-            .output();
-    }
 }
 
 #[cfg(test)]

@@ -97,6 +97,12 @@ pub struct Cli {
     #[arg(long)]
     pub no_save: bool,
 
+    /// Run as a subagent (used internally by the `delegate` write-subagent): the
+    /// agent won't be offered `explore`/`delegate` (depth ≤ 1) and never saves a
+    /// session. Not intended for direct use.
+    #[arg(long, hide = true)]
+    pub subagent: bool,
+
     /// List saved sessions, then exit.
     #[arg(long)]
     pub list_sessions: bool,
@@ -336,6 +342,10 @@ pub struct Profile {
     /// false to disable (e.g. for a very small local model).
     #[serde(default)]
     pub explore_subagents: Option<bool>,
+    /// Advertise the write-capable `delegate` subagent tool. Off by default (the
+    /// riskier tier); set to true to enable.
+    #[serde(default)]
+    pub write_subagents: Option<bool>,
     /// Other profile names to fall back to, in order, when this one returns
     /// nothing or errors.
     pub fallback: Option<Vec<String>>,
@@ -405,6 +415,7 @@ pub struct Settings {
     pub minimal_tools: bool,
     pub curate_skills: bool,
     pub explore_subagents: bool,
+    pub write_subagents: bool,
     pub moa: hi_ai::MoaConfig,
 }
 
@@ -610,6 +621,7 @@ pub fn resolve(cli: &Cli, config: &Config, registry: &Registry) -> Result<Settin
     let minimal_tools = profile.and_then(|p| p.minimal_tools).unwrap_or(false);
     let curate_skills = curate_skills_default(provider, profile.and_then(|p| p.curate_skills));
     let explore_subagents = explore_subagents_default(profile.and_then(|p| p.explore_subagents));
+    let write_subagents = profile.and_then(|p| p.write_subagents).unwrap_or(false);
 
     Ok(Settings {
         provider,
@@ -625,6 +637,7 @@ pub fn resolve(cli: &Cli, config: &Config, registry: &Registry) -> Result<Settin
         minimal_tools,
         curate_skills,
         explore_subagents,
+        write_subagents,
         moa: config.moa.clone(),
     })
 }
@@ -1187,6 +1200,7 @@ pub fn resolve_named_profile(config: &Config, name: &str, registry: &Registry) -
         minimal_tools: profile.minimal_tools.unwrap_or(false),
         curate_skills: curate_skills_default(provider, profile.curate_skills),
         explore_subagents: explore_subagents_default(profile.explore_subagents),
+        write_subagents: profile.write_subagents.unwrap_or(false),
         moa: config.moa.clone(),
     })
 }

@@ -729,6 +729,30 @@ pub fn explore_tool_spec() -> ToolSpec {
     }
 }
 
+/// The `delegate` write-capable subagent tool. Like [`explore_tool_spec`] it's kept
+/// OUT of [`TOOL_SPECS`] and [`is_read_only`], and is only injected for a top-level
+/// agent (via `write_subagents`) — never for a subagent, so it can't recurse.
+pub fn delegate_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "delegate".into(),
+        description: "Delegate a self-contained IMPLEMENTATION subtask to a subagent that runs in its own fresh context, can edit files and run commands, and verifies its own work. Its changes are merged back into your working tree ONLY if verification passes — otherwise they're rolled back automatically. Use it to hand off a well-scoped, independent chunk of work (e.g. \"implement the FooBar parser in src/foo.rs so `cargo test foo` passes\", \"add input validation to the signup handler and update its tests\") so it stays out of your context. Give ONE self-contained task with enough detail to complete standalone, and include how success is checked. Prefer doing small edits yourself; use this for a substantial, independently-verifiable subtask. The subagent cannot itself delegate or explore.".into(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "task": {
+                    "type": "string",
+                    "description": "A single, self-contained implementation subtask with enough detail to complete standalone, including what 'done' looks like."
+                },
+                "verify": {
+                    "type": "string",
+                    "description": "Optional shell command that must pass for the subagent's changes to be kept (e.g. `cargo test foo`). If omitted, the session's verify command is used."
+                }
+            },
+            "required": ["task"]
+        }),
+    }
+}
+
 /// Whether a tool only observes state, with no side effects — so several can
 /// run concurrently within one round, and it's safe to offer in `ReadOnly`
 /// tool mode. Tools that mutate the filesystem (`write`, `edit`, `multi_edit`,

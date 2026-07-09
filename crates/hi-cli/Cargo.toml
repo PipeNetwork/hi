@@ -13,6 +13,7 @@ hi-agent.workspace = true
 hi-tools.workspace = true
 hi-tui.workspace = true
 anyhow.workspace = true
+async-trait = { workspace = true }
 tokio.workspace = true
 clap.workspace = true
 serde.workspace = true

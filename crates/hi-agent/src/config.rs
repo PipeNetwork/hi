@@ -152,12 +152,19 @@ pub struct AgentConfig {
     /// budgeted); disable per profile with `explore_subagents = false`. Children
     /// never get it (depth ≤ 1).
     pub explore_subagents: bool,
-    /// True when this agent *is* an `explore` subagent (a child). Set internally,
-    /// never by config. It's the depth guard: a subagent is never advertised the
-    /// `explore` tool (even in read-only mode), so a subagent cannot spawn another
-    /// — capping nesting depth at 1. A top-level agent (`false`) keeps `explore`
-    /// even in a read-only/review turn, since delegating a read-only investigation
-    /// is itself read-only.
+    /// Advertise the write-capable `delegate` subagent tool: the model hands off a
+    /// self-contained implementation subtask to a child that can edit + verify in
+    /// its own context, and the changes are merged back only if verification passes
+    /// (else rolled back to a checkpoint). Off by default — this is the riskier
+    /// tier; opt in per profile or via `HI_WRITE_SUBAGENTS`. Depth-capped like
+    /// explore (a subagent never gets it).
+    pub write_subagents: bool,
+    /// True when this agent *is* a subagent (an `explore` or `delegate` child). Set
+    /// internally, never by config. It's the depth guard: a subagent is never
+    /// advertised the `explore`/`delegate` tools (even in read-only mode), so a
+    /// subagent cannot spawn another — capping nesting depth at 1. A top-level
+    /// agent (`false`) keeps `explore` even in a read-only/review turn, since
+    /// delegating a read-only investigation is itself read-only.
     pub is_subagent: bool,
 }
 
@@ -200,6 +207,7 @@ impl Default for AgentConfig {
             minimal_tools: false,
             curate_skills: false,
             explore_subagents: false,
+            write_subagents: false,
             is_subagent: false,
         }
     }

@@ -7,6 +7,7 @@ mod common;
 mod compaction;
 mod curate;
 mod decision;
+mod delegate;
 mod explore;
 mod finalize;
 mod goal;
