@@ -4870,6 +4870,86 @@ extern "C" int hi_cuda_launch_q3_k_gemv(
   return 0;
 }
 
+// Fused IQ2_XXS GEMV (M=1 decode). Reads IQ2_XXS weights directly: block = 66 bytes /
+// 256 weights (f16 d + 8 groups x 8 bytes). Per group: q[0..3] index IQ2_XXS_GRID (2-bit
+// values via IQ2_XXS_VALUES), aux32 (q[4..7]) carries the packed signs (iq2_xxs_signs)
+// and the 4-bit block scale (top nibble). Per-weight unpack mirrors
+// dequantize_iq2_xxs_kernel. One block per output row; f32 activation. cols % 256 == 0.
+__global__ void iq2_xxs_gemv_kernel(
+    const uint8_t* __restrict__ weights,
+    const float* __restrict__ x,
+    float* __restrict__ output,
+    int rows,
+    int cols) {
+  const int row = blockIdx.x;
+  if (row >= rows) {
+    return;
+  }
+  const int tid = threadIdx.x;
+  const int nsb = cols / 256;
+  const size_t row_bytes = static_cast<size_t>(nsb) * 66;
+  const uint8_t* row_ptr = weights + static_cast<size_t>(row) * row_bytes;
+  float acc = 0.0f;
+  for (int c = tid; c < cols; c += blockDim.x) {
+    const int sb = c >> 8;
+    const int within = c & 255;
+    const uint8_t* blk = row_ptr + static_cast<size_t>(sb) * 66;
+    const float d = __half2float(*reinterpret_cast<const __half*>(blk));
+    const int group32 = within >> 5;
+    const int offset32 = within & 31;
+    const int lane = offset32 >> 3;
+    const int j = offset32 & 7;
+    const uint8_t* q = blk + 2 + group32 * 8;
+    const uint32_t aux32 = static_cast<uint32_t>(q[4]) |
+                           (static_cast<uint32_t>(q[5]) << 8) |
+                           (static_cast<uint32_t>(q[6]) << 16) |
+                           (static_cast<uint32_t>(q[7]) << 24);
+    const float db = d * (0.5f + static_cast<float>(aux32 >> 28)) * 0.25f;
+    const uint16_t grid = IQ2_XXS_GRID[q[lane]];
+    const uint8_t value = IQ2_XXS_VALUES[(grid >> (2 * j)) & 0x03];
+    const uint8_t signs = iq2_xxs_signs(static_cast<uint8_t>((aux32 >> (7 * lane)) & 0x7f));
+    const float sign = (signs & (1u << j)) != 0 ? -1.0f : 1.0f;
+    acc += db * static_cast<float>(value) * sign * x[c];
+  }
+  __shared__ float warp_sums[32];
+  for (int off = 16; off > 0; off >>= 1) {
+    acc += __shfl_down_sync(0xffffffffu, acc, off);
+  }
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  if (lane == 0) {
+    warp_sums[warp] = acc;
+  }
+  __syncthreads();
+  if (warp == 0) {
+    const int nwarps = blockDim.x >> 5;
+    float v = (lane < nwarps) ? warp_sums[lane] : 0.0f;
+    for (int off = 16; off > 0; off >>= 1) {
+      v += __shfl_down_sync(0xffffffffu, v, off);
+    }
+    if (lane == 0) {
+      output[row] = v;
+    }
+  }
+}
+
+extern "C" int hi_cuda_launch_iq2_xxs_gemv(
+    const void* weights,
+    const void* x,
+    void* output,
+    int rows,
+    int cols,
+    void* stream) {
+  if (weights == nullptr || x == nullptr || output == nullptr || rows <= 0 ||
+      cols <= 0 || cols % 256 != 0 || stream == nullptr) {
+    return 1;
+  }
+  iq2_xxs_gemv_kernel<<<rows, 128, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint8_t*>(weights), static_cast<const float*>(x),
+      static_cast<float*>(output), rows, cols);
+  return 0;
+}
+
 // Fused IQ3_S GEMV (M=1 decode). Reads IQ3_S weights directly: block = 110 bytes / 256
 // weights (f16 d + 64-B qs + 8-B qh + 32-B signs + 4-B scales). Each group of 4 weights
 // comes from a 9-bit grid index (qs byte + qh high bit) into iq3_s_grid_value, times a

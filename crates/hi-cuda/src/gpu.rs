@@ -3373,6 +3373,31 @@ mod native {
                     buffer: output,
                 });
             }
+            // Fused IQ2_XXS GEMV (M=1 decode, non-output-head layer weights). Block-256
+            // 2-bit I-quant (grid codebook + packed signs + block scale).
+            if input.rows == 1
+                && !is_output_head
+                && matches!(matrix.dtype, GgufTensorType::IQ2_XXS)
+                && matrix.cols % 256 == 0
+            {
+                let output = DeviceBuffer::alloc(matrix.rows * std::mem::size_of::<f32>())
+                    .context("allocating CUDA IQ2_XXS GEMV output")?;
+                crate::kernels::launch_iq2_xxs_gemv(
+                    &matrix.buffer,
+                    &input.buffer,
+                    &output,
+                    matrix.rows,
+                    matrix.cols,
+                    &self.stream,
+                )
+                .with_context(|| format!("CUDA IQ2_XXS GEMV for {matrix_name}"))?;
+                self.op_barrier()?;
+                return Ok(GpuF32Tensor {
+                    rows: 1,
+                    cols: matrix.rows,
+                    buffer: output,
+                });
+            }
             // Quantized weight matmul via tensor-core f16 GEMM. Dequantizing to f16 is
             // expensive, so cache the f16 weight and reuse it — weights never change,
             // avoiding re-dequantizing the Q6_K lm_head every token. Bounded to the
