@@ -3262,6 +3262,14 @@ mod native {
                 && matches!(matrix.dtype, GgufTensorType::Q6_K)
                 && matrix.cols % 256 == 0
             {
+                if kquant_dp4a_enabled() {
+                    return self.kquant_dp4a_gemv(
+                        matrix_name,
+                        matrix,
+                        input,
+                        crate::kernels::launch_q6_k_dp4a_gemv,
+                    );
+                }
                 let output = DeviceBuffer::alloc(matrix.rows * std::mem::size_of::<f32>())
                     .context("allocating CUDA Q6_K GEMV output")?;
                 crate::kernels::launch_q6_k_gemv(
