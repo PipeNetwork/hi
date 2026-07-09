@@ -74,6 +74,11 @@ pub struct Goal {
 /// (with a "reconsider, don't repeat" nudge) before marking it `Failed`.
 pub const DEFAULT_SUBGOAL_RETRIES: u32 = 2;
 
+/// Hard ceiling on total sub-goals, including ones the executor appends as it
+/// discovers work. A runaway guard, not a target — a real project's plan grows,
+/// but not without bound.
+pub const MAX_TOTAL_SUB_GOALS: usize = 40;
+
 impl Goal {
     /// Create a fresh goal with sub-goals all `Pending` except the first
     /// `Active`. The agent decomposes the objective into `sub_goal_descriptions`
@@ -176,18 +181,40 @@ impl Goal {
             let Some(sg) = self.sub_goals.get_mut(i) else {
                 break;
             };
-            let new = match raw.trim().to_ascii_lowercase().as_str() {
-                "done" | "complete" | "completed" | "finished" => GoalStatus::Done,
-                "active" | "in_progress" | "in-progress" | "doing" | "current" | "started" => {
-                    GoalStatus::Active
-                }
-                _ => GoalStatus::Pending,
-            };
-            sg.status = new;
+            sg.status = parse_status(raw);
         }
-        // Re-derive the overall status: Done iff all done; Failed iff any
-        // failed and none active; else Active (ensure exactly one active when
-        // in progress — the first non-done sub-goal).
+        self.rederive_status();
+    }
+
+    /// Apply the executor's *evolving* plan (a `(description, status)` per step) to
+    /// the goal: update existing sub-goals' status by position — keeping their
+    /// richer planner descriptions — and **append** steps beyond the current list,
+    /// so the plan grows as the agent discovers work ("refactors-within-refactors"),
+    /// up to [`MAX_TOTAL_SUB_GOALS`]. Then re-derive the overall status. This is how
+    /// a goal stays a live contract over a real project rather than a frozen list.
+    pub fn apply_plan(&mut self, steps: &[(String, GoalStatus)]) {
+        for (i, (description, status)) in steps.iter().enumerate() {
+            if let Some(sg) = self.sub_goals.get_mut(i) {
+                sg.status = *status;
+            } else if self.sub_goals.len() < MAX_TOTAL_SUB_GOALS {
+                self.sub_goals.push(SubGoal {
+                    description: description.clone(),
+                    status: *status,
+                    attempts: 0,
+                    notes: Vec::new(),
+                });
+            }
+        }
+        self.rederive_status();
+    }
+
+    /// Re-derive the overall status from the sub-goals: `Done` iff all done;
+    /// `Failed` iff a sub-goal failed and none is active; else `Active` — making the
+    /// first not-done sub-goal active so there's always a cursor while in progress.
+    fn rederive_status(&mut self) {
+        if self.sub_goals.is_empty() {
+            return;
+        }
         if self.sub_goals.iter().all(|s| s.status == GoalStatus::Done) {
             self.status = GoalStatus::Done;
             return;
@@ -247,6 +274,17 @@ impl Goal {
             }
         }
         Some(out)
+    }
+}
+
+/// Map a tolerant status string (from the model's `update_plan`) to a `GoalStatus`.
+fn parse_status(raw: &str) -> GoalStatus {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "done" | "complete" | "completed" | "finished" => GoalStatus::Done,
+        "active" | "in_progress" | "in-progress" | "doing" | "current" | "started" => {
+            GoalStatus::Active
+        }
+        _ => GoalStatus::Pending,
     }
 }
 
@@ -390,5 +428,51 @@ mod tests {
         g.paused = true;
         g.apply_plan_statuses(&["done", "active", "pending"]);
         assert!(g.paused, "re-deriving status must not clear the pause flag");
+    }
+
+    #[test]
+    fn apply_plan_grows_as_the_agent_discovers_work() {
+        let mut g = goal(); // 3 planner sub-goals
+        // The executor reports the 3, then discovers 2 more mid-project.
+        g.apply_plan(&[
+            ("write tests".into(), GoalStatus::Done),
+            ("rewrite parser".into(), GoalStatus::Active),
+            ("update callers".into(), GoalStatus::Pending),
+            (
+                "fix a regression the rewrite surfaced".into(),
+                GoalStatus::Pending,
+            ),
+            ("update the changelog".into(), GoalStatus::Pending),
+        ]);
+        assert_eq!(g.sub_goals.len(), 5, "two discovered steps appended");
+        assert_eq!(
+            g.sub_goals[3].description,
+            "fix a regression the rewrite surfaced"
+        );
+        assert_eq!(g.sub_goals[0].status, GoalStatus::Done);
+        assert_eq!(g.active_index(), Some(1));
+    }
+
+    #[test]
+    fn apply_plan_keeps_planner_descriptions_for_existing_steps() {
+        let mut g = goal();
+        // A terser executor title must not overwrite the planner's richer text.
+        g.apply_plan(&[("wt".into(), GoalStatus::Done)]);
+        assert_eq!(g.sub_goals[0].description, "write tests");
+        assert_eq!(g.sub_goals[0].status, GoalStatus::Done);
+    }
+
+    #[test]
+    fn apply_plan_caps_total_sub_goals() {
+        let mut g = Goal::new("big", vec!["s0".into()]);
+        let steps: Vec<(String, GoalStatus)> = (0..MAX_TOTAL_SUB_GOALS + 10)
+            .map(|i| (format!("s{i}"), GoalStatus::Pending))
+            .collect();
+        g.apply_plan(&steps);
+        assert_eq!(
+            g.sub_goals.len(),
+            MAX_TOTAL_SUB_GOALS,
+            "capped at the ceiling"
+        );
     }
 }

@@ -10,14 +10,18 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow};
 use hi_ai::{ChatRequest, Content, Message, RequestProfile, StreamEvent, ToolMode};
 
-/// Upper bound on sub-tasks accepted from the planner — bias toward few so a
-/// small objective stays small and we never over-decompose.
-const MAX_SUB_GOALS: usize = 6;
+/// Safety bound on the planner's *initial* decomposition (a runaway guard, not a
+/// target). The goal can grow past this as the agent discovers work — the executor
+/// appends milestones via `update_plan`, capped by the goal's total ceiling
+/// ([`crate::goal::MAX_TOTAL_SUB_GOALS`]).
+const MAX_SUB_GOALS: usize = 20;
 
 const PLANNER_PROMPT: &str = "You are a planning assistant for a coding agent. Decompose the \
-user's coding objective into 2 to 6 ordered, independently-verifiable sub-tasks. Output one \
-imperative sub-task per line — no numbering, no bullet characters, no prose, no preamble, no \
-blank lines. If the objective is genuinely a single step, output exactly one line.";
+user's coding objective into ordered, independently-verifiable milestones — as many as it \
+genuinely needs (usually 3 to 10; more for a large project, fewer for a small one; one line if \
+it's truly a single step). Each should be a real, checkable step, not busywork. Output one \
+imperative milestone per line — no numbering, no bullet characters, no prose, no preamble, no \
+blank lines.";
 
 impl crate::Agent {
     /// Decompose `objective` into ordered sub-task descriptions via one bounded
@@ -133,11 +137,15 @@ mod tests {
     }
 
     #[test]
-    fn drops_blank_lines_and_bounds_to_six() {
-        let raw = "a\n\n  \nb\nc\nd\ne\nf\ng\nh\n"; // 8 non-empty
-        let out = parse_sub_goals(raw);
-        assert_eq!(out.len(), MAX_SUB_GOALS);
-        assert_eq!(out.first().map(String::as_str), Some("a"));
+    fn drops_blank_lines_and_bounds_to_cap() {
+        // More non-empty lines than the safety bound, with blanks interspersed.
+        let mut raw = String::from("first\n\n  \n");
+        for i in 0..MAX_SUB_GOALS + 5 {
+            raw.push_str(&format!("step {i}\n"));
+        }
+        let out = parse_sub_goals(&raw);
+        assert_eq!(out.len(), MAX_SUB_GOALS, "capped at the safety bound");
+        assert_eq!(out.first().map(String::as_str), Some("first"));
     }
 
     #[test]
