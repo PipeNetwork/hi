@@ -1129,6 +1129,37 @@ fn fix_prompt(spec: &LoopSpec, summary: &str) -> String {
 /// verify command — merge it into the real tree. Returns a `(line, loud)` outcome
 /// for the transcript. The verify gate ([`decide_fix`]) is the safety boundary:
 /// an unverified change is never applied.
+/// After a verified fix merges into the working tree, re-verify the *real* tree
+/// — which may have drifted during the ≤900s fix (a user edit, another loop's
+/// merge) — as ground truth. The worktree verify only proved the fix good against
+/// `base`; this closes the gap where the merged *combination* was never checked.
+/// On failure we surface it loudly (no auto-revert — the user decides whether to
+/// keep or `/undo`).
+fn merged_outcome(verify: Option<&str>, changed: &[String]) -> (String, bool) {
+    let combined_ok = verify
+        .map(|v| hi_tools::worktree::verify_passes(std::path::Path::new("."), v))
+        .unwrap_or(true);
+    if combined_ok {
+        (
+            format!(
+                "fixed & merged {} file(s): {}",
+                changed.len(),
+                changed.join(", ")
+            ),
+            true,
+        )
+    } else {
+        (
+            format!(
+                "⚠ merged {} file(s) but the combined tree fails verify — inspect: {}",
+                changed.len(),
+                changed.join(", ")
+            ),
+            true,
+        )
+    }
+}
+
 async fn run_fix(launcher: &FleetLauncher, spec: &LoopSpec, summary: &str) -> (String, bool) {
     use hi_tools::worktree;
 
@@ -1199,16 +1230,11 @@ async fn run_fix(launcher: &FleetLauncher, spec: &LoopSpec, summary: &str) -> (S
     let result = match decide_fix(true, completed, changed.len(), has_verify, verified) {
         // PR mode: land the verified fix as a reviewable branch + PR.
         FixDecision::Merge if spec.fix_pr => open_fix_pr(&wt, spec, summary, &changed),
-        // Merge mode: apply the verified diff into the working tree.
+        // Merge mode: apply the verified diff into the working tree, then
+        // re-verify the merged real tree (see merged_outcome — the base may have
+        // drifted during the fix).
         FixDecision::Merge => match worktree::apply_changes(&wt, &base) {
-            Ok(_) => (
-                format!(
-                    "fixed & merged {} file(s): {}",
-                    changed.len(),
-                    changed.join(", ")
-                ),
-                true,
-            ),
+            Ok(_) => merged_outcome(launcher.verify.as_deref(), &changed),
             Err(e) => (format!("verified but merge failed: {e}"), true),
         },
         FixDecision::NoChanges => ("made no changes".into(), false),
@@ -2397,6 +2423,40 @@ mod tests {
         assert!(
             !dir.join("bad.txt").exists(),
             "the unverified change must NOT reach the real tree"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merged_outcome_reflects_the_real_tree_verify() {
+        let _cwd = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("hi-merged-outcome-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+
+        // Combined tree passes verify → normal success line.
+        let ok = merged_outcome(Some("true"), &["a.rs".to_string()]);
+        // Combined tree FAILS verify (the base drifted under the fix) → a loud
+        // warning, not a false "merged" success.
+        let bad = merged_outcome(Some("false"), &["a.rs".to_string()]);
+        // No verify command → nothing to re-check; trust the merge.
+        let none = merged_outcome(None, &["a.rs".to_string()]);
+
+        std::env::set_current_dir(&prev).unwrap();
+
+        assert!(ok.0.contains("merged") && !ok.0.contains('⚠'), "{}", ok.0);
+        assert!(
+            bad.0.contains('⚠') && bad.0.contains("fails verify"),
+            "{}",
+            bad.0
+        );
+        assert!(
+            none.0.contains("merged") && !none.0.contains('⚠'),
+            "{}",
+            none.0
         );
 
         let _ = std::fs::remove_dir_all(&dir);
