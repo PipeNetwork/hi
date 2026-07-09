@@ -3161,13 +3161,6 @@ mod native {
                     buffer: output,
                 });
             }
-            // Quantized weight matmul via tensor-core f16 GEMM. Dequantizing to f16 is
-            // expensive, so cache the f16 weight and reuse it — weights never change,
-            // avoiding re-dequantizing the Q6_K lm_head every token. Bounded to the
-            // output head (the single weight projecting to a vocab-wide output): a
-            // general per-weight cache would, on models with no dp4a-eligible weights
-            // (e.g. IQ4_NL), cache the whole model in f16 and OOM. Everything else
-            // dequantizes per-op (prefill M>1, and layer weights that miss dp4a).
             let weight_elements = matrix
                 .rows
                 .checked_mul(matrix.cols)
@@ -3179,6 +3172,41 @@ mod native {
                     .and_then(|v| usize::try_from(v).ok())
                     .map(|vocab| matrix.rows == vocab)
                     .unwrap_or(false);
+            // Fused Q6_K GEMV (M=1 decode, non-output-head layer weights): read Q6_K
+            // directly instead of dequantizing the whole matrix to f32 every token — the
+            // per-op dequant is ~12x slower for Q6_K models kept quantized (f16 doesn't
+            // fit). The output head stays on the f16 cache below (cuBLAS, marginally
+            // faster and reused every token).
+            if input.rows == 1
+                && !is_output_head
+                && matches!(matrix.dtype, GgufTensorType::Q6_K)
+                && matrix.cols % 256 == 0
+            {
+                let output = DeviceBuffer::alloc(matrix.rows * std::mem::size_of::<f32>())
+                    .context("allocating CUDA Q6_K GEMV output")?;
+                crate::kernels::launch_q6_k_gemv(
+                    &matrix.buffer,
+                    &input.buffer,
+                    &output,
+                    matrix.rows,
+                    matrix.cols,
+                    &self.stream,
+                )
+                .with_context(|| format!("CUDA Q6_K GEMV for {matrix_name}"))?;
+                self.op_barrier()?;
+                return Ok(GpuF32Tensor {
+                    rows: 1,
+                    cols: matrix.rows,
+                    buffer: output,
+                });
+            }
+            // Quantized weight matmul via tensor-core f16 GEMM. Dequantizing to f16 is
+            // expensive, so cache the f16 weight and reuse it — weights never change,
+            // avoiding re-dequantizing the Q6_K lm_head every token. Bounded to the
+            // output head (the single weight projecting to a vocab-wide output): a
+            // general per-weight cache would, on models with no dp4a-eligible weights
+            // (e.g. IQ4_NL), cache the whole model in f16 and OOM. Everything else
+            // dequantizes per-op (prefill M>1, and layer weights that miss dp4a).
             let output = if is_output_head {
                 if !self.dequant_f16_cache.borrow().contains_key(matrix_name) {
                     let w = self.dequantize_matrix_to_f16(matrix, weight_elements)?;
