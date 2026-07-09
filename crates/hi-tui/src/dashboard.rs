@@ -75,6 +75,63 @@ pub(crate) struct FleetRow {
     /// Current turn start (for the elapsed column).
     pub(crate) started: Option<Instant>,
     pub(crate) turns: u32,
+    /// Session-cumulative tokens, from the child's per-turn report.
+    pub(crate) usage: u64,
+    /// Long-horizon goal progress, from the report's `goal` block.
+    pub(crate) goal: Option<RowGoal>,
+    /// Objective for a `/goal` dispatch — consumed by the row's *first* turn
+    /// (the child plans it via `--goal`; later turns drive the session's goal).
+    pub(crate) goal_objective: Option<String>,
+    /// The last report's raw goal JSON, for drive-stall comparison.
+    pub(crate) last_goal_json: Option<String>,
+    /// Whether the in-flight turn is a synthetic drive turn (not user input).
+    pub(crate) driving: bool,
+    /// Consecutive drive turns with an unchanged goal — parks the drive at
+    /// [`hi_agent::GOAL_DRIVE_STALL_LIMIT`]; any user reply resets it.
+    pub(crate) drive_stall: u32,
+    /// The real tree has advanced (another row merged) since this row's base.
+    pub(crate) stale: bool,
+    /// The row is waiting on the user (question, held merge, failure, parked
+    /// drive) — badge + ping.
+    pub(crate) attention: bool,
+}
+
+/// Goal progress mirrored from the child's report.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct RowGoal {
+    pub(crate) done: usize,
+    pub(crate) total: usize,
+    pub(crate) active: bool,
+    pub(crate) paused: bool,
+}
+
+/// The fields the dashboard consumes from a child turn's `--report` JSON.
+/// Tolerant: any missing/malformed field defaults.
+struct TurnReport {
+    total_tokens: u64,
+    goal: Option<RowGoal>,
+    /// Compact JSON of the goal block, for stall comparison.
+    goal_raw: Option<String>,
+}
+
+/// Parse the child's report JSON (tolerant — `None` only on unreadable JSON).
+fn parse_report(text: &str) -> Option<TurnReport> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let goal_value = value.get("goal").filter(|g| !g.is_null());
+    let goal = goal_value.map(|g| RowGoal {
+        done: g.get("done").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+        total: g.get("total").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+        active: g.get("status").and_then(|v| v.as_str()) == Some("Active"),
+        paused: g.get("paused").and_then(|v| v.as_bool()).unwrap_or(false),
+    });
+    Some(TurnReport {
+        total_tokens: value
+            .get("total_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        goal_raw: goal_value.map(|g| g.to_string()),
+        goal,
+    })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -129,6 +186,12 @@ enum RowDone {
         changed: Vec<String>,
         verified: bool,
     },
+    /// Post-merge: combined-tree verify verdict (None = no verify configured)
+    /// + the refreshed base the worktree was reset onto (None = refresh failed).
+    PostVerify {
+        verify_ok: Option<bool>,
+        new_base: Option<String>,
+    },
 }
 
 type RowFut = Pin<Box<dyn Future<Output = (usize, RowDone)>>>;
@@ -161,6 +224,8 @@ pub(crate) async fn run_dashboard(
     let mut dispatch = InputLine::default();
     let mut exit_armed = false;
     let mut flash: Option<String> = None;
+    // Peek scrollback: lines back from the live tail (0 = follow).
+    let mut peek_offset: usize = 0;
 
     loop {
         terminal.draw(|f| {
@@ -173,6 +238,7 @@ pub(crate) async fn run_dashboard(
                 in_flight.len(),
                 exit_armed,
                 flash.as_deref(),
+                peek_offset,
             )
         })?;
 
@@ -184,6 +250,9 @@ pub(crate) async fn run_dashboard(
                     }
                     RowDone::MergeCheck { changed, verified } => {
                         finish_merge_check(app, idx, changed, verified, launcher, &line_tx, &mut in_flight);
+                    }
+                    RowDone::PostVerify { verify_ok, new_base } => {
+                        finish_post_verify(app, idx, verify_ok, new_base, launcher, &line_tx, &mut in_flight);
                     }
                 }
             }
@@ -249,17 +318,47 @@ pub(crate) async fn run_dashboard(
                             }
                             KeyCode::Up => {
                                 selected = selected.saturating_sub(1);
+                                peek_offset = 0;
                             }
                             KeyCode::Down => {
                                 if !app.fleet.is_empty() {
                                     selected = (selected + 1).min(app.fleet.len() - 1);
                                 }
+                                peek_offset = 0;
                             }
                             KeyCode::Tab => {
                                 focus = match focus {
                                     Focus::Dispatch if !app.fleet.is_empty() => Focus::Reply,
                                     _ => Focus::Dispatch,
                                 };
+                                // Focusing a row's reply acknowledges it.
+                                if focus != Focus::Dispatch
+                                    && let Some(row) = app.fleet.get_mut(selected)
+                                {
+                                    row.attention = false;
+                                }
+                            }
+                            // Peek scrollback through the row's output tail.
+                            KeyCode::PageUp => {
+                                if let Some(row) = app.fleet.get(selected) {
+                                    peek_offset =
+                                        (peek_offset + 10).min(row.tail.len().saturating_sub(1));
+                                }
+                            }
+                            KeyCode::PageDown => {
+                                peek_offset = peek_offset.saturating_sub(10);
+                            }
+                            // r: rebase an idle row's worktree onto a fresh
+                            // snapshot of the real tree (clears the stale badge).
+                            KeyCode::Char('r')
+                                if focus == Focus::Dispatch
+                                    && app.fleet.get(selected).is_some_and(|r| {
+                                        r.state != RowState::Working && r.state != RowState::Closed
+                                    }) =>
+                            {
+                                let base =
+                                    hi_tools::checkpoint::create(std::path::Path::new(".")).await;
+                                rebase_row(app, selected, base, &mut flash);
                             }
                             // Ctrl+S: dispatch AND attach (or attach the selected
                             // row when the dispatch box is empty).
@@ -295,6 +394,7 @@ pub(crate) async fn run_dashboard(
                                     if let Some(row) = app.fleet.get_mut(selected) {
                                         let text = row.reply.submit().trim().to_string();
                                         if !text.is_empty() {
+                                            peek_offset = 0;
                                             send_reply(app, selected, text, launcher, &line_tx, &mut in_flight);
                                         }
                                     }
@@ -380,6 +480,10 @@ pub(crate) async fn run_dashboard(
                             _ => {}
                         }
                     }
+                    // Keep focus state live so attention pings fire only when
+                    // you're actually away.
+                    Event::FocusGained => app.set_focus(true),
+                    Event::FocusLost => app.set_focus(false),
                     _ => {}
                 }
             }
@@ -427,6 +531,10 @@ async fn dispatch_new(
             "not in a git repository (fleet rows need worktrees)"
         ));
     }
+    // A `/goal <objective>` dispatch makes the row goal-driven: the child
+    // plans the objective (via --goal) and the parent auto-continues while
+    // the goal stays active.
+    let (goal_objective, prompt) = split_goal_dispatch(prompt);
     // Snapshot the current tree (incl. uncommitted work) as the row's base.
     let base = hi_tools::checkpoint::create(std::path::Path::new("."))
         .await
@@ -452,6 +560,14 @@ async fn dispatch_new(
         kill: None,
         started: None,
         turns: 0,
+        usage: 0,
+        goal: None,
+        goal_objective,
+        last_goal_json: None,
+        driving: false,
+        drive_stall: 0,
+        stale: false,
+        attention: false,
     };
     app.fleet.push(row);
     let idx = app.fleet.len() - 1;
@@ -471,6 +587,8 @@ fn send_reply(
     let Some(row) = app.fleet.get_mut(idx) else {
         return;
     };
+    row.attention = false;
+    row.drive_stall = 0; // a user reply resets the drive-park guard
     if row.state == RowState::Working {
         row.push_line(format!("⧗ queued: {text}"));
         row.pending.push_back(text);
@@ -494,7 +612,12 @@ fn start_turn(
     row.state = RowState::Working;
     row.started = Some(Instant::now());
     row.activity = "starting…".to_string();
-    row.push_line(format!("› {prompt}"));
+    row.driving = prompt == hi_agent::GOAL_CONTINUE_PROMPT;
+    if row.driving {
+        row.push_line("⟳ goal drive".to_string());
+    } else {
+        row.push_line(format!("› {prompt}"));
+    }
 
     let mut cmd = tokio::process::Command::new(&launcher.exe);
     cmd.current_dir(&row.worktree)
@@ -516,6 +639,12 @@ fn start_turn(
             &launcher.max_steps.to_string(),
         ]);
     cmd.arg("--session-file").arg(&row.session);
+    // Per-turn ground truth: tokens, verify, changed files, goal progress.
+    cmd.arg("--report").arg(report_path(row));
+    // First turn of a /goal dispatch: the child plans the objective.
+    if let Some(objective) = row.goal_objective.take() {
+        cmd.arg("--goal").arg(objective);
+    }
     if let Some(v) = &launcher.verify {
         cmd.args([
             "--verify",
@@ -590,11 +719,42 @@ fn finish_turn(
     };
     row.kill = None;
     row.turns += 1;
+    // Ingest the child's report: session-cumulative tokens, goal progress, and
+    // the drive-stall comparison (an unchanged goal across a drive turn counts
+    // toward parking the drive).
+    let was_driving = row.driving;
+    row.driving = false;
+    if let Some(report) = std::fs::read_to_string(report_path(row))
+        .ok()
+        .and_then(|t| parse_report(&t))
+    {
+        if report.total_tokens > 0 {
+            row.usage = report.total_tokens;
+        }
+        row.drive_stall = next_drive_stall(
+            was_driving,
+            &row.last_goal_json,
+            &report.goal_raw,
+            row.drive_stall,
+        );
+        let was_active = row.goal.as_ref().is_some_and(|g| g.active);
+        row.last_goal_json = report.goal_raw;
+        row.goal = report.goal;
+        if was_active
+            && row
+                .goal
+                .as_ref()
+                .is_some_and(|g| !g.active && g.done == g.total)
+        {
+            row.push_line("◎ goal complete".to_string());
+        }
+    }
     if killed {
         row.state = RowState::Failed;
         row.started = None;
         row.activity.clear();
         row.push_line("⚠ turn killed".to_string());
+        flag_attention(app, idx);
         return;
     }
     if !ok {
@@ -602,6 +762,7 @@ fn finish_turn(
         row.started = None;
         row.activity.clear();
         row.push_line("✗ agent run failed (see output above)".to_string());
+        flag_attention(app, idx);
         return;
     }
     // Success: verify + diff in the worktree, off the render thread.
@@ -685,6 +846,56 @@ fn finish_merge_check(
                     row.changed.len(),
                     row.changed.join(", ")
                 ));
+                mark_others_stale(app, idx);
+                // Post-merge, off the render thread: verify the *combined* real
+                // tree (a diff can pass in its worktree yet break the combine),
+                // then refresh this row's base to a fresh snapshot so future
+                // diffs are minimal. The row stays Working until this lands —
+                // the worktree must not run a turn during the reset.
+                let verify = launcher.verify.clone();
+                let worktree_path = app.fleet[idx].worktree.clone();
+                let Some(row) = app.fleet.get_mut(idx) else {
+                    return;
+                };
+                row.state = RowState::Working;
+                row.activity = "post-merge check…".to_string();
+                in_flight.push(Box::pin(async move {
+                    let verify_ok = match &verify {
+                        Some(v) => {
+                            let v = v.clone();
+                            Some(
+                                tokio::task::spawn_blocking(move || {
+                                    worktree::verify_passes(std::path::Path::new("."), &v)
+                                })
+                                .await
+                                .unwrap_or(false),
+                            )
+                        }
+                        None => None,
+                    };
+                    let new_base = hi_tools::checkpoint::create(std::path::Path::new(".")).await;
+                    let new_base = match new_base {
+                        Some(base) => {
+                            let wt = worktree_path.clone();
+                            let sha = base.clone();
+                            let reset_ok = tokio::task::spawn_blocking(move || {
+                                worktree::reset_to(&wt, &sha).is_ok()
+                            })
+                            .await
+                            .unwrap_or(false);
+                            reset_ok.then_some(base)
+                        }
+                        None => None,
+                    };
+                    (
+                        idx,
+                        RowDone::PostVerify {
+                            verify_ok,
+                            new_base,
+                        },
+                    )
+                }));
+                return;
             }
             Err(err) => {
                 row.merge = MergeState::VerifyFailed;
@@ -692,8 +903,135 @@ fn finish_merge_check(
             }
         }
     }
+    continue_row(app, idx, launcher, line_tx, in_flight);
+}
+
+/// The post-merge check landed: record the combined-tree verify verdict, adopt
+/// the refreshed base, then continue the row (queued reply or goal drive).
+fn finish_post_verify(
+    app: &mut App,
+    idx: usize,
+    verify_ok: Option<bool>,
+    new_base: Option<String>,
+    launcher: &FleetLauncher,
+    line_tx: &mpsc::UnboundedSender<(usize, String)>,
+    in_flight: &mut FuturesUnordered<RowFut>,
+) {
+    let Some(row) = app.fleet.get_mut(idx) else {
+        return;
+    };
+    row.state = RowState::Idle;
+    row.started = None;
+    row.activity.clear();
+    if let Some(base) = new_base {
+        // The fresh snapshot contains this row's merged diff, so the worktree
+        // is now clean against it.
+        row.base = base;
+        row.changed.clear();
+        row.stale = false;
+    }
+    if verify_ok == Some(false) {
+        row.push_line("⚠ combined-tree verify failed after merge — inspect your tree".to_string());
+        flag_attention(app, idx);
+    }
+    continue_row(app, idx, launcher, line_tx, in_flight);
+}
+
+/// After a turn fully settles: run the next queued reply, else keep a goal
+/// drive going, else the row is waiting on the user (attention).
+fn continue_row(
+    app: &mut App,
+    idx: usize,
+    launcher: &FleetLauncher,
+    line_tx: &mpsc::UnboundedSender<(usize, String)>,
+    in_flight: &mut FuturesUnordered<RowFut>,
+) {
+    let Some(row) = app.fleet.get_mut(idx) else {
+        return;
+    };
+    if row.state != RowState::Idle {
+        return;
+    }
     if let Some(next) = row.pending.pop_front() {
+        row.drive_stall = 0; // user input resets the stall guard
         start_turn(app, idx, next, launcher, line_tx, in_flight);
+        return;
+    }
+    let drive = row.goal.as_ref().is_some_and(|g| g.active && !g.paused);
+    if drive {
+        if row.drive_stall >= hi_agent::GOAL_DRIVE_STALL_LIMIT {
+            row.push_line(
+                "⏸ drive parked — no progress for 2 turns; reply to steer and resume".to_string(),
+            );
+            flag_attention(app, idx);
+            return;
+        }
+        start_turn(
+            app,
+            idx,
+            hi_agent::GOAL_CONTINUE_PROMPT.to_string(),
+            launcher,
+            line_tx,
+            in_flight,
+        );
+        return;
+    }
+    // Idle with nothing to do: the agent is waiting on the user.
+    flag_attention(app, idx);
+}
+
+/// Mark the row as needing the user; ping the terminal when it's unfocused.
+fn flag_attention(app: &mut App, idx: usize) {
+    let unfocused = app.focus_known && !app.focused;
+    if let Some(row) = app.fleet.get_mut(idx)
+        && !row.attention
+    {
+        row.attention = true;
+        if unfocused {
+            crate::util::notify_done();
+        }
+    }
+}
+
+/// After a row's diff lands in the real tree, every other open row is building
+/// against a snapshot that no longer matches it.
+fn mark_others_stale(app: &mut App, idx: usize) {
+    for (i, other) in app.fleet.iter_mut().enumerate() {
+        if i != idx && other.state != RowState::Closed {
+            other.stale = true;
+        }
+    }
+}
+
+/// The row's per-turn report file (next to its session, outside any repo).
+fn report_path(row: &FleetRow) -> PathBuf {
+    row.session.with_extension("report.json")
+}
+
+/// Drive-stall bookkeeping: a *drive* turn that leaves the goal state
+/// unchanged counts toward the park limit; any user turn or goal change resets.
+fn next_drive_stall(
+    was_driving: bool,
+    prev_goal: &Option<String>,
+    new_goal: &Option<String>,
+    current: u32,
+) -> u32 {
+    if was_driving && new_goal == prev_goal {
+        current + 1
+    } else {
+        0
+    }
+}
+
+/// Split a dispatch-box entry: a `/goal <objective>` prefix makes the row
+/// goal-driven (objective doubles as the first prompt and the row title).
+fn split_goal_dispatch(prompt: String) -> (Option<String>, String) {
+    match prompt.strip_prefix("/goal ") {
+        Some(objective) => {
+            let objective = objective.trim().to_string();
+            (Some(objective.clone()), objective)
+        }
+        None => (None, prompt),
     }
 }
 
@@ -712,14 +1050,46 @@ fn force_merge(app: &mut App, idx: usize, flash: &mut Option<String>) {
         Ok(_) => {
             row.changed = changed;
             row.merge = MergeState::Merged(row.changed.len());
+            row.attention = false;
             row.push_line(format!(
                 "✓ merged {} file(s) into your tree (forced)",
                 row.changed.len()
             ));
+            mark_others_stale(app, idx);
         }
         Err(err) => {
             *flash = Some(format!("#{}: merge failed: {err:#}", row.id));
         }
+    }
+}
+
+/// `r`: rebase an idle row's worktree onto a fresh snapshot of the real tree.
+/// Refused while the row has unmerged changes (merge or close first).
+fn rebase_row(app: &mut App, idx: usize, new_base: Option<String>, flash: &mut Option<String>) {
+    let Some(row) = app.fleet.get_mut(idx) else {
+        return;
+    };
+    let unmerged = !row.changed.is_empty() && !matches!(row.merge, MergeState::Merged(_));
+    if unmerged {
+        *flash = Some(format!(
+            "#{}: unmerged changes — merge (m) or close (x) first",
+            row.id
+        ));
+        return;
+    }
+    let Some(base) = new_base else {
+        *flash = Some(format!("#{}: couldn't snapshot the tree", row.id));
+        return;
+    };
+    match worktree::reset_to(&row.worktree, &base) {
+        Ok(()) => {
+            row.base = base;
+            row.changed.clear();
+            row.stale = false;
+            row.attention = false;
+            row.push_line("⟳ rebased onto the current tree".to_string());
+        }
+        Err(err) => *flash = Some(format!("#{}: rebase failed: {err:#}", row.id)),
     }
 }
 
@@ -773,6 +1143,7 @@ fn render_dashboard(
     working: usize,
     exit_armed: bool,
     flash: Option<&str>,
+    peek_offset: usize,
 ) {
     let area = frame.area();
     let attach = focus == Focus::Attach;
@@ -814,7 +1185,7 @@ fn render_dashboard(
     if !attach {
         render_table(frame, app, selected, rows[1]);
     }
-    render_peek(frame, app, selected, rows[2], attach);
+    render_peek(frame, app, selected, rows[2], attach, peek_offset);
     render_input(frame, app, selected, focus, dispatch, rows[3]);
 
     let hint = match flash {
@@ -822,7 +1193,7 @@ fn render_dashboard(
         None => Line::styled(
             match focus {
                 Focus::Dispatch => {
-                    "Enter dispatch · Ctrl+S dispatch+attach · ↑↓ select · Tab reply · m merge · x close · Ctrl+K kill · Esc back"
+                    "Enter dispatch (/goal <obj> = driven) · Ctrl+S +attach · ↑↓ · Tab reply · m merge · r rebase · x close · Ctrl+K kill · PgUp scroll · Esc"
                 }
                 Focus::Reply => {
                     "Enter send · 1-9 quick answer · ↑↓ select · Tab dispatch · Esc back"
@@ -897,17 +1268,37 @@ fn render_table(frame: &mut ratatui::Frame, app: &App, selected: usize, area: Re
         } else {
             Style::default()
         };
+        // Attention (●), goal progress (◎d/t), stale (⟳), tokens — the fleet
+        // vitals at a glance.
+        let attention = if row.attention { "●" } else { " " };
+        let goal = row
+            .goal
+            .as_ref()
+            .map(|g| format!("◎{}/{}", g.done, g.total))
+            .unwrap_or_default();
+        let stale = if row.stale { "⟳" } else { " " };
         lines.push(Line::from(vec![
             Span::styled(format!(" {glyph} "), glyph_style),
+            Span::styled(attention.to_string(), Style::default().fg(Color::Cyan)),
             Span::styled(format!("#{:<2} {:>9}{} ", row.id, elapsed, queued), style),
+            Span::styled(format!("↓{:>6} ", crate::util::fmt_count(row.usage)), dim()),
+            Span::styled(format!("{goal:>7} "), Style::default().fg(Color::Magenta)),
+            Span::styled(stale.to_string(), Style::default().fg(Color::Yellow)),
             Span::styled(format!("{badge:>11} "), badge_style),
-            Span::styled(truncate(lead, 60), style),
+            Span::styled(truncate(lead, 46), style),
         ]));
     }
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-fn render_peek(frame: &mut ratatui::Frame, app: &App, selected: usize, area: Rect, attach: bool) {
+fn render_peek(
+    frame: &mut ratatui::Frame,
+    app: &App,
+    selected: usize,
+    area: Rect,
+    attach: bool,
+    offset: usize,
+) {
     let Some(row) = app.fleet.get(selected) else {
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
@@ -935,8 +1326,10 @@ fn render_peek(frame: &mut ratatui::Frame, app: &App, selected: usize, area: Rec
         .title(title);
     let inner = area.height.saturating_sub(2) as usize;
     let mut lines: Vec<Line> = Vec::new();
-    let shown = row.tail.len().saturating_sub(inner.saturating_sub(1));
-    for line in row.tail.iter().skip(shown) {
+    let follow = row.tail.len().saturating_sub(inner.saturating_sub(1));
+    let offset = offset.min(follow);
+    let shown = follow - offset;
+    for line in row.tail.iter().skip(shown).take(inner.saturating_sub(1)) {
         let style = if line.starts_with('⚙') || line.starts_with('›') {
             dim()
         } else if line.starts_with('✗') || line.starts_with('⚠') {
@@ -948,7 +1341,11 @@ fn render_peek(frame: &mut ratatui::Frame, app: &App, selected: usize, area: Rec
         };
         lines.push(Line::styled(line.clone(), style));
     }
-    if row.state == RowState::Working {
+    if offset > 0 {
+        // Scrolled back: show how far off the live tail we are instead of the
+        // spinner (PgDn returns to follow).
+        lines.push(Line::styled(format!("↓ {offset} newer (PgDn)"), dim()));
+    } else if row.state == RowState::Working {
         lines.push(Line::styled(
             format!(
                 "{} {}",
@@ -1049,7 +1446,65 @@ mod tests {
             kill: None,
             started: None,
             turns: 0,
+            usage: 0,
+            goal: None,
+            goal_objective: None,
+            last_goal_json: None,
+            driving: false,
+            drive_stall: 0,
+            stale: false,
+            attention: false,
         }
+    }
+
+    #[test]
+    fn parse_report_reads_tokens_and_goal() {
+        let json = r#"{"total_tokens": 12345, "verify_passed": true,
+            "goal": {"objective":"port it","done":2,"total":7,"status":"Active","paused":false}}"#;
+        let rep = parse_report(json).expect("parses");
+        assert_eq!(rep.total_tokens, 12345);
+        let goal = rep.goal.expect("goal block");
+        assert_eq!((goal.done, goal.total), (2, 7));
+        assert!(goal.active && !goal.paused);
+        assert!(rep.goal_raw.is_some());
+        // No goal → None; null goal → None.
+        assert!(
+            parse_report(r#"{"total_tokens": 5}"#)
+                .unwrap()
+                .goal
+                .is_none()
+        );
+        assert!(
+            parse_report(r#"{"total_tokens": 5, "goal": null}"#)
+                .unwrap()
+                .goal
+                .is_none()
+        );
+        // Garbage → None, caller keeps prior state.
+        assert!(parse_report("not json").is_none());
+    }
+
+    #[test]
+    fn drive_stall_counts_only_unchanged_drive_turns() {
+        let a = Some(r#"{"done":1,"total":3}"#.to_string());
+        let b = Some(r#"{"done":2,"total":3}"#.to_string());
+        // User turn: always resets.
+        assert_eq!(next_drive_stall(false, &a, &a, 5), 0);
+        // Drive turn with progress: resets.
+        assert_eq!(next_drive_stall(true, &a, &b, 1), 0);
+        // Drive turn without progress: increments.
+        assert_eq!(next_drive_stall(true, &a, &a, 0), 1);
+        assert_eq!(next_drive_stall(true, &None, &None, 1), 2);
+    }
+
+    #[test]
+    fn goal_dispatch_prefix_is_stripped() {
+        let (obj, prompt) = split_goal_dispatch("/goal port the parser to Rust".to_string());
+        assert_eq!(obj.as_deref(), Some("port the parser to Rust"));
+        assert_eq!(prompt, "port the parser to Rust");
+        let (obj, prompt) = split_goal_dispatch("fix the failing test".to_string());
+        assert!(obj.is_none());
+        assert_eq!(prompt, "fix the failing test");
     }
 
     #[test]

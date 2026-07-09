@@ -135,3 +135,91 @@ pub fn cleanup(worktrees: &[PathBuf]) {
             .output();
     }
 }
+
+/// Hard-reset a worktree onto a new base commit (fleet rebase: adopt a fresh
+/// snapshot of the real tree, discarding the worktree's current state — callers
+/// must ensure nothing unmerged is lost first).
+pub fn reset_to(worktree: &Path, base: &str) -> Result<()> {
+    let out = Command::new("git")
+        .args(["reset", "--hard", base])
+        .current_dir(worktree)
+        .output()
+        .context("running git reset in the worktree")?;
+    if !out.status.success() {
+        bail!(
+            "git reset --hard {base} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// End-to-end reset_to: a worktree with local edits hard-resets onto a new
+    /// base commit, discarding its state and adopting the new snapshot.
+    #[test]
+    fn reset_to_adopts_a_new_base() {
+        let dir = std::env::temp_dir().join(format!("hi-wt-reset-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str], cwd: &Path| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "-q"], &dir);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        git(&["add", "-A"], &dir);
+        git(
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "c1",
+            ],
+            &dir,
+        );
+        let wt = dir.join("wt");
+        git(
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "HEAD"],
+            &dir,
+        );
+        // Dirty the worktree, then advance the base in the main repo.
+        std::fs::write(wt.join("a.txt"), "dirty\n").unwrap();
+        std::fs::write(dir.join("a.txt"), "two\n").unwrap();
+        git(&["add", "-A"], &dir);
+        git(
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "c2",
+            ],
+            &dir,
+        );
+        let new_base = git(&["rev-parse", "HEAD"], &dir);
+
+        reset_to(&wt, &new_base).expect("reset succeeds");
+        assert_eq!(std::fs::read_to_string(wt.join("a.txt")).unwrap(), "two\n");
+
+        cleanup(&[wt]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

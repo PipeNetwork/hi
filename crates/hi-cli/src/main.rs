@@ -304,6 +304,30 @@ async fn main() -> Result<()> {
             report_model = hi_ai::MOA_MODEL_CONSERVATIVE.to_string();
             prompt = arg;
         }
+        // `--goal <objective>` (fleet rows): install a planner-decomposed goal
+        // before the turn — but never re-plan when the resumed session already
+        // carries one (later fleet turns drive the existing goal).
+        if let Some(objective) = cli.goal.as_deref().map(str::trim).filter(|s| !s.is_empty())
+            && agent.structured_goal().is_none()
+        {
+            if !cli.quiet {
+                println!("\x1b[2mplanning goal with the planner model…\x1b[0m");
+            }
+            let steps = match agent.decompose_goal(objective).await {
+                Ok(steps) if !steps.is_empty() => steps,
+                _ => vec![objective.to_string()],
+            };
+            let goal = hi_agent::Goal::new(objective.to_string(), steps);
+            if agent.set_structured_goal(Some(goal)).unwrap_or(false)
+                && !cli.quiet
+                && let Some(g) = agent.structured_goal()
+            {
+                println!(
+                    "\x1b[2m✓ goal set — {} sub-goal(s)\x1b[0m",
+                    g.sub_goals.len()
+                );
+            }
+        }
         let mut plain = PlainUi::new();
         let mut quiet = ui::QuietUi;
         let view: &mut dyn hi_agent::Ui = if cli.quiet { &mut quiet } else { &mut plain };
@@ -973,6 +997,17 @@ fn write_report(
         "compat_fallbacks_used": agent.last_compat_fallbacks(),
         "tool_mode_effective": tool_mode_label(agent.tool_mode()),
         "changed_files": agent.last_changed_files(),
+        // The long-horizon goal state, when one is active — fleet rows read
+        // this to decide auto-continue. Null when no structured goal is set.
+        "goal": agent.structured_goal().map(|g| {
+            serde_json::json!({
+                "objective": g.objective,
+                "done": g.sub_goals.iter().filter(|s| s.status == hi_agent::GoalStatus::Done).count(),
+                "total": g.sub_goals.len(),
+                "status": format!("{:?}", g.status),
+                "paused": g.paused,
+            })
+        }),
         "telemetry": {
             "effective_max_steps": tel.effective_max_steps,
             "verify_rounds": tel.verify_rounds,
