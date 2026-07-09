@@ -346,7 +346,13 @@ async fn main() -> Result<()> {
                 Ok(steps) if !steps.is_empty() => steps,
                 _ => vec![objective.to_string()],
             };
-            let goal = hi_agent::Goal::new(objective.to_string(), steps);
+            let mut goal = hi_agent::Goal::new(objective.to_string(), steps);
+            // `/goal team` is a TUI toggle; HI_SKEPTIC_MODEL + HI_GOAL_TEAM lets a
+            // one-shot / daemon / fleet goal run enable the skeptic gate headlessly
+            // (no-ops without a skeptic_model configured).
+            if std::env::var_os("HI_GOAL_TEAM").is_some() {
+                goal.team = true;
+            }
             if agent.set_structured_goal(Some(goal)).unwrap_or(false)
                 && !cli.quiet
                 && let Some(g) = agent.structured_goal()
