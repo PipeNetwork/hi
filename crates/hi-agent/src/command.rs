@@ -219,9 +219,9 @@ pub enum LoopArg {
     Budget { id: u64, tokens: Option<u64> },
     /// `on <id> <cmd|off>` — set/clear a shell command run when a firing is loud.
     Trigger { id: u64, cmd: Option<String> },
-    /// `fix <id> <on|off>` — enable/disable auto-fix (dispatch a verified fix
-    /// on a loud change).
-    Fix { id: u64, on: bool },
+    /// `fix <id> <on|pr|off>` — enable/disable auto-fix (dispatch a verified fix
+    /// on a loud change); `pr` lands it as a PR instead of a working-tree merge.
+    Fix { id: u64, on: bool, pr: bool },
     /// `<interval> <prompt>` — create a loop firing `prompt` every `secs`.
     Create { secs: u64, prompt: String },
     /// Anything unparseable (bad interval / missing prompt / bad id).
@@ -315,9 +315,22 @@ pub fn parse_loop_arg(arg: &str) -> LoopArg {
             Err(msg) => return LoopArg::Invalid(msg),
         };
         return match state.trim() {
-            "on" | "yes" | "true" => LoopArg::Fix { id, on: true },
-            "off" | "no" | "false" => LoopArg::Fix { id, on: false },
-            other => LoopArg::Invalid(format!("say on or off, not '{other}'")),
+            "on" | "yes" | "true" => LoopArg::Fix {
+                id,
+                on: true,
+                pr: false,
+            },
+            "pr" => LoopArg::Fix {
+                id,
+                on: true,
+                pr: true,
+            },
+            "off" | "no" | "false" => LoopArg::Fix {
+                id,
+                on: false,
+                pr: false,
+            },
+            other => LoopArg::Invalid(format!("say on, pr, or off, not '{other}'")),
         };
     }
     let Some((head, prompt)) = a.split_once(char::is_whitespace) else {
@@ -1075,11 +1088,30 @@ mod tests {
             parse_loop_arg("once in a while check"),
             LoopArg::Trigger { .. }
         ));
-        // Auto-fix toggle (`fix <id> on|off`).
-        assert_eq!(parse_loop_arg("fix 3 on"), LoopArg::Fix { id: 3, on: true });
+        // Auto-fix toggle (`fix <id> on|pr|off`).
+        assert_eq!(
+            parse_loop_arg("fix 3 on"),
+            LoopArg::Fix {
+                id: 3,
+                on: true,
+                pr: false
+            }
+        );
+        assert_eq!(
+            parse_loop_arg("fix 3 pr"),
+            LoopArg::Fix {
+                id: 3,
+                on: true,
+                pr: true
+            }
+        );
         assert_eq!(
             parse_loop_arg("fix #3 off"),
-            LoopArg::Fix { id: 3, on: false }
+            LoopArg::Fix {
+                id: 3,
+                on: false,
+                pr: false
+            }
         );
         assert!(matches!(parse_loop_arg("fix 3 maybe"), LoopArg::Invalid(_)));
         assert!(matches!(parse_loop_arg("fix"), LoopArg::Invalid(_)));

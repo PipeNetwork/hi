@@ -70,6 +70,10 @@ pub(crate) struct LoopSpec {
     /// verify-gated (only merged if the verify passes). Off by default.
     #[serde(default)]
     pub(crate) autofix: bool,
+    /// With `autofix`, land the verified fix as a pushed branch + PR (review)
+    /// instead of merging it into the working tree. Off by default.
+    #[serde(default)]
+    pub(crate) fix_pr: bool,
 }
 
 impl LoopSpec {
@@ -126,6 +130,8 @@ pub(crate) struct LoopWatchRow {
     pub(crate) last_trigger: Option<String>,
     /// Auto-fix is enabled for this loop.
     pub(crate) autofix: bool,
+    /// Auto-fix lands as a PR (review) rather than a working-tree merge.
+    pub(crate) fix_pr: bool,
     /// A fix attempt is currently in flight.
     pub(crate) fixing: bool,
     /// The outcome of the most recent fix attempt (for the peek).
@@ -191,10 +197,11 @@ pub(crate) enum LoopCtl {
         cmd: Option<String>,
         reply: oneshot::Sender<bool>,
     },
-    /// Enable/disable auto-fix for a loop.
+    /// Enable/disable auto-fix for a loop (`pr`: land as a PR, not a merge).
     Fix {
         id: u64,
         on: bool,
+        pr: bool,
         reply: oneshot::Sender<bool>,
     },
     List {
@@ -353,6 +360,7 @@ fn publish(
                 trigger: l.trigger.clone(),
                 last_trigger: rt.and_then(|r| r.last_trigger.clone()),
                 autofix: l.autofix,
+                fix_pr: l.fix_pr,
                 fixing: rt.is_some_and(|r| r.fixing),
                 last_fix: rt.and_then(|r| r.last_fix.clone()),
                 last_summary: rt.and_then(|r| r.last_summary.clone()),
@@ -503,6 +511,7 @@ async fn manager(
                                         spent_tokens: 0,
                                         trigger: None,
                                         autofix: false,
+                                        fix_pr: false,
                                     };
                                     state.loops.push(spec.clone());
                                     save(loops_file.as_deref(), &state);
@@ -596,11 +605,12 @@ async fn manager(
                         }
                         let _ = reply.send(ok);
                     }
-                    LoopCtl::Fix { id, on, reply } => {
+                    LoopCtl::Fix { id, on, pr, reply } => {
                         let mut ok = false;
                         for l in &mut state.loops {
                             if l.id == id {
                                 l.autofix = on;
+                                l.fix_pr = on && pr;
                                 ok = true;
                             }
                         }
@@ -1037,6 +1047,9 @@ async fn run_fix(launcher: &FleetLauncher, spec: &LoopSpec, summary: &str) -> (S
             .is_some_and(|v| worktree::verify_passes(&wt, v));
 
     let result = match decide_fix(true, completed, changed.len(), has_verify, verified) {
+        // PR mode: land the verified fix as a reviewable branch + PR.
+        FixDecision::Merge if spec.fix_pr => open_fix_pr(&wt, spec, summary, &changed),
+        // Merge mode: apply the verified diff into the working tree.
         FixDecision::Merge => match worktree::apply_changes(&wt, &base) {
             Ok(_) => (
                 format!(
@@ -1057,6 +1070,62 @@ async fn run_fix(launcher: &FleetLauncher, spec: &LoopSpec, summary: &str) -> (S
     };
     worktree::cleanup(std::slice::from_ref(&wt));
     result
+}
+
+/// Land a verified fix as a reviewable branch + PR instead of a working-tree
+/// merge. Commits the worktree's diff on a fresh branch, pushes it, and opens a
+/// PR with `gh`. Degrades gracefully: no remote → left on a local branch; no
+/// `gh` → a pushed branch to open a PR from. The branch persists after the
+/// worktree is cleaned up (it lives in the shared repo).
+fn open_fix_pr(
+    worktree: &std::path::Path,
+    spec: &LoopSpec,
+    summary: &str,
+    changed: &[String],
+) -> (String, bool) {
+    use hi_tools::worktree;
+    let name = spec.name();
+    let branch = format!("hi-autofix/loop{}-{}", spec.id, now_ms());
+    let commit_msg = format!("hi auto-fix: {name}\n\n{}", truncate(summary, 500));
+    if let Err(e) = worktree::commit_to_branch(worktree, &branch, &commit_msg) {
+        return (
+            format!("verified, but couldn't prepare the PR branch: {e}"),
+            true,
+        );
+    }
+    if let Err(e) = worktree::push_branch(worktree, &branch) {
+        return (
+            format!("fix committed to branch {branch} (couldn't push: {e}) — review it locally"),
+            true,
+        );
+    }
+    // Open the PR (best-effort; the pushed branch stands alone if `gh` is absent).
+    let title = format!("hi auto-fix: {name}");
+    let body = format!(
+        "A recurring `hi` watch (\"{name}\") detected a problem and an agent produced a \
+         verify-passing fix.\n\n**Problem**\n\n{summary}\n\n**Changed files**\n\n{}\n",
+        changed
+            .iter()
+            .map(|f| format!("- `{f}`"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    );
+    match std::process::Command::new("gh")
+        .current_dir(worktree)
+        .args([
+            "pr", "create", "--head", &branch, "--title", &title, "--body", &body,
+        ])
+        .output()
+    {
+        Ok(o) if o.status.success() => {
+            let url = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            (format!("opened PR: {url}"), true)
+        }
+        _ => (
+            format!("fix pushed to branch {branch} — open a PR to land it"),
+            true,
+        ),
+    }
 }
 
 /// How many loops are persisted for this project (for the daemon startup line).
@@ -1108,6 +1177,7 @@ mod tests {
             spent_tokens: 0,
             trigger: None,
             autofix: false,
+            fix_pr: false,
         }
     }
 
