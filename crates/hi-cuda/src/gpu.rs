@@ -3571,14 +3571,23 @@ mod native {
         ) -> Result<DeviceBuffer> {
             let weight_f16 = DeviceBuffer::alloc(weight_elements * std::mem::size_of::<u16>())
                 .context("allocating CUDA f16 weight scratch")?;
-            if dequant_f16_enabled() && matches!(matrix.dtype, GgufTensorType::Q4_0) {
-                crate::kernels::launch_dequantize_q4_0_to_f16(
-                    &matrix.buffer,
-                    &weight_f16,
-                    weight_elements,
-                    &self.stream,
-                )?;
-                return Ok(weight_f16);
+            if dequant_f16_enabled() {
+                type DequantF16 = for<'a, 'b, 'c> fn(
+                    &'a DeviceBuffer,
+                    &'b DeviceBuffer,
+                    usize,
+                    &'c Stream,
+                ) -> Result<()>;
+                let fused: Option<DequantF16> = match matrix.dtype {
+                    GgufTensorType::Q4_0 => Some(crate::kernels::launch_dequantize_q4_0_to_f16),
+                    GgufTensorType::Q4_K => Some(crate::kernels::launch_dequantize_q4_k_to_f16),
+                    GgufTensorType::Q6_K => Some(crate::kernels::launch_dequantize_q6_k_to_f16),
+                    _ => None,
+                };
+                if let Some(launch) = fused {
+                    launch(&matrix.buffer, &weight_f16, weight_elements, &self.stream)?;
+                    return Ok(weight_f16);
+                }
             }
             let dequantized = self.dequantize_matrix_f32_device(matrix)?;
             crate::kernels::launch_cast_f32_to_f16(

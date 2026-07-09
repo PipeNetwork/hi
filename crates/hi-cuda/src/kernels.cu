@@ -1609,6 +1609,107 @@ __global__ void dequantize_q6_k_kernel(const uint8_t* input, float* output, int 
   output[idx] = d * static_cast<float>(scale) * static_cast<float>(quant - 32);
 }
 
+// f16-output twins of dequantize_q4_k_kernel / dequantize_q6_k_kernel (exact same
+// value, wrapped in __float2half) for the fused prefill dequant->f16 path.
+__global__ void dequantize_q4_k_to_f16_kernel(
+    const uint8_t* input, __half* output, int elements) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= elements) {
+    return;
+  }
+  int block_id = idx / 256;
+  int within = idx % 256;
+  const uint8_t* block = input + block_id * 144;
+  float d = __half2float(*reinterpret_cast<const __half*>(block));
+  float dmin = __half2float(*reinterpret_cast<const __half*>(block + 2));
+  const uint8_t* scales = block + 4;
+  const uint8_t* qs = block + 16;
+
+  int group64 = within / 64;
+  int offset64 = within % 64;
+  int scale_index = group64 * 2 + (offset64 >= 32 ? 1 : 0);
+  uint8_t scale;
+  uint8_t min;
+  q4_k_scale_min(scale_index, scales, &scale, &min);
+
+  uint8_t packed = qs[group64 * 32 + (offset64 % 32)];
+  uint8_t quant = offset64 < 32 ? (packed & 0x0f) : (packed >> 4);
+  output[idx] = __float2half(d * static_cast<float>(scale) * static_cast<float>(quant) -
+                             dmin * static_cast<float>(min));
+}
+
+__global__ void dequantize_q6_k_to_f16_kernel(
+    const uint8_t* input, __half* output, int elements) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= elements) {
+    return;
+  }
+  int block_id = idx / 256;
+  int within = idx % 256;
+  const uint8_t* block = input + block_id * 210;
+  const uint8_t* ql = block;
+  const uint8_t* qh = block + 128;
+  const uint8_t* scales = block + 192;
+  float d = __half2float(*reinterpret_cast<const __half*>(block + 208));
+
+  int half = within / 128;
+  int pos = within % 128;
+  int l = pos % 32;
+  int group = pos / 32;
+  int ql_base = half * 64;
+  int qh_base = half * 32;
+  int scale_base = half * 8;
+  int is = l / 16;
+  uint8_t high = qh[qh_base + l];
+
+  int quant = 0;
+  int scale_index = scale_base + is;
+  switch (group) {
+    case 0:
+      quant = (ql[ql_base + l] & 0x0f) | (((high >> 0) & 0x03) << 4);
+      scale_index += 0;
+      break;
+    case 1:
+      quant = (ql[ql_base + l + 32] & 0x0f) | (((high >> 2) & 0x03) << 4);
+      scale_index += 2;
+      break;
+    case 2:
+      quant = (ql[ql_base + l] >> 4) | (((high >> 4) & 0x03) << 4);
+      scale_index += 4;
+      break;
+    default:
+      quant = (ql[ql_base + l + 32] >> 4) | (((high >> 6) & 0x03) << 4);
+      scale_index += 6;
+      break;
+  }
+  int8_t scale = static_cast<int8_t>(scales[scale_index]);
+  output[idx] = __float2half(d * static_cast<float>(scale) * static_cast<float>(quant - 32));
+}
+
+extern "C" int hi_cuda_launch_dequantize_q4_k_to_f16(
+    const void* input, void* output, int elements, void* stream) {
+  if (input == nullptr || output == nullptr || elements <= 0 || stream == nullptr) {
+    return 1;
+  }
+  dim3 block(256);
+  dim3 grid((elements + block.x - 1) / block.x);
+  dequantize_q4_k_to_f16_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint8_t*>(input), static_cast<__half*>(output), elements);
+  return 0;
+}
+
+extern "C" int hi_cuda_launch_dequantize_q6_k_to_f16(
+    const void* input, void* output, int elements, void* stream) {
+  if (input == nullptr || output == nullptr || elements <= 0 || stream == nullptr) {
+    return 1;
+  }
+  dim3 block(256);
+  dim3 grid((elements + block.x - 1) / block.x);
+  dequantize_q6_k_to_f16_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint8_t*>(input), static_cast<__half*>(output), elements);
+  return 0;
+}
+
 __global__ void dequantize_q8_k_kernel(const uint8_t* input, float* output, int elements) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= elements) {
