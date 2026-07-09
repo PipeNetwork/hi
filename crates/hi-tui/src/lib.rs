@@ -277,7 +277,6 @@ pub(crate) fn splash_lines(
 pub(crate) fn apply_metadata(
     app: &mut App,
     agent: &mut Agent,
-    registry: &hi_ai::Registry,
     result: &Result<Vec<hi_ai::ServedModel>>,
     cache_key: &str,
 ) {
@@ -287,7 +286,7 @@ pub(crate) fn apply_metadata(
             app.model_ids = served.iter().map(|m| m.id.clone()).collect();
             app.model_ids.sort();
             let model_id = app.model.clone();
-            app.apply_model(agent, registry, &model_id);
+            app.apply_model(agent, &model_id);
             // Persist for next startup (best-effort, fire-and-forget).
             let models = served.clone();
             let key = cache_key.to_string();
@@ -296,7 +295,7 @@ pub(crate) fn apply_metadata(
             });
         }
         Ok(_) => {
-            app.startup_notice = Some("model metadata not loaded; using catalog".into());
+            app.startup_notice = Some("model metadata not loaded".into());
         }
         Err(err) => {
             app.startup_notice = Some(format!("model metadata not loaded: {err:#}"));

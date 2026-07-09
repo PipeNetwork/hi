@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use hi_agent::Agent;
-use hi_ai::Registry;
 
 use crate::commands::handle_command;
 use crate::config::{self, Settings};
@@ -20,7 +19,6 @@ pub(crate) async fn repl(
     agent: &mut Agent,
     settings: &Settings,
     config: &mut config::Config,
-    registry: &Registry,
     auto_memory: bool,
     mut active_profile: Option<String>,
     config_path: Option<PathBuf>,
@@ -33,9 +31,8 @@ pub(crate) async fn repl(
 
     use crate::complete::{ProfileNames, ReplHelper};
 
-    let window = registry
-        .metadata(&settings.model)
-        .1
+    let window = agent
+        .context_window()
         .map(|w| format!(" · {}k ctx", w / 1000))
         .unwrap_or_default();
     println!(
@@ -263,11 +260,7 @@ pub(crate) async fn repl(
                                 .await
                                 .ok()
                                 .and_then(|models| models.into_iter().find(|m| m.id == id));
-                            let (_price, cat_window) = registry.metadata(&id);
-                            let window = served
-                                .as_ref()
-                                .and_then(|m| m.context_window)
-                                .or(cat_window);
+                            let window = served.as_ref().and_then(|m| m.context_window);
                             let max_output = served.as_ref().and_then(|m| m.max_output_tokens);
                             agent.set_model(id.clone(), window, max_output);
                             if let Some(name) = active_profile.as_deref() {
@@ -414,17 +407,16 @@ pub(crate) async fn repl(
                                 continue;
                             }
                             // Resolve the profile and update the provider.
-                            match config::resolve_named_profile(config, arg, registry) {
+                            match config::resolve_named_profile(config, arg) {
                                 Ok(new_settings) => {
                                     let label = provider_label(new_settings.provider);
                                     let model = new_settings.model.clone();
                                     let provider: std::sync::Arc<dyn hi_ai::Provider> =
                                         crate::build_chain(&new_settings, Vec::new()).into();
-                                    let (_price, window) = registry.metadata(&model);
                                     agent.set_provider(
                                         provider,
                                         model.clone(),
-                                        window,
+                                        None,
                                         new_settings.max_tokens,
                                         new_settings.max_tokens_explicit,
                                         None,
@@ -443,7 +435,7 @@ pub(crate) async fn repl(
                                             if let Some(served) =
                                                 models.iter().find(|m| m.id == model)
                                             {
-                                                let window = served.context_window.or(window);
+                                                let window = served.context_window;
                                                 agent.set_model(
                                                     model.clone(),
                                                     window,
@@ -496,7 +488,6 @@ pub(crate) async fn repl(
                                     match switch_to_mlx_profile(
                                         agent,
                                         config,
-                                        registry,
                                         config_path.as_deref(),
                                         &run,
                                     )
@@ -551,7 +542,7 @@ pub(crate) async fn repl(
                                     if hi_agent::command::goal_arg_is_objective(a)
                                         || a.trim() == "resume"
                             );
-                            handle_command(agent, other, registry);
+                            handle_command(agent, other);
                             if could_drive
                                 && agent
                                     .structured_goal()
@@ -675,7 +666,6 @@ pub(crate) async fn repl(
 async fn switch_to_mlx_profile(
     agent: &mut Agent,
     config: &mut config::Config,
-    registry: &Registry,
     config_path: Option<&Path>,
     run: &hi_tools::HfMlxRun,
 ) -> Result<()> {
@@ -690,10 +680,10 @@ async fn switch_to_mlx_profile(
         ..Default::default()
     };
     config::upsert_profile_as_default(config, &run.profile_name, profile, &path)?;
-    let settings = config::resolve_named_profile(config, &run.profile_name, registry)?;
+    let settings = config::resolve_named_profile(config, &run.profile_name)?;
     let provider: std::sync::Arc<dyn hi_ai::Provider> =
         crate::build_chain(&settings, Vec::new()).into();
-    let (_price, mut window) = registry.metadata(&settings.model);
+    let mut window: Option<u32> = None;
     agent.set_provider(
         provider,
         settings.model.clone(),

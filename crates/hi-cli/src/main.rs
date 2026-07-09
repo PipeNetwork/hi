@@ -18,7 +18,7 @@ use clap::Parser;
 use hi_agent::{Agent, AgentConfig, CompactionKind, VerifyStage};
 use hi_ai::{
     AnthropicProvider, Backend, FallbackProvider, McpDiscoveryProvider, Message, MoaProvider,
-    OpenAiProvider, PipeMcpClient, Provider, Registry, Usage,
+    OpenAiProvider, PipeMcpClient, Provider, Usage,
 };
 
 use commands::tool_mode_label;
@@ -37,16 +37,15 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     if cli.show_config {
-        let registry = Registry::load();
         let file = config::load_config(cli.config.as_deref())?;
-        match config::resolve(&cli, &file, &registry) {
+        match config::resolve(&cli, &file) {
             Ok(settings) => {
                 let live = if settings.provider == ProviderName::Pipenetwork {
                     let provider = build_provider(&settings);
-                    resolve_live_model_metadata(provider.as_ref(), &registry, &settings.model).await
+                    resolve_live_model_metadata(provider.as_ref(), &settings.model).await
                 } else {
                     LiveModelMetadata {
-                        context_window: registry.metadata(&settings.model).1,
+                        context_window: None,
                         max_output_tokens: None,
                     }
                 };
@@ -90,19 +89,10 @@ async fn main() -> Result<()> {
         }
     }
 
-    if cli.refresh_models {
-        let count = hi_ai::registry::refresh().await?;
-        let location = hi_ai::registry::cache_path()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
-        println!("Refreshed {count} models → {location}");
-        return Ok(());
-    }
     if cli.list_sessions {
         return session::list_sessions();
     }
 
-    let registry = Registry::load();
     let mut file = config::load_config(cli.config.as_deref())?;
 
     // First run on a real terminal with nothing configured: walk the user
@@ -114,7 +104,7 @@ async fn main() -> Result<()> {
         setup::run().await?
     } else {
         // Otherwise print config/onboarding guidance plainly (no "Error:" prefix).
-        match config::resolve(&cli, &file, &registry) {
+        match config::resolve(&cli, &file) {
             Ok(settings) => settings,
             Err(err) => {
                 eprintln!("{err}");
@@ -125,16 +115,6 @@ async fn main() -> Result<()> {
 
     if cli.prompt.as_deref() == Some("mcp") {
         return run_mcp_command(&settings).await;
-    }
-
-    let info = registry.lookup(&settings.model);
-    if let Some(info) = info
-        && !info.supports_tools
-    {
-        eprintln!(
-            "\x1b[33mwarning: model '{}' is not known to support tool calling\x1b[0m",
-            settings.model
-        );
     }
 
     // Fold piped stdin into the one-shot prompt as context.
@@ -173,14 +153,14 @@ async fn main() -> Result<()> {
     let (session_path, loaded) = resolve_session(&cli)?;
     let feedback_session_id = feedback::session_id_from_path(&session_path);
 
-    let fallbacks = config::resolve_fallbacks(&cli, &file, &registry);
+    let fallbacks = config::resolve_fallbacks(&cli, &file);
     // Arc so the agent can share it with read-only `explore` subagents.
     let provider: std::sync::Arc<dyn Provider> = build_chain(&settings, fallbacks).into();
     let live_metadata = if settings.provider == ProviderName::Pipenetwork {
-        resolve_live_model_metadata(provider.as_ref(), &registry, &settings.model).await
+        resolve_live_model_metadata(provider.as_ref(), &settings.model).await
     } else {
         LiveModelMetadata {
-            context_window: registry.metadata(&settings.model).1,
+            context_window: None,
             max_output_tokens: None,
         }
     };
@@ -375,7 +355,6 @@ async fn main() -> Result<()> {
             write_report(
                 path,
                 &agent,
-                &registry,
                 &report_model,
                 result.as_ref().err(),
             )
@@ -419,9 +398,8 @@ async fn main() -> Result<()> {
         let profiles: Vec<hi_tui::ProfileInfo> = profile_infos(&file);
         let resolver: hi_tui::ProfileResolver = Box::new({
             let file = file.clone();
-            let registry = registry.clone();
             move |name: &str| {
-                let settings = config::resolve_named_profile(&file, name, &registry)?;
+                let settings = config::resolve_named_profile(&file, name)?;
                 let label = provider_label(settings.provider).to_string();
                 let model = settings.model.clone();
                 let provider = build_chain(&settings, Vec::new());
@@ -499,7 +477,6 @@ async fn main() -> Result<()> {
         let mlx_switcher: hi_tui::MlxProfileSwitcher = Box::new({
             let file = std::sync::Mutex::new(file.clone());
             let config_path = cli.config.clone();
-            let registry = registry.clone();
             move |run: &hi_tools::HfMlxRun| {
                 let path = config::writable_config_path(config_path.as_deref())
                     .context("could not determine config path")?;
@@ -513,7 +490,7 @@ async fn main() -> Result<()> {
                     ..Default::default()
                 };
                 config::upsert_profile_as_default(&mut file, &run.profile_name, profile, &path)?;
-                let settings = config::resolve_named_profile(&file, &run.profile_name, &registry)?;
+                let settings = config::resolve_named_profile(&file, &run.profile_name)?;
                 let label = provider_label(settings.provider).to_string();
                 let model = settings.model.clone();
                 let provider = build_chain(&settings, Vec::new());
@@ -534,7 +511,6 @@ async fn main() -> Result<()> {
             provider_label(settings.provider),
             &settings.base_url,
             &settings.model,
-            &registry,
             session::history_path(),
             auto_memory,
             profiles,
@@ -575,7 +551,6 @@ async fn main() -> Result<()> {
         &mut agent,
         &settings,
         &mut file,
-        &registry,
         auto_memory,
         active_profile,
         cli.config.clone(),
@@ -1017,7 +992,6 @@ fn pipeline_command(stages: &[VerifyStage]) -> Option<String> {
 fn write_report(
     path: &std::path::Path,
     agent: &Agent,
-    _registry: &Registry,
     model: &str,
     error: Option<&anyhow::Error>,
 ) -> Result<()> {
@@ -1229,24 +1203,22 @@ fn effective_max_tokens_for_model(
 
 async fn resolve_live_model_metadata(
     provider: &dyn Provider,
-    registry: &Registry,
     model: &str,
 ) -> LiveModelMetadata {
-    let (_catalog_price, catalog_window) = registry.metadata(model);
     match provider.list_models().await {
         Ok(served) => served
             .into_iter()
             .find(|m| m.id == model)
             .map(|m| LiveModelMetadata {
-                context_window: m.context_window.or(catalog_window),
+                context_window: m.context_window,
                 max_output_tokens: m.max_output_tokens,
             })
             .unwrap_or(LiveModelMetadata {
-                context_window: catalog_window,
+                context_window: None,
                 max_output_tokens: None,
             }),
         Err(_) => LiveModelMetadata {
-            context_window: catalog_window,
+            context_window: None,
             max_output_tokens: None,
         },
     }

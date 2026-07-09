@@ -492,8 +492,7 @@ pub trait Provider: Send + Sync {
     ) -> Result<Completion>;
 
     /// The models this endpoint actually serves (via its `/models` route), with
-    /// any live metadata reported. Default: empty, so callers fall back to the
-    /// static models.dev catalog.
+    /// any live metadata reported. Default: empty.
     async fn list_models(&self) -> Result<Vec<ServedModel>> {
         Ok(Vec::new())
     }

@@ -87,8 +87,7 @@ impl ModelEntry {
 
 /// GET an OpenAI/Anthropic-style `/models` list from an already-authenticated
 /// request and return the served models — what the *current endpoint* actually
-/// offers (with any live window/price/health it reports), as opposed to the
-/// static models.dev catalog.
+/// offers (with any live window/price/health it reports).
 pub async fn fetch_models(builder: RequestBuilder) -> Result<Vec<ServedModel>> {
     let resp = send_with_retry(builder).await?;
     if !resp.status().is_success() {
