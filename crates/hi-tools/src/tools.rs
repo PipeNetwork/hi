@@ -1025,16 +1025,9 @@ async fn run(name: &str, arguments: &str) -> Result<ToolOutput> {
         }
         "bash" => {
             let args: BashArgs = parse(arguments)?;
-            let out = run_bash_tool(args, &mut |_| {}).await;
-            // A shell command can mutate any file (sed -i, codegen, git checkout,
-            // cargo add, …), so a later `read` must not serve stale cached content.
-            // We don't know which paths it touched — clear the whole read cache.
-            // Safe: `bash` runs alone, and the cache is only a within-turn read
-            // optimization.
-            if let Ok(mut cache) = READ_CACHE.lock() {
-                cache.clear();
-            }
-            out
+            // Read-cache invalidation lives inside run_bash_tool, so both this
+            // dispatch path and the streaming path (execute_streaming) clear it.
+            run_bash_tool(args, &mut |_| {}).await
         }
         "bash_output" => {
             #[derive(Deserialize)]
@@ -1601,6 +1594,12 @@ async fn run_bash_tool(
     }
     let timeout = resolve_bash_timeout(args.timeout);
     let out = run_bash_streaming_with_timeout(&args.command, on_line, timeout).await?;
+    // A shell command can mutate any file (sed -i, codegen, git checkout, mv, a
+    // formatter, …); a later `read` in the same turn must not serve stale cached
+    // content. We don't know which paths it touched — clear the whole read cache.
+    // Done HERE (not only in the dispatch arm) so the *streaming* path — the one
+    // the live turn loop actually uses (execute_streaming) — invalidates it too.
+    crate::paths::clear_read_cache();
     Ok(ToolOutput::plain(condense(&out)))
 }
 
@@ -1898,6 +1897,26 @@ mod tests {
         assert!(
             READ_CACHE.lock().unwrap().get(&key).is_none(),
             "bash must clear the read cache"
+        );
+    }
+
+    /// The real bug: the *streaming* entry point (execute_streaming) is what the
+    /// live turn loop uses, and it short-circuits to run_bash_tool before the
+    /// dispatch arm — so it must clear the cache too. This drives that path
+    /// explicitly (the test above only covers non-streaming `execute`).
+    #[tokio::test]
+    async fn streaming_bash_invalidates_the_read_cache() {
+        use crate::paths::{READ_CACHE, cache_key};
+        let key = cache_key("/tmp/hi-read-cache-probe-streaming");
+        READ_CACHE
+            .lock()
+            .unwrap()
+            .insert(key.clone(), "stale".into());
+        let mut sink = |_: &str| {};
+        let _ = crate::execute_streaming("bash", r#"{"command":"true"}"#, &mut sink).await;
+        assert!(
+            READ_CACHE.lock().unwrap().get(&key).is_none(),
+            "streaming bash must clear the read cache"
         );
     }
 

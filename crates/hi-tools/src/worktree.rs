@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 
 use anyhow::{Context, Result, bail};
 
@@ -18,6 +19,26 @@ const PYCACHE_EXCLUDES: &[&str] = &[
     ":(exclude,glob)**/*.pyc",
     ":(exclude,glob)**/*.pyo",
 ];
+
+/// Serializes merges into the shared working tree. Two isolated runs going loud
+/// at once (e.g. two auto-fix loops) would otherwise `git apply` into the same
+/// files concurrently and interleave writes. A plain `std::sync::Mutex` (these
+/// helpers are synchronous), held only across the real-tree apply.
+static MERGE_LOCK: Mutex<()> = Mutex::new(());
+
+/// The main repository's top-level directory. Patch paths from `git diff` are
+/// repo-root-relative, so the merge `git apply` must run from the repo root — not
+/// from whatever subdirectory `hi` happened to be launched in (which would make
+/// the apply fail, or target a wrong same-named nested path). `None` if cwd isn't
+/// inside a work tree, in which case the apply falls back to the process cwd.
+fn repo_toplevel() -> Option<PathBuf> {
+    let out = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !path.is_empty()).then(|| PathBuf::from(path))
+}
 
 /// Whether the current directory is inside a git work tree.
 pub fn in_git_repo() -> bool {
@@ -109,8 +130,16 @@ pub fn apply_changes(worktree: &Path, base: &str) -> Result<bool> {
     // apply says *which file/hunk* conflicted — in the TUI the inherited stderr
     // is invisible, which made fleet merge failures undiagnosable.
     use std::io::Write;
-    let mut child = Command::new("git")
-        .args(["apply", "--whitespace=nowarn"])
+    // Serialize the real-tree apply (MERGE_LOCK) and run it from the repo root so
+    // repo-root-relative patch paths resolve regardless of the launch cwd. The
+    // guard is held until this function returns (through the write + wait below).
+    let _merge = MERGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut apply = Command::new("git");
+    apply.args(["apply", "--whitespace=nowarn"]);
+    if let Some(top) = repo_toplevel() {
+        apply.current_dir(top);
+    }
+    let mut child = apply
         .stdin(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -321,6 +350,69 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(dir.join("a.py")).unwrap(),
             "x = 2\n"
+        );
+
+        cleanup(&[wt]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The merge `git apply` must run from the repo root even when `hi` was
+    /// launched from a subdirectory — patch paths are repo-root-relative, so a
+    /// subdir cwd used to break the merge (git apply looked under the subdir).
+    #[test]
+    fn apply_changes_merges_from_a_subdirectory_cwd() {
+        let _cwd = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("hi-wt-subdir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str], cwd: &Path| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q"], &dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("src.txt"), "one\n").unwrap();
+        git(&["add", "-A"], &dir);
+        git(
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "c1",
+            ],
+            &dir,
+        );
+        let wt = dir.join("wt");
+        git(
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "HEAD"],
+            &dir,
+        );
+        std::fs::write(wt.join("src.txt"), "two\n").unwrap();
+
+        // Launch condition: cwd is a SUBDIR of the repo, not its root.
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.join("sub")).unwrap();
+        let applied = apply_changes(&wt, "HEAD");
+        std::env::set_current_dir(prev).unwrap();
+
+        assert!(
+            applied.expect("apply ok from a subdir cwd"),
+            "a change applied"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("src.txt")).unwrap(),
+            "two\n"
         );
 
         cleanup(&[wt]);

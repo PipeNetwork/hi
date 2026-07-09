@@ -64,8 +64,13 @@ impl crate::Agent {
             ui.subagent_note(&format!("↳ delegate subagent {n} rolled back"));
         }
         // The runner may have applied a diff to the working tree; refresh the
-        // parent's snapshot so change detection / verify see the new state.
+        // parent's snapshot AND clear the read cache so change detection, verify,
+        // and any later `read` see the merged content — the merge writes files via
+        // `git apply`, outside the edit-tool layer that normally invalidates.
         self.invalidate_snapshot();
+        if outcome.applied {
+            hi_tools::clear_read_cache();
+        }
         outcome.summary
     }
 }

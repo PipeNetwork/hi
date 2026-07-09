@@ -103,8 +103,15 @@ pub(crate) async fn apply_multi_patch(patch: &str) -> Result<String> {
                 i += 1;
             }
 
-            let after = apply_hunk_patch(&orig_lines, &patch_lines)
+            let mut after = apply_hunk_patch(&orig_lines, &patch_lines)
                 .with_context(|| format!("patching {path}"))?;
+            // Preserve the original's trailing-newline state. `str::lines()` +
+            // apply_hunk_patch always re-emit a final '\n', which would silently
+            // add one to a file that had none — corrupting its EOF state and
+            // showing a spurious "No newline at end of file" churn line in diffs.
+            if !original.ends_with('\n') && after.ends_with('\n') {
+                after.pop();
+            }
 
             if let Ok(mut cache) = READ_CACHE.lock() {
                 cache.remove(&cache_key(path));
@@ -309,6 +316,19 @@ pub(crate) fn apply_edit(text: &str, old: &str, new: &str, replace_all: bool) ->
              or set replace_all=true to replace every occurrence"
         ),
         _ => {}
+    }
+
+    // Reaching the fuzzy strategies with `replace_all` means there were zero
+    // *exact* matches (the >0 case returned above). The fuzzy strategies below
+    // require a unique match and splice a single span, so they cannot honor
+    // replace_all — fail loudly rather than silently replacing one fuzzy
+    // occurrence and reporting success on a half-edited file.
+    if replace_all {
+        bail!(
+            "replace_all found no exact occurrences of old_string; fuzzy matching can't \
+             safely replace every occurrence — re-read the file and use the exact text, \
+             or make old_string unique and drop replace_all"
+        );
     }
 
     let lines = lines_with_offsets(text);
@@ -660,6 +680,20 @@ mod tests {
     }
 
     #[test]
+    fn replace_all_refuses_fuzzy_fallback() {
+        // No EXACT match (CRLF differs) but a fuzzy line-match exists. With
+        // replace_all we must NOT silently do a single fuzzy replacement and
+        // report success — bail so the model re-reads and uses exact text.
+        let err = apply_edit("a\r\nb\r\n", "a\nb", "X\nY", true)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("replace_all"), "explains the refusal: {err}");
+        // Without replace_all the same fuzzy edit still applies (single, unique).
+        let out = apply_edit("a\r\nb\r\n", "a\nb", "X\nY", false).unwrap();
+        assert!(out.contains('X') && out.contains('Y'), "{out:?}");
+    }
+
+    #[test]
     fn edit_not_found_help_finds_similar_lines() {
         // The needle has a typo ("funciton" vs "function") — no exact or
         // substring hit, but the similarity fallback should still point at the
@@ -727,6 +761,59 @@ mod tests {
         assert!(result.contains("deleted"), "{result}");
 
         // Restore environment for other tests.
+        unsafe {
+            if had_guard.is_some() {
+                std::env::set_var("HI_NO_PATH_GUARD", "1");
+            } else {
+                std::env::remove_var("HI_NO_PATH_GUARD");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn apply_multi_patch_preserves_trailing_newline_state() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let had_guard = std::env::var_os("HI_NO_PATH_GUARD");
+        let dir = std::env::temp_dir().join(format!(
+            "hi-patch-eof-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe {
+            std::env::set_var("HI_NO_PATH_GUARD", "1");
+        }
+
+        // A file with NO trailing newline: patching it must NOT add one.
+        let no_nl = dir.join("no_nl.txt");
+        std::fs::write(&no_nl, "alpha\nbeta").unwrap();
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: {}\n-alpha\n+ALPHA\n beta\n*** End Patch",
+            no_nl.display(),
+        );
+        apply_multi_patch(&patch).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&no_nl).unwrap(),
+            "ALPHA\nbeta",
+            "no trailing newline is preserved (not silently added)"
+        );
+
+        // A file WITH a trailing newline keeps it.
+        let with_nl = dir.join("with_nl.txt");
+        std::fs::write(&with_nl, "alpha\nbeta\n").unwrap();
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: {}\n-alpha\n+ALPHA\n beta\n*** End Patch",
+            with_nl.display(),
+        );
+        apply_multi_patch(&patch).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&with_nl).unwrap(),
+            "ALPHA\nbeta\n",
+            "trailing newline preserved"
+        );
+
         unsafe {
             if had_guard.is_some() {
                 std::env::set_var("HI_NO_PATH_GUARD", "1");

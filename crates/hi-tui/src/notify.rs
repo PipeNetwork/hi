@@ -92,7 +92,10 @@ async fn send(cfg: NotifyConfig, title: String, body: String) {
 
     if let Some(url) = &cfg.webhook {
         let payload = webhook_payload(&title, &body);
-        let _ = tokio::process::Command::new("curl")
+        // Actually await the child so it's reaped (the old `.map(async …)` built a
+        // future and dropped it — the wait never ran); kill_on_drop so a cancelled
+        // notify task doesn't leak a hung curl past its own `-m 10` timeout.
+        if let Ok(mut child) = tokio::process::Command::new("curl")
             .args([
                 "-s",
                 "-m",
@@ -107,10 +110,11 @@ async fn send(cfg: NotifyConfig, title: String, body: String) {
             ])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
+            .kill_on_drop(true)
             .spawn()
-            .map(|mut c| async move {
-                let _ = c.wait().await;
-            });
+        {
+            let _ = child.wait().await;
+        }
     }
 }
 

@@ -34,6 +34,10 @@ const TRIGGER_TIMEOUT_SECS: u64 = 60;
 const FIX_TIMEOUT_SECS: u64 = 900;
 /// Max simultaneously-armed loops per project.
 const MAX_LOOPS: usize = 8;
+/// Outside its fire window, a loop re-checks at least this often — rather than
+/// deferring a full interval, which would strand a long-interval loop outside
+/// its window forever (it would keep its out-of-window time-of-day phase).
+const WINDOW_RECHECK_SECS: u64 = 900;
 /// The marker a firing replies with when nothing changed since the last check.
 pub(crate) const QUIET_MARKER: &str = "NOTHING NEW";
 
@@ -297,6 +301,19 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// The next fire time (unix ms) after a fire decision. Inside the window (or when
+/// there is no window) it's a full interval away; *outside* the window we re-check
+/// within `WINDOW_RECHECK_SECS` so a long-interval loop re-enters its window at
+/// the next opening instead of keeping its out-of-window phase forever.
+fn next_fire_ms(now: u64, interval_secs: u64, in_window: bool) -> u64 {
+    let step = if in_window {
+        interval_secs
+    } else {
+        interval_secs.min(WINDOW_RECHECK_SECS)
+    };
+    now + step * 1000
+}
+
 /// The standing instructions wrapped around the user's prompt on every firing.
 /// The first firing establishes (and reports) the baseline; later firings
 /// compare against the session's previous checks and stay quiet when nothing
@@ -352,11 +369,26 @@ pub(crate) fn fmt_tokens(n: u64) -> String {
 }
 
 /// Whether a firing's final reply is the quiet marker (nothing to report).
+///
+/// The child is asked to reply *exactly* the marker, but often prepends a short
+/// lead-in ("checked again — NOTHING NEW"). We accept that, but only when the
+/// marker is set off as its own final line or by a separator (dash/colon) — so a
+/// genuinely *loud* summary that merely ends with the words "nothing new" (e.g.
+/// "the banner now reads NOTHING NEW") isn't silently suppressed.
 pub(crate) fn is_quiet(summary: &str) -> bool {
     let s = summary.trim().trim_end_matches('.').trim();
-    s.eq_ignore_ascii_case(QUIET_MARKER)
-        || s.ends_with(QUIET_MARKER)
-        || s.ends_with(&QUIET_MARKER.to_lowercase())
+    if s.eq_ignore_ascii_case(QUIET_MARKER) {
+        return true;
+    }
+    let last_line = s.lines().last().unwrap_or(s).trim();
+    if last_line.eq_ignore_ascii_case(QUIET_MARKER) {
+        return true;
+    }
+    let lower = last_line.to_ascii_lowercase();
+    if let Some(prefix) = lower.strip_suffix(&QUIET_MARKER.to_ascii_lowercase()) {
+        return prefix.trim_end().ends_with(['—', '–', '-', ':']);
+    }
+    false
 }
 
 /// Spawn the loop manager: loads persisted loops (dropping expired ones),
@@ -514,14 +546,25 @@ async fn manager(
             }
         });
         for spec in &mut state.loops {
-            if !spec.paused && spec.next_ms <= now && in_flight < 2 {
-                // Outside its fire window? Defer to the next interval, quietly.
+            // Also require this loop isn't already firing. `next_ms` is bumped at
+            // spawn, but a firing can outlive its interval (a 60s loop whose turn
+            // takes 90s), or a `FireNow` can land mid-flight — and re-firing would
+            // resume the *same* session file in a second child, corrupting the
+            // session/report and double-counting spend. One firing per loop.
+            if !spec.paused
+                && spec.next_ms <= now
+                && in_flight < 2
+                && !runtime.get(&spec.id).is_some_and(|r| r.firing)
+            {
+                // Outside its fire window? Re-check soon rather than deferring a
+                // whole interval — a day-aligned loop armed outside its window
+                // would otherwise never re-enter it. It fires shortly after open.
                 if spec.schedule.is_some_and(|s| !s.is_active_now()) {
-                    spec.next_ms = now + spec.interval_secs * 1000;
+                    spec.next_ms = next_fire_ms(now, spec.interval_secs, false);
                     fired = true; // next_ms changed → persist
                     continue;
                 }
-                spec.next_ms = now + spec.interval_secs * 1000;
+                spec.next_ms = next_fire_ms(now, spec.interval_secs, true);
                 spec.firings += 1;
                 in_flight += 1;
                 fired = true;
@@ -748,7 +791,9 @@ async fn manager(
                 let mut budget_line: Option<LoopLine> = None;
                 if let Some(spent) = tokens {
                     if let Some(l) = state.loops.iter_mut().find(|l| l.id == id) {
-                        l.spent_tokens = spent;
+                        // Never let a missing/torn report (spent == 0) clobber the
+                        // running total — cost history only ever grows.
+                        l.spent_tokens = l.spent_tokens.max(spent);
                         if let Some(budget) = l.token_budget
                             && !l.paused
                             && spent >= budget
@@ -1239,9 +1284,22 @@ pub(crate) fn persisted_count(loops_file: &std::path::Path) -> usize {
 }
 
 fn load(path: Option<&std::path::Path>) -> LoopsFile {
-    path.and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or_default()
+    let Some(path) = path else {
+        return LoopsFile::default();
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return LoopsFile::default(); // no file yet — a fresh project
+    };
+    match serde_json::from_str(&text) {
+        Ok(state) => state,
+        Err(_) => {
+            // A corrupt/truncated loops.json would otherwise be silently replaced
+            // by an empty set — losing every persisted loop. Preserve it aside so
+            // it's recoverable rather than clobbered by the next save.
+            let _ = std::fs::rename(path, path.with_extension("json.corrupt"));
+            LoopsFile::default()
+        }
+    }
 }
 
 fn save(path: Option<&std::path::Path>, state: &LoopsFile) {
@@ -1249,8 +1307,17 @@ fn save(path: Option<&std::path::Path>, state: &LoopsFile) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if let Ok(json) = serde_json::to_string_pretty(state) {
-        let _ = std::fs::write(path, json);
+    let Ok(json) = serde_json::to_string_pretty(state) else {
+        return;
+    };
+    // Write a temp sibling then atomically rename into place, so a crash mid-write
+    // can't leave a truncated loops.json (which load() would parse-fail and drop).
+    // rename within a directory is atomic on POSIX and Windows.
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, &json).is_ok() && std::fs::rename(&tmp, path).is_err() {
+        // Rename failed (e.g. cross-device) — fall back to a direct write.
+        let _ = std::fs::write(path, &json);
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -1310,11 +1377,47 @@ mod tests {
     }
 
     #[test]
+    fn save_is_atomic_and_load_preserves_corrupt() {
+        let dir = std::env::temp_dir().join(format!("hi-loops-persist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("loops.json");
+
+        // save → load round-trips and leaves no temp file behind.
+        let state = LoopsFile {
+            loops: vec![spec()],
+            next_id: 5,
+        };
+        save(Some(&path), &state);
+        assert!(!dir.join("loops.json.tmp").exists(), "temp file cleaned up");
+        let loaded = load(Some(&path));
+        assert_eq!(loaded.loops.len(), 1);
+        assert_eq!(loaded.next_id, 5);
+
+        // A corrupt/truncated file is preserved aside, not silently emptied.
+        std::fs::write(&path, "{ this is not json").unwrap();
+        let recovered = load(Some(&path));
+        assert!(recovered.loops.is_empty(), "corrupt file loads as empty");
+        assert!(
+            dir.join("loops.json.corrupt").exists(),
+            "corrupt file preserved for recovery"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn quiet_marker_detection() {
         assert!(is_quiet("NOTHING NEW"));
         assert!(is_quiet("  nothing new.  "));
         assert!(is_quiet("Checked the logs again — NOTHING NEW"));
+        assert!(is_quiet("Status: NOTHING NEW"));
+        // Marker on its own final line is quiet.
+        assert!(is_quiet("summary of the check:\nNOTHING NEW"));
         assert!(!is_quiet("CI is now red: 3 failures in parser tests"));
+        // A *loud* summary that merely ends with the words "nothing new"
+        // mid-sentence (not set off by a separator) must NOT be suppressed.
+        assert!(!is_quiet("the banner now reads NOTHING NEW"));
         assert!(!is_quiet(""));
     }
 
@@ -1446,6 +1549,20 @@ mod tests {
         assert!(!night.active(12, 3));
         assert_eq!(day.label(), "09-17");
         assert_eq!(wk.label(), "09-17 weekdays");
+    }
+
+    #[test]
+    fn next_fire_respects_window_recheck() {
+        // Inside the window (or no window): a full interval away.
+        assert_eq!(next_fire_ms(1_000, 3600, true), 1_000 + 3600 * 1000);
+        // A day-interval loop OUTSIDE its window re-checks within the cap, so it
+        // re-enters the window instead of stranding a whole day away.
+        assert_eq!(
+            next_fire_ms(1_000, 86_400, false),
+            1_000 + WINDOW_RECHECK_SECS * 1000
+        );
+        // A short-interval loop keeps its own (shorter) cadence either way.
+        assert_eq!(next_fire_ms(1_000, 300, false), 1_000 + 300 * 1000);
     }
 
     #[test]
@@ -1611,6 +1728,98 @@ mod tests {
         assert!(rx.await.unwrap(), "cancel removed the loop");
         wait_until(&handle, |rows| rows.is_empty()).await;
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stub `hi` that sleeps before replying, so a firing is still in flight
+    /// when the next one comes due — the case the per-loop fire guard protects.
+    fn slow_stub(dir: &std::path::Path, secs: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("slow.sh");
+        let script = format!(
+            "#!/bin/sh\nsleep {secs}\nprev=\nfor a in \"$@\"; do\n  \
+             [ \"$prev\" = \"--report\" ] && printf '{{\"total_tokens\": 10}}' > \"$a\"\n  \
+             prev=\"$a\"\ndone\nprintf 'slow reply\\n'\n"
+        );
+        std::fs::write(&path, script).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// A firing that outlives its interval (or a `FireNow` mid-flight) must NOT
+    /// spawn a second child on the *same* session. Without the per-loop guard,
+    /// `FireNow` while a firing is in flight double-fires (firings jumps to 2 with
+    /// two children racing one session/report); with it, the second attempt is
+    /// deferred until the first completes.
+    #[tokio::test]
+    async fn manager_does_not_double_fire_a_loop_in_flight() {
+        let dir = std::env::temp_dir().join(format!("hi-watch-nodouble-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sess = dir.join("loop.jsonl");
+        let exe = slow_stub(&dir, "1.2");
+        let launcher = FleetLauncher {
+            exe,
+            provider: "p".into(),
+            model: "m".into(),
+            base_url: "u".into(),
+            api_key: "k".into(),
+            verify: None,
+            max_verify: 0,
+            max_steps: 30,
+            session_path: Box::new(|| Ok(PathBuf::from("/tmp/unused.jsonl"))),
+            sessions: Box::new(Vec::new),
+            resume_info: Box::new(|_| None),
+            loop_session_path: Box::new(move || Ok(sess.clone())),
+            loops_file: None,
+        };
+        let handle = start(Arc::new(launcher), None);
+
+        let (tx, rx) = oneshot::channel();
+        handle
+            .ctl
+            .send(LoopCtl::Create {
+                secs: 3600,
+                prompt: "slow watch".into(),
+                reply: tx,
+            })
+            .unwrap();
+        let id = rx.await.unwrap().unwrap().id;
+
+        // Wait until the (slow) first firing is in flight.
+        wait_until(&handle, |rows| {
+            rows.iter().find(|r| r.id == id).is_some_and(|r| r.firing)
+        })
+        .await;
+
+        // Force a second fire attempt while the first child is still sleeping.
+        let (tx, rx) = oneshot::channel();
+        handle.ctl.send(LoopCtl::FireNow { id, reply: tx }).unwrap();
+        assert!(rx.await.unwrap(), "FireNow accepted");
+
+        // The guard defers it: while the firing is in flight, firings stays 1
+        // (no concurrent second child on the same session). Without the guard the
+        // FireNow spawns immediately and this sees firings == 2.
+        for _ in 0..8 {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            let rows = handle.snapshot.lock().unwrap();
+            let r = rows.iter().find(|r| r.id == id).unwrap();
+            if r.firing {
+                assert_eq!(r.firings, 1, "no second concurrent firing while in flight");
+            }
+        }
+
+        // Once the first firing completes, the deferred FireNow fires exactly once
+        // more — proving it was queued, not dropped.
+        wait_until(&handle, |rows| {
+            rows.iter()
+                .find(|r| r.id == id)
+                .is_some_and(|r| !r.firing && r.firings >= 2)
+        })
+        .await;
+
+        let (tx, rx) = oneshot::channel();
+        handle.ctl.send(LoopCtl::Cancel { id, reply: tx }).unwrap();
+        let _ = rx.await;
         let _ = std::fs::remove_dir_all(&dir);
     }
 
