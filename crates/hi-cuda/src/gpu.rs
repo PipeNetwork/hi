@@ -2731,12 +2731,22 @@ mod native {
     /// are kept quantized on the GPU, i.e. when f16 doesn't fit (large models), where
     /// it is ~6x faster than dequantizing each matmul. Small models where f16 fits use
     /// cuBLAS f16 and never hit this path.
-    /// Opt-in (`HI_CUDA_WMMA_ATTN`): tensor-core (WMMA) prefill attention. f16 matmuls
-    /// -> not bit-parity with the f32 kernel, so gated and validated by coherence.
-    fn wmma_attn_enabled() -> bool {
+    /// Force tensor-core (WMMA) prefill attention ON via `HI_CUDA_WMMA_ATTN` even for
+    /// non-quantized (f16-stored) models. WMMA is f16 (not bit-parity with the f32
+    /// kernel), so it defaults on only for quantized models (see the dispatch); this
+    /// env opts small models in too.
+    fn wmma_attn_forced_on() -> bool {
         use std::sync::OnceLock;
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| std::env::var("HI_CUDA_WMMA_ATTN").is_ok())
+    }
+
+    /// Force WMMA prefill attention OFF via `HI_CUDA_NO_WMMA_ATTN` (safety fallback to
+    /// the f32 flash kernel, e.g. if f16 precision ever matters).
+    fn wmma_attn_forced_off() -> bool {
+        use std::sync::OnceLock;
+        static DISABLED: OnceLock<bool> = OnceLock::new();
+        *DISABLED.get_or_init(|| std::env::var("HI_CUDA_NO_WMMA_ATTN").is_ok())
     }
 
     fn q4_0_gemv_enabled() -> bool {
@@ -15066,10 +15076,15 @@ mod native {
                 && head_dim <= FLASH_TILE_MAX_HEAD_DIM
                 && v_head_dim <= FLASH_TILE_MAX_HEAD_DIM
             {
-                if wmma_attn_enabled()
+                // Tensor-core (WMMA) prefill attention defaults on for quantized
+                // models (weights kept quantized == large models, where prefill is
+                // slow and the f16 attention is a fine trade); f16-stored small models
+                // stay on the f32 flash kernel unless HI_CUDA_WMMA_ATTN opts them in.
+                let use_wmma = (self.info.quantized_matrix_count > 0 || wmma_attn_forced_on())
+                    && !wmma_attn_forced_off()
                     && head_dim % 16 == 0
-                    && v_head_dim == head_dim
-                {
+                    && v_head_dim == head_dim;
+                if use_wmma {
                     // Tensor-core prefill attention: cast q/k/v to f16 and run WMMA.
                     let q16 = DeviceBuffer::alloc(q.rows * q.cols * std::mem::size_of::<u16>())
                         .context("alloc wmma q16")?;
