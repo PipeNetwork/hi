@@ -247,6 +247,18 @@ firer — the daemon and a TUI never both fire the same loops; whichever starts 
 feed instead (`/digest`) and says so. Set your loops up in the TUI, close it, `hi --loops-daemon &`,
 and come back later to `/digest` what it caught.
 
+**Notifications — reach you when you're away.** A background daemon logs to a transcript you're not
+watching, so loud events (a change a firing found, a landed fix, a budget pause) can also be pushed
+to you, opt-in via the environment:
+
+```bash
+HI_NOTIFY_DESKTOP=1 hi --loops-daemon                 # macOS terminal-notifier / Linux notify-send
+HI_NOTIFY_WEBHOOK=https://hooks.slack.com/… hi --loops-daemon   # JSON {"text":…} POST (Slack-compatible)
+```
+
+Both sinks are best-effort — a missing tool or a failed POST never blocks a firing — and work in the
+TUI too. The daemon prints which sinks are active on startup.
+
 ## Sessions
 
 Every session is saved as JSONL under `~/.local/share/hi/sessions/`.

@@ -384,6 +384,8 @@ async fn manager(
     snapshot: Arc<Mutex<Vec<LoopWatchRow>>>,
 ) {
     let activity = activity.as_deref();
+    // Reach-you notifications for loud events (opt-in via env; no-op otherwise).
+    let notify = crate::notify::NotifyConfig::from_env();
     let mut runtime: HashMap<u64, LoopRuntime> = HashMap::new();
     let mut state = load(loops_file.as_deref());
     let now = now_ms();
@@ -723,8 +725,12 @@ async fn manager(
                 while rt.history.len() > HISTORY_CAP {
                     rt.history.pop_front();
                 }
+                if line.1 {
+                    crate::notify::maybe_notify(&notify, &format!("loop#{id} {name}"), &line.0);
+                }
                 pending.lock().unwrap().push(line);
                 if let Some(bl) = budget_line {
+                    crate::notify::maybe_notify(&notify, &format!("loop#{id} {name}"), &bl.0);
                     pending.lock().unwrap().push(bl);
                 }
                 publish(&state, &mut runtime, &snapshot);
@@ -752,6 +758,13 @@ async fn manager(
                     .map(LoopSpec::name)
                     .unwrap_or_else(|| format!("#{id}"));
                 record(activity, id, &format!("loop#{id} {name}"), &format!("auto-fix: {outcome}"));
+                if loud {
+                    crate::notify::maybe_notify(
+                        &notify,
+                        &format!("loop#{id} {name} auto-fix"),
+                        &outcome,
+                    );
+                }
                 pending
                     .lock()
                     .unwrap()
