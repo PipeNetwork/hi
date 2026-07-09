@@ -48,9 +48,11 @@ mod imp {
 
 #[cfg(feature = "native-cuda")]
 mod imp {
+    use std::collections::HashMap;
     use std::ffi::CStr;
     use std::os::raw::{c_char, c_int, c_void};
     use std::ptr;
+    use std::sync::{Mutex, OnceLock};
 
     use anyhow::{Result, anyhow, bail};
 
@@ -171,6 +173,53 @@ mod imp {
         }))
     }
 
+    // Caching device allocator for the decode hot path. `cudaFree` is a
+    // *synchronizing* call, so the per-op alloc/free of transient buffers
+    // (~1.3k free() per decoded token on a 3B model) drains the stream at every
+    // op boundary and leaves the GPU idle ~44% of decode wall — nsys measured
+    // ~22s in cudaFree over a decode trace. Instead of freeing a small buffer we
+    // return it to a size-keyed free list and reuse it on the next same-size
+    // alloc, eliminating both the cudaMalloc and the synchronizing cudaFree.
+    //
+    // Safe because hi runs all device ops on the model's single stream: a reused
+    // buffer's next use is enqueued after its previous use on that stream, so
+    // stream ordering already guarantees the prior op completes first (the
+    // cudaFree sync was redundant for correctness, only load-bearing for freeing
+    // memory). Only buffers <= POOL_MAX_BYTES are pooled so large, rare prefill
+    // temporaries (dequantized weights, seq*hidden activations) still return
+    // their memory immediately and can't bloat the resident set on an 8GB card.
+    // Opt out with HI_CUDA_NO_BUF_POOL (falls back to plain cudaMalloc/cudaFree).
+    const POOL_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+    fn buffer_pool_enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("HI_CUDA_NO_BUF_POOL").is_err())
+    }
+
+    fn buffer_pool() -> &'static Mutex<HashMap<usize, Vec<usize>>> {
+        static POOL: OnceLock<Mutex<HashMap<usize, Vec<usize>>>> = OnceLock::new();
+        POOL.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn buffer_pool_take(bytes: usize) -> Option<*mut c_void> {
+        if bytes == 0 || bytes > POOL_MAX_BYTES || !buffer_pool_enabled() {
+            return None;
+        }
+        let mut pool = buffer_pool().lock().unwrap();
+        pool.get_mut(&bytes)
+            .and_then(|slots| slots.pop())
+            .map(|addr| addr as *mut c_void)
+    }
+
+    fn buffer_pool_return(ptr: *mut c_void, bytes: usize) -> bool {
+        if bytes == 0 || bytes > POOL_MAX_BYTES || !buffer_pool_enabled() {
+            return false;
+        }
+        let mut pool = buffer_pool().lock().unwrap();
+        pool.entry(bytes).or_default().push(ptr as usize);
+        true
+    }
+
     pub struct DeviceBuffer {
         ptr: *mut c_void,
         bytes: usize,
@@ -178,6 +227,9 @@ mod imp {
 
     impl DeviceBuffer {
         pub fn alloc(bytes: usize) -> Result<Self> {
+            if let Some(ptr) = buffer_pool_take(bytes) {
+                return Ok(Self { ptr, bytes });
+            }
             let mut ptr = ptr::null_mut();
             cuda_check(unsafe { cudaMalloc(&mut ptr, bytes) }, "cudaMalloc")?;
             Ok(Self { ptr, bytes })
@@ -326,6 +378,9 @@ mod imp {
     impl Drop for DeviceBuffer {
         fn drop(&mut self) {
             if !self.ptr.is_null() {
+                if buffer_pool_return(self.ptr, self.bytes) {
+                    return;
+                }
                 let _ = unsafe { cudaFree(self.ptr) };
             }
         }
