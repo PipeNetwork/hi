@@ -460,7 +460,7 @@ pub fn load_config(explicit: Option<&Path>) -> Result<Config> {
 }
 
 fn read_config(path: &Path) -> Result<Config> {
-    let text = std::fs::read_to_string(&path)
+    let text = std::fs::read_to_string(path)
         .with_context(|| format!("reading config {}", path.display()))?;
     let mut config = toml::from_str::<Config>(&text)
         .with_context(|| format!("parsing config {}", path.display()))?;
@@ -634,7 +634,6 @@ pub fn resolve(cli: &Cli, config: &Config) -> Result<Settings> {
     let profile_max_tokens = profile.and_then(|p| p.max_tokens);
     let max_tokens = configured_max_tokens(provider, cli.max_tokens, profile_max_tokens);
     let max_tokens_explicit = max_tokens_is_explicit(provider, cli.max_tokens, profile_max_tokens);
-    let max_tokens = max_tokens;
 
     let thinking_budget = cli.thinking.or(profile.and_then(|p| p.thinking_budget));
     let tool_mode = cli
@@ -1210,7 +1209,6 @@ pub fn resolve_named_profile(config: &Config, name: &str) -> Result<Settings> {
 
     let max_tokens = configured_max_tokens(provider, None, profile.max_tokens);
     let max_tokens_explicit = max_tokens_is_explicit(provider, None, profile.max_tokens);
-    let max_tokens = max_tokens;
 
     Ok(Settings {
         provider,

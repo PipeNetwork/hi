@@ -7,10 +7,7 @@
 use hi_agent::Agent;
 
 /// Act on a slash command. Returns true when the session should quit.
-pub(crate) fn handle_command(
-    agent: &mut Agent,
-    command: hi_agent::Command,
-) -> bool {
+pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> bool {
     use hi_agent::Command;
     match command {
         Command::Quit => return true,

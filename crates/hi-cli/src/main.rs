@@ -357,12 +357,7 @@ async fn main() -> Result<()> {
             agent.restore_model_state(state);
         }
         let report_result = if let Some(path) = &report_path {
-            write_report(
-                path,
-                &agent,
-                &report_model,
-                result.as_ref().err(),
-            )
+            write_report(path, &agent, &report_model, result.as_ref().err())
         } else {
             Ok(())
         };
@@ -1206,10 +1201,7 @@ fn effective_max_tokens_for_model(
     )
 }
 
-async fn resolve_live_model_metadata(
-    provider: &dyn Provider,
-    model: &str,
-) -> LiveModelMetadata {
+async fn resolve_live_model_metadata(provider: &dyn Provider, model: &str) -> LiveModelMetadata {
     match provider.list_models().await {
         Ok(served) => served
             .into_iter()
