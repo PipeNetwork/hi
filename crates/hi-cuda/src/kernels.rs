@@ -162,6 +162,18 @@ mod native {
             elements: c_int,
             stream: *mut c_void,
         ) -> c_int;
+        fn hi_cuda_launch_dequantize_q2_k_to_f16(
+            input: *const c_void,
+            output: *mut c_void,
+            elements: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_dequantize_q3_k_to_f16(
+            input: *const c_void,
+            output: *mut c_void,
+            elements: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
         fn hi_cuda_launch_cast_f32_to_bf16(
             input: *const c_void,
             output: *mut c_void,
@@ -1285,6 +1297,44 @@ mod native {
             )
         })?;
         check_last_error("hi_cuda_launch_dequantize_q8_0_to_f16")
+    }
+
+    /// Dequantize a Q2_K weight matrix straight to f16 (no f32 intermediate + cast).
+    pub fn launch_dequantize_q2_k_to_f16(
+        input: &DeviceBuffer,
+        output: &DeviceBuffer,
+        elements: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(elements, "dequantize_q2_k_to_f16 elements")?;
+        launch_status(unsafe {
+            hi_cuda_launch_dequantize_q2_k_to_f16(
+                input.as_ptr(),
+                output.as_mut_ptr(),
+                elements as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_dequantize_q2_k_to_f16")
+    }
+
+    /// Dequantize a Q3_K weight matrix straight to f16 (no f32 intermediate + cast).
+    pub fn launch_dequantize_q3_k_to_f16(
+        input: &DeviceBuffer,
+        output: &DeviceBuffer,
+        elements: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(elements, "dequantize_q3_k_to_f16 elements")?;
+        launch_status(unsafe {
+            hi_cuda_launch_dequantize_q3_k_to_f16(
+                input.as_ptr(),
+                output.as_mut_ptr(),
+                elements as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_dequantize_q3_k_to_f16")
     }
 
     pub fn launch_cast_f32_to_bf16(
