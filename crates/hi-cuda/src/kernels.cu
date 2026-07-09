@@ -964,6 +964,38 @@ __global__ void dequantize_q4_0_kernel(const uint8_t* input, float* output, int 
   output[idx] = d * static_cast<float>(static_cast<int>(quant) - 8);
 }
 
+// Dequantize Q4_0 straight to f16 (no f32 intermediate + separate cast). The
+// prefill f16-GEMM path used dequant->f32 then a cast_f32_to_f16 pass, which for
+// short prefills is ~40% of GPU time (write 4B/weight then re-read+write 2B) plus
+// a >4MB f32 scratch per weight whose synchronizing cudaFree dominates host time.
+// Same value as dequantize_q4_0_kernel then f32->f16, so bit-identical f16 output.
+__global__ void dequantize_q4_0_to_f16_kernel(
+    const uint8_t* input, __half* output, int elements) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= elements) {
+    return;
+  }
+  int block_id = idx / 32;
+  int within = idx % 32;
+  const uint8_t* block = input + block_id * 18;
+  float d = __half2float(*reinterpret_cast<const __half*>(block));
+  uint8_t packed = block[2 + (within % 16)];
+  uint8_t quant = within < 16 ? (packed & 0x0f) : (packed >> 4);
+  output[idx] = __float2half(d * static_cast<float>(static_cast<int>(quant) - 8));
+}
+
+extern "C" int hi_cuda_launch_dequantize_q4_0_to_f16(
+    const void* input, void* output, int elements, void* stream) {
+  if (input == nullptr || output == nullptr || elements <= 0 || stream == nullptr) {
+    return 1;
+  }
+  dim3 block(256);
+  dim3 grid((elements + block.x - 1) / block.x);
+  dequantize_q4_0_to_f16_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint8_t*>(input), static_cast<__half*>(output), elements);
+  return 0;
+}
+
 __global__ void dequantize_q4_1_kernel(const uint8_t* input, float* output, int elements) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= elements) {

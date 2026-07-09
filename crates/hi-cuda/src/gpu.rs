@@ -2761,6 +2761,14 @@ mod native {
         *ENABLED.get_or_init(|| std::env::var("HI_CUDA_NO_Q4_GEMV").is_err())
     }
 
+    /// Fuse Q4_0 weight dequant straight to f16 in the prefill GEMM path (default on;
+    /// `HI_CUDA_NO_DEQUANT_F16` reverts to dequant -> f32 -> cast).
+    fn dequant_f16_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("HI_CUDA_NO_DEQUANT_F16").is_err())
+    }
+
     fn weights_f16_choice(specs: &[MatrixSpec]) -> bool {
         match std::env::var("HI_CUDA_WEIGHTS_F16")
             .ok()
@@ -3553,15 +3561,26 @@ mod native {
             })
         }
 
-        /// Dequantize a quantized weight matrix to f16 (dequant -> f32 -> cast f16).
+        /// Dequantize a quantized weight matrix to f16. For Q4_0 this fuses straight
+        /// to f16 (no f32 intermediate + separate cast); other quant types fall back
+        /// to dequant -> f32 -> cast f16. `HI_CUDA_NO_DEQUANT_F16` forces the fallback.
         fn dequantize_matrix_to_f16(
             &self,
             matrix: &GpuMatrix,
             weight_elements: usize,
         ) -> Result<DeviceBuffer> {
-            let dequantized = self.dequantize_matrix_f32_device(matrix)?;
             let weight_f16 = DeviceBuffer::alloc(weight_elements * std::mem::size_of::<u16>())
                 .context("allocating CUDA f16 weight scratch")?;
+            if dequant_f16_enabled() && matches!(matrix.dtype, GgufTensorType::Q4_0) {
+                crate::kernels::launch_dequantize_q4_0_to_f16(
+                    &matrix.buffer,
+                    &weight_f16,
+                    weight_elements,
+                    &self.stream,
+                )?;
+                return Ok(weight_f16);
+            }
+            let dequantized = self.dequantize_matrix_f32_device(matrix)?;
             crate::kernels::launch_cast_f32_to_f16(
                 &dequantized,
                 &weight_f16,
