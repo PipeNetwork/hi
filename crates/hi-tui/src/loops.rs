@@ -109,12 +109,24 @@ fn now_ms() -> u64 {
 }
 
 /// The standing instructions wrapped around the user's prompt on every firing.
+/// The first firing establishes (and reports) the baseline; later firings
+/// compare against the session's previous checks and stay quiet when nothing
+/// changed.
 fn wrapper_prompt(spec: &LoopSpec) -> String {
+    let contract = if spec.firings <= 1 {
+        "This is the FIRST check of this watch — establish the baseline and report it briefly \
+         (never reply NOTHING NEW on the first check)."
+            .to_string()
+    } else {
+        format!(
+            "This conversation contains your previous checks — compare against them rather than \
+             re-describing everything. If nothing meaningful changed since the last check, reply \
+             with exactly: {QUIET_MARKER}. Otherwise summarize what changed and why it matters, \
+             briefly."
+        )
+    };
     format!(
-        "Recurring watch (loop \"{}\", every {}): {}\n\nThis conversation contains your previous \
-         checks — compare against them rather than re-describing everything. If nothing \
-         meaningful changed since the last check, reply with exactly: {QUIET_MARKER}. Otherwise \
-         summarize what changed and why it matters, briefly.",
+        "Recurring watch (loop \"{}\", every {}): {}\n\n{contract}",
         spec.name(),
         humanize_secs(spec.interval_secs),
         spec.prompt,
@@ -434,10 +446,18 @@ mod tests {
 
     #[test]
     fn wrapper_prompt_carries_contract() {
-        let w = wrapper_prompt(&spec());
-        assert!(w.contains("every 30m"), "{w}");
-        assert!(w.contains(QUIET_MARKER));
-        assert!(w.contains("check whether the CI pipeline"));
+        // First firing: baseline instructions, never the quiet marker.
+        let mut s = spec();
+        s.firings = 1;
+        let first = wrapper_prompt(&s);
+        assert!(first.contains("FIRST check"), "{first}");
+        assert!(first.contains("check whether the CI pipeline"));
+        // Later firings: compare + quiet contract.
+        s.firings = 2;
+        let later = wrapper_prompt(&s);
+        assert!(later.contains("every 30m"), "{later}");
+        assert!(later.contains(QUIET_MARKER));
+        assert!(!later.contains("FIRST check"));
     }
 
     #[test]
