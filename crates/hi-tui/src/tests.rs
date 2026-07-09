@@ -433,20 +433,20 @@ fn usage_event_updates_live_counter_and_working_line() {
     let mut app = test_app("openai", "gpt-4o");
     app.set_working(true);
     app.apply(UiEvent::Usage {
-        input: 1234,
-        output: 340,
+        prompt: 12,
+        generated: 340,
         ctx_used: 64_000,
         ctx_window: Some(128_000),
     });
-    assert_eq!(app.usage, (1234, 340));
+    assert_eq!(app.usage, (12, 340));
     assert_eq!(app.context_pct(), Some(50));
 
     let mut term = Terminal::new(TestBackend::new(72, 8)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     let screen = dump(&term);
     assert!(screen.contains(SPINNER[0]), "spinner shown: {screen}");
-    assert!(screen.contains("↑1.2k"), "live input tokens: {screen}");
-    assert!(screen.contains("↓340"), "live output tokens: {screen}");
+    assert!(screen.contains("prompt↑12"), "live prompt tokens: {screen}");
+    assert!(screen.contains("gen↓340"), "live output tokens: {screen}");
     assert!(screen.contains("50% ctx"), "live context fill: {screen}");
 }
 
@@ -1042,7 +1042,7 @@ fn turn_end_renders_the_steer_suffix_from_the_summary() {
     // turns; the TUI renders that string verbatim, so the suffix surfaces
     // in both the status bar and the done marker with no TUI-specific code.
     let mut app = test_app("openai", "gpt-4o");
-    let noisy = "[↑10 ↓2 · ctx 5% (500/10k) · steer: 2 verify · 1 retry]";
+    let noisy = "[prompt↑10 gen↓2 · ctx 5% (500/10k) · steer: 2 verify · 1 retry]";
     app.apply(UiEvent::TurnEnd(noisy.into()));
     assert!(
         app.status.contains("steer: 2 verify"),
@@ -1056,7 +1056,7 @@ fn turn_end_renders_the_steer_suffix_from_the_summary() {
 #[test]
 fn stalled_turn_end_is_marked_incomplete_not_done() {
     let mut app = test_app("openai", "gpt-4o");
-    let stalled = "[↑10 ↓2 · ctx 5% (500/10k) · steer: 2 repeat · stalled]";
+    let stalled = "[prompt↑10 gen↓2 · ctx 5% (500/10k) · steer: 2 repeat · stalled]";
     app.apply(UiEvent::TurnEnd(stalled.into()));
 
     assert!(app.status.contains("stalled"), "status: {}", app.status);

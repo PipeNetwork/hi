@@ -498,8 +498,8 @@ pub(crate) struct App {
     /// Handle to the `/loop` manager (timers + firings run in a background
     /// task; results drain into the transcript on UI ticks).
     pub(crate) loops: Option<crate::loops::LoopsHandle>,
-    /// Cumulative session token usage (input, output), mirrored from the agent
-    /// so the working line and `/tokens` can show it live while a turn runs.
+    /// Current-turn token display: raw user prompt estimate and generated
+    /// output, mirrored from the agent so the working line can update live.
     pub(crate) usage: (u64, u64),
     /// Current context occupancy (tokens of the last request) and the model's
     /// window, for the live context-fill gauge.

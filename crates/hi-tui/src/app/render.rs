@@ -127,10 +127,7 @@ impl crate::App {
         for line in [
             format!("status: {state}"),
             format!("provider/model: {} · {}", self.provider, self.model),
-            format!(
-                "context: {ctx}; usage: {input} in · {output} out · {} total",
-                input + output
-            ),
+            format!("context: {ctx}; turn usage: {input} prompt · {output} generated"),
             format!("goal: {goal}"),
             format!("verify: {verify}"),
             format!(
@@ -469,7 +466,11 @@ impl crate::App {
         let mut info_parts: Vec<String> = Vec::new();
         let (input, output) = self.usage;
         if input + output > 0 {
-            info_parts.push(format!("↑{} ↓{}", fmt_count(input), fmt_count(output)));
+            info_parts.push(format!(
+                "prompt↑{} gen↓{}",
+                fmt_count(input),
+                fmt_count(output)
+            ));
         }
         if let Some(goal) = &self.goal {
             let total = goal.sub_goals.len();
@@ -892,9 +893,8 @@ impl crate::App {
                     format!("tool calls this turn: {}", self.turn_tool_calls),
                     dim(),
                 ));
-                // Context composition: occupancy vs. window, and cumulative
-                // session tokens (the same numbers the usage line shows, but
-                // gathered here for a single diagnostics view).
+                // Context composition: occupancy vs. window, plus the current
+                // turn's raw prompt estimate and generated output.
                 let (input, output) = self.usage;
                 let ctx = if let Some(pct) = self.context_pct() {
                     format!(" · ctx {pct}%")
@@ -902,7 +902,11 @@ impl crate::App {
                     String::new()
                 };
                 ilines.push(Line::styled(
-                    format!("session: ↑{} ↓{}{ctx}", fmt_count(input), fmt_count(output)),
+                    format!(
+                        "turn: prompt↑{} gen↓{}{ctx}",
+                        fmt_count(input),
+                        fmt_count(output)
+                    ),
                     dim(),
                 ));
                 if let Some(limits) = fmt_rate_limits(self.rate_limits) {
@@ -959,7 +963,11 @@ impl crate::App {
                 // Show the running token total once the first round reports it.
                 let mut stats = String::new();
                 if input + output > 0 {
-                    stats.push_str(&format!(" · ↑{} ↓{}", fmt_count(input), fmt_count(output)));
+                    stats.push_str(&format!(
+                        " · prompt↑{} gen↓{}",
+                        fmt_count(input),
+                        fmt_count(output)
+                    ));
                 }
                 if let Some(pct) = self.context_pct() {
                     stats.push_str(&format!(" · {pct}% ctx"));

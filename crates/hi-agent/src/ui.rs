@@ -60,15 +60,15 @@ pub trait Ui: Send {
     /// in-place checklist rather than a scrolling transcript echo. Defaults to
     /// ignoring it — only interactive frontends render a tracker.
     fn plan(&mut self, _steps: &[crate::PlanStep]) {}
-    /// Token usage after a model round: cumulative session
-    /// `input_tokens`/`output_tokens`, plus the current context occupancy
+    /// Token usage after a model round: raw user-prompt estimate and generated
+    /// output for the current turn, plus the current context occupancy
     /// (`context_used` tokens against the model's `context_window`, when known)
     /// for a live fill gauge. Emitted each round so a frontend can show it climb
     /// while a turn runs. Defaults to ignoring it — only the live TUI needs it.
     fn usage(
         &mut self,
-        _input_tokens: u64,
-        _output_tokens: u64,
+        _prompt_tokens: u64,
+        _generated_tokens: u64,
         _context_used: u64,
         _context_window: Option<u32>,
     ) {

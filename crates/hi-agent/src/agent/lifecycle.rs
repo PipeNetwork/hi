@@ -109,6 +109,8 @@ impl crate::Agent {
             delegate_runner: None,
             persisted,
             totals: Usage::default(),
+            last_turn_usage: Usage::default(),
+            last_user_prompt_tokens: 0,
             last_verify: None,
             context_used: 0,
             checkpoints: Vec::new(),
@@ -286,6 +288,16 @@ impl crate::Agent {
         &self.totals
     }
 
+    /// Token usage accumulated by the most recent user turn.
+    pub fn last_turn_usage(&self) -> &Usage {
+        &self.last_turn_usage
+    }
+
+    /// Estimated tokens in the raw user prompt for the most recent user turn.
+    pub fn last_user_prompt_tokens(&self) -> u64 {
+        self.last_user_prompt_tokens
+    }
+
     /// The context-window occupancy, as last reported by the provider.
     pub fn context_used(&self) -> u64 {
         self.context_used
@@ -441,10 +453,16 @@ impl crate::Agent {
 
     pub(crate) fn add_usage(&mut self, usage: Usage) {
         self.totals.add(usage);
+        self.last_turn_usage.add(usage);
         let effective_input = usage.effective_input_tokens();
         if effective_input > 0 {
             self.context_used = effective_input;
         }
+    }
+
+    pub(crate) fn reset_last_turn_usage(&mut self, user_prompt_tokens: u64) {
+        self.last_turn_usage = Usage::default();
+        self.last_user_prompt_tokens = user_prompt_tokens;
     }
 
     pub(crate) fn add_error_usage(&mut self, err: &anyhow::Error) {
@@ -453,8 +471,8 @@ impl crate::Agent {
 
     pub(crate) fn emit_usage(&self, ui: &mut dyn Ui) {
         ui.usage(
-            self.totals.input_tokens,
-            self.totals.output_tokens,
+            self.last_user_prompt_tokens,
+            self.last_turn_usage.output_tokens,
             self.context_used,
             self.config.context_window,
         );

@@ -293,15 +293,15 @@ impl crate::App {
             }
             // Live counters only — no transcript line; the working/title bars read them.
             UiEvent::Usage {
-                input,
-                output,
+                prompt,
+                generated,
                 ctx_used,
                 ctx_window,
             } => {
                 self.event_log
-                    .push(format!("usage {input} in {output} out"));
+                    .push(format!("usage {prompt} prompt {generated} generated"));
                 self.last_turn_event = Some(TurnEventKind::Usage);
-                self.usage = (input, output);
+                self.usage = (prompt, generated);
                 self.context_used = ctx_used;
                 self.context_window = ctx_window;
             }

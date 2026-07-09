@@ -478,6 +478,10 @@ pub struct Agent {
     pub(crate) persisted: usize,
     /// Running total of tokens across the session.
     pub(crate) totals: Usage,
+    /// Token usage accumulated during the most recent `run_turn`.
+    pub(crate) last_turn_usage: Usage,
+    /// Estimated tokens in the raw user prompt for the most recent `run_turn`.
+    pub(crate) last_user_prompt_tokens: u64,
     /// Whether the most recent turn's verification passed (None if not run).
     pub(crate) last_verify: Option<bool>,
     /// Input tokens of the most recent model call — a proxy for how full the

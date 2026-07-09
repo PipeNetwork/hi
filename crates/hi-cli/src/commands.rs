@@ -27,11 +27,13 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
                 })
                 .unwrap_or_else(|| "unknown".into());
             println!(
-                "\x1b[2mstatus: ready\nmodel: {}\nusage: {} in · {} out · {} total\ncontext: {}\ngoal: {}\nverify: {}\nevidence: {} (reads {}, searches {}, listing_only {}, repair nudges {})\ncheckpoints: {}\x1b[0m",
+                "\x1b[2mstatus: ready\nmodel: {}\nsession usage: {} full-context in · {} generated out · {} total\nlast turn: {} prompt · {} generated\ncontext: {}\ngoal: {}\nverify: {}\nevidence: {} (reads {}, searches {}, listing_only {}, repair nudges {})\ncheckpoints: {}\x1b[0m",
                 agent.model(),
                 t.input_tokens,
                 t.output_tokens,
                 t.total(),
+                agent.last_user_prompt_tokens(),
+                agent.last_turn_usage().output_tokens,
                 ctx,
                 agent.goal_summary(),
                 agent.verify_summary(),
@@ -46,11 +48,13 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
         Command::Log => {
             let t = agent.totals();
             let body = format!(
-                "# hi debug log\n\nmodel: {}\nusage: {} in · {} out · {} total\ngoal: {}\nverify: {}\nlast_error: none\ncheckpoints: {}\n",
+                "# hi debug log\n\nmodel: {}\nsession usage: {} full-context in · {} generated out · {} total\nlast turn: {} prompt · {} generated\ngoal: {}\nverify: {}\nlast_error: none\ncheckpoints: {}\n",
                 agent.model(),
                 t.input_tokens,
                 t.output_tokens,
                 t.total(),
+                agent.last_user_prompt_tokens(),
+                agent.last_turn_usage().output_tokens,
                 agent.goal_summary(),
                 agent.verify_summary(),
                 agent.checkpoint_count(),
