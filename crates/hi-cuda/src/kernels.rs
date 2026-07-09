@@ -217,6 +217,13 @@ mod native {
             rows: c_int,
             cols: c_int,
             stream: *mut c_void,
+        ) -> c_int;        fn hi_cuda_launch_iq4_nl_gemv(
+            weights: *const c_void,
+            x: *const c_void,
+            output: *mut c_void,
+            rows: c_int,
+            cols: c_int,
+            stream: *mut c_void,
         ) -> c_int;
         fn hi_cuda_launch_rope(
             values: *mut c_void,
@@ -1299,6 +1306,31 @@ mod native {
             )
         })?;
         check_last_error("hi_cuda_launch_q5_k_gemv")
+    }
+
+    /// Fused IQ4_NL GEMV (M=1 decode): reads IQ4_NL weights directly, f32 activation.
+    /// Requires cols % 32 == 0.
+    pub fn launch_iq4_nl_gemv(
+        weights: &DeviceBuffer,
+        x: &DeviceBuffer,
+        output: &DeviceBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(rows, "iq4_nl gemv rows")?;
+        ensure_len(cols, "iq4_nl gemv cols")?;
+        launch_status(unsafe {
+            hi_cuda_launch_iq4_nl_gemv(
+                weights.as_ptr(),
+                x.as_ptr(),
+                output.as_mut_ptr(),
+                rows as c_int,
+                cols as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_iq4_nl_gemv")
     }
 
     pub fn launch_dequantize_matrix(
