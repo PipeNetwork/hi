@@ -4870,6 +4870,103 @@ extern "C" int hi_cuda_launch_q3_k_gemv(
   return 0;
 }
 
+// Fused IQ1_M GEMV (M=1 decode). Reads IQ1_M weights directly: block = 56 bytes / 256
+// weights (32-B qs + 16-B qh + 8-B scales; no separate d). The f16 super-scale is
+// reconstructed from the top nibbles of the four packed scale words; per-sub-block
+// 3-bit scale + per-lane delta bit (in qh) + 11-bit grid index (qs + qh) into
+// iq1_s_grid_code -> dl*(code + delta). Per-weight unpack mirrors dequantize_iq1_m_kernel.
+// One block per output row; f32 activation. Requires cols % 256 == 0.
+__global__ void iq1_m_gemv_kernel(
+    const uint8_t* __restrict__ weights,
+    const float* __restrict__ x,
+    float* __restrict__ output,
+    int rows,
+    int cols) {
+  const int row = blockIdx.x;
+  if (row >= rows) {
+    return;
+  }
+  const int tid = threadIdx.x;
+  const int nsb = cols / 256;
+  const size_t row_bytes = static_cast<size_t>(nsb) * 56;
+  const uint8_t* row_ptr = weights + static_cast<size_t>(row) * row_bytes;
+  float acc = 0.0f;
+  for (int c = tid; c < cols; c += blockDim.x) {
+    const int sb = c >> 8;
+    const int within = c & 255;
+    const uint8_t* blk = row_ptr + static_cast<size_t>(sb) * 56;
+    const uint8_t* qs = blk;
+    const uint8_t* qh = blk + 32;
+    const uint8_t* scales = blk + 48;
+    const uint16_t sc[4] = {
+        static_cast<uint16_t>(static_cast<uint16_t>(scales[0]) |
+                              (static_cast<uint16_t>(scales[1]) << 8)),
+        static_cast<uint16_t>(static_cast<uint16_t>(scales[2]) |
+                              (static_cast<uint16_t>(scales[3]) << 8)),
+        static_cast<uint16_t>(static_cast<uint16_t>(scales[4]) |
+                              (static_cast<uint16_t>(scales[5]) << 8)),
+        static_cast<uint16_t>(static_cast<uint16_t>(scales[6]) |
+                              (static_cast<uint16_t>(scales[7]) << 8)),
+    };
+    const uint16_t scale_bits = static_cast<uint16_t>(
+        (sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) | ((sc[2] >> 4) & 0x0f00) |
+        (sc[3] & 0xf000));
+    const float d = f16_bits_to_float(scale_bits);
+    const int group32 = within >> 5;
+    const int offset32 = within & 31;
+    const int lane = offset32 >> 3;
+    const int j = offset32 & 7;
+    const int scale_index = 2 * group32 + lane / 2;
+    const uint16_t scale_word = sc[scale_index / 4];
+    const float dl =
+        d * static_cast<float>(2 * ((scale_word >> (3 * (scale_index & 3))) & 0x07) + 1);
+    const uint8_t qh_byte = qh[2 * group32 + lane / 2];
+    const int qh_shift = 4 * (lane & 1);
+    const float delta = (qh_byte & (0x08u << qh_shift)) != 0 ? -1.125f : -0.875f;
+    const int grid_index = static_cast<int>(qs[4 * group32 + lane]) |
+                           (static_cast<int>((qh_byte >> qh_shift) & 0x07) << 8);
+    const uint8_t code = iq1_s_grid_code(grid_index, j);
+    acc += dl * (static_cast<float>(code) + delta) * x[c];
+  }
+  __shared__ float warp_sums[32];
+  for (int off = 16; off > 0; off >>= 1) {
+    acc += __shfl_down_sync(0xffffffffu, acc, off);
+  }
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  if (lane == 0) {
+    warp_sums[warp] = acc;
+  }
+  __syncthreads();
+  if (warp == 0) {
+    const int nwarps = blockDim.x >> 5;
+    float v = (lane < nwarps) ? warp_sums[lane] : 0.0f;
+    for (int off = 16; off > 0; off >>= 1) {
+      v += __shfl_down_sync(0xffffffffu, v, off);
+    }
+    if (lane == 0) {
+      output[row] = v;
+    }
+  }
+}
+
+extern "C" int hi_cuda_launch_iq1_m_gemv(
+    const void* weights,
+    const void* x,
+    void* output,
+    int rows,
+    int cols,
+    void* stream) {
+  if (weights == nullptr || x == nullptr || output == nullptr || rows <= 0 ||
+      cols <= 0 || cols % 256 != 0 || stream == nullptr) {
+    return 1;
+  }
+  iq1_m_gemv_kernel<<<rows, 128, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint8_t*>(weights), static_cast<const float*>(x),
+      static_cast<float*>(output), rows, cols);
+  return 0;
+}
+
 // Fused IQ1_S GEMV (M=1 decode). Reads IQ1_S weights directly: block = 50 bytes / 256
 // weights (f16 d + 32-B qs + 16-B qh). Per group the qh word carries a 3-bit scale, a
 // sign->delta bit, and 3 high bits of each 11-bit grid index (rest from qs); code comes
