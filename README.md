@@ -173,6 +173,15 @@ Type at any time to redirect (the drive resumes after); Esc pauses; `/goal resum
 the plan grows as work is discovered, with no default cap (`/goal limit N` sets one). Goals
 survive session resume, and a pinned checklist + `goal d/t` badge track progress in the TUI.
 
+**Skeptic gate (`/goal team`, experimental).** By default a single agent plans, implements, and
+verifies each turn. Point a reviewer model at it (`HI_SKEPTIC_MODEL=<model>`, or a profile
+`skeptic_model`) and turn on `/goal team`, and before a turn may mark a sub-goal *done* a second
+model reviews the turn's diff — plus the sub-goal and verify result — and can send it back to retry
+with concrete objections, which become notes the next turn must address. It's off by default (an
+extra model call per advance), fail-open (a reviewer error or timeout never blocks progress), and
+scoped to where orchestration has a real shot: a long-horizon goal, not a single bounded turn.
+`/goal team` alone reports the state and how many advances the skeptic has blocked.
+
 ## Fleet dashboard
 
 `/dashboard` scales that to a fleet: the dispatch box at the bottom always spawns a *new*
@@ -294,7 +303,7 @@ Slash commands (TUI or plain REPL):
 | `/verify [cmd\|off]` | show, set, or clear the test command turns iterate against — turn the verify-loop on without restarting |
 | `/diff` | show what files have changed this session (`git diff` + new files) |
 | `/copy [all]` | copy the last assistant response to the terminal clipboard; `all` copies the transcript |
-| `/goal [obj\|pause\|resume\|limit N\|clear]` | set a long-horizon goal: a planner model decomposes it into sub-goals the agent then **drives autonomously turn after turn** (your input always takes priority; Esc pauses). `pause`/`resume` hold and continue; `limit N` caps plan growth (unbounded by default) |
+| `/goal [obj\|pause\|resume\|limit N\|team on\|off\|clear]` | set a long-horizon goal: a planner model decomposes it into sub-goals the agent then **drives autonomously turn after turn** (your input always takes priority; Esc pauses). `pause`/`resume` hold and continue; `limit N` caps plan growth (unbounded by default); `team on` adds a skeptic reviewer that must approve each advance (needs `HI_SKEPTIC_MODEL`) |
 | `/loop <interval> <prompt>` | the same prompt, on a cadence (60s–7d: `90s`, `30m`, `2h`, `1d`): each firing is a **full agent turn** that remembers previous checks and reports only what changed. `/loop list`, `/loop cancel <id>`, `/loop pause\|resume <id>`, `/loop budget <id> <count\|off>` (token cap → auto-pause), `/loop on <id> <cmd\|off>` (run a shell command on each change, `$HI_LOOP_SUMMARY` in env), `/loop fix <id> <on\|pr\|off>` (verify-gated auto-fix on a loud change — `on` merges, `pr` opens a PR), `/loop window <id> <9-17 [weekdays]\|off>` (local-time fire window), `/loop cost` (token-spend breakdown), `/loop review [interval]` (a PR-review watcher — reviews open PRs via `gh`); loops auto-expire after 7 days |
 | `/watch` | full-screen live dashboard of all active loops: per-loop countdowns, firing spinners, last result, token spend, and recent history — with `f` fire-now, `p` pause, `c` cancel, `n` arm a new loop |
 | `/digest` (`/activity`) | what your loops have noticed, grouped by loop, with what's new since you last looked (a persisted, cross-restart feed of every loud change) |

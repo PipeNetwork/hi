@@ -111,6 +111,11 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
                     handle_goal_limit(agent, limit);
                 }
             }
+            s if hi_agent::command::parse_goal_team(s).is_some() => {
+                if let Some(team) = hi_agent::command::parse_goal_team(s) {
+                    handle_goal_team(agent, team);
+                }
+            }
             "" => {
                 // Report whichever goal view is active: the structured
                 // long-horizon goal when long_horizon is on, else the
@@ -381,6 +386,43 @@ fn handle_goal_limit(agent: &mut hi_agent::Agent, limit: hi_agent::command::Goal
             eprintln!(
                 "\x1b[33mgoal limit: '{value}' isn't a number — use /goal limit <n> or 'limit off'\x1b[0m"
             );
+        }
+    }
+}
+
+fn handle_goal_team(agent: &mut hi_agent::Agent, team: hi_agent::command::GoalTeamArg) {
+    use hi_agent::command::GoalTeamArg;
+    match team {
+        GoalTeamArg::Show => match agent.structured_goal() {
+            Some(g) if g.team => println!(
+                "\x1b[2mgoal team: on — a skeptic reviews each advance ({} objection(s) so far)\x1b[0m",
+                g.skeptic_objections
+            ),
+            Some(_) => println!("\x1b[2mgoal team: off — enable with /goal team on\x1b[0m"),
+            None => println!("\x1b[2mno active goal — set one with /goal <text> first\x1b[0m"),
+        },
+        GoalTeamArg::On => {
+            if !agent.has_skeptic() {
+                eprintln!(
+                    "\x1b[33mgoal team: no skeptic model configured — set HI_SKEPTIC_MODEL (or a profile skeptic_model) first\x1b[0m"
+                );
+            } else if agent.set_goal_team(true) {
+                println!(
+                    "\x1b[32m✓ goal team on — a skeptic reviews each turn before it advances a sub-goal\x1b[0m"
+                );
+            } else {
+                println!("\x1b[2mno active goal — set one with /goal <text> first\x1b[0m");
+            }
+        }
+        GoalTeamArg::Off => {
+            if agent.set_goal_team(false) {
+                println!("\x1b[32m✓ goal team off — single-agent driving\x1b[0m");
+            } else {
+                println!("\x1b[2mno active goal\x1b[0m");
+            }
+        }
+        GoalTeamArg::Invalid(value) => {
+            eprintln!("\x1b[33mgoal team: '{value}' — use /goal team on|off\x1b[0m");
         }
     }
 }

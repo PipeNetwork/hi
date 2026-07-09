@@ -3099,7 +3099,8 @@ If the task is already complete, stop and give your final recap."
             ended_at_cap,
             plan_updated_goal,
             ui,
-        );
+        )
+        .await;
 
         // Verifier-gated skill auto-curation: after a turn that PASSED verification
         // and actually changed files, optionally distill a reusable technique into a

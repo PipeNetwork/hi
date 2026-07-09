@@ -385,6 +385,171 @@ async fn long_horizon_driver_advances_on_clean_turn() {
 }
 
 #[tokio::test]
+async fn skeptic_gate_objection_blocks_advance_and_records_note() {
+    // With `/goal team` on and a skeptic model configured, a turn that would
+    // otherwise advance is reviewed first; an OBJECT sends the sub-goal back to
+    // retry (objections become notes) instead of advancing.
+    let mut cfg = config();
+    cfg.long_horizon = true;
+    cfg.skeptic_model = Some("skeptic".into());
+    let tmp = temp_file("skeptic-obj");
+    let p = tmp.to_string_lossy().to_string();
+    let responses = vec![
+        write_completion(&p),
+        completion(vec![Content::Text("done".into())], 1, 1),
+        // The skeptic call, fired at goal-turn end, objects.
+        completion(
+            vec![Content::Text(
+                "OBJECT\n- the empty-input edge case isn't handled".into(),
+            )],
+            1,
+            1,
+        ),
+    ];
+    let mut agent = agent(responses, cfg);
+    let mut goal = Goal::new("refactor", vec!["step one".into(), "step two".into()]);
+    goal.team = true;
+    agent.set_structured_goal(Some(goal)).unwrap();
+    let mut ui = RecUi::default();
+    agent.run_turn("go", &mut ui).await.unwrap();
+    let _ = std::fs::remove_file(&tmp);
+
+    let goal = agent.structured_goal().expect("goal still set");
+    assert_eq!(
+        goal.active_index(),
+        Some(0),
+        "objection blocked the advance"
+    );
+    assert_eq!(goal.sub_goals[0].status, GoalStatus::Active);
+    assert_eq!(goal.skeptic_objections, 1, "objection counted");
+    assert!(
+        goal.sub_goals[0]
+            .notes
+            .iter()
+            .any(|n| n.contains("empty-input edge case")),
+        "objection recorded as a retry note: {:?}",
+        goal.sub_goals[0].notes
+    );
+    // The note surfaces in the system prompt so the next turn addresses it.
+    assert!(
+        agent.messages()[0].text().contains("empty-input edge case"),
+        "objection in the system prompt"
+    );
+}
+
+#[tokio::test]
+async fn skeptic_gate_approval_advances_and_actually_calls_the_skeptic() {
+    let mut cfg = config();
+    cfg.long_horizon = true;
+    cfg.skeptic_model = Some("skeptic".into());
+    let tmp = temp_file("skeptic-ok");
+    let p = tmp.to_string_lossy().to_string();
+    let steps = vec![
+        ProviderStep::Completion(write_completion(&p)),
+        ProviderStep::Completion(completion(vec![Content::Text("done".into())], 1, 1)),
+        ProviderStep::Completion(completion(vec![Content::Text("APPROVE".into())], 1, 1)),
+    ];
+    let (mut agent, requests) = scripted_agent(steps, cfg);
+    let mut goal = Goal::new("refactor", vec!["step one".into(), "step two".into()]);
+    goal.team = true;
+    agent.set_structured_goal(Some(goal)).unwrap();
+    let mut ui = RecUi::default();
+    agent.run_turn("go", &mut ui).await.unwrap();
+    let _ = std::fs::remove_file(&tmp);
+
+    let goal = agent.structured_goal().expect("goal still set");
+    assert_eq!(
+        goal.sub_goals[0].status,
+        GoalStatus::Done,
+        "approved → advanced"
+    );
+    assert_eq!(goal.active_index(), Some(1));
+    assert_eq!(goal.skeptic_objections, 0);
+    // Exactly one extra call beyond the turn, and it was the skeptic (its system
+    // prompt is distinctive) — proving *which* call reviewed, not positional trust.
+    let reqs = requests.lock().unwrap();
+    assert_eq!(reqs.len(), 3, "turn (2 calls) + skeptic (1)");
+    assert!(
+        reqs.last()
+            .unwrap()
+            .iter()
+            .any(|m| m.text().contains("senior code reviewer")),
+        "the extra call carried the skeptic review prompt"
+    );
+}
+
+#[tokio::test]
+async fn skeptic_gate_off_makes_no_extra_call() {
+    // A skeptic model is configured, but `/goal team` is off (default): the gate
+    // must not fire — no extra provider call, and advancing is byte-identical to
+    // single-agent driving.
+    let mut cfg = config();
+    cfg.long_horizon = true;
+    cfg.skeptic_model = Some("skeptic".into());
+    let tmp = temp_file("skeptic-off");
+    let p = tmp.to_string_lossy().to_string();
+    // Only the turn's two calls are scripted; a spurious skeptic call would pop an
+    // absent step and panic — so this fails loudly on a regression too.
+    let steps = vec![
+        ProviderStep::Completion(write_completion(&p)),
+        ProviderStep::Completion(completion(vec![Content::Text("done".into())], 1, 1)),
+    ];
+    let (mut agent, requests) = scripted_agent(steps, cfg);
+    // team defaults to false.
+    agent
+        .set_structured_goal(Some(Goal::new(
+            "refactor",
+            vec!["step one".into(), "step two".into()],
+        )))
+        .unwrap();
+    let mut ui = RecUi::default();
+    agent.run_turn("go", &mut ui).await.unwrap();
+    let _ = std::fs::remove_file(&tmp);
+
+    assert_eq!(
+        agent.structured_goal().unwrap().active_index(),
+        Some(1),
+        "advanced normally with the gate off"
+    );
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        2,
+        "no extra skeptic call when team is off"
+    );
+}
+
+#[tokio::test]
+async fn skeptic_gate_fails_open_on_provider_error() {
+    // A skeptic that errors must not wedge the goal — the gate is fail-open, so the
+    // sub-goal advances as if there were no gate.
+    let mut cfg = config();
+    cfg.long_horizon = true;
+    cfg.skeptic_model = Some("skeptic".into());
+    let tmp = temp_file("skeptic-err");
+    let p = tmp.to_string_lossy().to_string();
+    let steps = vec![
+        ProviderStep::Completion(write_completion(&p)),
+        ProviderStep::Completion(completion(vec![Content::Text("done".into())], 1, 1)),
+        ProviderStep::Error(ProviderErrorKind::Outage),
+    ];
+    let (mut agent, _requests) = scripted_agent(steps, cfg);
+    let mut goal = Goal::new("refactor", vec!["step one".into(), "step two".into()]);
+    goal.team = true;
+    agent.set_structured_goal(Some(goal)).unwrap();
+    let mut ui = RecUi::default();
+    agent.run_turn("go", &mut ui).await.unwrap();
+    let _ = std::fs::remove_file(&tmp);
+
+    let goal = agent.structured_goal().unwrap();
+    assert_eq!(
+        goal.sub_goals[0].status,
+        GoalStatus::Done,
+        "fail-open advanced despite the skeptic error"
+    );
+    assert_eq!(goal.skeptic_objections, 0);
+}
+
+#[tokio::test]
 async fn long_horizon_driver_records_failure_on_stall() {
     // A turn that stalls (repeat guard exhausts) records a sub-goal attempt
     // so the next turn sees the prior note (and doesn't repeat the approach).

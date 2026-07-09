@@ -11,6 +11,7 @@ mod lifecycle;
 mod memory_turn;
 mod plan_goal;
 mod preflight;
+mod skeptic;
 mod turn;
 
 pub(crate) use curate_turn::MAX_AUTO_SKILLS_PER_SESSION;
