@@ -6,6 +6,7 @@
 //! the event loop can keep redrawing — spinner, streaming output, scrolling —
 //! while a turn is in flight, and can cancel it with Ctrl-C.
 
+mod activity;
 mod app;
 mod dashboard;
 mod loops;

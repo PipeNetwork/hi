@@ -277,8 +277,28 @@ pub(crate) fn start(launcher: Arc<FleetLauncher>, loops_file: Option<PathBuf>) -
         pending: pending.clone(),
         snapshot: snapshot.clone(),
     };
-    tokio::spawn(manager(launcher, loops_file, ctl_rx, pending, snapshot));
+    let activity = loops_file
+        .as_ref()
+        .map(|p| crate::activity::activity_path(p));
+    tokio::spawn(manager(
+        launcher, loops_file, activity, ctl_rx, pending, snapshot,
+    ));
     handle
+}
+
+/// Append one loud event to the project's activity feed (best-effort).
+fn record(activity: Option<&std::path::Path>, loop_id: u64, source: &str, text: &str) {
+    if let Some(path) = activity {
+        crate::activity::append(
+            path,
+            &crate::activity::ActivityEntry {
+                at_ms: now_ms(),
+                loop_id,
+                source: source.to_string(),
+                text: text.to_string(),
+            },
+        );
+    }
 }
 
 /// Rebuild the published `/watch` snapshot from persisted specs + live runtime,
@@ -325,10 +345,12 @@ fn publish(
 async fn manager(
     launcher: Arc<FleetLauncher>,
     loops_file: Option<PathBuf>,
+    activity: Option<PathBuf>,
     mut ctl: mpsc::UnboundedReceiver<LoopCtl>,
     pending: Arc<Mutex<Vec<LoopLine>>>,
     snapshot: Arc<Mutex<Vec<LoopWatchRow>>>,
 ) {
+    let activity = activity.as_deref();
     let mut runtime: HashMap<u64, LoopRuntime> = HashMap::new();
     let mut state = load(loops_file.as_deref());
     let now = now_ms();
@@ -373,6 +395,7 @@ async fn manager(
         let mut fired = false;
         state.loops.retain(|l| {
             if l.expires_ms <= now {
+                record(activity, l.id, &l.name(), "expired after 7 days");
                 pending.lock().unwrap().push((
                     format!("⟳ loop#{} ({}) expired after 7 days", l.id, l.name()),
                     true,
@@ -580,21 +603,23 @@ async fn manager(
                             && spent >= budget
                         {
                             l.paused = true;
-                            budget_line = Some((
-                                format!(
-                                    "⏸ loop#{id} ({name}) paused — hit token budget ({} / {})",
-                                    fmt_tokens(spent),
-                                    fmt_tokens(budget),
-                                ),
-                                true,
-                            ));
+                            let msg = format!(
+                                "paused — hit token budget ({} / {})",
+                                fmt_tokens(spent),
+                                fmt_tokens(budget),
+                            );
+                            record(activity, id, &name, &msg);
+                            budget_line = Some((format!("⏸ loop#{id} ({name}) {msg}"), true));
                         }
                     }
                     save(loops_file.as_deref(), &state);
                 }
-                // On a genuine loud change (not quiet, not a firing error), run
-                // the loop's on-change trigger if it has one — the watcher acts.
+                // On a genuine loud change (not quiet, not a firing error), record
+                // it to the activity feed and run the loop's on-change trigger.
                 let loud_change = tokens.is_some() && !quiet;
+                if loud_change {
+                    record(activity, id, &name, &summary);
+                }
                 if loud_change
                     && let Some(cmd) = state
                         .loops
@@ -1230,6 +1255,57 @@ mod tests {
                 .is_some_and(|r| r.trigger.is_none())
         })
         .await;
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A loud firing is persisted to the project's activity feed (for /digest).
+    #[tokio::test]
+    async fn manager_records_loud_firing_to_activity() {
+        let dir = std::env::temp_dir().join(format!("hi-watch-act-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sess = dir.join("loop.jsonl");
+        let loops_file = dir.join("loops.json");
+        let launcher = FleetLauncher {
+            exe: PathBuf::from("/bin/echo"),
+            provider: "p".into(),
+            model: "m".into(),
+            base_url: "u".into(),
+            api_key: "k".into(),
+            verify: None,
+            max_verify: 0,
+            max_steps: 30,
+            session_path: Box::new(|| Ok(PathBuf::from("/tmp/unused.jsonl"))),
+            sessions: Box::new(Vec::new),
+            resume_info: Box::new(|_| None),
+            loop_session_path: Box::new(move || Ok(sess.clone())),
+            loops_file: Some(loops_file.clone()),
+        };
+        let handle = start(Arc::new(launcher), Some(loops_file.clone()));
+
+        let (tx, rx) = oneshot::channel();
+        handle
+            .ctl
+            .send(LoopCtl::Create {
+                secs: 3600,
+                prompt: "watch the thing".into(),
+                reply: tx,
+            })
+            .unwrap();
+        let id = rx.await.unwrap().unwrap().id;
+        wait_until(&handle, |rows| {
+            rows.iter()
+                .find(|r| r.id == id)
+                .is_some_and(|r| !r.history.is_empty())
+        })
+        .await;
+
+        // The loud firing landed in activity.jsonl next to loops.json.
+        let entries = crate::activity::load(&crate::activity::activity_path(&loops_file));
+        assert!(
+            entries.iter().any(|e| e.loop_id == id),
+            "loud firing recorded to the activity feed"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -223,6 +223,12 @@ real change: `/loop on 3 notify-send "CI is red"`. It runs via `sh -c` only on a
 another `hi -p "…"` to kick off a fix. `/loop on 3 off` clears it. (The command is yours and runs
 with your shell's privileges — treat it like a git hook.)
 
+**Digest — what changed while you were away.** Loops write every loud event (a change they found, a
+budget pause, an expiry) to a per-project activity feed that survives restarts. `/digest` shows it
+grouped by loop — how many changes each noticed and the most recent, with a `•` on everything new
+since you last looked. Start `hi` after leaving loops running and you'll see a one-line
+`⟳ N loop change(s) since you last looked — /digest to review` nudge.
+
 ## Sessions
 
 Every session is saved as JSONL under `~/.local/share/hi/sessions/`.
@@ -248,7 +254,8 @@ Slash commands (TUI or plain REPL):
 | `/copy [all]` | copy the last assistant response to the terminal clipboard; `all` copies the transcript |
 | `/goal [obj\|pause\|resume\|limit N\|clear]` | set a long-horizon goal: a planner model decomposes it into sub-goals the agent then **drives autonomously turn after turn** (your input always takes priority; Esc pauses). `pause`/`resume` hold and continue; `limit N` caps plan growth (unbounded by default) |
 | `/loop <interval> <prompt>` | the same prompt, on a cadence (60s–7d: `90s`, `30m`, `2h`, `1d`): each firing is a **full agent turn** that remembers previous checks and reports only what changed. `/loop list`, `/loop cancel <id>`, `/loop pause\|resume <id>`, `/loop budget <id> <count\|off>` (token cap → auto-pause), `/loop on <id> <cmd\|off>` (run a shell command on each change, `$HI_LOOP_SUMMARY` in env); loops auto-expire after 7 days |
-| `/watch` | full-screen live dashboard of all active loops: per-loop countdowns, firing spinners, last result, and recent history — with `f` fire-now, `c` cancel, `n` arm a new loop |
+| `/watch` | full-screen live dashboard of all active loops: per-loop countdowns, firing spinners, last result, token spend, and recent history — with `f` fire-now, `p` pause, `c` cancel, `n` arm a new loop |
+| `/digest` (`/activity`) | what your loops have noticed, grouped by loop, with what's new since you last looked (a persisted, cross-restart feed of every loud change) |
 | `/dashboard` (`/fleet`) | control a fleet, not an agent: dispatch, monitor, and steer multiple concurrent sessions — each in its own git worktree with verified diffs auto-merging back; `/fleet status` lists this project's resumable fleet sessions ([docs](docs/fleet-dashboard.md)) |
 | `/delegate [on\|off]` | toggle the write-capable delegate subagent: the model can hand a self-contained subtask to a worktree-isolated child whose changes land only if they verify (off by default) |
 | `/init` | scan the repo and write an `HI.md` project guide (loaded as context in future sessions) |

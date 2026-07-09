@@ -171,6 +171,19 @@ pub async fn run(
         fleet_launcher.clone(),
         fleet_launcher.loops_file.clone(),
     ));
+    // "While you were away": if loops noticed changes since you last looked,
+    // nudge you toward /digest (which shows and then clears the marker).
+    if let Some(lf) = &fleet_launcher.loops_file {
+        let entries = crate::activity::load(&crate::activity::activity_path(lf));
+        let seen = crate::activity::load_seen(&crate::activity::seen_path(lf));
+        let fresh = entries.iter().filter(|e| e.at_ms > seen).count();
+        if fresh > 0 {
+            app.push(Line::styled(
+                format!("⟳ {fresh} loop change(s) since you last looked — /digest to review"),
+                Style::default().fg(Color::Cyan),
+            ));
+        }
+    }
     // Startup metadata fetch: race the live `/models` fetch against the first
     // keystroke, with a spinner ticking and the screen redrawing each tick so
     // the UI never looks stalled. The on-disk cache already applied instantly
@@ -1275,6 +1288,95 @@ pub async fn run(
                         .await?;
                     // Surface anything the loops reported while we were watching.
                     app.drain_loops();
+                    continue;
+                }
+                // `/digest`: the loud things loops have noticed, grouped by loop,
+                // with what's new since you last looked (then mark all as seen).
+                Command::Digest => {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    if let Some(lf) = &fleet_launcher.loops_file {
+                        let entries = crate::activity::load(&crate::activity::activity_path(lf));
+                        let seen_path = crate::activity::seen_path(lf);
+                        let seen = crate::activity::load_seen(&seen_path);
+                        let (groups, total, fresh) = crate::activity::digest(&entries, 0, seen, 3);
+                        if total == 0 {
+                            app.push(Line::styled(
+                                "no loop activity yet — loops record changes here as they notice them"
+                                    .to_string(),
+                                dim(),
+                            ));
+                        } else {
+                            let header = if fresh > 0 {
+                                format!(
+                                    "activity digest — {total} change(s) across {} loop(s) · {fresh} new since you last looked",
+                                    groups.len()
+                                )
+                            } else {
+                                format!(
+                                    "activity digest — {total} change(s) across {} loop(s)",
+                                    groups.len()
+                                )
+                            };
+                            app.push(Line::styled(
+                                header,
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(ratatui::style::Modifier::BOLD),
+                            ));
+                            let ago = |ms: u64| -> String {
+                                let s = now.saturating_sub(ms) / 1000;
+                                if s < 60 {
+                                    format!("{s}s")
+                                } else if s < 3600 {
+                                    format!("{}m", s / 60)
+                                } else if s < 86_400 {
+                                    format!("{}h", s / 3600)
+                                } else {
+                                    format!("{}d", s / 86_400)
+                                }
+                            };
+                            for g in &groups {
+                                let fresh_note = if g.fresh > 0 {
+                                    format!(" · {} new", g.fresh)
+                                } else {
+                                    String::new()
+                                };
+                                app.push(Line::styled(
+                                    format!(
+                                        "  loop#{} {} — {} change(s){}",
+                                        g.loop_id, g.source, g.count, fresh_note
+                                    ),
+                                    Style::default().add_modifier(ratatui::style::Modifier::BOLD),
+                                ));
+                                for (at, text, is_fresh) in &g.recent {
+                                    let mark = if *is_fresh { "• " } else { "  " };
+                                    let style = if *is_fresh {
+                                        Style::default().fg(Color::Cyan)
+                                    } else {
+                                        dim()
+                                    };
+                                    app.push(Line::styled(
+                                        format!(
+                                            "    {mark}{:>4} ago  {}",
+                                            ago(*at),
+                                            crate::dashboard::truncate_title(text, 72)
+                                        ),
+                                        style,
+                                    ));
+                                }
+                            }
+                        }
+                        crate::activity::save_seen(&seen_path, now);
+                    } else {
+                        app.push(Line::styled(
+                            "activity digest unavailable (no project loops file)".to_string(),
+                            dim(),
+                        ));
+                    }
+                    app.follow();
                     continue;
                 }
                 // `/goal <objective>`: decompose with the planner behind a spinner

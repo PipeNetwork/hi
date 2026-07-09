@@ -78,6 +78,9 @@ pub enum Command {
     Loop(String),
     /// Full-screen live dashboard of all active loops (TUI only).
     Watch,
+    /// Show the activity digest: what loops have noticed, grouped by loop, with
+    /// what's new since you last looked (TUI only).
+    Digest,
     Quit,
     /// A `/word` that isn't recognized.
     Unknown(String),
@@ -131,6 +134,7 @@ pub fn parse(line: &str) -> Option<Command> {
         "dashboard" | "fleet" => Command::Dashboard(arg),
         "loop" | "loops" => Command::Loop(arg),
         "watch" => Command::Watch,
+        "digest" | "activity" => Command::Digest,
         "exit" | "quit" | "q" => Command::Quit,
         other => Command::Unknown(other.to_string()),
     })
@@ -663,6 +667,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         arg_values: &[],
     },
     CommandSpec {
+        name: "digest",
+        args: "",
+        help: "what your loops noticed, grouped — with what's new since you last looked",
+        arg_values: &[],
+    },
+    CommandSpec {
         name: "status",
         args: "[topic]",
         help: "show runtime status, or discuss codebase status with a topic",
@@ -1053,6 +1063,8 @@ mod tests {
         // Command parse.
         assert_eq!(parse("/loop"), Some(Command::Loop(String::new())));
         assert_eq!(parse("/watch"), Some(Command::Watch));
+        assert_eq!(parse("/digest"), Some(Command::Digest));
+        assert_eq!(parse("/activity"), Some(Command::Digest));
         assert_eq!(
             parse("/loop 30m check ci"),
             Some(Command::Loop("30m check ci".into()))
