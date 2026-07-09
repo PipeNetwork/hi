@@ -10,27 +10,15 @@ use ratatui::text::Line;
 use crate::render::dim;
 
 impl crate::App {
-    /// Build a per-model-id capabilities map from the registry, for the model
-    /// picker's capability-tag column.
-    pub(crate) fn capabilities_map(
-        registry: &hi_ai::Registry,
-        ids: &[String],
-    ) -> HashMap<String, Vec<&'static str>> {
-        ids.iter()
-            .map(|id| (id.clone(), registry.capabilities(id)))
-            .collect()
-    }
-
     pub(crate) fn served_tags(&self) -> HashMap<String, String> {
         HashMap::new()
     }
 
     /// Apply `id` as the model: prefer live endpoint metadata (window/price) when
-    /// we have it, else the catalog. Updates the agent and the gauge.
-    pub(crate) fn apply_model(&mut self, agent: &mut Agent, registry: &hi_ai::Registry, id: &str) {
-        let (_cat_price, cat_window) = registry.metadata(id);
+    /// we have it. Updates the agent and the gauge.
+    pub(crate) fn apply_model(&mut self, agent: &mut Agent, id: &str) {
         let served = self.served.get(id);
-        let window = served.and_then(|m| m.context_window).or(cat_window);
+        let window = served.and_then(|m| m.context_window);
         agent.set_model(
             id.to_string(),
             window,
@@ -55,8 +43,8 @@ impl crate::App {
     }
 
     /// Apply an explicit user model selection and save it to the active profile.
-    pub(crate) fn select_model(&mut self, agent: &mut Agent, registry: &hi_ai::Registry, id: &str) {
-        self.apply_model(agent, registry, id);
+    pub(crate) fn select_model(&mut self, agent: &mut Agent, id: &str) {
+        self.apply_model(agent, id);
         match self.persist_active_profile_model(id) {
             Ok(Some(name)) => self.push(Line::styled(
                 format!("model set to {id} (saved to profile {name})"),
@@ -80,14 +68,14 @@ impl crate::App {
     }
 
     /// Apply the picker's current selection as the model, then close it.
-    pub(crate) fn pick_model(&mut self, agent: &mut Agent, registry: &hi_ai::Registry) {
+    pub(crate) fn pick_model(&mut self, agent: &mut Agent) {
         let id = self
             .picker
             .as_ref()
             .and_then(|p| p.current())
             .map(str::to_string);
         if let Some(id) = id {
-            self.select_model(agent, registry, &id);
+            self.select_model(agent, &id);
         }
         self.picker = None;
         self.follow();

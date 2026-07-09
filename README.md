@@ -88,10 +88,6 @@ provider = "ollama"
 model = "qwen2.5-coder"
 ```
 
-### Model registry
-
-`hi --refresh-models` pulls the [models.dev](https://models.dev) catalog into a local cache (~2700 models). It powers the per-turn token/context display, caps `--max-tokens` to a model's limit, and warns when a model isn't known to support tool calling.
-
 ### Compatibility
 
 OpenAI-compatible endpoints vary in how much of Chat Completions they implement. The default `--compat auto` retries common simpler shapes, such as retrying without streamed usage metadata when a provider rejects `stream_options`. Tool calling is not silently downgraded: if a request advertises tools and the provider rejects them, the turn fails fast instead of continuing chat-only. Use `--compat strict` to send only the initial request shape. Tool availability is controlled separately with `--tool-mode auto|required|chat-only|read-only`.
@@ -291,7 +287,7 @@ A cargo workspace:
 
 | crate | role |
 |---|---|
-| `hi-ai` | provider-neutral types, the `Provider` trait, OpenAI + Anthropic adapters, retry, models.dev registry |
+| `hi-ai` | provider-neutral types, the `Provider` trait, OpenAI + Anthropic adapters, retry |
 | `hi-tools` | the tools: `read` / `write` / `edit` / `multi_edit` / `apply_patch` / `bash` / `bash_output` / `bash_kill` / `list` / `grep` / `glob` / `diff` / `commit` / `update_plan` / `record_decision` |
 | `hi-agent` | the agent loop, verify-loop, sessions, the `Ui` trait |
 | `hi-tui` | full-screen terminal UI (transcript, spinner, queue, slash commands) |

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, ValueEnum};
 use hi_agent::VerifyStage;
-use hi_ai::{CompatMode, Registry, ToolMode};
+use hi_ai::{CompatMode, ToolMode};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_MAX_TOKENS: u32 = 8192;
@@ -76,10 +76,6 @@ pub struct Cli {
     /// Path to a config file (default: ./hi.toml or ~/.config/hi/config.toml).
     #[arg(long)]
     pub config: Option<PathBuf>,
-
-    /// Fetch the latest models.dev catalog into the local cache, then exit.
-    #[arg(long)]
-    pub refresh_models: bool,
 
     /// Print the resolved configuration (provider, model, base URL, etc.) and exit.
     #[arg(long)]
@@ -576,7 +572,7 @@ fn local_config_path() -> PathBuf {
 }
 
 /// Apply precedence to produce the effective [`Settings`].
-pub fn resolve(cli: &Cli, config: &Config, registry: &Registry) -> Result<Settings> {
+pub fn resolve(cli: &Cli, config: &Config) -> Result<Settings> {
     config.moa.validate()?;
     let profile = match cli.profile.as_ref().or(config.default_profile.as_ref()) {
         Some(name) => Some(
@@ -633,14 +629,7 @@ pub fn resolve(cli: &Cli, config: &Config, registry: &Registry) -> Result<Settin
     let profile_max_tokens = profile.and_then(|p| p.max_tokens);
     let max_tokens = configured_max_tokens(provider, cli.max_tokens, profile_max_tokens);
     let max_tokens_explicit = max_tokens_is_explicit(provider, cli.max_tokens, profile_max_tokens);
-    let mut max_tokens = max_tokens;
-    // Don't exceed a known model's output ceiling (avoids a 400 from Anthropic).
-    if let Some(info) = registry.lookup(&model)
-        && info.max_output > 0
-        && max_tokens > info.max_output
-    {
-        max_tokens = info.max_output;
-    }
+    let max_tokens = max_tokens;
 
     let thinking_budget = cli.thinking.or(profile.and_then(|p| p.thinking_budget));
     let tool_mode = cli
@@ -1152,7 +1141,7 @@ pub fn profile_names(config: &Config) -> Vec<String> {
 /// The fallback chain (excluding the primary) — `--fallback` flags first, then
 /// the selected profile's `fallback` list, deduped. Profiles that don't resolve
 /// (missing key/model) are skipped with a warning rather than blocking startup.
-pub fn resolve_fallbacks(cli: &Cli, config: &Config, registry: &Registry) -> Vec<Settings> {
+pub fn resolve_fallbacks(cli: &Cli, config: &Config) -> Vec<Settings> {
     let primary_name = cli.profile.as_ref().or(config.default_profile.as_ref());
 
     let mut names: Vec<String> = cli.fallback.clone();
@@ -1173,7 +1162,7 @@ pub fn resolve_fallbacks(cli: &Cli, config: &Config, registry: &Registry) -> Vec
         if !seen.insert(name.clone()) {
             continue;
         }
-        match resolve_named_profile(config, &name, registry) {
+        match resolve_named_profile(config, &name) {
             Ok(settings) => out.push(settings),
             Err(err) => {
                 eprintln!("\x1b[33mwarning: skipping fallback profile '{name}': {err}\x1b[0m")
@@ -1190,7 +1179,7 @@ pub fn resolve_fallbacks(cli: &Cli, config: &Config, registry: &Registry) -> Vec
 /// If the profile has no `model` and the provider has no default, a placeholder
 /// is used. The placeholder is fine for building the provider and listing
 /// models, but a turn can't run with it.
-pub fn resolve_named_profile(config: &Config, name: &str, registry: &Registry) -> Result<Settings> {
+pub fn resolve_named_profile(config: &Config, name: &str) -> Result<Settings> {
     config.moa.validate()?;
     let profile = config
         .profiles
@@ -1216,13 +1205,7 @@ pub fn resolve_named_profile(config: &Config, name: &str, registry: &Registry) -
 
     let max_tokens = configured_max_tokens(provider, None, profile.max_tokens);
     let max_tokens_explicit = max_tokens_is_explicit(provider, None, profile.max_tokens);
-    let mut max_tokens = max_tokens;
-    if let Some(info) = registry.lookup(&model)
-        && info.max_output > 0
-        && max_tokens > info.max_output
-    {
-        max_tokens = info.max_output;
-    }
+    let max_tokens = max_tokens;
 
     Ok(Settings {
         provider,

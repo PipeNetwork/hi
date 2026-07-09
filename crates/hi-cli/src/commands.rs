@@ -5,13 +5,11 @@
 //! [`crate::repl`]; this module covers the synchronous remainder.
 
 use hi_agent::Agent;
-use hi_ai::Registry;
 
 /// Act on a slash command. Returns true when the session should quit.
 pub(crate) fn handle_command(
     agent: &mut Agent,
     command: hi_agent::Command,
-    registry: &Registry,
 ) -> bool {
     use hi_agent::Command;
     match command {
@@ -68,15 +66,10 @@ pub(crate) fn handle_command(
         Command::Model(id) => {
             if id.is_empty() {
                 // The line REPL can't do an arrow-select picker; show the current
-                // model and the number of known model ids.
-                println!(
-                    "model: {}\n\x1b[2m{} models known\x1b[0m",
-                    agent.model(),
-                    registry.model_ids().len()
-                );
+                // model.
+                println!("model: {}", agent.model());
             } else {
-                let (_price, context_window) = registry.metadata(&id);
-                agent.set_model(id.clone(), context_window, None);
+                agent.set_model(id.clone(), None, None);
                 println!("model set to {id}");
             }
         }

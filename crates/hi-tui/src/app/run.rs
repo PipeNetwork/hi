@@ -41,7 +41,6 @@ pub async fn run(
     provider: &str,
     base_url: &str,
     model: &str,
-    registry: &hi_ai::Registry,
     history_path: Option<std::path::PathBuf>,
     auto_memory: bool,
     profiles: Vec<ProfileInfo>,
@@ -93,10 +92,7 @@ pub async fn run(
     );
     // Seed the context-fill gauge with the model's window so it reads 0% before
     // the first turn (it refreshes from real usage after each round).
-    app.context_window = registry.metadata(model).1;
-    // The catalog, for inline `/model <id>` completion (the picker fetches the
-    // live list on demand; this is the synchronous type-ahead source).
-    app.model_ids = registry.model_ids();
+    app.context_window = None;
     // Load the on-disk /models cache so model metadata (window/price)
     // applies instantly at startup, without blocking on the network. The live
     // fetch still runs in the background and refreshes this; the cache just
@@ -107,7 +103,7 @@ pub async fn run(
         app.model_ids.sort();
         app.served = cached.into_iter().map(|m| (m.id.clone(), m)).collect();
         let model_id = app.model.clone();
-        app.apply_model(agent, registry, &model_id);
+        app.apply_model(agent, &model_id);
     }
     if let Some(path) = &history_path
         && let Ok(text) = std::fs::read_to_string(path)
@@ -128,9 +124,8 @@ pub async fn run(
         // A one-line usage hint as the next transcript line. The provider and
         // model already appear in the border title (top of the box), so we don't
         // repeat them here — that would render as a duplicate header line.
-        let ctx = registry
-            .metadata(model)
-            .1
+        let ctx = app
+            .context_window
             .map(|w| format!(" · {w} token window"))
             .unwrap_or_default();
         // When resuming, show what we're walking back into before the hint.
@@ -219,7 +214,7 @@ pub async fn run(
         // block, so `apply_metadata` can take `&mut agent` below.
     }
     if let Some(result) = meta_result {
-        apply_metadata(&mut app, agent, registry, &result, &models_cache_key);
+        apply_metadata(&mut app, agent, &result, &models_cache_key);
     }
 
     let mut hf_state = hi_tools::HfCommandState::default();
@@ -281,7 +276,7 @@ pub async fn run(
                     Event::Key(key) if key.kind == KeyEventKind::Press && app.picker.is_some() => {
                         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
                         match key.code {
-                            KeyCode::Enter => app.pick_model(agent, registry),
+                            KeyCode::Enter => app.pick_model(agent),
                             KeyCode::Esc => app.picker = None,
                             KeyCode::Char('c') if ctrl => app.picker = None,
                             // Navigation/filter: a fresh borrow, no app-level action.
@@ -622,11 +617,10 @@ pub async fn run(
                                 Ok(switched) => {
                                     let label = switched.switched.label.clone();
                                     let model = switched.switched.model.clone();
-                                    let (_price, window) = registry.metadata(&model);
                                     agent.set_provider(
                                         switched.switched.provider.into(),
                                         model.clone(),
-                                        window,
+                                        None,
                                         switched.switched.max_tokens,
                                         switched.switched.max_tokens_explicit,
                                         None,
@@ -641,7 +635,7 @@ pub async fn run(
                                     app.model = model.clone();
                                     app.active_profile = Some(run.profile_name.clone());
                                     app.profiles = switched.profiles;
-                                    app.apply_model(agent, registry, &model);
+                                    app.apply_model(agent, &model);
                                     app.push(Line::styled(
                                         format!(
                                             "using local MLX profile '{}' — model: {model}",
@@ -751,8 +745,7 @@ pub async fn run(
                     };
                     let current = app.model.clone();
                     let tags = app.served_tags();
-                    let caps = App::capabilities_map(registry, &ids);
-                    app.picker = Some(ModelPicker::new(ids, &current, tags, &app.served, &caps));
+                    app.picker = Some(ModelPicker::new(ids, &current, tags, &app.served));
                     continue;
                 }
                 // `/provider` with no arg: list configured profiles.
@@ -888,12 +881,10 @@ pub async fn run(
                             let label = switched.label.clone();
                             let model = switched.model.clone();
                             let needs_model = model == "__model_not_configured__";
-                            // Refresh metadata from the registry for this model.
-                            let (_price, window) = registry.metadata(&model);
                             agent.set_provider(
                                 switched.provider.into(),
                                 model.clone(),
-                                window,
+                                None,
                                 switched.max_tokens,
                                 switched.max_tokens_explicit,
                                 None,
@@ -901,7 +892,7 @@ pub async fn run(
                             app.provider = label.clone();
                             app.model = model.clone();
                             app.active_profile = Some(arg.clone());
-                            app.context_window = window;
+                            app.context_window = None;
                             app.served.clear();
                             app.push(Line::styled(
                                 format!("using {label} (profile: {arg}) — model: {model}"),
@@ -977,9 +968,8 @@ pub async fn run(
                             };
                             let current = app.model.clone();
                             let tags = app.served_tags();
-                            let caps = App::capabilities_map(registry, &ids);
                             app.picker =
-                                Some(ModelPicker::new(ids, &current, tags, &app.served, &caps));
+                                Some(ModelPicker::new(ids, &current, tags, &app.served));
                         }
                         Err(err) => {
                             app.push(Line::styled(
@@ -1459,7 +1449,7 @@ pub async fn run(
                     continue;
                 }
                 other => {
-                    app.handle_command(agent, other, registry).await;
+                    app.handle_command(agent, other).await;
                     continue;
                 }
             }

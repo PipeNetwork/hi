@@ -9,7 +9,7 @@ use ratatui::text::{Line, Text};
 use crate::model_picker::ModelPicker;
 use crate::render::dim;
 use crate::util::{copy_to_clipboard, goal_feedback};
-use crate::{App, TurnState, working_tree_diff_sync};
+use crate::{TurnState, working_tree_diff_sync};
 
 impl crate::App {
     /// Apply a pure editing/navigation key to the input line, shared by the
@@ -412,7 +412,6 @@ impl crate::App {
         &mut self,
         agent: &mut Agent,
         command: Command,
-        registry: &hi_ai::Registry,
     ) {
         match command {
             Command::Quit => {}
@@ -439,7 +438,6 @@ impl crate::App {
                     let tags = self.served_tags();
                     let mut ids: Vec<String> = self.served.keys().cloned().collect();
                     ids.sort();
-                    let caps = App::capabilities_map(registry, &ids);
                     if ids.is_empty() {
                         self.push(Line::styled(
                             "no live model list available yet".to_string(),
@@ -447,10 +445,10 @@ impl crate::App {
                         ));
                     } else {
                         self.picker =
-                            Some(ModelPicker::new(ids, &current, tags, &self.served, &caps));
+                            Some(ModelPicker::new(ids, &current, tags, &self.served));
                     }
                 } else {
-                    self.select_model(agent, registry, &id);
+                    self.select_model(agent, &id);
                 }
             }
             Command::Clear => {

@@ -9,7 +9,6 @@ pub mod mcp;
 pub mod moa;
 pub mod openai;
 pub mod provider;
-pub mod registry;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
 pub mod types;
@@ -38,7 +37,6 @@ pub use provider::{
     provider_error_is_temporary_overload, provider_error_kind, provider_error_usage,
     provider_output_cap_error, provider_retry_after_seconds, provider_route_error_is_retryable,
 };
-pub use registry::{ModelInfo, Registry};
 pub use types::{
     ChatRequest, CompatMode, Completion, Content, Message, RateLimitBucket, RateLimitState,
     RequestProfile, Role, StreamEvent, ToolCall, ToolMode, ToolSpec, Usage,

@@ -21,7 +21,7 @@ pub(crate) struct ModelMeta {
     /// `id` is stored in `ModelPicker::all`; this holds only the extras.
     pub window: Option<u32>,
     pub price: Option<(f64, f64)>,
-    /// Capability tags from the static catalog: "tools", "reasoning".
+    /// Capability tags from the endpoint: "tools", "reasoning", etc.
     pub capabilities: Vec<String>,
 }
 
@@ -89,7 +89,6 @@ impl ModelPicker {
         current: &str,
         _tags: HashMap<String, String>,
         served: &HashMap<String, ServedModel>,
-        capabilities: &HashMap<String, Vec<&'static str>>,
     ) -> Self {
         let matches: Vec<usize> = (0..all.len()).collect();
         // Open with the current model highlighted (and scrolled into view).
@@ -102,16 +101,6 @@ impl ModelPicker {
                     .get(id)
                     .map(ModelMeta::from_served)
                     .unwrap_or_default();
-                let mut m = m;
-                // Attach capability tags from the static catalog when available.
-                if let Some(caps) = capabilities.get(id) {
-                    for cap in caps {
-                        let cap = (*cap).to_string();
-                        if !m.capabilities.iter().any(|existing| existing == &cap) {
-                            m.capabilities.push(cap);
-                        }
-                    }
-                }
                 (id.clone(), m)
             })
             .collect();
@@ -227,7 +216,6 @@ mod tests {
             ],
             "google/gemini",
             HashMap::new(),
-            &HashMap::new(),
             &HashMap::new(),
         );
         // Opens with the current model pre-selected.

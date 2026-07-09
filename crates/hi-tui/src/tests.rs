@@ -1341,7 +1341,6 @@ fn renders_model_picker() {
         "openai/gpt-4o",
         HashMap::new(),
         &HashMap::new(),
-        &HashMap::new(),
     ));
     let mut term = Terminal::new(TestBackend::new(60, 14)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
@@ -1365,7 +1364,6 @@ fn picker_hides_health_tag() {
         vec!["claude-sonnet-4.6".into(), "ipop/coder-balanced".into()],
         "ipop/coder-balanced",
         tags,
-        &HashMap::new(),
         &HashMap::new(),
     ));
     let mut term = Terminal::new(TestBackend::new(60, 14)).unwrap();
