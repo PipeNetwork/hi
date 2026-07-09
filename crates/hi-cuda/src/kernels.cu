@@ -4707,6 +4707,101 @@ __global__ void quantize_q8_row_kernel(
 // One warp per row; reads 4-bit weights + int8 activation (both quantized). Weight
 // block layout matches dequantize_q4_0_kernel: byte j = weight j (low nibble) and
 // weight j+16 (high nibble).
+// Fused Q6_K GEMV (M=1 decode). Reads Q6_K weights directly and dequantizes each
+// weight on the fly into the dot product, instead of materializing the whole f32
+// weight matrix every token. Q6_K block = 210 bytes / 256 weights (128 ql + 64 qh
+// + 16 int8 scales + f16 d); the per-weight unpack mirrors dequantize_q6_k_kernel.
+// One block per output row; f32 activation. Requires cols % 256 == 0.
+__global__ void q6_k_gemv_kernel(
+    const uint8_t* __restrict__ weights,
+    const float* __restrict__ x,
+    float* __restrict__ output,
+    int rows,
+    int cols) {
+  const int row = blockIdx.x;
+  if (row >= rows) {
+    return;
+  }
+  const int tid = threadIdx.x;
+  const int nsb = cols / 256;
+  const size_t row_bytes = static_cast<size_t>(nsb) * 210;
+  const uint8_t* row_ptr = weights + static_cast<size_t>(row) * row_bytes;
+  float acc = 0.0f;
+  for (int c = tid; c < cols; c += blockDim.x) {
+    const int sb = c >> 8;
+    const int within = c & 255;
+    const uint8_t* blk = row_ptr + static_cast<size_t>(sb) * 210;
+    const float d = __half2float(*reinterpret_cast<const __half*>(blk + 208));
+    const int half = within >> 7;
+    const int pos = within & 127;
+    const int l = pos & 31;
+    const int group = pos >> 5;
+    const int ql_base = half * 64;
+    const int qh_base = half * 32;
+    const int scale_base = half * 8;
+    const int is = l >> 4;
+    const uint8_t high = blk[128 + qh_base + l];
+    int quant;
+    int scale_index = scale_base + is;
+    switch (group) {
+      case 0:
+        quant = (blk[ql_base + l] & 0x0f) | (((high >> 0) & 0x03) << 4);
+        break;
+      case 1:
+        quant = (blk[ql_base + l + 32] & 0x0f) | (((high >> 2) & 0x03) << 4);
+        scale_index += 2;
+        break;
+      case 2:
+        quant = (blk[ql_base + l] >> 4) | (((high >> 4) & 0x03) << 4);
+        scale_index += 4;
+        break;
+      default:
+        quant = (blk[ql_base + l + 32] >> 4) | (((high >> 6) & 0x03) << 4);
+        scale_index += 6;
+        break;
+    }
+    const int8_t scale = static_cast<int8_t>(blk[192 + scale_index]);
+    acc += d * static_cast<float>(scale) * static_cast<float>(quant - 32) * x[c];
+  }
+  __shared__ float warp_sums[32];
+  for (int off = 16; off > 0; off >>= 1) {
+    acc += __shfl_down_sync(0xffffffffu, acc, off);
+  }
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  if (lane == 0) {
+    warp_sums[warp] = acc;
+  }
+  __syncthreads();
+  if (warp == 0) {
+    const int nwarps = blockDim.x >> 5;
+    float v = (lane < nwarps) ? warp_sums[lane] : 0.0f;
+    for (int off = 16; off > 0; off >>= 1) {
+      v += __shfl_down_sync(0xffffffffu, v, off);
+    }
+    if (lane == 0) {
+      output[row] = v;
+    }
+  }
+}
+
+extern "C" int hi_cuda_launch_q6_k_gemv(
+    const void* weights,
+    const void* x,
+    void* output,
+    int rows,
+    int cols,
+    void* stream) {
+  if (weights == nullptr || x == nullptr || output == nullptr || rows <= 0 ||
+      cols <= 0 || cols % 256 != 0 || stream == nullptr) {
+    return 1;
+  }
+  q6_k_gemv_kernel<<<rows, 128, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint8_t*>(weights), static_cast<const float*>(x),
+      static_cast<float*>(output), rows, cols);
+  return 0;
+}
+
 __global__ void q4_0_dp4a_gemv_kernel(
     const uint8_t* __restrict__ weight,
     const int8_t* __restrict__ xq,
