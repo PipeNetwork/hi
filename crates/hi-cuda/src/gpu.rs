@@ -3582,6 +3582,9 @@ mod native {
                     GgufTensorType::Q4_0 => Some(crate::kernels::launch_dequantize_q4_0_to_f16),
                     GgufTensorType::Q4_K => Some(crate::kernels::launch_dequantize_q4_k_to_f16),
                     GgufTensorType::Q6_K => Some(crate::kernels::launch_dequantize_q6_k_to_f16),
+                    GgufTensorType::Q5_K => Some(crate::kernels::launch_dequantize_q5_k_to_f16),
+                    GgufTensorType::IQ4_NL => Some(crate::kernels::launch_dequantize_iq4_nl_to_f16),
+                    GgufTensorType::Q8_0 => Some(crate::kernels::launch_dequantize_q8_0_to_f16),
                     _ => None,
                 };
                 if let Some(launch) = fused {

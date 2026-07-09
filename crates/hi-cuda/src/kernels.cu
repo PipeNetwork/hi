@@ -1710,6 +1710,104 @@ extern "C" int hi_cuda_launch_dequantize_q6_k_to_f16(
   return 0;
 }
 
+// f16-output twins of dequantize_q5_k_kernel / dequantize_iq4_nl_kernel /
+// dequantize_q8_0_kernel (exact same value, wrapped in __float2half) for the
+// fused prefill dequant->f16 path.
+__global__ void dequantize_q5_k_to_f16_kernel(
+    const uint8_t* input, __half* output, int elements) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= elements) {
+    return;
+  }
+  int block_id = idx / 256;
+  int within = idx % 256;
+  const uint8_t* block = input + block_id * 176;
+  float d = __half2float(*reinterpret_cast<const __half*>(block));
+  float dmin = __half2float(*reinterpret_cast<const __half*>(block + 2));
+  const uint8_t* scales = block + 4;
+  const uint8_t* qh = block + 16;
+  const uint8_t* qs = block + 48;
+
+  int group32 = within / 32;
+  int offset32 = within % 32;
+  int group64 = group32 / 2;
+  uint8_t scale;
+  uint8_t min;
+  q4_k_scale_min(group32, scales, &scale, &min);
+
+  uint8_t packed = qs[group64 * 32 + offset32];
+  uint8_t low = (group32 % 2) == 0 ? (packed & 0x0f) : (packed >> 4);
+  uint8_t high = (qh[offset32] & (1u << group32)) != 0 ? 16 : 0;
+  uint8_t quant = low + high;
+  output[idx] = __float2half(d * static_cast<float>(scale) * static_cast<float>(quant) -
+                             dmin * static_cast<float>(min));
+}
+
+__global__ void dequantize_iq4_nl_to_f16_kernel(
+    const uint8_t* input, __half* output, int elements) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= elements) {
+    return;
+  }
+  int block_id = idx / 32;
+  int within = idx % 32;
+  const uint8_t* block = input + block_id * 18;
+  float d = __half2float(*reinterpret_cast<const __half*>(block));
+  uint8_t packed = block[2 + (within % 16)];
+  uint8_t quant = within < 16 ? (packed & 0x0f) : (packed >> 4);
+  output[idx] = __float2half(d * static_cast<float>(IQ4_NL_VALUES[quant]));
+}
+
+__global__ void dequantize_q8_0_to_f16_kernel(
+    const uint8_t* input, __half* output, int elements) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= elements) {
+    return;
+  }
+  int block_id = idx / 32;
+  int within = idx % 32;
+  const uint8_t* block = input + block_id * 34;
+  float d = __half2float(*reinterpret_cast<const __half*>(block));
+  int8_t q = static_cast<int8_t>(block[2 + within]);
+  output[idx] = __float2half(d * static_cast<float>(q));
+}
+
+extern "C" int hi_cuda_launch_dequantize_q5_k_to_f16(
+    const void* input, void* output, int elements, void* stream) {
+  if (input == nullptr || output == nullptr || elements <= 0 || stream == nullptr) {
+    return 1;
+  }
+  dim3 block(256);
+  dim3 grid((elements + block.x - 1) / block.x);
+  dequantize_q5_k_to_f16_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint8_t*>(input), static_cast<__half*>(output), elements);
+  return 0;
+}
+
+extern "C" int hi_cuda_launch_dequantize_iq4_nl_to_f16(
+    const void* input, void* output, int elements, void* stream) {
+  if (input == nullptr || output == nullptr || elements <= 0 || stream == nullptr) {
+    return 1;
+  }
+  dim3 block(256);
+  dim3 grid((elements + block.x - 1) / block.x);
+  dequantize_iq4_nl_to_f16_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint8_t*>(input), static_cast<__half*>(output), elements);
+  return 0;
+}
+
+extern "C" int hi_cuda_launch_dequantize_q8_0_to_f16(
+    const void* input, void* output, int elements, void* stream) {
+  if (input == nullptr || output == nullptr || elements <= 0 || stream == nullptr) {
+    return 1;
+  }
+  dim3 block(256);
+  dim3 grid((elements + block.x - 1) / block.x);
+  dequantize_q8_0_to_f16_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint8_t*>(input), static_cast<__half*>(output), elements);
+  return 0;
+}
+
 __global__ void dequantize_q8_k_kernel(const uint8_t* input, float* output, int elements) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= elements) {
