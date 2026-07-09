@@ -8,6 +8,7 @@
 
 mod app;
 mod dashboard;
+mod loops;
 pub use app::run;
 mod completion;
 mod event;
@@ -89,6 +90,29 @@ pub struct FleetLauncher {
     pub session_path: Box<dyn Fn() -> Result<std::path::PathBuf> + Send + Sync>,
     /// Lists this project's resumable fleet sessions (`/fleet status`).
     pub sessions: Box<dyn Fn() -> Vec<FleetSessionInfo> + Send + Sync>,
+    /// Resolves a fleet session id (or "" = most recent) into everything needed
+    /// to re-adopt it as a dashboard row (`/fleet resume [id]`).
+    pub resume_info: FleetResumeResolver,
+    /// Allocates a session file for a `/loop` (each firing resumes it).
+    pub loop_session_path: Box<dyn Fn() -> Result<std::path::PathBuf> + Send + Sync>,
+    /// Where `/loop` definitions persist across restarts (per project).
+    pub loops_file: Option<std::path::PathBuf>,
+}
+
+/// Resolves a fleet session id into re-adoption info (`/fleet resume`).
+pub type FleetResumeResolver = Box<dyn Fn(&str) -> Option<FleetResumeInfo> + Send + Sync>;
+
+/// A fleet session resolved for re-adoption as a dashboard row.
+pub struct FleetResumeInfo {
+    pub id: String,
+    /// The session file (the row's child turns keep appending to it).
+    pub path: std::path::PathBuf,
+    /// The original dispatch prompt (row title).
+    pub title: String,
+    /// Whether the session's goal should keep auto-driving.
+    pub goal_active: bool,
+    pub goal_done: usize,
+    pub goal_total: usize,
 }
 
 /// A resumable fleet session, as shown by `/fleet status`.
@@ -466,6 +490,9 @@ pub(crate) struct App {
     pub(crate) fleet: Vec<crate::dashboard::FleetRow>,
     /// Monotonic display id for fleet rows (never reused within a session).
     pub(crate) fleet_next_id: usize,
+    /// Handle to the `/loop` manager (timers + firings run in a background
+    /// task; results drain into the transcript on UI ticks).
+    pub(crate) loops: Option<crate::loops::LoopsHandle>,
     /// Cumulative session token usage (input, output), mirrored from the agent
     /// so the working line and `/tokens` can show it live while a turn runs.
     pub(crate) usage: (u64, u64),

@@ -24,13 +24,17 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Install test system deps
         # aria2c is exercised by hi-tools' HuggingFace download tests.
         run: sudo apt-get update && sudo apt-get install -y aria2
       - name: Format
         run: cargo fmt --all --check
+      - name: Clippy (core crates)
+        # GPU crates (hi-cuda/hi-local/hi-mlx) are excluded so in-flight kernel
+        # work isn't blocked by lint churn; the core crates stay warning-free.
+        run: cargo clippy -p hi-agent -p hi-ai -p hi-tools -p hi-tui -p hi -p hi-eval -- -D warnings
       - name: Test
         run: cargo test --workspace --exclude hi-mlx
 

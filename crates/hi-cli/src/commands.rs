@@ -257,6 +257,11 @@ pub(crate) fn handle_command(
         Command::Delegate(arg) => {
             handle_delegate_command(agent, &arg);
         }
+        Command::Loop(_) => {
+            println!(
+                "\x1b[33m/loop is only available in the full-screen TUI (run hi without --plain)\x1b[0m"
+            );
+        }
         Command::Dashboard(arg) => match arg.trim() {
             "status" | "sessions" | "ls" => {
                 let sessions = crate::session::fleet_sessions();

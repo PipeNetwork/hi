@@ -164,6 +164,13 @@ pub async fn run(
         }
     });
     let mut ticker = tokio::time::interval(TICK);
+    // The /loop manager: timers + firings in a background task (it never
+    // touches the Agent); persisted loops re-arm now. Results drain on ticks.
+    let fleet_launcher = std::sync::Arc::new(fleet_launcher);
+    app.loops = Some(crate::loops::start(
+        fleet_launcher.clone(),
+        fleet_launcher.loops_file.clone(),
+    ));
     // Startup metadata fetch: race the live `/models` fetch against the first
     // keystroke, with a spinner ticking and the screen redrawing each tick so
     // the UI never looks stalled. The on-disk cache already applied instantly
@@ -231,7 +238,15 @@ pub async fn run(
                                 }
                             }
                         } else {
-                            input_rx.recv().await
+                            tokio::select! {
+                                maybe = input_rx.recv() => maybe,
+                                _ = ticker.tick() => {
+                                    // Loop firings land while you're idle too.
+                                    app.spinner = app.spinner.wrapping_add(1);
+                                    app.drain_loops();
+                                    continue 'input;
+                                }
+                            }
                         };
                         let Some(event) = event else { break 'session };
                         event
@@ -962,6 +977,105 @@ pub async fn run(
                     }
                     continue;
                 }
+                // `/loop`: recurring agent turns on a cadence (manager task).
+                Command::Loop(arg) => {
+                    match command::parse_loop_arg(&arg) {
+                        command::LoopArg::Create { secs, prompt } => {
+                            if let Some(loops) = &app.loops {
+                                let (tx, rx) = tokio::sync::oneshot::channel();
+                                let _ = loops.ctl.send(crate::loops::LoopCtl::Create {
+                                    secs,
+                                    prompt: prompt.clone(),
+                                    reply: tx,
+                                });
+                                match rx.await {
+                                    Ok(Ok(spec)) => {
+                                        app.push(Line::styled(
+                                            format!(
+                                                "✓ loop#{} armed — every {}, expires in 7d, firing now: {}",
+                                                spec.id,
+                                                crate::loops::humanize_secs(spec.interval_secs),
+                                                spec.name(),
+                                            ),
+                                            Style::default().fg(Color::Green),
+                                        ));
+                                    }
+                                    Ok(Err(err)) => {
+                                        app.push(Line::styled(
+                                            err,
+                                            Style::default().fg(Color::Yellow),
+                                        ));
+                                    }
+                                    Err(_) => {}
+                                }
+                            }
+                        }
+                        command::LoopArg::Cancel(id) => {
+                            if let Some(loops) = &app.loops {
+                                let (tx, rx) = tokio::sync::oneshot::channel();
+                                let _ = loops
+                                    .ctl
+                                    .send(crate::loops::LoopCtl::Cancel { id, reply: tx });
+                                let msg = match rx.await {
+                                    Ok(true) => (format!("✓ loop#{id} cancelled"), Color::Green),
+                                    _ => (
+                                        format!("no loop#{id} — /loop list shows ids"),
+                                        Color::Yellow,
+                                    ),
+                                };
+                                app.push(Line::styled(msg.0, Style::default().fg(msg.1)));
+                            }
+                        }
+                        command::LoopArg::List => {
+                            if let Some(loops) = &app.loops {
+                                let (tx, rx) = tokio::sync::oneshot::channel();
+                                let _ = loops.ctl.send(crate::loops::LoopCtl::List { reply: tx });
+                                if let Ok(specs) = rx.await {
+                                    if specs.is_empty() {
+                                        app.push(Line::styled(
+                                            "no active loops — /loop <interval> <prompt> to arm one"
+                                                .to_string(),
+                                            dim(),
+                                        ));
+                                    } else {
+                                        app.push(Line::styled(
+                                            format!("active loops ({}):", specs.len()),
+                                            Style::default()
+                                                .fg(Color::Cyan)
+                                                .add_modifier(ratatui::style::Modifier::BOLD),
+                                        ));
+                                        let now = std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .map(|d| d.as_millis() as u64)
+                                            .unwrap_or(0);
+                                        for l in specs {
+                                            let due_in = l.next_ms.saturating_sub(now) / 1000;
+                                            let expires_h =
+                                                l.expires_ms.saturating_sub(now) / 3_600_000;
+                                            app.push(Line::styled(
+                                                format!(
+                                                    "  #{} every {} · next in {}s · {} firing(s) · expires {}h · {}",
+                                                    l.id,
+                                                    crate::loops::humanize_secs(l.interval_secs),
+                                                    due_in,
+                                                    l.firings,
+                                                    expires_h,
+                                                    l.name(),
+                                                ),
+                                                dim(),
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        command::LoopArg::Invalid(msg) => {
+                            app.push(Line::styled(msg, Style::default().fg(Color::Yellow)));
+                        }
+                    }
+                    app.follow();
+                    continue;
+                }
                 // `/dashboard`: the fleet screen — dispatch, monitor, and steer
                 // multiple concurrent agent sessions. Runs its own select! loop
                 // over the same terminal/input/ticker; rows persist on `app.fleet`.
@@ -975,8 +1089,39 @@ pub async fn run(
                                 &mut ticker,
                                 &mut app,
                                 &fleet_launcher,
+                                None,
                             )
                             .await?;
+                        }
+                        // `/fleet resume [id]`: re-adopt a past fleet session as
+                        // a live row (most recent when no id) and open the fleet.
+                        resume if resume == "resume" || resume.starts_with("resume ") => {
+                            let id = resume.strip_prefix("resume").unwrap_or("").trim();
+                            match (fleet_launcher.resume_info)(id) {
+                                Some(info) => {
+                                    crate::dashboard::run_dashboard(
+                                        &mut terminal,
+                                        &mut input_rx,
+                                        &mut ticker,
+                                        &mut app,
+                                        &fleet_launcher,
+                                        Some(info),
+                                    )
+                                    .await?;
+                                }
+                                None => {
+                                    app.push(Line::styled(
+                                        if id.is_empty() {
+                                            "no fleet sessions to resume — /dashboard to dispatch some"
+                                                .to_string()
+                                        } else {
+                                            format!("no fleet session '{id}' — see /fleet status")
+                                        },
+                                        dim(),
+                                    ));
+                                    app.follow();
+                                }
+                            }
                         }
                         "status" | "sessions" | "ls" => {
                             let sessions = (fleet_launcher.sessions)();
@@ -1330,6 +1475,7 @@ async fn drive(
             }
             _ = ticker.tick() => {
                 app.spinner = app.spinner.wrapping_add(1);
+                app.drain_loops();
                 let idle = last_activity.elapsed();
                 app.waiting_for = Some(idle);
                 // Only notify about a quiet backend while no tool is legitimately

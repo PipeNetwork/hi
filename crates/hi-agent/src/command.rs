@@ -73,6 +73,9 @@ pub enum Command {
     /// concurrent agent sessions from one screen (TUI only). Arg: empty opens
     /// the dashboard; `status` lists this project's resumable fleet sessions.
     Dashboard(String),
+    /// Recurring agent turns on a cadence (TUI only): `<interval> <prompt>`
+    /// creates, empty/`list` lists, `cancel <id>` stops one.
+    Loop(String),
     Quit,
     /// A `/word` that isn't recognized.
     Unknown(String),
@@ -124,6 +127,7 @@ pub fn parse(line: &str) -> Option<Command> {
         "lsp" => Command::Lsp(arg),
         "delegate" | "delegates" => Command::Delegate(arg),
         "dashboard" | "fleet" => Command::Dashboard(arg),
+        "loop" | "loops" => Command::Loop(arg),
         "exit" | "quit" | "q" => Command::Quit,
         other => Command::Unknown(other.to_string()),
     })
@@ -146,6 +150,74 @@ pub fn goal_arg_is_objective(arg: &str) -> bool {
         || matches!(a, "clear" | "off" | "none" | "pause" | "resume")
         || a == "limit"
         || a.starts_with("limit "))
+}
+
+/// Parse a loop interval like `60s`, `90s`, `30m`, `2h`, `1d` into seconds.
+/// Bounds: 60 seconds to 7 days. Bare numbers are seconds.
+pub fn parse_loop_interval(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (num, unit) = match s.chars().last() {
+        Some(c) if c.is_ascii_digit() => (s, "s"),
+        Some('s') => (&s[..s.len() - 1], "s"),
+        Some('m') => (&s[..s.len() - 1], "m"),
+        Some('h') => (&s[..s.len() - 1], "h"),
+        Some('d') => (&s[..s.len() - 1], "d"),
+        _ => return None,
+    };
+    let n: u64 = num.parse().ok()?;
+    let secs = n.checked_mul(match unit {
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
+        _ => 1,
+    })?;
+    (60..=7 * 86_400).contains(&secs).then_some(secs)
+}
+
+/// The parsed form of a `/loop` argument.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LoopArg {
+    /// Empty or `list` — show active loops.
+    List,
+    /// `cancel <id>`.
+    Cancel(u64),
+    /// `<interval> <prompt>` — create a loop firing `prompt` every `secs`.
+    Create { secs: u64, prompt: String },
+    /// Anything unparseable (bad interval / missing prompt / bad id).
+    Invalid(String),
+}
+
+/// Split a `/loop` argument into its subcommand form.
+pub fn parse_loop_arg(arg: &str) -> LoopArg {
+    let a = arg.trim();
+    if a.is_empty() || a == "list" || a == "ls" || a == "status" {
+        return LoopArg::List;
+    }
+    if let Some(rest) = a.strip_prefix("cancel") {
+        let rest = rest.trim().trim_start_matches('#');
+        return match rest.parse() {
+            Ok(id) => LoopArg::Cancel(id),
+            Err(_) => LoopArg::Invalid(format!("bad loop id '{rest}' — /loop list shows ids")),
+        };
+    }
+    let Some((head, prompt)) = a.split_once(char::is_whitespace) else {
+        return LoopArg::Invalid(
+            "usage: /loop <interval> <prompt> — e.g. /loop 30m check whether CI is green".into(),
+        );
+    };
+    match parse_loop_interval(head) {
+        Some(secs) if !prompt.trim().is_empty() => LoopArg::Create {
+            secs,
+            prompt: prompt.trim().to_string(),
+        },
+        Some(_) => LoopArg::Invalid("missing prompt after the interval".into()),
+        None => LoopArg::Invalid(format!(
+            "bad interval '{head}' — use 60s..7d (e.g. 90s, 30m, 2h, 1d)"
+        )),
+    }
 }
 
 /// The parsed value of a `/goal limit …` subcommand.
@@ -472,9 +544,24 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "dashboard",
-        args: "[status]",
+        args: "[status|resume <id>]",
         help: "control a fleet: dispatch, monitor, and steer multiple agents (TUI)",
-        arg_values: &[("status", "list this project's resumable fleet sessions")],
+        arg_values: &[
+            ("status", "list this project's resumable fleet sessions"),
+            (
+                "resume",
+                "re-adopt a fleet session as a live row (most recent if no id)",
+            ),
+        ],
+    },
+    CommandSpec {
+        name: "loop",
+        args: "[<interval> <prompt>|list|cancel <id>]",
+        help: "recurring agent turns on a cadence (60s..7d; auto-expire after 7 days)",
+        arg_values: &[
+            ("list", "show active loops"),
+            ("cancel", "stop a loop by id: /loop cancel <id>"),
+        ],
     },
     CommandSpec {
         name: "status",
@@ -785,6 +872,46 @@ mod tests {
             parse("/cost"),
             Some(Command::Removed(m)) if m.contains("removed")
         ));
+    }
+
+    #[test]
+    fn loop_interval_and_arg_parsing() {
+        use super::{LoopArg, parse_loop_arg, parse_loop_interval};
+        // Units + bounds (60s..7d), bare number = seconds.
+        assert_eq!(parse_loop_interval("60s"), Some(60));
+        assert_eq!(parse_loop_interval("90"), Some(90));
+        assert_eq!(parse_loop_interval("30m"), Some(1800));
+        assert_eq!(parse_loop_interval("2h"), Some(7200));
+        assert_eq!(parse_loop_interval("1d"), Some(86_400));
+        assert_eq!(parse_loop_interval("7d"), Some(7 * 86_400));
+        assert_eq!(parse_loop_interval("59s"), None, "below the 60s floor");
+        assert_eq!(parse_loop_interval("8d"), None, "above the 7d ceiling");
+        assert_eq!(parse_loop_interval("2w"), None);
+        assert_eq!(parse_loop_interval(""), None);
+        // Arg splitting.
+        assert_eq!(parse_loop_arg(""), LoopArg::List);
+        assert_eq!(parse_loop_arg("list"), LoopArg::List);
+        assert_eq!(parse_loop_arg("cancel 3"), LoopArg::Cancel(3));
+        assert_eq!(parse_loop_arg("cancel #3"), LoopArg::Cancel(3));
+        assert_eq!(
+            parse_loop_arg("30m watch the CI logs"),
+            LoopArg::Create {
+                secs: 1800,
+                prompt: "watch the CI logs".into()
+            }
+        );
+        assert!(matches!(parse_loop_arg("30m"), LoopArg::Invalid(_)));
+        assert!(matches!(
+            parse_loop_arg("fast check ci"),
+            LoopArg::Invalid(_)
+        ));
+        assert!(matches!(parse_loop_arg("cancel abc"), LoopArg::Invalid(_)));
+        // Command parse.
+        assert_eq!(parse("/loop"), Some(Command::Loop(String::new())));
+        assert_eq!(
+            parse("/loop 30m check ci"),
+            Some(Command::Loop("30m check ci".into()))
+        );
     }
 
     #[test]
