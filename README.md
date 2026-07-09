@@ -224,10 +224,12 @@ another `hi -p "…"` to kick off a fix. `/loop on 3 off` clears it. (The comman
 with your shell's privileges — treat it like a git hook.)
 
 **Digest — what changed while you were away.** Loops write every loud event (a change they found, a
-budget pause, an expiry) to a per-project activity feed that survives restarts. `/digest` shows it
-grouped by loop — how many changes each noticed and the most recent, with a `•` on everything new
-since you last looked. Start `hi` after leaving loops running and you'll see a one-line
-`⟳ N loop change(s) since you last looked — /digest to review` nudge.
+budget pause, an expiry) to a per-project activity feed that survives restarts — and so do **fleet
+rows** (verified merges, combined-tree verify failures, goal completions). `/digest` shows the feed
+grouped by source (each loop, each fleet row) — how many changes each produced and the most recent,
+with a `•` on everything new since you last looked. Start `hi` after leaving work running and you'll
+see a one-line `⟳ N loop change(s) since you last looked — /digest to review` nudge. It's one pane
+for everything autonomous that happened.
 
 ## Sessions
 

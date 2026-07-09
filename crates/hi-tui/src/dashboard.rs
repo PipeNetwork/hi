@@ -882,6 +882,7 @@ fn finish_turn(
                 .is_some_and(|g| !g.active && g.done == g.total)
         {
             row.push_line("◎ goal complete".to_string());
+            record_fleet(launcher, row.id, &row.title, "goal complete");
         }
     }
     if killed {
@@ -928,6 +929,27 @@ fn finish_turn(
 
 /// The merge check landed: auto-merge when clean, hold when it overlaps other
 /// rows' unmerged-or-merged files, then start any queued follow-up.
+/// Record a notable fleet event (a verified merge, a combined-tree verify
+/// failure, a goal completion) to the shared activity feed, so `/digest` is one
+/// pane for every autonomous producer — loops, fleet rows, and goal drives.
+fn record_fleet(launcher: &FleetLauncher, id: usize, title: &str, text: &str) {
+    if let Some(lf) = &launcher.loops_file {
+        let at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        crate::activity::append(
+            &crate::activity::activity_path(lf),
+            &crate::activity::ActivityEntry {
+                at_ms,
+                loop_id: 0,
+                source: format!("fleet#{id} {}", truncate_title(title, 40)),
+                text: text.to_string(),
+            },
+        );
+    }
+}
+
 fn finish_merge_check(
     app: &mut App,
     idx: usize,
@@ -981,6 +1003,16 @@ fn finish_merge_check(
                     row.changed.len(),
                     row.changed.join(", ")
                 ));
+                record_fleet(
+                    launcher,
+                    row.id,
+                    &row.title,
+                    &format!(
+                        "merged {} file(s): {}",
+                        row.changed.len(),
+                        row.changed.join(", ")
+                    ),
+                );
                 mark_others_stale(app, idx);
                 // Post-merge, off the render thread: verify the *combined* real
                 // tree (a diff can pass in its worktree yet break the combine),
@@ -1067,6 +1099,12 @@ fn finish_post_verify(
     }
     if verify_ok == Some(false) {
         row.push_line("⚠ combined-tree verify failed after merge — inspect your tree".to_string());
+        record_fleet(
+            launcher,
+            row.id,
+            &row.title,
+            "combined-tree verify failed after merge — inspect your tree",
+        );
         flag_attention(app, idx);
     }
     continue_row(app, idx, launcher, line_tx, in_flight);

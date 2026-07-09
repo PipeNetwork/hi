@@ -1345,10 +1345,7 @@ pub async fn run(
                                     String::new()
                                 };
                                 app.push(Line::styled(
-                                    format!(
-                                        "  loop#{} {} — {} change(s){}",
-                                        g.loop_id, g.source, g.count, fresh_note
-                                    ),
+                                    format!("  {} — {} change(s){}", g.source, g.count, fresh_note),
                                     Style::default().add_modifier(ratatui::style::Modifier::BOLD),
                                 ));
                                 for (at, text, is_fresh) in &g.recent {

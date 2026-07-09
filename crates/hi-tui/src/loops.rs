@@ -395,7 +395,12 @@ async fn manager(
         let mut fired = false;
         state.loops.retain(|l| {
             if l.expires_ms <= now {
-                record(activity, l.id, &l.name(), "expired after 7 days");
+                record(
+                    activity,
+                    l.id,
+                    &format!("loop#{} {}", l.id, l.name()),
+                    "expired after 7 days",
+                );
                 pending.lock().unwrap().push((
                     format!("⟳ loop#{} ({}) expired after 7 days", l.id, l.name()),
                     true,
@@ -608,7 +613,7 @@ async fn manager(
                                 fmt_tokens(spent),
                                 fmt_tokens(budget),
                             );
-                            record(activity, id, &name, &msg);
+                            record(activity, id, &format!("loop#{id} {name}"), &msg);
                             budget_line = Some((format!("⏸ loop#{id} ({name}) {msg}"), true));
                         }
                     }
@@ -618,7 +623,7 @@ async fn manager(
                 // it to the activity feed and run the loop's on-change trigger.
                 let loud_change = tokens.is_some() && !quiet;
                 if loud_change {
-                    record(activity, id, &name, &summary);
+                    record(activity, id, &format!("loop#{id} {name}"), &summary);
                 }
                 if loud_change
                     && let Some(cmd) = state
