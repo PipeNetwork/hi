@@ -203,91 +203,104 @@ mod native {
             rows: c_int,
             cols: c_int,
             stream: *mut c_void,
-        ) -> c_int;        fn hi_cuda_launch_q4_k_gemv(
+        ) -> c_int;
+        fn hi_cuda_launch_q4_k_gemv(
             weights: *const c_void,
             x: *const c_void,
             output: *mut c_void,
             rows: c_int,
             cols: c_int,
             stream: *mut c_void,
-        ) -> c_int;        fn hi_cuda_launch_q5_k_gemv(
+        ) -> c_int;
+        fn hi_cuda_launch_q5_k_gemv(
             weights: *const c_void,
             x: *const c_void,
             output: *mut c_void,
             rows: c_int,
             cols: c_int,
             stream: *mut c_void,
-        ) -> c_int;        fn hi_cuda_launch_q3_k_gemv(
+        ) -> c_int;
+        fn hi_cuda_launch_q3_k_gemv(
             weights: *const c_void,
             x: *const c_void,
             output: *mut c_void,
             rows: c_int,
             cols: c_int,
             stream: *mut c_void,
-        ) -> c_int;        fn hi_cuda_launch_q2_k_gemv(
+        ) -> c_int;
+        fn hi_cuda_launch_q2_k_gemv(
             weights: *const c_void,
             x: *const c_void,
             output: *mut c_void,
             rows: c_int,
             cols: c_int,
             stream: *mut c_void,
-        ) -> c_int;        fn hi_cuda_launch_iq4_nl_gemv(
+        ) -> c_int;
+        fn hi_cuda_launch_iq4_nl_gemv(
             weights: *const c_void,
             x: *const c_void,
             output: *mut c_void,
             rows: c_int,
             cols: c_int,
             stream: *mut c_void,
-        ) -> c_int;        fn hi_cuda_launch_iq4_xs_gemv(
+        ) -> c_int;
+        fn hi_cuda_launch_iq4_xs_gemv(
             weights: *const c_void,
             x: *const c_void,
             output: *mut c_void,
             rows: c_int,
             cols: c_int,
             stream: *mut c_void,
-        ) -> c_int;        fn hi_cuda_launch_iq3_s_gemv(
+        ) -> c_int;
+        fn hi_cuda_launch_iq3_s_gemv(
             weights: *const c_void,
             x: *const c_void,
             output: *mut c_void,
             rows: c_int,
             cols: c_int,
             stream: *mut c_void,
-        ) -> c_int;        fn hi_cuda_launch_iq2_xxs_gemv(
+        ) -> c_int;
+        fn hi_cuda_launch_iq2_xxs_gemv(
             weights: *const c_void,
             x: *const c_void,
             output: *mut c_void,
             rows: c_int,
             cols: c_int,
             stream: *mut c_void,
-        ) -> c_int;        fn hi_cuda_launch_iq2_s_gemv(
+        ) -> c_int;
+        fn hi_cuda_launch_iq2_s_gemv(
             weights: *const c_void,
             x: *const c_void,
             output: *mut c_void,
             rows: c_int,
             cols: c_int,
             stream: *mut c_void,
-        ) -> c_int;        fn hi_cuda_launch_iq2_xs_gemv(
+        ) -> c_int;
+        fn hi_cuda_launch_iq2_xs_gemv(
             weights: *const c_void,
             x: *const c_void,
             output: *mut c_void,
             rows: c_int,
             cols: c_int,
             stream: *mut c_void,
-        ) -> c_int;        fn hi_cuda_launch_iq1_s_gemv(
+        ) -> c_int;
+        fn hi_cuda_launch_iq1_s_gemv(
             weights: *const c_void,
             x: *const c_void,
             output: *mut c_void,
             rows: c_int,
             cols: c_int,
             stream: *mut c_void,
-        ) -> c_int;        fn hi_cuda_launch_iq1_m_gemv(
+        ) -> c_int;
+        fn hi_cuda_launch_iq1_m_gemv(
             weights: *const c_void,
             x: *const c_void,
             output: *mut c_void,
             rows: c_int,
             cols: c_int,
             stream: *mut c_void,
-        ) -> c_int;        fn hi_cuda_launch_iq3_xxs_gemv(
+        ) -> c_int;
+        fn hi_cuda_launch_iq3_xxs_gemv(
             weights: *const c_void,
             x: *const c_void,
             output: *mut c_void,
