@@ -87,6 +87,20 @@ pub struct FleetLauncher {
     pub max_steps: u32,
     /// Allocates a unique session file for a new fleet row (collision-safe).
     pub session_path: Box<dyn Fn() -> Result<std::path::PathBuf> + Send + Sync>,
+    /// Lists this project's resumable fleet sessions (`/fleet status`).
+    pub sessions: Box<dyn Fn() -> Vec<FleetSessionInfo> + Send + Sync>,
+}
+
+/// A resumable fleet session, as shown by `/fleet status`.
+pub struct FleetSessionInfo {
+    /// The `--resume` id.
+    pub id: String,
+    /// The row's dispatch prompt (cleaned first user message).
+    pub title: String,
+    /// Humanized age ("3m ago").
+    pub age: String,
+    /// Session length in lines.
+    pub lines: usize,
 }
 
 /// A callback that persists the `/hf run --mlx` profile and returns a built

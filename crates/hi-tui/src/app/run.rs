@@ -965,15 +965,67 @@ pub async fn run(
                 // `/dashboard`: the fleet screen — dispatch, monitor, and steer
                 // multiple concurrent agent sessions. Runs its own select! loop
                 // over the same terminal/input/ticker; rows persist on `app.fleet`.
-                Command::Dashboard => {
-                    crate::dashboard::run_dashboard(
-                        &mut terminal,
-                        &mut input_rx,
-                        &mut ticker,
-                        &mut app,
-                        &fleet_launcher,
-                    )
-                    .await?;
+                // `/fleet status` lists this project's resumable fleet sessions.
+                Command::Dashboard(arg) => {
+                    match arg.trim() {
+                        "" => {
+                            crate::dashboard::run_dashboard(
+                                &mut terminal,
+                                &mut input_rx,
+                                &mut ticker,
+                                &mut app,
+                                &fleet_launcher,
+                            )
+                            .await?;
+                        }
+                        "status" | "sessions" | "ls" => {
+                            let sessions = (fleet_launcher.sessions)();
+                            if sessions.is_empty() {
+                                app.push(Line::styled(
+                                    "no fleet sessions in this project yet — /dashboard to dispatch some"
+                                        .to_string(),
+                                    dim(),
+                                ));
+                            } else {
+                                app.push(Line::styled(
+                                    format!("fleet sessions ({}):", sessions.len()),
+                                    Style::default()
+                                        .fg(Color::Magenta)
+                                        .add_modifier(ratatui::style::Modifier::BOLD),
+                                ));
+                                for s in sessions.iter().take(20) {
+                                    app.push(Line::styled(
+                                        format!(
+                                            "  {}  {:>8} · {:>4} lines · {}",
+                                            s.id,
+                                            s.age,
+                                            s.lines,
+                                            crate::dashboard::truncate_title(&s.title, 56),
+                                        ),
+                                        dim(),
+                                    ));
+                                }
+                                if sessions.len() > 20 {
+                                    app.push(Line::styled(
+                                        format!("  … +{} more", sessions.len() - 20),
+                                        dim(),
+                                    ));
+                                }
+                                app.push(Line::styled(
+                                    "resume one with: hi --resume <id>".to_string(),
+                                    dim(),
+                                ));
+                            }
+                            app.follow();
+                        }
+                        other => {
+                            app.push(Line::styled(
+                                format!("unknown /fleet subcommand '{other}' — try /fleet status"),
+                                dim(),
+                            ));
+                            app.follow();
+                        }
+                    }
                     continue;
                 }
                 // `/goal <objective>`: decompose with the planner behind a spinner
