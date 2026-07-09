@@ -1,0 +1,51 @@
+# hi configuration. Profiles let you keep several endpoints on hand and pick
+# one with `hi -p <name>`. See crates/hi-cli/src/config.rs for all fields.
+
+# Used when `hi` is run with no -p flag. Having this set is what stops the
+# interactive setup wizard ("config builder") from firing on a bare `hi`.
+default_profile = "local"
+
+# Local Qwen2.5-0.5B served by `hi-local` on the GPU (CUDA backend):
+#   hi-local serve --backend cuda --execution gpu --port 8080 \
+#     --model-id qwen2.5-0.5b ~/.hi/models/qwen2.5-0.5b-instruct-q4_0.gguf
+#
+# Then talk to it with:  hi -p local "your prompt"
+[profiles.local]
+provider = "ollama"                     # OpenAI-compatible wire format; no API key needed
+model = "qwen2.5-0.5b"                   # must match hi-local's --model-id
+base_url = "http://127.0.0.1:8080/v1"
+max_tokens = 2048                        # the model advertises max_output_tokens 2048
+tool_mode = "chat-only"                  # a 0.5B model isn't reliable at tool-calling
+
+# Local Qwen2.5-Coder-1.5B (Q8_0, ~1.6 GB) — the size that actually runs on this
+# 8 GB card with the hi-cuda backend, which is VRAM-hungry:
+#   * it keeps TWO resident copies of the weights (raw quantized tensors +
+#     normalized matrices), ~2x the file size, and
+#   * at generation time it dequantizes weight matrices to f32 scratch on-device.
+# Net: a 3B (~2.4 GB file -> ~5.1 GB resident) leaves too little for the f32
+# scratch and OOMs mid-generation; a 7B OOMs at load. 1.5B fits with headroom.
+#   hi-local serve --backend cuda --execution gpu --port 8080 \
+#     --model-id qwen2.5-coder-1.5b --max-batch-size 1 --max-batched-tokens 2048 \
+#     --kv-cache-mode legacy ~/.hi/models/qwen2.5-coder-1.5b-instruct-q8_0.gguf
+#
+# Then:  hi -p coder-1_5b "your prompt"   (TOML key can't contain a dot)
+[profiles.coder-1_5b]
+provider = "ollama"
+model = "qwen2.5-coder-1.5b"             # must match hi-local's --model-id
+base_url = "http://127.0.0.1:8080/v1"
+max_tokens = 2048
+tool_mode = "auto"                       # small but can drive simple tool calls
+
+# Local Qwen2.5-Coder-3B (Q6_K, ~2.4 GB) — now runs on the 8 GB card thanks to
+# the single-resident weights + auto FP16 weights + last-row prefill logits +
+# FP16 paged KV. Serve with:
+#   HI_CUDA_PREFIX_CACHE=1 hi-local serve --backend cuda --execution gpu \
+#     --port 8080 --model-id qwen2.5-coder-3b --max-batch-size 1 \
+#     --max-batched-tokens 8192 --kv-cache-mode paged \
+#     ~/.hi/models/qwen2.5-coder-3b-instruct-q6_k.gguf
+[profiles.coder-3b]
+provider = "ollama"
+model = "qwen2.5-coder-3b"               # must match hi-local's --model-id
+base_url = "http://127.0.0.1:8080/v1"
+max_tokens = 2048
+tool_mode = "auto"
