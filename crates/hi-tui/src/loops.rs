@@ -28,6 +28,8 @@ use crate::FleetLauncher;
 pub(crate) const LOOP_TTL_SECS: u64 = 7 * 86_400;
 /// A single firing is killed after this long (a watcher turn should be quick).
 const FIRING_TIMEOUT_SECS: u64 = 600;
+/// An on-change trigger command is killed after this long.
+const TRIGGER_TIMEOUT_SECS: u64 = 60;
 /// Max simultaneously-armed loops per project.
 const MAX_LOOPS: usize = 8;
 /// The marker a firing replies with when nothing changed since the last check.
@@ -58,6 +60,10 @@ pub(crate) struct LoopSpec {
     /// child's `--report`). Persisted so the cost survives a restart.
     #[serde(default)]
     pub(crate) spent_tokens: u64,
+    /// Optional shell command run (via `sh -c`) after a firing reports a real
+    /// change — a watcher that also *responds*. Off unless explicitly set.
+    #[serde(default)]
+    pub(crate) trigger: Option<String>,
 }
 
 impl LoopSpec {
@@ -108,6 +114,10 @@ pub(crate) struct LoopWatchRow {
     pub(crate) paused: bool,
     pub(crate) token_budget: Option<u64>,
     pub(crate) spent_tokens: u64,
+    /// The configured on-change command, if any.
+    pub(crate) trigger: Option<String>,
+    /// The outcome of the most recent trigger run (for the peek).
+    pub(crate) last_trigger: Option<String>,
     pub(crate) last_summary: Option<String>,
     pub(crate) last_quiet: bool,
     pub(crate) last_fired_ms: u64,
@@ -122,6 +132,8 @@ struct LoopRuntime {
     last_summary: Option<String>,
     last_quiet: bool,
     last_fired_ms: u64,
+    /// Outcome of the most recent on-change trigger run.
+    last_trigger: Option<String>,
     history: VecDeque<HistItem>,
 }
 
@@ -155,6 +167,12 @@ pub(crate) enum LoopCtl {
     Budget {
         id: u64,
         tokens: Option<u64>,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Set (`Some`) or clear (`None`) a loop's on-change trigger command.
+    Trigger {
+        id: u64,
+        cmd: Option<String>,
         reply: oneshot::Sender<bool>,
     },
     List {
@@ -290,6 +308,8 @@ fn publish(
                 paused: l.paused,
                 token_budget: l.token_budget,
                 spent_tokens: l.spent_tokens,
+                trigger: l.trigger.clone(),
+                last_trigger: rt.and_then(|r| r.last_trigger.clone()),
                 last_summary: rt.and_then(|r| r.last_summary.clone()),
                 last_quiet: rt.is_some_and(|r| r.last_quiet),
                 last_fired_ms: rt.map_or(0, |r| r.last_fired_ms),
@@ -343,6 +363,8 @@ async fn manager(
 
     // Firings in flight: (loop id, outcome) results come back over a channel.
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<(u64, Result<FiringOutcome, String>)>();
+    // On-change trigger runs report their outcome line over this channel.
+    let (trig_tx, mut trig_rx) = mpsc::unbounded_channel::<(u64, String)>();
     let mut in_flight: usize = 0;
 
     loop {
@@ -424,6 +446,7 @@ async fn manager(
                                         paused: false,
                                         token_budget: None,
                                         spent_tokens: 0,
+                                        trigger: None,
                                     };
                                     state.loops.push(spec.clone());
                                     save(loops_file.as_deref(), &state);
@@ -503,6 +526,20 @@ async fn manager(
                         }
                         let _ = reply.send(ok);
                     }
+                    LoopCtl::Trigger { id, cmd, reply } => {
+                        let mut ok = false;
+                        for l in &mut state.loops {
+                            if l.id == id {
+                                l.trigger = cmd.clone();
+                                ok = true;
+                            }
+                        }
+                        if ok {
+                            save(loops_file.as_deref(), &state);
+                            publish(&state, &mut runtime, &snapshot);
+                        }
+                        let _ = reply.send(ok);
+                    }
                     LoopCtl::List { reply } => {
                         let _ = reply.send(state.loops.clone());
                     }
@@ -555,6 +592,23 @@ async fn manager(
                     }
                     save(loops_file.as_deref(), &state);
                 }
+                // On a genuine loud change (not quiet, not a firing error), run
+                // the loop's on-change trigger if it has one — the watcher acts.
+                let loud_change = tokens.is_some() && !quiet;
+                if loud_change
+                    && let Some(cmd) = state
+                        .loops
+                        .iter()
+                        .find(|l| l.id == id)
+                        .and_then(|l| l.trigger.clone())
+                {
+                    let trig = trig_tx.clone();
+                    let (name, summary) = (name.clone(), summary.clone());
+                    tokio::spawn(async move {
+                        let outcome = run_trigger(&cmd, id, &name, &summary).await;
+                        let _ = trig.send((id, outcome));
+                    });
+                }
                 // Record the runtime result for the /watch dashboard + history.
                 let rt = runtime.entry(id).or_default();
                 rt.firing = false;
@@ -569,6 +623,21 @@ async fn manager(
                 if let Some(bl) = budget_line {
                     pending.lock().unwrap().push(bl);
                 }
+                publish(&state, &mut runtime, &snapshot);
+            }
+            Some((id, outcome)) = trig_rx.recv() => {
+                let name = state
+                    .loops
+                    .iter()
+                    .find(|l| l.id == id)
+                    .map(LoopSpec::name)
+                    .unwrap_or_else(|| format!("#{id}"));
+                let failed = !outcome.starts_with("ok");
+                pending
+                    .lock()
+                    .unwrap()
+                    .push((format!("⚡ loop#{id} ({name}) trigger: {outcome}"), failed));
+                runtime.entry(id).or_default().last_trigger = Some(outcome);
                 publish(&state, &mut runtime, &snapshot);
             }
             _ = tokio::time::sleep(Duration::from_millis(sleep_ms)) => {}
@@ -670,6 +739,51 @@ fn read_report_tokens(path: &std::path::Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// Run a loop's on-change trigger via `sh -c`, passing the loop id/name and the
+/// firing's summary in the environment. Returns a compact outcome line — one of
+/// `ok`, `ok: <stdout>`, `exit N: <stderr>`, `timed out …`, or `failed …` — so
+/// the transcript and `/watch` can show whether the response actually ran.
+async fn run_trigger(cmd: &str, id: u64, name: &str, summary: &str) -> String {
+    let mut c = tokio::process::Command::new("sh");
+    c.arg("-c")
+        .arg(cmd)
+        .env("HI_LOOP_ID", id.to_string())
+        .env("HI_LOOP_NAME", name)
+        .env("HI_LOOP_SUMMARY", summary)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let first_line = |bytes: &[u8]| {
+        String::from_utf8_lossy(bytes)
+            .lines()
+            .find(|l| !l.trim().is_empty())
+            .map(|l| truncate(l.trim(), 100))
+            .unwrap_or_default()
+    };
+    match tokio::time::timeout(Duration::from_secs(TRIGGER_TIMEOUT_SECS), c.output()).await {
+        Ok(Ok(out)) if out.status.success() => {
+            let head = first_line(&out.stdout);
+            if head.is_empty() {
+                "ok".to_string()
+            } else {
+                format!("ok: {head}")
+            }
+        }
+        Ok(Ok(out)) => {
+            let code = out.status.code().unwrap_or(-1);
+            let err = first_line(&out.stderr);
+            if err.is_empty() {
+                format!("exit {code}")
+            } else {
+                format!("exit {code}: {err}")
+            }
+        }
+        Ok(Err(e)) => format!("failed to run: {e}"),
+        Err(_) => format!("timed out after {TRIGGER_TIMEOUT_SECS}s"),
+    }
+}
+
 fn load(path: Option<&std::path::Path>) -> LoopsFile {
     path.and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|t| serde_json::from_str(&t).ok())
@@ -712,6 +826,7 @@ mod tests {
             paused: false,
             token_budget: None,
             spent_tokens: 0,
+            trigger: None,
         }
     }
 
@@ -1018,6 +1133,101 @@ mod tests {
         assert!(rx.await.unwrap());
         wait_until(&handle, |rows| {
             rows.iter().find(|r| r.id == id).is_some_and(|r| !r.paused)
+        })
+        .await;
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A loud firing runs the loop's on-change trigger, with the firing summary
+    /// in `$HI_LOOP_SUMMARY`. (`/bin/echo` firings are loud — they never reply
+    /// the quiet marker.)
+    #[tokio::test]
+    async fn manager_runs_trigger_on_loud_change() {
+        let dir = std::env::temp_dir().join(format!("hi-watch-trig-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sess = dir.join("loop.jsonl");
+        let sentinel = dir.join("fired.txt");
+        let launcher = FleetLauncher {
+            exe: PathBuf::from("/bin/echo"),
+            provider: "p".into(),
+            model: "m".into(),
+            base_url: "u".into(),
+            api_key: "k".into(),
+            verify: None,
+            max_verify: 0,
+            max_steps: 30,
+            session_path: Box::new(|| Ok(PathBuf::from("/tmp/unused.jsonl"))),
+            sessions: Box::new(Vec::new),
+            resume_info: Box::new(|_| None),
+            loop_session_path: Box::new(move || Ok(sess.clone())),
+            loops_file: None,
+        };
+        let handle = start(Arc::new(launcher), None);
+
+        let (tx, rx) = oneshot::channel();
+        handle
+            .ctl
+            .send(LoopCtl::Create {
+                secs: 3600,
+                prompt: "watch the thing".into(),
+                reply: tx,
+            })
+            .unwrap();
+        let id = rx.await.unwrap().unwrap().id;
+        wait_until(&handle, |rows| {
+            rows.iter()
+                .find(|r| r.id == id)
+                .is_some_and(|r| !r.history.is_empty())
+        })
+        .await;
+
+        // Attach a trigger that records $HI_LOOP_SUMMARY, then fire.
+        let cmd = format!(
+            "printf '%s' \"$HI_LOOP_SUMMARY\" > '{}'",
+            sentinel.display()
+        );
+        let (tx, rx) = oneshot::channel();
+        handle
+            .ctl
+            .send(LoopCtl::Trigger {
+                id,
+                cmd: Some(cmd),
+                reply: tx,
+            })
+            .unwrap();
+        assert!(rx.await.unwrap());
+        let (tx, rx) = oneshot::channel();
+        handle.ctl.send(LoopCtl::FireNow { id, reply: tx }).unwrap();
+        assert!(rx.await.unwrap());
+
+        // The trigger runs and reports an ok outcome into the runtime.
+        wait_until(&handle, |rows| {
+            rows.iter()
+                .find(|r| r.id == id)
+                .and_then(|r| r.last_trigger.as_deref())
+                .is_some_and(|t| t.starts_with("ok"))
+        })
+        .await;
+        // …and it actually executed, receiving the summary via the environment.
+        let written = std::fs::read_to_string(&sentinel).unwrap_or_default();
+        assert!(!written.trim().is_empty(), "trigger wrote the summary");
+
+        // Clearing the trigger removes it from the snapshot.
+        let (tx, rx) = oneshot::channel();
+        handle
+            .ctl
+            .send(LoopCtl::Trigger {
+                id,
+                cmd: None,
+                reply: tx,
+            })
+            .unwrap();
+        assert!(rx.await.unwrap());
+        wait_until(&handle, |rows| {
+            rows.iter()
+                .find(|r| r.id == id)
+                .is_some_and(|r| r.trigger.is_none())
         })
         .await;
 

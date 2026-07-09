@@ -1069,14 +1069,17 @@ pub async fn run(
                                                 ),
                                                 None => String::new(),
                                             };
+                                            let trig =
+                                                if l.trigger.is_some() { " · ⚡" } else { "" };
                                             app.push(Line::styled(
                                                 format!(
-                                                    "  #{} every {} · {} · {} firing(s){} · expires {}h · {}",
+                                                    "  #{} every {} · {} · {} firing(s){}{} · expires {}h · {}",
                                                     l.id,
                                                     crate::loops::humanize_secs(l.interval_secs),
                                                     next,
                                                     l.firings,
                                                     cost,
+                                                    trig,
                                                     expires_h,
                                                     l.name(),
                                                 ),
@@ -1126,6 +1129,31 @@ pub async fn run(
                                     ),
                                     (Ok(true), None) => {
                                         (format!("✓ loop#{id} budget cleared"), Color::Green)
+                                    }
+                                    _ => (
+                                        format!("no loop#{id} — /loop list shows ids"),
+                                        Color::Yellow,
+                                    ),
+                                };
+                                app.push(Line::styled(msg.0, Style::default().fg(msg.1)));
+                            }
+                        }
+                        command::LoopArg::Trigger { id, cmd } => {
+                            if let Some(loops) = &app.loops {
+                                let (tx, rx) = tokio::sync::oneshot::channel();
+                                let set = cmd.is_some();
+                                let _ = loops.ctl.send(crate::loops::LoopCtl::Trigger {
+                                    id,
+                                    cmd,
+                                    reply: tx,
+                                });
+                                let msg = match (rx.await, set) {
+                                    (Ok(true), true) => (
+                                        format!("✓ loop#{id} will run its command on each change"),
+                                        Color::Green,
+                                    ),
+                                    (Ok(true), false) => {
+                                        (format!("✓ loop#{id} trigger cleared"), Color::Green)
                                     }
                                     _ => (
                                         format!("no loop#{id} — /loop list shows ids"),

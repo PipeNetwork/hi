@@ -275,6 +275,16 @@ async fn arm_from_compose(ctl: &mpsc::UnboundedSender<LoopCtl>, text: String) ->
                 _ => format!("no loop#{id}"),
             })
         }
+        hi_agent::command::LoopArg::Trigger { id, cmd } => {
+            let set = cmd.is_some();
+            let (tx, rx) = oneshot::channel();
+            let _ = ctl.send(LoopCtl::Trigger { id, cmd, reply: tx });
+            Some(match (rx.await, set) {
+                (Ok(true), true) => format!("loop#{id} on-change command set"),
+                (Ok(true), false) => format!("loop#{id} trigger cleared"),
+                _ => format!("no loop#{id}"),
+            })
+        }
         hi_agent::command::LoopArg::List => None,
         hi_agent::command::LoopArg::Invalid(msg) => Some(msg),
     }
@@ -437,7 +447,8 @@ fn render_table(frame: &mut ratatui::Frame, rows: &[LoopWatchRow], selected: usi
         } else {
             Style::default()
         };
-        lines.push(Line::from(vec![
+        // A ⚡ before the result marks a loop that runs an on-change command.
+        let mut spans = vec![
             Span::styled(
                 if sel { "▸ " } else { "  " },
                 Style::default().fg(Color::Cyan),
@@ -445,15 +456,19 @@ fn render_table(frame: &mut ratatui::Frame, rows: &[LoopWatchRow], selected: usi
             Span::styled(glyph, glyph_style),
             Span::styled(" ", row_style),
             Span::styled(body, row_style),
-            Span::styled(
-                last,
-                if sel {
-                    last_style.add_modifier(Modifier::BOLD)
-                } else {
-                    last_style
-                },
-            ),
-        ]));
+        ];
+        if row.trigger.is_some() {
+            spans.push(Span::styled("⚡ ", Style::default().fg(Color::Magenta)));
+        }
+        spans.push(Span::styled(
+            last,
+            if sel {
+                last_style.add_modifier(Modifier::BOLD)
+            } else {
+                last_style
+            },
+        ));
+        lines.push(Line::from(spans));
     }
 
     let block = Block::bordered()
@@ -527,6 +542,24 @@ fn render_peek(
         )),
     }
     lines.push(Line::from(status));
+    // On-change trigger command + its last outcome.
+    if let Some(cmd) = &row.trigger {
+        let mut trig = vec![
+            Span::styled("⚡ on change: ", Style::default().fg(Color::Magenta)),
+            Span::styled(truncate(cmd, 72), dim()),
+        ];
+        if let Some(out) = &row.last_trigger {
+            trig.push(Span::styled(
+                format!("  (last: {})", truncate(out, 40)),
+                if out.starts_with("ok") {
+                    dim()
+                } else {
+                    Style::default().fg(Color::Yellow)
+                },
+            ));
+        }
+        lines.push(Line::from(trig));
+    }
     lines.push(Line::raw(""));
 
     if row.firing {
@@ -586,7 +619,7 @@ fn render_hints(frame: &mut ratatui::Frame, focus: Focus, area: Rect) {
             "↑↓ select · f fire · p pause · c cancel · n arm · PgUp/Dn history · Esc close"
         }
         Focus::Compose => {
-            "type <interval> <prompt> (or pause|resume|budget <id> …) · Enter · Esc/Tab back"
+            "type <interval> <prompt> · pause|resume|budget|on <id> … · Enter · Esc/Tab back"
         }
     };
     frame.render_widget(
@@ -687,6 +720,8 @@ mod tests {
                 paused: false,
                 token_budget: Some(500_000),
                 spent_tokens: 123_000,
+                trigger: Some("notify-send 'CI red'".into()),
+                last_trigger: Some("ok".into()),
                 last_summary: Some("CI went red: 3 parser test failures".into()),
                 last_quiet: false,
                 last_fired_ms: now.saturating_sub(120_000),
@@ -716,6 +751,8 @@ mod tests {
                 paused: false,
                 token_budget: None,
                 spent_tokens: 0,
+                trigger: None,
+                last_trigger: None,
                 last_summary: None,
                 last_quiet: false,
                 last_fired_ms: 0,
@@ -750,6 +787,10 @@ mod tests {
         assert!(s.contains("CI went red"), "{s}");
         assert!(s.contains("nothing new"), "quiet history rendered\n{s}");
         assert!(s.contains("123k / 500k tokens"), "peek budget line\n{s}");
+        // The trigger loop shows ⚡ and its command in the peek.
+        assert!(s.contains("⚡"), "trigger marker\n{s}");
+        assert!(s.contains("on change:"), "peek trigger line\n{s}");
+        assert!(s.contains("notify-send"), "peek trigger command\n{s}");
         // List-focus hints.
         assert!(s.contains("p pause"), "hints show pause\n{s}");
     }
@@ -770,6 +811,8 @@ mod tests {
             paused: true,
             token_budget: Some(200_000),
             spent_tokens: 200_000,
+            trigger: None,
+            last_trigger: None,
             last_summary: Some("build still green".into()),
             last_quiet: true,
             last_fired_ms: now.saturating_sub(60_000),

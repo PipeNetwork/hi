@@ -213,6 +213,8 @@ pub enum LoopArg {
     Resume(u64),
     /// `budget <id> <count|off>` — set/clear a token spend cap (auto-pauses).
     Budget { id: u64, tokens: Option<u64> },
+    /// `on <id> <cmd|off>` — set/clear a shell command run when a firing is loud.
+    Trigger { id: u64, cmd: Option<String> },
     /// `<interval> <prompt>` — create a loop firing `prompt` every `secs`.
     Create { secs: u64, prompt: String },
     /// Anything unparseable (bad interval / missing prompt / bad id).
@@ -274,6 +276,25 @@ pub fn parse_loop_arg(arg: &str) -> LoopArg {
                 "bad token count '{amount}' — use e.g. 500k, 1.5m, or off"
             )),
         };
+    }
+    if a == "on" || a.starts_with("on ") {
+        let rest = a[2..].trim();
+        let Some((id_str, cmd)) = rest.split_once(char::is_whitespace) else {
+            return LoopArg::Invalid(
+                "usage: /loop on <id> <command>  (runs when a firing is loud; `off` clears)".into(),
+            );
+        };
+        let id = match parse_loop_id(id_str) {
+            Ok(id) => id,
+            Err(msg) => return LoopArg::Invalid(msg),
+        };
+        let cmd = cmd.trim();
+        let cmd = if matches!(cmd, "off" | "none" | "clear" | "") {
+            None
+        } else {
+            Some(cmd.to_string())
+        };
+        return LoopArg::Trigger { id, cmd };
     }
     let Some((head, prompt)) = a.split_once(char::is_whitespace) else {
         return LoopArg::Invalid(
@@ -1006,6 +1027,24 @@ mod tests {
             LoopArg::Invalid(_)
         ));
         assert!(matches!(parse_loop_arg("budget"), LoopArg::Invalid(_)));
+        // Triggers (`on <id> <cmd|off>`).
+        assert_eq!(
+            parse_loop_arg("on 3 notify-send hi"),
+            LoopArg::Trigger {
+                id: 3,
+                cmd: Some("notify-send hi".into())
+            }
+        );
+        assert_eq!(
+            parse_loop_arg("on 3 off"),
+            LoopArg::Trigger { id: 3, cmd: None }
+        );
+        assert!(matches!(parse_loop_arg("on"), LoopArg::Invalid(_)));
+        // `once …` must not be mistaken for an `on` trigger.
+        assert!(!matches!(
+            parse_loop_arg("once in a while check"),
+            LoopArg::Trigger { .. }
+        ));
         // Token-count parsing.
         assert_eq!(super::parse_token_count("500k"), Some(500_000));
         assert_eq!(super::parse_token_count("1.5m"), Some(1_500_000));
