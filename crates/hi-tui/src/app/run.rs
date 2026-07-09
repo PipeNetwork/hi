@@ -975,8 +975,39 @@ pub async fn run(
                                 &mut ticker,
                                 &mut app,
                                 &fleet_launcher,
+                                None,
                             )
                             .await?;
+                        }
+                        // `/fleet resume [id]`: re-adopt a past fleet session as
+                        // a live row (most recent when no id) and open the fleet.
+                        resume if resume == "resume" || resume.starts_with("resume ") => {
+                            let id = resume.strip_prefix("resume").unwrap_or("").trim();
+                            match (fleet_launcher.resume_info)(id) {
+                                Some(info) => {
+                                    crate::dashboard::run_dashboard(
+                                        &mut terminal,
+                                        &mut input_rx,
+                                        &mut ticker,
+                                        &mut app,
+                                        &fleet_launcher,
+                                        Some(info),
+                                    )
+                                    .await?;
+                                }
+                                None => {
+                                    app.push(Line::styled(
+                                        if id.is_empty() {
+                                            "no fleet sessions to resume — /dashboard to dispatch some"
+                                                .to_string()
+                                        } else {
+                                            format!("no fleet session '{id}' — see /fleet status")
+                                        },
+                                        dim(),
+                                    ));
+                                    app.follow();
+                                }
+                            }
                         }
                         "status" | "sessions" | "ls" => {
                             let sessions = (fleet_launcher.sessions)();

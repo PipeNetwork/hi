@@ -374,6 +374,54 @@ fn is_fleet_stem(stem: &str) -> bool {
         .is_some_and(|(_, n)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
 }
 
+/// A session's persisted long-horizon goal state, summarized for the fleet:
+/// whether it should still auto-drive, and its progress.
+pub struct SessionGoalSummary {
+    pub active: bool,
+    pub done: usize,
+    pub total: usize,
+}
+
+/// Read the last-written goal state from a session file (`goal` /
+/// `goal_cleared` / `state_replacement` meta lines, last-wins — mirroring the
+/// resume loader) without loading the whole conversation.
+pub fn session_goal_summary(path: &Path) -> Option<SessionGoalSummary> {
+    let text = fs::read_to_string(path).ok()?;
+    let mut goal: Option<hi_agent::Goal> = None;
+    for line in text.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match value.get("type").and_then(|t| t.as_str()) {
+            Some("goal") => {
+                if let Some(g) = value
+                    .get("goal")
+                    .and_then(|g| serde_json::from_value(g.clone()).ok())
+                {
+                    goal = Some(g);
+                }
+            }
+            Some("goal_cleared") => goal = None,
+            Some("state_replacement") => {
+                goal = value
+                    .get("goal")
+                    .filter(|g| !g.is_null())
+                    .and_then(|g| serde_json::from_value(g.clone()).ok());
+            }
+            _ => {}
+        }
+    }
+    goal.map(|g| SessionGoalSummary {
+        active: g.should_auto_drive(),
+        done: g
+            .sub_goals
+            .iter()
+            .filter(|s| s.status == hi_agent::GoalStatus::Done)
+            .count(),
+        total: g.sub_goals.len(),
+    })
+}
+
 /// Path for a fleet-dispatched session. Unlike [`new_session_path`] (millis
 /// only), several fleet agents can be dispatched within the same millisecond,
 /// so a per-process counter suffix keeps the paths (and resume ids) unique
