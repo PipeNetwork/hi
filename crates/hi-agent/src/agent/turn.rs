@@ -2770,18 +2770,24 @@ If the task is already complete, stop and give your final recap."
                             && let Some(plan) = output.plan.as_deref()
                         {
                             self.last_plan = plan.to_vec();
-                        }
-                        // Long-horizon: the model's `update_plan` statuses map
-                        // onto the structured goal's sub-goals, so the agent
-                        // advances/skips in lockstep with the model's stated
-                        // progress. Only when long_horizon is on and a goal is
-                        // set; the plan UI still renders via the ToolOutput.
-                        if self.config.long_horizon
-                            && calls[i].1 == "update_plan"
-                            && let Some(goal) = self.structured_goal.as_mut()
-                        {
-                            apply_plan_to_goal(goal, &calls[i].2);
-                            plan_updated_goal = true;
+                            // Long-horizon: the model's `update_plan` maps onto the
+                            // structured goal's sub-goals (status by position, plus
+                            // appended steps it discovered), so the agent advances in
+                            // lockstep and the plan grows with the work. The plan UI
+                            // still renders via the ToolOutput.
+                            if self.config.long_horizon
+                                && let Some(goal) = self.structured_goal.as_mut()
+                            {
+                                let was_done = goal.status == crate::GoalStatus::Done;
+                                apply_plan_to_goal(goal, plan);
+                                plan_updated_goal = true;
+                                // The plan itself can finish the goal mid-turn —
+                                // announce here, since goal_turn_end skips
+                                // non-Active goals and would stay silent.
+                                if !was_done && goal.status == crate::GoalStatus::Done {
+                                    ui.status("✓ long-horizon goal complete");
+                                }
+                            }
                         }
                         // A filesystem-mutating tool may have changed files —
                         // invalidate the snapshot cache so a dependent read

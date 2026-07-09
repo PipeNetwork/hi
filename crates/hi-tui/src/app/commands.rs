@@ -224,17 +224,90 @@ impl crate::App {
     /// planner-decomposed path is driven from the run loop (it's an async call that
     /// needs the spinner) and lands in [`set_planned_goal`](Self::set_planned_goal).
     pub(crate) fn handle_goal(&mut self, agent: &mut Agent, arg: &str) {
-        let error = match arg.trim() {
-            "" => None, // no argument — just report the current goal
-            "clear" | "off" | "none" => agent
-                .set_transient_goal(None)
-                .err()
-                .map(|err| format!("goal clear failed: {err:#}")),
+        match arg.trim() {
+            // `/goal limit <n>` / `limit off` — cap or uncap plan growth.
+            s if command::parse_goal_limit(s).is_some() => {
+                if let Some(limit) = command::parse_goal_limit(s) {
+                    self.handle_goal_limit(agent, limit);
+                }
+            }
+            // Pause/resume: hold progress, stop/restart steering. Own messaging,
+            // not the goal-set echo.
+            "pause" | "resume" => {
+                let pause = arg.trim() == "pause";
+                let (msg, style) = if agent.set_goal_paused(pause) {
+                    let text = if pause {
+                        "✓ goal paused — resume with /goal resume"
+                    } else {
+                        "✓ goal resumed — steering turns again"
+                    };
+                    (text.to_string(), Style::default().fg(Color::Green))
+                } else {
+                    (format!("no goal to {}", arg.trim()), dim())
+                };
+                self.refresh_goal(agent);
+                self.push(Line::styled(msg, style));
+                self.follow();
+            }
+            "clear" | "off" | "none" => {
+                let error = agent
+                    .set_transient_goal(None)
+                    .err()
+                    .map(|err| format!("goal clear failed: {err:#}"));
+                self.refresh_goal(agent);
+                self.report_goal_result(agent, arg, error);
+            }
+            "" => self.report_goal_result(agent, arg, None), // report current
             // A single sub-goal equal to the objective (no decomposition).
-            goal => Self::apply_goal(agent, goal, vec![goal.to_string()]),
+            goal => {
+                let error = Self::apply_goal(agent, goal, vec![goal.to_string()]);
+                self.refresh_goal(agent);
+                self.report_goal_result(agent, arg, error);
+            }
+        }
+    }
+
+    /// `/goal limit …`: set/clear/report the plan-growth ceiling.
+    fn handle_goal_limit(&mut self, agent: &mut Agent, limit: command::GoalLimitArg) {
+        use command::GoalLimitArg;
+        let (msg, style) = match limit {
+            GoalLimitArg::Show => match agent.structured_goal().and_then(|g| g.step_limit) {
+                Some(n) => (format!("goal limit: {n} sub-goals"), dim()),
+                None => (
+                    "goal limit: none — the plan grows freely".to_string(),
+                    dim(),
+                ),
+            },
+            GoalLimitArg::Set(n) => {
+                if agent.set_goal_step_limit(Some(n)) {
+                    (
+                        format!("✓ goal limit set to {n} sub-goals"),
+                        Style::default().fg(Color::Green),
+                    )
+                } else {
+                    ("no goal to limit".to_string(), dim())
+                }
+            }
+            GoalLimitArg::Unlimited => {
+                if agent.set_goal_step_limit(None) {
+                    (
+                        "✓ goal limit removed — the plan grows freely".to_string(),
+                        Style::default().fg(Color::Green),
+                    )
+                } else {
+                    ("no goal to limit".to_string(), dim())
+                }
+            }
+            GoalLimitArg::Invalid(value) => (
+                format!(
+                    "goal limit: '{value}' isn't a number — use /goal limit <n> or 'limit off'"
+                ),
+                Style::default().fg(Color::Yellow),
+            ),
         };
         self.refresh_goal(agent);
-        self.report_goal_result(agent, arg, error);
+        self.push(Line::styled(msg, style));
+        self.follow();
     }
 
     /// Install a goal whose sub-goals a planner already decomposed (from the run
@@ -278,6 +351,24 @@ impl crate::App {
     /// block and header can render sub-goal progress.
     pub(crate) fn refresh_goal(&mut self, agent: &Agent) {
         self.goal = agent.structured_goal().cloned();
+    }
+
+    /// Queue the synthetic drive prompt when an active, unpaused goal should keep
+    /// moving: the run loop pops it like user input, so the agent works the next
+    /// sub-goal without the user re-prompting. Queued user input always takes
+    /// priority (only queues into an empty queue), and a stall stop holds until a
+    /// user turn resets it.
+    pub(crate) fn maybe_queue_goal_drive(&mut self, agent: &Agent) {
+        if !self.queue.is_empty() || self.goal_drive_stall >= hi_agent::GOAL_DRIVE_STALL_LIMIT {
+            return;
+        }
+        if agent
+            .structured_goal()
+            .is_some_and(hi_agent::Goal::should_auto_drive)
+        {
+            self.queue
+                .push_back(hi_agent::GOAL_CONTINUE_PROMPT.to_string());
+        }
     }
 
     /// Echo the current goal state: the structured checklist summary (prominent),

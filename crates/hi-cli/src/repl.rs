@@ -65,17 +65,35 @@ pub(crate) async fn repl(
     let mut last_turn_start = 0usize;
     let mut last_turn_snapshot: Option<hi_agent::AgentStateSnapshot> = None;
     let mut hf_state = hi_tools::HfCommandState::default();
+    // Long-horizon auto-drive: when set, the next loop iteration runs this
+    // synthetic prompt instead of waiting for input, so an active goal keeps
+    // moving turn after turn. Ctrl-C during a drive turn pauses the goal.
+    let mut pending_drive: Option<String> = None;
+    let mut goal_drive_stall: u32 = 0;
 
     loop {
         // Refresh profile names for the completer (covers add/edit changes).
         *profiles.borrow_mut() = config::profile_names(config);
-        match editor.readline("› ") {
+        let readline = match pending_drive.take() {
+            Some(prompt) => {
+                if let Some(sg) = agent.structured_goal().and_then(|g| g.active_sub_goal()) {
+                    println!("\x1b[2m⟳ goal drive — {}\x1b[0m", sg.description);
+                }
+                Ok(prompt)
+            }
+            None => editor.readline("› "),
+        };
+        match readline {
             Ok(line) => {
                 let line = line.trim().to_string();
                 if line.is_empty() {
                     continue;
                 }
-                let _ = editor.add_history_entry(&line);
+                // Synthetic drive prompts aren't user input — keep them out of
+                // the line history.
+                if line != hi_agent::GOAL_CONTINUE_PROMPT {
+                    let _ = editor.add_history_entry(&line);
+                }
 
                 // Resolve the line to a prompt to run. Commands either handle
                 // themselves (and `continue`) or yield a prompt (`/retry`).
@@ -505,17 +523,43 @@ pub(crate) async fn repl(
                             continue;
                         }
                         // `/goal <objective>` with a planner: decompose (one bounded
-                        // call), then install the structured goal. Read/clear and the
-                        // no-planner case fall through to the sync handler.
+                        // call), then install the structured goal. Control subcommands
+                        // (clear/pause/resume/limit) and the no-planner case fall
+                        // through to the sync handler.
                         Command::Goal(arg)
                             if agent.has_planner()
-                                && !matches!(arg.trim(), "" | "clear" | "off" | "none") =>
+                                && hi_agent::command::goal_arg_is_objective(&arg) =>
                         {
                             crate::commands::handle_goal_planned(agent, arg.trim()).await;
+                            // A goal is a contract: start pulling toward it now.
+                            // Ctrl-C during a drive turn pauses it.
+                            if agent
+                                .structured_goal()
+                                .is_some_and(hi_agent::Goal::should_auto_drive)
+                            {
+                                goal_drive_stall = 0;
+                                pending_drive = Some(hi_agent::GOAL_CONTINUE_PROMPT.to_string());
+                            }
                             continue;
                         }
                         other => {
+                            // `/goal <objective>` without a planner, and
+                            // `/goal resume`, also (re)start the drive.
+                            let could_drive = matches!(
+                                &other,
+                                Command::Goal(a)
+                                    if hi_agent::command::goal_arg_is_objective(a)
+                                        || a.trim() == "resume"
+                            );
                             handle_command(agent, other, registry);
+                            if could_drive
+                                && agent
+                                    .structured_goal()
+                                    .is_some_and(hi_agent::Goal::should_auto_drive)
+                            {
+                                goal_drive_stall = 0;
+                                pending_drive = Some(hi_agent::GOAL_CONTINUE_PROMPT.to_string());
+                            }
                             continue;
                         }
                     }
@@ -526,6 +570,10 @@ pub(crate) async fn repl(
                 // Run the turn with an animated "working… Ns" spinner so it's
                 // always clear something is happening. Ctrl-C cancels the turn.
                 last_prompt = Some(input.clone());
+                // Auto-drive bookkeeping: any goal-state change by turn end
+                // (advance, retry note, plan growth) is progress; none is a stall.
+                let goal_drive_turn = input == hi_agent::GOAL_CONTINUE_PROMPT;
+                let goal_before = agent.structured_goal().cloned();
                 let checkpoint = agent.messages().len();
                 last_turn_start = checkpoint;
                 let turn_snapshot = agent.state_snapshot();
@@ -552,6 +600,38 @@ pub(crate) async fn repl(
                         );
                     } else {
                         println!("\x1b[33m^C — interrupted; turn discarded\x1b[0m");
+                    }
+                    // Interrupting a drive turn is an explicit "stop": pause the
+                    // goal so the drive doesn't restart on the next message.
+                    if goal_drive_turn && agent.set_goal_paused(true) {
+                        println!(
+                            "\x1b[33mgoal drive interrupted — paused; /goal resume to continue\x1b[0m"
+                        );
+                    }
+                } else {
+                    // Long-horizon auto-drive: keep pulling toward an active goal.
+                    // Drive turns that change nothing count toward a stall stop;
+                    // any user turn resets it.
+                    if goal_drive_turn {
+                        if agent.structured_goal().cloned() == goal_before {
+                            goal_drive_stall += 1;
+                            if goal_drive_stall == hi_agent::GOAL_DRIVE_STALL_LIMIT {
+                                println!(
+                                    "\x1b[33mgoal drive paused itself: no progress for 2 turns — send guidance (your next message resumes the drive), or /goal pause|clear\x1b[0m"
+                                );
+                            }
+                        } else {
+                            goal_drive_stall = 0;
+                        }
+                    } else {
+                        goal_drive_stall = 0;
+                    }
+                    if goal_drive_stall < hi_agent::GOAL_DRIVE_STALL_LIMIT
+                        && agent
+                            .structured_goal()
+                            .is_some_and(hi_agent::Goal::should_auto_drive)
+                    {
+                        pending_drive = Some(hi_agent::GOAL_CONTINUE_PROMPT.to_string());
                     }
                 }
                 if let Some(state) = restore_model_state.take() {

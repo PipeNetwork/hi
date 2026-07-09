@@ -38,7 +38,7 @@ pub(crate) fn handle_command(
                 t.output_tokens,
                 t.total(),
                 ctx,
-                agent.goal().unwrap_or("off"),
+                agent.goal_summary(),
                 agent.verify_summary(),
                 tel.discovery_depth,
                 tel.file_reads,
@@ -56,7 +56,7 @@ pub(crate) fn handle_command(
                 t.input_tokens,
                 t.output_tokens,
                 t.total(),
-                agent.goal().unwrap_or("off"),
+                agent.goal_summary(),
                 agent.verify_summary(),
                 agent.checkpoint_count(),
             );
@@ -112,6 +112,11 @@ pub(crate) fn handle_command(
             println!("\x1b[33m/copy is only available in the full-screen TUI\x1b[0m");
         }
         Command::Goal(arg) => match arg.trim() {
+            s if hi_agent::command::parse_goal_limit(s).is_some() => {
+                if let Some(limit) = hi_agent::command::parse_goal_limit(s) {
+                    handle_goal_limit(agent, limit);
+                }
+            }
             "" => {
                 // Report whichever goal view is active: the structured
                 // long-horizon goal when long_horizon is on, else the
@@ -137,6 +142,20 @@ pub(crate) fn handle_command(
                 Ok(()) => println!("\x1b[32m✓ goal cleared\x1b[0m"),
                 Err(err) => eprintln!("\x1b[33mgoal clear failed: {err:#}\x1b[0m"),
             },
+            "pause" => {
+                if agent.set_goal_paused(true) {
+                    println!("\x1b[32m✓ goal paused — resume with /goal resume\x1b[0m");
+                } else {
+                    println!("\x1b[2mno goal to pause\x1b[0m");
+                }
+            }
+            "resume" => {
+                if agent.set_goal_paused(false) {
+                    println!("\x1b[32m✓ goal resumed — steering turns again\x1b[0m");
+                } else {
+                    println!("\x1b[2mno goal to resume\x1b[0m");
+                }
+            }
             goal => {
                 // When long-horizon agency is on, set a structured goal — a
                 // single sub-goal equal to the objective, which the model
@@ -305,6 +324,35 @@ pub(crate) async fn handle_goal_planned(agent: &mut hi_agent::Agent, objective: 
             Err(err) => eprintln!("\x1b[33mgoal set failed: {err:#}\x1b[0m"),
         },
         Err(err) => eprintln!("\x1b[33mgoal set failed: {err:#}\x1b[0m"),
+    }
+}
+
+fn handle_goal_limit(agent: &mut hi_agent::Agent, limit: hi_agent::command::GoalLimitArg) {
+    use hi_agent::command::GoalLimitArg;
+    match limit {
+        GoalLimitArg::Show => match agent.structured_goal().and_then(|g| g.step_limit) {
+            Some(n) => println!("\x1b[2mgoal limit: {n} sub-goals\x1b[0m"),
+            None => println!("\x1b[2mgoal limit: none — the plan grows freely\x1b[0m"),
+        },
+        GoalLimitArg::Set(n) => {
+            if agent.set_goal_step_limit(Some(n)) {
+                println!("\x1b[32m✓ goal limit set to {n} sub-goals\x1b[0m");
+            } else {
+                println!("\x1b[2mno goal to limit\x1b[0m");
+            }
+        }
+        GoalLimitArg::Unlimited => {
+            if agent.set_goal_step_limit(None) {
+                println!("\x1b[32m✓ goal limit removed — the plan grows freely\x1b[0m");
+            } else {
+                println!("\x1b[2mno goal to limit\x1b[0m");
+            }
+        }
+        GoalLimitArg::Invalid(value) => {
+            eprintln!(
+                "\x1b[33mgoal limit: '{value}' isn't a number — use /goal limit <n> or 'limit off'\x1b[0m"
+            );
+        }
     }
 }
 

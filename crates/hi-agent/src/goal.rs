@@ -61,11 +61,38 @@ pub struct Goal {
     /// The overall status — `Done` when all sub-goals are done, `Failed` if a
     /// sub-goal failed and the agent gave up, otherwise `Active`.
     pub status: GoalStatus,
+    /// Whether the goal is paused: progress is retained and persisted, but the
+    /// goal stops steering turns (dropped from the system prompt) and the driver
+    /// leaves it alone until resumed. Orthogonal to `status` — a re-derivation of
+    /// status (e.g. `apply_plan_statuses`) never touches it. `/goal resume` clears
+    /// it. `#[serde(default)]` so goals saved before pause/resume load as active.
+    #[serde(default)]
+    pub paused: bool,
+    /// Optional user-set ceiling on how many sub-goals the plan may grow to (via
+    /// `/goal limit <n>`). `None` (the default) means **no limit** — the plan keeps
+    /// expanding as the agent discovers work, which is the point for long,
+    /// adventurous objectives ("port this service to Rust"). Part of the contract,
+    /// so it persists with the goal. `#[serde(default)]` for older saved goals.
+    #[serde(default)]
+    pub step_limit: Option<usize>,
 }
 
 /// Default per-sub-goal retry budget: how many times to retry a failing sub-goal
 /// (with a "reconsider, don't repeat" nudge) before marking it `Failed`.
 pub const DEFAULT_SUBGOAL_RETRIES: u32 = 2;
+
+/// The synthetic prompt frontends feed the agent between turns to keep an active
+/// goal moving without the user re-prompting each step (the goal's checklist and
+/// notes ride in the system prompt, so this stays short). Frontends compare the
+/// input line against this constant to know a turn is auto-drive, not the user.
+pub const GOAL_CONTINUE_PROMPT: &str = "Continue the long-horizon goal: complete the active \
+sub-goal now, then update the plan with update_plan — including any newly discovered steps.";
+
+/// Stop auto-driving after this many consecutive drive turns that left the goal
+/// state untouched (no advance, no retry note, no plan growth). The goal stays
+/// active — the user's next message resumes the drive — but we don't burn turns
+/// spinning in place.
+pub const GOAL_DRIVE_STALL_LIMIT: u32 = 2;
 
 impl Goal {
     /// Create a fresh goal with sub-goals all `Pending` except the first
@@ -91,7 +118,16 @@ impl Goal {
             objective: objective.into(),
             sub_goals,
             status: GoalStatus::Active,
+            paused: false,
+            step_limit: None,
         }
+    }
+
+    /// Whether frontends should keep auto-driving this goal between turns: it's
+    /// still in progress, not paused by the user, and actually has steps. `Done`,
+    /// `Failed`, paused, or empty goals are left alone.
+    pub fn should_auto_drive(&self) -> bool {
+        self.status == GoalStatus::Active && !self.paused && !self.sub_goals.is_empty()
     }
 
     /// The currently-active sub-goal, if any (the first `Active` one).
@@ -168,18 +204,45 @@ impl Goal {
             let Some(sg) = self.sub_goals.get_mut(i) else {
                 break;
             };
-            let new = match raw.trim().to_ascii_lowercase().as_str() {
-                "done" | "complete" | "completed" | "finished" => GoalStatus::Done,
-                "active" | "in_progress" | "in-progress" | "doing" | "current" | "started" => {
-                    GoalStatus::Active
-                }
-                _ => GoalStatus::Pending,
-            };
-            sg.status = new;
+            sg.status = parse_status(raw);
         }
-        // Re-derive the overall status: Done iff all done; Failed iff any
-        // failed and none active; else Active (ensure exactly one active when
-        // in progress — the first non-done sub-goal).
+        self.rederive_status();
+    }
+
+    /// Apply the executor's *evolving* plan (a `(description, status)` per step) to
+    /// the goal: update existing sub-goals' status by position — keeping their
+    /// richer planner descriptions — and **append** steps beyond the current list,
+    /// so the plan grows as the agent discovers work ("refactors-within-refactors").
+    /// By default there's **no cap** — the plan expands as far as the objective
+    /// takes it; a user-set [`step_limit`](Self#structfield.step_limit) bounds it if
+    /// they want. Then re-derive the overall status. This is how a goal stays a live
+    /// contract over a real project rather than a frozen list.
+    pub fn apply_plan(&mut self, steps: &[(String, GoalStatus)]) {
+        for (i, (description, status)) in steps.iter().enumerate() {
+            if let Some(sg) = self.sub_goals.get_mut(i) {
+                sg.status = *status;
+            } else if self
+                .step_limit
+                .is_none_or(|limit| self.sub_goals.len() < limit)
+            {
+                self.sub_goals.push(SubGoal {
+                    description: description.clone(),
+                    status: *status,
+                    attempts: 0,
+                    notes: Vec::new(),
+                });
+            }
+        }
+        self.rederive_status();
+    }
+
+    /// Re-derive the overall status from the sub-goals: `Done` iff all done;
+    /// `Failed` iff a sub-goal failed and none is active; else `Active` — making the
+    /// first not-done sub-goal active so there's always a cursor while in progress.
+    fn rederive_status(&mut self) {
+        if self.sub_goals.is_empty() {
+            return;
+        }
         if self.sub_goals.iter().all(|s| s.status == GoalStatus::Done) {
             self.status = GoalStatus::Done;
             return;
@@ -215,7 +278,9 @@ impl Goal {
     /// statuses, and any retry notes on the active sub-goal (so it doesn't
     /// repeat a failed approach). `None` when there are no sub-goals.
     pub fn prompt_section(&self) -> Option<String> {
-        if self.sub_goals.is_empty() {
+        // A paused goal stops steering: no injection, so the agent treats the turn
+        // as goal-free until `/goal resume`.
+        if self.sub_goals.is_empty() || self.paused {
             return None;
         }
         let mut out =
@@ -237,6 +302,17 @@ impl Goal {
             }
         }
         Some(out)
+    }
+}
+
+/// Map a tolerant status string (from the model's `update_plan`) to a `GoalStatus`.
+fn parse_status(raw: &str) -> GoalStatus {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "done" | "complete" | "completed" | "finished" => GoalStatus::Done,
+        "active" | "in_progress" | "in-progress" | "doing" | "current" | "started" => {
+            GoalStatus::Active
+        }
+        _ => GoalStatus::Pending,
     }
 }
 
@@ -354,5 +430,104 @@ mod tests {
     fn prompt_section_none_for_empty_goal() {
         let g = Goal::new("nothing", vec![]);
         assert!(g.prompt_section().is_none());
+    }
+
+    #[test]
+    fn paused_goal_stops_steering_but_keeps_progress() {
+        let mut g = goal();
+        g.advance(); // sub-goal 2 active, 1 done
+        g.paused = true;
+        assert!(
+            g.prompt_section().is_none(),
+            "a paused goal is dropped from the system prompt"
+        );
+        // Progress is retained across the pause.
+        assert_eq!(g.sub_goals[0].status, GoalStatus::Done);
+        assert_eq!(g.active_index(), Some(1));
+        // Resume re-injects with progress intact.
+        g.paused = false;
+        let section = g.prompt_section().expect("resumed goal steers again");
+        assert!(section.contains("refactor the parser"));
+    }
+
+    #[test]
+    fn apply_plan_statuses_preserves_paused_flag() {
+        let mut g = goal();
+        g.paused = true;
+        g.apply_plan_statuses(&["done", "active", "pending"]);
+        assert!(g.paused, "re-deriving status must not clear the pause flag");
+    }
+
+    #[test]
+    fn apply_plan_grows_as_the_agent_discovers_work() {
+        let mut g = goal(); // 3 planner sub-goals
+        // The executor reports the 3, then discovers 2 more mid-project.
+        g.apply_plan(&[
+            ("write tests".into(), GoalStatus::Done),
+            ("rewrite parser".into(), GoalStatus::Active),
+            ("update callers".into(), GoalStatus::Pending),
+            (
+                "fix a regression the rewrite surfaced".into(),
+                GoalStatus::Pending,
+            ),
+            ("update the changelog".into(), GoalStatus::Pending),
+        ]);
+        assert_eq!(g.sub_goals.len(), 5, "two discovered steps appended");
+        assert_eq!(
+            g.sub_goals[3].description,
+            "fix a regression the rewrite surfaced"
+        );
+        assert_eq!(g.sub_goals[0].status, GoalStatus::Done);
+        assert_eq!(g.active_index(), Some(1));
+    }
+
+    #[test]
+    fn apply_plan_keeps_planner_descriptions_for_existing_steps() {
+        let mut g = goal();
+        // A terser executor title must not overwrite the planner's richer text.
+        g.apply_plan(&[("wt".into(), GoalStatus::Done)]);
+        assert_eq!(g.sub_goals[0].description, "write tests");
+        assert_eq!(g.sub_goals[0].status, GoalStatus::Done);
+    }
+
+    #[test]
+    fn should_auto_drive_only_when_active_and_unpaused() {
+        let mut g = goal();
+        assert!(g.should_auto_drive(), "fresh goal drives");
+        g.paused = true;
+        assert!(!g.should_auto_drive(), "paused holds the drive");
+        g.paused = false;
+        g.advance();
+        g.advance();
+        g.advance();
+        assert_eq!(g.status, GoalStatus::Done);
+        assert!(!g.should_auto_drive(), "done goal stops driving");
+        let mut failed = goal();
+        failed.record_failure("a", 0);
+        assert_eq!(failed.status, GoalStatus::Failed);
+        assert!(!failed.should_auto_drive(), "failed goal stops driving");
+        let empty = Goal::new("nothing", vec![]);
+        assert!(!empty.should_auto_drive(), "empty goal never drives");
+    }
+
+    #[test]
+    fn apply_plan_grows_without_limit_by_default() {
+        let mut g = Goal::new("big", vec!["s0".into()]);
+        let steps: Vec<(String, GoalStatus)> = (0..200)
+            .map(|i| (format!("s{i}"), GoalStatus::Pending))
+            .collect();
+        g.apply_plan(&steps);
+        assert_eq!(g.sub_goals.len(), 200, "no default cap — the plan expands");
+    }
+
+    #[test]
+    fn apply_plan_respects_a_user_set_limit() {
+        let mut g = Goal::new("big", vec!["s0".into()]);
+        g.step_limit = Some(5);
+        let steps: Vec<(String, GoalStatus)> = (0..50)
+            .map(|i| (format!("s{i}"), GoalStatus::Pending))
+            .collect();
+        g.apply_plan(&steps);
+        assert_eq!(g.sub_goals.len(), 5, "bounded by the user's /goal limit");
     }
 }

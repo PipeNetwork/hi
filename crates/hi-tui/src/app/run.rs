@@ -962,11 +962,11 @@ pub async fn run(
                     continue;
                 }
                 // `/goal <objective>`: decompose with the planner behind a spinner
-                // (Esc cancels), then install the structured goal. Read/clear and
-                // the no-planner case stay on the sync handler.
+                // (Esc cancels), then install the structured goal. Control
+                // subcommands (clear/pause/resume/limit) and the no-planner case
+                // stay on the sync handler.
                 Command::Goal(arg)
-                    if agent.has_planner()
-                        && !matches!(arg.trim(), "" | "clear" | "off" | "none") =>
+                    if agent.has_planner() && hi_agent::command::goal_arg_is_objective(&arg) =>
                 {
                     let objective = arg.trim().to_string();
                     app.planning = Some(Instant::now());
@@ -1021,6 +1021,23 @@ pub async fn run(
                         }
                     };
                     app.set_planned_goal(agent, &objective, sub_goals);
+                    // A goal is a contract: start pulling toward it immediately.
+                    // The user monitors and steers — pause/Esc stops the drive.
+                    app.goal_drive_stall = 0;
+                    app.maybe_queue_goal_drive(agent);
+                    continue;
+                }
+                // Other `/goal` forms (read/pause/resume/limit/clear, or an
+                // objective with no planner): the sync handler — then start the
+                // drive if an active goal came out of it (objective or resume).
+                Command::Goal(arg) => {
+                    let could_drive =
+                        hi_agent::command::goal_arg_is_objective(&arg) || arg.trim() == "resume";
+                    app.handle_goal(agent, &arg);
+                    if could_drive {
+                        app.goal_drive_stall = 0;
+                        app.maybe_queue_goal_drive(agent);
+                    }
                     continue;
                 }
                 other => {
@@ -1042,6 +1059,11 @@ pub async fn run(
         let checkpoint = agent.messages().len();
         app.last_turn_start = checkpoint;
         app.last_prompt = Some(run_line.clone());
+        // Long-horizon auto-drive bookkeeping: whether this is a synthetic drive
+        // turn, and the goal state going in — any change by turn end (advance,
+        // retry note, plan growth) counts as progress; no change is a stall.
+        let goal_drive_turn = run_line == hi_agent::GOAL_CONTINUE_PROMPT;
+        let goal_before = agent.structured_goal().cloned();
         let turn_snapshot = agent.state_snapshot();
         app.last_turn_snapshot = Some(turn_snapshot.clone());
         // Reset the per-turn tool-call counter for the observability panel.
@@ -1090,6 +1112,15 @@ pub async fn run(
                 msg
             };
             app.push(Line::styled(msg, Style::default().fg(Color::Yellow)));
+            // Interrupting a drive turn is an explicit "stop": pause the goal so
+            // the drive doesn't restart on the next message. Progress is held;
+            // `/goal resume` continues.
+            if goal_drive_turn && agent.set_goal_paused(true) {
+                app.push(Line::styled(
+                    "goal drive interrupted — paused; /goal resume to continue".to_string(),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
         } else {
             // Turn finished on its own — ping if you've likely stepped away.
             app.maybe_notify_done();
@@ -1113,6 +1144,30 @@ pub async fn run(
         // The goal driver (`goal_turn_end`) may have advanced/failed a sub-goal
         // this turn — mirror the new state so the pinned block + header reflect it.
         app.refresh_goal(agent);
+        // Long-horizon auto-drive: keep pulling toward an active goal between
+        // turns. Drive turns that change nothing count toward a stall stop; any
+        // user turn (steering) resets it. Queued user input always wins — the
+        // drive prompt is only queued into an empty queue.
+        if !cancelled {
+            if goal_drive_turn {
+                if agent.structured_goal().cloned() == goal_before {
+                    app.goal_drive_stall += 1;
+                    if app.goal_drive_stall == hi_agent::GOAL_DRIVE_STALL_LIMIT {
+                        app.push(Line::styled(
+                            "goal drive paused itself: no progress for 2 turns — send guidance \
+                             (your next message resumes the drive), or /goal pause|clear"
+                                .to_string(),
+                            Style::default().fg(Color::Yellow),
+                        ));
+                    }
+                } else {
+                    app.goal_drive_stall = 0;
+                }
+            } else {
+                app.goal_drive_stall = 0;
+            }
+            app.maybe_queue_goal_drive(agent);
+        }
         app.set_working(false);
         // No follow() at turn end: if the user scrolled up to read mid-turn, leave
         // them there (the "↓ N new" hint shows the summary is below). A new turn

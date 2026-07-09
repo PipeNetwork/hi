@@ -69,6 +69,7 @@ impl crate::App {
             status: String::new(),
             plan: Vec::new(),
             goal: None,
+            goal_drive_stall: 0,
             usage: (0, 0),
             context_used: 0,
             context_window: None,

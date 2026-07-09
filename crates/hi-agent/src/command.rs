@@ -132,6 +132,50 @@ pub fn expand_prompt_macro(line: &str) -> Option<String> {
     }
 }
 
+/// Whether a `/goal` argument is an objective to plan/decompose, versus a control
+/// subcommand (empty, `clear`/`off`/`none`, `pause`, `resume`, or `limit …`).
+/// Frontends use this to route only real objectives to the planner.
+pub fn goal_arg_is_objective(arg: &str) -> bool {
+    let a = arg.trim();
+    !(a.is_empty()
+        || matches!(a, "clear" | "off" | "none" | "pause" | "resume")
+        || a == "limit"
+        || a.starts_with("limit "))
+}
+
+/// The parsed value of a `/goal limit …` subcommand.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GoalLimitArg {
+    /// `/goal limit <n>` — cap the plan at `n` sub-goals.
+    Set(usize),
+    /// `/goal limit off|none|clear|0` — remove the cap (the default: grow freely).
+    Unlimited,
+    /// `/goal limit` — report the current limit.
+    Show,
+    /// `/goal limit <garbage>` — the value didn't parse.
+    Invalid(String),
+}
+
+/// Parse the argument of a `/goal limit …` subcommand. Returns `None` when `arg`
+/// isn't a `limit` subcommand at all (so the caller handles other `/goal` forms).
+pub fn parse_goal_limit(arg: &str) -> Option<GoalLimitArg> {
+    let a = arg.trim();
+    let rest = if a == "limit" {
+        ""
+    } else {
+        a.strip_prefix("limit ")?.trim()
+    };
+    Some(match rest {
+        "" => GoalLimitArg::Show,
+        "off" | "none" | "clear" => GoalLimitArg::Unlimited,
+        value => match value.parse::<usize>() {
+            Ok(0) => GoalLimitArg::Unlimited,
+            Ok(n) => GoalLimitArg::Set(n),
+            Err(_) => GoalLimitArg::Invalid(value.to_string()),
+        },
+    })
+}
+
 fn read_only_macro_prompt(kind: &str, topic: &str) -> String {
     let topic = topic.trim();
     let topic = if topic.is_empty() {
@@ -277,9 +321,20 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "goal",
-        args: "[text|clear]",
-        help: "show, set, or clear the current session goal",
-        arg_values: &[("clear", "clear the current goal")],
+        args: "[text|pause|resume|limit N|clear]",
+        help: "set a goal (planner-decomposed, grows as it works), or pause/resume/limit/clear it",
+        arg_values: &[
+            (
+                "pause",
+                "pause the goal — hold progress, stop steering turns",
+            ),
+            ("resume", "resume a paused goal"),
+            (
+                "limit",
+                "cap plan growth: /goal limit <n>, or 'limit off' for none",
+            ),
+            ("clear", "clear the current goal"),
+        ],
     },
     CommandSpec {
         name: "context",
@@ -504,7 +559,10 @@ pub fn help_text() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{COMMANDS, Command, expand_prompt_macro, help_text, matching, parse};
+    use super::{
+        COMMANDS, Command, GoalLimitArg, expand_prompt_macro, goal_arg_is_objective, help_text,
+        matching, parse, parse_goal_limit,
+    };
 
     #[test]
     fn every_listed_command_parses_to_a_real_command() {
@@ -710,6 +768,37 @@ mod tests {
             parse("/cost"),
             Some(Command::Removed(m)) if m.contains("removed")
         ));
+    }
+
+    #[test]
+    fn goal_arg_routing_and_limit_parsing() {
+        // Objectives go to the planner; control subcommands do not.
+        assert!(goal_arg_is_objective("port this service to Rust"));
+        assert!(goal_arg_is_objective("limitless refactor")); // not a `limit` subcommand
+        for control in [
+            "", "  ", "clear", "off", "none", "pause", "resume", "limit", "limit 20",
+        ] {
+            assert!(
+                !goal_arg_is_objective(control),
+                "control arg routed as objective: {control:?}"
+            );
+        }
+        // Limit parsing.
+        assert_eq!(parse_goal_limit("limit 20"), Some(GoalLimitArg::Set(20)));
+        assert_eq!(parse_goal_limit("limit"), Some(GoalLimitArg::Show));
+        assert_eq!(parse_goal_limit("limit off"), Some(GoalLimitArg::Unlimited));
+        assert_eq!(
+            parse_goal_limit("limit none"),
+            Some(GoalLimitArg::Unlimited)
+        );
+        assert_eq!(parse_goal_limit("limit 0"), Some(GoalLimitArg::Unlimited));
+        assert_eq!(
+            parse_goal_limit("limit huge"),
+            Some(GoalLimitArg::Invalid("huge".into()))
+        );
+        // Not a limit subcommand → None (handled elsewhere).
+        assert_eq!(parse_goal_limit("port to Rust"), None);
+        assert_eq!(parse_goal_limit("limitless"), None);
     }
 
     #[test]

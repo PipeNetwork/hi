@@ -647,6 +647,64 @@ impl crate::Agent {
         self.structured_goal.as_ref()
     }
 
+    /// Pause or resume the structured goal without losing progress: a paused goal
+    /// is dropped from the system prompt and the driver leaves it alone, but its
+    /// sub-goal progress is retained and persisted so `/goal resume` picks up
+    /// exactly where it left off. Returns whether there was a goal to update.
+    pub fn set_goal_paused(&mut self, paused: bool) -> bool {
+        let snapshot = match self.structured_goal.as_mut() {
+            Some(goal) => {
+                goal.paused = paused;
+                goal.clone()
+            }
+            None => return false,
+        };
+        if let Some(session) = self.session.as_mut() {
+            let _ = session.record_goal(&snapshot);
+        }
+        self.refresh_system_message();
+        true
+    }
+
+    /// Set (or clear, with `None`) a ceiling on how many sub-goals the goal's plan
+    /// may grow to. `None` is the default — no limit, the plan keeps expanding as the
+    /// agent discovers work. Persisted with the goal. Returns whether there was a
+    /// goal to update.
+    pub fn set_goal_step_limit(&mut self, limit: Option<usize>) -> bool {
+        let snapshot = match self.structured_goal.as_mut() {
+            Some(goal) => {
+                goal.step_limit = limit;
+                goal.clone()
+            }
+            None => return false,
+        };
+        if let Some(session) = self.session.as_mut() {
+            let _ = session.record_goal(&snapshot);
+        }
+        true
+    }
+
+    /// One-line goal summary for status surfaces: the structured goal's
+    /// progress ("objective — 2/7 sub-goals done", with a paused marker) when one
+    /// is set, else the transient goal string, else "off".
+    pub fn goal_summary(&self) -> String {
+        if let Some(g) = &self.structured_goal {
+            let done = g
+                .sub_goals
+                .iter()
+                .filter(|s| s.status == crate::GoalStatus::Done)
+                .count();
+            let paused = if g.paused { " · paused" } else { "" };
+            return format!(
+                "{} — {}/{} sub-goals done{paused}",
+                g.objective,
+                done,
+                g.sub_goals.len()
+            );
+        }
+        self.goal.clone().unwrap_or_else(|| "off".to_string())
+    }
+
     /// Whether long-horizon agency is on (the `long_horizon` config flag), so
     /// frontends can branch `/goal` between the structured goal and the
     /// transient goal string.

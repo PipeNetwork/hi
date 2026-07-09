@@ -120,7 +120,7 @@ impl crate::App {
             .context_pct()
             .map(|p| format!("{p}%"))
             .unwrap_or_else(|| "unknown".to_string());
-        let goal = agent.goal().unwrap_or("off");
+        let goal = agent.goal_summary();
         let verify = agent.verify_summary();
         let tel = agent.last_turn_telemetry();
         let error = self.last_error.as_deref().unwrap_or("none");
@@ -320,7 +320,8 @@ impl crate::App {
             .iter()
             .filter(|s| s.status == hi_agent::GoalStatus::Done)
             .count();
-        let mut header = format!("goal · {done}/{total}");
+        let state = if goal.paused { " · paused" } else { "" };
+        let mut header = format!("goal · {done}/{total}{state}");
         if !goal.objective.is_empty() {
             header.push_str(" · ");
             header.push_str(&goal.objective);
@@ -478,7 +479,11 @@ impl crate::App {
                     .iter()
                     .filter(|s| s.status == hi_agent::GoalStatus::Done)
                     .count();
-                info_parts.push(format!("goal {done}/{total}"));
+                if goal.paused {
+                    info_parts.push(format!("goal {done}/{total} ⏸"));
+                } else {
+                    info_parts.push(format!("goal {done}/{total}"));
+                }
             }
         }
         if let Some(pct) = self.context_pct() {
