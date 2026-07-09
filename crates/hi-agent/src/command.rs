@@ -219,6 +219,9 @@ pub enum LoopArg {
     Budget { id: u64, tokens: Option<u64> },
     /// `on <id> <cmd|off>` — set/clear a shell command run when a firing is loud.
     Trigger { id: u64, cmd: Option<String> },
+    /// `fix <id> <on|off>` — enable/disable auto-fix (dispatch a verified fix
+    /// on a loud change).
+    Fix { id: u64, on: bool },
     /// `<interval> <prompt>` — create a loop firing `prompt` every `secs`.
     Create { secs: u64, prompt: String },
     /// Anything unparseable (bad interval / missing prompt / bad id).
@@ -299,6 +302,23 @@ pub fn parse_loop_arg(arg: &str) -> LoopArg {
             Some(cmd.to_string())
         };
         return LoopArg::Trigger { id, cmd };
+    }
+    if let Some(rest) = a.strip_prefix("fix ") {
+        let Some((id_str, state)) = rest.trim().split_once(char::is_whitespace) else {
+            return LoopArg::Invalid(
+                "usage: /loop fix <id> on|off  (dispatch a verified auto-fix on a loud change)"
+                    .into(),
+            );
+        };
+        let id = match parse_loop_id(id_str) {
+            Ok(id) => id,
+            Err(msg) => return LoopArg::Invalid(msg),
+        };
+        return match state.trim() {
+            "on" | "yes" | "true" => LoopArg::Fix { id, on: true },
+            "off" | "no" | "false" => LoopArg::Fix { id, on: false },
+            other => LoopArg::Invalid(format!("say on or off, not '{other}'")),
+        };
     }
     let Some((head, prompt)) = a.split_once(char::is_whitespace) else {
         return LoopArg::Invalid(
@@ -1055,6 +1075,14 @@ mod tests {
             parse_loop_arg("once in a while check"),
             LoopArg::Trigger { .. }
         ));
+        // Auto-fix toggle (`fix <id> on|off`).
+        assert_eq!(parse_loop_arg("fix 3 on"), LoopArg::Fix { id: 3, on: true });
+        assert_eq!(
+            parse_loop_arg("fix #3 off"),
+            LoopArg::Fix { id: 3, on: false }
+        );
+        assert!(matches!(parse_loop_arg("fix 3 maybe"), LoopArg::Invalid(_)));
+        assert!(matches!(parse_loop_arg("fix"), LoopArg::Invalid(_)));
         // Token-count parsing.
         assert_eq!(super::parse_token_count("500k"), Some(500_000));
         assert_eq!(super::parse_token_count("1.5m"), Some(1_500_000));

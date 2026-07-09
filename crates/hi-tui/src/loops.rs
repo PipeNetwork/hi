@@ -30,6 +30,8 @@ pub(crate) const LOOP_TTL_SECS: u64 = 7 * 86_400;
 const FIRING_TIMEOUT_SECS: u64 = 600;
 /// An on-change trigger command is killed after this long.
 const TRIGGER_TIMEOUT_SECS: u64 = 60;
+/// An auto-fix attempt (a full write-capable agent run) is killed after this.
+const FIX_TIMEOUT_SECS: u64 = 900;
 /// Max simultaneously-armed loops per project.
 const MAX_LOOPS: usize = 8;
 /// The marker a firing replies with when nothing changed since the last check.
@@ -64,6 +66,10 @@ pub(crate) struct LoopSpec {
     /// change — a watcher that also *responds*. Off unless explicitly set.
     #[serde(default)]
     pub(crate) trigger: Option<String>,
+    /// When set, a loud change dispatches a worktree-isolated agent to *fix* it,
+    /// verify-gated (only merged if the verify passes). Off by default.
+    #[serde(default)]
+    pub(crate) autofix: bool,
 }
 
 impl LoopSpec {
@@ -118,6 +124,12 @@ pub(crate) struct LoopWatchRow {
     pub(crate) trigger: Option<String>,
     /// The outcome of the most recent trigger run (for the peek).
     pub(crate) last_trigger: Option<String>,
+    /// Auto-fix is enabled for this loop.
+    pub(crate) autofix: bool,
+    /// A fix attempt is currently in flight.
+    pub(crate) fixing: bool,
+    /// The outcome of the most recent fix attempt (for the peek).
+    pub(crate) last_fix: Option<String>,
     pub(crate) last_summary: Option<String>,
     pub(crate) last_quiet: bool,
     pub(crate) last_fired_ms: u64,
@@ -134,6 +146,10 @@ struct LoopRuntime {
     last_fired_ms: u64,
     /// Outcome of the most recent on-change trigger run.
     last_trigger: Option<String>,
+    /// A fix attempt is in flight (guards against dispatching a second).
+    fixing: bool,
+    /// Outcome of the most recent fix attempt.
+    last_fix: Option<String>,
     history: VecDeque<HistItem>,
 }
 
@@ -173,6 +189,12 @@ pub(crate) enum LoopCtl {
     Trigger {
         id: u64,
         cmd: Option<String>,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Enable/disable auto-fix for a loop.
+    Fix {
+        id: u64,
+        on: bool,
         reply: oneshot::Sender<bool>,
     },
     List {
@@ -330,6 +352,9 @@ fn publish(
                 spent_tokens: l.spent_tokens,
                 trigger: l.trigger.clone(),
                 last_trigger: rt.and_then(|r| r.last_trigger.clone()),
+                autofix: l.autofix,
+                fixing: rt.is_some_and(|r| r.fixing),
+                last_fix: rt.and_then(|r| r.last_fix.clone()),
                 last_summary: rt.and_then(|r| r.last_summary.clone()),
                 last_quiet: rt.is_some_and(|r| r.last_quiet),
                 last_fired_ms: rt.map_or(0, |r| r.last_fired_ms),
@@ -387,6 +412,8 @@ async fn manager(
     let (done_tx, mut done_rx) = mpsc::unbounded_channel::<(u64, Result<FiringOutcome, String>)>();
     // On-change trigger runs report their outcome line over this channel.
     let (trig_tx, mut trig_rx) = mpsc::unbounded_channel::<(u64, String)>();
+    // Auto-fix attempts report (id, outcome-line, loud) over this channel.
+    let (fix_tx, mut fix_rx) = mpsc::unbounded_channel::<(u64, String, bool)>();
     let mut in_flight: usize = 0;
 
     loop {
@@ -475,6 +502,7 @@ async fn manager(
                                         token_budget: None,
                                         spent_tokens: 0,
                                         trigger: None,
+                                        autofix: false,
                                     };
                                     state.loops.push(spec.clone());
                                     save(loops_file.as_deref(), &state);
@@ -568,6 +596,20 @@ async fn manager(
                         }
                         let _ = reply.send(ok);
                     }
+                    LoopCtl::Fix { id, on, reply } => {
+                        let mut ok = false;
+                        for l in &mut state.loops {
+                            if l.id == id {
+                                l.autofix = on;
+                                ok = true;
+                            }
+                        }
+                        if ok {
+                            save(loops_file.as_deref(), &state);
+                            publish(&state, &mut runtime, &snapshot);
+                        }
+                        let _ = reply.send(ok);
+                    }
                     LoopCtl::List { reply } => {
                         let _ = reply.send(state.loops.clone());
                     }
@@ -639,6 +681,28 @@ async fn manager(
                         let _ = trig.send((id, outcome));
                     });
                 }
+                // Auto-fix: on a loud change, if enabled and no fix is already in
+                // flight for this loop, dispatch a worktree-isolated agent to fix
+                // it. The merge is verify-gated inside run_fix.
+                let autofix_spec = state
+                    .loops
+                    .iter()
+                    .find(|l| l.id == id)
+                    .filter(|l| l.autofix)
+                    .cloned();
+                if loud_change
+                    && let Some(spec) = autofix_spec
+                    && !runtime.get(&id).is_some_and(|r| r.fixing)
+                {
+                    runtime.entry(id).or_default().fixing = true;
+                    let launcher = launcher.clone();
+                    let fix = fix_tx.clone();
+                    let summary = summary.clone();
+                    tokio::spawn(async move {
+                        let (line, loud) = run_fix(&launcher, &spec, &summary).await;
+                        let _ = fix.send((spec.id, line, loud));
+                    });
+                }
                 // Record the runtime result for the /watch dashboard + history.
                 let rt = runtime.entry(id).or_default();
                 rt.firing = false;
@@ -668,6 +732,23 @@ async fn manager(
                     .unwrap()
                     .push((format!("⚡ loop#{id} ({name}) trigger: {outcome}"), failed));
                 runtime.entry(id).or_default().last_trigger = Some(outcome);
+                publish(&state, &mut runtime, &snapshot);
+            }
+            Some((id, outcome, loud)) = fix_rx.recv() => {
+                let name = state
+                    .loops
+                    .iter()
+                    .find(|l| l.id == id)
+                    .map(LoopSpec::name)
+                    .unwrap_or_else(|| format!("#{id}"));
+                record(activity, id, &format!("loop#{id} {name}"), &format!("auto-fix: {outcome}"));
+                pending
+                    .lock()
+                    .unwrap()
+                    .push((format!("⚒ loop#{id} ({name}) auto-fix: {outcome}"), loud));
+                let rt = runtime.entry(id).or_default();
+                rt.fixing = false;
+                rt.last_fix = Some(outcome);
                 publish(&state, &mut runtime, &snapshot);
             }
             _ = tokio::time::sleep(Duration::from_millis(sleep_ms)) => {}
@@ -814,6 +895,147 @@ async fn run_trigger(cmd: &str, id: u64, name: &str, summary: &str) -> String {
     }
 }
 
+/// The verify-gated verdict for a completed fix attempt. Kept as a pure function
+/// so the safety rule — *never merge an unverified change* — is unit-testable in
+/// isolation from all the git I/O.
+#[derive(Debug, PartialEq, Eq)]
+enum FixDecision {
+    NotGitRepo,
+    NoChanges,
+    /// Safe to apply the worktree's diff to the real tree.
+    Merge,
+    /// Changes exist but must not be merged; carries why.
+    Reject(&'static str),
+}
+
+fn decide_fix(
+    in_repo: bool,
+    completed: bool,
+    changed_count: usize,
+    has_verify: bool,
+    verified: bool,
+) -> FixDecision {
+    if !in_repo {
+        FixDecision::NotGitRepo
+    } else if changed_count == 0 {
+        FixDecision::NoChanges
+    } else if !completed {
+        FixDecision::Reject("the fixer did not finish cleanly")
+    } else if !has_verify {
+        FixDecision::Reject("no verify command — set /verify to enable auto-merge")
+    } else if !verified {
+        FixDecision::Reject("the fix did not pass verify")
+    } else {
+        FixDecision::Merge
+    }
+}
+
+/// The task handed to the fix agent, built from the loud change it must resolve.
+fn fix_prompt(spec: &LoopSpec, summary: &str) -> String {
+    format!(
+        "A recurring watch (\"{}\") just detected a problem:\n\n{summary}\n\n\
+         Investigate and FIX it in this working copy with the minimal change that resolves it. \
+         Make sure the project still builds and its tests pass. If you cannot safely fix it, make \
+         no changes at all.",
+        spec.name()
+    )
+}
+
+/// One auto-fix attempt: snapshot the tree, run a write-capable child agent in an
+/// isolated worktree to fix the loud change, and — only if the diff passes the
+/// verify command — merge it into the real tree. Returns a `(line, loud)` outcome
+/// for the transcript. The verify gate ([`decide_fix`]) is the safety boundary:
+/// an unverified change is never applied.
+async fn run_fix(launcher: &FleetLauncher, spec: &LoopSpec, summary: &str) -> (String, bool) {
+    use hi_tools::worktree;
+
+    if !worktree::in_git_repo() {
+        return ("skipped — not a git repository".into(), false);
+    }
+    let base = match hi_tools::checkpoint::create(std::path::Path::new(".")).await {
+        Some(b) => b,
+        None => return ("skipped — couldn't snapshot the working tree".into(), true),
+    };
+    let wt = worktree::worktree_path("loopfix", spec.id as u32);
+    worktree::cleanup(std::slice::from_ref(&wt)); // clear any stale worktree
+    if let Err(e) = worktree::add_worktree(&wt, &base) {
+        return (format!("skipped — worktree setup failed: {e}"), true);
+    }
+
+    // A write-capable child agent runs the fix in the worktree, self-verifying
+    // via `--verify` if the session has one.
+    let mut cmd = tokio::process::Command::new(&launcher.exe);
+    cmd.current_dir(&wt)
+        .env("HI_API_KEY", &launcher.api_key)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .args([
+            "--provider",
+            &launcher.provider,
+            "--model",
+            &launcher.model,
+            "--base-url",
+            &launcher.base_url,
+            "--max-steps",
+            "40",
+        ]);
+    if let Some(v) = &launcher.verify {
+        cmd.arg("--verify").arg(v);
+    }
+    cmd.arg(fix_prompt(spec, summary));
+
+    let completed = match cmd.spawn() {
+        Ok(mut child) => {
+            match tokio::time::timeout(Duration::from_secs(FIX_TIMEOUT_SECS), child.wait()).await {
+                Ok(Ok(status)) => status.success(),
+                _ => {
+                    let _ = child.start_kill();
+                    let _ = child.wait().await;
+                    false
+                }
+            }
+        }
+        Err(e) => {
+            worktree::cleanup(std::slice::from_ref(&wt));
+            return (format!("skipped — couldn't launch the fixer: {e}"), true);
+        }
+    };
+
+    let changed = worktree::changed_files(&wt, &base);
+    let has_verify = launcher.verify.is_some();
+    // Ground-truth re-verify of the final worktree state before any merge.
+    let verified = completed
+        && !changed.is_empty()
+        && launcher
+            .verify
+            .as_deref()
+            .is_some_and(|v| worktree::verify_passes(&wt, v));
+
+    let result = match decide_fix(true, completed, changed.len(), has_verify, verified) {
+        FixDecision::Merge => match worktree::apply_changes(&wt, &base) {
+            Ok(_) => (
+                format!(
+                    "fixed & merged {} file(s): {}",
+                    changed.len(),
+                    changed.join(", ")
+                ),
+                true,
+            ),
+            Err(e) => (format!("verified but merge failed: {e}"), true),
+        },
+        FixDecision::NoChanges => ("made no changes".into(), false),
+        FixDecision::Reject(why) => (
+            format!("{} file(s) changed but NOT merged — {why}", changed.len()),
+            true,
+        ),
+        FixDecision::NotGitRepo => ("skipped — not a git repository".into(), false),
+    };
+    worktree::cleanup(std::slice::from_ref(&wt));
+    result
+}
+
 fn load(path: Option<&std::path::Path>) -> LoopsFile {
     path.and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|t| serde_json::from_str(&t).ok())
@@ -857,6 +1079,7 @@ mod tests {
             token_budget: None,
             spent_tokens: 0,
             trigger: None,
+            autofix: false,
         }
     }
 
@@ -883,6 +1106,57 @@ mod tests {
         assert!(later.contains("every 30m"), "{later}");
         assert!(later.contains(QUIET_MARKER));
         assert!(!later.contains("FIRST check"));
+    }
+
+    #[test]
+    fn decide_fix_never_merges_unverified() {
+        // The one rule that matters: Merge requires in-repo + completed +
+        // changes + a verify command + a passing verify. Anything missing → not
+        // a merge.
+        assert_eq!(
+            decide_fix(true, true, 2, true, true),
+            FixDecision::Merge,
+            "all conditions met → merge"
+        );
+        assert_eq!(
+            decide_fix(false, true, 2, true, true),
+            FixDecision::NotGitRepo
+        );
+        assert_eq!(
+            decide_fix(true, true, 0, true, true),
+            FixDecision::NoChanges
+        );
+        // Every unsafe combination must NOT be a merge.
+        for &completed in &[true, false] {
+            for &has_verify in &[true, false] {
+                for &verified in &[true, false] {
+                    // Skip the one all-true, changes-present, completed case.
+                    if completed && has_verify && verified {
+                        continue;
+                    }
+                    assert_ne!(
+                        decide_fix(true, completed, 3, has_verify, verified),
+                        FixDecision::Merge,
+                        "completed={completed} has_verify={has_verify} verified={verified} must not merge"
+                    );
+                }
+            }
+        }
+        // A change with no verify command is rejected, not merged.
+        assert!(matches!(
+            decide_fix(true, true, 1, false, false),
+            FixDecision::Reject(_)
+        ));
+    }
+
+    #[test]
+    fn fix_prompt_carries_the_change() {
+        let mut s = spec();
+        s.prompt = "watch prod p99 latency".into();
+        let p = fix_prompt(&s, "p99 jumped to 4200ms");
+        assert!(p.contains("p99 jumped to 4200ms"), "{p}");
+        assert!(p.contains("FIX it"), "{p}");
+        assert!(p.contains("make no changes"), "safe fallback\n{p}");
     }
 
     #[test]

@@ -1082,8 +1082,13 @@ pub async fn run(
                                                 ),
                                                 None => String::new(),
                                             };
-                                            let trig =
-                                                if l.trigger.is_some() { " · ⚡" } else { "" };
+                                            let mut marks = String::new();
+                                            if l.trigger.is_some() {
+                                                marks.push_str(" · ⚡");
+                                            }
+                                            if l.autofix {
+                                                marks.push_str(" · ⚒");
+                                            }
                                             app.push(Line::styled(
                                                 format!(
                                                     "  #{} every {} · {} · {} firing(s){}{} · expires {}h · {}",
@@ -1092,7 +1097,7 @@ pub async fn run(
                                                     next,
                                                     l.firings,
                                                     cost,
-                                                    trig,
+                                                    marks,
                                                     expires_h,
                                                     l.name(),
                                                 ),
@@ -1174,6 +1179,38 @@ pub async fn run(
                                     ),
                                 };
                                 app.push(Line::styled(msg.0, Style::default().fg(msg.1)));
+                            }
+                        }
+                        command::LoopArg::Fix { id, on } => {
+                            if let Some(loops) = &app.loops {
+                                let (tx, rx) = tokio::sync::oneshot::channel();
+                                let _ = loops.ctl.send(crate::loops::LoopCtl::Fix {
+                                    id,
+                                    on,
+                                    reply: tx,
+                                });
+                                let no_verify = on && fleet_launcher.verify.is_none();
+                                let msg = match rx.await {
+                                    Ok(true) if on => (
+                                        format!(
+                                            "✓ loop#{id} auto-fix on — a loud change dispatches a verified fix"
+                                        ),
+                                        Color::Green,
+                                    ),
+                                    Ok(true) => (format!("✓ loop#{id} auto-fix off"), Color::Green),
+                                    _ => (
+                                        format!("no loop#{id} — /loop list shows ids"),
+                                        Color::Yellow,
+                                    ),
+                                };
+                                app.push(Line::styled(msg.0, Style::default().fg(msg.1)));
+                                if no_verify {
+                                    app.push(Line::styled(
+                                        "  note: no verify command set — fixes won't auto-merge until you /verify <cmd>"
+                                            .to_string(),
+                                        dim(),
+                                    ));
+                                }
                             }
                         }
                         command::LoopArg::Invalid(msg) => {
