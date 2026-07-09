@@ -222,6 +222,14 @@ pub enum LoopArg {
     /// `fix <id> <on|pr|off>` — enable/disable auto-fix (dispatch a verified fix
     /// on a loud change); `pr` lands it as a PR instead of a working-tree merge.
     Fix { id: u64, on: bool, pr: bool },
+    /// `window <id> <H-H [weekdays]|off>` — only fire within a local-time window.
+    /// `Some((start_hour, end_hour, weekdays_only))`, or `None` to clear.
+    Window {
+        id: u64,
+        window: Option<(u8, u8, bool)>,
+    },
+    /// `cost` — a token-spend breakdown across loops.
+    Cost,
     /// `<interval> <prompt>` — create a loop firing `prompt` every `secs`.
     Create { secs: u64, prompt: String },
     /// Anything unparseable (bad interval / missing prompt / bad id).
@@ -236,10 +244,58 @@ fn parse_loop_id(s: &str) -> Result<u64, String> {
 }
 
 /// Split a `/loop` argument into its subcommand form.
+/// Parse a fire-window spec: `H-H` (hours 0..24) with an optional `weekdays`
+/// (or `mon-fri`) token → `(start_hour, end_hour, weekdays_only)`.
+pub fn parse_loop_window(s: &str) -> Option<(u8, u8, bool)> {
+    let s = s.trim();
+    let mut parts = s.split_whitespace();
+    let range = parts.next()?;
+    let (a, b) = range.split_once('-')?;
+    let start: u8 = a.trim().parse().ok()?;
+    let end: u8 = b.trim().parse().ok()?;
+    if start > 23 || end > 24 || start == end {
+        return None;
+    }
+    let weekdays = match parts.next() {
+        None => false,
+        Some("weekdays" | "mon-fri" | "weekday") => true,
+        Some(_) => return None,
+    };
+    Some((start, end, weekdays))
+}
+
 pub fn parse_loop_arg(arg: &str) -> LoopArg {
     let a = arg.trim();
     if a.is_empty() || a == "list" || a == "ls" || a == "status" {
         return LoopArg::List;
+    }
+    if matches!(a, "cost" | "spend") {
+        return LoopArg::Cost;
+    }
+    if let Some(rest) = a.strip_prefix("window") {
+        let rest = rest.trim();
+        let Some((id_str, spec)) = rest.split_once(char::is_whitespace) else {
+            return LoopArg::Invalid(
+                "usage: /loop window <id> <9-17 [weekdays]|off>  (local time)".into(),
+            );
+        };
+        let id = match parse_loop_id(id_str) {
+            Ok(id) => id,
+            Err(msg) => return LoopArg::Invalid(msg),
+        };
+        let spec = spec.trim();
+        if matches!(spec, "off" | "none" | "clear" | "always") {
+            return LoopArg::Window { id, window: None };
+        }
+        return match parse_loop_window(spec) {
+            Some(w) => LoopArg::Window {
+                id,
+                window: Some(w),
+            },
+            None => LoopArg::Invalid(format!(
+                "bad window '{spec}' — use e.g. 9-17, or 9-17 weekdays, or off"
+            )),
+        };
     }
     if let Some(rest) = a.strip_prefix("cancel") {
         return match parse_loop_id(rest) {
@@ -1115,6 +1171,45 @@ mod tests {
         );
         assert!(matches!(parse_loop_arg("fix 3 maybe"), LoopArg::Invalid(_)));
         assert!(matches!(parse_loop_arg("fix"), LoopArg::Invalid(_)));
+        // Fire windows (`window <id> <H-H [weekdays]|off>`).
+        assert_eq!(
+            parse_loop_arg("window 3 9-17"),
+            LoopArg::Window {
+                id: 3,
+                window: Some((9, 17, false))
+            }
+        );
+        assert_eq!(
+            parse_loop_arg("window 3 9-17 weekdays"),
+            LoopArg::Window {
+                id: 3,
+                window: Some((9, 17, true))
+            }
+        );
+        assert_eq!(
+            parse_loop_arg("window 3 off"),
+            LoopArg::Window {
+                id: 3,
+                window: None
+            }
+        );
+        assert!(matches!(
+            parse_loop_arg("window 3 25-30"),
+            LoopArg::Invalid(_)
+        ));
+        assert!(matches!(
+            parse_loop_arg("window 3 nope"),
+            LoopArg::Invalid(_)
+        ));
+        assert_eq!(parse_loop_arg("cost"), LoopArg::Cost);
+        // Window parse edge cases.
+        assert_eq!(super::parse_loop_window("0-24"), Some((0, 24, false)));
+        assert_eq!(
+            super::parse_loop_window("22-6"),
+            Some((22, 6, false)),
+            "wrap ok"
+        );
+        assert_eq!(super::parse_loop_window("9-9"), None, "empty window");
         // Token-count parsing.
         assert_eq!(super::parse_token_count("500k"), Some(500_000));
         assert_eq!(super::parse_token_count("1.5m"), Some(1_500_000));

@@ -211,6 +211,11 @@ raise the budget or `/loop resume 3` to continue). Pause and resume any loop by 
 `/loop pause <id>` / `/loop resume <id>` (or `p` in `/watch`); a paused loop holds its place and
 its cost without firing.
 
+**Windows & cost.** Loops fire 24/7 by default; give one a local-time window so it only fires when
+it matters: `/loop window 3 9-17` (or `9-17 weekdays`, or `off` to clear) — outside it, the loop
+quietly defers to the next interval. And `/loop cost` shows a token-spend breakdown across loops
+(each loop's spend, its budget, and the total) — cheap control for running many watchers.
+
 **Triggers — a watcher that acts.** Attach a shell command that runs whenever a firing reports a
 real change: `/loop on 3 notify-send "CI is red"`. It runs via `sh -c` only on a *loud* firing
 (never on `NOTHING NEW` or an error), with the change summary in `$HI_LOOP_SUMMARY` (plus
@@ -283,7 +288,7 @@ Slash commands (TUI or plain REPL):
 | `/diff` | show what files have changed this session (`git diff` + new files) |
 | `/copy [all]` | copy the last assistant response to the terminal clipboard; `all` copies the transcript |
 | `/goal [obj\|pause\|resume\|limit N\|clear]` | set a long-horizon goal: a planner model decomposes it into sub-goals the agent then **drives autonomously turn after turn** (your input always takes priority; Esc pauses). `pause`/`resume` hold and continue; `limit N` caps plan growth (unbounded by default) |
-| `/loop <interval> <prompt>` | the same prompt, on a cadence (60s–7d: `90s`, `30m`, `2h`, `1d`): each firing is a **full agent turn** that remembers previous checks and reports only what changed. `/loop list`, `/loop cancel <id>`, `/loop pause\|resume <id>`, `/loop budget <id> <count\|off>` (token cap → auto-pause), `/loop on <id> <cmd\|off>` (run a shell command on each change, `$HI_LOOP_SUMMARY` in env), `/loop fix <id> <on\|pr\|off>` (verify-gated auto-fix on a loud change — `on` merges, `pr` opens a PR); loops auto-expire after 7 days |
+| `/loop <interval> <prompt>` | the same prompt, on a cadence (60s–7d: `90s`, `30m`, `2h`, `1d`): each firing is a **full agent turn** that remembers previous checks and reports only what changed. `/loop list`, `/loop cancel <id>`, `/loop pause\|resume <id>`, `/loop budget <id> <count\|off>` (token cap → auto-pause), `/loop on <id> <cmd\|off>` (run a shell command on each change, `$HI_LOOP_SUMMARY` in env), `/loop fix <id> <on\|pr\|off>` (verify-gated auto-fix on a loud change — `on` merges, `pr` opens a PR), `/loop window <id> <9-17 [weekdays]\|off>` (local-time fire window), `/loop cost` (token-spend breakdown); loops auto-expire after 7 days |
 | `/watch` | full-screen live dashboard of all active loops: per-loop countdowns, firing spinners, last result, token spend, and recent history — with `f` fire-now, `p` pause, `c` cancel, `n` arm a new loop |
 | `/digest` (`/activity`) | what your loops have noticed, grouped by loop, with what's new since you last looked (a persisted, cross-restart feed of every loud change) |
 | `/dashboard` (`/fleet`) | control a fleet, not an agent: dispatch, monitor, and steer multiple concurrent sessions — each in its own git worktree with verified diffs auto-merging back; `/fleet status` lists this project's resumable fleet sessions ([docs](docs/fleet-dashboard.md)) |

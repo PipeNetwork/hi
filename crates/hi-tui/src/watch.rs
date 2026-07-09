@@ -300,7 +300,25 @@ async fn arm_from_compose(ctl: &mpsc::UnboundedSender<LoopCtl>, text: String) ->
                 _ => format!("no loop#{id}"),
             })
         }
-        hi_agent::command::LoopArg::List => None,
+        hi_agent::command::LoopArg::Window { id, window } => {
+            let (tx, rx) = oneshot::channel();
+            let _ = ctl.send(LoopCtl::Window {
+                id,
+                window,
+                reply: tx,
+            });
+            Some(match (rx.await, window) {
+                (Ok(true), Some((s, e, wd))) => {
+                    format!(
+                        "loop#{id} window {s:02}-{e:02}{}",
+                        if wd { " weekdays" } else { "" }
+                    )
+                }
+                (Ok(true), None) => format!("loop#{id} window cleared"),
+                _ => format!("no loop#{id}"),
+            })
+        }
+        hi_agent::command::LoopArg::List | hi_agent::command::LoopArg::Cost => None,
         hi_agent::command::LoopArg::Invalid(msg) => Some(msg),
     }
 }
@@ -523,13 +541,19 @@ fn render_peek(
     ));
     let created_ago = fmt_left(now.saturating_sub(row.created_ms) / 1000);
     let expires_in = fmt_left(row.expires_ms.saturating_sub(now) / 1000);
+    let window = row
+        .window
+        .as_deref()
+        .map(|w| format!(" · only {w}"))
+        .unwrap_or_default();
     lines.push(Line::styled(
         format!(
-            "every {} · {} firing(s) · started {} ago · expires in {}",
+            "every {} · {} firing(s) · started {} ago · expires in {}{}",
             humanize_secs(row.interval_secs),
             row.firings,
             created_ago,
             expires_in,
+            window,
         ),
         dim(),
     ));
@@ -659,7 +683,7 @@ fn render_hints(frame: &mut ratatui::Frame, focus: Focus, area: Rect) {
             "↑↓ select · f fire · p pause · c cancel · n arm · PgUp/Dn history · Esc close"
         }
         Focus::Compose => {
-            "type <interval> <prompt> · pause|resume|budget|on|fix <id> … · Enter · Esc/Tab back"
+            "<interval> <prompt> · pause|resume|budget|on|fix|window <id> … · Enter · Esc/Tab back"
         }
     };
     frame.render_widget(
@@ -764,6 +788,7 @@ mod tests {
                 last_trigger: Some("ok".into()),
                 autofix: true,
                 fix_pr: true,
+                window: Some("09-17 weekdays".into()),
                 fixing: false,
                 last_fix: Some("fixed & merged 1 file(s): parser.rs".into()),
                 last_summary: Some("CI went red: 3 parser test failures".into()),
@@ -799,6 +824,7 @@ mod tests {
                 last_trigger: None,
                 autofix: false,
                 fix_pr: false,
+                window: None,
                 fixing: false,
                 last_fix: None,
                 last_summary: None,
@@ -869,6 +895,7 @@ mod tests {
             last_trigger: None,
             autofix: false,
             fix_pr: false,
+            window: None,
             fixing: false,
             last_fix: None,
             last_summary: Some("build still green".into()),

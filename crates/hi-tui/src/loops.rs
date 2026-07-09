@@ -74,6 +74,62 @@ pub(crate) struct LoopSpec {
     /// instead of merging it into the working tree. Off by default.
     #[serde(default)]
     pub(crate) fix_pr: bool,
+    /// Optional local-time fire window; the loop only fires inside it.
+    #[serde(default)]
+    pub(crate) schedule: Option<Schedule>,
+}
+
+/// A local-time window a loop is allowed to fire within (e.g. 9–17 weekdays).
+#[derive(Clone, Copy, Serialize, Deserialize)]
+pub(crate) struct Schedule {
+    pub(crate) start_hour: u8,
+    pub(crate) end_hour: u8,
+    pub(crate) weekdays_only: bool,
+}
+
+impl Schedule {
+    /// Whether `hour` (0–23) / `weekday` (1=Mon..7=Sun) is inside the window.
+    fn active(&self, hour: u8, weekday: u8) -> bool {
+        let in_hours = if self.start_hour < self.end_hour {
+            hour >= self.start_hour && hour < self.end_hour
+        } else {
+            // A window that wraps past midnight (e.g. 22–6).
+            hour >= self.start_hour || hour < self.end_hour
+        };
+        let in_days = !self.weekdays_only || (1..=5).contains(&weekday);
+        in_hours && in_days
+    }
+
+    fn is_active_now(&self) -> bool {
+        let (hour, weekday) = local_hour_weekday();
+        self.active(hour, weekday)
+    }
+
+    pub(crate) fn label(&self) -> String {
+        format!(
+            "{:02}-{:02}{}",
+            self.start_hour,
+            self.end_hour,
+            if self.weekdays_only { " weekdays" } else { "" }
+        )
+    }
+}
+
+/// Local hour (0–23) and ISO weekday (1=Mon..7=Sun) via `date` — respects the
+/// system timezone with no time-crate dependency. Falls back to a midday
+/// weekday (i.e. "fire") if `date` is unavailable, so a broken clock never
+/// silently stops a loop.
+fn local_hour_weekday() -> (u8, u8) {
+    std::process::Command::new("date")
+        .arg("+%H %u")
+        .output()
+        .ok()
+        .and_then(|o| {
+            let s = String::from_utf8_lossy(&o.stdout);
+            let mut it = s.split_whitespace();
+            Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+        })
+        .unwrap_or((12, 3))
 }
 
 impl LoopSpec {
@@ -132,6 +188,8 @@ pub(crate) struct LoopWatchRow {
     pub(crate) autofix: bool,
     /// Auto-fix lands as a PR (review) rather than a working-tree merge.
     pub(crate) fix_pr: bool,
+    /// The fire-window label, if scheduled (e.g. "09-17 weekdays").
+    pub(crate) window: Option<String>,
     /// A fix attempt is currently in flight.
     pub(crate) fixing: bool,
     /// The outcome of the most recent fix attempt (for the peek).
@@ -202,6 +260,12 @@ pub(crate) enum LoopCtl {
         id: u64,
         on: bool,
         pr: bool,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Set (`Some`) or clear (`None`) a loop's fire window `(start, end, weekdays)`.
+    Window {
+        id: u64,
+        window: Option<(u8, u8, bool)>,
         reply: oneshot::Sender<bool>,
     },
     List {
@@ -361,6 +425,7 @@ fn publish(
                 last_trigger: rt.and_then(|r| r.last_trigger.clone()),
                 autofix: l.autofix,
                 fix_pr: l.fix_pr,
+                window: l.schedule.map(|s| s.label()),
                 fixing: rt.is_some_and(|r| r.fixing),
                 last_fix: rt.and_then(|r| r.last_fix.clone()),
                 last_summary: rt.and_then(|r| r.last_summary.clone()),
@@ -450,6 +515,12 @@ async fn manager(
         });
         for spec in &mut state.loops {
             if !spec.paused && spec.next_ms <= now && in_flight < 2 {
+                // Outside its fire window? Defer to the next interval, quietly.
+                if spec.schedule.is_some_and(|s| !s.is_active_now()) {
+                    spec.next_ms = now + spec.interval_secs * 1000;
+                    fired = true; // next_ms changed → persist
+                    continue;
+                }
                 spec.next_ms = now + spec.interval_secs * 1000;
                 spec.firings += 1;
                 in_flight += 1;
@@ -514,6 +585,7 @@ async fn manager(
                                         trigger: None,
                                         autofix: false,
                                         fix_pr: false,
+                                        schedule: None,
                                     };
                                     state.loops.push(spec.clone());
                                     save(loops_file.as_deref(), &state);
@@ -613,6 +685,26 @@ async fn manager(
                             if l.id == id {
                                 l.autofix = on;
                                 l.fix_pr = on && pr;
+                                ok = true;
+                            }
+                        }
+                        if ok {
+                            save(loops_file.as_deref(), &state);
+                            publish(&state, &mut runtime, &snapshot);
+                        }
+                        let _ = reply.send(ok);
+                    }
+                    LoopCtl::Window { id, window, reply } => {
+                        let mut ok = false;
+                        for l in &mut state.loops {
+                            if l.id == id {
+                                l.schedule = window.map(|(start_hour, end_hour, weekdays_only)| {
+                                    Schedule {
+                                        start_hour,
+                                        end_hour,
+                                        weekdays_only,
+                                    }
+                                });
                                 ok = true;
                             }
                         }
@@ -1191,6 +1283,7 @@ mod tests {
             trigger: None,
             autofix: false,
             fix_pr: false,
+            schedule: None,
         }
     }
 
@@ -1299,6 +1392,38 @@ mod tests {
                 "must not contain the no-edit phrase {bad:?}\n{p}"
             );
         }
+    }
+
+    #[test]
+    fn schedule_active_windows() {
+        let day = Schedule {
+            start_hour: 9,
+            end_hour: 17,
+            weekdays_only: false,
+        };
+        assert!(day.active(9, 3), "start inclusive");
+        assert!(day.active(16, 3));
+        assert!(!day.active(17, 3), "end exclusive");
+        assert!(!day.active(8, 3));
+        // Weekdays-only excludes Sat(6)/Sun(7).
+        let wk = Schedule {
+            start_hour: 9,
+            end_hour: 17,
+            weekdays_only: true,
+        };
+        assert!(wk.active(10, 5), "Friday ok");
+        assert!(!wk.active(10, 6), "Saturday excluded");
+        // A window that wraps past midnight (22–6).
+        let night = Schedule {
+            start_hour: 22,
+            end_hour: 6,
+            weekdays_only: false,
+        };
+        assert!(night.active(23, 3));
+        assert!(night.active(2, 3));
+        assert!(!night.active(12, 3));
+        assert_eq!(day.label(), "09-17");
+        assert_eq!(wk.label(), "09-17 weekdays");
     }
 
     #[test]
@@ -1579,6 +1704,120 @@ mod tests {
         assert!(rx.await.unwrap());
         wait_until(&handle, |rows| {
             rows.iter().find(|r| r.id == id).is_some_and(|r| !r.paused)
+        })
+        .await;
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A scheduled loop doesn't fire outside its window and does inside it.
+    /// Windows are computed from the real current hour, so the check is
+    /// deterministic regardless of when the test runs.
+    #[tokio::test]
+    async fn manager_respects_the_fire_window() {
+        let dir = std::env::temp_dir().join(format!("hi-watch-win-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sess = dir.join("loop.jsonl");
+        let launcher = FleetLauncher {
+            exe: PathBuf::from("/bin/echo"),
+            provider: "p".into(),
+            model: "m".into(),
+            base_url: "u".into(),
+            api_key: "k".into(),
+            verify: None,
+            max_verify: 0,
+            max_steps: 30,
+            session_path: Box::new(|| Ok(PathBuf::from("/tmp/unused.jsonl"))),
+            sessions: Box::new(Vec::new),
+            resume_info: Box::new(|_| None),
+            loop_session_path: Box::new(move || Ok(sess.clone())),
+            loops_file: None,
+        };
+        let handle = start(Arc::new(launcher), None);
+
+        let (tx, rx) = oneshot::channel();
+        handle
+            .ctl
+            .send(LoopCtl::Create {
+                secs: 60,
+                prompt: "watch".into(),
+                reply: tx,
+            })
+            .unwrap();
+        let id = rx.await.unwrap().unwrap().id;
+        wait_until(&handle, |rows| {
+            rows.iter()
+                .find(|r| r.id == id)
+                .is_some_and(|r| !r.history.is_empty())
+        })
+        .await;
+        let base_firings = handle
+            .snapshot
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|r| r.id == id)
+            .unwrap()
+            .firings;
+
+        // Current local hour → build a window that excludes "now".
+        let hour: u8 = String::from_utf8_lossy(
+            &std::process::Command::new("date")
+                .arg("+%H")
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .parse()
+        .unwrap();
+        let exclude = ((hour + 2) % 24, (hour + 3) % 24, false);
+        let (tx, rx) = oneshot::channel();
+        handle
+            .ctl
+            .send(LoopCtl::Window {
+                id,
+                window: Some(exclude),
+                reply: tx,
+            })
+            .unwrap();
+        assert!(rx.await.unwrap());
+        let (tx, rx) = oneshot::channel();
+        handle.ctl.send(LoopCtl::FireNow { id, reply: tx }).unwrap();
+        assert!(rx.await.unwrap());
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            handle
+                .snapshot
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|r| r.id == id)
+                .unwrap()
+                .firings,
+            base_firings,
+            "a loop outside its window must not fire"
+        );
+
+        // A window that includes "now" → firing resumes.
+        let include = (hour, (hour + 1) % 24, false);
+        let (tx, rx) = oneshot::channel();
+        handle
+            .ctl
+            .send(LoopCtl::Window {
+                id,
+                window: Some(include),
+                reply: tx,
+            })
+            .unwrap();
+        assert!(rx.await.unwrap());
+        let (tx, rx) = oneshot::channel();
+        handle.ctl.send(LoopCtl::FireNow { id, reply: tx }).unwrap();
+        assert!(rx.await.unwrap());
+        wait_until(&handle, |rows| {
+            rows.iter()
+                .find(|r| r.id == id)
+                .is_some_and(|r| r.firings > base_firings)
         })
         .await;
 
