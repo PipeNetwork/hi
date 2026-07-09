@@ -1,9 +1,9 @@
 # hi configuration. Profiles let you keep several endpoints on hand and pick
 # one with `hi -p <name>`. See crates/hi-cli/src/config.rs for all fields.
 
-# Used when `hi` is run with no -p flag. Having this set is what stops the
-# interactive setup wizard ("config builder") from firing on a bare `hi`.
-default_profile = "local"
+# This project adds local-model profiles, but leaves the default profile to
+# ~/.config/hi/config.toml so a hosted pipenetwork.ai setup remains the bare
+# `hi` default. Use `hi -p local` to force the small local model.
 
 # Local Qwen2.5-0.5B served by `hi-local` on the GPU (CUDA backend):
 #   hi-local serve --backend cuda --execution gpu --port 8080 \

@@ -272,7 +272,7 @@ impl ProviderName {
     pub fn key_envs(self) -> &'static [&'static str] {
         match self {
             ProviderName::Anthropic => &["HI_API_KEY", "ANTHROPIC_API_KEY"],
-            ProviderName::Pipenetwork => &["HI_API_KEY", "PIPENETWORK_API_KEY", "OPENAI_API_KEY"],
+            ProviderName::Pipenetwork => &["PIPENETWORK_API_KEY", "HI_API_KEY", "OPENAI_API_KEY"],
             ProviderName::Ollama => &["HI_API_KEY", "OLLAMA_API_KEY"],
             ProviderName::Openai => &["HI_API_KEY", "OPENROUTER_API_KEY", "OPENAI_API_KEY"],
         }
@@ -438,9 +438,27 @@ pub struct Settings {
 }
 
 pub fn load_config(explicit: Option<&Path>) -> Result<Config> {
-    let Some(path) = config_path(explicit) else {
-        return Ok(Config::default());
-    };
+    if let Some(path) = explicit {
+        return read_config(path);
+    }
+
+    let mut config = default_config_path()
+        .filter(|path| path.exists())
+        .map(|path| read_config(&path))
+        .transpose()?
+        .unwrap_or_default();
+
+    let local_path = local_config_path();
+    if local_path.exists() {
+        let local = read_config(&local_path)?;
+        merge_config(&mut config, local);
+    }
+
+    config.moa.validate()?;
+    Ok(config)
+}
+
+fn read_config(path: &Path) -> Result<Config> {
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("reading config {}", path.display()))?;
     let mut config = toml::from_str::<Config>(&text)
@@ -449,8 +467,18 @@ pub fn load_config(explicit: Option<&Path>) -> Result<Config> {
         .moa
         .validate()
         .with_context(|| format!("validating MoA config {}", path.display()))?;
-    migrate_api_key_env_to_literal(&mut config, &path);
+    migrate_api_key_env_to_literal(&mut config, path);
     Ok(config)
+}
+
+fn merge_config(base: &mut Config, overlay: Config) {
+    if overlay.default_profile.is_some() {
+        base.default_profile = overlay.default_profile;
+    }
+    if overlay.moa != hi_ai::MoaConfig::default() {
+        base.moa = overlay.moa;
+    }
+    base.profiles.extend(overlay.profiles);
 }
 
 /// Repair profiles whose `api_key_env` holds a literal key instead of an env
@@ -543,19 +571,8 @@ fn migrate_api_key_env_to_literal(config: &mut Config, path: &Path) {
     }
 }
 
-fn config_path(explicit: Option<&Path>) -> Option<PathBuf> {
-    if let Some(path) = explicit {
-        return Some(path.to_path_buf());
-    }
-    let local = PathBuf::from("hi.toml");
-    if local.exists() {
-        return Some(local);
-    }
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))?;
-    let candidate = base.join("hi").join("config.toml");
-    candidate.exists().then_some(candidate)
+fn local_config_path() -> PathBuf {
+    PathBuf::from("hi.toml")
 }
 
 /// Apply precedence to produce the effective [`Settings`].
@@ -1393,6 +1410,74 @@ mod tests {
             super::ONBOARDING.contains("--plain"),
             "onboarding should point to the actual opt-out flag"
         );
+    }
+
+    #[test]
+    fn pipenetwork_prefers_provider_specific_api_key_env() {
+        assert_eq!(
+            ProviderName::Pipenetwork.key_envs(),
+            &["PIPENETWORK_API_KEY", "HI_API_KEY", "OPENAI_API_KEY"]
+        );
+    }
+
+    #[test]
+    fn merge_config_keeps_global_default_when_local_omits_one() {
+        use super::merge_config;
+        let mut global = Config {
+            default_profile: Some("default".into()),
+            profiles: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "default".into(),
+                    Profile {
+                        provider: Some(ProviderName::Pipenetwork),
+                        model: Some("ipop/coder-balanced".into()),
+                        api_key: Some("pipe-key".into()),
+                        ..Default::default()
+                    },
+                );
+                m
+            },
+            ..Default::default()
+        };
+        let local = Config {
+            profiles: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "local".into(),
+                    Profile {
+                        provider: Some(ProviderName::Ollama),
+                        model: Some("qwen2.5-coder".into()),
+                        ..Default::default()
+                    },
+                );
+                m
+            },
+            ..Default::default()
+        };
+
+        merge_config(&mut global, local);
+
+        assert_eq!(global.default_profile.as_deref(), Some("default"));
+        assert!(global.profiles.contains_key("default"));
+        assert!(global.profiles.contains_key("local"));
+    }
+
+    #[test]
+    fn merge_config_honors_explicit_local_default() {
+        use super::merge_config;
+        let mut global = Config {
+            default_profile: Some("default".into()),
+            ..Default::default()
+        };
+        let local = Config {
+            default_profile: Some("local".into()),
+            ..Default::default()
+        };
+
+        merge_config(&mut global, local);
+
+        assert_eq!(global.default_profile.as_deref(), Some("local"));
     }
 
     #[test]
