@@ -353,6 +353,24 @@ impl crate::App {
         self.goal = agent.structured_goal().cloned();
     }
 
+    /// Queue the synthetic drive prompt when an active, unpaused goal should keep
+    /// moving: the run loop pops it like user input, so the agent works the next
+    /// sub-goal without the user re-prompting. Queued user input always takes
+    /// priority (only queues into an empty queue), and a stall stop holds until a
+    /// user turn resets it.
+    pub(crate) fn maybe_queue_goal_drive(&mut self, agent: &Agent) {
+        if !self.queue.is_empty() || self.goal_drive_stall >= hi_agent::GOAL_DRIVE_STALL_LIMIT {
+            return;
+        }
+        if agent
+            .structured_goal()
+            .is_some_and(hi_agent::Goal::should_auto_drive)
+        {
+            self.queue
+                .push_back(hi_agent::GOAL_CONTINUE_PROMPT.to_string());
+        }
+    }
+
     /// Echo the current goal state: the structured checklist summary (prominent),
     /// or the transient set/clear/read feedback.
     fn report_goal_result(&mut self, agent: &Agent, arg: &str, error: Option<String>) {

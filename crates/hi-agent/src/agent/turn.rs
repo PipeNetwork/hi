@@ -2778,8 +2778,15 @@ If the task is already complete, stop and give your final recap."
                             if self.config.long_horizon
                                 && let Some(goal) = self.structured_goal.as_mut()
                             {
+                                let was_done = goal.status == crate::GoalStatus::Done;
                                 apply_plan_to_goal(goal, plan);
                                 plan_updated_goal = true;
+                                // The plan itself can finish the goal mid-turn —
+                                // announce here, since goal_turn_end skips
+                                // non-Active goals and would stay silent.
+                                if !was_done && goal.status == crate::GoalStatus::Done {
+                                    ui.status("✓ long-horizon goal complete");
+                                }
                             }
                         }
                         // A filesystem-mutating tool may have changed files —

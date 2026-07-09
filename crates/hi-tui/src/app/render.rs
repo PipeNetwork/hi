@@ -120,7 +120,7 @@ impl crate::App {
             .context_pct()
             .map(|p| format!("{p}%"))
             .unwrap_or_else(|| "unknown".to_string());
-        let goal = agent.goal().unwrap_or("off");
+        let goal = agent.goal_summary();
         let verify = agent.verify_summary();
         let tel = agent.last_turn_telemetry();
         let error = self.last_error.as_deref().unwrap_or("none");

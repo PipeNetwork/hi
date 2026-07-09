@@ -63,7 +63,10 @@ use {
 };
 
 pub use decision::{Decision, DecisionLog};
-pub use goal::{DEFAULT_SUBGOAL_RETRIES, Goal, GoalStatus, SubGoal};
+pub use goal::{
+    DEFAULT_SUBGOAL_RETRIES, GOAL_CONTINUE_PROMPT, GOAL_DRIVE_STALL_LIMIT, Goal, GoalStatus,
+    SubGoal,
+};
 
 /// Crate version (from Cargo.toml).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

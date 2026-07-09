@@ -38,7 +38,7 @@ pub(crate) fn handle_command(
                 t.output_tokens,
                 t.total(),
                 ctx,
-                agent.goal().unwrap_or("off"),
+                agent.goal_summary(),
                 agent.verify_summary(),
                 tel.discovery_depth,
                 tel.file_reads,
@@ -56,7 +56,7 @@ pub(crate) fn handle_command(
                 t.input_tokens,
                 t.output_tokens,
                 t.total(),
-                agent.goal().unwrap_or("off"),
+                agent.goal_summary(),
                 agent.verify_summary(),
                 agent.checkpoint_count(),
             );

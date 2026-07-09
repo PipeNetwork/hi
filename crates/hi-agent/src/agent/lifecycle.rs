@@ -684,6 +684,27 @@ impl crate::Agent {
         true
     }
 
+    /// One-line goal summary for status surfaces: the structured goal's
+    /// progress ("objective — 2/7 sub-goals done", with a paused marker) when one
+    /// is set, else the transient goal string, else "off".
+    pub fn goal_summary(&self) -> String {
+        if let Some(g) = &self.structured_goal {
+            let done = g
+                .sub_goals
+                .iter()
+                .filter(|s| s.status == crate::GoalStatus::Done)
+                .count();
+            let paused = if g.paused { " · paused" } else { "" };
+            return format!(
+                "{} — {}/{} sub-goals done{paused}",
+                g.objective,
+                done,
+                g.sub_goals.len()
+            );
+        }
+        self.goal.clone().unwrap_or_else(|| "off".to_string())
+    }
+
     /// Whether long-horizon agency is on (the `long_horizon` config flag), so
     /// frontends can branch `/goal` between the structured goal and the
     /// transient goal string.

@@ -81,6 +81,19 @@ pub struct Goal {
 /// (with a "reconsider, don't repeat" nudge) before marking it `Failed`.
 pub const DEFAULT_SUBGOAL_RETRIES: u32 = 2;
 
+/// The synthetic prompt frontends feed the agent between turns to keep an active
+/// goal moving without the user re-prompting each step (the goal's checklist and
+/// notes ride in the system prompt, so this stays short). Frontends compare the
+/// input line against this constant to know a turn is auto-drive, not the user.
+pub const GOAL_CONTINUE_PROMPT: &str = "Continue the long-horizon goal: complete the active \
+sub-goal now, then update the plan with update_plan — including any newly discovered steps.";
+
+/// Stop auto-driving after this many consecutive drive turns that left the goal
+/// state untouched (no advance, no retry note, no plan growth). The goal stays
+/// active — the user's next message resumes the drive — but we don't burn turns
+/// spinning in place.
+pub const GOAL_DRIVE_STALL_LIMIT: u32 = 2;
+
 impl Goal {
     /// Create a fresh goal with sub-goals all `Pending` except the first
     /// `Active`. The agent decomposes the objective into `sub_goal_descriptions`
@@ -108,6 +121,13 @@ impl Goal {
             paused: false,
             step_limit: None,
         }
+    }
+
+    /// Whether frontends should keep auto-driving this goal between turns: it's
+    /// still in progress, not paused by the user, and actually has steps. `Done`,
+    /// `Failed`, paused, or empty goals are left alone.
+    pub fn should_auto_drive(&self) -> bool {
+        self.status == GoalStatus::Active && !self.paused && !self.sub_goals.is_empty()
     }
 
     /// The currently-active sub-goal, if any (the first `Active` one).
@@ -468,6 +488,26 @@ mod tests {
         g.apply_plan(&[("wt".into(), GoalStatus::Done)]);
         assert_eq!(g.sub_goals[0].description, "write tests");
         assert_eq!(g.sub_goals[0].status, GoalStatus::Done);
+    }
+
+    #[test]
+    fn should_auto_drive_only_when_active_and_unpaused() {
+        let mut g = goal();
+        assert!(g.should_auto_drive(), "fresh goal drives");
+        g.paused = true;
+        assert!(!g.should_auto_drive(), "paused holds the drive");
+        g.paused = false;
+        g.advance();
+        g.advance();
+        g.advance();
+        assert_eq!(g.status, GoalStatus::Done);
+        assert!(!g.should_auto_drive(), "done goal stops driving");
+        let mut failed = goal();
+        failed.record_failure("a", 0);
+        assert_eq!(failed.status, GoalStatus::Failed);
+        assert!(!failed.should_auto_drive(), "failed goal stops driving");
+        let empty = Goal::new("nothing", vec![]);
+        assert!(!empty.should_auto_drive(), "empty goal never drives");
     }
 
     #[test]
