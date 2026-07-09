@@ -146,7 +146,7 @@ impl ToolProgressLabel {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 struct ProgressTracker {
     no_progress_streak: u32,
     no_progress_nudges: u32,
@@ -154,19 +154,6 @@ struct ProgressTracker {
     last_progress_reason: String,
     last_stall_reason: String,
     events: Vec<ProgressEvent>,
-}
-
-impl Default for ProgressTracker {
-    fn default() -> Self {
-        Self {
-            no_progress_streak: 0,
-            no_progress_nudges: 0,
-            forced_final_answer_attempts: 0,
-            last_progress_reason: String::new(),
-            last_stall_reason: String::new(),
-            events: Vec::new(),
-        }
-    }
 }
 
 impl ProgressTracker {
@@ -2093,11 +2080,12 @@ If the task is already complete, stop and give your final recap."
                         ui.status(INCOMPLETE_STATUS);
                         break false;
                     }
+                    // (`saw_read` is implied here: the previous disjunct already
+                    // catches search-without-read, so boolean-equivalently drop it.)
                     let needs_evidence_depth_repair = evidence.listing_only()
                         || (evidence.saw_search && !evidence.saw_read)
                         || (matches!(read_only_intent, Some(ReviewIntent::Security))
                             && evidence.saw_search
-                            && evidence.saw_read
                             && !evidence.security_search_complete());
                     if !needs_evidence_depth_repair
                         && should_reject_review_repair_template(read_only_intent, &assistant_text)
