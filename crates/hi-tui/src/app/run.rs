@@ -1728,6 +1728,37 @@ pub async fn run(
         // The goal driver (`goal_turn_end`) may have advanced/failed a sub-goal
         // this turn — mirror the new state so the pinned block + header reflect it.
         app.refresh_goal(agent);
+        // Record a main /goal that just reached a terminal state to the activity
+        // feed (→ /digest), so the interactive autonomous producer joins loops +
+        // fleet there instead of being the one hole.
+        if let Some(before) = &goal_before
+            && before.status == hi_agent::GoalStatus::Active
+            && let Some(after) = agent.structured_goal()
+            && matches!(
+                after.status,
+                hi_agent::GoalStatus::Done | hi_agent::GoalStatus::Failed
+            )
+            && let Some(lf) = &fleet_launcher.loops_file
+        {
+            let verb = if after.status == hi_agent::GoalStatus::Done {
+                "goal complete"
+            } else {
+                "goal failed"
+            };
+            let at_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            crate::activity::append(
+                &crate::activity::activity_path(lf),
+                &crate::activity::ActivityEntry {
+                    at_ms,
+                    loop_id: 0,
+                    source: "goal".into(),
+                    text: format!("{verb}: {}", after.objective),
+                },
+            );
+        }
         // Long-horizon auto-drive: keep pulling toward an active goal between
         // turns. Drive turns that change nothing count toward a stall stop; any
         // user turn (steering) resets it. Queued user input always wins — the
