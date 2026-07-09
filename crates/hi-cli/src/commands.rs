@@ -235,8 +235,39 @@ pub(crate) fn handle_command(
         Command::Lsp(arg) => {
             handle_lsp(agent, &arg);
         }
+        Command::Delegate(arg) => {
+            handle_delegate_command(agent, &arg);
+        }
     }
     false
+}
+
+pub(crate) fn handle_delegate_command(agent: &mut hi_agent::Agent, arg: &str) {
+    match arg.trim() {
+        "on" => {
+            agent.set_write_subagents(true);
+            println!(
+                "\x1b[2mdelegate enabled — the model can now hand a self-contained subtask to a \
+                 worktree-isolated subagent whose changes are kept only if they verify.\x1b[0m"
+            );
+        }
+        "off" => {
+            agent.set_write_subagents(false);
+            println!("\x1b[2mdelegate disabled.\x1b[0m");
+        }
+        _ => {
+            let state = if agent.write_subagents_enabled() {
+                "on"
+            } else {
+                "off"
+            };
+            println!(
+                "\x1b[2mdelegate is {state} (off by default). `/delegate on` to enable — it's \
+                 worktree-isolated and verify-gated; best for large, independently-verifiable \
+                 subtasks.\x1b[0m"
+            );
+        }
+    }
 }
 
 pub(crate) fn handle_lsp(agent: &hi_agent::Agent, arg: &str) {

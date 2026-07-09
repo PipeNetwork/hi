@@ -108,6 +108,22 @@ async fn delegate_respects_session_budget() {
     );
 }
 
+#[test]
+fn set_write_subagents_toggles_advertisement() {
+    // The `/delegate` runtime toggle re-advertises the tool set.
+    let mut agent = agent(Vec::new(), config()); // write_subagents off
+    let has = |a: &Agent| {
+        a.request_tools_for(hi_ai::ToolMode::Auto)
+            .iter()
+            .any(|t| t.name == "delegate")
+    };
+    assert!(!has(&agent), "off by default");
+    agent.set_write_subagents(true);
+    assert!(has(&agent), "on after /delegate on");
+    agent.set_write_subagents(false);
+    assert!(!has(&agent), "off again after /delegate off");
+}
+
 #[tokio::test]
 async fn delegate_without_runner_is_unavailable() {
     // No runner attached (e.g. a frontend that doesn't support write subagents).
