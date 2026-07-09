@@ -219,6 +219,14 @@ mod native {
             matrix_rows: c_int,
             stream: *mut c_void,
         ) -> c_int;
+        fn hi_cuda_launch_gather_quant_rows(
+            matrix: *const c_void,
+            row_ids: *const c_void,
+            output: *mut c_void,
+            row_count: c_int,
+            row_bytes: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
         fn hi_cuda_launch_dequantize_matrix(
             input: *const c_void,
             output: *mut c_void,
@@ -1467,6 +1475,31 @@ mod native {
             )
         })?;
         check_last_error("hi_cuda_launch_gather_rows_f32_to_f32")
+    }
+
+    /// Gather whole quantized rows (`row_bytes` each) into a compact buffer, so the
+    /// caller can dequantize only the gathered rows instead of the full matrix.
+    pub fn launch_gather_quant_rows(
+        matrix: &DeviceBuffer,
+        row_ids: &DeviceBuffer,
+        output: &DeviceBuffer,
+        row_count: usize,
+        row_bytes: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(row_count, "gather_quant row_count")?;
+        ensure_len(row_bytes, "gather_quant row_bytes")?;
+        launch_status(unsafe {
+            hi_cuda_launch_gather_quant_rows(
+                matrix.as_ptr(),
+                row_ids.as_ptr(),
+                output.as_mut_ptr(),
+                row_count as c_int,
+                row_bytes as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_gather_quant_rows")
     }
 
     pub fn launch_quantize_q8_row(

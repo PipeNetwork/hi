@@ -3180,13 +3180,26 @@ mod native {
                     .and_then(|v| usize::try_from(v).ok())
                     .map(|vocab| matrix.rows == vocab)
                     .unwrap_or(false);
+            // Cache the output head as f16 only when it comfortably fits — for a
+            // huge-vocab model on a small card (qwen3-8B: 151k*4096 Q6_K -> 1.25 GB
+            // f16) the persistent cache would consume the headroom the KV cache and
+            // prefill scratch need, OOMing the next forward. When it won't fit, fall
+            // through to the fused quantized GEMV (reads the quant weights directly,
+            // no 1.25 GB resident). Once cached, keep using it.
+            let cache_output_head = is_output_head && {
+                let f16_bytes = weight_elements.saturating_mul(std::mem::size_of::<u16>());
+                self.dequant_f16_cache.borrow().contains_key(matrix_name)
+                    || crate::runtime::free_memory_bytes()
+                        .map(|free| f16_bytes.saturating_mul(2) <= free)
+                        .unwrap_or(true)
+            };
             // Fused Q6_K GEMV (M=1 decode, non-output-head layer weights): read Q6_K
             // directly instead of dequantizing the whole matrix to f32 every token — the
             // per-op dequant is ~12x slower for Q6_K models kept quantized (f16 doesn't
             // fit). The output head stays on the f16 cache below (cuBLAS, marginally
             // faster and reused every token).
             if input.rows == 1
-                && !is_output_head
+                && !cache_output_head
                 && matches!(matrix.dtype, GgufTensorType::Q6_K)
                 && matrix.cols % 256 == 0
             {
@@ -3212,7 +3225,7 @@ mod native {
             // the Q6_K path, for the most common quant (Q4_K_M). Keeps large Q4_K models
             // usable when weights don't fit f16 (else per-op dequant is ~5x slower).
             if input.rows == 1
-                && !is_output_head
+                && !cache_output_head
                 && matches!(matrix.dtype, GgufTensorType::Q4_K)
                 && matrix.cols % 256 == 0
             {
@@ -3236,7 +3249,7 @@ mod native {
             }
             // Fused Q5_K GEMV (M=1 decode, non-output-head layer weights).
             if input.rows == 1
-                && !is_output_head
+                && !cache_output_head
                 && matches!(matrix.dtype, GgufTensorType::Q5_K)
                 && matrix.cols % 256 == 0
             {
@@ -3260,7 +3273,7 @@ mod native {
             }
             // Fused Q3_K GEMV (M=1 decode, non-output-head layer weights).
             if input.rows == 1
-                && !is_output_head
+                && !cache_output_head
                 && matches!(matrix.dtype, GgufTensorType::Q3_K)
                 && matrix.cols % 256 == 0
             {
@@ -3284,7 +3297,7 @@ mod native {
             }
             // Fused Q2_K GEMV (M=1 decode, non-output-head layer weights).
             if input.rows == 1
-                && !is_output_head
+                && !cache_output_head
                 && matches!(matrix.dtype, GgufTensorType::Q2_K)
                 && matrix.cols % 256 == 0
             {
@@ -3309,7 +3322,7 @@ mod native {
             // Fused IQ4_NL GEMV (M=1 decode, non-output-head layer weights). Block-32
             // format (cols % 32, not 256), non-linear lookup table.
             if input.rows == 1
-                && !is_output_head
+                && !cache_output_head
                 && matches!(matrix.dtype, GgufTensorType::IQ4_NL)
                 && matrix.cols % 32 == 0
             {
@@ -3334,7 +3347,7 @@ mod native {
             // Fused IQ4_XS GEMV (M=1 decode, non-output-head layer weights). Block-256
             // I-quant (per-sub-block scale + IQ4_NL lookup table).
             if input.rows == 1
-                && !is_output_head
+                && !cache_output_head
                 && matches!(matrix.dtype, GgufTensorType::IQ4_XS)
                 && matrix.cols % 256 == 0
             {
@@ -3359,7 +3372,7 @@ mod native {
             // Fused IQ3_S GEMV (M=1 decode, non-output-head layer weights). Block-256
             // I-quant (grid codebook + per-weight signs + sub-block scale).
             if input.rows == 1
-                && !is_output_head
+                && !cache_output_head
                 && matches!(matrix.dtype, GgufTensorType::IQ3_S)
                 && matrix.cols % 256 == 0
             {
@@ -3384,7 +3397,7 @@ mod native {
             // Fused IQ2_XXS GEMV (M=1 decode, non-output-head layer weights). Block-256
             // 2-bit I-quant (grid codebook + packed signs + block scale).
             if input.rows == 1
-                && !is_output_head
+                && !cache_output_head
                 && matches!(matrix.dtype, GgufTensorType::IQ2_XXS)
                 && matrix.cols % 256 == 0
             {
@@ -3409,7 +3422,7 @@ mod native {
             // Fused IQ2_S GEMV (M=1 decode, non-output-head layer weights). Block-256
             // 2-bit I-quant (grid codebook + per-weight signs + sub-block scale).
             if input.rows == 1
-                && !is_output_head
+                && !cache_output_head
                 && matches!(matrix.dtype, GgufTensorType::IQ2_S)
                 && matrix.cols % 256 == 0
             {
@@ -3434,7 +3447,7 @@ mod native {
             // Fused IQ2_XS GEMV (M=1 decode, non-output-head layer weights). Block-256
             // 2-bit I-quant (grid codebook + packed signs + per-lane sub-block scale).
             if input.rows == 1
-                && !is_output_head
+                && !cache_output_head
                 && matches!(matrix.dtype, GgufTensorType::IQ2_XS)
                 && matrix.cols % 256 == 0
             {
@@ -3459,7 +3472,7 @@ mod native {
             // Fused IQ1_S GEMV (M=1 decode, non-output-head layer weights). Block-256
             // 1-bit I-quant (grid codebook + code+delta reconstruction).
             if input.rows == 1
-                && !is_output_head
+                && !cache_output_head
                 && matches!(matrix.dtype, GgufTensorType::IQ1_S)
                 && matrix.cols % 256 == 0
             {
@@ -3484,7 +3497,7 @@ mod native {
             // Fused IQ1_M GEMV (M=1 decode, non-output-head layer weights). Block-256
             // 1-bit I-quant (grid codebook + reconstructed f16 super-scale + code+delta).
             if input.rows == 1
-                && !is_output_head
+                && !cache_output_head
                 && matches!(matrix.dtype, GgufTensorType::IQ1_M)
                 && matrix.cols % 256 == 0
             {
@@ -3509,7 +3522,7 @@ mod native {
             // Fused IQ3_XXS GEMV (M=1 decode, non-output-head layer weights). Block-256
             // 3-bit I-quant (uint32 grid codebook + packed signs + block scale).
             if input.rows == 1
-                && !is_output_head
+                && !cache_output_head
                 && matches!(matrix.dtype, GgufTensorType::IQ3_XXS)
                 && matrix.cols % 256 == 0
             {
@@ -3538,7 +3551,7 @@ mod native {
             // general per-weight cache would, on models with no dp4a-eligible weights
             // (e.g. IQ4_NL), cache the whole model in f16 and OOM. Everything else
             // dequantizes per-op (prefill M>1, and layer weights that miss dp4a).
-            let output = if is_output_head {
+            let output = if cache_output_head {
                 if !self.dequant_f16_cache.borrow().contains_key(matrix_name) {
                     let w = self.dequantize_matrix_to_f16(matrix, weight_elements)?;
                     self.dequant_f16_cache
@@ -3906,14 +3919,42 @@ mod native {
                 | GgufTensorType::Q8_K
                 | GgufTensorType::TQ1_0
                 | GgufTensorType::TQ2_0 => {
-                    let matrix = self.dequantize_matrix_f32_device(embeddings)?;
-                    crate::kernels::launch_gather_rows_f32_to_f32(
-                        &matrix,
+                    // Gather only the needed quantized rows, then dequantize those —
+                    // NOT the whole matrix. Dequantizing the full embedding to f32 is
+                    // vocab*hidden*4 bytes every forward (2.5 GB for a 151k-vocab
+                    // 4096-hidden model), which both wastes bandwidth per token and
+                    // OOMs an 8 GB card once the weights are resident.
+                    if embeddings.rows == 0 {
+                        bail!("CUDA embedding matrix has zero rows");
+                    }
+                    let total_bytes = embeddings.buffer.bytes();
+                    if total_bytes % embeddings.rows != 0 {
+                        bail!(
+                            "CUDA embedding matrix size {total_bytes} not divisible by {} rows",
+                            embeddings.rows
+                        );
+                    }
+                    let row_bytes = total_bytes / embeddings.rows;
+                    let gathered = DeviceBuffer::alloc(
+                        token_ids
+                            .len()
+                            .checked_mul(row_bytes)
+                            .context("gathered embedding row byte count overflows usize")?,
+                    )
+                    .context("allocating gathered quantized embedding rows")?;
+                    crate::kernels::launch_gather_quant_rows(
+                        &embeddings.buffer,
                         &ids,
-                        &output,
+                        &gathered,
                         token_ids.len(),
-                        embeddings.cols,
-                        embeddings.rows,
+                        row_bytes,
+                        &self.stream,
+                    )?;
+                    crate::kernels::launch_dequantize_matrix(
+                        &gathered,
+                        &output,
+                        output_elements,
+                        embeddings.quant_type_id()?,
                         &self.stream,
                     )?
                 }

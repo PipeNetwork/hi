@@ -628,6 +628,46 @@ __global__ void gather_rows_f32_to_f32_kernel(
   output[idx] = matrix[matrix_row * cols + col];
 }
 
+// Gather whole quantized rows (row_bytes each) from a quantized matrix into a
+// compact buffer, so the caller can dequantize only the gathered rows instead of
+// the entire matrix. Used for the token-embedding lookup: dequantizing the full
+// embedding matrix to f32 costs vocab*hidden*4 bytes every forward (2.5 GB for a
+// 151k-vocab 4096-hidden model — OOMs an 8 GB card once the weights are loaded).
+// One thread per output byte; row_bytes is a whole number of quant blocks.
+__global__ void gather_quant_rows_kernel(
+    const uint8_t* __restrict__ matrix,
+    const uint32_t* __restrict__ row_ids,
+    uint8_t* __restrict__ output,
+    int row_count,
+    int row_bytes) {
+  long long idx = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  long long total = static_cast<long long>(row_count) * row_bytes;
+  if (idx >= total) {
+    return;
+  }
+  int out_row = static_cast<int>(idx / row_bytes);
+  int off = static_cast<int>(idx % row_bytes);
+  uint32_t matrix_row = row_ids[out_row];
+  output[idx] = matrix[static_cast<size_t>(matrix_row) * row_bytes + off];
+}
+
+extern "C" int hi_cuda_launch_gather_quant_rows(
+    const void* matrix, const void* row_ids, void* output, int row_count,
+    int row_bytes, void* stream) {
+  if (matrix == nullptr || row_ids == nullptr || output == nullptr ||
+      row_count <= 0 || row_bytes <= 0 || stream == nullptr) {
+    return 1;
+  }
+  long long total = static_cast<long long>(row_count) * row_bytes;
+  int block = 256;
+  long long grid = (total + block - 1) / block;
+  gather_quant_rows_kernel<<<static_cast<unsigned int>(grid), block, 0,
+                             static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint8_t*>(matrix), static_cast<const uint32_t*>(row_ids),
+      static_cast<uint8_t*>(output), row_count, row_bytes);
+  return 0;
+}
+
 __device__ void q4_k_scale_min(int index, const uint8_t* scales, uint8_t* scale, uint8_t* min) {
   if (index < 4) {
     *scale = scales[index] & 0x3f;
