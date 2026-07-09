@@ -3200,6 +3200,32 @@ mod native {
                     buffer: output,
                 });
             }
+            // Fused Q4_K GEMV (M=1 decode, non-output-head layer weights) — same idea as
+            // the Q6_K path, for the most common quant (Q4_K_M). Keeps large Q4_K models
+            // usable when weights don't fit f16 (else per-op dequant is ~5x slower).
+            if input.rows == 1
+                && !is_output_head
+                && matches!(matrix.dtype, GgufTensorType::Q4_K)
+                && matrix.cols % 256 == 0
+            {
+                let output = DeviceBuffer::alloc(matrix.rows * std::mem::size_of::<f32>())
+                    .context("allocating CUDA Q4_K GEMV output")?;
+                crate::kernels::launch_q4_k_gemv(
+                    &matrix.buffer,
+                    &input.buffer,
+                    &output,
+                    matrix.rows,
+                    matrix.cols,
+                    &self.stream,
+                )
+                .with_context(|| format!("CUDA Q4_K GEMV for {matrix_name}"))?;
+                self.op_barrier()?;
+                return Ok(GpuF32Tensor {
+                    rows: 1,
+                    cols: matrix.rows,
+                    buffer: output,
+                });
+            }
             // Quantized weight matmul via tensor-core f16 GEMM. Dequantizing to f16 is
             // expensive, so cache the f16 weight and reuse it — weights never change,
             // avoiding re-dequantizing the Q6_K lm_head every token. Bounded to the
