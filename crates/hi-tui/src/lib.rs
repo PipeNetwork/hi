@@ -7,6 +7,7 @@
 //! while a turn is in flight, and can cancel it with Ctrl-C.
 
 mod app;
+mod dashboard;
 pub use app::run;
 mod completion;
 mod event;
@@ -67,6 +68,12 @@ pub struct MlxProfileSwitch {
 /// it without needing to know about `Config`/`Settings` (which live in
 /// `hi-cli`).
 pub type ProfileResolver = Box<dyn Fn(&str) -> Result<SwitchedProvider> + Send + Sync>;
+
+/// A callback that builds one additional top-level agent (own session file,
+/// same provider/config recipe as the main session) for a `/dashboard` fleet
+/// row. `hi-cli` supplies this so the TUI never touches `Settings`/session
+/// paths directly.
+pub type FleetSpawner = Box<dyn Fn() -> Result<hi_agent::Agent> + Send + Sync>;
 
 /// A callback that persists the `/hf run --mlx` profile and returns a built
 /// provider for immediate use.
@@ -425,6 +432,12 @@ pub(crate) struct App {
     /// [`hi_agent::GOAL_DRIVE_STALL_LIMIT`] the drive stops queuing itself (the
     /// goal stays active); any user turn resets it.
     pub(crate) goal_drive_stall: u32,
+    /// The `/dashboard` fleet: dispatched agents (one session each), persisted
+    /// across dashboard open/close so rows aren't lost when you drop back to
+    /// the chat. In-flight turns live only inside the dashboard loop.
+    pub(crate) fleet: Vec<crate::dashboard::FleetRow>,
+    /// Monotonic display id for fleet rows (never reused within a session).
+    pub(crate) fleet_next_id: usize,
     /// Cumulative session token usage (input, output), mirrored from the agent
     /// so the working line and `/tokens` can show it live while a turn runs.
     pub(crate) usage: (u64, u64),

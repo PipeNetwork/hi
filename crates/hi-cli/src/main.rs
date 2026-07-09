@@ -235,6 +235,10 @@ async fn main() -> Result<()> {
         ..AgentConfig::default()
     };
     let resume_summary = loaded.as_ref().and_then(|l| l.resume_summary.clone());
+    // Keep clones of the resolved provider/config for the fleet spawner: the
+    // dashboard stamps out additional agents from the same session recipe.
+    let fleet_provider = provider.clone();
+    let fleet_config = agent_config.clone();
     let mut agent = match loaded {
         Some(loaded) => Agent::resume(
             provider,
@@ -252,7 +256,7 @@ async fn main() -> Result<()> {
     // so `/delegate on` can enable it at runtime. The tool stays gated by the
     // `write_subagents` advertisement; the runner just needs to be ready. It spawns
     // a `hi --subagent` child in an isolated worktree and applies only verified diffs.
-    if !cli.subagent
+    let delegate_runner: Option<std::sync::Arc<dyn hi_agent::DelegateRunner>> = if !cli.subagent
         && let Ok(exe) = std::env::current_exe()
     {
         let runner = delegate::CliDelegateRunner::new(
@@ -265,11 +269,31 @@ async fn main() -> Result<()> {
             cli.max_steps.unwrap_or(60),
             cli.max_verify,
         );
-        agent.set_delegate_runner(std::sync::Arc::new(runner));
+        Some(std::sync::Arc::new(runner))
+    } else {
+        None
+    };
+    if let Some(runner) = &delegate_runner {
+        agent.set_delegate_runner(runner.clone());
     }
     if !cli.no_save && !cli.subagent {
         agent.set_session(Box::new(JsonlSession::new(session_path)));
     }
+    // The fleet spawner: builds an additional top-level agent (own session file)
+    // from the same provider/config, for `/dashboard` dispatch rows.
+    let fleet_no_save = cli.no_save;
+    let fleet_delegate = delegate_runner.clone();
+    let fleet_spawner: hi_tui::FleetSpawner = Box::new(move || {
+        let mut a = Agent::new(fleet_provider.clone(), fleet_config.clone());
+        if let Some(runner) = &fleet_delegate {
+            a.set_delegate_runner(runner.clone());
+        }
+        if !fleet_no_save {
+            let path = session::new_fleet_session_path()?;
+            a.set_session(Box::new(JsonlSession::new(path)));
+        }
+        Ok(a)
+    });
 
     if let Some(mut prompt) = prompt_input {
         let mut restore_model_state: Option<hi_agent::AgentModelState> = None;
@@ -467,6 +491,7 @@ async fn main() -> Result<()> {
             resume_summary.clone(),
             settings.mcp_url.clone(),
             settings.api_key.clone(),
+            fleet_spawner,
         )
         .await
         {

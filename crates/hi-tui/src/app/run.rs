@@ -54,6 +54,7 @@ pub async fn run(
     resume_summary: Option<String>,
     mcp_url: Option<String>,
     api_key: String,
+    fleet_spawner: crate::FleetSpawner,
 ) -> Result<()> {
     if !io::stdin().is_terminal() {
         anyhow::bail!("TUI requires an interactive stdin");
@@ -959,6 +960,20 @@ pub async fn run(
                             ));
                         }
                     }
+                    continue;
+                }
+                // `/dashboard`: the fleet screen — dispatch, monitor, and steer
+                // multiple concurrent agent sessions. Runs its own select! loop
+                // over the same terminal/input/ticker; rows persist on `app.fleet`.
+                Command::Dashboard => {
+                    crate::dashboard::run_dashboard(
+                        &mut terminal,
+                        &mut input_rx,
+                        &mut ticker,
+                        &mut app,
+                        &fleet_spawner,
+                    )
+                    .await?;
                     continue;
                 }
                 // `/goal <objective>`: decompose with the planner behind a spinner
