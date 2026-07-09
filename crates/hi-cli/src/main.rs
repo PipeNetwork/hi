@@ -327,6 +327,11 @@ async fn main() -> Result<()> {
         loops_file: session::loops_file(),
     };
 
+    // Headless loop daemon: keep this project's loops firing without the TUI.
+    if cli.loops_daemon {
+        return hi_tui::run_loops_daemon(fleet_launcher).await;
+    }
+
     if let Some(mut prompt) = prompt_input {
         let mut restore_model_state: Option<hi_agent::AgentModelState> = None;
         let mut report_model = settings.model.clone();

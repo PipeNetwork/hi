@@ -1036,6 +1036,11 @@ async fn run_fix(launcher: &FleetLauncher, spec: &LoopSpec, summary: &str) -> (S
     result
 }
 
+/// How many loops are persisted for this project (for the daemon startup line).
+pub(crate) fn persisted_count(loops_file: &std::path::Path) -> usize {
+    load(Some(loops_file)).loops.len()
+}
+
 fn load(path: Option<&std::path::Path>) -> LoopsFile {
     path.and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|t| serde_json::from_str(&t).ok())
@@ -1584,6 +1589,104 @@ mod tests {
         assert!(
             entries.iter().any(|e| e.loop_id == id),
             "loud firing recorded to the activity feed"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn git(args: &[&str], cwd: &std::path::Path) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    /// A stub "fixer" `hi` that writes `file` in its cwd (the worktree),
+    /// simulating an agent that made a change. LLM-free.
+    fn fixer_stub(dir: &std::path::Path, name: &str, file: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\nprintf 'patched' > {file}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn fix_launcher(exe: PathBuf, verify: Option<&str>) -> FleetLauncher {
+        FleetLauncher {
+            exe,
+            provider: "p".into(),
+            model: "m".into(),
+            base_url: "u".into(),
+            api_key: "k".into(),
+            verify: verify.map(str::to_string),
+            max_verify: 0,
+            max_steps: 40,
+            session_path: Box::new(|| Ok(PathBuf::from("/tmp/unused.jsonl"))),
+            sessions: Box::new(Vec::new),
+            resume_info: Box::new(|_| None),
+            loop_session_path: Box::new(|| Ok(PathBuf::from("/tmp/unused.jsonl"))),
+            loops_file: None,
+        }
+    }
+
+    /// End-to-end auto-fix over *real git*, with a stub fixer standing in for the
+    /// LLM: a verified fix is merged into the working tree; a fix that fails
+    /// verify is NOT merged (the safety gate, proven for real — not just in
+    /// `decide_fix`). Serialized + cwd-restored since `run_fix` operates on the
+    /// process cwd (like the worktree helpers it reuses).
+    #[tokio::test]
+    async fn run_fix_merges_verified_and_rejects_unverified() {
+        static CWD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = CWD.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::current_dir().unwrap();
+
+        let dir = std::env::temp_dir().join(format!("hi-runfix-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&["init", "-q", "-b", "main"], &dir);
+        git(&["config", "user.email", "t@t"], &dir);
+        git(&["config", "user.name", "t"], &dir);
+        std::fs::write(dir.join("README"), "hi\n").unwrap();
+        git(&["add", "-A"], &dir);
+        git(&["commit", "-qm", "init"], &dir);
+
+        let mut s = spec();
+        s.id = 1;
+
+        // Passing verify → the fix merges into the real tree.
+        let pass = fix_launcher(
+            fixer_stub(&dir, "pass.sh", "fixed.txt"),
+            Some("test -f fixed.txt"),
+        );
+        // Failing verify → the fix is rejected, never applied.
+        let mut s2 = spec();
+        s2.id = 2;
+        let fail = fix_launcher(fixer_stub(&dir, "fail.sh", "bad.txt"), Some("false"));
+
+        std::env::set_current_dir(&dir).unwrap();
+        let merged = run_fix(&pass, &s, "something broke").await;
+        let rejected = run_fix(&fail, &s2, "something else broke").await;
+        std::env::set_current_dir(&prev).unwrap();
+
+        assert!(
+            merged.0.contains("merged"),
+            "verified fix merged: {}",
+            merged.0
+        );
+        assert!(
+            dir.join("fixed.txt").exists(),
+            "the verified fix landed in the real tree"
+        );
+        assert!(
+            rejected.0.contains("NOT merged"),
+            "unverified fix rejected: {}",
+            rejected.0
+        );
+        assert!(
+            !dir.join("bad.txt").exists(),
+            "the unverified change must NOT reach the real tree"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

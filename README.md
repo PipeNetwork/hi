@@ -240,6 +240,13 @@ with a `•` on everything new since you last looked. Start `hi` after leaving w
 see a one-line `⟳ N loop change(s) since you last looked — /digest to review` nudge. It's one pane
 for everything autonomous that happened.
 
+**Daemon — keep firing when the terminal's closed.** Loops only fire while a `hi` is running. Run
+`hi --loops-daemon` to keep this project's loops firing (and auto-fixing) headless in the background,
+logging each change, until you `Ctrl-C` (or `kill`) it. A per-project lock guarantees exactly one
+firer — the daemon and a TUI never both fire the same loops; whichever starts second reads the shared
+feed instead (`/digest`) and says so. Set your loops up in the TUI, close it, `hi --loops-daemon &`,
+and come back later to `/digest` what it caught.
+
 ## Sessions
 
 Every session is saved as JSONL under `~/.local/share/hi/sessions/`.
