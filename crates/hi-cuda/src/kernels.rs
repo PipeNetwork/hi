@@ -259,6 +259,20 @@ mod native {
             rows: c_int,
             cols: c_int,
             stream: *mut c_void,
+        ) -> c_int;        fn hi_cuda_launch_iq2_s_gemv(
+            weights: *const c_void,
+            x: *const c_void,
+            output: *mut c_void,
+            rows: c_int,
+            cols: c_int,
+            stream: *mut c_void,
+        ) -> c_int;        fn hi_cuda_launch_iq2_xs_gemv(
+            weights: *const c_void,
+            x: *const c_void,
+            output: *mut c_void,
+            rows: c_int,
+            cols: c_int,
+            stream: *mut c_void,
         ) -> c_int;
         fn hi_cuda_launch_rope(
             values: *mut c_void,
@@ -1491,6 +1505,56 @@ mod native {
             )
         })?;
         check_last_error("hi_cuda_launch_iq2_xxs_gemv")
+    }
+
+    /// Fused IQ2_S GEMV (M=1 decode): reads IQ2_S weights directly, f32 activation.
+    /// Requires cols % 256 == 0.
+    pub fn launch_iq2_s_gemv(
+        weights: &DeviceBuffer,
+        x: &DeviceBuffer,
+        output: &DeviceBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(rows, "iq2_s gemv rows")?;
+        ensure_len(cols, "iq2_s gemv cols")?;
+        launch_status(unsafe {
+            hi_cuda_launch_iq2_s_gemv(
+                weights.as_ptr(),
+                x.as_ptr(),
+                output.as_mut_ptr(),
+                rows as c_int,
+                cols as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_iq2_s_gemv")
+    }
+
+    /// Fused IQ2_XS GEMV (M=1 decode): reads IQ2_XS weights directly, f32 activation.
+    /// Requires cols % 256 == 0.
+    pub fn launch_iq2_xs_gemv(
+        weights: &DeviceBuffer,
+        x: &DeviceBuffer,
+        output: &DeviceBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(rows, "iq2_xs gemv rows")?;
+        ensure_len(cols, "iq2_xs gemv cols")?;
+        launch_status(unsafe {
+            hi_cuda_launch_iq2_xs_gemv(
+                weights.as_ptr(),
+                x.as_ptr(),
+                output.as_mut_ptr(),
+                rows as c_int,
+                cols as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_iq2_xs_gemv")
     }
 
     pub fn launch_dequantize_matrix(
