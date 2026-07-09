@@ -203,6 +203,48 @@ mod native {
             rows: c_int,
             cols: c_int,
             stream: *mut c_void,
+        ) -> c_int;        fn hi_cuda_launch_q4_k_gemv(
+            weights: *const c_void,
+            x: *const c_void,
+            output: *mut c_void,
+            rows: c_int,
+            cols: c_int,
+            stream: *mut c_void,
+        ) -> c_int;        fn hi_cuda_launch_q5_k_gemv(
+            weights: *const c_void,
+            x: *const c_void,
+            output: *mut c_void,
+            rows: c_int,
+            cols: c_int,
+            stream: *mut c_void,
+        ) -> c_int;        fn hi_cuda_launch_q3_k_gemv(
+            weights: *const c_void,
+            x: *const c_void,
+            output: *mut c_void,
+            rows: c_int,
+            cols: c_int,
+            stream: *mut c_void,
+        ) -> c_int;        fn hi_cuda_launch_q2_k_gemv(
+            weights: *const c_void,
+            x: *const c_void,
+            output: *mut c_void,
+            rows: c_int,
+            cols: c_int,
+            stream: *mut c_void,
+        ) -> c_int;        fn hi_cuda_launch_iq4_nl_gemv(
+            weights: *const c_void,
+            x: *const c_void,
+            output: *mut c_void,
+            rows: c_int,
+            cols: c_int,
+            stream: *mut c_void,
+        ) -> c_int;        fn hi_cuda_launch_iq4_xs_gemv(
+            weights: *const c_void,
+            x: *const c_void,
+            output: *mut c_void,
+            rows: c_int,
+            cols: c_int,
+            stream: *mut c_void,
         ) -> c_int;
         fn hi_cuda_launch_rope(
             values: *mut c_void,
@@ -1235,6 +1277,156 @@ mod native {
             )
         })?;
         check_last_error("hi_cuda_launch_q6_k_gemv")
+    }
+
+    /// Fused Q4_K GEMV (M=1 decode): reads Q4_K weights directly, f32 activation.
+    /// Requires cols % 256 == 0.
+    pub fn launch_q4_k_gemv(
+        weights: &DeviceBuffer,
+        x: &DeviceBuffer,
+        output: &DeviceBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(rows, "q4_k gemv rows")?;
+        ensure_len(cols, "q4_k gemv cols")?;
+        launch_status(unsafe {
+            hi_cuda_launch_q4_k_gemv(
+                weights.as_ptr(),
+                x.as_ptr(),
+                output.as_mut_ptr(),
+                rows as c_int,
+                cols as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_q4_k_gemv")
+    }
+
+    /// Fused Q5_K GEMV (M=1 decode): reads Q5_K weights directly, f32 activation.
+    /// Requires cols % 256 == 0.
+    pub fn launch_q5_k_gemv(
+        weights: &DeviceBuffer,
+        x: &DeviceBuffer,
+        output: &DeviceBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(rows, "q5_k gemv rows")?;
+        ensure_len(cols, "q5_k gemv cols")?;
+        launch_status(unsafe {
+            hi_cuda_launch_q5_k_gemv(
+                weights.as_ptr(),
+                x.as_ptr(),
+                output.as_mut_ptr(),
+                rows as c_int,
+                cols as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_q5_k_gemv")
+    }
+
+    /// Fused Q3_K GEMV (M=1 decode): reads Q3_K weights directly, f32 activation.
+    /// Requires cols % 256 == 0.
+    pub fn launch_q3_k_gemv(
+        weights: &DeviceBuffer,
+        x: &DeviceBuffer,
+        output: &DeviceBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(rows, "q3_k gemv rows")?;
+        ensure_len(cols, "q3_k gemv cols")?;
+        launch_status(unsafe {
+            hi_cuda_launch_q3_k_gemv(
+                weights.as_ptr(),
+                x.as_ptr(),
+                output.as_mut_ptr(),
+                rows as c_int,
+                cols as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_q3_k_gemv")
+    }
+
+    /// Fused Q2_K GEMV (M=1 decode): reads Q2_K weights directly, f32 activation.
+    /// Requires cols % 256 == 0.
+    pub fn launch_q2_k_gemv(
+        weights: &DeviceBuffer,
+        x: &DeviceBuffer,
+        output: &DeviceBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(rows, "q2_k gemv rows")?;
+        ensure_len(cols, "q2_k gemv cols")?;
+        launch_status(unsafe {
+            hi_cuda_launch_q2_k_gemv(
+                weights.as_ptr(),
+                x.as_ptr(),
+                output.as_mut_ptr(),
+                rows as c_int,
+                cols as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_q2_k_gemv")
+    }
+
+    /// Fused IQ4_NL GEMV (M=1 decode): reads IQ4_NL weights directly, f32 activation.
+    /// Requires cols % 32 == 0.
+    pub fn launch_iq4_nl_gemv(
+        weights: &DeviceBuffer,
+        x: &DeviceBuffer,
+        output: &DeviceBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(rows, "iq4_nl gemv rows")?;
+        ensure_len(cols, "iq4_nl gemv cols")?;
+        launch_status(unsafe {
+            hi_cuda_launch_iq4_nl_gemv(
+                weights.as_ptr(),
+                x.as_ptr(),
+                output.as_mut_ptr(),
+                rows as c_int,
+                cols as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_iq4_nl_gemv")
+    }
+
+    /// Fused IQ4_XS GEMV (M=1 decode): reads IQ4_XS weights directly, f32 activation.
+    /// Requires cols % 256 == 0.
+    pub fn launch_iq4_xs_gemv(
+        weights: &DeviceBuffer,
+        x: &DeviceBuffer,
+        output: &DeviceBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(rows, "iq4_xs gemv rows")?;
+        ensure_len(cols, "iq4_xs gemv cols")?;
+        launch_status(unsafe {
+            hi_cuda_launch_iq4_xs_gemv(
+                weights.as_ptr(),
+                x.as_ptr(),
+                output.as_mut_ptr(),
+                rows as c_int,
+                cols as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_iq4_xs_gemv")
     }
 
     pub fn launch_dequantize_matrix(
