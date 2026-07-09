@@ -89,11 +89,14 @@ pub fn apply_changes(worktree: &Path, base: &str) -> Result<bool> {
         return Ok(false); // nothing changed
     }
 
-    // Apply the patch in the main repo via stdin.
+    // Apply the patch in the main repo via stdin. Capture stderr so a failed
+    // apply says *which file/hunk* conflicted — in the TUI the inherited stderr
+    // is invisible, which made fleet merge failures undiagnosable.
     use std::io::Write;
     let mut child = Command::new("git")
         .args(["apply", "--whitespace=nowarn"])
         .stdin(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .context("spawning git apply")?;
     child
@@ -102,9 +105,18 @@ pub fn apply_changes(worktree: &Path, base: &str) -> Result<bool> {
         .context("git apply stdin")?
         .write_all(&diff.stdout)
         .context("writing patch to git apply")?;
-    let status = child.wait().context("waiting for git apply")?;
-    if !status.success() {
-        bail!("git apply failed (working tree may conflict with the patch)");
+    let out = child.wait_with_output().context("waiting for git apply")?;
+    if !out.status.success() {
+        let why = String::from_utf8_lossy(&out.stderr);
+        let why = why.trim();
+        bail!(
+            "git apply failed: {}",
+            if why.is_empty() {
+                "working tree may conflict with the patch"
+            } else {
+                why
+            }
+        );
     }
     Ok(true)
 }
