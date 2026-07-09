@@ -282,6 +282,26 @@ mod native {
             cols: c_int,
             stream: *mut c_void,
         ) -> c_int;
+        fn hi_cuda_launch_q2_k_dp4a_gemv(
+            weights: *const c_void,
+            xq: *const c_void,
+            dx: *const c_void,
+            xsum: *const c_void,
+            y: *mut c_void,
+            rows: c_int,
+            cols: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_q3_k_dp4a_gemv(
+            weights: *const c_void,
+            xq: *const c_void,
+            dx: *const c_void,
+            xsum: *const c_void,
+            y: *mut c_void,
+            rows: c_int,
+            cols: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
         fn hi_cuda_launch_q6_k_gemv(
             weights: *const c_void,
             x: *const c_void,
@@ -1666,6 +1686,62 @@ mod native {
             )
         })?;
         check_last_error("hi_cuda_launch_q6_k_dp4a_gemv")
+    }
+
+    /// dp4a Q2_K GEMV (M=1 decode). Requires cols % 256 == 0.
+    pub fn launch_q2_k_dp4a_gemv(
+        weights: &DeviceBuffer,
+        xq: &DeviceBuffer,
+        dx: &DeviceBuffer,
+        xsum: &DeviceBuffer,
+        y: &DeviceBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(rows, "q2_k dp4a rows")?;
+        ensure_len(cols, "q2_k dp4a cols")?;
+        launch_status(unsafe {
+            hi_cuda_launch_q2_k_dp4a_gemv(
+                weights.as_ptr(),
+                xq.as_ptr(),
+                dx.as_ptr(),
+                xsum.as_ptr(),
+                y.as_mut_ptr(),
+                rows as c_int,
+                cols as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_q2_k_dp4a_gemv")
+    }
+
+    /// dp4a Q3_K GEMV (M=1 decode). Requires cols % 256 == 0.
+    pub fn launch_q3_k_dp4a_gemv(
+        weights: &DeviceBuffer,
+        xq: &DeviceBuffer,
+        dx: &DeviceBuffer,
+        xsum: &DeviceBuffer,
+        y: &DeviceBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(rows, "q3_k dp4a rows")?;
+        ensure_len(cols, "q3_k dp4a cols")?;
+        launch_status(unsafe {
+            hi_cuda_launch_q3_k_dp4a_gemv(
+                weights.as_ptr(),
+                xq.as_ptr(),
+                dx.as_ptr(),
+                xsum.as_ptr(),
+                y.as_mut_ptr(),
+                rows as c_int,
+                cols as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_q3_k_dp4a_gemv")
     }
 
     /// Fused Q6_K GEMV (M=1 decode): reads Q6_K weights directly, f32 activation.

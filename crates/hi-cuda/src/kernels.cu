@@ -6476,6 +6476,186 @@ extern "C" int hi_cuda_launch_q6_k_dp4a_gemv(
   return 0;
 }
 
+// dp4a Q2_K GEMV. Q2_K = 84 B/256 (4-aligned), per-16 sub-blocks; w = d*(sc&0xf)*q
+// - dmin*(sc>>4), q is 2-bit. Each per-32 activation block = two group16 sub-blocks
+// (gi=0/1). Per group16: d*scale4*dp4a(q,xq) - dmin*min4*xsum16, scaled by dx[sub].
+__global__ void q2_k_dp4a_gemv_kernel(
+    const uint8_t* __restrict__ weights,
+    const int8_t* __restrict__ xq,
+    const float* __restrict__ dx,
+    const int* __restrict__ xsum,
+    float* __restrict__ y,
+    int rows,
+    int cols) {
+  (void)xsum;
+  const int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+  if (row >= rows) {
+    return;
+  }
+  const int lane = threadIdx.x & 31;
+  const int nsub = cols / 32;
+  const size_t row_bytes = static_cast<size_t>(cols / 256) * 84;
+  const uint8_t* row_ptr = weights + static_cast<size_t>(row) * row_bytes;
+  float acc = 0.0f;
+  for (int sub = lane; sub < nsub; sub += 32) {
+    const int kblock = sub >> 3;
+    const int rem = sub & 7;
+    const uint8_t* blk = row_ptr + static_cast<size_t>(kblock) * 84;
+    const float d = __half2float(*reinterpret_cast<const __half*>(blk + 80));
+    const float dmin = __half2float(*reinterpret_cast<const __half*>(blk + 82));
+    const int8_t* xqbase = xq + sub * 32;
+    float contrib = 0.0f;
+#pragma unroll
+    for (int gi = 0; gi < 2; ++gi) {
+      const int g = rem * 2 + gi;
+      const int half128 = g >> 3;
+      const int group_in_half = g & 7;
+      const int pair = group_in_half >> 1;
+      const bool upper16 = (group_in_half & 1) != 0;
+      const int base = half128 * 32 + (upper16 ? 16 : 0);
+      const int shift = 2 * pair;
+      const uint8_t sc = blk[g];
+      const float scale4 = static_cast<float>(sc & 0x0f);
+      const float min4 = static_cast<float>(sc >> 4);
+      const uint8_t* qs = blk + 16 + base;
+      const int8_t* xqg = xqbase + gi * 16;
+      int dot = 0;
+      int xs = 0;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const uint32_t qs4 = *reinterpret_cast<const uint32_t*>(qs + j * 4);
+        const int q = static_cast<int>((qs4 >> shift) & 0x03030303u);
+        const int xv = *reinterpret_cast<const int*>(xqg + j * 4);
+        dot = dp4a_i8(q, xv, dot);
+        xs = dp4a_i8(xv, 0x01010101, xs);
+      }
+      contrib += d * scale4 * static_cast<float>(dot) -
+                 dmin * min4 * static_cast<float>(xs);
+    }
+    acc += dx[sub] * contrib;
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    acc += __shfl_down_sync(0xffffffffu, acc, off);
+  }
+  if (lane == 0) {
+    y[row] = acc;
+  }
+}
+
+extern "C" int hi_cuda_launch_q2_k_dp4a_gemv(
+    const void* weights, const void* xq, const void* dx, const void* xsum, void* y,
+    int rows, int cols, void* stream) {
+  if (weights == nullptr || xq == nullptr || dx == nullptr || xsum == nullptr ||
+      y == nullptr || rows <= 0 || cols <= 0 || cols % 256 != 0 || stream == nullptr) {
+    return 1;
+  }
+  const int warps_per_block = 4;
+  const int grid = (rows + warps_per_block - 1) / warps_per_block;
+  q2_k_dp4a_gemv_kernel<<<grid, warps_per_block * 32, 0,
+                          static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint8_t*>(weights), static_cast<const int8_t*>(xq),
+      static_cast<const float*>(dx), static_cast<const int*>(xsum),
+      static_cast<float*>(y), rows, cols);
+  return 0;
+}
+
+// dp4a Q3_K GEMV. Q3_K = 110 B/256 (NOT 4-aligned -> byte loads), per-16 sub-blocks;
+// w = d*scale*q3, q3 = low2 - (hmask_bit ? 0 : 4) (signed, -4..3), scale = 6-bit-32.
+// sum(q3*xq) = dp4a(low,xq) - 4*dp4a(notbit,xq) (notbit=1 where hmask clear), which
+// avoids packed-subtraction borrows. acc += dx[sub]*d*sum_chunk(scale*dot).
+__global__ void q3_k_dp4a_gemv_kernel(
+    const uint8_t* __restrict__ weights,
+    const int8_t* __restrict__ xq,
+    const float* __restrict__ dx,
+    const int* __restrict__ xsum,
+    float* __restrict__ y,
+    int rows,
+    int cols) {
+  (void)xsum;
+  const int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+  if (row >= rows) {
+    return;
+  }
+  const int lane = threadIdx.x & 31;
+  const int nsub = cols / 32;
+  const size_t row_bytes = static_cast<size_t>(cols / 256) * 110;
+  const uint8_t* row_ptr = weights + static_cast<size_t>(row) * row_bytes;
+  float acc = 0.0f;
+  for (int sub = lane; sub < nsub; sub += 32) {
+    const int kblock = sub >> 3;
+    const int rem = sub & 7;
+    const uint8_t* blk = row_ptr + static_cast<size_t>(kblock) * 110;
+    const uint8_t* hmask = blk;         // 32 B
+    const uint8_t* qs = blk + 32;       // 64 B
+    const uint8_t* scales = blk + 96;   // 12 B
+    const float d = __half2float(*reinterpret_cast<const __half*>(blk + 108));
+    const int8_t* xqbase = xq + sub * 32;
+    float contrib = 0.0f;
+#pragma unroll
+    for (int gi = 0; gi < 2; ++gi) {
+      const int g = rem * 2 + gi;
+      const int half128 = g >> 3;
+      const int group_in_half = g & 7;
+      const int pair = group_in_half >> 1;
+      const bool upper16 = (group_in_half & 1) != 0;
+      const int qbase = half128 * 32 + (upper16 ? 16 : 0);
+      const int hbase = (upper16 ? 16 : 0);
+      const int shift = 2 * pair;
+      const int bitpos = 4 * half128 + pair;
+      const float scale = static_cast<float>(q3_k_scale(g, scales));
+      const int8_t* xqg = xqbase + gi * 16;
+      int dot_low = 0;
+      int dot_clear = 0;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const uint8_t* qp = qs + qbase + j * 4;
+        const uint32_t qs4 = static_cast<uint32_t>(qp[0]) |
+                             (static_cast<uint32_t>(qp[1]) << 8) |
+                             (static_cast<uint32_t>(qp[2]) << 16) |
+                             (static_cast<uint32_t>(qp[3]) << 24);
+        const int low = static_cast<int>((qs4 >> shift) & 0x03030303u);
+        const uint8_t* hp = hmask + hbase + j * 4;
+        const uint32_t hm4 = static_cast<uint32_t>(hp[0]) |
+                             (static_cast<uint32_t>(hp[1]) << 8) |
+                             (static_cast<uint32_t>(hp[2]) << 16) |
+                             (static_cast<uint32_t>(hp[3]) << 24);
+        const int notbit =
+            static_cast<int>(((hm4 >> bitpos) & 0x01010101u) ^ 0x01010101u);
+        const int xv = *reinterpret_cast<const int*>(xqg + j * 4);
+        dot_low = dp4a_i8(low, xv, dot_low);
+        dot_clear = dp4a_i8(notbit, xv, dot_clear);
+      }
+      contrib += scale * (static_cast<float>(dot_low) - 4.0f * static_cast<float>(dot_clear));
+    }
+    acc += dx[sub] * d * contrib;
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    acc += __shfl_down_sync(0xffffffffu, acc, off);
+  }
+  if (lane == 0) {
+    y[row] = acc;
+  }
+}
+
+extern "C" int hi_cuda_launch_q3_k_dp4a_gemv(
+    const void* weights, const void* xq, const void* dx, const void* xsum, void* y,
+    int rows, int cols, void* stream) {
+  if (weights == nullptr || xq == nullptr || dx == nullptr || xsum == nullptr ||
+      y == nullptr || rows <= 0 || cols <= 0 || cols % 256 != 0 || stream == nullptr) {
+    return 1;
+  }
+  const int warps_per_block = 4;
+  const int grid = (rows + warps_per_block - 1) / warps_per_block;
+  q3_k_dp4a_gemv_kernel<<<grid, warps_per_block * 32, 0,
+                          static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint8_t*>(weights), static_cast<const int8_t*>(xq),
+      static_cast<const float*>(dx), static_cast<const int*>(xsum),
+      static_cast<float*>(y), rows, cols);
+  return 0;
+}
+
 __global__ void q4_0_dp4a_gemv_kernel(
     const uint8_t* __restrict__ weight,
     const int8_t* __restrict__ xq,
