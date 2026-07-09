@@ -152,6 +152,13 @@ pub struct AgentConfig {
     /// budgeted); disable per profile with `explore_subagents = false`. Children
     /// never get it (depth ≤ 1).
     pub explore_subagents: bool,
+    /// True when this agent *is* an `explore` subagent (a child). Set internally,
+    /// never by config. It's the depth guard: a subagent is never advertised the
+    /// `explore` tool (even in read-only mode), so a subagent cannot spawn another
+    /// — capping nesting depth at 1. A top-level agent (`false`) keeps `explore`
+    /// even in a read-only/review turn, since delegating a read-only investigation
+    /// is itself read-only.
+    pub is_subagent: bool,
 }
 
 impl Default for AgentConfig {
@@ -193,6 +200,7 @@ impl Default for AgentConfig {
             minimal_tools: false,
             curate_skills: false,
             explore_subagents: false,
+            is_subagent: false,
         }
     }
 }

@@ -25,12 +25,12 @@ if [[ ! -x "$HI_BIN" ]]; then
   cargo build --release -p hi >&2 || exit 1
 fi
 
-# A broad, cross-file question the model should hand to the explore subagent.
-# Phrased WITHOUT "read-only / review / investigate / audit" wording on purpose:
-# those trip hi's review-intent classifier, which puts the *parent* turn into
-# read-only mode and filters out `explore` (it isn't classified read-only).
-PROMPT='Use the explore tool to summarize how the built-in tool set is defined and \
-registered in this repo (which files and structures), then give me the summary.'
+# Compel delegation so this is a deterministic feature check, not a gamble on
+# whether the model chooses to delegate: forbid direct inspection this turn, so
+# the only way to answer is via the explore subagent.
+PROMPT='Delegate to the explore tool and do NOT read, grep, list, or glob files \
+yourself this turn. Ask the subagent to find how the built-in tool set is defined \
+and registered in this repo (which files and structures), then give me its summary.'
 
 echo "== explore live smoke: model=$MODEL ==" >&2
 OUT=$(HI_API_KEY="$KEY" "$HI_BIN" \
