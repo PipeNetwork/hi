@@ -1,11 +1,14 @@
 //! Lightweight workspace fingerprinting for change detection between snapshots.
 
-/// A lightweight file fingerprint: mtime (seconds) + size in bytes. Two
+/// A lightweight file fingerprint: mtime (nanoseconds) + size in bytes. Two
 /// snapshots of the same file compare equal iff the file hasn't been touched.
-/// Much cheaper than reading every file's content on every turn.
+/// Much cheaper than reading every file's content on every turn. Nanosecond
+/// mtime (not seconds) so a same-second, length-preserving edit — e.g. a
+/// one-character fix in a rapid multi-turn eval run — isn't missed, which would
+/// silently skip the verify gate on exactly the change that needed checking.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct FileFingerprint {
-    pub(crate) mtime_secs: i64,
+    pub(crate) mtime_nanos: u128,
     pub(crate) len: u64,
 }
 
@@ -67,16 +70,16 @@ pub(crate) async fn workspace_snapshot(
             let Ok(meta) = std::fs::metadata(path) else {
                 continue;
             };
-            let mtime_secs = meta
+            let mtime_nanos = meta
                 .modified()
                 .ok()
                 .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
+                .map(|d| d.as_nanos())
                 .unwrap_or(0);
             out.insert(
                 rel.to_string_lossy().into_owned(),
                 FileFingerprint {
-                    mtime_secs,
+                    mtime_nanos,
                     len: meta.len(),
                 },
             );

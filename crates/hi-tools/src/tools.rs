@@ -1025,7 +1025,16 @@ async fn run(name: &str, arguments: &str) -> Result<ToolOutput> {
         }
         "bash" => {
             let args: BashArgs = parse(arguments)?;
-            run_bash_tool(args, &mut |_| {}).await
+            let out = run_bash_tool(args, &mut |_| {}).await;
+            // A shell command can mutate any file (sed -i, codegen, git checkout,
+            // cargo add, …), so a later `read` must not serve stale cached content.
+            // We don't know which paths it touched — clear the whole read cache.
+            // Safe: `bash` runs alone, and the cache is only a within-turn read
+            // optimization.
+            if let Ok(mut cache) = READ_CACHE.lock() {
+                cache.clear();
+            }
+            out
         }
         "bash_output" => {
             #[derive(Deserialize)]
@@ -1070,6 +1079,57 @@ async fn run(name: &str, arguments: &str) -> Result<ToolOutput> {
             Ok(ToolOutput::plain(result))
         }
         other => bail!("unknown tool: {other}"),
+    }
+}
+
+/// Compute a human-readable diff of what a mutating tool call *would* change,
+/// without writing anything — so `--confirm-edits` can show the change before
+/// the user approves it rather than asking blind. `None` for calls that can't be
+/// previewed (unparseable args, missing file, or a non-mutating tool).
+pub async fn preview_edit(name: &str, arguments: &str) -> Option<String> {
+    match name {
+        "edit" => {
+            let args: EditArgs = parse(arguments).ok()?;
+            let before = crate::read::read_text_file(&args.path).await.ok()?;
+            let after = apply_edit(
+                &before,
+                &args.old_string,
+                &args.new_string,
+                args.replace_all,
+            )
+            .ok()?;
+            Some(diff(&before, &after))
+        }
+        "multi_edit" => {
+            let args: MultiEditArgs = parse(arguments).ok()?;
+            let before = crate::read::read_text_file(&args.path).await.ok()?;
+            let mut after = before.clone();
+            for e in &args.edits {
+                after = apply_edit(&after, &e.old_string, &e.new_string, false).ok()?;
+            }
+            Some(diff(&before, &after))
+        }
+        "write" => {
+            #[derive(Deserialize)]
+            struct WriteArgs {
+                path: String,
+                content: String,
+            }
+            let args: WriteArgs = parse(arguments).ok()?;
+            let before = tokio::fs::read_to_string(&args.path)
+                .await
+                .unwrap_or_default();
+            Some(diff(&before, &args.content))
+        }
+        "apply_patch" => {
+            #[derive(Deserialize)]
+            struct PatchArgs {
+                patch: String,
+            }
+            // The patch text is itself the readable diff of the intended change.
+            Some(parse::<PatchArgs>(arguments).ok()?.patch)
+        }
+        _ => None,
     }
 }
 
@@ -1822,6 +1882,48 @@ mod tests {
         let (passed, out) = run_check("printf '%s' \"$AI_AGENT\"").await;
         assert!(passed, "got: {out:?}");
         assert_eq!(out, "hi");
+    }
+
+    /// A shell command can mutate any file, so `bash` must invalidate the read
+    /// cache — otherwise a later `read` serves stale pre-bash content.
+    #[tokio::test]
+    async fn bash_invalidates_the_read_cache() {
+        use crate::paths::{READ_CACHE, cache_key};
+        let key = cache_key("/tmp/hi-read-cache-probe");
+        READ_CACHE
+            .lock()
+            .unwrap()
+            .insert(key.clone(), "stale".into());
+        let _ = crate::execute("bash", r#"{"command":"true"}"#).await;
+        assert!(
+            READ_CACHE.lock().unwrap().get(&key).is_none(),
+            "bash must clear the read cache"
+        );
+    }
+
+    /// `--confirm-edits` must show the real change: `preview_edit` computes the
+    /// diff without writing.
+    #[tokio::test]
+    async fn preview_edit_computes_diff_without_writing() {
+        let dir = std::env::temp_dir().join(format!("hi-preview-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "alpha\nbeta\ngamma\n").unwrap();
+        let args = format!(
+            r#"{{"path":"{}","old_string":"beta","new_string":"BETA"}}"#,
+            file.display()
+        );
+        let preview = crate::preview_edit("edit", &args).await.expect("a preview");
+        assert!(
+            preview.contains("BETA"),
+            "preview shows the change: {preview}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "alpha\nbeta\ngamma\n",
+            "preview must not write to the file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // stdin is detached: a command reading stdin sees EOF immediately rather
