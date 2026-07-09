@@ -1,0 +1,3 @@
+name = "kanban-cli"
+prompt = "Build 'kan', a complete kanban board CLI in Python in this directory: storage.py (persist boards to kanban.json), models.py (Board/Column/Card with validation), cli.py using argparse subcommands (init, add, move, list, delete, stats) with tag filtering on list, unit tests covering storage, models, and every CLI subcommand under tests/, and a README.md with usage examples. python3 -m unittest discover -s tests -t . must pass."
+verify = "python3 -m unittest discover -s tests -t ."

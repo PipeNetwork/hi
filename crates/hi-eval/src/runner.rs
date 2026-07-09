@@ -25,6 +25,7 @@ pub fn dir_snapshot(dir: &Path) -> std::collections::BTreeMap<String, Vec<u8>> {
             if matches!(
                 name.as_ref(),
                 ".hi-eval-report.json"
+                    | ".hi-eval-session.jsonl"
                     | ".hi-debug.log"
                     | ".git"
                     | "target"
@@ -173,6 +174,14 @@ pub async fn run_config(
     Ok(result)
 }
 
+/// The report's `goal` block as a canonical JSON string (drive/stall signal).
+fn read_report_goal(report: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(report).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let goal = value.get("goal").filter(|g| !g.is_null())?;
+    Some(goal.to_string())
+}
+
 /// One independent attempt in an isolated copy of the fixture.
 pub fn run_candidate(
     hi: &Path,
@@ -190,32 +199,95 @@ pub fn run_candidate(
     }
     let report = work.join(".hi-eval-report.json");
 
-    let mut cmd = Command::new(hi);
-    cmd.current_dir(&work)
-        .arg("--no-save")
-        .arg("--report")
-        .arg(&report)
-        .arg("--temperature")
-        .arg(temperature.to_string());
-    for arg in profile.hi_args() {
-        cmd.arg(arg);
-    }
-    if let Some(model) = model_override {
-        cmd.env("HI_MODEL", model);
-    }
-    if use_verify {
-        cmd.arg("--verify").arg(&task.verify);
-    }
-    // Goal-mode A/B: HI_EVAL_GOAL=1 makes each run a long-horizon goal (the
-    // child plans the prompt as an objective before the turn), so the summary
-    // can compare goal-driven vs plain prompting.
-    if std::env::var_os("HI_EVAL_GOAL").is_some() {
-        cmd.arg("--goal").arg(&task.prompt);
-    }
-    cmd.arg(&task.prompt);
+    // Long-task drive (HI_EVAL_TURNS > 1): goal mode runs N session-continuing
+    // turns of TURN_STEPS each — the fleet/goal cadence — while plain mode gets
+    // the SAME total step budget in one turn, so the A/B compares structure,
+    // not budget. HI_EVAL_TURNS=1 (default) is today's single-run behavior.
+    let goal_mode = std::env::var_os("HI_EVAL_GOAL").is_some();
+    let turns: u32 = std::env::var("HI_EVAL_TURNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(1);
+    let turn_steps: u32 = std::env::var("HI_EVAL_TURN_STEPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(25);
+    let session = work.join(".hi-eval-session.jsonl");
+    const GOAL_CONTINUE_PROMPT: &str = "Continue the long-horizon goal: complete the active \
+sub-goal now, then update the plan with update_plan — including any newly discovered steps.";
+
+    let build_cmd = |prompt: &str, first: bool, max_steps: Option<u32>| {
+        let mut cmd = Command::new(hi);
+        cmd.current_dir(&work)
+            .arg("--report")
+            .arg(&report)
+            .arg("--temperature")
+            .arg(temperature.to_string());
+        if turns > 1 {
+            // Multi-turn: persist the conversation across child runs.
+            cmd.arg("--session-file").arg(&session);
+        } else {
+            cmd.arg("--no-save");
+        }
+        if let Some(steps) = max_steps {
+            cmd.arg("--max-steps").arg(steps.to_string());
+        }
+        for arg in profile.hi_args() {
+            cmd.arg(arg);
+        }
+        if let Some(model) = model_override {
+            cmd.env("HI_MODEL", model);
+        }
+        if use_verify {
+            cmd.arg("--verify").arg(&task.verify);
+        }
+        if goal_mode && first {
+            cmd.arg("--goal").arg(&task.prompt);
+        }
+        cmd.arg(prompt);
+        cmd
+    };
 
     let started = Instant::now();
-    let output = cmd.output().context("failed to launch hi")?;
+    let mut output = build_cmd(
+        &task.prompt,
+        true,
+        (turns > 1).then(|| {
+            if goal_mode {
+                turn_steps
+            } else {
+                turn_steps * turns
+            }
+        }),
+    )
+    .output()
+    .context("failed to launch hi")?;
+    if goal_mode && turns > 1 {
+        // Drive while the report says the goal is still active (stall guard: two
+        // consecutive turns with an unchanged goal park the drive).
+        let mut last_goal = read_report_goal(&report);
+        let mut stall = 0u32;
+        for _ in 1..turns {
+            let active = last_goal.as_ref().is_some_and(|g| {
+                g.contains("\"status\":\"Active\"") || g.contains("\"status\": \"Active\"")
+            });
+            if !active || stall >= 2 {
+                break;
+            }
+            output = build_cmd(GOAL_CONTINUE_PROMPT, false, Some(turn_steps))
+                .output()
+                .context("failed to launch hi (drive turn)")?;
+            let goal = read_report_goal(&report);
+            if goal == last_goal {
+                stall += 1;
+            } else {
+                stall = 0;
+            }
+            last_goal = goal;
+        }
+    }
     let seconds = started.elapsed().as_secs_f64();
     if !output.status.success() {
         eprintln!(
