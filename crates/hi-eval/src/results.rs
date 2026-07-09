@@ -167,6 +167,8 @@ pub struct RunArtifact {
     pub recovery: bool,
     /// Whether the write-`delegate` subagent was on for this run (for the A/B).
     pub write_subagents: bool,
+    /// Whether goal mode (planner-decomposed `--goal` per task) was on (A/B).
+    pub goal_mode: bool,
     pub passed: bool,
     pub failure_bucket: Option<String>,
     pub failure_confidence: Option<&'static str>,
