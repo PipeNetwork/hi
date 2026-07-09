@@ -472,9 +472,15 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "dashboard",
-        args: "[status]",
+        args: "[status|resume <id>]",
         help: "control a fleet: dispatch, monitor, and steer multiple agents (TUI)",
-        arg_values: &[("status", "list this project's resumable fleet sessions")],
+        arg_values: &[
+            ("status", "list this project's resumable fleet sessions"),
+            (
+                "resume",
+                "re-adopt a fleet session as a live row (most recent if no id)",
+            ),
+        ],
     },
     CommandSpec {
         name: "status",

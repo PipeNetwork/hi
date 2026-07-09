@@ -300,6 +300,29 @@ async fn main() -> Result<()> {
                 })
                 .collect()
         }),
+        resume_info: Box::new(|id| {
+            let id = if id.is_empty() {
+                // No id: the most recent fleet session in this project.
+                session::fleet_sessions().into_iter().next()?.id
+            } else {
+                id.to_string()
+            };
+            let path = session::session_path(&id).ok().filter(|p| p.is_file())?;
+            let title = session::fleet_sessions()
+                .into_iter()
+                .find(|s| s.id == id)
+                .map(|s| s.title)
+                .unwrap_or_else(|| id.clone());
+            let goal = session::session_goal_summary(&path);
+            Some(hi_tui::FleetResumeInfo {
+                id,
+                path,
+                title,
+                goal_active: goal.as_ref().is_some_and(|g| g.active),
+                goal_done: goal.as_ref().map(|g| g.done).unwrap_or(0),
+                goal_total: goal.as_ref().map(|g| g.total).unwrap_or(0),
+            })
+        }),
     };
 
     if let Some(mut prompt) = prompt_input {

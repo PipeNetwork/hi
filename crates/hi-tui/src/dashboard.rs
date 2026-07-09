@@ -178,7 +178,7 @@ impl FleetRow {
 }
 
 /// What a completed in-flight future reports back.
-enum RowDone {
+pub(crate) enum RowDone {
     /// The child turn exited.
     Turn { ok: bool, killed: bool },
     /// The off-thread merge check finished (diff vs base + verify verdict).
@@ -194,7 +194,7 @@ enum RowDone {
     },
 }
 
-type RowFut = Pin<Box<dyn Future<Output = (usize, RowDone)>>>;
+pub(crate) type RowFut = Pin<Box<dyn Future<Output = (usize, RowDone)>>>;
 
 /// Which input owns keystrokes.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -216,14 +216,24 @@ pub(crate) async fn run_dashboard(
     ticker: &mut tokio::time::Interval,
     app: &mut App,
     launcher: &FleetLauncher,
+    adopt: Option<crate::FleetResumeInfo>,
 ) -> Result<()> {
     let (line_tx, mut line_rx) = mpsc::unbounded_channel::<(usize, String)>();
     let mut in_flight: FuturesUnordered<RowFut> = FuturesUnordered::new();
     let mut selected: usize = app.fleet.len().saturating_sub(1);
+    // `/fleet resume [id]`: re-adopt a past session as a row before the loop
+    // starts (needs the loop's channels for its first drive turn).
+    let mut adopt_flash: Option<String> = None;
+    if let Some(info) = adopt {
+        match adopt_session(app, info, launcher, &line_tx, &mut in_flight).await {
+            Ok(idx) => selected = idx,
+            Err(err) => adopt_flash = Some(format!("resume failed: {err:#}")),
+        }
+    }
     let mut focus = Focus::Dispatch;
     let mut dispatch = InputLine::default();
     let mut exit_armed = false;
-    let mut flash: Option<String> = None;
+    let mut flash: Option<String> = adopt_flash.take();
     // Peek scrollback: lines back from the live tail (0 = follow).
     let mut peek_offset: usize = 0;
 
@@ -275,8 +285,7 @@ pub(crate) async fn run_dashboard(
                 match event {
                     Event::Paste(text) => {
                         flash = None;
-                        focused_input(app, selected, focus, &mut dispatch)
-                            .map(|input| input.insert_str(&text));
+                        if let Some(input) = focused_input(app, selected, focus, &mut dispatch) { input.insert_str(&text) }
                     }
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -431,7 +440,7 @@ pub(crate) async fn run_dashboard(
                                     }) =>
                             {
                                 if let Some(row) = app.fleet.get_mut(selected) {
-                                    worktree::cleanup(&[row.worktree.clone()]);
+                                    worktree::cleanup(std::slice::from_ref(&row.worktree));
                                     row.state = RowState::Closed;
                                     row.activity.clear();
                                     row.push_line(
@@ -459,8 +468,7 @@ pub(crate) async fn run_dashboard(
                                 focused_input(app, selected, focus, &mut dispatch).map(InputLine::end);
                             }
                             KeyCode::Char(c) if !ctrl => {
-                                focused_input(app, selected, focus, &mut dispatch)
-                                    .map(|input| input.insert(c));
+                                if let Some(input) = focused_input(app, selected, focus, &mut dispatch) { input.insert(c) }
                             }
                             KeyCode::Backspace => {
                                 focused_input(app, selected, focus, &mut dispatch).map(InputLine::backspace);
@@ -573,6 +581,133 @@ async fn dispatch_new(
     let idx = app.fleet.len() - 1;
     start_turn(app, idx, prompt, launcher, line_tx, in_flight);
     Ok(idx)
+}
+
+/// Re-adopt a past fleet session as a live row: fresh worktree off the current
+/// tree, the old session file continues, its transcript preloads the peek tail,
+/// and an active goal resumes driving immediately.
+pub(crate) async fn adopt_session(
+    app: &mut App,
+    info: crate::FleetResumeInfo,
+    launcher: &FleetLauncher,
+    line_tx: &mpsc::UnboundedSender<(usize, String)>,
+    in_flight: &mut FuturesUnordered<RowFut>,
+) -> Result<usize> {
+    if !worktree::in_git_repo() {
+        return Err(anyhow!(
+            "not in a git repository (fleet rows need worktrees)"
+        ));
+    }
+    let base = hi_tools::checkpoint::create(std::path::Path::new("."))
+        .await
+        .context("couldn't snapshot the working tree")?;
+    app.fleet_next_id += 1;
+    let id = app.fleet_next_id;
+    let path = worktree::worktree_path("fleet", id as u32);
+    worktree::add_worktree(&path, &base)?;
+    let goal = (info.goal_total > 0).then_some(RowGoal {
+        done: info.goal_done,
+        total: info.goal_total,
+        active: info.goal_active,
+        paused: false,
+    });
+    // Preload the peek tail with the session's conversation so attach shows
+    // history immediately, before any new turn runs.
+    let tail = load_transcript(&info.path, TAIL_CAP);
+    let mut row = FleetRow {
+        id,
+        title: info.title,
+        worktree: path,
+        base,
+        session: info.path,
+        state: RowState::Idle,
+        merge: MergeState::None,
+        changed: Vec::new(),
+        activity: String::new(),
+        tail,
+        pending: VecDeque::new(),
+        reply: InputLine::default(),
+        kill: None,
+        started: None,
+        turns: 0,
+        usage: 0,
+        goal,
+        goal_objective: None,
+        last_goal_json: None,
+        driving: false,
+        drive_stall: 0,
+        stale: false,
+        attention: false,
+    };
+    row.push_line(format!("⟲ resumed session {}", info.id));
+    let goal_active = row.goal.as_ref().is_some_and(|g| g.active);
+    app.fleet.push(row);
+    let idx = app.fleet.len() - 1;
+    if goal_active {
+        start_turn(
+            app,
+            idx,
+            hi_agent::GOAL_CONTINUE_PROMPT.to_string(),
+            launcher,
+            line_tx,
+            in_flight,
+        );
+    }
+    Ok(idx)
+}
+
+/// Render a session file's conversation as plain display lines (last `cap`):
+/// user prompts as `› …`, assistant text verbatim, tool calls as `⚙ label`.
+fn load_transcript(path: &std::path::Path, cap: usize) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut lines: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value.get("type").is_some() {
+            continue; // session meta (usage/goal/compaction/…)
+        }
+        let Ok(msg) = serde_json::from_value::<hi_ai::Message>(value) else {
+            continue;
+        };
+        match msg.role {
+            hi_ai::Role::User => {
+                for c in &msg.content {
+                    if let hi_ai::Content::Text(t) = c {
+                        let first = t.trim().lines().next().unwrap_or("").trim();
+                        if !first.is_empty() {
+                            lines.push(format!("› {}", truncate(first, 100)));
+                        }
+                    }
+                }
+            }
+            hi_ai::Role::Assistant => {
+                for c in &msg.content {
+                    match c {
+                        hi_ai::Content::Text(t) => lines.extend(
+                            t.lines()
+                                .map(str::trim_end)
+                                .filter(|l| !l.trim().is_empty())
+                                .map(str::to_string),
+                        ),
+                        hi_ai::Content::ToolCall {
+                            name, arguments, ..
+                        } => lines.push(format!("⚙ {}", hi_agent::ui::tool_label(name, arguments))),
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if lines.len() > cap {
+        let drop = lines.len() - cap;
+        lines.drain(..drop);
+    }
+    lines
 }
 
 /// Send `text` to the selected row: run it now if idle, else queue it.
@@ -1537,5 +1672,35 @@ mod tests {
         assert_eq!(strip_ansi("\u{1b}[32m✓ ok\u{1b}[0m"), "✓ ok");
         assert_eq!(strip_ansi("\u{1b}]0;title\u{7}body"), "body");
         assert_eq!(strip_ansi("no escapes"), "no escapes");
+    }
+
+    #[test]
+    fn load_transcript_renders_conversation_lines() {
+        use hi_ai::Message;
+        let dir = std::env::temp_dir().join(format!("hi-fleet-lt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("s.jsonl");
+        let mut lines = Vec::new();
+        lines.push(serde_json::to_string(&Message::system("sys prompt")).unwrap());
+        lines.push(serde_json::to_string(&Message::user("fix the parser\nsecond line")).unwrap());
+        lines.push(
+            serde_json::to_string(&Message::assistant(vec![hi_ai::Content::Text(
+                "done, it parses".into(),
+            )]))
+            .unwrap(),
+        );
+        lines.push(r#"{"type":"usage","input_tokens":1,"output_tokens":2}"#.to_string());
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+        let out = load_transcript(&path, 50);
+        assert!(
+            out.iter().any(|l| l.starts_with("› fix the parser")),
+            "{out:?}"
+        );
+        assert!(out.iter().any(|l| l == "done, it parses"), "{out:?}");
+        // System prompt + meta lines are skipped.
+        assert!(!out.iter().any(|l| l.contains("sys prompt")), "{out:?}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

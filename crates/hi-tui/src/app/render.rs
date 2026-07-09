@@ -261,10 +261,10 @@ impl crate::App {
         // Prefer the structured-goal view when a long-horizon goal is active: it's
         // the authoritative decomposition the executor's `update_plan` maps onto, so
         // showing both would be redundant.
-        if let Some(goal) = &self.goal {
-            if !goal.sub_goals.is_empty() {
-                return self.goal_lines(goal, max_steps);
-            }
+        if let Some(goal) = &self.goal
+            && !goal.sub_goals.is_empty()
+        {
+            return self.goal_lines(goal, max_steps);
         }
         if self.plan.is_empty() {
             return Vec::new();
