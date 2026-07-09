@@ -17,7 +17,7 @@ export HI_API_KEY="$KEY" PIPENETWORK_API_KEY="$KEY" HI_MODEL="$MODEL"
 export HI_EVAL_TURNS="${HI_EVAL_TURNS:-6}" HI_EVAL_TURN_STEPS="${HI_EVAL_TURN_STEPS:-25}"
 STAMP=$(date +%Y%m%d-%H%M%S)
 run_eval() { cargo run -q -p hi-eval -- "$TASKS" --profile=pipenetwork --configs=verify --artifacts="$1"; }
-echo "== bench/long A/B · $HI_EVAL_TURNS×$HI_EVAL_TURN_STEPS steps · model=$MODEL ==" >&2
+echo "== bench/long A/B · $HI_EVAL_TURNS x $HI_EVAL_TURN_STEPS steps · model=$MODEL ==" >&2
 echo "--- side A: plain (1 turn × $((HI_EVAL_TURNS * HI_EVAL_TURN_STEPS)) steps) ---" >&2
 run_eval "target/hi-eval/long-ab-$STAMP/off" 2>&1 | tee /tmp/long-ab-off.log
 echo "--- side B: goal-driven ($HI_EVAL_TURNS turns × $HI_EVAL_TURN_STEPS steps) ---" >&2
