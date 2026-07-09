@@ -364,6 +364,10 @@ pub struct Profile {
     /// `pipe/glm-5.2-fast` on the pipenetwork profile; `None` disables planning.
     #[serde(default)]
     pub planner_model: Option<String>,
+    /// Model id for the `/goal team` skeptic gate (reviews a turn before it
+    /// advances a sub-goal). `None` (default) disables the gate.
+    #[serde(default)]
+    pub skeptic_model: Option<String>,
     /// Other profile names to fall back to, in order, when this one returns
     /// nothing or errors.
     pub fallback: Option<Vec<String>>,
@@ -435,6 +439,7 @@ pub struct Settings {
     pub explore_subagents: bool,
     pub write_subagents: bool,
     pub planner_model: Option<String>,
+    pub skeptic_model: Option<String>,
     pub moa: hi_ai::MoaConfig,
 }
 
@@ -652,6 +657,9 @@ pub fn resolve(cli: &Cli, config: &Config) -> Result<Settings> {
     let write_subagents = profile.and_then(|p| p.write_subagents).unwrap_or(false);
     let planner_model =
         planner_model_default(provider, profile.and_then(|p| p.planner_model.clone()));
+    // Skeptic model: opt-in, no provider default (unlike the planner) — off unless
+    // a profile or HI_SKEPTIC_MODEL sets it.
+    let skeptic_model = profile.and_then(|p| p.skeptic_model.clone());
 
     Ok(Settings {
         provider,
@@ -669,6 +677,7 @@ pub fn resolve(cli: &Cli, config: &Config) -> Result<Settings> {
         explore_subagents,
         write_subagents,
         planner_model,
+        skeptic_model,
         moa: config.moa.clone(),
     })
 }
@@ -1226,6 +1235,7 @@ pub fn resolve_named_profile(config: &Config, name: &str) -> Result<Settings> {
         explore_subagents: explore_subagents_default(profile.explore_subagents),
         write_subagents: profile.write_subagents.unwrap_or(false),
         planner_model: planner_model_default(provider, profile.planner_model.clone()),
+        skeptic_model: profile.skeptic_model.clone(),
         moa: config.moa.clone(),
     })
 }

@@ -688,6 +688,24 @@ impl crate::Agent {
         true
     }
 
+    /// Turn the `/goal team` skeptic gate on/off for the active goal. Persists with
+    /// the goal (so a resumed goal remembers it) and refreshes the system message.
+    /// Returns `false` if there's no active goal.
+    pub fn set_goal_team(&mut self, on: bool) -> bool {
+        let snapshot = match self.structured_goal.as_mut() {
+            Some(goal) => {
+                goal.team = on;
+                goal.clone()
+            }
+            None => return false,
+        };
+        if let Some(session) = self.session.as_mut() {
+            let _ = session.record_goal(&snapshot);
+        }
+        self.refresh_system_message();
+        true
+    }
+
     /// Set (or clear, with `None`) a ceiling on how many sub-goals the goal's plan
     /// may grow to. `None` is the default — no limit, the plan keeps expanding as the
     /// agent discovers work. Persisted with the goal. Returns whether there was a
@@ -738,6 +756,12 @@ impl crate::Agent {
     /// ([`decompose_goal`](Self::decompose_goal)).
     pub fn has_planner(&self) -> bool {
         self.config.planner_model.is_some()
+    }
+
+    /// Whether a skeptic model is configured for the `/goal team` review gate
+    /// ([`skeptic_review`](Self::skeptic_review)).
+    pub fn has_skeptic(&self) -> bool {
+        self.config.skeptic_model.is_some()
     }
 
     /// Whether the most recent turn's verification passed (None if not run).

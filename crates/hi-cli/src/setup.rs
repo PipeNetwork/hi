@@ -88,6 +88,7 @@ pub async fn run() -> Result<Settings> {
         explore_subagents: false,
         write_subagents: false,
         planner_model: None,
+        skeptic_model: None,
         moa: hi_ai::MoaConfig::default(),
     })
 }
