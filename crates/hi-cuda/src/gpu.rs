@@ -15475,15 +15475,17 @@ mod native {
                 .context("CUDA batched attention output element count overflows usize")?;
             let output = DeviceBuffer::alloc(output_elements * std::mem::size_of::<f32>())
                 .context("allocating CUDA batched attention output")?;
-            if window == 0
-                && head_dim <= FLASH_TILE_MAX_HEAD_DIM
-                && v_head_dim <= FLASH_TILE_MAX_HEAD_DIM
+            if head_dim <= FLASH_ONLINE_MAX_HEAD_DIM
+                && v_head_dim <= FLASH_ONLINE_MAX_HEAD_DIM
             {
-                // Tensor-core (WMMA) prefill attention defaults on for quantized
-                // models (weights kept quantized == large models, where prefill is
-                // slow and the f16 attention is a fine trade); f16-stored small models
-                // stay on the f32 flash kernel unless HI_CUDA_WMMA_ATTN opts them in.
-                let use_wmma = (self.info.quantized_matrix_count > 0 || wmma_attn_forced_on())
+                // Flash path covers causal, sliding-window (window>0), and wide heads
+                // (adaptive key-tile). Tensor-core (WMMA) is used only for the common
+                // quantized-model causal case (no window, head_dim<=128, %16); larger
+                // heads / windowed attention use the f32 flash-tile kernel.
+                let use_wmma = window == 0
+                    && head_dim <= FLASH_TILE_MAX_HEAD_DIM
+                    && v_head_dim <= FLASH_TILE_MAX_HEAD_DIM
+                    && (self.info.quantized_matrix_count > 0 || wmma_attn_forced_on())
                     && !wmma_attn_forced_off()
                     && head_dim % 16 == 0
                     && v_head_dim == head_dim;
@@ -15537,6 +15539,7 @@ mod native {
                         kv_heads,
                         head_dim,
                         v_head_dim,
+                        window,
                         &self.stream,
                     )?;
                 }

@@ -538,6 +538,7 @@ mod native {
             kv_heads: c_int,
             qk_head_dim: c_int,
             v_head_dim: c_int,
+            window: c_int,
             stream: *mut c_void,
         ) -> c_int;
         fn hi_cuda_launch_wmma_causal_attention_batched(
@@ -2324,6 +2325,7 @@ mod native {
         kv_heads: usize,
         head_dim: usize,
         v_head_dim: usize,
+        window: usize,
         stream: &Stream,
     ) -> Result<()> {
         ensure_len(batch_count, "flash_attention batch_count")?;
@@ -2332,6 +2334,7 @@ mod native {
         ensure_len(kv_heads, "flash_attention kv_heads")?;
         ensure_len(head_dim, "flash_attention head_dim")?;
         ensure_len(v_head_dim, "flash_attention v_head_dim")?;
+        ensure_len(window, "flash_attention window")?;
         launch_status(unsafe {
             hi_cuda_launch_flashtile_causal_attention_batched(
                 q.as_ptr(),
@@ -2344,6 +2347,7 @@ mod native {
                 kv_heads as c_int,
                 head_dim as c_int,
                 v_head_dim as c_int,
+                window as c_int,
                 stream.as_raw(),
             )
         })?;
