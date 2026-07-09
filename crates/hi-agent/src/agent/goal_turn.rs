@@ -4,7 +4,7 @@
 
 use crate::Ui;
 use crate::decision::Decision;
-use crate::goal::{DEFAULT_SUBGOAL_RETRIES, GoalStatus};
+use crate::goal::{DEFAULT_SUBGOAL_RETRIES, Goal, GoalStatus};
 
 impl crate::Agent {
     /// Long-horizon driver — called at turn end. When a structured goal is set
@@ -20,23 +20,11 @@ impl crate::Agent {
         stalled_repeating: bool,
         hit_step_cap: bool,
         plan_updated_goal: bool,
+        goal_before: Option<Goal>,
         ui: &mut dyn Ui,
     ) {
         if !self.config.long_horizon {
             return;
-        }
-        // Early guards — short immutable borrow (the skeptic call below needs
-        // `&mut self`, so we can't hold a `&mut goal` across the whole function).
-        {
-            let Some(goal) = self.structured_goal.as_ref() else {
-                return;
-            };
-            if goal.paused {
-                return; // Paused by the user — hold progress.
-            }
-            if goal.status != GoalStatus::Active {
-                return; // Already done or failed — nothing to drive.
-            }
         }
         let max_retries = DEFAULT_SUBGOAL_RETRIES;
         // A turn that verified clean (or had no verify but made edits without
@@ -47,6 +35,61 @@ impl crate::Agent {
             && !stalled_repeating
             && !hit_step_cap
             && !self.last_changed_files.is_empty();
+        let clean_success = verified_clean || no_verify_clean;
+
+        // Skeptic gate: on a clean-success turn, a second model reviews the work
+        // before its progress stands. It reviews the sub-goal that was active AT
+        // TURN START — because `update_plan` may have marked that sub-goal (or the
+        // whole goal) done mid-turn, and the model's own "done" claim is exactly
+        // what a skeptic should second-guess. On an objection we revert the turn's
+        // goal progress (restore the pre-turn goal) and record the objections as a
+        // retry note; the edits stay on disk for the next turn to build on.
+        // Fail-open — any reviewer error/timeout/unparseable reply approves.
+        if clean_success
+            && self.has_skeptic()
+            && let Some((objective, sub_goal)) = goal_before.as_ref().and_then(|g| {
+                if !g.team || g.paused || g.status != GoalStatus::Active {
+                    return None;
+                }
+                let sg = g.active_sub_goal()?;
+                Some((g.objective.clone(), sg.description.clone()))
+            })
+        {
+            match self.skeptic_gate(&objective, &sub_goal).await {
+                Some(objections) => {
+                    // Objection: revert the turn's goal progress and record it.
+                    self.structured_goal = goal_before;
+                    if let Some(goal) = self.structured_goal.as_mut() {
+                        goal.skeptic_objections = goal.skeptic_objections.saturating_add(1);
+                        goal.record_failure(
+                            format!("reviewer objected — address then continue:\n{objections}"),
+                            max_retries,
+                        );
+                    }
+                    let first = objections.lines().next().unwrap_or("see notes");
+                    ui.status(&format!("🔍 skeptic objected — retrying: {first}"));
+                    self.refresh_system_message();
+                    self.persist_goal(ui);
+                    return;
+                }
+                // Approved (or a fail-open error): note it and let the advance
+                // stand — fall through to the normal advance/retry logic.
+                None => ui.status("🔍 skeptic reviewed — advancing"),
+            }
+        }
+
+        // Normal advance/retry bookkeeping, on the CURRENT goal.
+        {
+            let Some(goal) = self.structured_goal.as_ref() else {
+                return;
+            };
+            if goal.paused {
+                return; // Paused by the user — hold progress.
+            }
+            if goal.status != GoalStatus::Active {
+                return; // Done/failed (perhaps via update_plan) — nothing to drive.
+            }
+        }
         // A clean read-only turn (investigation, Q&A — no edits, no verify,
         // no stall) is neutral: neither advance nor record failure. The sub-goal
         // stays active for the next turn, which should do the actual work.
@@ -58,35 +101,7 @@ impl crate::Agent {
         if no_edit_neutral {
             return;
         }
-        if verified_clean || no_verify_clean {
-            // Skeptic gate: when `/goal team` is on and a skeptic model is
-            // configured, a second model reviews this turn *before* it advances a
-            // sub-goal. An objection sends the sub-goal back to retry (objections
-            // become notes) instead of advancing — fail-open (see `skeptic_gate`).
-            // Only on the normal advance, not when `update_plan` already advanced
-            // (the model's own bookkeeping, which the skeptic didn't drive).
-            let skeptic_objection = if !plan_updated_goal
-                && self.structured_goal.as_ref().is_some_and(|g| g.team)
-                && self.has_skeptic()
-            {
-                self.skeptic_gate().await
-            } else {
-                None
-            };
-            if let Some(objections) = skeptic_objection {
-                if let Some(goal) = self.structured_goal.as_mut() {
-                    goal.skeptic_objections = goal.skeptic_objections.saturating_add(1);
-                    goal.record_failure(
-                        format!("reviewer objected — address then continue:\n{objections}"),
-                        max_retries,
-                    );
-                }
-                let first = objections.lines().next().unwrap_or("see notes");
-                ui.status(&format!("🔍 skeptic objected — retrying: {first}"));
-                self.refresh_system_message();
-                self.persist_goal(ui);
-                return;
-            }
+        if clean_success {
             // Approve (or gate off): advance as today. If `update_plan` already
             // advanced the goal this turn, don't advance again (skips a sub-goal).
             if !plan_updated_goal && let Some(goal) = self.structured_goal.as_mut() {
