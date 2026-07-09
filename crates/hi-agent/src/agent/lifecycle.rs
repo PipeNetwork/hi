@@ -666,6 +666,24 @@ impl crate::Agent {
         true
     }
 
+    /// Set (or clear, with `None`) a ceiling on how many sub-goals the goal's plan
+    /// may grow to. `None` is the default — no limit, the plan keeps expanding as the
+    /// agent discovers work. Persisted with the goal. Returns whether there was a
+    /// goal to update.
+    pub fn set_goal_step_limit(&mut self, limit: Option<usize>) -> bool {
+        let snapshot = match self.structured_goal.as_mut() {
+            Some(goal) => {
+                goal.step_limit = limit;
+                goal.clone()
+            }
+            None => return false,
+        };
+        if let Some(session) = self.session.as_mut() {
+            let _ = session.record_goal(&snapshot);
+        }
+        true
+    }
+
     /// Whether long-horizon agency is on (the `long_horizon` config flag), so
     /// frontends can branch `/goal` between the structured goal and the
     /// transient goal string.

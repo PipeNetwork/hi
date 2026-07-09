@@ -10,10 +10,10 @@ use std::sync::Arc;
 use anyhow::{Result, anyhow};
 use hi_ai::{ChatRequest, Content, Message, RequestProfile, StreamEvent, ToolMode};
 
-/// Safety bound on the planner's *initial* decomposition (a runaway guard, not a
-/// target). The goal can grow past this as the agent discovers work — the executor
-/// appends milestones via `update_plan`, capped by the goal's total ceiling
-/// ([`crate::goal::MAX_TOTAL_SUB_GOALS`]).
+/// Safety bound on the planner's *initial* decomposition (a per-call runaway guard,
+/// not a target). The goal grows freely past this during execution — the executor
+/// appends milestones via `update_plan` with no default cap; a user can set one with
+/// `/goal limit <n>`.
 const MAX_SUB_GOALS: usize = 20;
 
 const PLANNER_PROMPT: &str = "You are a planning assistant for a coding agent. Decompose the \

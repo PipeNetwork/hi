@@ -225,6 +225,12 @@ impl crate::App {
     /// needs the spinner) and lands in [`set_planned_goal`](Self::set_planned_goal).
     pub(crate) fn handle_goal(&mut self, agent: &mut Agent, arg: &str) {
         match arg.trim() {
+            // `/goal limit <n>` / `limit off` — cap or uncap plan growth.
+            s if command::parse_goal_limit(s).is_some() => {
+                if let Some(limit) = command::parse_goal_limit(s) {
+                    self.handle_goal_limit(agent, limit);
+                }
+            }
             // Pause/resume: hold progress, stop/restart steering. Own messaging,
             // not the goal-set echo.
             "pause" | "resume" => {
@@ -259,6 +265,49 @@ impl crate::App {
                 self.report_goal_result(agent, arg, error);
             }
         }
+    }
+
+    /// `/goal limit …`: set/clear/report the plan-growth ceiling.
+    fn handle_goal_limit(&mut self, agent: &mut Agent, limit: command::GoalLimitArg) {
+        use command::GoalLimitArg;
+        let (msg, style) = match limit {
+            GoalLimitArg::Show => match agent.structured_goal().and_then(|g| g.step_limit) {
+                Some(n) => (format!("goal limit: {n} sub-goals"), dim()),
+                None => (
+                    "goal limit: none — the plan grows freely".to_string(),
+                    dim(),
+                ),
+            },
+            GoalLimitArg::Set(n) => {
+                if agent.set_goal_step_limit(Some(n)) {
+                    (
+                        format!("✓ goal limit set to {n} sub-goals"),
+                        Style::default().fg(Color::Green),
+                    )
+                } else {
+                    ("no goal to limit".to_string(), dim())
+                }
+            }
+            GoalLimitArg::Unlimited => {
+                if agent.set_goal_step_limit(None) {
+                    (
+                        "✓ goal limit removed — the plan grows freely".to_string(),
+                        Style::default().fg(Color::Green),
+                    )
+                } else {
+                    ("no goal to limit".to_string(), dim())
+                }
+            }
+            GoalLimitArg::Invalid(value) => (
+                format!(
+                    "goal limit: '{value}' isn't a number — use /goal limit <n> or 'limit off'"
+                ),
+                Style::default().fg(Color::Yellow),
+            ),
+        };
+        self.refresh_goal(agent);
+        self.push(Line::styled(msg, style));
+        self.follow();
     }
 
     /// Install a goal whose sub-goals a planner already decomposed (from the run

@@ -112,6 +112,11 @@ pub(crate) fn handle_command(
             println!("\x1b[33m/copy is only available in the full-screen TUI\x1b[0m");
         }
         Command::Goal(arg) => match arg.trim() {
+            s if hi_agent::command::parse_goal_limit(s).is_some() => {
+                if let Some(limit) = hi_agent::command::parse_goal_limit(s) {
+                    handle_goal_limit(agent, limit);
+                }
+            }
             "" => {
                 // Report whichever goal view is active: the structured
                 // long-horizon goal when long_horizon is on, else the
@@ -319,6 +324,35 @@ pub(crate) async fn handle_goal_planned(agent: &mut hi_agent::Agent, objective: 
             Err(err) => eprintln!("\x1b[33mgoal set failed: {err:#}\x1b[0m"),
         },
         Err(err) => eprintln!("\x1b[33mgoal set failed: {err:#}\x1b[0m"),
+    }
+}
+
+fn handle_goal_limit(agent: &mut hi_agent::Agent, limit: hi_agent::command::GoalLimitArg) {
+    use hi_agent::command::GoalLimitArg;
+    match limit {
+        GoalLimitArg::Show => match agent.structured_goal().and_then(|g| g.step_limit) {
+            Some(n) => println!("\x1b[2mgoal limit: {n} sub-goals\x1b[0m"),
+            None => println!("\x1b[2mgoal limit: none — the plan grows freely\x1b[0m"),
+        },
+        GoalLimitArg::Set(n) => {
+            if agent.set_goal_step_limit(Some(n)) {
+                println!("\x1b[32m✓ goal limit set to {n} sub-goals\x1b[0m");
+            } else {
+                println!("\x1b[2mno goal to limit\x1b[0m");
+            }
+        }
+        GoalLimitArg::Unlimited => {
+            if agent.set_goal_step_limit(None) {
+                println!("\x1b[32m✓ goal limit removed — the plan grows freely\x1b[0m");
+            } else {
+                println!("\x1b[2mno goal to limit\x1b[0m");
+            }
+        }
+        GoalLimitArg::Invalid(value) => {
+            eprintln!(
+                "\x1b[33mgoal limit: '{value}' isn't a number — use /goal limit <n> or 'limit off'\x1b[0m"
+            );
+        }
     }
 }
 

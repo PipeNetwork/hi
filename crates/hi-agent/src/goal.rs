@@ -68,16 +68,18 @@ pub struct Goal {
     /// it. `#[serde(default)]` so goals saved before pause/resume load as active.
     #[serde(default)]
     pub paused: bool,
+    /// Optional user-set ceiling on how many sub-goals the plan may grow to (via
+    /// `/goal limit <n>`). `None` (the default) means **no limit** — the plan keeps
+    /// expanding as the agent discovers work, which is the point for long,
+    /// adventurous objectives ("port this service to Rust"). Part of the contract,
+    /// so it persists with the goal. `#[serde(default)]` for older saved goals.
+    #[serde(default)]
+    pub step_limit: Option<usize>,
 }
 
 /// Default per-sub-goal retry budget: how many times to retry a failing sub-goal
 /// (with a "reconsider, don't repeat" nudge) before marking it `Failed`.
 pub const DEFAULT_SUBGOAL_RETRIES: u32 = 2;
-
-/// Hard ceiling on total sub-goals, including ones the executor appends as it
-/// discovers work. A runaway guard, not a target — a real project's plan grows,
-/// but not without bound.
-pub const MAX_TOTAL_SUB_GOALS: usize = 40;
 
 impl Goal {
     /// Create a fresh goal with sub-goals all `Pending` except the first
@@ -104,6 +106,7 @@ impl Goal {
             sub_goals,
             status: GoalStatus::Active,
             paused: false,
+            step_limit: None,
         }
     }
 
@@ -189,14 +192,19 @@ impl Goal {
     /// Apply the executor's *evolving* plan (a `(description, status)` per step) to
     /// the goal: update existing sub-goals' status by position — keeping their
     /// richer planner descriptions — and **append** steps beyond the current list,
-    /// so the plan grows as the agent discovers work ("refactors-within-refactors"),
-    /// up to [`MAX_TOTAL_SUB_GOALS`]. Then re-derive the overall status. This is how
-    /// a goal stays a live contract over a real project rather than a frozen list.
+    /// so the plan grows as the agent discovers work ("refactors-within-refactors").
+    /// By default there's **no cap** — the plan expands as far as the objective
+    /// takes it; a user-set [`step_limit`](Self#structfield.step_limit) bounds it if
+    /// they want. Then re-derive the overall status. This is how a goal stays a live
+    /// contract over a real project rather than a frozen list.
     pub fn apply_plan(&mut self, steps: &[(String, GoalStatus)]) {
         for (i, (description, status)) in steps.iter().enumerate() {
             if let Some(sg) = self.sub_goals.get_mut(i) {
                 sg.status = *status;
-            } else if self.sub_goals.len() < MAX_TOTAL_SUB_GOALS {
+            } else if self
+                .step_limit
+                .is_none_or(|limit| self.sub_goals.len() < limit)
+            {
                 self.sub_goals.push(SubGoal {
                     description: description.clone(),
                     status: *status,
@@ -463,16 +471,23 @@ mod tests {
     }
 
     #[test]
-    fn apply_plan_caps_total_sub_goals() {
+    fn apply_plan_grows_without_limit_by_default() {
         let mut g = Goal::new("big", vec!["s0".into()]);
-        let steps: Vec<(String, GoalStatus)> = (0..MAX_TOTAL_SUB_GOALS + 10)
+        let steps: Vec<(String, GoalStatus)> = (0..200)
             .map(|i| (format!("s{i}"), GoalStatus::Pending))
             .collect();
         g.apply_plan(&steps);
-        assert_eq!(
-            g.sub_goals.len(),
-            MAX_TOTAL_SUB_GOALS,
-            "capped at the ceiling"
-        );
+        assert_eq!(g.sub_goals.len(), 200, "no default cap — the plan expands");
+    }
+
+    #[test]
+    fn apply_plan_respects_a_user_set_limit() {
+        let mut g = Goal::new("big", vec!["s0".into()]);
+        g.step_limit = Some(5);
+        let steps: Vec<(String, GoalStatus)> = (0..50)
+            .map(|i| (format!("s{i}"), GoalStatus::Pending))
+            .collect();
+        g.apply_plan(&steps);
+        assert_eq!(g.sub_goals.len(), 5, "bounded by the user's /goal limit");
     }
 }

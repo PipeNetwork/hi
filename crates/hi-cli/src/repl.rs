@@ -505,14 +505,12 @@ pub(crate) async fn repl(
                             continue;
                         }
                         // `/goal <objective>` with a planner: decompose (one bounded
-                        // call), then install the structured goal. Read/clear/pause/
-                        // resume and the no-planner case fall through to the sync handler.
+                        // call), then install the structured goal. Control subcommands
+                        // (clear/pause/resume/limit) and the no-planner case fall
+                        // through to the sync handler.
                         Command::Goal(arg)
                             if agent.has_planner()
-                                && !matches!(
-                                    arg.trim(),
-                                    "" | "clear" | "off" | "none" | "pause" | "resume"
-                                ) =>
+                                && hi_agent::command::goal_arg_is_objective(&arg) =>
                         {
                             crate::commands::handle_goal_planned(agent, arg.trim()).await;
                             continue;
