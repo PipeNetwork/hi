@@ -4707,6 +4707,88 @@ __global__ void quantize_q8_row_kernel(
 // One warp per row; reads 4-bit weights + int8 activation (both quantized). Weight
 // block layout matches dequantize_q4_0_kernel: byte j = weight j (low nibble) and
 // weight j+16 (high nibble).
+// Fused Q3_K GEMV (M=1 decode). Reads Q3_K weights directly, dequantizing each 3-bit
+// weight on the fly into the dot product. Q3_K block = 110 bytes / 256 weights (32-byte
+// high-bit hmask + 64-byte 2-bit low quants + 12-byte packed 6-bit scales + f16 d); the
+// per-weight unpack mirrors dequantize_q3_k_kernel and reuses q3_k_scale. One block per
+// output row; f32 activation. Requires cols % 256 == 0.
+__global__ void q3_k_gemv_kernel(
+    const uint8_t* __restrict__ weights,
+    const float* __restrict__ x,
+    float* __restrict__ output,
+    int rows,
+    int cols) {
+  const int row = blockIdx.x;
+  if (row >= rows) {
+    return;
+  }
+  const int tid = threadIdx.x;
+  const int nsb = cols / 256;
+  const size_t row_bytes = static_cast<size_t>(nsb) * 110;
+  const uint8_t* row_ptr = weights + static_cast<size_t>(row) * row_bytes;
+  float acc = 0.0f;
+  for (int c = tid; c < cols; c += blockDim.x) {
+    const int sb = c >> 8;
+    const int within = c & 255;
+    const uint8_t* blk = row_ptr + static_cast<size_t>(sb) * 110;
+    const uint8_t* hmask = blk;
+    const uint8_t* qs = blk + 32;
+    const uint8_t* scales = blk + 96;
+    const float d = __half2float(*reinterpret_cast<const __half*>(blk + 108));
+    const int group16 = within >> 4;
+    const int offset16 = within & 15;
+    const int half128 = group16 >> 3;
+    const int group_in_half = group16 & 7;
+    const int pair = group_in_half >> 1;
+    const bool upper16 = (group_in_half & 1) != 0;
+    const int q_index = half128 * 32 + (upper16 ? 16 : 0) + offset16;
+    const int h_index = (upper16 ? 16 : 0) + offset16;
+    const int shift = 2 * pair;
+    const uint8_t mask = static_cast<uint8_t>(1u << (4 * half128 + pair));
+    const int low = (qs[q_index] >> shift) & 0x03;
+    const int quant = low - ((hmask[h_index] & mask) != 0 ? 0 : 4);
+    acc += d * static_cast<float>(q3_k_scale(group16, scales)) *
+           static_cast<float>(quant) * x[c];
+  }
+  __shared__ float warp_sums[32];
+  for (int off = 16; off > 0; off >>= 1) {
+    acc += __shfl_down_sync(0xffffffffu, acc, off);
+  }
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  if (lane == 0) {
+    warp_sums[warp] = acc;
+  }
+  __syncthreads();
+  if (warp == 0) {
+    const int nwarps = blockDim.x >> 5;
+    float v = (lane < nwarps) ? warp_sums[lane] : 0.0f;
+    for (int off = 16; off > 0; off >>= 1) {
+      v += __shfl_down_sync(0xffffffffu, v, off);
+    }
+    if (lane == 0) {
+      output[row] = v;
+    }
+  }
+}
+
+extern "C" int hi_cuda_launch_q3_k_gemv(
+    const void* weights,
+    const void* x,
+    void* output,
+    int rows,
+    int cols,
+    void* stream) {
+  if (weights == nullptr || x == nullptr || output == nullptr || rows <= 0 ||
+      cols <= 0 || cols % 256 != 0 || stream == nullptr) {
+    return 1;
+  }
+  q3_k_gemv_kernel<<<rows, 128, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint8_t*>(weights), static_cast<const float*>(x),
+      static_cast<float*>(output), rows, cols);
+  return 0;
+}
+
 // Fused IQ4_NL GEMV (M=1 decode). Reads IQ4_NL weights directly: block = 18 bytes / 32
 // weights (f16 d + 16-byte 4-bit indices into the fixed IQ4_NL_VALUES non-linear table).
 // Per-weight unpack mirrors dequantize_iq4_nl_kernel. One block per output row; f32
