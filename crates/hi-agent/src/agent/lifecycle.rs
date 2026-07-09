@@ -654,6 +654,12 @@ impl crate::Agent {
         self.config.long_horizon
     }
 
+    /// Whether a planner model is configured for `/goal` decomposition
+    /// ([`decompose_goal`](Self::decompose_goal)).
+    pub fn has_planner(&self) -> bool {
+        self.config.planner_model.is_some()
+    }
+
     /// Whether the most recent turn's verification passed (None if not run).
     pub fn last_verify(&self) -> Option<bool> {
         self.last_verify

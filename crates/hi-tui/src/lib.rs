@@ -409,11 +409,18 @@ pub(crate) struct App {
     pub(crate) history_search: Option<HistorySearch>,
     /// When set, a model-list fetch is in flight (start time, for the spinner).
     pub(crate) fetching: Option<Instant>,
+    /// When set, a `/goal` decomposition (planner call) is in flight (start time,
+    /// for the spinner).
+    pub(crate) planning: Option<Instant>,
     pub(crate) status: String,
     /// The latest task plan from the `update_plan` tool, pinned above the input
     /// as a live checklist. Empty until the model posts a plan; replaced wholesale
     /// on each update so it never drifts.
     pub(crate) plan: Vec<hi_agent::PlanStep>,
+    /// The active long-horizon goal, mirrored from the agent so the pinned plan
+    /// block and header can show sub-goal progress. Refreshed when `/goal` sets it
+    /// and after every turn (the driver may advance it). `None` when no goal is set.
+    pub(crate) goal: Option<hi_agent::Goal>,
     /// Cumulative session token usage (input, output), mirrored from the agent
     /// so the working line and `/tokens` can show it live while a turn runs.
     pub(crate) usage: (u64, u64),

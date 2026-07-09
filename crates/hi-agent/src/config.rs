@@ -125,6 +125,11 @@ pub struct AgentConfig {
     /// resumes across sessions. Off by default while it stabilizes; when off,
     /// the agent behaves as the single-turn loop.
     pub long_horizon: bool,
+    /// The model id used to decompose a `/goal <objective>` into sub-goals (a
+    /// single bounded planning call). `None` disables decomposition — `/goal`
+    /// then sets a single sub-goal equal to the objective. Defaults to
+    /// `pipe/glm-5.2-fast` on the pipenetwork profile.
+    pub planner_model: Option<String>,
     /// When true, ask the user to confirm each file edit (write/edit/multi_edit/
     /// apply_patch) before applying it. The UI shows a diff preview and prompts
     /// for y/n. In non-interactive mode, edits are auto-approved.
@@ -202,6 +207,7 @@ impl Default for AgentConfig {
             proactive_verify: false,
             read_only_preflight: true,
             long_horizon: false,
+            planner_model: None,
             confirm_edits: false,
             lsp: false,
             minimal_tools: false,

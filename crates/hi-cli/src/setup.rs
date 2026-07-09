@@ -87,6 +87,7 @@ pub async fn run() -> Result<Settings> {
         curate_skills: false,
         explore_subagents: false,
         write_subagents: false,
+        planner_model: None,
         moa: hi_ai::MoaConfig::default(),
     })
 }

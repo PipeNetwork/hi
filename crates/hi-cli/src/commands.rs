@@ -270,6 +270,44 @@ pub(crate) fn handle_delegate_command(agent: &mut hi_agent::Agent, arg: &str) {
     }
 }
 
+/// `/goal <objective>` with a planner (the async path driven from the repl):
+/// decompose the objective into sub-goals via one bounded planner call, install the
+/// structured goal, and echo the checklist. Falls back to a single sub-goal on
+/// failure so `/goal` always sets *something*.
+pub(crate) async fn handle_goal_planned(agent: &mut hi_agent::Agent, objective: &str) {
+    println!("\x1b[2mplanning goal with the planner model…\x1b[0m");
+    let sub_goals = match agent.decompose_goal(objective).await {
+        Ok(steps) if !steps.is_empty() => steps,
+        Ok(_) => vec![objective.to_string()],
+        Err(err) => {
+            println!(
+                "\x1b[2mplanner unavailable ({err:#}); using the objective as one step\x1b[0m"
+            );
+            vec![objective.to_string()]
+        }
+    };
+    match agent.set_structured_goal(Some(hi_agent::Goal::new(objective.to_string(), sub_goals))) {
+        Ok(true) => {
+            if let Some(g) = agent.structured_goal() {
+                println!(
+                    "\x1b[32m✓ long-horizon goal set — {} sub-goal(s):\x1b[0m",
+                    g.sub_goals.len()
+                );
+                for (i, s) in g.sub_goals.iter().enumerate() {
+                    println!("\x1b[2m  {}. {}\x1b[0m", i + 1, s.description);
+                }
+            }
+        }
+        Ok(false) => match agent.set_transient_goal(Some(objective.to_string())) {
+            Ok(()) => {
+                println!("\x1b[32m✓ goal set — steers every turn until cleared: {objective}\x1b[0m")
+            }
+            Err(err) => eprintln!("\x1b[33mgoal set failed: {err:#}\x1b[0m"),
+        },
+        Err(err) => eprintln!("\x1b[33mgoal set failed: {err:#}\x1b[0m"),
+    }
+}
+
 pub(crate) fn handle_lsp(agent: &hi_agent::Agent, arg: &str) {
     let arg = arg.trim();
     match arg {
