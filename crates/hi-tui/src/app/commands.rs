@@ -219,47 +219,75 @@ impl crate::App {
         self.follow();
     }
 
+    /// `/goal` (read), `/goal clear`, and `/goal <objective>` when no planner
+    /// decomposition applies (non-pipenetwork, or the planner is unavailable). The
+    /// planner-decomposed path is driven from the run loop (it's an async call that
+    /// needs the spinner) and lands in [`set_planned_goal`](Self::set_planned_goal).
     pub(crate) fn handle_goal(&mut self, agent: &mut Agent, arg: &str) {
-        // Apply the change first, then describe the resulting state. When
-        // long-horizon agency is on, setting a goal creates a structured `Goal`
-        // (a single sub-goal equal to the objective, which the model decomposes
-        // as it works via `update_plan`); clearing drops both views.
         let error = match arg.trim() {
             "" => None, // no argument — just report the current goal
-            "clear" | "off" | "none" => {
-                if let Err(err) = agent.set_transient_goal(None) {
-                    Some(format!("goal clear failed: {err:#}"))
-                } else {
-                    None
-                }
-            }
-            goal => {
-                if agent.long_horizon() {
-                    match agent.set_structured_goal(Some(hi_agent::Goal::new(
-                        goal.to_string(),
-                        vec![goal.to_string()],
-                    ))) {
-                        Ok(true) => None,
-                        Ok(false) => agent
-                            .set_transient_goal(Some(goal.to_string()))
-                            .err()
-                            .map(|err| format!("goal set failed: {err:#}")),
-                        Err(err) => Some(format!("goal set failed: {err:#}")),
-                    }
-                } else {
-                    agent
-                        .set_transient_goal(Some(goal.to_string()))
-                        .err()
-                        .map(|err| format!("goal set failed: {err:#}"))
-                }
-            }
+            "clear" | "off" | "none" => agent
+                .set_transient_goal(None)
+                .err()
+                .map(|err| format!("goal clear failed: {err:#}")),
+            // A single sub-goal equal to the objective (no decomposition).
+            goal => Self::apply_goal(agent, goal, vec![goal.to_string()]),
         };
+        self.refresh_goal(agent);
+        self.report_goal_result(agent, arg, error);
+    }
+
+    /// Install a goal whose sub-goals a planner already decomposed (from the run
+    /// loop, after [`Agent::decompose_goal`]), then echo the resulting checklist.
+    pub(crate) fn set_planned_goal(
+        &mut self,
+        agent: &mut Agent,
+        objective: &str,
+        sub_goals: Vec<String>,
+    ) {
+        let error = Self::apply_goal(agent, objective, sub_goals);
+        self.refresh_goal(agent);
+        self.report_goal_result(agent, objective, error);
+    }
+
+    /// Set a structured `Goal` from a decomposed sub-goal list; fall back to a
+    /// transient goal string when the long-horizon path is off. Returns an error
+    /// message on failure. When long-horizon is on, the executor's own
+    /// `update_plan` calls report progress onto these sub-goals.
+    fn apply_goal(agent: &mut Agent, objective: &str, sub_goals: Vec<String>) -> Option<String> {
+        if agent.long_horizon() {
+            match agent
+                .set_structured_goal(Some(hi_agent::Goal::new(objective.to_string(), sub_goals)))
+            {
+                Ok(true) => None,
+                Ok(false) => agent
+                    .set_transient_goal(Some(objective.to_string()))
+                    .err()
+                    .map(|err| format!("goal set failed: {err:#}")),
+                Err(err) => Some(format!("goal set failed: {err:#}")),
+            }
+        } else {
+            agent
+                .set_transient_goal(Some(objective.to_string()))
+                .err()
+                .map(|err| format!("goal set failed: {err:#}"))
+        }
+    }
+
+    /// Mirror the agent's active structured goal into the `App` so the pinned plan
+    /// block and header can render sub-goal progress.
+    pub(crate) fn refresh_goal(&mut self, agent: &Agent) {
+        self.goal = agent.structured_goal().cloned();
+    }
+
+    /// Echo the current goal state: the structured checklist summary (prominent),
+    /// or the transient set/clear/read feedback.
+    fn report_goal_result(&mut self, agent: &Agent, arg: &str, error: Option<String>) {
         if let Some(msg) = error {
             self.push(Line::styled(msg, Style::default().fg(Color::Yellow)));
             self.follow();
             return;
         }
-        // Report whichever view is active.
         let (msg, prominent) = if let Some(g) = agent.structured_goal() {
             let done = g
                 .sub_goals
@@ -278,8 +306,8 @@ impl crate::App {
         } else {
             goal_feedback(arg, agent.goal())
         };
-        // A set/clear is an applied change — show it plainly (green ✓), not dim,
-        // so it's obvious it took effect. A bare `/goal` is just a read-out.
+        // A set/clear is an applied change — show it plainly (green), not dim, so
+        // it's obvious it took effect. A bare `/goal` is just a read-out.
         let style = if prominent {
             Style::default().fg(Color::Green)
         } else {

@@ -258,6 +258,14 @@ impl crate::App {
     /// `max_steps` caps how many step lines are rendered (on top of the header)
     /// so a long plan can't swallow the input area or overflow the screen.
     pub(crate) fn plan_lines(&self, max_steps: usize) -> Vec<Line<'static>> {
+        // Prefer the structured-goal view when a long-horizon goal is active: it's
+        // the authoritative decomposition the executor's `update_plan` maps onto, so
+        // showing both would be redundant.
+        if let Some(goal) = &self.goal {
+            if !goal.sub_goals.is_empty() {
+                return self.goal_lines(goal, max_steps);
+            }
+        }
         if self.plan.is_empty() {
             return Vec::new();
         }
@@ -290,6 +298,55 @@ impl crate::App {
             out.push(Line::from(vec![
                 Span::styled(format!("  {glyph} "), glyph_style),
                 Span::styled(s.title.clone(), title_style),
+            ]));
+        }
+        if total > max_steps {
+            out.push(Line::styled(
+                format!("  … +{} more", total - max_steps),
+                dim(),
+            ));
+        }
+        out
+    }
+
+    /// The pinned block for an active long-horizon goal: a `goal · done/total ·
+    /// objective` header plus the planner-decomposed sub-goal checklist.
+    fn goal_lines(&self, goal: &hi_agent::Goal, max_steps: usize) -> Vec<Line<'static>> {
+        const HARD_CAP: usize = 8;
+        let max_steps = max_steps.min(HARD_CAP);
+        let total = goal.sub_goals.len();
+        let done = goal
+            .sub_goals
+            .iter()
+            .filter(|s| s.status == hi_agent::GoalStatus::Done)
+            .count();
+        let mut header = format!("goal · {done}/{total}");
+        if !goal.objective.is_empty() {
+            header.push_str(" · ");
+            header.push_str(&goal.objective);
+        }
+        let mut out = vec![Line::styled(
+            header,
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        )];
+        for s in goal.sub_goals.iter().take(max_steps) {
+            let (glyph, glyph_style, title_style) = match s.status {
+                hi_agent::GoalStatus::Done => ('✓', Style::default().fg(Color::Green), dim()),
+                hi_agent::GoalStatus::Active => (
+                    '▸',
+                    Style::default()
+                        .fg(Color::Magenta)
+                        .add_modifier(Modifier::BOLD),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                hi_agent::GoalStatus::Failed => ('✗', Style::default().fg(Color::Red), dim()),
+                hi_agent::GoalStatus::Pending => ('○', dim(), Style::default()),
+            };
+            out.push(Line::from(vec![
+                Span::styled(format!("  {glyph} "), glyph_style),
+                Span::styled(s.description.clone(), title_style),
             ]));
         }
         if total > max_steps {
@@ -413,6 +470,17 @@ impl crate::App {
         if input + output > 0 {
             info_parts.push(format!("↑{} ↓{}", fmt_count(input), fmt_count(output)));
         }
+        if let Some(goal) = &self.goal {
+            let total = goal.sub_goals.len();
+            if total > 0 {
+                let done = goal
+                    .sub_goals
+                    .iter()
+                    .filter(|s| s.status == hi_agent::GoalStatus::Done)
+                    .count();
+                info_parts.push(format!("goal {done}/{total}"));
+            }
+        }
         if let Some(pct) = self.context_pct() {
             info_parts.push(format!("{pct}% ctx"));
         }
@@ -500,19 +568,21 @@ impl crate::App {
             .scroll((scroll, 0));
         frame.render_widget(para, rows[0]);
 
-        // --- Bottom region: a fetch spinner, the model picker, or the input bar. ---
-        if let Some(started) = self.fetching {
+        // --- Bottom region: a fetch/plan spinner, the model picker, or the input bar. ---
+        if let Some(started) = self.fetching.or(self.planning) {
             let frame_ch = SPINNER[self.spinner % SPINNER.len()];
             let elapsed = fmt_elapsed(started.elapsed().as_secs());
+            let label = if self.planning.is_some() {
+                "planning goal with the planner model…".to_string()
+            } else {
+                format!("fetching models from {}…", self.provider)
+            };
             let block = Block::bordered()
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(Color::Cyan));
             let body = Line::from(vec![
                 Span::styled(
-                    format!(
-                        "{frame_ch} fetching models from {}… {elapsed}",
-                        self.provider
-                    ),
+                    format!("{frame_ch} {label} {elapsed}"),
                     Style::default()
                         .fg(Color::Cyan)
                         .add_modifier(Modifier::BOLD),

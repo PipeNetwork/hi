@@ -255,9 +255,10 @@ fn effective_max_steps_for_turn(
     if config.max_steps_explicit {
         return config.max_steps.max(1);
     }
-    if config.long_horizon {
-        200
-    } else if implementation_intent.is_some() {
+    // Intent-aware per-turn cap, regardless of `long_horizon`. A long-horizon goal
+    // spans many turns (each advancing one sub-goal), so each turn gets the normal
+    // per-intent budget — not a flat 200 that would also apply when no goal is set.
+    if implementation_intent.is_some() {
         120
     } else if read_only_intent.is_some() {
         80
@@ -3432,5 +3433,50 @@ fn format_rate_limit_reset(seconds: u64) -> String {
                 format!("{hours}h {minutes}m")
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod step_cap_tests {
+    use super::*;
+    use crate::steering::ImplementationIntent;
+
+    fn cfg(long_horizon: bool) -> crate::AgentConfig {
+        crate::AgentConfig {
+            long_horizon,
+            max_steps_explicit: false,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn max_steps_is_intent_aware_even_with_long_horizon() {
+        // Decoupled from `long_horizon`: each turn gets its per-intent cap whether
+        // or not a long-horizon goal is active (the goal spans many turns).
+        for lh in [false, true] {
+            assert_eq!(
+                effective_max_steps_for_turn(&cfg(lh), None, Some(ImplementationIntent::default())),
+                120,
+                "implementation intent (long_horizon={lh})"
+            );
+            assert_eq!(
+                effective_max_steps_for_turn(&cfg(lh), Some(ReviewIntent::Security), None),
+                80,
+                "read-only intent (long_horizon={lh})"
+            );
+            assert_eq!(
+                effective_max_steps_for_turn(&cfg(lh), None, None),
+                200,
+                "no intent (long_horizon={lh})"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_max_steps_always_wins() {
+        let mut c = cfg(true);
+        c.max_steps_explicit = true;
+        c.max_steps = 42;
+        assert_eq!(effective_max_steps_for_turn(&c, None, None), 42);
     }
 }

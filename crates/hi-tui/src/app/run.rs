@@ -961,6 +961,68 @@ pub async fn run(
                     }
                     continue;
                 }
+                // `/goal <objective>`: decompose with the planner behind a spinner
+                // (Esc cancels), then install the structured goal. Read/clear and
+                // the no-planner case stay on the sync handler.
+                Command::Goal(arg)
+                    if agent.has_planner()
+                        && !matches!(arg.trim(), "" | "clear" | "off" | "none") =>
+                {
+                    let objective = arg.trim().to_string();
+                    app.planning = Some(Instant::now());
+                    let mut decomposed: Option<Result<Vec<String>>> = None;
+                    let mut cancelled = false;
+                    {
+                        let fut = agent.decompose_goal(&objective);
+                        tokio::pin!(fut);
+                        loop {
+                            terminal.draw(|f| app.render(f))?;
+                            tokio::select! {
+                                result = &mut fut => { decomposed = Some(result); break; }
+                                _ = ticker.tick() => app.spinner = app.spinner.wrapping_add(1),
+                                maybe = input_rx.recv() => {
+                                    match maybe {
+                                        Some(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                                            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                                            if matches!(key.code, KeyCode::Esc)
+                                                || (ctrl && matches!(key.code, KeyCode::Char('c')))
+                                            {
+                                                cancelled = true;
+                                                break;
+                                            }
+                                        }
+                                        Some(_) => {}
+                                        None => return Ok(()),
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    app.planning = None;
+                    if cancelled {
+                        app.push(Line::styled("goal planning cancelled".to_string(), dim()));
+                        app.follow();
+                        continue;
+                    }
+                    // Fall back to a single sub-goal if the planner errored or
+                    // returned nothing usable.
+                    let sub_goals = match decomposed {
+                        Some(Ok(steps)) if !steps.is_empty() => steps,
+                        other => {
+                            if let Some(Err(err)) = other {
+                                app.push(Line::styled(
+                                    format!(
+                                        "planner unavailable ({err:#}); using the objective as one step"
+                                    ),
+                                    dim(),
+                                ));
+                            }
+                            vec![objective.clone()]
+                        }
+                    };
+                    app.set_planned_goal(agent, &objective, sub_goals);
+                    continue;
+                }
                 other => {
                     app.handle_command(agent, other, registry).await;
                     continue;
@@ -1048,6 +1110,9 @@ pub async fn run(
             app.model = model;
             app.context_window = context_window;
         }
+        // The goal driver (`goal_turn_end`) may have advanced/failed a sub-goal
+        // this turn — mirror the new state so the pinned block + header reflect it.
+        app.refresh_goal(agent);
         app.set_working(false);
         // No follow() at turn end: if the user scrolled up to read mid-turn, leave
         // them there (the "↓ N new" hint shows the summary is below). A new turn

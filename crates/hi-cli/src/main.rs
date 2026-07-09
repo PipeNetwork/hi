@@ -186,6 +186,13 @@ async fn main() -> Result<()> {
         }
     };
     let max_tokens = effective_max_tokens_for_model(&settings, live_metadata.max_output_tokens);
+    // The goal planner (glm-5.2 on pipenetwork by default). `HI_PLANNER_MODEL`
+    // overrides the profile; long-horizon goals turn on wherever a planner exists
+    // (never for a subagent — it gets a direct task, not a goal).
+    let planner_model = std::env::var("HI_PLANNER_MODEL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| settings.planner_model.clone());
     let agent_config = AgentConfig {
         model: settings.model.clone(),
         requested_max_tokens: settings.max_tokens,
@@ -222,6 +229,9 @@ async fn main() -> Result<()> {
             }),
         finalize: !cli.no_finalize,
         confirm_edits: cli.confirm_edits,
+        planner_model: planner_model.clone(),
+        long_horizon: !cli.subagent
+            && (planner_model.is_some() || std::env::var_os("HI_LONG_HORIZON").is_some()),
         ..AgentConfig::default()
     };
     let resume_summary = loaded.as_ref().and_then(|l| l.resume_summary.clone());
@@ -1172,6 +1182,7 @@ mod tests {
             curate_skills: false,
             explore_subagents: false,
             write_subagents: false,
+            planner_model: None,
             moa: hi_ai::MoaConfig::default(),
         }
     }
@@ -1192,6 +1203,7 @@ mod tests {
             curate_skills: false,
             explore_subagents: false,
             write_subagents: false,
+            planner_model: None,
             moa: hi_ai::MoaConfig::default(),
         }
     }

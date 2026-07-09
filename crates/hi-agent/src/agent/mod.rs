@@ -9,6 +9,7 @@ mod explore_turn;
 mod goal_turn;
 mod lifecycle;
 mod memory_turn;
+mod plan_goal;
 mod preflight;
 mod turn;
 

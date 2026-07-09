@@ -346,6 +346,10 @@ pub struct Profile {
     /// riskier tier); set to true to enable.
     #[serde(default)]
     pub write_subagents: Option<bool>,
+    /// Model id that decomposes a `/goal <objective>` into sub-goals. Defaults to
+    /// `pipe/glm-5.2-fast` on the pipenetwork profile; `None` disables planning.
+    #[serde(default)]
+    pub planner_model: Option<String>,
     /// Other profile names to fall back to, in order, when this one returns
     /// nothing or errors.
     pub fallback: Option<Vec<String>>,
@@ -416,6 +420,7 @@ pub struct Settings {
     pub curate_skills: bool,
     pub explore_subagents: bool,
     pub write_subagents: bool,
+    pub planner_model: Option<String>,
     pub moa: hi_ai::MoaConfig,
 }
 
@@ -622,6 +627,8 @@ pub fn resolve(cli: &Cli, config: &Config, registry: &Registry) -> Result<Settin
     let curate_skills = curate_skills_default(provider, profile.and_then(|p| p.curate_skills));
     let explore_subagents = explore_subagents_default(profile.and_then(|p| p.explore_subagents));
     let write_subagents = profile.and_then(|p| p.write_subagents).unwrap_or(false);
+    let planner_model =
+        planner_model_default(provider, profile.and_then(|p| p.planner_model.clone()));
 
     Ok(Settings {
         provider,
@@ -638,6 +645,7 @@ pub fn resolve(cli: &Cli, config: &Config, registry: &Registry) -> Result<Settin
         curate_skills,
         explore_subagents,
         write_subagents,
+        planner_model,
         moa: config.moa.clone(),
     })
 }
@@ -1201,6 +1209,7 @@ pub fn resolve_named_profile(config: &Config, name: &str, registry: &Registry) -
         curate_skills: curate_skills_default(provider, profile.curate_skills),
         explore_subagents: explore_subagents_default(profile.explore_subagents),
         write_subagents: profile.write_subagents.unwrap_or(false),
+        planner_model: planner_model_default(provider, profile.planner_model.clone()),
         moa: config.moa.clone(),
     })
 }
@@ -1242,6 +1251,16 @@ fn explore_subagents_default(profile_value: Option<bool>) -> bool {
     profile_value.unwrap_or(true)
 }
 
+/// The `/goal` planner model. An explicit `planner_model` in the profile always
+/// wins; otherwise it defaults to glm-5.2 on pipenetwork (a strong planner served
+/// there) and `None` (no decomposition — a single sub-goal) for every other
+/// provider, since the id wouldn't route on their endpoint.
+fn planner_model_default(provider: ProviderName, profile_value: Option<String>) -> Option<String> {
+    profile_value.or_else(|| {
+        (provider == ProviderName::Pipenetwork).then(|| "pipe/glm-5.2-fast".to_string())
+    })
+}
+
 fn max_tokens_is_explicit(
     provider: ProviderName,
     cli_max_tokens: Option<u32>,
@@ -1266,7 +1285,7 @@ mod tests {
         Config, DEFAULT_MAX_TOKENS, LEGACY_PIPENETWORK_DEFAULT_MAX_TOKENS,
         PIPENETWORK_DEFAULT_MAX_TOKENS, Profile, ProviderName, configured_max_tokens,
         curate_skills_default, detect_verify_pipeline, explore_subagents_default,
-        max_tokens_is_explicit, save_config_to,
+        max_tokens_is_explicit, planner_model_default, save_config_to,
     };
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -1383,6 +1402,30 @@ mod tests {
         assert!(explore_subagents_default(None));
         assert!(!explore_subagents_default(Some(false)));
         assert!(explore_subagents_default(Some(true)));
+    }
+
+    #[test]
+    fn planner_model_defaults_to_glm_on_pipenetwork_only() {
+        // Default: glm-5.2 on pipenetwork, none elsewhere (the id wouldn't route).
+        assert_eq!(
+            planner_model_default(ProviderName::Pipenetwork, None).as_deref(),
+            Some("pipe/glm-5.2-fast")
+        );
+        assert_eq!(planner_model_default(ProviderName::Openai, None), None);
+        assert_eq!(planner_model_default(ProviderName::Ollama, None), None);
+        // An explicit profile value always wins.
+        assert_eq!(
+            planner_model_default(
+                ProviderName::Pipenetwork,
+                Some("custom/planner".to_string())
+            )
+            .as_deref(),
+            Some("custom/planner")
+        );
+        assert_eq!(
+            planner_model_default(ProviderName::Openai, Some("x/y".to_string())).as_deref(),
+            Some("x/y")
+        );
     }
 
     #[test]
