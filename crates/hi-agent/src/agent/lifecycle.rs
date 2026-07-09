@@ -144,7 +144,11 @@ impl crate::Agent {
         // The working tree just changed under us, so any cached snapshot is now
         // stale. Without this, the next turn reuses pre-undo fingerprints and
         // change detection / verify gating / last_changed_files can be wrong.
+        // Clear the read cache too — restore() rewrites files directly, so a read
+        // between now and the next turn's clear would otherwise serve pre-undo
+        // content.
         self.invalidate_snapshot();
+        hi_tools::clear_read_cache();
         Ok(Some(n))
     }
 
