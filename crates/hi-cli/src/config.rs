@@ -103,6 +103,19 @@ pub struct Cli {
     #[arg(long, hide = true)]
     pub subagent: bool,
 
+    /// Exact session file to create or resume (used internally by the
+    /// `/dashboard` fleet: the parent owns the path, so a child running in a
+    /// worktree appends to the parent project's session rather than creating
+    /// one in the worktree's bucket). Not intended for direct use.
+    #[arg(long, hide = true)]
+    pub session_file: Option<std::path::PathBuf>,
+
+    /// Set a long-horizon goal (planner-decomposed) before the one-shot turn
+    /// runs — used by `/dashboard` goal-driven rows. Ignored when the session
+    /// already carries a goal (later fleet turns must not re-plan).
+    #[arg(long, hide = true)]
+    pub goal: Option<String>,
+
     /// List saved sessions, then exit.
     #[arg(long)]
     pub list_sessions: bool,

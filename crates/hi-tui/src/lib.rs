@@ -69,11 +69,25 @@ pub struct MlxProfileSwitch {
 /// `hi-cli`).
 pub type ProfileResolver = Box<dyn Fn(&str) -> Result<SwitchedProvider> + Send + Sync>;
 
-/// A callback that builds one additional top-level agent (own session file,
-/// same provider/config recipe as the main session) for a `/dashboard` fleet
-/// row. `hi-cli` supplies this so the TUI never touches `Settings`/session
-/// paths directly.
-pub type FleetSpawner = Box<dyn Fn() -> Result<hi_agent::Agent> + Send + Sync>;
+/// Everything the `/dashboard` fleet needs to launch worktree-isolated child
+/// `hi` runs: the binary + provider wiring for the child command line, the
+/// verify pipeline for the merge gate, and a session-path allocator. `hi-cli`
+/// supplies this so the TUI never touches `Settings`/session paths directly.
+pub struct FleetLauncher {
+    /// The `hi` binary to spawn for each row turn.
+    pub exe: std::path::PathBuf,
+    pub provider: String,
+    pub model: String,
+    pub base_url: String,
+    pub api_key: String,
+    /// Combined verify pipeline command, when the session has one: passed to
+    /// the child (`--verify`) and re-run as the ground-truth merge gate.
+    pub verify: Option<String>,
+    pub max_verify: u32,
+    pub max_steps: u32,
+    /// Allocates a unique session file for a new fleet row (collision-safe).
+    pub session_path: Box<dyn Fn() -> Result<std::path::PathBuf> + Send + Sync>,
+}
 
 /// A callback that persists the `/hf run --mlx` profile and returns a built
 /// provider for immediate use.

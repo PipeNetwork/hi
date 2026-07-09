@@ -9,7 +9,7 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 
 /// Whether the current directory is inside a git work tree.
-pub(crate) fn in_git_repo() -> bool {
+pub fn in_git_repo() -> bool {
     Command::new("git")
         .args(["rev-parse", "--is-inside-work-tree"])
         .output()
@@ -18,12 +18,12 @@ pub(crate) fn in_git_repo() -> bool {
 }
 
 /// A temp worktree path, namespaced by a caller `prefix` + `index`.
-pub(crate) fn worktree_path(prefix: &str, index: u32) -> PathBuf {
+pub fn worktree_path(prefix: &str, index: u32) -> PathBuf {
     std::env::temp_dir().join(format!("hi-{prefix}-{}-{index}", std::process::id()))
 }
 
 /// Create a detached worktree at `path` checked out to `base` (a commit-ish).
-pub(crate) fn add_worktree(path: &Path, base: &str) -> Result<()> {
+pub fn add_worktree(path: &Path, base: &str) -> Result<()> {
     let output = Command::new("git")
         .args(["worktree", "add", "--detach"])
         .arg(path)
@@ -40,8 +40,8 @@ pub(crate) fn add_worktree(path: &Path, base: &str) -> Result<()> {
 }
 
 /// Ground-truth check: run the verify command inside the worktree.
-pub(crate) fn verify_passes(worktree: &Path, verify: &str) -> bool {
-    hi_tools::prepare_verify_workdir(worktree);
+pub fn verify_passes(worktree: &Path, verify: &str) -> bool {
+    crate::prepare_verify_workdir(worktree);
     Command::new("sh")
         .arg("-c")
         .arg(verify)
@@ -54,7 +54,7 @@ pub(crate) fn verify_passes(worktree: &Path, verify: &str) -> bool {
 
 /// Apply the worktree's changes (relative to `base`, including new/deleted files)
 /// to the main working tree. Returns `true` if any change was applied.
-pub(crate) fn apply_changes(worktree: &Path, base: &str) -> Result<bool> {
+pub fn apply_changes(worktree: &Path, base: &str) -> Result<bool> {
     // Stage everything so the diff captures new/deleted files too.
     let add = Command::new("git")
         .current_dir(worktree)
@@ -105,7 +105,7 @@ pub(crate) fn apply_changes(worktree: &Path, base: &str) -> Result<bool> {
 
 /// The files the worktree changed relative to `base` (staged first so new/deleted
 /// files are included).
-pub(crate) fn changed_files(worktree: &Path, base: &str) -> Vec<String> {
+pub fn changed_files(worktree: &Path, base: &str) -> Vec<String> {
     let _ = Command::new("git")
         .current_dir(worktree)
         .args(["add", "-A"])
@@ -127,7 +127,7 @@ pub(crate) fn changed_files(worktree: &Path, base: &str) -> Vec<String> {
 }
 
 /// Force-remove the given worktrees.
-pub(crate) fn cleanup(worktrees: &[PathBuf]) {
+pub fn cleanup(worktrees: &[PathBuf]) {
     for path in worktrees {
         let _ = Command::new("git")
             .args(["worktree", "remove", "--force"])

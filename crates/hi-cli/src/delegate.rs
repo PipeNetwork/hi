@@ -66,7 +66,7 @@ impl DelegateRunner for CliDelegateRunner {
             .map(str::to_string)
             .or_else(|| self.default_verify.clone());
 
-        if !crate::worktree::in_git_repo() {
+        if !hi_tools::worktree::in_git_repo() {
             return outcome(false, "delegate unavailable: not in a git repository.");
         }
         // Snapshot the parent's current tree (incl. uncommitted work) as the base
@@ -127,8 +127,8 @@ fn run_blocking(
     checkpoint: &str,
     idx: u32,
 ) -> DelegateOutcome {
-    let worktree = crate::worktree::worktree_path("delegate", idx);
-    if let Err(err) = crate::worktree::add_worktree(&worktree, checkpoint) {
+    let worktree = hi_tools::worktree::worktree_path("delegate", idx);
+    if let Err(err) = hi_tools::worktree::add_worktree(&worktree, checkpoint) {
         return outcome(
             false,
             &format!("delegate failed to create an isolated worktree: {err}"),
@@ -170,7 +170,7 @@ fn run_blocking(
         Ok(()) => decide(&worktree, checkpoint, verify_cmd.as_deref()),
     };
     // Always tear the worktree down — the real tree only ever sees an applied diff.
-    crate::worktree::cleanup(&[worktree]);
+    hi_tools::worktree::cleanup(&[worktree]);
     result
 }
 
@@ -211,10 +211,10 @@ fn run_with_timeout(mut cmd: Command, secs: u64) -> Result<(), String> {
 /// Ground-truth gate (re-run verify ourselves) + apply-back.
 fn decide(worktree: &Path, checkpoint: &str, verify_cmd: Option<&str>) -> DelegateOutcome {
     let passed = match verify_cmd {
-        Some(v) => crate::worktree::verify_passes(worktree, v),
+        Some(v) => hi_tools::worktree::verify_passes(worktree, v),
         None => true,
     };
-    let changed = crate::worktree::changed_files(worktree, checkpoint);
+    let changed = hi_tools::worktree::changed_files(worktree, checkpoint);
 
     if !passed {
         return outcome(
@@ -229,7 +229,7 @@ fn decide(worktree: &Path, checkpoint: &str, verify_cmd: Option<&str>) -> Delega
     if changed.is_empty() {
         return outcome(false, "delegate made no changes; nothing to apply.");
     }
-    match crate::worktree::apply_changes(worktree, checkpoint) {
+    match hi_tools::worktree::apply_changes(worktree, checkpoint) {
         Ok(_) => {
             let note = if verify_cmd.is_some() {
                 " · verification passed"

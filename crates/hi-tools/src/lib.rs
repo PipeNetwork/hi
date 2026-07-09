@@ -6,6 +6,7 @@
 pub mod checkpoint;
 pub mod guard;
 mod lsp;
+pub mod worktree;
 
 mod attribution;
 mod background;

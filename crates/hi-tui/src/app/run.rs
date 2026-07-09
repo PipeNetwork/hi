@@ -54,7 +54,7 @@ pub async fn run(
     resume_summary: Option<String>,
     mcp_url: Option<String>,
     api_key: String,
-    fleet_spawner: crate::FleetSpawner,
+    fleet_launcher: crate::FleetLauncher,
 ) -> Result<()> {
     if !io::stdin().is_terminal() {
         anyhow::bail!("TUI requires an interactive stdin");
@@ -971,7 +971,7 @@ pub async fn run(
                         &mut input_rx,
                         &mut ticker,
                         &mut app,
-                        &fleet_spawner,
+                        &fleet_launcher,
                     )
                     .await?;
                     continue;
@@ -1222,6 +1222,8 @@ pub async fn run(
         }
         let _ = std::fs::write(path, app.input.history.join("\n"));
     }
+    // Remove any remaining fleet worktrees (sessions stay on disk, resumable).
+    crate::dashboard::cleanup_fleet(&mut app);
 
     Ok(())
 }
