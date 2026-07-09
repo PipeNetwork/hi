@@ -1267,6 +1267,28 @@ fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+    /// Serializes tests that mutate the process cwd (`run_fix` and any manager
+    /// firing that reaches it operate on the cwd), so they don't race.
+    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Init a throwaway git repo with one commit; returns nothing (caller uses it
+    /// as cwd). Kept tiny so cwd-controlled tests read cleanly.
+    fn init_git_repo(dir: &std::path::Path) {
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(dir.join("README"), "hi\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+    }
+
     fn spec() -> LoopSpec {
         LoopSpec {
             id: 1,
@@ -1919,6 +1941,110 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The pipeline works *together*, not just each piece in isolation: one loud
+    /// firing on a loop with BOTH a trigger and auto-fix dispatches both, and
+    /// both result channels (trigger + fix) resolve into the snapshot without
+    /// starving each other or the manager. Runs cwd-controlled in a throwaway git
+    /// repo (the fix operates on the cwd), serialized via CWD_LOCK.
+    #[tokio::test]
+    async fn manager_pipeline_trigger_and_autofix_together() {
+        let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_cwd = std::env::current_dir().unwrap();
+        let dir = std::env::temp_dir().join(format!("hi-watch-pipe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        init_git_repo(&dir);
+        std::env::set_current_dir(&dir).unwrap();
+        let sess = dir.join("loop.jsonl");
+        let sentinel = dir.join("trig.txt");
+        let launcher = FleetLauncher {
+            exe: PathBuf::from("/bin/echo"),
+            provider: "p".into(),
+            model: "m".into(),
+            base_url: "u".into(),
+            api_key: "k".into(),
+            verify: None,
+            max_verify: 0,
+            max_steps: 30,
+            session_path: Box::new(|| Ok(PathBuf::from("/tmp/unused.jsonl"))),
+            sessions: Box::new(Vec::new),
+            resume_info: Box::new(|_| None),
+            loop_session_path: Box::new(move || Ok(sess.clone())),
+            loops_file: None,
+        };
+        let handle = start(Arc::new(launcher), None);
+
+        let (tx, rx) = oneshot::channel();
+        handle
+            .ctl
+            .send(LoopCtl::Create {
+                secs: 3600,
+                prompt: "watch".into(),
+                reply: tx,
+            })
+            .unwrap();
+        let id = rx.await.unwrap().unwrap().id;
+        wait_until(&handle, |rows| {
+            rows.iter()
+                .find(|r| r.id == id)
+                .is_some_and(|r| !r.history.is_empty())
+        })
+        .await;
+
+        // Attach BOTH a trigger and auto-fix, then fire once.
+        let cmd = format!("touch '{}'", sentinel.display());
+        for ctl in [
+            LoopCtl::Trigger {
+                id,
+                cmd: Some(cmd),
+                reply: oneshot::channel().0,
+            },
+            LoopCtl::Fix {
+                id,
+                on: true,
+                pr: false,
+                reply: oneshot::channel().0,
+            },
+        ] {
+            handle.ctl.send(ctl).unwrap();
+        }
+        // Small settle so both ctl messages land before the firing.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (tx, rx) = oneshot::channel();
+        handle.ctl.send(LoopCtl::FireNow { id, reply: tx }).unwrap();
+        assert!(rx.await.unwrap());
+
+        // Both the trigger AND the fix resolve from the one firing.
+        wait_until(&handle, |rows| {
+            rows.iter().find(|r| r.id == id).is_some_and(|r| {
+                r.last_trigger
+                    .as_deref()
+                    .is_some_and(|t| t.starts_with("ok"))
+                    && r.last_fix.is_some()
+            })
+        })
+        .await;
+        assert!(sentinel.exists(), "trigger ran");
+        let last_fix = handle
+            .snapshot
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|r| r.id == id)
+            .unwrap()
+            .last_fix
+            .clone()
+            .unwrap();
+        // echo isn't a real fixer → no changes in the clean repo → nothing merged.
+        assert!(
+            last_fix.contains("made no changes"),
+            "fix dispatched + resolved from the same firing: {last_fix}"
+        );
+
+        let _ = std::env::set_current_dir(prev_cwd);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A loud firing is persisted to the project's activity feed (for /digest).
     #[tokio::test]
     async fn manager_records_loud_firing_to_activity() {
@@ -2014,8 +2140,7 @@ mod tests {
     /// process cwd (like the worktree helpers it reuses).
     #[tokio::test]
     async fn run_fix_merges_verified_and_rejects_unverified() {
-        static CWD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        let _guard = CWD.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::current_dir().unwrap();
 
         let dir = std::env::temp_dir().join(format!("hi-runfix-{}", std::process::id()));

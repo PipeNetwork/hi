@@ -581,6 +581,11 @@ impl crate::Agent {
     /// run; if it fails, its output is fed back and the model iterates, up to
     /// `max_verify_iterations` rounds.
     pub async fn run_turn(&mut self, input: &str, ui: &mut dyn Ui) -> Result<()> {
+        // Reset the per-turn file-read cache. It's invalidated per-key by the
+        // edit tools and wholesale after `bash`, but clearing it here restores
+        // its documented per-turn contract — so a file changed outside `hi`
+        // between turns is re-read fresh, not served from a prior turn's cache.
+        hi_tools::clear_read_cache();
         let expanded_input =
             command::expand_prompt_macro(input).unwrap_or_else(|| input.to_string());
         let implementation_candidate = classify_implementation_intent(&expanded_input);
@@ -2420,6 +2425,15 @@ If the task is already complete, stop and give your final recap."
                         // in the same tree, checkpoint-guarded so a failed delegation rolls
                         // back. Like `explore`, handled here because it needs `&mut self`
                         // and is itself an agent turn.
+                        //
+                        // Capture the turn baseline + checkpoint BEFORE it mutates the
+                        // tree — otherwise the later lazy snapshot (verify gate) would
+                        // record delegate's own output as the baseline, making the
+                        // parent's verify + changed-files see "no changes", and leaving
+                        // no pre-delegate checkpoint for `/undo` to isolate this turn.
+                        self.ensure_turn_snapshot(&mut turn_snapshot).await;
+                        self.ensure_turn_checkpoint(&mut turn_checkpoint_created, ui)
+                            .await;
                         ui.tool_call(name, arguments);
                         let content = self.handle_delegate(arguments, &mut *ui).await;
                         emit_tool_output(
@@ -2622,13 +2636,12 @@ If the task is already complete, stop and give your final recap."
                             ) {
                                 let path = hi_tools::target_path(name, &calls[i].2)
                                     .unwrap_or_else(|| "(unknown)".to_string());
-                                // Generate a diff preview for edit/multi_edit/apply_patch.
-                                let preview = match name.as_str() {
-                                    "edit" | "multi_edit" | "apply_patch" => {
-                                        "(diff preview unavailable in concurrent batch)".to_string()
-                                    }
-                                    _ => String::new(),
-                                };
+                                // Show the actual diff (computed without writing) so
+                                // the user approves the change with it in front of them,
+                                // not blind.
+                                let preview = hi_tools::preview_edit(name, &calls[i].2)
+                                    .await
+                                    .unwrap_or_default();
                                 if !ui.confirm_edit(&path, &preview) {
                                     denied.push(i);
                                 }

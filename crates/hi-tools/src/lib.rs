@@ -36,7 +36,8 @@ pub use paths::clear_read_cache;
 pub use tools::{
     MINIMAL_TOOL_SPECS, TOOL_SPECS, commit, delegate_tool_spec, execute, execute_streaming,
     explore_tool_spec, fast_check_for, is_filesystem_mutating, is_read_only,
-    prepare_verify_workdir, run_check, target_path, working_tree_diff, working_tree_diff_plain,
+    prepare_verify_workdir, preview_edit, run_check, target_path, working_tree_diff,
+    working_tree_diff_plain,
 };
 pub use web::{run_web_download, run_web_fetch, run_web_search};
 

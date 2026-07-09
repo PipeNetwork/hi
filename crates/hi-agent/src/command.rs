@@ -244,6 +244,18 @@ fn parse_loop_id(s: &str) -> Result<u64, String> {
 }
 
 /// Split a `/loop` argument into its subcommand form.
+/// The purpose-built prompt for a `/loop review` PR-review watcher. The loop's
+/// child agent has shell access, so it drives `gh` directly; the session it
+/// resumes each firing remembers which PRs it already reviewed, and the
+/// quiet/loud contract makes "no new PRs" a silent `NOTHING NEW`.
+pub const REVIEW_PROMPT: &str = "Review this repository's open pull requests. Run \
+    `gh pr list --state open` to find them. For each PR you have NOT already reviewed earlier in \
+    this conversation, read its diff with `gh pr diff <number>` and assess it for correctness, \
+    missing tests, and risks, then post a concise review with \
+    `gh pr review <number> --comment --body \"<your review>\"` (a comment — do not approve or \
+    request changes). If there are no pull requests you haven't already reviewed, reply with \
+    exactly: NOTHING NEW. Otherwise report which PRs you reviewed and the gist of each.";
+
 /// Parse a fire-window spec: `H-H` (hours 0..24) with an optional `weekdays`
 /// (or `mon-fri`) token → `(start_hour, end_hour, weekdays_only)`.
 pub fn parse_loop_window(s: &str) -> Option<(u8, u8, bool)> {
@@ -271,6 +283,26 @@ pub fn parse_loop_arg(arg: &str) -> LoopArg {
     }
     if matches!(a, "cost" | "spend") {
         return LoopArg::Cost;
+    }
+    // `review [interval]` — a preset PR-review watcher (default every 30m).
+    if a == "review" || a.starts_with("review ") {
+        let rest = a[6..].trim();
+        let secs = if rest.is_empty() {
+            1800
+        } else {
+            match parse_loop_interval(rest) {
+                Some(secs) => secs,
+                None => {
+                    return LoopArg::Invalid(format!(
+                        "bad interval '{rest}' — use e.g. /loop review 1h (default 30m)"
+                    ));
+                }
+            }
+        };
+        return LoopArg::Create {
+            secs,
+            prompt: REVIEW_PROMPT.to_string(),
+        };
     }
     if let Some(rest) = a.strip_prefix("window") {
         let rest = rest.trim();
@@ -1202,6 +1234,23 @@ mod tests {
             LoopArg::Invalid(_)
         ));
         assert_eq!(parse_loop_arg("cost"), LoopArg::Cost);
+        // PR-review preset (`review [interval]`).
+        assert_eq!(
+            parse_loop_arg("review"),
+            LoopArg::Create {
+                secs: 1800,
+                prompt: super::REVIEW_PROMPT.to_string()
+            }
+        );
+        assert_eq!(
+            parse_loop_arg("review 1h"),
+            LoopArg::Create {
+                secs: 3600,
+                prompt: super::REVIEW_PROMPT.to_string()
+            }
+        );
+        assert!(matches!(parse_loop_arg("review 5s"), LoopArg::Invalid(_)));
+        assert!(super::REVIEW_PROMPT.contains("gh pr review"));
         // Window parse edge cases.
         assert_eq!(super::parse_loop_window("0-24"), Some((0, 24, false)));
         assert_eq!(
