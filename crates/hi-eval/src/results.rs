@@ -165,6 +165,8 @@ pub struct RunArtifact {
     pub condense: bool,
     /// Whether recovery sampling was on for this run (for the A/B).
     pub recovery: bool,
+    /// Whether the write-`delegate` subagent was on for this run (for the A/B).
+    pub write_subagents: bool,
     pub passed: bool,
     pub failure_bucket: Option<String>,
     pub failure_confidence: Option<&'static str>,

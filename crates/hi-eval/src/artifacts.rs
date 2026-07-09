@@ -13,6 +13,7 @@ pub fn write_artifact(
     profile: EvalProfile,
     condense: bool,
     recovery: bool,
+    write_subagents: bool,
     result: &RunResult,
 ) -> Result<()> {
     let artifact = RunArtifact {
@@ -23,6 +24,7 @@ pub fn write_artifact(
         profile: profile.label().to_string(),
         condense,
         recovery,
+        write_subagents,
         passed: result.passed,
         failure_bucket: result.fail.map(|f| f.label().to_string()),
         failure_confidence: result.failure_confidence,

@@ -130,8 +130,11 @@ async fn async_main() -> Result<()> {
     };
     let condense_on = env_on("HI_CONDENSE");
     let recovery_on = env_on("HI_RECOVERY_SAMPLING");
+    // Off by default (unlike condense/recovery) — on only when the var is present,
+    // matching hi's own gating. The child `hi` inherits it via the env.
+    let write_subagents_on = std::env::var_os("HI_WRITE_SUBAGENTS").is_some();
     eprintln!(
-        "hi-eval: {} task(s) × {} config(s) × {} model(s) × {trials} trial(s) · models={} · profile={} · condense={} · recovery={} · hi={} · artifacts={}",
+        "hi-eval: {} task(s) × {} config(s) × {} model(s) × {trials} trial(s) · models={} · profile={} · condense={} · recovery={} · write_subagents={} · hi={} · artifacts={}",
         tasks.len(),
         active.len(),
         models_to_run.len(),
@@ -139,6 +142,7 @@ async fn async_main() -> Result<()> {
         profile.label(),
         if condense_on { "on" } else { "off" },
         if recovery_on { "on" } else { "off" },
+        if write_subagents_on { "on" } else { "off" },
         hi.display(),
         artifacts_dir.display()
     );
@@ -207,7 +211,14 @@ async fn async_main() -> Result<()> {
                         result.trial = trial;
                         result.model = model_for_run.clone();
                         result.mcp_model = mcp_model;
-                        write_artifact(&artifacts_dir, profile, condense_on, recovery_on, &result)?;
+                        write_artifact(
+                            &artifacts_dir,
+                            profile,
+                            condense_on,
+                            recovery_on,
+                            write_subagents_on,
+                            &result,
+                        )?;
                         eprintln!(
                             "  {:10} {:4} {}  model={} ({} cand, {} tok, {:.1}s)",
                             config_name,
