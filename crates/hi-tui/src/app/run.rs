@@ -1002,8 +1002,7 @@ pub async fn run(
                             };
                             let current = app.model.clone();
                             let tags = app.served_tags();
-                            app.picker =
-                                Some(ModelPicker::new(ids, &current, tags, &app.served));
+                            app.picker = Some(ModelPicker::new(ids, &current, tags, &app.served));
                         }
                         Err(err) => {
                             app.push(Line::styled(

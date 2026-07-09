@@ -408,11 +408,7 @@ impl crate::App {
         self.follow();
     }
 
-    pub(crate) async fn handle_command(
-        &mut self,
-        agent: &mut Agent,
-        command: Command,
-    ) {
+    pub(crate) async fn handle_command(&mut self, agent: &mut Agent, command: Command) {
         match command {
             Command::Quit => {}
             // Handled inline by the run loop (needs terminal/input/ticker).
@@ -444,8 +440,7 @@ impl crate::App {
                             dim(),
                         ));
                     } else {
-                        self.picker =
-                            Some(ModelPicker::new(ids, &current, tags, &self.served));
+                        self.picker = Some(ModelPicker::new(ids, &current, tags, &self.served));
                     }
                 } else {
                     self.select_model(agent, &id);
