@@ -3129,6 +3129,56 @@ mod native {
             })
         }
 
+        /// M=1 decode via a dp4a K-quant GEMV: quantize the activation to int8
+        /// (per-32) once, then run `launch` (one of the q*_k dp4a GEMVs). Shared by
+        /// the Q4_K/Q5_K/Q6_K/Q2_K/Q3_K decode branches.
+        #[allow(clippy::type_complexity)]
+        fn kquant_dp4a_gemv(
+            &self,
+            matrix_name: &str,
+            matrix: &GpuMatrix,
+            input: &GpuF32Tensor,
+            launch: fn(
+                &DeviceBuffer,
+                &DeviceBuffer,
+                &DeviceBuffer,
+                &DeviceBuffer,
+                &DeviceBuffer,
+                usize,
+                usize,
+                &Stream,
+            ) -> Result<()>,
+        ) -> Result<GpuF32Tensor> {
+            let k = matrix.cols;
+            let nblocks = k / 32;
+            let xq = DeviceBuffer::alloc(k).context("allocating Q8 activation quants")?;
+            let dx = DeviceBuffer::alloc(nblocks * std::mem::size_of::<f32>())
+                .context("allocating Q8 activation scales")?;
+            let xsum = DeviceBuffer::alloc(nblocks * std::mem::size_of::<i32>())
+                .context("allocating Q8 activation sums")?;
+            crate::kernels::launch_quantize_q8_row(&input.buffer, &xq, &dx, &xsum, k, &self.stream)
+                .with_context(|| format!("Q8 activation quant for {matrix_name}"))?;
+            let output = DeviceBuffer::alloc(matrix.rows * std::mem::size_of::<f32>())
+                .context("allocating CUDA K-quant dp4a GEMV output")?;
+            launch(
+                &matrix.buffer,
+                &xq,
+                &dx,
+                &xsum,
+                &output,
+                matrix.rows,
+                matrix.cols,
+                &self.stream,
+            )
+            .with_context(|| format!("CUDA K-quant dp4a GEMV for {matrix_name}"))?;
+            self.op_barrier()?;
+            Ok(GpuF32Tensor {
+                rows: 1,
+                cols: matrix.rows,
+                buffer: output,
+            })
+        }
+
         fn project_quantized_f32_device(
             &self,
             matrix_name: &str,
@@ -3295,6 +3345,14 @@ mod native {
                 && matches!(matrix.dtype, GgufTensorType::Q5_K)
                 && matrix.cols % 256 == 0
             {
+                if kquant_dp4a_enabled() {
+                    return self.kquant_dp4a_gemv(
+                        matrix_name,
+                        matrix,
+                        input,
+                        crate::kernels::launch_q5_k_dp4a_gemv,
+                    );
+                }
                 let output = DeviceBuffer::alloc(matrix.rows * std::mem::size_of::<f32>())
                     .context("allocating CUDA Q5_K GEMV output")?;
                 crate::kernels::launch_q5_k_gemv(
