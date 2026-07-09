@@ -420,6 +420,8 @@ impl crate::App {
             Command::Dashboard(_) => {}
             // Handled inline by the run loop (needs the loops manager handle).
             Command::Loop(_) => {}
+            // Handled inline by the run loop (needs terminal/input/ticker).
+            Command::Watch => {}
             Command::Help => {
                 for line in command::help_text().lines() {
                     self.push(Line::styled(line.to_string(), dim()));

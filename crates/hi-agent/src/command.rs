@@ -76,6 +76,8 @@ pub enum Command {
     /// Recurring agent turns on a cadence (TUI only): `<interval> <prompt>`
     /// creates, empty/`list` lists, `cancel <id>` stops one.
     Loop(String),
+    /// Full-screen live dashboard of all active loops (TUI only).
+    Watch,
     Quit,
     /// A `/word` that isn't recognized.
     Unknown(String),
@@ -128,6 +130,7 @@ pub fn parse(line: &str) -> Option<Command> {
         "delegate" | "delegates" => Command::Delegate(arg),
         "dashboard" | "fleet" => Command::Dashboard(arg),
         "loop" | "loops" => Command::Loop(arg),
+        "watch" => Command::Watch,
         "exit" | "quit" | "q" => Command::Quit,
         other => Command::Unknown(other.to_string()),
     })
@@ -564,6 +567,12 @@ pub const COMMANDS: &[CommandSpec] = &[
         ],
     },
     CommandSpec {
+        name: "watch",
+        args: "",
+        help: "full-screen live dashboard of all active loops",
+        arg_values: &[],
+    },
+    CommandSpec {
         name: "status",
         args: "[topic]",
         help: "show runtime status, or discuss codebase status with a topic",
@@ -908,6 +917,7 @@ mod tests {
         assert!(matches!(parse_loop_arg("cancel abc"), LoopArg::Invalid(_)));
         // Command parse.
         assert_eq!(parse("/loop"), Some(Command::Loop(String::new())));
+        assert_eq!(parse("/watch"), Some(Command::Watch));
         assert_eq!(
             parse("/loop 30m check ci"),
             Some(Command::Loop("30m check ci".into()))

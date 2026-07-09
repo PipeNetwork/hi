@@ -1173,6 +1173,16 @@ pub async fn run(
                     }
                     continue;
                 }
+                // `/watch`: full-screen live dashboard of all active loops. Runs
+                // over the same terminal/input/ticker; the loop manager keeps
+                // firing throughout, and closing it returns to the chat.
+                Command::Watch => {
+                    crate::watch::run_watch(&mut terminal, &mut input_rx, &mut ticker, &mut app)
+                        .await?;
+                    // Surface anything the loops reported while we were watching.
+                    app.drain_loops();
+                    continue;
+                }
                 // `/goal <objective>`: decompose with the planner behind a spinner
                 // (Esc cancels), then install the structured goal. Control
                 // subcommands (clear/pause/resume/limit) and the no-planner case

@@ -17,6 +17,7 @@ mod model_picker;
 mod provider_form;
 mod render;
 mod util;
+mod watch;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;

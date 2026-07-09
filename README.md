@@ -201,6 +201,13 @@ nothing changed — quiet firings land as a dim one-liner, real changes land lou
 ping when you're unfocused). Loops persist per project and re-arm when `hi` restarts (they fire
 while `hi` is running).
 
+`/watch` opens a **full-screen dashboard of every active loop**: a live table with per-loop
+countdowns to the next firing, a spinner while one is checking, and each loop's last result
+(dim `· nothing new` or a loud one-line change). Select a loop to peek its recent firing history;
+`f` fires the selected loop immediately, `c` cancels it, and `n` arms a new one from the same
+`<interval> <prompt>` box — all without leaving the screen. The loops keep firing in the
+background; Esc returns to the chat.
+
 ## Sessions
 
 Every session is saved as JSONL under `~/.local/share/hi/sessions/`.
@@ -226,6 +233,7 @@ Slash commands (TUI or plain REPL):
 | `/copy [all]` | copy the last assistant response to the terminal clipboard; `all` copies the transcript |
 | `/goal [obj\|pause\|resume\|limit N\|clear]` | set a long-horizon goal: a planner model decomposes it into sub-goals the agent then **drives autonomously turn after turn** (your input always takes priority; Esc pauses). `pause`/`resume` hold and continue; `limit N` caps plan growth (unbounded by default) |
 | `/loop <interval> <prompt>` | the same prompt, on a cadence (60s–7d: `90s`, `30m`, `2h`, `1d`): each firing is a **full agent turn** that remembers previous checks and reports only what changed. `/loop list`, `/loop cancel <id>`; loops auto-expire after 7 days |
+| `/watch` | full-screen live dashboard of all active loops: per-loop countdowns, firing spinners, last result, and recent history — with `f` fire-now, `c` cancel, `n` arm a new loop |
 | `/dashboard` (`/fleet`) | control a fleet, not an agent: dispatch, monitor, and steer multiple concurrent sessions — each in its own git worktree with verified diffs auto-merging back; `/fleet status` lists this project's resumable fleet sessions ([docs](docs/fleet-dashboard.md)) |
 | `/delegate [on\|off]` | toggle the write-capable delegate subagent: the model can hand a self-contained subtask to a worktree-isolated child whose changes land only if they verify (off by default) |
 | `/init` | scan the repo and write an `HI.md` project guide (loaded as context in future sessions) |
