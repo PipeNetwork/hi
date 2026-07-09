@@ -763,6 +763,17 @@ struct FiringOutcome {
     total_tokens: u64,
 }
 
+/// Whether a child-output line is decoration rather than reply text: a tool-call
+/// glyph line, or the trailing usage footer (`[↑… ↓… · ctx …]`) the one-shot
+/// child prints after its reply. Excluding the footer keeps it from being picked
+/// as the firing summary (it isn't a decoration glyph, so a naive filter missed
+/// it — caught in a live daemon run).
+fn is_decoration_line(line: &str) -> bool {
+    let l = line.trim_start();
+    l.starts_with(['⏺', '✓', '⚙', '›', '↳'])
+        || (l.starts_with('[') && l.contains('↑') && l.contains("ctx"))
+}
+
 /// One firing: a fleet-style child run in the real cwd, resuming the loop's
 /// session. Returns the child's final reply line as the summary, plus the
 /// session-cumulative token total read back from its `--report`.
@@ -826,11 +837,13 @@ async fn run_firing(launcher: &FleetLauncher, spec: &LoopSpec) -> Result<FiringO
             tail.last().cloned().unwrap_or_default()
         ));
     }
-    // The final non-decoration line is the reply's tail — the summary.
+    // The final non-decoration line is the reply's tail — the summary. Skip the
+    // trailing usage line (`[↑… ↓… · ctx …]`) the child prints after the reply,
+    // which is otherwise picked as the summary (it isn't a decoration glyph).
     let summary = tail
         .iter()
         .rev()
-        .find(|l| !l.trim_start().starts_with(['⏺', '✓', '⚙', '›', '↳']))
+        .find(|l| !is_decoration_line(l))
         .cloned()
         .unwrap_or_else(|| tail.last().cloned().unwrap_or_default());
     let total_tokens = read_report_tokens(&report_path);
@@ -931,12 +944,22 @@ fn decide_fix(
 }
 
 /// The task handed to the fix agent, built from the loud change it must resolve.
+///
+/// Phrased as an **implementation task** on purpose: `hi`'s steering runs a
+/// read-only preflight for review-shaped prompts (and any "make no changes"
+/// wording), which made an earlier version inspect-but-never-edit. Matching
+/// `classify_implementation_intent` ("implementation task" + an edit affordance,
+/// no no-edit clause) keeps the fixer in write mode. The verify gate — not the
+/// prompt — is the real safety boundary, so no defensive "make no changes"
+/// clause is needed here.
 fn fix_prompt(spec: &LoopSpec, summary: &str) -> String {
     format!(
-        "A recurring watch (\"{}\") just detected a problem:\n\n{summary}\n\n\
-         Investigate and FIX it in this working copy with the minimal change that resolves it. \
-         Make sure the project still builds and its tests pass. If you cannot safely fix it, make \
-         no changes at all.",
+        "Implementation task: fix a problem the recurring watch \"{}\" just detected.\n\n\
+         Problem:\n{summary}\n\n\
+         You are expected to edit files and apply patches in this working copy to make the \
+         minimal change that resolves it, then run the verification command to confirm the \
+         project builds and its tests pass. Prefer the smallest correct change; if the fix is \
+         genuinely unclear, stop and explain rather than guess.",
         spec.name()
     )
 }
@@ -1155,13 +1178,44 @@ mod tests {
     }
 
     #[test]
-    fn fix_prompt_carries_the_change() {
+    fn decoration_excludes_usage_footer_and_glyphs() {
+        // The reply text is kept…
+        assert!(!is_decoration_line(
+            "tests fail: add(2,3) returned -1, expected 5"
+        ));
+        // …the trailing usage footer and tool-glyph lines are not.
+        assert!(is_decoration_line("[↑3.9k ↓133 · ctx 0% (1.4k/1.0M)]"));
+        assert!(is_decoration_line("⏺ ran python3 test_calc.py"));
+        assert!(is_decoration_line("✓ done"));
+        // A bracketed sentence that isn't the usage footer stays reply text.
+        assert!(!is_decoration_line("[note] the parser is fine"));
+    }
+
+    #[test]
+    fn fix_prompt_is_an_implementation_task() {
         let mut s = spec();
         s.prompt = "watch prod p99 latency".into();
-        let p = fix_prompt(&s, "p99 jumped to 4200ms");
-        assert!(p.contains("p99 jumped to 4200ms"), "{p}");
-        assert!(p.contains("FIX it"), "{p}");
-        assert!(p.contains("make no changes"), "safe fallback\n{p}");
+        let p = fix_prompt(&s, "p99 jumped to 4200ms").to_lowercase();
+        assert!(
+            p.contains("p99 jumped to 4200ms"),
+            "carries the change\n{p}"
+        );
+        // Must read as an implementation task (edits), not a review — otherwise
+        // hi's read-only preflight makes the fixer inspect-but-never-edit.
+        assert!(p.contains("implementation task"), "{p}");
+        assert!(p.contains("edit files"), "{p}");
+        // Must NOT contain a no-edit clause that trips the read-only guard.
+        for bad in [
+            "make no changes",
+            "do not edit",
+            "without modifying",
+            "no changes",
+        ] {
+            assert!(
+                !p.contains(bad),
+                "must not contain the no-edit phrase {bad:?}\n{p}"
+            );
+        }
     }
 
     #[test]
