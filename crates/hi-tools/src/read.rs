@@ -54,10 +54,11 @@ pub(crate) async fn run_read(arguments: &str) -> Result<ToolOutput> {
 /// Read one file as UTF-8 text, using the per-turn cache and bailing clearly
 /// on binary files. Shared by the single- and multi-path read paths.
 async fn read_one(path: &str) -> Result<String> {
-    let cached = {
-        #[allow(unused_mut)]
-        let mut cache = READ_CACHE.lock().unwrap();
-        cache.get(&cache_key(path)).cloned()
+    let cached = match READ_CACHE.lock() {
+        Ok(mut cache) => cache.get(&cache_key(path)).cloned(),
+        // Poisoned lock — treat as a cache miss and re-read the file, rather than
+        // turning every subsequent `read` into a panic (as `.unwrap()` did).
+        Err(_) => None,
     };
     if let Some(cached) = cached {
         return Ok(cached);
