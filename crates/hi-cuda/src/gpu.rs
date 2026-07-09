@@ -3250,6 +3250,30 @@ mod native {
                     buffer: output,
                 });
             }
+            // Fused Q3_K GEMV (M=1 decode, non-output-head layer weights).
+            if input.rows == 1
+                && !is_output_head
+                && matches!(matrix.dtype, GgufTensorType::Q3_K)
+                && matrix.cols % 256 == 0
+            {
+                let output = DeviceBuffer::alloc(matrix.rows * std::mem::size_of::<f32>())
+                    .context("allocating CUDA Q3_K GEMV output")?;
+                crate::kernels::launch_q3_k_gemv(
+                    &matrix.buffer,
+                    &input.buffer,
+                    &output,
+                    matrix.rows,
+                    matrix.cols,
+                    &self.stream,
+                )
+                .with_context(|| format!("CUDA Q3_K GEMV for {matrix_name}"))?;
+                self.op_barrier()?;
+                return Ok(GpuF32Tensor {
+                    rows: 1,
+                    cols: matrix.rows,
+                    buffer: output,
+                });
+            }
             // Fused IQ4_NL GEMV (M=1 decode, non-output-head layer weights). Block-32
             // format (cols % 32, not 256), non-linear lookup table.
             if input.rows == 1
