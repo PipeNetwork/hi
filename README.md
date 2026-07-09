@@ -188,6 +188,19 @@ follow-up; `Ctrl+S` dispatches *and* attaches. Prefix a dispatch with `/goal ` a
 drives a whole objective autonomously. Every row is its own resumable session. Details:
 [docs/fleet-dashboard.md](docs/fleet-dashboard.md).
 
+## Loops
+
+`/loop 30m check whether CI on main is green` — the same prompt, on a cadence. Intervals run
+from 60 seconds to days (`90s`, `30m`, `2h`, `1d`); loops auto-expire after 7 days and are
+cancellable by id (`/loop list`, `/loop cancel 3`). The shape is built for **watching things**:
+CI logs, a canary deploy, a live service, a flaky test you're trying to catch in the act.
+
+Each firing is a full agent turn, not a dumb cron job: it resumes the loop's own session, so it
+*remembers* previous checks, compares instead of re-describing, and replies `NOTHING NEW` when
+nothing changed — quiet firings land as a dim one-liner, real changes land loud (with a terminal
+ping when you're unfocused). Loops persist per project and re-arm when `hi` restarts (they fire
+while `hi` is running).
+
 ## Sessions
 
 Every session is saved as JSONL under `~/.local/share/hi/sessions/`.
@@ -212,6 +225,7 @@ Slash commands (TUI or plain REPL):
 | `/diff` | show what files have changed this session (`git diff` + new files) |
 | `/copy [all]` | copy the last assistant response to the terminal clipboard; `all` copies the transcript |
 | `/goal [obj\|pause\|resume\|limit N\|clear]` | set a long-horizon goal: a planner model decomposes it into sub-goals the agent then **drives autonomously turn after turn** (your input always takes priority; Esc pauses). `pause`/`resume` hold and continue; `limit N` caps plan growth (unbounded by default) |
+| `/loop <interval> <prompt>` | the same prompt, on a cadence (60s–7d: `90s`, `30m`, `2h`, `1d`): each firing is a **full agent turn** that remembers previous checks and reports only what changed. `/loop list`, `/loop cancel <id>`; loops auto-expire after 7 days |
 | `/dashboard` (`/fleet`) | control a fleet, not an agent: dispatch, monitor, and steer multiple concurrent sessions — each in its own git worktree with verified diffs auto-merging back; `/fleet status` lists this project's resumable fleet sessions ([docs](docs/fleet-dashboard.md)) |
 | `/delegate [on\|off]` | toggle the write-capable delegate subagent: the model can hand a self-contained subtask to a worktree-isolated child whose changes land only if they verify (off by default) |
 | `/init` | scan the repo and write an `HI.md` project guide (loaded as context in future sessions) |

@@ -1551,6 +1551,11 @@ fn render_input(
     frame.set_cursor_position((area.x + 3 + cursor_col, area.y + 1));
 }
 
+/// Strip ANSI from one child-output line (shared with `/loop` firings).
+pub(crate) fn strip_ansi_line(s: &str) -> String {
+    strip_ansi(s)
+}
+
 /// Truncate for single-line display (shared with the /fleet status view).
 pub(crate) fn truncate_title(s: &str, max: usize) -> String {
     truncate(s, max)

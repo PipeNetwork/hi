@@ -422,6 +422,24 @@ pub fn session_goal_summary(path: &Path) -> Option<SessionGoalSummary> {
     })
 }
 
+/// Path for a `/loop` session (each firing resumes it). `-loop<n>` stems keep
+/// these out of `/fleet status` while staying resumable by id.
+pub fn new_loop_session_path() -> Result<PathBuf> {
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let dir = sessions_dir().context("could not determine session directory")?;
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(dir.join(format!("{millis:013}-loop{n}.jsonl")))
+}
+
+/// The per-project `/loop` definitions file (sibling of the sessions dir).
+pub fn loops_file() -> Option<PathBuf> {
+    sessions_dir().and_then(|d| d.parent().map(|p| p.join("loops.json")))
+}
+
 /// Path for a fleet-dispatched session. Unlike [`new_session_path`] (millis
 /// only), several fleet agents can be dispatched within the same millisecond,
 /// so a per-process counter suffix keeps the paths (and resume ids) unique
