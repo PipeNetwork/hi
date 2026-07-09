@@ -4707,6 +4707,88 @@ __global__ void quantize_q8_row_kernel(
 // One warp per row; reads 4-bit weights + int8 activation (both quantized). Weight
 // block layout matches dequantize_q4_0_kernel: byte j = weight j (low nibble) and
 // weight j+16 (high nibble).
+// Fused Q5_K GEMV (M=1 decode). Reads Q5_K weights directly, dequantizing each 5-bit
+// weight on the fly into the dot product. Q5_K block = 176 bytes / 256 weights (f16 d +
+// f16 dmin + 12-byte packed 6-bit sub-block scales/mins + 32-byte high bits + 128-byte
+// 4-bit low quants); the per-weight unpack mirrors dequantize_q5_k_kernel. One block per
+// output row; f32 activation. Requires cols % 256 == 0.
+__global__ void q5_k_gemv_kernel(
+    const uint8_t* __restrict__ weights,
+    const float* __restrict__ x,
+    float* __restrict__ output,
+    int rows,
+    int cols) {
+  const int row = blockIdx.x;
+  if (row >= rows) {
+    return;
+  }
+  const int tid = threadIdx.x;
+  const int nsb = cols / 256;
+  const size_t row_bytes = static_cast<size_t>(nsb) * 176;
+  const uint8_t* row_ptr = weights + static_cast<size_t>(row) * row_bytes;
+  float acc = 0.0f;
+  for (int c = tid; c < cols; c += blockDim.x) {
+    const int sb = c >> 8;
+    const int within = c & 255;
+    const uint8_t* blk = row_ptr + static_cast<size_t>(sb) * 176;
+    const float d = __half2float(*reinterpret_cast<const __half*>(blk));
+    const float dmin = __half2float(*reinterpret_cast<const __half*>(blk + 2));
+    const uint8_t* scales = blk + 4;
+    const uint8_t* qh = blk + 16;
+    const uint8_t* qs = blk + 48;
+    const int group32 = within >> 5;
+    const int offset32 = within & 31;
+    const int group64 = group32 >> 1;
+    uint8_t scale;
+    uint8_t mn;
+    q4_k_scale_min(group32, scales, &scale, &mn);
+    const uint8_t packed = qs[group64 * 32 + offset32];
+    const uint8_t low = (group32 & 1) == 0 ? (packed & 0x0f) : (packed >> 4);
+    const uint8_t high = (qh[offset32] & (1u << group32)) != 0 ? 16 : 0;
+    const uint8_t quant = low + high;
+    acc += (d * static_cast<float>(scale) * static_cast<float>(quant) -
+            dmin * static_cast<float>(mn)) *
+           x[c];
+  }
+  __shared__ float warp_sums[32];
+  for (int off = 16; off > 0; off >>= 1) {
+    acc += __shfl_down_sync(0xffffffffu, acc, off);
+  }
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  if (lane == 0) {
+    warp_sums[warp] = acc;
+  }
+  __syncthreads();
+  if (warp == 0) {
+    const int nwarps = blockDim.x >> 5;
+    float v = (lane < nwarps) ? warp_sums[lane] : 0.0f;
+    for (int off = 16; off > 0; off >>= 1) {
+      v += __shfl_down_sync(0xffffffffu, v, off);
+    }
+    if (lane == 0) {
+      output[row] = v;
+    }
+  }
+}
+
+extern "C" int hi_cuda_launch_q5_k_gemv(
+    const void* weights,
+    const void* x,
+    void* output,
+    int rows,
+    int cols,
+    void* stream) {
+  if (weights == nullptr || x == nullptr || output == nullptr || rows <= 0 ||
+      cols <= 0 || cols % 256 != 0 || stream == nullptr) {
+    return 1;
+  }
+  q5_k_gemv_kernel<<<rows, 128, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint8_t*>(weights), static_cast<const float*>(x),
+      static_cast<float*>(output), rows, cols);
+  return 0;
+}
+
 // Fused Q4_K GEMV (M=1 decode). Reads Q4_K weights directly, dequantizing each 4-bit
 // weight on the fly into the dot product instead of materializing the whole f32 weight
 // matrix every token. Q4_K block = 144 bytes / 256 weights (f16 d + f16 dmin + 12-byte
