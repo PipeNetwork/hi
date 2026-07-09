@@ -8,11 +8,18 @@
 //! thrown away.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use hi_agent::{DelegateOutcome, DelegateRunner};
+
+/// Wall-clock cap on one delegate subagent subprocess. If the child hangs (e.g. a
+/// stuck provider request), it's killed so the parent can't block forever. A
+/// legitimate write+verify subtask finishes well within this; overridable via
+/// `HI_DELEGATE_TIMEOUT_SECS`.
+const DELEGATE_TIMEOUT_SECS: u64 = 600;
 
 pub struct CliDelegateRunner {
     exe: PathBuf,
@@ -132,36 +139,73 @@ fn run_blocking(
     // further subagents (depth ≤ 1) and implies no session save.
     let prompt = child_prompt(task, verify_cmd.as_deref());
     let mut cmd = Command::new(exe);
-    cmd.current_dir(&worktree).env("HI_API_KEY", api_key).args([
-        "--subagent",
-        "--provider",
-        provider,
-        "--model",
-        model,
-        "--base-url",
-        base_url,
-        "--no-save",
-        "--temperature",
-        "0",
-        "--max-steps",
-        &max_steps.to_string(),
-    ]);
+    cmd.current_dir(&worktree)
+        .env("HI_API_KEY", api_key)
+        // No pipes: we gate on the ground-truth verify + the worktree diff, not the
+        // child's stdout — and unread pipes would deadlock the timeout wait.
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .args([
+            "--subagent",
+            "--provider",
+            provider,
+            "--model",
+            model,
+            "--base-url",
+            base_url,
+            "--no-save",
+            "--temperature",
+            "0",
+            "--max-steps",
+            &max_steps.to_string(),
+        ]);
     if let Some(v) = &verify_cmd {
         cmd.args(["--verify", v, "--max-verify", &max_verify.to_string()]);
     }
     cmd.arg(&prompt);
-    let launched = cmd.output();
 
-    let result = match launched {
-        Err(err) => outcome(
-            false,
-            &format!("delegate couldn't launch the subagent: {err}"),
-        ),
-        Ok(_) => decide(&worktree, checkpoint, verify_cmd.as_deref()),
+    let result = match run_with_timeout(cmd, delegate_timeout_secs()) {
+        Err(err) => outcome(false, &format!("delegate {err}")),
+        Ok(()) => decide(&worktree, checkpoint, verify_cmd.as_deref()),
     };
     // Always tear the worktree down — the real tree only ever sees an applied diff.
     crate::worktree::cleanup(&[worktree]);
     result
+}
+
+fn delegate_timeout_secs() -> u64 {
+    std::env::var("HI_DELEGATE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(DELEGATE_TIMEOUT_SECS)
+}
+
+/// Run the child to completion, or kill it after `secs`. `Err(msg)` on launch
+/// failure or timeout (the worktree is discarded either way, so nothing is applied).
+fn run_with_timeout(mut cmd: Command, secs: u64) -> Result<(), String> {
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("couldn't launch the subagent: {e}"))?;
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => return Ok(()),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "timed out after {secs}s (subagent killed); nothing applied. Try a smaller \
+                         task or check the provider."
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            Err(e) => return Err(format!("subagent wait failed: {e}")),
+        }
+    }
 }
 
 /// Ground-truth gate (re-run verify ourselves) + apply-back.
