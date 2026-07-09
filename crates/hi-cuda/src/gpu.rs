@@ -2761,6 +2761,23 @@ mod native {
         *ENABLED.get_or_init(|| std::env::var("HI_CUDA_NO_Q4_GEMV").is_err())
     }
 
+    /// Fuse Q4_0 weight dequant straight to f16 in the prefill GEMM path (default on;
+    /// `HI_CUDA_NO_DEQUANT_F16` reverts to dequant -> f32 -> cast).
+    fn dequant_f16_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("HI_CUDA_NO_DEQUANT_F16").is_err())
+    }
+
+    /// dp4a K-quant decode GEMVs (int8 activation + `__dp4a` + warp-per-row) instead
+    /// of the float per-op GEMVs — ~3x faster (validated on Q4_K). Default on;
+    /// `HI_CUDA_NO_KQUANT_DP4A` reverts to the float GEMVs.
+    fn kquant_dp4a_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("HI_CUDA_NO_KQUANT_DP4A").is_err())
+    }
+
     fn weights_f16_choice(specs: &[MatrixSpec]) -> bool {
         match std::env::var("HI_CUDA_WEIGHTS_F16")
             .ok()
@@ -3112,6 +3129,56 @@ mod native {
             })
         }
 
+        /// M=1 decode via a dp4a K-quant GEMV: quantize the activation to int8
+        /// (per-32) once, then run `launch` (one of the q*_k dp4a GEMVs). Shared by
+        /// the Q4_K/Q5_K/Q6_K/Q2_K/Q3_K decode branches.
+        #[allow(clippy::type_complexity)]
+        fn kquant_dp4a_gemv(
+            &self,
+            matrix_name: &str,
+            matrix: &GpuMatrix,
+            input: &GpuF32Tensor,
+            launch: fn(
+                &DeviceBuffer,
+                &DeviceBuffer,
+                &DeviceBuffer,
+                &DeviceBuffer,
+                &DeviceBuffer,
+                usize,
+                usize,
+                &Stream,
+            ) -> Result<()>,
+        ) -> Result<GpuF32Tensor> {
+            let k = matrix.cols;
+            let nblocks = k / 32;
+            let xq = DeviceBuffer::alloc(k).context("allocating Q8 activation quants")?;
+            let dx = DeviceBuffer::alloc(nblocks * std::mem::size_of::<f32>())
+                .context("allocating Q8 activation scales")?;
+            let xsum = DeviceBuffer::alloc(nblocks * std::mem::size_of::<i32>())
+                .context("allocating Q8 activation sums")?;
+            crate::kernels::launch_quantize_q8_row(&input.buffer, &xq, &dx, &xsum, k, &self.stream)
+                .with_context(|| format!("Q8 activation quant for {matrix_name}"))?;
+            let output = DeviceBuffer::alloc(matrix.rows * std::mem::size_of::<f32>())
+                .context("allocating CUDA K-quant dp4a GEMV output")?;
+            launch(
+                &matrix.buffer,
+                &xq,
+                &dx,
+                &xsum,
+                &output,
+                matrix.rows,
+                matrix.cols,
+                &self.stream,
+            )
+            .with_context(|| format!("CUDA K-quant dp4a GEMV for {matrix_name}"))?;
+            self.op_barrier()?;
+            Ok(GpuF32Tensor {
+                rows: 1,
+                cols: matrix.rows,
+                buffer: output,
+            })
+        }
+
         fn project_quantized_f32_device(
             &self,
             matrix_name: &str,
@@ -3172,16 +3239,37 @@ mod native {
                     .and_then(|v| usize::try_from(v).ok())
                     .map(|vocab| matrix.rows == vocab)
                     .unwrap_or(false);
+            // Cache the output head as f16 only when it comfortably fits — for a
+            // huge-vocab model on a small card (qwen3-8B: 151k*4096 Q6_K -> 1.25 GB
+            // f16) the persistent cache would consume the headroom the KV cache and
+            // prefill scratch need, OOMing the next forward. When it won't fit, fall
+            // through to the fused quantized GEMV (reads the quant weights directly,
+            // no 1.25 GB resident). Once cached, keep using it.
+            let cache_output_head = is_output_head && {
+                let f16_bytes = weight_elements.saturating_mul(std::mem::size_of::<u16>());
+                self.dequant_f16_cache.borrow().contains_key(matrix_name)
+                    || crate::runtime::free_memory_bytes()
+                        .map(|free| f16_bytes.saturating_mul(2) <= free)
+                        .unwrap_or(true)
+            };
             // Fused Q6_K GEMV (M=1 decode, non-output-head layer weights): read Q6_K
             // directly instead of dequantizing the whole matrix to f32 every token — the
             // per-op dequant is ~12x slower for Q6_K models kept quantized (f16 doesn't
             // fit). The output head stays on the f16 cache below (cuBLAS, marginally
             // faster and reused every token).
             if input.rows == 1
-                && !is_output_head
+                && !cache_output_head
                 && matches!(matrix.dtype, GgufTensorType::Q6_K)
                 && matrix.cols % 256 == 0
             {
+                if kquant_dp4a_enabled() {
+                    return self.kquant_dp4a_gemv(
+                        matrix_name,
+                        matrix,
+                        input,
+                        crate::kernels::launch_q6_k_dp4a_gemv,
+                    );
+                }
                 let output = DeviceBuffer::alloc(matrix.rows * std::mem::size_of::<f32>())
                     .context("allocating CUDA Q6_K GEMV output")?;
                 crate::kernels::launch_q6_k_gemv(
@@ -3204,21 +3292,54 @@ mod native {
             // the Q6_K path, for the most common quant (Q4_K_M). Keeps large Q4_K models
             // usable when weights don't fit f16 (else per-op dequant is ~5x slower).
             if input.rows == 1
-                && !is_output_head
+                && !cache_output_head
                 && matches!(matrix.dtype, GgufTensorType::Q4_K)
                 && matrix.cols % 256 == 0
             {
                 let output = DeviceBuffer::alloc(matrix.rows * std::mem::size_of::<f32>())
                     .context("allocating CUDA Q4_K GEMV output")?;
-                crate::kernels::launch_q4_k_gemv(
-                    &matrix.buffer,
-                    &input.buffer,
-                    &output,
-                    matrix.rows,
-                    matrix.cols,
-                    &self.stream,
-                )
-                .with_context(|| format!("CUDA Q4_K GEMV for {matrix_name}"))?;
+                if kquant_dp4a_enabled() {
+                    // dp4a path: quantize the activation to int8 (per-32, same as Q4_0)
+                    // and run the __dp4a Q4_K GEMV — ~3-4x faster than the float
+                    // q4_k_gemv, which re-reads block metadata per weight.
+                    let k = matrix.cols;
+                    let nblocks = k / 32;
+                    let xq = DeviceBuffer::alloc(k).context("allocating Q8 activation quants")?;
+                    let dx = DeviceBuffer::alloc(nblocks * std::mem::size_of::<f32>())
+                        .context("allocating Q8 activation scales")?;
+                    let xsum = DeviceBuffer::alloc(nblocks * std::mem::size_of::<i32>())
+                        .context("allocating Q8 activation sums")?;
+                    crate::kernels::launch_quantize_q8_row(
+                        &input.buffer,
+                        &xq,
+                        &dx,
+                        &xsum,
+                        k,
+                        &self.stream,
+                    )
+                    .with_context(|| format!("Q8 activation quant for {matrix_name}"))?;
+                    crate::kernels::launch_q4_k_dp4a_gemv(
+                        &matrix.buffer,
+                        &xq,
+                        &dx,
+                        &xsum,
+                        &output,
+                        matrix.rows,
+                        matrix.cols,
+                        &self.stream,
+                    )
+                    .with_context(|| format!("CUDA Q4_K dp4a GEMV for {matrix_name}"))?;
+                } else {
+                    crate::kernels::launch_q4_k_gemv(
+                        &matrix.buffer,
+                        &input.buffer,
+                        &output,
+                        matrix.rows,
+                        matrix.cols,
+                        &self.stream,
+                    )
+                    .with_context(|| format!("CUDA Q4_K GEMV for {matrix_name}"))?;
+                }
                 self.op_barrier()?;
                 return Ok(GpuF32Tensor {
                     rows: 1,
@@ -3228,10 +3349,18 @@ mod native {
             }
             // Fused Q5_K GEMV (M=1 decode, non-output-head layer weights).
             if input.rows == 1
-                && !is_output_head
+                && !cache_output_head
                 && matches!(matrix.dtype, GgufTensorType::Q5_K)
                 && matrix.cols % 256 == 0
             {
+                if kquant_dp4a_enabled() {
+                    return self.kquant_dp4a_gemv(
+                        matrix_name,
+                        matrix,
+                        input,
+                        crate::kernels::launch_q5_k_dp4a_gemv,
+                    );
+                }
                 let output = DeviceBuffer::alloc(matrix.rows * std::mem::size_of::<f32>())
                     .context("allocating CUDA Q5_K GEMV output")?;
                 crate::kernels::launch_q5_k_gemv(
@@ -3252,10 +3381,18 @@ mod native {
             }
             // Fused Q3_K GEMV (M=1 decode, non-output-head layer weights).
             if input.rows == 1
-                && !is_output_head
+                && !cache_output_head
                 && matches!(matrix.dtype, GgufTensorType::Q3_K)
                 && matrix.cols % 256 == 0
             {
+                if kquant_dp4a_enabled() {
+                    return self.kquant_dp4a_gemv(
+                        matrix_name,
+                        matrix,
+                        input,
+                        crate::kernels::launch_q3_k_dp4a_gemv,
+                    );
+                }
                 let output = DeviceBuffer::alloc(matrix.rows * std::mem::size_of::<f32>())
                     .context("allocating CUDA Q3_K GEMV output")?;
                 crate::kernels::launch_q3_k_gemv(
@@ -3276,10 +3413,18 @@ mod native {
             }
             // Fused Q2_K GEMV (M=1 decode, non-output-head layer weights).
             if input.rows == 1
-                && !is_output_head
+                && !cache_output_head
                 && matches!(matrix.dtype, GgufTensorType::Q2_K)
                 && matrix.cols % 256 == 0
             {
+                if kquant_dp4a_enabled() {
+                    return self.kquant_dp4a_gemv(
+                        matrix_name,
+                        matrix,
+                        input,
+                        crate::kernels::launch_q2_k_dp4a_gemv,
+                    );
+                }
                 let output = DeviceBuffer::alloc(matrix.rows * std::mem::size_of::<f32>())
                     .context("allocating CUDA Q2_K GEMV output")?;
                 crate::kernels::launch_q2_k_gemv(
@@ -3301,7 +3446,7 @@ mod native {
             // Fused IQ4_NL GEMV (M=1 decode, non-output-head layer weights). Block-32
             // format (cols % 32, not 256), non-linear lookup table.
             if input.rows == 1
-                && !is_output_head
+                && !cache_output_head
                 && matches!(matrix.dtype, GgufTensorType::IQ4_NL)
                 && matrix.cols % 32 == 0
             {
@@ -3326,7 +3471,7 @@ mod native {
             // Fused IQ4_XS GEMV (M=1 decode, non-output-head layer weights). Block-256
             // I-quant (per-sub-block scale + IQ4_NL lookup table).
             if input.rows == 1
-                && !is_output_head
+                && !cache_output_head
                 && matches!(matrix.dtype, GgufTensorType::IQ4_XS)
                 && matrix.cols % 256 == 0
             {
@@ -3351,7 +3496,7 @@ mod native {
             // Fused IQ3_S GEMV (M=1 decode, non-output-head layer weights). Block-256
             // I-quant (grid codebook + per-weight signs + sub-block scale).
             if input.rows == 1
-                && !is_output_head
+                && !cache_output_head
                 && matches!(matrix.dtype, GgufTensorType::IQ3_S)
                 && matrix.cols % 256 == 0
             {
@@ -3376,7 +3521,7 @@ mod native {
             // Fused IQ2_XXS GEMV (M=1 decode, non-output-head layer weights). Block-256
             // 2-bit I-quant (grid codebook + packed signs + block scale).
             if input.rows == 1
-                && !is_output_head
+                && !cache_output_head
                 && matches!(matrix.dtype, GgufTensorType::IQ2_XXS)
                 && matrix.cols % 256 == 0
             {
@@ -3401,7 +3546,7 @@ mod native {
             // Fused IQ2_S GEMV (M=1 decode, non-output-head layer weights). Block-256
             // 2-bit I-quant (grid codebook + per-weight signs + sub-block scale).
             if input.rows == 1
-                && !is_output_head
+                && !cache_output_head
                 && matches!(matrix.dtype, GgufTensorType::IQ2_S)
                 && matrix.cols % 256 == 0
             {
@@ -3426,7 +3571,7 @@ mod native {
             // Fused IQ2_XS GEMV (M=1 decode, non-output-head layer weights). Block-256
             // 2-bit I-quant (grid codebook + packed signs + per-lane sub-block scale).
             if input.rows == 1
-                && !is_output_head
+                && !cache_output_head
                 && matches!(matrix.dtype, GgufTensorType::IQ2_XS)
                 && matrix.cols % 256 == 0
             {
@@ -3451,7 +3596,7 @@ mod native {
             // Fused IQ1_S GEMV (M=1 decode, non-output-head layer weights). Block-256
             // 1-bit I-quant (grid codebook + code+delta reconstruction).
             if input.rows == 1
-                && !is_output_head
+                && !cache_output_head
                 && matches!(matrix.dtype, GgufTensorType::IQ1_S)
                 && matrix.cols % 256 == 0
             {
@@ -3476,7 +3621,7 @@ mod native {
             // Fused IQ1_M GEMV (M=1 decode, non-output-head layer weights). Block-256
             // 1-bit I-quant (grid codebook + reconstructed f16 super-scale + code+delta).
             if input.rows == 1
-                && !is_output_head
+                && !cache_output_head
                 && matches!(matrix.dtype, GgufTensorType::IQ1_M)
                 && matrix.cols % 256 == 0
             {
@@ -3501,7 +3646,7 @@ mod native {
             // Fused IQ3_XXS GEMV (M=1 decode, non-output-head layer weights). Block-256
             // 3-bit I-quant (uint32 grid codebook + packed signs + block scale).
             if input.rows == 1
-                && !is_output_head
+                && !cache_output_head
                 && matches!(matrix.dtype, GgufTensorType::IQ3_XXS)
                 && matrix.cols % 256 == 0
             {
@@ -3530,7 +3675,7 @@ mod native {
             // general per-weight cache would, on models with no dp4a-eligible weights
             // (e.g. IQ4_NL), cache the whole model in f16 and OOM. Everything else
             // dequantizes per-op (prefill M>1, and layer weights that miss dp4a).
-            let output = if is_output_head {
+            let output = if cache_output_head {
                 if !self.dequant_f16_cache.borrow().contains_key(matrix_name) {
                     let w = self.dequantize_matrix_to_f16(matrix, weight_elements)?;
                     self.dequant_f16_cache
@@ -3553,15 +3698,40 @@ mod native {
             })
         }
 
-        /// Dequantize a quantized weight matrix to f16 (dequant -> f32 -> cast f16).
+        /// Dequantize a quantized weight matrix to f16. For Q4_0 this fuses straight
+        /// to f16 (no f32 intermediate + separate cast); other quant types fall back
+        /// to dequant -> f32 -> cast f16. `HI_CUDA_NO_DEQUANT_F16` forces the fallback.
         fn dequantize_matrix_to_f16(
             &self,
             matrix: &GpuMatrix,
             weight_elements: usize,
         ) -> Result<DeviceBuffer> {
-            let dequantized = self.dequantize_matrix_f32_device(matrix)?;
             let weight_f16 = DeviceBuffer::alloc(weight_elements * std::mem::size_of::<u16>())
                 .context("allocating CUDA f16 weight scratch")?;
+            if dequant_f16_enabled() {
+                type DequantF16 = for<'a, 'b, 'c> fn(
+                    &'a DeviceBuffer,
+                    &'b DeviceBuffer,
+                    usize,
+                    &'c Stream,
+                ) -> Result<()>;
+                let fused: Option<DequantF16> = match matrix.dtype {
+                    GgufTensorType::Q4_0 => Some(crate::kernels::launch_dequantize_q4_0_to_f16),
+                    GgufTensorType::Q4_K => Some(crate::kernels::launch_dequantize_q4_k_to_f16),
+                    GgufTensorType::Q6_K => Some(crate::kernels::launch_dequantize_q6_k_to_f16),
+                    GgufTensorType::Q5_K => Some(crate::kernels::launch_dequantize_q5_k_to_f16),
+                    GgufTensorType::IQ4_NL => Some(crate::kernels::launch_dequantize_iq4_nl_to_f16),
+                    GgufTensorType::Q8_0 => Some(crate::kernels::launch_dequantize_q8_0_to_f16),
+                    GgufTensorType::Q2_K => Some(crate::kernels::launch_dequantize_q2_k_to_f16),
+                    GgufTensorType::Q3_K => Some(crate::kernels::launch_dequantize_q3_k_to_f16),
+                    _ => None,
+                };
+                if let Some(launch) = fused {
+                    launch(&matrix.buffer, &weight_f16, weight_elements, &self.stream)?;
+                    return Ok(weight_f16);
+                }
+            }
+            let dequantized = self.dequantize_matrix_f32_device(matrix)?;
             crate::kernels::launch_cast_f32_to_f16(
                 &dequantized,
                 &weight_f16,
@@ -3873,14 +4043,42 @@ mod native {
                 | GgufTensorType::Q8_K
                 | GgufTensorType::TQ1_0
                 | GgufTensorType::TQ2_0 => {
-                    let matrix = self.dequantize_matrix_f32_device(embeddings)?;
-                    crate::kernels::launch_gather_rows_f32_to_f32(
-                        &matrix,
+                    // Gather only the needed quantized rows, then dequantize those —
+                    // NOT the whole matrix. Dequantizing the full embedding to f32 is
+                    // vocab*hidden*4 bytes every forward (2.5 GB for a 151k-vocab
+                    // 4096-hidden model), which both wastes bandwidth per token and
+                    // OOMs an 8 GB card once the weights are resident.
+                    if embeddings.rows == 0 {
+                        bail!("CUDA embedding matrix has zero rows");
+                    }
+                    let total_bytes = embeddings.buffer.bytes();
+                    if total_bytes % embeddings.rows != 0 {
+                        bail!(
+                            "CUDA embedding matrix size {total_bytes} not divisible by {} rows",
+                            embeddings.rows
+                        );
+                    }
+                    let row_bytes = total_bytes / embeddings.rows;
+                    let gathered = DeviceBuffer::alloc(
+                        token_ids
+                            .len()
+                            .checked_mul(row_bytes)
+                            .context("gathered embedding row byte count overflows usize")?,
+                    )
+                    .context("allocating gathered quantized embedding rows")?;
+                    crate::kernels::launch_gather_quant_rows(
+                        &embeddings.buffer,
                         &ids,
-                        &output,
+                        &gathered,
                         token_ids.len(),
-                        embeddings.cols,
-                        embeddings.rows,
+                        row_bytes,
+                        &self.stream,
+                    )?;
+                    crate::kernels::launch_dequantize_matrix(
+                        &gathered,
+                        &output,
+                        output_elements,
+                        embeddings.quant_type_id()?,
                         &self.stream,
                     )?
                 }

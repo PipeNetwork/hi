@@ -126,6 +126,54 @@ mod native {
             len: c_int,
             stream: *mut c_void,
         ) -> c_int;
+        fn hi_cuda_launch_dequantize_q4_0_to_f16(
+            input: *const c_void,
+            output: *mut c_void,
+            elements: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_dequantize_q4_k_to_f16(
+            input: *const c_void,
+            output: *mut c_void,
+            elements: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_dequantize_q6_k_to_f16(
+            input: *const c_void,
+            output: *mut c_void,
+            elements: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_dequantize_q5_k_to_f16(
+            input: *const c_void,
+            output: *mut c_void,
+            elements: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_dequantize_iq4_nl_to_f16(
+            input: *const c_void,
+            output: *mut c_void,
+            elements: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_dequantize_q8_0_to_f16(
+            input: *const c_void,
+            output: *mut c_void,
+            elements: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_dequantize_q2_k_to_f16(
+            input: *const c_void,
+            output: *mut c_void,
+            elements: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_dequantize_q3_k_to_f16(
+            input: *const c_void,
+            output: *mut c_void,
+            elements: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
         fn hi_cuda_launch_cast_f32_to_bf16(
             input: *const c_void,
             output: *mut c_void,
@@ -171,6 +219,14 @@ mod native {
             matrix_rows: c_int,
             stream: *mut c_void,
         ) -> c_int;
+        fn hi_cuda_launch_gather_quant_rows(
+            matrix: *const c_void,
+            row_ids: *const c_void,
+            output: *mut c_void,
+            row_count: c_int,
+            row_bytes: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
         fn hi_cuda_launch_dequantize_matrix(
             input: *const c_void,
             output: *mut c_void,
@@ -188,6 +244,56 @@ mod native {
         ) -> c_int;
         fn hi_cuda_launch_q4_0_dp4a_gemv(
             weight: *const c_void,
+            xq: *const c_void,
+            dx: *const c_void,
+            xsum: *const c_void,
+            y: *mut c_void,
+            rows: c_int,
+            cols: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_q4_k_dp4a_gemv(
+            weights: *const c_void,
+            xq: *const c_void,
+            dx: *const c_void,
+            xsum: *const c_void,
+            y: *mut c_void,
+            rows: c_int,
+            cols: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_q5_k_dp4a_gemv(
+            weights: *const c_void,
+            xq: *const c_void,
+            dx: *const c_void,
+            xsum: *const c_void,
+            y: *mut c_void,
+            rows: c_int,
+            cols: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_q6_k_dp4a_gemv(
+            weights: *const c_void,
+            xq: *const c_void,
+            dx: *const c_void,
+            xsum: *const c_void,
+            y: *mut c_void,
+            rows: c_int,
+            cols: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_q2_k_dp4a_gemv(
+            weights: *const c_void,
+            xq: *const c_void,
+            dx: *const c_void,
+            xsum: *const c_void,
+            y: *mut c_void,
+            rows: c_int,
+            cols: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_q3_k_dp4a_gemv(
+            weights: *const c_void,
             xq: *const c_void,
             dx: *const c_void,
             xsum: *const c_void,
@@ -1136,6 +1242,159 @@ mod native {
         check_last_error("hi_cuda_launch_cast_f32_to_f16")
     }
 
+    /// Dequantize a Q4_0 weight matrix straight to f16 (no f32 intermediate + cast).
+    /// `elements` is rows*cols; `output` must hold `elements` f16 values.
+    pub fn launch_dequantize_q4_0_to_f16(
+        input: &DeviceBuffer,
+        output: &DeviceBuffer,
+        elements: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(elements, "dequantize_q4_0_to_f16 elements")?;
+        launch_status(unsafe {
+            hi_cuda_launch_dequantize_q4_0_to_f16(
+                input.as_ptr(),
+                output.as_mut_ptr(),
+                elements as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_dequantize_q4_0_to_f16")
+    }
+
+    /// Dequantize a Q4_K weight matrix straight to f16 (no f32 intermediate + cast).
+    pub fn launch_dequantize_q4_k_to_f16(
+        input: &DeviceBuffer,
+        output: &DeviceBuffer,
+        elements: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(elements, "dequantize_q4_k_to_f16 elements")?;
+        launch_status(unsafe {
+            hi_cuda_launch_dequantize_q4_k_to_f16(
+                input.as_ptr(),
+                output.as_mut_ptr(),
+                elements as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_dequantize_q4_k_to_f16")
+    }
+
+    /// Dequantize a Q6_K weight matrix straight to f16 (no f32 intermediate + cast).
+    pub fn launch_dequantize_q6_k_to_f16(
+        input: &DeviceBuffer,
+        output: &DeviceBuffer,
+        elements: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(elements, "dequantize_q6_k_to_f16 elements")?;
+        launch_status(unsafe {
+            hi_cuda_launch_dequantize_q6_k_to_f16(
+                input.as_ptr(),
+                output.as_mut_ptr(),
+                elements as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_dequantize_q6_k_to_f16")
+    }
+
+    /// Dequantize a Q5_K weight matrix straight to f16 (no f32 intermediate + cast).
+    pub fn launch_dequantize_q5_k_to_f16(
+        input: &DeviceBuffer,
+        output: &DeviceBuffer,
+        elements: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(elements, "dequantize_q5_k_to_f16 elements")?;
+        launch_status(unsafe {
+            hi_cuda_launch_dequantize_q5_k_to_f16(
+                input.as_ptr(),
+                output.as_mut_ptr(),
+                elements as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_dequantize_q5_k_to_f16")
+    }
+
+    /// Dequantize an IQ4_NL weight matrix straight to f16 (no f32 intermediate + cast).
+    pub fn launch_dequantize_iq4_nl_to_f16(
+        input: &DeviceBuffer,
+        output: &DeviceBuffer,
+        elements: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(elements, "dequantize_iq4_nl_to_f16 elements")?;
+        launch_status(unsafe {
+            hi_cuda_launch_dequantize_iq4_nl_to_f16(
+                input.as_ptr(),
+                output.as_mut_ptr(),
+                elements as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_dequantize_iq4_nl_to_f16")
+    }
+
+    /// Dequantize a Q8_0 weight matrix straight to f16 (no f32 intermediate + cast).
+    pub fn launch_dequantize_q8_0_to_f16(
+        input: &DeviceBuffer,
+        output: &DeviceBuffer,
+        elements: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(elements, "dequantize_q8_0_to_f16 elements")?;
+        launch_status(unsafe {
+            hi_cuda_launch_dequantize_q8_0_to_f16(
+                input.as_ptr(),
+                output.as_mut_ptr(),
+                elements as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_dequantize_q8_0_to_f16")
+    }
+
+    /// Dequantize a Q2_K weight matrix straight to f16 (no f32 intermediate + cast).
+    pub fn launch_dequantize_q2_k_to_f16(
+        input: &DeviceBuffer,
+        output: &DeviceBuffer,
+        elements: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(elements, "dequantize_q2_k_to_f16 elements")?;
+        launch_status(unsafe {
+            hi_cuda_launch_dequantize_q2_k_to_f16(
+                input.as_ptr(),
+                output.as_mut_ptr(),
+                elements as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_dequantize_q2_k_to_f16")
+    }
+
+    /// Dequantize a Q3_K weight matrix straight to f16 (no f32 intermediate + cast).
+    pub fn launch_dequantize_q3_k_to_f16(
+        input: &DeviceBuffer,
+        output: &DeviceBuffer,
+        elements: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(elements, "dequantize_q3_k_to_f16 elements")?;
+        launch_status(unsafe {
+            hi_cuda_launch_dequantize_q3_k_to_f16(
+                input.as_ptr(),
+                output.as_mut_ptr(),
+                elements as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_dequantize_q3_k_to_f16")
+    }
+
     pub fn launch_cast_f32_to_bf16(
         input: &DeviceBuffer,
         output: &DeviceBuffer,
@@ -1268,6 +1527,31 @@ mod native {
         check_last_error("hi_cuda_launch_gather_rows_f32_to_f32")
     }
 
+    /// Gather whole quantized rows (`row_bytes` each) into a compact buffer, so the
+    /// caller can dequantize only the gathered rows instead of the full matrix.
+    pub fn launch_gather_quant_rows(
+        matrix: &DeviceBuffer,
+        row_ids: &DeviceBuffer,
+        output: &DeviceBuffer,
+        row_count: usize,
+        row_bytes: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(row_count, "gather_quant row_count")?;
+        ensure_len(row_bytes, "gather_quant row_bytes")?;
+        launch_status(unsafe {
+            hi_cuda_launch_gather_quant_rows(
+                matrix.as_ptr(),
+                row_ids.as_ptr(),
+                output.as_mut_ptr(),
+                row_count as c_int,
+                row_bytes as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_gather_quant_rows")
+    }
+
     pub fn launch_quantize_q8_row(
         x: &DeviceBuffer,
         xq: &DeviceBuffer,
@@ -1315,6 +1599,149 @@ mod native {
             )
         })?;
         check_last_error("hi_cuda_launch_q4_0_dp4a_gemv")
+    }
+
+    /// dp4a Q4_K GEMV (M=1 decode): reads Q4_K weights + int8-quantized activation
+    /// (from `launch_quantize_q8_row`, block 32) via `__dp4a`. Requires cols % 256 == 0.
+    pub fn launch_q4_k_dp4a_gemv(
+        weights: &DeviceBuffer,
+        xq: &DeviceBuffer,
+        dx: &DeviceBuffer,
+        xsum: &DeviceBuffer,
+        y: &DeviceBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(rows, "q4_k dp4a rows")?;
+        ensure_len(cols, "q4_k dp4a cols")?;
+        launch_status(unsafe {
+            hi_cuda_launch_q4_k_dp4a_gemv(
+                weights.as_ptr(),
+                xq.as_ptr(),
+                dx.as_ptr(),
+                xsum.as_ptr(),
+                y.as_mut_ptr(),
+                rows as c_int,
+                cols as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_q4_k_dp4a_gemv")
+    }
+
+    /// dp4a Q5_K GEMV (M=1 decode): Q5_K weights + int8-quantized activation via
+    /// `__dp4a`. Requires cols % 256 == 0.
+    pub fn launch_q5_k_dp4a_gemv(
+        weights: &DeviceBuffer,
+        xq: &DeviceBuffer,
+        dx: &DeviceBuffer,
+        xsum: &DeviceBuffer,
+        y: &DeviceBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(rows, "q5_k dp4a rows")?;
+        ensure_len(cols, "q5_k dp4a cols")?;
+        launch_status(unsafe {
+            hi_cuda_launch_q5_k_dp4a_gemv(
+                weights.as_ptr(),
+                xq.as_ptr(),
+                dx.as_ptr(),
+                xsum.as_ptr(),
+                y.as_mut_ptr(),
+                rows as c_int,
+                cols as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_q5_k_dp4a_gemv")
+    }
+
+    /// dp4a Q6_K GEMV (M=1 decode): Q6_K weights + int8-quantized activation via
+    /// `__dp4a` (per-16 sums computed in-kernel). Requires cols % 256 == 0.
+    pub fn launch_q6_k_dp4a_gemv(
+        weights: &DeviceBuffer,
+        xq: &DeviceBuffer,
+        dx: &DeviceBuffer,
+        xsum: &DeviceBuffer,
+        y: &DeviceBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(rows, "q6_k dp4a rows")?;
+        ensure_len(cols, "q6_k dp4a cols")?;
+        launch_status(unsafe {
+            hi_cuda_launch_q6_k_dp4a_gemv(
+                weights.as_ptr(),
+                xq.as_ptr(),
+                dx.as_ptr(),
+                xsum.as_ptr(),
+                y.as_mut_ptr(),
+                rows as c_int,
+                cols as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_q6_k_dp4a_gemv")
+    }
+
+    /// dp4a Q2_K GEMV (M=1 decode). Requires cols % 256 == 0.
+    pub fn launch_q2_k_dp4a_gemv(
+        weights: &DeviceBuffer,
+        xq: &DeviceBuffer,
+        dx: &DeviceBuffer,
+        xsum: &DeviceBuffer,
+        y: &DeviceBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(rows, "q2_k dp4a rows")?;
+        ensure_len(cols, "q2_k dp4a cols")?;
+        launch_status(unsafe {
+            hi_cuda_launch_q2_k_dp4a_gemv(
+                weights.as_ptr(),
+                xq.as_ptr(),
+                dx.as_ptr(),
+                xsum.as_ptr(),
+                y.as_mut_ptr(),
+                rows as c_int,
+                cols as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_q2_k_dp4a_gemv")
+    }
+
+    /// dp4a Q3_K GEMV (M=1 decode). Requires cols % 256 == 0.
+    pub fn launch_q3_k_dp4a_gemv(
+        weights: &DeviceBuffer,
+        xq: &DeviceBuffer,
+        dx: &DeviceBuffer,
+        xsum: &DeviceBuffer,
+        y: &DeviceBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(rows, "q3_k dp4a rows")?;
+        ensure_len(cols, "q3_k dp4a cols")?;
+        launch_status(unsafe {
+            hi_cuda_launch_q3_k_dp4a_gemv(
+                weights.as_ptr(),
+                xq.as_ptr(),
+                dx.as_ptr(),
+                xsum.as_ptr(),
+                y.as_mut_ptr(),
+                rows as c_int,
+                cols as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_q3_k_dp4a_gemv")
     }
 
     /// Fused Q6_K GEMV (M=1 decode): reads Q6_K weights directly, f32 activation.

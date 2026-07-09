@@ -37,6 +37,12 @@ __device__ __forceinline__ float hi_softplusf(float x) {
   return log1pf(expf(x));
 }
 
+// One block per row: all threads cooperate on the sum-of-squares (coalesced
+// strided loads + block reduction), then write the output in parallel. The old
+// one-thread-per-row layout left a single thread doing ~2*cols sequential
+// unhidden global loads at M=1 (decode), which nsys measured at ~163us/call and
+// ~27% of decode time on a 3B model. Reduction order differs from the sequential
+// sum, so results are not bit-identical but the relative FP error is ~1e-6.
 __global__ void rms_norm_kernel(
     const float* input,
     const float* weight,
@@ -44,18 +50,30 @@ __global__ void rms_norm_kernel(
     int rows,
     int cols,
     float eps) {
-  int row = blockIdx.x * blockDim.x + threadIdx.x;
+  int row = blockIdx.x;
   if (row >= rows) {
     return;
   }
-  const float* in = input + row * cols;
-  float* out = output + row * cols;
-  float sum = 0.0f;
-  for (int col = 0; col < cols; ++col) {
-    sum += in[col] * in[col];
+  const float* in = input + static_cast<size_t>(row) * cols;
+  float* out = output + static_cast<size_t>(row) * cols;
+  int tid = threadIdx.x;
+  int nthreads = blockDim.x;
+  float local = 0.0f;
+  for (int col = tid; col < cols; col += nthreads) {
+    float v = in[col];
+    local += v * v;
   }
-  float inv = rsqrtf(sum / static_cast<float>(cols) + eps);
-  for (int col = 0; col < cols; ++col) {
+  __shared__ float sdata[256];
+  sdata[tid] = local;
+  __syncthreads();
+  for (int stride = nthreads >> 1; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      sdata[tid] += sdata[tid + stride];
+    }
+    __syncthreads();
+  }
+  float inv = rsqrtf(sdata[0] / static_cast<float>(cols) + eps);
+  for (int col = tid; col < cols; col += nthreads) {
     out[col] = in[col] * inv * weight[col];
   }
 }
@@ -610,6 +628,46 @@ __global__ void gather_rows_f32_to_f32_kernel(
   output[idx] = matrix[matrix_row * cols + col];
 }
 
+// Gather whole quantized rows (row_bytes each) from a quantized matrix into a
+// compact buffer, so the caller can dequantize only the gathered rows instead of
+// the entire matrix. Used for the token-embedding lookup: dequantizing the full
+// embedding matrix to f32 costs vocab*hidden*4 bytes every forward (2.5 GB for a
+// 151k-vocab 4096-hidden model — OOMs an 8 GB card once the weights are loaded).
+// One thread per output byte; row_bytes is a whole number of quant blocks.
+__global__ void gather_quant_rows_kernel(
+    const uint8_t* __restrict__ matrix,
+    const uint32_t* __restrict__ row_ids,
+    uint8_t* __restrict__ output,
+    int row_count,
+    int row_bytes) {
+  long long idx = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  long long total = static_cast<long long>(row_count) * row_bytes;
+  if (idx >= total) {
+    return;
+  }
+  int out_row = static_cast<int>(idx / row_bytes);
+  int off = static_cast<int>(idx % row_bytes);
+  uint32_t matrix_row = row_ids[out_row];
+  output[idx] = matrix[static_cast<size_t>(matrix_row) * row_bytes + off];
+}
+
+extern "C" int hi_cuda_launch_gather_quant_rows(
+    const void* matrix, const void* row_ids, void* output, int row_count,
+    int row_bytes, void* stream) {
+  if (matrix == nullptr || row_ids == nullptr || output == nullptr ||
+      row_count <= 0 || row_bytes <= 0 || stream == nullptr) {
+    return 1;
+  }
+  long long total = static_cast<long long>(row_count) * row_bytes;
+  int block = 256;
+  long long grid = (total + block - 1) / block;
+  gather_quant_rows_kernel<<<static_cast<unsigned int>(grid), block, 0,
+                             static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint8_t*>(matrix), static_cast<const uint32_t*>(row_ids),
+      static_cast<uint8_t*>(output), row_count, row_bytes);
+  return 0;
+}
+
 __device__ void q4_k_scale_min(int index, const uint8_t* scales, uint8_t* scale, uint8_t* min) {
   if (index < 4) {
     *scale = scales[index] & 0x3f;
@@ -944,6 +1002,38 @@ __global__ void dequantize_q4_0_kernel(const uint8_t* input, float* output, int 
   uint8_t packed = block[2 + (within % 16)];
   uint8_t quant = within < 16 ? (packed & 0x0f) : (packed >> 4);
   output[idx] = d * static_cast<float>(static_cast<int>(quant) - 8);
+}
+
+// Dequantize Q4_0 straight to f16 (no f32 intermediate + separate cast). The
+// prefill f16-GEMM path used dequant->f32 then a cast_f32_to_f16 pass, which for
+// short prefills is ~40% of GPU time (write 4B/weight then re-read+write 2B) plus
+// a >4MB f32 scratch per weight whose synchronizing cudaFree dominates host time.
+// Same value as dequantize_q4_0_kernel then f32->f16, so bit-identical f16 output.
+__global__ void dequantize_q4_0_to_f16_kernel(
+    const uint8_t* input, __half* output, int elements) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= elements) {
+    return;
+  }
+  int block_id = idx / 32;
+  int within = idx % 32;
+  const uint8_t* block = input + block_id * 18;
+  float d = __half2float(*reinterpret_cast<const __half*>(block));
+  uint8_t packed = block[2 + (within % 16)];
+  uint8_t quant = within < 16 ? (packed & 0x0f) : (packed >> 4);
+  output[idx] = __float2half(d * static_cast<float>(static_cast<int>(quant) - 8));
+}
+
+extern "C" int hi_cuda_launch_dequantize_q4_0_to_f16(
+    const void* input, void* output, int elements, void* stream) {
+  if (input == nullptr || output == nullptr || elements <= 0 || stream == nullptr) {
+    return 1;
+  }
+  dim3 block(256);
+  dim3 grid((elements + block.x - 1) / block.x);
+  dequantize_q4_0_to_f16_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint8_t*>(input), static_cast<__half*>(output), elements);
+  return 0;
 }
 
 __global__ void dequantize_q4_1_kernel(const uint8_t* input, float* output, int elements) {
@@ -1557,6 +1647,290 @@ __global__ void dequantize_q6_k_kernel(const uint8_t* input, float* output, int 
   }
   int8_t scale = static_cast<int8_t>(scales[scale_index]);
   output[idx] = d * static_cast<float>(scale) * static_cast<float>(quant - 32);
+}
+
+// f16-output twins of dequantize_q4_k_kernel / dequantize_q6_k_kernel (exact same
+// value, wrapped in __float2half) for the fused prefill dequant->f16 path.
+__global__ void dequantize_q4_k_to_f16_kernel(
+    const uint8_t* input, __half* output, int elements) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= elements) {
+    return;
+  }
+  int block_id = idx / 256;
+  int within = idx % 256;
+  const uint8_t* block = input + block_id * 144;
+  float d = __half2float(*reinterpret_cast<const __half*>(block));
+  float dmin = __half2float(*reinterpret_cast<const __half*>(block + 2));
+  const uint8_t* scales = block + 4;
+  const uint8_t* qs = block + 16;
+
+  int group64 = within / 64;
+  int offset64 = within % 64;
+  int scale_index = group64 * 2 + (offset64 >= 32 ? 1 : 0);
+  uint8_t scale;
+  uint8_t min;
+  q4_k_scale_min(scale_index, scales, &scale, &min);
+
+  uint8_t packed = qs[group64 * 32 + (offset64 % 32)];
+  uint8_t quant = offset64 < 32 ? (packed & 0x0f) : (packed >> 4);
+  output[idx] = __float2half(d * static_cast<float>(scale) * static_cast<float>(quant) -
+                             dmin * static_cast<float>(min));
+}
+
+__global__ void dequantize_q6_k_to_f16_kernel(
+    const uint8_t* input, __half* output, int elements) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= elements) {
+    return;
+  }
+  int block_id = idx / 256;
+  int within = idx % 256;
+  const uint8_t* block = input + block_id * 210;
+  const uint8_t* ql = block;
+  const uint8_t* qh = block + 128;
+  const uint8_t* scales = block + 192;
+  float d = __half2float(*reinterpret_cast<const __half*>(block + 208));
+
+  int half = within / 128;
+  int pos = within % 128;
+  int l = pos % 32;
+  int group = pos / 32;
+  int ql_base = half * 64;
+  int qh_base = half * 32;
+  int scale_base = half * 8;
+  int is = l / 16;
+  uint8_t high = qh[qh_base + l];
+
+  int quant = 0;
+  int scale_index = scale_base + is;
+  switch (group) {
+    case 0:
+      quant = (ql[ql_base + l] & 0x0f) | (((high >> 0) & 0x03) << 4);
+      scale_index += 0;
+      break;
+    case 1:
+      quant = (ql[ql_base + l + 32] & 0x0f) | (((high >> 2) & 0x03) << 4);
+      scale_index += 2;
+      break;
+    case 2:
+      quant = (ql[ql_base + l] >> 4) | (((high >> 4) & 0x03) << 4);
+      scale_index += 4;
+      break;
+    default:
+      quant = (ql[ql_base + l + 32] >> 4) | (((high >> 6) & 0x03) << 4);
+      scale_index += 6;
+      break;
+  }
+  int8_t scale = static_cast<int8_t>(scales[scale_index]);
+  output[idx] = __float2half(d * static_cast<float>(scale) * static_cast<float>(quant - 32));
+}
+
+extern "C" int hi_cuda_launch_dequantize_q4_k_to_f16(
+    const void* input, void* output, int elements, void* stream) {
+  if (input == nullptr || output == nullptr || elements <= 0 || stream == nullptr) {
+    return 1;
+  }
+  dim3 block(256);
+  dim3 grid((elements + block.x - 1) / block.x);
+  dequantize_q4_k_to_f16_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint8_t*>(input), static_cast<__half*>(output), elements);
+  return 0;
+}
+
+extern "C" int hi_cuda_launch_dequantize_q6_k_to_f16(
+    const void* input, void* output, int elements, void* stream) {
+  if (input == nullptr || output == nullptr || elements <= 0 || stream == nullptr) {
+    return 1;
+  }
+  dim3 block(256);
+  dim3 grid((elements + block.x - 1) / block.x);
+  dequantize_q6_k_to_f16_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint8_t*>(input), static_cast<__half*>(output), elements);
+  return 0;
+}
+
+// f16-output twins of dequantize_q5_k_kernel / dequantize_iq4_nl_kernel /
+// dequantize_q8_0_kernel (exact same value, wrapped in __float2half) for the
+// fused prefill dequant->f16 path.
+__global__ void dequantize_q5_k_to_f16_kernel(
+    const uint8_t* input, __half* output, int elements) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= elements) {
+    return;
+  }
+  int block_id = idx / 256;
+  int within = idx % 256;
+  const uint8_t* block = input + block_id * 176;
+  float d = __half2float(*reinterpret_cast<const __half*>(block));
+  float dmin = __half2float(*reinterpret_cast<const __half*>(block + 2));
+  const uint8_t* scales = block + 4;
+  const uint8_t* qh = block + 16;
+  const uint8_t* qs = block + 48;
+
+  int group32 = within / 32;
+  int offset32 = within % 32;
+  int group64 = group32 / 2;
+  uint8_t scale;
+  uint8_t min;
+  q4_k_scale_min(group32, scales, &scale, &min);
+
+  uint8_t packed = qs[group64 * 32 + offset32];
+  uint8_t low = (group32 % 2) == 0 ? (packed & 0x0f) : (packed >> 4);
+  uint8_t high = (qh[offset32] & (1u << group32)) != 0 ? 16 : 0;
+  uint8_t quant = low + high;
+  output[idx] = __float2half(d * static_cast<float>(scale) * static_cast<float>(quant) -
+                             dmin * static_cast<float>(min));
+}
+
+__global__ void dequantize_iq4_nl_to_f16_kernel(
+    const uint8_t* input, __half* output, int elements) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= elements) {
+    return;
+  }
+  int block_id = idx / 32;
+  int within = idx % 32;
+  const uint8_t* block = input + block_id * 18;
+  float d = __half2float(*reinterpret_cast<const __half*>(block));
+  uint8_t packed = block[2 + (within % 16)];
+  uint8_t quant = within < 16 ? (packed & 0x0f) : (packed >> 4);
+  output[idx] = __float2half(d * static_cast<float>(IQ4_NL_VALUES[quant]));
+}
+
+__global__ void dequantize_q8_0_to_f16_kernel(
+    const uint8_t* input, __half* output, int elements) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= elements) {
+    return;
+  }
+  int block_id = idx / 32;
+  int within = idx % 32;
+  const uint8_t* block = input + block_id * 34;
+  float d = __half2float(*reinterpret_cast<const __half*>(block));
+  int8_t q = static_cast<int8_t>(block[2 + within]);
+  output[idx] = __float2half(d * static_cast<float>(q));
+}
+
+extern "C" int hi_cuda_launch_dequantize_q5_k_to_f16(
+    const void* input, void* output, int elements, void* stream) {
+  if (input == nullptr || output == nullptr || elements <= 0 || stream == nullptr) {
+    return 1;
+  }
+  dim3 block(256);
+  dim3 grid((elements + block.x - 1) / block.x);
+  dequantize_q5_k_to_f16_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint8_t*>(input), static_cast<__half*>(output), elements);
+  return 0;
+}
+
+extern "C" int hi_cuda_launch_dequantize_iq4_nl_to_f16(
+    const void* input, void* output, int elements, void* stream) {
+  if (input == nullptr || output == nullptr || elements <= 0 || stream == nullptr) {
+    return 1;
+  }
+  dim3 block(256);
+  dim3 grid((elements + block.x - 1) / block.x);
+  dequantize_iq4_nl_to_f16_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint8_t*>(input), static_cast<__half*>(output), elements);
+  return 0;
+}
+
+extern "C" int hi_cuda_launch_dequantize_q8_0_to_f16(
+    const void* input, void* output, int elements, void* stream) {
+  if (input == nullptr || output == nullptr || elements <= 0 || stream == nullptr) {
+    return 1;
+  }
+  dim3 block(256);
+  dim3 grid((elements + block.x - 1) / block.x);
+  dequantize_q8_0_to_f16_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint8_t*>(input), static_cast<__half*>(output), elements);
+  return 0;
+}
+
+// f16-output twins of dequantize_q2_k_kernel / dequantize_q3_k_kernel (exact same
+// value, wrapped in __float2half) for the fused prefill dequant->f16 path.
+__global__ void dequantize_q2_k_to_f16_kernel(
+    const uint8_t* input, __half* output, int elements) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= elements) {
+    return;
+  }
+  int block_id = idx / 256;
+  int within = idx % 256;
+  const uint8_t* block = input + block_id * 84;
+  const uint8_t* scales = block;
+  const uint8_t* qs = block + 16;
+  float d = __half2float(*reinterpret_cast<const __half*>(block + 80));
+  float dmin = __half2float(*reinterpret_cast<const __half*>(block + 82));
+
+  int group16 = within / 16;
+  int offset16 = within % 16;
+  int half128 = group16 / 8;
+  int group_in_half = group16 % 8;
+  int pair = group_in_half / 2;
+  bool upper16 = (group_in_half % 2) != 0;
+  int q_index = half128 * 32 + (upper16 ? 16 : 0) + offset16;
+  int shift = 2 * pair;
+  uint8_t sc = scales[group16];
+  uint8_t quant = (qs[q_index] >> shift) & 0x03;
+  output[idx] = __float2half(d * static_cast<float>(sc & 0x0f) * static_cast<float>(quant) -
+                             dmin * static_cast<float>(sc >> 4));
+}
+
+__global__ void dequantize_q3_k_to_f16_kernel(
+    const uint8_t* input, __half* output, int elements) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= elements) {
+    return;
+  }
+  int block_id = idx / 256;
+  int within = idx % 256;
+  const uint8_t* block = input + block_id * 110;
+  const uint8_t* hmask = block;
+  const uint8_t* qs = block + 32;
+  const uint8_t* scales = block + 96;
+  float d = __half2float(*reinterpret_cast<const __half*>(block + 108));
+
+  int group16 = within / 16;
+  int offset16 = within % 16;
+  int half128 = group16 / 8;
+  int group_in_half = group16 % 8;
+  int pair = group_in_half / 2;
+  bool upper16 = (group_in_half % 2) != 0;
+  int q_index = half128 * 32 + (upper16 ? 16 : 0) + offset16;
+  int h_index = (upper16 ? 16 : 0) + offset16;
+  int shift = 2 * pair;
+  uint8_t mask = static_cast<uint8_t>(1u << (4 * half128 + pair));
+
+  int low = static_cast<int>((qs[q_index] >> shift) & 0x03);
+  int quant = low - ((hmask[h_index] & mask) != 0 ? 0 : 4);
+  output[idx] = __float2half(
+      d * static_cast<float>(q3_k_scale(group16, scales)) * static_cast<float>(quant));
+}
+
+extern "C" int hi_cuda_launch_dequantize_q2_k_to_f16(
+    const void* input, void* output, int elements, void* stream) {
+  if (input == nullptr || output == nullptr || elements <= 0 || stream == nullptr) {
+    return 1;
+  }
+  dim3 block(256);
+  dim3 grid((elements + block.x - 1) / block.x);
+  dequantize_q2_k_to_f16_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint8_t*>(input), static_cast<__half*>(output), elements);
+  return 0;
+}
+
+extern "C" int hi_cuda_launch_dequantize_q3_k_to_f16(
+    const void* input, void* output, int elements, void* stream) {
+  if (input == nullptr || output == nullptr || elements <= 0 || stream == nullptr) {
+    return 1;
+  }
+  dim3 block(256);
+  dim3 grid((elements + block.x - 1) / block.x);
+  dequantize_q3_k_to_f16_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint8_t*>(input), static_cast<__half*>(output), elements);
+  return 0;
 }
 
 __global__ void dequantize_q8_k_kernel(const uint8_t* input, float* output, int elements) {
@@ -4163,8 +4537,8 @@ extern "C" int hi_cuda_launch_rms_norm(
   if (rows == 0) {
     return 0;
   }
-  dim3 block(128);
-  dim3 grid((rows + block.x - 1) / block.x);
+  dim3 block(256);
+  dim3 grid(rows);
   rms_norm_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const float*>(input),
       static_cast<const float*>(weight),
@@ -5760,6 +6134,157 @@ extern "C" int hi_cuda_launch_q4_k_gemv(
   return 0;
 }
 
+// dp4a Q4_K x Q8 mat-vec (M=1 decode). Same result as q4_k_gemv but ~3-4x faster:
+// warp per row + int8-quantized activation + hardware __dp4a + warp-shuffle reduce,
+// and the super-block metadata (d/dmin) and 6-bit sub-block scale/min are read ONCE
+// per 32-weight sub-block instead of once per weight. Activation is pre-quantized
+// per-32 by quantize_q8_row (same as the Q4_0 dp4a path): sub-block `sub` covers
+// columns [sub*32 .. sub*32+31], which align exactly with Q4_K's 32-weight
+// sub-blocks. w = d*sc*q - dmin*m, so per sub-block:
+//   acc += dx[sub] * (d*sc*dp4a(q,xq) - dmin*m*xsum[sub]).
+__global__ void q4_k_dp4a_gemv_kernel(
+    const uint8_t* __restrict__ weights,
+    const int8_t* __restrict__ xq,
+    const float* __restrict__ dx,
+    const int* __restrict__ xsum,
+    float* __restrict__ y,
+    int rows,
+    int cols) {
+  const int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+  if (row >= rows) {
+    return;
+  }
+  const int lane = threadIdx.x & 31;
+  const int nsub = cols / 32;
+  const size_t row_bytes = static_cast<size_t>(cols / 256) * 144;
+  const uint8_t* row_ptr = weights + static_cast<size_t>(row) * row_bytes;
+  float acc = 0.0f;
+  for (int sub = lane; sub < nsub; sub += 32) {
+    const int kblock = sub >> 3;   // which 256-weight super-block
+    const int si = sub & 7;        // sub-block index 0..7 (== q4_k scale_index)
+    const uint8_t* blk = row_ptr + static_cast<size_t>(kblock) * 144;
+    const float d = __half2float(*reinterpret_cast<const __half*>(blk));
+    const float dmin = __half2float(*reinterpret_cast<const __half*>(blk + 2));
+    const uint8_t* scales = blk + 4;
+    const uint8_t* qs = blk + 16;
+    uint8_t scale, mn;
+    q4_k_scale_min(si, scales, &scale, &mn);
+    const int base = (si >> 1) * 32;      // group64 * 32
+    const bool high = (si & 1) != 0;      // odd sub-block -> high nibble
+    const int8_t* xqb = xq + sub * 32;
+    int dot = 0;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const uint32_t packed = *reinterpret_cast<const uint32_t*>(qs + base + j * 4);
+      const int nib = high ? static_cast<int>((packed >> 4) & 0x0F0F0F0Fu)
+                           : static_cast<int>(packed & 0x0F0F0F0Fu);
+      const int xv = *reinterpret_cast<const int*>(xqb + j * 4);
+      dot = dp4a_i8(nib, xv, dot);
+    }
+    acc += dx[sub] * (d * static_cast<float>(scale) * static_cast<float>(dot) -
+                      dmin * static_cast<float>(mn) * static_cast<float>(xsum[sub]));
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    acc += __shfl_down_sync(0xffffffffu, acc, off);
+  }
+  if (lane == 0) {
+    y[row] = acc;
+  }
+}
+
+extern "C" int hi_cuda_launch_q4_k_dp4a_gemv(
+    const void* weights, const void* xq, const void* dx, const void* xsum, void* y,
+    int rows, int cols, void* stream) {
+  if (weights == nullptr || xq == nullptr || dx == nullptr || xsum == nullptr ||
+      y == nullptr || rows <= 0 || cols <= 0 || cols % 256 != 0 || stream == nullptr) {
+    return 1;
+  }
+  const int warps_per_block = 4;
+  const int grid = (rows + warps_per_block - 1) / warps_per_block;
+  q4_k_dp4a_gemv_kernel<<<grid, warps_per_block * 32, 0,
+                          static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint8_t*>(weights), static_cast<const int8_t*>(xq),
+      static_cast<const float*>(dx), static_cast<const int*>(xsum),
+      static_cast<float*>(y), rows, cols);
+  return 0;
+}
+
+// dp4a Q5_K GEMV — Q4_K path + the 5th (high) bit from qh. Q5_K block = 176 B/256,
+// per-32 sub-blocks (aligns with the per-32 int8 activation); q5 = low4 + 16*qh_bit.
+// w = d*sc*q5 - dmin*m, so acc += dx[sub]*(d*sc*dp4a(q5,xq) - dmin*m*xsum[sub]).
+__global__ void q5_k_dp4a_gemv_kernel(
+    const uint8_t* __restrict__ weights,
+    const int8_t* __restrict__ xq,
+    const float* __restrict__ dx,
+    const int* __restrict__ xsum,
+    float* __restrict__ y,
+    int rows,
+    int cols) {
+  const int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+  if (row >= rows) {
+    return;
+  }
+  const int lane = threadIdx.x & 31;
+  const int nsub = cols / 32;
+  const size_t row_bytes = static_cast<size_t>(cols / 256) * 176;
+  const uint8_t* row_ptr = weights + static_cast<size_t>(row) * row_bytes;
+  float acc = 0.0f;
+  for (int sub = lane; sub < nsub; sub += 32) {
+    const int kblock = sub >> 3;
+    const int si = sub & 7;                // group32 (0..7)
+    const uint8_t* blk = row_ptr + static_cast<size_t>(kblock) * 176;
+    const float d = __half2float(*reinterpret_cast<const __half*>(blk));
+    const float dmin = __half2float(*reinterpret_cast<const __half*>(blk + 2));
+    const uint8_t* scales = blk + 4;
+    const uint8_t* qh = blk + 16;
+    const uint8_t* qs = blk + 48;
+    uint8_t scale, mn;
+    q4_k_scale_min(si, scales, &scale, &mn);
+    const int base = (si >> 1) * 32;       // group64 * 32
+    const bool high = (si & 1) != 0;
+    const int8_t* xqb = xq + sub * 32;
+    int dot = 0;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const uint32_t packed = *reinterpret_cast<const uint32_t*>(qs + base + j * 4);
+      const int lo = high ? static_cast<int>((packed >> 4) & 0x0F0F0F0Fu)
+                          : static_cast<int>(packed & 0x0F0F0F0Fu);
+      const uint32_t qh4 = *reinterpret_cast<const uint32_t*>(qh + j * 4);
+      // bit `si` of each qh byte -> 0x10 in that byte (the +16 high bit)
+      const int hbit = static_cast<int>(((qh4 & (0x01010101u << si)) >> si) << 4);
+      const int xv = *reinterpret_cast<const int*>(xqb + j * 4);
+      dot = dp4a_i8(lo | hbit, xv, dot);
+    }
+    acc += dx[sub] * (d * static_cast<float>(scale) * static_cast<float>(dot) -
+                      dmin * static_cast<float>(mn) * static_cast<float>(xsum[sub]));
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    acc += __shfl_down_sync(0xffffffffu, acc, off);
+  }
+  if (lane == 0) {
+    y[row] = acc;
+  }
+}
+
+extern "C" int hi_cuda_launch_q5_k_dp4a_gemv(
+    const void* weights, const void* xq, const void* dx, const void* xsum, void* y,
+    int rows, int cols, void* stream) {
+  if (weights == nullptr || xq == nullptr || dx == nullptr || xsum == nullptr ||
+      y == nullptr || rows <= 0 || cols <= 0 || cols % 256 != 0 || stream == nullptr) {
+    return 1;
+  }
+  const int warps_per_block = 4;
+  const int grid = (rows + warps_per_block - 1) / warps_per_block;
+  q5_k_dp4a_gemv_kernel<<<grid, warps_per_block * 32, 0,
+                          static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint8_t*>(weights), static_cast<const int8_t*>(xq),
+      static_cast<const float*>(dx), static_cast<const int*>(xsum),
+      static_cast<float*>(y), rows, cols);
+  return 0;
+}
+
 // Fused Q6_K GEMV (M=1 decode). Reads Q6_K weights directly and dequantizes each
 // weight on the fly into the dot product, instead of materializing the whole f32
 // weight matrix every token. Q6_K block = 210 bytes / 256 weights (128 ql + 64 qh
@@ -5852,6 +6377,282 @@ extern "C" int hi_cuda_launch_q6_k_gemv(
   q6_k_gemv_kernel<<<rows, 128, 0, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const uint8_t*>(weights), static_cast<const float*>(x),
       static_cast<float*>(output), rows, cols);
+  return 0;
+}
+
+// dp4a Q6_K GEMV. Q6_K = 210 B/256 with per-16 int8 scales and a -32 zero-point;
+// w = d*scale*(q6-32), q6 = ql(4b) | qh(2b)<<4. Each per-32 activation block maps
+// to one Q6_K "group" (fixed half+group), split into two 16-weight scale-chunks
+// (is=0 for l<16, is=1 for l>=16). The 210-byte block is NOT 4-aligned, so ql/qh
+// are read byte-wise then packed. xsum per 16 is computed in-kernel via
+// dp4a(xq, ones). acc += dx[sub]*d*sum_chunk(scale*(dp4a(q6,xq) - 32*xsum16)).
+__global__ void q6_k_dp4a_gemv_kernel(
+    const uint8_t* __restrict__ weights,
+    const int8_t* __restrict__ xq,
+    const float* __restrict__ dx,
+    const int* __restrict__ xsum,
+    float* __restrict__ y,
+    int rows,
+    int cols) {
+  (void)xsum;  // Q6_K uses per-16 sums computed in-kernel, not the per-32 xsum.
+  const int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+  if (row >= rows) {
+    return;
+  }
+  const int lane = threadIdx.x & 31;
+  const int nsub = cols / 32;
+  const size_t row_bytes = static_cast<size_t>(cols / 256) * 210;
+  const uint8_t* row_ptr = weights + static_cast<size_t>(row) * row_bytes;
+  float acc = 0.0f;
+  for (int sub = lane; sub < nsub; sub += 32) {
+    const int kblock = sub >> 3;
+    const int rem = sub & 7;
+    const int half = rem >> 2;    // 0 or 1
+    const int group = rem & 3;    // 0..3
+    const uint8_t* blk = row_ptr + static_cast<size_t>(kblock) * 210;
+    const float d = __half2float(*reinterpret_cast<const __half*>(blk + 208));
+    const int ql_base = half * 64 + ((group == 1 || group == 3) ? 32 : 0);
+    const int qh_base = 128 + half * 32;
+    const int scale_base = 192 + half * 8;
+    const int shift = group * 2;
+    const bool highn = group >= 2;
+    const int8_t* xqbase = xq + sub * 32;
+    float contrib = 0.0f;
+#pragma unroll
+    for (int chunk = 0; chunk < 2; ++chunk) {
+      const int l0 = chunk * 16;
+      const int8_t scale =
+          static_cast<int8_t>(blk[scale_base + chunk + group * 2]);
+      int dot = 0;
+      int xs = 0;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const int l = l0 + j * 4;
+        const uint8_t* qlp = blk + ql_base + l;
+        const uint32_t ql4 = static_cast<uint32_t>(qlp[0]) |
+                             (static_cast<uint32_t>(qlp[1]) << 8) |
+                             (static_cast<uint32_t>(qlp[2]) << 16) |
+                             (static_cast<uint32_t>(qlp[3]) << 24);
+        const int nib = highn ? static_cast<int>((ql4 >> 4) & 0x0F0F0F0Fu)
+                              : static_cast<int>(ql4 & 0x0F0F0F0Fu);
+        const uint8_t* qhp = blk + qh_base + l;
+        const uint32_t qh4 = static_cast<uint32_t>(qhp[0]) |
+                             (static_cast<uint32_t>(qhp[1]) << 8) |
+                             (static_cast<uint32_t>(qhp[2]) << 16) |
+                             (static_cast<uint32_t>(qhp[3]) << 24);
+        const int hb = static_cast<int>(((qh4 >> shift) & 0x03030303u) << 4);
+        const int xv = *reinterpret_cast<const int*>(xqbase + l);
+        dot = dp4a_i8(nib | hb, xv, dot);
+        xs = dp4a_i8(xv, 0x01010101, xs);
+      }
+      contrib += static_cast<float>(scale) *
+                 (static_cast<float>(dot) - 32.0f * static_cast<float>(xs));
+    }
+    acc += dx[sub] * d * contrib;
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    acc += __shfl_down_sync(0xffffffffu, acc, off);
+  }
+  if (lane == 0) {
+    y[row] = acc;
+  }
+}
+
+extern "C" int hi_cuda_launch_q6_k_dp4a_gemv(
+    const void* weights, const void* xq, const void* dx, const void* xsum, void* y,
+    int rows, int cols, void* stream) {
+  if (weights == nullptr || xq == nullptr || dx == nullptr || xsum == nullptr ||
+      y == nullptr || rows <= 0 || cols <= 0 || cols % 256 != 0 || stream == nullptr) {
+    return 1;
+  }
+  const int warps_per_block = 4;
+  const int grid = (rows + warps_per_block - 1) / warps_per_block;
+  q6_k_dp4a_gemv_kernel<<<grid, warps_per_block * 32, 0,
+                          static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint8_t*>(weights), static_cast<const int8_t*>(xq),
+      static_cast<const float*>(dx), static_cast<const int*>(xsum),
+      static_cast<float*>(y), rows, cols);
+  return 0;
+}
+
+// dp4a Q2_K GEMV. Q2_K = 84 B/256 (4-aligned), per-16 sub-blocks; w = d*(sc&0xf)*q
+// - dmin*(sc>>4), q is 2-bit. Each per-32 activation block = two group16 sub-blocks
+// (gi=0/1). Per group16: d*scale4*dp4a(q,xq) - dmin*min4*xsum16, scaled by dx[sub].
+__global__ void q2_k_dp4a_gemv_kernel(
+    const uint8_t* __restrict__ weights,
+    const int8_t* __restrict__ xq,
+    const float* __restrict__ dx,
+    const int* __restrict__ xsum,
+    float* __restrict__ y,
+    int rows,
+    int cols) {
+  (void)xsum;
+  const int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+  if (row >= rows) {
+    return;
+  }
+  const int lane = threadIdx.x & 31;
+  const int nsub = cols / 32;
+  const size_t row_bytes = static_cast<size_t>(cols / 256) * 84;
+  const uint8_t* row_ptr = weights + static_cast<size_t>(row) * row_bytes;
+  float acc = 0.0f;
+  for (int sub = lane; sub < nsub; sub += 32) {
+    const int kblock = sub >> 3;
+    const int rem = sub & 7;
+    const uint8_t* blk = row_ptr + static_cast<size_t>(kblock) * 84;
+    const float d = __half2float(*reinterpret_cast<const __half*>(blk + 80));
+    const float dmin = __half2float(*reinterpret_cast<const __half*>(blk + 82));
+    const int8_t* xqbase = xq + sub * 32;
+    float contrib = 0.0f;
+#pragma unroll
+    for (int gi = 0; gi < 2; ++gi) {
+      const int g = rem * 2 + gi;
+      const int half128 = g >> 3;
+      const int group_in_half = g & 7;
+      const int pair = group_in_half >> 1;
+      const bool upper16 = (group_in_half & 1) != 0;
+      const int base = half128 * 32 + (upper16 ? 16 : 0);
+      const int shift = 2 * pair;
+      const uint8_t sc = blk[g];
+      const float scale4 = static_cast<float>(sc & 0x0f);
+      const float min4 = static_cast<float>(sc >> 4);
+      const uint8_t* qs = blk + 16 + base;
+      const int8_t* xqg = xqbase + gi * 16;
+      int dot = 0;
+      int xs = 0;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const uint32_t qs4 = *reinterpret_cast<const uint32_t*>(qs + j * 4);
+        const int q = static_cast<int>((qs4 >> shift) & 0x03030303u);
+        const int xv = *reinterpret_cast<const int*>(xqg + j * 4);
+        dot = dp4a_i8(q, xv, dot);
+        xs = dp4a_i8(xv, 0x01010101, xs);
+      }
+      contrib += d * scale4 * static_cast<float>(dot) -
+                 dmin * min4 * static_cast<float>(xs);
+    }
+    acc += dx[sub] * contrib;
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    acc += __shfl_down_sync(0xffffffffu, acc, off);
+  }
+  if (lane == 0) {
+    y[row] = acc;
+  }
+}
+
+extern "C" int hi_cuda_launch_q2_k_dp4a_gemv(
+    const void* weights, const void* xq, const void* dx, const void* xsum, void* y,
+    int rows, int cols, void* stream) {
+  if (weights == nullptr || xq == nullptr || dx == nullptr || xsum == nullptr ||
+      y == nullptr || rows <= 0 || cols <= 0 || cols % 256 != 0 || stream == nullptr) {
+    return 1;
+  }
+  const int warps_per_block = 4;
+  const int grid = (rows + warps_per_block - 1) / warps_per_block;
+  q2_k_dp4a_gemv_kernel<<<grid, warps_per_block * 32, 0,
+                          static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint8_t*>(weights), static_cast<const int8_t*>(xq),
+      static_cast<const float*>(dx), static_cast<const int*>(xsum),
+      static_cast<float*>(y), rows, cols);
+  return 0;
+}
+
+// dp4a Q3_K GEMV. Q3_K = 110 B/256 (NOT 4-aligned -> byte loads), per-16 sub-blocks;
+// w = d*scale*q3, q3 = low2 - (hmask_bit ? 0 : 4) (signed, -4..3), scale = 6-bit-32.
+// sum(q3*xq) = dp4a(low,xq) - 4*dp4a(notbit,xq) (notbit=1 where hmask clear), which
+// avoids packed-subtraction borrows. acc += dx[sub]*d*sum_chunk(scale*dot).
+__global__ void q3_k_dp4a_gemv_kernel(
+    const uint8_t* __restrict__ weights,
+    const int8_t* __restrict__ xq,
+    const float* __restrict__ dx,
+    const int* __restrict__ xsum,
+    float* __restrict__ y,
+    int rows,
+    int cols) {
+  (void)xsum;
+  const int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+  if (row >= rows) {
+    return;
+  }
+  const int lane = threadIdx.x & 31;
+  const int nsub = cols / 32;
+  const size_t row_bytes = static_cast<size_t>(cols / 256) * 110;
+  const uint8_t* row_ptr = weights + static_cast<size_t>(row) * row_bytes;
+  float acc = 0.0f;
+  for (int sub = lane; sub < nsub; sub += 32) {
+    const int kblock = sub >> 3;
+    const int rem = sub & 7;
+    const uint8_t* blk = row_ptr + static_cast<size_t>(kblock) * 110;
+    const uint8_t* hmask = blk;         // 32 B
+    const uint8_t* qs = blk + 32;       // 64 B
+    const uint8_t* scales = blk + 96;   // 12 B
+    const float d = __half2float(*reinterpret_cast<const __half*>(blk + 108));
+    const int8_t* xqbase = xq + sub * 32;
+    float contrib = 0.0f;
+#pragma unroll
+    for (int gi = 0; gi < 2; ++gi) {
+      const int g = rem * 2 + gi;
+      const int half128 = g >> 3;
+      const int group_in_half = g & 7;
+      const int pair = group_in_half >> 1;
+      const bool upper16 = (group_in_half & 1) != 0;
+      const int qbase = half128 * 32 + (upper16 ? 16 : 0);
+      const int hbase = (upper16 ? 16 : 0);
+      const int shift = 2 * pair;
+      const int bitpos = 4 * half128 + pair;
+      const float scale = static_cast<float>(q3_k_scale(g, scales));
+      const int8_t* xqg = xqbase + gi * 16;
+      int dot_low = 0;
+      int dot_clear = 0;
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const uint8_t* qp = qs + qbase + j * 4;
+        const uint32_t qs4 = static_cast<uint32_t>(qp[0]) |
+                             (static_cast<uint32_t>(qp[1]) << 8) |
+                             (static_cast<uint32_t>(qp[2]) << 16) |
+                             (static_cast<uint32_t>(qp[3]) << 24);
+        const int low = static_cast<int>((qs4 >> shift) & 0x03030303u);
+        const uint8_t* hp = hmask + hbase + j * 4;
+        const uint32_t hm4 = static_cast<uint32_t>(hp[0]) |
+                             (static_cast<uint32_t>(hp[1]) << 8) |
+                             (static_cast<uint32_t>(hp[2]) << 16) |
+                             (static_cast<uint32_t>(hp[3]) << 24);
+        const int notbit =
+            static_cast<int>(((hm4 >> bitpos) & 0x01010101u) ^ 0x01010101u);
+        const int xv = *reinterpret_cast<const int*>(xqg + j * 4);
+        dot_low = dp4a_i8(low, xv, dot_low);
+        dot_clear = dp4a_i8(notbit, xv, dot_clear);
+      }
+      contrib += scale * (static_cast<float>(dot_low) - 4.0f * static_cast<float>(dot_clear));
+    }
+    acc += dx[sub] * d * contrib;
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    acc += __shfl_down_sync(0xffffffffu, acc, off);
+  }
+  if (lane == 0) {
+    y[row] = acc;
+  }
+}
+
+extern "C" int hi_cuda_launch_q3_k_dp4a_gemv(
+    const void* weights, const void* xq, const void* dx, const void* xsum, void* y,
+    int rows, int cols, void* stream) {
+  if (weights == nullptr || xq == nullptr || dx == nullptr || xsum == nullptr ||
+      y == nullptr || rows <= 0 || cols <= 0 || cols % 256 != 0 || stream == nullptr) {
+    return 1;
+  }
+  const int warps_per_block = 4;
+  const int grid = (rows + warps_per_block - 1) / warps_per_block;
+  q3_k_dp4a_gemv_kernel<<<grid, warps_per_block * 32, 0,
+                          static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint8_t*>(weights), static_cast<const int8_t*>(xq),
+      static_cast<const float*>(dx), static_cast<const int*>(xsum),
+      static_cast<float*>(y), rows, cols);
   return 0;
 }
 

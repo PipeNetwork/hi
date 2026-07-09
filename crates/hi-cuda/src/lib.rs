@@ -19954,6 +19954,1038 @@ mod tests {
         );
     }
 
+    /// Each dp4a K-quant decode GEMV must match a trusted reference: dequantize the
+    /// weight to f32 (the dequant kernels are the canonical definition) and dot it
+    /// with the SAME int8-reconstructed activation (dx*xq) the GEMV consumes. That
+    /// product is exactly what the GEMV computes, so the match is tight — this guards
+    /// the 5 K-quant dp4a kernels (validated only end-to-end before) against
+    /// regressions in the unpack/scale/zero-point/index logic.
+    /// gather_quant_rows must copy exactly the requested quantized rows (byte-for-byte)
+    /// in order — this is what the token-embedding lookup relies on to dequantize only
+    /// the gathered rows instead of the whole matrix.
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_gather_quant_rows_copies_selected_rows() {
+        use crate::runtime::{DeviceBuffer, Stream};
+        let stream = Stream::create().unwrap();
+        let row_bytes = 10usize;
+        let matrix_rows = 5usize;
+        // Row r filled with the byte value (r*10 + i) so mismatches are obvious.
+        let mut matrix = vec![0u8; matrix_rows * row_bytes];
+        for r in 0..matrix_rows {
+            for i in 0..row_bytes {
+                matrix[r * row_bytes + i] = (r * 10 + i) as u8;
+            }
+        }
+        let ids: Vec<u32> = vec![3, 0, 4, 1];
+        let m_dev = DeviceBuffer::alloc(matrix.len()).unwrap();
+        m_dev.copy_from_host(&matrix).unwrap();
+        let ids_dev = DeviceBuffer::alloc(ids.len() * std::mem::size_of::<u32>()).unwrap();
+        ids_dev.copy_from_host(&ids).unwrap();
+        let out_dev = DeviceBuffer::alloc(ids.len() * row_bytes).unwrap();
+        crate::kernels::launch_gather_quant_rows(
+            &m_dev,
+            &ids_dev,
+            &out_dev,
+            ids.len(),
+            row_bytes,
+            &stream,
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+        let out = out_dev.copy_to_host::<u8>(ids.len() * row_bytes).unwrap();
+        for (i, &id) in ids.iter().enumerate() {
+            let got = &out[i * row_bytes..(i + 1) * row_bytes];
+            let want = &matrix[id as usize * row_bytes..(id as usize + 1) * row_bytes];
+            assert_eq!(got, want, "gathered row {i} (id {id}) mismatch");
+        }
+    }
+
+    /// rms_norm (rewritten this session to one-block-per-row) must match the host
+    /// definition out = x * rsqrt(mean(x^2) + eps) * weight, across shapes including
+    /// the M=1 decode row and wide hidden dims.
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_rms_norm_matches_reference() {
+        use crate::runtime::{DeviceBuffer, Stream};
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let stream = Stream::create().unwrap();
+        let mut rng = StdRng::seed_from_u64(0x2503_01);
+        let eps = 1.0e-6f32;
+        for &(rows, cols) in &[(1usize, 2048usize), (5, 128), (17, 2048), (8, 4096)] {
+            let input: Vec<f32> = (0..rows * cols)
+                .map(|_| rng.gen_range(-3.0f32..3.0))
+                .collect();
+            let weight: Vec<f32> = (0..cols).map(|_| rng.gen_range(0.4f32..1.6)).collect();
+            let in_dev = DeviceBuffer::alloc(rows * cols * 4).unwrap();
+            in_dev.copy_from_host(&input).unwrap();
+            let w_dev = DeviceBuffer::alloc(cols * 4).unwrap();
+            w_dev.copy_from_host(&weight).unwrap();
+            let out_dev = DeviceBuffer::alloc(rows * cols * 4).unwrap();
+            crate::kernels::launch_rms_norm(&in_dev, &w_dev, &out_dev, rows, cols, eps, &stream)
+                .unwrap();
+            stream.synchronize().unwrap();
+            let out = out_dev.copy_to_host::<f32>(rows * cols).unwrap();
+            for r in 0..rows {
+                let mut ss = 0.0f64;
+                for c in 0..cols {
+                    ss += f64::from(input[r * cols + c]).powi(2);
+                }
+                let inv = 1.0 / (ss / cols as f64 + f64::from(eps)).sqrt();
+                for c in 0..cols {
+                    let expect = f64::from(input[r * cols + c]) * inv * f64::from(weight[c]);
+                    assert!(
+                        (f64::from(out[r * cols + c]) - expect).abs()
+                            <= 2.0e-3 + 1.0e-3 * expect.abs(),
+                        "rms_norm {rows}x{cols} [{r}][{c}]: {} vs {expect}",
+                        out[r * cols + c],
+                    );
+                }
+            }
+        }
+    }
+
+    /// layer_norm must match out = (x - mean) * rsqrt(var + eps) * weight + bias.
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_layer_norm_matches_reference() {
+        use crate::runtime::{DeviceBuffer, Stream};
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let stream = Stream::create().unwrap();
+        let mut rng = StdRng::seed_from_u64(0x1a4e_01);
+        let eps = 1.0e-5f32;
+        for &(rows, cols) in &[(1usize, 1024usize), (7, 256), (16, 1024)] {
+            let input: Vec<f32> = (0..rows * cols)
+                .map(|_| rng.gen_range(-2.0f32..2.0))
+                .collect();
+            let weight: Vec<f32> = (0..cols).map(|_| rng.gen_range(0.5f32..1.5)).collect();
+            let bias: Vec<f32> = (0..cols).map(|_| rng.gen_range(-0.5f32..0.5)).collect();
+            let in_dev = DeviceBuffer::alloc(rows * cols * 4).unwrap();
+            in_dev.copy_from_host(&input).unwrap();
+            let w_dev = DeviceBuffer::alloc(cols * 4).unwrap();
+            w_dev.copy_from_host(&weight).unwrap();
+            let b_dev = DeviceBuffer::alloc(cols * 4).unwrap();
+            b_dev.copy_from_host(&bias).unwrap();
+            let out_dev = DeviceBuffer::alloc(rows * cols * 4).unwrap();
+            crate::kernels::launch_layer_norm(
+                &in_dev, &w_dev, &b_dev, &out_dev, rows, cols, eps, &stream,
+            )
+            .unwrap();
+            stream.synchronize().unwrap();
+            let out = out_dev.copy_to_host::<f32>(rows * cols).unwrap();
+            for r in 0..rows {
+                let mean: f64 = (0..cols)
+                    .map(|c| f64::from(input[r * cols + c]))
+                    .sum::<f64>()
+                    / cols as f64;
+                let var: f64 = (0..cols)
+                    .map(|c| (f64::from(input[r * cols + c]) - mean).powi(2))
+                    .sum::<f64>()
+                    / cols as f64;
+                let inv = 1.0 / (var + f64::from(eps)).sqrt();
+                for c in 0..cols {
+                    let expect =
+                        (f64::from(input[r * cols + c]) - mean) * inv * f64::from(weight[c])
+                            + f64::from(bias[c]);
+                    assert!(
+                        (f64::from(out[r * cols + c]) - expect).abs()
+                            <= 2.0e-3 + 1.0e-3 * expect.abs(),
+                        "layer_norm {rows}x{cols} [{r}][{c}]: {} vs {expect}",
+                        out[r * cols + c],
+                    );
+                }
+            }
+        }
+    }
+
+    /// Causal batched prefill attention: the tiled, flash, and WMMA kernels must all
+    /// match a host scaled-dot-product softmax reference (with real random Q/K/V, not
+    /// the q=k=0 uniform case the older test used). Covers GQA (kv_heads<heads) on the
+    /// f32 kernels; WMMA is f16 so it gets a looser tolerance.
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_causal_attention_matches_reference() {
+        use crate::runtime::{DeviceBuffer, Stream};
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        fn reference(
+            q: &[f32],
+            k: &[f32],
+            v: &[f32],
+            batch: usize,
+            seq: usize,
+            heads: usize,
+            kv_heads: usize,
+            hd: usize,
+        ) -> Vec<f32> {
+            let scale = 1.0f64 / (hd as f64).sqrt();
+            let kvr = heads / kv_heads;
+            let mut out = vec![0.0f32; batch * seq * heads * hd];
+            for b in 0..batch {
+                for h in 0..heads {
+                    let kvh = h / kvr;
+                    for t in 0..seq {
+                        let mut sc = vec![0.0f64; t + 1];
+                        let mut mx = f64::NEG_INFINITY;
+                        for (s, sci) in sc.iter_mut().enumerate() {
+                            let mut dot = 0.0f64;
+                            for d in 0..hd {
+                                dot += f64::from(q[((b * seq + t) * heads + h) * hd + d])
+                                    * f64::from(k[((b * seq + s) * kv_heads + kvh) * hd + d]);
+                            }
+                            *sci = dot * scale;
+                            mx = mx.max(*sci);
+                        }
+                        let mut sum = 0.0f64;
+                        for sci in sc.iter_mut() {
+                            *sci = (*sci - mx).exp();
+                            sum += *sci;
+                        }
+                        for d in 0..hd {
+                            let mut acc = 0.0f64;
+                            for (s, &sci) in sc.iter().enumerate() {
+                                acc += sci / sum
+                                    * f64::from(v[((b * seq + s) * kv_heads + kvh) * hd + d]);
+                            }
+                            out[((b * seq + t) * heads + h) * hd + d] = acc as f32;
+                        }
+                    }
+                }
+            }
+            out
+        }
+
+        let stream = Stream::create().unwrap();
+        let mut rng = StdRng::seed_from_u64(0xa77e_71);
+        // (batch, seq, heads, kv_heads, head_dim); hd % 16 == 0 for WMMA.
+        for &(batch, seq, heads, kv_heads, hd) in
+            &[(2usize, 8usize, 4usize, 4usize, 16usize), (1, 12, 4, 2, 32)]
+        {
+            let qn = batch * seq * heads * hd;
+            let kn = batch * seq * kv_heads * hd;
+            let on = qn;
+            let q: Vec<f32> = (0..qn).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+            let k: Vec<f32> = (0..kn).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+            let v: Vec<f32> = (0..kn).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+            let reference = reference(&q, &k, &v, batch, seq, heads, kv_heads, hd);
+
+            let q_dev = DeviceBuffer::alloc(qn * 4).unwrap();
+            q_dev.copy_from_host(&q).unwrap();
+            let k_dev = DeviceBuffer::alloc(kn * 4).unwrap();
+            k_dev.copy_from_host(&k).unwrap();
+            let v_dev = DeviceBuffer::alloc(kn * 4).unwrap();
+            v_dev.copy_from_host(&v).unwrap();
+
+            let tiled = DeviceBuffer::alloc(on * 4).unwrap();
+            crate::kernels::launch_tiled_causal_attention_batched(
+                &q_dev, &k_dev, &v_dev, &tiled, batch, seq, heads, kv_heads, hd, hd, 0, &stream,
+            )
+            .unwrap();
+            let flash = DeviceBuffer::alloc(on * 4).unwrap();
+            crate::kernels::launch_flashtile_causal_attention_batched(
+                &q_dev, &k_dev, &v_dev, &flash, batch, seq, heads, kv_heads, hd, hd, 0, &stream,
+            )
+            .unwrap();
+
+            // WMMA consumes f16 Q/K/V.
+            let qf16 = DeviceBuffer::alloc(qn * 2).unwrap();
+            crate::kernels::launch_cast_f32_to_f16(&q_dev, &qf16, qn, &stream).unwrap();
+            let kf16 = DeviceBuffer::alloc(kn * 2).unwrap();
+            crate::kernels::launch_cast_f32_to_f16(&k_dev, &kf16, kn, &stream).unwrap();
+            let vf16 = DeviceBuffer::alloc(kn * 2).unwrap();
+            crate::kernels::launch_cast_f32_to_f16(&v_dev, &vf16, kn, &stream).unwrap();
+            let wmma = DeviceBuffer::alloc(on * 4).unwrap();
+            crate::kernels::launch_wmma_causal_attention_batched(
+                &qf16, &kf16, &vf16, &wmma, batch, seq, heads, kv_heads, hd, &stream,
+            )
+            .unwrap();
+            stream.synchronize().unwrap();
+
+            let t = tiled.copy_to_host::<f32>(on).unwrap();
+            let f = flash.copy_to_host::<f32>(on).unwrap();
+            let w = wmma.copy_to_host::<f32>(on).unwrap();
+            for i in 0..on {
+                assert!(
+                    (t[i] - reference[i]).abs() <= 1.0e-3,
+                    "tiled attn [{i}] (hd {hd}): {} vs {}",
+                    t[i],
+                    reference[i],
+                );
+                assert!(
+                    (f[i] - reference[i]).abs() <= 1.0e-3,
+                    "flash attn [{i}] (hd {hd}): {} vs {}",
+                    f[i],
+                    reference[i],
+                );
+                assert!(
+                    (w[i] - reference[i]).abs() <= 3.0e-2,
+                    "wmma attn [{i}] (hd {hd}): {} vs {}",
+                    w[i],
+                    reference[i],
+                );
+            }
+        }
+    }
+
+    /// Paged decode attention (M=1) reads a f16 KV cache through a page table. Both
+    /// the per-batch-positions (live path) and single-position variants must match a
+    /// host softmax reference that walks the same page_table -> physical_page -> offset
+    /// indirection. K/V are round-tripped through f16 so the reference uses the exact
+    /// f16 values the kernel sees. Uses GQA + a non-trivial (non-identity) page table.
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_paged_decode_attention_matches_reference() {
+        use crate::runtime::{DeviceBuffer, Stream};
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        #[allow(clippy::too_many_arguments)]
+        fn paged_ref(
+            q: &[f32],
+            kref: &[f32],
+            vref: &[f32],
+            page_table: &[u32],
+            positions: &[usize],
+            batch: usize,
+            heads: usize,
+            kv_heads: usize,
+            hd: usize,
+            page_size: usize,
+            page_table_len: usize,
+        ) -> Vec<f32> {
+            let scale = 1.0f64 / (hd as f64).sqrt();
+            let kvr = heads / kv_heads;
+            let slot = |phys: usize, kvh: usize, off: usize, d: usize| {
+                ((phys * kv_heads + kvh) * page_size + off) * hd + d
+            };
+            let mut out = vec![0.0f32; batch * heads * hd];
+            for b in 0..batch {
+                for h in 0..heads {
+                    let kvh = h / kvr;
+                    let pos = positions[b];
+                    let mut sc = vec![0.0f64; pos + 1];
+                    let mut mx = f64::NEG_INFINITY;
+                    for (s, sci) in sc.iter_mut().enumerate() {
+                        let phys = page_table[b * page_table_len + s / page_size] as usize;
+                        let off = s % page_size;
+                        let mut dot = 0.0f64;
+                        for d in 0..hd {
+                            dot += f64::from(q[(b * heads + h) * hd + d])
+                                * f64::from(kref[slot(phys, kvh, off, d)]);
+                        }
+                        *sci = dot * scale;
+                        mx = mx.max(*sci);
+                    }
+                    let mut sum = 0.0f64;
+                    for sci in sc.iter_mut() {
+                        *sci = (*sci - mx).exp();
+                        sum += *sci;
+                    }
+                    for d in 0..hd {
+                        let mut acc = 0.0f64;
+                        for (s, &sci) in sc.iter().enumerate() {
+                            let phys = page_table[b * page_table_len + s / page_size] as usize;
+                            acc += sci / sum * f64::from(vref[slot(phys, kvh, s % page_size, d)]);
+                        }
+                        out[(b * heads + h) * hd + d] = acc as f32;
+                    }
+                }
+            }
+            out
+        }
+
+        let stream = Stream::create().unwrap();
+        let mut rng = StdRng::seed_from_u64(0x9a6e_d01);
+        let (batch, heads, kv_heads, hd) = (2usize, 4usize, 2usize, 8usize);
+        let (page_size, page_table_len, num_phys) = (4usize, 2usize, 3usize);
+        let pages_elems = num_phys * kv_heads * page_size * hd;
+        // Non-identity mapping: batch 0 logical [0,1]->phys [2,0]; batch 1 ->[1,0].
+        let page_table: Vec<u32> = vec![2, 0, 1, 0];
+
+        let q: Vec<f32> = (0..batch * heads * hd)
+            .map(|_| rng.gen_range(-1.0f32..1.0))
+            .collect();
+        let kf: Vec<f32> = (0..pages_elems)
+            .map(|_| rng.gen_range(-1.0f32..1.0))
+            .collect();
+        let vf: Vec<f32> = (0..pages_elems)
+            .map(|_| rng.gen_range(-1.0f32..1.0))
+            .collect();
+
+        let q_dev = DeviceBuffer::alloc(q.len() * 4).unwrap();
+        q_dev.copy_from_host(&q).unwrap();
+        let pt_dev = DeviceBuffer::alloc(page_table.len() * 4).unwrap();
+        pt_dev.copy_from_host(&page_table).unwrap();
+
+        // K/V -> f16 pages (what the kernel reads), then f16 -> f32 for the reference.
+        let to_f16_pages = |src: &[f32]| {
+            let f32_dev = DeviceBuffer::alloc(pages_elems * 4).unwrap();
+            f32_dev.copy_from_host(src).unwrap();
+            let f16_dev = DeviceBuffer::alloc(pages_elems * 2).unwrap();
+            crate::kernels::launch_cast_f32_to_f16(&f32_dev, &f16_dev, pages_elems, &stream)
+                .unwrap();
+            let back = DeviceBuffer::alloc(pages_elems * 4).unwrap();
+            crate::kernels::launch_cast_f16_to_f32(&f16_dev, &back, pages_elems, &stream).unwrap();
+            (f16_dev, back)
+        };
+        let (k_pages, k_ref_dev) = to_f16_pages(&kf);
+        let (v_pages, v_ref_dev) = to_f16_pages(&vf);
+
+        let out_pos = DeviceBuffer::alloc(batch * heads * hd * 4).unwrap();
+        let positions: Vec<u32> = vec![6, 2];
+        let pos_dev = DeviceBuffer::alloc(positions.len() * 4).unwrap();
+        pos_dev.copy_from_host(&positions).unwrap();
+        crate::kernels::launch_tiled_paged_decode_attention_batched_positions(
+            &q_dev,
+            &k_pages,
+            &v_pages,
+            &pt_dev,
+            &pos_dev,
+            &out_pos,
+            batch,
+            page_size,
+            page_table_len,
+            heads,
+            kv_heads,
+            hd,
+            hd,
+            0,
+            &stream,
+        )
+        .unwrap();
+
+        let out_np = DeviceBuffer::alloc(batch * heads * hd * 4).unwrap();
+        let single_pos = 5usize;
+        crate::kernels::launch_tiled_paged_decode_attention_batched(
+            &q_dev,
+            &k_pages,
+            &v_pages,
+            &pt_dev,
+            &out_np,
+            batch,
+            single_pos,
+            page_size,
+            page_table_len,
+            heads,
+            kv_heads,
+            hd,
+            hd,
+            0,
+            &stream,
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+
+        let k_ref = k_ref_dev.copy_to_host::<f32>(pages_elems).unwrap();
+        let v_ref = v_ref_dev.copy_to_host::<f32>(pages_elems).unwrap();
+        let out_pos_h = out_pos.copy_to_host::<f32>(batch * heads * hd).unwrap();
+        let out_np_h = out_np.copy_to_host::<f32>(batch * heads * hd).unwrap();
+
+        let pos_usize: Vec<usize> = positions.iter().map(|&p| p as usize).collect();
+        let ref_pos = paged_ref(
+            &q,
+            &k_ref,
+            &v_ref,
+            &page_table,
+            &pos_usize,
+            batch,
+            heads,
+            kv_heads,
+            hd,
+            page_size,
+            page_table_len,
+        );
+        let ref_np = paged_ref(
+            &q,
+            &k_ref,
+            &v_ref,
+            &page_table,
+            &vec![single_pos; batch],
+            batch,
+            heads,
+            kv_heads,
+            hd,
+            page_size,
+            page_table_len,
+        );
+        for i in 0..batch * heads * hd {
+            assert!(
+                (out_pos_h[i] - ref_pos[i]).abs() <= 2.0e-3,
+                "paged positions [{i}]: {} vs {}",
+                out_pos_h[i],
+                ref_pos[i],
+            );
+            assert!(
+                (out_np_h[i] - ref_np[i]).abs() <= 2.0e-3,
+                "paged single-position [{i}]: {} vs {}",
+                out_np_h[i],
+                ref_np[i],
+            );
+        }
+    }
+
+    /// The paged KV-cache write kernels must land each token's K/V in the correct
+    /// paged slot: values[batch][row][kv_head][dim] -> pages[phys][head][offset][dim]
+    /// at logical_pos = start + row, via page_table[batch][logical_page]. Write into a
+    /// zeroed f16 cache, read it back, and check every slot equals the f16-rounded
+    /// written value (written slots) or 0 (untouched). Covers the per-batch-positions
+    /// (live) and single-start variants with a non-identity page table.
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_write_paged_kv_cache_places_tokens_correctly() {
+        use crate::runtime::{DeviceBuffer, Stream};
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let stream = Stream::create().unwrap();
+        let mut rng = StdRng::seed_from_u64(0x5c17_e0);
+        let (batch, rows, kv_heads, hd) = (2usize, 5usize, 2usize, 8usize);
+        let (page_size, page_table_len, num_phys) = (4usize, 2usize, 4usize);
+        let pages_elems = num_phys * kv_heads * page_size * hd;
+        // Distinct physical pages per batch so no two writes collide.
+        let page_table: Vec<u32> = vec![0, 1, 2, 3];
+        let pt_dev = DeviceBuffer::alloc(page_table.len() * 4).unwrap();
+        pt_dev.copy_from_host(&page_table).unwrap();
+
+        let values: Vec<f32> = (0..batch * rows * kv_heads * hd)
+            .map(|_| rng.gen_range(-2.0f32..2.0))
+            .collect();
+        let val_dev = DeviceBuffer::alloc(values.len() * 4).unwrap();
+        val_dev.copy_from_host(&values).unwrap();
+        // f16-rounded copy of the values, for the expected cache contents.
+        let vals_f16 = DeviceBuffer::alloc(values.len() * 2).unwrap();
+        crate::kernels::launch_cast_f32_to_f16(&val_dev, &vals_f16, values.len(), &stream).unwrap();
+        let vals_r_dev = DeviceBuffer::alloc(values.len() * 4).unwrap();
+        crate::kernels::launch_cast_f16_to_f32(&vals_f16, &vals_r_dev, values.len(), &stream)
+            .unwrap();
+        stream.synchronize().unwrap();
+        let vals_r = vals_r_dev.copy_to_host::<f32>(values.len()).unwrap();
+
+        let slot = |phys: usize, head: usize, off: usize, d: usize| {
+            ((phys * kv_heads + head) * page_size + off) * hd + d
+        };
+
+        // starts: per-batch positions for the live variant; a single start for the other.
+        for (label, starts) in [
+            ("positions", vec![0usize, 2usize]),
+            ("single-start", vec![1usize, 1usize]),
+        ] {
+            let pages = DeviceBuffer::alloc(pages_elems * 2).unwrap();
+            pages.memset_zero_async(&stream).unwrap();
+            if label == "positions" {
+                let pos: Vec<u32> = starts.iter().map(|&p| p as u32).collect();
+                let pos_dev = DeviceBuffer::alloc(pos.len() * 4).unwrap();
+                pos_dev.copy_from_host(&pos).unwrap();
+                crate::kernels::launch_write_paged_kv_cache_batched_positions(
+                    &val_dev,
+                    &pages,
+                    &pt_dev,
+                    &pos_dev,
+                    batch,
+                    rows,
+                    kv_heads,
+                    hd,
+                    page_size,
+                    page_table_len,
+                    &stream,
+                )
+                .unwrap();
+            } else {
+                crate::kernels::launch_write_paged_kv_cache_batched(
+                    &val_dev,
+                    &pages,
+                    &pt_dev,
+                    batch,
+                    rows,
+                    kv_heads,
+                    hd,
+                    page_size,
+                    page_table_len,
+                    starts[0],
+                    &stream,
+                )
+                .unwrap();
+            }
+            let pages_f32 = DeviceBuffer::alloc(pages_elems * 4).unwrap();
+            crate::kernels::launch_cast_f16_to_f32(&pages, &pages_f32, pages_elems, &stream)
+                .unwrap();
+            stream.synchronize().unwrap();
+            let got = pages_f32.copy_to_host::<f32>(pages_elems).unwrap();
+
+            let mut expected = vec![0.0f32; pages_elems];
+            for b in 0..batch {
+                for row in 0..rows {
+                    let logical_pos = starts[b] + row;
+                    let logical_page = logical_pos / page_size;
+                    if logical_page >= page_table_len {
+                        continue;
+                    }
+                    let phys = page_table[b * page_table_len + logical_page] as usize;
+                    let off = logical_pos % page_size;
+                    for head in 0..kv_heads {
+                        for d in 0..hd {
+                            let v = vals_r[((b * rows + row) * kv_heads + head) * hd + d];
+                            expected[slot(phys, head, off, d)] = v;
+                        }
+                    }
+                }
+            }
+            for i in 0..pages_elems {
+                assert!(
+                    (got[i] - expected[i]).abs() <= 1.0e-6,
+                    "{label} paged write slot {i}: {} vs {}",
+                    got[i],
+                    expected[i],
+                );
+            }
+        }
+    }
+
+    /// The fused dequant->f16 prefill kernels must be byte-identical to the fallback
+    /// dequant->f32 + cast_f32_to_f16 (both are __float2half of the same value). This
+    /// is an exact check, so it catches any drift in the fused unpack.
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_dequant_to_f16_matches_dequant_then_cast() {
+        use crate::runtime::{DeviceBuffer, Stream};
+        use rand::rngs::StdRng;
+        use rand::{RngCore, SeedableRng};
+
+        type Launch = fn(&DeviceBuffer, &DeviceBuffer, usize, &Stream) -> anyhow::Result<()>;
+        // (name, block_weights, block_bytes, quant_type_id, fused dequant->f16 launch)
+        let cases: &[(&str, usize, usize, i32, Launch)] = &[
+            (
+                "Q4_0",
+                32,
+                18,
+                2,
+                crate::kernels::launch_dequantize_q4_0_to_f16,
+            ),
+            (
+                "Q4_K",
+                256,
+                144,
+                12,
+                crate::kernels::launch_dequantize_q4_k_to_f16,
+            ),
+            (
+                "Q5_K",
+                256,
+                176,
+                13,
+                crate::kernels::launch_dequantize_q5_k_to_f16,
+            ),
+            (
+                "Q6_K",
+                256,
+                210,
+                14,
+                crate::kernels::launch_dequantize_q6_k_to_f16,
+            ),
+            (
+                "IQ4_NL",
+                32,
+                18,
+                20,
+                crate::kernels::launch_dequantize_iq4_nl_to_f16,
+            ),
+            (
+                "Q8_0",
+                32,
+                34,
+                8,
+                crate::kernels::launch_dequantize_q8_0_to_f16,
+            ),
+            (
+                "Q2_K",
+                256,
+                84,
+                10,
+                crate::kernels::launch_dequantize_q2_k_to_f16,
+            ),
+            (
+                "Q3_K",
+                256,
+                110,
+                11,
+                crate::kernels::launch_dequantize_q3_k_to_f16,
+            ),
+        ];
+
+        let stream = Stream::create().unwrap();
+        let rows = 4usize;
+        let cols = 512usize;
+        let elements = rows * cols;
+
+        for &(name, block_weights, block_bytes, qtype, fused) in cases {
+            let mut rng = StdRng::seed_from_u64(0xf16d_00 + qtype as u64);
+            let wlen = rows * (cols / block_weights) * block_bytes;
+            let mut wbytes = vec![0u8; wlen];
+            rng.fill_bytes(&mut wbytes);
+            let w_dev = DeviceBuffer::alloc(wlen).unwrap();
+            w_dev.copy_from_host(&wbytes).unwrap();
+
+            let fused_dev = DeviceBuffer::alloc(elements * std::mem::size_of::<u16>()).unwrap();
+            fused(&w_dev, &fused_dev, elements, &stream).unwrap();
+
+            let f32_dev = DeviceBuffer::alloc(elements * std::mem::size_of::<f32>()).unwrap();
+            crate::kernels::launch_dequantize_matrix(&w_dev, &f32_dev, elements, qtype, &stream)
+                .unwrap();
+            let ref_dev = DeviceBuffer::alloc(elements * std::mem::size_of::<u16>()).unwrap();
+            crate::kernels::launch_cast_f32_to_f16(&f32_dev, &ref_dev, elements, &stream).unwrap();
+            stream.synchronize().unwrap();
+
+            let fused_bits = fused_dev.copy_to_host::<u16>(elements).unwrap();
+            let ref_bits = ref_dev.copy_to_host::<u16>(elements).unwrap();
+            assert_eq!(
+                fused_bits, ref_bits,
+                "{name}: fused dequant->f16 != dequant->f32->cast"
+            );
+        }
+    }
+
+    /// Every float fused decode GEMV (the K-quant fallbacks + the whole IQ family)
+    /// must match the dequant reference: dequantize the weight to f32 and dot it with
+    /// the same float activation. The GEMV re-derives each weight with the same
+    /// formula as the dequant kernel, so the products are identical and only the
+    /// accumulation order differs — the tolerance is bounded by the L1 norm of the
+    /// products. Guards the on-the-fly unpack of 13 quant formats.
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_float_gemv_matches_dequant_reference() {
+        use crate::runtime::{DeviceBuffer, Stream};
+        use rand::rngs::StdRng;
+        use rand::{Rng, RngCore, SeedableRng};
+
+        type Launch = fn(
+            &DeviceBuffer,
+            &DeviceBuffer,
+            &DeviceBuffer,
+            usize,
+            usize,
+            &Stream,
+        ) -> anyhow::Result<()>;
+        // (name, block_weights, block_bytes, quant_type_id, &[f16 offsets to pin], launch)
+        let cases: &[(&str, usize, usize, i32, &[usize], Launch)] = &[
+            (
+                "Q4_K",
+                256,
+                144,
+                12,
+                &[0, 2],
+                crate::kernels::launch_q4_k_gemv,
+            ),
+            (
+                "Q5_K",
+                256,
+                176,
+                13,
+                &[0, 2],
+                crate::kernels::launch_q5_k_gemv,
+            ),
+            (
+                "Q6_K",
+                256,
+                210,
+                14,
+                &[208],
+                crate::kernels::launch_q6_k_gemv,
+            ),
+            (
+                "Q2_K",
+                256,
+                84,
+                10,
+                &[80, 82],
+                crate::kernels::launch_q2_k_gemv,
+            ),
+            (
+                "Q3_K",
+                256,
+                110,
+                11,
+                &[108],
+                crate::kernels::launch_q3_k_gemv,
+            ),
+            (
+                "IQ4_NL",
+                32,
+                18,
+                20,
+                &[0],
+                crate::kernels::launch_iq4_nl_gemv,
+            ),
+            (
+                "IQ4_XS",
+                256,
+                136,
+                23,
+                &[0],
+                crate::kernels::launch_iq4_xs_gemv,
+            ),
+            (
+                "IQ3_S",
+                256,
+                110,
+                21,
+                &[0],
+                crate::kernels::launch_iq3_s_gemv,
+            ),
+            (
+                "IQ3_XXS",
+                256,
+                98,
+                18,
+                &[0],
+                crate::kernels::launch_iq3_xxs_gemv,
+            ),
+            (
+                "IQ2_XXS",
+                256,
+                66,
+                16,
+                &[0],
+                crate::kernels::launch_iq2_xxs_gemv,
+            ),
+            (
+                "IQ2_XS",
+                256,
+                74,
+                17,
+                &[0],
+                crate::kernels::launch_iq2_xs_gemv,
+            ),
+            (
+                "IQ2_S",
+                256,
+                82,
+                22,
+                &[0],
+                crate::kernels::launch_iq2_s_gemv,
+            ),
+            (
+                "IQ1_S",
+                256,
+                50,
+                19,
+                &[0],
+                crate::kernels::launch_iq1_s_gemv,
+            ),
+        ];
+
+        let stream = Stream::create().unwrap();
+        let rows = 6usize;
+        let cols = 512usize;
+
+        for &(name, block_weights, block_bytes, qtype, f16_offsets, launch) in cases {
+            let mut rng = StdRng::seed_from_u64(0xf10a_00 + qtype as u64);
+            let nblocks = cols / block_weights;
+            let wlen = rows * nblocks * block_bytes;
+            let mut wbytes = vec![0u8; wlen];
+            rng.fill_bytes(&mut wbytes);
+            for blk in 0..(rows * nblocks) {
+                let base = blk * block_bytes;
+                for &off in f16_offsets {
+                    wbytes[base + off] = 0x00; // f16 1.0 (0x3C00), little-endian
+                    wbytes[base + off + 1] = 0x3C;
+                }
+            }
+            let x: Vec<f32> = (0..cols).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+
+            let w_dev = DeviceBuffer::alloc(wlen).unwrap();
+            w_dev.copy_from_host(&wbytes).unwrap();
+            let x_dev = DeviceBuffer::alloc(cols * std::mem::size_of::<f32>()).unwrap();
+            x_dev.copy_from_host(&x).unwrap();
+
+            let elements = rows * cols;
+            let wf32_dev = DeviceBuffer::alloc(elements * std::mem::size_of::<f32>()).unwrap();
+            crate::kernels::launch_dequantize_matrix(&w_dev, &wf32_dev, elements, qtype, &stream)
+                .unwrap();
+
+            let y_dev = DeviceBuffer::alloc(rows * std::mem::size_of::<f32>()).unwrap();
+            launch(&w_dev, &x_dev, &y_dev, rows, cols, &stream).unwrap();
+            stream.synchronize().unwrap();
+
+            let wf32 = wf32_dev.copy_to_host::<f32>(elements).unwrap();
+            let y = y_dev.copy_to_host::<f32>(rows).unwrap();
+            assert!(
+                wf32.iter().all(|v| v.is_finite()),
+                "{name}: dequant produced non-finite weights"
+            );
+
+            for r in 0..rows {
+                let mut acc = 0.0f64;
+                let mut l1 = 0.0f64;
+                for c in 0..cols {
+                    let p = f64::from(wf32[r * cols + c]) * f64::from(x[c]);
+                    acc += p;
+                    l1 += p.abs();
+                }
+                let reference = acc as f32;
+                let tol = 0.1 + 1.0e-4 * l1 as f32;
+                assert!(
+                    (y[r] - reference).abs() <= tol,
+                    "{name} row {r}: gemv {} vs reference {} (tol {tol})",
+                    y[r],
+                    reference,
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_kquant_dp4a_gemv_matches_dequant_reference() {
+        use crate::runtime::{DeviceBuffer, Stream};
+        use rand::rngs::StdRng;
+        use rand::{Rng, RngCore, SeedableRng};
+
+        type Launch = fn(
+            &DeviceBuffer,
+            &DeviceBuffer,
+            &DeviceBuffer,
+            &DeviceBuffer,
+            &DeviceBuffer,
+            usize,
+            usize,
+            &Stream,
+        ) -> anyhow::Result<()>;
+        // (name, block_weights, block_bytes, quant_type_id, f16 d offset, f16 dmin
+        // offset or -1, launch)
+        let cases: &[(&str, usize, usize, i32, usize, i64, Launch)] = &[
+            (
+                "Q4_0",
+                32,
+                18,
+                2,
+                0,
+                -1,
+                crate::kernels::launch_q4_0_dp4a_gemv,
+            ),
+            (
+                "Q4_K",
+                256,
+                144,
+                12,
+                0,
+                2,
+                crate::kernels::launch_q4_k_dp4a_gemv,
+            ),
+            (
+                "Q5_K",
+                256,
+                176,
+                13,
+                0,
+                2,
+                crate::kernels::launch_q5_k_dp4a_gemv,
+            ),
+            (
+                "Q6_K",
+                256,
+                210,
+                14,
+                208,
+                -1,
+                crate::kernels::launch_q6_k_dp4a_gemv,
+            ),
+            (
+                "Q2_K",
+                256,
+                84,
+                10,
+                80,
+                82,
+                crate::kernels::launch_q2_k_dp4a_gemv,
+            ),
+            (
+                "Q3_K",
+                256,
+                110,
+                11,
+                108,
+                -1,
+                crate::kernels::launch_q3_k_dp4a_gemv,
+            ),
+        ];
+
+        let stream = Stream::create().unwrap();
+        let rows = 6usize;
+        let cols = 512usize;
+
+        for &(name, block_weights, block_bytes, qtype, d_off, dmin_off, launch) in cases {
+            let mut rng = StdRng::seed_from_u64(0x4b_51_00 + qtype as u64);
+            let nblocks = cols / block_weights;
+            let wlen = rows * nblocks * block_bytes;
+            let mut wbytes = vec![0u8; wlen];
+            rng.fill_bytes(&mut wbytes);
+            // Pin the f16 (super-)block scales so random bytes can't produce inf/nan:
+            // d = 1.0 (0x3C00), dmin = 0.5 (0x3800), little-endian.
+            for blk in 0..(rows * nblocks) {
+                let base = blk * block_bytes;
+                wbytes[base + d_off] = 0x00;
+                wbytes[base + d_off + 1] = 0x3C;
+                if dmin_off >= 0 {
+                    let o = base + dmin_off as usize;
+                    wbytes[o] = 0x00;
+                    wbytes[o + 1] = 0x38;
+                }
+            }
+            let x: Vec<f32> = (0..cols).map(|_| rng.gen_range(-1.5f32..1.5)).collect();
+
+            let w_dev = DeviceBuffer::alloc(wlen).unwrap();
+            w_dev.copy_from_host(&wbytes).unwrap();
+            let x_dev = DeviceBuffer::alloc(cols * std::mem::size_of::<f32>()).unwrap();
+            x_dev.copy_from_host(&x).unwrap();
+
+            let elements = rows * cols;
+            let wf32_dev = DeviceBuffer::alloc(elements * std::mem::size_of::<f32>()).unwrap();
+            crate::kernels::launch_dequantize_matrix(&w_dev, &wf32_dev, elements, qtype, &stream)
+                .unwrap();
+
+            let xq_dev = DeviceBuffer::alloc(cols).unwrap();
+            let dx_dev = DeviceBuffer::alloc((cols / 32) * std::mem::size_of::<f32>()).unwrap();
+            let xsum_dev = DeviceBuffer::alloc((cols / 32) * std::mem::size_of::<i32>()).unwrap();
+            crate::kernels::launch_quantize_q8_row(
+                &x_dev, &xq_dev, &dx_dev, &xsum_dev, cols, &stream,
+            )
+            .unwrap();
+
+            let y_dev = DeviceBuffer::alloc(rows * std::mem::size_of::<f32>()).unwrap();
+            launch(
+                &w_dev, &xq_dev, &dx_dev, &xsum_dev, &y_dev, rows, cols, &stream,
+            )
+            .unwrap();
+            stream.synchronize().unwrap();
+
+            let wf32 = wf32_dev.copy_to_host::<f32>(elements).unwrap();
+            let xq = xq_dev.copy_to_host::<i8>(cols).unwrap();
+            let dx = dx_dev.copy_to_host::<f32>(cols / 32).unwrap();
+            let y = y_dev.copy_to_host::<f32>(rows).unwrap();
+
+            for r in 0..rows {
+                let mut acc = 0.0f64;
+                for c in 0..cols {
+                    let xr = f64::from(dx[c / 32]) * f64::from(xq[c]);
+                    acc += f64::from(wf32[r * cols + c]) * xr;
+                }
+                let reference = acc as f32;
+                let tol = 1.0e-2 + 2.0e-3 * reference.abs();
+                assert!(
+                    (y[r] - reference).abs() <= tol,
+                    "{name} row {r}: dp4a {} vs reference {} (tol {tol})",
+                    y[r],
+                    reference,
+                );
+            }
+        }
+    }
+
     #[cfg(feature = "native-cuda")]
     #[test]
     fn native_cuda_kernels_run_on_device() {
