@@ -55,6 +55,10 @@ pub fn verify_passes(worktree: &Path, verify: &str) -> bool {
 /// Apply the worktree's changes (relative to `base`, including new/deleted files)
 /// to the main working tree. Returns `true` if any change was applied.
 pub fn apply_changes(worktree: &Path, base: &str) -> Result<bool> {
+    // Strip Python bytecode caches the child's own test runs left behind:
+    // untracked `__pycache__/*.pyc` would otherwise be staged by `add -A` and
+    // enter the diff as unappliable binary patches (real-fleet finding).
+    crate::prepare_verify_workdir(worktree);
     // Stage everything so the diff captures new/deleted files too.
     let add = Command::new("git")
         .current_dir(worktree)
@@ -70,7 +74,9 @@ pub fn apply_changes(worktree: &Path, base: &str) -> Result<bool> {
 
     let diff = Command::new("git")
         .current_dir(worktree)
-        .args(["diff", "--cached", base])
+        // --binary so legitimate binary assets (images, fixtures) survive the
+        // pipe to `git apply` instead of arriving as "Binary files differ".
+        .args(["diff", "--cached", "--binary", base])
         .output()
         .context("git diff in worktree")?;
     if !diff.status.success() {
@@ -104,8 +110,10 @@ pub fn apply_changes(worktree: &Path, base: &str) -> Result<bool> {
 }
 
 /// The files the worktree changed relative to `base` (staged first so new/deleted
-/// files are included).
+/// files are included). Python bytecode caches are stripped first so they don't
+/// show up as phantom changes (or trigger spurious overlap holds in the fleet).
 pub fn changed_files(worktree: &Path, base: &str) -> Vec<String> {
+    crate::prepare_verify_workdir(worktree);
     let _ = Command::new("git")
         .current_dir(worktree)
         .args(["add", "-A"])
@@ -157,6 +165,72 @@ pub fn reset_to(worktree: &Path, base: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Python bytecode caches left by a child's test runs must not enter the
+    /// diff: they made `git apply` fail (binary) and polluted overlap sets.
+    #[test]
+    fn pycache_is_stripped_from_changes_and_apply() {
+        let dir = std::env::temp_dir().join(format!("hi-wt-pyc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str], cwd: &Path| {
+            let out = Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q"], &dir);
+        std::fs::write(dir.join("a.py"), "x = 1\n").unwrap();
+        git(&["add", "-A"], &dir);
+        git(
+            &[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-qm",
+                "c1",
+            ],
+            &dir,
+        );
+        let wt = dir.join("wt");
+        git(
+            &["worktree", "add", "-q", wt.to_str().unwrap(), "HEAD"],
+            &dir,
+        );
+        // The "agent" edits a.py AND its test run drops binary bytecode.
+        std::fs::write(wt.join("a.py"), "x = 2\n").unwrap();
+        std::fs::create_dir_all(wt.join("__pycache__")).unwrap();
+        std::fs::write(wt.join("__pycache__/a.cpython-312.pyc"), b"\x00\x01junk").unwrap();
+
+        let changed = changed_files(&wt, "HEAD");
+        assert_eq!(
+            changed,
+            vec!["a.py"],
+            "pycache must not appear: {changed:?}"
+        );
+        // Apply must succeed (before the fix the binary .pyc broke git apply)
+        // — run it from the main repo dir, as callers do.
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        let applied = apply_changes(&wt, "HEAD");
+        std::env::set_current_dir(prev).unwrap();
+        assert!(applied.expect("apply ok"), "expected a change applied");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("a.py")).unwrap(),
+            "x = 2\n"
+        );
+
+        cleanup(&[wt]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// End-to-end reset_to: a worktree with local edits hard-resets onto a new
     /// base commit, discarding its state and adopting the new snapshot.
