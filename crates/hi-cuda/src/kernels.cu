@@ -5946,10 +5946,12 @@ __global__ void flashtile_causal_attention_batched_kernel(
     int heads,
     int kv_heads,
     int qk_head_dim,
-    int v_head_dim) {
+    int v_head_dim,
+    int window,
+    int ktile) {
   extern __shared__ float smem[];
   float* k_tile = smem;
-  float* v_tile = smem + HI_CUDA_FLASH_KTILE * qk_head_dim;
+  float* v_tile = smem + ktile * qk_head_dim;
 
   const int head = blockIdx.y;
   const int batch = blockIdx.z;
@@ -5977,9 +5979,15 @@ __global__ void flashtile_causal_attention_batched_kernel(
 
   const int block_max_target =
       min((blockIdx.x + 1) * HI_CUDA_FLASH_QWARPS - 1, seq_len - 1);
-  for (int tile_start = 0; tile_start <= block_max_target;
-       tile_start += HI_CUDA_FLASH_KTILE) {
-    for (int e = threadIdx.x; e < HI_CUDA_FLASH_KTILE * qk_head_dim; e += blockDim.x) {
+  // Sliding window: no query in this block needs keys before (block_min - window + 1);
+  // start the tile loop there (rounded down to a tile) and mask per query below.
+  int tile_lo = 0;
+  if (window > 0) {
+    const int block_min = blockIdx.x * HI_CUDA_FLASH_QWARPS - window + 1;
+    tile_lo = block_min > 0 ? (block_min / ktile) * ktile : 0;
+  }
+  for (int tile_start = tile_lo; tile_start <= block_max_target; tile_start += ktile) {
+    for (int e = threadIdx.x; e < ktile * qk_head_dim; e += blockDim.x) {
       const int j = e / qk_head_dim;
       const int d = e - j * qk_head_dim;
       const int source = tile_start + j;
@@ -5987,7 +5995,7 @@ __global__ void flashtile_causal_attention_batched_kernel(
                       ? k[((batch * seq_len + source) * kv_heads + kv_head) * qk_head_dim + d]
                       : 0.0f;
     }
-    for (int e = threadIdx.x; e < HI_CUDA_FLASH_KTILE * v_head_dim; e += blockDim.x) {
+    for (int e = threadIdx.x; e < ktile * v_head_dim; e += blockDim.x) {
       const int j = e / v_head_dim;
       const int d = e - j * v_head_dim;
       const int source = tile_start + j;
@@ -5998,8 +6006,12 @@ __global__ void flashtile_causal_attention_batched_kernel(
     __syncthreads();
 
     if (active) {
-      const int tile_end = min(tile_start + HI_CUDA_FLASH_KTILE, target + 1);
-      for (int source = tile_start; source < tile_end; ++source) {
+      const int tile_end = min(tile_start + ktile, target + 1);
+      // Causal upper bound is target+1; sliding-window lower bound is target-window+1.
+      const int first = (window > 0 && target - window + 1 > tile_start)
+                            ? target - window + 1
+                            : tile_start;
+      for (int source = first; source < tile_end; ++source) {
         const float* kt = k_tile + (source - tile_start) * qk_head_dim;
         float dot = 0.0f;
 #pragma unroll
@@ -6199,25 +6211,31 @@ extern "C" int hi_cuda_launch_wmma_causal_attention_batched(
 extern "C" int hi_cuda_launch_flashtile_causal_attention_batched(
     const void* q, const void* k, const void* v, void* output,
     int batch_count, int seq_len, int heads, int kv_heads,
-    int qk_head_dim, int v_head_dim, void* stream) {
+    int qk_head_dim, int v_head_dim, int window, void* stream) {
   if (q == nullptr || k == nullptr || v == nullptr || output == nullptr ||
       batch_count <= 0 || seq_len <= 0 || heads <= 0 || kv_heads <= 0 ||
       qk_head_dim <= 0 || v_head_dim <= 0 ||
-      qk_head_dim > HI_CUDA_FLASH_TILE_MAX_HEAD_DIM ||
-      v_head_dim > HI_CUDA_FLASH_TILE_MAX_HEAD_DIM || heads % kv_heads != 0 ||
+      qk_head_dim > HI_CUDA_FLASH_MAX_HEAD_DIM ||
+      v_head_dim > HI_CUDA_FLASH_MAX_HEAD_DIM || heads % kv_heads != 0 ||
       stream == nullptr) {
     return 1;
+  }
+  // Pick the largest key tile whose K+V shared-memory footprint fits (~45 KB margin);
+  // 32 for head_dim<=~192, 16 for 256, smaller for wider heads.
+  int ktile = HI_CUDA_FLASH_KTILE;
+  const size_t per_tile = static_cast<size_t>(qk_head_dim + v_head_dim) * sizeof(float);
+  while (ktile > 1 && static_cast<size_t>(ktile) * per_tile > 46080) {
+    ktile >>= 1;
   }
   const int qtiles = (seq_len + HI_CUDA_FLASH_QWARPS - 1) / HI_CUDA_FLASH_QWARPS;
   dim3 grid(qtiles, heads, batch_count);
   dim3 block(HI_CUDA_FLASH_QWARPS * 32);
-  size_t shared_bytes =
-      static_cast<size_t>(HI_CUDA_FLASH_KTILE) * (qk_head_dim + v_head_dim) * sizeof(float);
+  size_t shared_bytes = static_cast<size_t>(ktile) * per_tile;
   flashtile_causal_attention_batched_kernel<<<grid, block, shared_bytes,
                                               static_cast<cudaStream_t>(stream)>>>(
       static_cast<const float*>(q), static_cast<const float*>(k),
       static_cast<const float*>(v), static_cast<float*>(output), batch_count, seq_len,
-      heads, kv_heads, qk_head_dim, v_head_dim);
+      heads, kv_heads, qk_head_dim, v_head_dim, window, ktile);
   return 0;
 }
 
