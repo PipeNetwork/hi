@@ -20429,6 +20429,123 @@ mod tests {
         }
     }
 
+    /// The paged KV-cache write kernels must land each token's K/V in the correct
+    /// paged slot: values[batch][row][kv_head][dim] -> pages[phys][head][offset][dim]
+    /// at logical_pos = start + row, via page_table[batch][logical_page]. Write into a
+    /// zeroed f16 cache, read it back, and check every slot equals the f16-rounded
+    /// written value (written slots) or 0 (untouched). Covers the per-batch-positions
+    /// (live) and single-start variants with a non-identity page table.
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_write_paged_kv_cache_places_tokens_correctly() {
+        use crate::runtime::{DeviceBuffer, Stream};
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let stream = Stream::create().unwrap();
+        let mut rng = StdRng::seed_from_u64(0x5c17_e0);
+        let (batch, rows, kv_heads, hd) = (2usize, 5usize, 2usize, 8usize);
+        let (page_size, page_table_len, num_phys) = (4usize, 2usize, 4usize);
+        let pages_elems = num_phys * kv_heads * page_size * hd;
+        // Distinct physical pages per batch so no two writes collide.
+        let page_table: Vec<u32> = vec![0, 1, 2, 3];
+        let pt_dev = DeviceBuffer::alloc(page_table.len() * 4).unwrap();
+        pt_dev.copy_from_host(&page_table).unwrap();
+
+        let values: Vec<f32> = (0..batch * rows * kv_heads * hd)
+            .map(|_| rng.gen_range(-2.0f32..2.0))
+            .collect();
+        let val_dev = DeviceBuffer::alloc(values.len() * 4).unwrap();
+        val_dev.copy_from_host(&values).unwrap();
+        // f16-rounded copy of the values, for the expected cache contents.
+        let vals_f16 = DeviceBuffer::alloc(values.len() * 2).unwrap();
+        crate::kernels::launch_cast_f32_to_f16(&val_dev, &vals_f16, values.len(), &stream).unwrap();
+        let vals_r_dev = DeviceBuffer::alloc(values.len() * 4).unwrap();
+        crate::kernels::launch_cast_f16_to_f32(&vals_f16, &vals_r_dev, values.len(), &stream)
+            .unwrap();
+        stream.synchronize().unwrap();
+        let vals_r = vals_r_dev.copy_to_host::<f32>(values.len()).unwrap();
+
+        let slot = |phys: usize, head: usize, off: usize, d: usize| {
+            ((phys * kv_heads + head) * page_size + off) * hd + d
+        };
+
+        // starts: per-batch positions for the live variant; a single start for the other.
+        for (label, starts) in [
+            ("positions", vec![0usize, 2usize]),
+            ("single-start", vec![1usize, 1usize]),
+        ] {
+            let pages = DeviceBuffer::alloc(pages_elems * 2).unwrap();
+            pages.memset_zero_async(&stream).unwrap();
+            if label == "positions" {
+                let pos: Vec<u32> = starts.iter().map(|&p| p as u32).collect();
+                let pos_dev = DeviceBuffer::alloc(pos.len() * 4).unwrap();
+                pos_dev.copy_from_host(&pos).unwrap();
+                crate::kernels::launch_write_paged_kv_cache_batched_positions(
+                    &val_dev,
+                    &pages,
+                    &pt_dev,
+                    &pos_dev,
+                    batch,
+                    rows,
+                    kv_heads,
+                    hd,
+                    page_size,
+                    page_table_len,
+                    &stream,
+                )
+                .unwrap();
+            } else {
+                crate::kernels::launch_write_paged_kv_cache_batched(
+                    &val_dev,
+                    &pages,
+                    &pt_dev,
+                    batch,
+                    rows,
+                    kv_heads,
+                    hd,
+                    page_size,
+                    page_table_len,
+                    starts[0],
+                    &stream,
+                )
+                .unwrap();
+            }
+            let pages_f32 = DeviceBuffer::alloc(pages_elems * 4).unwrap();
+            crate::kernels::launch_cast_f16_to_f32(&pages, &pages_f32, pages_elems, &stream)
+                .unwrap();
+            stream.synchronize().unwrap();
+            let got = pages_f32.copy_to_host::<f32>(pages_elems).unwrap();
+
+            let mut expected = vec![0.0f32; pages_elems];
+            for b in 0..batch {
+                for row in 0..rows {
+                    let logical_pos = starts[b] + row;
+                    let logical_page = logical_pos / page_size;
+                    if logical_page >= page_table_len {
+                        continue;
+                    }
+                    let phys = page_table[b * page_table_len + logical_page] as usize;
+                    let off = logical_pos % page_size;
+                    for head in 0..kv_heads {
+                        for d in 0..hd {
+                            let v = vals_r[((b * rows + row) * kv_heads + head) * hd + d];
+                            expected[slot(phys, head, off, d)] = v;
+                        }
+                    }
+                }
+            }
+            for i in 0..pages_elems {
+                assert!(
+                    (got[i] - expected[i]).abs() <= 1.0e-6,
+                    "{label} paged write slot {i}: {} vs {}",
+                    got[i],
+                    expected[i],
+                );
+            }
+        }
+    }
+
     /// The fused dequant->f16 prefill kernels must be byte-identical to the fallback
     /// dequant->f32 + cast_f32_to_f16 (both are __float2half of the same value). This
     /// is an exact check, so it catches any drift in the fused unpack.
