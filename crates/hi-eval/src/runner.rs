@@ -206,6 +206,12 @@ pub fn run_candidate(
     if use_verify {
         cmd.arg("--verify").arg(&task.verify);
     }
+    // Goal-mode A/B: HI_EVAL_GOAL=1 makes each run a long-horizon goal (the
+    // child plans the prompt as an objective before the turn), so the summary
+    // can compare goal-driven vs plain prompting.
+    if std::env::var_os("HI_EVAL_GOAL").is_some() {
+        cmd.arg("--goal").arg(&task.prompt);
+    }
     cmd.arg(&task.prompt);
 
     let started = Instant::now();

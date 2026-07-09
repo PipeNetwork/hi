@@ -14,6 +14,7 @@ pub fn write_artifact(
     condense: bool,
     recovery: bool,
     write_subagents: bool,
+    goal_mode: bool,
     result: &RunResult,
 ) -> Result<()> {
     let artifact = RunArtifact {
@@ -25,6 +26,7 @@ pub fn write_artifact(
         condense,
         recovery,
         write_subagents,
+        goal_mode,
         passed: result.passed,
         failure_bucket: result.fail.map(|f| f.label().to_string()),
         failure_confidence: result.failure_confidence,
