@@ -3250,6 +3250,31 @@ mod native {
                     buffer: output,
                 });
             }
+            // Fused IQ4_NL GEMV (M=1 decode, non-output-head layer weights). Block-32
+            // format (cols % 32, not 256), non-linear lookup table.
+            if input.rows == 1
+                && !is_output_head
+                && matches!(matrix.dtype, GgufTensorType::IQ4_NL)
+                && matrix.cols % 32 == 0
+            {
+                let output = DeviceBuffer::alloc(matrix.rows * std::mem::size_of::<f32>())
+                    .context("allocating CUDA IQ4_NL GEMV output")?;
+                crate::kernels::launch_iq4_nl_gemv(
+                    &matrix.buffer,
+                    &input.buffer,
+                    &output,
+                    matrix.rows,
+                    matrix.cols,
+                    &self.stream,
+                )
+                .with_context(|| format!("CUDA IQ4_NL GEMV for {matrix_name}"))?;
+                self.op_barrier()?;
+                return Ok(GpuF32Tensor {
+                    rows: 1,
+                    cols: matrix.rows,
+                    buffer: output,
+                });
+            }
             // Quantized weight matmul via tensor-core f16 GEMM. Dequantizing to f16 is
             // expensive, so cache the f16 weight and reuse it — weights never change,
             // avoiding re-dequantizing the Q6_K lm_head every token. Bounded to the
