@@ -23,12 +23,15 @@ KEY="${PIPENETWORK_API_KEY:-${HI_API_KEY:-}}"
 # delegate tier; build it once and pin it so hi-eval doesn't pick a stale debug one.
 export HI_BIN="${HI_BIN:-$PWD/target/release/hi}"
 [[ -x "$HI_BIN" ]] || { echo "building hi (release)…" >&2; cargo build --release -p hi >&2 || exit 1; }
-export HI_API_KEY="$KEY" HI_MODEL="$MODEL"
+export HI_API_KEY="$KEY" PIPENETWORK_API_KEY="$KEY" HI_MODEL="$MODEL"
 
 STAMP=$(date +%Y%m%d-%H%M%S)
 OFF_DIR="target/hi-eval/ab-$STAMP/off"
 ON_DIR="target/hi-eval/ab-$STAMP/on"
-run_eval() { cargo run -q -p hi-eval -- "$TASKS" --provider pipenetwork --configs "$CONFIGS" --artifacts "$1"; }
+# hi-eval flags use `=`, and the pipenetwork child provider comes from the
+# `pipenetwork` eval profile (which injects `--provider pipenetwork` into the child)
+# — not a bare `--provider` (hi-eval doesn't parse one).
+run_eval() { cargo run -q -p hi-eval -- "$TASKS" --profile=pipenetwork --configs="$CONFIGS" --artifacts="$1"; }
 
 echo "== write_subagents A/B · tasks=$TASKS · configs=$CONFIGS · model=$MODEL ==" >&2
 
