@@ -20001,6 +20001,298 @@ mod tests {
         }
     }
 
+    /// The fused dequant->f16 prefill kernels must be byte-identical to the fallback
+    /// dequant->f32 + cast_f32_to_f16 (both are __float2half of the same value). This
+    /// is an exact check, so it catches any drift in the fused unpack.
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_dequant_to_f16_matches_dequant_then_cast() {
+        use crate::runtime::{DeviceBuffer, Stream};
+        use rand::rngs::StdRng;
+        use rand::{RngCore, SeedableRng};
+
+        type Launch = fn(&DeviceBuffer, &DeviceBuffer, usize, &Stream) -> anyhow::Result<()>;
+        // (name, block_weights, block_bytes, quant_type_id, fused dequant->f16 launch)
+        let cases: &[(&str, usize, usize, i32, Launch)] = &[
+            (
+                "Q4_0",
+                32,
+                18,
+                2,
+                crate::kernels::launch_dequantize_q4_0_to_f16,
+            ),
+            (
+                "Q4_K",
+                256,
+                144,
+                12,
+                crate::kernels::launch_dequantize_q4_k_to_f16,
+            ),
+            (
+                "Q5_K",
+                256,
+                176,
+                13,
+                crate::kernels::launch_dequantize_q5_k_to_f16,
+            ),
+            (
+                "Q6_K",
+                256,
+                210,
+                14,
+                crate::kernels::launch_dequantize_q6_k_to_f16,
+            ),
+            (
+                "IQ4_NL",
+                32,
+                18,
+                20,
+                crate::kernels::launch_dequantize_iq4_nl_to_f16,
+            ),
+            (
+                "Q8_0",
+                32,
+                34,
+                8,
+                crate::kernels::launch_dequantize_q8_0_to_f16,
+            ),
+            (
+                "Q2_K",
+                256,
+                84,
+                10,
+                crate::kernels::launch_dequantize_q2_k_to_f16,
+            ),
+            (
+                "Q3_K",
+                256,
+                110,
+                11,
+                crate::kernels::launch_dequantize_q3_k_to_f16,
+            ),
+        ];
+
+        let stream = Stream::create().unwrap();
+        let rows = 4usize;
+        let cols = 512usize;
+        let elements = rows * cols;
+
+        for &(name, block_weights, block_bytes, qtype, fused) in cases {
+            let mut rng = StdRng::seed_from_u64(0xf16d_00 + qtype as u64);
+            let wlen = rows * (cols / block_weights) * block_bytes;
+            let mut wbytes = vec![0u8; wlen];
+            rng.fill_bytes(&mut wbytes);
+            let w_dev = DeviceBuffer::alloc(wlen).unwrap();
+            w_dev.copy_from_host(&wbytes).unwrap();
+
+            let fused_dev = DeviceBuffer::alloc(elements * std::mem::size_of::<u16>()).unwrap();
+            fused(&w_dev, &fused_dev, elements, &stream).unwrap();
+
+            let f32_dev = DeviceBuffer::alloc(elements * std::mem::size_of::<f32>()).unwrap();
+            crate::kernels::launch_dequantize_matrix(&w_dev, &f32_dev, elements, qtype, &stream)
+                .unwrap();
+            let ref_dev = DeviceBuffer::alloc(elements * std::mem::size_of::<u16>()).unwrap();
+            crate::kernels::launch_cast_f32_to_f16(&f32_dev, &ref_dev, elements, &stream).unwrap();
+            stream.synchronize().unwrap();
+
+            let fused_bits = fused_dev.copy_to_host::<u16>(elements).unwrap();
+            let ref_bits = ref_dev.copy_to_host::<u16>(elements).unwrap();
+            assert_eq!(
+                fused_bits, ref_bits,
+                "{name}: fused dequant->f16 != dequant->f32->cast"
+            );
+        }
+    }
+
+    /// Every float fused decode GEMV (the K-quant fallbacks + the whole IQ family)
+    /// must match the dequant reference: dequantize the weight to f32 and dot it with
+    /// the same float activation. The GEMV re-derives each weight with the same
+    /// formula as the dequant kernel, so the products are identical and only the
+    /// accumulation order differs — the tolerance is bounded by the L1 norm of the
+    /// products. Guards the on-the-fly unpack of 13 quant formats.
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_float_gemv_matches_dequant_reference() {
+        use crate::runtime::{DeviceBuffer, Stream};
+        use rand::rngs::StdRng;
+        use rand::{Rng, RngCore, SeedableRng};
+
+        type Launch = fn(
+            &DeviceBuffer,
+            &DeviceBuffer,
+            &DeviceBuffer,
+            usize,
+            usize,
+            &Stream,
+        ) -> anyhow::Result<()>;
+        // (name, block_weights, block_bytes, quant_type_id, &[f16 offsets to pin], launch)
+        let cases: &[(&str, usize, usize, i32, &[usize], Launch)] = &[
+            (
+                "Q4_K",
+                256,
+                144,
+                12,
+                &[0, 2],
+                crate::kernels::launch_q4_k_gemv,
+            ),
+            (
+                "Q5_K",
+                256,
+                176,
+                13,
+                &[0, 2],
+                crate::kernels::launch_q5_k_gemv,
+            ),
+            (
+                "Q6_K",
+                256,
+                210,
+                14,
+                &[208],
+                crate::kernels::launch_q6_k_gemv,
+            ),
+            (
+                "Q2_K",
+                256,
+                84,
+                10,
+                &[80, 82],
+                crate::kernels::launch_q2_k_gemv,
+            ),
+            (
+                "Q3_K",
+                256,
+                110,
+                11,
+                &[108],
+                crate::kernels::launch_q3_k_gemv,
+            ),
+            (
+                "IQ4_NL",
+                32,
+                18,
+                20,
+                &[0],
+                crate::kernels::launch_iq4_nl_gemv,
+            ),
+            (
+                "IQ4_XS",
+                256,
+                136,
+                23,
+                &[0],
+                crate::kernels::launch_iq4_xs_gemv,
+            ),
+            (
+                "IQ3_S",
+                256,
+                110,
+                21,
+                &[0],
+                crate::kernels::launch_iq3_s_gemv,
+            ),
+            (
+                "IQ3_XXS",
+                256,
+                98,
+                18,
+                &[0],
+                crate::kernels::launch_iq3_xxs_gemv,
+            ),
+            (
+                "IQ2_XXS",
+                256,
+                66,
+                16,
+                &[0],
+                crate::kernels::launch_iq2_xxs_gemv,
+            ),
+            (
+                "IQ2_XS",
+                256,
+                74,
+                17,
+                &[0],
+                crate::kernels::launch_iq2_xs_gemv,
+            ),
+            (
+                "IQ2_S",
+                256,
+                82,
+                22,
+                &[0],
+                crate::kernels::launch_iq2_s_gemv,
+            ),
+            (
+                "IQ1_S",
+                256,
+                50,
+                19,
+                &[0],
+                crate::kernels::launch_iq1_s_gemv,
+            ),
+        ];
+
+        let stream = Stream::create().unwrap();
+        let rows = 6usize;
+        let cols = 512usize;
+
+        for &(name, block_weights, block_bytes, qtype, f16_offsets, launch) in cases {
+            let mut rng = StdRng::seed_from_u64(0xf10a_00 + qtype as u64);
+            let nblocks = cols / block_weights;
+            let wlen = rows * nblocks * block_bytes;
+            let mut wbytes = vec![0u8; wlen];
+            rng.fill_bytes(&mut wbytes);
+            for blk in 0..(rows * nblocks) {
+                let base = blk * block_bytes;
+                for &off in f16_offsets {
+                    wbytes[base + off] = 0x00; // f16 1.0 (0x3C00), little-endian
+                    wbytes[base + off + 1] = 0x3C;
+                }
+            }
+            let x: Vec<f32> = (0..cols).map(|_| rng.gen_range(-1.0f32..1.0)).collect();
+
+            let w_dev = DeviceBuffer::alloc(wlen).unwrap();
+            w_dev.copy_from_host(&wbytes).unwrap();
+            let x_dev = DeviceBuffer::alloc(cols * std::mem::size_of::<f32>()).unwrap();
+            x_dev.copy_from_host(&x).unwrap();
+
+            let elements = rows * cols;
+            let wf32_dev = DeviceBuffer::alloc(elements * std::mem::size_of::<f32>()).unwrap();
+            crate::kernels::launch_dequantize_matrix(&w_dev, &wf32_dev, elements, qtype, &stream)
+                .unwrap();
+
+            let y_dev = DeviceBuffer::alloc(rows * std::mem::size_of::<f32>()).unwrap();
+            launch(&w_dev, &x_dev, &y_dev, rows, cols, &stream).unwrap();
+            stream.synchronize().unwrap();
+
+            let wf32 = wf32_dev.copy_to_host::<f32>(elements).unwrap();
+            let y = y_dev.copy_to_host::<f32>(rows).unwrap();
+            assert!(
+                wf32.iter().all(|v| v.is_finite()),
+                "{name}: dequant produced non-finite weights"
+            );
+
+            for r in 0..rows {
+                let mut acc = 0.0f64;
+                let mut l1 = 0.0f64;
+                for c in 0..cols {
+                    let p = f64::from(wf32[r * cols + c]) * f64::from(x[c]);
+                    acc += p;
+                    l1 += p.abs();
+                }
+                let reference = acc as f32;
+                let tol = 0.1 + 1.0e-4 * l1 as f32;
+                assert!(
+                    (y[r] - reference).abs() <= tol,
+                    "{name} row {r}: gemv {} vs reference {} (tol {tol})",
+                    y[r],
+                    reference,
+                );
+            }
+        }
+    }
+
     #[cfg(feature = "native-cuda")]
     #[test]
     fn native_cuda_kquant_dp4a_gemv_matches_dequant_reference() {
@@ -20018,12 +20310,39 @@ mod tests {
             usize,
             &Stream,
         ) -> anyhow::Result<()>;
-        // (name, block_bytes, quant_type_id, f16 d offset, f16 dmin offset or -1, launch)
-        let cases: &[(&str, usize, i32, usize, i64, Launch)] = &[
-            ("Q4_K", 144, 12, 0, 2, crate::kernels::launch_q4_k_dp4a_gemv),
-            ("Q5_K", 176, 13, 0, 2, crate::kernels::launch_q5_k_dp4a_gemv),
+        // (name, block_weights, block_bytes, quant_type_id, f16 d offset, f16 dmin
+        // offset or -1, launch)
+        let cases: &[(&str, usize, usize, i32, usize, i64, Launch)] = &[
+            (
+                "Q4_0",
+                32,
+                18,
+                2,
+                0,
+                -1,
+                crate::kernels::launch_q4_0_dp4a_gemv,
+            ),
+            (
+                "Q4_K",
+                256,
+                144,
+                12,
+                0,
+                2,
+                crate::kernels::launch_q4_k_dp4a_gemv,
+            ),
+            (
+                "Q5_K",
+                256,
+                176,
+                13,
+                0,
+                2,
+                crate::kernels::launch_q5_k_dp4a_gemv,
+            ),
             (
                 "Q6_K",
+                256,
                 210,
                 14,
                 208,
@@ -20032,6 +20351,7 @@ mod tests {
             ),
             (
                 "Q2_K",
+                256,
                 84,
                 10,
                 80,
@@ -20040,6 +20360,7 @@ mod tests {
             ),
             (
                 "Q3_K",
+                256,
                 110,
                 11,
                 108,
@@ -20050,17 +20371,17 @@ mod tests {
 
         let stream = Stream::create().unwrap();
         let rows = 6usize;
-        let cols = 512usize; // two 256-weight super-blocks
-        let nsb = cols / 256;
+        let cols = 512usize;
 
-        for &(name, block_bytes, qtype, d_off, dmin_off, launch) in cases {
+        for &(name, block_weights, block_bytes, qtype, d_off, dmin_off, launch) in cases {
             let mut rng = StdRng::seed_from_u64(0x4b_51_00 + qtype as u64);
-            let wlen = rows * nsb * block_bytes;
+            let nblocks = cols / block_weights;
+            let wlen = rows * nblocks * block_bytes;
             let mut wbytes = vec![0u8; wlen];
             rng.fill_bytes(&mut wbytes);
-            // Pin the f16 super-block scales so random bytes can't produce inf/nan:
+            // Pin the f16 (super-)block scales so random bytes can't produce inf/nan:
             // d = 1.0 (0x3C00), dmin = 0.5 (0x3800), little-endian.
-            for blk in 0..(rows * nsb) {
+            for blk in 0..(rows * nblocks) {
                 let base = blk * block_bytes;
                 wbytes[base + d_off] = 0x00;
                 wbytes[base + d_off + 1] = 0x3C;
