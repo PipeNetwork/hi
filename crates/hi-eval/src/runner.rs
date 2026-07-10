@@ -8,7 +8,7 @@ use crate::artifacts::{copy_dir, make_workdir, verify_output_in};
 use crate::config::{EvalProfile, Task};
 use crate::results::{
     Candidate, FailKind, RunResult, Trajectory, TrajectoryAttribution, TrajectoryToolCall,
-    classify, looks_like_build_error,
+    TurnMetric, classify, looks_like_build_error,
 };
 
 /// A content snapshot of `dir` (relative path → bytes), excluding eval/run and
@@ -90,6 +90,7 @@ pub async fn run_config(
         seconds: 0.0,
         mcp_model: None,
         trajectory: Trajectory::default(),
+        growth: Vec::new(),
     };
 
     // Run candidates in parallel — each gets its own temp workdir.
@@ -136,6 +137,7 @@ pub async fn run_config(
     // trajectory is surfaced, mirroring how `result.fail` is chosen.
     let mut best_rank: i32 = -1;
     let mut representative_trajectory: Option<Trajectory> = None;
+    let mut representative_growth: Vec<TurnMetric> = Vec::new();
     for candidate in candidates {
         let cand_rank = candidate
             .fail
@@ -144,6 +146,7 @@ pub async fn run_config(
         if cand_rank > best_rank {
             best_rank = cand_rank;
             representative_trajectory = Some(candidate.trajectory.clone());
+            representative_growth = candidate.growth.clone();
         }
         result.passed |= candidate.passed;
         if let Some(k) = candidate.fail {
@@ -170,6 +173,7 @@ pub async fn run_config(
         result.fail = fails.into_iter().max_by_key(|k| k.rank());
     }
     result.trajectory = representative_trajectory.unwrap_or_default();
+    result.growth = representative_growth;
     result.changed_files.sort();
     result.changed_files.dedup();
     result.compat_fallbacks_used.sort();
@@ -184,6 +188,31 @@ fn read_report_goal(report: &Path) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
     let goal = value.get("goal").filter(|g| !g.is_null())?;
     Some(goal.to_string())
+}
+
+/// A single turn's context-growth snapshot from the just-written report: context
+/// (input) tokens sent this turn, total booked, tool calls, and goal progress.
+/// Best-effort — a missing/short report yields zeroed fields, never an error.
+fn read_turn_metric(report: &Path, turn: u32) -> TurnMetric {
+    let mut m = TurnMetric {
+        turn,
+        ..Default::default()
+    };
+    let Ok(text) = std::fs::read_to_string(report) else {
+        return m;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return m;
+    };
+    m.input_tokens = v["input_tokens"].as_u64().unwrap_or(0);
+    m.total_tokens = v["total_tokens"].as_u64().unwrap_or(0);
+    m.tool_calls = v["telemetry"]["tool_calls"].as_u64().unwrap_or(0) as u32;
+    // The report's `goal` block is a summary: {objective, status, done, total}.
+    if let Some(goal) = v.get("goal").filter(|g| !g.is_null()) {
+        m.goal_done = goal["done"].as_u64().unwrap_or(0) as u32;
+        m.goal_total = goal["total"].as_u64().unwrap_or(0) as u32;
+    }
+    m
 }
 
 /// One independent attempt in an isolated copy of the fixture.
@@ -275,12 +304,18 @@ sub-goal now, then update the plan with update_plan — including any newly disc
     )
     .output()
     .context("failed to launch hi")?;
+    // Per-turn context-growth series (multi-turn drive only). Turn 1 first, then
+    // one snapshot per session-continuing drive turn — the growth curve.
+    let mut growth: Vec<TurnMetric> = Vec::new();
+    if turns > 1 {
+        growth.push(read_turn_metric(&report, 1));
+    }
     if goal_mode && turns > 1 {
         // Drive while the report says the goal is still active (stall guard: two
         // consecutive turns with an unchanged goal park the drive).
         let mut last_goal = read_report_goal(&report);
         let mut stall = 0u32;
-        for _ in 1..turns {
+        for turn in 1..turns {
             let active = last_goal.as_ref().is_some_and(|g| {
                 g.contains("\"status\":\"Active\"") || g.contains("\"status\": \"Active\"")
             });
@@ -290,6 +325,7 @@ sub-goal now, then update the plan with update_plan — including any newly disc
             output = build_cmd(GOAL_CONTINUE_PROMPT, false, Some(turn_steps))
                 .output()
                 .context("failed to launch hi (drive turn)")?;
+            growth.push(read_turn_metric(&report, turn + 1));
             let goal = read_report_goal(&report);
             if goal == last_goal {
                 stall += 1;
@@ -352,6 +388,7 @@ sub-goal now, then update the plan with update_plan — including any newly disc
         input_tokens: report.input_tokens,
         seconds,
         trajectory: report.trajectory,
+        growth,
     })
 }
 
@@ -564,5 +601,36 @@ mod tests {
         assert!(!parsed.trajectory.hit_step_cap);
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn read_turn_metric_captures_tokens_and_goal_progress() {
+        use super::read_turn_metric;
+        let path =
+            std::env::temp_dir().join(format!("hi-eval-turn-metric-{}.json", std::process::id()));
+        let report = serde_json::json!({
+            "total_tokens": 9000,
+            "input_tokens": 8000,
+            "telemetry": { "tool_calls": 7 },
+            // The report's goal block is a summary, not the full sub_goals list.
+            "goal": { "objective": "x", "status": "Active", "done": 2, "total": 4 }
+        });
+        std::fs::write(&path, serde_json::to_string(&report).unwrap()).unwrap();
+
+        let m = read_turn_metric(&path, 3);
+        assert_eq!(m.turn, 3);
+        assert_eq!(m.input_tokens, 8000);
+        assert_eq!(m.total_tokens, 9000);
+        assert_eq!(m.tool_calls, 7);
+        assert_eq!(m.goal_total, 4);
+        assert_eq!(m.goal_done, 2);
+
+        let _ = std::fs::remove_file(&path);
+
+        // Missing report → zeroed metric, never a panic (fail-open).
+        let absent = read_turn_metric(std::path::Path::new("/no/such/report.json"), 5);
+        assert_eq!(absent.turn, 5);
+        assert_eq!(absent.input_tokens, 0);
+        assert_eq!(absent.goal_total, 0);
     }
 }

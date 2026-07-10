@@ -1,0 +1,47 @@
+name = "interp"
+prompt = """Build an infix expression interpreter in interp.py. Implement `evaluate(expr, env=None)` that parses and evaluates an arithmetic/logic expression string and returns the result. The file currently raises NotImplementedError. Edit only interp.py. Implement all of these requirements:
+
+1. Integer and float literals (e.g. `42`, `1.5`).
+2. Binary `+ - * /` with standard precedence (`*` and `/` bind tighter than `+` and `-`), left-associative.
+3. Parentheses for grouping.
+4. Unary minus and unary plus (e.g. `-3`, `-(2+3)`, `- -5`).
+5. Modulo `%` (same precedence as `*`/`/`).
+6. Exponentiation `**`, right-associative and binding tighter than unary minus's operand — i.e. `2 ** 3 ** 2 == 512`.
+7. Variables resolved from the `env` dict argument, e.g. `evaluate("x + 1", {"x": 3}) == 4`.
+8. Comparison operators `< > <= >= == !=` (lowest precedence) returning a bool.
+9. Built-in functions `min`, `max` (variadic), and `abs`, callable with parenthesised comma-separated args, e.g. `evaluate("max(2, 3) + 1") == 4`.
+10. Errors: division or modulo by zero raises ZeroDivisionError; an undefined variable or unknown function name raises NameError; any malformed/unparseable input (bad character, trailing tokens, unbalanced parens, missing operand) raises ValueError.
+
+Write a real tokenizer and parser — do not use eval() or the ast module. Verify your work as you go."""
+verify = '''python3 -c "
+import interp as m
+E = m.evaluate
+assert E('1 + 2 * 3') == 7
+assert E('(1 + 2) * 3') == 9
+assert E('10 - 2 - 3') == 5
+assert E('7 % 3') == 1
+assert E('2 ** 3 ** 2') == 512
+assert E('6 / 2') == 3
+assert E('-3 + 4') == 1
+assert E('-(2 + 3)') == -5
+assert E('- -5') == 5
+assert E('1.5 + 2') == 3.5
+assert E('x + 1', {'x': 3}) == 4
+assert E('a * b', {'a': 4, 'b': 5}) == 20
+assert E('2 < 3') is True
+assert E('3 <= 3') is True
+assert E('2 == 2') is True
+assert E('2 != 3') is True
+assert E('5 > 9') is False
+assert E('max(2, 3) + 1') == 4
+assert E('min(4, 2, 7)') == 2
+assert E('abs(-8)') == 8
+assert E('max(abs(-3), 2)') == 3
+import sys
+for expr, exc in [('1 / 0', ZeroDivisionError), ('5 % 0', ZeroDivisionError), ('y + 1', NameError), ('1 +', ValueError), ('2 @ 3', ValueError), ('(1 + 2', ValueError)]:
+    try:
+        E(expr); sys.exit('no error for: ' + expr)
+    except exc:
+        pass
+print('ok')
+"'''
