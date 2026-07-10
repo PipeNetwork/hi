@@ -444,8 +444,6 @@ async fn main() -> Result<()> {
                     model: data.model.clone(),
                     base_url: data.base_url.clone(),
                 };
-                let path = config::writable_config_path(config_path.as_deref())
-                    .context("could not determine config path")?;
                 let mut file = file.lock().unwrap();
                 // Editing an existing profile must not wipe the fields the form
                 // doesn't cover (max_tokens, fallback, tool_mode, …).
@@ -453,7 +451,7 @@ async fn main() -> Result<()> {
                     Some(existing) => form.apply_to(existing),
                     None => form.to_profile(),
                 };
-                config::upsert_profile(&mut file, &data.name, profile, &path)?;
+                config::upsert_profile(&mut file, &data.name, profile, config_path.as_deref())?;
                 // Return the updated profile list.
                 Ok(profile_infos(&file))
             }
@@ -480,10 +478,8 @@ async fn main() -> Result<()> {
             let file = std::sync::Mutex::new(file.clone());
             let config_path = cli.config.clone();
             move |name: &str| {
-                let path = config::writable_config_path(config_path.as_deref())
-                    .context("could not determine config path")?;
                 let mut file = file.lock().unwrap();
-                let existed = config::remove_profile(&mut file, name, &path)?;
+                let existed = config::remove_profile(&mut file, name, config_path.as_deref())?;
                 if !existed {
                     anyhow::bail!("no profile named '{name}'");
                 }
@@ -494,8 +490,6 @@ async fn main() -> Result<()> {
             let file = std::sync::Mutex::new(file.clone());
             let config_path = cli.config.clone();
             move |run: &hi_tools::HfMlxRun| {
-                let path = config::writable_config_path(config_path.as_deref())
-                    .context("could not determine config path")?;
                 let mut file = file.lock().unwrap();
                 let profile = config::Profile {
                     provider: Some(ProviderName::Openai),
@@ -505,7 +499,12 @@ async fn main() -> Result<()> {
                     max_tokens: Some(2048),
                     ..Default::default()
                 };
-                config::upsert_profile_as_default(&mut file, &run.profile_name, profile, &path)?;
+                config::upsert_profile_as_default(
+                    &mut file,
+                    &run.profile_name,
+                    profile,
+                    config_path.as_deref(),
+                )?;
                 let settings = config::resolve_named_profile(&file, &run.profile_name)?;
                 let label = provider_label(settings.provider).to_string();
                 let model = settings.model.clone();

@@ -443,16 +443,22 @@ pub fn load_config(explicit: Option<&Path>) -> Result<Config> {
 }
 
 fn read_config(path: &Path) -> Result<Config> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading config {}", path.display()))?;
-    let mut config = toml::from_str::<Config>(&text)
-        .with_context(|| format!("parsing config {}", path.display()))?;
+    let mut config = read_config_file(path)?;
     config
         .moa
         .validate()
         .with_context(|| format!("validating MoA config {}", path.display()))?;
     migrate_api_key_env_to_literal(&mut config, path);
     Ok(config)
+}
+
+/// Parse a single config file as-is: no validation, no key migration. Used by
+/// the read-modify-write save path, which must reproduce the file's own
+/// contents faithfully rather than the session's merged/migrated view.
+fn read_config_file(path: &Path) -> Result<Config> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading config {}", path.display()))?;
+    toml::from_str::<Config>(&text).with_context(|| format!("parsing config {}", path.display()))
 }
 
 fn merge_config(base: &mut Config, overlay: Config) {
@@ -994,16 +1000,92 @@ impl ProfileForm {
     }
 }
 
-/// Add or replace a profile in the config and save it to disk.
+// --- Layered profile persistence ------------------------------------------
+//
+// The session's `Config` is the *merge* of the global config and a local
+// `hi.toml`, but saves must never serialize that merged view into one file:
+// with a local `hi.toml` present that copied every global profile — API keys
+// included — into a project file that's easy to commit, and removing a
+// globally-defined profile only masked it locally until the next merge
+// resurrected it. Instead, every save is a read-modify-write of exactly the
+// file(s) that own the data being changed: the explicit `--config` file when
+// one was given (the whole session is that single file), else the layer file
+// that defines the profile (local first — it wins the merge), else the
+// default writable path for brand-new profiles.
+
+/// Read `path` (or start empty if it doesn't exist), apply `mutate` to that
+/// file's own contents, and write it back.
+fn rmw_config_file(path: &Path, mutate: impl FnOnce(&mut Config)) -> Result<()> {
+    let mut file = if path.exists() {
+        read_config_file(path)?
+    } else {
+        Config::default()
+    };
+    mutate(&mut file);
+    save_config_to(&file, path)
+}
+
+/// Existing config layer files, highest merge precedence first (local
+/// `hi.toml`, then the global config).
+fn layer_paths() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let local = local_config_path();
+    if local.exists() {
+        out.push(local);
+    }
+    if let Some(global) = default_config_path().filter(|p| p.exists()) {
+        out.push(global);
+    }
+    out
+}
+
+/// The layer files (from `layers`, highest precedence first) that define
+/// profile `name`. Files that fail to parse are skipped (the profile can't
+/// have come from them).
+fn layers_defining(layers: &[PathBuf], name: &str) -> Vec<PathBuf> {
+    layers
+        .iter()
+        .filter(|p| {
+            read_config_file(p)
+                .map(|c| c.profiles.contains_key(name))
+                .unwrap_or(false)
+        })
+        .cloned()
+        .collect()
+}
+
+/// The highest-precedence layer file that defines profile `name`.
+fn owning_path_in(layers: &[PathBuf], name: &str) -> Option<PathBuf> {
+    layers_defining(layers, name).into_iter().next()
+}
+
+/// Where a change to profile `name` must be written: the explicit `--config`
+/// path if given, else the layer file that defines the profile, else (a new
+/// profile) the default writable path.
+fn profile_save_target(name: &str, explicit: Option<&Path>) -> Result<PathBuf> {
+    if let Some(path) = explicit {
+        return Ok(path.to_path_buf());
+    }
+    owning_path_in(&layer_paths(), name)
+        .or_else(|| writable_config_path(None))
+        .ok_or_else(|| anyhow!("could not determine config path"))
+}
+
+/// Add or replace a profile in the config and save it to disk. Only `name`'s
+/// entry in the owning file is touched (see module note above).
 pub fn upsert_profile(
     config: &mut Config,
     name: &str,
     profile: Profile,
-    config_path: &Path,
+    explicit: Option<&Path>,
 ) -> Result<()> {
     validate_profile(&profile)?;
+    let target = profile_save_target(name, explicit)?;
+    rmw_config_file(&target, |file| {
+        file.profiles.insert(name.to_string(), profile.clone());
+    })?;
     config.profiles.insert(name.to_string(), profile);
-    save_config_to(config, config_path)
+    Ok(())
 }
 
 /// Add or replace a profile, select it as the default profile, and save.
@@ -1011,12 +1093,26 @@ pub fn upsert_profile_as_default(
     config: &mut Config,
     name: &str,
     profile: Profile,
-    config_path: &Path,
+    explicit: Option<&Path>,
 ) -> Result<()> {
-    validate_profile(&profile)?;
-    config.profiles.insert(name.to_string(), profile);
+    upsert_profile(config, name, profile, explicit)?;
+    // `default_profile` must land where the merge can't shadow it: the
+    // explicit file, else the highest-precedence layer (a local `hi.toml`
+    // overrides the global default_profile whenever it sets one), else the
+    // default writable path.
+    let target = match explicit {
+        Some(path) => path.to_path_buf(),
+        None => layer_paths()
+            .into_iter()
+            .next()
+            .or_else(|| writable_config_path(None))
+            .ok_or_else(|| anyhow!("could not determine config path"))?,
+    };
+    rmw_config_file(&target, |file| {
+        file.default_profile = Some(name.to_string());
+    })?;
     config.default_profile = Some(name.to_string());
-    save_config_to(config, config_path)
+    Ok(())
 }
 
 /// Update only the selected model on an existing profile and save it to disk.
@@ -1024,7 +1120,7 @@ pub fn set_profile_model(
     config: &mut Config,
     name: &str,
     model: &str,
-    config_path: &Path,
+    explicit: Option<&Path>,
 ) -> Result<()> {
     let profile = config
         .profiles
@@ -1032,16 +1128,41 @@ pub fn set_profile_model(
         .ok_or_else(|| anyhow!("profile '{name}' not found in config"))?;
     profile.model = Some(model.to_string());
     validate_profile(profile)?;
-    save_config_to(config, config_path)
+    let updated = profile.clone();
+    let target = profile_save_target(name, explicit)?;
+    rmw_config_file(&target, |file| {
+        match file.profiles.get_mut(name) {
+            // Touch only the model, preserving whatever else that file says
+            // about the profile.
+            Some(p) => p.model = Some(model.to_string()),
+            // The file doesn't define it (deleted mid-session, or a fresh
+            // explicit path): write the full in-memory profile.
+            None => {
+                file.profiles.insert(name.to_string(), updated.clone());
+            }
+        }
+    })
 }
 
-/// Remove a profile from the config and save it to disk. Returns `false` if the
-/// profile didn't exist (caller may treat that as an error or a no-op).
-pub fn remove_profile(config: &mut Config, name: &str, config_path: &Path) -> Result<bool> {
-    if config.profiles.remove(name).is_none() {
+/// Remove a profile from the config and save. Returns `false` if the profile
+/// didn't exist (caller may treat that as an error or a no-op). Without an
+/// explicit path the profile is removed from *every* layer file that defines
+/// it — deleting it from just one file would let the merge resurrect it from
+/// the other on the next launch.
+pub fn remove_profile(config: &mut Config, name: &str, explicit: Option<&Path>) -> Result<bool> {
+    let in_memory = config.profiles.remove(name).is_some();
+    let targets: Vec<PathBuf> = match explicit {
+        Some(path) => vec![path.to_path_buf()],
+        None => layers_defining(&layer_paths(), name),
+    };
+    if !in_memory && targets.is_empty() {
         return Ok(false);
     }
-    save_config_to(config, config_path)?;
+    for path in &targets {
+        rmw_config_file(path, |file| {
+            file.profiles.remove(name);
+        })?;
+    }
     Ok(true)
 }
 
@@ -1797,7 +1918,8 @@ mod tests {
             ..Default::default()
         };
 
-        set_profile_model(&mut config, "default", "ipop/coder-balanced", &path).expect("set model");
+        set_profile_model(&mut config, "default", "ipop/coder-balanced", Some(&path))
+            .expect("set model");
 
         let p = config.profiles.get("default").unwrap();
         assert_eq!(p.model.as_deref(), Some("ipop/coder-balanced"));
@@ -1805,6 +1927,126 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("model = \"ipop/coder-balanced\""));
         assert!(text.contains("api_key = \"test-key\""));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn layered_test_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "hi-layered-{tag}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The leak scenario the layered save exists to prevent: a change to a
+    /// globally-defined profile must be written to the global file only —
+    /// never by dumping the merged view (global API keys included) into the
+    /// project-local `hi.toml`.
+    #[test]
+    fn layered_save_writes_only_the_owning_file() {
+        use super::{owning_path_in, read_config_file, rmw_config_file};
+        let dir = layered_test_dir("owning");
+        let global = dir.join("config.toml");
+        let local = dir.join("hi.toml");
+        std::fs::write(
+            &global,
+            "[profiles.work]\nprovider = \"openai\"\nmodel = \"old\"\napi_key = \"sk-secret\"\n\n\
+             [profiles.other]\nprovider = \"openai\"\napi_key = \"sk-other\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &local,
+            "[profiles.scratch]\nprovider = \"ollama\"\nmodel = \"m\"\n",
+        )
+        .unwrap();
+        let layers = vec![local.clone(), global.clone()];
+
+        // "work" lives in the global file — that's where the edit must go.
+        assert_eq!(owning_path_in(&layers, "work"), Some(global.clone()));
+        // "scratch" lives in the local file, which wins the merge.
+        assert_eq!(owning_path_in(&layers, "scratch"), Some(local.clone()));
+
+        let local_before = std::fs::read_to_string(&local).unwrap();
+        rmw_config_file(&global, |file| {
+            file.profiles.get_mut("work").unwrap().model = Some("new-model".into());
+        })
+        .unwrap();
+
+        // The local file is byte-for-byte untouched — no global profiles or
+        // API keys copied into it.
+        assert_eq!(std::fs::read_to_string(&local).unwrap(), local_before);
+        // The global file has the new model, keeps its own fields, and gained
+        // nothing else.
+        let global_cfg = read_config_file(&global).unwrap();
+        assert_eq!(global_cfg.profiles.len(), 2);
+        let work = &global_cfg.profiles["work"];
+        assert_eq!(work.model.as_deref(), Some("new-model"));
+        assert_eq!(work.api_key.as_deref(), Some("sk-secret"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A profile defined in both layers must be removed from both — deleting
+    /// it from one file lets the merge resurrect it from the other on the
+    /// next launch.
+    #[test]
+    fn remove_targets_every_layer_that_defines_the_profile() {
+        use super::{layers_defining, read_config_file, rmw_config_file};
+        let dir = layered_test_dir("remove");
+        let global = dir.join("config.toml");
+        let local = dir.join("hi.toml");
+        std::fs::write(
+            &global,
+            "[profiles.dup]\nprovider = \"openai\"\nmodel = \"g\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &local,
+            "[profiles.dup]\nprovider = \"ollama\"\nmodel = \"l\"\n\n\
+             [profiles.keep]\nprovider = \"ollama\"\nmodel = \"k\"\n",
+        )
+        .unwrap();
+        let layers = vec![local.clone(), global.clone()];
+
+        let targets = layers_defining(&layers, "dup");
+        assert_eq!(targets, vec![local.clone(), global.clone()]);
+
+        // What remove_profile does without an explicit path.
+        for path in &targets {
+            rmw_config_file(path, |file| {
+                file.profiles.remove("dup");
+            })
+            .unwrap();
+        }
+        assert!(layers_defining(&layers, "dup").is_empty(), "no copy left to resurrect");
+        let local_cfg = read_config_file(&local).unwrap();
+        assert!(local_cfg.profiles.contains_key("keep"), "unrelated profile kept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// RMW on a missing file creates it containing only the mutation.
+    #[test]
+    fn rmw_creates_missing_file_with_only_the_delta() {
+        use super::{Profile, read_config_file, rmw_config_file};
+        let dir = layered_test_dir("create");
+        let path = dir.join("hi.toml");
+        rmw_config_file(&path, |file| {
+            file.profiles.insert(
+                "new".into(),
+                Profile {
+                    provider: Some(super::ProviderName::Ollama),
+                    model: Some("m".into()),
+                    ..Default::default()
+                },
+            );
+        })
+        .unwrap();
+        let cfg = read_config_file(&path).unwrap();
+        assert_eq!(cfg.profiles.len(), 1);
+        assert!(cfg.default_profile.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
