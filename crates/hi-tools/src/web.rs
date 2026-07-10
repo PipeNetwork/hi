@@ -123,6 +123,33 @@ fn ssrf_safe_client() -> reqwest::Client {
         .unwrap_or_else(|_| reqwest::Client::new())
 }
 
+/// Follow `url`'s redirect chain in-process, re-validating every hop against
+/// the SSRF blocklist, and return the final URL.
+///
+/// `web_download` hands the URL to `curl -L` / `aria2c`, which follow
+/// redirects at the OS level with no such check — so a model-supplied public
+/// URL that 302s to `169.254.169.254` (or `127.0.0.1`, an RFC1918 host, …)
+/// would slip straight past the initial-hop [`validate_url`]. Walking the
+/// chain here with [`ssrf_safe_client`] (whose redirect policy errors on a
+/// private hop) means the downloader only ever receives a validated terminal
+/// URL, and it runs with its own redirect following disabled so it can't be
+/// steered anywhere we didn't vet.
+async fn resolve_download_redirects(url: &str) -> Result<String> {
+    validate_url(url)?;
+    // GET, not HEAD: some CDNs (HuggingFace's included) only emit the 302 on
+    // GET. The body is never read here, so `.send()` returns as soon as the
+    // headers arrive — a multi-GB file is not downloaded — and `resp.url()` is
+    // the final location after all (validated) redirects. A private hop makes
+    // the redirect policy fail the request, which surfaces here as an error.
+    let resp = ssrf_safe_client()
+        .get(url)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("resolving download URL: {e}"))?;
+    Ok(resp.url().to_string())
+}
+
 /// Per-result snippet budget. Each search returns up to `max_results` items;
 /// each snippet is clipped to this many chars so one verbose page can't dominate
 /// the context.
@@ -358,6 +385,13 @@ pub async fn run_web_download(arguments: &str) -> Result<ToolOutput> {
     // Validate the output path stays in the workspace.
     crate::paths::validate_workspace_path(&output_path)?;
 
+    // Resolve the redirect chain in-process, re-validating every hop, so the
+    // downloader only ever fetches a vetted terminal URL (curl/aria2c follow
+    // redirects with no SSRF check of their own). Done after the cheap path
+    // check so a bad output path fails fast without a network round-trip. Also
+    // covers the HuggingFace path, whose `resolve/…` URL 302s to a CDN host.
+    let url = resolve_download_redirects(&url).await?;
+
     // Make sure aria2c (parallel chunked downloads) is available. If it's
     // missing, try to install it when the user opted in via
     // `HI_AUTO_INSTALL_TOOLS`; otherwise note the fallback so the model can
@@ -494,6 +528,13 @@ fn is_root() -> bool {
 /// server (HuggingFace's CDN honours HTTP range requests), so a multi-GB model
 /// file downloads several times faster than a single curl connection. Falls
 /// back to resumable single-connection `curl` when aria2c isn't on PATH.
+///
+/// `url` MUST already be the validated terminal URL from
+/// [`resolve_download_redirects`]: the curl branch does not follow redirects
+/// (no `-L`), so it fails closed on any unexpected 3xx. aria2c has no flag to
+/// disable redirect following, but since the URL is pre-resolved there is no
+/// hop left to follow; a public content host re-redirecting to a private one
+/// is the same residual DNS-rebind-class risk `validate_url` already documents.
 pub(crate) fn download_command(url: &str, output_path: &str) -> String {
     let agent_header = shell_quote(&agent_header());
     let user_agent = shell_quote(&agent_user_agent());
@@ -527,9 +568,12 @@ pub(crate) fn download_command(url: &str, output_path: &str) -> String {
             url = shell_quote(url),
         )
     } else {
-        // Resumable single-connection download (-L follows redirects, -C - resumes).
+        // Resumable single-connection download (-C - resumes). No -L: the URL
+        // is already the validated terminal from resolve_download_redirects, so
+        // any 3xx here means the server is steering us somewhere unvetted —
+        // --fail turns that into an error instead of a followed redirect.
         format!(
-            "curl -L -C - --fail -H {agent_header} -A {user_agent} -o {out} {url}",
+            "curl -C - --fail -H {agent_header} -A {user_agent} -o {out} {url}",
             out = shell_quote(output_path),
             url = shell_quote(url),
         )
@@ -557,12 +601,13 @@ async fn resolve_download(
     source: &str,
     filename: Option<&str>,
 ) -> Result<(DownloadTarget, String)> {
-    // Full URL — validate like `web_fetch` before handing it to curl/aria2c:
-    // the URL is model-supplied, and without this check `web_download` reaches
-    // cloud metadata services / localhost / private ranges and writes the
-    // response into a workspace file the model can read back. (The downloader
-    // still follows redirects without re-validation; the initial-hop check
-    // blocks the direct form of the attack.)
+    // Full URL — validate like `web_fetch` before handing it on: the URL is
+    // model-supplied, and without this check `web_download` reaches cloud
+    // metadata services / localhost / private ranges and writes the response
+    // into a workspace file the model can read back. The redirect chain is
+    // re-validated hop-by-hop in `resolve_download_redirects` before the
+    // download runs, so a public URL that 302s to an internal host is blocked
+    // too; this is just the fast initial-hop reject.
     if source.starts_with("http://") || source.starts_with("https://") {
         validate_url(source)?;
         let name = filename
@@ -1011,17 +1056,59 @@ mod tests {
         // absent the command must be a resumable curl. We can't remove aria2c,
         // so just assert the fallback string is well-formed when constructed.
         let cmd = format!(
-            "curl -L -C - --fail -H {agent_header} -A {user_agent} -o {out} {url}",
+            "curl -C - --fail -H {agent_header} -A {user_agent} -o {out} {url}",
             agent_header = shell_quote(&agent_header()),
             user_agent = shell_quote(&agent_user_agent()),
             out = shell_quote("a/b.gguf"),
             url = shell_quote("https://example.com/b.gguf"),
         );
-        assert!(cmd.starts_with("curl -L -C - --fail"));
+        assert!(cmd.starts_with("curl -C - --fail"));
         assert!(cmd.contains(" -o a/b.gguf "));
         assert!(cmd.contains("-H 'AI_AGENT: hi'"));
         assert!(cmd.contains("-A hi/"));
         assert!(cmd.contains("a/b.gguf"));
+    }
+
+    #[test]
+    fn download_command_curl_does_not_follow_redirects() {
+        // The curl fallback must not carry -L: the URL handed to it is already
+        // the SSRF-validated terminal from resolve_download_redirects, so
+        // following a fresh redirect would reopen the metadata/localhost hole.
+        // Construct the exact fallback string (aria2c is present here, so we
+        // can't reach the branch via download_command).
+        let cmd = format!(
+            "curl -C - --fail -H {agent_header} -A {user_agent} -o {out} {url}",
+            agent_header = shell_quote(&agent_header()),
+            user_agent = shell_quote(&agent_user_agent()),
+            out = shell_quote("f.gguf"),
+            url = shell_quote("https://example.com/f.gguf"),
+        );
+        assert!(
+            !cmd.split_whitespace().any(|a| a == "-L" || a == "--location"),
+            "curl must not follow redirects: {cmd}"
+        );
+        assert!(cmd.contains("--fail"), "curl must fail closed on 3xx/4xx: {cmd}");
+    }
+
+    #[tokio::test]
+    async fn web_download_private_url_rejected() {
+        // A literal private/link-local host is rejected before any network I/O
+        // (validate_url resolves the literal IP and refuses it). This is the
+        // initial-hop guard; the redirect chain is validated the same way.
+        for src in [
+            "http://169.254.169.254/latest/meta-data/",
+            "http://127.0.0.1:6379/",
+            "http://10.0.0.1/secret",
+        ] {
+            let out = resolve_download(src, None).await;
+            assert!(out.is_err(), "should reject private URL {src}");
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_download_redirects_rejects_private_initial_url() {
+        let out = resolve_download_redirects("http://169.254.169.254/latest/meta-data/").await;
+        assert!(out.is_err(), "metadata endpoint must be refused");
     }
 
     #[tokio::test]
