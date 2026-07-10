@@ -176,36 +176,89 @@ mod native {
             *value = (*value - max).exp();
         }
 
-        let mut ranked = scaled.iter().copied().enumerate().collect::<Vec<_>>();
-        ranked.sort_by(|(left_id, left), (right_id, right)| {
-            right.total_cmp(left).then_with(|| left_id.cmp(right_id))
-        });
-        if let Some(top_k) = top_k.and_then(|value| usize::try_from(value).ok()) {
-            if top_k > 0 {
-                ranked.truncate(top_k.min(ranked.len()));
-            }
-        }
-
         let cutoff = if top_p.is_finite() {
             top_p.clamp(0.0, 1.0)
         } else {
             1.0
         };
-        let total = ranked.iter().map(|(_, weight)| *weight).sum::<f32>();
+        let by_rank = |(left_id, left): &(usize, f32), (right_id, right): &(usize, f32)| {
+            right.total_cmp(left).then_with(|| left_id.cmp(right_id))
+        };
+        let mut ranked = scaled.iter().copied().enumerate().collect::<Vec<_>>();
+
+        // Materialize only as much of the descending order as the sampler can consume,
+        // instead of fully sorting the entire ~150k-token vocabulary every step:
+        //   * top-k bound -> exactly the k highest tokens (O(n) select + O(k log k) sort);
+        //   * top-p only  -> a bounded prefix window, falling back to a full sort only if
+        //                    the nucleus is larger than the window (rare for real logits).
+        // `by_rank` is a total order, so both fast paths yield the candidate set identical
+        // to a full sort. `ordered_len` is how many leading entries are sorted descending.
+        const TOP_P_PREFILTER_WINDOW: usize = 1024;
+        let top_k_keep = top_k
+            .and_then(|value| usize::try_from(value).ok())
+            .filter(|&value| value > 0)
+            .map(|value| value.min(ranked.len()));
+        let ordered_len = match top_k_keep {
+            Some(k) => {
+                if k < ranked.len() {
+                    ranked.select_nth_unstable_by(k, by_rank);
+                    ranked.truncate(k);
+                }
+                ranked.sort_by(by_rank);
+                ranked.len()
+            }
+            None if cutoff < 1.0 && TOP_P_PREFILTER_WINDOW < ranked.len() => {
+                ranked.select_nth_unstable_by(TOP_P_PREFILTER_WINDOW, by_rank);
+                ranked[..TOP_P_PREFILTER_WINDOW].sort_by(by_rank);
+                TOP_P_PREFILTER_WINDOW
+            }
+            None => {
+                ranked.sort_by(by_rank);
+                ranked.len()
+            }
+        };
+
+        // `total` normalizes the top-p cutoff. With a top-k bound it is the kept mass,
+        // summed over the sorted kept set; otherwise it is the full-vocabulary mass,
+        // summed in vocab order so the normalizer is independent of the ranking window.
+        let total = if top_k_keep.is_some() {
+            ranked.iter().map(|(_, weight)| *weight).sum::<f32>()
+        } else {
+            scaled.iter().copied().sum::<f32>()
+        };
         if total <= 0.0 || !total.is_finite() {
             return argmax_host(logits);
         }
 
         let mut candidates = Vec::new();
         let mut cumulative_probability = 0.0f32;
-        for (idx, weight) in ranked {
+        let mut covered = ordered_len == ranked.len();
+        for &(idx, weight) in &ranked[..ordered_len] {
             if weight <= 0.0 {
                 continue;
             }
             candidates.push((idx, weight));
             cumulative_probability += weight / total;
             if cutoff < 1.0 && cumulative_probability >= cutoff {
+                covered = true;
                 break;
+            }
+        }
+        if !covered {
+            // The bounded window did not reach the top-p cutoff, so the nucleus is larger
+            // than the window; order the full distribution and recollect it exactly.
+            ranked.sort_by(by_rank);
+            candidates.clear();
+            cumulative_probability = 0.0;
+            for (idx, weight) in ranked {
+                if weight <= 0.0 {
+                    continue;
+                }
+                candidates.push((idx, weight));
+                cumulative_probability += weight / total;
+                if cutoff < 1.0 && cumulative_probability >= cutoff {
+                    break;
+                }
             }
         }
         if candidates.is_empty() {
@@ -21046,6 +21099,132 @@ mod native {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        // Brute-force full-sort baseline for the host ranked sampler: it mirrors
+        // `sample_host_ranked_logits_with_uniform` but always fully sorts the vocabulary,
+        // so it pins down the exact semantics the windowed/partial-select fast paths must
+        // reproduce. Kept in lock-step with the production `total`/cutoff/CDF rules.
+        fn reference_ranked_sample(
+            logits: &[f32],
+            temperature: f32,
+            top_p: f32,
+            top_k: Option<u32>,
+            sample: f32,
+        ) -> u32 {
+            let mut scaled: Vec<f32> = logits
+                .iter()
+                .map(|&l| {
+                    if l.is_finite() {
+                        l / temperature
+                    } else {
+                        f32::NEG_INFINITY
+                    }
+                })
+                .collect();
+            let max = scaled
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, |acc, v| acc.max(v));
+            for v in &mut scaled {
+                *v = (*v - max).exp();
+            }
+            let mut ranked: Vec<(usize, f32)> = scaled.iter().copied().enumerate().collect();
+            ranked.sort_by(|(li, l), (ri, r)| r.total_cmp(l).then_with(|| li.cmp(ri)));
+            let top_k_keep = top_k
+                .and_then(|v| usize::try_from(v).ok())
+                .filter(|&k| k > 0)
+                .map(|k| k.min(ranked.len()));
+            if let Some(k) = top_k_keep {
+                ranked.truncate(k);
+            }
+            let cutoff = if top_p.is_finite() {
+                top_p.clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            let total = if top_k_keep.is_some() {
+                ranked.iter().map(|(_, w)| *w).sum::<f32>()
+            } else {
+                scaled.iter().copied().sum::<f32>()
+            };
+            let mut candidates = Vec::new();
+            let mut cum = 0.0f32;
+            for (idx, w) in ranked {
+                if w <= 0.0 {
+                    continue;
+                }
+                candidates.push((idx, w));
+                cum += w / total;
+                if cutoff < 1.0 && cum >= cutoff {
+                    break;
+                }
+            }
+            let candidate_total: f32 = candidates.iter().map(|(_, w)| *w).sum();
+            let s = if sample.is_finite() {
+                sample.clamp(0.0, 0.99999994)
+            } else {
+                0.0
+            };
+            let target = s * candidate_total;
+            let mut c = 0.0f32;
+            let last = candidates.last().unwrap().0;
+            for (idx, w) in candidates {
+                c += w;
+                if target < c {
+                    return idx as u32;
+                }
+            }
+            last as u32
+        }
+
+        #[test]
+        fn host_ranked_sampling_matches_full_sort_reference() {
+            // Deterministic LCG-driven logits (no rand/Date needed) so failures reproduce.
+            fn make_logits(seed: u64, n: usize, spread: f32) -> Vec<f32> {
+                let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+                (0..n)
+                    .map(|_| {
+                        s = s
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
+                        let u = ((s >> 40) as f32) / ((1u64 << 24) as f32); // ~[0,1)
+                        (u - 0.5) * spread
+                    })
+                    .collect()
+            }
+
+            // Vocab sizes straddle the TOP_P_PREFILTER_WINDOW (1024) so the small, windowed,
+            // and window-overflow fallback paths all run.
+            let vocabs = [64usize, 200, 1500, 4096];
+            let temps = [0.7f32, 1.0, 1.3];
+            let top_ps = [f32::INFINITY, 0.5, 0.9, 0.95, 0.999];
+            let top_ks: [Option<u32>; 5] = [None, Some(1), Some(10), Some(40), Some(2000)];
+            let samples = [0.0f32, 0.13, 0.5, 0.77, 0.999];
+            let mut cases = 0u64;
+            for (vi, &n) in vocabs.iter().enumerate() {
+                // A tight spread makes a top-p nucleus wide enough to overflow the window on
+                // the large vocabs, exercising the full-sort fallback.
+                let logits = make_logits(0x1234 + vi as u64, n, 4.0);
+                for &t in &temps {
+                    for &tp in &top_ps {
+                        for &tk in &top_ks {
+                            for &sm in &samples {
+                                let got =
+                                    sample_host_ranked_logits_with_uniform(&logits, t, tp, tk, sm)
+                                        .unwrap();
+                                let want = reference_ranked_sample(&logits, t, tp, tk, sm);
+                                assert_eq!(
+                                    got, want,
+                                    "mismatch: vocab={n} temp={t} top_p={tp} top_k={tk:?} sample={sm}"
+                                );
+                                cases += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(cases >= 1500, "expected a broad grid, ran {cases}");
+        }
 
         #[test]
         fn qwen25_window_plan_reorders_merged_groups_then_reverses_merger_rows() {
