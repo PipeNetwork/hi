@@ -689,7 +689,7 @@ fn clip(s: &str, max: usize) -> String {
     if let Some(boundary) = s[..end].rfind(|c: char| c.is_whitespace()) {
         end = boundary;
     }
-    format!("{}…", &s[..end].trim_end())
+    format!("{}…", s[..end].trim_end())
 }
 
 /// A reqwest client with the shared agent identity.
