@@ -1084,10 +1084,14 @@ mod tests {
             url = shell_quote("https://example.com/f.gguf"),
         );
         assert!(
-            !cmd.split_whitespace().any(|a| a == "-L" || a == "--location"),
+            !cmd.split_whitespace()
+                .any(|a| a == "-L" || a == "--location"),
             "curl must not follow redirects: {cmd}"
         );
-        assert!(cmd.contains("--fail"), "curl must fail closed on 3xx/4xx: {cmd}");
+        assert!(
+            cmd.contains("--fail"),
+            "curl must fail closed on 3xx/4xx: {cmd}"
+        );
     }
 
     #[tokio::test]

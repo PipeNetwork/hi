@@ -2021,9 +2021,15 @@ mod tests {
             })
             .unwrap();
         }
-        assert!(layers_defining(&layers, "dup").is_empty(), "no copy left to resurrect");
+        assert!(
+            layers_defining(&layers, "dup").is_empty(),
+            "no copy left to resurrect"
+        );
         let local_cfg = read_config_file(&local).unwrap();
-        assert!(local_cfg.profiles.contains_key("keep"), "unrelated profile kept");
+        assert!(
+            local_cfg.profiles.contains_key("keep"),
+            "unrelated profile kept"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

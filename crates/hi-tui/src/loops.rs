@@ -990,21 +990,17 @@ async fn run_firing(launcher: &FleetLauncher, spec: &LoopSpec) -> Result<FiringO
     // closes stdout but wedges before exiting would otherwise hang this firing
     // forever — leaving `firing` stuck true (that loop never fires again) and
     // leaking its `in_flight` slot for the life of the process.
-    let status = match tokio::time::timeout(
-        Duration::from_secs(FIRING_TIMEOUT_SECS),
-        child.wait(),
-    )
-    .await
-    {
-        Ok(status) => status.map_err(|e| format!("wait failed: {e}"))?,
-        Err(_) => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            return Err(format!(
-                "child closed stdout but didn't exit within {FIRING_TIMEOUT_SECS}s"
-            ));
-        }
-    };
+    let status =
+        match tokio::time::timeout(Duration::from_secs(FIRING_TIMEOUT_SECS), child.wait()).await {
+            Ok(status) => status.map_err(|e| format!("wait failed: {e}"))?,
+            Err(_) => {
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                return Err(format!(
+                    "child closed stdout but didn't exit within {FIRING_TIMEOUT_SECS}s"
+                ));
+            }
+        };
     if !status.success() {
         return Err(format!(
             "agent run failed ({}): {}",
