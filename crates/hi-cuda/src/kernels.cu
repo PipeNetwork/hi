@@ -4367,6 +4367,14 @@ __global__ void sample_last_row_kernel(
   *output_token = argmax_row_device(row, cols);
 }
 
+// One BLOCK per batch (was one thread): the old kernel scanned the whole vocab
+// ~3x sequentially on a single thread, adding ~31 ms/token to temperature sampling
+// (the default non-greedy path). Parallelize: block-reduce the max+argmax (reused by
+// every path); for the temp-only path (no top_k/top_p) block-reduce the softmax total
+// and do the inverse-CDF via a contiguous-chunk prefix sum + a per-chunk local scan,
+// so the sequential tail is ~cols/blockDim, not cols. The ranked top_k/top_p path is
+// a serial scan-per-rank; it stays on thread 0 (far cheaper) but reuses the parallel
+// max. Launched with 256 threads; shared arrays are sized to match.
 __global__ void sample_batched_last_token_kernel(
     const float* logits,
     uint32_t* output_tokens,
@@ -4377,65 +4385,127 @@ __global__ void sample_batched_last_token_kernel(
     float temperature,
     float top_p,
     int top_k) {
-  int batch = blockIdx.x;
-  if (threadIdx.x != 0 || batch >= batch_count || seq_len <= 0 || cols <= 0) {
+  const int batch = blockIdx.x;
+  if (batch >= batch_count || seq_len <= 0 || cols <= 0) {
     return;
   }
-  const float* row = logits + (batch * seq_len + (seq_len - 1)) * cols;
-  float sample = samples != nullptr ? samples[batch] : 0.0f;
+  const int tid = threadIdx.x;
+  const int nthreads = blockDim.x;
+  const float* row =
+      logits + (static_cast<size_t>(batch) * seq_len + (seq_len - 1)) * cols;
+  const float sample = samples != nullptr ? samples[batch] : 0.0f;
+
+  __shared__ float s_max[256];
+  __shared__ int s_argmax[256];
+  __shared__ float s_chunk[256];
+  __shared__ float s_prefix[256];
+  __shared__ float s_total;
+  __shared__ unsigned int s_token;
+
+  // Parallel max logit + argmax (reused by every path).
+  float lmax = -INFINITY;
+  int largmax = 0;
+  for (int i = tid; i < cols; i += nthreads) {
+    const float v = row[i];
+    if (isfinite(v) && v > lmax) {
+      lmax = v;
+      largmax = i;
+    }
+  }
+  s_max[tid] = lmax;
+  s_argmax[tid] = largmax;
+  __syncthreads();
+  for (int s = nthreads >> 1; s > 0; s >>= 1) {
+    if (tid < s && s_max[tid + s] > s_max[tid]) {
+      s_max[tid] = s_max[tid + s];
+      s_argmax[tid] = s_argmax[tid + s];
+    }
+    __syncthreads();
+  }
+  const float max_logit = s_max[0];
+  const unsigned int argmax = static_cast<unsigned int>(s_argmax[0]);
+
   if (!isfinite(temperature) || temperature <= 0.0f) {
-    output_tokens[batch] = argmax_row_device(row, cols);
+    if (tid == 0) {
+      output_tokens[batch] = argmax;
+    }
     return;
   }
-
-  float max_scaled = -INFINITY;
-  for (int idx = 0; idx < cols; ++idx) {
-    float logit = row[idx];
-    if (!isfinite(logit)) {
-      continue;
-    }
-    float scaled = logit / temperature;
-    if (isfinite(scaled) && scaled > max_scaled) {
-      max_scaled = scaled;
-    }
-  }
+  const float max_scaled = max_logit / temperature;
   if (!isfinite(max_scaled)) {
-    output_tokens[batch] = argmax_row_device(row, cols);
+    if (tid == 0) {
+      output_tokens[batch] = argmax;
+    }
     return;
   }
 
-  float cutoff = isfinite(top_p) ? fminf(fmaxf(top_p, 0.0f), 1.0f) : 1.0f;
-  float uniform = isfinite(sample) ? fminf(fmaxf(sample, 0.0f), 0.99999994f) : 0.0f;
-  int effective_top_k = top_k > 0 && top_k < cols ? top_k : cols;
+  const float cutoff = isfinite(top_p) ? fminf(fmaxf(top_p, 0.0f), 1.0f) : 1.0f;
+  const float uniform = isfinite(sample) ? fminf(fmaxf(sample, 0.0f), 0.99999994f) : 0.0f;
+  const int effective_top_k = top_k > 0 && top_k < cols ? top_k : cols;
 
   if (effective_top_k == cols && cutoff >= 1.0f) {
-    float total = 0.0f;
-    for (int idx = 0; idx < cols; ++idx) {
-      total += sampling_weight(row, idx, temperature, max_scaled);
+    // Temp-only: block-reduce the total, then inverse-CDF over contiguous chunks.
+    const int chunk = (cols + nthreads - 1) / nthreads;
+    const int start = tid * chunk;
+    const int end = min(start + chunk, cols);
+    float csum = 0.0f;
+    for (int i = start; i < end; ++i) {
+      csum += sampling_weight(row, i, temperature, max_scaled);
     }
+    s_chunk[tid] = csum;
+    __syncthreads();
+    if (tid == 0) {
+      float acc = 0.0f;
+      for (int j = 0; j < nthreads; ++j) {
+        s_prefix[j] = acc;
+        acc += s_chunk[j];
+      }
+      s_total = acc;
+      s_token = 0xFFFFFFFFu;
+    }
+    __syncthreads();
+    const float total = s_total;
     if (total <= 0.0f || !isfinite(total)) {
-      output_tokens[batch] = argmax_row_device(row, cols);
+      if (tid == 0) {
+        output_tokens[batch] = argmax;
+      }
       return;
     }
-    float target = uniform * total;
-    float cumulative = 0.0f;
-    int last_positive = -1;
-    for (int idx = 0; idx < cols; ++idx) {
-      float weight = sampling_weight(row, idx, temperature, max_scaled);
-      if (weight <= 0.0f) {
-        continue;
+    const float target = uniform * total;
+    // The sequential inverse-CDF picks the first token whose running cumulative
+    // exceeds `target`; that token lives in exactly one contiguous chunk. The owning
+    // thread rescans its chunk starting from its exclusive prefix.
+    const float lo = s_prefix[tid];
+    const float hi = lo + s_chunk[tid];
+    if (start < end && target >= lo && (target < hi || tid == nthreads - 1)) {
+      float cumulative = lo;
+      int chosen = -1;
+      for (int i = start; i < end; ++i) {
+        const float weight = sampling_weight(row, i, temperature, max_scaled);
+        if (weight <= 0.0f) {
+          continue;
+        }
+        chosen = i;  // last positive so far
+        cumulative += weight;
+        if (target < cumulative) {
+          break;
+        }
       }
-      last_positive = idx;
-      cumulative += weight;
-      if (target < cumulative) {
-        output_tokens[batch] = static_cast<uint32_t>(idx);
-        return;
+      if (chosen >= 0) {
+        atomicMin(&s_token, static_cast<unsigned int>(chosen));
       }
     }
-    output_tokens[batch] = static_cast<uint32_t>(last_positive >= 0 ? last_positive : 0);
+    __syncthreads();
+    if (tid == 0) {
+      output_tokens[batch] = (s_token != 0xFFFFFFFFu) ? s_token : argmax;
+    }
     return;
   }
 
+  // Ranked top_k / top_p selection: serial scan-per-rank, kept on one thread.
+  if (tid != 0) {
+    return;
+  }
   float total = 0.0f;
   float previous_weight = INFINITY;
   int previous_id = -1;
@@ -8538,7 +8608,7 @@ extern "C" int hi_cuda_launch_sample_batched_last_token(
       stream == nullptr) {
     return 1;
   }
-  sample_batched_last_token_kernel<<<batch_count, 1, 0, static_cast<cudaStream_t>(stream)>>>(
+  sample_batched_last_token_kernel<<<batch_count, 256, 0, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const float*>(logits),
       static_cast<uint32_t*>(output_tokens),
       static_cast<const float*>(samples),

@@ -20986,6 +20986,81 @@ mod tests {
         }
     }
 
+    /// The parallelized temperature sampler must be a correct inverse-CDF: the same
+    /// logits are replayed across a batch with a sweep of uniform samples; each
+    /// selected token must fall in its softmax CDF bin, and the selection must be
+    /// monotonically non-decreasing in the uniform (the CDF is in token-index order).
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_sample_temperature_is_correct_inverse_cdf() {
+        use crate::runtime::{DeviceBuffer, Stream};
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let stream = Stream::create().unwrap();
+        let mut rng = StdRng::seed_from_u64(0x5a3f_01);
+        let cols = 512usize;
+        let temperature = 1.0f32;
+        let logits: Vec<f32> = (0..cols).map(|_| rng.gen_range(-4.0f32..4.0)).collect();
+        let uniforms: Vec<f32> = vec![0.02, 0.12, 0.27, 0.41, 0.5, 0.63, 0.78, 0.9, 0.97];
+        let batch = uniforms.len();
+
+        // Same logits replayed per batch row; one uniform per row.
+        let mut logits_batched = Vec::with_capacity(batch * cols);
+        for _ in 0..batch {
+            logits_batched.extend_from_slice(&logits);
+        }
+        let logits_dev = DeviceBuffer::alloc(logits_batched.len() * 4).unwrap();
+        logits_dev.copy_from_host(&logits_batched).unwrap();
+        let samples_dev = DeviceBuffer::alloc(batch * 4).unwrap();
+        samples_dev.copy_from_host(&uniforms).unwrap();
+        let out_dev = DeviceBuffer::alloc(batch * std::mem::size_of::<u32>()).unwrap();
+        crate::kernels::launch_sample_batched_last_token(
+            &logits_dev,
+            &out_dev,
+            &samples_dev,
+            batch,
+            1,
+            cols,
+            temperature,
+            1.0,
+            None,
+            &stream,
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+        let tokens = out_dev.copy_to_host::<u32>(batch).unwrap();
+
+        // Host softmax CDF (temp=1 -> weight = exp(logit - max)).
+        let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let weights: Vec<f64> = logits.iter().map(|&l| ((l - max) as f64).exp()).collect();
+        let total: f64 = weights.iter().sum();
+        let mut prefix = vec![0.0f64; cols + 1];
+        for i in 0..cols {
+            prefix[i + 1] = prefix[i] + weights[i];
+        }
+        let tol = total * 1.0e-3;
+        let mut prev = -1i64;
+        for (b, &u) in uniforms.iter().enumerate() {
+            let t = tokens[b] as usize;
+            assert!(t < cols, "token {t} out of range");
+            let target = f64::from(u) * total;
+            // target must lie in token t's CDF bin [prefix[t], prefix[t]+weight[t]).
+            assert!(
+                prefix[t] - tol <= target && target <= prefix[t + 1] + tol,
+                "u={u}: token {t} bin [{}, {}] does not contain target {target}",
+                prefix[t],
+                prefix[t + 1],
+            );
+            // monotonic in the uniform (CDF is in index order)
+            assert!(
+                t as i64 >= prev,
+                "u={u}: token {t} < previous {prev} (not monotone)"
+            );
+            prev = t as i64;
+        }
+    }
+
     #[cfg(feature = "native-cuda")]
     #[test]
     fn native_cuda_kernels_run_on_device() {
