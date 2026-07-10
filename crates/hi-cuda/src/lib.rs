@@ -20162,10 +20162,14 @@ mod tests {
 
         let stream = Stream::create().unwrap();
         let mut rng = StdRng::seed_from_u64(0xa77e_71);
-        // (batch, seq, heads, kv_heads, head_dim); hd % 16 == 0 for WMMA.
-        for &(batch, seq, heads, kv_heads, hd) in
-            &[(2usize, 8usize, 4usize, 4usize, 16usize), (1, 12, 4, 2, 32)]
-        {
+        // (batch, seq, heads, kv_heads, head_dim); hd % 16 == 0 for WMMA. The last case
+        // uses head_dim=128 (8 fragment tiles) and seq=40 (multiple query AND key tiles)
+        // so the WMMA online-softmax rescale across key tiles is exercised, plus GQA.
+        for &(batch, seq, heads, kv_heads, hd) in &[
+            (2usize, 8usize, 4usize, 4usize, 16usize),
+            (1, 12, 4, 2, 32),
+            (1, 40, 8, 2, 128),
+        ] {
             let qn = batch * seq * heads * hd;
             let kn = batch * seq * kv_heads * hd;
             let on = qn;

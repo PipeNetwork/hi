@@ -6947,16 +6947,20 @@ __global__ void wmma_causal_attention_batched_kernel(
     int kv_heads,
     int head_dim) {
   const int T = HI_CUDA_WMMA_TILE;
-  extern __shared__ float smem_f[];
-  // Layout (bytes): Q[T*head_dim half] K[T*head_dim half] V[T*head_dim half]
-  //                 P[T*T half] S/O in float section.
-  half* q_sh = reinterpret_cast<half*>(smem_f);
-  half* k_sh = q_sh + T * head_dim;
-  half* v_sh = k_sh + T * head_dim;
-  half* p_sh = v_sh + T * head_dim;
-  // float section: m[T], l[T], S[T*T], O[T*head_dim]
-  float* s_sh = reinterpret_cast<float*>(p_sh + T * T);
-  float* o_sh = s_sh + 2 * T + T * T;
+  const int hd_tiles = head_dim / T;   // <= 8 (head_dim <= 128)
+  // Flash-attention-v2 style: Q and the O accumulators live in registers/fragments
+  // across the whole key loop, so shared holds only the current K/V tile + small
+  // softmax scratch (~10 KB vs ~22 KB when O was a shared T*head_dim tile). Freeing
+  // shared lets ~2.5x more blocks reside per SM, hiding the WMMA/softmax latency that
+  // a single warp per block cannot on its own.
+  extern __shared__ char smem_raw[];
+  half* k_sh = reinterpret_cast<half*>(smem_raw);  // [T*head_dim]
+  half* v_sh = k_sh + T * head_dim;                // [T*head_dim]
+  half* p_sh = v_sh + T * head_dim;                // [T*T]
+  float* s_sh = reinterpret_cast<float*>(p_sh + T * T);  // [T*T], reused as O store tile
+  float* m_sh = s_sh + T * T;   // [T] running max per query row
+  float* l_sh = m_sh + T;       // [T] running denominator per query row
+  float* f_sh = l_sh + T;       // [T] this-tile O rescale factor per query row
 
   const int head = blockIdx.y;
   const int batch = blockIdx.z;
@@ -6966,93 +6970,120 @@ __global__ void wmma_causal_attention_batched_kernel(
   const float scale = rsqrtf(static_cast<float>(head_dim));
   const int tid = threadIdx.x;         // 0..31 (one warp)
 
-  // load Q tile -> shared (f16), zero-pad rows past seq_len
+  // Stage Q into shared once (reusing k_sh), then hold it in persistent fragments.
   for (int e = tid; e < T * head_dim; e += 32) {
     const int r = e / head_dim, d = e - r * head_dim, qq = q0 + r;
-    q_sh[e] = (qq < seq_len)
+    k_sh[e] = (qq < seq_len)
                   ? q[((batch * seq_len + qq) * heads + head) * head_dim + d]
                   : __float2half(0.0f);
   }
-  for (int e = tid; e < T * head_dim; e += 32) o_sh[e] = 0.0f;
-  float m_run = -INFINITY, l_run = 0.0f;  // per-query, held by thread==row later
-  if (tid < T) { s_sh[tid] = -INFINITY; s_sh[T + tid] = 0.0f; }  // m,l per row in s_sh[0..],[T..]
+  __syncwarp();
+  wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> qf[8];
+  for (int h = 0; h < hd_tiles; ++h) {
+    wmma::load_matrix_sync(qf[h], k_sh + h * T, head_dim);
+  }
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> of[8];
+  for (int h = 0; h < hd_tiles; ++h) {
+    wmma::fill_fragment(of[h], 0.0f);
+  }
+  if (tid < T) {
+    m_sh[tid] = -INFINITY;
+    l_sh[tid] = 0.0f;
+  }
   __syncwarp();
 
-  const int hd_tiles = head_dim / T;
+  // nvcuda 16x16x16 f32 accumulator row map: element i belongs to query row
+  // (lane>>2) for i in {0,1,4,5} and (lane>>2)+8 for i in {2,3,6,7}. Only the row
+  // is needed to apply the per-row online-softmax rescale directly in-fragment.
+  const int row_lo = tid >> 2;
+  const int row_hi = row_lo + 8;
+
   const int block_max_q = min(q0 + T - 1, seq_len - 1);
   for (int kt = 0; kt <= block_max_q; kt += T) {
     // load K,V tile -> shared
     for (int e = tid; e < T * head_dim; e += 32) {
       const int r = e / head_dim, d = e - r * head_dim, src = kt + r;
-      k_sh[e] = (src < seq_len)
-                    ? k[((batch * seq_len + src) * kv_heads + kv_head) * head_dim + d]
-                    : __float2half(0.0f);
-      v_sh[e] = (src < seq_len)
-                    ? v[((batch * seq_len + src) * kv_heads + kv_head) * head_dim + d]
-                    : __float2half(0.0f);
+      const bool ok = src < seq_len;
+      k_sh[e] = ok ? k[((batch * seq_len + src) * kv_heads + kv_head) * head_dim + d]
+                   : __float2half(0.0f);
+      v_sh[e] = ok ? v[((batch * seq_len + src) * kv_heads + kv_head) * head_dim + d]
+                   : __float2half(0.0f);
     }
     __syncwarp();
     // S = Q @ K^T (tensor cores)
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> s_frag;
     wmma::fill_fragment(s_frag, 0.0f);
     for (int h = 0; h < hd_tiles; ++h) {
-      wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> qf;
       wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> kf;
-      wmma::load_matrix_sync(qf, q_sh + h * T, head_dim);
       wmma::load_matrix_sync(kf, k_sh + h * T, head_dim);
-      wmma::mma_sync(s_frag, qf, kf, s_frag);
+      wmma::mma_sync(s_frag, qf[h], kf, s_frag);
     }
-    wmma::store_matrix_sync(s_sh + 2 * T, s_frag, T, wmma::mem_row_major);  // S at s_sh+2T
+    wmma::store_matrix_sync(s_sh, s_frag, T, wmma::mem_row_major);
     __syncwarp();
-    // softmax over this key tile (thread == query row), causal + rescale O
+    // softmax over this key tile (thread == query row), causal; publish P + factor
     if (tid < T) {
       const int qpos = q0 + tid;
-      float* srow = s_sh + 2 * T + tid * T;
+      float* srow = s_sh + tid * T;
       float rmax = -INFINITY;
       for (int j = 0; j < T; ++j) {
         const int kpos = kt + j;
-        float sc = (kpos < seq_len && kpos <= qpos) ? srow[j] * scale : -INFINITY;
+        const float sc = (kpos < seq_len && kpos <= qpos) ? srow[j] * scale : -INFINITY;
         srow[j] = sc;
         rmax = fmaxf(rmax, sc);
       }
-      const float m_old = s_sh[tid];
+      const float m_old = m_sh[tid];
       const float new_m = fmaxf(m_old, rmax);
       const float factor = isfinite(m_old) ? __expf(m_old - new_m) : 0.0f;
+      f_sh[tid] = factor;
       float rsum = 0.0f;
       for (int j = 0; j < T; ++j) {
         const float p = isfinite(srow[j]) ? __expf(srow[j] - new_m) : 0.0f;
         p_sh[tid * T + j] = __float2half(p);
         rsum += p;
       }
-      s_sh[T + tid] = s_sh[T + tid] * factor + rsum;  // l
-      s_sh[tid] = new_m;                                // m
-      float* orow = o_sh + tid * head_dim;
-      for (int d = 0; d < head_dim; ++d) orow[d] *= factor;  // rescale O
+      l_sh[tid] = l_sh[tid] * factor + rsum;
+      m_sh[tid] = new_m;
     }
     __syncwarp();
-    // O += P @ V (tensor cores), per head_dim tile
+    // rescale O accumulators by the per-row factor, then O += P @ V (tensor cores)
+    const float fac_lo = f_sh[row_lo];
+    const float fac_hi = f_sh[row_hi];
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pf;
+    wmma::load_matrix_sync(pf, p_sh, T);
     for (int h = 0; h < hd_tiles; ++h) {
-      wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pf;
+#pragma unroll
+      for (int i = 0; i < of[h].num_elements; ++i) {
+        of[h].x[i] *= (((i >> 1) & 1) ? fac_hi : fac_lo);
+      }
       wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> vf;
-      wmma::fragment<wmma::accumulator, 16, 16, 16, float> of;
-      wmma::load_matrix_sync(pf, p_sh, T);
       wmma::load_matrix_sync(vf, v_sh + h * T, head_dim);
-      wmma::load_matrix_sync(of, o_sh + h * T, head_dim, wmma::mem_row_major);
-      wmma::mma_sync(of, pf, vf, of);
-      wmma::store_matrix_sync(o_sh + h * T, of, head_dim, wmma::mem_row_major);
+      wmma::mma_sync(of[h], pf, vf, of[h]);
     }
     __syncwarp();
   }
-  // write O / l
-  if (tid < T) {
-    const int qpos = q0 + tid;
-    if (qpos < seq_len) {
-      const float l = s_sh[T + tid];
-      const float inv = (l == 0.0f || !isfinite(l)) ? 0.0f : 1.0f / l;
-      float* orow = o_sh + tid * head_dim;
-      for (int d = 0; d < head_dim; ++d)
-        output[((batch * seq_len + qpos) * heads + head) * head_dim + d] = orow[d] * inv;
+
+  // normalize by 1/l per row and write O (through a shared tile, guarding seq_len)
+  const float l_lo = l_sh[row_lo];
+  const float inv_lo = (l_lo == 0.0f || !isfinite(l_lo)) ? 0.0f : 1.0f / l_lo;
+  const float l_hi = l_sh[row_hi];
+  const float inv_hi = (l_hi == 0.0f || !isfinite(l_hi)) ? 0.0f : 1.0f / l_hi;
+  for (int h = 0; h < hd_tiles; ++h) {
+#pragma unroll
+    for (int i = 0; i < of[h].num_elements; ++i) {
+      of[h].x[i] *= (((i >> 1) & 1) ? inv_hi : inv_lo);
     }
+    wmma::store_matrix_sync(s_sh, of[h], T, wmma::mem_row_major);
+    __syncwarp();
+    if (tid < T) {
+      const int qpos = q0 + tid;
+      if (qpos < seq_len) {
+        const float* orow = s_sh + tid * T;
+        for (int c = 0; c < T; ++c) {
+          output[((batch * seq_len + qpos) * heads + head) * head_dim + h * T + c] = orow[c];
+        }
+      }
+    }
+    __syncwarp();
   }
 }
 
@@ -7069,8 +7100,10 @@ extern "C" int hi_cuda_launch_wmma_causal_attention_batched(
   const int qtiles = (seq_len + T - 1) / T;
   dim3 grid(qtiles, heads, batch_count);
   dim3 block(32);
-  size_t shared_bytes = (3 * T * head_dim + T * T) * sizeof(half) +
-                        (2 * T + T * T + T * head_dim) * sizeof(float);
+  // Shared: K[T*head_dim half] V[T*head_dim half] P[T*T half] + S[T*T float] (reused
+  // as the O store tile) + m[T] l[T] factor[T] float. O accumulators live in fragments.
+  size_t shared_bytes = (2 * T * head_dim + T * T) * sizeof(half) +
+                        (T * T + 3 * T) * sizeof(float);
   wmma_causal_attention_batched_kernel<<<grid, block, shared_bytes,
                                          static_cast<cudaStream_t>(stream)>>>(
       static_cast<const half*>(q), static_cast<const half*>(k),
