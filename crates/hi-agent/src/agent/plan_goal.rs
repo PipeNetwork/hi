@@ -65,7 +65,7 @@ impl crate::Agent {
                 return Err(err);
             }
         };
-        self.add_usage(completion.usage);
+        self.add_side_usage(completion.usage);
         // Fall back to the completion content if the provider returned text only in
         // the final object rather than via stream deltas.
         if text.trim().is_empty() {

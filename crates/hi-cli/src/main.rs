@@ -70,16 +70,7 @@ async fn main() -> Result<()> {
                 );
                 println!("tool_mode:  {:?}", settings.tool_mode);
                 println!("compat:     {:?}", settings.compat);
-                let api_key_display = if settings.api_key.len() > 8 {
-                    format!(
-                        "{}...{}",
-                        &settings.api_key[..4],
-                        &settings.api_key[settings.api_key.len() - 4..]
-                    )
-                } else {
-                    "***".to_string()
-                };
-                println!("api_key:    {}", api_key_display);
+                println!("api_key:    {}", config::mask_key(&settings.api_key));
                 return Ok(());
             }
             Err(err) => {
@@ -456,12 +447,12 @@ async fn main() -> Result<()> {
                 let path = config::writable_config_path(config_path.as_deref())
                     .context("could not determine config path")?;
                 let mut file = file.lock().unwrap();
-                let mut profile = form.to_profile();
-                if profile.mcp_url.is_none()
-                    && let Some(existing) = file.profiles.get(&data.name)
-                {
-                    profile.mcp_url = existing.mcp_url.clone();
-                }
+                // Editing an existing profile must not wipe the fields the form
+                // doesn't cover (max_tokens, fallback, tool_mode, …).
+                let profile = match file.profiles.get(&data.name) {
+                    Some(existing) => form.apply_to(existing),
+                    None => form.to_profile(),
+                };
                 config::upsert_profile(&mut file, &data.name, profile, &path)?;
                 // Return the updated profile list.
                 Ok(profile_infos(&file))

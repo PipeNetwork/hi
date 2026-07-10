@@ -115,7 +115,7 @@ impl crate::Agent {
                 return;
             }
         };
-        self.add_usage(completion.usage);
+        self.add_side_usage(completion.usage);
         let _ = self.persist();
 
         // Fall back to the final content if the provider didn't stream text.

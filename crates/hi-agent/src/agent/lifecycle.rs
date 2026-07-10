@@ -455,13 +455,25 @@ impl crate::Agent {
         out
     }
 
+    /// Usage from a *main-conversation* model call: counts toward all totals
+    /// and refreshes the context gauge with the request's occupancy.
     pub(crate) fn add_usage(&mut self, usage: Usage) {
-        self.totals.add(usage);
-        self.last_turn_usage.add(usage);
+        self.add_side_usage(usage);
         let effective_input = usage.effective_input_tokens();
         if effective_input > 0 {
             self.context_used = effective_input;
         }
+    }
+
+    /// Usage from a *side* model call (finalize, skeptic, curate, memory,
+    /// goal planning, explore children, compaction summarize): counts toward
+    /// totals and the turn's spend, but must not touch `context_used` — that
+    /// gauge tracks the main conversation's occupancy and drives
+    /// auto-compaction, and a ~3K-token side request at the end of a 150K
+    /// session would reset it to 2%, silently disabling the next compaction.
+    pub(crate) fn add_side_usage(&mut self, usage: Usage) {
+        self.totals.add(usage);
+        self.last_turn_usage.add(usage);
     }
 
     pub(crate) fn reset_last_turn_usage(&mut self, user_prompt_tokens: u64) {

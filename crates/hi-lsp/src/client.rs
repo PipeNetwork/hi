@@ -3,12 +3,12 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
-use tokio::io::BufReader;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStdout};
 use tokio::sync::Mutex;
 
@@ -18,11 +18,38 @@ use crate::protocol::{read_message, request_timeout, write_message};
 /// keyed by document URI. Updated as notifications arrive during requests.
 pub type DiagnosticsMap = StdMutex<HashMap<String, Vec<Value>>>;
 
+/// Once data for a message has started arriving, how long a complete frame may
+/// take to finish before we declare the stream unrecoverable. Local pipes
+/// deliver even multi-MB `publishDiagnostics` payloads in milliseconds, so
+/// this only fires on a genuinely wedged server.
+const MESSAGE_GRACE: Duration = Duration::from_secs(10);
+
+/// Outcome of one bounded read attempt on the server's stdout.
+enum ReadOutcome {
+    /// A complete JSON-RPC message.
+    Message(Vec<u8>),
+    /// No data arrived within the budget; the stream position is untouched.
+    Idle,
+    /// The stream closed (server exited or pipe broke at a frame boundary).
+    Closed,
+    /// A read stalled mid-frame — the stream position is unknown, so this
+    /// client is unusable and must be respawned (see [`LspClient::is_poisoned`]).
+    Poisoned,
+}
+
 /// One running language server. Owns the child process and its stdio.
 pub struct LspClient {
     child: Mutex<Child>,
     stdin: Mutex<tokio::process::ChildStdin>,
     stdout: Mutex<BufReader<ChildStdout>>,
+    /// Serializes whole request/drain round-trips. Without it, two concurrent
+    /// requests read from the same stream and each can consume (and drop) the
+    /// other's response, leaving the loser to spin until its timeout.
+    io: Mutex<()>,
+    /// Set when a read stopped mid-frame, leaving the JSON-RPC stream position
+    /// unknown: every later read would misparse body bytes as headers. The
+    /// manager checks this and respawns the server.
+    poisoned: AtomicBool,
     next_id: AtomicU64,
     versions: StdMutex<HashMap<String, u64>>,
     /// Diagnostics pushed by the server, keyed by document URI.
@@ -48,6 +75,8 @@ impl LspClient {
             child: Mutex::new(child),
             stdin: Mutex::new(stdin),
             stdout: Mutex::new(BufReader::new(stdout)),
+            io: Mutex::new(()),
+            poisoned: AtomicBool::new(false),
             next_id: AtomicU64::new(1),
             versions: StdMutex::new(HashMap::new()),
             pushed_diagnostics: StdMutex::new(HashMap::new()),
@@ -73,17 +102,61 @@ impl LspClient {
         Ok(())
     }
 
+    /// Read one message from stdout, spending at most `budget` *waiting for
+    /// data to appear*. Split into two phases because `read_message` is not
+    /// cancellation-safe: a timeout that fires mid-frame throws away consumed
+    /// bytes and permanently desyncs the stream.
+    ///
+    /// Phase 1 waits on `fill_buf`, which consumes nothing — cancelling it is
+    /// harmless. Once bytes are available, phase 2 commits to reading the full
+    /// frame under its own generous grace; only if *that* stalls is the client
+    /// marked poisoned (respawned by the manager on the next query).
+    async fn read_one(&self, budget: Duration) -> ReadOutcome {
+        let mut stdout = self.stdout.lock().await;
+        match tokio::time::timeout(budget, stdout.fill_buf()).await {
+            Err(_) => return ReadOutcome::Idle,
+            Ok(Err(_)) => return ReadOutcome::Closed,
+            Ok(Ok([])) => return ReadOutcome::Closed,
+            Ok(Ok(_)) => {}
+        }
+        match tokio::time::timeout(MESSAGE_GRACE, read_message(&mut stdout)).await {
+            Ok(Some(msg)) => ReadOutcome::Message(msg),
+            Ok(None) => ReadOutcome::Closed,
+            Err(_) => {
+                self.poisoned.store(true, Ordering::SeqCst);
+                ReadOutcome::Poisoned
+            }
+        }
+    }
+
+    /// Record a `publishDiagnostics` notification into `pushed_diagnostics`.
+    /// Other notifications are dropped.
+    fn capture_notification(&self, v: &Value) {
+        if v.get("method").and_then(|m| m.as_str()) == Some("textDocument/publishDiagnostics")
+            && let Some(params) = v.get("params")
+            && let Some(uri) = params.get("uri").and_then(|u| u.as_str())
+        {
+            let diags = params
+                .get("diagnostics")
+                .and_then(|d| d.as_array())
+                .cloned()
+                .unwrap_or_default();
+            self.pushed_diagnostics
+                .lock()
+                .unwrap()
+                .insert(uri.to_string(), diags);
+        }
+    }
+
     /// Send a request and wait for the matching response.
     ///
-    /// NOTE: this acquires `self.stdout` on each read, so concurrent requests
-    /// on the same `LspClient` serialize. `LspManager` now clones an `Arc`
-    /// handle and drops the servers lock before calling, so different languages
-    /// run concurrently — but two calls to the *same* client still serialize
-    /// here. A response whose `id` doesn't match is currently dropped (only
-    /// `publishDiagnostics` notifications are captured). If pipelining is ever
-    /// added, a background reader task feeding a per-id channel would be needed
-    /// to avoid losing out-of-order responses.
+    /// The whole round-trip holds the `io` lock, so concurrent requests (and
+    /// drains) on the same client serialize instead of stealing each other's
+    /// messages off the shared stream. `LspManager` clones an `Arc` handle and
+    /// drops the servers lock before calling, so different languages still run
+    /// concurrently.
     pub async fn request(&self, method: &str, params: Option<Value>) -> Result<Value> {
+        let _io = self.io.lock().await;
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let body = json!({
             "jsonrpc": "2.0",
@@ -101,40 +174,25 @@ impl LspClient {
             if remaining.is_zero() {
                 bail!("LSP request `{method}` timed out");
             }
-            let msg = tokio::time::timeout(remaining, async {
-                let mut stdout = self.stdout.lock().await;
-                read_message(&mut stdout).await
-            })
-            .await
-            .context("LSP read timed out")?;
-            let msg = match msg {
-                Some(m) => m,
-                None => bail!("LSP server closed the stream"),
-            };
-            let v: Value = serde_json::from_slice(&msg)?;
-            if v.get("id").and_then(|i| i.as_u64()) == Some(id) {
-                if let Some(err) = v.get("error") {
-                    bail!("LSP error on `{method}`: {err}");
+            match self.read_one(remaining).await {
+                ReadOutcome::Idle => continue, // deadline re-checked above
+                ReadOutcome::Closed => bail!("LSP server closed the stream"),
+                ReadOutcome::Poisoned => bail!(
+                    "LSP stream lost sync during `{method}`; the server will be restarted on the next query"
+                ),
+                ReadOutcome::Message(msg) => {
+                    let v: Value = serde_json::from_slice(&msg)?;
+                    if v.get("id").and_then(|i| i.as_u64()) == Some(id) {
+                        if let Some(err) = v.get("error") {
+                            bail!("LSP error on `{method}`: {err}");
+                        }
+                        return Ok(v["result"].clone());
+                    }
+                    // Capture pushed diagnostics — the server sends these as
+                    // notifications after didOpen/didChange, not as responses.
+                    self.capture_notification(&v);
                 }
-                return Ok(v["result"].clone());
             }
-            // Capture pushed diagnostics — the server sends these as
-            // notifications after didOpen/didChange, not as responses.
-            if v.get("method").and_then(|m| m.as_str()) == Some("textDocument/publishDiagnostics")
-                && let Some(params) = v.get("params")
-                && let Some(uri) = params.get("uri").and_then(|u| u.as_str())
-            {
-                let diags = params
-                    .get("diagnostics")
-                    .and_then(|d| d.as_array())
-                    .cloned()
-                    .unwrap_or_default();
-                self.pushed_diagnostics
-                    .lock()
-                    .unwrap()
-                    .insert(uri.to_string(), diags);
-            }
-            // Other notifications are dropped.
         }
     }
 
@@ -177,40 +235,28 @@ impl LspClient {
         Ok(())
     }
 
-    /// Read any pending notifications from stdout without blocking, capturing
-    /// `publishDiagnostics` into `pushed_diagnostics`. Times out after `wait`
-    /// if no data is available.
+    /// Read any pending notifications from stdout, capturing
+    /// `publishDiagnostics` into `pushed_diagnostics`. Returns after `wait`
+    /// with no data. Holds the `io` lock so it can't race a concurrent
+    /// request's read loop and eat its response; the two-phase `read_one`
+    /// means an expiring budget can't cancel a frame mid-read (which used to
+    /// desync the stream when a large diagnostics payload straddled the
+    /// deadline).
     pub async fn drain_notifications(&self, wait: Duration) {
+        let _io = self.io.lock().await;
         let deadline = Instant::now() + wait;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return;
             }
-            let msg = tokio::time::timeout(remaining, async {
-                let mut stdout = self.stdout.lock().await;
-                read_message(&mut stdout).await
-            })
-            .await;
-            let msg = match msg {
-                Ok(Some(m)) => m,
-                _ => return,
-            };
-            if let Ok(v) = serde_json::from_slice::<Value>(&msg)
-                && v.get("method").and_then(|m| m.as_str())
-                    == Some("textDocument/publishDiagnostics")
-                && let Some(params) = v.get("params")
-                && let Some(uri) = params.get("uri").and_then(|u| u.as_str())
-            {
-                let diags = params
-                    .get("diagnostics")
-                    .and_then(|d| d.as_array())
-                    .cloned()
-                    .unwrap_or_default();
-                self.pushed_diagnostics
-                    .lock()
-                    .unwrap()
-                    .insert(uri.to_string(), diags);
+            match self.read_one(remaining).await {
+                ReadOutcome::Message(msg) => {
+                    if let Ok(v) = serde_json::from_slice::<Value>(&msg) {
+                        self.capture_notification(&v);
+                    }
+                }
+                ReadOutcome::Idle | ReadOutcome::Closed | ReadOutcome::Poisoned => return,
             }
         }
     }
@@ -222,8 +268,12 @@ impl LspClient {
     /// strong ref. The `child`/`stdin`/`stdout` are already behind `Mutex`es,
     /// so no `&mut` is actually required.
     pub async fn shutdown(&self) -> Result<()> {
-        let _ = self.request("shutdown", None).await;
-        let _ = self.notify("exit", Value::Null).await;
+        // Skip the graceful JSON-RPC goodbye on a desynced stream — the
+        // `shutdown` request would only misread frames until its timeout.
+        if !self.is_poisoned() {
+            let _ = self.request("shutdown", None).await;
+            let _ = self.notify("exit", Value::Null).await;
+        }
         // Give the server a moment to exit gracefully, then force-kill so a
         // stubborn server can't hang the shutdown indefinitely. `kill_on_drop`
         // would eventually clean up, but only when the `LspClient` is dropped —
@@ -240,6 +290,13 @@ impl LspClient {
     /// Whether the child process is still running.
     pub async fn is_alive(&self) -> bool {
         matches!(self.child.lock().await.try_wait(), Ok(None))
+    }
+
+    /// Whether the JSON-RPC stream has lost sync (a read stalled mid-frame).
+    /// A poisoned client's child may still be alive, but no further messages
+    /// can be exchanged reliably — the manager respawns it on the next query.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::SeqCst)
     }
 
     /// Get the diagnostics the server has pushed for a URI (via

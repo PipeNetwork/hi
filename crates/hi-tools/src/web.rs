@@ -557,8 +557,14 @@ async fn resolve_download(
     source: &str,
     filename: Option<&str>,
 ) -> Result<(DownloadTarget, String)> {
-    // Full URL — use directly.
+    // Full URL — validate like `web_fetch` before handing it to curl/aria2c:
+    // the URL is model-supplied, and without this check `web_download` reaches
+    // cloud metadata services / localhost / private ranges and writes the
+    // response into a workspace file the model can read back. (The downloader
+    // still follows redirects without re-validation; the initial-hop check
+    // blocks the direct form of the attack.)
     if source.starts_with("http://") || source.starts_with("https://") {
+        validate_url(source)?;
         let name = filename
             .map(str::to_string)
             .or_else(|| {

@@ -96,7 +96,7 @@ impl crate::Agent {
                 return;
             }
         };
-        self.add_usage(completion.usage);
+        self.add_side_usage(completion.usage);
         let _ = self.persist();
         if out.trim().is_empty() {
             for c in &completion.content {

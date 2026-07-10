@@ -157,7 +157,7 @@ impl crate::Agent {
                 return SkepticVerdict::Approve; // fail-open on a provider error
             }
         };
-        self.add_usage(completion.usage);
+        self.add_side_usage(completion.usage);
         if text.trim().is_empty() {
             text = content_text(&completion.content);
         }

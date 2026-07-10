@@ -339,6 +339,11 @@ fn looks_like_path_or_command(bullet: &str) -> Option<String> {
     for word in body.split_whitespace() {
         let word =
             word.trim_matches(|c: char| !c.is_alphanumeric() && c != '/' && c != '.' && c != '-');
+        // A trailing '.' is sentence punctuation, not part of a path: without
+        // this, "src/main.rs." never exists and any prose word ending a
+        // sentence ("messages.") reads as having an (empty) extension — either
+        // way the bullet gets dropped as an implausible path.
+        let word = word.trim_end_matches('.');
         if word.contains('/') || has_extension(word) {
             return Some(word.to_string());
         }
@@ -347,9 +352,16 @@ fn looks_like_path_or_command(bullet: &str) -> Option<String> {
 }
 
 fn has_extension(s: &str) -> bool {
-    Path::new(s)
-        .extension()
-        .is_some_and(|e| e.to_string_lossy().len() <= 6)
+    Path::new(s).extension().is_some_and(|e| {
+        let e = e.to_string_lossy();
+        // Real file extensions (rs, py, json, mp4, …) are short alphanumerics
+        // with at least one letter. This keeps version numbers ("v1.2") and
+        // abbreviations from classifying prose as a path to be verified.
+        !e.is_empty()
+            && e.len() <= 6
+            && e.chars().all(|c| c.is_ascii_alphanumeric())
+            && e.chars().any(|c| c.is_ascii_alphabetic())
+    })
 }
 
 /// Verify distilled bullets that look like paths or commands against the current
@@ -582,15 +594,35 @@ impl Drop for LockGuard {
     }
 }
 
+/// A lock older than this is presumed abandoned (the holder crashed or was
+/// killed before its `Drop` ran). Memory writes are sub-second, so minutes of
+/// age means no live holder — without this, one SIGKILL would disable memory
+/// persistence for every future session until the file is deleted by hand.
+const LOCK_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
 fn take_lock(parent: &Path) -> Result<LockGuard, String> {
     let lock = parent.join(".memory.lock");
-    match OpenOptions::new().write(true).create_new(true).open(&lock) {
-        Ok(_) => Ok(LockGuard(lock)),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            Err("another session is updating memory".to_string())
+    for _ in 0..2 {
+        match OpenOptions::new().write(true).create_new(true).open(&lock) {
+            Ok(_) => return Ok(LockGuard(lock)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = fs::metadata(&lock)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.elapsed().ok())
+                    .is_some_and(|age| age > LOCK_STALE_AFTER);
+                if !stale {
+                    return Err("another session is updating memory".to_string());
+                }
+                // Break the stale lock and retry the exclusive create once (a
+                // concurrent session may break it first — losing that race
+                // lands in AlreadyExists again and errors out normally).
+                let _ = fs::remove_file(&lock);
+            }
+            Err(e) => return Err(format!("couldn't take memory lock: {e}")),
         }
-        Err(e) => Err(format!("couldn't take memory lock: {e}")),
     }
+    Err("another session is updating memory".to_string())
 }
 
 // Forward the message types so callers don't need a separate import.

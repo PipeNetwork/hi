@@ -17,6 +17,11 @@ use crate::types::{Completion, Content, StreamEvent, Usage, estimate_messages_to
 const SPECIAL_TOKEN_PREFIX: &str = "<|";
 const SPECIAL_TOKEN_SUFFIX: &str = "|>";
 
+/// Upper bound on parallel tool calls in one response. The per-delta `index`
+/// arrives straight from the provider's SSE JSON; without a bound, one corrupt
+/// frame (`"index": 9999999999`) forces a multi-GB allocation.
+const MAX_STREAM_TOOL_CALLS: usize = 512;
+
 /// How long to keep reading after `finish_reason` for the trailing usage frame.
 /// With `stream_options.include_usage`, spec-compliant providers send usage in
 /// a separate chunk AFTER the finish chunk (empty `choices`) — breaking on
@@ -188,9 +193,22 @@ impl<'a> StreamingTextFilter<'a> {
         let mut i = 0;
         while i < bytes.len() {
             if bytes[i] == b'<' && i + 1 < bytes.len() && bytes[i + 1] == b'|' {
-                if let Some(end) = combined[i..].find(SPECIAL_TOKEN_SUFFIX) {
-                    let token_end = i + end + SPECIAL_TOKEN_SUFFIX.len();
-                    let inner = &combined[i + SPECIAL_TOKEN_PREFIX.len()..i + end];
+                let inner_start = i + SPECIAL_TOKEN_PREFIX.len();
+                // A token identifier is `[A-Za-z0-9_]+`, so if the char right
+                // after `<|` can't start one (e.g. the text `<|>`), this can
+                // never become a special token — pass it through instead of
+                // buffering. Searching the suffix from `inner_start` also keeps
+                // the prefix's own `|` from matching `|>` (which produced a
+                // reversed slice range and panicked on the 3-char input `<|>`).
+                if inner_start < bytes.len()
+                    && !(bytes[inner_start].is_ascii_alphanumeric() || bytes[inner_start] == b'_')
+                {
+                    i += 1;
+                    continue;
+                }
+                if let Some(end) = combined[inner_start..].find(SPECIAL_TOKEN_SUFFIX) {
+                    let token_end = inner_start + end + SPECIAL_TOKEN_SUFFIX.len();
+                    let inner = &combined[inner_start..inner_start + end];
                     if is_token_identifier(inner) {
                         out.push_str(&combined[last..i]);
                         last = token_end;
@@ -565,15 +583,19 @@ fn strip_special_tokens(text: &str) -> String {
     let mut last = 0;
     let mut i = 0;
     while i < bytes.len() {
+        // Search the suffix from after the `<|` prefix so the prefix's own `|`
+        // can't match `|>` (the text `<|>` produced a reversed slice range and
+        // panicked).
         if bytes[i] == b'<'
             && i + 1 < bytes.len()
             && bytes[i + 1] == b'|'
-            && let Some(end) = text[i..].find(SPECIAL_TOKEN_SUFFIX)
+            && let Some(end) = text[i + SPECIAL_TOKEN_PREFIX.len()..].find(SPECIAL_TOKEN_SUFFIX)
         {
-            let inner = &text[i + SPECIAL_TOKEN_PREFIX.len()..i + end];
+            let inner_start = i + SPECIAL_TOKEN_PREFIX.len();
+            let inner = &text[inner_start..inner_start + end];
             if is_token_identifier(inner) {
                 out.push_str(&text[last..i]);
-                last = i + end + SPECIAL_TOKEN_SUFFIX.len();
+                last = inner_start + end + SPECIAL_TOKEN_SUFFIX.len();
                 i = last;
                 continue;
             }
@@ -671,12 +693,23 @@ where
         if data == "[DONE]" {
             break;
         }
-        let chunk = serde_json::from_str::<ChatChunk>(&data).with_context(|| {
-            format!(
-                "malformed SSE JSON chunk: {}",
-                data.chars().take(160).collect::<String>()
-            )
-        })?;
+        let chunk = match serde_json::from_str::<ChatChunk>(&data) {
+            Ok(chunk) => chunk,
+            // Same trade-off as the read-error arm above: once the answer has
+            // finished, the only thing left is the trailing usage frame, and a
+            // provider that pads the tail with a heartbeat / vendor sentinel /
+            // truncated frame must not cost us (and re-bill) a fully-streamed
+            // completion.
+            Err(_) if stream_complete => break,
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "malformed SSE JSON chunk: {}",
+                        data.chars().take(160).collect::<String>()
+                    )
+                });
+            }
+        };
         if let Some(error) = chunk.error {
             let message = stream_error_message(&error);
             return Err(ProviderError::new(classify_stream_api_error(&message), message).into());
@@ -722,10 +755,45 @@ where
             if let Some(deltas) = delta.tool_calls {
                 progressed = true;
                 for tcd in deltas {
-                    if tool_calls.len() <= tcd.index {
-                        tool_calls.resize_with(tcd.index + 1, ToolCallBuilder::default);
+                    let index = match tcd.index {
+                        // The index comes straight off the wire — bound it so a
+                        // corrupt frame can't force a huge `resize_with`
+                        // allocation (or a capacity-overflow abort).
+                        Some(i) if i >= MAX_STREAM_TOOL_CALLS => continue,
+                        Some(i) => i,
+                        // Some local OpenAI-compat servers omit `index` (the
+                        // same ones that omit `id` — see ToolCallBuilder::
+                        // finish). serde's default of 0 would concatenate every
+                        // call into tool_calls[0] ("readread", `{..}{..}`).
+                        // These servers send each call complete in one delta,
+                        // so: a delta announcing a name (or a different id)
+                        // when the current call already has one starts a new
+                        // call; anything else continues the current call.
+                        None => {
+                            let delta_id = tcd.id.as_deref().unwrap_or("");
+                            let delta_name = tcd
+                                .function
+                                .as_ref()
+                                .and_then(|f| f.name.as_deref())
+                                .unwrap_or("");
+                            match tool_calls.last() {
+                                None => 0,
+                                Some(last)
+                                    if (!delta_name.is_empty() && !last.name.is_empty())
+                                        || (!delta_id.is_empty()
+                                            && !last.id.is_empty()
+                                            && last.id != delta_id) =>
+                                {
+                                    tool_calls.len()
+                                }
+                                Some(_) => tool_calls.len() - 1,
+                            }
+                        }
+                    };
+                    if tool_calls.len() <= index {
+                        tool_calls.resize_with(index + 1, ToolCallBuilder::default);
                     }
-                    let builder = &mut tool_calls[tcd.index];
+                    let builder = &mut tool_calls[index];
                     if let Some(id) = tcd.id
                         && !id.is_empty()
                     {
@@ -956,8 +1024,11 @@ struct Delta {
 
 #[derive(Deserialize)]
 struct ToolCallDelta {
+    /// `None` when the server omits `index` entirely — routing then falls back
+    /// to the new-call heuristic in the delta loop instead of collapsing every
+    /// call into slot 0.
     #[serde(default)]
-    index: usize,
+    index: Option<usize>,
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]

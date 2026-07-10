@@ -282,7 +282,11 @@ impl Goal {
                 .any(|s| s.status == GoalStatus::Active)
         {
             self.status = GoalStatus::Failed;
-        } else if self.status == GoalStatus::Done {
+        } else {
+            // Per the contract above: not all done, not failed-with-no-active
+            // → Active. This must also revive a previously `Failed` goal whose
+            // plan was revised to activate new work — leaving it `Failed`
+            // would permanently disable auto-drive despite live sub-goals.
             self.status = GoalStatus::Active;
         }
     }

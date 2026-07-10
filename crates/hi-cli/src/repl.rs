@@ -295,7 +295,7 @@ pub(crate) async fn repl(
                             let arg = arg.trim();
                             // --- Subcommands ---
                             if arg == "add" {
-                                match provider_add_prompt(config, &mut editor) {
+                                match provider_add_prompt(config, config_path.as_deref(), &mut editor) {
                                     Ok(name) => {
                                         println!(
                                             "\x1b[2msaved profile '{name}' — /provider {name} to use\x1b[0m"
@@ -309,7 +309,12 @@ pub(crate) async fn repl(
                             }
                             if let Some(edit_name) = arg.strip_prefix("edit") {
                                 let edit_name = edit_name.trim();
-                                match provider_edit_prompt(config, edit_name, &mut editor) {
+                                match provider_edit_prompt(
+                                    config,
+                                    config_path.as_deref(),
+                                    edit_name,
+                                    &mut editor,
+                                ) {
                                     Ok(name) => {
                                         println!("\x1b[2msaved profile '{name}'\x1b[0m");
                                     }
@@ -341,7 +346,9 @@ pub(crate) async fn repl(
                                     );
                                     continue;
                                 }
-                                let path = match config::writable_config_path(None) {
+                                let path = match config::writable_config_path(
+                                    config_path.as_deref(),
+                                ) {
                                     Some(p) => p,
                                     None => {
                                         eprintln!("\x1b[33mcould not determine config path\x1b[0m");
@@ -759,6 +766,7 @@ fn rl_prompt(editor: &mut crate::complete::ReplEditor, message: &str) -> Result<
 /// config file. Returns the profile name.
 fn provider_add_prompt(
     config: &mut config::Config,
+    config_path: Option<&Path>,
     editor: &mut crate::complete::ReplEditor,
 ) -> Result<String> {
     use config::{ProfileForm, ProviderName, upsert_profile, writable_config_path};
@@ -842,7 +850,7 @@ fn provider_add_prompt(
     };
     let profile = form.to_profile();
 
-    let path = writable_config_path(None).context("could not determine config path")?;
+    let path = writable_config_path(config_path).context("could not determine config path")?;
     upsert_profile(config, &name, profile, &path)?;
     Ok(name)
 }
@@ -850,6 +858,7 @@ fn provider_add_prompt(
 /// Interactively edit an existing profile. `name` may be empty to prompt for it.
 fn provider_edit_prompt(
     config: &mut config::Config,
+    config_path: Option<&Path>,
     name: &str,
     editor: &mut crate::complete::ReplEditor,
 ) -> Result<String> {
@@ -903,17 +912,7 @@ fn provider_edit_prompt(
 
     // API key.
     let key_label = if form.store_as_env { "env var" } else { "key" };
-    let masked = if form.api_key.len() > 8 {
-        format!(
-            "{}…{}",
-            &form.api_key[..4],
-            &form.api_key[form.api_key.len() - 4..]
-        )
-    } else if form.api_key.is_empty() {
-        "(none)".to_string()
-    } else {
-        "***".to_string()
-    };
+    let masked = config::mask_key(&form.api_key);
     let new_key = rl_prompt(
         editor,
         &format!("API key/{key_label} (current: {masked}): "),
@@ -935,11 +934,8 @@ fn provider_edit_prompt(
         form.base_url = new_url;
     }
 
-    let mut profile = form.to_profile();
-    if profile.mcp_url.is_none() {
-        profile.mcp_url = existing.mcp_url.clone();
-    }
-    let path = writable_config_path(None).context("could not determine config path")?;
+    let profile = form.apply_to(existing);
+    let path = writable_config_path(config_path).context("could not determine config path")?;
     upsert_profile(config, &name, profile, &path)?;
     Ok(name)
 }

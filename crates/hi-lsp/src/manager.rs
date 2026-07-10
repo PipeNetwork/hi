@@ -91,6 +91,10 @@ impl LspManager {
                 let _ = client.shutdown().await;
             }
             self.running.lock().unwrap().clear();
+            // The dedup hashes describe documents open on the servers we just
+            // shut down. Without clearing, a later `/lsp on` would skip the
+            // didOpen for "already synced" files the fresh servers never saw.
+            self.synced.lock().unwrap().clear();
         } else {
             // Warm up the server for the project's primary language.
             if let Some(lang) = detect_project_language(&self.root)
@@ -159,29 +163,42 @@ impl LspManager {
     /// wins, and later spawners detect the existing live server and explicitly
     /// shut down their duplicate (rather than relying on `kill_on_drop`).
     async fn ensure(&self, lang: Language) -> Result<()> {
-        // Fast path: already running and alive.
+        // Fast path: already running, alive, and its stream is intact.
         {
             let servers = self.servers.lock().await;
             if let Some(client) = servers.get(&lang) {
-                if client.is_alive().await {
+                if client.is_alive().await && !client.is_poisoned() {
                     return Ok(());
                 }
-                // Crashed — fall through to respawn. Drop the lock first by
-                // removing under a fresh acquisition below.
+                // Crashed or desynced — fall through to respawn. Drop the lock
+                // first by removing under a fresh acquisition below.
             } else {
                 // Not present — spawn.
             }
         }
-        // Remove any dead entry, then spawn outside the lock.
-        {
+        // Remove any dead/poisoned entry, then spawn outside the lock.
+        let stale = {
             let mut servers = self.servers.lock().await;
-            if let Some(client) = servers.get(&lang) {
-                if client.is_alive().await {
-                    return Ok(()); // raced with another ensure; it's alive
+            match servers.get(&lang) {
+                Some(client) if client.is_alive().await && !client.is_poisoned() => {
+                    return Ok(()); // raced with another ensure; it's healthy
                 }
-                servers.remove(&lang);
-                self.running.lock().unwrap().remove(&lang);
+                Some(_) => {
+                    let stale = servers.remove(&lang);
+                    self.running.lock().unwrap().remove(&lang);
+                    // The old server had documents open that the replacement
+                    // won't know about — drop the dedup hashes so every file
+                    // re-syncs (didOpen) on its next query instead of being
+                    // skipped as "unchanged" against a server that never saw it.
+                    self.synced.lock().unwrap().clear();
+                    stale
+                }
+                None => None,
             }
+        };
+        // A poisoned child may still be alive — reap it deterministically.
+        if let Some(stale) = stale {
+            let _ = stale.shutdown().await;
         }
         if !server_available(lang) {
             bail!("{}", install_hint(lang));
@@ -189,17 +206,18 @@ impl LspManager {
         let (cmd, args) = server_command(lang);
         let client = LspClient::spawn(cmd, &args, &self.root).await?;
         let mut servers = self.servers.lock().await;
-        // If another task raced and inserted a live server, keep it and
+        // If another task raced and inserted a healthy server, keep it and
         // explicitly shut down the duplicate we just spawned (rather than
         // relying on `kill_on_drop` at drop time, which is correct but
         // non-deterministic about *when* the orphaned child is reaped).
         if let Some(existing) = servers.get(&lang) {
-            if existing.is_alive().await {
+            if existing.is_alive().await && !existing.is_poisoned() {
                 drop(servers); // release before awaiting shutdown
                 let _ = client.shutdown().await;
                 return Ok(());
             }
             servers.remove(&lang);
+            self.synced.lock().unwrap().clear();
         }
         servers.insert(lang, Arc::new(client));
         self.running.lock().unwrap().insert(lang, true);
@@ -258,11 +276,18 @@ impl LspManager {
                 .with_context(|| format!("no LSP server for {lang:?} after ensure"))?
                 .clone()
         };
-        if already_open {
+        let result = if already_open {
             client.clear_pushed_diagnostics(&uri);
-            client.did_change(&uri, text).await?;
+            client.did_change(&uri, text).await
         } else {
-            client.did_open(&uri, lang.language_id(), text).await?;
+            client.did_open(&uri, lang.language_id(), text).await
+        };
+        if let Err(e) = result {
+            // The hash was inserted optimistically above, but the server never
+            // received the notify — leaving it would make every future sync
+            // skip this content as "unchanged".
+            self.synced.lock().unwrap().remove(&uri);
+            return Err(e);
         }
         Ok(())
     }
