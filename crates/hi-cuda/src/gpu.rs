@@ -2824,6 +2824,24 @@ mod native {
         *ENABLED.get_or_init(|| std::env::var("HI_CUDA_KV_Q8").is_ok())
     }
 
+    /// Row-chunk the dense-FFN activations during prefill so the transient
+    /// `N × intermediate` gate/up/activated buffers (the dominant prefill scratch — ~960 MB
+    /// at N=6500 for an 8B) are bounded by the chunk size instead of the full prompt length,
+    /// letting long prompts fit alongside a large KV cache. The FFN is per-token independent
+    /// so this is exact. Returns the chunk size (rows); 0 = off. `HI_CUDA_PREFILL_FFN_CHUNK`.
+    fn prefill_ffn_chunk() -> usize {
+        use std::sync::OnceLock;
+        static CHUNK: OnceLock<usize> = OnceLock::new();
+        *CHUNK.get_or_init(|| {
+            // Explicit override; otherwise auto-enable when Q8 is on (Q8 raises the KV pool
+            // so prefill scratch becomes the ceiling — chunking moves it back to the pool).
+            std::env::var("HI_CUDA_PREFILL_FFN_CHUNK")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(if kv_q8_enabled() { 1024 } else { 0 })
+        })
+    }
+
     /// Fuse Q4_0 weight dequant straight to f16 in the prefill GEMM path (default on;
     /// `HI_CUDA_NO_DEQUANT_F16` reverts to dequant -> f32 -> cast).
     fn dequant_f16_enabled() -> bool {
@@ -15242,23 +15260,73 @@ mod native {
             let output = if self.has_matrix(&format!("{prefix}.ffn_gate_inp.weight")) {
                 self.moe_f32_device(prefix, input)?
             } else {
-                let gate = self.project_f32_device(&format!("{prefix}.ffn_gate.weight"), input)?;
-                let gate =
-                    self.add_optional_rowwise_f32_device(gate, &format!("{prefix}.ffn_gate.bias"))?;
-                let up = self.project_f32_device(&format!("{prefix}.ffn_up.weight"), input)?;
-                let up =
-                    self.add_optional_rowwise_f32_device(up, &format!("{prefix}.ffn_up.bias"))?;
-                // Gemma uses GeGLU (gelu(gate) * up); other dense models use SwiGLU.
-                let activated = if self.config.is_gemma() {
-                    self.gelu_mul_f32_device(&gate, &up)?
+                // The dense FFN is per-token independent, so for long prefills row-chunk it
+                // (bounding the N × intermediate scratch) instead of one full-N forward.
+                let chunk = prefill_ffn_chunk();
+                if chunk == 0 || input.rows <= chunk {
+                    self.dense_ffn_body_f32_device(prefix, input)?
                 } else {
-                    self.silu_mul_f32_device(&gate, &up)?
-                };
-                let down =
-                    self.project_f32_device(&format!("{prefix}.ffn_down.weight"), &activated)?;
-                self.add_optional_rowwise_f32_device(down, &format!("{prefix}.ffn_down.bias"))?
+                    self.dense_ffn_chunked_f32_device(prefix, input, chunk)?
+                }
             };
             self.apply_gemma_post_ffn_norm(prefix, output)
+        }
+
+        /// One dense SwiGLU/GeGLU FFN over all of `input`'s rows.
+        fn dense_ffn_body_f32_device(
+            &self,
+            prefix: &str,
+            input: &GpuF32Tensor,
+        ) -> Result<GpuF32Tensor> {
+            let gate = self.project_f32_device(&format!("{prefix}.ffn_gate.weight"), input)?;
+            let gate =
+                self.add_optional_rowwise_f32_device(gate, &format!("{prefix}.ffn_gate.bias"))?;
+            let up = self.project_f32_device(&format!("{prefix}.ffn_up.weight"), input)?;
+            let up = self.add_optional_rowwise_f32_device(up, &format!("{prefix}.ffn_up.bias"))?;
+            // Gemma uses GeGLU (gelu(gate) * up); other dense models use SwiGLU.
+            let activated = if self.config.is_gemma() {
+                self.gelu_mul_f32_device(&gate, &up)?
+            } else {
+                self.silu_mul_f32_device(&gate, &up)?
+            };
+            let down = self.project_f32_device(&format!("{prefix}.ffn_down.weight"), &activated)?;
+            self.add_optional_rowwise_f32_device(down, &format!("{prefix}.ffn_down.bias"))
+        }
+
+        /// Run `dense_ffn_body_f32_device` over row chunks of `input` and reassemble, so the
+        /// transient gate/up/activated buffers are bounded by `chunk` rows, not `input.rows`.
+        fn dense_ffn_chunked_f32_device(
+            &self,
+            prefix: &str,
+            input: &GpuF32Tensor,
+            chunk: usize,
+        ) -> Result<GpuF32Tensor> {
+            let rows = input.rows;
+            let mut output: Option<DeviceBuffer> = None;
+            let mut out_cols = 0usize;
+            let mut start = 0usize;
+            while start < rows {
+                let len = chunk.min(rows - start);
+                let x_chunk = self.slice_rows_f32_device(input, start, len)?;
+                let out_chunk = self.dense_ffn_body_f32_device(prefix, &x_chunk)?;
+                if output.is_none() {
+                    out_cols = out_chunk.cols;
+                    let bytes = rows
+                        .checked_mul(out_cols)
+                        .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+                        .context("chunked FFN output byte count overflows usize")?;
+                    output =
+                        Some(DeviceBuffer::alloc(bytes).context("allocating chunked FFN output")?);
+                }
+                self.write_rows_f32_device(output.as_ref().unwrap(), start, &out_chunk)?;
+                start += len;
+            }
+            let buffer = output.ok_or_else(|| anyhow!("chunked FFN produced no output"))?;
+            Ok(GpuF32Tensor {
+                rows,
+                cols: out_cols,
+                buffer,
+            })
         }
 
         fn moe_f32_device(&self, prefix: &str, input: &GpuF32Tensor) -> Result<GpuF32Tensor> {
@@ -16501,6 +16569,64 @@ mod native {
             } else {
                 0
             }
+        }
+
+        /// Copy the contiguous row range `[start, start+len)` of a row-major f32 tensor
+        /// into a fresh `len × cols` tensor (a device-to-device slice for chunked FFN).
+        fn slice_rows_f32_device(
+            &self,
+            input: &GpuF32Tensor,
+            start: usize,
+            len: usize,
+        ) -> Result<GpuF32Tensor> {
+            if start.checked_add(len).is_none_or(|end| end > input.rows) {
+                bail!(
+                    "CUDA row slice {start}..{} out of bounds for {} rows",
+                    start.saturating_add(len),
+                    input.rows
+                );
+            }
+            let elem = std::mem::size_of::<f32>();
+            let row_bytes = input
+                .cols
+                .checked_mul(elem)
+                .context("CUDA row slice row byte count overflows usize")?;
+            let output =
+                DeviceBuffer::alloc(len.checked_mul(row_bytes).context("row slice bytes")?)
+                    .context("allocating CUDA row slice output")?;
+            output.copy_device_range(
+                0,
+                &input.buffer,
+                start * row_bytes,
+                len * row_bytes,
+                &self.stream,
+            )?;
+            Ok(GpuF32Tensor {
+                rows: len,
+                cols: input.cols,
+                buffer: output,
+            })
+        }
+
+        /// Write `src` (a `len × cols` tensor) into rows `[start, start+len)` of `dst`.
+        fn write_rows_f32_device(
+            &self,
+            dst: &DeviceBuffer,
+            start: usize,
+            src: &GpuF32Tensor,
+        ) -> Result<()> {
+            let elem = std::mem::size_of::<f32>();
+            let row_bytes = src
+                .cols
+                .checked_mul(elem)
+                .context("CUDA row write row byte count overflows usize")?;
+            dst.copy_device_range(
+                start * row_bytes,
+                &src.buffer,
+                0,
+                src.rows * row_bytes,
+                &self.stream,
+            )
         }
 
         fn copy_row_f32_device(&self, input: &GpuF32Tensor, row: usize) -> Result<GpuF32Tensor> {

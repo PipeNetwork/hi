@@ -263,6 +263,36 @@ mod imp {
             )
         }
 
+        /// Async device-to-device copy of `len` bytes from `src[src_offset..]` into
+        /// `self[dst_offset..]` on `stream`. Used to slice/scatter row ranges of an
+        /// activation tensor for chunked processing.
+        pub fn copy_device_range(
+            &self,
+            dst_offset: usize,
+            src: &DeviceBuffer,
+            src_offset: usize,
+            len: usize,
+            stream: &Stream,
+        ) -> Result<()> {
+            if len == 0 {
+                return Ok(());
+            }
+            self.require_capacity(dst_offset.saturating_add(len))?;
+            src.require_capacity(src_offset.saturating_add(len))?;
+            cuda_check(
+                unsafe {
+                    cudaMemcpyAsync(
+                        (self.ptr as *mut u8).add(dst_offset).cast(),
+                        (src.ptr as *const u8).add(src_offset).cast(),
+                        len,
+                        CudaMemcpyKind::DeviceToDevice as c_int,
+                        stream.raw,
+                    )
+                },
+                "cudaMemcpyAsync(device_to_device)",
+            )
+        }
+
         pub fn copy_from_host_async<T>(&self, data: &[T], stream: &Stream) -> Result<()> {
             let bytes = checked_slice_bytes(data)?;
             self.require_capacity(bytes)?;
@@ -745,6 +775,7 @@ mod imp {
     enum CudaMemcpyKind {
         HostToDevice = 1,
         DeviceToHost = 2,
+        DeviceToDevice = 3,
     }
 
     #[repr(i32)]
