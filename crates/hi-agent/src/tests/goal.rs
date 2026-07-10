@@ -353,7 +353,8 @@ async fn long_horizon_driver_advances_on_clean_turn() {
     cfg.long_horizon = true;
     // One turn: model writes a file (tool), then a clean text finish. No
     // verify configured → a non-stalling turn with no verify is "clean".
-    let tmp = temp_file("lh1");
+    let _guard = VERIFY_TEST_LOCK.lock().await;
+    let tmp = visible_temp_file("lh1");
     let p = tmp.to_string_lossy().to_string();
     let responses = vec![
         write_completion(&p),
@@ -392,7 +393,8 @@ async fn skeptic_gate_objection_blocks_advance_and_records_note() {
     let mut cfg = config();
     cfg.long_horizon = true;
     cfg.skeptic_model = Some("skeptic".into());
-    let tmp = temp_file("skeptic-obj");
+    let _guard = VERIFY_TEST_LOCK.lock().await;
+    let tmp = visible_temp_file("skeptic-obj");
     let p = tmp.to_string_lossy().to_string();
     let responses = vec![
         write_completion(&p),
@@ -442,7 +444,8 @@ async fn skeptic_gate_approval_advances_and_actually_calls_the_skeptic() {
     let mut cfg = config();
     cfg.long_horizon = true;
     cfg.skeptic_model = Some("skeptic".into());
-    let tmp = temp_file("skeptic-ok");
+    let _guard = VERIFY_TEST_LOCK.lock().await;
+    let tmp = visible_temp_file("skeptic-ok");
     let p = tmp.to_string_lossy().to_string();
     let steps = vec![
         ProviderStep::Completion(write_completion(&p)),
@@ -486,7 +489,8 @@ async fn skeptic_gate_off_makes_no_extra_call() {
     let mut cfg = config();
     cfg.long_horizon = true;
     cfg.skeptic_model = Some("skeptic".into());
-    let tmp = temp_file("skeptic-off");
+    let _guard = VERIFY_TEST_LOCK.lock().await;
+    let tmp = visible_temp_file("skeptic-off");
     let p = tmp.to_string_lossy().to_string();
     // Only the turn's two calls are scripted; a spurious skeptic call would pop an
     // absent step and panic — so this fails loudly on a regression too.
@@ -525,7 +529,8 @@ async fn skeptic_gate_fails_open_on_provider_error() {
     let mut cfg = config();
     cfg.long_horizon = true;
     cfg.skeptic_model = Some("skeptic".into());
-    let tmp = temp_file("skeptic-err");
+    let _guard = VERIFY_TEST_LOCK.lock().await;
+    let tmp = visible_temp_file("skeptic-err");
     let p = tmp.to_string_lossy().to_string();
     let steps = vec![
         ProviderStep::Completion(write_completion(&p)),
@@ -558,7 +563,8 @@ async fn skeptic_gate_reviews_update_plan_completion_and_reverts_on_objection() 
     let mut cfg = config();
     cfg.long_horizon = true;
     cfg.skeptic_model = Some("skeptic".into());
-    let tmp = temp_file("skeptic-plan");
+    let _guard = VERIFY_TEST_LOCK.lock().await;
+    let tmp = visible_temp_file("skeptic-plan");
     let p = tmp.to_string_lossy().to_string();
     let update_plan = completion(
         vec![Content::ToolCall {
@@ -680,7 +686,8 @@ async fn long_horizon_driver_records_failure_on_unfinished_turn() {
     // when an implementation task only scaffolds setup and never edits source.
     // That should count as a failed attempt on the active sub-goal, not advance
     // as a clean changed-files turn.
-    let dir = temp_file("lh-unfinished-scaffold");
+    let _guard = VERIFY_TEST_LOCK.lock().await;
+    let dir = visible_temp_file("lh-unfinished-scaffold");
     let dir_string = dir.to_string_lossy().to_string();
 
     let mut cfg = config();
@@ -734,7 +741,7 @@ async fn long_horizon_driver_records_failure_on_unfinished_turn() {
 #[tokio::test]
 async fn long_horizon_driver_records_verify_failure_reason_after_exhaustion() {
     let _guard = VERIFY_TEST_LOCK.lock().await;
-    let tmp = temp_file("lh-verify-failure");
+    let tmp = visible_temp_file("lh-verify-failure");
     let p = tmp.to_string_lossy().to_string();
 
     let mut cfg = config();

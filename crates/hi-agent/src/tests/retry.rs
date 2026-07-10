@@ -944,7 +944,10 @@ async fn terminal_error_after_recovery_retry_reports_retry_count() {
 
 #[tokio::test]
 async fn terminal_error_after_tool_progress_reports_changed_files_and_tools() {
-    let path = temp_file("terminal-error-tool-progress");
+    // Visible file + snapshot-diff assertions → serialize with the other
+    // change-detection tests (see visible_temp_file).
+    let _guard = VERIFY_TEST_LOCK.lock().await;
+    let path = visible_temp_file("terminal-error-tool-progress");
     let path_string = path.to_string_lossy().to_string();
     let file_name = path.file_name().unwrap().to_string_lossy().to_string();
     let (mut agent, _requests) = scripted_agent(
