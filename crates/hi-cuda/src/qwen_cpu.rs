@@ -115,7 +115,12 @@ impl QwenCpuReference {
 
     fn from_gguf_inner(gguf: &GgufFile, load_weights: bool) -> Result<Self> {
         let config = gguf.qwen_config()?;
-        gguf.validate_qwen_tensors()?;
+        // The tokenizer-only reference (GPU execution) skips tensor validation: the GPU model
+        // built alongside it validates, so a redundant ~5 s pass on a large MoE is avoided.
+        // The weight-loading reference validates, since it dequantizes those tensors here.
+        if load_weights {
+            gguf.validate_qwen_tensors()?;
+        }
         let tokenizer = gguf.tokenizer()?;
         let embedding_length = usize::try_from(config.embedding_length)
             .context("qwen embedding_length does not fit usize")?;

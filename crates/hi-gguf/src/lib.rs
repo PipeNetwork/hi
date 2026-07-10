@@ -27,6 +27,10 @@ pub struct GgufFile {
     data_start: u64,
     metadata: BTreeMap<String, MetadataValue>,
     tensors: Vec<TensorInfo>,
+    // name -> index into `tensors`, so `tensor(name)` is O(1) instead of a linear scan.
+    // Matters for MoE models with tens of thousands of tensors, where per-tensor lookups
+    // during model construction were O(n^2).
+    tensor_index: std::collections::HashMap<String, usize>,
 }
 
 impl GgufFile {
@@ -63,7 +67,7 @@ impl GgufFile {
     }
 
     pub fn tensor(&self, name: &str) -> Option<TensorView<'_>> {
-        let info = self.tensors.iter().find(|tensor| tensor.name == name)?;
+        let info = self.tensors.get(*self.tensor_index.get(name)?)?;
         self.tensor_view(info).ok()
     }
 
@@ -4812,6 +4816,11 @@ fn parse_mmap(path: PathBuf, mmap: Mmap) -> Result<GgufFile> {
         }
     }
 
+    let tensor_index = tensors
+        .iter()
+        .enumerate()
+        .map(|(idx, tensor)| (tensor.name.clone(), idx))
+        .collect();
     Ok(GgufFile {
         path,
         mmap,
@@ -4820,6 +4829,7 @@ fn parse_mmap(path: PathBuf, mmap: Mmap) -> Result<GgufFile> {
         data_start,
         metadata,
         tensors,
+        tensor_index,
     })
 }
 

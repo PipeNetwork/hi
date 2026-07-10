@@ -749,7 +749,10 @@ impl CudaBackend {
         let gguf = GgufFile::open(path)?;
         let chat_template = gguf.chat_template().map(ToString::to_string);
         let qwen = gguf.qwen_config()?;
-        gguf.validate_qwen_tensors()?;
+        // Tensor validation is deferred to the model constructors below (both
+        // CudaQwenGpuModel::from_gguf and QwenCpuReference::from_gguf validate up front),
+        // avoiding a redundant pass — it is ~5 s on a 30B MoE with tens of thousands of
+        // tensors.
         // GPU execution only needs the CPU reference's tokenizer, so skip loading its f32
         // weight copy (~120 GB + minutes of dequant for a 30B model — otherwise large models
         // are effectively unloadable). The cpu-reference execution path loads the weights.
