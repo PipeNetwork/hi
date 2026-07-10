@@ -11687,6 +11687,80 @@ mod tests {
         );
     }
 
+    // Real-model speedup measurement for prompt-lookup speculative decode. Opt-in:
+    //   HI_CUDA_SPEC_BENCH_GGUF=/path/model.gguf cargo test --release -p hi-cuda \
+    //     --features native-cuda native_cuda_speculative_ngram_bench -- --nocapture
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_speculative_ngram_bench() {
+        use hi_gguf::GgufFile;
+        let Ok(path) = std::env::var("HI_CUDA_SPEC_BENCH_GGUF") else {
+            eprintln!("skipping; set HI_CUDA_SPEC_BENCH_GGUF=/path/model.gguf");
+            return;
+        };
+        let gguf = GgufFile::open(&path).unwrap();
+        let tok = crate::qwen_cpu::QwenCpuReference::from_gguf_tokenizer_only(&gguf).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+        // A repetitive prompt (the structured text a coding tool emits) — high n-gram hit rate.
+        let prompt = "Repeat the list exactly.\n\
+            item 1: alpha\nitem 2: beta\nitem 3: gamma\nitem 4: delta\n\
+            item 1: alpha\nitem 2: beta\nitem 3: gamma\nitem 4: delta\n\
+            item 1: alpha\nitem 2: beta\nitem 3: gamma\nitem 4: delta\n";
+        let ids = tok.tokenizer().encode(prompt).unwrap();
+        let max = 128usize;
+
+        let t0 = std::time::Instant::now();
+        let greedy = model.generate_greedy_tokens(&ids, max, None).unwrap();
+        let greedy_ms = t0.elapsed().as_secs_f64() * 1e3;
+
+        let t1 = std::time::Instant::now();
+        let spec = model
+            .generate_greedy_speculative_ngram(&ids, max, None, 3, 8)
+            .unwrap();
+        let spec_ms = t1.elapsed().as_secs_f64() * 1e3;
+
+        assert_eq!(spec.tokens, greedy, "speculative != greedy");
+        let toks_per_pass = spec.tokens.len() as f64 / spec.forward_passes as f64;
+        eprintln!(
+            "spec-decode: {} tokens | greedy {:.0}ms ({:.1} tok/s) | spec {:.0}ms ({:.1} tok/s, {:.2}x) | {:.2} tokens/pass | accept {}/{}",
+            spec.tokens.len(),
+            greedy_ms,
+            greedy.len() as f64 / (greedy_ms / 1e3),
+            spec_ms,
+            spec.tokens.len() as f64 / (spec_ms / 1e3),
+            greedy_ms / spec_ms,
+            toks_per_pass,
+            spec.accepted_drafts,
+            spec.proposed_total,
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_speculative_ngram_matches_greedy() {
+        use hi_gguf::GgufFile;
+
+        let path = tempfile_path("gpu-speculative-ngram-matches-greedy");
+        write_reference_qwen(&path);
+        let gguf = GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+        // Every emitted token is the model's greedy token, so speculative decode must
+        // reproduce plain greedy exactly, regardless of what the n-gram proposer guesses.
+        for input in [vec![0u32], vec![1, 0, 1, 0, 1], vec![0, 1, 2, 0, 1, 2, 0, 1]] {
+            let max = 12usize;
+            let greedy = model.generate_greedy_tokens(&input, max, None).unwrap();
+            let spec = model
+                .generate_greedy_speculative_ngram(&input, max, None, 2, 4)
+                .unwrap();
+            assert_eq!(spec.tokens, greedy, "speculative output diverged from greedy");
+            // One forward pass yields at least one token, never more tokens than passes*(draft+1).
+            assert!(spec.forward_passes >= 1);
+            assert!(spec.forward_passes <= spec.tokens.len().max(1));
+            assert!(spec.accepted_drafts <= spec.proposed_total);
+        }
+    }
+
     #[cfg(feature = "native-cuda")]
     #[test]
     fn native_cuda_recurrent_ssm_paged_text_generation_uses_persistent_state_cache() {
