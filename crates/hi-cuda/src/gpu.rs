@@ -2929,11 +2929,14 @@ mod native {
                 // the f16 copy is built lazily during prefill rather than eagerly at load).
                 if f16_bytes.saturating_mul(3) <= free.saturating_mul(2) {
                     WeightResidency::HybridQuantF16
-                } else if f16_bytes.saturating_mul(5) <= free.saturating_mul(4) {
-                    // f16 fits with ~20% headroom but the hybrid doesn't: pure f16.
-                    WeightResidency::F16
                 } else {
-                    // Not even f16 alone: stay quantized, dequant prefill per op.
+                    // Hybrid doesn't fit: stay quantized rather than pure-f16. On a
+                    // bandwidth-bound GPU, quantized dp4a decode reads ~3x fewer bytes than
+                    // f16 (so ~3x faster decode) and loads faster (no eager dequant); pure
+                    // f16 only wins on repeated prefill, which the hybrid already covers when
+                    // it fits. Observed on a 32B that just missed the hybrid bound: f16 gave
+                    // 3.6 tok/s (64 GB/token) vs the ~10 tok/s quantized dp4a delivers.
+                    // Force pure f16 with HI_CUDA_WEIGHTS_F16=1 for prefill-heavy workloads.
                     WeightResidency::Quantized
                 }
             }
