@@ -7251,6 +7251,173 @@ mod native {
             self.decode_batch_logits_paged_device(token_ids, position, &mut cache)
         }
 
+        /// Append `token_ids` (one sequence) to the paged cache starting at `position` and
+        /// return PER-POSITION logits `[token_ids.len(), vocab]`. This is one window of the
+        /// chunked-prefill forward: each appended token attends causally to the already
+        /// cached prefix (positions `0..position`) plus the earlier tokens in this window,
+        /// and its K/V is written at its position. Used by speculative decode to verify a
+        /// batch of proposed tokens in a single weight-read pass. Text decoder layouts only
+        /// (dense / GQA / MoE); RoPE uses the `Batched` position layout, so it does not cover
+        /// mRoPE vision or recurrent SSM.
+        fn append_tokens_logits_paged_device(
+            &self,
+            token_ids: &[u32],
+            position: usize,
+            page_size: usize,
+            page_table: &[usize],
+            physical_page_count: usize,
+        ) -> Result<GpuF32Tensor> {
+            if token_ids.is_empty() {
+                bail!("append_tokens_logits requires at least one token");
+            }
+            if self.config.recurrent_ssm_tensor_layout || !self.supports_batched_text_generation()
+            {
+                bail!("append_tokens_logits requires a text decoder layout");
+            }
+            let dims = self.qwen_dims()?;
+            let seq_len = token_ids.len();
+            let token_capacity = position
+                .checked_add(seq_len)
+                .filter(|cap| *cap <= dims.context)
+                .context("speculative append exceeds context length")?;
+
+            let mut pool_slot = self.paged_batch_pool.borrow_mut();
+            let recreate_pool = pool_slot
+                .as_ref()
+                .is_none_or(|pool| !pool.can_cover(&dims, page_size, physical_page_count));
+            if recreate_pool {
+                *pool_slot = Some(CudaPagedBatchDevicePool::new(
+                    self.config.block_count,
+                    &dims,
+                    page_size,
+                    physical_page_count,
+                    &self.stream,
+                )?);
+            }
+            let pool = pool_slot
+                .as_ref()
+                .ok_or_else(|| anyhow!("CUDA paged batch device pool was not initialized"))?;
+            let mut cache = CudaPagedBatchKvCache::new_with_page_tables_from_pool(
+                &dims,
+                1,
+                page_size,
+                token_capacity,
+                std::slice::from_ref(&page_table.to_vec()),
+                pool,
+                &self.stream,
+            )?;
+
+            let _t = self.forward_timer();
+            let eps = self.config.rms_norm_eps.unwrap_or(1.0e-6);
+            let rope_base = self
+                .config
+                .rope_freq_base
+                .unwrap_or_else(|| self.config.default_rope_freq_base());
+            let rope_scale = self.config.rope_freq_scale.unwrap_or(1.0);
+
+            let mut hidden = self.embed_tokens_device(token_ids)?;
+            for layer in 0..self.config.block_count {
+                let layer_idx =
+                    usize::try_from(layer).context("qwen layer index does not fit usize")?;
+                let prefix = format!("blk.{layer}");
+                self.ensure_layer_runtime_supported(&prefix)?;
+                let window = self.layer_attention_window(&prefix);
+                let attn_input =
+                    self.rms_norm_f32_device(&format!("{prefix}.attn_norm.weight"), &hidden, eps)?;
+                let (q, k, v, gate) = self.attention_qkv_f32_device(
+                    &prefix,
+                    &attn_input,
+                    &dims,
+                    eps,
+                    rope_base,
+                    rope_scale,
+                    QwenRopeLayout::Batched {
+                        batch_count: 1,
+                        seq_len,
+                        position_offset: position,
+                    },
+                )?;
+                cache.write_layer_batched(
+                    layer_idx,
+                    &k,
+                    &v,
+                    1,
+                    seq_len,
+                    position,
+                    dims.kv_heads,
+                    dims.head_dim,
+                    dims.v_head_dim,
+                    &self.stream,
+                )?;
+                let attn = self.paged_prefill_attention_f32_device(
+                    &q,
+                    cache.layer(layer_idx)?,
+                    position,
+                    1,
+                    seq_len,
+                    &dims,
+                    window,
+                )?;
+                let attn_out =
+                    self.attention_output_projection_f32_device(&prefix, &attn, gate.as_ref())?;
+                hidden = self.add_f32_device(&hidden, &attn_out)?;
+                let mlp_input =
+                    self.rms_norm_f32_device(&format!("{prefix}.ffn_norm.weight"), &hidden, eps)?;
+                let mlp_out = self.ffn_f32_device(&prefix, &mlp_input)?;
+                hidden = self.add_f32_device(&hidden, &mlp_out)?;
+            }
+            let normed = self.rms_norm_f32_device("output_norm.weight", &hidden, eps)?;
+            // All-row projection (not last-row): one logits row per appended token.
+            self.output_logits_f32_device(&normed)
+        }
+
+        /// One greedy speculative decode step against a request's paged cache. `sequence` is
+        /// the request's full logical token stream (prompt ++ generated); its last token is
+        /// the confirmed token whose KV this step (re)writes. Proposes up to `max_draft`
+        /// continuation tokens by `ngram` prompt-lookup, verifies them in ONE forward, and
+        /// returns the accepted greedy tokens (>= 1: the next token, plus every accepted draft
+        /// and one bonus/correction token). Every returned token is the model's greedy token,
+        /// so output matches plain greedy decode exactly. Rollback is implicit: rejected
+        /// drafts' KV at later positions is simply overwritten by subsequent writes.
+        pub fn speculative_greedy_next_tokens_paged_with_page_table(
+            &self,
+            sequence: &[u32],
+            page_size: usize,
+            page_table: &[usize],
+            physical_page_count: usize,
+            ngram: usize,
+            max_draft: usize,
+        ) -> Result<Vec<u32>> {
+            if sequence.is_empty() {
+                bail!("speculative decode requires a non-empty sequence");
+            }
+            let position = sequence.len() - 1;
+            let last_token = sequence[position];
+            let draft = ngram_lookup_proposal(sequence, ngram, max_draft);
+            let mut verify_input = Vec::with_capacity(draft.len() + 1);
+            verify_input.push(last_token);
+            verify_input.extend_from_slice(&draft);
+
+            let logits = self.append_tokens_logits_paged_device(
+                &verify_input,
+                position,
+                page_size,
+                page_table,
+                physical_page_count,
+            )?;
+            // Row i predicts the token after position `position + i`, so greedy[0] is the
+            // definitive next token and greedy[i] is the target token following draft[i-1].
+            let greedy = self.argmax_rows(&logits, 0, verify_input.len())?;
+            let mut accepted = draft.len();
+            for (i, &d) in draft.iter().enumerate() {
+                if d != greedy[i] {
+                    accepted = i;
+                    break;
+                }
+            }
+            Ok(greedy[..=accepted].to_vec())
+        }
+
         fn next_token_logits_batch_paged_with_page_tables(
             &self,
             inputs: &[Vec<u32>],

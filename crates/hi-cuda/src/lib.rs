@@ -4630,6 +4630,28 @@ fn forget_retired_recurrent_state(
     }
 }
 
+/// Prompt-lookup speculative decode config `(ngram, max_draft)`, from `HI_CUDA_SPEC_DECODE`.
+/// Unset/`0` = off. Accepts `1` (defaults 2,8) or `ngram:draft` (e.g. `3:8`). Applies only to
+/// a single greedy text request decoding alone; other cases use the normal batched decode.
+fn speculative_decode_config() -> Option<(usize, usize)> {
+    use std::sync::OnceLock;
+    static CFG: OnceLock<Option<(usize, usize)>> = OnceLock::new();
+    *CFG.get_or_init(|| {
+        let raw = std::env::var("HI_CUDA_SPEC_DECODE").ok()?;
+        let raw = raw.trim();
+        match raw {
+            "" | "0" | "off" | "false" => None,
+            "1" | "on" | "true" => Some((2, 8)),
+            other => {
+                let (n, d) = other.split_once(':')?;
+                let ngram = n.trim().parse().ok().filter(|v| *v >= 1)?;
+                let draft = d.trim().parse().ok().filter(|v| *v >= 1)?;
+                Some((ngram, draft))
+            }
+        }
+    })
+}
+
 fn process_continuous_decode_chunk(
     state: &CudaSchedulerState,
     stats: &CudaSchedulerStats,
@@ -4690,6 +4712,93 @@ fn process_continuous_decode_chunk(
         }
     };
     let started = Instant::now();
+
+    // Speculative decode fast path: a single greedy text request decoding alone verifies a
+    // batch of prompt-lookup drafts in one weight-read pass, emitting 1..=K+1 tokens. Every
+    // emitted token is the model's greedy token, so output is identical to normal decode.
+    if let Some((ngram, max_draft)) = speculative_decode_config()
+        && phase == CudaContinuousStepPhase::Decode
+        && matches!(sampling_key, CudaSchedulerSamplingKey::Greedy)
+        && indexes.len() == 1
+        && !state.qwen.recurrent_ssm_tensor_layout
+    {
+        let idx = indexes[0];
+        // Never emit past this request's token budget; we emit up to accepted+1 tokens.
+        let remaining = active[idx]
+            .max_tokens
+            .saturating_sub(active[idx].generated_tokens.len());
+        let draft_cap = max_draft.min(remaining.saturating_sub(1));
+        let extended = active[idx].context_len().saturating_add(draft_cap).saturating_add(1);
+        let page_table = match active[idx].page_table_for_token_count(extended, state.kv_page_size)
+        {
+            Ok(pt) => pt,
+            Err(err) => {
+                mark_continuous_error(active, retire, idx, anyhow!("{err}"));
+                return;
+            }
+        };
+        let mut sequence = active[idx].prompt_tokens.clone();
+        sequence.extend_from_slice(&active[idx].generated_tokens);
+        let produced = model.speculative_greedy_next_tokens_paged_with_page_table(
+            &sequence,
+            state.kv_page_size,
+            &page_table,
+            kv_pages.pages_total,
+            ngram,
+            draft_cap,
+        );
+        let elapsed = started.elapsed();
+        match produced {
+            Ok(tokens) if !tokens.is_empty() => {
+                record_continuous_decode_batch_stats(stats, phase, sampling_key, 1);
+                stats
+                    .decode_tokens
+                    .fetch_add(usize_to_u64(tokens.len()), Ordering::Relaxed);
+                stats
+                    .decode_micros
+                    .fetch_add(usize_to_u64(elapsed.as_micros() as usize), Ordering::Relaxed);
+                for token in tokens {
+                    if retire[idx].is_some() {
+                        break;
+                    }
+                    if active[idx].job.tx.is_closed() {
+                        retire[idx] = Some(CudaContinuousRetireReason::Cancelled);
+                        break;
+                    }
+                    active[idx].generated_tokens.push(token);
+                    match send_continuous_token_delta(state, &mut active[idx], token) {
+                        Ok(()) => {}
+                        Err(CudaContinuousRetireReason::Cancelled) => {
+                            retire[idx] = Some(CudaContinuousRetireReason::Cancelled);
+                            break;
+                        }
+                        Err(CudaContinuousRetireReason::Errored) => {
+                            retire[idx] = Some(CudaContinuousRetireReason::Errored);
+                            break;
+                        }
+                        Err(CudaContinuousRetireReason::Completed) => unreachable!(),
+                    }
+                    if continuous_request_finished(&state.qwen, &active[idx], token) {
+                        retire[idx] = Some(finish_continuous_request(state, &active[idx]));
+                        break;
+                    }
+                }
+            }
+            Ok(_) => {
+                mark_continuous_error(
+                    active,
+                    retire,
+                    idx,
+                    anyhow!("CUDA speculative decode produced no tokens"),
+                );
+            }
+            Err(err) => {
+                mark_continuous_error(active, retire, idx, anyhow!("{err}"));
+            }
+        }
+        return;
+    }
+
     let mut shared_prefix_reused_tokens = 0;
     let result = match phase {
         CudaContinuousStepPhase::Prefill => {
