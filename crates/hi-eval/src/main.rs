@@ -21,6 +21,7 @@ mod reporting;
 mod results;
 mod runner;
 mod selftest;
+mod skeptic_detector;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -62,6 +63,42 @@ async fn async_main() -> Result<()> {
                 .map(str::to_string)
                 .collect()
         });
+    // Skeptic detector eval: measure the reviewer's precision/recall on labeled
+    // (forward/reversed) bug-fix diffs — independent of the task/config matrix.
+    if args.iter().any(|a| a == "--skeptic-detector") {
+        profile.validate_env()?;
+        let repo = args
+            .iter()
+            .find_map(|a| a.strip_prefix("--repo="))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let n = args
+            .iter()
+            .find_map(|a| a.strip_prefix("--n="))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20);
+        let reviewer = args
+            .iter()
+            .find_map(|a| a.strip_prefix("--reviewer="))
+            .unwrap_or("pipe/glm-5.2-fast")
+            .to_string();
+        let max_diff_lines = args
+            .iter()
+            .find_map(|a| a.strip_prefix("--max-diff-lines="))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(350);
+        return skeptic_detector::run(skeptic_detector::Options {
+            repo,
+            hi_bin: find_hi()?,
+            reviewer,
+            provider_args: profile.hi_args().iter().map(|s| s.to_string()).collect(),
+            n,
+            max_diff_lines,
+            concurrency: 4,
+        })
+        .await;
+    }
+
     let artifacts_dir = args
         .iter()
         .find_map(|a| a.strip_prefix("--artifacts="))

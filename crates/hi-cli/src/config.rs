@@ -177,6 +177,13 @@ pub struct Cli {
     #[arg(short = 'q', long)]
     pub quiet: bool,
 
+    /// Offline detector eval of the skeptic reviewer: read a JSON
+    /// `{objective, sub_goal, diff}` from stdin, run the real skeptic review, print
+    /// `{objected, objections}` JSON, and exit. Reviewer = `HI_SKEPTIC_MODEL` or
+    /// `--model`. Used by `hi-eval --skeptic-detector`.
+    #[arg(long, hide = true)]
+    pub skeptic_review: bool,
+
     /// One-shot prompt. If omitted, starts an interactive session.
     pub prompt: Option<String>,
 }
