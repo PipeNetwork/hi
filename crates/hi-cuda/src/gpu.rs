@@ -3390,18 +3390,27 @@ mod native {
             // prefill scratch need, OOMing the next forward. When it won't fit, fall
             // through to the fused quantized GEMV (reads the quant weights directly,
             // no 1.25 GB resident). Once cached, keep using it.
-            let cache_output_head = is_output_head && {
-                let f16_bytes = weight_elements.saturating_mul(std::mem::size_of::<u16>());
-                self.dequant_f16_cache.borrow().contains_key(matrix_name)
-                    || crate::runtime::free_memory_bytes()
-                        .map(|free| f16_bytes.saturating_mul(2) <= free)
-                        .unwrap_or(true)
-            };
-            // Fused Q6_K GEMV (M=1 decode, non-output-head layer weights): read Q6_K
-            // directly instead of dequantizing the whole matrix to f32 every token — the
-            // per-op dequant is ~12x slower for Q6_K models kept quantized (f16 doesn't
-            // fit). The output head stays on the f16 cache below (cuBLAS, marginally
-            // faster and reused every token).
+            //
+            // The output head is *always* M=1 (logits come from the last row even during
+            // prefill), so the f16 copy never gets a real GEMM — it's an f16 GEMV vs the
+            // dp4a GEMV, and on a bandwidth-bound box the dp4a path reads ~2.5x fewer bytes
+            // (Q6_K ~0.66 vs f16 2 bytes/param) and wins outright. So in the hybrid plan
+            // (which is chosen precisely when we're not VRAM-starved) skip the f16 cache
+            // for the head and let the dp4a GEMV below handle it.
+            let cache_output_head = is_output_head
+                && !self.cache_layer_f16
+                && {
+                    let f16_bytes = weight_elements.saturating_mul(std::mem::size_of::<u16>());
+                    self.dequant_f16_cache.borrow().contains_key(matrix_name)
+                        || crate::runtime::free_memory_bytes()
+                            .map(|free| f16_bytes.saturating_mul(2) <= free)
+                            .unwrap_or(true)
+                };
+            // Fused Q6_K GEMV (M=1 decode): read Q6_K directly instead of dequantizing the
+            // whole matrix to f32 every token — the per-op dequant is ~12x slower for Q6_K
+            // models kept quantized (f16 doesn't fit). Also handles the Q6_K output head in
+            // the hybrid plan (cache_output_head is false there); in the non-hybrid f16-head
+            // case it stays on the cuBLAS f16 cache below.
             if input.rows == 1
                 && !cache_output_head
                 && matches!(matrix.dtype, GgufTensorType::Q6_K)
