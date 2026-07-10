@@ -7377,6 +7377,177 @@ __global__ void flashtile_causal_attention_batched_kernel(
   }
 }
 
+// Chunked-prefill attention: a chunk of `chunk_len` query tokens (per batch sequence)
+// attends causally to the PAGED KV cache, which already holds positions
+// [0, query_offset + chunk_len) (prior chunks + this chunk's just-written K/V). Query row
+// r is at absolute position query_offset+r and attends to cached sources <= that. Same
+// warp-per-query flash structure as flashtile_causal_attention_batched, but each K/V tile
+// is gathered from the cache via the page table (so the query tile shares one KV load,
+// unlike the per-query decode kernel). f16 (kv_t) cache.
+__global__ void paged_prefill_causal_attention_batched_kernel(
+    const float* __restrict__ q,
+    const kv_t* __restrict__ k_pages,
+    const kv_t* __restrict__ v_pages,
+    const uint32_t* __restrict__ page_table,
+    float* __restrict__ output,
+    int query_offset,
+    int batch_count,
+    int chunk_len,
+    int page_size,
+    int page_table_len,
+    int heads,
+    int kv_heads,
+    int qk_head_dim,
+    int v_head_dim,
+    int ktile) {
+  extern __shared__ float smem[];
+  float* k_tile = smem;
+  float* v_tile = smem + ktile * qk_head_dim;
+
+  const int head = blockIdx.y;
+  const int batch = blockIdx.z;
+  const int warp_id = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int target = blockIdx.x * HI_CUDA_FLASH_QWARPS + warp_id;  // query row within chunk
+  const int kv_repeats = heads / kv_heads;
+  const int kv_head = head / kv_repeats;
+  const float scale = rsqrtf(static_cast<float>(qk_head_dim));
+  const bool active = target < chunk_len;
+  const int abs_pos = query_offset + target;  // this query's absolute position
+
+  constexpr int MAX_PER_LANE = HI_CUDA_FLASH_MAX_HEAD_DIM / 32;
+  float q_reg[MAX_PER_LANE];
+  float acc[MAX_PER_LANE];
+#pragma unroll
+  for (int i = 0; i < MAX_PER_LANE; ++i) {
+    const int d = lane + i * 32;
+    q_reg[i] = (active && d < qk_head_dim)
+                   ? q[((batch * chunk_len + target) * heads + head) * qk_head_dim + d]
+                   : 0.0f;
+    acc[i] = 0.0f;
+  }
+  float m = -INFINITY;
+  float l = 0.0f;
+
+  const int block_max_row = min((blockIdx.x + 1) * HI_CUDA_FLASH_QWARPS - 1, chunk_len - 1);
+  const int block_max_pos = query_offset + block_max_row;  // causal upper bound for this block
+
+  for (int tile_start = 0; tile_start <= block_max_pos; tile_start += ktile) {
+    for (int e = threadIdx.x; e < ktile * qk_head_dim; e += blockDim.x) {
+      const int j = e / qk_head_dim;
+      const int d = e - j * qk_head_dim;
+      const int source = tile_start + j;
+      float kv = 0.0f;
+      if (source <= block_max_pos) {
+        const int lp = source / page_size;
+        if (lp < page_table_len) {
+          const uint32_t phys = page_table[batch * page_table_len + lp];
+          const int off = source - lp * page_size;
+          kv = kv_to_float(
+              k_pages[((static_cast<int>(phys) * kv_heads + kv_head) * page_size + off) *
+                          qk_head_dim +
+                      d]);
+        }
+      }
+      k_tile[e] = kv;
+    }
+    for (int e = threadIdx.x; e < ktile * v_head_dim; e += blockDim.x) {
+      const int j = e / v_head_dim;
+      const int d = e - j * v_head_dim;
+      const int source = tile_start + j;
+      float vv = 0.0f;
+      if (source <= block_max_pos) {
+        const int lp = source / page_size;
+        if (lp < page_table_len) {
+          const uint32_t phys = page_table[batch * page_table_len + lp];
+          const int off = source - lp * page_size;
+          vv = kv_to_float(
+              v_pages[((static_cast<int>(phys) * kv_heads + kv_head) * page_size + off) *
+                          v_head_dim +
+                      d]);
+        }
+      }
+      v_tile[e] = vv;
+    }
+    __syncthreads();
+
+    if (active) {
+      const int tile_end = min(tile_start + ktile, abs_pos + 1);  // causal: source <= abs_pos
+      for (int source = tile_start; source < tile_end; ++source) {
+        const float* kt = k_tile + (source - tile_start) * qk_head_dim;
+        float dot = 0.0f;
+#pragma unroll
+        for (int i = 0; i < MAX_PER_LANE; ++i) {
+          const int d = lane + i * 32;
+          if (d < qk_head_dim) {
+            dot += q_reg[i] * kt[d];
+          }
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+          dot += __shfl_down_sync(0xffffffffu, dot, off);
+        }
+        const float sc = __shfl_sync(0xffffffffu, dot, 0) * scale;
+        const float next_m = fmaxf(m, sc);
+        const float rescale = isfinite(m) ? expf(m - next_m) : 0.0f;
+        const float weight = expf(sc - next_m);
+        const float* vt = v_tile + (source - tile_start) * v_head_dim;
+#pragma unroll
+        for (int i = 0; i < MAX_PER_LANE; ++i) {
+          const int d = lane + i * 32;
+          if (d < v_head_dim) {
+            acc[i] = acc[i] * rescale + weight * vt[d];
+          }
+        }
+        l = l * rescale + weight;
+        m = next_m;
+      }
+    }
+    __syncthreads();
+  }
+
+  if (active) {
+    const float inv = (l == 0.0f || !isfinite(l)) ? 0.0f : 1.0f / l;
+#pragma unroll
+    for (int i = 0; i < MAX_PER_LANE; ++i) {
+      const int d = lane + i * 32;
+      if (d < v_head_dim) {
+        output[((batch * chunk_len + target) * heads + head) * v_head_dim + d] = acc[i] * inv;
+      }
+    }
+  }
+}
+
+extern "C" int hi_cuda_launch_paged_prefill_causal_attention_batched(
+    const void* q, const void* k_pages, const void* v_pages, const void* page_table,
+    void* output, int query_offset, int batch_count, int chunk_len, int page_size,
+    int page_table_len, int heads, int kv_heads, int qk_head_dim, int v_head_dim,
+    void* stream) {
+  if (q == nullptr || k_pages == nullptr || v_pages == nullptr || page_table == nullptr ||
+      output == nullptr || query_offset < 0 || batch_count <= 0 || chunk_len <= 0 ||
+      page_size <= 0 || page_table_len <= 0 || heads <= 0 || kv_heads <= 0 || qk_head_dim <= 0 ||
+      v_head_dim <= 0 || heads % kv_heads != 0 || qk_head_dim > HI_CUDA_FLASH_MAX_HEAD_DIM ||
+      v_head_dim > HI_CUDA_FLASH_MAX_HEAD_DIM || stream == nullptr) {
+    return 1;
+  }
+  int ktile = HI_CUDA_FLASH_KTILE;
+  const size_t per_tile = static_cast<size_t>(qk_head_dim + v_head_dim) * sizeof(float);
+  while (ktile > 1 && static_cast<size_t>(ktile) * per_tile > 46080) {
+    ktile >>= 1;
+  }
+  const int qtiles = (chunk_len + HI_CUDA_FLASH_QWARPS - 1) / HI_CUDA_FLASH_QWARPS;
+  dim3 grid(qtiles, heads, batch_count);
+  dim3 block(HI_CUDA_FLASH_QWARPS * 32);
+  size_t shared_bytes = static_cast<size_t>(ktile) * per_tile;
+  paged_prefill_causal_attention_batched_kernel<<<grid, block, shared_bytes,
+                                                  static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const float*>(q), static_cast<const kv_t*>(k_pages),
+      static_cast<const kv_t*>(v_pages), static_cast<const uint32_t*>(page_table),
+      static_cast<float*>(output), query_offset, batch_count, chunk_len, page_size,
+      page_table_len, heads, kv_heads, qk_head_dim, v_head_dim, ktile);
+  return 0;
+}
+
 // Tensor-core (WMMA) flash-attention, causal, batched. One warp per block per
 // (batch, head, 16-query tile). Q*K^T and P*V run on tensor cores (f16 in, f32
 // accumulate); the online softmax + O rescale live in shared memory (clear

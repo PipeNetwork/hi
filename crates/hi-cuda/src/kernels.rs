@@ -674,6 +674,23 @@ mod native {
             window: c_int,
             stream: *mut c_void,
         ) -> c_int;
+        fn hi_cuda_launch_paged_prefill_causal_attention_batched(
+            q: *const c_void,
+            k_pages: *const c_void,
+            v_pages: *const c_void,
+            page_table: *const c_void,
+            output: *mut c_void,
+            query_offset: c_int,
+            batch_count: c_int,
+            chunk_len: c_int,
+            page_size: c_int,
+            page_table_len: c_int,
+            heads: c_int,
+            kv_heads: c_int,
+            qk_head_dim: c_int,
+            v_head_dim: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
         fn hi_cuda_launch_wmma_causal_attention_batched(
             q: *const c_void,
             k: *const c_void,
@@ -2929,6 +2946,58 @@ mod native {
             )
         })?;
         check_last_error("hi_cuda_launch_flashtile_causal_attention_batched")
+    }
+
+    /// Chunked-prefill causal attention: a `chunk_len`-token query chunk attends to the f16
+    /// paged KV cache (which already holds `[0, query_offset+chunk_len)`), query row r at
+    /// absolute position `query_offset+r`. Shares the KV load across the query tile.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_paged_prefill_causal_attention_batched(
+        q: &DeviceBuffer,
+        k_pages: &DeviceBuffer,
+        v_pages: &DeviceBuffer,
+        page_table: &DeviceBuffer,
+        output: &DeviceBuffer,
+        query_offset: usize,
+        batch_count: usize,
+        chunk_len: usize,
+        page_size: usize,
+        page_table_len: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        v_head_dim: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(query_offset, "paged_prefill query_offset")?;
+        ensure_len(batch_count, "paged_prefill batch_count")?;
+        ensure_len(chunk_len, "paged_prefill chunk_len")?;
+        ensure_len(page_size, "paged_prefill page_size")?;
+        ensure_len(page_table_len, "paged_prefill page_table_len")?;
+        ensure_len(heads, "paged_prefill heads")?;
+        ensure_len(kv_heads, "paged_prefill kv_heads")?;
+        ensure_len(head_dim, "paged_prefill head_dim")?;
+        ensure_len(v_head_dim, "paged_prefill v_head_dim")?;
+        launch_status(unsafe {
+            hi_cuda_launch_paged_prefill_causal_attention_batched(
+                q.as_ptr(),
+                k_pages.as_ptr(),
+                v_pages.as_ptr(),
+                page_table.as_ptr(),
+                output.as_mut_ptr(),
+                query_offset as c_int,
+                batch_count as c_int,
+                chunk_len as c_int,
+                page_size as c_int,
+                page_table_len as c_int,
+                heads as c_int,
+                kv_heads as c_int,
+                head_dim as c_int,
+                v_head_dim as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_paged_prefill_causal_attention_batched")
     }
 
     /// Tensor-core (WMMA) flash-attention, causal batched. q/k/v are f16; output f32.
