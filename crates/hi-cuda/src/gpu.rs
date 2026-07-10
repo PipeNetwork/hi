@@ -425,6 +425,11 @@ mod native {
         // output head so models with no dp4a-eligible weights don't cache the whole
         // model in f16.
         dequant_f16_cache: RefCell<BTreeMap<String, DeviceBuffer>>,
+        // Hybrid weight residency (see `WeightResidency::HybridQuantF16`): weights are
+        // kept quantized for the dp4a decode GEMV, and the M>1 prefill GEMM caches a
+        // dequantized f16 copy of each layer weight in `dequant_f16_cache` (bounded by a
+        // live free-memory check). False = the classic all-f16 or dequant-per-op paths.
+        cache_layer_f16: bool,
         // Per-generation forward-pass timing: (prefill_micros, decode_micros,
         // forward_count). The first forward after a reset is the (batched) prompt
         // prefill; every later forward is a per-token decode. Fed by ForwardTimer
@@ -2875,25 +2880,62 @@ mod native {
         *ENABLED.get_or_init(|| std::env::var("HI_CUDA_NO_KQUANT_DP4A").is_err())
     }
 
-    fn weights_f16_choice(specs: &[MatrixSpec]) -> bool {
+    /// How quantized weights are held resident, trading VRAM for the prefill/decode
+    /// speed balance. See `weight_residency_plan`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum WeightResidency {
+        /// Convert every weight to a resident f16 copy at load; the quantized bytes are
+        /// dropped. Fast prefill GEMM, but decode reads 2 bytes/param (no dp4a). Best
+        /// when f16 fits but the hybrid does not.
+        F16,
+        /// Keep the quantized weights resident (decode runs the dp4a GEMV at ~0.5
+        /// byte/param) AND lazily cache a dequantized f16 copy per weight for the M>1
+        /// prefill GEMM. Best of both — fast prefill and ~2-3x faster decode — at the
+        /// cost of holding quantized + f16 (~1.3x the f16 size). The default whenever
+        /// that fits, which on a big-memory (e.g. Grace-Blackwell) box is ~always.
+        HybridQuantF16,
+        /// Keep weights quantized with no persistent f16 cache; the prefill GEMM
+        /// dequantizes per op. Smallest footprint — for cards where even f16 alone
+        /// won't fit alongside the KV cache.
+        Quantized,
+    }
+
+    /// Decide the weight-residency plan. `HI_CUDA_WEIGHTS_F16` forces it:
+    /// `1`/`true` -> F16, `0`/`false` -> Quantized, `hybrid` -> HybridQuantF16.
+    /// Unset = auto by free VRAM.
+    fn weight_residency_plan(specs: &[MatrixSpec]) -> WeightResidency {
         match std::env::var("HI_CUDA_WEIGHTS_F16")
             .ok()
             .map(|value| value.trim().to_ascii_lowercase())
             .as_deref()
         {
-            Some("1" | "true" | "yes" | "on") => return true,
-            Some("0" | "false" | "no" | "off") => return false,
+            Some("1" | "true" | "yes" | "on") => return WeightResidency::F16,
+            Some("hybrid") => return WeightResidency::HybridQuantF16,
+            Some("0" | "false" | "no" | "off") => return WeightResidency::Quantized,
             _ => {}
         }
         let f16_bytes = specs.iter().fold(0usize, |total, spec| {
             total.saturating_add(spec.rows.saturating_mul(spec.cols).saturating_mul(2))
         });
         match crate::runtime::free_memory_bytes() {
-            // Enable FP16 only if the weights leave ~20% of free VRAM for the KV
-            // cache, activations, and transient prefill scratch.
-            Ok(free) => f16_bytes.saturating_mul(5) <= free.saturating_mul(4),
+            Ok(free) => {
+                // The hybrid holds quantized (already resident) + a full f16 cache
+                // (~1.3x the f16 size for 4-bit). Requiring 2x f16 to fit is a safe
+                // bound that still leaves ~35% of VRAM for the KV cache, activations,
+                // and prefill scratch. Prefer it: it dominates pure f16 (same fast
+                // prefill, far cheaper decode) whenever the extra ~0.3x f16 fits.
+                if f16_bytes.saturating_mul(2) <= free {
+                    WeightResidency::HybridQuantF16
+                } else if f16_bytes.saturating_mul(5) <= free.saturating_mul(4) {
+                    // f16 fits with ~20% headroom but the hybrid doesn't: pure f16.
+                    WeightResidency::F16
+                } else {
+                    // Not even f16 alone: stay quantized, dequant prefill per op.
+                    WeightResidency::Quantized
+                }
+            }
             // Can't measure free memory — stay on the safe quantized path.
-            Err(_) => false,
+            Err(_) => WeightResidency::Quantized,
         }
     }
 
@@ -2981,14 +3023,19 @@ mod native {
                 );
             }
 
-            // Convert quantized weights to a resident FP16 copy at load so decode
-            // skips the per-token dequant-to-f32 and runs the FP16 GEMM directly
-            // — a large decode speedup at the cost of ~2 bytes/param VRAM. On by
-            // default when the FP16 weights fit (auto), overridable via
-            // HI_CUDA_WEIGHTS_F16; large models that only fit quantized stay
-            // quantized.
+            // Pick how weights are held resident (see `WeightResidency`), trading VRAM
+            // for the prefill/decode balance. On a big-memory box the default is the
+            // hybrid: keep the quantized weights for the cheap dp4a decode GEMV, and
+            // cache a dequantized f16 copy per weight for the prefill GEMM. Mid-size
+            // cards fall back to all-f16 (fast prefill, 2 bytes/param decode); tiny
+            // cards to quantized-only (dequant prefill per op). `HI_CUDA_WEIGHTS_F16`
+            // forces the choice.
             let matrix_specs = qwen_matrix_specs(gguf, &config)?;
-            let weights_f16 = weights_f16_choice(&matrix_specs);
+            let residency = weight_residency_plan(&matrix_specs);
+            let weights_f16 = matches!(residency, WeightResidency::F16);
+            // Hybrid: weights stay quantized (dp4a decode) but the prefill GEMM caches a
+            // dequantized f16 copy per weight so it isn't re-dequantized every forward.
+            let cache_layer_f16 = matches!(residency, WeightResidency::HybridQuantF16);
             let mut matrices = BTreeMap::new();
             let mut total_matrix_bytes = 0usize;
             let mut quantized_matrix_count = 0usize;
@@ -3071,6 +3118,7 @@ mod native {
                 vectors,
                 paged_batch_pool: RefCell::new(None),
                 dequant_f16_cache: RefCell::new(BTreeMap::new()),
+                cache_layer_f16,
                 recurrent_page_states: RefCell::new(BTreeMap::new()),
                 generation_timing: Cell::new((0, 0, 0)),
                 forward_in_progress: Cell::new(false),
@@ -3767,12 +3815,27 @@ mod native {
             }
             // Quantized weight matmul via tensor-core f16 GEMM. Dequantizing to f16 is
             // expensive, so cache the f16 weight and reuse it — weights never change,
-            // avoiding re-dequantizing the Q6_K lm_head every token. Bounded to the
-            // output head (the single weight projecting to a vocab-wide output): a
-            // general per-weight cache would, on models with no dp4a-eligible weights
-            // (e.g. IQ4_NL), cache the whole model in f16 and OOM. Everything else
-            // dequantizes per-op (prefill M>1, and layer weights that miss dp4a).
-            let output = if cache_output_head {
+            // avoiding re-dequantizing the same weight every forward.
+            //
+            // Caching is bounded by memory. Two cases persist an f16 copy:
+            //   - the output head (a vocab-wide weight, re-dequantized every decode), and
+            //   - in the hybrid plan, every layer weight *during prefill* (rows > 1) — the
+            //     dp4a decode GEMVs above already returned for M=1, so this only speeds up
+            //     the prefill GEMM without touching the cheap-VRAM decode path.
+            // A general always-on per-weight cache would, on a small card or a model with
+            // no dp4a-eligible weights (e.g. IQ4_NL), cache the whole model in f16 and OOM;
+            // so a live free-memory check gates each insert, and non-hybrid builds keep the
+            // old dequant-per-op prefill. Once cached, a weight is always reused (so a later
+            // decode that reaches here — a quant type without a dp4a GEMV — reuses it too).
+            let use_persistent_f16 = self.dequant_f16_cache.borrow().contains_key(matrix_name)
+                || cache_output_head
+                || (self.cache_layer_f16 && input.rows > 1 && {
+                    let f16_bytes = weight_elements.saturating_mul(std::mem::size_of::<u16>());
+                    crate::runtime::free_memory_bytes()
+                        .map(|free| f16_bytes.saturating_mul(2) <= free)
+                        .unwrap_or(false)
+                });
+            let output = if use_persistent_f16 {
                 if !self.dequant_f16_cache.borrow().contains_key(matrix_name) {
                     let w = self.dequantize_matrix_to_f16(matrix, weight_elements)?;
                     self.dequant_f16_cache
