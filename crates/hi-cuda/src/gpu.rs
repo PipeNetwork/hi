@@ -18014,7 +18014,7 @@ mod native {
                     self.page_table_len,
                     stream,
                 )?;
-                return stream.synchronize();
+                return Ok(());
             }
             crate::kernels::launch_write_paged_kv_cache_batched(
                 &key.buffer,
@@ -18042,7 +18042,13 @@ mod native {
                 start_pos,
                 stream,
             )?;
-            stream.synchronize()
+            // No host sync here: the K/V writes are enqueued on the model's single stream,
+            // and the attention kernel that reads these pages runs later on the SAME stream,
+            // so stream ordering already guarantees the writes complete first. The old
+            // per-layer `stream.synchronize()` drained the pipeline ~36x/token (once per
+            // layer) for no correctness benefit — the same redundancy `op_barrier` removed
+            // for the other decode ops. The final token-id copy_to_host provides the sync.
+            Ok(())
         }
 
         #[allow(clippy::too_many_arguments)]
