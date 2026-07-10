@@ -16041,6 +16041,49 @@ mod native {
                 .context("CUDA paged batched attention output element count overflows usize")?;
             let output = DeviceBuffer::alloc(output_elements * std::mem::size_of::<f32>())
                 .context("allocating CUDA paged batched attention output")?;
+            if let (Some(key_scales), Some(value_scales)) = (&cache.key_scales, &cache.value_scales)
+            {
+                if head_dim > FLASH_ONLINE_MAX_HEAD_DIM {
+                    bail!(
+                        "CUDA Q8 KV cache decode requires head_dim <= {FLASH_ONLINE_MAX_HEAD_DIM}, got {head_dim}"
+                    );
+                }
+                // Reuse the positions Q8 kernel with a uniform per-batch position buffer.
+                let positions: Vec<u32> = vec![
+                    u32::try_from(position).context(
+                        "CUDA Q8 decode position does not fit u32"
+                    )?;
+                    batch_count
+                ];
+                let positions_dev = DeviceBuffer::alloc(batch_count * std::mem::size_of::<u32>())
+                    .context("allocating CUDA Q8 uniform positions")?;
+                positions_dev.copy_from_host(&positions)?;
+                crate::kernels::launch_tiled_paged_decode_attention_batched_positions_q8(
+                    &q.buffer,
+                    cache.key_pages.as_buffer(),
+                    cache.value_pages.as_buffer(),
+                    key_scales.as_buffer(),
+                    value_scales.as_buffer(),
+                    &cache.page_table,
+                    &positions_dev,
+                    &output,
+                    batch_count,
+                    cache.page_size,
+                    cache.page_table_len,
+                    heads,
+                    kv_heads,
+                    head_dim,
+                    v_head_dim,
+                    window,
+                    &self.stream,
+                )?;
+                self.stream.synchronize()?;
+                return Ok(GpuF32Tensor {
+                    rows: batch_count,
+                    cols: heads * v_head_dim,
+                    buffer: output,
+                });
+            }
             if head_dim <= FLASH_ONLINE_MAX_HEAD_DIM {
                 crate::kernels::launch_tiled_paged_decode_attention_batched(
                     &q.buffer,
@@ -16124,6 +16167,39 @@ mod native {
                 )?;
             let output = DeviceBuffer::alloc(output_elements * std::mem::size_of::<f32>())
                 .context("allocating CUDA paged batched positioned attention output")?;
+            if let (Some(key_scales), Some(value_scales)) = (&cache.key_scales, &cache.value_scales)
+            {
+                if head_dim > FLASH_ONLINE_MAX_HEAD_DIM {
+                    bail!(
+                        "CUDA Q8 KV cache decode requires head_dim <= {FLASH_ONLINE_MAX_HEAD_DIM}, got {head_dim}"
+                    );
+                }
+                crate::kernels::launch_tiled_paged_decode_attention_batched_positions_q8(
+                    &q.buffer,
+                    cache.key_pages.as_buffer(),
+                    cache.value_pages.as_buffer(),
+                    key_scales.as_buffer(),
+                    value_scales.as_buffer(),
+                    &cache.page_table,
+                    positions,
+                    &output,
+                    batch_count,
+                    cache.page_size,
+                    cache.page_table_len,
+                    heads,
+                    kv_heads,
+                    head_dim,
+                    v_head_dim,
+                    window,
+                    &self.stream,
+                )?;
+                self.op_barrier()?;
+                return Ok(GpuF32Tensor {
+                    rows: batch_count,
+                    cols: heads * v_head_dim,
+                    buffer: output,
+                });
+            }
             if head_dim <= FLASH_ONLINE_MAX_HEAD_DIM {
                 crate::kernels::launch_tiled_paged_decode_attention_batched_positions(
                     &q.buffer,
@@ -16764,6 +16840,9 @@ mod native {
     struct CudaPagedBatchDevicePoolLayer {
         key_pages: DeviceBuffer,
         value_pages: DeviceBuffer,
+        // Present only for the int8/Q8 cache (see CudaPagedLayerKvCache).
+        key_scales: Option<DeviceBuffer>,
+        value_scales: Option<DeviceBuffer>,
     }
 
     impl CudaPagedBatchDevicePool {
@@ -16792,12 +16871,20 @@ mod native {
                 .and_then(|value| value.checked_mul(page_size))
                 .and_then(|value| value.checked_mul(dims.v_head_dim))
                 .context("CUDA paged batch device value pool element count overflows usize")?;
+            // int8/Q8 cache: 1 byte/element + one f32 scale per vector; else f16 (2 bytes).
+            let q8 = kv_q8_enabled();
+            let elem_bytes = if q8 { 1 } else { std::mem::size_of::<u16>() };
             let key_bytes = key_elements
-                .checked_mul(std::mem::size_of::<u16>()) // f16 KV pages (kv_t = __half)
+                .checked_mul(elem_bytes)
                 .context("CUDA paged batch device key pool byte count overflows usize")?;
             let value_bytes = value_elements
-                .checked_mul(std::mem::size_of::<u16>()) // f16 KV pages (kv_t = __half)
+                .checked_mul(elem_bytes)
                 .context("CUDA paged batch device value pool byte count overflows usize")?;
+            let scale_bytes = physical_page_count
+                .checked_mul(dims.kv_heads)
+                .and_then(|value| value.checked_mul(page_size))
+                .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+                .context("CUDA paged batch device scale pool byte count overflows usize")?;
             let mut layers = Vec::with_capacity(layer_count);
             for _ in 0..layer_count {
                 let key_pages = DeviceBuffer::alloc(key_bytes)
@@ -16806,9 +16893,22 @@ mod native {
                     .context("allocating CUDA paged batch value pool")?;
                 key_pages.memset_zero_async(stream)?;
                 value_pages.memset_zero_async(stream)?;
+                let (key_scales, value_scales) = if q8 {
+                    let ks = DeviceBuffer::alloc(scale_bytes)
+                        .context("allocating CUDA paged batch Q8 key scale pool")?;
+                    let vs = DeviceBuffer::alloc(scale_bytes)
+                        .context("allocating CUDA paged batch Q8 value scale pool")?;
+                    ks.memset_zero_async(stream)?;
+                    vs.memset_zero_async(stream)?;
+                    (Some(ks), Some(vs))
+                } else {
+                    (None, None)
+                };
                 layers.push(CudaPagedBatchDevicePoolLayer {
                     key_pages,
                     value_pages,
+                    key_scales,
+                    value_scales,
                 });
             }
             stream.synchronize()?;
@@ -16930,6 +17030,9 @@ mod native {
                 layers.push(CudaPagedBatchLayerKvCache {
                     key_pages: CudaPagedBatchBuffer::Owned(key_pages),
                     value_pages: CudaPagedBatchBuffer::Owned(value_pages),
+                    // The owned batch cache stays f16; only the pool path serves Q8.
+                    key_scales: None,
+                    value_scales: None,
                     page_table: page_table_device,
                     batch_count,
                     page_size,
@@ -17013,6 +17116,14 @@ mod native {
                 layers.push(CudaPagedBatchLayerKvCache {
                     key_pages: CudaPagedBatchBuffer::Borrowed(&pool_layer.key_pages),
                     value_pages: CudaPagedBatchBuffer::Borrowed(&pool_layer.value_pages),
+                    key_scales: pool_layer
+                        .key_scales
+                        .as_ref()
+                        .map(CudaPagedBatchBuffer::Borrowed),
+                    value_scales: pool_layer
+                        .value_scales
+                        .as_ref()
+                        .map(CudaPagedBatchBuffer::Borrowed),
                     page_table: page_table_device,
                     batch_count,
                     page_size,
@@ -17347,6 +17458,9 @@ mod native {
     struct CudaPagedBatchLayerKvCache<'a> {
         key_pages: CudaPagedBatchBuffer<'a>,
         value_pages: CudaPagedBatchBuffer<'a>,
+        // Present only for the int8/Q8 cache (pool path); None keeps the f16 path.
+        key_scales: Option<CudaPagedBatchBuffer<'a>>,
+        value_scales: Option<CudaPagedBatchBuffer<'a>>,
         page_table: DeviceBuffer,
         batch_count: usize,
         page_size: usize,
@@ -17408,6 +17522,39 @@ mod native {
                     start_pos.saturating_add(row_count),
                     self.max_seq
                 );
+            }
+            if let (Some(key_scales), Some(value_scales)) = (&self.key_scales, &self.value_scales) {
+                crate::kernels::launch_write_paged_kv_cache_q8_batched(
+                    &key.buffer,
+                    self.key_pages.as_buffer(),
+                    key_scales.as_buffer(),
+                    &self.page_table,
+                    None,
+                    start_pos,
+                    batch_count,
+                    row_count,
+                    kv_heads,
+                    head_dim,
+                    self.page_size,
+                    self.page_table_len,
+                    stream,
+                )?;
+                crate::kernels::launch_write_paged_kv_cache_q8_batched(
+                    &value.buffer,
+                    self.value_pages.as_buffer(),
+                    value_scales.as_buffer(),
+                    &self.page_table,
+                    None,
+                    start_pos,
+                    batch_count,
+                    row_count,
+                    kv_heads,
+                    v_head_dim,
+                    self.page_size,
+                    self.page_table_len,
+                    stream,
+                )?;
+                return stream.synchronize();
             }
             crate::kernels::launch_write_paged_kv_cache_batched(
                 &key.buffer,
@@ -17482,6 +17629,39 @@ mod native {
                     v_head_dim
                 );
             }
+            if let (Some(key_scales), Some(value_scales)) = (&self.key_scales, &self.value_scales) {
+                crate::kernels::launch_write_paged_kv_cache_q8_batched(
+                    &key.buffer,
+                    self.key_pages.as_buffer(),
+                    key_scales.as_buffer(),
+                    &self.page_table,
+                    Some(positions),
+                    0,
+                    batch_count,
+                    row_count,
+                    kv_heads,
+                    head_dim,
+                    self.page_size,
+                    self.page_table_len,
+                    stream,
+                )?;
+                crate::kernels::launch_write_paged_kv_cache_q8_batched(
+                    &value.buffer,
+                    self.value_pages.as_buffer(),
+                    value_scales.as_buffer(),
+                    &self.page_table,
+                    Some(positions),
+                    0,
+                    batch_count,
+                    row_count,
+                    kv_heads,
+                    v_head_dim,
+                    self.page_size,
+                    self.page_table_len,
+                    stream,
+                )?;
+                return stream.synchronize();
+            }
             crate::kernels::launch_write_paged_kv_cache_batched_positions(
                 &key.buffer,
                 self.key_pages.as_buffer(),
@@ -17521,6 +17701,14 @@ mod native {
         ) -> Result<()> {
             if token_count == 0 {
                 return Ok(());
+            }
+            if self.key_scales.is_some() {
+                // The int8/Q8 cache would need a quant-aware copy (int8 data + scales); the
+                // f16 element copy below corrupts it. Until that lands, Q8 requires the
+                // cross-request shared-prefix cache off (HI_CUDA_PREFIX_CACHE=0).
+                bail!(
+                    "CUDA Q8 KV cache does not support the shared-prefix copy path; set HI_CUDA_PREFIX_CACHE=0 to use HI_CUDA_KV_Q8"
+                );
             }
             if self.batch_count < 2 {
                 bail!("CUDA paged batch KV prefix copy requires at least two batch rows");
