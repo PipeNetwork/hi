@@ -594,43 +594,32 @@ impl Transcript {
     /// only the latest verification output stays in context instead of
     /// accumulating one nudge per failed round.
     ///
-    /// If a prior nudge of `kind` exists: pops from the tail — trailing `Tool`
-    /// and `Assistant` messages that belong to the prior cycle, then the prior
-    /// nudge itself — and pushes the new one. If no prior nudge of `kind` is
-    /// found, **nothing is popped** and the new nudge is simply appended (this
-    /// is the first round: there's no prior cycle to replace, so the model's
-    /// just-completed assistant turn and its tool results must stay).
+    /// A prior nudge is replaceable only when it *immediately precedes* the
+    /// trailing run of `Tool`/`Assistant` messages — i.e. the tail is exactly
+    /// the prior nudge's response cycle. Then that cycle and the nudge are
+    /// popped and the fresh nudge pushed. Otherwise (first round of this turn,
+    /// or any other message in between) the nudge is simply appended: deciding
+    /// off a marker anywhere in history — as this used to — meant a stale
+    /// nudge from an *earlier* turn erased the current turn's work and left
+    /// two consecutive user messages.
     pub(crate) fn replace_last_nudge(&mut self, kind: NudgeKind, text: impl Into<String>) {
         let marker = marker_for(kind);
-        // First, find whether a prior nudge of this kind exists. If not, just
-        // append — don't strip the model's just-finished turn.
-        let has_prior = self.messages.iter().any(|m| {
+        let body = text.into();
+        let tagged = format!("{}\n{}", marker, body);
+        let msgs = self.make_mut();
+        let mut idx = msgs.len();
+        while idx > 0 && matches!(msgs[idx - 1].role, Role::Tool | Role::Assistant) {
+            idx -= 1;
+        }
+        let prior_nudge = idx.checked_sub(1).filter(|&i| {
+            let m = &msgs[i];
             m.role == Role::User
                 && m.content
                     .iter()
                     .any(|c| matches!(c, Content::Text(t) if t.starts_with(marker)))
         });
-        let body = text.into();
-        let tagged = format!("{}\n{}", marker, body);
-        let msgs = self.make_mut();
-        if has_prior {
-            while let Some(last) = msgs.last() {
-                if last.role == Role::User
-                    && last
-                        .content
-                        .iter()
-                        .any(|c| matches!(c, Content::Text(t) if t.starts_with(marker)))
-                {
-                    msgs.pop();
-                    break;
-                }
-                match last.role {
-                    Role::Tool | Role::Assistant => {
-                        msgs.pop();
-                    }
-                    _ => break,
-                }
-            }
+        if let Some(i) = prior_nudge {
+            msgs.truncate(i);
         }
         msgs.push(Message::user(tagged));
     }

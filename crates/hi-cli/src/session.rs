@@ -5,7 +5,7 @@
 //! sessions (pi-style) are a future extension; this is a linear log.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -73,27 +73,41 @@ impl JsonlSession {
         Self { path }
     }
 
+    /// Append a fully-formatted payload (one or more `\n`-terminated JSONL
+    /// lines) with a single `write_all` on the `O_APPEND` fd. A buffered
+    /// writer would split records larger than its buffer across multiple
+    /// `write()` calls, letting a concurrent appender (a second `hi -c` in the
+    /// same project, or a fleet child on `--session-file`) interleave mid-line
+    /// — and `load_history` silently drops unparseable lines.
+    fn append(&self, payload: &str) -> Result<()> {
+        if let Some(parent) = self.path.parent() {
+            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .with_context(|| format!("opening {}", self.path.display()))?;
+        file.write_all(payload.as_bytes())
+            .with_context(|| format!("appending to {}", self.path.display()))?;
+        Ok(())
+    }
+
+    fn append_meta(&self, meta: &SessionMeta) -> Result<()> {
+        let mut line = serde_json::to_string(meta)?;
+        line.push('\n');
+        self.append(&line)
+    }
+
     /// Persist checkpoint refs so a resumed session knows where it branched.
     #[allow(dead_code)]
     pub fn record_checkpoints(&mut self, refs: &[String]) -> Result<()> {
         if refs.is_empty() {
             return Ok(());
         }
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-        }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .with_context(|| format!("opening {}", self.path.display()))?;
-        let mut writer = BufWriter::new(file);
-        let line = serde_json::to_string(&SessionMeta::Checkpoints {
+        self.append_meta(&SessionMeta::Checkpoints {
             refs: refs.to_vec(),
-        })?;
-        writeln!(writer, "{line}")?;
-        writer.flush()?;
-        Ok(())
+        })
     }
 }
 
@@ -106,97 +120,40 @@ impl SessionSink for JsonlSession {
         if messages.is_empty() && usage.is_zero() {
             return Ok(());
         }
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-        }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .with_context(|| format!("opening {}", self.path.display()))?;
-        let mut writer = BufWriter::new(file);
+        let mut payload = String::new();
         for message in messages {
-            let line = serde_json::to_string(message)?;
-            writeln!(writer, "{line}")?;
+            payload.push_str(&serde_json::to_string(message)?);
+            payload.push('\n');
         }
-        let line = serde_json::to_string(&SessionMeta::Usage {
+        payload.push_str(&serde_json::to_string(&SessionMeta::Usage {
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
             cache_read_tokens: usage.cache_read_tokens,
             cache_creation_tokens: usage.cache_creation_tokens,
             estimated: usage.estimated,
-        })?;
-        writeln!(writer, "{line}")?;
-        writer.flush()?;
-        Ok(())
+        })?);
+        payload.push('\n');
+        self.append(&payload)
     }
 
     fn record_compaction(&mut self, messages: &[Message]) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-        }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .with_context(|| format!("opening {}", self.path.display()))?;
-        let mut writer = BufWriter::new(file);
-        let line = serde_json::to_string(&SessionMeta::Compaction {
+        self.append_meta(&SessionMeta::Compaction {
             messages: messages.to_vec(),
-        })?;
-        writeln!(writer, "{line}")?;
-        writer.flush()?;
-        Ok(())
+        })
     }
 
     fn record_goal(&mut self, goal: &hi_agent::Goal) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-        }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .with_context(|| format!("opening {}", self.path.display()))?;
-        let mut writer = BufWriter::new(file);
-        let line = serde_json::to_string(&SessionMeta::Goal { goal: goal.clone() })?;
-        writeln!(writer, "{line}")?;
-        writer.flush()?;
-        Ok(())
+        self.append_meta(&SessionMeta::Goal { goal: goal.clone() })
     }
 
     fn clear_goal(&mut self) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-        }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .with_context(|| format!("opening {}", self.path.display()))?;
-        let mut writer = BufWriter::new(file);
-        let line = serde_json::to_string(&SessionMeta::GoalCleared)?;
-        writeln!(writer, "{line}")?;
-        writer.flush()?;
-        Ok(())
+        self.append_meta(&SessionMeta::GoalCleared)
     }
 
     fn record_decisions(&mut self, decisions: &hi_agent::DecisionLog) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-        }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .with_context(|| format!("opening {}", self.path.display()))?;
-        let mut writer = BufWriter::new(file);
-        let line = serde_json::to_string(&SessionMeta::Decisions {
+        self.append_meta(&SessionMeta::Decisions {
             decisions: decisions.entries().to_vec(),
-        })?;
-        writeln!(writer, "{line}")?;
-        writer.flush()?;
-        Ok(())
+        })
     }
 
     fn record_state_replacement(
@@ -205,23 +162,11 @@ impl SessionSink for JsonlSession {
         goal: Option<&hi_agent::Goal>,
         decisions: &hi_agent::DecisionLog,
     ) -> Result<()> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-        }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .with_context(|| format!("opening {}", self.path.display()))?;
-        let mut writer = BufWriter::new(file);
-        let line = serde_json::to_string(&SessionMeta::StateReplacement {
+        self.append_meta(&SessionMeta::StateReplacement {
             messages: messages.to_vec(),
             goal: goal.cloned(),
             decisions: decisions.entries().to_vec(),
-        })?;
-        writeln!(writer, "{line}")?;
-        writer.flush()?;
-        Ok(())
+        })
     }
 }
 

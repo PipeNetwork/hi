@@ -19,6 +19,10 @@ use crate::types::{
 
 const API_VERSION: &str = "2023-06-01";
 
+/// Upper bound on content blocks in one response — the per-event `index`
+/// arrives straight from the provider's SSE JSON.
+const MAX_CONTENT_BLOCKS: usize = 512;
+
 pub struct AnthropicProvider {
     http: reqwest::Client,
     base_url: String,
@@ -105,6 +109,11 @@ impl Provider for AnthropicProvider {
                 }
                 "content_block_start" => {
                     let index = data["index"].as_u64().unwrap_or(0) as usize;
+                    // The index comes straight off the wire — bound it so a
+                    // corrupt frame can't force a huge `resize_with` allocation.
+                    if index >= MAX_CONTENT_BLOCKS {
+                        continue;
+                    }
                     if blocks.len() <= index {
                         blocks.resize_with(index + 1, || None);
                     }
@@ -155,9 +164,17 @@ impl Provider for AnthropicProvider {
             .collect();
         if completion.usage.input_tokens == 0 {
             completion.usage.input_tokens = estimate_messages_tokens(&request.messages);
+            completion.usage.estimated = true;
         }
         if completion.usage.output_tokens == 0 {
             completion.usage.output_tokens = estimate_completion_output_tokens(&completion.content);
+            completion.usage.estimated = true;
+        }
+        // Keep the occupancy gauge alive on the estimate path too (matches the
+        // OpenAI path's backfill): a proxy that omits `message_start` usage
+        // would otherwise leave it at 0 all session.
+        if completion.usage.context_occupancy == 0 {
+            completion.usage.context_occupancy = completion.usage.input_tokens;
         }
         Ok(completion)
     }

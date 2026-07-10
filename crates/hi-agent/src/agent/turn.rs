@@ -2384,11 +2384,14 @@ If the task is already complete, stop and give your final recap."
                 let mut completed = vec![false; calls.len()];
                 let mut completion_order: Vec<usize> = Vec::with_capacity(calls.len());
                 let mut scheduler_forced_skip = false;
-                // Pre-pass: handle `record_decision` calls serially. They mutate
-                // agent state (`self.decisions`) and aren't real tool dispatches,
-                // so they can't run in the parallel `execute` stream (no `&mut
-                // self` there). They're instantaneous and have no deps that
-                // matter, so handling them up front is safe.
+                // Pre-pass: resolve calls blocked by read-only intent up front.
+                // They produce instant synthetic error results and mutate
+                // nothing, so completing them out of dep order is safe.
+                // (`explore`/`delegate`/`record_decision` used to run here too,
+                // but they *do* have deps that matter — running a subagent
+                // before an earlier `write` in the same batch handed it a stale
+                // tree — so they now dispatch inside the dep-aware scheduler
+                // loop below.)
                 for (i, (id, name, arguments)) in calls.iter().enumerate() {
                     if read_only_blocks_tool(read_only_intent, name) {
                         ui.tool_call(name, arguments);
@@ -2405,68 +2408,7 @@ If the task is already complete, stop and give your final recap."
                         results[i] = Some((id.clone(), content));
                         completed[i] = true;
                         completion_order.push(i);
-                        continue;
                     }
-                    if name == "explore" {
-                        // Read-only subagent: runs a bounded child turn (own context,
-                        // read-only tools) sharing this agent's provider, then returns a
-                        // concise answer. Handled here (not in the parallel `execute`
-                        // stream) because it needs `&mut self` and is itself an agent turn.
-                        ui.tool_call(name, arguments);
-                        let content = self.handle_explore(arguments, &mut *ui).await;
-                        emit_tool_output(
-                            &mut *ui,
-                            name,
-                            &hi_tools::ToolOutput {
-                                content: content.clone(),
-                                display: None,
-                                plan: None,
-                            },
-                        );
-                        results[i] = Some((id.clone(), content));
-                        completed[i] = true;
-                        completion_order.push(i);
-                        continue;
-                    }
-                    if name == "delegate" {
-                        // Write-capable subagent: runs a child turn that edits + verifies
-                        // in the same tree, checkpoint-guarded so a failed delegation rolls
-                        // back. Like `explore`, handled here because it needs `&mut self`
-                        // and is itself an agent turn.
-                        //
-                        // Capture the turn baseline + checkpoint BEFORE it mutates the
-                        // tree — otherwise the later lazy snapshot (verify gate) would
-                        // record delegate's own output as the baseline, making the
-                        // parent's verify + changed-files see "no changes", and leaving
-                        // no pre-delegate checkpoint for `/undo` to isolate this turn.
-                        self.ensure_turn_snapshot(&mut turn_snapshot).await;
-                        self.ensure_turn_checkpoint(&mut turn_checkpoint_created, ui)
-                            .await;
-                        ui.tool_call(name, arguments);
-                        let content = self.handle_delegate(arguments, &mut *ui).await;
-                        emit_tool_output(
-                            &mut *ui,
-                            name,
-                            &hi_tools::ToolOutput {
-                                content: content.clone(),
-                                display: None,
-                                plan: None,
-                            },
-                        );
-                        results[i] = Some((id.clone(), content));
-                        completed[i] = true;
-                        completion_order.push(i);
-                        continue;
-                    }
-                    if name != "record_decision" {
-                        continue;
-                    }
-                    ui.tool_call(name, arguments);
-                    let content = self.handle_record_decision(arguments);
-                    ui.tool_result(name, &content);
-                    results[i] = Some((id.clone(), content));
-                    completed[i] = true;
-                    completion_order.push(i);
                 }
                 let mut done = completion_order.len();
                 // Proactive per-edit checks: kicked off in the background as
@@ -2613,6 +2555,62 @@ If the task is already complete, stop and give your final recap."
                         completion_order.push(i);
                         done += 1;
                         // Bash runs alone → a serial run and a batch of size 1.
+                        sched_tool_calls += 1;
+                        sched_serial_runs += 1;
+                        sched_max_concurrent = sched_max_concurrent.max(1);
+                        continue;
+                    }
+                    // Self-dispatched calls: `explore`/`delegate` run a child
+                    // agent turn and `record_decision` mutates agent state, so
+                    // all three need `&mut self` and can't join the parallel
+                    // `execute` stream. Run one alone when it's ready — the dep
+                    // graph then guarantees earlier mutations in the batch have
+                    // landed before a subagent sees the tree.
+                    let self_idx = ready.iter().copied().find(|&i| {
+                        matches!(
+                            calls[i].1.as_str(),
+                            "explore" | "delegate" | "record_decision"
+                        )
+                    });
+                    if let Some(i) = self_idx {
+                        let (id, name, arguments) = &calls[i];
+                        if name == "delegate" {
+                            // Write-capable subagent: capture the turn baseline +
+                            // checkpoint BEFORE it mutates the tree — otherwise the
+                            // later lazy snapshot (verify gate) would record
+                            // delegate's own output as the baseline, making the
+                            // parent's verify + changed-files see "no changes", and
+                            // leaving no pre-delegate checkpoint for `/undo` to
+                            // isolate this turn.
+                            self.ensure_turn_snapshot(&mut turn_snapshot).await;
+                            self.ensure_turn_checkpoint(&mut turn_checkpoint_created, ui)
+                                .await;
+                        }
+                        ui.tool_call(name, arguments);
+                        let content = match name.as_str() {
+                            "explore" => self.handle_explore(arguments, &mut *ui).await,
+                            "delegate" => self.handle_delegate(arguments, &mut *ui).await,
+                            _ => self.handle_record_decision(arguments),
+                        };
+                        emit_tool_output(
+                            &mut *ui,
+                            name,
+                            &hi_tools::ToolOutput {
+                                content: content.clone(),
+                                display: None,
+                                plan: None,
+                            },
+                        );
+                        results[i] = Some((id.clone(), content));
+                        if name == "delegate" {
+                            // The child turn edits the same tree — a dependent
+                            // read after it must re-walk.
+                            self.invalidate_snapshot();
+                        }
+                        completed[i] = true;
+                        completion_order.push(i);
+                        done += 1;
+                        // Runs alone, like bash.
                         sched_tool_calls += 1;
                         sched_serial_runs += 1;
                         sched_max_concurrent = sched_max_concurrent.max(1);
@@ -2824,6 +2822,12 @@ If the task is already complete, stop and give your final recap."
                         done += 1;
                     }
                 }
+                // Consume an interrupt that landed while (or just after) the
+                // batch's last call finished — the loop above only polls the
+                // flag between rounds, so a leftover flag would spuriously
+                // cancel the next round's (or even the next turn's) batch.
+                self.interrupt
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 debug_assert_eq!(
                     done,
                     calls.len(),
@@ -3221,7 +3225,9 @@ If the task is already complete, stop and give your final recap."
             }
         };
 
-        self.add_usage(completion.usage);
+        // Side call: spend counts, but its small request must not clobber the
+        // main conversation's context gauge (see add_side_usage).
+        self.add_side_usage(completion.usage);
         self.emit_usage(ui);
 
         // Fall back to the final content if the provider didn't stream text.

@@ -271,15 +271,18 @@ fn strip_chatml_tokens(text: &str) -> String {
     let mut last = 0;
     let mut i = 0;
     while i < bytes.len() {
+        // Search the suffix from after the `<|` prefix so the prefix's own `|`
+        // can't match `|>` (the text `<|>` produced a reversed slice range and
+        // panicked).
         if bytes[i] == b'<'
             && i + 1 < bytes.len()
             && bytes[i + 1] == b'|'
-            && let Some(end) = text[i..].find("|>")
+            && let Some(end) = text[i + 2..].find("|>")
         {
-            let inner = &text[i + 2..i + end];
+            let inner = &text[i + 2..i + 2 + end];
             if !inner.is_empty() && inner.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                 out.push_str(&text[last..i]);
-                last = i + end + 2;
+                last = i + 2 + end + 2;
                 i = last;
                 continue;
             }

@@ -338,99 +338,65 @@ impl serde::Serialize for Config {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+// Serialized with `skip_serializing_if` on every field so a saved config omits
+// unset keys instead of filling with `model = ""` lines. Keep the attribute on
+// each new field: a field missing it is fine, but a field missing from
+// serialization entirely (as with the old hand-written `Serialize` impl) is
+// silently deleted from the user's config file on every save.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Profile {
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<ProviderName>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     /// MCP endpoint used for metadata discovery, when supported by the provider.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub mcp_url: Option<String>,
     /// A literal API key (written by the setup wizard).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
     /// Name of an env var holding the API key for this profile.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_budget: Option<u32>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_mode: Option<ToolMode>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compat: Option<CompatMode>,
     /// Advertise only the essential tool subset instead of the full set. Small
     /// (~3B) local models can't reliably plan over the full ~20-tool schema;
     /// this restores usable tool-calling. Defaults to off.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub minimal_tools: Option<bool>,
     /// Verifier-gated skill auto-curation: after a verified turn, distill a
     /// reusable technique into a learned skill. Defaults to off.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub curate_skills: Option<bool>,
     /// Advertise the read-only `explore` subagent tool. On by default; set to
     /// false to disable (e.g. for a very small local model).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub explore_subagents: Option<bool>,
     /// Advertise the write-capable `delegate` subagent tool. Off by default (the
     /// riskier tier); set to true to enable.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub write_subagents: Option<bool>,
     /// Model id that decomposes a `/goal <objective>` into sub-goals. Defaults to
     /// `pipe/glm-5.2-fast` on the pipenetwork profile; `None` disables planning.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub planner_model: Option<String>,
     /// Model id for the `/goal team` skeptic gate (reviews a turn before it
     /// advances a sub-goal). `None` (default) disables the gate.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skeptic_model: Option<String>,
     /// Other profile names to fall back to, in order, when this one returns
     /// nothing or errors.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback: Option<Vec<String>>,
-}
-
-// Serialize `Profile` with clean output: omit `None` fields so the TOML
-// doesn't fill with `model = ""` lines. We can't put `skip_serializing_if` on
-// each field above (it'd require repeating it 9 times), so we implement a
-// custom serializer that skips None values.
-impl serde::Serialize for Profile {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("Profile", 11)?;
-        if let Some(v) = &self.provider {
-            s.serialize_field("provider", v)?;
-        }
-        if let Some(v) = &self.model {
-            s.serialize_field("model", v)?;
-        }
-        if let Some(v) = &self.base_url {
-            s.serialize_field("base_url", v)?;
-        }
-        if let Some(v) = &self.mcp_url {
-            s.serialize_field("mcp_url", v)?;
-        }
-        if let Some(v) = &self.api_key {
-            s.serialize_field("api_key", v)?;
-        }
-        if let Some(v) = &self.api_key_env {
-            s.serialize_field("api_key_env", v)?;
-        }
-        if let Some(v) = &self.max_tokens {
-            s.serialize_field("max_tokens", v)?;
-        }
-        if let Some(v) = &self.thinking_budget {
-            s.serialize_field("thinking_budget", v)?;
-        }
-        if let Some(v) = &self.tool_mode {
-            s.serialize_field("tool_mode", v)?;
-        }
-        if let Some(v) = &self.compat {
-            s.serialize_field("compat", v)?;
-        }
-        if let Some(v) = &self.fallback {
-            s.serialize_field("fallback", v)?;
-        }
-        s.end()
-    }
 }
 
 /// Fully-resolved settings used to build a provider and run the agent.
@@ -900,6 +866,23 @@ pub fn writable_config_path(explicit: Option<&Path>) -> Option<PathBuf> {
     default_config_path()
 }
 
+/// Mask an API key (or env var name) for display: first and last four
+/// characters with an ellipsis. Char-based, so a key containing multi-byte
+/// characters (e.g. pasted with a stray curly quote) can't panic a byte slice.
+pub fn mask_key(key: &str) -> String {
+    if key.is_empty() {
+        return "(none)".to_string();
+    }
+    let chars: Vec<char> = key.chars().collect();
+    if chars.len() > 8 {
+        let head: String = chars[..4].iter().collect();
+        let tail: String = chars[chars.len() - 4..].iter().collect();
+        format!("{head}…{tail}")
+    } else {
+        "***".to_string()
+    }
+}
+
 /// Serialize `config` to TOML and write it to `path`, creating parent dirs.
 /// Sets 0600 permissions on Unix so API keys in the file aren't world-readable.
 pub fn save_config_to(config: &Config, path: &Path) -> Result<()> {
@@ -976,6 +959,22 @@ impl ProfileForm {
             }
         }
         p
+    }
+
+    /// Build a `Profile` for an *edit*: start from the existing profile so the
+    /// fields the form doesn't cover (max_tokens, thinking_budget, tool_mode,
+    /// compat, fallback, subagent/planner settings, mcp_url, …) survive, and
+    /// overwrite only what the form actually edits.
+    pub fn apply_to(&self, existing: &Profile) -> Profile {
+        let form = self.to_profile();
+        Profile {
+            provider: form.provider,
+            model: form.model,
+            base_url: form.base_url,
+            api_key: form.api_key,
+            api_key_env: form.api_key_env,
+            ..existing.clone()
+        }
     }
 
     /// Populate the form from an existing profile (for editing).

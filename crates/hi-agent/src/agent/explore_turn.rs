@@ -93,7 +93,7 @@ impl crate::Agent {
             }
         };
         // Fold the child's token usage into the parent's session totals.
-        self.add_usage(*child.totals());
+        self.add_side_usage(*child.totals());
         ui.subagent_note(&format!("↳ explore subagent {n} done"));
         result
     }

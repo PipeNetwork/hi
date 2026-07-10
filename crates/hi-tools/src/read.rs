@@ -495,8 +495,11 @@ pub(crate) fn is_binary(bytes: &[u8]) -> bool {
 }
 
 /// Read a file as UTF-8 text, bailing with a clear message if it's binary
-/// (same heuristic as `read`). Used by `edit`/`multi_edit` so a binary file
-/// produces a helpful error instead of an opaque `read_to_string` UTF-8 panic.
+/// (same heuristic as `read`) or not valid UTF-8. Used by the preserving-edit
+/// paths (`edit`/`multi_edit`/`apply_patch`), which write the decoded string
+/// back to disk — a lossy decode here would silently replace every invalid
+/// byte in the whole file with U+FFFD on the write-back, corrupting e.g.
+/// Latin-1 files even on lines the edit never touched.
 pub(crate) async fn read_text_file(path: &str) -> Result<String> {
     let bytes = tokio::fs::read(path)
         .await
@@ -508,7 +511,13 @@ pub(crate) async fn read_text_file(path: &str) -> Result<String> {
             bytes.len()
         );
     }
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    String::from_utf8(bytes).map_err(|e| {
+        anyhow::anyhow!(
+            "{path} is not valid UTF-8 (first invalid byte at offset {}) — editing it in place \
+             would corrupt its encoding. Use `bash` (e.g. sed/iconv) to modify it.",
+            e.utf8_error().valid_up_to()
+        )
+    })
 }
 
 #[derive(Deserialize)]

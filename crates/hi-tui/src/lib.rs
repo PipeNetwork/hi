@@ -334,6 +334,11 @@ pub(crate) struct ExploreRun {
     pub lines: u32,
     /// Whether every result so far was empty (`(no output)`).
     pub all_empty: bool,
+    /// Absolute transcript position (`trimmed` + local index) of this run's
+    /// summary line. Merging is only valid while that line is still the *last*
+    /// transcript entry — otherwise the in-place update would overwrite
+    /// whatever landed after it (e.g. committed assistant prose).
+    pub line_pos: u64,
 }
 
 impl TranscriptEntry {

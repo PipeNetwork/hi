@@ -764,8 +764,10 @@ impl crate::App {
                     .and_then(|i| self.input.history.get(i))
                     .map(|s| s.replace('\n', " "))
                     .unwrap_or_default();
-                let preview = if preview.len() > 60 {
-                    format!("{}…", &preview[..60])
+                // Char-based truncation: history entries are arbitrary input,
+                // and a byte slice panics on a multi-byte char at the cut.
+                let preview = if preview.chars().count() > 60 {
+                    format!("{}…", preview.chars().take(60).collect::<String>())
                 } else {
                     preview
                 };

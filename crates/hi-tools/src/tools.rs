@@ -1509,9 +1509,20 @@ async fn read_lines<R: tokio::io::AsyncRead + Unpin>(
         return;
     };
     use tokio::io::{AsyncBufReadExt, BufReader};
-    let mut reader = BufReader::new(pipe).lines();
-    while let Ok(Some(line)) = reader.next_line().await {
-        let mut with_nl = line;
+    // Read raw bytes and lossy-decode per line: `next_line()` errors on the
+    // first invalid-UTF-8 byte, which would stop draining the pipe — output
+    // after that point would be lost, and a child still writing would block on
+    // a full pipe buffer until the timeout kills it.
+    let mut reader = BufReader::new(pipe);
+    let mut bytes = Vec::new();
+    loop {
+        bytes.clear();
+        match reader.read_until(b'\n', &mut bytes).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let line = String::from_utf8_lossy(&bytes);
+        let mut with_nl = line.trim_end_matches(['\r', '\n']).to_string();
         with_nl.push('\n');
         if let Ok(mut cb) = on_line.lock() {
             (*cb)(&with_nl);

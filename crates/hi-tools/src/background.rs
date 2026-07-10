@@ -235,10 +235,21 @@ async fn drive(
 /// cap by front-trimming on a char boundary (and shifting the read cursor).
 async fn pump<R: tokio::io::AsyncRead + Unpin>(pipe: Option<R>, proc: &BgProc) {
     let Some(pipe) = pipe else { return };
-    let mut reader = BufReader::new(pipe).lines();
-    while let Ok(Some(line)) = reader.next_line().await {
+    // Read raw bytes and lossy-decode per line: `next_line()` errors on the
+    // first invalid-UTF-8 byte, which would stop draining the pipe — output
+    // after that point would be lost, and a child still writing would block on
+    // a full pipe buffer.
+    let mut reader = BufReader::new(pipe);
+    let mut bytes = Vec::new();
+    loop {
+        bytes.clear();
+        match reader.read_until(b'\n', &mut bytes).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let line = String::from_utf8_lossy(&bytes);
         let mut inner = proc.inner.lock().unwrap();
-        inner.output.push_str(&line);
+        inner.output.push_str(line.trim_end_matches(['\r', '\n']));
         inner.output.push('\n');
         if inner.output.len() > MAX_BG_BUFFER {
             let overflow = inner.output.len() - MAX_BG_BUFFER;

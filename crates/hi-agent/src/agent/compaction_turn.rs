@@ -436,7 +436,7 @@ impl crate::Agent {
                 return Err(err);
             }
         };
-        self.add_usage(completion.usage);
+        self.add_side_usage(completion.usage);
         let _ = self.persist();
         self.emit_usage(ui);
 

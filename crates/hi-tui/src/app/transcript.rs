@@ -378,12 +378,15 @@ impl crate::App {
             // Merge consecutive same-tool explore results into one line, so a
             // burst of reads renders as `⏺ read 6 files · 743 lines` instead of
             // six separate lines. A run continues only while the tool name is
-            // the same and no other event has broken the chain.
+            // the same AND the run's summary line is still the last transcript
+            // entry — events that commit lines without resetting the run
+            // (assistant text, status) would otherwise get overwritten by the
+            // in-place update below.
+            let last_pos = (self.trimmed + self.transcript.len() as u64).checked_sub(1);
             let merge = self
                 .explore_run
                 .as_ref()
-                .map(|r| r.tool == name)
-                .unwrap_or(false);
+                .is_some_and(|r| r.tool == name && Some(r.line_pos) == last_pos);
             if merge {
                 let run = self.explore_run.as_mut().unwrap();
                 run.count += 1;
@@ -395,12 +398,14 @@ impl crate::App {
                 self.replace_last_line(line);
                 return;
             }
-            // Start a new run.
+            // Start a new run; its summary line is about to be pushed at the
+            // current end of the transcript.
             self.explore_run = Some(ExploreRun {
                 tool: name.to_string(),
                 count: 1,
                 lines: n,
                 all_empty: n == 0,
+                line_pos: self.trimmed + self.transcript.len() as u64,
             });
             let line = self.render_explore_run(&header);
             self.push(Line::styled(line, Style::default().fg(Color::Cyan)));
