@@ -4,8 +4,8 @@ use crate::results::{FailKind, RunResult};
 pub fn print_summary(results: &[RunResult], task_count: usize, active: &[&Config], trials: usize) {
     println!("\n=== Results ({task_count} tasks × {trials} trial(s)) ===");
     println!(
-        "{:<32} {:>14} {:>8} {:>6} {:>11} {:>10}",
-        "config", "pass@1", "pass@k", "cand", "tok/trial", "tok/task"
+        "{:<32} {:>14} {:>8} {:>6} {:>11} {:>10} {:>10}",
+        "config", "pass@1", "pass@k", "cand", "tok/trial", "tok/task", "ctx/task"
     );
     let mut models: Vec<&str> = results.iter().map(|r| r.model.as_str()).collect();
     models.sort();
@@ -55,17 +55,24 @@ pub fn print_summary(results: &[RunResult], task_count: usize, active: &[&Config
             }
 
             let tokens: u64 = rows.iter().map(|r| r.tokens).sum::<u64>() / trials as u64;
+            let input_tokens: u64 =
+                rows.iter().map(|r| r.input_tokens).sum::<u64>() / trials as u64;
             // The headline A/B number: mean tokens to attempt one task (summed across
             // a config's candidates). Compare it across condense on/off runs.
             let tok_per_task = tokens / task_count.max(1) as u64;
+            // Context (input) tokens per task — the "how much context does hi send"
+            // axis. Tune system-prompt/tools/compaction to drop this without
+            // dropping pass@1 (the Pi-efficiency loop).
+            let ctx_per_task = input_tokens / task_count.max(1) as u64;
             println!(
-                "{:<32} {:>14} {:>8} {:>6} {:>11} {:>10}",
+                "{:<32} {:>14} {:>8} {:>6} {:>11} {:>10} {:>10}",
                 label,
                 pass1,
                 format!("{}/{task_count}", solved.len()),
                 config.temperatures.len(),
                 tokens,
                 tok_per_task,
+                ctx_per_task,
             );
 
             // Failure-mode breakdown: where this config loses, across all trials.

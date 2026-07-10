@@ -110,6 +110,9 @@ pub struct RunResult {
     pub failure_confidence: Option<&'static str>,
     pub candidates: usize,
     pub tokens: u64,
+    /// Input (context) tokens sent to the model, summed across the config's
+    /// candidates — the "how much context" axis (system prompt + tools + history).
+    pub input_tokens: u64,
     pub seconds: f64,
     pub mcp_model: Option<McpModelArtifact>,
     /// Trajectory of the representative (furthest-progressing) candidate —
@@ -136,6 +139,7 @@ pub struct Candidate {
     pub verify_output_summary: String,
     pub failure_confidence: Option<&'static str>,
     pub tokens: u64,
+    pub input_tokens: u64,
     pub seconds: f64,
     pub trajectory: Trajectory,
 }
