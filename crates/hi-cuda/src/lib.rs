@@ -20595,6 +20595,139 @@ mod tests {
         }
     }
 
+    /// int8/Q8 chunked-prefill causal attention vs a host softmax over the dequantized
+    /// paged cache (isolates the attention math from quant error). Write K/V via the Q8
+    /// write kernel, run the Q8 paged-prefill kernel, compare to the reference over the
+    /// round-tripped int8 cache.
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_paged_prefill_causal_attention_q8_matches_reference() {
+        use crate::runtime::{DeviceBuffer, Stream};
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let stream = Stream::create().unwrap();
+        let mut rng = StdRng::seed_from_u64(0x71c8_aa);
+        let (heads, kv_heads, hd) = (4usize, 2usize, 16usize);
+        let (query_offset, chunk_len) = (18usize, 12usize);
+        let seq = query_offset + chunk_len;
+        let page_size = 8usize;
+        let num_phys = (seq + page_size - 1) / page_size;
+        let page_table_len = num_phys;
+        let page_table: Vec<u32> = (0..num_phys as u32).collect();
+        let pt = DeviceBuffer::alloc(page_table.len() * 4).unwrap();
+        pt.copy_from_host(&page_table).unwrap();
+
+        let kv_n = seq * kv_heads * hd;
+        let kvals: Vec<f32> = (0..kv_n).map(|_| rng.gen_range(-1.2f32..1.2)).collect();
+        let vvals: Vec<f32> = (0..kv_n).map(|_| rng.gen_range(-1.2f32..1.2)).collect();
+        let ks = DeviceBuffer::alloc(kv_n * 4).unwrap();
+        ks.copy_from_host(&kvals).unwrap();
+        let vs = DeviceBuffer::alloc(kv_n * 4).unwrap();
+        vs.copy_from_host(&vvals).unwrap();
+
+        let pages_elems = num_phys * kv_heads * page_size * hd;
+        let scale_elems = num_phys * kv_heads * page_size;
+        let kpg = DeviceBuffer::alloc(pages_elems).unwrap();
+        let vpg = DeviceBuffer::alloc(pages_elems).unwrap();
+        let ksc = DeviceBuffer::alloc(scale_elems * 4).unwrap();
+        let vsc = DeviceBuffer::alloc(scale_elems * 4).unwrap();
+        for b in [&kpg, &vpg, &ksc, &vsc] {
+            b.memset_zero_async(&stream).unwrap();
+        }
+        for (src, pg, sc) in [(&ks, &kpg, &ksc), (&vs, &vpg, &vsc)] {
+            crate::kernels::launch_write_paged_kv_cache_q8_batched(
+                src,
+                pg,
+                sc,
+                &pt,
+                None,
+                0,
+                1,
+                seq,
+                kv_heads,
+                hd,
+                page_size,
+                page_table_len,
+                &stream,
+            )
+            .unwrap();
+        }
+
+        let qn = chunk_len * heads * hd;
+        let qvals: Vec<f32> = (0..qn).map(|_| rng.gen_range(-1.2f32..1.2)).collect();
+        let q = DeviceBuffer::alloc(qn * 4).unwrap();
+        q.copy_from_host(&qvals).unwrap();
+        let out = DeviceBuffer::alloc(chunk_len * heads * hd * 4).unwrap();
+        crate::kernels::launch_paged_prefill_causal_attention_batched_q8(
+            &q,
+            &kpg,
+            &vpg,
+            &ksc,
+            &vsc,
+            &pt,
+            &out,
+            query_offset,
+            1,
+            chunk_len,
+            page_size,
+            page_table_len,
+            heads,
+            kv_heads,
+            hd,
+            hd,
+            &stream,
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+        let got = out.copy_to_host::<f32>(chunk_len * heads * hd).unwrap();
+
+        let codes_k = kpg.copy_to_host::<i8>(pages_elems).unwrap();
+        let codes_v = vpg.copy_to_host::<i8>(pages_elems).unwrap();
+        let sk = ksc.copy_to_host::<f32>(scale_elems).unwrap();
+        let sv = vsc.copy_to_host::<f32>(scale_elems).unwrap();
+        let deq = |codes: &[i8], sc: &[f32], kvh: usize, pos: usize, d: usize| -> f64 {
+            let lp = pos / page_size;
+            let off = pos % page_size;
+            let phys = page_table[lp] as usize;
+            let slot = ((phys * kv_heads + kvh) * page_size + off) * hd + d;
+            let sslot = (phys * kv_heads + kvh) * page_size + off;
+            codes[slot] as f64 * sc[sslot] as f64
+        };
+        let scale = 1.0f64 / (hd as f64).sqrt();
+        let kvr = heads / kv_heads;
+        for r in 0..chunk_len {
+            let p = query_offset + r;
+            for h in 0..heads {
+                let kvh = h / kvr;
+                let mut row = vec![0.0f64; p + 1];
+                let mut mx = f64::NEG_INFINITY;
+                for (s, rs) in row.iter_mut().enumerate() {
+                    let mut dot = 0.0f64;
+                    for d in 0..hd {
+                        dot +=
+                            qvals[(r * heads + h) * hd + d] as f64 * deq(&codes_k, &sk, kvh, s, d);
+                    }
+                    *rs = dot * scale;
+                    mx = mx.max(*rs);
+                }
+                let mut sum = 0.0f64;
+                for rs in row.iter_mut() {
+                    *rs = (*rs - mx).exp();
+                    sum += *rs;
+                }
+                for d in 0..hd {
+                    let mut acc = 0.0f64;
+                    for (s, &rs) in row.iter().enumerate() {
+                        acc += rs / sum * deq(&codes_v, &sv, kvh, s, d);
+                    }
+                    let g = got[(r * heads + h) * hd + d] as f64;
+                    assert!((g - acc).abs() <= 2e-3, "r={r} h={h} d={d}: {g} vs {acc}");
+                }
+            }
+        }
+    }
+
     /// int8/Q8 tiled paged decode attention vs a host softmax reference computed over the
     /// SAME dequantized cache (so this isolates the attention math from quant error, which
     /// the write test covers): write random K/V through the Q8 write kernel, run the Q8
