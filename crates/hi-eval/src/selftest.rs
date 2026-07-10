@@ -76,6 +76,7 @@ pub async fn run_self_test(active: &[&Config], profile: EvalProfile) -> Result<(
         let config_name = config.name.to_string();
         let use_verify = config.use_verify;
         let temperatures = config.temperatures.to_vec();
+        let config_env = config.env;
         futs.push(tokio::spawn(async move {
             run_config(
                 &hi,
@@ -84,6 +85,7 @@ pub async fn run_self_test(active: &[&Config], profile: EvalProfile) -> Result<(
                 &config_name,
                 use_verify,
                 &temperatures,
+                config_env,
                 profile,
                 None,
             )

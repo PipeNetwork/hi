@@ -119,7 +119,7 @@ async fn async_main() -> Result<()> {
         })
         .collect();
     if active.is_empty() {
-        bail!("no configs match --configs; known: baseline, verify, best-of-3");
+        bail!("no configs match --configs; known: baseline, verify, best-of-3, goal-team");
     }
 
     if self_test {
@@ -216,6 +216,7 @@ async fn async_main() -> Result<()> {
                     let config_name = config.name.to_string();
                     let use_verify = config.use_verify;
                     let temperatures = config.temperatures.to_vec();
+                    let config_env = config.env;
                     let sem = semaphore.clone();
                     let artifacts_dir = artifacts_dir.clone();
                     let label2 = label.clone();
@@ -237,6 +238,7 @@ async fn async_main() -> Result<()> {
                             &config_name,
                             use_verify,
                             &temperatures,
+                            config_env,
                             profile,
                             model_override,
                         )
