@@ -545,6 +545,21 @@ mod native {
             page_table_len: c_int,
             stream: *mut c_void,
         ) -> c_int;
+        fn hi_cuda_launch_write_paged_kv_cache_q8_batched(
+            values: *const c_void,
+            pages: *mut c_void,
+            scales: *mut c_void,
+            page_table: *const c_void,
+            positions: *const c_void,
+            start_pos: c_int,
+            batch_count: c_int,
+            row_count: c_int,
+            kv_heads: c_int,
+            head_dim: c_int,
+            page_size: c_int,
+            page_table_len: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
         fn hi_cuda_launch_copy_paged_kv_cache_prefix_batched(
             pages: *mut c_void,
             page_table: *const c_void,
@@ -743,6 +758,24 @@ mod native {
             q: *const c_void,
             k_pages: *const c_void,
             v_pages: *const c_void,
+            page_table: *const c_void,
+            output: *mut c_void,
+            position: c_int,
+            page_size: c_int,
+            page_table_len: c_int,
+            heads: c_int,
+            kv_heads: c_int,
+            qk_head_dim: c_int,
+            v_head_dim: c_int,
+            window: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_tiled_paged_decode_attention_q8(
+            q: *const c_void,
+            k_pages: *const c_void,
+            v_pages: *const c_void,
+            k_scales: *const c_void,
+            v_scales: *const c_void,
             page_table: *const c_void,
             output: *mut c_void,
             position: c_int,
@@ -2488,6 +2521,54 @@ mod native {
         check_last_error("hi_cuda_launch_write_paged_kv_cache_batched_positions")
     }
 
+    /// int8/Q8 paged KV write. Quantizes each `(batch,row,kv_head)` head_dim vector to
+    /// int8 + one f32 scale. `positions` (per-batch base position) is used when `Some`
+    /// (decode); otherwise `start_pos` is the base for all rows (prefill).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_write_paged_kv_cache_q8_batched(
+        values: &DeviceBuffer,
+        pages: &DeviceBuffer,
+        scales: &DeviceBuffer,
+        page_table: &DeviceBuffer,
+        positions: Option<&DeviceBuffer>,
+        start_pos: usize,
+        batch_count: usize,
+        row_count: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        page_size: usize,
+        page_table_len: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(batch_count, "kv_q8 batch_count")?;
+        ensure_len(row_count, "kv_q8 row_count")?;
+        ensure_len(kv_heads, "kv_q8 kv_heads")?;
+        ensure_len(head_dim, "kv_q8 head_dim")?;
+        ensure_len(page_size, "kv_q8 page_size")?;
+        ensure_len(page_table_len, "kv_q8 page_table_len")?;
+        let positions_ptr = positions
+            .map(|buffer| buffer.as_ptr())
+            .unwrap_or(std::ptr::null());
+        launch_status(unsafe {
+            hi_cuda_launch_write_paged_kv_cache_q8_batched(
+                values.as_ptr(),
+                pages.as_mut_ptr(),
+                scales.as_mut_ptr(),
+                page_table.as_ptr(),
+                positions_ptr,
+                start_pos as c_int,
+                batch_count as c_int,
+                row_count as c_int,
+                kv_heads as c_int,
+                head_dim as c_int,
+                page_size as c_int,
+                page_table_len as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_write_paged_kv_cache_q8_batched")
+    }
+
     pub fn launch_copy_paged_kv_cache_prefix_batched(
         pages: &DeviceBuffer,
         page_table: &DeviceBuffer,
@@ -3088,6 +3169,58 @@ mod native {
             )
         })?;
         check_last_error("hi_cuda_launch_tiled_paged_decode_attention")
+    }
+
+    /// int8/Q8 tiled paged decode attention: K/V pages are int8, dequantized per-vector
+    /// via the parallel `k_scales`/`v_scales` buffers (one f32 scale per cache vector).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_tiled_paged_decode_attention_q8(
+        q: &DeviceBuffer,
+        k_pages: &DeviceBuffer,
+        v_pages: &DeviceBuffer,
+        k_scales: &DeviceBuffer,
+        v_scales: &DeviceBuffer,
+        page_table: &DeviceBuffer,
+        output: &DeviceBuffer,
+        position: usize,
+        page_size: usize,
+        page_table_len: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        v_head_dim: usize,
+        window: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(position, "tiled_paged_attention_q8 position")?;
+        ensure_len(page_size, "tiled_paged_attention_q8 page_size")?;
+        ensure_len(page_table_len, "tiled_paged_attention_q8 page_table_len")?;
+        ensure_len(heads, "tiled_paged_attention_q8 heads")?;
+        ensure_len(kv_heads, "tiled_paged_attention_q8 kv_heads")?;
+        ensure_len(head_dim, "tiled_paged_attention_q8 head_dim")?;
+        ensure_len(v_head_dim, "tiled_paged_attention_q8 v_head_dim")?;
+        ensure_len(window, "tiled_paged_attention_q8 window")?;
+        launch_status(unsafe {
+            hi_cuda_launch_tiled_paged_decode_attention_q8(
+                q.as_ptr(),
+                k_pages.as_ptr(),
+                v_pages.as_ptr(),
+                k_scales.as_ptr(),
+                v_scales.as_ptr(),
+                page_table.as_ptr(),
+                output.as_mut_ptr(),
+                position as c_int,
+                page_size as c_int,
+                page_table_len as c_int,
+                heads as c_int,
+                kv_heads as c_int,
+                head_dim as c_int,
+                v_head_dim as c_int,
+                window as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_tiled_paged_decode_attention_q8")
     }
 
     #[allow(clippy::too_many_arguments)]

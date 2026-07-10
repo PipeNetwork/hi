@@ -20439,6 +20439,243 @@ mod tests {
     /// zeroed f16 cache, read it back, and check every slot equals the f16-rounded
     /// written value (written slots) or 0 (untouched). Covers the per-batch-positions
     /// (live) and single-start variants with a non-identity page table.
+    /// int8/Q8 tiled paged decode attention vs a host softmax reference computed over the
+    /// SAME dequantized cache (so this isolates the attention math from quant error, which
+    /// the write test covers): write random K/V through the Q8 write kernel, run the Q8
+    /// read kernel, and compare to the host reference over the round-tripped int8 values.
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_paged_decode_attention_q8_matches_reference() {
+        use crate::runtime::{DeviceBuffer, Stream};
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let stream = Stream::create().unwrap();
+        let mut rng = StdRng::seed_from_u64(0x0a11_c8);
+        let (heads, kv_heads, hd) = (4usize, 2usize, 8usize);
+        let (ctx, page_size) = (20usize, 8usize);
+        let num_phys = (ctx + page_size - 1) / page_size;
+        let page_table_len = num_phys;
+        let page_table: Vec<u32> = (0..num_phys as u32).collect();
+        let pt_dev = DeviceBuffer::alloc(page_table.len() * 4).unwrap();
+        pt_dev.copy_from_host(&page_table).unwrap();
+
+        let kv_n = ctx * kv_heads * hd;
+        let kvals: Vec<f32> = (0..kv_n).map(|_| rng.gen_range(-1.5f32..1.5)).collect();
+        let vvals: Vec<f32> = (0..kv_n).map(|_| rng.gen_range(-1.5f32..1.5)).collect();
+        let k_src = DeviceBuffer::alloc(kv_n * 4).unwrap();
+        k_src.copy_from_host(&kvals).unwrap();
+        let v_src = DeviceBuffer::alloc(kv_n * 4).unwrap();
+        v_src.copy_from_host(&vvals).unwrap();
+
+        let pages_elems = num_phys * kv_heads * page_size * hd;
+        let scale_elems = num_phys * kv_heads * page_size;
+        let k_pages = DeviceBuffer::alloc(pages_elems).unwrap();
+        let v_pages = DeviceBuffer::alloc(pages_elems).unwrap();
+        let k_scales = DeviceBuffer::alloc(scale_elems * 4).unwrap();
+        let v_scales = DeviceBuffer::alloc(scale_elems * 4).unwrap();
+        for b in [&k_pages, &v_pages, &k_scales, &v_scales] {
+            b.memset_zero_async(&stream).unwrap();
+        }
+        for (src, pg, sc) in [(&k_src, &k_pages, &k_scales), (&v_src, &v_pages, &v_scales)] {
+            crate::kernels::launch_write_paged_kv_cache_q8_batched(
+                src,
+                pg,
+                sc,
+                &pt_dev,
+                None,
+                0,
+                1,
+                ctx,
+                kv_heads,
+                hd,
+                page_size,
+                page_table_len,
+                &stream,
+            )
+            .unwrap();
+        }
+
+        let qvals: Vec<f32> = (0..heads * hd)
+            .map(|_| rng.gen_range(-1.5f32..1.5))
+            .collect();
+        let q_dev = DeviceBuffer::alloc(qvals.len() * 4).unwrap();
+        q_dev.copy_from_host(&qvals).unwrap();
+        let out = DeviceBuffer::alloc(heads * hd * 4).unwrap();
+        crate::kernels::launch_tiled_paged_decode_attention_q8(
+            &q_dev,
+            &k_pages,
+            &v_pages,
+            &k_scales,
+            &v_scales,
+            &pt_dev,
+            &out,
+            ctx - 1,
+            page_size,
+            page_table_len,
+            heads,
+            kv_heads,
+            hd,
+            hd,
+            0,
+            &stream,
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+        let got = out.copy_to_host::<f32>(heads * hd).unwrap();
+
+        let codes_k = k_pages.copy_to_host::<i8>(pages_elems).unwrap();
+        let codes_v = v_pages.copy_to_host::<i8>(pages_elems).unwrap();
+        let sk = k_scales.copy_to_host::<f32>(scale_elems).unwrap();
+        let sv = v_scales.copy_to_host::<f32>(scale_elems).unwrap();
+        let deq = |codes: &[i8], sc: &[f32], kvh: usize, t: usize, d: usize| -> f64 {
+            let lp = t / page_size;
+            let off = t % page_size;
+            let phys = page_table[lp] as usize;
+            let slot = ((phys * kv_heads + kvh) * page_size + off) * hd + d;
+            let sslot = (phys * kv_heads + kvh) * page_size + off;
+            codes[slot] as f64 * sc[sslot] as f64
+        };
+        let scale = 1.0f64 / (hd as f64).sqrt();
+        let kvr = heads / kv_heads;
+        for h in 0..heads {
+            let kvh = h / kvr;
+            let mut row = vec![0.0f64; ctx];
+            let mut mx = f64::NEG_INFINITY;
+            for (t, r) in row.iter_mut().enumerate() {
+                let mut dot = 0.0f64;
+                for d in 0..hd {
+                    dot += qvals[h * hd + d] as f64 * deq(&codes_k, &sk, kvh, t, d);
+                }
+                *r = dot * scale;
+                mx = mx.max(*r);
+            }
+            let mut sum = 0.0f64;
+            for r in row.iter_mut() {
+                *r = (*r - mx).exp();
+                sum += *r;
+            }
+            for d in 0..hd {
+                let mut acc = 0.0f64;
+                for (t, &r) in row.iter().enumerate() {
+                    acc += r / sum * deq(&codes_v, &sv, kvh, t, d);
+                }
+                let g = got[h * hd + d] as f64;
+                assert!((g - acc).abs() <= 2e-4, "h={h} d={d}: {g} vs {acc}");
+            }
+        }
+    }
+
+    /// int8/Q8 paged KV write: each (batch,row,kv_head) head_dim vector is symmetric-int8
+    /// quantized (scale = amax/127) into the page slot + a parallel scale buffer. Write
+    /// random values, read back codes+scales, dequantize on host, and check every written
+    /// slot is within the quantization step of the original. Covers positions + start_pos.
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_write_paged_kv_cache_q8_matches_dequant() {
+        use crate::runtime::{DeviceBuffer, Stream};
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let stream = Stream::create().unwrap();
+        let mut rng = StdRng::seed_from_u64(0x9b_7e_44);
+        let (batch, rows, kv_heads, hd) = (2usize, 5usize, 2usize, 8usize);
+        let (page_size, page_table_len, num_phys) = (4usize, 2usize, 4usize);
+        let pages_elems = num_phys * kv_heads * page_size * hd;
+        let scale_elems = num_phys * kv_heads * page_size;
+        let page_table: Vec<u32> = vec![0, 1, 2, 3];
+        let pt_dev = DeviceBuffer::alloc(page_table.len() * 4).unwrap();
+        pt_dev.copy_from_host(&page_table).unwrap();
+
+        let values: Vec<f32> = (0..batch * rows * kv_heads * hd)
+            .map(|_| rng.gen_range(-2.0f32..2.0))
+            .collect();
+        let val_dev = DeviceBuffer::alloc(values.len() * 4).unwrap();
+        val_dev.copy_from_host(&values).unwrap();
+
+        let slot = |phys: usize, head: usize, off: usize, d: usize| {
+            ((phys * kv_heads + head) * page_size + off) * hd + d
+        };
+        let scale_slot =
+            |phys: usize, head: usize, off: usize| (phys * kv_heads + head) * page_size + off;
+
+        for (label, starts) in [
+            ("positions", vec![0usize, 2usize]),
+            ("single-start", vec![1usize, 1usize]),
+        ] {
+            let pages = DeviceBuffer::alloc(pages_elems).unwrap(); // int8: 1 byte/elem
+            pages.memset_zero_async(&stream).unwrap();
+            let scales = DeviceBuffer::alloc(scale_elems * 4).unwrap();
+            scales.memset_zero_async(&stream).unwrap();
+            let positions = if label == "positions" {
+                let pos: Vec<u32> = starts.iter().map(|&p| p as u32).collect();
+                let pos_dev = DeviceBuffer::alloc(pos.len() * 4).unwrap();
+                pos_dev.copy_from_host(&pos).unwrap();
+                Some(pos_dev)
+            } else {
+                None
+            };
+            let start_pos = if label == "positions" { 0 } else { starts[0] };
+            crate::kernels::launch_write_paged_kv_cache_q8_batched(
+                &val_dev,
+                &pages,
+                &scales,
+                &pt_dev,
+                positions.as_ref(),
+                start_pos,
+                batch,
+                rows,
+                kv_heads,
+                hd,
+                page_size,
+                page_table_len,
+                &stream,
+            )
+            .unwrap();
+            stream.synchronize().unwrap();
+            let codes = pages.copy_to_host::<i8>(pages_elems).unwrap();
+            let dev_scales = scales.copy_to_host::<f32>(scale_elems).unwrap();
+
+            for b in 0..batch {
+                for row in 0..rows {
+                    let logical_pos = starts[b] + row;
+                    let logical_page = logical_pos / page_size;
+                    if logical_page >= page_table_len {
+                        continue;
+                    }
+                    let phys = page_table[b * page_table_len + logical_page] as usize;
+                    let off = logical_pos % page_size;
+                    for head in 0..kv_heads {
+                        let mut amax = 0.0f32;
+                        for d in 0..hd {
+                            amax = amax
+                                .max(values[((b * rows + row) * kv_heads + head) * hd + d].abs());
+                        }
+                        let ref_scale = amax / 127.0;
+                        let dev_scale = dev_scales[scale_slot(phys, head, off)];
+                        assert!(
+                            (dev_scale - ref_scale).abs() <= 1e-6 * (1.0 + ref_scale),
+                            "{label} scale b={b} row={row} head={head}: {dev_scale} vs {ref_scale}"
+                        );
+                        for d in 0..hd {
+                            let v = values[((b * rows + row) * kv_heads + head) * hd + d];
+                            let dequant = codes[slot(phys, head, off, d)] as f32 * dev_scale;
+                            assert!(
+                                (dequant - v).abs() <= amax / 200.0 + 1e-6,
+                                "{label} value b={b} row={row} head={head} d={d}: {dequant} vs {v} (amax={amax})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// paged slot: values[batch][row][kv_head][dim] -> pages[phys][head][offset][dim]
+    /// at logical_pos = start + row, via page_table[batch][logical_page]. Write into a
+    /// zeroed f16 cache, read it back, and check every slot equals the f16-rounded
+    /// written value (written slots) or 0 (untouched). Covers the per-batch-positions
+    /// (live) and single-start variants with a non-identity page table.
     #[cfg(feature = "native-cuda")]
     #[test]
     fn native_cuda_write_paged_kv_cache_places_tokens_correctly() {

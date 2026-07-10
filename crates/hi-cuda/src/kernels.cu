@@ -2366,6 +2366,88 @@ __global__ void copy_paged_kv_cache_prefix_batched_kernel(
   pages[dst_idx] = pages[src_idx];
 }
 
+// int8/Q8 paged KV write: one warp per (batch, row, kv_head) head_dim vector. The warp
+// reduces the vector's amax (symmetric scale = amax/127), writes int8 codes into the page
+// slot and one f32 scale into the parallel scale buffer (indexed per [phys_page][kv_head]
+// [page_offset]). Base position is positions[batch] when `positions` is non-null (decode),
+// otherwise `start_pos` (prefill). Mirrors quantize_q8_row's warp-amax pattern.
+__global__ void write_paged_kv_cache_q8_batched_kernel(
+    const float* __restrict__ values,
+    int8_t* __restrict__ pages,
+    float* __restrict__ scales,
+    const uint32_t* __restrict__ page_table,
+    const uint32_t* __restrict__ positions,
+    int start_pos,
+    int batch_count,
+    int row_count,
+    int kv_heads,
+    int head_dim,
+    int page_size,
+    int page_table_len) {
+  int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+  int lane = threadIdx.x & 31;
+  int total_vectors = batch_count * row_count * kv_heads;
+  if (warp >= total_vectors) {
+    return;
+  }
+  int head = warp % kv_heads;
+  int row = (warp / kv_heads) % row_count;
+  int batch = warp / (kv_heads * row_count);
+  int base = positions ? static_cast<int>(positions[batch]) : start_pos;
+  int logical_pos = base + row;
+  int logical_page = logical_pos / page_size;
+  int page_offset = logical_pos - logical_page * page_size;
+  if (logical_pos < 0 || logical_page >= page_table_len) {
+    return;
+  }
+  uint32_t physical_page = page_table[batch * page_table_len + logical_page];
+  const float* src = values + ((batch * row_count + row) * kv_heads + head) * head_dim;
+  float amax = 0.0f;
+  for (int d = lane; d < head_dim; d += 32) {
+    amax = fmaxf(amax, fabsf(src[d]));
+  }
+  for (int o = 16; o > 0; o >>= 1) {
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+  }
+  float scale = amax / 127.0f;
+  float inv = (scale > 0.0f) ? 1.0f / scale : 0.0f;
+  long slot =
+      (static_cast<long>(static_cast<int>(physical_page) * kv_heads + head) * page_size +
+       page_offset) *
+      head_dim;
+  int scale_idx =
+      (static_cast<int>(physical_page) * kv_heads + head) * page_size + page_offset;
+  for (int d = lane; d < head_dim; d += 32) {
+    int q = max(-127, min(127, __float2int_rn(src[d] * inv)));
+    pages[slot + d] = static_cast<int8_t>(q);
+  }
+  if (lane == 0) {
+    scales[scale_idx] = scale;
+  }
+}
+
+extern "C" int hi_cuda_launch_write_paged_kv_cache_q8_batched(
+    const void* values, void* pages, void* scales, const void* page_table,
+    const void* positions, int start_pos, int batch_count, int row_count, int kv_heads,
+    int head_dim, int page_size, int page_table_len, void* stream) {
+  if (values == nullptr || pages == nullptr || scales == nullptr || page_table == nullptr ||
+      batch_count <= 0 || row_count <= 0 || kv_heads <= 0 || head_dim <= 0 || page_size <= 0 ||
+      page_table_len <= 0 || stream == nullptr) {
+    return 1;
+  }
+  long total_vectors = static_cast<long>(batch_count) * row_count * kv_heads;
+  int block = 256;
+  int warps_per_block = block / 32;
+  long grid = (total_vectors + warps_per_block - 1) / warps_per_block;
+  write_paged_kv_cache_q8_batched_kernel<<<static_cast<unsigned int>(grid), block, 0,
+                                           static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const float*>(values), static_cast<int8_t*>(pages),
+      static_cast<float*>(scales), static_cast<const uint32_t*>(page_table),
+      static_cast<const uint32_t*>(positions), start_pos, batch_count, row_count, kv_heads,
+      head_dim, page_size, page_table_len);
+  return 0;
+}
+
 __global__ void causal_attention_kernel(
     const float* q,
     const float* k,
@@ -3474,6 +3556,159 @@ __global__ void tiled_paged_decode_attention_kernel(
     }
     out_vec[dim] = a * inv;
   }
+}
+
+// int8/Q8 variant of tiled_paged_decode_attention_kernel. K/V pages are int8; each
+// (phys_page,kv_head,page_offset) head_dim vector has one f32 scale in the parallel
+// k_scales/v_scales buffers, loaded once per source and multiplied into the dequantized
+// int8 value. Split-K flash decode is otherwise identical to the f16 kernel.
+__global__ void tiled_paged_decode_attention_q8_kernel(
+    const float* q,
+    const int8_t* k_pages,
+    const int8_t* v_pages,
+    const float* k_scales,
+    const float* v_scales,
+    const uint32_t* page_table,
+    float* output,
+    int position,
+    int page_size,
+    int page_table_len,
+    int heads,
+    int kv_heads,
+    int qk_head_dim,
+    int v_head_dim,
+    int window) {
+  const int head = blockIdx.x;
+  if (head >= heads || qk_head_dim > HI_CUDA_FLASH_MAX_HEAD_DIM ||
+      v_head_dim > HI_CUDA_FLASH_MAX_HEAD_DIM) {
+    return;
+  }
+  const int warp_id = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int kv_repeats = heads / kv_heads;
+  const int kv_head = head / kv_repeats;
+  const float scale = rsqrtf(static_cast<float>(qk_head_dim));
+  const float* q_vec = q + head * qk_head_dim;
+  float* out_vec = output + head * v_head_dim;
+
+  constexpr int MAX_PER_LANE = HI_CUDA_FLASH_MAX_HEAD_DIM / 32;
+  float q_reg[MAX_PER_LANE];
+  float acc[MAX_PER_LANE];
+#pragma unroll
+  for (int i = 0; i < MAX_PER_LANE; ++i) {
+    const int dim = lane + i * 32;
+    q_reg[i] = (dim < qk_head_dim) ? q_vec[dim] : 0.0f;
+    acc[i] = 0.0f;
+  }
+  float m = -INFINITY;
+  float l = 0.0f;
+  const int source_start = (window > 0 && position >= window) ? position - window + 1 : 0;
+  for (int source = source_start + warp_id; source <= position;
+       source += HI_CUDA_DECODE_WARPS) {
+    const int logical_page = source / page_size;
+    const int page_offset = source - logical_page * page_size;
+    float dot = 0.0f;
+    const int8_t* v_vec = nullptr;
+    float v_scale = 0.0f;
+    if (logical_page < page_table_len) {
+      const uint32_t physical_page = page_table[logical_page];
+      const int scale_idx =
+          (static_cast<int>(physical_page) * kv_heads + kv_head) * page_size + page_offset;
+      const int8_t* k_vec = k_pages + static_cast<long>(scale_idx) * qk_head_dim;
+      v_vec = v_pages + static_cast<long>(scale_idx) * v_head_dim;
+      const float k_scale = k_scales[scale_idx];
+      v_scale = v_scales[scale_idx];
+#pragma unroll
+      for (int i = 0; i < MAX_PER_LANE; ++i) {
+        const int dim = lane + i * 32;
+        if (dim < qk_head_dim) {
+          dot += q_reg[i] * (static_cast<float>(k_vec[dim]) * k_scale);
+        }
+      }
+    }
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      dot += __shfl_down_sync(0xffffffffu, dot, offset);
+    }
+    const float score = __shfl_sync(0xffffffffu, dot, 0) * scale;
+    const float next_m = fmaxf(m, score);
+    const float rescale = isfinite(m) ? expf(m - next_m) : 0.0f;
+    const float weight = expf(score - next_m);
+    if (v_vec != nullptr) {
+#pragma unroll
+      for (int i = 0; i < MAX_PER_LANE; ++i) {
+        const int dim = lane + i * 32;
+        if (dim < v_head_dim) {
+          acc[i] = acc[i] * rescale + weight * (static_cast<float>(v_vec[dim]) * v_scale);
+        }
+      }
+    }
+    l = l * rescale + weight;
+    m = next_m;
+  }
+
+  extern __shared__ float smem[];
+  float* sh_m = smem;
+  float* sh_l = smem + HI_CUDA_DECODE_WARPS;
+  float* sh_acc = smem + 2 * HI_CUDA_DECODE_WARPS;
+  if (lane == 0) {
+    sh_m[warp_id] = m;
+    sh_l[warp_id] = l;
+  }
+#pragma unroll
+  for (int i = 0; i < MAX_PER_LANE; ++i) {
+    const int dim = lane + i * 32;
+    if (dim < v_head_dim) {
+      sh_acc[warp_id * v_head_dim + dim] = acc[i];
+    }
+  }
+  __syncthreads();
+  float global_max = -INFINITY;
+#pragma unroll
+  for (int w = 0; w < HI_CUDA_DECODE_WARPS; ++w) {
+    global_max = fmaxf(global_max, sh_m[w]);
+  }
+  float total = 0.0f;
+#pragma unroll
+  for (int w = 0; w < HI_CUDA_DECODE_WARPS; ++w) {
+    total += sh_l[w] * expf(sh_m[w] - global_max);
+  }
+  const float inv = (total == 0.0f || !isfinite(total)) ? 0.0f : 1.0f / total;
+  for (int dim = threadIdx.x; dim < v_head_dim; dim += blockDim.x) {
+    float a = 0.0f;
+#pragma unroll
+    for (int w = 0; w < HI_CUDA_DECODE_WARPS; ++w) {
+      a += sh_acc[w * v_head_dim + dim] * expf(sh_m[w] - global_max);
+    }
+    out_vec[dim] = a * inv;
+  }
+}
+
+extern "C" int hi_cuda_launch_tiled_paged_decode_attention_q8(
+    const void* q, const void* k_pages, const void* v_pages, const void* k_scales,
+    const void* v_scales, const void* page_table, void* output, int position, int page_size,
+    int page_table_len, int heads, int kv_heads, int qk_head_dim, int v_head_dim, int window,
+    void* stream) {
+  if (q == nullptr || k_pages == nullptr || v_pages == nullptr || k_scales == nullptr ||
+      v_scales == nullptr || page_table == nullptr || output == nullptr || position < 0 ||
+      page_size <= 0 || page_table_len <= 0 || heads <= 0 || kv_heads <= 0 ||
+      qk_head_dim <= 0 || v_head_dim <= 0 || heads % kv_heads != 0 ||
+      qk_head_dim > HI_CUDA_FLASH_MAX_HEAD_DIM || v_head_dim > HI_CUDA_FLASH_MAX_HEAD_DIM ||
+      stream == nullptr) {
+    return 1;
+  }
+  dim3 grid(heads);
+  dim3 block(HI_CUDA_DECODE_WARPS * 32);
+  size_t shared_bytes =
+      (2 * HI_CUDA_DECODE_WARPS + HI_CUDA_DECODE_WARPS * v_head_dim) * sizeof(float);
+  tiled_paged_decode_attention_q8_kernel<<<grid, block, shared_bytes,
+                                           static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const float*>(q), static_cast<const int8_t*>(k_pages),
+      static_cast<const int8_t*>(v_pages), static_cast<const float*>(k_scales),
+      static_cast<const float*>(v_scales), static_cast<const uint32_t*>(page_table),
+      static_cast<float*>(output), position, page_size, page_table_len, heads, kv_heads,
+      qk_head_dim, v_head_dim, window);
+  return 0;
 }
 
 __global__ void paged_decode_attention_batched_kernel(
