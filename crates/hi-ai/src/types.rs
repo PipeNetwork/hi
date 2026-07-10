@@ -284,6 +284,13 @@ pub struct Usage {
     /// usage so frontends can show whether failures are route/provider throttles.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limits: Option<RateLimitState>,
+    /// True when a token field was backfilled from a chars/4 estimate rather
+    /// than provider-reported usage (the provider sent no usage frame, or an
+    /// all-zeros one). Sticky across [`Usage::add`], so session totals disclose
+    /// that they contain guessed numbers — surfaced as `usage_estimated` in
+    /// `--report`.
+    #[serde(default)]
+    pub estimated: bool,
 }
 
 impl Usage {
@@ -303,7 +310,13 @@ impl Usage {
         self.output_tokens += other.output_tokens;
         self.cache_read_tokens += other.cache_read_tokens;
         self.cache_creation_tokens += other.cache_creation_tokens;
-        self.rate_limits = other.rate_limits;
+        // "Latest observed": a booking that carries no rate-limit snapshot
+        // (side-calls, error usage, estimates) must not wipe the last real one —
+        // that made the rate-limit display blank out mid-session.
+        if other.rate_limits.is_some() {
+            self.rate_limits = other.rate_limits;
+        }
+        self.estimated |= other.estimated;
     }
 
     /// Deprecated: prefer [`Usage::context_occupancy`], which is set by the
@@ -387,4 +400,61 @@ pub struct ToolCall<'a> {
     pub id: &'a str,
     pub name: &'a str,
     pub arguments: &'a str,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RateLimitBucket, RateLimitState, Usage};
+
+    #[test]
+    fn add_preserves_last_observed_rate_limits_and_sticks_estimated() {
+        let mut totals = Usage {
+            input_tokens: 100,
+            output_tokens: 10,
+            rate_limits: Some(RateLimitState {
+                requests_min: RateLimitBucket {
+                    limit: 10,
+                    remaining: 8,
+                    reset_seconds: 1,
+                },
+                ..RateLimitState::default()
+            }),
+            ..Usage::default()
+        };
+
+        // A booking with no rate-limit snapshot (side-call, error usage,
+        // estimate) must not wipe the last observed one.
+        totals.add(Usage {
+            input_tokens: 50,
+            output_tokens: 5,
+            estimated: true,
+            ..Usage::default()
+        });
+        assert_eq!(totals.input_tokens, 150);
+        assert!(
+            totals.rate_limits.is_some(),
+            "zero-snapshot add wiped rate limits"
+        );
+        // Estimated is sticky: once any component was guessed, totals say so.
+        assert!(totals.estimated);
+        totals.add(Usage {
+            input_tokens: 5,
+            ..Usage::default()
+        });
+        assert!(totals.estimated, "estimated must not reset");
+
+        // A booking that carries a fresh snapshot replaces the old one.
+        totals.add(Usage {
+            rate_limits: Some(RateLimitState {
+                requests_min: RateLimitBucket {
+                    limit: 10,
+                    remaining: 3,
+                    reset_seconds: 2,
+                },
+                ..RateLimitState::default()
+            }),
+            ..Usage::default()
+        });
+        assert_eq!(totals.rate_limits.unwrap().requests_min.remaining, 3);
+    }
 }

@@ -177,6 +177,7 @@ impl Provider for OpenAiProvider {
                     input_includes_cache: true,
                     context_occupancy: estimated_input_tokens,
                     rate_limits,
+                    estimated: true,
                 })
             })?;
         stream::backfill_missing_usage(&mut completion, &request);

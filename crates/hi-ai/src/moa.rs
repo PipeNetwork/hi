@@ -430,6 +430,7 @@ fn add_reference_usage(aggregate: &mut Usage, reference: Usage) {
     aggregate.context_occupancy = aggregate_context;
     aggregate.input_includes_cache = aggregate_includes_cache;
     aggregate.rate_limits = aggregate_rate_limits.or(reference_rate_limits);
+    aggregate.estimated |= reference.estimated;
 }
 
 #[cfg(test)]
@@ -519,11 +520,8 @@ mod tests {
             usage: Usage {
                 input_tokens: input,
                 output_tokens: output,
-                cache_read_tokens: 0,
-                cache_creation_tokens: 0,
-                input_includes_cache: false,
                 context_occupancy: input,
-                rate_limits: None,
+                ..Usage::default()
             },
             stop_reason: Some("stop".into()),
         }
