@@ -182,7 +182,17 @@ impl LspClient {
                 ),
                 ReadOutcome::Message(msg) => {
                     let v: Value = serde_json::from_slice(&msg)?;
-                    if v.get("id").and_then(|i| i.as_u64()) == Some(id) {
+                    // A JSON-RPC *response* has an `id` and no `method`. A
+                    // server→client *request* (e.g. `workspace/configuration`,
+                    // `window/workDoneProgress/create`) also carries an `id`, and
+                    // servers number those from the same small range as our
+                    // `next_id`, so ids collide. Matching on id alone would treat
+                    // that request as our response — its `result` is absent, so we
+                    // return `Null` (a definition/hover silently yields nothing)
+                    // and then drop the real response as a "notification". Require
+                    // the message to be method-less so only true responses match.
+                    let is_response = v.get("method").is_none();
+                    if is_response && v.get("id").and_then(|i| i.as_u64()) == Some(id) {
                         if let Some(err) = v.get("error") {
                             bail!("LSP error on `{method}`: {err}");
                         }

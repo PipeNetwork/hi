@@ -332,16 +332,17 @@ pub(crate) async fn repl(
                                 .or_else(|| arg.strip_prefix("rm"))
                             {
                                 let rm_name = rm_name.trim();
-                                let target = if rm_name.is_empty() {
-                                    let names = config::profile_names(config);
-                                    if names.is_empty() {
-                                        eprintln!("\x1b[2mno profiles to remove\x1b[0m");
-                                        continue;
-                                    }
-                                    names[0].clone()
-                                } else {
-                                    rm_name.to_string()
-                                };
+                                if rm_name.is_empty() {
+                                    // Never guess a target — deleting the
+                                    // alphabetically-first profile (and its API
+                                    // key) because the user typed `/provider
+                                    // remove` to see usage is silent data loss.
+                                    eprintln!(
+                                        "\x1b[33m/provider remove <name> — name the profile to delete (see /provider)\x1b[0m"
+                                    );
+                                    continue;
+                                }
+                                let target = rm_name.to_string();
                                 let active = config.default_profile.as_ref();
                                 if active.map(|a| a.as_str()) == Some(&target) {
                                     eprintln!(
@@ -426,6 +427,11 @@ pub(crate) async fn repl(
                                         new_settings.max_tokens_explicit,
                                         None,
                                     );
+                                    // Track the now-active profile so a later
+                                    // `/model` persists into THIS profile, not the
+                                    // startup one (which would corrupt a different
+                                    // profile's config with a foreign model id).
+                                    active_profile = Some(arg.to_string());
                                     println!(
                                         "\x1b[2musing {label} (profile: {arg}) — model: {model}\x1b[0m"
                                     );

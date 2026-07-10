@@ -488,6 +488,12 @@ fn merge_config(base: &mut Config, overlay: Config) {
 /// string "HI_API_KEY" and get a 401.
 fn migrate_api_key_env_to_literal(config: &mut Config, path: &Path) {
     let mut changed = false;
+    // Set when a repair copies a live secret out of the environment into
+    // `api_key` (below). We keep that repair in memory so the session works, but
+    // must NOT persist it: writing the resolved secret to disk would leak it into
+    // the file — including a project-local `hi.toml` that is routinely committed
+    // to git — turning what was an env-var reference into a checked-in credential.
+    let mut materialized_env_secret = false;
     for profile in config.profiles.values_mut() {
         // First, repair a bad migration from an earlier version of this fix:
         // the previous migration moved an env var *name* (like "HI_API_KEY")
@@ -502,9 +508,11 @@ fn migrate_api_key_env_to_literal(config: &mut Config, path: &Path) {
             if let Ok(val) = std::env::var(&key)
                 && !val.is_empty()
             {
-                // The env var is set — use its value as the literal key.
+                // The env var is set — use its value as the literal key
+                // in-memory only (do not persist the resolved secret to disk).
                 profile.api_key = Some(val);
                 changed = true;
+                materialized_env_secret = true;
             } else {
                 // Env var not set — this is an env var reference, not a key.
                 // Move it back to api_key_env so resolve_api_key_for gives the
@@ -552,12 +560,13 @@ fn migrate_api_key_env_to_literal(config: &mut Config, path: &Path) {
         }
         changed = true;
     }
-    if changed {
+    if changed && !materialized_env_secret {
         // Best-effort rewrite; if it fails we've still repaired the in-memory
-        // config so this run works, just not the next one.
-        if let Ok(text) = toml::to_string_pretty(config) {
-            let _ = std::fs::write(path, text);
-        }
+        // config so this run works, just not the next one. Route through
+        // `save_config_to` so the file keeps 0600 (a bare `fs::write` would drop
+        // permissions, leaving keys world-readable). Skipped when the repair
+        // materialized a live env secret — that stays in memory only (see above).
+        let _ = save_config_to(config, path);
     }
 }
 
@@ -846,6 +855,12 @@ pub fn needs_setup(cli: &Cli, file: &Config) -> bool {
         && cli.provider.is_none()
         && cli.profile.is_none()
         && file.default_profile.is_none()
+        // Only treat this as a first run when there are no profiles at all. A
+        // user who defines profiles but no `default_profile` (they always launch
+        // with `-p <name>`) must NOT get the setup wizard on a bare `hi` — its
+        // `save_config` blindly overwrites the entire config file with a single
+        // hardcoded profile, destroying every existing profile and its API key.
+        && file.profiles.is_empty()
         && std::env::var("HI_MODEL").is_err()
         && auto_select().is_none()
 }

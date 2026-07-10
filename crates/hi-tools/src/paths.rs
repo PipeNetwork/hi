@@ -55,20 +55,42 @@ pub(crate) fn validate_workspace_path(path: &str) -> Result<std::path::PathBuf> 
     );
 }
 
-/// Canonicalize a not-yet-existing path by resolving its parent directory (if
-/// it exists) and re-joining the file name. This resolves symlinks on the
-/// parent so a symlink directory inside the workspace pointing outside can't
-/// be used to escape. Falls back to lexical normalization if the parent also
-/// doesn't exist.
+/// Canonicalize a not-yet-existing path by resolving its nearest existing
+/// ancestor and re-joining the not-yet-existing tail. Canonicalizing the
+/// deepest existing ancestor resolves symlinks in *every* existing component,
+/// so a symlink inside the workspace pointing outside can't be used to escape —
+/// even through a not-yet-existing intermediate directory. For example, with
+/// `ws/link -> /etc` and target `ws/link/new/passwd`: canonicalizing only the
+/// immediate parent (`ws/link/new`) fails because `new` doesn't exist, but
+/// walking up to `ws/link` resolves the symlink, so containment sees
+/// `/etc/new/passwd` and refuses it. Falls back to lexical normalization only
+/// if no ancestor canonicalizes (should not happen — the root always does).
 fn canonicalize_via_parent(path: &Path) -> std::path::PathBuf {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-        && let Ok(canonical_parent) = parent.canonicalize()
-        && let Some(filename) = path.file_name()
-    {
-        return canonical_parent.join(filename);
+    // Normalize `.`/`..` first so the ancestor walk is a clean climb to root.
+    let abs = lexical_abs(path);
+    let mut existing = abs.as_path();
+    // File names of the not-yet-existing tail, collected deepest-first.
+    let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+    loop {
+        if let Ok(canonical) = existing.canonicalize() {
+            let mut resolved = canonical;
+            // Re-append the tail (which was collected deepest-first).
+            for name in tail.iter().rev() {
+                resolved.push(name);
+            }
+            return resolved;
+        }
+        match existing.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => {
+                if let Some(name) = existing.file_name() {
+                    tail.push(name);
+                }
+                existing = parent;
+            }
+            _ => break,
+        }
     }
-    lexical_abs(path)
+    abs
 }
 
 /// Lexically normalize a path to an absolute form with no `.` or `..` segments
@@ -368,6 +390,47 @@ mod tests {
             resolved.file_name(),
             Some(std::ffi::OsStr::new("new_file.txt"))
         );
+
+        let _ = std::fs::remove_dir_all(&workspace);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonicalize_via_parent_resolves_symlink_through_missing_dirs() {
+        // Multi-level escape: a symlink inside the workspace pointing outside,
+        // traversed via a *not-yet-existing* intermediate directory
+        // (`ws/escape/new_dir/file.txt`). Canonicalizing only the immediate
+        // parent (`ws/escape/new_dir`) fails because `new_dir` is missing;
+        // walking up to the existing symlink `ws/escape` resolves it, so the
+        // path must land under `outside`, not lexically under the workspace.
+        use super::canonicalize_via_parent;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = std::env::var("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let workspace = base.join(format!(".hi-symlink-ws2-{stamp}"));
+        let outside = base.join(format!(".hi-symlink-out2-{stamp}"));
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let link = workspace.join("escape");
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+        // `new_dir` does not exist — the escape must still be detected.
+        let target = link.join("new_dir").join("file.txt");
+        let resolved = canonicalize_via_parent(&target);
+
+        let canonical_outside = outside.canonicalize().unwrap();
+        assert!(
+            resolved.starts_with(&canonical_outside),
+            "symlink should resolve to outside ({}) through the missing dir, got {}",
+            canonical_outside.display(),
+            resolved.display()
+        );
+        assert!(resolved.ends_with("new_dir/file.txt"));
 
         let _ = std::fs::remove_dir_all(&workspace);
         let _ = std::fs::remove_dir_all(&outside);

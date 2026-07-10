@@ -554,13 +554,17 @@ pub(crate) fn write_memory(path: &Path, body: &str) -> Result<usize, String> {
 
     // Atomic publish: temp file + rename. fs::rename is atomic on POSIX when
     // source and destination are on the same filesystem (they are — both in
-    // the memory file's parent dir).
+    // the memory file's parent dir). The temp name is PID-scoped (mirroring
+    // `write_skill`): even if two processes ever hold the lock at once (the
+    // stale-lock break is racy), distinct temp files mean each rename installs a
+    // *complete* file — last-writer-wins, never the torn/empty result a shared
+    // `memory.md.tmp` produced when one writer truncated it mid-rename.
     let mut tmp = path.to_path_buf();
     let mut name = tmp
         .file_name()
         .map(|n| n.to_os_string())
         .unwrap_or_else(|| std::ffi::OsString::from("memory.md"));
-    name.push(".tmp");
+    name.push(format!(".{}.tmp", std::process::id()));
     tmp.set_file_name(name);
 
     let content = format!("{MEMORY_HEADER}\n{body}\n");

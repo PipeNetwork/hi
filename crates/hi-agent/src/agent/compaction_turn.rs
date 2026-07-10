@@ -87,30 +87,35 @@ impl crate::Agent {
         safety_window: Option<u32>,
         ui: &mut dyn Ui,
     ) -> Result<ContextPreflight> {
-        let Some(window) = self.effective_context_window(safety_window) else {
-            return Ok(ContextPreflight {
-                max_tokens: requested_max_tokens,
-                dropped_prior_context: false,
-            });
-        };
-        if window == 0 {
-            return Ok(ContextPreflight {
-                max_tokens: requested_max_tokens,
-                dropped_prior_context: false,
-            });
-        }
+        // The *soft* window is the min of the real model window and any
+        // read-only safety window (12k). It only ever triggers non-destructive
+        // tool-output elision — keeping a read-only review turn lean — and must
+        // NOT gate the destructive steps below. The *hard* window is the real
+        // model window alone; only exceeding it may drop prior history or
+        // hard-fail. Otherwise an ordinary read-only question on a 200k-window
+        // model would durably discard the whole session the instant its context
+        // crossed the 12k safety preference.
+        let soft_window = self.effective_context_window(safety_window);
+        let hard_window = self.effective_context_window(None);
 
-        let mut dropped_prior_context = false;
-        if self.request_estimated_tokens(requested_max_tokens, request_overhead_tokens)
-            <= u64::from(window)
+        // 1. Already within the soft preference → nothing to do.
+        if let Some(soft) = soft_window
+            && soft > 0
+            && self.request_estimated_tokens(requested_max_tokens, request_overhead_tokens)
+                <= u64::from(soft)
         {
             return Ok(ContextPreflight {
                 max_tokens: requested_max_tokens,
-                dropped_prior_context,
+                dropped_prior_context: false,
             });
         }
 
-        if self.config.auto_compact {
+        // 2. Over the soft preference: try non-destructive elision (no model
+        //    call — see note below), and if that brings us under, we're done.
+        if self.config.auto_compact
+            && let Some(soft) = soft_window
+            && soft > 0
+        {
             let freed = compaction::elide_tool_outputs_except_recent(
                 self.messages.mutate_slice(),
                 self.config.in_turn_keep_tool_results,
@@ -123,11 +128,11 @@ impl crate::Agent {
                 ));
             }
             if self.request_estimated_tokens(requested_max_tokens, request_overhead_tokens)
-                <= u64::from(window)
+                <= u64::from(soft)
             {
                 return Ok(ContextPreflight {
                     max_tokens: requested_max_tokens,
-                    dropped_prior_context,
+                    dropped_prior_context: false,
                 });
             }
 
@@ -139,6 +144,25 @@ impl crate::Agent {
             // bulk or drop prior context while preserving the latest prompt.
         }
 
+        // 3. Destructive recovery is gated on the REAL model window only. With
+        //    no configured window we can't tell — so proceed rather than drop.
+        let Some(window) = hard_window else {
+            return Ok(ContextPreflight {
+                max_tokens: requested_max_tokens,
+                dropped_prior_context: false,
+            });
+        };
+        if window == 0
+            || self.request_estimated_tokens(requested_max_tokens, request_overhead_tokens)
+                <= u64::from(window)
+        {
+            return Ok(ContextPreflight {
+                max_tokens: requested_max_tokens,
+                dropped_prior_context: false,
+            });
+        }
+
+        let mut dropped_prior_context = false;
         if turn_start > 1 {
             self.replace_history_with_compaction(vec![self.system_message()])?;
             self.messages.push_user(format!(

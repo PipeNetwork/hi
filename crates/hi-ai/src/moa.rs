@@ -11,7 +11,10 @@ use anyhow::{Result, bail};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::provider::{Provider, ServedModel, provider_error_usage};
+use crate::provider::{
+    Provider, ProviderError, ProviderErrorKind, ServedModel, provider_error_kind,
+    provider_error_usage,
+};
 use crate::types::{
     ChatRequest, Completion, Content, Message, RequestProfile, Role, StreamEvent, ToolMode, Usage,
 };
@@ -207,7 +210,24 @@ impl Provider for MoaProvider {
             preset.aggregator_model
         )));
         let aggregate_request = aggregate_request(request, &preset, guidance);
-        let mut completion = self.routes.stream(aggregate_request, sink).await?;
+        let mut completion = match self.routes.stream(aggregate_request, sink).await {
+            Ok(completion) => completion,
+            Err(err) => {
+                // The reference call already ran and was billed. If the
+                // aggregator fails, fold that usage into the error rather than
+                // dropping it — otherwise the reference model's spend silently
+                // vanishes from session accounting on every aggregator error.
+                if reference_usage.is_zero() {
+                    return Err(err);
+                }
+                let mut usage = provider_error_usage(&err);
+                add_reference_usage(&mut usage, reference_usage);
+                let kind = provider_error_kind(&err).unwrap_or(ProviderErrorKind::Other);
+                return Err(ProviderError::new(kind, err.to_string())
+                    .with_usage(usage)
+                    .into());
+            }
+        };
         add_reference_usage(&mut completion.usage, reference_usage);
         Ok(completion)
     }
@@ -423,10 +443,14 @@ fn add_reference_usage(aggregate: &mut Usage, reference: Usage) {
     let aggregate_rate_limits = aggregate.rate_limits;
     let reference_rate_limits = reference.rate_limits;
 
-    aggregate.input_tokens += reference.input_tokens;
-    aggregate.output_tokens += reference.output_tokens;
-    aggregate.cache_read_tokens += reference.cache_read_tokens;
-    aggregate.cache_creation_tokens += reference.cache_creation_tokens;
+    aggregate.input_tokens = aggregate.input_tokens.saturating_add(reference.input_tokens);
+    aggregate.output_tokens = aggregate.output_tokens.saturating_add(reference.output_tokens);
+    aggregate.cache_read_tokens = aggregate
+        .cache_read_tokens
+        .saturating_add(reference.cache_read_tokens);
+    aggregate.cache_creation_tokens = aggregate
+        .cache_creation_tokens
+        .saturating_add(reference.cache_creation_tokens);
     aggregate.context_occupancy = aggregate_context;
     aggregate.input_includes_cache = aggregate_includes_cache;
     aggregate.rate_limits = aggregate_rate_limits.or(reference_rate_limits);

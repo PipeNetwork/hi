@@ -402,3 +402,66 @@ async fn elide_shrinks_old_tool_output_without_a_model_call() {
     );
     assert_eq!(outputs[1], big, "recent kept verbatim");
 }
+
+#[tokio::test]
+async fn read_only_safety_window_preserves_history_within_real_window() {
+    // Regression: a read-only turn passes a 12k SOFT safety window into
+    // ensure_request_fits_context. That must only drive non-destructive elision —
+    // it must NOT be treated as the real context window and durably discard the
+    // whole session. Here the real window is 200k and the estimate (~15k tokens)
+    // is over the 12k soft preference but far under 200k, so history stays.
+    let mut cfg = config();
+    cfg.context_window = Some(200_000);
+    cfg.auto_compact = false;
+    let mut agent = agent(vec![], cfg);
+    agent.messages_mut().push(Message::user("x".repeat(60_000))); // ~15k tokens
+    let before = agent.messages().len();
+    let pre = agent
+        .ensure_request_fits_context("review this module", 2, 100, 0, Some(12_000), &mut NullUi)
+        .expect("must not hard-fail within the real window");
+    assert!(
+        !pre.dropped_prior_context,
+        "read-only safety window must not drop prior history"
+    );
+    assert_eq!(
+        agent.messages().len(),
+        before,
+        "no messages may be discarded"
+    );
+}
+
+#[tokio::test]
+async fn context_preflight_still_drops_when_real_window_exceeded() {
+    // The destructive drop must still fire when the REAL model window is
+    // genuinely exceeded (turn_start > 1), so the fix above doesn't disable
+    // legitimate overflow recovery.
+    let mut cfg = config();
+    cfg.context_window = Some(200_000);
+    cfg.auto_compact = false;
+    let mut agent = agent(vec![], cfg);
+    agent.messages_mut().push(Message::user("y".repeat(1_000_000))); // ~250k tokens
+    let pre = agent
+        .ensure_request_fits_context("continue", 2, 100, 0, None, &mut NullUi)
+        .expect("dropping history brings the request under the window");
+    assert!(
+        pre.dropped_prior_context,
+        "genuine overflow must still drop prior context"
+    );
+}
+
+#[test]
+fn persist_after_transcript_shrink_does_not_panic() {
+    // Regression: strip_trailing_nudges/strip_finalize_pair pop messages without
+    // moving the `persisted` cursor, so after a mid-turn persist the cursor can
+    // exceed the length. persist() must clamp rather than slice out of bounds.
+    let records = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let mut agent = agent(vec![], config());
+    agent.set_session(Box::new(RecordingSession {
+        records: records.clone(),
+    }));
+    agent.messages_mut().push(Message::user("a"));
+    agent.messages_mut().push(Message::user("b"));
+    agent.persist().unwrap(); // persisted == 2
+    agent.messages_mut().pop(); // len == 1, persisted == 2 (> len)
+    agent.persist().unwrap(); // must not panic on the [persisted..] slice
+}

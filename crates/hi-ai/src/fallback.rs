@@ -53,8 +53,16 @@ impl Provider for FallbackProvider {
             match backend.provider.stream(req, sink).await {
                 Ok(mut completion) if !completion.content.is_empty() || is_last => {
                     if !prior_usage.is_zero() {
-                        completion.usage.input_tokens += prior_usage.input_tokens;
-                        completion.usage.output_tokens += prior_usage.output_tokens;
+                        // Fold ALL usage from the failed/empty earlier attempts
+                        // into the winner — the previous manual add dropped
+                        // `cache_read_tokens`, `cache_creation_tokens`, and the
+                        // `estimated` flag, silently under-counting cost. Merge
+                        // prior-then-winner so the winner's rate-limit snapshot
+                        // (the most recent) still wins over any stale one.
+                        let winner = std::mem::take(&mut completion.usage);
+                        let mut merged = prior_usage;
+                        merged.add(winner);
+                        completion.usage = merged;
                     }
                     return Ok(completion);
                 }

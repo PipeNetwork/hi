@@ -50,6 +50,17 @@ fn is_private_ip(ip: IpAddr) -> bool {
                 || v4.is_documentation()
         }
         IpAddr::V6(v6) => {
+            // An IPv4-mapped address (`::ffff:a.b.c.d`) routes to the embedded
+            // IPv4 host at connect time, so a literal like
+            // `[::ffff:169.254.169.254]` or `[::ffff:127.0.0.1]` would reach the
+            // metadata/localhost endpoint. Re-check the embedded v4 against the
+            // v4 rules rather than only the v6 ones (which never match a mapped
+            // form). `to_ipv4_mapped` matches only `::ffff:0:0/96`, so `::1`/`::`
+            // still fall through to the explicit loopback/unspecified checks
+            // below (unlike `to_ipv4`, which would mis-map them to `0.0.0.x`).
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_private_ip(IpAddr::V4(v4));
+            }
             v6.is_loopback() // ::1
                 || v6.is_unspecified() // ::
                 || v6.is_unicast_link_local() // fe80::/10
@@ -162,6 +173,37 @@ const MAX_RESULTS_CAP: usize = 10;
 /// Cap on fetched content — protects the context budget. JSON/API responses
 /// are usually small; HTML pages can be huge, so we truncate.
 const FETCH_CHAR_BUDGET: usize = 8_000;
+/// Hard cap on how many response bytes `web_fetch` reads into memory. Only the
+/// first [`FETCH_CHAR_BUDGET`] chars ever reach the model, so this just needs to
+/// be comfortably larger than any real page while stopping a hostile or runaway
+/// endpoint from streaming gigabytes into RAM (`resp.text()` would buffer the
+/// whole body first). 8 MiB leaves ample room for large HTML/JSON docs.
+const FETCH_BYTE_CAP: usize = 8 * 1024 * 1024;
+
+/// Read at most `cap` bytes of a response body, then stop (dropping the rest of
+/// the stream). Guards against unbounded-download / decompression-bomb DoS:
+/// `reqwest::Response::text()` reads the entire body into memory with no size
+/// limit, so a URL that returns a multi-GB body would exhaust RAM. Returns the
+/// bytes decoded lossily as UTF-8 (matching `text()`'s lenient behavior).
+async fn read_body_capped(mut resp: reqwest::Response, cap: usize) -> Result<String> {
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp
+        .chunk()
+        .await
+        .map_err(|e| anyhow::anyhow!("reading response body: {e}"))?
+    {
+        let room = cap.saturating_sub(buf.len());
+        if room == 0 {
+            break;
+        }
+        let take = room.min(chunk.len());
+        buf.extend_from_slice(&chunk[..take]);
+        if take < chunk.len() {
+            break; // hit the cap mid-chunk — stop reading the rest.
+        }
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
 
 // ---------------------------------------------------------------------------
 // web_search
@@ -266,7 +308,10 @@ pub async fn run_web_fetch(arguments: &str) -> Result<ToolOutput> {
 
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
+        // Error bodies are usually short and only the first 200 chars are shown,
+        // but cap the read anyway so a hostile endpoint can't stream gigabytes
+        // on an error status.
+        let body = read_body_capped(resp, 64 * 1024).await.unwrap_or_default();
         bail!("fetch returned {status}: {}", clip(&body, 200));
     }
 
@@ -277,7 +322,9 @@ pub async fn run_web_fetch(arguments: &str) -> Result<ToolOutput> {
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    let body = resp.text().await.unwrap_or_default();
+    let body = read_body_capped(resp, FETCH_BYTE_CAP)
+        .await
+        .unwrap_or_default();
     let cleaned = if content_type.contains("json") {
         // JSON: try to pretty-print; fall back to raw.
         match serde_json::from_str::<serde_json::Value>(&body) {
@@ -848,6 +895,35 @@ mod tests {
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn ipv4_mapped_ipv6_is_private() {
+        use std::net::{IpAddr, Ipv6Addr};
+        // `::ffff:169.254.169.254` (cloud metadata) and `::ffff:127.0.0.1`
+        // (loopback) route to the embedded IPv4 host, so they must be refused —
+        // the v6 branch used to miss these because none of loopback/ULA/link-local
+        // match a mapped form.
+        let metadata: Ipv6Addr = "::ffff:169.254.169.254".parse().unwrap();
+        let loopback: Ipv6Addr = "::ffff:127.0.0.1".parse().unwrap();
+        let private: Ipv6Addr = "::ffff:10.0.0.1".parse().unwrap();
+        assert!(is_private_ip(IpAddr::V6(metadata)));
+        assert!(is_private_ip(IpAddr::V6(loopback)));
+        assert!(is_private_ip(IpAddr::V6(private)));
+        // Native v6 loopback/unspecified still caught (not mis-mapped by to_ipv4).
+        assert!(is_private_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        assert!(is_private_ip(IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
+        // A genuine public v6 address is allowed.
+        let public: Ipv6Addr = "2606:4700:4700::1111".parse().unwrap();
+        assert!(!is_private_ip(IpAddr::V6(public)));
+    }
+
+    #[tokio::test]
+    async fn web_fetch_rejects_ipv4_mapped_metadata() {
+        // The literal is refused before any network I/O.
+        let out = run_web_fetch(r#"{"url":"http://[::ffff:169.254.169.254]/latest/meta-data/"}"#)
+            .await;
+        assert!(out.is_err(), "ipv4-mapped metadata literal must be refused");
+    }
 
     #[test]
     fn format_results_empty_message() {

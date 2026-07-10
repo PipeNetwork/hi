@@ -659,15 +659,23 @@ where
     let mut filter = StreamingTextFilter::new(sink);
 
     let mut usage_seen = false;
+    // Absolute deadline for the trailing-usage grace, set once the finish chunk
+    // arrives. It must be a TOTAL bound, not a per-chunk timeout: a provider that
+    // pads the tail with parseable heartbeat frames (`{"choices":[]}`) more often
+    // than the grace interval would otherwise re-arm a per-chunk timeout forever
+    // and hang a fully-completed answer.
+    let mut post_finish_deadline: Option<tokio::time::Instant> = None;
 
     loop {
         // After the finish chunk, only wait a bounded grace for the trailing
         // usage frame; before it, block on the stream as usual.
         let next = if stream_complete {
-            match tokio::time::timeout(POST_FINISH_USAGE_GRACE, stream.next()).await {
+            let deadline = *post_finish_deadline
+                .get_or_insert_with(|| tokio::time::Instant::now() + POST_FINISH_USAGE_GRACE);
+            match tokio::time::timeout_at(deadline, stream.next()).await {
                 Ok(item) => item,
-                // Provider holds the stream open after finish without sending
-                // the usage frame: give up on it, keep the completed answer.
+                // Grace elapsed without the usage frame (or the provider is
+                // padding the tail past the deadline): keep the completed answer.
                 Err(_) => break,
             }
         } else {

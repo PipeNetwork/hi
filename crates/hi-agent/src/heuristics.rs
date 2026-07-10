@@ -418,6 +418,31 @@ pub(crate) fn tool_mode_label(mode: ToolMode) -> &'static str {
     }
 }
 
+/// Whether the session `tool_mode` forbids *executing* `name`, returning the
+/// synthetic blocked-tool result to feed back to the model if so.
+///
+/// This enforces the mode at execution time, not just via tool advertisement —
+/// which is what closes the text-promoted tool-call hole: a local model can emit
+/// a tool call as prose (`{"name":"write",…}`) that never went through the
+/// advertised tool list, so a ChatOnly/ReadOnly session (including every
+/// `explore` subagent) would otherwise run it. `explore` launches only a
+/// read-only child, so it's allowed under ReadOnly (mirroring the advertisement
+/// rules and [`crate::steering::nudges::read_only_blocks_tool`]).
+pub(crate) fn mode_blocks_tool(mode: ToolMode, name: &str) -> Option<String> {
+    match mode {
+        ToolMode::Auto | ToolMode::Required => None,
+        ToolMode::ChatOnly => Some(format!(
+            "Tool `{name}` blocked: this is a discuss-only turn (tool mode chat-only). \
+             Answer in text without calling tools."
+        )),
+        ToolMode::ReadOnly if !hi_tools::is_read_only(name) && name != "explore" => Some(format!(
+            "Tool `{name}` blocked: this session is read-only (tool mode read-only). \
+             Use read-only inspection tools and do not modify files."
+        )),
+        ToolMode::ReadOnly => None,
+    }
+}
+
 pub(crate) fn looks_mutating(input: &str) -> bool {
     let s = input.to_ascii_lowercase();
     [
@@ -694,6 +719,22 @@ pub(crate) fn recovery_telemetry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mode_blocks_tool_enforces_session_mode() {
+        // ChatOnly blocks every tool (nothing runs, not even reads).
+        assert!(mode_blocks_tool(ToolMode::ChatOnly, "read").is_some());
+        assert!(mode_blocks_tool(ToolMode::ChatOnly, "write").is_some());
+        // ReadOnly blocks mutating tools but allows inspection + `explore`.
+        assert!(mode_blocks_tool(ToolMode::ReadOnly, "write").is_some());
+        assert!(mode_blocks_tool(ToolMode::ReadOnly, "bash").is_some());
+        assert!(mode_blocks_tool(ToolMode::ReadOnly, "read").is_none());
+        assert!(mode_blocks_tool(ToolMode::ReadOnly, "grep").is_none());
+        assert!(mode_blocks_tool(ToolMode::ReadOnly, "explore").is_none());
+        // Auto/Required never block by mode.
+        assert!(mode_blocks_tool(ToolMode::Auto, "write").is_none());
+        assert!(mode_blocks_tool(ToolMode::Required, "bash").is_none());
+    }
 
     #[test]
     fn humanize_count_abbreviates_consistently() {

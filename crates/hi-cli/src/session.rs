@@ -331,6 +331,12 @@ fn is_fleet_stem(stem: &str) -> bool {
         .is_some_and(|(_, n)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
 }
 
+/// Whether a session file stem names a `/loop` session: `<millis>-loop<n>`.
+fn is_loop_stem(stem: &str) -> bool {
+    stem.rsplit_once("-loop")
+        .is_some_and(|(_, n)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+}
+
 /// A session's persisted long-horizon goal state, summarized for the fleet:
 /// whether it should still auto-drive, and its progress.
 pub struct SessionGoalSummary {
@@ -450,13 +456,22 @@ pub fn session_path(id: &str) -> Result<PathBuf> {
     Ok(dir.join(name))
 }
 
-/// The most recently modified session, if any.
+/// The most recently modified *user* session, if any. Fleet (`-f<n>`) and loop
+/// (`-loop<n>`) sessions are excluded so `hi -c` resumes the user's own last
+/// chat, not a background fleet child or a `/loop` firing — the latter rewrites
+/// its session on every interval and would otherwise always win the mtime race,
+/// making `-c` never reach the user's real session again.
 pub fn latest_session() -> Option<PathBuf> {
     let dir = sessions_dir()?;
     fs::read_dir(dir)
         .ok()?
         .filter_map(|entry| entry.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|ext| ext == "jsonl"))
+        .filter(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .is_none_or(|stem| !is_fleet_stem(stem) && !is_loop_stem(stem))
+        })
         .max_by_key(|p| {
             fs::metadata(p)
                 .and_then(|m| m.modified())
@@ -706,6 +721,14 @@ mod tests {
         assert!(super::is_fleet_stem("0000000000001-f42"));
         assert!(!super::is_fleet_stem("0000000000002"));
         assert!(!super::is_fleet_stem("0000000000002-fx"));
+        // Loop-stem filter (kept out of `hi -c`'s latest_session).
+        assert!(super::is_loop_stem("0000000000001-loop0"));
+        assert!(super::is_loop_stem("0000000000001-loop7"));
+        assert!(!super::is_loop_stem("0000000000002"));
+        assert!(!super::is_loop_stem("0000000000002-loopx"));
+        assert!(!super::is_loop_stem("0000000000002-f3"));
+        // A plain user-session stem is neither.
+        assert!(!super::is_fleet_stem("0000000000002") && !super::is_loop_stem("0000000000002"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
