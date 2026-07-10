@@ -7901,6 +7901,387 @@ extern "C" int hi_cuda_launch_wmma_causal_attention_batched(
   return 0;
 }
 
+// Tensor-core (WMMA) paged causal prefill attention. Same FA2 fragment structure
+// as wmma_causal_attention_batched_kernel (Q + O accumulators live in fragments
+// across the key loop), but the K/V tiles are gathered from the paged KV cache via
+// the page table instead of a dense f16 buffer, and the causal mask is by ABSOLUTE
+// position (query_offset + row) so a chunk attends to the whole cached prefix. This
+// replaces the flashtile (scalar, no-tensor-core) paged prefill kernel on the hot
+// path. Requires head_dim (== qk == v head dim) a multiple of 16, <= 128. f16
+// matmuls -> not bit-parity with the f32 flashtile paged kernel; validated by
+// parity-vs-reference + coherence.
+__global__ void wmma_paged_prefill_causal_attention_batched_kernel(
+    const float* __restrict__ q,  // [batch][chunk_len][heads][head_dim] f32
+    const kv_t* __restrict__ k_pages,
+    const kv_t* __restrict__ v_pages,
+    const uint32_t* __restrict__ page_table,
+    float* __restrict__ output,  // [batch][chunk_len][heads][head_dim] f32
+    int query_offset,
+    int batch_count,
+    int chunk_len,
+    int page_size,
+    int page_table_len,
+    int heads,
+    int kv_heads,
+    int head_dim) {
+  const int T = HI_CUDA_WMMA_TILE;
+  const int hd_tiles = head_dim / T;
+  extern __shared__ char smem_raw[];
+  half* k_sh = reinterpret_cast<half*>(smem_raw);
+  half* v_sh = k_sh + T * head_dim;
+  half* p_sh = v_sh + T * head_dim;
+  float* s_sh = reinterpret_cast<float*>(p_sh + T * T);
+  float* m_sh = s_sh + T * T;
+  float* l_sh = m_sh + T;
+  float* f_sh = l_sh + T;
+
+  const int head = blockIdx.y;
+  const int batch = blockIdx.z;
+  const int q0 = blockIdx.x * T;
+  const int kv_repeats = heads / kv_heads;
+  const int kv_head = head / kv_repeats;
+  const float scale = rsqrtf(static_cast<float>(head_dim));
+  const int tid = threadIdx.x;
+
+  // Stage Q (f32 -> f16) into shared once (reusing k_sh), then hold in fragments.
+  for (int e = tid; e < T * head_dim; e += 32) {
+    const int r = e / head_dim, d = e - r * head_dim, qq = q0 + r;
+    k_sh[e] = (qq < chunk_len)
+                  ? __float2half(q[((batch * chunk_len + qq) * heads + head) * head_dim + d])
+                  : __float2half(0.0f);
+  }
+  __syncwarp();
+  wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> qf[8];
+  for (int h = 0; h < hd_tiles; ++h) {
+    wmma::load_matrix_sync(qf[h], k_sh + h * T, head_dim);
+  }
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> of[8];
+  for (int h = 0; h < hd_tiles; ++h) {
+    wmma::fill_fragment(of[h], 0.0f);
+  }
+  if (tid < T) {
+    m_sh[tid] = -INFINITY;
+    l_sh[tid] = 0.0f;
+  }
+  __syncwarp();
+
+  const int row_lo = tid >> 2;
+  const int row_hi = row_lo + 8;
+
+  const int block_max_row = min(q0 + T - 1, chunk_len - 1);
+  const int block_max_pos = query_offset + block_max_row;  // causal upper bound for this block
+
+  for (int kt = 0; kt <= block_max_pos; kt += T) {
+    // Gather the K,V tile (cache positions kt..kt+T) from the paged cache -> shared f16.
+    for (int e = tid; e < T * head_dim; e += 32) {
+      const int r = e / head_dim, d = e - r * head_dim, src = kt + r;
+      half kval = __float2half(0.0f), vval = __float2half(0.0f);
+      if (src <= block_max_pos) {
+        const int lp = src / page_size;
+        if (lp < page_table_len) {
+          const uint32_t phys = page_table[batch * page_table_len + lp];
+          const int off = src - lp * page_size;
+          const long slot =
+              (static_cast<long>(static_cast<int>(phys) * kv_heads + kv_head) * page_size + off) *
+                  head_dim +
+              d;
+          kval = k_pages[slot];
+          vval = v_pages[slot];
+        }
+      }
+      k_sh[e] = kval;
+      v_sh[e] = vval;
+    }
+    __syncwarp();
+    // S = Q @ K^T (tensor cores)
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> s_frag;
+    wmma::fill_fragment(s_frag, 0.0f);
+    for (int h = 0; h < hd_tiles; ++h) {
+      wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> kf;
+      wmma::load_matrix_sync(kf, k_sh + h * T, head_dim);
+      wmma::mma_sync(s_frag, qf[h], kf, s_frag);
+    }
+    wmma::store_matrix_sync(s_sh, s_frag, T, wmma::mem_row_major);
+    __syncwarp();
+    // online softmax over this key tile (thread == query row), causal by ABSOLUTE position
+    if (tid < T) {
+      const int qpos = query_offset + q0 + tid;
+      float* srow = s_sh + tid * T;
+      float rmax = -INFINITY;
+      for (int j = 0; j < T; ++j) {
+        const int kpos = kt + j;
+        const float sc = (kpos <= qpos) ? srow[j] * scale : -INFINITY;
+        srow[j] = sc;
+        rmax = fmaxf(rmax, sc);
+      }
+      const float m_old = m_sh[tid];
+      const float new_m = fmaxf(m_old, rmax);
+      const float factor = isfinite(m_old) ? __expf(m_old - new_m) : 0.0f;
+      f_sh[tid] = factor;
+      float rsum = 0.0f;
+      for (int j = 0; j < T; ++j) {
+        const float p = isfinite(srow[j]) ? __expf(srow[j] - new_m) : 0.0f;
+        p_sh[tid * T + j] = __float2half(p);
+        rsum += p;
+      }
+      l_sh[tid] = l_sh[tid] * factor + rsum;
+      m_sh[tid] = new_m;
+    }
+    __syncwarp();
+    // rescale O accumulators by the per-row factor, then O += P @ V (tensor cores)
+    const float fac_lo = f_sh[row_lo];
+    const float fac_hi = f_sh[row_hi];
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pf;
+    wmma::load_matrix_sync(pf, p_sh, T);
+    for (int h = 0; h < hd_tiles; ++h) {
+#pragma unroll
+      for (int i = 0; i < of[h].num_elements; ++i) {
+        of[h].x[i] *= (((i >> 1) & 1) ? fac_hi : fac_lo);
+      }
+      wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> vf;
+      wmma::load_matrix_sync(vf, v_sh + h * T, head_dim);
+      wmma::mma_sync(of[h], pf, vf, of[h]);
+    }
+    __syncwarp();
+  }
+
+  const float l_lo = l_sh[row_lo];
+  const float inv_lo = (l_lo == 0.0f || !isfinite(l_lo)) ? 0.0f : 1.0f / l_lo;
+  const float l_hi = l_sh[row_hi];
+  const float inv_hi = (l_hi == 0.0f || !isfinite(l_hi)) ? 0.0f : 1.0f / l_hi;
+  for (int h = 0; h < hd_tiles; ++h) {
+#pragma unroll
+    for (int i = 0; i < of[h].num_elements; ++i) {
+      of[h].x[i] *= (((i >> 1) & 1) ? inv_hi : inv_lo);
+    }
+    wmma::store_matrix_sync(s_sh, of[h], T, wmma::mem_row_major);
+    __syncwarp();
+    if (tid < T) {
+      const int qq = q0 + tid;
+      if (qq < chunk_len) {
+        const float* orow = s_sh + tid * T;
+        for (int c = 0; c < T; ++c) {
+          output[((batch * chunk_len + qq) * heads + head) * head_dim + h * T + c] = orow[c];
+        }
+      }
+    }
+    __syncwarp();
+  }
+}
+
+extern "C" int hi_cuda_launch_wmma_paged_prefill_causal_attention_batched(
+    const void* q, const void* k_pages, const void* v_pages, const void* page_table, void* output,
+    int query_offset, int batch_count, int chunk_len, int page_size, int page_table_len, int heads,
+    int kv_heads, int head_dim, void* stream) {
+  if (q == nullptr || k_pages == nullptr || v_pages == nullptr || page_table == nullptr ||
+      output == nullptr || query_offset < 0 || batch_count <= 0 || chunk_len <= 0 ||
+      page_size <= 0 || page_table_len <= 0 || heads <= 0 || kv_heads <= 0 || head_dim <= 0 ||
+      head_dim % 16 != 0 || head_dim > 128 || heads % kv_heads != 0 || stream == nullptr) {
+    return 1;
+  }
+  const int T = HI_CUDA_WMMA_TILE;
+  const int qtiles = (chunk_len + T - 1) / T;
+  dim3 grid(qtiles, heads, batch_count);
+  dim3 block(32);
+  size_t shared_bytes =
+      (2 * T * head_dim + T * T) * sizeof(half) + (T * T + 3 * T) * sizeof(float);
+  wmma_paged_prefill_causal_attention_batched_kernel<<<grid, block, shared_bytes,
+                                                       static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const float*>(q), static_cast<const kv_t*>(k_pages),
+      static_cast<const kv_t*>(v_pages), static_cast<const uint32_t*>(page_table),
+      static_cast<float*>(output), query_offset, batch_count, chunk_len, page_size, page_table_len,
+      heads, kv_heads, head_dim);
+  return 0;
+}
+
+// int8/Q8 variant of wmma_paged_prefill_causal_attention_batched: K/V pages are
+// int8, dequantized per-vector via the parallel scale buffers during the shared
+// tile gather; the tensor-core path downstream is identical.
+__global__ void wmma_paged_prefill_causal_attention_batched_q8_kernel(
+    const float* __restrict__ q,
+    const int8_t* __restrict__ k_pages,
+    const int8_t* __restrict__ v_pages,
+    const float* __restrict__ k_scales,
+    const float* __restrict__ v_scales,
+    const uint32_t* __restrict__ page_table,
+    float* __restrict__ output,
+    int query_offset,
+    int batch_count,
+    int chunk_len,
+    int page_size,
+    int page_table_len,
+    int heads,
+    int kv_heads,
+    int head_dim) {
+  const int T = HI_CUDA_WMMA_TILE;
+  const int hd_tiles = head_dim / T;
+  extern __shared__ char smem_raw[];
+  half* k_sh = reinterpret_cast<half*>(smem_raw);
+  half* v_sh = k_sh + T * head_dim;
+  half* p_sh = v_sh + T * head_dim;
+  float* s_sh = reinterpret_cast<float*>(p_sh + T * T);
+  float* m_sh = s_sh + T * T;
+  float* l_sh = m_sh + T;
+  float* f_sh = l_sh + T;
+
+  const int head = blockIdx.y;
+  const int batch = blockIdx.z;
+  const int q0 = blockIdx.x * T;
+  const int kv_repeats = heads / kv_heads;
+  const int kv_head = head / kv_repeats;
+  const float scale = rsqrtf(static_cast<float>(head_dim));
+  const int tid = threadIdx.x;
+
+  for (int e = tid; e < T * head_dim; e += 32) {
+    const int r = e / head_dim, d = e - r * head_dim, qq = q0 + r;
+    k_sh[e] = (qq < chunk_len)
+                  ? __float2half(q[((batch * chunk_len + qq) * heads + head) * head_dim + d])
+                  : __float2half(0.0f);
+  }
+  __syncwarp();
+  wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> qf[8];
+  for (int h = 0; h < hd_tiles; ++h) {
+    wmma::load_matrix_sync(qf[h], k_sh + h * T, head_dim);
+  }
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> of[8];
+  for (int h = 0; h < hd_tiles; ++h) {
+    wmma::fill_fragment(of[h], 0.0f);
+  }
+  if (tid < T) {
+    m_sh[tid] = -INFINITY;
+    l_sh[tid] = 0.0f;
+  }
+  __syncwarp();
+
+  const int row_lo = tid >> 2;
+  const int row_hi = row_lo + 8;
+
+  const int block_max_row = min(q0 + T - 1, chunk_len - 1);
+  const int block_max_pos = query_offset + block_max_row;
+
+  for (int kt = 0; kt <= block_max_pos; kt += T) {
+    for (int e = tid; e < T * head_dim; e += 32) {
+      const int r = e / head_dim, d = e - r * head_dim, src = kt + r;
+      half kval = __float2half(0.0f), vval = __float2half(0.0f);
+      if (src <= block_max_pos) {
+        const int lp = src / page_size;
+        if (lp < page_table_len) {
+          const uint32_t phys = page_table[batch * page_table_len + lp];
+          const int off = src - lp * page_size;
+          const int scale_idx = (static_cast<int>(phys) * kv_heads + kv_head) * page_size + off;
+          kval = __float2half(
+              static_cast<float>(k_pages[static_cast<long>(scale_idx) * head_dim + d]) *
+              k_scales[scale_idx]);
+          vval = __float2half(
+              static_cast<float>(v_pages[static_cast<long>(scale_idx) * head_dim + d]) *
+              v_scales[scale_idx]);
+        }
+      }
+      k_sh[e] = kval;
+      v_sh[e] = vval;
+    }
+    __syncwarp();
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> s_frag;
+    wmma::fill_fragment(s_frag, 0.0f);
+    for (int h = 0; h < hd_tiles; ++h) {
+      wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> kf;
+      wmma::load_matrix_sync(kf, k_sh + h * T, head_dim);
+      wmma::mma_sync(s_frag, qf[h], kf, s_frag);
+    }
+    wmma::store_matrix_sync(s_sh, s_frag, T, wmma::mem_row_major);
+    __syncwarp();
+    if (tid < T) {
+      const int qpos = query_offset + q0 + tid;
+      float* srow = s_sh + tid * T;
+      float rmax = -INFINITY;
+      for (int j = 0; j < T; ++j) {
+        const int kpos = kt + j;
+        const float sc = (kpos <= qpos) ? srow[j] * scale : -INFINITY;
+        srow[j] = sc;
+        rmax = fmaxf(rmax, sc);
+      }
+      const float m_old = m_sh[tid];
+      const float new_m = fmaxf(m_old, rmax);
+      const float factor = isfinite(m_old) ? __expf(m_old - new_m) : 0.0f;
+      f_sh[tid] = factor;
+      float rsum = 0.0f;
+      for (int j = 0; j < T; ++j) {
+        const float p = isfinite(srow[j]) ? __expf(srow[j] - new_m) : 0.0f;
+        p_sh[tid * T + j] = __float2half(p);
+        rsum += p;
+      }
+      l_sh[tid] = l_sh[tid] * factor + rsum;
+      m_sh[tid] = new_m;
+    }
+    __syncwarp();
+    const float fac_lo = f_sh[row_lo];
+    const float fac_hi = f_sh[row_hi];
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pf;
+    wmma::load_matrix_sync(pf, p_sh, T);
+    for (int h = 0; h < hd_tiles; ++h) {
+#pragma unroll
+      for (int i = 0; i < of[h].num_elements; ++i) {
+        of[h].x[i] *= (((i >> 1) & 1) ? fac_hi : fac_lo);
+      }
+      wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> vf;
+      wmma::load_matrix_sync(vf, v_sh + h * T, head_dim);
+      wmma::mma_sync(of[h], pf, vf, of[h]);
+    }
+    __syncwarp();
+  }
+
+  const float l_lo = l_sh[row_lo];
+  const float inv_lo = (l_lo == 0.0f || !isfinite(l_lo)) ? 0.0f : 1.0f / l_lo;
+  const float l_hi = l_sh[row_hi];
+  const float inv_hi = (l_hi == 0.0f || !isfinite(l_hi)) ? 0.0f : 1.0f / l_hi;
+  for (int h = 0; h < hd_tiles; ++h) {
+#pragma unroll
+    for (int i = 0; i < of[h].num_elements; ++i) {
+      of[h].x[i] *= (((i >> 1) & 1) ? inv_hi : inv_lo);
+    }
+    wmma::store_matrix_sync(s_sh, of[h], T, wmma::mem_row_major);
+    __syncwarp();
+    if (tid < T) {
+      const int qq = q0 + tid;
+      if (qq < chunk_len) {
+        const float* orow = s_sh + tid * T;
+        for (int c = 0; c < T; ++c) {
+          output[((batch * chunk_len + qq) * heads + head) * head_dim + h * T + c] = orow[c];
+        }
+      }
+    }
+    __syncwarp();
+  }
+}
+
+extern "C" int hi_cuda_launch_wmma_paged_prefill_causal_attention_batched_q8(
+    const void* q, const void* k_pages, const void* v_pages, const void* k_scales,
+    const void* v_scales, const void* page_table, void* output, int query_offset, int batch_count,
+    int chunk_len, int page_size, int page_table_len, int heads, int kv_heads, int head_dim,
+    void* stream) {
+  if (q == nullptr || k_pages == nullptr || v_pages == nullptr || k_scales == nullptr ||
+      v_scales == nullptr || page_table == nullptr || output == nullptr || query_offset < 0 ||
+      batch_count <= 0 || chunk_len <= 0 || page_size <= 0 || page_table_len <= 0 || heads <= 0 ||
+      kv_heads <= 0 || head_dim <= 0 || head_dim % 16 != 0 || head_dim > 128 ||
+      heads % kv_heads != 0 || stream == nullptr) {
+    return 1;
+  }
+  const int T = HI_CUDA_WMMA_TILE;
+  const int qtiles = (chunk_len + T - 1) / T;
+  dim3 grid(qtiles, heads, batch_count);
+  dim3 block(32);
+  size_t shared_bytes =
+      (2 * T * head_dim + T * T) * sizeof(half) + (T * T + 3 * T) * sizeof(float);
+  wmma_paged_prefill_causal_attention_batched_q8_kernel<<<grid, block, shared_bytes,
+                                                          static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const float*>(q), static_cast<const int8_t*>(k_pages),
+      static_cast<const int8_t*>(v_pages), static_cast<const float*>(k_scales),
+      static_cast<const float*>(v_scales), static_cast<const uint32_t*>(page_table),
+      static_cast<float*>(output), query_offset, batch_count, chunk_len, page_size, page_table_len,
+      heads, kv_heads, head_dim);
+  return 0;
+}
+
 extern "C" int hi_cuda_launch_flashtile_causal_attention_batched(
     const void* q, const void* k, const void* v, void* output,
     int batch_count, int seq_len, int heads, int kv_heads,

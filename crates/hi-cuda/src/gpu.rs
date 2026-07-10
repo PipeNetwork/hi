@@ -13115,46 +13115,92 @@ mod native {
                 .context("CUDA paged prefill attention output count overflows usize")?;
             let output = DeviceBuffer::alloc(output_elements * std::mem::size_of::<f32>())
                 .context("allocating CUDA paged prefill attention output")?;
-            if let (Some(key_scales), Some(value_scales)) =
-                (&layer_cache.key_scales, &layer_cache.value_scales)
-            {
-                crate::kernels::launch_paged_prefill_causal_attention_batched_q8(
-                    &q.buffer,
-                    layer_cache.key_pages.as_buffer(),
-                    layer_cache.value_pages.as_buffer(),
-                    key_scales.as_buffer(),
-                    value_scales.as_buffer(),
-                    &layer_cache.page_table,
-                    &output,
-                    query_offset,
-                    batch_count,
-                    chunk_len,
-                    layer_cache.page_size,
-                    layer_cache.page_table_len,
-                    dims.heads,
-                    dims.kv_heads,
-                    dims.head_dim,
-                    dims.v_head_dim,
-                    &self.stream,
-                )?;
-            } else {
-                crate::kernels::launch_paged_prefill_causal_attention_batched(
-                    &q.buffer,
-                    layer_cache.key_pages.as_buffer(),
-                    layer_cache.value_pages.as_buffer(),
-                    &layer_cache.page_table,
-                    &output,
-                    query_offset,
-                    batch_count,
-                    chunk_len,
-                    layer_cache.page_size,
-                    layer_cache.page_table_len,
-                    dims.heads,
-                    dims.kv_heads,
-                    dims.head_dim,
-                    dims.v_head_dim,
-                    &self.stream,
-                )?;
+            // Tensor-core (WMMA) paged attention is the hot path; it needs symmetric head dims
+            // (qk == v), a multiple of 16, <= 128. Otherwise (or forced off) fall back to the
+            // scalar flashtile paged kernels, which also cover asymmetric-head models.
+            let use_wmma = !wmma_attn_forced_off()
+                && dims.head_dim == dims.v_head_dim
+                && dims.head_dim % 16 == 0
+                && dims.head_dim <= 128;
+            match (&layer_cache.key_scales, &layer_cache.value_scales) {
+                (Some(key_scales), Some(value_scales)) if use_wmma => {
+                    crate::kernels::launch_wmma_paged_prefill_causal_attention_batched_q8(
+                        &q.buffer,
+                        layer_cache.key_pages.as_buffer(),
+                        layer_cache.value_pages.as_buffer(),
+                        key_scales.as_buffer(),
+                        value_scales.as_buffer(),
+                        &layer_cache.page_table,
+                        &output,
+                        query_offset,
+                        batch_count,
+                        chunk_len,
+                        layer_cache.page_size,
+                        layer_cache.page_table_len,
+                        dims.heads,
+                        dims.kv_heads,
+                        dims.head_dim,
+                        &self.stream,
+                    )?;
+                }
+                (Some(key_scales), Some(value_scales)) => {
+                    crate::kernels::launch_paged_prefill_causal_attention_batched_q8(
+                        &q.buffer,
+                        layer_cache.key_pages.as_buffer(),
+                        layer_cache.value_pages.as_buffer(),
+                        key_scales.as_buffer(),
+                        value_scales.as_buffer(),
+                        &layer_cache.page_table,
+                        &output,
+                        query_offset,
+                        batch_count,
+                        chunk_len,
+                        layer_cache.page_size,
+                        layer_cache.page_table_len,
+                        dims.heads,
+                        dims.kv_heads,
+                        dims.head_dim,
+                        dims.v_head_dim,
+                        &self.stream,
+                    )?;
+                }
+                _ if use_wmma => {
+                    crate::kernels::launch_wmma_paged_prefill_causal_attention_batched(
+                        &q.buffer,
+                        layer_cache.key_pages.as_buffer(),
+                        layer_cache.value_pages.as_buffer(),
+                        &layer_cache.page_table,
+                        &output,
+                        query_offset,
+                        batch_count,
+                        chunk_len,
+                        layer_cache.page_size,
+                        layer_cache.page_table_len,
+                        dims.heads,
+                        dims.kv_heads,
+                        dims.head_dim,
+                        &self.stream,
+                    )?;
+                }
+                _ => {
+                    crate::kernels::launch_paged_prefill_causal_attention_batched(
+                        &q.buffer,
+                        layer_cache.key_pages.as_buffer(),
+                        layer_cache.value_pages.as_buffer(),
+                        &layer_cache.page_table,
+                        &output,
+                        query_offset,
+                        batch_count,
+                        chunk_len,
+                        layer_cache.page_size,
+                        layer_cache.page_table_len,
+                        dims.heads,
+                        dims.kv_heads,
+                        dims.head_dim,
+                        dims.v_head_dim,
+                        &self.stream,
+                    )?;
+                }
             }
             self.op_barrier()?;
             Ok(GpuF32Tensor {
