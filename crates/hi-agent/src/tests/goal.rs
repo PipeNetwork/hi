@@ -473,7 +473,7 @@ async fn skeptic_gate_approval_advances_and_actually_calls_the_skeptic() {
         reqs.last()
             .unwrap()
             .iter()
-            .any(|m| m.text().contains("senior code reviewer")),
+            .any(|m| m.text().contains("code reviewer acting as a merge gate")),
         "the extra call carried the skeptic review prompt"
     );
 }
