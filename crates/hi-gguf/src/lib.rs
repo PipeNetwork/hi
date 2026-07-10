@@ -66,6 +66,11 @@ impl GgufFile {
         &self.tensors
     }
 
+    /// O(1) lookup of a tensor's metadata by name (vs a linear scan of `tensors()`).
+    pub fn tensor_info(&self, name: &str) -> Option<&TensorInfo> {
+        self.tensors.get(*self.tensor_index.get(name)?)
+    }
+
     pub fn tensor(&self, name: &str) -> Option<TensorView<'_>> {
         let info = self.tensors.get(*self.tensor_index.get(name)?)?;
         self.tensor_view(info).ok()

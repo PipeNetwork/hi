@@ -3120,9 +3120,7 @@ mod native {
                     continue;
                 }
                 let info = gguf
-                    .tensors()
-                    .iter()
-                    .find(|info| info.name == spec.tensor_name)
+                    .tensor_info(&spec.tensor_name)
                     .ok_or_else(|| anyhow!("GGUF tensor {} is missing", spec.tensor_name))?;
                 let vector = GpuVector::load_from_spec(gguf, info, &spec).with_context(|| {
                     format!(
