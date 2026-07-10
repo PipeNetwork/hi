@@ -1308,7 +1308,7 @@ pub async fn run(
                                                 .fg(Color::Cyan)
                                                 .add_modifier(ratatui::style::Modifier::BOLD),
                                         ));
-                                        specs.sort_by(|a, b| b.spent_tokens.cmp(&a.spent_tokens));
+                                        specs.sort_by_key(|l| std::cmp::Reverse(l.spent_tokens));
                                         for l in specs {
                                             let budget = l
                                                 .token_budget

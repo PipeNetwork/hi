@@ -294,7 +294,11 @@ pub(crate) async fn repl(
                             let arg = arg.trim();
                             // --- Subcommands ---
                             if arg == "add" {
-                                match provider_add_prompt(config, config_path.as_deref(), &mut editor) {
+                                match provider_add_prompt(
+                                    config,
+                                    config_path.as_deref(),
+                                    &mut editor,
+                                ) {
                                     Ok(name) => {
                                         println!(
                                             "\x1b[2msaved profile '{name}' — /provider {name} to use\x1b[0m"

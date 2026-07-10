@@ -689,7 +689,7 @@ fn clip(s: &str, max: usize) -> String {
     if let Some(boundary) = s[..end].rfind(|c: char| c.is_whitespace()) {
         end = boundary;
     }
-    format!("{}…", &s[..end].trim_end())
+    format!("{}…", s[..end].trim_end())
 }
 
 /// A reqwest client with the shared agent identity.
@@ -1084,10 +1084,14 @@ mod tests {
             url = shell_quote("https://example.com/f.gguf"),
         );
         assert!(
-            !cmd.split_whitespace().any(|a| a == "-L" || a == "--location"),
+            !cmd.split_whitespace()
+                .any(|a| a == "-L" || a == "--location"),
             "curl must not follow redirects: {cmd}"
         );
-        assert!(cmd.contains("--fail"), "curl must fail closed on 3xx/4xx: {cmd}");
+        assert!(
+            cmd.contains("--fail"),
+            "curl must fail closed on 3xx/4xx: {cmd}"
+        );
     }
 
     #[tokio::test]
