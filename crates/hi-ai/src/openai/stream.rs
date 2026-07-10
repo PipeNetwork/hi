@@ -17,6 +17,15 @@ use crate::types::{Completion, Content, StreamEvent, Usage, estimate_messages_to
 const SPECIAL_TOKEN_PREFIX: &str = "<|";
 const SPECIAL_TOKEN_SUFFIX: &str = "|>";
 
+/// How long to keep reading after `finish_reason` for the trailing usage frame.
+/// With `stream_options.include_usage`, spec-compliant providers send usage in
+/// a separate chunk AFTER the finish chunk (empty `choices`) — breaking on
+/// finish discarded it, leaving streamed calls with zero provider usage and the
+/// token counters running on chars/4 estimates. Bounded so a provider that
+/// holds the connection open after finish (no `[DONE]`, no close) still can't
+/// leave a completed answer spinning — the guarantee break-on-finish gave.
+const POST_FINISH_USAGE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Check if `inner` (the text between `<|` and `|>`) looks like a special
 /// token identifier: non-empty, alphanumeric + underscore, no spaces or
 /// newlines. Real tokens: `im_start`, `im_end`, `endoftext`, `system`, etc.
@@ -599,9 +608,11 @@ fn strip_text_tool_protocol_artifact(text: &str) -> String {
 /// [`Completion`], forwarding text/reasoning/tool tokens to `sink`.
 ///
 /// The collector reads until the provider sends `[DONE]`, closes the stream,
-/// returns a stream error, or reports a `finish_reason`. A `finish_reason` is
-/// treated as completion so providers that omit `[DONE]` cannot leave a
-/// completed answer spinning forever.
+/// or returns a stream error. After a `finish_reason` it keeps reading — but
+/// only within [`POST_FINISH_USAGE_GRACE`] — for the trailing usage-only chunk
+/// that `stream_options.include_usage` providers send after the finish chunk,
+/// so providers that omit `[DONE]` still cannot leave a completed answer
+/// spinning forever.
 pub(crate) async fn collect_completion<S>(
     mut stream: S,
     sink: &mut (dyn FnMut(StreamEvent) + Send),
@@ -625,8 +636,22 @@ where
     // borrow-conflict chaining of two `&mut dyn FnMut` filters.
     let mut filter = StreamingTextFilter::new(sink);
 
+    let mut usage_seen = false;
+
     loop {
-        let data = match stream.next().await {
+        // After the finish chunk, only wait a bounded grace for the trailing
+        // usage frame; before it, block on the stream as usual.
+        let next = if stream_complete {
+            match tokio::time::timeout(POST_FINISH_USAGE_GRACE, stream.next()).await {
+                Ok(item) => item,
+                // Provider holds the stream open after finish without sending
+                // the usage frame: give up on it, keep the completed answer.
+                Err(_) => break,
+            }
+        } else {
+            stream.next().await
+        };
+        let data = match next {
             Some(Ok(data)) => data,
             // A stream *read* error mid-flight: the provider reset the connection
             // or sent a truncated frame instead of closing cleanly / sending
@@ -658,6 +683,7 @@ where
         }
 
         if let Some(usage) = chunk.usage {
+            usage_seen = true;
             let cached = usage
                 .prompt_tokens_details
                 .map(|d| d.cached_tokens)
@@ -673,6 +699,7 @@ where
                 input_includes_cache: true,
                 context_occupancy: usage.prompt_tokens,
                 rate_limits: None,
+                estimated: false,
             };
         }
         for choice in chunk.choices {
@@ -721,7 +748,11 @@ where
                 stream_complete = true;
             }
         }
-        if stream_complete {
+        // Once both the finish marker and a usage frame have arrived there is
+        // nothing left to wait for (providers that attach usage to the finish
+        // chunk break here immediately, as before). With finish but no usage
+        // yet, loop back into the bounded drain above for the trailing frame.
+        if stream_complete && usage_seen {
             break;
         }
     }
@@ -744,6 +775,7 @@ where
     }
     if completion.usage.output_tokens == 0 && output_chars > 0 {
         completion.usage.output_tokens = output_chars.div_ceil(4) as u64;
+        completion.usage.estimated = true;
     }
     Ok(completion)
 }
@@ -827,10 +859,18 @@ pub(crate) fn backfill_missing_usage(
 ) {
     if completion.usage.input_tokens == 0 {
         completion.usage.input_tokens = estimate_messages_tokens(&request.messages);
+        completion.usage.estimated = true;
     }
     if completion.usage.output_tokens == 0 {
         completion.usage.output_tokens =
             crate::types::estimate_completion_output_tokens(&completion.content);
+        completion.usage.estimated = true;
+    }
+    // Keep the occupancy gauge alive on the estimate path too — it previously
+    // stayed 0 here, leaving consumers of `context_occupancy` blind whenever
+    // the provider reported no usage.
+    if completion.usage.context_occupancy == 0 {
+        completion.usage.context_occupancy = completion.usage.input_tokens;
     }
 }
 
@@ -1017,8 +1057,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn stops_after_finish_reason_without_done() {
         // Some providers send `finish_reason` and then neither `[DONE]` nor a
-        // socket close. Treating the finish marker as terminal returns promptly
-        // without any timer.
+        // socket close. The finish marker is still terminal — after the bounded
+        // post-finish usage grace, the completed answer is returned rather than
+        // spinning forever.
         let stream = never_ending(vec![
             r#"{"choices":[{"delta":{"content":"the answer"},"finish_reason":null}]}"#,
             r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
@@ -1035,8 +1076,8 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn usage_on_finish_chunk_is_captured() {
-        // Usage included on the same chunk as `finish_reason` is captured without
-        // requiring a trailing grace timer.
+        // Usage included on the same chunk as `finish_reason` is captured and
+        // terminates collection immediately — no trailing grace timer runs.
         let stream = never_ending(vec![
             r#"{"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":2}}"#,
         ]);
@@ -1044,6 +1085,44 @@ mod tests {
         let completion = collect_completion(stream, &mut sink).await.unwrap();
         assert_eq!(completion.usage.input_tokens, 10);
         assert_eq!(completion.usage.output_tokens, 2);
+        assert!(!completion.usage.estimated);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn usage_in_post_finish_chunk_is_captured() {
+        // The spec shape for `stream_options.include_usage`: usage arrives in a
+        // separate chunk AFTER the finish chunk, with empty `choices`. Breaking
+        // on finish used to discard it, leaving streamed calls with zero
+        // provider usage (and the counters running on chars/4 estimates).
+        let stream = never_ending(vec![
+            r#"{"choices":[{"delta":{"content":"the answer"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            r#"{"choices":[],"usage":{"prompt_tokens":1234,"completion_tokens":56}}"#,
+        ]);
+        let mut sink = |_: StreamEvent| {};
+        let completion = collect_completion(stream, &mut sink).await.unwrap();
+        assert_eq!(completion.stop_reason.as_deref(), Some("stop"));
+        assert_eq!(completion.usage.input_tokens, 1234);
+        assert_eq!(completion.usage.output_tokens, 56);
+        assert_eq!(completion.usage.context_occupancy, 1234);
+        assert!(!completion.usage.estimated);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn all_zero_usage_frame_marks_output_estimate() {
+        // Observed on pipenetwork: the post-finish usage frame exists but is all
+        // zeros. The in-stream chars/4 output fallback kicks in and the usage is
+        // marked estimated, so downstream consumers know the numbers are guesses.
+        let stream = never_ending(vec![
+            r#"{"choices":[{"delta":{"content":"four ch"},"finish_reason":null}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            r#"{"choices":[],"usage":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}}"#,
+        ]);
+        let mut sink = |_: StreamEvent| {};
+        let completion = collect_completion(stream, &mut sink).await.unwrap();
+        assert_eq!(completion.usage.input_tokens, 0, "input backfills upstream");
+        assert!(completion.usage.output_tokens > 0, "chars/4 fallback");
+        assert!(completion.usage.estimated);
     }
 
     #[tokio::test(start_paused = true)]

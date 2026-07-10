@@ -1113,6 +1113,10 @@ fn write_report(
         "usage_scope": "session_cumulative_full_context",
         "input_token_scope": "full_request_context_not_user_prompt",
         "output_token_scope": "generated_output",
+        // True when any counted call fell back to a chars/4 estimate because
+        // the provider reported no (or all-zeros) usage — the numbers above are
+        // then approximate, not provider-metered.
+        "usage_estimated": totals.estimated,
         "session_input_tokens": totals.input_tokens,
         "session_output_tokens": totals.output_tokens,
         "session_total_tokens": totals.total(),

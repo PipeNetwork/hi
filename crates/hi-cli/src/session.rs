@@ -20,6 +20,15 @@ enum SessionMeta {
     Usage {
         input_tokens: u64,
         output_tokens: u64,
+        /// Cache counters and the estimated marker ride along so a resumed
+        /// session's totals keep full fidelity. `#[serde(default)]` so session
+        /// files written before these fields load as zero/false.
+        #[serde(default)]
+        cache_read_tokens: u64,
+        #[serde(default)]
+        cache_creation_tokens: u64,
+        #[serde(default)]
+        estimated: bool,
     },
     Checkpoints {
         refs: Vec<String>,
@@ -113,6 +122,9 @@ impl SessionSink for JsonlSession {
         let line = serde_json::to_string(&SessionMeta::Usage {
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
+            cache_read_tokens: usage.cache_read_tokens,
+            cache_creation_tokens: usage.cache_creation_tokens,
+            estimated: usage.estimated,
         })?;
         writeln!(writer, "{line}")?;
         writer.flush()?;
@@ -525,15 +537,19 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
                 SessionMeta::Usage {
                     input_tokens,
                     output_tokens,
+                    cache_read_tokens,
+                    cache_creation_tokens,
+                    estimated,
                 } => {
                     usage = Usage {
                         input_tokens,
                         output_tokens,
-                        cache_read_tokens: 0,
-                        cache_creation_tokens: 0,
+                        cache_read_tokens,
+                        cache_creation_tokens,
                         input_includes_cache: false,
                         context_occupancy: input_tokens,
                         rate_limits: None,
+                        estimated,
                     };
                 }
                 SessionMeta::Checkpoints { refs } => {
@@ -786,11 +802,8 @@ mod tests {
                 Usage {
                     input_tokens: 123,
                     output_tokens: 45,
-                    cache_read_tokens: 0,
-                    cache_creation_tokens: 0,
-                    input_includes_cache: false,
                     context_occupancy: 123,
-                    rate_limits: None,
+                    ..Usage::default()
                 },
             )
             .unwrap();
@@ -958,11 +971,8 @@ mod tests {
                 Usage {
                     input_tokens: 1,
                     output_tokens: 1,
-                    cache_read_tokens: 0,
-                    cache_creation_tokens: 0,
-                    input_includes_cache: false,
                     context_occupancy: 1,
-                    rate_limits: None,
+                    ..Usage::default()
                 },
             )
             .unwrap();
@@ -994,6 +1004,45 @@ mod tests {
             cleared.goal.is_none(),
             "goal_cleared metadata should override earlier persisted goals"
         );
+    }
+
+    #[test]
+    fn usage_round_trips_cache_tokens_and_estimated_marker() {
+        // Session totals must keep full fidelity across resume: cache counters
+        // and the estimated marker used to be dropped (only input/output were
+        // persisted), silently shrinking a resumed session's numbers.
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "hi-session-usage-fidelity-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut session = JsonlSession::new(path.clone());
+        session
+            .record(
+                &[Message::user("go")],
+                Usage {
+                    input_tokens: 100,
+                    output_tokens: 20,
+                    cache_read_tokens: 60,
+                    cache_creation_tokens: 7,
+                    estimated: true,
+                    ..Usage::default()
+                },
+            )
+            .unwrap();
+
+        let loaded = load_history(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(loaded.usage.input_tokens, 100);
+        assert_eq!(loaded.usage.output_tokens, 20);
+        assert_eq!(loaded.usage.cache_read_tokens, 60);
+        assert_eq!(loaded.usage.cache_creation_tokens, 7);
+        assert!(loaded.usage.estimated, "estimated marker survives resume");
     }
 
     #[test]
