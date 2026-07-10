@@ -7973,24 +7973,32 @@ __global__ void wmma_paged_prefill_causal_attention_batched_kernel(
 
   for (int kt = 0; kt <= block_max_pos; kt += T) {
     // Gather the K,V tile (cache positions kt..kt+T) from the paged cache -> shared f16.
-    for (int e = tid; e < T * head_dim; e += 32) {
-      const int r = e / head_dim, d = e - r * head_dim, src = kt + r;
-      half kval = __float2half(0.0f), vval = __float2half(0.0f);
-      if (src <= block_max_pos) {
-        const int lp = src / page_size;
-        if (lp < page_table_len) {
-          const uint32_t phys = page_table[batch * page_table_len + lp];
-          const int off = src - lp * page_size;
-          const long slot =
-              (static_cast<long>(static_cast<int>(phys) * kv_heads + kv_head) * page_size + off) *
-                  head_dim +
-              d;
-          kval = k_pages[slot];
-          vval = v_pages[slot];
+    // Vectorized: each thread moves 8 contiguous halfs (16B int4) from one cache vector, so a
+    // single page lookup covers 8 elements and the global loads/stores are 16B-coalesced.
+    {
+      constexpr int VEC = 8;
+      const int vpr = head_dim / VEC;  // 16B vectors per row (head_dim is a multiple of 16)
+      for (int ve = tid; ve < T * vpr; ve += 32) {
+        const int r = ve / vpr;
+        const int d0 = (ve - r * vpr) * VEC;
+        const int src = kt + r;
+        int4 kp = make_int4(0, 0, 0, 0), vp = make_int4(0, 0, 0, 0);
+        if (src <= block_max_pos) {
+          const int lp = src / page_size;
+          if (lp < page_table_len) {
+            const uint32_t phys = page_table[batch * page_table_len + lp];
+            const int off = src - lp * page_size;
+            const long slot =
+                (static_cast<long>(static_cast<int>(phys) * kv_heads + kv_head) * page_size + off) *
+                    head_dim +
+                d0;
+            kp = *reinterpret_cast<const int4*>(k_pages + slot);
+            vp = *reinterpret_cast<const int4*>(v_pages + slot);
+          }
         }
+        *reinterpret_cast<int4*>(k_sh + r * head_dim + d0) = kp;
+        *reinterpret_cast<int4*>(v_sh + r * head_dim + d0) = vp;
       }
-      k_sh[e] = kval;
-      v_sh[e] = vval;
     }
     __syncwarp();
     // S = Q @ K^T (tensor cores)
@@ -8160,25 +8168,47 @@ __global__ void wmma_paged_prefill_causal_attention_batched_q8_kernel(
   const int block_max_pos = query_offset + block_max_row;
 
   for (int kt = 0; kt <= block_max_pos; kt += T) {
-    for (int e = tid; e < T * head_dim; e += 32) {
-      const int r = e / head_dim, d = e - r * head_dim, src = kt + r;
-      half kval = __float2half(0.0f), vval = __float2half(0.0f);
-      if (src <= block_max_pos) {
-        const int lp = src / page_size;
-        if (lp < page_table_len) {
-          const uint32_t phys = page_table[batch * page_table_len + lp];
-          const int off = src - lp * page_size;
-          const int scale_idx = (static_cast<int>(phys) * kv_heads + kv_head) * page_size + off;
-          kval = __float2half(
-              static_cast<float>(k_pages[static_cast<long>(scale_idx) * head_dim + d]) *
-              k_scales[scale_idx]);
-          vval = __float2half(
-              static_cast<float>(v_pages[static_cast<long>(scale_idx) * head_dim + d]) *
-              v_scales[scale_idx]);
+    // Vectorized Q8 gather: load 8 int8 codes (int2) per cache vector with one scale lookup,
+    // dequantize, and write 8 halfs to shared (matches the f16 kernel's 8-wide gather).
+    {
+      constexpr int VEC = 8;
+      const int vpr = head_dim / VEC;
+      for (int ve = tid; ve < T * vpr; ve += 32) {
+        const int r = ve / vpr;
+        const int d0 = (ve - r * vpr) * VEC;
+        const int src = kt + r;
+        half kh[VEC], vh[VEC];
+#pragma unroll
+        for (int t = 0; t < VEC; ++t) {
+          kh[t] = __float2half(0.0f);
+          vh[t] = __float2half(0.0f);
+        }
+        if (src <= block_max_pos) {
+          const int lp = src / page_size;
+          if (lp < page_table_len) {
+            const uint32_t phys = page_table[batch * page_table_len + lp];
+            const int off = src - lp * page_size;
+            const int scale_idx = (static_cast<int>(phys) * kv_heads + kv_head) * page_size + off;
+            const long base = static_cast<long>(scale_idx) * head_dim + d0;
+            const float ksc = k_scales[scale_idx];
+            const float vsc = v_scales[scale_idx];
+            const int2 kpk = *reinterpret_cast<const int2*>(k_pages + base);
+            const int2 vpk = *reinterpret_cast<const int2*>(v_pages + base);
+            const int8_t* kc = reinterpret_cast<const int8_t*>(&kpk);
+            const int8_t* vc = reinterpret_cast<const int8_t*>(&vpk);
+#pragma unroll
+            for (int t = 0; t < VEC; ++t) {
+              kh[t] = __float2half(static_cast<float>(kc[t]) * ksc);
+              vh[t] = __float2half(static_cast<float>(vc[t]) * vsc);
+            }
+          }
+        }
+#pragma unroll
+        for (int t = 0; t < VEC; ++t) {
+          k_sh[r * head_dim + d0 + t] = kh[t];
+          v_sh[r * head_dim + d0 + t] = vh[t];
         }
       }
-      k_sh[e] = kval;
-      v_sh[e] = vval;
     }
     __syncwarp();
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> s_frag;
