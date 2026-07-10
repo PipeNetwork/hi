@@ -39,6 +39,7 @@ pub fn write_artifact(
         mcp_model: result.mcp_model.clone(),
         verify_output_summary: result.verify_output_summary.clone(),
         trajectory: result.trajectory.clone(),
+        growth: result.growth.clone(),
     };
     let name = format!(
         "trial-{:03}-{}-{}-{}.json",

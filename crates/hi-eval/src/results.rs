@@ -95,6 +95,25 @@ impl Trajectory {
     }
 }
 
+/// One turn of a multi-turn (long-task) drive: how much context that
+/// session-continuing turn sent and how far the goal had progressed by its end.
+/// Empty for single-turn runs. `input_tokens` per turn is the growth-curve axis —
+/// "how fast does context accumulate" — that the compaction/curation levers move.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnMetric {
+    pub turn: u32,
+    /// Context (input) tokens sent to the model on this turn.
+    pub input_tokens: u64,
+    /// Total tokens (input + output) booked this turn.
+    pub total_tokens: u64,
+    /// Tool calls this turn.
+    pub tool_calls: u32,
+    /// Sub-goals marked `Done` by the end of this turn (progress axis).
+    pub goal_done: u32,
+    /// Total sub-goals in the plan (0 when not goal-driven).
+    pub goal_total: u32,
+}
+
 pub struct RunResult {
     pub config: String,
     pub model: String,
@@ -118,6 +137,9 @@ pub struct RunResult {
     /// Trajectory of the representative (furthest-progressing) candidate —
     /// verify rounds, recovery retries, nudges, last verify attribution.
     pub trajectory: Trajectory,
+    /// Per-turn context-growth series of the representative candidate. Non-empty
+    /// only for multi-turn (`HI_EVAL_TURNS>1`) drives.
+    pub growth: Vec<TurnMetric>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -142,6 +164,8 @@ pub struct Candidate {
     pub input_tokens: u64,
     pub seconds: f64,
     pub trajectory: Trajectory,
+    /// Per-turn context-growth series (multi-turn drive only; empty otherwise).
+    pub growth: Vec<TurnMetric>,
 }
 
 /// Why a candidate failed — so the summary shows *where* hi loses, not just how
@@ -186,6 +210,9 @@ pub struct RunArtifact {
     pub mcp_model: Option<McpModelArtifact>,
     pub verify_output_summary: String,
     pub trajectory: Trajectory,
+    /// Per-turn context-growth series (multi-turn drive only; empty otherwise).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub growth: Vec<TurnMetric>,
 }
 
 impl FailKind {

@@ -154,6 +154,30 @@ pub fn print_summary(results: &[RunResult], task_count: usize, active: &[&Config
                     "           parallel: {avg_max:.1} max concurrent batch · {serial_pct}% of {total_calls} calls serial",
                 );
             }
+
+            // Context-growth curve (multi-turn drives only): the representative
+            // trial's per-turn input-token trajectory — "how fast does context
+            // accumulate vs. how far does the goal get". The exemplar is the row
+            // that drove the most turns. Watch for ctx climbing while goal/done
+            // stalls: that's the bloat the compaction/curation levers should flatten.
+            if let Some(row) = rows
+                .iter()
+                .filter(|r| !r.growth.is_empty())
+                .max_by_key(|r| r.growth.len())
+            {
+                println!("           growth (ctx tok · tools · sub-goals done):");
+                for m in &row.growth {
+                    let prog = if m.goal_total > 0 {
+                        format!("{}/{}", m.goal_done, m.goal_total)
+                    } else {
+                        "-".to_string()
+                    };
+                    println!(
+                        "             t{:<2} ctx={:>8} tools={:>3} goal={}",
+                        m.turn, m.input_tokens, m.tool_calls, prog
+                    );
+                }
+            }
         }
     }
 }
