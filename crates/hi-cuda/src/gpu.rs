@@ -2814,6 +2814,16 @@ mod native {
         *ENABLED.get_or_init(|| std::env::var("HI_CUDA_NO_Q4_GEMV").is_err())
     }
 
+    /// Store the paged KV cache as int8 (per-(token,kv_head)-vector symmetric quant, one
+    /// f32 scale each) instead of f16, ~halving KV memory to roughly double the context
+    /// ceiling. Off by default; enable with `HI_CUDA_KV_Q8`. Only the tiled paged decode
+    /// path supports it (head_dim <= FLASH_ONLINE_MAX_HEAD_DIM).
+    fn kv_q8_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("HI_CUDA_KV_Q8").is_ok())
+    }
+
     /// Fuse Q4_0 weight dequant straight to f16 in the prefill GEMM path (default on;
     /// `HI_CUDA_NO_DEQUANT_F16` reverts to dequant -> f32 -> cast).
     fn dequant_f16_enabled() -> bool {
@@ -15917,6 +15927,39 @@ mod native {
                 .context("CUDA paged attention output element count overflows usize")?;
             let output = DeviceBuffer::alloc(output_elements * std::mem::size_of::<f32>())
                 .context("allocating CUDA paged attention output")?;
+            if let (Some(key_scales), Some(value_scales)) = (&cache.key_scales, &cache.value_scales)
+            {
+                // int8/Q8 cache: only the tiled path dequantizes; wide heads are unsupported.
+                if head_dim > FLASH_ONLINE_MAX_HEAD_DIM {
+                    bail!(
+                        "CUDA Q8 KV cache decode requires head_dim <= {FLASH_ONLINE_MAX_HEAD_DIM}, got {head_dim}"
+                    );
+                }
+                crate::kernels::launch_tiled_paged_decode_attention_q8(
+                    &q.buffer,
+                    &cache.key_pages,
+                    &cache.value_pages,
+                    key_scales,
+                    value_scales,
+                    &cache.page_table,
+                    &output,
+                    position,
+                    cache.page_size,
+                    cache.page_table_len,
+                    heads,
+                    kv_heads,
+                    head_dim,
+                    v_head_dim,
+                    window,
+                    &self.stream,
+                )?;
+                self.op_barrier()?;
+                return Ok(GpuF32Tensor {
+                    rows: 1,
+                    cols: heads * v_head_dim,
+                    buffer: output,
+                });
+            }
             if head_dim <= FLASH_ONLINE_MAX_HEAD_DIM {
                 crate::kernels::launch_tiled_paged_decode_attention(
                     &q.buffer,
@@ -16621,12 +16664,20 @@ mod native {
                 .and_then(|value| value.checked_mul(page_size))
                 .and_then(|value| value.checked_mul(dims.v_head_dim))
                 .context("CUDA paged KV value cache element count overflows usize")?;
+            // int8/Q8 cache: 1 byte/element + one f32 scale per vector; else f16 (2 bytes).
+            let q8 = kv_q8_enabled();
+            let elem_bytes = if q8 { 1 } else { std::mem::size_of::<u16>() };
             let key_bytes = key_elements
-                .checked_mul(std::mem::size_of::<u16>()) // f16 KV pages (kv_t = __half)
+                .checked_mul(elem_bytes)
                 .context("CUDA paged KV key cache byte count overflows usize")?;
             let value_bytes = value_elements
-                .checked_mul(std::mem::size_of::<u16>()) // f16 KV pages (kv_t = __half)
+                .checked_mul(elem_bytes)
                 .context("CUDA paged KV value cache byte count overflows usize")?;
+            let scale_bytes = page_table_len
+                .checked_mul(dims.kv_heads)
+                .and_then(|value| value.checked_mul(page_size))
+                .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+                .context("CUDA paged KV scale byte count overflows usize")?;
             let page_table = (0..page_table_len)
                 .map(|page| u32::try_from(page).context("CUDA KV page index does not fit u32"))
                 .collect::<Result<Vec<_>>>()?;
@@ -16644,12 +16695,25 @@ mod native {
                     .context("allocating CUDA paged KV page table")?;
                 key_pages.memset_zero_async(stream)?;
                 value_pages.memset_zero_async(stream)?;
+                let (key_scales, value_scales) = if q8 {
+                    let ks = DeviceBuffer::alloc(scale_bytes)
+                        .context("allocating CUDA paged Q8 key scales")?;
+                    let vs = DeviceBuffer::alloc(scale_bytes)
+                        .context("allocating CUDA paged Q8 value scales")?;
+                    ks.memset_zero_async(stream)?;
+                    vs.memset_zero_async(stream)?;
+                    (Some(ks), Some(vs))
+                } else {
+                    (None, None)
+                };
                 page_table_device
                     .copy_from_host(&page_table)
                     .context("copying CUDA paged KV page table")?;
                 layers.push(CudaPagedLayerKvCache {
                     key_pages,
                     value_pages,
+                    key_scales,
+                    value_scales,
                     page_table: page_table_device,
                     page_size,
                     page_table_len,
@@ -17147,6 +17211,10 @@ mod native {
     struct CudaPagedLayerKvCache {
         key_pages: DeviceBuffer,
         value_pages: DeviceBuffer,
+        // Present only for the int8/Q8 cache: one f32 scale per [phys_page][kv_head]
+        // [page_offset] vector. `None` means the f16 (kv_t) cache is in use.
+        key_scales: Option<DeviceBuffer>,
+        value_scales: Option<DeviceBuffer>,
         page_table: DeviceBuffer,
         page_size: usize,
         page_table_len: usize,
@@ -17199,6 +17267,40 @@ mod native {
                     start_pos.saturating_add(key.rows),
                     self.max_seq
                 );
+            }
+            if let (Some(key_scales), Some(value_scales)) = (&self.key_scales, &self.value_scales) {
+                // int8/Q8 cache: quantize each vector on write (batch_count = 1).
+                crate::kernels::launch_write_paged_kv_cache_q8_batched(
+                    &key.buffer,
+                    &self.key_pages,
+                    key_scales,
+                    &self.page_table,
+                    None,
+                    start_pos,
+                    1,
+                    key.rows,
+                    kv_heads,
+                    head_dim,
+                    self.page_size,
+                    self.page_table_len,
+                    stream,
+                )?;
+                crate::kernels::launch_write_paged_kv_cache_q8_batched(
+                    &value.buffer,
+                    &self.value_pages,
+                    value_scales,
+                    &self.page_table,
+                    None,
+                    start_pos,
+                    1,
+                    value.rows,
+                    kv_heads,
+                    v_head_dim,
+                    self.page_size,
+                    self.page_table_len,
+                    stream,
+                )?;
+                return stream.synchronize();
             }
             crate::kernels::launch_write_paged_kv_cache(
                 &key.buffer,
