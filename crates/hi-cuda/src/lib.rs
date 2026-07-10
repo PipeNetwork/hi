@@ -4719,6 +4719,8 @@ fn process_continuous_decode_chunk(
     // Speculative decode fast path: a single greedy text request decoding alone verifies a
     // batch of prompt-lookup drafts in one weight-read pass, emitting 1..=K+1 tokens. Every
     // emitted token is the model's greedy token, so output is identical to normal decode.
+    // (Only greedy: a sampled verify would sample the full-vocab logits per row on the host,
+    // which costs more than the weight-read it saves — it needs on-GPU sampling to pay off.)
     if let Some((ngram, max_draft)) = speculative_decode_config()
         && phase == CudaContinuousStepPhase::Decode
         && matches!(sampling_key, CudaSchedulerSamplingKey::Greedy)
