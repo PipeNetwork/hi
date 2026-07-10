@@ -179,6 +179,11 @@ async fn main() -> Result<()> {
         .ok()
         .filter(|s| !s.is_empty())
         .or_else(|| settings.skeptic_model.clone());
+    // Offline skeptic detector eval: review one (objective, sub_goal, diff) from
+    // stdin and exit, before building the normal turn agent.
+    if cli.skeptic_review {
+        return run_skeptic_review(provider, &settings, skeptic_model).await;
+    }
     let agent_config = AgentConfig {
         model: settings.model.clone(),
         requested_max_tokens: settings.max_tokens,
@@ -836,6 +841,44 @@ fn effective_prompt(cli: &Cli) -> Result<Option<String>> {
         return Ok(Some(prompt));
     }
     Ok(Some(format!("{prompt}\n\nstdin:\n```\n{piped}\n```")))
+}
+
+/// Offline detector eval of the skeptic reviewer (`hi --skeptic-review`): read a
+/// `{objective, sub_goal, diff}` JSON from stdin, run the *real* skeptic review,
+/// and print `{objected, objections}` JSON. Reviewer = `HI_SKEPTIC_MODEL`/profile,
+/// else `--model`. Lets `hi-eval` measure the reviewer's precision/recall on
+/// labeled diffs without running full goal episodes.
+async fn run_skeptic_review(
+    provider: std::sync::Arc<dyn Provider>,
+    settings: &Settings,
+    skeptic_model: Option<String>,
+) -> Result<()> {
+    #[derive(serde::Deserialize)]
+    struct Req {
+        objective: String,
+        sub_goal: String,
+        diff: String,
+    }
+    let input = std::io::read_to_string(std::io::stdin())
+        .context("reading skeptic-review JSON from stdin")?;
+    let req: Req =
+        serde_json::from_str(&input).context("parsing skeptic-review JSON from stdin")?;
+    let config = AgentConfig {
+        model: settings.model.clone(),
+        // Reviewer model: HI_SKEPTIC_MODEL/profile, else fall back to --model.
+        skeptic_model: Some(skeptic_model.unwrap_or_else(|| settings.model.clone())),
+        compat: settings.compat,
+        ..AgentConfig::default()
+    };
+    let mut agent = Agent::new(provider, config);
+    let (objected, objections) = agent
+        .review_diff(&req.objective, &req.sub_goal, &req.diff)
+        .await;
+    println!(
+        "{}",
+        serde_json::json!({ "objected": objected, "objections": objections })
+    );
+    Ok(())
 }
 
 fn absolutize_path(path: &Path) -> Result<PathBuf> {

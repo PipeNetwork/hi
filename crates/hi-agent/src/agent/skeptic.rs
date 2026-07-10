@@ -51,6 +51,40 @@ impl crate::Agent {
         }
     }
 
+    /// Review an arbitrary `(objective, sub_goal, diff)` with the real skeptic —
+    /// for offline *detector* evaluation of the reviewer (precision/recall on
+    /// labeled diffs), independent of a live goal. Returns `(objected, objections)`.
+    /// Uses the same prompt, model (`skeptic_model`), and fail-open behaviour as
+    /// the gate; records no history.
+    pub async fn review_diff(
+        &mut self,
+        objective: &str,
+        sub_goal: &str,
+        diff: &str,
+    ) -> (bool, Vec<String>) {
+        let mut diff = diff.to_string();
+        if diff.len() > SKEPTIC_DIFF_BUDGET {
+            let mut end = SKEPTIC_DIFF_BUDGET;
+            while !diff.is_char_boundary(end) {
+                end -= 1;
+            }
+            diff.truncate(end);
+            diff.push_str("\n… (diff truncated)");
+        }
+        // Mirror the gate's context format so the reviewer sees the same shape.
+        let context = format!(
+            "Objective: {objective}\n\n\
+             Active sub-goal (the one about to be marked done): {sub_goal}\n\n\
+             verify result: (none configured)\n\
+             Files changed this turn: (see diff)\n\n\
+             Diff of this turn's changes:\n{diff}"
+        );
+        match self.skeptic_review(&context).await {
+            SkepticVerdict::Object(objs) => (true, objs),
+            SkepticVerdict::Approve => (false, Vec::new()),
+        }
+    }
+
     /// Assemble the review blob: objective + active sub-goal + verify result +
     /// changed files + a best-effort diff of this turn's changes (truncated).
     async fn skeptic_context(&self, objective: &str, sub_goal: &str) -> String {
