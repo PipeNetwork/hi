@@ -53,16 +53,24 @@ impl Provider for FallbackProvider {
             match backend.provider.stream(req, sink).await {
                 Ok(mut completion) if !completion.content.is_empty() || is_last => {
                     if !prior_usage.is_zero() {
-                        // Fold ALL usage from the failed/empty earlier attempts
-                        // into the winner — the previous manual add dropped
-                        // `cache_read_tokens`, `cache_creation_tokens`, and the
-                        // `estimated` flag, silently under-counting cost. Merge
-                        // prior-then-winner so the winner's rate-limit snapshot
-                        // (the most recent) still wins over any stale one.
-                        let winner = std::mem::take(&mut completion.usage);
-                        let mut merged = prior_usage;
-                        merged.add(winner);
-                        completion.usage = merged;
+                        // Fold the failed/empty earlier attempts' token counts
+                        // into the winner. `Usage::add` sums only the token counts
+                        // + `estimated` and leaves `context_occupancy` /
+                        // `input_includes_cache` untouched (so the winner's stay),
+                        // but it would let a stale prior rate-limit snapshot
+                        // overwrite the winner's — so preserve the winner's
+                        // occupancy/cache/rate-limit scalars explicitly (these
+                        // drive the context gauge; taking them from a zeroed prior
+                        // attempt would mis-count cache tokens and trip early
+                        // auto-compaction).
+                        let winner_context = completion.usage.context_occupancy;
+                        let winner_includes_cache = completion.usage.input_includes_cache;
+                        let winner_rate_limits = completion.usage.rate_limits;
+                        let prior_rate_limits = prior_usage.rate_limits;
+                        completion.usage.add(prior_usage);
+                        completion.usage.context_occupancy = winner_context;
+                        completion.usage.input_includes_cache = winner_includes_cache;
+                        completion.usage.rate_limits = winner_rate_limits.or(prior_rate_limits);
                     }
                     return Ok(completion);
                 }

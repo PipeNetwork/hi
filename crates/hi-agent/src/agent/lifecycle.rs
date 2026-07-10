@@ -485,6 +485,18 @@ impl crate::Agent {
         self.add_usage(provider_error_usage(err));
     }
 
+    /// Like [`add_error_usage`] but for a *side* model call (skeptic, curate,
+    /// memory, goal planning, finalize, summarize). Books the error's usage
+    /// toward totals/turn spend without touching `context_used` — routing a
+    /// small side request's input size through `add_usage` would reset the main
+    /// conversation's occupancy gauge and silently disable the next
+    /// auto-compaction (see [`add_side_usage`]). Providers do attach nonzero
+    /// input usage to some errors (e.g. EmptyCompletion/MalformedStream), so
+    /// this matters in practice, not just in theory.
+    pub(crate) fn add_side_error_usage(&mut self, err: &anyhow::Error) {
+        self.add_side_usage(provider_error_usage(err));
+    }
+
     pub(crate) fn emit_usage(&self, ui: &mut dyn Ui) {
         ui.usage(
             self.last_user_prompt_tokens,

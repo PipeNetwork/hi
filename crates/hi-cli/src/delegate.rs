@@ -140,6 +140,9 @@ fn run_blocking(
     let prompt = child_prompt(task, verify_cmd.as_deref());
     let mut cmd = Command::new(exe);
     cmd.current_dir(&worktree)
+        // Force the child to use the parent's resolved key (not a re-resolved
+        // default-profile literal). Env, not argv, so it isn't visible in `ps`.
+        .env("HI_FORCE_API_KEY", api_key)
         .env("HI_API_KEY", api_key)
         // No pipes: we gate on the ground-truth verify + the worktree diff, not the
         // child's stdout — and unread pipes would deadlock the timeout wait.

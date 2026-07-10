@@ -10,7 +10,9 @@ use ratatui::text::{Line, Text};
 use crate::event::UiEvent;
 use crate::render::{diff_lines, dim, looks_like_diff, markdown_line};
 use crate::util::fmt_rate_limits;
-use crate::{ExploreRun, MAX_TRANSCRIPT_LINES, TranscriptEntry, TurnEventKind, TurnState};
+use crate::{
+    ExploreRun, MAX_EVENT_LOG, MAX_TRANSCRIPT_LINES, TranscriptEntry, TurnEventKind, TurnState,
+};
 
 impl crate::App {
     pub(crate) fn push(&mut self, line: Line<'static>) {
@@ -189,6 +191,14 @@ impl crate::App {
     }
 
     pub(crate) fn apply(&mut self, event: UiEvent) {
+        // Bound the debug event log (each arm below pushes one entry). Drop the
+        // oldest quarter in a batch when over the cap, so the front-drain is
+        // amortized O(1) per event rather than shifting the whole vec each push.
+        if self.event_log.len() > MAX_EVENT_LOG {
+            let drop_to = MAX_EVENT_LOG * 3 / 4;
+            let excess = self.event_log.len() - drop_to;
+            self.event_log.drain(..excess);
+        }
         match event {
             UiEvent::Text(t) => {
                 self.event_log

@@ -3235,7 +3235,9 @@ If the task is already complete, stop and give your final recap."
         let completion = match self.provider.stream(request, &mut sink).await {
             Ok(completion) => completion,
             Err(err) => {
-                self.add_error_usage(&err);
+                // Finalize is a side call — book its error usage without resetting
+                // the main conversation's `context_used` gauge.
+                self.add_side_error_usage(&err);
                 self.emit_usage(ui);
                 // Flush any partially-streamed recap text before the status
                 // line, so it isn't left dangling in the UI's pending buffer.

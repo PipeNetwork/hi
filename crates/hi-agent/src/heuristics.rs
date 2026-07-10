@@ -312,7 +312,11 @@ pub(crate) fn emit_tool_output(ui: &mut dyn Ui, name: &str, output: &ToolOutput)
 /// - A mutating call (`write`/`edit`/`multi_edit`/`bash`/`apply_patch`) depends
 ///   on every earlier mutating call, so side effects apply in emission order.
 ///   (Two independent writes still serialize — file edits aren't commutative
-///   and a later write may depend on an earlier write's content.)
+///   and a later write may depend on an earlier write's content.) It also
+///   depends on any earlier *read* of the same path (write-after-read): "read
+///   a.rs, then write a.rs" must let the read observe the pre-write content, not
+///   a file being truncated/rewritten under it. A mutation with an unknown write
+///   path (`bash`) conservatively waits for every earlier read.
 /// - A read-only call depends on any earlier mutating call whose inferred
 ///   target path matches the read's target path — so "write a.rs, then read
 ///   a.rs" reads the post-write state even if a scheduler reorders independent
@@ -333,8 +337,12 @@ pub(crate) fn tool_deps(calls: &[(String, String, String)]) -> Vec<Vec<usize>> {
         let my_path = hi_tools::target_path(name, arguments);
         for (j, (was_mut, their_path)) in prior.iter().enumerate() {
             let must_wait = if mutating {
-                // Mutating calls serialize after all earlier mutations.
-                *was_mut
+                // Serialize after all earlier mutations (was_mut), and after an
+                // earlier read of the same path (write-after-read: the read must
+                // see the pre-write file). A mutation with an unknown write path
+                // (bash) conservatively waits for every earlier read, since
+                // paths_overlap treats an unknown path as overlapping.
+                *was_mut || paths_overlap(their_path.as_deref(), my_path.as_deref())
             } else {
                 // Reads wait for an earlier mutation on the same path. If
                 // either side has no parseable path, be safe and serialize
@@ -719,6 +727,39 @@ pub(crate) fn recovery_telemetry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_deps_serializes_write_after_read_on_same_path() {
+        // read a.rs then write a.rs: the write must wait for the read so the read
+        // observes the pre-write file (previously they ran concurrently, so the
+        // read could see a torn/post-write file).
+        let calls = vec![
+            ("r".into(), "read".into(), r#"{"path":"a.rs"}"#.into()),
+            (
+                "w".into(),
+                "write".into(),
+                r#"{"path":"a.rs","content":"x"}"#.into(),
+            ),
+        ];
+        let deps = tool_deps(&calls);
+        assert!(deps[0].is_empty(), "the read has no deps");
+        assert_eq!(deps[1], vec![0], "the write waits for the same-path read");
+
+        // read a.rs then write b.rs: different files, still independent.
+        let calls = vec![
+            ("r".into(), "read".into(), r#"{"path":"a.rs"}"#.into()),
+            (
+                "w".into(),
+                "write".into(),
+                r#"{"path":"b.rs","content":"x"}"#.into(),
+            ),
+        ];
+        let deps = tool_deps(&calls);
+        assert!(
+            deps[1].is_empty(),
+            "a write to a different file is independent of the read"
+        );
+    }
 
     #[test]
     fn mode_blocks_tool_enforces_session_mode() {

@@ -202,6 +202,9 @@ fn run_candidate(
     let report = report_path.to_string_lossy().into_owned();
     let output = Command::new(opts.exe)
         .current_dir(worktree)
+        // Force the parent's resolved key (not a re-resolved default-profile
+        // literal). Env, not argv, so it isn't exposed in `ps`.
+        .env("HI_FORCE_API_KEY", opts.api_key)
         .env("HI_API_KEY", opts.api_key)
         .args([
             "--no-save",

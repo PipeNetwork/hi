@@ -123,9 +123,23 @@ pub async fn restore(dir: &Path, target: &str) -> Result<usize> {
     let current = create(dir)
         .await
         .context("couldn't snapshot current state")?;
+    // `-z` gives NUL-delimited, *unquoted* output: `status\0path\0` per entry.
+    // Without it, git octal-quotes any non-ASCII path (`"caf\303\251.txt"`), and
+    // the quoted string joins to a path that matches nothing — so `/undo` would
+    // silently skip every file with a non-ASCII name (leaving created files on
+    // disk and modified/deleted files un-reverted) while still reporting success,
+    // breaking the "anything is undoable" guarantee. `-z` also avoids splitting a
+    // filename that legitimately contains a tab.
     let diff = git(
         dir,
-        &["diff", "--no-renames", "--name-status", target, &current],
+        &[
+            "diff",
+            "--no-renames",
+            "--name-status",
+            "-z",
+            target,
+            &current,
+        ],
     )
     .await?;
     if !diff.status.success() {
@@ -133,10 +147,17 @@ pub async fn restore(dir: &Path, target: &str) -> Result<usize> {
     }
 
     let mut changed = 0usize;
-    for line in String::from_utf8_lossy(&diff.stdout).lines() {
-        let mut it = line.splitn(2, '\t');
-        let status = it.next().unwrap_or("");
-        let rel = it.next().unwrap_or("").trim();
+    let stdout = String::from_utf8_lossy(&diff.stdout);
+    // Fields alternate status, path, status, path, … each NUL-terminated. Do NOT
+    // trim the path — leading/trailing spaces are valid in filenames.
+    let mut fields = stdout.split('\0');
+    while let Some(status) = fields.next() {
+        if status.is_empty() {
+            break; // trailing empty field after the final NUL
+        }
+        let Some(rel) = fields.next() else {
+            break;
+        };
         if rel.is_empty() {
             continue;
         }
@@ -215,6 +236,50 @@ mod tests {
             "stays\n"
         );
         assert!(!dir.join("new.txt").exists(), "created file removed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_restores_non_ascii_filenames() {
+        // Regression: git octal-quotes non-ASCII paths in `--name-status` unless
+        // `-z` is used, which made /undo silently skip files like `café.txt`.
+        static N: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "hi-ckpt-utf8-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        sh(
+            &dir,
+            "git init -q && git config user.email t@t && git config user.name t",
+        );
+        std::fs::write(dir.join("café.txt"), "v1\n").unwrap();
+        std::fs::write(dir.join("naïve.txt"), "stays\n").unwrap();
+        let cp = create(&dir).await.expect("checkpoint");
+
+        // Modify one non-ASCII file, delete another, create a third.
+        std::fs::write(dir.join("café.txt"), "v2\n").unwrap();
+        std::fs::remove_file(dir.join("naïve.txt")).unwrap();
+        std::fs::write(dir.join("résumé.txt"), "new\n").unwrap();
+
+        let n = restore(&dir, &cp).await.expect("restore");
+        assert_eq!(n, 3, "all three non-ASCII files handled");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("café.txt")).unwrap(),
+            "v1\n",
+            "modified non-ASCII file reverted"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("naïve.txt")).unwrap(),
+            "stays\n",
+            "deleted non-ASCII file restored"
+        );
+        assert!(
+            !dir.join("résumé.txt").exists(),
+            "created non-ASCII file removed"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

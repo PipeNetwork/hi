@@ -1248,6 +1248,19 @@ fn resolve_api_key(cli: &Cli, profile: Option<&Profile>, provider: ProviderName)
     if let Some(key) = &cli.api_key {
         return Ok(key.clone());
     }
+    // A launcher (best-of / delegate / fleet child) passes the parent's already
+    // resolved key here so the child authenticates with the SAME key the parent
+    // used. The child re-resolves config from scratch and would otherwise let a
+    // default-profile literal `api_key` shadow the parent's key (e.g. when the
+    // parent ran with `--profile alt` or `--api-key`), causing silent auth
+    // failures. It's passed in the environment, not argv, so it isn't exposed in
+    // `ps` — hence it must win over the profile here rather than being a
+    // last-resort candidate like `HI_API_KEY`.
+    if let Ok(key) = std::env::var("HI_FORCE_API_KEY")
+        && !key.is_empty()
+    {
+        return Ok(key);
+    }
     resolve_api_key_for(profile, provider)
 }
 

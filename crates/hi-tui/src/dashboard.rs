@@ -756,6 +756,9 @@ fn start_turn(
 
     let mut cmd = tokio::process::Command::new(&launcher.exe);
     cmd.current_dir(&row.worktree)
+        // Force the parent's resolved key (not a re-resolved default-profile
+        // literal). Env, not argv, so it isn't exposed in `ps`.
+        .env("HI_FORCE_API_KEY", &launcher.api_key)
         .env("HI_API_KEY", &launcher.api_key)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

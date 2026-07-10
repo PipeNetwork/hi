@@ -452,7 +452,9 @@ impl crate::Agent {
         let completion = match self.provider.stream(request, &mut sink).await {
             Ok(completion) => completion,
             Err(err) => {
-                self.add_error_usage(&err);
+                // Summarize is a side call — don't let its request size clobber
+                // the main conversation's `context_used` gauge.
+                self.add_side_error_usage(&err);
                 self.emit_usage(ui);
                 // Flush any partially-streamed summary text before returning.
                 ui.assistant_end();
