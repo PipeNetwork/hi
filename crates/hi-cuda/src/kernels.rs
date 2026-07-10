@@ -242,6 +242,26 @@ mod native {
             k: c_int,
             stream: *mut c_void,
         ) -> c_int;
+        fn hi_cuda_launch_quantize_q8_rows(
+            x: *const c_void,
+            xq: *mut c_void,
+            dx: *mut c_void,
+            xsum: *mut c_void,
+            m: c_int,
+            k: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_q4_k_a8_gemm(
+            weights: *const c_void,
+            xq: *const c_void,
+            dx: *const c_void,
+            xsum: *const c_void,
+            out: *mut c_void,
+            m: c_int,
+            n: c_int,
+            k: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
         fn hi_cuda_launch_q4_0_dp4a_gemv(
             weight: *const c_void,
             xq: *const c_void,
@@ -1706,6 +1726,76 @@ mod native {
             )
         })?;
         check_last_error("hi_cuda_launch_quantize_q8_row")
+    }
+
+    /// Batched per-32-block int8 activation quant for M rows (W4A8 prefill GEMM): produces
+    /// xq[M,K] int8, dx[M,K/32] block scales, xsum[M,K/32] block int sums.
+    pub fn launch_quantize_q8_rows(
+        x: &DeviceBuffer,
+        xq: &DeviceBuffer,
+        dx: &DeviceBuffer,
+        xsum: &DeviceBuffer,
+        m: usize,
+        k: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(m, "quantize_q8_rows m")?;
+        ensure_len(k, "quantize_q8_rows k")?;
+        launch_status(unsafe {
+            hi_cuda_launch_quantize_q8_rows(
+                x.as_ptr(),
+                xq.as_mut_ptr(),
+                dx.as_mut_ptr(),
+                xsum.as_mut_ptr(),
+                m as c_int,
+                k as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_quantize_q8_rows")
+    }
+
+    /// W4A8 prefill GEMM: C[M,N] f32 = A[M,K] x W[N,K]^T with A int8 (per-32-block dx/xsum
+    /// from `launch_quantize_q8_rows`) and W Q4_K, via int8 tensor cores + per-block rescale.
+    /// Requires k % 256 == 0.
+    ///
+    /// EXPERIMENTAL / NOT WIRED INTO THE MODEL. Parity-validated (see
+    /// `native_cuda_q4_k_a8_gemm_matches_dequant_reference`) but currently ~0.26x the speed of
+    /// the shipping dequant->f16 + cuBLAS f16 path at the qwen3-8B projection shapes (see
+    /// `bench_w4a8_vs_f16_gemm`): a hand-rolled tiled GEMM at ~3.4% of int8 peak can't beat
+    /// cuBLAS's ~35% of f16 peak on this card. Kept as a validated foundation. To compete it
+    /// needs cutlass/MMQ-class machinery — cp.async double/triple-buffered staging (sm_80+, so
+    /// a multi-arch fatbin since hi-cuda ships compute_75 PTX), swizzled bank-conflict-free
+    /// shared, warp specialization. Even then the end-to-end ceiling is ~9% of prefill.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_q4_k_a8_gemm(
+        weights: &DeviceBuffer,
+        xq: &DeviceBuffer,
+        dx: &DeviceBuffer,
+        xsum: &DeviceBuffer,
+        out: &DeviceBuffer,
+        m: usize,
+        n: usize,
+        k: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(m, "q4_k_a8_gemm m")?;
+        ensure_len(n, "q4_k_a8_gemm n")?;
+        ensure_len(k, "q4_k_a8_gemm k")?;
+        launch_status(unsafe {
+            hi_cuda_launch_q4_k_a8_gemm(
+                weights.as_ptr(),
+                xq.as_ptr(),
+                dx.as_ptr(),
+                xsum.as_ptr(),
+                out.as_mut_ptr(),
+                m as c_int,
+                n as c_int,
+                k as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_q4_k_a8_gemm")
     }
 
     pub fn launch_q4_0_dp4a_gemv(

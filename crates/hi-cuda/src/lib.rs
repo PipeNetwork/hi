@@ -19985,6 +19985,77 @@ mod tests {
         );
     }
 
+    /// Microbenchmark the f16 tensor-core GEMM at the qwen3-8B prefill projection shapes
+    /// (M = one 1024-token chunk), to decide whether a fused int8 (W4A8) GEMM is worth it.
+    /// Prints ms/call + GFLOPS per shape and the extrapolated per-chunk / 10-chunk GEMM total.
+    /// Run with: cargo test -p hi-cuda --features native-cuda --release bench_prefill_gemm -- --ignored --nocapture --test-threads=1
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+    fn bench_prefill_gemm_f16() {
+        use crate::runtime::{Cublas, DeviceBuffer, GemmDType, Stream};
+        use std::time::Instant;
+
+        let stream = Stream::create().unwrap();
+        let cublas = Cublas::create().unwrap();
+        cublas.set_stream(&stream).unwrap();
+        let m = 1024usize; // one prefill chunk
+        // (n, k, per-layer count, label) for qwen3-8B: hidden 4096, kv_dim 1024, ffn 12288.
+        let shapes = [
+            (4096usize, 4096usize, 1usize, "q_proj    N=4096 K=4096"),
+            (1024, 4096, 2, "kv_proj   N=1024 K=4096 (x2)"),
+            (4096, 4096, 1, "o_proj    N=4096 K=4096"),
+            (12288, 4096, 2, "gate/up   N=12288 K=4096 (x2)"),
+            (4096, 12288, 1, "down      N=4096 K=12288"),
+        ];
+        let mut per_layer_ms = 0.0f64;
+        println!("\n=== f16 tensor-core GEMM @ M={m} (one chunk) ===");
+        for (n, k, count, label) in shapes {
+            let a = DeviceBuffer::alloc(m * k * 2).unwrap();
+            let w = DeviceBuffer::alloc(n * k * 2).unwrap();
+            let o = DeviceBuffer::alloc(m * n * 4).unwrap();
+            a.memset_zero_async(&stream).unwrap();
+            w.memset_zero_async(&stream).unwrap();
+            stream.synchronize().unwrap();
+            let run = || {
+                cublas
+                    .matmul_mixed_rhs_transposed_row_major(
+                        &a,
+                        &w,
+                        &o,
+                        m,
+                        n,
+                        k,
+                        GemmDType::F16,
+                        GemmDType::F16,
+                    )
+                    .unwrap();
+            };
+            for _ in 0..10 {
+                run();
+            }
+            stream.synchronize().unwrap();
+            let iters = 50;
+            let t = Instant::now();
+            for _ in 0..iters {
+                run();
+            }
+            stream.synchronize().unwrap();
+            let ms = t.elapsed().as_secs_f64() * 1000.0 / iters as f64;
+            let gflops = 2.0 * (m * n * k) as f64 / 1e9 / (ms / 1000.0);
+            per_layer_ms += ms * count as f64;
+            println!("  {label}  x{count}: {ms:.3} ms/call  {gflops:.0} GFLOPS");
+        }
+        let layers = 36.0;
+        let chunk_ms = per_layer_ms * layers;
+        println!("  per-layer GEMM total: {per_layer_ms:.3} ms");
+        println!(
+            "  per-chunk (x{layers} layers): {:.1} ms  ->  10-chunk (~10k-tok) prefill GEMM: {:.1} s",
+            chunk_ms,
+            chunk_ms * 10.0 / 1000.0
+        );
+    }
+
     /// Each dp4a K-quant decode GEMV must match a trusted reference: dequantize the
     /// weight to f32 (the dequant kernels are the canonical definition) and dot it
     /// with the SAME int8-reconstructed activation (dx*xq) the GEMV consumes. That
@@ -21850,6 +21921,191 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// W4A8 prefill GEMM (int8 tensor-core Q4_K x int8 activation) vs a host reference over the
+    /// dequantized Q4_K weights + round-tripped int8 activations -- the same math as the
+    /// validated q4_k dp4a GEMV, extended to M>1. M and N are deliberately NOT multiples of 16
+    /// to exercise the partial-tile edge guards. Q4_K weights synthesized as in the dp4a test.
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_q4_k_a8_gemm_matches_dequant_reference() {
+        use crate::runtime::{DeviceBuffer, Stream};
+        use rand::rngs::StdRng;
+        use rand::{Rng, RngCore, SeedableRng};
+
+        let stream = Stream::create().unwrap();
+        let mut rng = StdRng::seed_from_u64(0xa8_4b_51);
+        let m = 20usize; // rows (16 + 4)
+        let n = 40usize; // output cols (32 + 8)
+        let k = 512usize; // % 256 == 0
+        let block_bytes = 144usize;
+        let block_weights = 256usize;
+        let nblocks_k = k / block_weights;
+        let wlen = n * nblocks_k * block_bytes;
+        let mut wbytes = vec![0u8; wlen];
+        rng.fill_bytes(&mut wbytes);
+        // Pin f16 d = 1.0 (0x3C00) and dmin = 0.5 (0x3800) so random bytes can't make inf/nan.
+        for blk in 0..(n * nblocks_k) {
+            let base = blk * block_bytes;
+            wbytes[base] = 0x00;
+            wbytes[base + 1] = 0x3C;
+            wbytes[base + 2] = 0x00;
+            wbytes[base + 3] = 0x38;
+        }
+        let w_dev = DeviceBuffer::alloc(wlen).unwrap();
+        w_dev.copy_from_host(&wbytes).unwrap();
+
+        let x: Vec<f32> = (0..m * k).map(|_| rng.gen_range(-1.5f32..1.5)).collect();
+        let x_dev = DeviceBuffer::alloc(m * k * std::mem::size_of::<f32>()).unwrap();
+        x_dev.copy_from_host(&x).unwrap();
+
+        let elements = n * k;
+        let wf32_dev = DeviceBuffer::alloc(elements * std::mem::size_of::<f32>()).unwrap();
+        crate::kernels::launch_dequantize_matrix(&w_dev, &wf32_dev, elements, 12, &stream).unwrap();
+
+        let nsub = k / 32;
+        let xq_dev = DeviceBuffer::alloc(m * k).unwrap();
+        let dx_dev = DeviceBuffer::alloc(m * nsub * std::mem::size_of::<f32>()).unwrap();
+        let xsum_dev = DeviceBuffer::alloc(m * nsub * std::mem::size_of::<i32>()).unwrap();
+        crate::kernels::launch_quantize_q8_rows(&x_dev, &xq_dev, &dx_dev, &xsum_dev, m, k, &stream)
+            .unwrap();
+
+        let out_dev = DeviceBuffer::alloc(m * n * std::mem::size_of::<f32>()).unwrap();
+        crate::kernels::launch_q4_k_a8_gemm(
+            &w_dev, &xq_dev, &dx_dev, &xsum_dev, &out_dev, m, n, k, &stream,
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+
+        let wf32 = wf32_dev.copy_to_host::<f32>(elements).unwrap();
+        let xq = xq_dev.copy_to_host::<i8>(m * k).unwrap();
+        let dx = dx_dev.copy_to_host::<f32>(m * nsub).unwrap();
+        let got = out_dev.copy_to_host::<f32>(m * n).unwrap();
+
+        for mm in 0..m {
+            for nn in 0..n {
+                let mut acc = 0.0f64;
+                for c in 0..k {
+                    let xr = f64::from(dx[mm * nsub + c / 32]) * f64::from(xq[mm * k + c]);
+                    acc += f64::from(wf32[nn * k + c]) * xr;
+                }
+                let reference = acc as f32;
+                let tol = 1.0e-2 + 3.0e-3 * reference.abs();
+                assert!(
+                    (got[mm * n + nn] - reference).abs() <= tol,
+                    "m={mm} n={nn}: w4a8 gemm {} vs reference {} (tol {tol})",
+                    got[mm * n + nn],
+                    reference,
+                );
+            }
+        }
+    }
+
+    /// Head-to-head: the full f16 path (dequant Q4_K->f16 + cast input->f16 + cuBLAS f16 GEMM)
+    /// vs the full W4A8 path (quantize activations to int8 + q4_k_a8 int8-tensor-core GEMM), at
+    /// the qwen3-8B projection shapes (M = one 1024-token chunk). Prints ms/call + the ratio and
+    /// the extrapolated per-layer / 10-chunk projection total. Decides whether W4A8 wins.
+    /// Run: cargo test -p hi-cuda --features native-cuda --release bench_w4a8 -- --ignored --nocapture --test-threads=1
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+    fn bench_w4a8_vs_f16_gemm() {
+        use crate::runtime::{Cublas, DeviceBuffer, GemmDType, Stream};
+        use rand::rngs::StdRng;
+        use rand::{RngCore, SeedableRng};
+        use std::time::Instant;
+
+        let stream = Stream::create().unwrap();
+        let cublas = Cublas::create().unwrap();
+        cublas.set_stream(&stream).unwrap();
+        let m = 1024usize;
+        let shapes = [
+            (4096usize, 4096usize, 2usize, "q/o     N=4096  K=4096 "),
+            (1024, 4096, 2, "kv      N=1024  K=4096 "),
+            (12288, 4096, 2, "gate/up N=12288 K=4096 "),
+            (4096, 12288, 1, "down    N=4096  K=12288"),
+        ];
+        let mut rng = StdRng::seed_from_u64(0xbeef_51);
+        let mut f16_total = 0.0f64;
+        let mut w4a8_total = 0.0f64;
+        println!("\n=== W4A8 vs f16 full projection path @ M={m} ===");
+        for (n, k, count, label) in shapes {
+            let nblk = n * (k / 256);
+            let wlen = nblk * 144;
+            let mut wb = vec![0u8; wlen];
+            rng.fill_bytes(&mut wb);
+            for blk in 0..nblk {
+                let b = blk * 144;
+                wb[b] = 0;
+                wb[b + 1] = 0x3C;
+                wb[b + 2] = 0;
+                wb[b + 3] = 0x38;
+            }
+            let w = DeviceBuffer::alloc(wlen).unwrap();
+            w.copy_from_host(&wb).unwrap();
+            let xf = DeviceBuffer::alloc(m * k * 4).unwrap();
+            xf.memset_zero_async(&stream).unwrap();
+            let out = DeviceBuffer::alloc(m * n * 4).unwrap();
+            let wf16 = DeviceBuffer::alloc(n * k * 2).unwrap();
+            let xf16 = DeviceBuffer::alloc(m * k * 2).unwrap();
+            let nsub = k / 32;
+            let xq = DeviceBuffer::alloc(m * k).unwrap();
+            let dx = DeviceBuffer::alloc(m * nsub * 4).unwrap();
+            let xsum = DeviceBuffer::alloc(m * nsub * 4).unwrap();
+            let f16_run = || {
+                crate::kernels::launch_dequantize_q4_k_to_f16(&w, &wf16, n * k, &stream).unwrap();
+                crate::kernels::launch_cast_f32_to_f16(&xf, &xf16, m * k, &stream).unwrap();
+                cublas
+                    .matmul_mixed_rhs_transposed_row_major(
+                        &xf16,
+                        &wf16,
+                        &out,
+                        m,
+                        n,
+                        k,
+                        GemmDType::F16,
+                        GemmDType::F16,
+                    )
+                    .unwrap();
+            };
+            let w4a8_run = || {
+                crate::kernels::launch_quantize_q8_rows(&xf, &xq, &dx, &xsum, m, k, &stream)
+                    .unwrap();
+                crate::kernels::launch_q4_k_a8_gemm(&w, &xq, &dx, &xsum, &out, m, n, k, &stream)
+                    .unwrap();
+            };
+            let bench = |run: &dyn Fn()| {
+                for _ in 0..10 {
+                    run();
+                }
+                stream.synchronize().unwrap();
+                let iters = 50;
+                let t = Instant::now();
+                for _ in 0..iters {
+                    run();
+                }
+                stream.synchronize().unwrap();
+                t.elapsed().as_secs_f64() * 1000.0 / iters as f64
+            };
+            let f16_ms = bench(&f16_run);
+            let w4a8_ms = bench(&w4a8_run);
+            f16_total += f16_ms * count as f64;
+            w4a8_total += w4a8_ms * count as f64;
+            println!(
+                "  {label} x{count}: f16 {f16_ms:.3} ms  w4a8 {w4a8_ms:.3} ms  ({:.2}x)",
+                f16_ms / w4a8_ms
+            );
+        }
+        println!(
+            "  per-layer: f16 {f16_total:.2} ms  w4a8 {w4a8_total:.2} ms  ({:.2}x)",
+            f16_total / w4a8_total
+        );
+        println!(
+            "  10-chunk (~10k-tok) projection total: f16 {:.1} s  w4a8 {:.1} s",
+            f16_total * 36.0 * 10.0 / 1000.0,
+            w4a8_total * 36.0 * 10.0 / 1000.0
+        );
     }
 
     /// The parallelized temperature sampler must be a correct inverse-CDF: the same

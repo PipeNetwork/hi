@@ -7234,6 +7234,61 @@ extern "C" int hi_cuda_launch_quantize_q8_row(
   return 0;
 }
 
+// Batched per-32-block int8 activation quant for M>1 (W4A8 prefill GEMM). One block per
+// (row, 32-block): xq[m,k] int8, dx[m, k/32] block scale, xsum[m, k/32] block int sum.
+// Mirrors quantize_q8_row_kernel row-by-row.
+__global__ void quantize_q8_rows_kernel(
+    const float* __restrict__ x,
+    int8_t* __restrict__ xq,
+    float* __restrict__ dx,
+    int* __restrict__ xsum,
+    int m,
+    int k) {
+  const int row = blockIdx.y;
+  const int block = blockIdx.x;
+  if (row >= m) {
+    return;
+  }
+  const int lane = threadIdx.x;
+  const int nblocks = k / 32;
+  const size_t idx = static_cast<size_t>(row) * k + block * 32 + lane;
+  const float v = (block * 32 + lane < k) ? x[idx] : 0.0f;
+  float amax = fabsf(v);
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) {
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+  }
+  const float d = amax / 127.0f;
+  const float inv = (d > 0.0f) ? (1.0f / d) : 0.0f;
+  int q = static_cast<int>(rintf(v * inv));
+  q = max(-127, min(127, q));
+  if (block * 32 + lane < k) {
+    xq[idx] = static_cast<int8_t>(q);
+  }
+  int s = q;
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) {
+    s += __shfl_xor_sync(0xffffffffu, s, o);
+  }
+  if (lane == 0) {
+    dx[static_cast<size_t>(row) * nblocks + block] = d;
+    xsum[static_cast<size_t>(row) * nblocks + block] = s;
+  }
+}
+
+extern "C" int hi_cuda_launch_quantize_q8_rows(
+    const void* x, void* xq, void* dx, void* xsum, int m, int k, void* stream) {
+  if (x == nullptr || xq == nullptr || dx == nullptr || xsum == nullptr || m <= 0 || k <= 0 ||
+      k % 32 != 0 || stream == nullptr) {
+    return 1;
+  }
+  dim3 grid(k / 32, m);
+  quantize_q8_rows_kernel<<<grid, 32, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const float*>(x), static_cast<int8_t*>(xq), static_cast<float*>(dx),
+      static_cast<int*>(xsum), m, k);
+  return 0;
+}
+
 extern "C" int hi_cuda_launch_q4_0_dp4a_gemv(
     const void* weight, const void* xq, const void* dx, const void* xsum, void* y,
     int rows, int cols, void* stream) {
@@ -8309,6 +8364,192 @@ extern "C" int hi_cuda_launch_wmma_paged_prefill_causal_attention_batched_q8(
       static_cast<const float*>(v_scales), static_cast<const uint32_t*>(page_table),
       static_cast<float*>(output), query_offset, batch_count, chunk_len, page_size, page_table_len,
       heads, kv_heads, head_dim);
+  return 0;
+}
+
+// W4A8 prefill GEMM: C[M,N] f32 = A[M,K] x W[N,K]^T, where A is int8-quantized per 32-block
+// (scale dx[M,K/32], int sum xsum[M,K/32]) and W is Q4_K [N rows, K cols]. One warp per 16x16
+// output tile: for each 32-weight sub-block, two k16 int8 tensor-core MMAs produce the int32
+// dot DP[m,n], then the Q4_K per-block rescale accumulates into an f32 fragment:
+//   C[m,n] += dx[m,sub] * (d*scale*DP - dmin*min*xsum[m,sub]).
+// The sub-block/nibble/scale unpack mirrors q4_k_dp4a_gemv_kernel. Requires K % 256 == 0,
+// K <= (fits int). int8 tensor cores need sm_75+ (this card is sm_86). f16-free, so not
+// bit-parity with the f32 path; validated by parity-vs-dequant-reference + coherence.
+__global__ void q4_k_a8_gemm_kernel(
+    const uint8_t* __restrict__ weights,  // Q4_K [N][K]
+    const int8_t* __restrict__ xq,        // [M][K] int8
+    const float* __restrict__ dx,         // [M][K/32]
+    const int* __restrict__ xsum,         // [M][K/32]
+    float* __restrict__ out,              // [M][N] f32
+    int M,
+    int N,
+    int K) {
+  // 64x64 output tile per block, 4 warps in a 2x2 grid; each warp owns a 32x32 sub-tile
+  // (2x2 WMMA 16x16 fragments). Per 32-weight Q4_K sub-block, the A tile [64][32] and the
+  // unpacked weight tile [64][32] are staged once and reused across all 16 WMMA tiles. Two
+  // k16 int8 tensor-core MMAs give the int32 dot per sub-block, then the Q4_K rescale
+  // accumulates into f32. (Measured best tile on this card; 64x128/8-warp was slower.)
+  constexpr int BM = 64, BN = 64, WN = 2, THREADS = 128;
+  const int nsub = K / 32;
+  const size_t row_bytes = static_cast<size_t>(K / 256) * 144;
+
+  const int tid = threadIdx.x;   // 0..127
+  const int warp = tid >> 5;     // 0..3
+  const int lane = tid & 31;
+  const int warp_row = warp / WN;  // 0..1
+  const int warp_col = warp % WN;  // 0..1
+  const int m0 = blockIdx.y * BM;
+  const int n0 = blockIdx.x * BN;
+
+  __shared__ int8_t a_sh[BM * 32];  // [64 m][32 k]
+  __shared__ int8_t b_sh[BN * 32];  // [64 n][32 k]
+  __shared__ float wscale_sh[BN];
+  __shared__ float wmin_sh[BN];
+  __shared__ float dx_sh[BM];
+  __shared__ int xsum_sh[BM];
+
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[2][2];
+#pragma unroll
+  for (int tr = 0; tr < 2; ++tr) {
+#pragma unroll
+    for (int tc = 0; tc < 2; ++tc) {
+      wmma::fill_fragment(acc[tr][tc], 0.0f);
+    }
+  }
+
+  // per-lane element -> (row,col) map within a 16x16 accumulator fragment (8 elems/lane).
+  const int r_base = lane >> 2;
+  const int c_base = (lane & 3) * 2;
+
+  for (int sub = 0; sub < nsub; ++sub) {
+    const int kblock = sub >> 3;
+    const int si = sub & 7;
+    const int base = (si >> 1) * 32;
+    const bool high = (si & 1) != 0;
+    // stage A tile [64 m][32 k], vectorized: each thread moves 16 contiguous int8 (int4).
+    for (int v = tid; v < BM * 2; v += THREADS) {
+      const int r = v >> 1, half = v & 1;
+      const int m = m0 + r;
+      int4 val = make_int4(0, 0, 0, 0);
+      if (m < M) {
+        val = *reinterpret_cast<const int4*>(xq + static_cast<size_t>(m) * K + sub * 32 + half * 16);
+      }
+      *reinterpret_cast<int4*>(a_sh + r * 32 + half * 16) = val;
+    }
+    // stage + unpack weight tile [64 n][32 k]
+    for (int e = tid; e < BN * 32; e += THREADS) {
+      const int r = e >> 5, c = e & 31;
+      const int n = n0 + r;
+      int8_t wv = 0;
+      if (n < N) {
+        const uint8_t* blk =
+            weights + static_cast<size_t>(n) * row_bytes + static_cast<size_t>(kblock) * 144;
+        const uint8_t byte = blk[16 + base + c];
+        wv = static_cast<int8_t>(high ? (byte >> 4) : (byte & 0x0F));
+      }
+      b_sh[e] = wv;
+    }
+    // per-n weight scale/min
+    for (int r = tid; r < BN; r += THREADS) {
+      const int n = n0 + r;
+      float ws = 0.0f, wm = 0.0f;
+      if (n < N) {
+        const uint8_t* blk =
+            weights + static_cast<size_t>(n) * row_bytes + static_cast<size_t>(kblock) * 144;
+        const float d = __half2float(*reinterpret_cast<const __half*>(blk));
+        const float dmin = __half2float(*reinterpret_cast<const __half*>(blk + 2));
+        uint8_t sc, mn;
+        q4_k_scale_min(si, blk + 4, &sc, &mn);
+        ws = d * static_cast<float>(sc);
+        wm = dmin * static_cast<float>(mn);
+      }
+      wscale_sh[r] = ws;
+      wmin_sh[r] = wm;
+    }
+    // per-m activation scale/sum
+    for (int r = tid; r < BM; r += THREADS) {
+      const int m = m0 + r;
+      dx_sh[r] = (m < M) ? dx[static_cast<size_t>(m) * nsub + sub] : 0.0f;
+      xsum_sh[r] = (m < M) ? xsum[static_cast<size_t>(m) * nsub + sub] : 0;
+    }
+    __syncthreads();
+
+    // each warp: 2x2 WMMA tiles over its 32x32 region
+#pragma unroll
+    for (int tr = 0; tr < 2; ++tr) {
+#pragma unroll
+      for (int tc = 0; tc < 2; ++tc) {
+        const int a_row = warp_row * 32 + tr * 16;
+        const int b_row = warp_col * 32 + tc * 16;
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, signed char, wmma::row_major> af;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, signed char, wmma::col_major> bf;
+        wmma::fragment<wmma::accumulator, 16, 16, 16, int> dp;
+        wmma::fill_fragment(dp, 0);
+        wmma::load_matrix_sync(af, a_sh + a_row * 32, 32);
+        wmma::load_matrix_sync(bf, b_sh + b_row * 32, 32);
+        wmma::mma_sync(dp, af, bf, dp);
+        wmma::load_matrix_sync(af, a_sh + a_row * 32 + 16, 32);
+        wmma::load_matrix_sync(bf, b_sh + b_row * 32 + 16, 32);
+        wmma::mma_sync(dp, af, bf, dp);
+        // Register-cache the rescale operands: 2 M-rows (lo/hi halves) x 4 N-cols per tile,
+        // rather than 4 shared loads per fragment element. Element->(row,col) map:
+        //   i=0,1 -> (lo, c0/c1);  i=2,3 -> (hi, c0/c1);  i=4,5 -> (lo, c8/c9);  i=6,7 -> (hi, c8/c9)
+        const int mlo = a_row + r_base, mhi = mlo + 8;
+        const float dxl = dx_sh[mlo], dxh = dx_sh[mhi];
+        const float xsl = static_cast<float>(xsum_sh[mlo]), xsh = static_cast<float>(xsum_sh[mhi]);
+        const int c0 = b_row + c_base;
+        const float ws0 = wscale_sh[c0], ws1 = wscale_sh[c0 + 1], ws8 = wscale_sh[c0 + 8],
+                    ws9 = wscale_sh[c0 + 9];
+        const float wm0 = wmin_sh[c0], wm1 = wmin_sh[c0 + 1], wm8 = wmin_sh[c0 + 8],
+                    wm9 = wmin_sh[c0 + 9];
+        acc[tr][tc].x[0] += dxl * (ws0 * static_cast<float>(dp.x[0]) - wm0 * xsl);
+        acc[tr][tc].x[1] += dxl * (ws1 * static_cast<float>(dp.x[1]) - wm1 * xsl);
+        acc[tr][tc].x[2] += dxh * (ws0 * static_cast<float>(dp.x[2]) - wm0 * xsh);
+        acc[tr][tc].x[3] += dxh * (ws1 * static_cast<float>(dp.x[3]) - wm1 * xsh);
+        acc[tr][tc].x[4] += dxl * (ws8 * static_cast<float>(dp.x[4]) - wm8 * xsl);
+        acc[tr][tc].x[5] += dxl * (ws9 * static_cast<float>(dp.x[5]) - wm9 * xsl);
+        acc[tr][tc].x[6] += dxh * (ws8 * static_cast<float>(dp.x[6]) - wm8 * xsh);
+        acc[tr][tc].x[7] += dxh * (ws9 * static_cast<float>(dp.x[7]) - wm9 * xsh);
+      }
+    }
+    __syncthreads();
+  }
+
+  // store each warp's 4 tiles (guard M,N edges) via a per-warp shared scratch.
+  __shared__ float c_sh[4][256];
+#pragma unroll
+  for (int tr = 0; tr < 2; ++tr) {
+#pragma unroll
+    for (int tc = 0; tc < 2; ++tc) {
+      wmma::store_matrix_sync(c_sh[warp], acc[tr][tc], 16, wmma::mem_row_major);
+      __syncwarp();
+      const int a_row = warp_row * 32 + tr * 16;
+      const int b_row = warp_col * 32 + tc * 16;
+      for (int e = lane; e < 256; e += 32) {
+        const int rl = e >> 4, cl = e & 15;
+        const int m = m0 + a_row + rl;
+        const int n = n0 + b_row + cl;
+        if (m < M && n < N) {
+          out[static_cast<size_t>(m) * N + n] = c_sh[warp][e];
+        }
+      }
+      __syncwarp();
+    }
+  }
+}
+
+extern "C" int hi_cuda_launch_q4_k_a8_gemm(
+    const void* weights, const void* xq, const void* dx, const void* xsum, void* out, int m, int n,
+    int k, void* stream) {
+  if (weights == nullptr || xq == nullptr || dx == nullptr || xsum == nullptr || out == nullptr ||
+      m <= 0 || n <= 0 || k <= 0 || k % 256 != 0 || stream == nullptr) {
+    return 1;
+  }
+  dim3 grid((n + 63) / 64, (m + 63) / 64);
+  q4_k_a8_gemm_kernel<<<grid, 128, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint8_t*>(weights), static_cast<const int8_t*>(xq),
+      static_cast<const float*>(dx), static_cast<const int*>(xsum), static_cast<float*>(out), m, n,
+      k);
   return 0;
 }
 
