@@ -1724,16 +1724,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("s.jsonl");
-        let mut lines = Vec::new();
-        lines.push(serde_json::to_string(&Message::system("sys prompt")).unwrap());
-        lines.push(serde_json::to_string(&Message::user("fix the parser\nsecond line")).unwrap());
-        lines.push(
+        let lines = [
+            serde_json::to_string(&Message::system("sys prompt")).unwrap(),
+            serde_json::to_string(&Message::user("fix the parser\nsecond line")).unwrap(),
             serde_json::to_string(&Message::assistant(vec![hi_ai::Content::Text(
                 "done, it parses".into(),
             )]))
             .unwrap(),
-        );
-        lines.push(r#"{"type":"usage","input_tokens":1,"output_tokens":2}"#.to_string());
+            r#"{"type":"usage","input_tokens":1,"output_tokens":2}"#.to_string(),
+        ];
         std::fs::write(&path, lines.join("\n") + "\n").unwrap();
 
         let out = load_transcript(&path, 50);

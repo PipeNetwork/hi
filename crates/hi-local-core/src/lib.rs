@@ -1,3 +1,8 @@
+// Axum request handlers use `Result<T, Response>` so a failed check can early-return
+// a fully-formed HTTP response. `Response` is large, but boxing it in every handler
+// signature would be non-idiomatic and churn the whole server surface.
+#![allow(clippy::result_large_err)]
+
 pub mod backend;
 pub mod model;
 pub mod prompt;

@@ -1320,7 +1320,7 @@ enum QwenFfn {
 impl QwenFfn {
     fn load(gguf: &GgufFile, config: &QwenGgufConfig, prefix: &str) -> Result<Self> {
         if config.expert_count.is_some()
-            && qwen_moe_router_weight_names(&prefix)
+            && qwen_moe_router_weight_names(prefix)
                 .iter()
                 .any(|name| gguf.tensor(name).is_some())
         {
@@ -1680,14 +1680,14 @@ impl Matrix {
                 self.cols
             );
         }
-        if let Some(bias) = bias {
-            if bias.len() != self.rows {
-                bail!(
-                    "matrix bias length {} does not match matrix rows {}",
-                    bias.len(),
-                    self.rows
-                );
-            }
+        if let Some(bias) = bias
+            && bias.len() != self.rows
+        {
+            bail!(
+                "matrix bias length {} does not match matrix rows {}",
+                bias.len(),
+                self.rows
+            );
         }
         let mut output = Vec::with_capacity(self.rows);
         for row in 0..self.rows {
@@ -3000,7 +3000,7 @@ fn apply_rope(
     scale: f32,
     split_half: bool,
 ) -> Result<()> {
-    if values.len() % 2 != 0 {
+    if !values.len().is_multiple_of(2) {
         bail!("RoPE head dimension {} must be even", values.len());
     }
     let half = values.len() / 2;
@@ -3172,10 +3172,10 @@ pub fn sample_from_logits_with_rng<R: Rng + ?Sized>(
     ranked.sort_by(|(left_id, left), (right_id, right)| {
         right.total_cmp(left).then_with(|| left_id.cmp(right_id))
     });
-    if let Some(top_k) = top_k.and_then(|value| usize::try_from(value).ok()) {
-        if top_k > 0 {
-            ranked.truncate(top_k.min(ranked.len()));
-        }
+    if let Some(top_k) = top_k.and_then(|value| usize::try_from(value).ok())
+        && top_k > 0
+    {
+        ranked.truncate(top_k.min(ranked.len()));
     }
     let cutoff = if top_p.is_finite() {
         top_p.clamp(0.0, 1.0)

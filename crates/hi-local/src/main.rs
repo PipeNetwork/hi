@@ -1,3 +1,7 @@
+// The server-launch and generation entry points take many tuning parameters by
+// design; bundling them would only move the argument list elsewhere.
+#![allow(clippy::too_many_arguments)]
+
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

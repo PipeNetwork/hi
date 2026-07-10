@@ -108,22 +108,22 @@ fn attention_health_details(health: &str) -> Value {
         return json!({"status": "unavailable"});
     };
     let mut object = status_segment_details(status);
-    if let Some(detail) = health_segment(health, "attention-detail") {
-        if let Value::Object(fields) = &mut object {
-            fields.insert("detail".to_string(), json!(detail));
-            for field in split_top_level(detail, ',')
-                .into_iter()
-                .map(str::trim)
-                .filter(|field| !field.is_empty())
-            {
-                let Some((key, value)) = field.split_once('=') else {
-                    continue;
-                };
-                fields.insert(
-                    key.trim().to_string(),
-                    parse_health_field_value(value.trim()),
-                );
-            }
+    if let Some(detail) = health_segment(health, "attention-detail")
+        && let Value::Object(fields) = &mut object
+    {
+        fields.insert("detail".to_string(), json!(detail));
+        for field in split_top_level(detail, ',')
+            .into_iter()
+            .map(str::trim)
+            .filter(|field| !field.is_empty())
+        {
+            let Some((key, value)) = field.split_once('=') else {
+                continue;
+            };
+            fields.insert(
+                key.trim().to_string(),
+                parse_health_field_value(value.trim()),
+            );
         }
     }
     object
@@ -955,17 +955,17 @@ impl OpenAiSseState {
             self.created,
             finish_reason,
         )));
-        if self.include_usage {
-            if let Some(usage) = self.final_usage.take() {
-                self.pending.push_back(sse_json_event(json!({
-                    "id": self.id,
-                    "object": "chat.completion.chunk",
-                    "created": self.created,
-                    "model": self.model,
-                    "choices": [],
-                    "usage": usage,
-                })));
-            }
+        if self.include_usage
+            && let Some(usage) = self.final_usage.take()
+        {
+            self.pending.push_back(sse_json_event(json!({
+                "id": self.id,
+                "object": "chat.completion.chunk",
+                "created": self.created,
+                "model": self.model,
+                "choices": [],
+                "usage": usage,
+            })));
         }
         self.pending.push_back(done_event());
         self.finished = true;
