@@ -180,7 +180,10 @@ model reviews the turn's diff — plus the sub-goal and verify result — and ca
 with concrete objections, which become notes the next turn must address. It's off by default (an
 extra model call per advance), fail-open (a reviewer error or timeout never blocks progress), and
 scoped to where orchestration has a real shot: a long-horizon goal, not a single bounded turn.
-`/goal team` alone reports the state and how many advances the skeptic has blocked.
+`/goal team` alone reports the state and how many advances the skeptic has blocked. Headless runs
+(one-shot `--goal`, the daemon, fleet rows) enable it with `HI_GOAL_TEAM=1`. The review covers both
+ways a turn claims a sub-goal done — the heuristic advance and an explicit `update_plan` — and an
+objection reverts the turn's goal progress (the edits stay on disk for the next turn to fix).
 
 ## Fleet dashboard
 

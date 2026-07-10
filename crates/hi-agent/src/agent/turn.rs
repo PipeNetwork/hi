@@ -721,6 +721,11 @@ impl crate::Agent {
         // goal during this turn (so goal_turn_end doesn't advance again and
         // skip the next sub-goal).
         let mut plan_updated_goal = false;
+        // The goal as it stood at turn start — so the skeptic gate can review
+        // against the sub-goal that was active *before* the turn (update_plan may
+        // have marked it done mid-turn) and, on an objection, revert the turn's
+        // goal progress.
+        let goal_before = self.structured_goal.clone();
         // Scheduler parallelism counters: how many calls ran this turn, the
         // largest concurrent ready-batch, and how many ran serially (bash or a
         // lone ready call). Flushed into telemetry so the dep-aware scheduler's
@@ -3098,6 +3103,7 @@ If the task is already complete, stop and give your final recap."
             stalled_repeating,
             ended_at_cap,
             plan_updated_goal,
+            goal_before,
             ui,
         )
         .await;

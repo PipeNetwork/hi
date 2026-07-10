@@ -34,17 +34,13 @@ pub(crate) enum SkepticVerdict {
 }
 
 impl crate::Agent {
-    /// Run the skeptic gate for the active sub-goal. Returns the joined objections
-    /// if the skeptic wants the work retried, or `None` to advance (approve).
-    /// Fail-open: no active goal, no objection, a provider error, or an unparseable
-    /// reply all return `None`. Books usage; records no history.
-    pub(crate) async fn skeptic_gate(&mut self) -> Option<String> {
-        let (objective, sub_goal) = {
-            let goal = self.structured_goal.as_ref()?;
-            let sg = goal.active_sub_goal()?;
-            (goal.objective.clone(), sg.description.clone())
-        };
-        let context = self.skeptic_context(&objective, &sub_goal).await;
+    /// Run the skeptic gate against `sub_goal` (the sub-goal that was active at
+    /// turn start — the current one may already be marked done via update_plan).
+    /// Returns the joined objections if the skeptic wants the work retried, or
+    /// `None` to let it stand (approve). Fail-open: no objection, a provider error,
+    /// or an unparseable reply all return `None`. Books usage; records no history.
+    pub(crate) async fn skeptic_gate(&mut self, objective: &str, sub_goal: &str) -> Option<String> {
+        let context = self.skeptic_context(objective, sub_goal).await;
         match self.skeptic_review(&context).await {
             SkepticVerdict::Object(objs) if !objs.is_empty() => Some(objs.join("\n")),
             _ => None,

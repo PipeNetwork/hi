@@ -550,6 +550,82 @@ async fn skeptic_gate_fails_open_on_provider_error() {
 }
 
 #[tokio::test]
+async fn skeptic_gate_reviews_update_plan_completion_and_reverts_on_objection() {
+    // The common case a live run exposed: the model marks a sub-goal done via
+    // update_plan (not the heuristic advance). The skeptic must STILL review it,
+    // and on an objection revert the update_plan advance (re-open the sub-goal) —
+    // otherwise the gate is bypassed exactly when a capable model claims "done".
+    let mut cfg = config();
+    cfg.long_horizon = true;
+    cfg.skeptic_model = Some("skeptic".into());
+    let tmp = temp_file("skeptic-plan");
+    let p = tmp.to_string_lossy().to_string();
+    let update_plan = completion(
+        vec![Content::ToolCall {
+            id: "up".into(),
+            name: "update_plan".into(),
+            arguments: serde_json::json!({
+                "steps": [
+                    {"title": "step one", "status": "done"},
+                    {"title": "step two", "status": "active"},
+                ]
+            })
+            .to_string(),
+        }],
+        1,
+        1,
+    );
+    let steps = vec![
+        ProviderStep::Completion(write_completion(&p)),
+        ProviderStep::Completion(update_plan),
+        ProviderStep::Completion(completion(vec![Content::Text("done".into())], 1, 1)),
+        ProviderStep::Completion(completion(
+            vec![Content::Text(
+                "OBJECT\n- step one wasn't actually finished".into(),
+            )],
+            1,
+            1,
+        )),
+    ];
+    let (mut agent, requests) = scripted_agent(steps, cfg);
+    let mut goal = Goal::new("refactor", vec!["step one".into(), "step two".into()]);
+    goal.team = true;
+    agent.set_structured_goal(Some(goal)).unwrap();
+    let mut ui = RecUi::default();
+    agent.run_turn("go", &mut ui).await.unwrap();
+    let _ = std::fs::remove_file(&tmp);
+
+    let goal = agent.structured_goal().expect("goal still set");
+    // The update_plan advance was REVERTED — step one active again, not step two.
+    assert_eq!(
+        goal.active_index(),
+        Some(0),
+        "objection reverted the update_plan advance"
+    );
+    assert_eq!(goal.sub_goals[0].status, GoalStatus::Active);
+    assert_eq!(goal.sub_goals[1].status, GoalStatus::Pending);
+    assert_eq!(goal.skeptic_objections, 1);
+    assert!(
+        goal.sub_goals[0]
+            .notes
+            .iter()
+            .any(|n| n.contains("wasn't actually finished")),
+        "objection recorded as a note: {:?}",
+        goal.sub_goals[0].notes
+    );
+    // The skeptic really ran (4th call) and reviewed the pre-turn active sub-goal.
+    let reqs = requests.lock().unwrap();
+    assert_eq!(reqs.len(), 4, "write + update_plan + finish + skeptic");
+    assert!(
+        reqs.last()
+            .unwrap()
+            .iter()
+            .any(|m| m.text().contains("step one")),
+        "skeptic reviewed the sub-goal active at turn start"
+    );
+}
+
+#[tokio::test]
 async fn long_horizon_driver_records_failure_on_stall() {
     // A turn that stalls (repeat guard exhausts) records a sub-goal attempt
     // so the next turn sees the prior note (and doesn't repeat the approach).
