@@ -264,13 +264,12 @@ pub(crate) async fn repl(
                             let max_output = served.as_ref().and_then(|m| m.max_output_tokens);
                             agent.set_model(id.clone(), window, max_output);
                             if let Some(name) = active_profile.as_deref() {
-                                match config::writable_config_path(config_path.as_deref())
-                                    .ok_or_else(|| {
-                                        anyhow::anyhow!("could not determine config path")
-                                    })
-                                    .and_then(|path| {
-                                        config::set_profile_model(config, name, &id, &path)
-                                    }) {
+                                match config::set_profile_model(
+                                    config,
+                                    name,
+                                    &id,
+                                    config_path.as_deref(),
+                                ) {
                                     Ok(()) => {
                                         println!("model set to {id} (saved to profile {name})");
                                     }
@@ -346,16 +345,11 @@ pub(crate) async fn repl(
                                     );
                                     continue;
                                 }
-                                let path = match config::writable_config_path(
+                                match config::remove_profile(
+                                    config,
+                                    &target,
                                     config_path.as_deref(),
                                 ) {
-                                    Some(p) => p,
-                                    None => {
-                                        eprintln!("\x1b[33mcould not determine config path\x1b[0m");
-                                        continue;
-                                    }
-                                };
-                                match config::remove_profile(config, &target, &path) {
                                     Ok(true) => {
                                         println!("\x1b[2mremoved profile '{target}'\x1b[0m");
                                     }
@@ -676,8 +670,6 @@ async fn switch_to_mlx_profile(
     config_path: Option<&Path>,
     run: &hi_tools::HfMlxRun,
 ) -> Result<()> {
-    let path = config::writable_config_path(config_path)
-        .context("could not determine config path for MLX profile")?;
     let profile = config::Profile {
         provider: Some(config::ProviderName::Openai),
         model: Some(run.model_id.clone()),
@@ -686,7 +678,7 @@ async fn switch_to_mlx_profile(
         max_tokens: Some(2048),
         ..Default::default()
     };
-    config::upsert_profile_as_default(config, &run.profile_name, profile, &path)?;
+    config::upsert_profile_as_default(config, &run.profile_name, profile, config_path)?;
     let settings = config::resolve_named_profile(config, &run.profile_name)?;
     let provider: std::sync::Arc<dyn hi_ai::Provider> =
         crate::build_chain(&settings, Vec::new()).into();
@@ -769,7 +761,7 @@ fn provider_add_prompt(
     config_path: Option<&Path>,
     editor: &mut crate::complete::ReplEditor,
 ) -> Result<String> {
-    use config::{ProfileForm, ProviderName, upsert_profile, writable_config_path};
+    use config::{ProfileForm, ProviderName, upsert_profile};
 
     println!("\x1b[2m— add a provider profile —\x1b[0m");
 
@@ -850,8 +842,7 @@ fn provider_add_prompt(
     };
     let profile = form.to_profile();
 
-    let path = writable_config_path(config_path).context("could not determine config path")?;
-    upsert_profile(config, &name, profile, &path)?;
+    upsert_profile(config, &name, profile, config_path)?;
     Ok(name)
 }
 
@@ -862,7 +853,7 @@ fn provider_edit_prompt(
     name: &str,
     editor: &mut crate::complete::ReplEditor,
 ) -> Result<String> {
-    use config::{ProfileForm, ProviderName, upsert_profile, writable_config_path};
+    use config::{ProfileForm, ProviderName, upsert_profile};
 
     // Resolve which profile to edit.
     let name = if name.is_empty() {
@@ -935,7 +926,6 @@ fn provider_edit_prompt(
     }
 
     let profile = form.apply_to(existing);
-    let path = writable_config_path(config_path).context("could not determine config path")?;
-    upsert_profile(config, &name, profile, &path)?;
+    upsert_profile(config, &name, profile, config_path)?;
     Ok(name)
 }
