@@ -35,7 +35,7 @@ async fn finalizes_with_a_recap_when_files_changed() {
     let _guard = VERIFY_TEST_LOCK.lock().await;
     let mut cfg = config();
     cfg.finalize = true;
-    let tmp = temp_file("finalize");
+    let tmp = visible_temp_file("finalize");
     let p = tmp.to_string_lossy().to_string();
     let responses = vec![
         write_completion(&p),
@@ -101,7 +101,7 @@ async fn finalize_recap_is_emitted_to_the_ui() {
     let _guard = VERIFY_TEST_LOCK.lock().await;
     let mut cfg = config();
     cfg.finalize = true;
-    let tmp = temp_file("finalize_ui");
+    let tmp = visible_temp_file("finalize_ui");
     let p = tmp.to_string_lossy().to_string();
     let responses = vec![
         write_completion(&p),
@@ -137,7 +137,7 @@ async fn finalize_nudge_does_not_bleed_into_next_turn() {
     let _guard = VERIFY_TEST_LOCK.lock().await;
     let mut cfg = config();
     cfg.finalize = true;
-    let tmp = temp_file("finalize_bleed");
+    let tmp = visible_temp_file("finalize_bleed");
     let p = tmp.to_string_lossy().to_string();
     let responses = vec![
         // Turn 1: write a file, then a "done" text, then the recap.

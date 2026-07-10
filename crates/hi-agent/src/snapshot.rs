@@ -49,6 +49,11 @@ pub(crate) async fn workspace_snapshot(
                             | ".hg"
                             | ".svn"
                             | ".jj"
+                            // hi's own state dir (goal/memory/session
+                            // persistence). The agent writing its own
+                            // bookkeeping mid-turn is not user work and must
+                            // not trip the verify gate or changed-files lists.
+                            | ".hi"
                             | "target"
                             | "node_modules"
                             | ".venv"

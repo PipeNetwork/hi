@@ -14,7 +14,7 @@ async fn layered_verify_stops_at_first_failing_stage() {
     cfg.max_verify_iterations = 1;
     // The model edits (so verification runs), then stops; after the failing
     // verify it re-prompts once more before the cap is reached.
-    let tmp = temp_file("stop");
+    let tmp = visible_temp_file("stop");
     let p = tmp.to_string_lossy().to_string();
     let mut agent = agent(
         vec![
@@ -66,7 +66,7 @@ async fn layered_verify_passes_when_all_stages_pass() {
         VerifyStage::new("check", "true"),
         VerifyStage::new("test", "true"),
     ];
-    let tmp = temp_file("pass");
+    let tmp = visible_temp_file("pass");
     let p = tmp.to_string_lossy().to_string();
     let mut agent = agent(
         vec![
@@ -88,7 +88,7 @@ async fn verify_failure_exhausts_retries() {
     cfg.max_verify_iterations = 2;
     // The model edits once (so verify runs), then keeps finishing without
     // tool calls; verify fails each round until the cap.
-    let tmp = temp_file("exhaust");
+    let tmp = visible_temp_file("exhaust");
     let p = tmp.to_string_lossy().to_string();
     let responses = vec![
         write_completion(&p),
@@ -111,7 +111,7 @@ async fn verify_failure_exhaustion_does_not_finalize_as_done() {
     cfg.finalize = true;
     cfg.verify = vec![VerifyStage::new("test", "false")];
     cfg.max_verify_iterations = 1;
-    let tmp = temp_file("verify-fail-no-finalize");
+    let tmp = visible_temp_file("verify-fail-no-finalize");
     let p = tmp.to_string_lossy().to_string();
     let responses = vec![
         write_completion(&p),
@@ -161,7 +161,7 @@ async fn verify_failure_nudge_carries_attribution() {
         "printf 'error[E0308]: mismatched types\\n  --> src/lib.rs:42:18\\n' >&2; exit 1",
     )];
     cfg.max_verify_iterations = 1;
-    let tmp = temp_file("attr");
+    let tmp = visible_temp_file("attr");
     let p = tmp.to_string_lossy().to_string();
     let mut agent = agent(
         vec![
@@ -231,7 +231,7 @@ async fn verify_skipped_when_no_files_changed() {
 #[tokio::test]
 async fn verify_skipped_for_prose_only_changes() {
     let _guard = VERIFY_TEST_LOCK.lock().await;
-    let tmp = temp_file("docs").with_extension("md");
+    let tmp = visible_temp_file("docs").with_extension("md");
     let p = tmp.to_string_lossy().to_string();
     let mut cfg = config();
     cfg.verify = vec![VerifyStage::new("test", "false")];
@@ -263,7 +263,7 @@ async fn verify_skipped_for_prose_only_changes() {
 #[tokio::test]
 async fn verify_runs_when_bash_changes_files() {
     let _guard = VERIFY_TEST_LOCK.lock().await;
-    let tmp = temp_file("bash");
+    let tmp = visible_temp_file("bash");
     let p = tmp.to_string_lossy().to_string();
     let mut cfg = config();
     cfg.verify = vec![VerifyStage::new("test", "true")];
@@ -306,7 +306,7 @@ async fn proactive_verify_surfaces_a_per_edit_check_failure() {
     let _guard = VERIFY_TEST_LOCK.lock().await;
     let mut cfg = config();
     cfg.proactive_verify = true;
-    let tmp = temp_file("proactive");
+    let tmp = visible_temp_file("proactive");
     let py = tmp.with_extension("py");
     let p = py.to_string_lossy().to_string();
     // Write invalid Python so py_compile fails.

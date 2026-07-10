@@ -310,19 +310,41 @@ pub(crate) fn bash_completion(command: &str) -> Completion {
     )
 }
 
-/// A unique throwaway file path under the current workspace. The name is
-/// unique per *call* (not just per process), so concurrent test runs and
-/// repeated calls within one process never collide — and a file left
-/// behind by a test that panicked before cleanup doesn't get clobbered
-/// or mistaken for another test's artifact. The file lives in the
-/// workspace (cwd) on purpose: the verify snapshot walks `.` to detect
-/// changes, so the temp file must be inside it for verify to notice.
+/// A unique throwaway file path in the gitignored `hi-test-scratch/` dir.
+/// The name is unique per *call* (not just per process), so concurrent test
+/// runs and repeated calls within one process never collide — and a file left
+/// behind by a test that panicked before cleanup doesn't get clobbered or
+/// mistaken for another test's artifact.
+///
+/// The directory is gitignored ON PURPOSE: the workspace snapshot respects
+/// gitignore, so files here are invisible to change detection. Tests run in
+/// parallel in one process sharing one cwd — a *visible* scratch file
+/// flickering into existence mid-run lands in a concurrent test's
+/// changed-files diff and flips its verify gating (an extension-less name
+/// defeats the prose-only skip, spending a canned completion the other test
+/// didn't script → flaky `remove(0)` panic in the `Canned` provider).
+///
+/// Use [`visible_temp_file`] only when the test asserts on change *detection*
+/// itself (verify gating, changed-files lists); those tests must hold
+/// [`VERIFY_TEST_LOCK`] so they can't see each other's files either.
 pub(crate) fn temp_file(tag: &str) -> std::path::PathBuf {
+    let dir = std::env::current_dir().unwrap().join("hi-test-scratch");
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join(unique_name(tag))
+}
+
+/// A unique throwaway file path directly in the workspace root, where the
+/// verify snapshot can see it. Only for tests that assert on change detection
+/// — hold [`VERIFY_TEST_LOCK`] for the whole test, or this file will flicker
+/// through concurrent tests' changed-files diffs (see [`temp_file`]).
+pub(crate) fn visible_temp_file(tag: &str) -> std::path::PathBuf {
+    std::env::current_dir().unwrap().join(unique_name(tag))
+}
+
+fn unique_name(tag: &str) -> String {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    std::env::current_dir()
-        .unwrap()
-        .join(format!("hi-test-{tag}-{}-{n}", std::process::id()))
+    format!("hi-test-{tag}-{}-{n}", std::process::id())
 }
 
 #[derive(Default)]
