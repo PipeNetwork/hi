@@ -870,6 +870,25 @@ mod native {
             window: c_int,
             stream: *mut c_void,
         ) -> c_int;
+        fn hi_cuda_launch_tiled_paged_decode_attention_batched_positions_q8(
+            q: *const c_void,
+            k_pages: *const c_void,
+            v_pages: *const c_void,
+            k_scales: *const c_void,
+            v_scales: *const c_void,
+            page_table: *const c_void,
+            positions: *const c_void,
+            output: *mut c_void,
+            batch_count: c_int,
+            page_size: c_int,
+            page_table_len: c_int,
+            heads: c_int,
+            kv_heads: c_int,
+            qk_head_dim: c_int,
+            v_head_dim: c_int,
+            window: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
         fn hi_cuda_launch_cached_decode_attention_batched(
             q: *const c_void,
             k_cache: *const c_void,
@@ -3456,6 +3475,65 @@ mod native {
             )
         })?;
         check_last_error("hi_cuda_launch_tiled_paged_decode_attention_batched_positions")
+    }
+
+    /// int8/Q8 batched-positions tiled paged decode attention (dequantizes int8 K/V pages
+    /// via the parallel scale buffers). Mirrors the f16 batched-positions variant.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_tiled_paged_decode_attention_batched_positions_q8(
+        q: &DeviceBuffer,
+        k_pages: &DeviceBuffer,
+        v_pages: &DeviceBuffer,
+        k_scales: &DeviceBuffer,
+        v_scales: &DeviceBuffer,
+        page_table: &DeviceBuffer,
+        positions: &DeviceBuffer,
+        output: &DeviceBuffer,
+        batch_count: usize,
+        page_size: usize,
+        page_table_len: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        v_head_dim: usize,
+        window: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(
+            batch_count,
+            "tiled_paged_attention_q8 positions batch_count",
+        )?;
+        ensure_len(page_size, "tiled_paged_attention_q8 positions page_size")?;
+        ensure_len(
+            page_table_len,
+            "tiled_paged_attention_q8 positions page_table_len",
+        )?;
+        ensure_len(heads, "tiled_paged_attention_q8 positions heads")?;
+        ensure_len(kv_heads, "tiled_paged_attention_q8 positions kv_heads")?;
+        ensure_len(head_dim, "tiled_paged_attention_q8 positions head_dim")?;
+        ensure_len(v_head_dim, "tiled_paged_attention_q8 positions v_head_dim")?;
+        launch_status(unsafe {
+            hi_cuda_launch_tiled_paged_decode_attention_batched_positions_q8(
+                q.as_ptr(),
+                k_pages.as_ptr(),
+                v_pages.as_ptr(),
+                k_scales.as_ptr(),
+                v_scales.as_ptr(),
+                page_table.as_ptr(),
+                positions.as_ptr(),
+                output.as_mut_ptr(),
+                batch_count as c_int,
+                page_size as c_int,
+                page_table_len as c_int,
+                heads as c_int,
+                kv_heads as c_int,
+                head_dim as c_int,
+                v_head_dim as c_int,
+                window as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_tiled_paged_decode_attention_batched_positions_q8")
     }
 
     pub fn launch_cached_decode_attention_batched(
