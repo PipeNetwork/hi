@@ -89,6 +89,9 @@ pub struct QwenCpuReference {
     output: Option<Matrix>,
     output_bias: Option<Vec<f32>>,
     rms_eps: f32,
+    // False when built tokenizer-only (`from_gguf_tokenizer_only`) — the weight tensors
+    // were skipped, so `forward` / `last_logits` are unavailable.
+    weights_loaded: bool,
 }
 
 impl QwenCpuReference {
@@ -98,6 +101,19 @@ impl QwenCpuReference {
     }
 
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self> {
+        Self::from_gguf_inner(gguf, true)
+    }
+
+    /// Build a reference that carries only the tokenizer + config, skipping the (dequantized
+    /// f32) weight tensors. The GPU execution path only needs the tokenizer, so this avoids
+    /// materializing a full f32 copy of the model on the CPU — which for a 30B model is ~120
+    /// GB and minutes of dequant work, making large models effectively unloadable otherwise.
+    /// `forward` / `last_logits` return an error on a tokenizer-only reference.
+    pub fn from_gguf_tokenizer_only(gguf: &GgufFile) -> Result<Self> {
+        Self::from_gguf_inner(gguf, false)
+    }
+
+    fn from_gguf_inner(gguf: &GgufFile, load_weights: bool) -> Result<Self> {
         let config = gguf.qwen_config()?;
         gguf.validate_qwen_tensors()?;
         let tokenizer = gguf.tokenizer()?;
@@ -117,6 +133,23 @@ impl QwenCpuReference {
         }
 
         let rms_eps = config.rms_norm_eps.unwrap_or(1.0e-6);
+        if !load_weights {
+            return Ok(Self {
+                config,
+                tokenizer,
+                embeddings: EmbeddingTable {
+                    vocab: 0,
+                    embed: 0,
+                    data: Vec::new(),
+                },
+                layers: Vec::new(),
+                output_norm: Vec::new(),
+                output: None,
+                output_bias: None,
+                rms_eps,
+                weights_loaded: false,
+            });
+        }
         let embeddings = EmbeddingTable::load_aliases(
             gguf,
             &qwen_dense_token_embd_weight_names(),
@@ -159,6 +192,7 @@ impl QwenCpuReference {
             output,
             output_bias,
             rms_eps,
+            weights_loaded: true,
         })
     }
 
@@ -171,6 +205,12 @@ impl QwenCpuReference {
     }
 
     pub fn forward(&self, input_ids: &[u32]) -> Result<Vec<Vec<f32>>> {
+        if !self.weights_loaded {
+            bail!(
+                "Qwen CPU reference was built tokenizer-only (GPU execution); its weights are \
+                 not loaded, so CPU forward/last_logits is unavailable"
+            );
+        }
         if input_ids.is_empty() {
             bail!("Qwen CPU reference requires at least one input token");
         }

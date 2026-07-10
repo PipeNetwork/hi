@@ -750,7 +750,14 @@ impl CudaBackend {
         let chat_template = gguf.chat_template().map(ToString::to_string);
         let qwen = gguf.qwen_config()?;
         gguf.validate_qwen_tensors()?;
-        let cpu_reference = Arc::new(qwen_cpu::QwenCpuReference::from_gguf(&gguf)?);
+        // GPU execution only needs the CPU reference's tokenizer, so skip loading its f32
+        // weight copy (~120 GB + minutes of dequant for a 30B model — otherwise large models
+        // are effectively unloadable). The cpu-reference execution path loads the weights.
+        let cpu_reference = Arc::new(if execution == CudaExecution::Gpu {
+            qwen_cpu::QwenCpuReference::from_gguf_tokenizer_only(&gguf)?
+        } else {
+            qwen_cpu::QwenCpuReference::from_gguf(&gguf)?
+        });
         let gpu_model = gpu::CudaQwenGpuModel::from_gguf(&gguf)
             .map(Mutex::new)
             .map(Arc::new)
