@@ -528,14 +528,45 @@ impl CudaPagedKvCacheManager {
         if heads % kv_heads != 0 {
             bail!("qwen attention heads {heads} must be a multiple of kv heads {kv_heads}");
         }
-        let pages_total = div_ceil_usize(max_batched_tokens.max(1), page_size)?;
-        let bytes_per_page = layer_count
+        let kv_elems_per_page = layer_count
             .checked_mul(kv_heads)
             .and_then(|value| value.checked_mul(qk_head_dim.checked_add(v_head_dim)?))
             .and_then(|value| value.checked_mul(page_size))
-            // KV pages are stored as f16 (kv_t = __half in kernels.cu).
-            .and_then(|value| value.checked_mul(std::mem::size_of::<u16>()))
+            .context("CUDA paged KV page element count overflows usize")?;
+        // f16 (kv_t = __half): 2 bytes/element, no scales.
+        let f16_bytes_per_page = kv_elems_per_page
+            .checked_mul(std::mem::size_of::<u16>())
             .context("CUDA paged KV page byte count overflows usize")?;
+        // When the int8/Q8 cache is enabled (HI_CUDA_KV_Q8), each KV page uses ~half the
+        // bytes (1 byte/elem + one f32 scale per K and V vector). Raise the token budget by
+        // the exact f16/Q8 page-byte ratio so the page pool lands at the SAME VRAM an f16
+        // cache would use for `max_batched_tokens`, but holds ~2x the tokens — realizing the
+        // capacity gain automatically instead of requiring a bigger --max-batched-tokens.
+        let (pages_total, bytes_per_page) = if std::env::var("HI_CUDA_KV_Q8").is_ok() {
+            let scale_bytes_per_page = layer_count
+                .checked_mul(kv_heads)
+                .and_then(|value| value.checked_mul(page_size))
+                .and_then(|value| value.checked_mul(2)) // one scale each for K and V
+                .and_then(|value| value.checked_mul(std::mem::size_of::<f32>()))
+                .context("CUDA paged Q8 KV scale byte count overflows usize")?;
+            let q8_bytes_per_page = kv_elems_per_page
+                .checked_add(scale_bytes_per_page)
+                .context("CUDA paged Q8 KV page byte count overflows usize")?;
+            let raised_tokens = (max_batched_tokens.max(1) as u128)
+                .checked_mul(f16_bytes_per_page as u128)
+                .map(|value| value / q8_bytes_per_page as u128)
+                .and_then(|value| usize::try_from(value).ok())
+                .context("CUDA paged Q8 KV token budget overflows usize")?;
+            (
+                div_ceil_usize(raised_tokens.max(1), page_size)?,
+                q8_bytes_per_page,
+            )
+        } else {
+            (
+                div_ceil_usize(max_batched_tokens.max(1), page_size)?,
+                f16_bytes_per_page,
+            )
+        };
         let bytes_total = bytes_per_page
             .checked_mul(pages_total)
             .context("CUDA paged KV total byte count overflows usize")?;
