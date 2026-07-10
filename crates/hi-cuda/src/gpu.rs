@@ -17702,14 +17702,6 @@ mod native {
             if token_count == 0 {
                 return Ok(());
             }
-            if self.key_scales.is_some() {
-                // The int8/Q8 cache would need a quant-aware copy (int8 data + scales); the
-                // f16 element copy below corrupts it. Until that lands, Q8 requires the
-                // cross-request shared-prefix cache off (HI_CUDA_PREFIX_CACHE=0).
-                bail!(
-                    "CUDA Q8 KV cache does not support the shared-prefix copy path; set HI_CUDA_PREFIX_CACHE=0 to use HI_CUDA_KV_Q8"
-                );
-            }
             if self.batch_count < 2 {
                 bail!("CUDA paged batch KV prefix copy requires at least two batch rows");
             }
@@ -17718,6 +17710,34 @@ mod native {
                     "CUDA paged batch KV prefix copy token count {token_count} exceeds max sequence {}",
                     self.max_seq
                 );
+            }
+            if let (Some(key_scales), Some(value_scales)) = (&self.key_scales, &self.value_scales) {
+                // int8/Q8 cache: copy int8 page data + the parallel per-vector scales.
+                crate::kernels::launch_copy_paged_kv_cache_prefix_batched_q8(
+                    self.key_pages.as_buffer(),
+                    key_scales.as_buffer(),
+                    &self.page_table,
+                    self.batch_count,
+                    token_count,
+                    kv_heads,
+                    head_dim,
+                    self.page_size,
+                    self.page_table_len,
+                    stream,
+                )?;
+                crate::kernels::launch_copy_paged_kv_cache_prefix_batched_q8(
+                    self.value_pages.as_buffer(),
+                    value_scales.as_buffer(),
+                    &self.page_table,
+                    self.batch_count,
+                    token_count,
+                    kv_heads,
+                    v_head_dim,
+                    self.page_size,
+                    self.page_table_len,
+                    stream,
+                )?;
+                return stream.synchronize();
             }
             crate::kernels::launch_copy_paged_kv_cache_prefix_batched(
                 self.key_pages.as_buffer(),

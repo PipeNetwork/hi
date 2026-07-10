@@ -571,6 +571,18 @@ mod native {
             page_table_len: c_int,
             stream: *mut c_void,
         ) -> c_int;
+        fn hi_cuda_launch_copy_paged_kv_cache_prefix_batched_q8(
+            pages: *mut c_void,
+            scales: *mut c_void,
+            page_table: *const c_void,
+            batch_count: c_int,
+            token_count: c_int,
+            kv_heads: c_int,
+            head_dim: c_int,
+            page_size: c_int,
+            page_table_len: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
         fn hi_cuda_launch_causal_attention(
             q: *const c_void,
             k: *const c_void,
@@ -2619,6 +2631,44 @@ mod native {
             )
         })?;
         check_last_error("hi_cuda_launch_copy_paged_kv_cache_prefix_batched")
+    }
+
+    /// int8/Q8 prefix copy: copies int8 page data + the parallel per-vector scales from
+    /// batch row 0 to the other batch rows. Call once for K (pages+scales) and once for V.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_copy_paged_kv_cache_prefix_batched_q8(
+        pages: &DeviceBuffer,
+        scales: &DeviceBuffer,
+        page_table: &DeviceBuffer,
+        batch_count: usize,
+        token_count: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        page_size: usize,
+        page_table_len: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(batch_count, "copy_paged_kv_prefix_q8 batch_count")?;
+        ensure_len(token_count, "copy_paged_kv_prefix_q8 token_count")?;
+        ensure_len(kv_heads, "copy_paged_kv_prefix_q8 kv_heads")?;
+        ensure_len(head_dim, "copy_paged_kv_prefix_q8 head_dim")?;
+        ensure_len(page_size, "copy_paged_kv_prefix_q8 page_size")?;
+        ensure_len(page_table_len, "copy_paged_kv_prefix_q8 page_table_len")?;
+        launch_status(unsafe {
+            hi_cuda_launch_copy_paged_kv_cache_prefix_batched_q8(
+                pages.as_mut_ptr(),
+                scales.as_mut_ptr(),
+                page_table.as_ptr(),
+                batch_count as c_int,
+                token_count as c_int,
+                kv_heads as c_int,
+                head_dim as c_int,
+                page_size as c_int,
+                page_table_len as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_copy_paged_kv_cache_prefix_batched_q8")
     }
 
     pub fn launch_causal_attention(

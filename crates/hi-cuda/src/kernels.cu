@@ -2366,6 +2366,63 @@ __global__ void copy_paged_kv_cache_prefix_batched_kernel(
   pages[dst_idx] = pages[src_idx];
 }
 
+// int8/Q8 variant of the prefix copy: copies int8 page bytes (correct element size) and,
+// once per vector (dim == 0), the parallel per-vector f32 scale. Called for K and V.
+__global__ void copy_paged_kv_cache_prefix_batched_q8_kernel(
+    int8_t* pages,
+    float* scales,
+    const uint32_t* page_table,
+    int batch_count,
+    int token_count,
+    int kv_heads,
+    int head_dim,
+    int page_size,
+    int page_table_len) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int dst_batches = batch_count - 1;
+  int total = dst_batches * token_count * kv_heads * head_dim;
+  if (idx >= total) {
+    return;
+  }
+  int dim = idx % head_dim;
+  int head = (idx / head_dim) % kv_heads;
+  int row = (idx / (head_dim * kv_heads)) % token_count;
+  int dst_batch = 1 + idx / (token_count * kv_heads * head_dim);
+  int logical_page = row / page_size;
+  int page_offset = row - logical_page * page_size;
+  if (logical_page >= page_table_len) {
+    return;
+  }
+  uint32_t src_page = page_table[logical_page];
+  uint32_t dst_page = page_table[dst_batch * page_table_len + logical_page];
+  int src_scale = (static_cast<int>(src_page) * kv_heads + head) * page_size + page_offset;
+  int dst_scale = (static_cast<int>(dst_page) * kv_heads + head) * page_size + page_offset;
+  pages[static_cast<long>(dst_scale) * head_dim + dim] =
+      pages[static_cast<long>(src_scale) * head_dim + dim];
+  if (dim == 0) {
+    scales[dst_scale] = scales[src_scale];
+  }
+}
+
+extern "C" int hi_cuda_launch_copy_paged_kv_cache_prefix_batched_q8(
+    void* pages, void* scales, const void* page_table, int batch_count, int token_count,
+    int kv_heads, int head_dim, int page_size, int page_table_len, void* stream) {
+  if (pages == nullptr || scales == nullptr || page_table == nullptr || batch_count <= 1 ||
+      token_count <= 0 || kv_heads <= 0 || head_dim <= 0 || page_size <= 0 ||
+      page_table_len <= 0 || token_count > page_size * page_table_len || stream == nullptr) {
+    return 1;
+  }
+  int total = (batch_count - 1) * token_count * kv_heads * head_dim;
+  dim3 block(256);
+  dim3 grid((total + block.x - 1) / block.x);
+  copy_paged_kv_cache_prefix_batched_q8_kernel<<<grid, block, 0,
+                                                 static_cast<cudaStream_t>(stream)>>>(
+      static_cast<int8_t*>(pages), static_cast<float*>(scales),
+      static_cast<const uint32_t*>(page_table), batch_count, token_count, kv_heads, head_dim,
+      page_size, page_table_len);
+  return 0;
+}
+
 // int8/Q8 paged KV write: one warp per (batch, row, kv_head) head_dim vector. The warp
 // reduces the vector's amax (symmetric scale = amax/127), writes int8 codes into the page
 // slot and one f32 scale into the parallel scale buffer (indexed per [phys_page][kv_head]

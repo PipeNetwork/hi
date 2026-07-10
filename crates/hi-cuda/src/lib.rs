@@ -20566,6 +20566,88 @@ mod tests {
         }
     }
 
+    /// int8/Q8 shared-prefix copy: after writing batch row 0's KV, the copy must replicate
+    /// its int8 page bytes AND per-vector scales into the other batch rows' physical pages.
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_copy_prefix_q8_matches_source() {
+        use crate::runtime::{DeviceBuffer, Stream};
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let stream = Stream::create().unwrap();
+        let mut rng = StdRng::seed_from_u64(0xc0_9e_11);
+        let (batch, tokens, kv_heads, hd) = (2usize, 6usize, 2usize, 8usize);
+        let (page_size, page_table_len, num_phys) = (4usize, 2usize, 4usize);
+        // batch 0 -> phys 0,1 ; batch 1 -> phys 2,3
+        let page_table: Vec<u32> = vec![0, 1, 2, 3];
+        let pt = DeviceBuffer::alloc(page_table.len() * 4).unwrap();
+        pt.copy_from_host(&page_table).unwrap();
+        // batch 0 random, batch 1 zeros (to be overwritten by the copy).
+        let mut values = vec![0.0f32; batch * tokens * kv_heads * hd];
+        for v in values.iter_mut().take(tokens * kv_heads * hd) {
+            *v = rng.gen_range(-1.5f32..1.5);
+        }
+        let val = DeviceBuffer::alloc(values.len() * 4).unwrap();
+        val.copy_from_host(&values).unwrap();
+        let pages_elems = num_phys * kv_heads * page_size * hd;
+        let scale_elems = num_phys * kv_heads * page_size;
+        let pages = DeviceBuffer::alloc(pages_elems).unwrap();
+        let scales = DeviceBuffer::alloc(scale_elems * 4).unwrap();
+        pages.memset_zero_async(&stream).unwrap();
+        scales.memset_zero_async(&stream).unwrap();
+        crate::kernels::launch_write_paged_kv_cache_q8_batched(
+            &val,
+            &pages,
+            &scales,
+            &pt,
+            None,
+            0,
+            batch,
+            tokens,
+            kv_heads,
+            hd,
+            page_size,
+            page_table_len,
+            &stream,
+        )
+        .unwrap();
+        crate::kernels::launch_copy_paged_kv_cache_prefix_batched_q8(
+            &pages,
+            &scales,
+            &pt,
+            batch,
+            tokens,
+            kv_heads,
+            hd,
+            page_size,
+            page_table_len,
+            &stream,
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+        let codes = pages.copy_to_host::<i8>(pages_elems).unwrap();
+        let sc = scales.copy_to_host::<f32>(scale_elems).unwrap();
+        for row in 0..tokens {
+            let lp = row / page_size;
+            let off = row % page_size;
+            let src_phys = page_table[lp] as usize; // batch 0
+            let dst_phys = page_table[page_table_len + lp] as usize; // batch 1
+            for head in 0..kv_heads {
+                let ss = (src_phys * kv_heads + head) * page_size + off;
+                let ds = (dst_phys * kv_heads + head) * page_size + off;
+                assert_eq!(sc[ds], sc[ss], "scale row={row} head={head}");
+                for d in 0..hd {
+                    assert_eq!(
+                        codes[ds * hd + d],
+                        codes[ss * hd + d],
+                        "code {row}/{head}/{d}"
+                    );
+                }
+            }
+        }
+    }
+
     /// int8/Q8 paged KV write: each (batch,row,kv_head) head_dim vector is symmetric-int8
     /// quantized (scale = amax/127) into the page slot + a parallel scale buffer. Write
     /// random values, read back codes+scales, dequantize on host, and check every written
