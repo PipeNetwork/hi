@@ -1,0 +1,14 @@
+name = "moving-average"
+prompt = "Implement moving_average(nums, k) in solution.py returning the list of k-sized moving averages as floats. moving_average([1, 2, 3, 4], 2) == [1.5, 2.5, 3.5]. An empty list returns []. IMPORTANT: raise ValueError if k <= 0, or if k > len(nums) when nums is non-empty. The file currently raises NotImplementedError. Edit only solution.py."
+verify = '''python3 -c "
+import solution as m
+assert m.moving_average([1, 2, 3, 4], 2) == [1.5, 2.5, 3.5]
+assert m.moving_average([5], 1) == [5.0]
+assert m.moving_average([], 3) == []
+for bad in (0, -1, 5):
+    try:
+        m.moving_average([1, 2, 3], bad)
+        raise SystemExit('bad k=' + str(bad) + ' did not raise')
+    except ValueError:
+        pass
+"'''

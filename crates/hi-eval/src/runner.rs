@@ -64,6 +64,7 @@ pub async fn run_config(
     config_name: &str,
     use_verify: bool,
     temperatures: &[f32],
+    env: &'static [(&'static str, &'static str)],
     profile: EvalProfile,
     model_override: Option<String>,
 ) -> Result<RunResult> {
@@ -114,6 +115,7 @@ pub async fn run_config(
                     },
                     use_verify,
                     temperature,
+                    env,
                     profile,
                     model_override.as_deref(),
                 )
@@ -183,12 +185,14 @@ fn read_report_goal(report: &Path) -> Option<String> {
 }
 
 /// One independent attempt in an isolated copy of the fixture.
+#[allow(clippy::too_many_arguments)]
 pub fn run_candidate(
     hi: &Path,
     task_dir: &Path,
     task: &Task,
     use_verify: bool,
     temperature: f32,
+    env: &[(&str, &str)],
     profile: EvalProfile,
     model_override: Option<&str>,
 ) -> Result<Candidate> {
@@ -239,6 +243,11 @@ sub-goal now, then update the plan with update_plan — including any newly disc
         }
         if let Some(model) = model_override {
             cmd.env("HI_MODEL", model);
+        }
+        // Per-config env — the orchestration lever under test (e.g. the skeptic
+        // gate). Same for the first turn and every drive turn.
+        for (key, value) in env {
+            cmd.env(key, value);
         }
         if use_verify {
             cmd.arg("--verify").arg(&task.verify);

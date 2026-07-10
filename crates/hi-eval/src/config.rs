@@ -19,6 +19,11 @@ pub struct Config {
     /// ANY candidate passes — execution-grounded best-of-N (the test suite is
     /// the judge). Tokens are summed across all candidates.
     pub temperatures: &'static [f32],
+    /// Extra environment variables set on every child `hi` run — how a config
+    /// turns on an orchestration knob (e.g. the `/goal team` skeptic gate via
+    /// `HI_GOAL_TEAM` + `HI_SKEPTIC_MODEL`) without any other difference. This is
+    /// what lets a config pair be an honest A/B of one lever.
+    pub env: &'static [(&'static str, &'static str)],
 }
 
 pub const CONFIGS: &[Config] = &[
@@ -26,16 +31,33 @@ pub const CONFIGS: &[Config] = &[
         name: "baseline",
         use_verify: false,
         temperatures: &[0.0],
+        env: &[],
     },
     Config {
         name: "verify",
         use_verify: true,
         temperatures: &[0.0],
+        env: &[],
     },
     Config {
         name: "best-of-3",
         use_verify: true,
         temperatures: &[0.2, 0.7, 1.0],
+        env: &[],
+    },
+    // The skeptic-gate A/B: identical to `baseline` (no --verify, one candidate)
+    // except the `/goal team` gate is on. Run BOTH in goal mode
+    // (`HI_EVAL_GOAL=1 HI_EVAL_TURNS=N`) and compare `baseline` vs `goal-team` —
+    // the only difference is the reviewer, so a pass-rate delta is its value and
+    // the token delta is its cost.
+    Config {
+        name: "goal-team",
+        use_verify: false,
+        temperatures: &[0.0],
+        env: &[
+            ("HI_GOAL_TEAM", "1"),
+            ("HI_SKEPTIC_MODEL", "pipe/glm-5.2-fast"),
+        ],
     },
 ];
 

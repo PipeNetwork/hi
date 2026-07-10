@@ -1,0 +1,17 @@
+name = "stack-ops"
+prompt = "Implement a Stack class in solution.py with these methods: push(x) adds an item; pop() removes and returns the top item; peek() returns the top item without removing it; size() returns the number of items; is_empty() returns True iff empty. IMPORTANT: both pop() and peek() must raise IndexError when the stack is empty. The file currently raises NotImplementedError. Edit only solution.py."
+verify = '''python3 -c "
+import solution as m
+s = m.Stack()
+assert s.is_empty() and s.size() == 0
+s.push(1); s.push(2)
+assert s.size() == 2 and not s.is_empty()
+assert s.peek() == 2 and s.size() == 2
+assert s.pop() == 2 and s.pop() == 1 and s.is_empty()
+for meth in ('pop', 'peek'):
+    try:
+        getattr(m.Stack(), meth)()
+        raise SystemExit('empty ' + meth + ' did not raise')
+    except IndexError:
+        pass
+"'''
