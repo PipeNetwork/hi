@@ -2842,6 +2842,22 @@ mod native {
         })
     }
 
+    /// Full chunked prefill (paged): process a long prompt in `chunk`-token windows, each
+    /// projecting QKV, writing its K/V to the paged cache, and attending causally to the
+    /// cache via the paged-prefill kernel — so EVERY N-scaled prefill buffer (not just the
+    /// FFN) is bounded by the chunk, letting context grow to the KV-pool limit. Returns the
+    /// chunk size (tokens); 0 = off. `HI_CUDA_PREFILL_CHUNK` (default off).
+    fn prefill_chunk() -> usize {
+        use std::sync::OnceLock;
+        static CHUNK: OnceLock<usize> = OnceLock::new();
+        *CHUNK.get_or_init(|| {
+            std::env::var("HI_CUDA_PREFILL_CHUNK")
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or(0)
+        })
+    }
+
     /// Fuse Q4_0 weight dequant straight to f16 in the prefill GEMM path (default on;
     /// `HI_CUDA_NO_DEQUANT_F16` reverts to dequant -> f32 -> cast).
     fn dequant_f16_enabled() -> bool {
@@ -12902,14 +12918,26 @@ mod native {
                 // Prefill only needs the last position's logits to pick the
                 // first generated token; project just that row (returned as
                 // logits_seq_len = 1) to avoid a vocab-wide buffer per prompt
-                // token.
-                let logits = self.full_context_logits_device_batched_paged_cache(
-                    &flat,
-                    batch_count,
-                    prompt_len,
-                    &mut cache,
-                    true,
-                )?;
+                // token. When chunked prefill is enabled for a long prompt, process
+                // it in windows (bounded scratch, attending to the paged cache).
+                let chunk = prefill_chunk();
+                let logits = if chunk > 0 && prompt_len > chunk {
+                    self.full_context_logits_device_batched_paged_cache_chunked(
+                        &flat,
+                        batch_count,
+                        prompt_len,
+                        &mut cache,
+                        chunk,
+                    )?
+                } else {
+                    self.full_context_logits_device_batched_paged_cache(
+                        &flat,
+                        batch_count,
+                        prompt_len,
+                        &mut cache,
+                        true,
+                    )?
+                };
                 return Ok((cache, logits, 1));
             }
 
@@ -13062,6 +13090,194 @@ mod native {
             } else {
                 self.output_logits_f32_device(&normed)
             }
+        }
+
+        /// Attention for a chunked-prefill window: the `chunk_len`-token query chunk attends
+        /// causally to the paged cache (which already holds this chunk's just-written K/V).
+        /// Picks the Q8 or f16 paged-prefill kernel from the cache layout.
+        fn paged_prefill_attention_f32_device(
+            &self,
+            q: &GpuF32Tensor,
+            layer_cache: &CudaPagedBatchLayerKvCache,
+            query_offset: usize,
+            batch_count: usize,
+            chunk_len: usize,
+            dims: &QwenDims,
+            window: usize,
+        ) -> Result<GpuF32Tensor> {
+            if window > 0 {
+                bail!("CUDA chunked prefill does not support sliding-window (Gemma) attention");
+            }
+            let output_elements = batch_count
+                .checked_mul(chunk_len)
+                .and_then(|value| value.checked_mul(dims.heads))
+                .and_then(|value| value.checked_mul(dims.v_head_dim))
+                .context("CUDA paged prefill attention output count overflows usize")?;
+            let output = DeviceBuffer::alloc(output_elements * std::mem::size_of::<f32>())
+                .context("allocating CUDA paged prefill attention output")?;
+            if let (Some(key_scales), Some(value_scales)) =
+                (&layer_cache.key_scales, &layer_cache.value_scales)
+            {
+                crate::kernels::launch_paged_prefill_causal_attention_batched_q8(
+                    &q.buffer,
+                    layer_cache.key_pages.as_buffer(),
+                    layer_cache.value_pages.as_buffer(),
+                    key_scales.as_buffer(),
+                    value_scales.as_buffer(),
+                    &layer_cache.page_table,
+                    &output,
+                    query_offset,
+                    batch_count,
+                    chunk_len,
+                    layer_cache.page_size,
+                    layer_cache.page_table_len,
+                    dims.heads,
+                    dims.kv_heads,
+                    dims.head_dim,
+                    dims.v_head_dim,
+                    &self.stream,
+                )?;
+            } else {
+                crate::kernels::launch_paged_prefill_causal_attention_batched(
+                    &q.buffer,
+                    layer_cache.key_pages.as_buffer(),
+                    layer_cache.value_pages.as_buffer(),
+                    &layer_cache.page_table,
+                    &output,
+                    query_offset,
+                    batch_count,
+                    chunk_len,
+                    layer_cache.page_size,
+                    layer_cache.page_table_len,
+                    dims.heads,
+                    dims.kv_heads,
+                    dims.head_dim,
+                    dims.v_head_dim,
+                    &self.stream,
+                )?;
+            }
+            self.op_barrier()?;
+            Ok(GpuF32Tensor {
+                rows: batch_count * chunk_len,
+                cols: dims.heads * dims.v_head_dim,
+                buffer: output,
+            })
+        }
+
+        /// Chunked prefill (paged): process the prompt in `chunk_size`-token windows, each a
+        /// full forward whose attention reads the paged cache (prior windows + this window's
+        /// K/V), so every N-scaled prefill buffer is bounded by the window. Cross-window
+        /// dependency flows only through the KV cache; logits come from the last window.
+        /// Requires last-row-only logits (the next-token path).
+        fn full_context_logits_device_batched_paged_cache_chunked(
+            &self,
+            token_ids: &[u32],
+            batch_count: usize,
+            seq_len: usize,
+            cache: &mut CudaPagedBatchKvCache,
+            chunk_size: usize,
+        ) -> Result<GpuF32Tensor> {
+            let _t = self.forward_timer();
+            let dims = self.qwen_dims()?;
+            if batch_count == 0 || seq_len == 0 {
+                bail!("CUDA chunked prefill requires non-empty batch and sequence");
+            }
+            if token_ids.len() != batch_count * seq_len {
+                bail!(
+                    "CUDA chunked prefill got {} tokens; expected batch {batch_count} x seq {seq_len}",
+                    token_ids.len()
+                );
+            }
+            if seq_len > dims.context {
+                bail!(
+                    "input length {seq_len} exceeds qwen context length {}",
+                    dims.context
+                );
+            }
+            let eps = self.config.rms_norm_eps.unwrap_or(1.0e-6);
+            let rope_base = self
+                .config
+                .rope_freq_base
+                .unwrap_or_else(|| self.config.default_rope_freq_base());
+            let rope_scale = self.config.rope_freq_scale.unwrap_or(1.0);
+
+            let mut last_logits: Option<GpuF32Tensor> = None;
+            let mut offset = 0usize;
+            while offset < seq_len {
+                let chunk_len = chunk_size.min(seq_len - offset);
+                let mut chunk_tokens = Vec::with_capacity(batch_count * chunk_len);
+                for b in 0..batch_count {
+                    let base = b * seq_len + offset;
+                    chunk_tokens.extend_from_slice(&token_ids[base..base + chunk_len]);
+                }
+                let mut hidden = self.embed_tokens_device(&chunk_tokens)?;
+                for layer in 0..self.config.block_count {
+                    let layer_idx =
+                        usize::try_from(layer).context("qwen layer index does not fit usize")?;
+                    let prefix = format!("blk.{layer}");
+                    self.ensure_layer_runtime_supported(&prefix)?;
+                    let window = self.layer_attention_window(&prefix);
+                    let attn_input = self.rms_norm_f32_device(
+                        &format!("{prefix}.attn_norm.weight"),
+                        &hidden,
+                        eps,
+                    )?;
+                    let (q, k, v, gate) = self.attention_qkv_f32_device(
+                        &prefix,
+                        &attn_input,
+                        &dims,
+                        eps,
+                        rope_base,
+                        rope_scale,
+                        QwenRopeLayout::Batched {
+                            batch_count,
+                            seq_len: chunk_len,
+                            position_offset: offset,
+                        },
+                    )?;
+                    cache.write_layer_batched(
+                        layer_idx,
+                        &k,
+                        &v,
+                        batch_count,
+                        chunk_len,
+                        offset,
+                        dims.kv_heads,
+                        dims.head_dim,
+                        dims.v_head_dim,
+                        &self.stream,
+                    )?;
+                    let attn = self.paged_prefill_attention_f32_device(
+                        &q,
+                        cache.layer(layer_idx)?,
+                        offset,
+                        batch_count,
+                        chunk_len,
+                        &dims,
+                        window,
+                    )?;
+                    let attn_out =
+                        self.attention_output_projection_f32_device(&prefix, &attn, gate.as_ref())?;
+                    hidden = self.add_f32_device(&hidden, &attn_out)?;
+                    let mlp_input = self.rms_norm_f32_device(
+                        &format!("{prefix}.ffn_norm.weight"),
+                        &hidden,
+                        eps,
+                    )?;
+                    let mlp_out = self.ffn_f32_device(&prefix, &mlp_input)?;
+                    hidden = self.add_f32_device(&hidden, &mlp_out)?;
+                }
+                if offset + chunk_len >= seq_len {
+                    let normed = self.rms_norm_f32_device("output_norm.weight", &hidden, eps)?;
+                    last_logits = Some(self.output_logits_last_row_f32_device(
+                        &normed,
+                        batch_count,
+                        chunk_len,
+                    )?);
+                }
+                offset += chunk_len;
+            }
+            last_logits.ok_or_else(|| anyhow!("CUDA chunked prefill produced no logits"))
         }
 
         fn full_context_logits_device_with_cache(
