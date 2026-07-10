@@ -2919,12 +2919,15 @@ mod native {
         });
         match crate::runtime::free_memory_bytes() {
             Ok(free) => {
-                // The hybrid holds quantized (already resident) + a full f16 cache
-                // (~1.3x the f16 size for 4-bit). Requiring 2x f16 to fit is a safe
-                // bound that still leaves ~35% of VRAM for the KV cache, activations,
-                // and prefill scratch. Prefer it: it dominates pure f16 (same fast
-                // prefill, far cheaper decode) whenever the extra ~0.3x f16 fits.
-                if f16_bytes.saturating_mul(2) <= free {
+                // The hybrid holds the quantized weights (already resident, ~0.3x the f16
+                // size for 4-bit) plus a full f16 cache, so ~1.3x f16 total. Require
+                // 1.5x f16 to fit (3*f16 <= 2*free) — accurate enough to still leave ~25%
+                // of VRAM for the KV cache / activations while letting large models (e.g. a
+                // 30B where 2x f16 wouldn't fit but 1.3x does) take the hybrid instead of
+                // the pure-f16 tier. Hybrid dominates pure f16: same fast prefill, far
+                // cheaper (dp4a) decode, AND a fast load (only the quantized bytes upload;
+                // the f16 copy is built lazily during prefill rather than eagerly at load).
+                if f16_bytes.saturating_mul(3) <= free.saturating_mul(2) {
                     WeightResidency::HybridQuantF16
                 } else if f16_bytes.saturating_mul(5) <= free.saturating_mul(4) {
                     // f16 fits with ~20% headroom but the hybrid doesn't: pure f16.
