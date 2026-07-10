@@ -177,6 +177,11 @@ pub struct Cli {
     #[arg(short = 'q', long)]
     pub quiet: bool,
 
+    /// Advertise a reduced tool set to cut the per-call tool-schema context.
+    /// Overrides (ORs with) the profile's `minimal_tools`.
+    #[arg(long)]
+    pub minimal_tools: bool,
+
     /// Offline detector eval of the skeptic reviewer: read a JSON
     /// `{objective, sub_goal, diff}` from stdin, run the real skeptic review, print
     /// `{objected, objections}` JSON, and exit. Reviewer = `HI_SKEPTIC_MODEL` or

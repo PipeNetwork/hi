@@ -86,6 +86,7 @@ pub async fn run_config(
         failure_confidence: None,
         candidates: temperatures.len(),
         tokens: 0,
+        input_tokens: 0,
         seconds: 0.0,
         mcp_model: None,
         trajectory: Trajectory::default(),
@@ -160,6 +161,7 @@ pub async fn run_config(
         }
         result.failure_confidence = candidate.failure_confidence;
         result.tokens += candidate.tokens;
+        result.input_tokens += candidate.input_tokens;
         result.seconds += candidate.seconds;
     }
     // When the config failed (no candidate passed), its representative failure is
@@ -347,6 +349,7 @@ sub-goal now, then update the plan with update_plan — including any newly disc
         verify_output_summary: summarize_output(&verify_output),
         failure_confidence,
         tokens: report.tokens,
+        input_tokens: report.input_tokens,
         seconds,
         trajectory: report.trajectory,
     })
@@ -373,6 +376,7 @@ fn summarize_output(output: &str) -> String {
 #[derive(Default)]
 struct ReportInfo {
     tokens: u64,
+    input_tokens: u64,
     provider_error_kind: Option<String>,
     compat_fallbacks_used: Vec<String>,
     changed_files: Vec<String>,
@@ -462,6 +466,7 @@ fn read_report(path: &Path) -> ReportInfo {
     };
     ReportInfo {
         tokens: value["total_tokens"].as_u64().unwrap_or(0),
+        input_tokens: value["input_tokens"].as_u64().unwrap_or(0),
         provider_error_kind: value["provider_error_kind"].as_str().map(str::to_string),
         compat_fallbacks_used: string_array(&value["compat_fallbacks_used"]),
         changed_files: string_array(&value["changed_files"]),
@@ -515,6 +520,7 @@ mod tests {
         ));
         let report = serde_json::json!({
             "total_tokens": 123,
+            "input_tokens": 100,
             "changed_files": [],
             "compat_fallbacks_used": [],
             "telemetry": {
@@ -542,6 +548,7 @@ mod tests {
         let parsed = read_report(&path);
 
         assert_eq!(parsed.tokens, 123);
+        assert_eq!(parsed.input_tokens, 100);
         assert_eq!(parsed.trajectory.effective_max_steps, 12);
         assert_eq!(parsed.trajectory.quality_repair_nudges, 4);
         assert_eq!(
