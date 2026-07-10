@@ -29,6 +29,6 @@ fn main() {
         .cuda(true)
         .file("src/kernels.cu")
         .flag("-std=c++17")
-        .flag(&format!("-gencode=arch={cuda_arch},code={cuda_arch}"))
+        .flag(format!("-gencode=arch={cuda_arch},code={cuda_arch}"))
         .compile("hi_cuda_kernels");
 }

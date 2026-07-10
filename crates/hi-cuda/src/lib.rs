@@ -1,3 +1,10 @@
+// GPU kernel-launch wrappers and model-forward entry points legitimately take
+// many tensor / stride / dimension parameters; grouping them into structs would
+// add indirection without clarifying the CUDA call sites. Index-based loops in
+// the CPU reference kernels mirror the tensor math (and often index several
+// parallel arrays at once), so the range-loop form is intentional there.
+#![allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
@@ -1120,15 +1127,15 @@ impl CudaBackend {
                 u64::try_from(request.media_inputs.len()).unwrap_or(u64::MAX),
                 Ordering::Relaxed,
             );
-            if self.execution == CudaExecution::Gpu {
-                if let Some(scheduler) = &self.scheduler {
-                    scheduler.record_direct_fallback(CudaSchedulerFallbackReason::Multimodal, 1);
-                    record_multimodal_fallback(
-                        &self.multimodal_stats,
-                        CudaMultimodalFallbackReason::Direct,
-                        1,
-                    );
-                }
+            if self.execution == CudaExecution::Gpu
+                && let Some(scheduler) = &self.scheduler
+            {
+                scheduler.record_direct_fallback(CudaSchedulerFallbackReason::Multimodal, 1);
+                record_multimodal_fallback(
+                    &self.multimodal_stats,
+                    CudaMultimodalFallbackReason::Direct,
+                    1,
+                );
             }
             let projection = self.project_media_inputs(&request.media_inputs)?;
             if self.execution != CudaExecution::Gpu {
@@ -2230,7 +2237,7 @@ fn video_frames_to_qwen_vl_patches(
     if info.temporal_patch_size == 0 {
         bail!("CUDA Qwen-VL temporal patch size must be non-zero");
     }
-    if frames.len() % info.temporal_patch_size != 0 {
+    if !frames.len().is_multiple_of(info.temporal_patch_size) {
         bail!(
             "CUDA Qwen-VL video frame count {} is not divisible by temporal patch size {}",
             frames.len(),
@@ -2358,7 +2365,7 @@ fn normalize_video_frame_count(
             .clone();
         frames.push(last);
     }
-    while frames.len() % temporal_patch_size != 0 {
+    while !frames.len().is_multiple_of(temporal_patch_size) {
         let last = frames
             .last()
             .ok_or_else(|| anyhow!("CUDA Qwen-VL video has no frame to pad"))?
@@ -4013,12 +4020,9 @@ fn admit_continuous_ready_jobs(
 
     let mut admitted = 0usize;
     for job in text_jobs {
-        match admit_continuous_text_job(state, stats, job) {
-            Some(request) => {
-                admitted = admitted.saturating_add(1);
-                active.push(request);
-            }
-            None => {}
+        if let Some(request) = admit_continuous_text_job(state, stats, job) {
+            admitted = admitted.saturating_add(1);
+            active.push(request);
         }
     }
 
@@ -4301,7 +4305,7 @@ fn admit_continuous_text_job(
     let rng = match sampling_key {
         CudaSchedulerSamplingKey::Greedy => None,
         CudaSchedulerSamplingKey::Sampled { .. } => Some(StdRng::seed_from_u64(
-            job.request.seed.unwrap_or_else(|| rand::random::<u64>()),
+            job.request.seed.unwrap_or_else(rand::random::<u64>),
         )),
     };
     Some(CudaContinuousTextRequest {
@@ -5553,7 +5557,7 @@ fn process_scheduler_batch_with_multimodal_reason(
                 .iter()
                 .filter(|job| !job.request.media_inputs.is_empty())
                 .count();
-            let multimodal_fallback_reason = forced_multimodal_fallback_reason.or_else(|| {
+            let multimodal_fallback_reason = forced_multimodal_fallback_reason.or({
                 if media_requests > 0 && media_requests < batch.len() {
                     Some(CudaMultimodalFallbackReason::MixedBatch)
                 } else if media_requests > 0 {
@@ -5580,10 +5584,10 @@ fn process_scheduler_batch_with_multimodal_reason(
                     CudaSchedulerFallbackReason::Multimodal
                 };
                 record_scheduler_fallback(&mut outcome, reason, 1);
-                if !job.request.media_inputs.is_empty() {
-                    if let Some(reason) = multimodal_fallback_reason {
-                        record_multimodal_fallback(&state.multimodal_stats, reason, 1);
-                    }
+                if !job.request.media_inputs.is_empty()
+                    && let Some(reason) = multimodal_fallback_reason
+                {
+                    record_multimodal_fallback(&state.multimodal_stats, reason, 1);
                 }
             }
             outcome
@@ -6171,7 +6175,7 @@ fn process_multimodal_ragged_prefix_decode_candidate_batch(
         .fetch_add(usize_to_u64(candidate_count), Ordering::Relaxed);
 
     let Some(kv_pages) = (state.kv_cache_mode == CudaKvCacheMode::Paged)
-        .then(|| state.kv_pages.as_ref())
+        .then_some(state.kv_pages.as_ref())
         .flatten()
     else {
         let paged_storage = match state.kv_cache_mode {
@@ -7135,9 +7139,7 @@ fn process_compatible_gpu_batch(
                 return false;
             }
             let max_decode_steps = decode_limits.iter().copied().max().unwrap_or(1);
-            let token_capacity = prompt_len
-                .checked_add(max_decode_steps)
-                .unwrap_or(usize::MAX);
+            let token_capacity = prompt_len.saturating_add(max_decode_steps);
             scheduler_lease_page_tables_for_group(state, candidate, leases, token_capacity)
                 .is_some()
         };
@@ -7191,9 +7193,7 @@ fn process_compatible_gpu_batch(
                     }
                 };
                 let max_decode_steps = group_limits.iter().copied().max().unwrap_or(1);
-                let token_capacity = prompt_len
-                    .checked_add(max_decode_steps)
-                    .unwrap_or(usize::MAX);
+                let token_capacity = prompt_len.saturating_add(max_decode_steps);
                 let lease_page_tables =
                     scheduler_lease_page_tables_for_group(state, &indexes, leases, token_capacity);
                 let paged_storage = match state.kv_cache_mode {

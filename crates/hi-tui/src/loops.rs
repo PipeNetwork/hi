@@ -2193,6 +2193,9 @@ mod tests {
     /// starving each other or the manager. Runs cwd-controlled in a throwaway git
     /// repo (the fix operates on the cwd), serialized via CWD_LOCK.
     #[tokio::test]
+    // CWD_LOCK (a std Mutex) is deliberately held across awaits to serialize
+    // the cwd-mutating async tests; the guard must outlive every await here.
+    #[allow(clippy::await_holding_lock)]
     async fn manager_pipeline_trigger_and_autofix_together() {
         let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev_cwd = std::env::current_dir().unwrap();
@@ -2385,6 +2388,9 @@ mod tests {
     /// `decide_fix`). Serialized + cwd-restored since `run_fix` operates on the
     /// process cwd (like the worktree helpers it reuses).
     #[tokio::test]
+    // CWD_LOCK (a std Mutex) is deliberately held across awaits to serialize
+    // the cwd-mutating async tests; the guard must outlive every await here.
+    #[allow(clippy::await_holding_lock)]
     async fn run_fix_merges_verified_and_rejects_unverified() {
         let _guard = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = std::env::current_dir().unwrap();

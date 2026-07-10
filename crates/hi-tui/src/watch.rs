@@ -884,7 +884,7 @@ mod tests {
             prompt: "watch the nightly build".into(),
             interval_secs: 3600,
             created_ms: now,
-            next_ms: now + 3600_000,
+            next_ms: now + 3_600_000,
             expires_ms: now + 7 * 86_400_000,
             firings: 2,
             firing: false,

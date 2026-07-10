@@ -1,3 +1,8 @@
+// Quant block decoders index several parallel sub-arrays (quants, scales, mins)
+// by the same counter, so the range-loop form mirrors the layout and is
+// intentional over an iterator rewrite.
+#![allow(clippy::needless_range_loop)]
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -581,7 +586,7 @@ impl GgufTensorType {
             | Self::TQ2_0 => {
                 let block_elements = self.block_element_count().expect("quantized block size");
                 let block_bytes = self.block_byte_len().expect("quantized block byte length");
-                if element_count % block_elements != 0 {
+                if !element_count.is_multiple_of(block_elements) {
                     bail!(
                         "{} tensor element count {element_count} is not divisible by block size {block_elements}",
                         self.label()
@@ -734,24 +739,24 @@ impl GgufTokenizer {
         }
 
         let scores = gguf.metadata_f32_array("tokenizer.ggml.scores")?;
-        if let Some(scores) = &scores {
-            if scores.len() != tokens.len() {
-                bail!(
-                    "GGUF tokenizer score count {} does not match token count {}",
-                    scores.len(),
-                    tokens.len()
-                );
-            }
+        if let Some(scores) = &scores
+            && scores.len() != tokens.len()
+        {
+            bail!(
+                "GGUF tokenizer score count {} does not match token count {}",
+                scores.len(),
+                tokens.len()
+            );
         }
         let token_types = gguf.metadata_i32_array("tokenizer.ggml.token_type")?;
-        if let Some(token_types) = &token_types {
-            if token_types.len() != tokens.len() {
-                bail!(
-                    "GGUF tokenizer token_type count {} does not match token count {}",
-                    token_types.len(),
-                    tokens.len()
-                );
-            }
+        if let Some(token_types) = &token_types
+            && token_types.len() != tokens.len()
+        {
+            bail!(
+                "GGUF tokenizer token_type count {} does not match token count {}",
+                token_types.len(),
+                tokens.len()
+            );
         }
 
         let bos_token_id = gguf.metadata_u32("tokenizer.ggml.bos_token_id");
@@ -774,7 +779,7 @@ impl GgufTokenizer {
         }
         if let Some(token_types) = &token_types {
             for (idx, token_type) in token_types.iter().enumerate() {
-                if matches!(*token_type, 2 | 3 | 4 | 5) {
+                if matches!(*token_type, 2..=5) {
                     special_ids.insert(idx as u32);
                 }
             }
@@ -789,7 +794,7 @@ impl GgufTokenizer {
             .filter_map(|id| tokens.get(*id as usize).map(|token| (token.clone(), *id)))
             .filter(|(token, _)| !token.is_empty())
             .collect::<Vec<_>>();
-        special_tokens.sort_by(|(left, _), (right, _)| right.len().cmp(&left.len()));
+        special_tokens.sort_by_key(|(token, _)| std::cmp::Reverse(token.len()));
 
         Ok(Self {
             model,
@@ -843,18 +848,18 @@ impl GgufTokenizer {
 
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
         let mut ids = Vec::new();
-        if self.add_bos_token {
-            if let Some(id) = self.bos_token_id {
-                ids.push(id);
-            }
+        if self.add_bos_token
+            && let Some(id) = self.bos_token_id
+        {
+            ids.push(id);
         }
 
         ids.extend(self.encode_with_special_tokens(text)?);
 
-        if self.add_eos_token {
-            if let Some(id) = self.eos_token_id {
-                ids.push(id);
-            }
+        if self.add_eos_token
+            && let Some(id) = self.eos_token_id
+        {
+            ids.push(id);
         }
         Ok(ids)
     }
@@ -1691,13 +1696,14 @@ fn reject_unsupported_qwen_ssm_layout(
     }
 
     for tensor in &gguf.tensors {
-        if let Some(feature) = qwen_ssm_tensor_feature(&tensor.name) {
-            if !dense_decoder_present && !recurrent_ssm_decoder_present {
-                bail!(
-                    "unsupported Qwen GGUF tensor layout: tensor {} uses {feature}; CUDA Qwen support requires either dense attention/MLP decoder tensors or a complete recurrent SSM tensor set ssm_in or attn_qkv+attn_gate plus ssm_conv1d/ssm_dt/ssm_a/ssm_ba/ssm_norm/ssm_out",
-                    tensor.name
-                );
-            }
+        if let Some(feature) = qwen_ssm_tensor_feature(&tensor.name)
+            && !dense_decoder_present
+            && !recurrent_ssm_decoder_present
+        {
+            bail!(
+                "unsupported Qwen GGUF tensor layout: tensor {} uses {feature}; CUDA Qwen support requires either dense attention/MLP decoder tensors or a complete recurrent SSM tensor set ssm_in or attn_qkv+attn_gate plus ssm_conv1d/ssm_dt/ssm_a/ssm_ba/ssm_norm/ssm_out",
+                tensor.name
+            );
         }
     }
 
@@ -3904,17 +3910,15 @@ impl QwenTensorValidator<'_> {
             .iter()
             .find(|name| self.tensors.contains_key(name.as_str()))
         else {
-            if required {
-                if let Some(primary) = names.first() {
-                    if names.len() > 1 {
-                        self.errors.push(format!(
-                            "missing required tensor {primary}; accepted aliases: {}",
-                            names[1..].join(", ")
-                        ));
-                    } else {
-                        self.errors
-                            .push(format!("missing required tensor {primary}"));
-                    }
+            if required && let Some(primary) = names.first() {
+                if names.len() > 1 {
+                    self.errors.push(format!(
+                        "missing required tensor {primary}; accepted aliases: {}",
+                        names[1..].join(", ")
+                    ));
+                } else {
+                    self.errors
+                        .push(format!("missing required tensor {primary}"));
                 }
             }
             return;
@@ -6215,7 +6219,7 @@ fn dequantize_q6_k(bytes: &[u8], element_count: usize) -> Result<Vec<f32>> {
             for l in 0..32 {
                 let is = l / 16;
                 let qh_byte = qh[qh_offset + l];
-                let q1 = (((ql[ql_offset + l] & 0x0f) | (((qh_byte >> 0) & 0x03) << 4)) as i8) - 32;
+                let q1 = (((ql[ql_offset + l] & 0x0f) | ((qh_byte & 0x03) << 4)) as i8) - 32;
                 let q2 =
                     (((ql[ql_offset + l + 32] & 0x0f) | (((qh_byte >> 2) & 0x03) << 4)) as i8) - 32;
                 let q3 = (((ql[ql_offset + l] >> 4) | (((qh_byte >> 4) & 0x03) << 4)) as i8) - 32;
@@ -6280,7 +6284,7 @@ fn require_quantized_len(
     block_bytes: usize,
     label: &str,
 ) -> Result<()> {
-    if element_count % block_elements != 0 {
+    if !element_count.is_multiple_of(block_elements) {
         bail!(
             "{label} tensor element count {element_count} is not divisible by block size {block_elements}"
         );

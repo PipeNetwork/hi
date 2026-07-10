@@ -38,32 +38,33 @@ pub fn build_prompt_with_template(
             if let Some(rendered) = render_gguf_chat_template(template, messages) {
                 return rendered;
             }
-        } else if {
-            let t = normalize_jinja_template(template);
-            t.contains("<|channel|>") && t.contains("<|call|>")
-        } {
-            // GPT-OSS harmony: tools go in a TypeScript functions namespace and calls use the commentary
-            // channel — the generic `<tool_call>` instruction doesn't fit, so render it natively.
-            return render_gptoss_tools(messages, tools, tool_choice);
-        } else if {
-            let t = normalize_jinja_template(template);
-            t.contains("<|header_start|>") && t.contains("<|eot|>")
-        } {
-            // Llama-4: uses the Llama-3.1 tool prompt + `{"name", "parameters"}` output, not `<tool_call>`.
-            return render_llama4_tools(messages, tools, tool_choice);
-        } else if matches!(
-            family,
-            ModelFamily::Qwen2 | ModelFamily::Qwen3 | ModelFamily::NemotronH | ModelFamily::Gemma
-        ) && !normalize_jinja_template(template).contains("<|im_start|>")
-        {
-            // Expansion archs route to the Qwen/Gemma family for text but carry a non-chatml native
-            // template (granite, cohere, gpt_oss, llama4, phi-moe, gemma2/3…). The family prompt would
-            // hand them chatml/gemma without their real turn format, so render the native template with
-            // the tool instruction folded into a system turn instead. Archs whose family has bespoke
-            // tool rendering (Llama/Phi/DeepSeek/GlmFlash) fall through to build_prompt below.
-            let augmented = inject_tool_system(messages, tools, tool_choice);
-            if let Some(rendered) = render_gguf_chat_template(template, &augmented) {
-                return rendered;
+        } else {
+            // Normalize once for the tool-routing checks below.
+            let normalized = normalize_jinja_template(template);
+            if normalized.contains("<|channel|>") && normalized.contains("<|call|>") {
+                // GPT-OSS harmony: tools go in a TypeScript functions namespace and calls use the commentary
+                // channel — the generic `<tool_call>` instruction doesn't fit, so render it natively.
+                return render_gptoss_tools(messages, tools, tool_choice);
+            } else if normalized.contains("<|header_start|>") && normalized.contains("<|eot|>") {
+                // Llama-4: uses the Llama-3.1 tool prompt + `{"name", "parameters"}` output, not `<tool_call>`.
+                return render_llama4_tools(messages, tools, tool_choice);
+            } else if matches!(
+                family,
+                ModelFamily::Qwen2
+                    | ModelFamily::Qwen3
+                    | ModelFamily::NemotronH
+                    | ModelFamily::Gemma
+            ) && !normalized.contains("<|im_start|>")
+            {
+                // Expansion archs route to the Qwen/Gemma family for text but carry a non-chatml native
+                // template (granite, cohere, gpt_oss, llama4, phi-moe, gemma2/3…). The family prompt would
+                // hand them chatml/gemma without their real turn format, so render the native template with
+                // the tool instruction folded into a system turn instead. Archs whose family has bespoke
+                // tool rendering (Llama/Phi/DeepSeek/GlmFlash) fall through to build_prompt below.
+                let augmented = inject_tool_system(messages, tools, tool_choice);
+                if let Some(rendered) = render_gguf_chat_template(template, &augmented) {
+                    return rendered;
+                }
             }
         }
     }
