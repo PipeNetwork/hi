@@ -3060,16 +3060,19 @@ mod native {
         })
     }
 
-    /// Grouped MoE execution (`HI_CUDA_MOE_GROUPED=1`, opt-in): run each MoE
-    /// projection as ONE grouped GEMV launch over all (token row, routed expert)
+    /// Grouped MoE execution (default ON; `HI_CUDA_MOE_GROUPED=0` reverts): run each
+    /// MoE projection as ONE grouped GEMV launch over all (token row, routed expert)
     /// pairs with device-resident routing, instead of ~3 launches per expert per
     /// row plus a blocking route readback per layer. Requires uniform Q4_K/Q6_K
     /// expert weights without per-expert biases; other layouts keep the legacy loop.
+    /// Grouped output is BIT-identical to the per-expert loop
+    /// (`native_cuda_moe_grouped_gemv_matches_per_expert_loop`); measured
+    /// Qwen3-30B-A3B decode 34.9 -> 48.8 tok/s (55.6 with graphs).
     fn moe_grouped_enabled() -> bool {
         use std::sync::OnceLock;
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED
-            .get_or_init(|| std::env::var("HI_CUDA_MOE_GROUPED").is_ok_and(|value| value != "0"))
+            .get_or_init(|| std::env::var("HI_CUDA_MOE_GROUPED").map_or(true, |value| value != "0"))
     }
 
     /// Device pointer table over one MoE projection's expert weights (see
@@ -3145,15 +3148,16 @@ mod native {
         *ENABLED.get_or_init(|| std::env::var("HI_CUDA_NO_KQUANT_DP4A").is_err())
     }
 
-    /// Quantized small-M GEMM for batched decode (`HI_CUDA_MMQ=1`, opt-in): small-M
-    /// matmuls read the Q4_K/Q6_K weights directly via the dp4a GEMM instead of the
-    /// dequant->f16->cuBLAS tail, cutting the batched-decode weight read ~3.5x (and,
-    /// in Quantized residency, removing a full re-dequant per forward). Each output
-    /// row stays bit-identical to the M=1 dp4a GEMV path.
+    /// Quantized small-M GEMM for batched decode (default ON; `HI_CUDA_MMQ=0`
+    /// reverts): small-M matmuls read the Q4_K/Q6_K weights directly via the dp4a
+    /// GEMM instead of the dequant->f16->cuBLAS tail, cutting the batched-decode
+    /// weight read ~3.5x (and, in Quantized residency, removing a full re-dequant
+    /// per forward). Each output row stays bit-identical to the M=1 dp4a GEMV path
+    /// (`native_cuda_kquant_dp4a_gemm_matches_gemv_rows`).
     fn mmq_gemm_enabled() -> bool {
         use std::sync::OnceLock;
         static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| std::env::var("HI_CUDA_MMQ").is_ok_and(|value| value != "0"))
+        *ENABLED.get_or_init(|| std::env::var("HI_CUDA_MMQ").map_or(true, |value| value != "0"))
     }
 
     /// Largest M routed to the dp4a K-quant GEMM (`HI_CUDA_MMQ_MAX_M`, default 8,

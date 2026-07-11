@@ -4986,15 +4986,17 @@ fn forget_retired_recurrent_state(
     }
 }
 
-/// Heterogeneous batched decode (`HI_CUDA_HET_DECODE`, opt-in): decode-phase requests at
-/// DIFFERENT context lengths and sampling configs batch into ONE forward with per-row
-/// positions, so the weights are read once per step for the whole batch instead of once
-/// per exact-context-length group (which real traffic never shares). Off = the historical
-/// grouping by (context length, sampling config).
+/// Heterogeneous batched decode (default ON; `HI_CUDA_HET_DECODE=0` reverts):
+/// decode-phase requests at DIFFERENT context lengths and sampling configs batch into
+/// ONE forward with per-row positions, so the weights are read once per step for the
+/// whole batch instead of once per exact-context-length group (which real traffic
+/// never shares). Off = the historical grouping by (context length, sampling config).
+/// Parity: `native_cuda_het_batched_decode_matches_sequential` (bit-exact); measured
+/// K=4 aggregate 70 -> 226 tok/s across P1/P2/P6.
 fn het_decode_enabled() -> bool {
     use std::sync::OnceLock;
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("HI_CUDA_HET_DECODE").is_ok_and(|value| value != "0"))
+    *ENABLED.get_or_init(|| std::env::var("HI_CUDA_HET_DECODE").map_or(true, |value| value != "0"))
 }
 
 /// Minimum decode batch for the heterogeneous path (`HI_CUDA_HET_DECODE_MIN`).
@@ -5008,7 +5010,7 @@ fn het_decode_min_batch() -> usize {
     use std::sync::OnceLock;
     static MIN: OnceLock<usize> = OnceLock::new();
     *MIN.get_or_init(|| {
-        let mmq = std::env::var("HI_CUDA_MMQ").is_ok_and(|value| value != "0");
+        let mmq = std::env::var("HI_CUDA_MMQ").map_or(true, |value| value != "0");
         std::env::var("HI_CUDA_HET_DECODE_MIN")
             .ok()
             .and_then(|value| value.trim().parse().ok())
@@ -5017,19 +5019,23 @@ fn het_decode_min_batch() -> usize {
     })
 }
 
-/// Chunked prefill (`HI_CUDA_CHUNK_PREFILL`, opt-in): split each prompt's prefill
-/// into chunks of at most this many tokens per scheduler iteration, run AFTER the
-/// iteration's decode work — so admitting a long prompt no longer stalls every
-/// running stream for the whole prefill; inter-token latency is bounded by one
-/// chunk instead of one prompt. `1`/`on` = default 1024 tokens; an explicit value
-/// (>= 64) sets the per-iteration chunk budget; unset/`0` = whole-prompt prefill.
+/// Chunked prefill (default ON at 1024 tokens; `HI_CUDA_CHUNK_PREFILL=0` reverts to
+/// whole-prompt prefill): split each prompt's prefill into chunks of at most this
+/// many tokens per scheduler iteration, run AFTER the iteration's decode work — so
+/// admitting a long prompt no longer stalls every running stream for the whole
+/// prefill; inter-token latency is bounded by one chunk instead of one prompt
+/// (measured: 5k-token prompt admitted mid-decode stalled another stream 4246ms ->
+/// 787ms at 1024). An explicit value (>= 64) sets the per-iteration chunk budget.
 /// Non-final chunk boundaries are page-aligned (KV pages stay whole for prefix
-/// reuse). Recurrent-SSM and sliding-window layouts keep whole-prompt prefill.
+/// reuse); chunked-vs-whole first tokens are bit-identical. Recurrent-SSM and
+/// sliding-window layouts keep whole-prompt prefill.
 fn chunk_prefill_tokens() -> Option<usize> {
     use std::sync::OnceLock;
     static TOKENS: OnceLock<Option<usize>> = OnceLock::new();
     *TOKENS.get_or_init(|| {
-        let raw = std::env::var("HI_CUDA_CHUNK_PREFILL").ok()?;
+        let Ok(raw) = std::env::var("HI_CUDA_CHUNK_PREFILL") else {
+            return Some(1024);
+        };
         match raw.trim() {
             "" | "0" | "off" | "false" => None,
             "1" | "on" | "true" => Some(1024),
