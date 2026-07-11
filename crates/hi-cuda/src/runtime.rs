@@ -30,7 +30,8 @@ impl CudaRuntime {
 
 #[cfg(feature = "native-cuda")]
 pub use imp::{
-    Cublas, CublasLt, DeviceBuffer, GemmDType, Stream, check_last_error, free_memory_bytes,
+    Cublas, CublasLt, CudaGraph, DeviceBuffer, GemmDType, GraphExec, Stream, check_last_error,
+    free_memory_bytes, set_capture_active,
 };
 
 #[cfg(not(feature = "native-cuda"))]
@@ -50,7 +51,7 @@ mod imp {
 mod imp {
     use std::collections::HashMap;
     use std::ffi::CStr;
-    use std::os::raw::{c_char, c_int, c_void};
+    use std::os::raw::{c_char, c_int, c_ulonglong, c_void};
     use std::ptr;
     use std::sync::{Mutex, OnceLock};
 
@@ -61,6 +62,8 @@ mod imp {
     type CudaError = c_int;
     type CublasStatus = c_int;
     type CudaStream = *mut c_void;
+    type CudaGraphRaw = *mut c_void;
+    type CudaGraphExecRaw = *mut c_void;
     type CublasHandle = *mut c_void;
     type CublasLtHandle = *mut c_void;
     type CudaDataType = c_int;
@@ -95,6 +98,16 @@ mod imp {
         fn cudaStreamCreate(stream: *mut CudaStream) -> CudaError;
         fn cudaStreamDestroy(stream: CudaStream) -> CudaError;
         fn cudaStreamSynchronize(stream: CudaStream) -> CudaError;
+        fn cudaStreamBeginCapture(stream: CudaStream, mode: c_int) -> CudaError;
+        fn cudaStreamEndCapture(stream: CudaStream, graph: *mut CudaGraphRaw) -> CudaError;
+        fn cudaGraphInstantiate(
+            exec: *mut CudaGraphExecRaw,
+            graph: CudaGraphRaw,
+            flags: c_ulonglong,
+        ) -> CudaError;
+        fn cudaGraphLaunch(exec: CudaGraphExecRaw, stream: CudaStream) -> CudaError;
+        fn cudaGraphExecDestroy(exec: CudaGraphExecRaw) -> CudaError;
+        fn cudaGraphDestroy(graph: CudaGraphRaw) -> CudaError;
     }
 
     #[link(name = "cublas")]
@@ -196,13 +209,33 @@ mod imp {
         *ENABLED.get_or_init(|| std::env::var("HI_CUDA_NO_BUF_POOL").is_err())
     }
 
+    // During CUDA graph capture, cudaMalloc/cudaFree are illegal on the captured stream.
+    // While this flag is set the pool never falls through to cudaMalloc (alloc errors
+    // instead — the pool must be pre-warmed) and never cudaFrees on drop (every freed
+    // buffer is retained in the pool regardless of size). Set via `set_capture_active`
+    // around a capture window.
+    fn capture_flag() -> &'static std::sync::atomic::AtomicBool {
+        static FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        &FLAG
+    }
+
+    pub fn set_capture_active(active: bool) {
+        capture_flag().store(active, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn capture_active() -> bool {
+        capture_flag().load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     fn buffer_pool() -> &'static Mutex<HashMap<usize, Vec<usize>>> {
         static POOL: OnceLock<Mutex<HashMap<usize, Vec<usize>>>> = OnceLock::new();
         POOL.get_or_init(|| Mutex::new(HashMap::new()))
     }
 
     fn buffer_pool_take(bytes: usize) -> Option<*mut c_void> {
-        if bytes == 0 || bytes > POOL_MAX_BYTES || !buffer_pool_enabled() {
+        // During capture, pool any size (a matching buffer may have been retained on a
+        // capture-time free); otherwise only pool <= POOL_MAX_BYTES.
+        if bytes == 0 || (bytes > POOL_MAX_BYTES && !capture_active()) || !buffer_pool_enabled() {
             return None;
         }
         let mut pool = buffer_pool().lock().unwrap();
@@ -212,7 +245,8 @@ mod imp {
     }
 
     fn buffer_pool_return(ptr: *mut c_void, bytes: usize) -> bool {
-        if bytes == 0 || bytes > POOL_MAX_BYTES || !buffer_pool_enabled() {
+        // Retain every buffer (any size) while capturing so drop never cudaFrees.
+        if bytes == 0 || (bytes > POOL_MAX_BYTES && !capture_active()) || !buffer_pool_enabled() {
             return false;
         }
         let mut pool = buffer_pool().lock().unwrap();
@@ -229,6 +263,14 @@ mod imp {
         pub fn alloc(bytes: usize) -> Result<Self> {
             if let Some(ptr) = buffer_pool_take(bytes) {
                 return Ok(Self { ptr, bytes });
+            }
+            if capture_active() {
+                // cudaMalloc is illegal during graph capture. The pool wasn't warmed for
+                // this size — surface it so the caller falls back to eager execution.
+                bail!(
+                    "CUDA graph capture needs a {bytes}-byte buffer the pool has not warmed; \
+                     cannot cudaMalloc during capture"
+                );
             }
             let mut ptr = ptr::null_mut();
             cuda_check(unsafe { cudaMalloc(&mut ptr, bytes) }, "cudaMalloc")?;
@@ -436,6 +478,77 @@ mod imp {
 
         pub fn as_raw(&self) -> *mut c_void {
             self.raw
+        }
+
+        /// Begin capturing every op enqueued on this stream into a graph instead of
+        /// executing them. ThreadLocal mode records only this thread's ops. During capture
+        /// no synchronizing CUDA call (cudaMalloc/cudaFree/cudaMemcpy/stream sync) may be
+        /// issued on this stream, so the buffer pool must be pre-warmed (see
+        /// `set_capture_active`).
+        pub fn begin_capture(&self) -> Result<()> {
+            const CUDA_STREAM_CAPTURE_MODE_THREAD_LOCAL: c_int = 1;
+            cuda_check(
+                unsafe { cudaStreamBeginCapture(self.raw, CUDA_STREAM_CAPTURE_MODE_THREAD_LOCAL) },
+                "cudaStreamBeginCapture",
+            )
+        }
+
+        /// Finish capture and return the recorded graph.
+        pub fn end_capture(&self) -> Result<CudaGraph> {
+            let mut graph: CudaGraphRaw = ptr::null_mut();
+            cuda_check(
+                unsafe { cudaStreamEndCapture(self.raw, &mut graph) },
+                "cudaStreamEndCapture",
+            )?;
+            Ok(CudaGraph { raw: graph })
+        }
+    }
+
+    /// A recorded (but not yet executable) CUDA graph.
+    pub struct CudaGraph {
+        raw: CudaGraphRaw,
+    }
+
+    impl CudaGraph {
+        /// Instantiate into an executable graph that can be replayed cheaply.
+        pub fn instantiate(&self) -> Result<GraphExec> {
+            let mut exec: CudaGraphExecRaw = ptr::null_mut();
+            cuda_check(
+                unsafe { cudaGraphInstantiate(&mut exec, self.raw, 0) },
+                "cudaGraphInstantiate",
+            )?;
+            Ok(GraphExec { raw: exec })
+        }
+    }
+
+    impl Drop for CudaGraph {
+        fn drop(&mut self) {
+            if !self.raw.is_null() {
+                let _ = unsafe { cudaGraphDestroy(self.raw) };
+            }
+        }
+    }
+
+    /// An instantiated, replayable CUDA graph.
+    pub struct GraphExec {
+        raw: CudaGraphExecRaw,
+    }
+
+    impl GraphExec {
+        /// Replay the whole captured op sequence on `stream` as a single launch.
+        pub fn launch(&self, stream: &Stream) -> Result<()> {
+            cuda_check(
+                unsafe { cudaGraphLaunch(self.raw, stream.raw) },
+                "cudaGraphLaunch",
+            )
+        }
+    }
+
+    impl Drop for GraphExec {
+        fn drop(&mut self) {
+            if !self.raw.is_null() {
+                let _ = unsafe { cudaGraphExecDestroy(self.raw) };
+            }
         }
     }
 

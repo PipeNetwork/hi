@@ -4733,7 +4733,10 @@ fn process_continuous_decode_chunk(
             .max_tokens
             .saturating_sub(active[idx].generated_tokens.len());
         let draft_cap = max_draft.min(remaining.saturating_sub(1));
-        let extended = active[idx].context_len().saturating_add(draft_cap).saturating_add(1);
+        let extended = active[idx]
+            .context_len()
+            .saturating_add(draft_cap)
+            .saturating_add(1);
         let page_table = match active[idx].page_table_for_token_count(extended, state.kv_page_size)
         {
             Ok(pt) => pt,
@@ -4759,9 +4762,10 @@ fn process_continuous_decode_chunk(
                 stats
                     .decode_tokens
                     .fetch_add(usize_to_u64(tokens.len()), Ordering::Relaxed);
-                stats
-                    .decode_micros
-                    .fetch_add(usize_to_u64(elapsed.as_micros() as usize), Ordering::Relaxed);
+                stats.decode_micros.fetch_add(
+                    usize_to_u64(elapsed.as_micros() as usize),
+                    Ordering::Relaxed,
+                );
                 for token in tokens {
                     if retire[idx].is_some() {
                         break;
@@ -11801,6 +11805,92 @@ mod tests {
         );
     }
 
+    // CUDA-graph capture viability check on a real model. Opt-in:
+    //   HI_CUDA_GRAPH_SMOKE_GGUF=/path/model.gguf cargo test --release -p hi-cuda \
+    //     --features native-cuda native_cuda_graph_capture_decode_smoke -- --nocapture
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_graph_capture_decode_smoke() {
+        use hi_gguf::GgufFile;
+        let Ok(path) = std::env::var("HI_CUDA_GRAPH_SMOKE_GGUF") else {
+            eprintln!("skipping; set HI_CUDA_GRAPH_SMOKE_GGUF=/path/model.gguf");
+            return;
+        };
+        // Force quantized weights so decode is all dp4a (cuBLAS may not be stream-capturable).
+        // SAFETY: single-threaded test setup.
+        unsafe { std::env::set_var("HI_CUDA_WEIGHTS_F16", "0") };
+        let gguf = GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+        let (eager, replayed) = model
+            .graph_capture_decode_smoke(1, 0, 16, &[0], 1)
+            .expect("capture + replay should succeed");
+        assert_eq!(eager.len(), replayed.len());
+        assert_eq!(
+            eager, replayed,
+            "replayed CUDA-graph logits differ from the eager forward"
+        );
+        eprintln!(
+            "graph capture OK: {} logits, replay bit-identical to eager",
+            eager.len()
+        );
+
+        // Multi-token: one captured graph replayed for positions 0..20 must match eager decode.
+        // 20 tokens at page_size 16 crosses the page-0 -> page-1 boundary, proving a single
+        // capture replays across pages (d_position drives KV-write/attention into later pages,
+        // so no per-page re-capture is needed as long as the full page table is present).
+        let seq: Vec<u32> = (1u32..=20).collect();
+        let (eager_seq, graphed_seq) = model
+            .graph_decode_multitoken_smoke(&seq, 16, &[0, 1], 2)
+            .expect("multi-token graph decode should succeed");
+        assert_eq!(eager_seq.len(), graphed_seq.len());
+        for (i, (e, g)) in eager_seq.iter().zip(&graphed_seq).enumerate() {
+            assert_eq!(e, g, "graph decode logits differ from eager at token {i}");
+        }
+        eprintln!(
+            "multi-token graph decode OK: {} tokens, all replays match eager",
+            eager_seq.len()
+        );
+
+        // Speedup: 128 decode steps eager vs graph replay.
+        let (eager_us, graph_us) = model
+            .graph_decode_bench(128, 16, &[0, 1, 2, 3, 4, 5, 6, 7], 8)
+            .expect("graph decode bench should run");
+        eprintln!(
+            "graph decode speedup: eager {:.1} us/tok ({:.0} tok/s) -> graph {:.1} us/tok ({:.0} tok/s), {:.2}x",
+            eager_us,
+            1e6 / eager_us,
+            graph_us,
+            1e6 / graph_us,
+            eager_us / graph_us,
+        );
+
+        // End-to-end: the captured-graph generate must produce identical tokens to the
+        // eager paged generate, and should be faster on wall-clock.
+        let prompt: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let max_new = 64usize;
+        let t = std::time::Instant::now();
+        let eager_gen = model
+            .generate_greedy_tokens_paged(&prompt, max_new, None, 16)
+            .expect("eager paged generate should run");
+        let eager_gen_s = t.elapsed().as_secs_f64();
+        let t = std::time::Instant::now();
+        let graph_gen = model
+            .generate_greedy_tokens_paged_graph(&prompt, max_new, None, 16, &[])
+            .expect("graph paged generate should run");
+        let graph_gen_s = t.elapsed().as_secs_f64();
+        assert_eq!(
+            eager_gen, graph_gen,
+            "graph generate tokens diverged from eager generate"
+        );
+        eprintln!(
+            "end-to-end graph generate OK: {} tokens identical; eager {:.0} tok/s -> graph {:.0} tok/s ({:.2}x)",
+            eager_gen.len(),
+            eager_gen.len() as f64 / eager_gen_s,
+            graph_gen.len() as f64 / graph_gen_s,
+            eager_gen_s / graph_gen_s,
+        );
+    }
+
     // Real-model speedup measurement for prompt-lookup speculative decode. Opt-in:
     //   HI_CUDA_SPEC_BENCH_GGUF=/path/model.gguf cargo test --release -p hi-cuda \
     //     --features native-cuda native_cuda_speculative_ngram_bench -- --nocapture
@@ -11861,13 +11951,20 @@ mod tests {
 
         // Every emitted token is the model's greedy token, so speculative decode must
         // reproduce plain greedy exactly, regardless of what the n-gram proposer guesses.
-        for input in [vec![0u32], vec![1, 0, 1, 0, 1], vec![0, 1, 2, 0, 1, 2, 0, 1]] {
+        for input in [
+            vec![0u32],
+            vec![1, 0, 1, 0, 1],
+            vec![0, 1, 2, 0, 1, 2, 0, 1],
+        ] {
             let max = 12usize;
             let greedy = model.generate_greedy_tokens(&input, max, None).unwrap();
             let spec = model
                 .generate_greedy_speculative_ngram(&input, max, None, 2, 4)
                 .unwrap();
-            assert_eq!(spec.tokens, greedy, "speculative output diverged from greedy");
+            assert_eq!(
+                spec.tokens, greedy,
+                "speculative output diverged from greedy"
+            );
             // One forward pass yields at least one token, never more tokens than passes*(draft+1).
             assert!(spec.forward_passes >= 1);
             assert!(spec.forward_passes <= spec.tokens.len().max(1));
