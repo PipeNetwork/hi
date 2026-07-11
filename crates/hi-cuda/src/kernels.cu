@@ -218,11 +218,17 @@ __device__ float qwen_ssm_gate_value(
   return qkv[group * source_group_dim + 2 * state_size + value_group_dim + local];
 }
 
+// `ba_alpha`: when non-null, the beta/alpha projections are split (Qwen3.5):
+// `ba` holds beta[time_step_rank] and `ba_alpha` holds alpha[time_step_rank].
+// When null, `ba` is the fused per-group `[beta(repeat) | alpha(repeat)]`
+// layout (Qwen3-Next). `kv_group_round_robin`: value head `h` reads q/k group
+// `h % group_count` (Qwen3.5) instead of `h / repeat` (Qwen3-Next).
 __global__ void qwen_ssm_streaming_step_kernel(
     const float* qkv,
     const float* gate,
     const float* conv_weight,
     const float* ba,
+    const float* ba_alpha,
     const float* dt_bias,
     const float* a_log,
     const float* norm_weight,
@@ -239,6 +245,7 @@ __global__ void qwen_ssm_streaming_step_kernel(
     int group_count,
     int head_v_dim,
     int packed_qkvz,
+    int kv_group_round_robin,
     float eps) {
   if (blockIdx.x != 0 || threadIdx.x != 0) {
     return;
@@ -305,14 +312,23 @@ __global__ void qwen_ssm_streaming_step_kernel(
 
   float q_scale = rsqrtf(static_cast<float>(state_size));
   for (int head = 0; head < time_step_rank; ++head) {
-    int group = head / repeat;
-    int local_head = head % repeat;
+    int group = kv_group_round_robin ? (head % group_count) : (head / repeat);
     int q_start = group * state_size;
     int k_start = group * state_size;
     int v_start = head * head_v_dim;
-    int ba_group = group * group_ba_dim;
-    float beta = hi_sigmoidf(ba[ba_group + local_head]);
-    float alpha = ba[ba_group + repeat + local_head];
+    float beta_raw;
+    float alpha;
+    if (ba_alpha != nullptr) {
+      beta_raw = ba[head];
+      alpha = ba_alpha[head];
+    } else {
+      // Fused layout stays keyed by the block group irrespective of the q/k
+      // pairing above.
+      int ba_group = (head / repeat) * group_ba_dim;
+      beta_raw = ba[ba_group + head % repeat];
+      alpha = ba[ba_group + repeat + head % repeat];
+    }
+    float beta = hi_sigmoidf(beta_raw);
     float decay = expf(-expf(a_log[head]) * hi_softplusf(alpha + dt_bias[head]));
     int state_start = head * state_size * head_v_dim;
 
@@ -2128,12 +2144,13 @@ __global__ void rope_kernel(
     int seq_len,
     int heads,
     int head_dim,
+    int rot_dim,
     float base,
     float scale,
     int position_offset,
     int split_half) {
   int pair = blockIdx.x * blockDim.x + threadIdx.x;
-  int pairs_per_token = heads * (head_dim / 2);
+  int pairs_per_token = heads * (rot_dim / 2);
   int total_pairs = seq_len * pairs_per_token;
   if (pair >= total_pairs) {
     return;
@@ -2142,21 +2159,21 @@ __global__ void rope_kernel(
   int position = pair / pairs_per_token + position_offset;
   int row = pair / pairs_per_token;
   int within = pair % pairs_per_token;
-  int head = within / (head_dim / 2);
-  int pair_in_head = within % (head_dim / 2);
+  int head = within / (rot_dim / 2);
+  int pair_in_head = within % (rot_dim / 2);
   int base_idx = (row * heads + head) * head_dim;
   int left_idx;
   int right_idx;
   if (split_half) {
     left_idx = base_idx + pair_in_head;
-    right_idx = base_idx + pair_in_head + head_dim / 2;
+    right_idx = base_idx + pair_in_head + rot_dim / 2;
   } else {
     left_idx = base_idx + pair_in_head * 2;
     right_idx = left_idx + 1;
   }
 
   float freq = powf(base, -(static_cast<float>(pair_in_head) * 2.0f) /
-                              static_cast<float>(head_dim));
+                              static_cast<float>(rot_dim));
   float angle = static_cast<float>(position) * scale * freq;
   float s = sinf(angle);
   float c = cosf(angle);
@@ -2172,6 +2189,7 @@ __global__ void rope_batched_kernel(
     int seq_len,
     int heads,
     int head_dim,
+    int rot_dim,
     float base,
     float scale,
     int position_offset,
@@ -2185,7 +2203,7 @@ __global__ void rope_batched_kernel(
     position_offset = *d_position_offset;
   }
   int pair = blockIdx.x * blockDim.x + threadIdx.x;
-  int pairs_per_token = heads * (head_dim / 2);
+  int pairs_per_token = heads * (rot_dim / 2);
   int total_pairs = batch_count * seq_len * pairs_per_token;
   if (pair >= total_pairs) {
     return;
@@ -2194,21 +2212,21 @@ __global__ void rope_batched_kernel(
   int row = pair / pairs_per_token;
   int position = (row % seq_len) + position_offset;
   int within = pair % pairs_per_token;
-  int head = within / (head_dim / 2);
-  int pair_in_head = within % (head_dim / 2);
+  int head = within / (rot_dim / 2);
+  int pair_in_head = within % (rot_dim / 2);
   int base_idx = (row * heads + head) * head_dim;
   int left_idx;
   int right_idx;
   if (split_half) {
     left_idx = base_idx + pair_in_head;
-    right_idx = base_idx + pair_in_head + head_dim / 2;
+    right_idx = base_idx + pair_in_head + rot_dim / 2;
   } else {
     left_idx = base_idx + pair_in_head * 2;
     right_idx = left_idx + 1;
   }
 
   float freq = powf(base, -(static_cast<float>(pair_in_head) * 2.0f) /
-                              static_cast<float>(head_dim));
+                              static_cast<float>(rot_dim));
   float angle = static_cast<float>(position) * scale * freq;
   float s = sinf(angle);
   float c = cosf(angle);
@@ -2225,11 +2243,12 @@ __global__ void rope_batched_positions_kernel(
     int seq_len,
     int heads,
     int head_dim,
+    int rot_dim,
     float base,
     float scale,
     int split_half) {
   int pair = blockIdx.x * blockDim.x + threadIdx.x;
-  int pairs_per_token = heads * (head_dim / 2);
+  int pairs_per_token = heads * (rot_dim / 2);
   int total_pairs = batch_count * seq_len * pairs_per_token;
   if (pair >= total_pairs) {
     return;
@@ -2239,21 +2258,21 @@ __global__ void rope_batched_positions_kernel(
   int batch = row / seq_len;
   int position = static_cast<int>(positions[batch]) + (row % seq_len);
   int within = pair % pairs_per_token;
-  int head = within / (head_dim / 2);
-  int pair_in_head = within % (head_dim / 2);
+  int head = within / (rot_dim / 2);
+  int pair_in_head = within % (rot_dim / 2);
   int base_idx = (row * heads + head) * head_dim;
   int left_idx;
   int right_idx;
   if (split_half) {
     left_idx = base_idx + pair_in_head;
-    right_idx = base_idx + pair_in_head + head_dim / 2;
+    right_idx = base_idx + pair_in_head + rot_dim / 2;
   } else {
     left_idx = base_idx + pair_in_head * 2;
     right_idx = left_idx + 1;
   }
 
   float freq = powf(base, -(static_cast<float>(pair_in_head) * 2.0f) /
-                              static_cast<float>(head_dim));
+                              static_cast<float>(rot_dim));
   float angle = static_cast<float>(position) * scale * freq;
   float s = sinf(angle);
   float c = cosf(angle);
@@ -6272,6 +6291,7 @@ extern "C" int hi_cuda_launch_qwen_ssm_streaming_step(
     const void* gate,
     const void* conv_weight,
     const void* ba,
+    const void* ba_alpha,
     const void* dt_bias,
     const void* a_log,
     const void* norm_weight,
@@ -6288,6 +6308,7 @@ extern "C" int hi_cuda_launch_qwen_ssm_streaming_step(
     int group_count,
     int head_v_dim,
     int packed_qkvz,
+    int kv_group_round_robin,
     float eps,
     void* stream) {
   if (qkv == nullptr || conv_weight == nullptr || ba == nullptr ||
@@ -6315,6 +6336,7 @@ extern "C" int hi_cuda_launch_qwen_ssm_streaming_step(
       static_cast<const float*>(gate),
       static_cast<const float*>(conv_weight),
       static_cast<const float*>(ba),
+      static_cast<const float*>(ba_alpha),
       static_cast<const float*>(dt_bias),
       static_cast<const float*>(a_log),
       static_cast<const float*>(norm_weight),
@@ -6331,6 +6353,7 @@ extern "C" int hi_cuda_launch_qwen_ssm_streaming_step(
       group_count,
       head_v_dim,
       packed_qkvz,
+      kv_group_round_robin,
       eps);
   return 0;
 }
@@ -10824,15 +10847,17 @@ extern "C" int hi_cuda_launch_rope(
     int seq_len,
     int heads,
     int head_dim,
+    int rot_dim,
     float base,
     float scale,
     int split_half,
     void* stream) {
   if (values == nullptr || seq_len < 0 || heads <= 0 || head_dim <= 0 ||
-      head_dim % 2 != 0 || base <= 0.0f || stream == nullptr) {
+      rot_dim <= 0 || rot_dim > head_dim || rot_dim % 2 != 0 ||
+      base <= 0.0f || stream == nullptr) {
     return 1;
   }
-  int total_pairs = seq_len * heads * (head_dim / 2);
+  int total_pairs = seq_len * heads * (rot_dim / 2);
   if (total_pairs == 0) {
     return 0;
   }
@@ -10843,6 +10868,7 @@ extern "C" int hi_cuda_launch_rope(
       seq_len,
       heads,
       head_dim,
+      rot_dim,
       base,
       scale,
       0,
@@ -10855,17 +10881,19 @@ extern "C" int hi_cuda_launch_rope_with_offset(
     int seq_len,
     int heads,
     int head_dim,
+    int rot_dim,
     float base,
     float scale,
     int position_offset,
     int split_half,
     void* stream) {
   if (values == nullptr || seq_len < 0 || heads <= 0 || head_dim <= 0 ||
-      head_dim % 2 != 0 || base <= 0.0f || position_offset < 0 ||
+      rot_dim <= 0 || rot_dim > head_dim || rot_dim % 2 != 0 ||
+      base <= 0.0f || position_offset < 0 ||
       stream == nullptr) {
     return 1;
   }
-  int total_pairs = seq_len * heads * (head_dim / 2);
+  int total_pairs = seq_len * heads * (rot_dim / 2);
   if (total_pairs == 0) {
     return 0;
   }
@@ -10876,6 +10904,7 @@ extern "C" int hi_cuda_launch_rope_with_offset(
       seq_len,
       heads,
       head_dim,
+      rot_dim,
       base,
       scale,
       position_offset,
@@ -10889,17 +10918,19 @@ extern "C" int hi_cuda_launch_rope_batched_with_offset(
     int seq_len,
     int heads,
     int head_dim,
+    int rot_dim,
     float base,
     float scale,
     int position_offset,
     int split_half,
     void* stream) {
   if (values == nullptr || batch_count <= 0 || seq_len <= 0 || heads <= 0 ||
-      head_dim <= 0 || head_dim % 2 != 0 || base <= 0.0f ||
+      head_dim <= 0 || rot_dim <= 0 || rot_dim > head_dim ||
+      rot_dim % 2 != 0 || base <= 0.0f ||
       position_offset < 0 || stream == nullptr) {
     return 1;
   }
-  int total_pairs = batch_count * seq_len * heads * (head_dim / 2);
+  int total_pairs = batch_count * seq_len * heads * (rot_dim / 2);
   dim3 block(256);
   dim3 grid((total_pairs + block.x - 1) / block.x);
   rope_batched_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
@@ -10908,6 +10939,7 @@ extern "C" int hi_cuda_launch_rope_batched_with_offset(
       seq_len,
       heads,
       head_dim,
+      rot_dim,
       base,
       scale,
       position_offset,
@@ -10924,17 +10956,19 @@ extern "C" int hi_cuda_launch_rope_batched_with_offset_devpos(
     int seq_len,
     int heads,
     int head_dim,
+    int rot_dim,
     float base,
     float scale,
     const void* d_position_offset,
     int split_half,
     void* stream) {
   if (values == nullptr || batch_count <= 0 || seq_len <= 0 || heads <= 0 ||
-      head_dim <= 0 || head_dim % 2 != 0 || base <= 0.0f ||
+      head_dim <= 0 || rot_dim <= 0 || rot_dim > head_dim ||
+      rot_dim % 2 != 0 || base <= 0.0f ||
       d_position_offset == nullptr || stream == nullptr) {
     return 1;
   }
-  int total_pairs = batch_count * seq_len * heads * (head_dim / 2);
+  int total_pairs = batch_count * seq_len * heads * (rot_dim / 2);
   dim3 block(256);
   dim3 grid((total_pairs + block.x - 1) / block.x);
   rope_batched_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
@@ -10943,6 +10977,7 @@ extern "C" int hi_cuda_launch_rope_batched_with_offset_devpos(
       seq_len,
       heads,
       head_dim,
+      rot_dim,
       base,
       scale,
       0,
@@ -10958,16 +10993,18 @@ extern "C" int hi_cuda_launch_rope_batched_positions(
     int seq_len,
     int heads,
     int head_dim,
+    int rot_dim,
     float base,
     float scale,
     int split_half,
     void* stream) {
   if (values == nullptr || positions == nullptr || batch_count <= 0 ||
-      seq_len <= 0 || heads <= 0 || head_dim <= 0 || head_dim % 2 != 0 ||
+      seq_len <= 0 || heads <= 0 || head_dim <= 0 || rot_dim <= 0 ||
+      rot_dim > head_dim || rot_dim % 2 != 0 ||
       base <= 0.0f || stream == nullptr) {
     return 1;
   }
-  int pairs = batch_count * seq_len * heads * (head_dim / 2);
+  int pairs = batch_count * seq_len * heads * (rot_dim / 2);
   dim3 block(256);
   dim3 grid((pairs + block.x - 1) / block.x);
   rope_batched_positions_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
@@ -10977,6 +11014,7 @@ extern "C" int hi_cuda_launch_rope_batched_positions(
       seq_len,
       heads,
       head_dim,
+      rot_dim,
       base,
       scale,
       split_half);

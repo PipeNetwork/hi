@@ -99,6 +99,7 @@ mod native {
             gate: *const c_void,
             conv_weight: *const c_void,
             ba: *const c_void,
+            ba_alpha: *const c_void,
             dt_bias: *const c_void,
             a_log: *const c_void,
             norm_weight: *const c_void,
@@ -115,6 +116,7 @@ mod native {
             group_count: c_int,
             head_v_dim: c_int,
             packed_qkvz: c_int,
+            kv_group_round_robin: c_int,
             eps: c_float,
             stream: *mut c_void,
         ) -> c_int;
@@ -539,6 +541,7 @@ mod native {
             seq_len: c_int,
             heads: c_int,
             head_dim: c_int,
+            rot_dim: c_int,
             base: c_float,
             scale: c_float,
             split_half: c_int,
@@ -549,6 +552,7 @@ mod native {
             seq_len: c_int,
             heads: c_int,
             head_dim: c_int,
+            rot_dim: c_int,
             base: c_float,
             scale: c_float,
             position_offset: c_int,
@@ -561,6 +565,7 @@ mod native {
             seq_len: c_int,
             heads: c_int,
             head_dim: c_int,
+            rot_dim: c_int,
             base: c_float,
             scale: c_float,
             position_offset: c_int,
@@ -573,6 +578,7 @@ mod native {
             seq_len: c_int,
             heads: c_int,
             head_dim: c_int,
+            rot_dim: c_int,
             base: c_float,
             scale: c_float,
             d_position_offset: *const c_void,
@@ -586,6 +592,7 @@ mod native {
             seq_len: c_int,
             heads: c_int,
             head_dim: c_int,
+            rot_dim: c_int,
             base: c_float,
             scale: c_float,
             split_half: c_int,
@@ -1511,6 +1518,7 @@ mod native {
         gate: Option<&DeviceBuffer>,
         conv_weight: &DeviceBuffer,
         ba: &DeviceBuffer,
+        ba_alpha: Option<&DeviceBuffer>,
         dt_bias: &DeviceBuffer,
         a_log: &DeviceBuffer,
         norm_weight: &DeviceBuffer,
@@ -1527,6 +1535,7 @@ mod native {
         group_count: usize,
         head_v_dim: usize,
         packed_qkvz: bool,
+        kv_group_round_robin: bool,
         eps: f32,
         stream: &Stream,
     ) -> Result<()> {
@@ -1544,6 +1553,7 @@ mod native {
                 gate.map_or(std::ptr::null(), DeviceBuffer::as_ptr),
                 conv_weight.as_ptr(),
                 ba.as_ptr(),
+                ba_alpha.map_or(std::ptr::null(), DeviceBuffer::as_ptr),
                 dt_bias.as_ptr(),
                 a_log.as_ptr(),
                 norm_weight.as_ptr(),
@@ -1560,6 +1570,7 @@ mod native {
                 group_count as c_int,
                 head_v_dim as c_int,
                 if packed_qkvz { 1 } else { 0 },
+                if kv_group_round_robin { 1 } else { 0 },
                 eps,
                 stream.as_raw(),
             )
@@ -2856,6 +2867,7 @@ mod native {
         seq_len: usize,
         heads: usize,
         head_dim: usize,
+        rot_dim: usize,
         base: f32,
         scale: f32,
         split_half: bool,
@@ -2864,12 +2876,14 @@ mod native {
         ensure_len(seq_len, "rope seq_len")?;
         ensure_len(heads, "rope heads")?;
         ensure_len(head_dim, "rope head_dim")?;
+        ensure_len(rot_dim, "rope rot_dim")?;
         launch_status(unsafe {
             hi_cuda_launch_rope(
                 values.as_mut_ptr(),
                 seq_len as c_int,
                 heads as c_int,
                 head_dim as c_int,
+                rot_dim as c_int,
                 base,
                 scale,
                 if split_half { 1 } else { 0 },
@@ -2879,11 +2893,13 @@ mod native {
         check_last_error("hi_cuda_launch_rope")
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn launch_rope_with_offset(
         values: &DeviceBuffer,
         seq_len: usize,
         heads: usize,
         head_dim: usize,
+        rot_dim: usize,
         base: f32,
         scale: f32,
         position_offset: usize,
@@ -2893,6 +2909,7 @@ mod native {
         ensure_len(seq_len, "rope seq_len")?;
         ensure_len(heads, "rope heads")?;
         ensure_len(head_dim, "rope head_dim")?;
+        ensure_len(rot_dim, "rope rot_dim")?;
         ensure_len(position_offset, "rope position_offset")?;
         launch_status(unsafe {
             hi_cuda_launch_rope_with_offset(
@@ -2900,6 +2917,7 @@ mod native {
                 seq_len as c_int,
                 heads as c_int,
                 head_dim as c_int,
+                rot_dim as c_int,
                 base,
                 scale,
                 position_offset as c_int,
@@ -2910,12 +2928,14 @@ mod native {
         check_last_error("hi_cuda_launch_rope_with_offset")
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn launch_rope_batched_with_offset(
         values: &DeviceBuffer,
         batch_count: usize,
         seq_len: usize,
         heads: usize,
         head_dim: usize,
+        rot_dim: usize,
         base: f32,
         scale: f32,
         position_offset: usize,
@@ -2926,6 +2946,7 @@ mod native {
         ensure_len(seq_len, "rope seq_len")?;
         ensure_len(heads, "rope heads")?;
         ensure_len(head_dim, "rope head_dim")?;
+        ensure_len(rot_dim, "rope rot_dim")?;
         ensure_len(position_offset, "rope position_offset")?;
         launch_status(unsafe {
             hi_cuda_launch_rope_batched_with_offset(
@@ -2934,6 +2955,7 @@ mod native {
                 seq_len as c_int,
                 heads as c_int,
                 head_dim as c_int,
+                rot_dim as c_int,
                 base,
                 scale,
                 position_offset as c_int,
@@ -2953,6 +2975,7 @@ mod native {
         seq_len: usize,
         heads: usize,
         head_dim: usize,
+        rot_dim: usize,
         base: f32,
         scale: f32,
         d_position_offset: &DeviceBuffer,
@@ -2963,6 +2986,7 @@ mod native {
         ensure_len(seq_len, "rope seq_len")?;
         ensure_len(heads, "rope heads")?;
         ensure_len(head_dim, "rope head_dim")?;
+        ensure_len(rot_dim, "rope rot_dim")?;
         launch_status(unsafe {
             hi_cuda_launch_rope_batched_with_offset_devpos(
                 values.as_mut_ptr(),
@@ -2970,6 +2994,7 @@ mod native {
                 seq_len as c_int,
                 heads as c_int,
                 head_dim as c_int,
+                rot_dim as c_int,
                 base,
                 scale,
                 d_position_offset.as_ptr(),
@@ -2988,6 +3013,7 @@ mod native {
         seq_len: usize,
         heads: usize,
         head_dim: usize,
+        rot_dim: usize,
         base: f32,
         scale: f32,
         split_half: bool,
@@ -2997,6 +3023,7 @@ mod native {
         ensure_len(seq_len, "rope positions seq_len")?;
         ensure_len(heads, "rope positions heads")?;
         ensure_len(head_dim, "rope positions head_dim")?;
+        ensure_len(rot_dim, "rope positions rot_dim")?;
         launch_status(unsafe {
             hi_cuda_launch_rope_batched_positions(
                 values.as_mut_ptr(),
@@ -3005,6 +3032,7 @@ mod native {
                 seq_len as c_int,
                 heads as c_int,
                 head_dim as c_int,
+                rot_dim as c_int,
                 base,
                 scale,
                 if split_half { 1 } else { 0 },

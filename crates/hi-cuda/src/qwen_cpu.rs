@@ -25,10 +25,10 @@ use hi_gguf::{
     qwen_moe_shared_expert_gate_up_bias_names, qwen_moe_shared_expert_gate_up_weight_names,
     qwen_moe_shared_expert_gate_weight_names, qwen_moe_shared_expert_up_gate_bias_names,
     qwen_moe_shared_expert_up_gate_weight_names, qwen_moe_shared_expert_weight_names,
-    qwen_ssm_a_names, qwen_ssm_ba_weight_names, qwen_ssm_conv1d_weight_names,
-    qwen_ssm_dt_bias_names, qwen_ssm_gate_weight_names, qwen_ssm_in_weight_names,
-    qwen_ssm_layer_tensors_present, qwen_ssm_norm_weight_names, qwen_ssm_out_weight_names,
-    qwen_ssm_qkv_weight_names,
+    qwen_ssm_a_names, qwen_ssm_alpha_weight_names, qwen_ssm_ba_weight_names,
+    qwen_ssm_beta_weight_names, qwen_ssm_conv1d_weight_names, qwen_ssm_dt_bias_names,
+    qwen_ssm_gate_weight_names, qwen_ssm_in_weight_names, qwen_ssm_layer_tensors_present,
+    qwen_ssm_norm_weight_names, qwen_ssm_out_weight_names, qwen_ssm_qkv_weight_names,
 };
 use rand::distributions::{Distribution, WeightedIndex};
 use rand::rngs::StdRng;
@@ -452,7 +452,7 @@ struct QwenRecurrentSsm {
     conv1d: Matrix,
     dt_bias: Vec<f32>,
     a: Vec<f32>,
-    ba: Matrix,
+    beta_alpha: QwenSsmBetaAlphaProjection,
     norm: Vec<f32>,
     out: Matrix,
     state_size: usize,
@@ -465,12 +465,26 @@ struct QwenRecurrentSsm {
     conv_dim: usize,
     qkvz_dim: usize,
     ba_dim: usize,
+    /// Qwen3.5 pairs value head `h` with q/k group `h % group_count`
+    /// (round-robin); Qwen3-Next uses block repeat `h / repeat`.
+    kv_group_round_robin: bool,
 }
 
 #[derive(Debug)]
 enum QwenSsmInputProjection {
     Legacy { qkvz: Matrix },
     Optimized { qkv: Matrix, gate: Matrix },
+}
+
+/// Beta/alpha (delta-rule strength / decay) projection. Qwen3-Next fuses both
+/// into one `ssm_ba` matrix laid out `[beta(repeat) | alpha(repeat)]` per q/k
+/// group; Qwen3.5 ships separate `ssm_beta` / `ssm_alpha` matrices with one
+/// column per value head. Projected rows are `[beta(rank) | alpha(rank)]` for
+/// the split form.
+#[derive(Debug)]
+enum QwenSsmBetaAlphaProjection {
+    Fused { ba: Matrix },
+    Split { beta: Matrix, alpha: Matrix },
 }
 
 impl QwenRecurrentSsm {
@@ -568,6 +582,29 @@ impl QwenRecurrentSsm {
             }
         };
 
+        let beta_alpha = if qwen_ssm_ba_weight_names(prefix)
+            .iter()
+            .any(|name| gguf.tensor(name).is_some())
+        {
+            QwenSsmBetaAlphaProjection::Fused {
+                ba: load_matrix_aliases(gguf, &qwen_ssm_ba_weight_names(prefix), ba_dim, embed)?,
+            }
+        } else {
+            QwenSsmBetaAlphaProjection::Split {
+                beta: load_matrix_aliases(
+                    gguf,
+                    &qwen_ssm_beta_weight_names(prefix),
+                    time_step_rank,
+                    embed,
+                )?,
+                alpha: load_matrix_aliases(
+                    gguf,
+                    &qwen_ssm_alpha_weight_names(prefix),
+                    time_step_rank,
+                    embed,
+                )?,
+            }
+        };
         Ok(Self {
             input,
             conv1d: load_matrix_aliases(
@@ -578,7 +615,7 @@ impl QwenRecurrentSsm {
             )?,
             dt_bias: load_vector_aliases(gguf, &qwen_ssm_dt_bias_names(prefix), time_step_rank)?,
             a: load_vector_aliases(gguf, &qwen_ssm_a_names(prefix), time_step_rank)?,
-            ba: load_matrix_aliases(gguf, &qwen_ssm_ba_weight_names(prefix), ba_dim, embed)?,
+            beta_alpha,
             norm: load_vector_aliases(gguf, &qwen_ssm_norm_weight_names(prefix), head_v_dim)?,
             out: load_matrix_aliases(gguf, &qwen_ssm_out_weight_names(prefix), embed, value_dim)?,
             state_size,
@@ -591,6 +628,7 @@ impl QwenRecurrentSsm {
             conv_dim,
             qkvz_dim,
             ba_dim,
+            kv_group_round_robin: config.ssm_kv_group_round_robin(),
         })
     }
 
@@ -629,7 +667,14 @@ impl QwenRecurrentSsm {
             };
             mixed_qkv.extend(qkv_token);
             z.extend(z_token);
-            let ba_token = self.ba.mul_vec(token)?;
+            let ba_token = match &self.beta_alpha {
+                QwenSsmBetaAlphaProjection::Fused { ba } => ba.mul_vec(token)?,
+                QwenSsmBetaAlphaProjection::Split { beta, alpha } => {
+                    let mut projected = beta.mul_vec(token)?;
+                    projected.extend(alpha.mul_vec(token)?);
+                    projected
+                }
+            };
             if ba_token.len() != self.ba_dim {
                 bail!(
                     "Qwen recurrent SSM ba projection length {} does not match ba_dim {}",
@@ -769,14 +814,31 @@ impl QwenRecurrentSsm {
         let mut delta = vec![0.0; self.head_v_dim];
         for row in 0..rows {
             for head in 0..self.time_step_rank {
-                let group = head / repeat;
-                let local_head = head % repeat;
+                let group = if self.kv_group_round_robin {
+                    head % self.group_count
+                } else {
+                    head / repeat
+                };
                 let q_start = row * self.key_dim + group * self.state_size;
                 let k_start = row * self.key_dim + group * self.state_size;
                 let v_start = row * self.value_dim + head * self.head_v_dim;
-                let ba_group = row * self.ba_dim + group * group_ba_dim;
-                let beta = sigmoid(ba[ba_group + local_head]);
-                let alpha = ba[ba_group + repeat + local_head];
+                let (beta_raw, alpha_raw) = match &self.beta_alpha {
+                    QwenSsmBetaAlphaProjection::Fused { .. } => {
+                        // Fused rows are `[beta(repeat) | alpha(repeat)]` per
+                        // block group regardless of the q/k pairing above.
+                        let ba_group = row * self.ba_dim + (head / repeat) * group_ba_dim;
+                        (
+                            ba[ba_group + head % repeat],
+                            ba[ba_group + repeat + head % repeat],
+                        )
+                    }
+                    QwenSsmBetaAlphaProjection::Split { .. } => {
+                        let base = row * self.ba_dim;
+                        (ba[base + head], ba[base + self.time_step_rank + head])
+                    }
+                };
+                let beta = sigmoid(beta_raw);
+                let alpha = alpha_raw;
                 let decay = (-self.a[head].exp() * softplus(alpha + self.dt_bias[head])).exp();
                 let state_start = head * self.state_size * self.head_v_dim;
 
@@ -869,6 +931,9 @@ struct QwenAttention {
     rope_base: f32,
     rope_scale: f32,
     split_half_rope: bool,
+    /// Rotary dims per head; less than `qk_head_dim` for partial rope
+    /// (`rope.dimension_count`, e.g. Qwen3.5 rotates 64 of 256 dims).
+    rope_rot_dim: usize,
 }
 
 #[derive(Debug)]
@@ -1088,6 +1153,7 @@ impl QwenAttention {
                 .unwrap_or_else(|| config.default_rope_freq_base()),
             rope_scale: config.rope_freq_scale.unwrap_or(1.0),
             split_half_rope: true,
+            rope_rot_dim: config.rope_rot_dim(qk_head_dim),
         })
     }
 
@@ -1136,8 +1202,9 @@ impl QwenAttention {
                         if let Some(weight) = q_norm {
                             rms_norm_in_place(&mut q_token[range.clone()], weight, rms_eps)?;
                         }
+                        let rot = range.start..range.start + self.rope_rot_dim;
                         apply_rope(
-                            &mut q_token[range],
+                            &mut q_token[rot],
                             position,
                             self.rope_base,
                             self.rope_scale,
@@ -1149,8 +1216,9 @@ impl QwenAttention {
                         if let Some(weight) = k_norm {
                             rms_norm_in_place(&mut k_token[range.clone()], weight, rms_eps)?;
                         }
+                        let rot = range.start..range.start + self.rope_rot_dim;
                         apply_rope(
-                            &mut k_token[range],
+                            &mut k_token[rot],
                             position,
                             self.rope_base,
                             self.rope_scale,
@@ -3740,6 +3808,7 @@ mod tests {
             rope_base: 1_000_000.0,
             rope_scale: 1.0,
             split_half_rope: true,
+            rope_rot_dim: 2,
         };
 
         let output = attention

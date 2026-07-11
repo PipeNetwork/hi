@@ -97,10 +97,10 @@ mod native {
         qwen_moe_shared_expert_gate_up_bias_names, qwen_moe_shared_expert_gate_up_weight_names,
         qwen_moe_shared_expert_gate_weight_names, qwen_moe_shared_expert_up_gate_bias_names,
         qwen_moe_shared_expert_up_gate_weight_names, qwen_moe_shared_expert_weight_names,
-        qwen_ssm_a_names, qwen_ssm_ba_weight_names, qwen_ssm_conv1d_weight_names,
-        qwen_ssm_dt_bias_names, qwen_ssm_gate_weight_names, qwen_ssm_in_weight_names,
-        qwen_ssm_layer_tensors_present, qwen_ssm_norm_weight_names, qwen_ssm_out_weight_names,
-        qwen_ssm_qkv_weight_names,
+        qwen_ssm_a_names, qwen_ssm_alpha_weight_names, qwen_ssm_ba_weight_names,
+        qwen_ssm_beta_weight_names, qwen_ssm_conv1d_weight_names, qwen_ssm_dt_bias_names,
+        qwen_ssm_gate_weight_names, qwen_ssm_in_weight_names, qwen_ssm_layer_tensors_present,
+        qwen_ssm_norm_weight_names, qwen_ssm_out_weight_names, qwen_ssm_qkv_weight_names,
     };
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
@@ -17672,14 +17672,32 @@ mod native {
                 .as_ref()
                 .unwrap_or(&conv_weight_matrix.buffer);
 
-            let ba = self.project_f32_device(&format!("{prefix}.ssm_ba.weight"), attn_input)?;
-            if ba.cols != ssm.ba_dim {
-                bail!(
-                    "CUDA recurrent SSM projection {prefix}.ssm_ba.weight produced {} columns; expected {}",
-                    ba.cols,
-                    ssm.ba_dim
-                );
-            }
+            let ba_split = !self.has_matrix(&format!("{prefix}.ssm_ba.weight"));
+            let (ba, ba_alpha) = if ba_split {
+                let beta =
+                    self.project_f32_device(&format!("{prefix}.ssm_beta.weight"), attn_input)?;
+                let alpha =
+                    self.project_f32_device(&format!("{prefix}.ssm_alpha.weight"), attn_input)?;
+                if beta.cols != ssm.time_step_rank || alpha.cols != ssm.time_step_rank {
+                    bail!(
+                        "CUDA recurrent SSM projections {prefix}.ssm_beta/ssm_alpha produced {}/{} columns; expected {}",
+                        beta.cols,
+                        alpha.cols,
+                        ssm.time_step_rank
+                    );
+                }
+                (beta, Some(alpha))
+            } else {
+                let ba = self.project_f32_device(&format!("{prefix}.ssm_ba.weight"), attn_input)?;
+                if ba.cols != ssm.ba_dim {
+                    bail!(
+                        "CUDA recurrent SSM projection {prefix}.ssm_ba.weight produced {} columns; expected {}",
+                        ba.cols,
+                        ssm.ba_dim
+                    );
+                }
+                (ba, None)
+            };
             let dt_bias = self
                 .vector(&format!("{prefix}.ssm_dt.bias"))
                 .ok_or_else(|| anyhow!("CUDA vector {prefix}.ssm_dt.bias is missing"))?;
@@ -17763,6 +17781,7 @@ mod native {
                 gate.as_ref().map(|tensor| &tensor.buffer),
                 conv_weight,
                 &ba.buffer,
+                ba_alpha.as_ref().map(|tensor| &tensor.buffer),
                 &dt_bias.buffer,
                 &a_log.buffer,
                 &norm_weight.buffer,
@@ -17779,6 +17798,7 @@ mod native {
                 ssm.group_count,
                 ssm.head_v_dim,
                 packed_qkvz,
+                self.config.ssm_kv_group_round_robin(),
                 eps,
                 &self.stream,
             )?;
@@ -17857,15 +17877,40 @@ mod native {
                 &conv_weight_name,
             )?;
 
-            let ba = self.project_f32_device(&format!("{prefix}.ssm_ba.weight"), attn_input)?;
-            if ba.cols != ssm.ba_dim {
-                bail!(
-                    "CUDA recurrent SSM projection {prefix}.ssm_ba.weight produced {} columns; expected {}",
-                    ba.cols,
-                    ssm.ba_dim
-                );
-            }
-            let ba_host = ba.copy_to_host()?;
+            let ba_split = !self.has_matrix(&format!("{prefix}.ssm_ba.weight"));
+            let ba_host = if ba_split {
+                let beta =
+                    self.project_f32_device(&format!("{prefix}.ssm_beta.weight"), attn_input)?;
+                let alpha =
+                    self.project_f32_device(&format!("{prefix}.ssm_alpha.weight"), attn_input)?;
+                if beta.cols != ssm.time_step_rank || alpha.cols != ssm.time_step_rank {
+                    bail!(
+                        "CUDA recurrent SSM projections {prefix}.ssm_beta/ssm_alpha produced {}/{} columns; expected {}",
+                        beta.cols,
+                        alpha.cols,
+                        ssm.time_step_rank
+                    );
+                }
+                let beta_host = beta.copy_to_host()?;
+                let alpha_host = alpha.copy_to_host()?;
+                let mut combined = Vec::with_capacity(attn_input.rows * ssm.ba_dim);
+                for row in 0..attn_input.rows {
+                    let start = row * ssm.time_step_rank;
+                    combined.extend_from_slice(&beta_host[start..start + ssm.time_step_rank]);
+                    combined.extend_from_slice(&alpha_host[start..start + ssm.time_step_rank]);
+                }
+                combined
+            } else {
+                let ba = self.project_f32_device(&format!("{prefix}.ssm_ba.weight"), attn_input)?;
+                if ba.cols != ssm.ba_dim {
+                    bail!(
+                        "CUDA recurrent SSM projection {prefix}.ssm_ba.weight produced {} columns; expected {}",
+                        ba.cols,
+                        ssm.ba_dim
+                    );
+                }
+                ba.copy_to_host()?
+            };
             let dt_bias = self
                 .vector(&format!("{prefix}.ssm_dt.bias"))
                 .ok_or_else(|| anyhow!("CUDA vector {prefix}.ssm_dt.bias is missing"))?
@@ -17886,6 +17931,8 @@ mod native {
                 &a_log,
                 attn_input.rows,
                 &ssm,
+                ba_split,
+                self.config.ssm_kv_group_round_robin(),
                 prefix,
             )?;
             let normed = qwen_ssm_gated_rms_norm_host(
@@ -18825,11 +18872,13 @@ mod native {
                     heads * head_dim
                 );
             }
+            let rot_dim = self.config.rope_rot_dim(head_dim);
             crate::kernels::launch_rope_with_offset(
                 &input.buffer,
                 seq_len,
                 heads,
                 head_dim,
+                rot_dim,
                 base,
                 scale,
                 position_offset,
@@ -18897,6 +18946,7 @@ mod native {
                     heads * head_dim
                 );
             }
+            let rot_dim = self.config.rope_rot_dim(head_dim);
             if let Some(d_pos) = self.active_graph_position() {
                 crate::kernels::launch_rope_batched_with_offset_devpos(
                     &input.buffer,
@@ -18904,6 +18954,7 @@ mod native {
                     seq_len,
                     heads,
                     head_dim,
+                    rot_dim,
                     base,
                     scale,
                     d_pos,
@@ -18917,6 +18968,7 @@ mod native {
                     seq_len,
                     heads,
                     head_dim,
+                    rot_dim,
                     base,
                     scale,
                     position_offset,
@@ -18949,6 +19001,7 @@ mod native {
                     heads * head_dim
                 );
             }
+            let rot_dim = self.config.rope_rot_dim(head_dim);
             crate::kernels::launch_rope_batched_positions(
                 &input.buffer,
                 positions,
@@ -18956,6 +19009,7 @@ mod native {
                 seq_len,
                 heads,
                 head_dim,
+                rot_dim,
                 base,
                 scale,
                 split_half,
@@ -22475,6 +22529,10 @@ mod native {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// `ba_split`: `mixed_ba` rows are `[beta(rank) | alpha(rank)]` (Qwen3.5
+    /// separate projections) instead of the fused per-group
+    /// `[beta(repeat) | alpha(repeat)]` blocks. `kv_group_round_robin`: value
+    /// head `h` pairs with q/k group `h % group_count` instead of `h / repeat`.
     fn qwen_ssm_gated_delta_host(
         conv: &[f32],
         mixed_ba: &[f32],
@@ -22482,6 +22540,8 @@ mod native {
         a_log: &[f32],
         rows: usize,
         ssm: &QwenSsmDims,
+        ba_split: bool,
+        kv_group_round_robin: bool,
         prefix: &str,
     ) -> Result<Vec<f32>> {
         let expected_conv = rows
@@ -22550,14 +22610,31 @@ mod native {
         let mut delta = vec![0.0; ssm.head_v_dim];
         for row in 0..rows {
             for head in 0..ssm.time_step_rank {
-                let group = head / repeat;
-                let local_head = head % repeat;
+                let group = if kv_group_round_robin {
+                    head % ssm.group_count
+                } else {
+                    head / repeat
+                };
                 let q_start = row * ssm.key_dim + group * ssm.state_size;
                 let k_start = row * ssm.key_dim + group * ssm.state_size;
                 let v_start = row * ssm.value_dim + head * ssm.head_v_dim;
-                let ba_group = row * ssm.ba_dim + group * group_ba_dim;
-                let beta = sigmoid(mixed_ba[ba_group + local_head]);
-                let alpha = mixed_ba[ba_group + repeat + local_head];
+                let (beta_raw, alpha_raw) = if ba_split {
+                    let base = row * ssm.ba_dim;
+                    (
+                        mixed_ba[base + head],
+                        mixed_ba[base + ssm.time_step_rank + head],
+                    )
+                } else {
+                    // Fused rows stay `[beta(repeat) | alpha(repeat)]` per
+                    // block group regardless of the q/k pairing above.
+                    let ba_group = row * ssm.ba_dim + (head / repeat) * group_ba_dim;
+                    (
+                        mixed_ba[ba_group + head % repeat],
+                        mixed_ba[ba_group + repeat + head % repeat],
+                    )
+                };
+                let beta = sigmoid(beta_raw);
+                let alpha = alpha_raw;
                 let decay = (-a_log[head].exp() * softplus(alpha + dt_bias[head])).exp();
                 let state_start = head * ssm.state_size * ssm.head_v_dim;
 
@@ -23091,29 +23168,47 @@ mod native {
                         embed,
                     ));
                 }
-                specs.extend([
-                    dense_matrix_spec_with_aliases(
-                        gguf,
-                        format!("{prefix}.ssm_conv1d.weight"),
-                        qwen_ssm_conv1d_weight_names(&prefix),
-                        ssm.conv_dim,
-                        ssm.conv_kernel,
-                    ),
-                    dense_matrix_spec_with_aliases(
+                specs.push(dense_matrix_spec_with_aliases(
+                    gguf,
+                    format!("{prefix}.ssm_conv1d.weight"),
+                    qwen_ssm_conv1d_weight_names(&prefix),
+                    ssm.conv_dim,
+                    ssm.conv_kernel,
+                ));
+                if qwen_ssm_ba_weight_names(&prefix)
+                    .iter()
+                    .any(|name| gguf.tensor(name).is_some())
+                {
+                    specs.push(dense_matrix_spec_with_aliases(
                         gguf,
                         format!("{prefix}.ssm_ba.weight"),
                         qwen_ssm_ba_weight_names(&prefix),
                         ssm.ba_dim,
                         embed,
-                    ),
-                    dense_matrix_spec_with_aliases(
+                    ));
+                } else {
+                    specs.push(dense_matrix_spec_with_aliases(
                         gguf,
-                        format!("{prefix}.ssm_out.weight"),
-                        qwen_ssm_out_weight_names(&prefix),
+                        format!("{prefix}.ssm_beta.weight"),
+                        qwen_ssm_beta_weight_names(&prefix),
+                        ssm.time_step_rank,
                         embed,
-                        ssm.value_dim,
-                    ),
-                ]);
+                    ));
+                    specs.push(dense_matrix_spec_with_aliases(
+                        gguf,
+                        format!("{prefix}.ssm_alpha.weight"),
+                        qwen_ssm_alpha_weight_names(&prefix),
+                        ssm.time_step_rank,
+                        embed,
+                    ));
+                }
+                specs.push(dense_matrix_spec_with_aliases(
+                    gguf,
+                    format!("{prefix}.ssm_out.weight"),
+                    qwen_ssm_out_weight_names(&prefix),
+                    embed,
+                    ssm.value_dim,
+                ));
             } else if qwen_mla_attention_tensors_present(gguf, &prefix) {
                 let mla = qwen_mla_dims(config)?
                     .ok_or_else(|| anyhow!("complete MLA tensor layout missing MLA metadata"))?;

@@ -1353,6 +1353,10 @@ pub struct QwenGgufConfig {
     pub rope_freq_base: Option<f32>,
     pub rope_freq_scale: Option<f32>,
     pub rope_dimension_sections: Option<[u32; 4]>,
+    /// Rotary dimension count (`{arch}.rope.dimension_count`). When smaller
+    /// than the attention head dim (e.g. Qwen3.5 rotates 64 of 256 dims), only
+    /// the leading `rope_dimension_count` dims of each head are rotated.
+    pub rope_dimension_count: Option<u32>,
     pub rms_norm_eps: Option<f32>,
     /// Gemma-2 attention logit soft-cap (`cap * tanh(score/cap)` on the QK^T
     /// scores). In practice the scaled scores sit far inside the cap, so this is
@@ -1511,6 +1515,7 @@ impl QwenGgufConfig {
             rope_freq_base: gguf.metadata_f32(&format!("{prefix}.rope.freq_base")),
             rope_freq_scale: gguf.metadata_f32(&format!("{prefix}.rope.freq_scale")),
             rope_dimension_sections,
+            rope_dimension_count: gguf.metadata_u32(&format!("{prefix}.rope.dimension_count")),
             rms_norm_eps: gguf.metadata_f32(&format!("{prefix}.attention.layer_norm_rms_epsilon")),
             attn_logit_softcapping: gguf.metadata_f32(&format!("{prefix}.attn_logit_softcapping")),
             final_logit_softcapping: gguf
@@ -1568,6 +1573,22 @@ impl QwenGgufConfig {
             | ModelFamily::Phi
             | ModelFamily::DeepSeek => 10_000.0,
             _ => 1_000_000.0,
+        }
+    }
+
+    /// Qwen3.5 pairs each gated-delta value head `h` with q/k group
+    /// `h % group_count` (round-robin); Qwen3-Next block-repeats each group
+    /// over `h / repeat`. Matches llama.cpp's per-arch head interleaving.
+    pub fn ssm_kv_group_round_robin(&self) -> bool {
+        self.architecture.starts_with("qwen35")
+    }
+
+    /// Rotary dims per head: `rope.dimension_count` when present (Qwen3.5
+    /// rotates 64 of 256 dims), otherwise the full head dim.
+    pub fn rope_rot_dim(&self, head_dim: usize) -> usize {
+        match self.rope_dimension_count {
+            Some(count) if count as usize != 0 && (count as usize) < head_dim => count as usize,
+            _ => head_dim,
         }
     }
 
@@ -1860,7 +1881,7 @@ fn reject_unsupported_qwen_ssm_layout(
             && !recurrent_ssm_decoder_present
         {
             bail!(
-                "unsupported Qwen GGUF tensor layout: tensor {} uses {feature}; CUDA Qwen support requires either dense attention/MLP decoder tensors or a complete recurrent SSM tensor set ssm_in or attn_qkv+attn_gate plus ssm_conv1d/ssm_dt/ssm_a/ssm_ba/ssm_norm/ssm_out",
+                "unsupported Qwen GGUF tensor layout: tensor {} uses {feature}; CUDA Qwen support requires either dense attention/MLP decoder tensors or a complete recurrent SSM tensor set ssm_in or attn_qkv+attn_gate plus ssm_conv1d/ssm_dt/ssm_a/ssm_ba (or ssm_beta+ssm_alpha)/ssm_norm/ssm_out",
                 tensor.name
             );
         }
@@ -2575,6 +2596,30 @@ pub fn qwen_ssm_ba_weight_names(prefix: &str) -> Vec<String> {
             format!("{prefix}.ssm_beta_alpha.weight"),
             format!("{prefix}.linear_attn.in_proj_ba.weight"),
             format!("{prefix}.gated_delta.in_proj_ba.weight"),
+        ]
+    })
+}
+
+/// Qwen3.5 splits the fused beta/alpha (`ssm_ba`) projection into separate
+/// `ssm_beta` / `ssm_alpha` tensors of `time_step_rank` columns each.
+pub fn qwen_ssm_beta_weight_names(prefix: &str) -> Vec<String> {
+    layer_prefix_aliases(prefix, |prefix| {
+        vec![
+            format!("{prefix}.ssm_beta.weight"),
+            format!("{prefix}.linear_attn.in_proj_beta.weight"),
+            format!("{prefix}.linear_attn.beta_proj.weight"),
+            format!("{prefix}.gated_delta.beta_proj.weight"),
+        ]
+    })
+}
+
+pub fn qwen_ssm_alpha_weight_names(prefix: &str) -> Vec<String> {
+    layer_prefix_aliases(prefix, |prefix| {
+        vec![
+            format!("{prefix}.ssm_alpha.weight"),
+            format!("{prefix}.linear_attn.in_proj_alpha.weight"),
+            format!("{prefix}.linear_attn.alpha_proj.weight"),
+            format!("{prefix}.gated_delta.alpha_proj.weight"),
         ]
     })
 }
@@ -3366,9 +3411,15 @@ where
             .iter()
             .any(|name| has_tensor(name))
         && qwen_ssm_a_names(prefix).iter().any(|name| has_tensor(name))
-        && qwen_ssm_ba_weight_names(prefix)
+        && (qwen_ssm_ba_weight_names(prefix)
             .iter()
             .any(|name| has_tensor(name))
+            || (qwen_ssm_beta_weight_names(prefix)
+                .iter()
+                .any(|name| has_tensor(name))
+                && qwen_ssm_alpha_weight_names(prefix)
+                    .iter()
+                    .any(|name| has_tensor(name))))
         && qwen_ssm_norm_weight_names(prefix)
             .iter()
             .any(|name| has_tensor(name))
@@ -4502,11 +4553,27 @@ fn require_ssm_layer_tensors(
         vec![ShapeRule::exact([dims.time_step_rank])],
         DTypePolicy::Any,
     );
-    validator.require_one_of(
-        &qwen_ssm_ba_weight_names(prefix),
-        matrix_rules(embed, dims.ba_dim),
-        DTypePolicy::Matrix,
-    );
+    let fused_ba_present = qwen_ssm_ba_weight_names(prefix)
+        .iter()
+        .any(|name| validator.tensors.contains_key(name.as_str()));
+    if fused_ba_present {
+        validator.require_one_of(
+            &qwen_ssm_ba_weight_names(prefix),
+            matrix_rules(embed, dims.ba_dim),
+            DTypePolicy::Matrix,
+        );
+    } else {
+        validator.require_one_of(
+            &qwen_ssm_beta_weight_names(prefix),
+            matrix_rules(embed, dims.time_step_rank),
+            DTypePolicy::Matrix,
+        );
+        validator.require_one_of(
+            &qwen_ssm_alpha_weight_names(prefix),
+            matrix_rules(embed, dims.time_step_rank),
+            DTypePolicy::Matrix,
+        );
+    }
     validator.require_one_of(
         &qwen_ssm_norm_weight_names(prefix),
         vec![ShapeRule::exact([dims.head_v_dim])],

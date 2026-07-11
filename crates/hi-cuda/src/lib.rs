@@ -13560,6 +13560,123 @@ mod tests {
     }
 
     #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_qwen35_hybrid_matches_cpu_reference() {
+        use hi_gguf::GgufFile;
+
+        let path = tempfile_path("gpu-qwen35-hybrid");
+        write_reference_qwen35_hybrid(&path);
+        let gguf = GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+        let cpu = crate::qwen_cpu::QwenCpuReference::load(&path).unwrap();
+
+        let config = cpu.config();
+        assert_eq!(config.architecture, "qwen35");
+        assert!(config.recurrent_ssm_tensor_layout);
+        assert!(config.ssm_kv_group_round_robin());
+        assert_eq!(config.rope_dimension_count, Some(2));
+        assert_eq!(config.rope_rot_dim(4), 2);
+        // blk.0 keeps the split beta/alpha projections; blk.1's double-width
+        // attn_q materializes as the gated query projection.
+        assert!(model.has_matrix("blk.0.ssm_beta.weight"));
+        assert!(model.has_matrix("blk.0.ssm_alpha.weight"));
+        assert!(!model.has_matrix("blk.0.ssm_ba.weight"));
+        assert!(model.has_matrix("blk.1.attn_q_gated.weight"));
+
+        assert_close_vec(
+            &model.last_logits_host(&[0]).unwrap(),
+            &cpu.last_logits(&[0]).unwrap(),
+        );
+        let cpu_logits = cpu.forward(&[0, 1, 2]).unwrap();
+        let cpu_logits = cpu_logits.into_iter().flatten().collect::<Vec<_>>();
+        assert_close_vec(
+            &model.full_context_logits_host(&[0, 1, 2]).unwrap(),
+            &cpu_logits,
+        );
+
+        let expected = cpu.generate_greedy(&[1], 3).unwrap();
+        assert_eq!(
+            model.generate_greedy_tokens(&[1], 3, None).unwrap(),
+            expected
+        );
+        assert_eq!(
+            model
+                .generate_greedy_tokens_paged(&[1], 3, None, 1)
+                .unwrap(),
+            expected
+        );
+
+        // Streaming decode (recurrent state + paged attention KV) must match
+        // the stateless full-context path token for token. Recurrent batched
+        // generation requires equal prompt lengths.
+        let inputs = vec![vec![0, 2], vec![1, 0]];
+        let limits = vec![3, 3];
+        let batch_expected = inputs
+            .iter()
+            .zip(limits.iter())
+            .map(|(input, limit)| model.generate_greedy_tokens(input, *limit, None).unwrap())
+            .collect::<Vec<_>>();
+        let page_tables = vec![vec![0, 1, 2, 3, 4, 5], vec![6, 7, 8, 9, 10, 11]];
+        assert_eq!(
+            model
+                .generate_greedy_tokens_batch_paged_with_page_tables(
+                    &inputs,
+                    &limits,
+                    None,
+                    1,
+                    &page_tables,
+                    12,
+                )
+                .unwrap(),
+            batch_expected
+        );
+
+        let expected_next = inputs
+            .iter()
+            .map(|input| model.greedy_next_token(input).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            model
+                .prefill_greedy_next_tokens_batch_paged_with_page_tables(
+                    &inputs,
+                    1,
+                    &page_tables,
+                    12,
+                )
+                .unwrap(),
+            expected_next
+        );
+        let append_contexts = inputs
+            .iter()
+            .zip(expected_next.iter().copied())
+            .map(|(input, token)| {
+                let mut context = input.clone();
+                context.push(token);
+                context
+            })
+            .collect::<Vec<_>>();
+        let expected_append = append_contexts
+            .iter()
+            .map(|input| model.greedy_next_token(input).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            model
+                .decode_greedy_next_tokens_batch_paged_with_page_tables(
+                    &[expected_next[0], expected_next[1]],
+                    2,
+                    1,
+                    &page_tables,
+                    12,
+                )
+                .unwrap(),
+            expected_append
+        );
+        model
+            .forget_recurrent_page_contexts(&page_tables, "test recurrent cleanup")
+            .unwrap();
+    }
+
+    #[cfg(feature = "native-cuda")]
     #[tokio::test]
     async fn cuda_backend_generates_with_qwen_ssm_metadata_dense_gpu_execution() {
         let path = tempfile_path("backend-generate-qwen-ssm-metadata-dense-gpu");
@@ -25494,6 +25611,7 @@ mod tests {
             Some(&gate),
             &conv_weight,
             &ba,
+            None,
             &dt_bias,
             &a_log,
             &norm_weight,
@@ -25509,6 +25627,7 @@ mod tests {
             2,
             1,
             2,
+            false,
             false,
             1.0e-6,
             &stream,
@@ -25559,8 +25678,10 @@ mod tests {
 
         let rope = DeviceBuffer::alloc(2 * std::mem::size_of::<f32>()).unwrap();
         rope.copy_from_host(&[1.0f32, 0.0]).unwrap();
-        crate::kernels::launch_rope_with_offset(&rope, 1, 1, 2, 10_000.0, 1.0, 1, false, &stream)
-            .unwrap();
+        crate::kernels::launch_rope_with_offset(
+            &rope, 1, 1, 2, 2, 10_000.0, 1.0, 1, false, &stream,
+        )
+        .unwrap();
         stream.synchronize().unwrap();
         let (sin_one, cos_one) = 1.0f32.sin_cos();
         assert_close_vec(&rope.copy_to_host::<f32>(2).unwrap(), &[cos_one, sin_one]);
@@ -25577,6 +25698,7 @@ mod tests {
             2,
             1,
             1,
+            2,
             2,
             10_000.0,
             1.0,
@@ -27306,6 +27428,285 @@ mod tests {
             tensor_f16("blk.1.ffn_down.weight", vec![2, 2], &[0.0; 4]),
         ];
         write_qwen_next_recurrent_ssm_gguf_with_block_count(path, tensors, 2);
+    }
+
+    /// Deterministic small nonzero weights so hybrid-layer parity tests
+    /// exercise real math (delta rule, round-robin K/V pairing, partial rope,
+    /// gated q) instead of the all-zero fixed points of the older fixtures.
+    /// Values are multiples of 1/64 so they are exactly representable in f16
+    /// (`tensor_f16_exact` converts without rounding).
+    #[cfg(feature = "native-cuda")]
+    fn qwen35_fixture_values(count: usize, seed: u32) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(12345);
+        (0..count)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (((state >> 16) % 45) as f32 - 22.0) / 64.0
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn qwen35_fixture_norm_values(count: usize, seed: u32) -> Vec<f32> {
+        qwen35_fixture_values(count, seed)
+            .into_iter()
+            .map(|value| value + 58.0 / 64.0)
+            .collect()
+    }
+
+    /// Exact f32 -> f16 bits for fixture values on the 1/64 grid with
+    /// |value| < 32 (integer-only normalization; asserts exactness).
+    #[cfg(feature = "native-cuda")]
+    fn f16_bits_exact_64th(value: f32) -> u16 {
+        let scaled = value * 64.0;
+        let m = scaled.round() as i32;
+        assert_eq!(
+            m as f32, scaled,
+            "fixture value {value} is not a multiple of 1/64"
+        );
+        if m == 0 {
+            return 0;
+        }
+        let sign = if m < 0 { 0x8000u16 } else { 0 };
+        let mut mag = m.unsigned_abs();
+        let mut exp = -6i32;
+        while mag < 1024 {
+            mag <<= 1;
+            exp -= 1;
+        }
+        while mag >= 2048 {
+            assert_eq!(mag % 2, 0, "fixture value {value} needs f16 rounding");
+            mag >>= 1;
+            exp += 1;
+        }
+        let biased = exp + 10 + 15;
+        assert!(
+            (1..=30).contains(&biased),
+            "fixture value {value} outside f16 normal range"
+        );
+        sign | ((biased as u16) << 10) | ((mag - 1024) as u16)
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn tensor_f16_exact(name: &str, dims: Vec<u64>, values: &[f32]) -> TestTensor {
+        let expected: u64 = dims.iter().product();
+        assert_eq!(values.len() as u64, expected);
+        let bytes = values
+            .iter()
+            .flat_map(|value| f16_bits_exact_64th(*value).to_le_bytes())
+            .collect();
+        TestTensor {
+            name: name.to_string(),
+            dims,
+            dtype: 1,
+            bytes,
+            offset: 0,
+        }
+    }
+
+    /// Qwen3.5 hybrid fixture: blk.0 is a gated-delta linear layer with the
+    /// SPLIT `ssm_beta`/`ssm_alpha` projections and round-robin K/V pairing
+    /// (group_count=2 < time_step_rank=4 so round-robin differs from block
+    /// repeat); blk.1 is full attention with a double-width interleaved
+    /// query‖gate `attn_q` and partial rope (rot 2 of head_dim 4).
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_qwen35_hybrid(path: &Path) {
+        // embed=4, ff=4, vocab=3; ssm: conv=2 state=2 groups=2 rank=4 inner=8
+        // -> head_v=2 key_dim=4 value_dim=8 conv_dim=16; attn: heads=2 kv=1
+        // head_dim=4 (q gated width 16), rope.dimension_count=2.
+        let tensors = vec![
+            tensor_f16_exact(
+                "token_embd.weight",
+                vec![4, 3],
+                &qwen35_fixture_values(12, 1),
+            ),
+            tensor_f32(
+                "output_norm.weight",
+                vec![4],
+                &qwen35_fixture_norm_values(4, 2),
+            ),
+            tensor_f32(
+                "blk.0.attn_norm.weight",
+                vec![4],
+                &qwen35_fixture_norm_values(4, 3),
+            ),
+            tensor_f32(
+                "blk.0.post_attention_norm.weight",
+                vec![4],
+                &qwen35_fixture_norm_values(4, 4),
+            ),
+            tensor_f16_exact(
+                "blk.0.attn_qkv.weight",
+                vec![4, 16],
+                &qwen35_fixture_values(64, 5),
+            ),
+            tensor_f16_exact(
+                "blk.0.attn_gate.weight",
+                vec![4, 8],
+                &qwen35_fixture_values(32, 6),
+            ),
+            tensor_f16_exact(
+                "blk.0.ssm_conv1d.weight",
+                vec![2, 16],
+                &qwen35_fixture_values(32, 7),
+            ),
+            tensor_f32("blk.0.ssm_dt.bias", vec![4], &qwen35_fixture_values(4, 8)),
+            tensor_f32("blk.0.ssm_a", vec![4], &qwen35_fixture_values(4, 9)),
+            tensor_f16_exact(
+                "blk.0.ssm_beta.weight",
+                vec![4, 4],
+                &qwen35_fixture_values(16, 10),
+            ),
+            tensor_f16_exact(
+                "blk.0.ssm_alpha.weight",
+                vec![4, 4],
+                &qwen35_fixture_values(16, 11),
+            ),
+            tensor_f32(
+                "blk.0.ssm_norm.weight",
+                vec![2],
+                &qwen35_fixture_norm_values(2, 12),
+            ),
+            tensor_f16_exact(
+                "blk.0.ssm_out.weight",
+                vec![8, 4],
+                &qwen35_fixture_values(32, 13),
+            ),
+            tensor_f16_exact(
+                "blk.0.ffn_gate.weight",
+                vec![4, 4],
+                &qwen35_fixture_values(16, 14),
+            ),
+            tensor_f16_exact(
+                "blk.0.ffn_up.weight",
+                vec![4, 4],
+                &qwen35_fixture_values(16, 15),
+            ),
+            tensor_f16_exact(
+                "blk.0.ffn_down.weight",
+                vec![4, 4],
+                &qwen35_fixture_values(16, 16),
+            ),
+            tensor_f32(
+                "blk.1.attn_norm.weight",
+                vec![4],
+                &qwen35_fixture_norm_values(4, 17),
+            ),
+            tensor_f32(
+                "blk.1.post_attention_norm.weight",
+                vec![4],
+                &qwen35_fixture_norm_values(4, 18),
+            ),
+            tensor_f16_exact(
+                "blk.1.attn_q.weight",
+                vec![4, 16],
+                &qwen35_fixture_values(64, 19),
+            ),
+            tensor_f16_exact(
+                "blk.1.attn_k.weight",
+                vec![4, 4],
+                &qwen35_fixture_values(16, 20),
+            ),
+            tensor_f16_exact(
+                "blk.1.attn_v.weight",
+                vec![4, 4],
+                &qwen35_fixture_values(16, 21),
+            ),
+            tensor_f32(
+                "blk.1.attn_q_norm.weight",
+                vec![4],
+                &qwen35_fixture_norm_values(4, 22),
+            ),
+            tensor_f32(
+                "blk.1.attn_k_norm.weight",
+                vec![4],
+                &qwen35_fixture_norm_values(4, 23),
+            ),
+            tensor_f16_exact(
+                "blk.1.attn_output.weight",
+                vec![8, 4],
+                &qwen35_fixture_values(32, 24),
+            ),
+            tensor_f16_exact(
+                "blk.1.ffn_gate.weight",
+                vec![4, 4],
+                &qwen35_fixture_values(16, 25),
+            ),
+            tensor_f16_exact(
+                "blk.1.ffn_up.weight",
+                vec![4, 4],
+                &qwen35_fixture_values(16, 26),
+            ),
+            tensor_f16_exact(
+                "blk.1.ffn_down.weight",
+                vec![4, 4],
+                &qwen35_fixture_values(16, 27),
+            ),
+        ];
+        write_qwen35_hybrid_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_qwen35_hybrid_gguf(path: &Path, tensors: Vec<TestTensor>) {
+        let mut data = Vec::new();
+        let tensors = tensors
+            .into_iter()
+            .map(|mut tensor| {
+                pad_to_alignment(&mut data, 32);
+                tensor.offset = data.len() as u64;
+                data.extend_from_slice(&tensor.bytes);
+                tensor
+            })
+            .collect::<Vec<_>>();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        write_u32(&mut bytes, 3);
+        write_u64(&mut bytes, tensors.len() as u64);
+        write_u64(&mut bytes, 24);
+
+        write_kv_string(&mut bytes, "general.architecture", "qwen35");
+        write_kv_string(&mut bytes, "general.name", "cpu-reference-qwen35-hybrid");
+        write_kv_u32(&mut bytes, "general.alignment", 32);
+        write_kv_u32(&mut bytes, "general.file_type", 1);
+        write_kv_u32(&mut bytes, "qwen35.context_length", 128);
+        write_kv_u32(&mut bytes, "qwen35.embedding_length", 4);
+        write_kv_u32(&mut bytes, "qwen35.feed_forward_length", 4);
+        write_kv_u32(&mut bytes, "qwen35.block_count", 2);
+        write_kv_u32(&mut bytes, "qwen35.attention.head_count", 2);
+        write_kv_u32(&mut bytes, "qwen35.attention.head_count_kv", 1);
+        write_kv_u32(&mut bytes, "qwen35.attention.key_length", 4);
+        write_kv_u32(&mut bytes, "qwen35.attention.value_length", 4);
+        write_kv_f32(
+            &mut bytes,
+            "qwen35.attention.layer_norm_rms_epsilon",
+            1.0e-6,
+        );
+        write_kv_f32(&mut bytes, "qwen35.rope.freq_base", 10_000.0);
+        write_kv_u32(&mut bytes, "qwen35.rope.dimension_count", 2);
+        write_kv_u32(&mut bytes, "qwen35.full_attention_interval", 2);
+        write_kv_u32(&mut bytes, "qwen35.ssm.conv_kernel", 2);
+        write_kv_u32(&mut bytes, "qwen35.ssm.inner_size", 8);
+        write_kv_u32(&mut bytes, "qwen35.ssm.state_size", 2);
+        write_kv_u32(&mut bytes, "qwen35.ssm.time_step_rank", 4);
+        write_kv_u32(&mut bytes, "qwen35.ssm.group_count", 2);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.eos_token_id", 2);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.unknown_token_id", 2);
+        write_kv_string_array(&mut bytes, "tokenizer.ggml.tokens", &["a", "b", "c"]);
+
+        for tensor in tensors {
+            write_string(&mut bytes, &tensor.name);
+            write_u32(&mut bytes, tensor.dims.len() as u32);
+            for dim in tensor.dims {
+                write_u64(&mut bytes, dim);
+            }
+            write_u32(&mut bytes, tensor.dtype);
+            write_u64(&mut bytes, tensor.offset);
+        }
+
+        pad_to_alignment(&mut bytes, 32);
+        bytes.extend(data);
+        fs::write(path, bytes).unwrap();
     }
 
     #[cfg(feature = "native-cuda")]

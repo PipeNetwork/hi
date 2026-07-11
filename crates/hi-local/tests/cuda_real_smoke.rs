@@ -125,6 +125,17 @@ const FAMILY_FIXTURES: &[FixtureSpec] = &[
             "qwen3-30b-a3b-gguf/Qwen3-30B-A3B-Q4_K_M.gguf",
         ],
     },
+    // Qwen3.5: hybrid gated-delta linear attention + full attention every 4th
+    // layer, split ssm_beta/ssm_alpha projections, partial rope (64 of 256).
+    FixtureSpec {
+        label: "qwen35-9b",
+        env_name: "HI_CUDA_SMOKE_QWEN35_GGUF",
+        expected_family: ModelFamily::Qwen3,
+        relative_candidates: &[
+            "qwen35-9b/model.gguf",
+            "qwen35-9b-gguf/Qwen3.5-9B-Q4_K_M.gguf",
+        ],
+    },
 ];
 
 #[test]
