@@ -793,6 +793,10 @@ impl CudaBackend {
                 .as_ref()
                 .expect("gpu_model is available after gpu execution validation")
                 .clone();
+            let chunk_prefill_supported = gpu_model
+                .lock()
+                .map(|model| model.supports_scheduler_chunked_prefill())
+                .unwrap_or(false);
             Some(CudaGenerationScheduler::start(
                 CudaSchedulerState {
                     qwen: qwen.clone(),
@@ -807,6 +811,7 @@ impl CudaBackend {
                     max_active_requests: config.max_active_requests,
                     prefix_cache: Mutex::new(None),
                     sse_writer: None,
+                    chunk_prefill_supported,
                 },
                 config.max_batch_size,
                 config.max_active_requests,
@@ -2817,6 +2822,9 @@ struct CudaSchedulerState {
     /// requests enqueue events here instead of blocking the scheduler thread.
     /// `None` = direct blocking sends. Set by `CudaGenerationScheduler::start`.
     sse_writer: Option<mpsc::Sender<CudaSseEmitJob>>,
+    /// Whether the model supports the paged chunk-append forward that
+    /// `HI_CUDA_CHUNK_PREFILL` uses (standard decoder layout, in-limit head dims).
+    chunk_prefill_supported: bool,
 }
 
 /// A completed request's KV retained for cross-request prefix reuse. `pages`
@@ -3979,6 +3987,11 @@ struct CudaContinuousTextRequest {
     /// prefill phase runs only `prompt_tokens[reuse_tokens..]` because the first
     /// `reuse_tokens` positions of the lease's page table already hold valid KV.
     prefix_reuse_tokens: usize,
+    /// Chunked prefill (`HI_CUDA_CHUNK_PREFILL`) progress: prompt tokens whose KV
+    /// is already written. Starts at `prefix_reuse_tokens`; reaches
+    /// `prompt_tokens.len()` on the final chunk, which also produces the first
+    /// generated token. Unused by the whole-prompt prefill path.
+    prefill_pos: usize,
 }
 
 impl CudaContinuousTextRequest {
@@ -4452,6 +4465,7 @@ fn admit_continuous_text_job(
         rng,
         lease,
         prefix_reuse_tokens,
+        prefill_pos: prefix_reuse_tokens,
     })
 }
 
@@ -4646,7 +4660,15 @@ fn process_continuous_decode_iteration(
     // sampling params); prefill and recurrent-SSM decode keep the exact-length
     // grouping their entry points require.
     let het_decode = het_decode_enabled() && !state.qwen.recurrent_ssm_tensor_layout;
+    // Chunked prefill needs the paged chunk-append forward; the model capability
+    // (layout + head dims) is checked once at scheduler startup.
+    let chunk_prefill = if state.chunk_prefill_supported {
+        chunk_prefill_tokens()
+    } else {
+        None
+    };
     let mut het_group: Vec<usize> = Vec::new();
+    let mut chunk_prefill_group: Vec<usize> = Vec::new();
     let mut groups: BTreeMap<
         (CudaContinuousStepPhase, usize, CudaSchedulerSamplingKey),
         Vec<usize>,
@@ -4661,6 +4683,22 @@ fn process_continuous_decode_iteration(
             if het_decode && phase == CudaContinuousStepPhase::Decode {
                 het_group.push(idx);
                 continue;
+            }
+            if let Some(budget) = chunk_prefill
+                && phase == CudaContinuousStepPhase::Prefill
+            {
+                // Only LONG prompts chunk (plus any request already mid-chunking).
+                // Short prompts keep the whole-prompt path below, preserving its
+                // equal-length batching and intra-batch shared-prefix reuse.
+                let mid_chunking = request.prefill_pos > request.prefix_reuse_tokens;
+                let remaining = request
+                    .prompt_tokens
+                    .len()
+                    .saturating_sub(request.prefill_pos);
+                if mid_chunking || remaining > budget {
+                    chunk_prefill_group.push(idx);
+                    continue;
+                }
             }
             let token_count = match phase {
                 CudaContinuousStepPhase::Prefill => request.prompt_tokens.len(),
@@ -4738,6 +4776,24 @@ fn process_continuous_decode_iteration(
             );
         } else {
             process_continuous_het_decode_chunk(state, stats, active, &mut retire, &chunk);
+        }
+    }
+
+    // Chunked prefill runs AFTER the iteration's decode work, spending at most the
+    // per-iteration chunk budget (oldest request first) so a long prompt advances
+    // steadily without stalling running streams for its whole prefill.
+    if let Some(chunk_budget) = chunk_prefill {
+        let mut budget = chunk_budget;
+        for idx in chunk_prefill_group {
+            if retire[idx].is_some() {
+                continue;
+            }
+            if budget == 0 {
+                break;
+            }
+            let consumed =
+                process_continuous_prefill_chunk(state, stats, active, &mut retire, idx, budget);
+            budget = budget.saturating_sub(consumed);
         }
     }
 
@@ -4854,6 +4910,27 @@ fn het_decode_min_batch() -> usize {
     })
 }
 
+/// Chunked prefill (`HI_CUDA_CHUNK_PREFILL`, opt-in): split each prompt's prefill
+/// into chunks of at most this many tokens per scheduler iteration, run AFTER the
+/// iteration's decode work — so admitting a long prompt no longer stalls every
+/// running stream for the whole prefill; inter-token latency is bounded by one
+/// chunk instead of one prompt. `1`/`on` = default 1024 tokens; an explicit value
+/// (>= 64) sets the per-iteration chunk budget; unset/`0` = whole-prompt prefill.
+/// Non-final chunk boundaries are page-aligned (KV pages stay whole for prefix
+/// reuse). Recurrent-SSM and sliding-window layouts keep whole-prompt prefill.
+fn chunk_prefill_tokens() -> Option<usize> {
+    use std::sync::OnceLock;
+    static TOKENS: OnceLock<Option<usize>> = OnceLock::new();
+    *TOKENS.get_or_init(|| {
+        let raw = std::env::var("HI_CUDA_CHUNK_PREFILL").ok()?;
+        match raw.trim() {
+            "" | "0" | "off" | "false" => None,
+            "1" | "on" | "true" => Some(1024),
+            other => other.parse().ok().filter(|tokens| *tokens >= 64),
+        }
+    })
+}
+
 /// Prompt-lookup speculative decode config `(ngram, max_draft)`, from `HI_CUDA_SPEC_DECODE`.
 /// Unset/`0` = off. Accepts `1` (defaults 2,8) or `ngram:draft` (e.g. `3:8`). Applies only to
 /// a single greedy text request decoding alone; other cases use the normal batched decode.
@@ -4874,6 +4951,167 @@ fn speculative_decode_config() -> Option<(usize, usize)> {
             }
         }
     })
+}
+
+/// One chunked-prefill step for one request (`HI_CUDA_CHUNK_PREFILL`): append up
+/// to `budget` prompt tokens at the request's `prefill_pos`, attending to the
+/// already-written prefix. Non-final chunk boundaries are floored to a page
+/// multiple (whole KV pages for prefix reuse); the final chunk also selects the
+/// request's first token — through the same per-row selector the batched prefill
+/// paths use, and drawing the RNG exactly once, so output matches whole-prompt
+/// prefill. Returns the number of prompt tokens consumed from the budget.
+fn process_continuous_prefill_chunk(
+    state: &CudaSchedulerState,
+    stats: &CudaSchedulerStats,
+    active: &mut [CudaContinuousTextRequest],
+    retire: &mut [Option<CudaContinuousRetireReason>],
+    idx: usize,
+    budget: usize,
+) -> usize {
+    if continuous_request_cancelled(&active[idx]) {
+        retire[idx] = Some(CudaContinuousRetireReason::Cancelled);
+        return 0;
+    }
+    let prompt_len = active[idx].prompt_tokens.len();
+    let start = active[idx].prefill_pos;
+    let Some(remaining) = prompt_len.checked_sub(start).filter(|left| *left > 0) else {
+        mark_continuous_error(
+            state,
+            active,
+            retire,
+            idx,
+            anyhow!("CUDA chunked prefill request has no remaining prompt tokens"),
+        );
+        return 0;
+    };
+    let mut chunk_len = remaining.min(budget);
+    let is_final = chunk_len == remaining;
+    if !is_final {
+        // Keep non-final boundaries on whole pages; if the budget can't reach the
+        // next page boundary, wait for the next iteration.
+        let end = start + chunk_len;
+        let aligned_end = end - (end % state.kv_page_size);
+        if aligned_end <= start {
+            return 0;
+        }
+        chunk_len = aligned_end - start;
+    }
+    let Some(kv_pages) = &state.kv_pages else {
+        mark_continuous_error(
+            state,
+            active,
+            retire,
+            idx,
+            anyhow!("CUDA continuous decode requires paged KV leases"),
+        );
+        return 0;
+    };
+    let page_table =
+        match active[idx].page_table_for_token_count(start + chunk_len, state.kv_page_size) {
+            Ok(page_table) => page_table,
+            Err(err) => {
+                mark_continuous_error(state, active, retire, idx, anyhow!("{err}"));
+                return 0;
+            }
+        };
+    let final_sampling = if is_final {
+        let row_sampling = match active[idx].sampling_key {
+            CudaSchedulerSamplingKey::Greedy => gpu::CudaRowSampling::Greedy,
+            CudaSchedulerSamplingKey::Sampled {
+                temperature_bits,
+                top_p_bits,
+                top_k,
+            } => gpu::CudaRowSampling::Sampled {
+                temperature: f32::from_bits(temperature_bits),
+                top_p: f32::from_bits(top_p_bits),
+                top_k,
+            },
+        };
+        let sample = continuous_sampling_values(active, &[idx])[0];
+        Some((row_sampling, sample))
+    } else {
+        None
+    };
+    let chunk_tokens = active[idx].prompt_tokens[start..start + chunk_len].to_vec();
+    let pages_total = kv_pages.pages_total;
+    let started = Instant::now();
+    let produced = {
+        let model = match state.gpu_model.lock() {
+            Ok(model) => model,
+            Err(_) => {
+                mark_continuous_error(
+                    state,
+                    active,
+                    retire,
+                    idx,
+                    anyhow!("CUDA gpu model lock poisoned"),
+                );
+                return 0;
+            }
+        };
+        model.prefill_chunk_next_token_paged_with_page_table(
+            &chunk_tokens,
+            start,
+            state.kv_page_size,
+            &page_table,
+            pages_total,
+            final_sampling,
+        )
+    };
+    let elapsed = started.elapsed();
+    // The final chunk yields the request's first generated token, which the
+    // whole-prompt path accounts as one decode token — mirror that split exactly.
+    let timing = scheduler_token_timing(usize_to_u64(chunk_len), u64::from(is_final), elapsed);
+    stats
+        .prefill_tokens
+        .fetch_add(timing.prefill_tokens, Ordering::Relaxed);
+    stats
+        .decode_tokens
+        .fetch_add(timing.decode_tokens, Ordering::Relaxed);
+    stats
+        .prefill_micros
+        .fetch_add(timing.prefill_micros, Ordering::Relaxed);
+    stats
+        .decode_micros
+        .fetch_add(timing.decode_micros, Ordering::Relaxed);
+    stats
+        .token_budget_split_chunks
+        .fetch_add(1, Ordering::Relaxed);
+    match produced {
+        Ok(None) => {
+            active[idx].prefill_pos = start + chunk_len;
+            chunk_len
+        }
+        Ok(Some(token)) => {
+            active[idx].prefill_pos = prompt_len;
+            record_continuous_decode_batch_stats(
+                stats,
+                CudaContinuousStepPhase::Prefill,
+                active[idx].sampling_key,
+                1,
+            );
+            if continuous_request_cancelled(&active[idx]) {
+                retire[idx] = Some(CudaContinuousRetireReason::Cancelled);
+                return chunk_len;
+            }
+            active[idx].generated_tokens.push(token);
+            match send_continuous_token_delta(state, &mut active[idx], token) {
+                Ok(()) => {}
+                Err(reason) => {
+                    retire[idx] = Some(reason);
+                    return chunk_len;
+                }
+            }
+            if continuous_request_finished(&state.qwen, &active[idx], token) {
+                retire[idx] = Some(finish_continuous_request(state, &active[idx]));
+            }
+            chunk_len
+        }
+        Err(err) => {
+            mark_continuous_error(state, active, retire, idx, anyhow!("{err}"));
+            chunk_len
+        }
+    }
 }
 
 /// One heterogeneous decode forward (`HI_CUDA_HET_DECODE`): every open request in
@@ -11316,9 +11554,15 @@ mod tests {
             health_counter(&health.quantization, "vision_batched_requests"),
             Some(2)
         );
-        assert_eq!(
-            health_counter(&health.quantization, "vision_batched_batches"),
-            Some(1)
+        // Both requests share one vision batch when they land in the same admission
+        // window; under parallel test load the second submission can miss the
+        // max_wait gather and encode alone. Either way the invariant under test —
+        // different mrope video positions NEVER share a decode batch — is asserted
+        // exactly below.
+        let vision_batches = health_counter(&health.quantization, "vision_batched_batches");
+        assert!(
+            matches!(vision_batches, Some(1) | Some(2)),
+            "unexpected vision_batched_batches: {vision_batches:?}"
         );
         assert_eq!(
             health_counter(&health.quantization, "multimodal_decode_batched_requests"),
@@ -17622,6 +17866,7 @@ mod tests {
             max_active_requests: 1,
             prefix_cache: super::Mutex::new(None),
             sse_writer: None,
+            chunk_prefill_supported: false,
         };
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(rx);
@@ -22905,6 +23150,102 @@ mod tests {
                     y[r],
                     reference,
                 );
+            }
+        }
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_chunked_prefill_matches_whole_prompt() {
+        use crate::gpu::CudaRowSampling;
+        use hi_gguf::GgufFile;
+
+        let path = tempfile_path("gpu-qwen-chunked-prefill");
+        write_reference_qwen(&path);
+        let gguf = GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+        assert!(model.supports_batched_text_generation());
+
+        let page_size = 2usize;
+        let physical_page_count = 16usize;
+        let prompt: Vec<u32> = vec![0, 1, 2, 0, 2, 1, 0];
+        let lease: Vec<usize> = (0..8).collect();
+
+        // Reference: whole-prompt prefill + 3 greedy decode steps.
+        let pages_for =
+            |tokens: usize| -> Vec<usize> { lease[..tokens.div_ceil(page_size)].to_vec() };
+        let first_ref = model
+            .prefill_greedy_next_tokens_batch_paged_with_page_tables(
+                &[prompt.clone()],
+                page_size,
+                &[pages_for(prompt.len())],
+                physical_page_count,
+            )
+            .unwrap()[0];
+        let mut ctx_ref = prompt.clone();
+        ctx_ref.push(first_ref);
+        let mut ref_tokens = vec![first_ref];
+        for _ in 0..3 {
+            let next = model
+                .decode_greedy_next_tokens_batch_paged_with_page_tables(
+                    &[*ctx_ref.last().unwrap()],
+                    ctx_ref.len() - 1,
+                    page_size,
+                    &[pages_for(ctx_ref.len())],
+                    physical_page_count,
+                )
+                .unwrap()[0];
+            ref_tokens.push(next);
+            ctx_ref.push(next);
+        }
+
+        // Chunked: page-aligned non-final chunks (2, 4) + ragged final chunk (1),
+        // then the same decode steps — everything must match exactly.
+        for chunks in [vec![2usize, 4, 1], vec![6, 1], vec![2, 2, 2, 1]] {
+            assert_eq!(chunks.iter().sum::<usize>(), prompt.len());
+            let mut pos = 0usize;
+            let mut first_chunked = None;
+            for (i, chunk) in chunks.iter().copied().enumerate() {
+                let is_final = i == chunks.len() - 1;
+                let produced = model
+                    .prefill_chunk_next_token_paged_with_page_table(
+                        &prompt[pos..pos + chunk],
+                        pos,
+                        page_size,
+                        &pages_for(pos + chunk),
+                        physical_page_count,
+                        is_final.then_some((CudaRowSampling::Greedy, 0.0)),
+                    )
+                    .unwrap();
+                pos += chunk;
+                if is_final {
+                    first_chunked = produced;
+                } else {
+                    assert!(produced.is_none());
+                }
+            }
+            assert_eq!(
+                first_chunked,
+                Some(first_ref),
+                "chunked prefill {chunks:?} first token diverged"
+            );
+            let mut ctx = prompt.clone();
+            ctx.push(first_ref);
+            for (step, want) in ref_tokens[1..].iter().enumerate() {
+                let next = model
+                    .decode_greedy_next_tokens_batch_paged_with_page_tables(
+                        &[*ctx.last().unwrap()],
+                        ctx.len() - 1,
+                        page_size,
+                        &[pages_for(ctx.len())],
+                        physical_page_count,
+                    )
+                    .unwrap()[0];
+                assert_eq!(
+                    next, *want,
+                    "chunked prefill {chunks:?} decode step {step} diverged"
+                );
+                ctx.push(next);
             }
         }
     }

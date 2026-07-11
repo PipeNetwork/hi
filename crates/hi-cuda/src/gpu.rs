@@ -8482,6 +8482,80 @@ mod native {
             page_table: &[usize],
             physical_page_count: usize,
         ) -> Result<GpuF32Tensor> {
+            let normed = self.append_hidden_normed_paged_device(
+                token_ids,
+                position,
+                page_size,
+                page_table,
+                physical_page_count,
+            )?;
+            // All-row projection (not last-row): one logits row per appended token.
+            self.output_logits_f32_device(&normed)
+        }
+
+        /// Whether the scheduler may split this model's prefills into paged chunk
+        /// appends: needs the standard text-decoder layout (no recurrent SSM, no
+        /// Gemma3 sliding window — the paged prefill attention rejects windows) and
+        /// head dims within the flash prefill kernels' limits (the wide-head models
+        /// use a different, non-chunkable attention path).
+        pub fn supports_scheduler_chunked_prefill(&self) -> bool {
+            if self.config.recurrent_ssm_tensor_layout || !self.supports_batched_text_generation() {
+                return false;
+            }
+            if self.config.is_gemma3() && self.config.attention_sliding_window.is_some() {
+                return false;
+            }
+            let Ok(dims) = self.qwen_dims() else {
+                return false;
+            };
+            dims.head_dim <= FLASH_ONLINE_MAX_HEAD_DIM
+                && dims.v_head_dim <= FLASH_ONLINE_MAX_HEAD_DIM
+        }
+
+        /// One prefill chunk for the continuous scheduler (`HI_CUDA_CHUNK_PREFILL`):
+        /// append `token_ids` at `position`, attending to the already-written
+        /// 0..position prefix. Non-final chunks (`final_sampling` None) skip the
+        /// vocab projection entirely — only the KV writes matter. The final chunk
+        /// projects the LAST row only and selects the request's first token through
+        /// the same per-row selector the batched prefill paths use, so chunked
+        /// prefill produces exactly the token whole-prompt prefill would.
+        pub fn prefill_chunk_next_token_paged_with_page_table(
+            &self,
+            token_ids: &[u32],
+            position: usize,
+            page_size: usize,
+            page_table: &[usize],
+            physical_page_count: usize,
+            final_sampling: Option<(CudaRowSampling, f32)>,
+        ) -> Result<Option<u32>> {
+            let normed = self.append_hidden_normed_paged_device(
+                token_ids,
+                position,
+                page_size,
+                page_table,
+                physical_page_count,
+            )?;
+            let Some((row_sampling, sample)) = final_sampling else {
+                self.op_barrier()?;
+                return Ok(None);
+            };
+            let logits = self.output_logits_last_row_f32_device(&normed, 1, token_ids.len())?;
+            let tokens =
+                self.select_batched_last_token_per_row(&logits, 1, 1, &[row_sampling], &[sample])?;
+            Ok(tokens.first().copied())
+        }
+
+        /// Shared body of the append-at-offset forwards: run `token_ids` at
+        /// `position` against the paged prefix and return the output-normed hidden
+        /// states (one row per token), leaving the head projection to the caller.
+        fn append_hidden_normed_paged_device(
+            &self,
+            token_ids: &[u32],
+            position: usize,
+            page_size: usize,
+            page_table: &[usize],
+            physical_page_count: usize,
+        ) -> Result<GpuF32Tensor> {
             if token_ids.is_empty() {
                 bail!("append_tokens_logits requires at least one token");
             }
@@ -8580,9 +8654,7 @@ mod native {
                 let mlp_out = self.ffn_f32_device(&prefix, &mlp_input)?;
                 hidden = self.add_f32_device(&hidden, &mlp_out)?;
             }
-            let normed = self.rms_norm_f32_device("output_norm.weight", &hidden, eps)?;
-            // All-row projection (not last-row): one logits row per appended token.
-            self.output_logits_f32_device(&normed)
+            self.rms_norm_f32_device("output_norm.weight", &hidden, eps)
         }
 
         /// One greedy speculative decode step against a request's paged cache. `sequence` is
@@ -24763,6 +24835,25 @@ mod non_native {
             bail!(
                 "hi-cuda was built without native-cuda support; GPU Qwen paged generation is unavailable"
             )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn prefill_chunk_next_token_paged_with_page_table(
+            &self,
+            _token_ids: &[u32],
+            _position: usize,
+            _page_size: usize,
+            _page_table: &[usize],
+            _physical_page_count: usize,
+            _final_sampling: Option<(super::CudaRowSampling, f32)>,
+        ) -> Result<Option<u32>> {
+            bail!(
+                "hi-cuda was built without native-cuda support; GPU Qwen paged generation is unavailable"
+            )
+        }
+
+        pub fn supports_scheduler_chunked_prefill(&self) -> bool {
+            false
         }
 
         #[allow(clippy::too_many_arguments)]
