@@ -499,6 +499,11 @@ struct CudaPagedKvCacheSnapshot {
 struct CudaPagedKvCacheLease {
     manager: Arc<CudaPagedKvCacheManager>,
     pages: Vec<usize>,
+    /// The first `shared_page_count` entries of `pages` are OWNED by the prefix
+    /// index (this lease only holds references, tracked by the index's per-entry
+    /// refcounts); `Drop` frees only the exclusive tail. Always 0 for leases
+    /// without prefix reuse.
+    shared_page_count: usize,
 }
 
 impl CudaPagedKvCacheManager {
@@ -612,6 +617,7 @@ impl CudaPagedKvCacheManager {
         Ok(CudaPagedKvCacheLease {
             manager: self.clone(),
             pages,
+            shared_page_count: 0,
         })
     }
 
@@ -646,14 +652,20 @@ impl CudaPagedKvCacheManager {
         Ok(pages)
     }
 
-    /// Wrap an already-owned set of physical pages (some reused from a retained
-    /// prefix, some freshly taken via [`Self::take_free_pages`]) into a lease.
-    /// The pages must already be accounted as allocated; the lease frees them on
-    /// drop unless [`CudaPagedKvCacheLease::detach_pages`] takes them first.
-    fn lease_from_pages(self: &Arc<Self>, pages: Vec<usize>) -> CudaPagedKvCacheLease {
+    /// Wrap an already-owned set of physical pages into a lease: the first
+    /// `shared_page_count` are prefix-index pages this lease merely references,
+    /// the rest were freshly taken via [`Self::take_free_pages`]. All pages are
+    /// already accounted as allocated; `Drop` frees only the exclusive tail
+    /// unless [`CudaPagedKvCacheLease::take_pages`] empties the lease first.
+    fn lease_from_pages(
+        self: &Arc<Self>,
+        pages: Vec<usize>,
+        shared_page_count: usize,
+    ) -> CudaPagedKvCacheLease {
         CudaPagedKvCacheLease {
             manager: self.clone(),
             pages,
+            shared_page_count,
         }
     }
 
@@ -695,18 +707,25 @@ impl CudaPagedKvCacheManager {
 }
 
 impl CudaPagedKvCacheLease {
-    /// Take the lease's pages, leaving it empty so `Drop` frees nothing. The
-    /// caller assumes ownership — e.g. to retain a completed request's prefix
-    /// KV pages for the next request. The pages stay accounted as allocated
-    /// until explicitly returned via [`CudaPagedKvCacheManager::release_pages`].
-    fn detach_pages(&mut self) -> Vec<usize> {
-        std::mem::take(&mut self.pages)
+    /// Take the lease's pages and shared count, leaving it empty so `Drop`
+    /// frees nothing. The caller assumes responsibility for the exclusive tail
+    /// (still accounted as allocated) and for releasing the shared head's index
+    /// references. Used when retiring a request into the prefix index.
+    fn take_pages(&mut self) -> (Vec<usize>, usize) {
+        let shared = self.shared_page_count;
+        self.shared_page_count = 0;
+        (std::mem::take(&mut self.pages), shared)
     }
 }
 
 impl Drop for CudaPagedKvCacheLease {
     fn drop(&mut self) {
-        self.manager.release_pages(&mut self.pages);
+        // The shared head belongs to the prefix index (the retirement path
+        // releases our references); only the exclusive tail returns here.
+        let split = self.shared_page_count.min(self.pages.len());
+        let mut exclusive: Vec<usize> = self.pages.split_off(split);
+        self.manager.release_pages(&mut exclusive);
+        self.pages.clear();
     }
 }
 
@@ -809,7 +828,7 @@ impl CudaBackend {
                     mmproj: mmproj.clone(),
                     multimodal_stats: multimodal_stats.clone(),
                     max_active_requests: config.max_active_requests,
-                    prefix_cache: Mutex::new(None),
+                    prefix_index: Mutex::new(prefix_cache::PrefixBlockIndex::new()),
                     sse_writer: None,
                     chunk_prefill_supported,
                     graph_scratch: Mutex::new(None),
@@ -1058,12 +1077,14 @@ impl CudaBackend {
             return "disabled(reason=scheduler-unavailable)".to_string();
         };
         format!(
-            "enabled(scope=batch,backend=paged-shared-prefix,batches={},requests={},tokens_total={},cross_request_reuse_requests={},cross_request_reuse_tokens={})",
+            "enabled(scope=batch,backend=paged-shared-prefix,batches={},requests={},tokens_total={},cross_request_reuse_requests={},cross_request_reuse_tokens={},entries={},referenced={})",
             snapshot.shared_prefix_batches,
             snapshot.shared_prefix_requests,
             snapshot.shared_prefix_tokens,
             snapshot.retained_prefix_reuse_requests,
-            snapshot.retained_prefix_reuse_tokens
+            snapshot.retained_prefix_reuse_tokens,
+            snapshot.prefix_index_entries,
+            snapshot.prefix_index_referenced
         )
     }
 
@@ -2815,10 +2836,12 @@ struct CudaSchedulerState {
     max_active_requests: usize,
     /// Cross-request prefix cache: the token ids
     /// and physical KV pages of the most recently completed request, so the next
-    /// request sharing a page-aligned prefix can reuse that KV and prefill only
-    /// the divergent suffix. `None` until the first request retires (or when the
-    /// feature is off).
-    prefix_cache: Mutex<Option<RetainedPrefix>>,
+    /// Cross-request prefix cache: a refcounted block-hash index over retained
+    /// KV pages (see `prefix_cache::PrefixBlockIndex`). Any number of concurrent
+    /// requests may share cached prefix pages read-only; completed requests
+    /// contribute their full pages; unreferenced entries evict LRU-first under
+    /// allocation pressure.
+    prefix_index: Mutex<prefix_cache::PrefixBlockIndex>,
     /// SSE writer thread input (`HI_CUDA_SSE_WRITER`, default on): continuous
     /// requests enqueue events here instead of blocking the scheduler thread.
     /// `None` = direct blocking sends. Set by `CudaGenerationScheduler::start`.
@@ -2834,15 +2857,6 @@ struct CudaSchedulerState {
     /// reservation retries later. Held as a lease so the page returns to the
     /// allocator with the scheduler.
     graph_scratch: Mutex<Option<CudaPagedKvCacheLease>>,
-}
-
-/// A completed request's KV retained for cross-request prefix reuse. `pages`
-/// hold valid KV for `tokens` (in `tokens.len()`-order, position i in
-/// `pages[i / page_size]`) and are held off the allocator free list until the
-/// prefix is consumed by the next request or freed on replacement.
-struct RetainedPrefix {
-    tokens: Vec<u32>,
-    pages: Vec<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -2953,6 +2967,10 @@ struct CudaSchedulerStats {
     // previously-computed prefix, and how many prompt tokens' prefill that skipped.
     retained_prefix_reuse_requests: AtomicU64,
     retained_prefix_reuse_tokens: AtomicU64,
+    // Gauges (last published value, not counters): prefix-index size and how
+    // many of its entries live requests currently reference.
+    prefix_index_entries: AtomicU64,
+    prefix_index_referenced: AtomicU64,
     fallback_requests: AtomicU64,
     fallback_single_request: AtomicU64,
     fallback_moe_requests: AtomicU64,
@@ -3028,6 +3046,8 @@ struct CudaSchedulerSnapshot {
     shared_prefix_tokens: u64,
     retained_prefix_reuse_requests: u64,
     retained_prefix_reuse_tokens: u64,
+    prefix_index_entries: u64,
+    prefix_index_referenced: u64,
     fallback_requests: u64,
     fallback_single_request: u64,
     fallback_moe_requests: u64,
@@ -3305,6 +3325,8 @@ fn new_cuda_scheduler_stats() -> CudaSchedulerStats {
         shared_prefix_tokens: AtomicU64::new(0),
         retained_prefix_reuse_requests: AtomicU64::new(0),
         retained_prefix_reuse_tokens: AtomicU64::new(0),
+        prefix_index_entries: AtomicU64::new(0),
+        prefix_index_referenced: AtomicU64::new(0),
         fallback_requests: AtomicU64::new(0),
         fallback_single_request: AtomicU64::new(0),
         fallback_moe_requests: AtomicU64::new(0),
@@ -3541,6 +3563,8 @@ impl CudaGenerationScheduler {
                 .stats
                 .retained_prefix_reuse_tokens
                 .load(Ordering::Relaxed),
+            prefix_index_entries: self.stats.prefix_index_entries.load(Ordering::Relaxed),
+            prefix_index_referenced: self.stats.prefix_index_referenced.load(Ordering::Relaxed),
             fallback_requests: self.stats.fallback_requests.load(Ordering::Relaxed),
             fallback_single_request: self.stats.fallback_single_request.load(Ordering::Relaxed),
             fallback_moe_requests: self.stats.fallback_moe_requests.load(Ordering::Relaxed),
@@ -4001,6 +4025,10 @@ struct CudaContinuousTextRequest {
     /// `prompt_tokens.len()` on the final chunk, which also produces the first
     /// generated token. Unused by the whole-prompt prefill path.
     prefill_pos: usize,
+    /// Block-hash chain matched at admission; the request holds one prefix-index
+    /// reference per shared page (`lease.shared_page_count`), released at
+    /// retirement via `finalize_prefix_cache_for_request`.
+    shared_prefix_hashes: Vec<u64>,
 }
 
 impl CudaContinuousTextRequest {
@@ -4215,126 +4243,157 @@ fn prefix_cache_enabled_for(state: &CudaSchedulerState) -> bool {
     }
 }
 
-/// Acquire the KV lease for a new request, reusing a retained prefix's pages
-/// when possible. Returns the lease and the number of leading prompt tokens
-/// whose KV is reused (0 = normal full prefill).
+/// Acquire the KV lease for a new request, sharing cached prefix pages from the
+/// block-hash index when possible. Returns the lease, the number of leading
+/// prompt tokens whose KV is reused (0 = normal full prefill), and the matched
+/// hash chain (the request releases those references at retirement).
 ///
-/// When reuse is allowed and a retained prefix shares a page-aligned prefix, the
-/// lease is built from `[reused prefix pages] ++ [freshly allocated pages]` so
-/// the prefill phase can skip the reused positions. The retained prefix is
-/// always consumed here (its unused pages freed), keeping the accounting and the
-/// free list leak-safe.
+/// The lease is `[shared index pages] ++ [freshly allocated pages]`; the shared
+/// head is never written (reuse is page-aligned and capped below the prompt
+/// length, so the request's first KV write lands in its first exclusive page).
+/// Under allocation pressure, unreferenced index entries evict LRU-first and
+/// the allocation retries once before rejecting.
 fn acquire_lease_with_prefix_reuse(
     state: &CudaSchedulerState,
     kv_pages: &Arc<CudaPagedKvCacheManager>,
     prompt_tokens: &[u32],
     token_budget: usize,
     reuse_allowed: bool,
-) -> Result<(CudaPagedKvCacheLease, usize)> {
+) -> Result<(CudaPagedKvCacheLease, usize, Vec<u64>)> {
     let page_size = state.kv_page_size;
     let total_pages = kv_pages.pages_for_tokens(token_budget)?;
+    let enabled = reuse_allowed && prefix_cache_enabled_for(state);
 
-    // Take the retained prefix regardless of whether we can reuse it, so a stale
-    // prefix never lingers holding pages. If the feature is off there's nothing
-    // retained and this is a plain allocation.
-    let retained = {
-        let mut slot = state
-            .prefix_cache
+    let take_fresh = |pages_needed: usize,
+                      index: Option<&mut prefix_cache::PrefixBlockIndex>|
+     -> Result<Vec<usize>> {
+        match kv_pages.take_free_pages(pages_needed, token_budget) {
+            Ok(fresh) => Ok(fresh),
+            Err(err) => {
+                // Evict unreferenced cached prefixes and retry once.
+                let Some(index) = index else {
+                    return Err(err);
+                };
+                let mut evicted = index.evict_lru(pages_needed);
+                if evicted.is_empty() {
+                    return Err(err);
+                }
+                kv_pages.release_pages(&mut evicted);
+                kv_pages.take_free_pages(pages_needed, token_budget)
+            }
+        }
+    };
+
+    if !enabled {
+        // Still evict-under-pressure so a full index can never wedge admission.
+        let mut index = state
+            .prefix_index
             .lock()
             .map_err(|_| anyhow!("CUDA prefix cache lock poisoned"))?;
-        slot.take()
-    };
-
-    // If reuse isn't allowed here (feature off, sampled, or recurrent), free any
-    // retained prefix we took and allocate fresh.
-    if !reuse_allowed || !prefix_cache_enabled_for(state) {
-        if let Some(mut retained) = retained {
-            kv_pages.release_pages(&mut retained.pages);
-        }
-        return Ok((kv_pages.allocate_for_tokens(token_budget)?, 0));
-    }
-    let Some(mut retained) = retained else {
-        return Ok((kv_pages.allocate_for_tokens(token_budget)?, 0));
-    };
-
-    let reuse_tokens =
-        prefix_cache::reusable_prefix_tokens(prompt_tokens, &retained.tokens, page_size);
-    let reuse_pages = prefix_cache::pages_for_tokens(reuse_tokens, page_size);
-    if reuse_pages == 0 || reuse_pages > retained.pages.len() {
-        kv_pages.release_pages(&mut retained.pages);
-        return Ok((kv_pages.allocate_for_tokens(token_budget)?, 0));
+        let pages = take_fresh(total_pages, Some(&mut index))?;
+        return Ok((kv_pages.lease_from_pages(pages, 0), 0, Vec::new()));
     }
 
-    // Keep the first `reuse_pages`, return the rest of the retained prefix.
-    let mut reused = retained.pages;
-    let mut stale = reused.split_off(reuse_pages);
-    kv_pages.release_pages(&mut stale);
-
-    // Allocate the remaining pages for the suffix + generated tokens. On failure,
-    // return the reused pages to the free list so nothing leaks.
-    let fresh_needed = total_pages.saturating_sub(reuse_pages);
-    let fresh = match kv_pages.take_free_pages(fresh_needed, token_budget) {
+    // Reuse covers whole pages strictly below the prompt end: at least one
+    // prompt token must run through the model to produce logits.
+    let max_reuse_pages = prompt_tokens.len().saturating_sub(1) / page_size;
+    let chain = prefix_cache::block_hash_chain(prompt_tokens, page_size);
+    let mut index = state
+        .prefix_index
+        .lock()
+        .map_err(|_| anyhow!("CUDA prefix cache lock poisoned"))?;
+    let shared = index.match_prefix(&chain[..max_reuse_pages.min(chain.len())]);
+    let shared_count = shared.len();
+    let reuse_tokens = shared_count * page_size;
+    let fresh_needed = total_pages.saturating_sub(shared_count);
+    let fresh = match take_fresh(fresh_needed, Some(&mut index)) {
         Ok(fresh) => fresh,
         Err(err) => {
-            kv_pages.release_pages(&mut reused);
+            index.release_prefix(&chain, shared_count);
             return Err(err);
         }
     };
-
-    let mut pages = reused;
+    let mut pages = shared;
     pages.extend(fresh);
-    Ok((kv_pages.lease_from_pages(pages), reuse_tokens))
+    Ok((
+        kv_pages.lease_from_pages(pages, shared_count),
+        reuse_tokens,
+        chain,
+    ))
 }
 
-/// Retain a completed request's KV pages and tokens for the next request's
-/// prefix reuse, freeing whatever prefix was previously retained. Called on
-/// normal completion when the feature is enabled and the request used the
-/// greedy, non-recurrent path. Extra (unused) tail pages are freed; the pages
-/// covering the final `tokens` are moved out of the lease so `Drop` won't free
-/// them.
-fn retain_prefix_from_request(state: &CudaSchedulerState, request: &mut CudaContinuousTextRequest) {
-    if !prefix_cache_enabled_for(state) || state.qwen.recurrent_ssm_tensor_layout {
-        return;
-    }
-    if !matches!(request.sampling_key, CudaSchedulerSamplingKey::Greedy) {
-        return;
-    }
+/// Publish the prefix index's size gauges to the scheduler stats (surfaced in
+/// `/health` as `entries`/`referenced`). Called after admission and retirement,
+/// the only points that mutate the index.
+fn publish_prefix_index_gauges(state: &CudaSchedulerState, stats: &CudaSchedulerStats) {
+    let index = match state.prefix_index.lock() {
+        Ok(index) => index,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    stats
+        .prefix_index_entries
+        .store(usize_to_u64(index.entry_count()), Ordering::Relaxed);
+    stats
+        .prefix_index_referenced
+        .store(usize_to_u64(index.referenced_count()), Ordering::Relaxed);
+}
+
+/// Retire a request from the prefix index's point of view: on normal completion
+/// of a standard-layout request, contribute its full KV pages to the index
+/// (exclusive pages transfer ownership; pages whose hash is already cached are
+/// freed as duplicates); in every case, release the references the request held
+/// on its shared prefix head. Must run before `active.remove` drops the lease.
+fn finalize_prefix_cache_for_request(
+    state: &CudaSchedulerState,
+    request: &mut CudaContinuousTextRequest,
+    completed: bool,
+) {
     let Some(kv_pages) = &state.kv_pages else {
         return;
     };
-    let mut tokens = request.prompt_tokens.clone();
-    tokens.extend_from_slice(&request.generated_tokens);
-    let pages_kept = match kv_pages.pages_for_tokens(tokens.len()) {
-        Ok(pages_kept) => pages_kept,
-        Err(_) => return,
-    };
-    let mut all_pages = request.lease.detach_pages();
-    if pages_kept > all_pages.len() {
-        // Shouldn't happen (the lease was sized for the full budget), but never
-        // keep more pages than we own — return them all and retain nothing.
-        kv_pages.release_pages(&mut all_pages);
+    if request.lease.pages.is_empty() && request.shared_prefix_hashes.is_empty() {
         return;
     }
-    let mut unused = all_pages.split_off(pages_kept);
-    kv_pages.release_pages(&mut unused);
-    let kept = all_pages;
-
-    let mut slot = match state.prefix_cache.lock() {
-        Ok(slot) => slot,
-        Err(_) => {
-            // Lock poisoned: don't leak the detached pages.
-            let mut kept = kept;
-            kv_pages.release_pages(&mut kept);
-            return;
-        }
+    let mut index = match state.prefix_index.lock() {
+        Ok(index) => index,
+        Err(poisoned) => poisoned.into_inner(),
     };
-    if let Some(mut previous) = slot.take() {
-        kv_pages.release_pages(&mut previous.pages);
+    let contribute =
+        completed && prefix_cache_enabled_for(state) && !state.qwen.recurrent_ssm_tensor_layout;
+    if contribute {
+        let mut tokens = request.prompt_tokens.clone();
+        tokens.extend_from_slice(&request.generated_tokens);
+        // The FINAL generated token's KV is never written (nothing forwards
+        // after it is sampled), so it must not be hashed: if the sequence ended
+        // exactly on a page boundary, its chain entry would publish a page with
+        // one garbage position.
+        tokens.pop();
+        let chain = prefix_cache::block_hash_chain(&tokens, state.kv_page_size);
+        let (pages, shared_count) = request.lease.take_pages();
+        let insert_count = chain.len().min(pages.len());
+        // Shared head entries re-offer the index's own pages (no-ops); exclusive
+        // pages either transfer to the index or come back as duplicates.
+        let mut duplicates = index.insert_chain(&chain[..insert_count], &pages[..insert_count]);
+        // Never free a shared-head page as a "duplicate": those are index-owned.
+        // (Cannot happen — a shared page's hash maps to itself — but keep the
+        // debug assertion honest.)
+        debug_assert!(
+            duplicates
+                .iter()
+                .all(|page| !pages[..shared_count].contains(page))
+        );
+        kv_pages.release_pages(&mut duplicates);
+        let mut tail: Vec<usize> = pages[insert_count..].to_vec();
+        kv_pages.release_pages(&mut tail);
+        index.release_prefix(&request.shared_prefix_hashes, shared_count);
+    } else {
+        // Not contributing: just drop our shared references; the lease's Drop
+        // frees the exclusive tail when the request is removed.
+        index.release_prefix(
+            &request.shared_prefix_hashes,
+            request.lease.shared_page_count,
+        );
     }
-    *slot = Some(RetainedPrefix {
-        tokens,
-        pages: kept,
-    });
 }
 
 fn admit_continuous_text_job(
@@ -4419,10 +4478,17 @@ fn admit_continuous_text_job(
     update_atomic_max(&stats.admission_requested_pages_max, pages_needed);
 
     let sampling_key = scheduler_sampling_key(&job.request);
-    // Prefix reuse only supports the greedy, non-recurrent decode path.
-    let reuse_allowed = matches!(sampling_key, CudaSchedulerSamplingKey::Greedy)
-        && !state.qwen.recurrent_ssm_tensor_layout;
-    let (lease, prefix_reuse_tokens) = match acquire_lease_with_prefix_reuse(
+    // KV content depends only on (token ids, positions) — never on sampling —
+    // so sampled requests reuse and contribute cached prefixes too. Recurrent
+    // layouts (whose state lives outside the pages) are excluded, and sampled
+    // reuse additionally needs the chunked-prefill entry point: it is the only
+    // sampled prefill that starts at an offset instead of rewriting the shared
+    // head (greedy has `prefill_greedy_next_tokens_paged_reusing_prefix`).
+    let chunked_prefill_available =
+        state.chunk_prefill_supported && chunk_prefill_tokens().is_some();
+    let reuse_allowed = !state.qwen.recurrent_ssm_tensor_layout
+        && (matches!(sampling_key, CudaSchedulerSamplingKey::Greedy) || chunked_prefill_available);
+    let (lease, prefix_reuse_tokens, shared_prefix_hashes) = match acquire_lease_with_prefix_reuse(
         state,
         kv_pages,
         &prompt_tokens,
@@ -4452,6 +4518,7 @@ fn admit_continuous_text_job(
             .retained_prefix_reuse_tokens
             .fetch_add(usize_to_u64(prefix_reuse_tokens), Ordering::Relaxed);
     }
+    publish_prefix_index_gauges(state, stats);
 
     let rng = match sampling_key {
         CudaSchedulerSamplingKey::Greedy => None,
@@ -4475,6 +4542,7 @@ fn admit_continuous_text_job(
         lease,
         prefix_reuse_tokens,
         prefill_pos: prefix_reuse_tokens,
+        shared_prefix_hashes,
     })
 }
 
@@ -4678,6 +4746,13 @@ fn process_continuous_decode_iteration(
     };
     let mut het_group: Vec<usize> = Vec::new();
     let mut chunk_prefill_group: Vec<usize> = Vec::new();
+    // Requests reusing a cached prefix must never share a whole-prompt batched
+    // prefill: that path re-prefills from position 0, rewriting index-owned
+    // shared pages with (geometry-dependent, ±ulp different) KV bytes that other
+    // live requests may be reading. They take the suffix-chunk path when
+    // chunking is available, else a singleton whole-prompt group (whose
+    // greedy-single arm uses the suffix-reuse entry point).
+    let mut reuse_prefill_singletons: Vec<usize> = Vec::new();
     let mut groups: BTreeMap<
         (CudaContinuousStepPhase, usize, CudaSchedulerSamplingKey),
         Vec<usize>,
@@ -4693,19 +4768,24 @@ fn process_continuous_decode_iteration(
                 het_group.push(idx);
                 continue;
             }
-            if let Some(budget) = chunk_prefill
-                && phase == CudaContinuousStepPhase::Prefill
-            {
-                // Only LONG prompts chunk (plus any request already mid-chunking).
-                // Short prompts keep the whole-prompt path below, preserving its
-                // equal-length batching and intra-batch shared-prefix reuse.
-                let mid_chunking = request.prefill_pos > request.prefix_reuse_tokens;
-                let remaining = request
-                    .prompt_tokens
-                    .len()
-                    .saturating_sub(request.prefill_pos);
-                if mid_chunking || remaining > budget {
-                    chunk_prefill_group.push(idx);
+            if phase == CudaContinuousStepPhase::Prefill {
+                if let Some(budget) = chunk_prefill {
+                    // LONG prompts chunk (plus any request already mid-chunking,
+                    // and any request holding a reused prefix — see above).
+                    // Short fresh prompts keep the whole-prompt path below,
+                    // preserving its equal-length batching and intra-batch
+                    // shared-prefix reuse.
+                    let mid_chunking = request.prefill_pos > request.prefix_reuse_tokens;
+                    let remaining = request
+                        .prompt_tokens
+                        .len()
+                        .saturating_sub(request.prefill_pos);
+                    if mid_chunking || remaining > budget || request.prefix_reuse_tokens > 0 {
+                        chunk_prefill_group.push(idx);
+                        continue;
+                    }
+                } else if request.prefix_reuse_tokens > 0 {
+                    reuse_prefill_singletons.push(idx);
                     continue;
                 }
             }
@@ -4756,6 +4836,24 @@ fn process_continuous_decode_iteration(
                 &chunk,
             );
         }
+    }
+
+    for idx in reuse_prefill_singletons {
+        if retire[idx].is_some() {
+            continue;
+        }
+        let token_count = active[idx].prompt_tokens.len();
+        let sampling_key = active[idx].sampling_key;
+        process_continuous_decode_chunk(
+            state,
+            stats,
+            active,
+            &mut retire,
+            CudaContinuousStepPhase::Prefill,
+            token_count,
+            sampling_key,
+            &[idx],
+        );
     }
 
     for chunk in het_group.chunks(max_batch_size.max(1)) {
@@ -4848,12 +4946,12 @@ fn process_continuous_decode_iteration(
             let Some(reason) = &retire[idx] else {
                 continue;
             };
-            // Retain a normally-completed greedy request's KV so the next
-            // request's shared prefix can reuse it. Must run before the lease is
-            // dropped by `active.remove`.
-            if matches!(reason, CudaContinuousRetireReason::Completed) {
-                retain_prefix_from_request(state, &mut active[idx]);
-            }
+            // Contribute a completed request's KV to the prefix index and, for
+            // every retirement, release the request's shared-prefix references.
+            // Must run before the lease is dropped by `active.remove`.
+            let completed = matches!(reason, CudaContinuousRetireReason::Completed);
+            finalize_prefix_cache_for_request(state, &mut active[idx], completed);
+            publish_prefix_index_gauges(state, stats);
             active.remove(idx);
         }
     }
@@ -5673,15 +5771,19 @@ fn process_continuous_decode_chunk(
             }
             match sampling_key {
                 CudaSchedulerSamplingKey::Greedy => {
-                    // Reuse a retained prefix's KV only when this request is
-                    // prefilled alone (a reused request can't share a batched
-                    // full-prefill with fresh ones). Multi-request batches fall
-                    // back to a full prefill, which still writes correct KV into
-                    // the (identical-token) reused pages — just without the
-                    // speedup.
+                    // Requests holding a reused prefix are always scheduled alone
+                    // here (the grouping loop routes them to the chunk path or a
+                    // singleton group), so a multi-request batch never contains
+                    // one — a batched full prefill would rewrite index-owned
+                    // shared pages other requests may be reading.
                     let reuse = if indexes.len() == 1 {
                         active[indexes[0]].prefix_reuse_tokens
                     } else {
+                        debug_assert!(
+                            indexes
+                                .iter()
+                                .all(|idx| active[*idx].prefix_reuse_tokens == 0)
+                        );
                         0
                     };
                     if reuse > 0 {
@@ -12079,7 +12181,7 @@ mod tests {
         assert!(health.quantization.contains("idle_micros_total="));
         assert!(health.quantization.contains("idle_micros_max="));
         assert!(health.quantization.contains(
-            "prefix-cache=enabled(scope=batch,backend=paged-shared-prefix,batches=0,requests=0,tokens_total=0,cross_request_reuse_requests=0,cross_request_reuse_tokens=0)"
+            "prefix-cache=enabled(scope=batch,backend=paged-shared-prefix,batches=0,requests=0,tokens_total=0,cross_request_reuse_requests=0,cross_request_reuse_tokens=0,entries=0,referenced=0)"
         ));
         assert_eq!(
             health_counter(&health.quantization, "admission_cancelled_requests"),
@@ -17230,7 +17332,7 @@ mod tests {
             Some(4)
         );
         assert!(health.quantization.contains(
-            "prefix-cache=enabled(scope=batch,backend=paged-shared-prefix,batches=1,requests=2,tokens_total=4,cross_request_reuse_requests=0,cross_request_reuse_tokens=0)"
+            "prefix-cache=enabled(scope=batch,backend=paged-shared-prefix,batches=1,requests=2,tokens_total=4,cross_request_reuse_requests=0,cross_request_reuse_tokens=0,"
         ));
         assert_eq!(
             health_counter(&health.quantization, "prefill_tokens_total"),
@@ -17930,7 +18032,7 @@ mod tests {
             mmproj: None,
             multimodal_stats: backend.multimodal_stats.clone(),
             max_active_requests: 1,
-            prefix_cache: super::Mutex::new(None),
+            prefix_index: super::Mutex::new(super::prefix_cache::PrefixBlockIndex::new()),
             sse_writer: None,
             chunk_prefill_supported: false,
             graph_scratch: super::Mutex::new(None),
@@ -17967,6 +18069,212 @@ mod tests {
         let snapshot = kv_pages.snapshot();
         assert_eq!(snapshot.pages_free, snapshot.pages_total);
         assert_eq!(snapshot.total_allocations, 0);
+    }
+
+    /// True when `HI_CUDA_PREFIX_CACHE=0` (or similar) explicitly disables the
+    /// prefix cache for the whole process — the reuse tests below exercise the
+    /// feature itself, so they no-op under that override.
+    #[cfg(feature = "native-cuda")]
+    fn prefix_cache_disabled_by_env() -> bool {
+        matches!(
+            std::env::var("HI_CUDA_PREFIX_CACHE")
+                .ok()
+                .map(|value| value.trim().to_ascii_lowercase())
+                .as_deref(),
+            Some("0" | "false" | "no" | "off")
+        )
+    }
+
+    /// Agent-loop shape: a second request whose prompt extends the first
+    /// request's prompt reuses the completed request's cached KV pages
+    /// (single-active server, where the prefix cache defaults on), and its
+    /// output is byte-identical to the same prompt on a cold backend.
+    #[cfg(feature = "native-cuda")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cuda_gpu_scheduler_reuses_completed_prefix_across_requests() {
+        if prefix_cache_disabled_by_env() {
+            return;
+        }
+        let path = tempfile_path("backend-scheduler-gpu-prefix-index-reuse");
+        write_reference_qwen(&path);
+
+        let config = super::CudaBackendConfig {
+            max_batch_size: 1,
+            max_active_requests: 1,
+            max_wait_us: 0,
+            kv_page_size: 8,
+            mmproj_path: None,
+            ..super::CudaBackendConfig::default()
+        };
+        let backend = CudaBackend::load_with_config(
+            &path,
+            Some("tiny-cuda".to_string()),
+            CudaExecution::Gpu,
+            config.clone(),
+        )
+        .unwrap();
+        let request = |prompt: &str| GenerationRequest {
+            prompt: prompt.to_string(),
+            max_tokens: 4,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            seed: None,
+            stop_sequences: Vec::new(),
+            media_inputs: Vec::new(),
+        };
+
+        // 17 tokens: two full 8-token pages of 'a' plus one suffix token. After
+        // completion (>= 1 generated token, minus the final unwritten one) the
+        // index holds both full 'a' pages.
+        let turn1 = format!("{}b", "a".repeat(16));
+        let first = backend.generate(request(&turn1)).await.unwrap();
+        assert!(first.completion_tokens >= 1);
+
+        // Extends the same 16-token 'a' head, diverging afterwards: exactly the
+        // two cached pages (16 tokens) are reusable.
+        let turn2 = format!("{}bcb", "a".repeat(16));
+        let second = backend.generate(request(&turn2)).await.unwrap();
+
+        let health = backend.health();
+        assert_eq!(
+            health_counter(&health.quantization, "cross_request_reuse_requests"),
+            Some(1),
+            "expected one reusing request in {}",
+            health.quantization
+        );
+        assert_eq!(
+            health_counter(&health.quantization, "cross_request_reuse_tokens"),
+            Some(16),
+            "expected 16 reused prefix tokens in {}",
+            health.quantization
+        );
+        // Both full 'a' pages stay cached (turn 2 re-offered them as no-ops),
+        // and no retired request still references them.
+        assert_eq!(health_counter(&health.quantization, "entries"), Some(2));
+        assert!(health.quantization.contains("referenced=0)"));
+
+        // Same prompt on a cold backend (empty index -> full prefill) must
+        // produce the identical completion: reused KV == recomputed KV.
+        let cold = CudaBackend::load_with_config(
+            &path,
+            Some("tiny-cuda".to_string()),
+            CudaExecution::Gpu,
+            config,
+        )
+        .unwrap();
+        let cold_second = cold.generate(request(&turn2)).await.unwrap();
+        assert_eq!(second.text, cold_second.text);
+        assert_eq!(second.completion_tokens, cold_second.completion_tokens);
+        let cold_health = cold.health();
+        assert_eq!(
+            health_counter(&cold_health.quantization, "cross_request_reuse_requests"),
+            Some(0),
+            "cold backend must not reuse: {}",
+            cold_health.quantization
+        );
+    }
+
+    /// Prefix-index page accounting against the allocator: referenced entries
+    /// never evict (admission fails instead), unreferenced entries evict
+    /// LRU-first when a fresh allocation would otherwise be rejected, and every
+    /// page stays owned by exactly one of free list / lease tail / index.
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn cuda_gpu_prefix_index_evicts_only_unreferenced_pages_under_pressure() {
+        if prefix_cache_disabled_by_env() {
+            return;
+        }
+        let path = tempfile_path("backend-scheduler-gpu-prefix-index-evict");
+        write_reference_qwen(&path);
+
+        let backend = CudaBackend::load_with_config(
+            &path,
+            Some("tiny-cuda".to_string()),
+            CudaExecution::Gpu,
+            super::CudaBackendConfig {
+                max_batch_size: 1,
+                max_active_requests: 1,
+                max_wait_us: 0,
+                kv_cache_mode: super::CudaKvCacheMode::Paged,
+                kv_page_size: 8,
+                mmproj_path: None,
+                ..super::CudaBackendConfig::default()
+            },
+        )
+        .unwrap();
+        // 4-page pool, 8 tokens per page.
+        let kv_pages = std::sync::Arc::new(
+            super::CudaPagedKvCacheManager::for_qwen(&backend.qwen, 32, 8).unwrap(),
+        );
+        let state = super::CudaSchedulerState {
+            qwen: backend.qwen.clone(),
+            max_output_tokens: backend.model.max_output_tokens,
+            cpu_reference: backend.cpu_reference.clone(),
+            gpu_model: backend.gpu_model.as_ref().unwrap().clone(),
+            kv_pages: Some(kv_pages.clone()),
+            kv_cache_mode: super::CudaKvCacheMode::Paged,
+            kv_page_size: 8,
+            mmproj: None,
+            multimodal_stats: backend.multimodal_stats.clone(),
+            max_active_requests: 1,
+            prefix_index: super::Mutex::new(super::prefix_cache::PrefixBlockIndex::new()),
+            sse_writer: None,
+            chunk_prefill_supported: false,
+            graph_scratch: super::Mutex::new(None),
+        };
+
+        // Seed the index with 2 pages covering tokens [0..16).
+        let tokens: Vec<u32> = (0..16).collect();
+        let chain = super::prefix_cache::block_hash_chain(&tokens, 8);
+        {
+            let seed_pages = kv_pages.take_free_pages(2, 16).unwrap();
+            let mut index = state.prefix_index.lock().unwrap();
+            assert!(index.insert_chain(&chain, &seed_pages).is_empty());
+        }
+        assert_eq!(kv_pages.snapshot().pages_free, 2);
+
+        // A prompt extending those 16 tokens shares both index pages and
+        // allocates only its exclusive tail (3-page budget -> 1 fresh page).
+        let mut prompt = tokens.clone();
+        prompt.push(99);
+        let (lease, reuse_tokens, matched) =
+            super::acquire_lease_with_prefix_reuse(&state, &kv_pages, &prompt, 24, true).unwrap();
+        assert_eq!(reuse_tokens, 16);
+        assert_eq!(lease.shared_page_count, 2);
+        assert_eq!(lease.pages.len(), 3);
+        assert_eq!(matched.len(), 2);
+        assert_eq!(kv_pages.snapshot().pages_free, 1);
+        assert_eq!(state.prefix_index.lock().unwrap().referenced_count(), 2);
+
+        // While the lease references the shared head, pressure must NOT evict
+        // it: a 2-page ask with 1 free page fails outright.
+        let other: Vec<u32> = (100..117).collect();
+        let denied = super::acquire_lease_with_prefix_reuse(&state, &kv_pages, &other, 16, true);
+        assert!(denied.is_err());
+        assert_eq!(state.prefix_index.lock().unwrap().entry_count(), 2);
+
+        // Retire the sharer (release refs, drop frees ONLY the exclusive tail).
+        state
+            .prefix_index
+            .lock()
+            .unwrap()
+            .release_prefix(&matched, 2);
+        drop(lease);
+        assert_eq!(kv_pages.snapshot().pages_free, 2);
+
+        // Now the same ask succeeds by evicting the unreferenced entries.
+        let (evict_lease, evict_reuse, _) =
+            super::acquire_lease_with_prefix_reuse(&state, &kv_pages, &other, 24, true).unwrap();
+        assert_eq!(evict_reuse, 0);
+        assert_eq!(evict_lease.pages.len(), 3);
+        assert_eq!(state.prefix_index.lock().unwrap().entry_count(), 0);
+        assert_eq!(kv_pages.snapshot().pages_free, 1);
+
+        // Full drain: dropping the last lease returns every page.
+        drop(evict_lease);
+        let snapshot = kv_pages.snapshot();
+        assert_eq!(snapshot.pages_free, snapshot.pages_total);
     }
 
     #[cfg(feature = "native-cuda")]
@@ -18238,7 +18546,16 @@ mod tests {
             Some(0)
         );
         assert!(health_counter(&health.quantization, "peak_pending").is_some());
-        assert!(health.quantization.contains("pages_free=2"));
+        // With the prefix cache active (HI_CUDA_PREFIX_CACHE=1), the completed
+        // request's full pages stay retained in the index instead of returning
+        // to the free list; everything else must drain.
+        let retained = health_counter(&health.quantization, "entries").unwrap_or(0);
+        let expected_free = format!("pages_free={}", 2 - retained);
+        assert!(
+            health.quantization.contains(&expected_free),
+            "expected {expected_free} in {}",
+            health.quantization
+        );
     }
 
     #[cfg(feature = "native-cuda")]
