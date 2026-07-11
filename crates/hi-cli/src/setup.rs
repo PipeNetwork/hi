@@ -81,6 +81,7 @@ pub async fn run() -> Result<Settings> {
         max_tokens: 8192,
         max_tokens_explicit: false,
         thinking_budget: None,
+        reasoning_effort: None,
         tool_mode: hi_ai::ToolMode::Auto,
         compat: hi_ai::CompatMode::Auto,
         minimal_tools: false,

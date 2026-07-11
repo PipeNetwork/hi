@@ -559,6 +559,54 @@ impl crate::App {
                 };
                 self.push(Line::styled(msg, dim()));
             }
+            Command::Config(arg) => {
+                use hi_agent::command::{ConfigArg, parse_config_arg};
+                match parse_config_arg(&arg) {
+                    ConfigArg::Show => {
+                        let r = agent
+                            .reasoning_effort()
+                            .map(|e| e.as_str().to_string())
+                            .unwrap_or_else(|| "off".into());
+                        let t = agent
+                            .temperature()
+                            .map(|t| t.to_string())
+                            .unwrap_or_else(|| "default".into());
+                        self.push(Line::styled(
+                            format!("config — reasoning: {r} · temperature: {t}"),
+                            dim(),
+                        ));
+                        self.push(Line::styled(
+                            "set: /config reasoning <minimal|low|medium|high|xhigh|off> · \
+                             /config temp <0.0-2.0|off>"
+                                .to_string(),
+                            dim(),
+                        ));
+                    }
+                    ConfigArg::Reasoning(effort) => {
+                        agent.set_reasoning_effort(effort);
+                        let msg = match effort {
+                            Some(e) => format!(
+                                "reasoning effort → {} (applies next turn; OpenAI-compatible endpoints only)",
+                                e.as_str()
+                            ),
+                            None => "reasoning effort → off (no reasoning_effort sent; endpoint default)"
+                                .to_string(),
+                        };
+                        self.push(Line::styled(msg, dim()));
+                    }
+                    ConfigArg::Temperature(temp) => {
+                        agent.set_temperature(temp);
+                        let msg = match temp {
+                            Some(t) => format!("temperature → {t}"),
+                            None => "temperature → provider default (cleared)".to_string(),
+                        };
+                        self.push(Line::styled(msg, dim()));
+                    }
+                    ConfigArg::Invalid(m) => {
+                        self.push(Line::styled(m, Style::default().fg(Color::Yellow)));
+                    }
+                }
+            }
             Command::Diff => {
                 let out = hi_tools::working_tree_diff().await;
                 let text = out.into_text().unwrap_or_else(|_| Text::from(out.clone()));

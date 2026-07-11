@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Parser, ValueEnum};
 use hi_agent::VerifyStage;
-use hi_ai::{CompatMode, ToolMode};
+use hi_ai::{CompatMode, ReasoningEffort, ToolMode};
 use serde::{Deserialize, Serialize};
 
 const DEFAULT_MAX_TOKENS: u32 = 8192;
@@ -64,6 +64,11 @@ pub struct Cli {
     /// Enable reasoning with this thinking-token budget (Anthropic).
     #[arg(long, value_name = "BUDGET")]
     pub thinking: Option<u32>,
+
+    /// Reasoning effort for OpenAI-compatible endpoints that support it
+    /// (minimal, low, medium, high, xhigh). Sent as `reasoning_effort`.
+    #[arg(long, value_enum)]
+    pub reasoning_effort: Option<CliReasoningEffort>,
 
     /// Tool calling mode: auto, required, chat-only, or read-only.
     #[arg(long, value_enum)]
@@ -240,6 +245,27 @@ impl From<CliCompatMode> for CompatMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum CliReasoningEffort {
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+}
+
+impl From<CliReasoningEffort> for ReasoningEffort {
+    fn from(value: CliReasoningEffort) -> Self {
+        match value {
+            CliReasoningEffort::Minimal => Self::Minimal,
+            CliReasoningEffort::Low => Self::Low,
+            CliReasoningEffort::Medium => Self::Medium,
+            CliReasoningEffort::High => Self::High,
+            CliReasoningEffort::Xhigh => Self::Xhigh,
+        }
+    }
+}
+
 impl ProviderName {
     /// True if this provider speaks the native Anthropic wire format.
     pub fn is_anthropic(self) -> bool {
@@ -364,6 +390,10 @@ pub struct Profile {
     pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking_budget: Option<u32>,
+    /// Reasoning effort (`reasoning_effort`) for OpenAI-compatible endpoints
+    /// that support it. TOML values: minimal/low/medium/high/xhigh.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_mode: Option<ToolMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -410,6 +440,7 @@ pub struct Settings {
     pub max_tokens: u32,
     pub max_tokens_explicit: bool,
     pub thinking_budget: Option<u32>,
+    pub reasoning_effort: Option<ReasoningEffort>,
     pub tool_mode: ToolMode,
     pub compat: CompatMode,
     pub minimal_tools: bool,
@@ -634,6 +665,10 @@ pub fn resolve(cli: &Cli, config: &Config) -> Result<Settings> {
     let max_tokens_explicit = max_tokens_is_explicit(provider, cli.max_tokens, profile_max_tokens);
 
     let thinking_budget = cli.thinking.or(profile.and_then(|p| p.thinking_budget));
+    let reasoning_effort = cli
+        .reasoning_effort
+        .map(ReasoningEffort::from)
+        .or_else(|| profile.and_then(|p| p.reasoning_effort));
     let tool_mode = cli
         .tool_mode
         .map(ToolMode::from)
@@ -663,6 +698,7 @@ pub fn resolve(cli: &Cli, config: &Config) -> Result<Settings> {
         max_tokens,
         max_tokens_explicit,
         thinking_budget,
+        reasoning_effort,
         tool_mode,
         compat,
         minimal_tools,
@@ -1388,6 +1424,7 @@ pub fn resolve_named_profile(config: &Config, name: &str) -> Result<Settings> {
         max_tokens,
         max_tokens_explicit,
         thinking_budget: profile.thinking_budget,
+        reasoning_effort: profile.reasoning_effort,
         tool_mode: profile.tool_mode.unwrap_or_default(),
         compat: profile.compat.unwrap_or_default(),
         minimal_tools: profile.minimal_tools.unwrap_or(false),

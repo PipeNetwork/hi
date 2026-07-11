@@ -705,6 +705,7 @@ mod tests {
             top_p: None,
             frequency_penalty: None,
             thinking_budget: None,
+            reasoning_effort: None,
             profile,
         }
     }

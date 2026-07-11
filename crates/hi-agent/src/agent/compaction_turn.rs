@@ -433,6 +433,7 @@ impl crate::Agent {
             top_p: None,
             frequency_penalty: None,
             thinking_budget: None,
+            reasoning_effort: None,
             profile: RequestProfile {
                 compat: self.config.compat,
                 tool_mode: ToolMode::ChatOnly,

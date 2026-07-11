@@ -55,6 +55,7 @@ impl crate::Agent {
             max_tokens_explicit: self.config.max_tokens_explicit,
             temperature: self.config.temperature,
             thinking_budget: self.config.thinking_budget,
+            reasoning_effort: self.config.reasoning_effort,
             compat: self.config.compat,
             context_window: self.config.context_window,
             project_context: self.config.project_context.clone(),

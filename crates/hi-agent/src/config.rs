@@ -1,6 +1,6 @@
 //! Per-session agent configuration and the layered-verification stage type.
 
-use hi_ai::{CompatMode, ToolMode};
+use hi_ai::{CompatMode, ReasoningEffort, ToolMode};
 
 use crate::compaction::{CompactionKind, DEFAULT_KEEP_RECENT};
 use crate::{
@@ -52,6 +52,12 @@ pub struct AgentConfig {
     pub max_tokens_explicit: bool,
     pub temperature: Option<f32>,
     pub thinking_budget: Option<u32>,
+    /// Abstract reasoning level (`reasoning_effort`) applied to every main-turn
+    /// request on OpenAI-compatible endpoints that support it; `None` leaves the
+    /// endpoint default. See [`hi_ai::ReasoningEffort`]. Housekeeping calls
+    /// (compaction/memory/recap) deliberately leave this off. Set via
+    /// `--reasoning-effort`, a profile, or `/config reasoning <level>`.
+    pub reasoning_effort: Option<ReasoningEffort>,
     pub tool_mode: ToolMode,
     pub compat: CompatMode,
     /// Model context window, when known — used to show how full it is.
@@ -191,6 +197,7 @@ impl Default for AgentConfig {
             max_tokens_explicit: false,
             temperature: None,
             thinking_budget: None,
+            reasoning_effort: None,
             tool_mode: ToolMode::Auto,
             compat: CompatMode::Auto,
             context_window: None,

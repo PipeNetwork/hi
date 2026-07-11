@@ -39,7 +39,7 @@ pub use provider::{
 };
 pub use types::{
     ChatRequest, CompatMode, Completion, Content, Message, RateLimitBucket, RateLimitState,
-    RequestProfile, Role, StreamEvent, ToolCall, ToolMode, ToolSpec, Usage,
+    ReasoningEffort, RequestProfile, Role, StreamEvent, ToolCall, ToolMode, ToolSpec, Usage,
     estimate_completion_output_tokens, estimate_content_tokens, estimate_messages_tokens,
     estimate_text_tokens,
 };
