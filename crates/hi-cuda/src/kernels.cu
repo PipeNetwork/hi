@@ -9253,7 +9253,6 @@ __global__ void wmma_causal_attention_batched_kernel(
   float* s_sh = reinterpret_cast<float*>(p_sh + T * T);  // [T*T], reused as O store tile
   float* m_sh = s_sh + T * T;   // [T] running max per query row
   float* l_sh = m_sh + T;       // [T] running denominator per query row
-  float* f_sh = l_sh + T;       // [T] this-tile O rescale factor per query row
 
   const int head = blockIdx.y;
   const int batch = blockIdx.z;
@@ -9311,36 +9310,73 @@ __global__ void wmma_causal_attention_batched_kernel(
       wmma::load_matrix_sync(kf, k_sh + h * T, head_dim);
       wmma::mma_sync(s_frag, qf[h], kf, s_frag);
     }
-    wmma::store_matrix_sync(s_sh, s_frag, T, wmma::mem_row_major);
-    __syncwarp();
-    // softmax over this key tile (thread == query row), causal; publish P + factor
-    if (tid < T) {
-      const int qpos = q0 + tid;
-      float* srow = s_sh + tid * T;
-      float rmax = -INFINITY;
-      for (int j = 0; j < T; ++j) {
-        const int kpos = kt + j;
-        const float sc = (kpos < seq_len && kpos <= qpos) ? srow[j] * scale : -INFINITY;
-        srow[j] = sc;
-        rmax = fmaxf(rmax, sc);
+    // In-fragment online softmax: each lane owns 8 elements of the 16x16 S
+    // accumulator (rows row_lo/row_hi, 4 columns each at col_base + {0,1,8,9});
+    // row max/sum reduce across the 4-lane row group via xor-shuffles and P is
+    // written straight to shared as f16. Replaces a 16-thread serial pass
+    // (~32 masked-exp steps per tile with half the warp idle, plus a full S
+    // round-trip through shared) that profiled as the dominant cost of
+    // chunked prefill.
+    const int col_base = (tid & 3) * 2;
+    const int qpos_lo = q0 + row_lo;
+    const int qpos_hi = q0 + row_hi;
+    float sv[8];
+    float rmax_lo = -INFINITY;
+    float rmax_hi = -INFINITY;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const bool hi_row = ((i >> 1) & 1) != 0;
+      const int col = col_base + (i & 1) + ((i >> 2) << 3);
+      const int kpos = kt + col;
+      const int qpos = hi_row ? qpos_hi : qpos_lo;
+      const float sc = (kpos < seq_len && kpos <= qpos) ? s_frag.x[i] * scale : -INFINITY;
+      sv[i] = sc;
+      if (hi_row) {
+        rmax_hi = fmaxf(rmax_hi, sc);
+      } else {
+        rmax_lo = fmaxf(rmax_lo, sc);
       }
-      const float m_old = m_sh[tid];
-      const float new_m = fmaxf(m_old, rmax);
-      const float factor = isfinite(m_old) ? __expf(m_old - new_m) : 0.0f;
-      f_sh[tid] = factor;
-      float rsum = 0.0f;
-      for (int j = 0; j < T; ++j) {
-        const float p = isfinite(srow[j]) ? __expf(srow[j] - new_m) : 0.0f;
-        p_sh[tid * T + j] = __float2half(p);
-        rsum += p;
+    }
+#pragma unroll
+    for (int off = 1; off <= 2; off <<= 1) {
+      rmax_lo = fmaxf(rmax_lo, __shfl_xor_sync(0xffffffffu, rmax_lo, off));
+      rmax_hi = fmaxf(rmax_hi, __shfl_xor_sync(0xffffffffu, rmax_hi, off));
+    }
+    const float m_old_lo = m_sh[row_lo];
+    const float m_old_hi = m_sh[row_hi];
+    const float newm_lo = fmaxf(m_old_lo, rmax_lo);
+    const float newm_hi = fmaxf(m_old_hi, rmax_hi);
+    const float fac_lo = isfinite(m_old_lo) ? __expf(m_old_lo - newm_lo) : 0.0f;
+    const float fac_hi = isfinite(m_old_hi) ? __expf(m_old_hi - newm_hi) : 0.0f;
+    float rsum_lo = 0.0f;
+    float rsum_hi = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const bool hi_row = ((i >> 1) & 1) != 0;
+      const int col = col_base + (i & 1) + ((i >> 2) << 3);
+      const float p =
+          isfinite(sv[i]) ? __expf(sv[i] - (hi_row ? newm_hi : newm_lo)) : 0.0f;
+      p_sh[(hi_row ? row_hi : row_lo) * T + col] = __float2half(p);
+      if (hi_row) {
+        rsum_hi += p;
+      } else {
+        rsum_lo += p;
       }
-      l_sh[tid] = l_sh[tid] * factor + rsum;
-      m_sh[tid] = new_m;
+    }
+#pragma unroll
+    for (int off = 1; off <= 2; off <<= 1) {
+      rsum_lo += __shfl_xor_sync(0xffffffffu, rsum_lo, off);
+      rsum_hi += __shfl_xor_sync(0xffffffffu, rsum_hi, off);
+    }
+    if ((tid & 3) == 0) {
+      l_sh[row_lo] = l_sh[row_lo] * fac_lo + rsum_lo;
+      l_sh[row_hi] = l_sh[row_hi] * fac_hi + rsum_hi;
+      m_sh[row_lo] = newm_lo;
+      m_sh[row_hi] = newm_hi;
     }
     __syncwarp();
-    // rescale O accumulators by the per-row factor, then O += P @ V (tensor cores)
-    const float fac_lo = f_sh[row_lo];
-    const float fac_hi = f_sh[row_hi];
+    // rescale O accumulators by the per-row factor (already in registers,
+    // identical across each 4-lane row group), then O += P @ V (tensor cores)
     wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pf;
     wmma::load_matrix_sync(pf, p_sh, T);
     for (int h = 0; h < hd_tiles; ++h) {
@@ -9437,7 +9473,6 @@ __global__ void wmma_paged_prefill_causal_attention_batched_kernel(
   float* s_sh = reinterpret_cast<float*>(p_sh + T * T);
   float* m_sh = s_sh + T * T;
   float* l_sh = m_sh + T;
-  float* f_sh = l_sh + T;
 
   const int head = blockIdx.y;
   const int batch = blockIdx.z;
@@ -9513,36 +9548,73 @@ __global__ void wmma_paged_prefill_causal_attention_batched_kernel(
       wmma::load_matrix_sync(kf, k_sh + h * T, head_dim);
       wmma::mma_sync(s_frag, qf[h], kf, s_frag);
     }
-    wmma::store_matrix_sync(s_sh, s_frag, T, wmma::mem_row_major);
-    __syncwarp();
-    // online softmax over this key tile (thread == query row), causal by ABSOLUTE position
-    if (tid < T) {
-      const int qpos = query_offset + q0 + tid;
-      float* srow = s_sh + tid * T;
-      float rmax = -INFINITY;
-      for (int j = 0; j < T; ++j) {
-        const int kpos = kt + j;
-        const float sc = (kpos <= qpos) ? srow[j] * scale : -INFINITY;
-        srow[j] = sc;
-        rmax = fmaxf(rmax, sc);
+    // In-fragment online softmax: each lane owns 8 elements of the 16x16 S
+    // accumulator (rows row_lo/row_hi, 4 columns each at col_base + {0,1,8,9});
+    // row max/sum reduce across the 4-lane row group via xor-shuffles and P is
+    // written straight to shared as f16. Replaces a 16-thread serial pass
+    // (~32 masked-exp steps per tile with half the warp idle, plus a full S
+    // round-trip through shared) that profiled as the dominant cost of
+    // chunked prefill.
+    const int col_base = (tid & 3) * 2;
+    const int qpos_lo = query_offset + q0 + row_lo;
+    const int qpos_hi = query_offset + q0 + row_hi;
+    float sv[8];
+    float rmax_lo = -INFINITY;
+    float rmax_hi = -INFINITY;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const bool hi_row = ((i >> 1) & 1) != 0;
+      const int col = col_base + (i & 1) + ((i >> 2) << 3);
+      const int kpos = kt + col;
+      const int qpos = hi_row ? qpos_hi : qpos_lo;
+      const float sc = (kpos <= qpos) ? s_frag.x[i] * scale : -INFINITY;
+      sv[i] = sc;
+      if (hi_row) {
+        rmax_hi = fmaxf(rmax_hi, sc);
+      } else {
+        rmax_lo = fmaxf(rmax_lo, sc);
       }
-      const float m_old = m_sh[tid];
-      const float new_m = fmaxf(m_old, rmax);
-      const float factor = isfinite(m_old) ? __expf(m_old - new_m) : 0.0f;
-      f_sh[tid] = factor;
-      float rsum = 0.0f;
-      for (int j = 0; j < T; ++j) {
-        const float p = isfinite(srow[j]) ? __expf(srow[j] - new_m) : 0.0f;
-        p_sh[tid * T + j] = __float2half(p);
-        rsum += p;
+    }
+#pragma unroll
+    for (int off = 1; off <= 2; off <<= 1) {
+      rmax_lo = fmaxf(rmax_lo, __shfl_xor_sync(0xffffffffu, rmax_lo, off));
+      rmax_hi = fmaxf(rmax_hi, __shfl_xor_sync(0xffffffffu, rmax_hi, off));
+    }
+    const float m_old_lo = m_sh[row_lo];
+    const float m_old_hi = m_sh[row_hi];
+    const float newm_lo = fmaxf(m_old_lo, rmax_lo);
+    const float newm_hi = fmaxf(m_old_hi, rmax_hi);
+    const float fac_lo = isfinite(m_old_lo) ? __expf(m_old_lo - newm_lo) : 0.0f;
+    const float fac_hi = isfinite(m_old_hi) ? __expf(m_old_hi - newm_hi) : 0.0f;
+    float rsum_lo = 0.0f;
+    float rsum_hi = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const bool hi_row = ((i >> 1) & 1) != 0;
+      const int col = col_base + (i & 1) + ((i >> 2) << 3);
+      const float p =
+          isfinite(sv[i]) ? __expf(sv[i] - (hi_row ? newm_hi : newm_lo)) : 0.0f;
+      p_sh[(hi_row ? row_hi : row_lo) * T + col] = __float2half(p);
+      if (hi_row) {
+        rsum_hi += p;
+      } else {
+        rsum_lo += p;
       }
-      l_sh[tid] = l_sh[tid] * factor + rsum;
-      m_sh[tid] = new_m;
+    }
+#pragma unroll
+    for (int off = 1; off <= 2; off <<= 1) {
+      rsum_lo += __shfl_xor_sync(0xffffffffu, rsum_lo, off);
+      rsum_hi += __shfl_xor_sync(0xffffffffu, rsum_hi, off);
+    }
+    if ((tid & 3) == 0) {
+      l_sh[row_lo] = l_sh[row_lo] * fac_lo + rsum_lo;
+      l_sh[row_hi] = l_sh[row_hi] * fac_hi + rsum_hi;
+      m_sh[row_lo] = newm_lo;
+      m_sh[row_hi] = newm_hi;
     }
     __syncwarp();
-    // rescale O accumulators by the per-row factor, then O += P @ V (tensor cores)
-    const float fac_lo = f_sh[row_lo];
-    const float fac_hi = f_sh[row_hi];
+    // rescale O accumulators by the per-row factor (already in registers,
+    // identical across each 4-lane row group), then O += P @ V (tensor cores)
     wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pf;
     wmma::load_matrix_sync(pf, p_sh, T);
     for (int h = 0; h < hd_tiles; ++h) {
@@ -9634,7 +9706,6 @@ __global__ void wmma_paged_prefill_causal_attention_batched_q8_kernel(
   float* s_sh = reinterpret_cast<float*>(p_sh + T * T);
   float* m_sh = s_sh + T * T;
   float* l_sh = m_sh + T;
-  float* f_sh = l_sh + T;
 
   const int head = blockIdx.y;
   const int batch = blockIdx.z;
@@ -9722,34 +9793,73 @@ __global__ void wmma_paged_prefill_causal_attention_batched_q8_kernel(
       wmma::load_matrix_sync(kf, k_sh + h * T, head_dim);
       wmma::mma_sync(s_frag, qf[h], kf, s_frag);
     }
-    wmma::store_matrix_sync(s_sh, s_frag, T, wmma::mem_row_major);
-    __syncwarp();
-    if (tid < T) {
-      const int qpos = query_offset + q0 + tid;
-      float* srow = s_sh + tid * T;
-      float rmax = -INFINITY;
-      for (int j = 0; j < T; ++j) {
-        const int kpos = kt + j;
-        const float sc = (kpos <= qpos) ? srow[j] * scale : -INFINITY;
-        srow[j] = sc;
-        rmax = fmaxf(rmax, sc);
+    // In-fragment online softmax: each lane owns 8 elements of the 16x16 S
+    // accumulator (rows row_lo/row_hi, 4 columns each at col_base + {0,1,8,9});
+    // row max/sum reduce across the 4-lane row group via xor-shuffles and P is
+    // written straight to shared as f16. Replaces a 16-thread serial pass
+    // (~32 masked-exp steps per tile with half the warp idle, plus a full S
+    // round-trip through shared) that profiled as the dominant cost of
+    // chunked prefill.
+    const int col_base = (tid & 3) * 2;
+    const int qpos_lo = query_offset + q0 + row_lo;
+    const int qpos_hi = query_offset + q0 + row_hi;
+    float sv[8];
+    float rmax_lo = -INFINITY;
+    float rmax_hi = -INFINITY;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const bool hi_row = ((i >> 1) & 1) != 0;
+      const int col = col_base + (i & 1) + ((i >> 2) << 3);
+      const int kpos = kt + col;
+      const int qpos = hi_row ? qpos_hi : qpos_lo;
+      const float sc = (kpos <= qpos) ? s_frag.x[i] * scale : -INFINITY;
+      sv[i] = sc;
+      if (hi_row) {
+        rmax_hi = fmaxf(rmax_hi, sc);
+      } else {
+        rmax_lo = fmaxf(rmax_lo, sc);
       }
-      const float m_old = m_sh[tid];
-      const float new_m = fmaxf(m_old, rmax);
-      const float factor = isfinite(m_old) ? __expf(m_old - new_m) : 0.0f;
-      f_sh[tid] = factor;
-      float rsum = 0.0f;
-      for (int j = 0; j < T; ++j) {
-        const float p = isfinite(srow[j]) ? __expf(srow[j] - new_m) : 0.0f;
-        p_sh[tid * T + j] = __float2half(p);
-        rsum += p;
+    }
+#pragma unroll
+    for (int off = 1; off <= 2; off <<= 1) {
+      rmax_lo = fmaxf(rmax_lo, __shfl_xor_sync(0xffffffffu, rmax_lo, off));
+      rmax_hi = fmaxf(rmax_hi, __shfl_xor_sync(0xffffffffu, rmax_hi, off));
+    }
+    const float m_old_lo = m_sh[row_lo];
+    const float m_old_hi = m_sh[row_hi];
+    const float newm_lo = fmaxf(m_old_lo, rmax_lo);
+    const float newm_hi = fmaxf(m_old_hi, rmax_hi);
+    const float fac_lo = isfinite(m_old_lo) ? __expf(m_old_lo - newm_lo) : 0.0f;
+    const float fac_hi = isfinite(m_old_hi) ? __expf(m_old_hi - newm_hi) : 0.0f;
+    float rsum_lo = 0.0f;
+    float rsum_hi = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const bool hi_row = ((i >> 1) & 1) != 0;
+      const int col = col_base + (i & 1) + ((i >> 2) << 3);
+      const float p =
+          isfinite(sv[i]) ? __expf(sv[i] - (hi_row ? newm_hi : newm_lo)) : 0.0f;
+      p_sh[(hi_row ? row_hi : row_lo) * T + col] = __float2half(p);
+      if (hi_row) {
+        rsum_hi += p;
+      } else {
+        rsum_lo += p;
       }
-      l_sh[tid] = l_sh[tid] * factor + rsum;
-      m_sh[tid] = new_m;
+    }
+#pragma unroll
+    for (int off = 1; off <= 2; off <<= 1) {
+      rsum_lo += __shfl_xor_sync(0xffffffffu, rsum_lo, off);
+      rsum_hi += __shfl_xor_sync(0xffffffffu, rsum_hi, off);
+    }
+    if ((tid & 3) == 0) {
+      l_sh[row_lo] = l_sh[row_lo] * fac_lo + rsum_lo;
+      l_sh[row_hi] = l_sh[row_hi] * fac_hi + rsum_hi;
+      m_sh[row_lo] = newm_lo;
+      m_sh[row_hi] = newm_hi;
     }
     __syncwarp();
-    const float fac_lo = f_sh[row_lo];
-    const float fac_hi = f_sh[row_hi];
+    // rescale O accumulators by the per-row factor (already in registers,
+    // identical across each 4-lane row group), then O += P @ V (tensor cores)
     wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pf;
     wmma::load_matrix_sync(pf, p_sh, T);
     for (int h = 0; h < hd_tiles; ++h) {
