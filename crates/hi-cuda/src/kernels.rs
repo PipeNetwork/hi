@@ -251,6 +251,18 @@ mod native {
             k: c_int,
             stream: *mut c_void,
         ) -> c_int;
+        fn hi_cuda_launch_kquant_dp4a_gemm(
+            dtype: c_int,
+            weights: *const c_void,
+            xq: *const c_void,
+            dx: *const c_void,
+            xsum: *const c_void,
+            y: *mut c_void,
+            m: c_int,
+            rows: c_int,
+            cols: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
         fn hi_cuda_launch_moe_grouped_dp4a_gemv(
             dtype: c_int,
             expert_ptrs: *const c_void,
@@ -1846,6 +1858,44 @@ mod native {
     pub enum MoeGroupedGemvDtype {
         Q4K = 0,
         Q6K = 1,
+    }
+
+    /// dp4a K-quant GEMM for small M (2..=32): each decoded weight sub-block is
+    /// dotted against ALL M activation rows, so quantized weights stream once for
+    /// the whole batch. Per output row bit-identical to the M=1 dp4a GEMV.
+    /// Activations are the [m, cols] int8 rows from `launch_quantize_q8_rows`;
+    /// y is [m, rows].
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_kquant_dp4a_gemm(
+        dtype: MoeGroupedGemvDtype,
+        weights: &DeviceBuffer,
+        xq: &DeviceBuffer,
+        dx: &DeviceBuffer,
+        xsum: &DeviceBuffer,
+        y: &DeviceBuffer,
+        m: usize,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(m, "kquant_gemm m")?;
+        ensure_len(rows, "kquant_gemm rows")?;
+        ensure_len(cols, "kquant_gemm cols")?;
+        launch_status(unsafe {
+            hi_cuda_launch_kquant_dp4a_gemm(
+                dtype as c_int,
+                weights.as_ptr(),
+                xq.as_ptr(),
+                dx.as_ptr(),
+                xsum.as_ptr(),
+                y.as_mut_ptr(),
+                m as c_int,
+                rows as c_int,
+                cols as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_kquant_dp4a_gemm")
     }
 
     /// One launch for every (token row, routed expert) pair of a MoE projection:

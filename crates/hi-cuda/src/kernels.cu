@@ -7225,6 +7225,246 @@ extern "C" int hi_cuda_launch_moe_grouped_dp4a_gemv(
   }
 }
 
+// dp4a K-quant GEMM for small M (batched decode, M = 2..32): warp per weight row,
+// each decoded per-32 sub-block is dotted against ALL M activation rows before
+// moving on, so the quantized weight bytes are read ONCE per step for the whole
+// batch (0.57 B/param for Q4_K) instead of the dequant->f16 GEMM's 2 B/param.
+// Weight decode, dp4a order, per-sub rescale, and the final warp reduction are
+// identical to the M=1 GEMV per activation row, so each output row is
+// BIT-IDENTICAL to running that row through the GEMV. Activations ([M, cols]
+// int8 rows from quantize_q8_rows) are small enough to stay L2-resident, so the
+// M-way re-read is cheap; weights dominate and stream once. Compute stays under
+// the dp4a envelope through M=32 at this card's weight bandwidth.
+template <int MB>
+__global__ void q4_k_dp4a_gemm_kernel(
+    const uint8_t* __restrict__ weights,
+    const int8_t* __restrict__ xq,
+    const float* __restrict__ dx,
+    const int* __restrict__ xsum,
+    float* __restrict__ y,
+    int m,
+    int rows,
+    int cols) {
+  const int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+  if (row >= rows) {
+    return;
+  }
+  const int lane = threadIdx.x & 31;
+  const int nsub = cols / 32;
+  const size_t row_bytes = static_cast<size_t>(cols / 256) * 144;
+  const uint8_t* row_ptr = weights + static_cast<size_t>(row) * row_bytes;
+  float acc[MB];
+#pragma unroll
+  for (int mi = 0; mi < MB; ++mi) {
+    acc[mi] = 0.0f;
+  }
+  for (int sub = lane; sub < nsub; sub += 32) {
+    const int kblock = sub >> 3;
+    const int si = sub & 7;
+    const uint8_t* blk = row_ptr + static_cast<size_t>(kblock) * 144;
+    const float d = __half2float(*reinterpret_cast<const __half*>(blk));
+    const float dmin = __half2float(*reinterpret_cast<const __half*>(blk + 2));
+    const uint8_t* scales = blk + 4;
+    const uint8_t* qs = blk + 16;
+    uint8_t scale, mn;
+    q4_k_scale_min(si, scales, &scale, &mn);
+    const int base = (si >> 1) * 32;
+    const bool high = (si & 1) != 0;
+    // Decode the 32 nibbles ONCE, then reuse them for every activation row.
+    int nib[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const uint32_t packed = *reinterpret_cast<const uint32_t*>(qs + base + j * 4);
+      nib[j] = high ? static_cast<int>((packed >> 4) & 0x0F0F0F0Fu)
+                    : static_cast<int>(packed & 0x0F0F0F0Fu);
+    }
+    const float ws = d * static_cast<float>(scale);
+    const float wm = dmin * static_cast<float>(mn);
+#pragma unroll
+    for (int mi = 0; mi < MB; ++mi) {
+      if (mi >= m) {
+        break;
+      }
+      const int8_t* xqb = xq + static_cast<size_t>(mi) * cols + sub * 32;
+      int dot = 0;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const int xv = *reinterpret_cast<const int*>(xqb + j * 4);
+        dot = dp4a_i8(nib[j], xv, dot);
+      }
+      acc[mi] += dx[static_cast<size_t>(mi) * nsub + sub] *
+                 (ws * static_cast<float>(dot) -
+                  wm * static_cast<float>(xsum[static_cast<size_t>(mi) * nsub + sub]));
+    }
+  }
+#pragma unroll
+  for (int mi = 0; mi < MB; ++mi) {
+    if (mi >= m) {
+      break;
+    }
+    float v = acc[mi];
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      v += __shfl_down_sync(0xffffffffu, v, off);
+    }
+    if (lane == 0) {
+      y[static_cast<size_t>(mi) * rows + row] = v;
+    }
+  }
+}
+
+template <int MB>
+__global__ void q6_k_dp4a_gemm_kernel(
+    const uint8_t* __restrict__ weights,
+    const int8_t* __restrict__ xq,
+    const float* __restrict__ dx,
+    float* __restrict__ y,
+    int m,
+    int rows,
+    int cols) {
+  const int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+  if (row >= rows) {
+    return;
+  }
+  const int lane = threadIdx.x & 31;
+  const int nsub = cols / 32;
+  const size_t row_bytes = static_cast<size_t>(cols / 256) * 210;
+  const uint8_t* row_ptr = weights + static_cast<size_t>(row) * row_bytes;
+  float acc[MB];
+#pragma unroll
+  for (int mi = 0; mi < MB; ++mi) {
+    acc[mi] = 0.0f;
+  }
+  for (int sub = lane; sub < nsub; sub += 32) {
+    const int kblock = sub >> 3;
+    const int rem = sub & 7;
+    const int half = rem >> 2;
+    const int group = rem & 3;
+    const uint8_t* blk = row_ptr + static_cast<size_t>(kblock) * 210;
+    const float d = __half2float(*reinterpret_cast<const __half*>(blk + 208));
+    const int ql_base = half * 64 + ((group == 1 || group == 3) ? 32 : 0);
+    const int qh_base = 128 + half * 32;
+    const int scale_base = 192 + half * 8;
+    const int shift = group * 2;
+    const bool highn = group >= 2;
+    // Decode the two 16-weight chunks' q6 words + scales ONCE.
+    int q6[2][4];
+    int8_t chunk_scale[2];
+#pragma unroll
+    for (int chunk = 0; chunk < 2; ++chunk) {
+      const int l0 = chunk * 16;
+      chunk_scale[chunk] = static_cast<int8_t>(blk[scale_base + chunk + group * 2]);
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const int l = l0 + j * 4;
+        const uint8_t* qlp = blk + ql_base + l;
+        const uint32_t ql4 = static_cast<uint32_t>(qlp[0]) |
+                             (static_cast<uint32_t>(qlp[1]) << 8) |
+                             (static_cast<uint32_t>(qlp[2]) << 16) |
+                             (static_cast<uint32_t>(qlp[3]) << 24);
+        const int nib = highn ? static_cast<int>((ql4 >> 4) & 0x0F0F0F0Fu)
+                              : static_cast<int>(ql4 & 0x0F0F0F0Fu);
+        const uint8_t* qhp = blk + qh_base + l;
+        const uint32_t qh4 = static_cast<uint32_t>(qhp[0]) |
+                             (static_cast<uint32_t>(qhp[1]) << 8) |
+                             (static_cast<uint32_t>(qhp[2]) << 16) |
+                             (static_cast<uint32_t>(qhp[3]) << 24);
+        const int hb = static_cast<int>(((qh4 >> shift) & 0x03030303u) << 4);
+        q6[chunk][j] = nib | hb;
+      }
+    }
+#pragma unroll
+    for (int mi = 0; mi < MB; ++mi) {
+      if (mi >= m) {
+        break;
+      }
+      const int8_t* xqbase = xq + static_cast<size_t>(mi) * cols + sub * 32;
+      float contrib = 0.0f;
+#pragma unroll
+      for (int chunk = 0; chunk < 2; ++chunk) {
+        const int l0 = chunk * 16;
+        int dot = 0;
+        int xs = 0;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          const int xv = *reinterpret_cast<const int*>(xqbase + l0 + j * 4);
+          dot = dp4a_i8(q6[chunk][j], xv, dot);
+          xs = dp4a_i8(xv, 0x01010101, xs);
+        }
+        contrib += static_cast<float>(chunk_scale[chunk]) *
+                   (static_cast<float>(dot) - 32.0f * static_cast<float>(xs));
+      }
+      acc[mi] += dx[static_cast<size_t>(mi) * nsub + sub] * d * contrib;
+    }
+  }
+#pragma unroll
+  for (int mi = 0; mi < MB; ++mi) {
+    if (mi >= m) {
+      break;
+    }
+    float v = acc[mi];
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      v += __shfl_down_sync(0xffffffffu, v, off);
+    }
+    if (lane == 0) {
+      y[static_cast<size_t>(mi) * rows + row] = v;
+    }
+  }
+}
+
+extern "C" int hi_cuda_launch_kquant_dp4a_gemm(
+    int dtype,  // 0 = Q4_K, 1 = Q6_K
+    const void* weights,
+    const void* xq,
+    const void* dx,
+    const void* xsum,
+    void* y,
+    int m,
+    int rows,
+    int cols,
+    void* stream) {
+  if (weights == nullptr || xq == nullptr || dx == nullptr || xsum == nullptr ||
+      y == nullptr || m < 2 || m > 32 || rows <= 0 || cols <= 0 ||
+      cols % 256 != 0 || stream == nullptr) {
+    return 1;
+  }
+  const int warps_per_block = 4;
+  const int grid = (rows + warps_per_block - 1) / warps_per_block;
+  const cudaStream_t s = static_cast<cudaStream_t>(stream);
+  const uint8_t* w = static_cast<const uint8_t*>(weights);
+  const int8_t* xqp = static_cast<const int8_t*>(xq);
+  const float* dxp = static_cast<const float*>(dx);
+  const int* xsp = static_cast<const int*>(xsum);
+  float* yp = static_cast<float*>(y);
+#define HI_CUDA_KQUANT_GEMM_LAUNCH(MB)                                          \
+  do {                                                                          \
+    if (dtype == 0) {                                                           \
+      q4_k_dp4a_gemm_kernel<MB><<<grid, warps_per_block * 32, 0, s>>>(          \
+          w, xqp, dxp, xsp, yp, m, rows, cols);                                 \
+    } else {                                                                    \
+      q6_k_dp4a_gemm_kernel<MB><<<grid, warps_per_block * 32, 0, s>>>(          \
+          w, xqp, dxp, yp, m, rows, cols);                                      \
+    }                                                                           \
+  } while (0)
+  if (dtype != 0 && dtype != 1) {
+    return 1;
+  }
+  if (m <= 2) {
+    HI_CUDA_KQUANT_GEMM_LAUNCH(2);
+  } else if (m <= 4) {
+    HI_CUDA_KQUANT_GEMM_LAUNCH(4);
+  } else if (m <= 8) {
+    HI_CUDA_KQUANT_GEMM_LAUNCH(8);
+  } else if (m <= 16) {
+    HI_CUDA_KQUANT_GEMM_LAUNCH(16);
+  } else {
+    HI_CUDA_KQUANT_GEMM_LAUNCH(32);
+  }
+#undef HI_CUDA_KQUANT_GEMM_LAUNCH
+  return 0;
+}
+
 // out[row] += sum_k route_weights[row*top_k + k] * down[row*top_k + k], k in rank
 // order — the same accumulation order as the sequential per-expert
 // add_scaled_row_in_place calls it replaces. Atomic-free: each (row, col) is

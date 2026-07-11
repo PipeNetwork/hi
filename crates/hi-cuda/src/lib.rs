@@ -4834,21 +4834,23 @@ fn het_decode_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var("HI_CUDA_HET_DECODE").is_ok_and(|value| value != "0"))
 }
 
-/// Minimum decode batch for the heterogeneous path (`HI_CUDA_HET_DECODE_MIN`, default 3).
-/// Below it, requests keep the historical grouping: while weights are cached f16, an
-/// M>1 matmul reads 2 bytes/param per step vs 0.57 per dp4a GEMV forward, so batching
-/// only pays once the batch amortizes that (measured on Qwen2.5-VL-3B: K=2 batched is
-/// ~14% SLOWER aggregate, K=4 is +63%, K=8 is +174%). A quantized M>1 GEMM will drop
-/// the break-even to 2.
+/// Minimum decode batch for the heterogeneous path (`HI_CUDA_HET_DECODE_MIN`).
+/// Below it, requests keep the historical grouping. Default depends on the matmul
+/// the batch would use: with the quantized GEMM (`HI_CUDA_MMQ`) batching wins from
+/// 2 rows (measured: K=2 aggregate +71%), while the cached-f16 GEMM reads
+/// 2 bytes/param per step vs 0.57 per dp4a GEMV forward and only pays from ~3-4
+/// rows (measured: K=2 batched was ~14% SLOWER, K=4 +63%) — so the default is 2
+/// with MMQ enabled and 3 without.
 fn het_decode_min_batch() -> usize {
     use std::sync::OnceLock;
     static MIN: OnceLock<usize> = OnceLock::new();
     *MIN.get_or_init(|| {
+        let mmq = std::env::var("HI_CUDA_MMQ").is_ok_and(|value| value != "0");
         std::env::var("HI_CUDA_HET_DECODE_MIN")
             .ok()
             .and_then(|value| value.trim().parse().ok())
             .filter(|value| *value >= 2)
-            .unwrap_or(3)
+            .unwrap_or(if mmq { 2 } else { 3 })
     })
 }
 
@@ -22902,6 +22904,255 @@ mod tests {
                     "{name} row {r}: gemv {} vs reference {} (tol {tol})",
                     y[r],
                     reference,
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_kquant_dp4a_gemm_matches_gemv_rows() {
+        use crate::kernels::MoeGroupedGemvDtype;
+        use crate::runtime::{DeviceBuffer, Stream};
+        use rand::rngs::StdRng;
+        use rand::{Rng, RngCore, SeedableRng};
+
+        let stream = Stream::create().unwrap();
+        let rows = 48usize;
+        let cols = 512usize;
+        let nsub = cols / 32;
+
+        type Launch = fn(
+            &DeviceBuffer,
+            &DeviceBuffer,
+            &DeviceBuffer,
+            &DeviceBuffer,
+            &DeviceBuffer,
+            usize,
+            usize,
+            &Stream,
+        ) -> anyhow::Result<()>;
+        let cases: &[(MoeGroupedGemvDtype, usize, usize, i64, Launch)] = &[
+            (
+                MoeGroupedGemvDtype::Q4K,
+                144,
+                0,
+                2,
+                crate::kernels::launch_q4_k_dp4a_gemv,
+            ),
+            (
+                MoeGroupedGemvDtype::Q6K,
+                210,
+                208,
+                -1,
+                crate::kernels::launch_q6_k_dp4a_gemv,
+            ),
+        ];
+        for &(dtype, block_bytes, d_off, dmin_off, gemv) in cases {
+            let mut rng = StdRng::seed_from_u64(0x9e77 + block_bytes as u64);
+            let nblocks = cols / 256;
+            let wlen = rows * nblocks * block_bytes;
+            let mut wbytes = vec![0u8; wlen];
+            rng.fill_bytes(&mut wbytes);
+            for blk in 0..(rows * nblocks) {
+                let base = blk * block_bytes;
+                wbytes[base + d_off] = 0x00;
+                wbytes[base + d_off + 1] = 0x3C;
+                if dmin_off >= 0 {
+                    let o = base + dmin_off as usize;
+                    wbytes[o] = 0x00;
+                    wbytes[o + 1] = 0x38;
+                }
+            }
+            let w = DeviceBuffer::alloc(wlen).unwrap();
+            w.copy_from_host(&wbytes).unwrap();
+
+            // Ragged M values across every kernel bucket (2/4/8/16/32).
+            for m in [2usize, 3, 5, 8, 17, 32] {
+                let x: Vec<f32> = (0..m * cols).map(|_| rng.gen_range(-1.5f32..1.5)).collect();
+                let x_dev = DeviceBuffer::alloc(x.len() * std::mem::size_of::<f32>()).unwrap();
+                x_dev.copy_from_host(&x).unwrap();
+                let xq = DeviceBuffer::alloc(m * cols).unwrap();
+                let dx = DeviceBuffer::alloc(m * nsub * std::mem::size_of::<f32>()).unwrap();
+                let xsum = DeviceBuffer::alloc(m * nsub * std::mem::size_of::<i32>()).unwrap();
+                crate::kernels::launch_quantize_q8_rows(&x_dev, &xq, &dx, &xsum, m, cols, &stream)
+                    .unwrap();
+                let y = DeviceBuffer::alloc(m * rows * std::mem::size_of::<f32>()).unwrap();
+                crate::kernels::launch_kquant_dp4a_gemm(
+                    dtype, &w, &xq, &dx, &xsum, &y, m, rows, cols, &stream,
+                )
+                .unwrap();
+                stream.synchronize().unwrap();
+                let got = y.copy_to_host::<f32>(m * rows).unwrap();
+                for mi in 0..m {
+                    let xq_row = DeviceBuffer::alloc(cols).unwrap();
+                    xq_row
+                        .copy_device_range(0, &xq, mi * cols, cols, &stream)
+                        .unwrap();
+                    let dx_row = DeviceBuffer::alloc(nsub * std::mem::size_of::<f32>()).unwrap();
+                    dx_row
+                        .copy_device_range(
+                            0,
+                            &dx,
+                            mi * nsub * std::mem::size_of::<f32>(),
+                            nsub * std::mem::size_of::<f32>(),
+                            &stream,
+                        )
+                        .unwrap();
+                    let xsum_row = DeviceBuffer::alloc(nsub * std::mem::size_of::<i32>()).unwrap();
+                    xsum_row
+                        .copy_device_range(
+                            0,
+                            &xsum,
+                            mi * nsub * std::mem::size_of::<i32>(),
+                            nsub * std::mem::size_of::<i32>(),
+                            &stream,
+                        )
+                        .unwrap();
+                    let y_ref = DeviceBuffer::alloc(rows * std::mem::size_of::<f32>()).unwrap();
+                    gemv(&w, &xq_row, &dx_row, &xsum_row, &y_ref, rows, cols, &stream).unwrap();
+                    stream.synchronize().unwrap();
+                    let reference = y_ref.copy_to_host::<f32>(rows).unwrap();
+                    for (row, (&have, &want)) in got[mi * rows..(mi + 1) * rows]
+                        .iter()
+                        .zip(reference.iter())
+                        .enumerate()
+                    {
+                        assert_eq!(
+                            have.to_bits(),
+                            want.to_bits(),
+                            "{dtype:?} m={m} row-of-batch {mi} weight-row {row}: GEMM {have} != GEMV {want}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Head-to-head at batched-decode M: the cached-f16 competitor (cast input +
+    /// cuBLAS f16 GEMM; dequant excluded — hybrid residency has the f16 weight
+    /// cached) vs the dp4a K-quant GEMM (quantize rows + GEMM), plus the
+    /// Quantized-residency competitor (dequant + cast + cuBLAS) for reference.
+    /// Run: cargo test -p hi-cuda --features native-cuda --release bench_kquant_gemm -- --ignored --nocapture --test-threads=1
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    #[ignore = "microbenchmark; run explicitly with --ignored --nocapture"]
+    fn bench_kquant_gemm_vs_f16_gemm() {
+        use crate::kernels::MoeGroupedGemvDtype;
+        use crate::runtime::{Cublas, DeviceBuffer, GemmDType, Stream};
+        use rand::rngs::StdRng;
+        use rand::{RngCore, SeedableRng};
+        use std::time::Instant;
+
+        let stream = Stream::create().unwrap();
+        let cublas = Cublas::create().unwrap();
+        cublas.set_stream(&stream).unwrap();
+        // (dtype, N, K, label): qwen3-32b dense FFN shapes + the Q6_K lm_head.
+        let shapes = [
+            (
+                MoeGroupedGemvDtype::Q4K,
+                25600usize,
+                5120usize,
+                "up      Q4_K N=25600  K=5120 ",
+            ),
+            (
+                MoeGroupedGemvDtype::Q4K,
+                5120,
+                25600,
+                "down    Q4_K N=5120   K=25600",
+            ),
+            (
+                MoeGroupedGemvDtype::Q6K,
+                151936,
+                5120,
+                "lm_head Q6_K N=151936 K=5120 ",
+            ),
+        ];
+        let mut rng = StdRng::seed_from_u64(0xbe9c_4);
+        for (dtype, n, k, label) in shapes {
+            let (block_bytes, d_off, dmin_off): (usize, usize, i64) = match dtype {
+                MoeGroupedGemvDtype::Q4K => (144, 0, 2),
+                MoeGroupedGemvDtype::Q6K => (210, 208, -1),
+            };
+            let nblk = n * (k / 256);
+            let wlen = nblk * block_bytes;
+            let mut wb = vec![0u8; wlen];
+            rng.fill_bytes(&mut wb);
+            for blk in 0..nblk {
+                let b = blk * block_bytes;
+                wb[b + d_off] = 0;
+                wb[b + d_off + 1] = 0x3C;
+                if dmin_off >= 0 {
+                    let o = b + dmin_off as usize;
+                    wb[o] = 0;
+                    wb[o + 1] = 0x38;
+                }
+            }
+            let w = DeviceBuffer::alloc(wlen).unwrap();
+            w.copy_from_host(&wb).unwrap();
+            let wf16 = DeviceBuffer::alloc(n * k * 2).unwrap();
+            let dequant = match dtype {
+                MoeGroupedGemvDtype::Q4K => crate::kernels::launch_dequantize_q4_k_to_f16,
+                MoeGroupedGemvDtype::Q6K => crate::kernels::launch_dequantize_q6_k_to_f16,
+            };
+            dequant(&w, &wf16, n * k, &stream).unwrap();
+            println!("\n=== {label} ===");
+            for m in [2usize, 4, 8, 16, 32] {
+                let xf = DeviceBuffer::alloc(m * k * 4).unwrap();
+                xf.memset_zero_async(&stream).unwrap();
+                let xf16 = DeviceBuffer::alloc(m * k * 2).unwrap();
+                let out = DeviceBuffer::alloc(m * n * 4).unwrap();
+                let nsub = k / 32;
+                let xq = DeviceBuffer::alloc(m * k).unwrap();
+                let dx = DeviceBuffer::alloc(m * nsub * 4).unwrap();
+                let xsum = DeviceBuffer::alloc(m * nsub * 4).unwrap();
+                let f16_cached = || {
+                    crate::kernels::launch_cast_f32_to_f16(&xf, &xf16, m * k, &stream).unwrap();
+                    cublas
+                        .matmul_mixed_rhs_transposed_row_major(
+                            &xf16,
+                            &wf16,
+                            &out,
+                            m,
+                            n,
+                            k,
+                            GemmDType::F16,
+                            GemmDType::F16,
+                        )
+                        .unwrap();
+                };
+                let f16_dequant = || {
+                    dequant(&w, &wf16, n * k, &stream).unwrap();
+                    f16_cached();
+                };
+                let mmq = || {
+                    crate::kernels::launch_quantize_q8_rows(&xf, &xq, &dx, &xsum, m, k, &stream)
+                        .unwrap();
+                    crate::kernels::launch_kquant_dp4a_gemm(
+                        dtype, &w, &xq, &dx, &xsum, &out, m, n, k, &stream,
+                    )
+                    .unwrap();
+                };
+                let bench = |run: &dyn Fn()| {
+                    for _ in 0..5 {
+                        run();
+                    }
+                    stream.synchronize().unwrap();
+                    let iters = 30;
+                    let t = Instant::now();
+                    for _ in 0..iters {
+                        run();
+                    }
+                    stream.synchronize().unwrap();
+                    t.elapsed().as_secs_f64() * 1000.0 / iters as f64
+                };
+                let cached_ms = bench(&f16_cached);
+                let dequant_ms = bench(&f16_dequant);
+                let mmq_ms = bench(&mmq);
+                println!(
+                    "M={m:>2}: f16-cached {cached_ms:>7.3} ms | f16-dequant {dequant_ms:>7.3} ms | mmq {mmq_ms:>7.3} ms | mmq vs cached {:>5.2}x, vs dequant {:>5.2}x",
+                    cached_ms / mmq_ms,
+                    dequant_ms / mmq_ms,
                 );
             }
         }

@@ -3030,6 +3030,34 @@ mod native {
         *ENABLED.get_or_init(|| std::env::var("HI_CUDA_NO_KQUANT_DP4A").is_err())
     }
 
+    /// Quantized small-M GEMM for batched decode (`HI_CUDA_MMQ=1`, opt-in): small-M
+    /// matmuls read the Q4_K/Q6_K weights directly via the dp4a GEMM instead of the
+    /// dequant->f16->cuBLAS tail, cutting the batched-decode weight read ~3.5x (and,
+    /// in Quantized residency, removing a full re-dequant per forward). Each output
+    /// row stays bit-identical to the M=1 dp4a GEMV path.
+    fn mmq_gemm_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("HI_CUDA_MMQ").is_ok_and(|value| value != "0"))
+    }
+
+    /// Largest M routed to the dp4a K-quant GEMM (`HI_CUDA_MMQ_MAX_M`, default 8,
+    /// kernel limit 32). Measured on the GB10 (bench_kquant_gemm_vs_f16_gemm): the
+    /// dp4a GEMM beats cached-f16 cuBLAS 1.5-2.7x at M=2..8, ties around M=16, and
+    /// loses ~2x at M=32 (the per-lane M-loop turns compute-bound) — so larger M
+    /// keeps the cuBLAS tail until a tensor-core mainloop lands.
+    fn mmq_gemm_max_m() -> usize {
+        use std::sync::OnceLock;
+        static MAX_M: OnceLock<usize> = OnceLock::new();
+        *MAX_M.get_or_init(|| {
+            std::env::var("HI_CUDA_MMQ_MAX_M")
+                .ok()
+                .and_then(|value| value.trim().parse().ok())
+                .filter(|value| (2..=32).contains(value))
+                .unwrap_or(8)
+        })
+    }
+
     /// How quantized weights are held resident, trading VRAM for the prefill/decode
     /// speed balance. See `weight_residency_plan`.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3538,6 +3566,61 @@ mod native {
             })
         }
 
+        /// Small-M batched decode via the dp4a K-quant GEMM (`HI_CUDA_MMQ`): quantize
+        /// the M activation rows to int8 once, then read the quantized weights ONCE
+        /// for the whole batch. Each output row is bit-identical to the M=1 GEMV.
+        fn kquant_dp4a_gemm(
+            &self,
+            matrix_name: &str,
+            matrix: &GpuMatrix,
+            input: &GpuF32Tensor,
+            dtype: crate::kernels::MoeGroupedGemvDtype,
+        ) -> Result<GpuF32Tensor> {
+            let m = input.rows;
+            let k = matrix.cols;
+            let nsub = k / 32;
+            let xq = DeviceBuffer::alloc(m * k).context("allocating Q8 batched activations")?;
+            let dx = DeviceBuffer::alloc(m * nsub * std::mem::size_of::<f32>())
+                .context("allocating Q8 batched activation scales")?;
+            let xsum = DeviceBuffer::alloc(m * nsub * std::mem::size_of::<i32>())
+                .context("allocating Q8 batched activation sums")?;
+            crate::kernels::launch_quantize_q8_rows(
+                &input.buffer,
+                &xq,
+                &dx,
+                &xsum,
+                m,
+                k,
+                &self.stream,
+            )
+            .with_context(|| format!("Q8 batched activation quant for {matrix_name}"))?;
+            let output = DeviceBuffer::alloc(
+                m.checked_mul(matrix.rows)
+                    .context("CUDA K-quant GEMM output element count overflows usize")?
+                    * std::mem::size_of::<f32>(),
+            )
+            .context("allocating CUDA K-quant dp4a GEMM output")?;
+            crate::kernels::launch_kquant_dp4a_gemm(
+                dtype,
+                &matrix.buffer,
+                &xq,
+                &dx,
+                &xsum,
+                &output,
+                m,
+                matrix.rows,
+                matrix.cols,
+                &self.stream,
+            )
+            .with_context(|| format!("CUDA K-quant dp4a GEMM for {matrix_name}"))?;
+            self.op_barrier()?;
+            Ok(GpuF32Tensor {
+                rows: m,
+                cols: matrix.rows,
+                buffer: output,
+            })
+        }
+
         fn project_quantized_f32_device(
             &self,
             matrix_name: &str,
@@ -4033,6 +4116,27 @@ mod native {
                     cols: matrix.rows,
                     buffer: output,
                 });
+            }
+            // dp4a K-quant GEMM for small-M batched decode (HI_CUDA_MMQ): reads the
+            // quantized weight ONCE for the whole batch (~0.57 B/param for Q4_K)
+            // instead of the f16 tail's 2 B/param (or, in Quantized residency, a full
+            // re-dequant per forward). Each output row is bit-identical to sending
+            // that row through the M=1 dp4a GEMV. Prefill (M > 32) keeps the cuBLAS
+            // f16 GEMM below, which wins once M amortizes the f16 read.
+            if mmq_gemm_enabled()
+                && kquant_dp4a_enabled()
+                && input.rows >= 2
+                && input.rows <= mmq_gemm_max_m()
+                && matrix.cols % 256 == 0
+            {
+                let dtype = match matrix.dtype {
+                    GgufTensorType::Q4_K => Some(crate::kernels::MoeGroupedGemvDtype::Q4K),
+                    GgufTensorType::Q6_K => Some(crate::kernels::MoeGroupedGemvDtype::Q6K),
+                    _ => None,
+                };
+                if let Some(dtype) = dtype {
+                    return self.kquant_dp4a_gemm(matrix_name, matrix, input, dtype);
+                }
             }
             // Quantized weight matmul via tensor-core f16 GEMM. Dequantizing to f16 is
             // expensive, so cache the f16 weight and reuse it — weights never change,
