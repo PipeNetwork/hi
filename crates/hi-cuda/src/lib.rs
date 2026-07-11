@@ -6139,26 +6139,26 @@ fn send_continuous_token_delta(
     request: &mut CudaContinuousTextRequest,
     token: u32,
 ) -> std::result::Result<(), CudaContinuousRetireReason> {
-    let delta = if request.stream_decoder.is_some() {
-        // Incremental path: push only the tokens generated since the last call
-        // (usually one; the speculative path can append several per pass).
+    // Incremental path: push only the tokens generated since the last call
+    // (usually one; the speculative path can append several per pass). The
+    // decoder is taken out of the request for the loop (and restored on every
+    // exit) so the error path can hand `request` to emit_continuous_event.
+    let delta = if let Some(mut decoder) = request.stream_decoder.take() {
         let tokenizer = state.cpu_reference.tokenizer();
         let mut delta = String::new();
         while request.decoded_token_count < request.generated_tokens.len() {
             let id = request.generated_tokens[request.decoded_token_count];
-            let decoder = request
-                .stream_decoder
-                .as_mut()
-                .expect("stream_decoder checked above");
             match decoder.push(tokenizer, id) {
                 Ok(text) => delta.push_str(&text),
                 Err(err) => {
+                    request.stream_decoder = Some(decoder);
                     let _ = emit_continuous_event(state, request, Err(err));
                     return Err(CudaContinuousRetireReason::Errored);
                 }
             }
             request.decoded_token_count += 1;
         }
+        request.stream_decoder = Some(decoder);
         delta
     } else {
         let current_text = match state

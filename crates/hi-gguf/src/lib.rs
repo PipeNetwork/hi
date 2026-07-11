@@ -1152,6 +1152,9 @@ impl GgufTokenizer {
             next: i32,
             alive: bool,
         }
+        /// Min-heap entry: (rank, left position, merged symbol, left symbol,
+        /// right symbol) under `Reverse` ordering.
+        type MergeEntry = std::cmp::Reverse<(u32, u32, u32, u32, u32)>;
 
         // Interned ids >= this are per-call locals for chars that appear in no
         // merge rule (they can never merge, but must survive as symbols).
@@ -1189,9 +1192,8 @@ impl GgufTokenizer {
             // symbol, left symbol, right symbol). Position tiebreak = leftmost
             // among equal ranks; node indices are stable and order-preserving
             // (a merge keeps the left node), matching the naive scan order.
-            let mut heap: std::collections::BinaryHeap<
-                std::cmp::Reverse<(u32, u32, u32, u32, u32)>,
-            > = std::collections::BinaryHeap::with_capacity(nodes.len());
+            let mut heap: std::collections::BinaryHeap<MergeEntry> =
+                std::collections::BinaryHeap::with_capacity(nodes.len());
             for idx in 0..nodes.len() - 1 {
                 let pair = (nodes[idx].sym, nodes[idx + 1].sym);
                 if let Some((rank, merged)) = self.bpe_pair_merges.get(&pair) {
