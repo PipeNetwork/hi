@@ -866,6 +866,40 @@ mod native {
             head_dim: c_int,
             stream: *mut c_void,
         ) -> c_int;
+        fn hi_cuda_launch_fa2_paged_prefill_causal_attention_batched(
+            q: *const c_void,
+            k_pages: *const c_void,
+            v_pages: *const c_void,
+            page_table: *const c_void,
+            output: *mut c_void,
+            query_offset: c_int,
+            batch_count: c_int,
+            chunk_len: c_int,
+            page_size: c_int,
+            page_table_len: c_int,
+            heads: c_int,
+            kv_heads: c_int,
+            head_dim: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_fa2_paged_prefill_causal_attention_batched_q8(
+            q: *const c_void,
+            k_pages: *const c_void,
+            v_pages: *const c_void,
+            k_scales: *const c_void,
+            v_scales: *const c_void,
+            page_table: *const c_void,
+            output: *mut c_void,
+            query_offset: c_int,
+            batch_count: c_int,
+            chunk_len: c_int,
+            page_size: c_int,
+            page_table_len: c_int,
+            heads: c_int,
+            kv_heads: c_int,
+            head_dim: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
         fn hi_cuda_launch_wmma_causal_attention_batched(
             q: *const c_void,
             k: *const c_void,
@@ -3761,6 +3795,107 @@ mod native {
             )
         })?;
         check_last_error("hi_cuda_launch_wmma_paged_prefill_causal_attention_batched_q8")
+    }
+
+    /// FA2 multi-warp paged prefill attention (4 warps per 64-query block tile,
+    /// shared 32-key K/V staging): same interface and shape constraints as
+    /// `launch_wmma_paged_prefill_causal_attention_batched`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_fa2_paged_prefill_causal_attention_batched(
+        q: &DeviceBuffer,
+        k_pages: &DeviceBuffer,
+        v_pages: &DeviceBuffer,
+        page_table: &DeviceBuffer,
+        output: &DeviceBuffer,
+        query_offset: usize,
+        batch_count: usize,
+        chunk_len: usize,
+        page_size: usize,
+        page_table_len: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(query_offset, "fa2_paged_prefill query_offset")?;
+        ensure_len(batch_count, "fa2_paged_prefill batch_count")?;
+        ensure_len(chunk_len, "fa2_paged_prefill chunk_len")?;
+        ensure_len(page_size, "fa2_paged_prefill page_size")?;
+        ensure_len(page_table_len, "fa2_paged_prefill page_table_len")?;
+        ensure_len(heads, "fa2_paged_prefill heads")?;
+        ensure_len(kv_heads, "fa2_paged_prefill kv_heads")?;
+        ensure_len(head_dim, "fa2_paged_prefill head_dim")?;
+        launch_status(unsafe {
+            hi_cuda_launch_fa2_paged_prefill_causal_attention_batched(
+                q.as_ptr(),
+                k_pages.as_ptr(),
+                v_pages.as_ptr(),
+                page_table.as_ptr(),
+                output.as_mut_ptr(),
+                query_offset as c_int,
+                batch_count as c_int,
+                chunk_len as c_int,
+                page_size as c_int,
+                page_table_len as c_int,
+                heads as c_int,
+                kv_heads as c_int,
+                head_dim as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_fa2_paged_prefill_causal_attention_batched")
+    }
+
+    /// int8/Q8 variant of `launch_fa2_paged_prefill_causal_attention_batched`
+    /// (dequantizes via the scale buffers during the shared gather).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_fa2_paged_prefill_causal_attention_batched_q8(
+        q: &DeviceBuffer,
+        k_pages: &DeviceBuffer,
+        v_pages: &DeviceBuffer,
+        k_scales: &DeviceBuffer,
+        v_scales: &DeviceBuffer,
+        page_table: &DeviceBuffer,
+        output: &DeviceBuffer,
+        query_offset: usize,
+        batch_count: usize,
+        chunk_len: usize,
+        page_size: usize,
+        page_table_len: usize,
+        heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(query_offset, "fa2_paged_prefill_q8 query_offset")?;
+        ensure_len(batch_count, "fa2_paged_prefill_q8 batch_count")?;
+        ensure_len(chunk_len, "fa2_paged_prefill_q8 chunk_len")?;
+        ensure_len(page_size, "fa2_paged_prefill_q8 page_size")?;
+        ensure_len(page_table_len, "fa2_paged_prefill_q8 page_table_len")?;
+        ensure_len(heads, "fa2_paged_prefill_q8 heads")?;
+        ensure_len(kv_heads, "fa2_paged_prefill_q8 kv_heads")?;
+        ensure_len(head_dim, "fa2_paged_prefill_q8 head_dim")?;
+        launch_status(unsafe {
+            hi_cuda_launch_fa2_paged_prefill_causal_attention_batched_q8(
+                q.as_ptr(),
+                k_pages.as_ptr(),
+                v_pages.as_ptr(),
+                k_scales.as_ptr(),
+                v_scales.as_ptr(),
+                page_table.as_ptr(),
+                output.as_mut_ptr(),
+                query_offset as c_int,
+                batch_count as c_int,
+                chunk_len as c_int,
+                page_size as c_int,
+                page_table_len as c_int,
+                heads as c_int,
+                kv_heads as c_int,
+                head_dim as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_fa2_paged_prefill_causal_attention_batched_q8")
     }
 
     /// Tensor-core (WMMA) flash-attention, causal batched. q/k/v are f16; output f32.

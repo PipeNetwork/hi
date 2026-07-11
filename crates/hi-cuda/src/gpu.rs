@@ -2928,6 +2928,17 @@ mod native {
         *ENABLED.get_or_init(|| std::env::var("HI_CUDA_WMMA_ATTN").is_ok())
     }
 
+    /// FA2 multi-warp paged prefill attention (`HI_CUDA_FA2_ATTN=1`, opt-in): four
+    /// warps per 64-query block tile share one 32-key K/V staging tile (4x fewer
+    /// paged-prefix gathers per query) with per-warp softmax/output ownership,
+    /// replacing the single-warp-per-16-queries WMMA kernel on prefill chunks
+    /// large enough to fill the tile. Same f16 tensor-core accuracy class.
+    fn fa2_attn_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("HI_CUDA_FA2_ATTN").is_ok_and(|value| value != "0"))
+    }
+
     /// Force WMMA prefill attention OFF via `HI_CUDA_NO_WMMA_ATTN` (safety fallback to
     /// the f32 flash kernel, e.g. if f16 precision ever matters).
     fn wmma_attn_forced_off() -> bool {
@@ -15488,7 +15499,49 @@ mod native {
                 && dims.head_dim == dims.v_head_dim
                 && dims.head_dim % 16 == 0
                 && dims.head_dim <= 128;
+            // FA2 (multi-warp, shared K/V staging) takes over from the single-warp
+            // WMMA kernel when the chunk is long enough to fill its 64-query tiles;
+            // short chunks keep WMMA, whose 16-query blocks waste less padding.
+            let use_fa2 = use_wmma && fa2_attn_enabled() && chunk_len >= 48;
             match (&layer_cache.key_scales, &layer_cache.value_scales) {
+                (Some(key_scales), Some(value_scales)) if use_fa2 => {
+                    crate::kernels::launch_fa2_paged_prefill_causal_attention_batched_q8(
+                        &q.buffer,
+                        layer_cache.key_pages.as_buffer(),
+                        layer_cache.value_pages.as_buffer(),
+                        key_scales.as_buffer(),
+                        value_scales.as_buffer(),
+                        &layer_cache.page_table,
+                        &output,
+                        query_offset,
+                        batch_count,
+                        chunk_len,
+                        layer_cache.page_size,
+                        layer_cache.page_table_len,
+                        dims.heads,
+                        dims.kv_heads,
+                        dims.head_dim,
+                        &self.stream,
+                    )?;
+                }
+                (None, None) if use_fa2 => {
+                    crate::kernels::launch_fa2_paged_prefill_causal_attention_batched(
+                        &q.buffer,
+                        layer_cache.key_pages.as_buffer(),
+                        layer_cache.value_pages.as_buffer(),
+                        &layer_cache.page_table,
+                        &output,
+                        query_offset,
+                        batch_count,
+                        chunk_len,
+                        layer_cache.page_size,
+                        layer_cache.page_table_len,
+                        dims.heads,
+                        dims.kv_heads,
+                        dims.head_dim,
+                        &self.stream,
+                    )?;
+                }
                 (Some(key_scales), Some(value_scales)) if use_wmma => {
                     crate::kernels::launch_wmma_paged_prefill_causal_attention_batched_q8(
                         &q.buffer,

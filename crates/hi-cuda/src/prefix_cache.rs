@@ -13,6 +13,9 @@
 //! through the existing paged decode-append path) lives in `lib.rs`.
 
 /// Length of the longest common prefix of two token sequences.
+/// (Superseded by [`block_hash_chain`] matching on the live path; kept with its
+/// tests as the readable specification of the reuse decision.)
+#[cfg(test)]
 pub(crate) fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
     a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
 }
@@ -24,6 +27,7 @@ pub(crate) fn common_prefix_len(a: &[u32], b: &[u32]) -> usize {
 /// leave at least one token for the model to actually process (otherwise there
 /// are no logits to generate the next token from). The result is therefore a
 /// multiple of `page_size`, in `[0, new_tokens.len())`.
+#[cfg(test)]
 pub(crate) fn reusable_prefix_tokens(
     new_tokens: &[u32],
     cached_tokens: &[u32],
@@ -39,6 +43,7 @@ pub(crate) fn reusable_prefix_tokens(
 }
 
 /// Number of whole pages covering `token_count` positions (ceiling division).
+#[cfg(test)]
 pub(crate) fn pages_for_tokens(token_count: usize, page_size: usize) -> usize {
     if page_size == 0 {
         return 0;

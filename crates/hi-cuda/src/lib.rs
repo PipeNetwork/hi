@@ -22569,6 +22569,298 @@ mod tests {
         }
     }
 
+    /// FA2 multi-warp paged prefill attention (f16 + Q8 caches) vs a host f64 softmax over the
+    /// f16-rounded (or dequantized) cache — the same reference and 2e-2 f16-matmul tolerance as
+    /// the WMMA tests. Shapes chosen to hit every structural edge: chunks that underfill one
+    /// 64-query tile, cross tiles, and leave partially-empty warps; offsets that make low warps
+    /// skip whole 32-key tiles; page-boundary straddles; GQA grouping.
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_fa2_paged_prefill_causal_attention_matches_reference() {
+        use crate::runtime::{DeviceBuffer, Stream};
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let stream = Stream::create().unwrap();
+        let mut rng = StdRng::seed_from_u64(0x7fa2_11);
+        for (chunk_len, query_offset, hd, q8) in [
+            (48usize, 0usize, 64usize, false),
+            (64, 37, 32, false),
+            (100, 0, 128, false),
+            (129, 51, 64, false),
+            (96, 20, 64, true),
+        ] {
+            let (heads, kv_heads) = (4usize, 2usize);
+            let seq = query_offset + chunk_len;
+            let page_size = 16usize;
+            let num_phys = seq.div_ceil(page_size);
+            let page_table_len = num_phys;
+            let page_table: Vec<u32> = (0..num_phys as u32).collect();
+            let pt = DeviceBuffer::alloc(page_table.len() * 4).unwrap();
+            pt.copy_from_host(&page_table).unwrap();
+
+            let kv_n = seq * kv_heads * hd;
+            let kvals: Vec<f32> = (0..kv_n).map(|_| rng.gen_range(-1.2f32..1.2)).collect();
+            let vvals: Vec<f32> = (0..kv_n).map(|_| rng.gen_range(-1.2f32..1.2)).collect();
+            let ks = DeviceBuffer::alloc(kv_n * 4).unwrap();
+            ks.copy_from_host(&kvals).unwrap();
+            let vs = DeviceBuffer::alloc(kv_n * 4).unwrap();
+            vs.copy_from_host(&vvals).unwrap();
+
+            let pages_elems = num_phys * kv_heads * page_size * hd;
+            let out = DeviceBuffer::alloc(chunk_len * heads * hd * 4).unwrap();
+            let qn = chunk_len * heads * hd;
+            let qvals: Vec<f32> = (0..qn).map(|_| rng.gen_range(-1.2f32..1.2)).collect();
+            let q = DeviceBuffer::alloc(qn * 4).unwrap();
+            q.copy_from_host(&qvals).unwrap();
+
+            // Reference K/V = what the kernel actually reads back from its cache.
+            let (kref, vref);
+            if q8 {
+                let kpg = DeviceBuffer::alloc(pages_elems).unwrap();
+                let vpg = DeviceBuffer::alloc(pages_elems).unwrap();
+                let scale_elems = num_phys * kv_heads * page_size;
+                let ksc = DeviceBuffer::alloc(scale_elems * 4).unwrap();
+                let vsc = DeviceBuffer::alloc(scale_elems * 4).unwrap();
+                for b in [&kpg, &vpg, &ksc, &vsc] {
+                    b.memset_zero_async(&stream).unwrap();
+                }
+                for (src, pg, sc) in [(&ks, &kpg, &ksc), (&vs, &vpg, &vsc)] {
+                    crate::kernels::launch_write_paged_kv_cache_q8_batched(
+                        src,
+                        pg,
+                        sc,
+                        &pt,
+                        None,
+                        None,
+                        0,
+                        1,
+                        seq,
+                        kv_heads,
+                        hd,
+                        page_size,
+                        page_table_len,
+                        &stream,
+                    )
+                    .unwrap();
+                }
+                stream.synchronize().unwrap();
+                // Dequantized reference: replicate the write kernel's quantization.
+                let dequant = |vals: &[f32]| -> Vec<f32> {
+                    let mut out = vals.to_vec();
+                    for pos in 0..seq {
+                        for h in 0..kv_heads {
+                            let row = &mut out[(pos * kv_heads + h) * hd..][..hd];
+                            let amax = row.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+                            let scale = amax / 127.0;
+                            let inv = if scale > 0.0 { 1.0 / scale } else { 0.0 };
+                            for v in row.iter_mut() {
+                                let q = (*v * inv).round_ties_even().clamp(-127.0, 127.0);
+                                *v = q * scale;
+                            }
+                        }
+                    }
+                    out
+                };
+                kref = dequant(&kvals);
+                vref = dequant(&vvals);
+                crate::kernels::launch_fa2_paged_prefill_causal_attention_batched_q8(
+                    &q,
+                    &kpg,
+                    &vpg,
+                    &ksc,
+                    &vsc,
+                    &pt,
+                    &out,
+                    query_offset,
+                    1,
+                    chunk_len,
+                    page_size,
+                    page_table_len,
+                    heads,
+                    kv_heads,
+                    hd,
+                    &stream,
+                )
+                .unwrap();
+            } else {
+                let round_f16 = |src: &DeviceBuffer, n: usize| -> Vec<f32> {
+                    let h = DeviceBuffer::alloc(n * 2).unwrap();
+                    crate::kernels::launch_cast_f32_to_f16(src, &h, n, &stream).unwrap();
+                    let b = DeviceBuffer::alloc(n * 4).unwrap();
+                    crate::kernels::launch_cast_f16_to_f32(&h, &b, n, &stream).unwrap();
+                    stream.synchronize().unwrap();
+                    b.copy_to_host::<f32>(n).unwrap()
+                };
+                kref = round_f16(&ks, kv_n);
+                vref = round_f16(&vs, kv_n);
+                let kpg = DeviceBuffer::alloc(pages_elems * 2).unwrap();
+                let vpg = DeviceBuffer::alloc(pages_elems * 2).unwrap();
+                kpg.memset_zero_async(&stream).unwrap();
+                vpg.memset_zero_async(&stream).unwrap();
+                for (src, pg) in [(&ks, &kpg), (&vs, &vpg)] {
+                    crate::kernels::launch_write_paged_kv_cache_batched(
+                        src,
+                        pg,
+                        &pt,
+                        1,
+                        seq,
+                        kv_heads,
+                        hd,
+                        page_size,
+                        page_table_len,
+                        0,
+                        &stream,
+                    )
+                    .unwrap();
+                }
+                crate::kernels::launch_fa2_paged_prefill_causal_attention_batched(
+                    &q,
+                    &kpg,
+                    &vpg,
+                    &pt,
+                    &out,
+                    query_offset,
+                    1,
+                    chunk_len,
+                    page_size,
+                    page_table_len,
+                    heads,
+                    kv_heads,
+                    hd,
+                    &stream,
+                )
+                .unwrap();
+            }
+            stream.synchronize().unwrap();
+            let got = out.copy_to_host::<f32>(chunk_len * heads * hd).unwrap();
+
+            let scale = 1.0f64 / (hd as f64).sqrt();
+            let kvr = heads / kv_heads;
+            let kidx = |pos: usize, kvh: usize, d: usize| (pos * kv_heads + kvh) * hd + d;
+            for r in 0..chunk_len {
+                let p = query_offset + r;
+                for h in 0..heads {
+                    let kvh = h / kvr;
+                    let mut sc = vec![0.0f64; p + 1];
+                    let mut mx = f64::NEG_INFINITY;
+                    for (s, sci) in sc.iter_mut().enumerate() {
+                        let mut dot = 0.0f64;
+                        for d in 0..hd {
+                            dot += qvals[(r * heads + h) * hd + d] as f64
+                                * kref[kidx(s, kvh, d)] as f64;
+                        }
+                        *sci = dot * scale;
+                        mx = mx.max(*sci);
+                    }
+                    let mut sum = 0.0f64;
+                    for sci in sc.iter_mut() {
+                        *sci = (*sci - mx).exp();
+                        sum += *sci;
+                    }
+                    for d in 0..hd {
+                        let mut acc = 0.0f64;
+                        for (s, &sci) in sc.iter().enumerate() {
+                            acc += sci / sum * vref[kidx(s, kvh, d)] as f64;
+                        }
+                        let g = got[(r * heads + h) * hd + d] as f64;
+                        assert!(
+                            (g - acc).abs() <= 2e-2,
+                            "chunk={chunk_len} off={query_offset} hd={hd} q8={q8} r={r} h={h} d={d}: {g} vs {acc}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Micro-bench (--ignored): WMMA (1 warp / 16 queries) vs FA2 (4 warps / 64
+    /// queries) paged prefill attention at serving-shaped chunks and prefixes.
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    #[ignore = "kernel A/B bench; run with --ignored on a quiet GPU"]
+    fn bench_fa2_vs_wmma_paged_prefill_attention() {
+        use crate::runtime::{DeviceBuffer, Stream};
+
+        let stream = Stream::create().unwrap();
+        let (heads, kv_heads, hd) = (16usize, 2usize, 128usize);
+        let page_size = 16usize;
+        for (chunk_len, query_offset) in [(1024usize, 0usize), (1024, 6144), (256, 7168)] {
+            let seq = query_offset + chunk_len;
+            let num_phys = seq.div_ceil(page_size);
+            let page_table: Vec<u32> = (0..num_phys as u32).collect();
+            let pt = DeviceBuffer::alloc(page_table.len() * 4).unwrap();
+            pt.copy_from_host(&page_table).unwrap();
+            let pages_elems = num_phys * kv_heads * page_size * hd;
+            let kpg = DeviceBuffer::alloc(pages_elems * 2).unwrap();
+            let vpg = DeviceBuffer::alloc(pages_elems * 2).unwrap();
+            kpg.memset_zero_async(&stream).unwrap();
+            vpg.memset_zero_async(&stream).unwrap();
+            let qn = chunk_len * heads * hd;
+            let q = DeviceBuffer::alloc(qn * 4).unwrap();
+            q.memset_zero_async(&stream).unwrap();
+            let out = DeviceBuffer::alloc(qn * 4).unwrap();
+            stream.synchronize().unwrap();
+
+            let time = |fa2: bool| -> f64 {
+                let reps = 20;
+                let run = || {
+                    if fa2 {
+                        crate::kernels::launch_fa2_paged_prefill_causal_attention_batched(
+                            &q,
+                            &kpg,
+                            &vpg,
+                            &pt,
+                            &out,
+                            query_offset,
+                            1,
+                            chunk_len,
+                            page_size,
+                            num_phys,
+                            heads,
+                            kv_heads,
+                            hd,
+                            &stream,
+                        )
+                        .unwrap();
+                    } else {
+                        crate::kernels::launch_wmma_paged_prefill_causal_attention_batched(
+                            &q,
+                            &kpg,
+                            &vpg,
+                            &pt,
+                            &out,
+                            query_offset,
+                            1,
+                            chunk_len,
+                            page_size,
+                            num_phys,
+                            heads,
+                            kv_heads,
+                            hd,
+                            &stream,
+                        )
+                        .unwrap();
+                    }
+                };
+                run();
+                stream.synchronize().unwrap();
+                let start = std::time::Instant::now();
+                for _ in 0..reps {
+                    run();
+                }
+                stream.synchronize().unwrap();
+                start.elapsed().as_secs_f64() * 1e6 / reps as f64
+            };
+            let wmma_us = time(false);
+            let fa2_us = time(true);
+            println!(
+                "chunk={chunk_len} offset={query_offset}: wmma {wmma_us:.0}us fa2 {fa2_us:.0}us ({:.2}x)",
+                wmma_us / fa2_us
+            );
+        }
+    }
+
     /// Tensor-core (WMMA) paged chunked-prefill causal attention (f16 cache) vs the same host
     /// softmax reference as the scalar flashtile test. The kernel does f16 Q@K^T and P@V (f32
     /// accumulate), so it is NOT bit-parity with the f32 reference; a looser 2e-2 tolerance
