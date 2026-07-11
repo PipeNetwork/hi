@@ -402,6 +402,37 @@ mod native {
         shared
     }
 
+    /// Persistent captured-graph decode state for the continuous scheduler's batch=1 greedy
+    /// path. Keyed by `(page_size, lease_pages, physical_page_count)`: the captured forward
+    /// reads/writes exactly those pool pages and is valid for ANY request leasing them (KV is
+    /// read fresh from the pages via `d_position` each replay), so a request that inherits the
+    /// same lease reuses the graph without a rebuild. Rebuilt when the key changes (new lease
+    /// shape or pool recreation, which would dangle the cache's raw page pointers).
+    struct SchedulerGraphDecodeState {
+        exec: crate::runtime::GraphExec,
+        // Holds raw pointers into the pooled KV pages (kept alive in `paged_batch_pool`).
+        cache: CudaPagedBatchKvCache,
+        d_position: DeviceBuffer,
+        d_token: DeviceBuffer,
+        d_argmax: DeviceBuffer,
+        page_size: usize,
+        lease_pages: Vec<usize>,
+        physical_page_count: usize,
+    }
+
+    impl SchedulerGraphDecodeState {
+        fn matches(
+            &self,
+            page_size: usize,
+            lease_pages: &[usize],
+            physical_page_count: usize,
+        ) -> bool {
+            self.page_size == page_size
+                && self.physical_page_count == physical_page_count
+                && self.lease_pages == lease_pages
+        }
+    }
+
     pub struct CudaQwenGpuModel {
         info: CudaQwenGpuModelInfo,
         #[allow(dead_code)]
@@ -448,6 +479,12 @@ mod native {
         // unchanged. The pointees outlive any capture; the model is accessed single-threaded.
         graph_capture_token: Cell<*const DeviceBuffer>,
         graph_capture_position: Cell<*const DeviceBuffer>,
+        // Continuous-scheduler batch=1 greedy captured-graph decode (see
+        // `SchedulerGraphDecodeState`). `None` until the first eligible decode captures a graph;
+        // `scheduler_graph_disabled` latches true if a capture ever fails (e.g. a non-capturable
+        // weight residency) so the scheduler stops retrying and stays on eager decode.
+        scheduler_graph_state: RefCell<Option<SchedulerGraphDecodeState>>,
+        scheduler_graph_disabled: Cell<bool>,
     }
 
     /// RAII guard: on drop, attributes its lifetime to the model's per-generation
@@ -2831,7 +2868,7 @@ mod native {
     /// ~700 kernel launches/token (~+8-11% decode throughput). Opt-in via
     /// `HI_CUDA_DECODE_GRAPH`; single-sequence greedy text decode only, and it falls back
     /// to eager decode on any capture/replay failure (e.g. a non-capturable cuBLAS path).
-    fn decode_graph_enabled() -> bool {
+    pub(crate) fn decode_graph_enabled() -> bool {
         use std::sync::OnceLock;
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| std::env::var("HI_CUDA_DECODE_GRAPH").is_ok())
@@ -3213,6 +3250,8 @@ mod native {
                 forward_in_progress: Cell::new(false),
                 graph_capture_token: Cell::new(std::ptr::null()),
                 graph_capture_position: Cell::new(std::ptr::null()),
+                scheduler_graph_state: RefCell::new(None),
+                scheduler_graph_disabled: Cell::new(false),
             })
         }
 
@@ -7799,6 +7838,263 @@ mod native {
                 position += 1;
             }
 
+            Ok(generated)
+        }
+
+        /// One captured-graph decode step for the continuous scheduler's batch=1 greedy path:
+        /// decode `last_token` at `position` (its KV goes to `lease_pages[position/page_size]`)
+        /// and return the next greedy token. The first call for a given
+        /// `(page_size, lease_pages, physical_page_count)` key captures the graph (an eager
+        /// warmup forward, which IS this step's real decode, plus a recorded capture); later
+        /// calls replay it. Returns `Ok(None)` when graphs are unavailable (capture failed once
+        /// and latched off, or the layout is ineligible) so the caller decodes eagerly.
+        ///
+        /// SAFETY of reuse across requests: the captured forward only bakes in WHICH pages and
+        /// weights it touches, never their contents; each replay reads live KV from the pages
+        /// via `d_position`. A new request that inherits an identical lease therefore replays
+        /// correctly against its own (freshly prefilled) KV without a rebuild.
+        pub fn scheduler_graph_decode_step(
+            &self,
+            last_token: u32,
+            position: usize,
+            page_size: usize,
+            lease_pages: &[usize],
+            physical_page_count: usize,
+        ) -> Result<Option<u32>> {
+            if self.scheduler_graph_disabled.get()
+                || self.config.recurrent_ssm_tensor_layout
+                || !self.supports_batched_text_generation()
+            {
+                return Ok(None);
+            }
+            let dims = self.qwen_dims()?;
+            if position >= dims.context {
+                return Ok(None);
+            }
+
+            let key_matches = self
+                .scheduler_graph_state
+                .borrow()
+                .as_ref()
+                .is_some_and(|state| state.matches(page_size, lease_pages, physical_page_count));
+
+            if key_matches {
+                let state = self.scheduler_graph_state.borrow();
+                let state = state.as_ref().expect("checked matches");
+                state.d_position.copy_from_host(&[position as i32])?;
+                state.d_token.copy_from_host(&[last_token])?;
+                state.exec.launch(&self.stream)?;
+                self.stream.synchronize()?;
+                let next = state.d_argmax.copy_to_host::<u32>(1)?[0];
+                return Ok(Some(next));
+            }
+
+            // Rebuild for this lease. On any capture/replay failure, latch graphs off and let
+            // the caller fall back to eager decode (never breaks generation).
+            match self.build_scheduler_graph_state(
+                last_token,
+                position,
+                page_size,
+                lease_pages,
+                physical_page_count,
+                &dims,
+            ) {
+                Ok((state, first_token)) => {
+                    *self.scheduler_graph_state.borrow_mut() = Some(state);
+                    Ok(Some(first_token))
+                }
+                Err(err) => {
+                    self.scheduler_graph_disabled.set(true);
+                    *self.scheduler_graph_state.borrow_mut() = None;
+                    warn_decode_graph_fallback_once(&err);
+                    Ok(None)
+                }
+            }
+        }
+
+        fn build_scheduler_graph_state(
+            &self,
+            last_token: u32,
+            position: usize,
+            page_size: usize,
+            lease_pages: &[usize],
+            physical_page_count: usize,
+            dims: &QwenDims,
+        ) -> Result<(SchedulerGraphDecodeState, u32)> {
+            let token_capacity = lease_pages
+                .len()
+                .checked_mul(page_size)
+                .context("CUDA scheduler graph decode token capacity overflows usize")?
+                .min(dims.context);
+            // The pool is already sized for `physical_page_count` (the scheduler prefilled into
+            // it); build a persistent cache viewing this request's full lease. Its raw page
+            // pointers stay valid as long as the pool is not recreated (guarded by the key).
+            let mut cache = {
+                let mut pool_slot = self.paged_batch_pool.borrow_mut();
+                if pool_slot
+                    .as_ref()
+                    .is_none_or(|pool| !pool.can_cover(dims, page_size, physical_page_count))
+                {
+                    *pool_slot = Some(CudaPagedBatchDevicePool::new(
+                        self.config.block_count,
+                        dims,
+                        page_size,
+                        physical_page_count,
+                        &self.stream,
+                    )?);
+                }
+                let pool = pool_slot
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("CUDA paged batch device pool was not initialized"))?;
+                CudaPagedBatchKvCache::new_with_page_tables_from_pool(
+                    dims,
+                    1,
+                    page_size,
+                    token_capacity,
+                    std::slice::from_ref(&lease_pages.to_vec()),
+                    pool,
+                    &self.stream,
+                )?
+                // pool_slot borrow released here; the forwards below must not re-borrow it.
+            };
+
+            let d_position = DeviceBuffer::alloc(std::mem::size_of::<i32>())
+                .context("allocating CUDA scheduler graph position counter")?;
+            let d_token = DeviceBuffer::alloc(std::mem::size_of::<u32>())
+                .context("allocating CUDA scheduler graph token counter")?;
+            let d_argmax = DeviceBuffer::alloc(std::mem::size_of::<u32>())
+                .context("allocating CUDA scheduler graph argmax slot")?;
+
+            // Warm the pool for every decode-forward allocation (so capture never cudaMalloc's)
+            // AND perform this step's real decode: writes `last_token` KV at `position` and
+            // yields the next token. Replays start at `position + 1`.
+            let first_token = {
+                let logits =
+                    self.decode_batch_logits_paged_device(&[last_token], position, &mut cache)?;
+                crate::kernels::launch_argmax_batched_last_token(
+                    &logits.buffer,
+                    &d_argmax,
+                    1,
+                    1,
+                    logits.cols,
+                    &self.stream,
+                )?;
+                self.stream.synchronize()?;
+                let token = d_argmax.copy_to_host::<u32>(1)?[0];
+                drop(logits);
+                token
+            };
+
+            crate::runtime::set_capture_active(true);
+            self.graph_capture_token.set(&d_token);
+            self.graph_capture_position.set(&d_position);
+            let captured = (|| -> Result<crate::runtime::CudaGraph> {
+                self.stream.begin_capture()?;
+                let logits =
+                    self.decode_batch_logits_paged_device(&[last_token], position, &mut cache)?;
+                crate::kernels::launch_argmax_batched_last_token(
+                    &logits.buffer,
+                    &d_argmax,
+                    1,
+                    1,
+                    logits.cols,
+                    &self.stream,
+                )?;
+                self.stream.end_capture()
+            })();
+            self.graph_capture_token.set(std::ptr::null());
+            self.graph_capture_position.set(std::ptr::null());
+            crate::runtime::set_capture_active(false);
+            let exec = captured?.instantiate()?;
+
+            Ok((
+                SchedulerGraphDecodeState {
+                    exec,
+                    cache,
+                    d_position,
+                    d_token,
+                    d_argmax,
+                    page_size,
+                    lease_pages: lease_pages.to_vec(),
+                    physical_page_count,
+                },
+                first_token,
+            ))
+        }
+
+        /// Drive `scheduler_graph_decode_step` in a loop the way the continuous scheduler does:
+        /// prefill the prompt into the pool, then per-token capture-once/replay via the stateful
+        /// scheduler entry. Returns the generated tokens (length `max_tokens`, no stop handling)
+        /// so a test can assert they equal the eager paged generate. Resets any prior graph
+        /// state first so the capture path is exercised fresh.
+        #[doc(hidden)]
+        pub fn scheduler_graph_decode_smoke(
+            &self,
+            input_ids: &[u32],
+            max_tokens: usize,
+            page_size: usize,
+        ) -> Result<Vec<u32>> {
+            let dims = self.qwen_dims()?;
+            let token_capacity = input_ids
+                .len()
+                .checked_add(max_tokens)
+                .context("scheduler graph decode smoke token capacity overflows usize")?
+                .min(dims.context);
+            let physical_page_count = token_capacity.div_ceil(page_size);
+            let lease_pages: Vec<usize> = (0..physical_page_count).collect();
+            let page_tables = vec![lease_pages.clone()];
+
+            let first_token = {
+                let mut pool_slot = self.paged_batch_pool.borrow_mut();
+                if pool_slot
+                    .as_ref()
+                    .is_none_or(|pool| !pool.can_cover(&dims, page_size, physical_page_count))
+                {
+                    *pool_slot = Some(CudaPagedBatchDevicePool::new(
+                        self.config.block_count,
+                        &dims,
+                        page_size,
+                        physical_page_count,
+                        &self.stream,
+                    )?);
+                }
+                let pool = pool_slot
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("CUDA paged batch device pool was not initialized"))?;
+                let (_cache, logits, _seq_len) = self
+                    .full_context_logits_device_batched_paged_cache_with_shared_prefix(
+                        std::slice::from_ref(&input_ids.to_vec()),
+                        page_size,
+                        token_capacity,
+                        &page_tables,
+                        pool,
+                    )?;
+                self.argmax_batched_last_token(&logits, 1, 1)?[0]
+            };
+
+            *self.scheduler_graph_state.borrow_mut() = None;
+            self.scheduler_graph_disabled.set(false);
+
+            let mut generated = vec![first_token];
+            let mut token = first_token;
+            let mut position = input_ids.len();
+            for _ in 1..max_tokens {
+                if position >= token_capacity {
+                    break;
+                }
+                let next = self
+                    .scheduler_graph_decode_step(
+                        token,
+                        position,
+                        page_size,
+                        &lease_pages,
+                        physical_page_count,
+                    )?
+                    .ok_or_else(|| anyhow!("scheduler graph decode returned None (unavailable)"))?;
+                generated.push(next);
+                token = next;
+                position += 1;
+            }
             Ok(generated)
         }
 
@@ -22994,9 +23290,15 @@ mod native {
 }
 
 #[cfg(feature = "native-cuda")]
+pub(crate) use native::decode_graph_enabled;
+#[cfg(feature = "native-cuda")]
 pub use native::{
     CudaMmprojProjector, CudaQwenGpuModel, CudaVisionEncoder, GpuMatrix, GpuTensor, GpuVector,
 };
+#[cfg(not(feature = "native-cuda"))]
+pub(crate) fn decode_graph_enabled() -> bool {
+    false
+}
 
 #[cfg(not(feature = "native-cuda"))]
 mod non_native {
@@ -23498,6 +23800,18 @@ mod non_native {
             bail!(
                 "hi-cuda was built without native-cuda support; GPU Qwen paged generation is unavailable"
             )
+        }
+
+        pub fn scheduler_graph_decode_step(
+            &self,
+            _last_token: u32,
+            _position: usize,
+            _page_size: usize,
+            _lease_pages: &[usize],
+            _physical_page_count: usize,
+        ) -> Result<Option<u32>> {
+            // No native CUDA: graphs are unavailable, so the scheduler decodes eagerly.
+            Ok(None)
         }
 
         #[allow(clippy::too_many_arguments)]

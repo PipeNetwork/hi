@@ -4808,6 +4808,89 @@ fn process_continuous_decode_chunk(
         return;
     }
 
+    // Captured-graph decode fast path: a single greedy text request decoding alone replays a
+    // captured per-token forward, cutting ~700 kernel launches/token (~+8-11% decode). Emits
+    // one token per step, identical to eager decode. Distinct from (and lower priority than)
+    // speculative decode above, which verifies multiple drafts per forward. Falls back to the
+    // eager batched path below if the model returns None (graphs unavailable for this layout).
+    if gpu::decode_graph_enabled()
+        && phase == CudaContinuousStepPhase::Decode
+        && matches!(sampling_key, CudaSchedulerSamplingKey::Greedy)
+        && indexes.len() == 1
+        && !state.qwen.recurrent_ssm_tensor_layout
+    {
+        let idx = indexes[0];
+        let position = match active[idx].context_len().checked_sub(1) {
+            Some(position) => position,
+            None => {
+                mark_continuous_error(
+                    active,
+                    retire,
+                    idx,
+                    anyhow!("CUDA continuous graph decode requires a non-empty context"),
+                );
+                return;
+            }
+        };
+        let last_token = match active[idx].generated_tokens.last().copied() {
+            Some(token) => token,
+            None => {
+                mark_continuous_error(
+                    active,
+                    retire,
+                    idx,
+                    anyhow!("CUDA continuous graph decode request has no generated token"),
+                );
+                return;
+            }
+        };
+        match model.scheduler_graph_decode_step(
+            last_token,
+            position,
+            state.kv_page_size,
+            &active[idx].lease.pages,
+            kv_pages.pages_total,
+        ) {
+            Ok(Some(token)) => {
+                let elapsed = started.elapsed();
+                record_continuous_decode_batch_stats(stats, phase, sampling_key, 1);
+                stats.decode_tokens.fetch_add(1, Ordering::Relaxed);
+                stats.decode_micros.fetch_add(
+                    usize_to_u64(elapsed.as_micros() as usize),
+                    Ordering::Relaxed,
+                );
+                if active[idx].job.tx.is_closed() {
+                    retire[idx] = Some(CudaContinuousRetireReason::Cancelled);
+                    return;
+                }
+                active[idx].generated_tokens.push(token);
+                match send_continuous_token_delta(state, &mut active[idx], token) {
+                    Ok(()) => {}
+                    Err(CudaContinuousRetireReason::Cancelled) => {
+                        retire[idx] = Some(CudaContinuousRetireReason::Cancelled);
+                        return;
+                    }
+                    Err(CudaContinuousRetireReason::Errored) => {
+                        retire[idx] = Some(CudaContinuousRetireReason::Errored);
+                        return;
+                    }
+                    Err(CudaContinuousRetireReason::Completed) => unreachable!(),
+                }
+                if continuous_request_finished(&state.qwen, &active[idx], token) {
+                    retire[idx] = Some(finish_continuous_request(state, &active[idx]));
+                }
+                return;
+            }
+            Ok(None) => {
+                // Graphs unavailable for this layout; fall through to eager decode below.
+            }
+            Err(err) => {
+                mark_continuous_error(active, retire, idx, anyhow!("{err}"));
+                return;
+            }
+        }
+    }
+
     let mut shared_prefix_reused_tokens = 0;
     let result = match phase {
         CudaContinuousStepPhase::Prefill => {
@@ -11888,6 +11971,20 @@ mod tests {
             eager_gen.len() as f64 / eager_gen_s,
             graph_gen.len() as f64 / graph_gen_s,
             eager_gen_s / graph_gen_s,
+        );
+
+        // Scheduler path: the stateful per-token scheduler_graph_decode_step loop (what the
+        // continuous scheduler's batch=1 greedy path runs) must produce the same tokens as eager.
+        let sched_gen = model
+            .scheduler_graph_decode_smoke(&prompt, max_new, 16)
+            .expect("scheduler graph decode smoke should run");
+        assert_eq!(
+            eager_gen, sched_gen,
+            "scheduler graph decode tokens diverged from eager generate"
+        );
+        eprintln!(
+            "scheduler graph decode OK: {} tokens identical to eager",
+            sched_gen.len()
         );
     }
 
