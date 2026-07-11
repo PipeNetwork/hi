@@ -499,6 +499,12 @@ mod native {
         // output head so models with no dp4a-eligible weights don't cache the whole
         // model in f16.
         dequant_f16_cache: RefCell<BTreeMap<String, DeviceBuffer>>,
+        // Grouped-MoE expert pointer tables, lazily built per (layer, projection):
+        // a device u64 table of every expert's weight base address so the grouped
+        // GEMV can index experts from device-resident route ids. `None` caches
+        // "this projection is unsupported" (mixed dtypes, biases) so unsupported
+        // layers probe once and then always take the legacy per-expert loop.
+        moe_expert_groups: RefCell<BTreeMap<String, Option<Rc<MoeExpertGroup>>>>,
         // Hybrid weight residency (see `WeightResidency::HybridQuantF16`): weights are
         // kept quantized for the dp4a decode GEMV, and the M>1 prefill GEMM caches a
         // dequantized f16 copy of each layer weight in `dequant_f16_cache` (bounded by a
@@ -2939,6 +2945,28 @@ mod native {
         *ENABLED.get_or_init(|| std::env::var("HI_CUDA_KV_Q8").is_ok())
     }
 
+    /// Grouped MoE execution (`HI_CUDA_MOE_GROUPED=1`, opt-in): run each MoE
+    /// projection as ONE grouped GEMV launch over all (token row, routed expert)
+    /// pairs with device-resident routing, instead of ~3 launches per expert per
+    /// row plus a blocking route readback per layer. Requires uniform Q4_K/Q6_K
+    /// expert weights without per-expert biases; other layouts keep the legacy loop.
+    fn moe_grouped_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED
+            .get_or_init(|| std::env::var("HI_CUDA_MOE_GROUPED").is_ok_and(|value| value != "0"))
+    }
+
+    /// Device pointer table over one MoE projection's expert weights (see
+    /// `CudaQwenGpuModel::moe_expert_groups`). The addresses point into the
+    /// per-expert `GpuMatrix` buffers, which live as long as the model.
+    struct MoeExpertGroup {
+        ptrs: DeviceBuffer,
+        rows: usize,
+        cols: usize,
+        dtype: crate::kernels::MoeGroupedGemvDtype,
+    }
+
     /// Reuse the device-resident batch page table across decode iterations when its
     /// contents are unchanged (the common case: a stable decode batch re-sends the same
     /// page tables every token). Exact-match keyed (full table compare, no hash), so a
@@ -3299,6 +3327,7 @@ mod native {
                 vectors,
                 paged_batch_pool: RefCell::new(None),
                 dequant_f16_cache: RefCell::new(BTreeMap::new()),
+                moe_expert_groups: RefCell::new(BTreeMap::new()),
                 cache_layer_f16,
                 recurrent_page_states: RefCell::new(BTreeMap::new()),
                 generation_timing: Cell::new((0, 0, 0)),
@@ -17268,6 +17297,12 @@ mod native {
                     "qwen MoE expert counts are invalid: expert_count={experts}, expert_used_count={top_k}"
                 );
             }
+            if moe_grouped_enabled()
+                && let Some(output) =
+                    self.moe_grouped_f32_device(prefix, input, &router, experts, top_k)?
+            {
+                return Ok(output);
+            }
             let routes = self.moe_routes_device(&router, top_k, self.config.expert_weights_norm)?;
 
             let output = DeviceBuffer::alloc(input.element_count()? * std::mem::size_of::<f32>())
@@ -17419,6 +17454,323 @@ mod native {
                 routes.push(row_routes);
             }
             Ok(routes)
+        }
+
+        /// Device-resident routing: same top-k router launch as `moe_routes_device`
+        /// but the (ids, weights) stay on the GPU for the grouped kernels — no
+        /// per-layer blocking readback.
+        fn moe_route_buffers_device(
+            &self,
+            router: &GpuF32Tensor,
+            top_k: usize,
+            norm_topk: bool,
+        ) -> Result<(DeviceBuffer, DeviceBuffer)> {
+            let route_count = router
+                .rows
+                .checked_mul(top_k)
+                .context("CUDA MoE route count overflows usize")?;
+            let ids = DeviceBuffer::alloc(route_count * std::mem::size_of::<u32>())
+                .context("allocating CUDA MoE route ids")?;
+            let weights = DeviceBuffer::alloc(route_count * std::mem::size_of::<f32>())
+                .context("allocating CUDA MoE route weights")?;
+            crate::kernels::launch_moe_topk_router(
+                &router.buffer,
+                &ids,
+                &weights,
+                router.rows,
+                router.cols,
+                top_k,
+                norm_topk,
+                &self.stream,
+            )?;
+            Ok((ids, weights))
+        }
+
+        /// Cached device pointer table over one MoE projection's expert weights.
+        /// `None` = the projection is not groupable (missing/mixed-shape/mixed-dtype
+        /// experts, unsupported dtype, or per-expert biases) — cached too, so the
+        /// legacy loop is chosen without re-probing every forward.
+        fn moe_expert_group(
+            &self,
+            prefix: &str,
+            projection: &str,
+            experts: usize,
+        ) -> Result<Option<Rc<MoeExpertGroup>>> {
+            let key = format!("{prefix}.{projection}");
+            if let Some(cached) = self.moe_expert_groups.borrow().get(&key) {
+                return Ok(cached.clone());
+            }
+            let mut ptrs: Vec<u64> = Vec::with_capacity(experts);
+            let mut shape: Option<(usize, usize, GgufTensorType)> = None;
+            let mut supported = true;
+            for expert in 0..experts {
+                let name = format!("{prefix}.ffn_{projection}_exps.{expert}.weight");
+                let Some(matrix) = self.matrix(&name) else {
+                    supported = false;
+                    break;
+                };
+                if self
+                    .vector(&format!("{prefix}.ffn_{projection}_exps.{expert}.bias"))
+                    .is_some()
+                {
+                    supported = false;
+                    break;
+                }
+                let this_shape = (matrix.rows, matrix.cols, matrix.dtype);
+                match shape {
+                    None => shape = Some(this_shape),
+                    Some(existing) if existing == this_shape => {}
+                    Some(_) => {
+                        supported = false;
+                        break;
+                    }
+                }
+                ptrs.push(matrix.buffer.as_ptr() as u64);
+            }
+            let group = if !supported {
+                None
+            } else if let Some((rows, cols, dtype)) = shape {
+                let dtype = match dtype {
+                    GgufTensorType::Q4_K => Some(crate::kernels::MoeGroupedGemvDtype::Q4K),
+                    GgufTensorType::Q6_K => Some(crate::kernels::MoeGroupedGemvDtype::Q6K),
+                    _ => None,
+                };
+                match dtype {
+                    Some(dtype) if cols % 256 == 0 => {
+                        let table = DeviceBuffer::alloc(experts * std::mem::size_of::<u64>())
+                            .context("allocating CUDA MoE expert pointer table")?;
+                        table
+                            .copy_from_host(&ptrs)
+                            .context("copying CUDA MoE expert pointer table")?;
+                        Some(Rc::new(MoeExpertGroup {
+                            ptrs: table,
+                            rows,
+                            cols,
+                            dtype,
+                        }))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            self.moe_expert_groups
+                .borrow_mut()
+                .insert(key, group.clone());
+            Ok(group)
+        }
+
+        /// Grouped MoE forward (`HI_CUDA_MOE_GROUPED`): device routing, ONE grouped
+        /// dp4a GEMV launch per projection over all (row, expert) pairs, fused
+        /// weighted scatter-reduce, and a device-side shared-expert gate — replacing
+        /// ~3 launches per expert per row plus two blocking readbacks per layer.
+        /// Returns Ok(None) when the layer layout is unsupported so the caller
+        /// falls back to the legacy per-expert loop.
+        fn moe_grouped_f32_device(
+            &self,
+            prefix: &str,
+            input: &GpuF32Tensor,
+            router: &GpuF32Tensor,
+            experts: usize,
+            top_k: usize,
+        ) -> Result<Option<GpuF32Tensor>> {
+            let rows = input.rows;
+            let Some(pairs) = rows.checked_mul(top_k) else {
+                return Ok(None);
+            };
+            // Grid.y limits for the grouped/scatter kernels.
+            if rows == 0 || pairs == 0 || pairs > 65535 {
+                return Ok(None);
+            }
+            let Some(gate_group) = self.moe_expert_group(prefix, "gate", experts)? else {
+                return Ok(None);
+            };
+            let Some(up_group) = self.moe_expert_group(prefix, "up", experts)? else {
+                return Ok(None);
+            };
+            let Some(down_group) = self.moe_expert_group(prefix, "down", experts)? else {
+                return Ok(None);
+            };
+            let hidden = input.cols;
+            let ff = gate_group.rows;
+            if gate_group.cols != hidden
+                || up_group.cols != hidden
+                || up_group.rows != ff
+                || down_group.cols != ff
+                || down_group.rows != hidden
+            {
+                return Ok(None);
+            }
+            let (route_ids, route_weights) =
+                self.moe_route_buffers_device(router, top_k, self.config.expert_weights_norm)?;
+
+            let quantize_rows = |tensor: &GpuF32Tensor,
+                                 m: usize,
+                                 k: usize|
+             -> Result<(DeviceBuffer, DeviceBuffer, DeviceBuffer)> {
+                let nsub = k / 32;
+                let xq = DeviceBuffer::alloc(m * k)
+                    .context("allocating CUDA MoE Q8 activation quants")?;
+                let dx = DeviceBuffer::alloc(m * nsub * std::mem::size_of::<f32>())
+                    .context("allocating CUDA MoE Q8 activation scales")?;
+                let xsum = DeviceBuffer::alloc(m * nsub * std::mem::size_of::<i32>())
+                    .context("allocating CUDA MoE Q8 activation sums")?;
+                crate::kernels::launch_quantize_q8_rows(
+                    &tensor.buffer,
+                    &xq,
+                    &dx,
+                    &xsum,
+                    m,
+                    k,
+                    &self.stream,
+                )?;
+                Ok((xq, dx, xsum))
+            };
+
+            let (xq, dx, xsum) = quantize_rows(input, rows, hidden)?;
+            let alloc_f32 = |elements: usize, what: &str| -> Result<DeviceBuffer> {
+                DeviceBuffer::alloc(elements * std::mem::size_of::<f32>())
+                    .with_context(|| format!("allocating CUDA MoE {what}"))
+            };
+            let pair_ff = pairs
+                .checked_mul(ff)
+                .context("CUDA MoE grouped activation size overflows usize")?;
+            let gate = alloc_f32(pair_ff, "grouped gate output")?;
+            crate::kernels::launch_moe_grouped_dp4a_gemv(
+                gate_group.dtype,
+                &gate_group.ptrs,
+                &route_ids,
+                &xq,
+                &dx,
+                &xsum,
+                &gate,
+                pairs,
+                top_k,
+                false,
+                ff,
+                hidden,
+                &self.stream,
+            )?;
+            let up = alloc_f32(pair_ff, "grouped up output")?;
+            crate::kernels::launch_moe_grouped_dp4a_gemv(
+                up_group.dtype,
+                &up_group.ptrs,
+                &route_ids,
+                &xq,
+                &dx,
+                &xsum,
+                &up,
+                pairs,
+                top_k,
+                false,
+                ff,
+                hidden,
+                &self.stream,
+            )?;
+            let gate = GpuF32Tensor {
+                rows: pairs,
+                cols: ff,
+                buffer: gate,
+            };
+            let up = GpuF32Tensor {
+                rows: pairs,
+                cols: ff,
+                buffer: up,
+            };
+            let activated = self.silu_mul_f32_device(&gate, &up)?;
+            let (axq, adx, axsum) = quantize_rows(&activated, pairs, ff)?;
+            let pair_hidden = pairs
+                .checked_mul(hidden)
+                .context("CUDA MoE grouped down size overflows usize")?;
+            let down = alloc_f32(pair_hidden, "grouped down output")?;
+            crate::kernels::launch_moe_grouped_dp4a_gemv(
+                down_group.dtype,
+                &down_group.ptrs,
+                &route_ids,
+                &axq,
+                &adx,
+                &axsum,
+                &down,
+                pairs,
+                top_k,
+                true,
+                hidden,
+                ff,
+                &self.stream,
+            )?;
+            let output = alloc_f32(
+                rows.checked_mul(hidden)
+                    .context("CUDA MoE grouped output size overflows usize")?,
+                "grouped output",
+            )?;
+            output.memset_zero_async(&self.stream)?;
+            crate::kernels::launch_moe_scatter_reduce(
+                &down,
+                &route_weights,
+                &output,
+                rows,
+                top_k,
+                hidden,
+                &self.stream,
+            )?;
+
+            if self.has_matrix(&format!("{prefix}.ffn_gate_shexp.weight")) {
+                let gates = if self.has_matrix(&format!("{prefix}.ffn_gate_inp_shexp.weight")) {
+                    let gate = self.project_f32_device(
+                        &format!("{prefix}.ffn_gate_inp_shexp.weight"),
+                        input,
+                    )?;
+                    let gate = self.add_optional_rowwise_f32_device(
+                        gate,
+                        &format!("{prefix}.ffn_gate_inp_shexp.bias"),
+                    )?;
+                    if gate.rows != rows || gate.cols != 1 {
+                        bail!(
+                            "CUDA MoE shared expert gate shape {}x{} does not match expected {rows}x1",
+                            gate.rows,
+                            gate.cols
+                        );
+                    }
+                    Some(gate)
+                } else {
+                    None
+                };
+                let shexp_gate =
+                    self.project_f32_device(&format!("{prefix}.ffn_gate_shexp.weight"), input)?;
+                let shexp_gate = self.add_optional_rowwise_f32_device(
+                    shexp_gate,
+                    &format!("{prefix}.ffn_gate_shexp.bias"),
+                )?;
+                let shexp_up =
+                    self.project_f32_device(&format!("{prefix}.ffn_up_shexp.weight"), input)?;
+                let shexp_up = self.add_optional_rowwise_f32_device(
+                    shexp_up,
+                    &format!("{prefix}.ffn_up_shexp.bias"),
+                )?;
+                let shexp_activated = self.silu_mul_f32_device(&shexp_gate, &shexp_up)?;
+                let shexp_down = self.project_f32_device(
+                    &format!("{prefix}.ffn_down_shexp.weight"),
+                    &shexp_activated,
+                )?;
+                let shexp_down = self.add_optional_rowwise_f32_device(
+                    shexp_down,
+                    &format!("{prefix}.ffn_down_shexp.bias"),
+                )?;
+                crate::kernels::launch_moe_add_rows_scaled_by_sigmoid(
+                    &shexp_down.buffer,
+                    gates.as_ref().map(|gate| &gate.buffer),
+                    &output,
+                    rows,
+                    hidden,
+                    &self.stream,
+                )?;
+            }
+            self.op_barrier()?;
+            Ok(Some(GpuF32Tensor {
+                rows,
+                cols: hidden,
+                buffer: output,
+            }))
         }
 
         fn optional_head_rms_norm_f32_device(

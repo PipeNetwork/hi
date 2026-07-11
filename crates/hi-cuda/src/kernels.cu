@@ -6737,22 +6737,18 @@ extern "C" int hi_cuda_launch_q4_k_gemv(
 // columns [sub*32 .. sub*32+31], which align exactly with Q4_K's 32-weight
 // sub-blocks. w = d*sc*q - dmin*m, so per sub-block:
 //   acc += dx[sub] * (d*sc*dp4a(q,xq) - dmin*m*xsum[sub]).
-__global__ void q4_k_dp4a_gemv_kernel(
-    const uint8_t* __restrict__ weights,
+// One weight-row dot for the dp4a Q4_K GEMV, striped across the calling warp's
+// lanes (each lane covers per-32 sub-blocks `lane, lane+32, ...`); the caller
+// warp-reduces the returned partial. Shared by the plain GEMV and the grouped
+// MoE GEMV so both stay bit-identical.
+__device__ __forceinline__ float q4_k_dp4a_row_acc(
+    const uint8_t* __restrict__ row_ptr,
     const int8_t* __restrict__ xq,
     const float* __restrict__ dx,
     const int* __restrict__ xsum,
-    float* __restrict__ y,
-    int rows,
-    int cols) {
-  const int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
-  if (row >= rows) {
-    return;
-  }
-  const int lane = threadIdx.x & 31;
+    int cols,
+    int lane) {
   const int nsub = cols / 32;
-  const size_t row_bytes = static_cast<size_t>(cols / 256) * 144;
-  const uint8_t* row_ptr = weights + static_cast<size_t>(row) * row_bytes;
   float acc = 0.0f;
   for (int sub = lane; sub < nsub; sub += 32) {
     const int kblock = sub >> 3;   // which 256-weight super-block
@@ -6779,6 +6775,25 @@ __global__ void q4_k_dp4a_gemv_kernel(
     acc += dx[sub] * (d * static_cast<float>(scale) * static_cast<float>(dot) -
                       dmin * static_cast<float>(mn) * static_cast<float>(xsum[sub]));
   }
+  return acc;
+}
+
+__global__ void q4_k_dp4a_gemv_kernel(
+    const uint8_t* __restrict__ weights,
+    const int8_t* __restrict__ xq,
+    const float* __restrict__ dx,
+    const int* __restrict__ xsum,
+    float* __restrict__ y,
+    int rows,
+    int cols) {
+  const int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+  if (row >= rows) {
+    return;
+  }
+  const int lane = threadIdx.x & 31;
+  const size_t row_bytes = static_cast<size_t>(cols / 256) * 144;
+  const uint8_t* row_ptr = weights + static_cast<size_t>(row) * row_bytes;
+  float acc = q4_k_dp4a_row_acc(row_ptr, xq, dx, xsum, cols, lane);
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1) {
     acc += __shfl_down_sync(0xffffffffu, acc, off);
@@ -6981,23 +6996,15 @@ extern "C" int hi_cuda_launch_q6_k_gemv(
 // (is=0 for l<16, is=1 for l>=16). The 210-byte block is NOT 4-aligned, so ql/qh
 // are read byte-wise then packed. xsum per 16 is computed in-kernel via
 // dp4a(xq, ones). acc += dx[sub]*d*sum_chunk(scale*(dp4a(q6,xq) - 32*xsum16)).
-__global__ void q6_k_dp4a_gemv_kernel(
-    const uint8_t* __restrict__ weights,
+// One weight-row dot for the dp4a Q6_K GEMV (see q4_k_dp4a_row_acc for the
+// striping/reduction contract). Shared by the plain and grouped MoE GEMVs.
+__device__ __forceinline__ float q6_k_dp4a_row_acc(
+    const uint8_t* __restrict__ row_ptr,
     const int8_t* __restrict__ xq,
     const float* __restrict__ dx,
-    const int* __restrict__ xsum,
-    float* __restrict__ y,
-    int rows,
-    int cols) {
-  (void)xsum;  // Q6_K uses per-16 sums computed in-kernel, not the per-32 xsum.
-  const int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
-  if (row >= rows) {
-    return;
-  }
-  const int lane = threadIdx.x & 31;
+    int cols,
+    int lane) {
   const int nsub = cols / 32;
-  const size_t row_bytes = static_cast<size_t>(cols / 256) * 210;
-  const uint8_t* row_ptr = weights + static_cast<size_t>(row) * row_bytes;
   float acc = 0.0f;
   for (int sub = lane; sub < nsub; sub += 32) {
     const int kblock = sub >> 3;
@@ -7045,6 +7052,26 @@ __global__ void q6_k_dp4a_gemv_kernel(
     }
     acc += dx[sub] * d * contrib;
   }
+  return acc;
+}
+
+__global__ void q6_k_dp4a_gemv_kernel(
+    const uint8_t* __restrict__ weights,
+    const int8_t* __restrict__ xq,
+    const float* __restrict__ dx,
+    const int* __restrict__ xsum,
+    float* __restrict__ y,
+    int rows,
+    int cols) {
+  (void)xsum;  // Q6_K uses per-16 sums computed in-kernel, not the per-32 xsum.
+  const int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+  if (row >= rows) {
+    return;
+  }
+  const int lane = threadIdx.x & 31;
+  const size_t row_bytes = static_cast<size_t>(cols / 256) * 210;
+  const uint8_t* row_ptr = weights + static_cast<size_t>(row) * row_bytes;
+  float acc = q6_k_dp4a_row_acc(row_ptr, xq, dx, cols, lane);
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1) {
     acc += __shfl_down_sync(0xffffffffu, acc, off);
@@ -7068,6 +7095,217 @@ extern "C" int hi_cuda_launch_q6_k_dp4a_gemv(
       static_cast<const uint8_t*>(weights), static_cast<const int8_t*>(xq),
       static_cast<const float*>(dx), static_cast<const int*>(xsum),
       static_cast<float*>(y), rows, cols);
+  return 0;
+}
+
+// Grouped MoE dp4a GEMV: ONE launch covers every (token row, routed expert) pair
+// of a MoE layer projection, instead of one sequential GEMV launch per expert per
+// row. blockIdx.y = pair; the expert weight base comes from a device pointer
+// table indexed by the pair's routed expert id, so routing never round-trips to
+// the host. Activations are per-32 int8 rows from quantize_q8_rows: gate/up read
+// token row pair/top_k (act_per_pair=0), the down projection reads activated row
+// `pair` (act_per_pair=1). Output y[pair][rows]. Per row this calls the exact
+// row-dot helper of the plain per-expert GEMV with the same warp striping and
+// reduction order, so results are bit-identical to the sequential loop.
+__global__ void q4_k_moe_grouped_dp4a_gemv_kernel(
+    const unsigned long long* __restrict__ expert_ptrs,
+    const uint32_t* __restrict__ route_ids,
+    const int8_t* __restrict__ xq,
+    const float* __restrict__ dx,
+    const int* __restrict__ xsum,
+    float* __restrict__ y,
+    int pairs,
+    int top_k,
+    int act_per_pair,
+    int rows,
+    int cols) {
+  const int pair = blockIdx.y;
+  const int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+  if (pair >= pairs || row >= rows) {
+    return;
+  }
+  const int lane = threadIdx.x & 31;
+  const uint8_t* weights =
+      reinterpret_cast<const uint8_t*>(expert_ptrs[route_ids[pair]]);
+  const int act_row = act_per_pair ? pair : pair / top_k;
+  const int nsub = cols / 32;
+  const int8_t* xq_row = xq + static_cast<size_t>(act_row) * cols;
+  const float* dx_row = dx + static_cast<size_t>(act_row) * nsub;
+  const int* xsum_row = xsum + static_cast<size_t>(act_row) * nsub;
+  const size_t row_bytes = static_cast<size_t>(cols / 256) * 144;
+  float acc = q4_k_dp4a_row_acc(
+      weights + static_cast<size_t>(row) * row_bytes, xq_row, dx_row, xsum_row,
+      cols, lane);
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    acc += __shfl_down_sync(0xffffffffu, acc, off);
+  }
+  if (lane == 0) {
+    y[static_cast<size_t>(pair) * rows + row] = acc;
+  }
+}
+
+__global__ void q6_k_moe_grouped_dp4a_gemv_kernel(
+    const unsigned long long* __restrict__ expert_ptrs,
+    const uint32_t* __restrict__ route_ids,
+    const int8_t* __restrict__ xq,
+    const float* __restrict__ dx,
+    float* __restrict__ y,
+    int pairs,
+    int top_k,
+    int act_per_pair,
+    int rows,
+    int cols) {
+  const int pair = blockIdx.y;
+  const int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+  if (pair >= pairs || row >= rows) {
+    return;
+  }
+  const int lane = threadIdx.x & 31;
+  const uint8_t* weights =
+      reinterpret_cast<const uint8_t*>(expert_ptrs[route_ids[pair]]);
+  const int act_row = act_per_pair ? pair : pair / top_k;
+  const int nsub = cols / 32;
+  const int8_t* xq_row = xq + static_cast<size_t>(act_row) * cols;
+  const float* dx_row = dx + static_cast<size_t>(act_row) * nsub;
+  const size_t row_bytes = static_cast<size_t>(cols / 256) * 210;
+  float acc = q6_k_dp4a_row_acc(
+      weights + static_cast<size_t>(row) * row_bytes, xq_row, dx_row, cols, lane);
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    acc += __shfl_down_sync(0xffffffffu, acc, off);
+  }
+  if (lane == 0) {
+    y[static_cast<size_t>(pair) * rows + row] = acc;
+  }
+}
+
+extern "C" int hi_cuda_launch_moe_grouped_dp4a_gemv(
+    int dtype,  // 0 = Q4_K, 1 = Q6_K
+    const void* expert_ptrs,
+    const void* route_ids,
+    const void* xq,
+    const void* dx,
+    const void* xsum,
+    void* y,
+    int pairs,
+    int top_k,
+    int act_per_pair,
+    int rows,
+    int cols,
+    void* stream) {
+  if (expert_ptrs == nullptr || route_ids == nullptr || xq == nullptr ||
+      dx == nullptr || xsum == nullptr || y == nullptr || pairs <= 0 ||
+      top_k <= 0 || rows <= 0 || cols <= 0 || cols % 256 != 0 || pairs > 65535 ||
+      stream == nullptr) {
+    return 1;
+  }
+  const int warps_per_block = 4;
+  const dim3 grid((rows + warps_per_block - 1) / warps_per_block, pairs);
+  switch (dtype) {
+    case 0:
+      q4_k_moe_grouped_dp4a_gemv_kernel<<<grid, warps_per_block * 32, 0,
+                                          static_cast<cudaStream_t>(stream)>>>(
+          static_cast<const unsigned long long*>(expert_ptrs),
+          static_cast<const uint32_t*>(route_ids),
+          static_cast<const int8_t*>(xq), static_cast<const float*>(dx),
+          static_cast<const int*>(xsum), static_cast<float*>(y), pairs, top_k,
+          act_per_pair, rows, cols);
+      return 0;
+    case 1:
+      q6_k_moe_grouped_dp4a_gemv_kernel<<<grid, warps_per_block * 32, 0,
+                                          static_cast<cudaStream_t>(stream)>>>(
+          static_cast<const unsigned long long*>(expert_ptrs),
+          static_cast<const uint32_t*>(route_ids),
+          static_cast<const int8_t*>(xq), static_cast<const float*>(dx),
+          static_cast<float*>(y), pairs, top_k, act_per_pair, rows, cols);
+      return 0;
+    default:
+      return 1;
+  }
+}
+
+// out[row] += sum_k route_weights[row*top_k + k] * down[row*top_k + k], k in rank
+// order — the same accumulation order as the sequential per-expert
+// add_scaled_row_in_place calls it replaces. Atomic-free: each (row, col) is
+// owned by one thread. Reading the routed weights from device memory is what
+// removes the per-layer route readback to the host.
+__global__ void moe_scatter_reduce_kernel(
+    const float* __restrict__ down,
+    const float* __restrict__ route_weights,
+    float* __restrict__ out,
+    int rows,
+    int top_k,
+    int cols) {
+  const int row = blockIdx.y;
+  const int col = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= rows || col >= cols) {
+    return;
+  }
+  const size_t out_idx = static_cast<size_t>(row) * cols + col;
+  float acc = out[out_idx];
+  for (int k = 0; k < top_k; ++k) {
+    const int pair = row * top_k + k;
+    acc += route_weights[pair] * down[static_cast<size_t>(pair) * cols + col];
+  }
+  out[out_idx] = acc;
+}
+
+extern "C" int hi_cuda_launch_moe_scatter_reduce(
+    const void* down,
+    const void* route_weights,
+    void* out,
+    int rows,
+    int top_k,
+    int cols,
+    void* stream) {
+  if (down == nullptr || route_weights == nullptr || out == nullptr ||
+      rows <= 0 || top_k <= 0 || cols <= 0 || rows > 65535 || stream == nullptr) {
+    return 1;
+  }
+  const dim3 grid((cols + 255) / 256, rows);
+  moe_scatter_reduce_kernel<<<grid, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const float*>(down), static_cast<const float*>(route_weights),
+      static_cast<float*>(out), rows, top_k, cols);
+  return 0;
+}
+
+// out[row] += sigmoid(gates[row]) * values[row], for the MoE shared expert whose
+// gate is a per-row scalar logit. gates == nullptr means an ungated shared
+// expert (scale 1). Replaces a blocking per-row scalar D2H + host sigmoid.
+__global__ void moe_add_rows_scaled_by_sigmoid_kernel(
+    const float* __restrict__ values,
+    const float* __restrict__ gates,
+    float* __restrict__ out,
+    int rows,
+    int cols) {
+  const int row = blockIdx.y;
+  const int col = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row >= rows || col >= cols) {
+    return;
+  }
+  const float scale =
+      gates != nullptr ? 1.0f / (1.0f + expf(-gates[row])) : 1.0f;
+  const size_t idx = static_cast<size_t>(row) * cols + col;
+  out[idx] += scale * values[idx];
+}
+
+extern "C" int hi_cuda_launch_moe_add_rows_scaled_by_sigmoid(
+    const void* values,
+    const void* gates,
+    void* out,
+    int rows,
+    int cols,
+    void* stream) {
+  if (values == nullptr || out == nullptr || rows <= 0 || cols <= 0 ||
+      rows > 65535 || stream == nullptr) {
+    return 1;
+  }
+  const dim3 grid((cols + 255) / 256, rows);
+  moe_add_rows_scaled_by_sigmoid_kernel<<<grid, 256, 0,
+                                          static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const float*>(values), static_cast<const float*>(gates),
+      static_cast<float*>(out), rows, cols);
   return 0;
 }
 

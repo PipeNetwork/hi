@@ -251,6 +251,38 @@ mod native {
             k: c_int,
             stream: *mut c_void,
         ) -> c_int;
+        fn hi_cuda_launch_moe_grouped_dp4a_gemv(
+            dtype: c_int,
+            expert_ptrs: *const c_void,
+            route_ids: *const c_void,
+            xq: *const c_void,
+            dx: *const c_void,
+            xsum: *const c_void,
+            y: *mut c_void,
+            pairs: c_int,
+            top_k: c_int,
+            act_per_pair: c_int,
+            rows: c_int,
+            cols: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_moe_scatter_reduce(
+            down: *const c_void,
+            route_weights: *const c_void,
+            out: *mut c_void,
+            rows: c_int,
+            top_k: c_int,
+            cols: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_moe_add_rows_scaled_by_sigmoid(
+            values: *const c_void,
+            gates: *const c_void,
+            out: *mut c_void,
+            rows: c_int,
+            cols: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
         fn hi_cuda_launch_q4_k_a8_gemm(
             weights: *const c_void,
             xq: *const c_void,
@@ -1807,6 +1839,111 @@ mod native {
             )
         })?;
         check_last_error("hi_cuda_launch_quantize_q8_rows")
+    }
+
+    /// Expert weight dtype for the grouped MoE dp4a GEMV.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum MoeGroupedGemvDtype {
+        Q4K = 0,
+        Q6K = 1,
+    }
+
+    /// One launch for every (token row, routed expert) pair of a MoE projection:
+    /// `expert_ptrs` is a device table of expert weight base addresses (u64),
+    /// `route_ids[pairs]` selects the expert per pair, activations are the per-32
+    /// int8 rows from `launch_quantize_q8_rows` (`act_per_pair`: 0 = gate/up read
+    /// token row pair/top_k, 1 = down reads activated row pair). y is [pairs, rows].
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_moe_grouped_dp4a_gemv(
+        dtype: MoeGroupedGemvDtype,
+        expert_ptrs: &DeviceBuffer,
+        route_ids: &DeviceBuffer,
+        xq: &DeviceBuffer,
+        dx: &DeviceBuffer,
+        xsum: &DeviceBuffer,
+        y: &DeviceBuffer,
+        pairs: usize,
+        top_k: usize,
+        act_per_pair: bool,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(pairs, "moe_grouped_gemv pairs")?;
+        ensure_len(top_k, "moe_grouped_gemv top_k")?;
+        ensure_len(rows, "moe_grouped_gemv rows")?;
+        ensure_len(cols, "moe_grouped_gemv cols")?;
+        launch_status(unsafe {
+            hi_cuda_launch_moe_grouped_dp4a_gemv(
+                dtype as c_int,
+                expert_ptrs.as_ptr(),
+                route_ids.as_ptr(),
+                xq.as_ptr(),
+                dx.as_ptr(),
+                xsum.as_ptr(),
+                y.as_mut_ptr(),
+                pairs as c_int,
+                top_k as c_int,
+                c_int::from(act_per_pair),
+                rows as c_int,
+                cols as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_moe_grouped_dp4a_gemv")
+    }
+
+    /// out[row] += sum over the row's top_k pairs of route_weight * down_row, in
+    /// rank order (matching the sequential per-expert accumulation it replaces).
+    pub fn launch_moe_scatter_reduce(
+        down: &DeviceBuffer,
+        route_weights: &DeviceBuffer,
+        out: &DeviceBuffer,
+        rows: usize,
+        top_k: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(rows, "moe_scatter_reduce rows")?;
+        ensure_len(top_k, "moe_scatter_reduce top_k")?;
+        ensure_len(cols, "moe_scatter_reduce cols")?;
+        launch_status(unsafe {
+            hi_cuda_launch_moe_scatter_reduce(
+                down.as_ptr(),
+                route_weights.as_ptr(),
+                out.as_mut_ptr(),
+                rows as c_int,
+                top_k as c_int,
+                cols as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_moe_scatter_reduce")
+    }
+
+    /// out[row] += sigmoid(gates[row]) * values[row] (gates None = scale 1), for
+    /// the MoE shared expert; keeps the per-row scalar gate on the device.
+    pub fn launch_moe_add_rows_scaled_by_sigmoid(
+        values: &DeviceBuffer,
+        gates: Option<&DeviceBuffer>,
+        out: &DeviceBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(rows, "moe_add_sigmoid rows")?;
+        ensure_len(cols, "moe_add_sigmoid cols")?;
+        launch_status(unsafe {
+            hi_cuda_launch_moe_add_rows_scaled_by_sigmoid(
+                values.as_ptr(),
+                gates.map_or(std::ptr::null(), |buffer| buffer.as_ptr()),
+                out.as_mut_ptr(),
+                rows as c_int,
+                cols as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_moe_add_rows_scaled_by_sigmoid")
     }
 
     /// W4A8 prefill GEMM: C[M,N] f32 = A[M,K] x W[N,K]^T with A int8 (per-32-block dx/xsum

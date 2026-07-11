@@ -22909,6 +22909,261 @@ mod tests {
 
     #[cfg(feature = "native-cuda")]
     #[test]
+    fn native_cuda_moe_grouped_gemv_matches_per_expert_loop() {
+        use crate::kernels::MoeGroupedGemvDtype;
+        use crate::runtime::{DeviceBuffer, Stream};
+        use rand::rngs::StdRng;
+        use rand::{Rng, RngCore, SeedableRng};
+
+        let stream = Stream::create().unwrap();
+        let experts = 5usize;
+        let rows = 48usize; // output dim per expert
+        let cols = 512usize; // reduction dim
+        let m = 3usize; // token rows
+        let top_k = 4usize;
+        let pairs = m * top_k;
+        let nsub = cols / 32;
+
+        // (dtype, block_bytes, d f16 offset, dmin f16 offset or -1, per-expert launch)
+        type Launch = fn(
+            &DeviceBuffer,
+            &DeviceBuffer,
+            &DeviceBuffer,
+            &DeviceBuffer,
+            &DeviceBuffer,
+            usize,
+            usize,
+            &Stream,
+        ) -> anyhow::Result<()>;
+        let cases: &[(MoeGroupedGemvDtype, usize, usize, i64, Launch)] = &[
+            (
+                MoeGroupedGemvDtype::Q4K,
+                144,
+                0,
+                2,
+                crate::kernels::launch_q4_k_dp4a_gemv,
+            ),
+            (
+                MoeGroupedGemvDtype::Q6K,
+                210,
+                208,
+                -1,
+                crate::kernels::launch_q6_k_dp4a_gemv,
+            ),
+        ];
+
+        for &(dtype, block_bytes, d_off, dmin_off, launch) in cases {
+            let mut rng = StdRng::seed_from_u64(0x30e_000 + block_bytes as u64);
+            let nblocks = cols / 256;
+            let wlen = rows * nblocks * block_bytes;
+            let mut expert_buffers = Vec::with_capacity(experts);
+            let mut ptrs: Vec<u64> = Vec::with_capacity(experts);
+            for _ in 0..experts {
+                let mut wbytes = vec![0u8; wlen];
+                rng.fill_bytes(&mut wbytes);
+                // Pin the f16 (super-)block scales so random bytes can't produce inf/nan.
+                for blk in 0..(rows * nblocks) {
+                    let base = blk * block_bytes;
+                    wbytes[base + d_off] = 0x00;
+                    wbytes[base + d_off + 1] = 0x3C;
+                    if dmin_off >= 0 {
+                        let o = base + dmin_off as usize;
+                        wbytes[o] = 0x00;
+                        wbytes[o + 1] = 0x38;
+                    }
+                }
+                let dev = DeviceBuffer::alloc(wlen).unwrap();
+                dev.copy_from_host(&wbytes).unwrap();
+                ptrs.push(dev.as_ptr() as u64);
+                expert_buffers.push(dev);
+            }
+            let ptr_table = DeviceBuffer::alloc(experts * std::mem::size_of::<u64>()).unwrap();
+            ptr_table.copy_from_host(&ptrs).unwrap();
+
+            let route_ids: Vec<u32> = (0..pairs)
+                .map(|_| rng.gen_range(0..experts as u32))
+                .collect();
+            let ids_dev = DeviceBuffer::alloc(pairs * std::mem::size_of::<u32>()).unwrap();
+            ids_dev.copy_from_host(&route_ids).unwrap();
+
+            // act_per_pair = false (gate/up: activation row = pair / top_k, m rows)
+            // and act_per_pair = true (down: activation row = pair, `pairs` rows).
+            for (act_per_pair, act_rows) in [(false, m), (true, pairs)] {
+                let x: Vec<f32> = (0..act_rows * cols)
+                    .map(|_| rng.gen_range(-1.5f32..1.5))
+                    .collect();
+                let x_dev = DeviceBuffer::alloc(x.len() * std::mem::size_of::<f32>()).unwrap();
+                x_dev.copy_from_host(&x).unwrap();
+                let xq = DeviceBuffer::alloc(act_rows * cols).unwrap();
+                let dx = DeviceBuffer::alloc(act_rows * nsub * std::mem::size_of::<f32>()).unwrap();
+                let xsum =
+                    DeviceBuffer::alloc(act_rows * nsub * std::mem::size_of::<i32>()).unwrap();
+                crate::kernels::launch_quantize_q8_rows(
+                    &x_dev, &xq, &dx, &xsum, act_rows, cols, &stream,
+                )
+                .unwrap();
+
+                let y_grouped =
+                    DeviceBuffer::alloc(pairs * rows * std::mem::size_of::<f32>()).unwrap();
+                crate::kernels::launch_moe_grouped_dp4a_gemv(
+                    dtype,
+                    &ptr_table,
+                    &ids_dev,
+                    &xq,
+                    &dx,
+                    &xsum,
+                    &y_grouped,
+                    pairs,
+                    top_k,
+                    act_per_pair,
+                    rows,
+                    cols,
+                    &stream,
+                )
+                .unwrap();
+                stream.synchronize().unwrap();
+                let grouped = y_grouped.copy_to_host::<f32>(pairs * rows).unwrap();
+
+                // Reference: the plain per-expert GEMV, one pair at a time, fed the
+                // EXACT same quantized-activation bits via device-to-device slices.
+                for pair in 0..pairs {
+                    let act_row = if act_per_pair { pair } else { pair / top_k };
+                    let xq_row = DeviceBuffer::alloc(cols).unwrap();
+                    xq_row
+                        .copy_device_range(0, &xq, act_row * cols, cols, &stream)
+                        .unwrap();
+                    let dx_row = DeviceBuffer::alloc(nsub * std::mem::size_of::<f32>()).unwrap();
+                    dx_row
+                        .copy_device_range(
+                            0,
+                            &dx,
+                            act_row * nsub * std::mem::size_of::<f32>(),
+                            nsub * std::mem::size_of::<f32>(),
+                            &stream,
+                        )
+                        .unwrap();
+                    let xsum_row = DeviceBuffer::alloc(nsub * std::mem::size_of::<i32>()).unwrap();
+                    xsum_row
+                        .copy_device_range(
+                            0,
+                            &xsum,
+                            act_row * nsub * std::mem::size_of::<i32>(),
+                            nsub * std::mem::size_of::<i32>(),
+                            &stream,
+                        )
+                        .unwrap();
+                    let y_ref = DeviceBuffer::alloc(rows * std::mem::size_of::<f32>()).unwrap();
+                    launch(
+                        &expert_buffers[route_ids[pair] as usize],
+                        &xq_row,
+                        &dx_row,
+                        &xsum_row,
+                        &y_ref,
+                        rows,
+                        cols,
+                        &stream,
+                    )
+                    .unwrap();
+                    stream.synchronize().unwrap();
+                    let reference = y_ref.copy_to_host::<f32>(rows).unwrap();
+                    for (row, (&got, &want)) in grouped[pair * rows..(pair + 1) * rows]
+                        .iter()
+                        .zip(reference.iter())
+                        .enumerate()
+                    {
+                        assert_eq!(
+                            got.to_bits(),
+                            want.to_bits(),
+                            "{dtype:?} act_per_pair={act_per_pair} pair {pair} row {row}: grouped {got} != per-expert {want}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // moe_scatter_reduce: rank-order weighted accumulation vs a host reference.
+        let mut rng = StdRng::seed_from_u64(0x5ca77e2);
+        let cols_out = 96usize;
+        let down: Vec<f32> = (0..pairs * cols_out)
+            .map(|_| rng.gen_range(-2.0f32..2.0))
+            .collect();
+        let weights: Vec<f32> = (0..pairs).map(|_| rng.gen_range(0.0f32..1.0)).collect();
+        let down_dev = DeviceBuffer::alloc(down.len() * std::mem::size_of::<f32>()).unwrap();
+        down_dev.copy_from_host(&down).unwrap();
+        let weights_dev = DeviceBuffer::alloc(weights.len() * std::mem::size_of::<f32>()).unwrap();
+        weights_dev.copy_from_host(&weights).unwrap();
+        let out_dev = DeviceBuffer::alloc(m * cols_out * std::mem::size_of::<f32>()).unwrap();
+        out_dev.copy_from_host(&vec![0.0f32; m * cols_out]).unwrap();
+        crate::kernels::launch_moe_scatter_reduce(
+            &down_dev,
+            &weights_dev,
+            &out_dev,
+            m,
+            top_k,
+            cols_out,
+            &stream,
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+        let got = out_dev.copy_to_host::<f32>(m * cols_out).unwrap();
+        for row in 0..m {
+            for col in 0..cols_out {
+                let mut want = 0.0f32;
+                for k in 0..top_k {
+                    let pair = row * top_k + k;
+                    want += weights[pair] * down[pair * cols_out + col];
+                }
+                let have = got[row * cols_out + col];
+                assert!(
+                    (have - want).abs() <= 1e-5 * want.abs().max(1.0),
+                    "scatter_reduce row {row} col {col}: {have} vs {want}"
+                );
+            }
+        }
+
+        // moe_add_rows_scaled_by_sigmoid, gated and ungated.
+        let values: Vec<f32> = (0..m * cols_out)
+            .map(|_| rng.gen_range(-2.0f32..2.0))
+            .collect();
+        let gates: Vec<f32> = (0..m).map(|_| rng.gen_range(-3.0f32..3.0)).collect();
+        let values_dev = DeviceBuffer::alloc(values.len() * std::mem::size_of::<f32>()).unwrap();
+        values_dev.copy_from_host(&values).unwrap();
+        let gates_dev = DeviceBuffer::alloc(gates.len() * std::mem::size_of::<f32>()).unwrap();
+        gates_dev.copy_from_host(&gates).unwrap();
+        for use_gates in [true, false] {
+            let out = DeviceBuffer::alloc(m * cols_out * std::mem::size_of::<f32>()).unwrap();
+            out.copy_from_host(&vec![1.0f32; m * cols_out]).unwrap();
+            crate::kernels::launch_moe_add_rows_scaled_by_sigmoid(
+                &values_dev,
+                use_gates.then_some(&gates_dev),
+                &out,
+                m,
+                cols_out,
+                &stream,
+            )
+            .unwrap();
+            stream.synchronize().unwrap();
+            let got = out.copy_to_host::<f32>(m * cols_out).unwrap();
+            for row in 0..m {
+                for col in 0..cols_out {
+                    let scale = if use_gates {
+                        1.0 / (1.0 + (-gates[row]).exp())
+                    } else {
+                        1.0
+                    };
+                    let want = 1.0 + scale * values[row * cols_out + col];
+                    let have = got[row * cols_out + col];
+                    assert!(
+                        (have - want).abs() <= 1e-5 * want.abs().max(1.0),
+                        "sigmoid add gated={use_gates} row {row} col {col}: {have} vs {want}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
     fn native_cuda_kquant_dp4a_gemv_matches_dequant_reference() {
         use crate::runtime::{DeviceBuffer, Stream};
         use rand::rngs::StdRng;
