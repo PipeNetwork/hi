@@ -701,6 +701,12 @@ pub struct GgufTokenizer {
     tokens: Vec<String>,
     token_to_id: HashMap<String, u32>,
     merge_ranks: HashMap<(String, String), usize>,
+    /// Integer-keyed mirror of `merge_ranks` for the BPE hot loop: every string
+    /// appearing on either side of a merge (and every merge result) is interned
+    /// to a symbol id in `bpe_symbol_ids`, and `(left, right) -> (rank, merged)`
+    /// lets the encoder test/apply merges without allocating or hashing strings.
+    bpe_symbol_ids: HashMap<String, u32>,
+    bpe_pair_merges: HashMap<(u32, u32), (u32, u32)>,
     scores: Option<Vec<f32>>,
     token_types: Option<Vec<i32>>,
     special_ids: BTreeSet<u32>,
@@ -737,6 +743,8 @@ impl GgufTokenizer {
             .metadata_string_array("tokenizer.ggml.merges")?
             .unwrap_or_default();
         let mut merge_ranks = HashMap::with_capacity(merges.len());
+        let mut bpe_symbol_ids: HashMap<String, u32> = HashMap::new();
+        let mut bpe_pair_merges: HashMap<(u32, u32), (u32, u32)> = HashMap::new();
         for (rank, merge) in merges.iter().enumerate() {
             let (left, right) = merge
                 .split_once(' ')
@@ -745,6 +753,21 @@ impl GgufTokenizer {
                 bail!("invalid GGUF tokenizer merge {merge:?}");
             }
             merge_ranks.insert((left.to_string(), right.to_string()), rank);
+            let mut intern = |s: &str| -> Result<u32> {
+                if let Some(id) = bpe_symbol_ids.get(s) {
+                    return Ok(*id);
+                }
+                let id = u32::try_from(bpe_symbol_ids.len())
+                    .context("GGUF tokenizer merge symbol count exceeds u32")?;
+                bpe_symbol_ids.insert(s.to_string(), id);
+                Ok(id)
+            };
+            let left_id = intern(left)?;
+            let right_id = intern(right)?;
+            let merged_id = intern(&format!("{left}{right}"))?;
+            let rank = u32::try_from(rank).context("GGUF tokenizer merge rank exceeds u32")?;
+            // Duplicate pairs keep last-wins semantics, matching `merge_ranks`.
+            bpe_pair_merges.insert((left_id, right_id), (rank, merged_id));
         }
 
         let scores = gguf.metadata_f32_array("tokenizer.ggml.scores")?;
@@ -810,6 +833,8 @@ impl GgufTokenizer {
             tokens,
             token_to_id,
             merge_ranks,
+            bpe_symbol_ids,
+            bpe_pair_merges,
             scores,
             token_types,
             special_ids,
@@ -1097,7 +1122,7 @@ impl GgufTokenizer {
         let encoded = encode_byte_level_text(text.as_bytes());
         let mut ids = Vec::new();
         for symbol in self.apply_bpe(&encoded) {
-            match self.token_to_id.get(&symbol).copied() {
+            match self.token_to_id.get(symbol).copied() {
                 Some(id) => ids.push(id),
                 None => match self.unknown_token_id {
                     Some(id) => ids.push(id),
@@ -1108,34 +1133,135 @@ impl GgufTokenizer {
         Ok(ids)
     }
 
-    fn apply_bpe(&self, encoded: &str) -> Vec<String> {
-        let mut symbols = encoded.chars().map(|ch| ch.to_string()).collect::<Vec<_>>();
-        if symbols.len() < 2 || self.merge_ranks.is_empty() {
-            return symbols;
+    /// BPE merge loop over the byte-level-encoded text, returning the final
+    /// symbols as slices of `encoded` (merges are always adjacent, so every
+    /// symbol is a contiguous substring).
+    ///
+    /// Semantics are exactly the naive algorithm's — repeatedly merge the
+    /// lowest-rank pair present, leftmost first among equal ranks — but run as
+    /// a binary heap over a doubly-linked symbol list with integer-interned
+    /// symbols, so a pass is O(n log n) with no per-iteration allocation. The
+    /// naive rescan (clone + hash two Strings per pair, per merge) was O(n^2)
+    /// with heavy constants: ~2.7s for a 5k-token prompt, dominating TTFT.
+    fn apply_bpe<'a>(&self, encoded: &'a str) -> Vec<&'a str> {
+        struct Node {
+            start: usize,
+            end: usize,
+            sym: u32,
+            prev: i32,
+            next: i32,
+            alive: bool,
         }
 
-        loop {
-            let mut best: Option<(usize, usize)> = None;
-            for idx in 0..symbols.len().saturating_sub(1) {
-                let pair = (symbols[idx].clone(), symbols[idx + 1].clone());
-                let Some(rank) = self.merge_ranks.get(&pair).copied() else {
-                    continue;
-                };
-                if best.is_none_or(|(best_rank, _)| rank < best_rank) {
-                    best = Some((rank, idx));
+        // Interned ids >= this are per-call locals for chars that appear in no
+        // merge rule (they can never merge, but must survive as symbols).
+        let local_base = u32::try_from(self.bpe_symbol_ids.len()).unwrap_or(u32::MAX);
+        let mut local_chars: HashMap<char, u32> = HashMap::new();
+        let mut char_buf = [0u8; 4];
+        let mut nodes: Vec<Node> = Vec::with_capacity(encoded.chars().count());
+        for (offset, ch) in encoded.char_indices() {
+            let sym = match self
+                .bpe_symbol_ids
+                .get(ch.encode_utf8(&mut char_buf) as &str)
+            {
+                Some(id) => *id,
+                None => {
+                    let next_local = local_base.saturating_add(local_chars.len() as u32);
+                    *local_chars.entry(ch).or_insert(next_local)
+                }
+            };
+            let idx = nodes.len() as i32;
+            nodes.push(Node {
+                start: offset,
+                end: offset + ch.len_utf8(),
+                sym,
+                prev: idx - 1,
+                next: idx + 1,
+                alive: true,
+            });
+        }
+        if let Some(last) = nodes.last_mut() {
+            last.next = -1;
+        }
+
+        if nodes.len() >= 2 && !self.bpe_pair_merges.is_empty() {
+            // Reverse-ordered min-heap entries: (rank, left position, merged
+            // symbol, left symbol, right symbol). Position tiebreak = leftmost
+            // among equal ranks; node indices are stable and order-preserving
+            // (a merge keeps the left node), matching the naive scan order.
+            let mut heap: std::collections::BinaryHeap<
+                std::cmp::Reverse<(u32, u32, u32, u32, u32)>,
+            > = std::collections::BinaryHeap::with_capacity(nodes.len());
+            for idx in 0..nodes.len() - 1 {
+                let pair = (nodes[idx].sym, nodes[idx + 1].sym);
+                if let Some((rank, merged)) = self.bpe_pair_merges.get(&pair) {
+                    heap.push(std::cmp::Reverse((
+                        *rank, idx as u32, *merged, pair.0, pair.1,
+                    )));
                 }
             }
-
-            let Some((_, idx)) = best else {
-                break;
-            };
-            let merged = format!("{}{}", symbols[idx], symbols[idx + 1]);
-            symbols.splice(idx..idx + 2, [merged]);
-            if symbols.len() < 2 {
-                break;
+            while let Some(std::cmp::Reverse((_, left_idx, merged, left_sym, right_sym))) =
+                heap.pop()
+            {
+                let left_idx = left_idx as usize;
+                // Stale entries: either node died, or a neighboring merge
+                // changed the pair since this entry was pushed.
+                if !nodes[left_idx].alive || nodes[left_idx].sym != left_sym {
+                    continue;
+                }
+                let right_idx = nodes[left_idx].next;
+                if right_idx < 0 {
+                    continue;
+                }
+                let right_idx = right_idx as usize;
+                if nodes[right_idx].sym != right_sym {
+                    continue;
+                }
+                // Merge right into left.
+                nodes[left_idx].end = nodes[right_idx].end;
+                nodes[left_idx].sym = merged;
+                nodes[right_idx].alive = false;
+                let after = nodes[right_idx].next;
+                nodes[left_idx].next = after;
+                if after >= 0 {
+                    nodes[after as usize].prev = left_idx as i32;
+                }
+                // New candidate pairs with both neighbors.
+                let before = nodes[left_idx].prev;
+                if before >= 0 {
+                    let pair = (nodes[before as usize].sym, merged);
+                    if let Some((rank, m)) = self.bpe_pair_merges.get(&pair) {
+                        heap.push(std::cmp::Reverse((
+                            *rank,
+                            before as u32,
+                            *m,
+                            pair.0,
+                            pair.1,
+                        )));
+                    }
+                }
+                if after >= 0 {
+                    let pair = (merged, nodes[after as usize].sym);
+                    if let Some((rank, m)) = self.bpe_pair_merges.get(&pair) {
+                        heap.push(std::cmp::Reverse((
+                            *rank,
+                            left_idx as u32,
+                            *m,
+                            pair.0,
+                            pair.1,
+                        )));
+                    }
+                }
             }
         }
 
+        let mut symbols = Vec::new();
+        let mut cursor = if nodes.is_empty() { -1 } else { 0i32 };
+        while cursor >= 0 {
+            let node = &nodes[cursor as usize];
+            symbols.push(&encoded[node.start..node.end]);
+            cursor = node.next;
+        }
         symbols
     }
 
@@ -8157,6 +8283,123 @@ mod tests {
         );
         assert_eq!(tokenizer.decode(&[8, 10]).unwrap(), "hello");
         assert_eq!(tokenizer.summary().merge_count, 4);
+    }
+
+    /// The heap/linked-list BPE must be observationally identical to the naive
+    /// algorithm it replaced (repeatedly merge the lowest-rank pair, leftmost
+    /// among ties): sweep random strings over an alphabet chosen to force
+    /// overlapping candidates, equal-rank ties, and merge chains.
+    #[test]
+    fn bpe_heap_encoder_matches_naive_reference() {
+        fn naive_apply_bpe(tokenizer: &GgufTokenizer, encoded: &str) -> Vec<String> {
+            let mut symbols = encoded.chars().map(|ch| ch.to_string()).collect::<Vec<_>>();
+            if symbols.len() < 2 || tokenizer.merge_ranks.is_empty() {
+                return symbols;
+            }
+            loop {
+                let mut best: Option<(usize, usize)> = None;
+                for idx in 0..symbols.len().saturating_sub(1) {
+                    let pair = (symbols[idx].clone(), symbols[idx + 1].clone());
+                    let Some(rank) = tokenizer.merge_ranks.get(&pair).copied() else {
+                        continue;
+                    };
+                    if best.is_none_or(|(best_rank, _)| rank < best_rank) {
+                        best = Some((rank, idx));
+                    }
+                }
+                let Some((_, idx)) = best else {
+                    break;
+                };
+                let merged = format!("{}{}", symbols[idx], symbols[idx + 1]);
+                symbols.splice(idx..idx + 2, [merged]);
+                if symbols.len() < 2 {
+                    break;
+                }
+            }
+            symbols
+        }
+
+        let path = tempfile_path("bpe-heap-property");
+        // Merge table with chains (a+a=aa, aa+a, aa+aa), equal-length
+        // alternatives, and cross-symbol follow-ups; tokens cover every merge
+        // result so encode() resolves without the unknown fallback.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        write_u32(&mut bytes, 3);
+        write_u64(&mut bytes, 0);
+        write_u64(&mut bytes, 4);
+        write_kv_u32(&mut bytes, "general.alignment", 32);
+        write_kv_string(&mut bytes, "tokenizer.ggml.model", "gpt2");
+        let tokens = [
+            "a",
+            "b",
+            "c",
+            "d",
+            " ",
+            "\u{0120}",
+            "aa",
+            "ab",
+            "ba",
+            "aaa",
+            "aaaa",
+            "ab\u{0120}",
+            "\u{0120}a",
+            "\u{0120}ab",
+            "bc",
+            "abc",
+            "cd",
+            "abcd",
+            "<|unk|>",
+        ];
+        write_kv_string_array(&mut bytes, "tokenizer.ggml.tokens", &tokens);
+        let merges = [
+            "a a",
+            "a b",
+            "b a",
+            "aa a",
+            "aa aa",
+            "b c",
+            "ab c",
+            "c d",
+            "abc d",
+            "\u{0120} a",
+            "\u{0120}a b",
+            "ab \u{0120}",
+        ];
+        write_kv_string_array(&mut bytes, "tokenizer.ggml.merges", &merges);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.unknown_token_id", 18);
+        std::fs::write(&path, bytes).unwrap();
+        let gguf = GgufFile::open(&path).unwrap();
+        let tokenizer = gguf.tokenizer().unwrap();
+
+        let alphabet = ['a', 'b', 'c', 'd', ' ', 'e'];
+        let mut state = 0x9e37_79b9u64;
+        for case in 0..400 {
+            let len = (lcg_next(&mut state) % 60) as usize + (case % 3);
+            let text: String = (0..len)
+                .map(|_| alphabet[(lcg_next(&mut state) % alphabet.len() as u64) as usize])
+                .collect();
+            let encoded = encode_byte_level_text(text.as_bytes());
+            let fast: Vec<&str> = tokenizer.apply_bpe(&encoded);
+            let naive = naive_apply_bpe(&tokenizer, &encoded);
+            assert_eq!(
+                fast, naive,
+                "heap BPE diverged from naive reference for {text:?}"
+            );
+        }
+
+        // Adversarial: long uniform runs (maximal equal-rank tie pressure) and
+        // a run long enough that an O(n^2) reintroduction would be obvious.
+        for text in [
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "abababababababab",
+            "aaab aaab aaab",
+        ] {
+            let encoded = encode_byte_level_text(text.as_bytes());
+            let fast: Vec<&str> = tokenizer.apply_bpe(&encoded);
+            let naive = naive_apply_bpe(&tokenizer, &encoded);
+            assert_eq!(fast, naive, "heap BPE diverged for {text:?}");
+        }
     }
 
     #[test]
