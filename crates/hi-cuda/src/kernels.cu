@@ -10019,7 +10019,12 @@ struct Fa2GatherQ8 {
   }
 };
 
-template <typename KVGather>
+// HD_TILES (head_dim / 16) is a compile-time parameter so the per-tile
+// fragment arrays index with constant bounds: with a runtime bound, nvcc
+// places qf[]/of[] in LOCAL memory and every mma round-trips its fragments
+// through L1 (the kernel showed 63 regs/thread against a ~128-reg fragment
+// footprint — the difference was spills).
+template <typename KVGather, int HD_TILES>
 __global__ void fa2_paged_prefill_causal_attention_batched_kernel(
     const float* __restrict__ q,  // [batch][chunk_len][heads][head_dim] f32
     KVGather gather,
@@ -10034,7 +10039,7 @@ __global__ void fa2_paged_prefill_causal_attention_batched_kernel(
     int kv_heads,
     int head_dim) {
   const int T = HI_CUDA_WMMA_TILE;
-  const int hd_tiles = head_dim / T;
+  constexpr int hd_tiles = HD_TILES;
   extern __shared__ char smem_raw[];
   half* k_sh = reinterpret_cast<half*>(smem_raw);  // [FA2_BN][head_dim]
   half* v_sh = k_sh + FA2_BN * head_dim;           // [FA2_BN][head_dim]
@@ -10063,11 +10068,11 @@ __global__ void fa2_paged_prefill_causal_attention_batched_kernel(
                   : __float2half(0.0f);
   }
   __syncthreads();
-  wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> qf[8];
+  wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> qf[HD_TILES];
   for (int h = 0; h < hd_tiles; ++h) {
     wmma::load_matrix_sync(qf[h], k_sh + (warp * T) * head_dim + h * T, head_dim);
   }
-  wmma::fragment<wmma::accumulator, 16, 16, 16, float> of[8];
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> of[HD_TILES];
   for (int h = 0; h < hd_tiles; ++h) {
     wmma::fill_fragment(of[h], 0.0f);
   }
@@ -10130,7 +10135,8 @@ __global__ void fa2_paged_prefill_causal_attention_batched_kernel(
       wmma::fragment<wmma::accumulator, 16, 16, 16, float> s_frag[2];
       wmma::fill_fragment(s_frag[0], 0.0f);
       wmma::fill_fragment(s_frag[1], 0.0f);
-      for (int h = 0; h < hd_tiles; ++h) {
+  #pragma unroll
+    for (int h = 0; h < hd_tiles; ++h) {
         wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> kf;
         wmma::load_matrix_sync(kf, k_sh + h * T, head_dim);
         wmma::mma_sync(s_frag[0], qf[h], kf, s_frag[0]);
@@ -10210,7 +10216,8 @@ __global__ void fa2_paged_prefill_causal_attention_batched_kernel(
       wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pf[2];
       wmma::load_matrix_sync(pf[0], my_p, FA2_BN);
       wmma::load_matrix_sync(pf[1], my_p + T, FA2_BN);
-      for (int h = 0; h < hd_tiles; ++h) {
+  #pragma unroll
+    for (int h = 0; h < hd_tiles; ++h) {
 #pragma unroll
         for (int i = 0; i < of[h].num_elements; ++i) {
           of[h].x[i] *= (((i >> 1) & 1) ? fac_hi : fac_lo);
@@ -10232,6 +10239,7 @@ __global__ void fa2_paged_prefill_causal_attention_batched_kernel(
     const float inv_lo = (l_lo == 0.0f || !isfinite(l_lo)) ? 0.0f : 1.0f / l_lo;
     const float l_hi = my_l[row_hi];
     const float inv_hi = (l_hi == 0.0f || !isfinite(l_hi)) ? 0.0f : 1.0f / l_hi;
+#pragma unroll
     for (int h = 0; h < hd_tiles; ++h) {
 #pragma unroll
       for (int i = 0; i < of[h].num_elements; ++i) {
@@ -10270,11 +10278,24 @@ extern "C" int hi_cuda_launch_fa2_paged_prefill_causal_attention_batched(
       (2 * FA2_BN * head_dim + FA2_WARPS * HI_CUDA_WMMA_TILE * FA2_BN) * sizeof(half) +
       (FA2_WARPS * HI_CUDA_WMMA_TILE * FA2_BN + 3 * FA2_BM) * sizeof(float);
   Fa2GatherF16 gather{static_cast<const half*>(k_pages), static_cast<const half*>(v_pages)};
-  fa2_paged_prefill_causal_attention_batched_kernel<Fa2GatherF16>
-      <<<grid, block, shared_bytes, static_cast<cudaStream_t>(stream)>>>(
-          static_cast<const float*>(q), gather, static_cast<const uint32_t*>(page_table),
-          static_cast<float*>(output), query_offset, batch_count, chunk_len, page_size,
-          page_table_len, heads, kv_heads, head_dim);
+#define HI_CUDA_FA2_LAUNCH(HT)                                                                   \
+  fa2_paged_prefill_causal_attention_batched_kernel<Fa2GatherF16, HT>                            \
+      <<<grid, block, shared_bytes, static_cast<cudaStream_t>(stream)>>>(                        \
+          static_cast<const float*>(q), gather, static_cast<const uint32_t*>(page_table),       \
+          static_cast<float*>(output), query_offset, batch_count, chunk_len, page_size,         \
+          page_table_len, heads, kv_heads, head_dim)
+  switch (head_dim / HI_CUDA_WMMA_TILE) {
+    case 1: HI_CUDA_FA2_LAUNCH(1); break;
+    case 2: HI_CUDA_FA2_LAUNCH(2); break;
+    case 3: HI_CUDA_FA2_LAUNCH(3); break;
+    case 4: HI_CUDA_FA2_LAUNCH(4); break;
+    case 5: HI_CUDA_FA2_LAUNCH(5); break;
+    case 6: HI_CUDA_FA2_LAUNCH(6); break;
+    case 7: HI_CUDA_FA2_LAUNCH(7); break;
+    case 8: HI_CUDA_FA2_LAUNCH(8); break;
+    default: return 1;
+  }
+#undef HI_CUDA_FA2_LAUNCH
   return 0;
 }
 
@@ -10299,11 +10320,24 @@ extern "C" int hi_cuda_launch_fa2_paged_prefill_causal_attention_batched_q8(
   Fa2GatherQ8 gather{static_cast<const int8_t*>(k_pages), static_cast<const int8_t*>(v_pages),
                      static_cast<const float*>(k_scales), static_cast<const float*>(v_scales),
                      head_dim};
-  fa2_paged_prefill_causal_attention_batched_kernel<Fa2GatherQ8>
-      <<<grid, block, shared_bytes, static_cast<cudaStream_t>(stream)>>>(
-          static_cast<const float*>(q), gather, static_cast<const uint32_t*>(page_table),
-          static_cast<float*>(output), query_offset, batch_count, chunk_len, page_size,
-          page_table_len, heads, kv_heads, head_dim);
+#define HI_CUDA_FA2_LAUNCH_Q8(HT)                                                                \
+  fa2_paged_prefill_causal_attention_batched_kernel<Fa2GatherQ8, HT>                             \
+      <<<grid, block, shared_bytes, static_cast<cudaStream_t>(stream)>>>(                        \
+          static_cast<const float*>(q), gather, static_cast<const uint32_t*>(page_table),       \
+          static_cast<float*>(output), query_offset, batch_count, chunk_len, page_size,         \
+          page_table_len, heads, kv_heads, head_dim)
+  switch (head_dim / HI_CUDA_WMMA_TILE) {
+    case 1: HI_CUDA_FA2_LAUNCH_Q8(1); break;
+    case 2: HI_CUDA_FA2_LAUNCH_Q8(2); break;
+    case 3: HI_CUDA_FA2_LAUNCH_Q8(3); break;
+    case 4: HI_CUDA_FA2_LAUNCH_Q8(4); break;
+    case 5: HI_CUDA_FA2_LAUNCH_Q8(5); break;
+    case 6: HI_CUDA_FA2_LAUNCH_Q8(6); break;
+    case 7: HI_CUDA_FA2_LAUNCH_Q8(7); break;
+    case 8: HI_CUDA_FA2_LAUNCH_Q8(8); break;
+    default: return 1;
+  }
+#undef HI_CUDA_FA2_LAUNCH_Q8
   return 0;
 }
 
