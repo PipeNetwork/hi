@@ -2937,15 +2937,18 @@ mod native {
         *ENABLED.get_or_init(|| std::env::var("HI_CUDA_NO_FP4_GEMV").is_err())
     }
 
-    /// FA2 multi-warp paged prefill attention (`HI_CUDA_FA2_ATTN=1`, opt-in): four
-    /// warps per 64-query block tile share one 32-key K/V staging tile (4x fewer
-    /// paged-prefix gathers per query) with per-warp softmax/output ownership,
-    /// replacing the single-warp-per-16-queries WMMA kernel on prefill chunks
-    /// large enough to fill the tile. Same f16 tensor-core accuracy class.
+    /// FA2 multi-warp paged prefill attention (default ON; `HI_CUDA_FA2_ATTN=0`
+    /// reverts to the single-warp WMMA kernel): four warps per 64-query block
+    /// tile share one 32-key K/V staging tile (4x fewer paged-prefix gathers per
+    /// query — the gather traffic, not compute, is what bounds the single-warp
+    /// kernel) with per-warp in-fragment softmax and output ownership. Measured
+    /// 1.3-2.2x over WMMA across prefill shapes; same f16 tensor-core accuracy
+    /// class, pinned by the f64-reference parity test.
     fn fa2_attn_enabled() -> bool {
         use std::sync::OnceLock;
         static ENABLED: OnceLock<bool> = OnceLock::new();
-        *ENABLED.get_or_init(|| std::env::var("HI_CUDA_FA2_ATTN").is_ok_and(|value| value != "0"))
+        *ENABLED
+            .get_or_init(|| std::env::var("HI_CUDA_FA2_ATTN").map_or(true, |value| value != "0"))
     }
 
     /// Force WMMA prefill attention OFF via `HI_CUDA_NO_WMMA_ATTN` (safety fallback to
