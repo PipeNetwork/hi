@@ -2945,6 +2945,46 @@ mod native {
         *ENABLED.get_or_init(|| std::env::var("HI_CUDA_KV_Q8").is_ok())
     }
 
+    /// GQA-grouped decode attention (`HI_CUDA_GQA_DECODE=1`, opt-in): one block
+    /// serves all Q heads sharing a KV head, reading each K/V vector ONCE — decode
+    /// attention's KV traffic drops by the GQA factor (4-8x on Qwen models) — and
+    /// long contexts additionally grid-split across SMs with a flash merge.
+    fn gqa_decode_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("HI_CUDA_GQA_DECODE").is_ok_and(|value| value != "0"))
+    }
+
+    /// Minimum cache capacity (tokens) before the GQA decode kernel engages
+    /// (`HI_CUDA_GQA_DECODE_MIN`, default 1024). Below it the per-head kernels
+    /// win: at tiny contexts attention is launch/occupancy-bound and the grouped
+    /// block (8 warps x kv_heads blocks) underfills the SMs — measured -7%
+    /// single-stream at ~200-token contexts vs +41% at ~5k. Capacity, not live
+    /// position, keeps the decision shape-stable for captured graphs.
+    fn gqa_decode_min_context() -> usize {
+        use std::sync::OnceLock;
+        static MIN: OnceLock<usize> = OnceLock::new();
+        *MIN.get_or_init(|| {
+            std::env::var("HI_CUDA_GQA_DECODE_MIN")
+                .ok()
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or(1024)
+        })
+    }
+
+    /// Override the GQA decode's KV split factor (`HI_CUDA_DECODE_SPLIT`, 1..=8).
+    /// Unset = a shape-only heuristic (fill the SMs, bounded by cache capacity).
+    fn decode_split_override() -> Option<usize> {
+        use std::sync::OnceLock;
+        static SPLIT: OnceLock<Option<usize>> = OnceLock::new();
+        *SPLIT.get_or_init(|| {
+            std::env::var("HI_CUDA_DECODE_SPLIT")
+                .ok()
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .map(|value| value.clamp(1, 8))
+        })
+    }
+
     /// Grouped MoE execution (`HI_CUDA_MOE_GROUPED=1`, opt-in): run each MoE
     /// projection as ONE grouped GEMV launch over all (token row, routed expert)
     /// pairs with device-resident routing, instead of ~3 launches per expert per
@@ -18541,6 +18581,107 @@ mod native {
             })
         }
 
+        /// GQA-grouped (+ split-KV) decode attention over the batched paged cache
+        /// (`HI_CUDA_GQA_DECODE`). Position resolves per-row, from the graph device
+        /// counter, or the host scalar — mirroring the per-head kernels. Returns
+        /// Ok(None) when disabled or the (kv_repeats, head_dim) shape has no kernel
+        /// bucket, and the caller falls back.
+        #[allow(clippy::too_many_arguments)]
+        fn gqa_paged_decode_attention_f32_device(
+            &self,
+            q: &GpuF32Tensor,
+            cache: &CudaPagedBatchLayerKvCache,
+            positions: Option<&DeviceBuffer>,
+            d_position: Option<&DeviceBuffer>,
+            position: usize,
+            batch_count: usize,
+            heads: usize,
+            kv_heads: usize,
+            head_dim: usize,
+            v_head_dim: usize,
+            window: usize,
+        ) -> Result<Option<GpuF32Tensor>> {
+            if !gqa_decode_enabled() || kv_heads == 0 || heads % kv_heads != 0 {
+                return Ok(None);
+            }
+            if heads / kv_heads < 2 || cache.max_seq < gqa_decode_min_context() {
+                return Ok(None);
+            }
+            let q8 = cache.key_scales.is_some();
+            // Split factor is a pure function of SHAPE (SM fill vs cache capacity,
+            // never the live position) so a captured graph replays correctly as the
+            // sequence grows.
+            let blocks = batch_count.saturating_mul(kv_heads).max(1);
+            let split = decode_split_override().unwrap_or_else(|| {
+                (crate::runtime::multiprocessor_count() / blocks)
+                    .min(8)
+                    .min(cache.max_seq.div_ceil(512).max(1))
+                    .max(1)
+            });
+            let output_elements = batch_count
+                .checked_mul(heads)
+                .and_then(|value| value.checked_mul(v_head_dim))
+                .context("CUDA GQA attention output element count overflows usize")?;
+            let output = DeviceBuffer::alloc(output_elements * std::mem::size_of::<f32>())
+                .context("allocating CUDA GQA attention output")?;
+            let launch = |target: &DeviceBuffer, split_count: usize| -> Result<bool> {
+                crate::kernels::launch_gqa_paged_decode_attention(
+                    q8,
+                    &q.buffer,
+                    cache.key_pages.as_buffer(),
+                    cache.value_pages.as_buffer(),
+                    cache.key_scales.as_ref().map(|b| b.as_buffer()),
+                    cache.value_scales.as_ref().map(|b| b.as_buffer()),
+                    &cache.page_table,
+                    target,
+                    positions,
+                    d_position,
+                    position,
+                    batch_count,
+                    split_count,
+                    cache.page_size,
+                    cache.page_table_len,
+                    heads,
+                    kv_heads,
+                    head_dim,
+                    v_head_dim,
+                    window,
+                    &self.stream,
+                )
+            };
+            if split <= 1 {
+                if !launch(&output, 1)? {
+                    return Ok(None);
+                }
+            } else {
+                let partial_elements = batch_count
+                    .checked_mul(heads)
+                    .and_then(|value| value.checked_mul(split))
+                    .and_then(|value| value.checked_mul(2 + v_head_dim))
+                    .context("CUDA GQA attention partial element count overflows usize")?;
+                let partials = DeviceBuffer::alloc(partial_elements * std::mem::size_of::<f32>())
+                    .context("allocating CUDA GQA attention partials")?;
+                if !launch(&partials, split)? {
+                    return Ok(None);
+                }
+                crate::kernels::launch_gqa_split_decode_merge(
+                    &partials,
+                    &output,
+                    batch_count,
+                    heads,
+                    split,
+                    v_head_dim,
+                    &self.stream,
+                )?;
+            }
+            self.op_barrier()?;
+            Ok(Some(GpuF32Tensor {
+                rows: batch_count,
+                cols: heads * v_head_dim,
+                buffer: output,
+            }))
+        }
+
         fn paged_decode_attention_batched_f32_device(
             &self,
             q: &GpuF32Tensor,
@@ -18566,6 +18707,21 @@ mod native {
                     "CUDA paged batched attention cache batch {} does not match q batch {batch_count}",
                     cache.batch_count
                 );
+            }
+            if let Some(output) = self.gqa_paged_decode_attention_f32_device(
+                q,
+                cache,
+                None,
+                self.active_graph_position(),
+                position,
+                batch_count,
+                heads,
+                kv_heads,
+                head_dim,
+                v_head_dim,
+                window,
+            )? {
+                return Ok(output);
             }
             let output_elements = batch_count
                 .checked_mul(heads)
@@ -18710,6 +18866,21 @@ mod native {
                     "CUDA paged batched positioned attention cache batch {} does not match q batch {batch_count}",
                     cache.batch_count
                 );
+            }
+            if let Some(output) = self.gqa_paged_decode_attention_f32_device(
+                q,
+                cache,
+                Some(positions),
+                None,
+                0,
+                batch_count,
+                heads,
+                kv_heads,
+                head_dim,
+                v_head_dim,
+                window,
+            )? {
+                return Ok(output);
             }
             let output_elements = batch_count
                 .checked_mul(heads)

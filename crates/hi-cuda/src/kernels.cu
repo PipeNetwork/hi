@@ -4565,6 +4565,376 @@ __global__ void flash_cached_decode_attention_batched_kernel(
   }
 }
 
+// GQA-grouped + grid-split flash decode (HI_CUDA_GQA_DECODE). One block serves
+// ALL G Q-heads that share one KV head, reading each K/V vector ONCE and folding
+// it into G online-softmax states — decode attention's KV traffic drops by the
+// GQA factor (4-8x on Qwen models). blockIdx.z splits the sequence across SMs
+// (flash-decoding): chunk bounds are computed ON-DEVICE from the resolved
+// position, so a fixed grid stays valid at every position (empty chunks publish
+// m=-INF / l=0 partials that merge away, and chunk 0 is never empty). With
+// split_count == 1 the block normalizes and writes the output directly; else it
+// writes (m, l, unnormalized acc) partials for gqa_split_decode_merge_kernel.
+// Register budget bounds the (G, head_dim) buckets: q+acc registers per lane =
+// 2 * G_MAX * HD_MAX/32 floats, so the launcher instantiates (8,128), (4,256),
+// (2,512) — larger G x head_dim combinations fall back to the per-head kernels.
+// Position resolution matches the other decode kernels: per-row `positions`,
+// else the device counter `d_position` (CUDA graphs), else the host scalar.
+// 8 warps (not the per-head kernels' 16): the grouped accumulators cost
+// ~G_MAX * HD_MAX/16 registers per lane, and 16 warps of that exceeds the
+// per-block register file (launch error 701). Split-KV restores the lost
+// block-level parallelism across SMs.
+constexpr int GQA_DECODE_WARPS = 8;
+
+template <int G_MAX, int HD_MAX, bool Q8>
+__global__ void gqa_paged_decode_attention_kernel(
+    const float* q,
+    const void* k_pages_raw,
+    const void* v_pages_raw,
+    const float* k_scales,
+    const float* v_scales,
+    const uint32_t* page_table,
+    float* out_or_partials,
+    const uint32_t* positions,
+    const int* d_position,
+    int position,
+    int batch_count,
+    int split_count,
+    int page_size,
+    int page_table_len,
+    int heads,
+    int kv_heads,
+    int qk_head_dim,
+    int v_head_dim,
+    int window) {
+  const int kv_head = blockIdx.x;
+  const int batch = blockIdx.y;
+  const int chunk_idx = blockIdx.z;
+  if (kv_head >= kv_heads || batch >= batch_count) {
+    return;
+  }
+  if (qk_head_dim > HD_MAX || v_head_dim > HD_MAX) {
+    return;
+  }
+  const int kv_repeats = heads / kv_heads;  // launcher guarantees <= G_MAX
+  const int pos = positions != nullptr
+                      ? static_cast<int>(positions[batch])
+                      : (d_position != nullptr ? *d_position : position);
+  const int source_start = (window > 0 && pos >= window) ? pos - window + 1 : 0;
+  const int span = pos - source_start + 1;
+  const int chunk = (span + split_count - 1) / split_count;
+  const int begin = source_start + chunk_idx * chunk;
+  const int end_excl = min(begin + chunk, pos + 1);
+
+  const int warp_id = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const float scale = rsqrtf(static_cast<float>(qk_head_dim));
+  const uint32_t* row_table = page_table + batch * page_table_len;
+
+  constexpr int PER_LANE = HD_MAX / 32;
+  float q_reg[G_MAX][PER_LANE];
+  float acc[G_MAX][PER_LANE];
+  float m[G_MAX];
+  float l[G_MAX];
+#pragma unroll
+  for (int g = 0; g < G_MAX; ++g) {
+    const int head = kv_head * kv_repeats + g;
+    const float* q_vec =
+        q + (static_cast<size_t>(batch) * heads + head) * qk_head_dim;
+#pragma unroll
+    for (int i = 0; i < PER_LANE; ++i) {
+      const int dim = lane + i * 32;
+      q_reg[g][i] = (g < kv_repeats && dim < qk_head_dim) ? q_vec[dim] : 0.0f;
+      acc[g][i] = 0.0f;
+    }
+    m[g] = -INFINITY;
+    l[g] = 0.0f;
+  }
+
+  const kv_t* k_pages = static_cast<const kv_t*>(k_pages_raw);
+  const kv_t* v_pages = static_cast<const kv_t*>(v_pages_raw);
+  const int8_t* k_pages_q8 = static_cast<const int8_t*>(k_pages_raw);
+  const int8_t* v_pages_q8 = static_cast<const int8_t*>(v_pages_raw);
+
+  for (int source = begin + warp_id; source < end_excl;
+       source += GQA_DECODE_WARPS) {
+    const int logical_page = source / page_size;
+    if (logical_page >= page_table_len) {
+      continue;
+    }
+    const uint32_t physical_page = row_table[logical_page];
+    const int page_offset = source - logical_page * page_size;
+    const size_t vec_index =
+        (static_cast<size_t>(physical_page) * kv_heads + kv_head) * page_size +
+        page_offset;
+    float k_scale = 1.0f;
+    float v_scale = 1.0f;
+    if (Q8) {
+      k_scale = k_scales[vec_index];
+      v_scale = v_scales[vec_index];
+    }
+    // Load this lane's K components ONCE, dot against every grouped Q head.
+    float k_lane[PER_LANE];
+#pragma unroll
+    for (int i = 0; i < PER_LANE; ++i) {
+      const int dim = lane + i * 32;
+      if (dim < qk_head_dim) {
+        k_lane[i] = Q8 ? k_scale * static_cast<float>(
+                                       k_pages_q8[vec_index * qk_head_dim + dim])
+                       : kv_to_float(k_pages[vec_index * qk_head_dim + dim]);
+      } else {
+        k_lane[i] = 0.0f;
+      }
+    }
+    float v_lane[PER_LANE];
+#pragma unroll
+    for (int i = 0; i < PER_LANE; ++i) {
+      const int dim = lane + i * 32;
+      if (dim < v_head_dim) {
+        v_lane[i] = Q8 ? v_scale * static_cast<float>(
+                                       v_pages_q8[vec_index * v_head_dim + dim])
+                       : kv_to_float(v_pages[vec_index * v_head_dim + dim]);
+      } else {
+        v_lane[i] = 0.0f;
+      }
+    }
+#pragma unroll
+    for (int g = 0; g < G_MAX; ++g) {
+      if (g >= kv_repeats) {
+        break;
+      }
+      float dot = 0.0f;
+#pragma unroll
+      for (int i = 0; i < PER_LANE; ++i) {
+        dot += q_reg[g][i] * k_lane[i];
+      }
+#pragma unroll
+      for (int offset = 16; offset > 0; offset >>= 1) {
+        dot += __shfl_down_sync(0xffffffffu, dot, offset);
+      }
+      const float score = __shfl_sync(0xffffffffu, dot, 0) * scale;
+      const float next_m = fmaxf(m[g], score);
+      const float rescale = isfinite(m[g]) ? expf(m[g] - next_m) : 0.0f;
+      const float weight = expf(score - next_m);
+#pragma unroll
+      for (int i = 0; i < PER_LANE; ++i) {
+        acc[g][i] = acc[g][i] * rescale + weight * v_lane[i];
+      }
+      l[g] = l[g] * rescale + weight;
+      m[g] = next_m;
+    }
+  }
+
+  // Per-head flash rescale-merge across warps, one grouped head at a time so the
+  // shared buffer stays the same size as the per-head kernel's.
+  extern __shared__ float smem[];
+  float* sh_m = smem;
+  float* sh_l = smem + GQA_DECODE_WARPS;
+  float* sh_acc = smem + 2 * GQA_DECODE_WARPS;
+  for (int g = 0; g < kv_repeats; ++g) {
+    if (lane == 0) {
+      sh_m[warp_id] = m[g];
+      sh_l[warp_id] = l[g];
+    }
+#pragma unroll
+    for (int i = 0; i < PER_LANE; ++i) {
+      const int dim = lane + i * 32;
+      if (dim < v_head_dim) {
+        sh_acc[warp_id * v_head_dim + dim] = acc[g][i];
+      }
+    }
+    __syncthreads();
+    float global_max = -INFINITY;
+#pragma unroll
+    for (int w = 0; w < GQA_DECODE_WARPS; ++w) {
+      global_max = fmaxf(global_max, sh_m[w]);
+    }
+    float total = 0.0f;
+#pragma unroll
+    for (int w = 0; w < GQA_DECODE_WARPS; ++w) {
+      total += sh_l[w] * (isfinite(sh_m[w]) ? expf(sh_m[w] - global_max) : 0.0f);
+    }
+    const int head = kv_head * kv_repeats + g;
+    if (split_count == 1) {
+      const float inv = (total == 0.0f || !isfinite(total)) ? 0.0f : 1.0f / total;
+      float* out_vec =
+          out_or_partials + (static_cast<size_t>(batch) * heads + head) * v_head_dim;
+      for (int dim = threadIdx.x; dim < v_head_dim; dim += blockDim.x) {
+        float a = 0.0f;
+#pragma unroll
+        for (int w = 0; w < GQA_DECODE_WARPS; ++w) {
+          a += sh_acc[w * v_head_dim + dim] *
+               (isfinite(sh_m[w]) ? expf(sh_m[w] - global_max) : 0.0f);
+        }
+        out_vec[dim] = a * inv;
+      }
+    } else {
+      float* partial = out_or_partials +
+                       ((static_cast<size_t>(batch) * heads + head) * split_count +
+                        chunk_idx) *
+                           (2 + v_head_dim);
+      if (threadIdx.x == 0) {
+        partial[0] = global_max;
+        partial[1] = total;
+      }
+      for (int dim = threadIdx.x; dim < v_head_dim; dim += blockDim.x) {
+        float a = 0.0f;
+#pragma unroll
+        for (int w = 0; w < GQA_DECODE_WARPS; ++w) {
+          a += sh_acc[w * v_head_dim + dim] *
+               (isfinite(sh_m[w]) ? expf(sh_m[w] - global_max) : 0.0f);
+        }
+        partial[2 + dim] = a;  // unnormalized numerator for the cross-split merge
+      }
+    }
+    __syncthreads();
+  }
+}
+
+// Cross-split merge for the grid-split GQA decode: standard flash combine of the
+// per-chunk (m, l, unnormalized numerator) partials. Empty chunks published
+// l == 0 and are skipped. One block per (batch, head).
+__global__ void gqa_split_decode_merge_kernel(
+    const float* partials,
+    float* output,
+    int batch_count,
+    int heads,
+    int split_count,
+    int v_head_dim) {
+  const int bh = blockIdx.x;
+  if (bh >= batch_count * heads) {
+    return;
+  }
+  const float* base =
+      partials + static_cast<size_t>(bh) * split_count * (2 + v_head_dim);
+  float global_max = -INFINITY;
+  for (int s = 0; s < split_count; ++s) {
+    const float m_s = base[s * (2 + v_head_dim)];
+    const float l_s = base[s * (2 + v_head_dim) + 1];
+    if (l_s > 0.0f && isfinite(m_s)) {
+      global_max = fmaxf(global_max, m_s);
+    }
+  }
+  float total = 0.0f;
+  for (int s = 0; s < split_count; ++s) {
+    const float m_s = base[s * (2 + v_head_dim)];
+    const float l_s = base[s * (2 + v_head_dim) + 1];
+    if (l_s > 0.0f && isfinite(m_s)) {
+      total += l_s * expf(m_s - global_max);
+    }
+  }
+  const float inv = (total == 0.0f || !isfinite(total)) ? 0.0f : 1.0f / total;
+  float* out_vec = output + static_cast<size_t>(bh) * v_head_dim;
+  for (int dim = threadIdx.x; dim < v_head_dim; dim += blockDim.x) {
+    float a = 0.0f;
+    for (int s = 0; s < split_count; ++s) {
+      const float m_s = base[s * (2 + v_head_dim)];
+      const float l_s = base[s * (2 + v_head_dim) + 1];
+      if (l_s > 0.0f && isfinite(m_s)) {
+        a += base[s * (2 + v_head_dim) + 2 + dim] * expf(m_s - global_max);
+      }
+    }
+    out_vec[dim] = a * inv;
+  }
+}
+
+extern "C" int hi_cuda_launch_gqa_paged_decode_attention(
+    int q8,
+    const void* q,
+    const void* k_pages,
+    const void* v_pages,
+    const void* k_scales,
+    const void* v_scales,
+    const void* page_table,
+    void* out_or_partials,
+    const void* positions,
+    const void* d_position,
+    int position,
+    int batch_count,
+    int split_count,
+    int page_size,
+    int page_table_len,
+    int heads,
+    int kv_heads,
+    int qk_head_dim,
+    int v_head_dim,
+    int window,
+    void* stream) {
+  if (q == nullptr || k_pages == nullptr || v_pages == nullptr ||
+      page_table == nullptr || out_or_partials == nullptr || batch_count <= 0 ||
+      split_count <= 0 || split_count > 8 || page_size <= 0 ||
+      page_table_len <= 0 || heads <= 0 || kv_heads <= 0 ||
+      heads % kv_heads != 0 || qk_head_dim <= 0 || v_head_dim <= 0 ||
+      stream == nullptr) {
+    return 1;
+  }
+  if (q8 != 0 && (k_scales == nullptr || v_scales == nullptr)) {
+    return 1;
+  }
+  const int kv_repeats = heads / kv_heads;
+  const int max_dim = qk_head_dim > v_head_dim ? qk_head_dim : v_head_dim;
+  const dim3 grid(kv_heads, batch_count, split_count);
+  const int threads = GQA_DECODE_WARPS * 32;
+  const size_t shared_bytes =
+      (2 * GQA_DECODE_WARPS +
+       static_cast<size_t>(GQA_DECODE_WARPS) * v_head_dim) *
+      sizeof(float);
+  const cudaStream_t s = static_cast<cudaStream_t>(stream);
+#define HI_CUDA_GQA_DECODE_LAUNCH(G, HD, Q8V)                                     \
+  gqa_paged_decode_attention_kernel<G, HD, Q8V>                                   \
+      <<<grid, threads, shared_bytes, s>>>(                                       \
+          static_cast<const float*>(q), k_pages, v_pages,                         \
+          static_cast<const float*>(k_scales),                                    \
+          static_cast<const float*>(v_scales),                                    \
+          static_cast<const uint32_t*>(page_table),                               \
+          static_cast<float*>(out_or_partials),                                   \
+          static_cast<const uint32_t*>(positions),                                \
+          static_cast<const int*>(d_position), position, batch_count,             \
+          split_count, page_size, page_table_len, heads, kv_heads, qk_head_dim,   \
+          v_head_dim, window)
+  if (kv_repeats >= 2 && kv_repeats <= 8 && max_dim <= 128) {
+    if (q8 != 0) {
+      HI_CUDA_GQA_DECODE_LAUNCH(8, 128, true);
+    } else {
+      HI_CUDA_GQA_DECODE_LAUNCH(8, 128, false);
+    }
+  } else if (kv_repeats >= 2 && kv_repeats <= 4 && max_dim <= 256) {
+    if (q8 != 0) {
+      HI_CUDA_GQA_DECODE_LAUNCH(4, 256, true);
+    } else {
+      HI_CUDA_GQA_DECODE_LAUNCH(4, 256, false);
+    }
+  } else if (kv_repeats == 2 && max_dim <= 512) {
+    if (q8 != 0) {
+      HI_CUDA_GQA_DECODE_LAUNCH(2, 512, true);
+    } else {
+      HI_CUDA_GQA_DECODE_LAUNCH(2, 512, false);
+    }
+  } else {
+    return 2;  // unsupported (G, head_dim) bucket — caller falls back
+  }
+#undef HI_CUDA_GQA_DECODE_LAUNCH
+  return 0;
+}
+
+extern "C" int hi_cuda_launch_gqa_split_decode_merge(
+    const void* partials,
+    void* output,
+    int batch_count,
+    int heads,
+    int split_count,
+    int v_head_dim,
+    void* stream) {
+  if (partials == nullptr || output == nullptr || batch_count <= 0 ||
+      heads <= 0 || split_count <= 0 || v_head_dim <= 0 || stream == nullptr) {
+    return 1;
+  }
+  gqa_split_decode_merge_kernel<<<batch_count * heads, 128, 0,
+                                  static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const float*>(partials), static_cast<float*>(output),
+      batch_count, heads, split_count, v_head_dim);
+  return 0;
+}
+
 // Parallel last-token argmax: one 256-thread block cooperatively scans `n` logits
 // with a shared-memory value+index reduction (ties resolve to the lowest index,
 // matching the serial reference). Replaces a single-thread scan over the vocab.

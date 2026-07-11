@@ -31,7 +31,7 @@ impl CudaRuntime {
 #[cfg(feature = "native-cuda")]
 pub use imp::{
     Cublas, CublasLt, CudaGraph, DeviceBuffer, GemmDType, GraphExec, Stream, check_last_error,
-    free_memory_bytes, set_capture_active,
+    free_memory_bytes, multiprocessor_count, set_capture_active,
 };
 
 #[cfg(not(feature = "native-cuda"))]
@@ -79,6 +79,7 @@ mod imp {
         fn cudaMalloc(ptr: *mut *mut c_void, size: usize) -> CudaError;
         fn cudaFree(ptr: *mut c_void) -> CudaError;
         fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> CudaError;
+        fn cudaDeviceGetAttribute(value: *mut c_int, attr: c_int, device: c_int) -> CudaError;
         fn cudaMemcpy(dst: *mut c_void, src: *const c_void, count: usize, kind: c_int)
         -> CudaError;
         fn cudaMemcpyAsync(
@@ -930,6 +931,24 @@ mod imp {
                 let _ = unsafe { cublasLtDestroy(self.raw) };
             }
         }
+    }
+
+    /// Streaming-multiprocessor count of the active device, cached after the first
+    /// query. Used to size grid splits (e.g. flash-decoding split-KV). Falls back
+    /// to the GB10's 48 if the attribute query fails.
+    pub fn multiprocessor_count() -> usize {
+        use std::sync::OnceLock;
+        static COUNT: OnceLock<usize> = OnceLock::new();
+        *COUNT.get_or_init(|| {
+            // cudaDevAttrMultiProcessorCount == 16.
+            let mut value: c_int = 0;
+            let code = unsafe { cudaDeviceGetAttribute(&mut value, 16, 0) };
+            if code == 0 && value > 0 {
+                value as usize
+            } else {
+                48
+            }
+        })
     }
 
     /// Free device memory (bytes) currently available on the active CUDA device.

@@ -251,6 +251,38 @@ mod native {
             k: c_int,
             stream: *mut c_void,
         ) -> c_int;
+        fn hi_cuda_launch_gqa_paged_decode_attention(
+            q8: c_int,
+            q: *const c_void,
+            k_pages: *const c_void,
+            v_pages: *const c_void,
+            k_scales: *const c_void,
+            v_scales: *const c_void,
+            page_table: *const c_void,
+            out_or_partials: *mut c_void,
+            positions: *const c_void,
+            d_position: *const c_void,
+            position: c_int,
+            batch_count: c_int,
+            split_count: c_int,
+            page_size: c_int,
+            page_table_len: c_int,
+            heads: c_int,
+            kv_heads: c_int,
+            qk_head_dim: c_int,
+            v_head_dim: c_int,
+            window: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_gqa_split_decode_merge(
+            partials: *const c_void,
+            output: *mut c_void,
+            batch_count: c_int,
+            heads: c_int,
+            split_count: c_int,
+            v_head_dim: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
         fn hi_cuda_launch_kquant_dp4a_gemm(
             dtype: c_int,
             weights: *const c_void,
@@ -1858,6 +1890,109 @@ mod native {
     pub enum MoeGroupedGemvDtype {
         Q4K = 0,
         Q6K = 1,
+    }
+
+    /// GQA-grouped (+ optional grid-split) paged decode attention. One block per
+    /// (kv_head, batch row, split chunk) serves all grouped Q heads, reading each
+    /// K/V vector once. Position resolves per-row (`positions`), from the device
+    /// counter (`d_position`), or the host scalar. With `split_count` == 1 writes
+    /// `out_or_partials` as the attention output; otherwise writes per-chunk
+    /// flash partials for `launch_gqa_split_decode_merge`. Returns Ok(false) when
+    /// the (kv_repeats, head_dim) combination has no kernel bucket — the caller
+    /// falls back to the per-head kernels.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_gqa_paged_decode_attention(
+        q8: bool,
+        q: &DeviceBuffer,
+        k_pages: &DeviceBuffer,
+        v_pages: &DeviceBuffer,
+        k_scales: Option<&DeviceBuffer>,
+        v_scales: Option<&DeviceBuffer>,
+        page_table: &DeviceBuffer,
+        out_or_partials: &DeviceBuffer,
+        positions: Option<&DeviceBuffer>,
+        d_position: Option<&DeviceBuffer>,
+        position: usize,
+        batch_count: usize,
+        split_count: usize,
+        page_size: usize,
+        page_table_len: usize,
+        heads: usize,
+        kv_heads: usize,
+        qk_head_dim: usize,
+        v_head_dim: usize,
+        window: usize,
+        stream: &Stream,
+    ) -> Result<bool> {
+        ensure_len(position, "gqa_decode position")?;
+        ensure_len(batch_count, "gqa_decode batch_count")?;
+        ensure_len(split_count, "gqa_decode split_count")?;
+        ensure_len(page_size, "gqa_decode page_size")?;
+        ensure_len(page_table_len, "gqa_decode page_table_len")?;
+        ensure_len(heads, "gqa_decode heads")?;
+        ensure_len(kv_heads, "gqa_decode kv_heads")?;
+        ensure_len(qk_head_dim, "gqa_decode qk_head_dim")?;
+        ensure_len(v_head_dim, "gqa_decode v_head_dim")?;
+        ensure_len(window, "gqa_decode window")?;
+        let null = std::ptr::null();
+        let status = unsafe {
+            hi_cuda_launch_gqa_paged_decode_attention(
+                c_int::from(q8),
+                q.as_ptr(),
+                k_pages.as_ptr(),
+                v_pages.as_ptr(),
+                k_scales.map_or(null, |buffer| buffer.as_ptr()),
+                v_scales.map_or(null, |buffer| buffer.as_ptr()),
+                page_table.as_ptr(),
+                out_or_partials.as_mut_ptr(),
+                positions.map_or(null, |buffer| buffer.as_ptr()),
+                d_position.map_or(null, |buffer| buffer.as_ptr()),
+                position as c_int,
+                batch_count as c_int,
+                split_count as c_int,
+                page_size as c_int,
+                page_table_len as c_int,
+                heads as c_int,
+                kv_heads as c_int,
+                qk_head_dim as c_int,
+                v_head_dim as c_int,
+                window as c_int,
+                stream.as_raw(),
+            )
+        };
+        if status == 2 {
+            return Ok(false);
+        }
+        launch_status(status)?;
+        check_last_error("hi_cuda_launch_gqa_paged_decode_attention")?;
+        Ok(true)
+    }
+
+    pub fn launch_gqa_split_decode_merge(
+        partials: &DeviceBuffer,
+        output: &DeviceBuffer,
+        batch_count: usize,
+        heads: usize,
+        split_count: usize,
+        v_head_dim: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(batch_count, "gqa_merge batch_count")?;
+        ensure_len(heads, "gqa_merge heads")?;
+        ensure_len(split_count, "gqa_merge split_count")?;
+        ensure_len(v_head_dim, "gqa_merge v_head_dim")?;
+        launch_status(unsafe {
+            hi_cuda_launch_gqa_split_decode_merge(
+                partials.as_ptr(),
+                output.as_mut_ptr(),
+                batch_count as c_int,
+                heads as c_int,
+                split_count as c_int,
+                v_head_dim as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_gqa_split_decode_merge")
     }
 
     /// dp4a K-quant GEMM for small M (2..=32): each decoded weight sub-block is

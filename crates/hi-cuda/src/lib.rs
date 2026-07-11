@@ -23156,6 +23156,217 @@ mod tests {
 
     #[cfg(feature = "native-cuda")]
     #[test]
+    fn native_cuda_gqa_decode_attention_matches_per_head_kernel() {
+        use crate::runtime::{DeviceBuffer, Stream};
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+
+        let stream = Stream::create().unwrap();
+        let mut rng = StdRng::seed_from_u64(0x59a_dec);
+
+        // (heads, kv_heads, head_dim, page_size, window)
+        let cases = [
+            (16usize, 2usize, 64usize, 16usize, 0usize),
+            (8, 2, 128, 2, 0),
+            (14, 2, 64, 4, 0),  // odd GQA factor 7
+            (8, 4, 128, 16, 5), // sliding window
+        ];
+        for (heads, kv_heads, head_dim, page_size, window) in cases {
+            for q8 in [false, true] {
+                let batch = 3usize;
+                let positions: Vec<u32> = vec![7, 29, 18];
+                let max_pos = 29usize;
+                let page_table_len = (max_pos + 1).div_ceil(page_size);
+                let physical_pages = batch * page_table_len + 2;
+                let mut table = Vec::new();
+                for row in 0..batch {
+                    for p in 0..page_table_len {
+                        table.push((row * page_table_len + p) as u32);
+                    }
+                }
+                let table_dev =
+                    DeviceBuffer::alloc(table.len() * std::mem::size_of::<u32>()).unwrap();
+                table_dev.copy_from_host(&table).unwrap();
+                let positions_dev =
+                    DeviceBuffer::alloc(batch * std::mem::size_of::<u32>()).unwrap();
+                positions_dev.copy_from_host(&positions).unwrap();
+
+                let vecs = physical_pages * kv_heads * page_size;
+                let elements = vecs * head_dim;
+                let (k_pages, v_pages, scales) = if q8 {
+                    let ints: Vec<i8> = (0..elements * 2)
+                        .map(|_| rng.gen_range(-127i8..=127))
+                        .collect();
+                    let k = DeviceBuffer::alloc(elements).unwrap();
+                    k.copy_from_host(&ints[..elements]).unwrap();
+                    let v = DeviceBuffer::alloc(elements).unwrap();
+                    v.copy_from_host(&ints[elements..]).unwrap();
+                    let scale_values: Vec<f32> = (0..vecs * 2)
+                        .map(|_| rng.gen_range(0.001f32..0.03))
+                        .collect();
+                    let ks = DeviceBuffer::alloc(vecs * 4).unwrap();
+                    ks.copy_from_host(&scale_values[..vecs]).unwrap();
+                    let vs = DeviceBuffer::alloc(vecs * 4).unwrap();
+                    vs.copy_from_host(&scale_values[vecs..]).unwrap();
+                    (k, v, Some((ks, vs)))
+                } else {
+                    let floats: Vec<f32> = (0..elements * 2)
+                        .map(|_| rng.gen_range(-1.5f32..1.5))
+                        .collect();
+                    let staging = DeviceBuffer::alloc(elements * 2 * 4).unwrap();
+                    staging.copy_from_host(&floats).unwrap();
+                    let k = DeviceBuffer::alloc(elements * 2).unwrap();
+                    let v = DeviceBuffer::alloc(elements * 2).unwrap();
+                    crate::kernels::launch_cast_f32_to_f16(&staging, &k, elements, &stream)
+                        .unwrap();
+                    // Second half of the staging buffer -> v pages.
+                    let staging_v = DeviceBuffer::alloc(elements * 4).unwrap();
+                    staging_v
+                        .copy_device_range(0, &staging, elements * 4, elements * 4, &stream)
+                        .unwrap();
+                    crate::kernels::launch_cast_f32_to_f16(&staging_v, &v, elements, &stream)
+                        .unwrap();
+                    (k, v, None)
+                };
+                let q: Vec<f32> = (0..batch * heads * head_dim)
+                    .map(|_| rng.gen_range(-1.0f32..1.0))
+                    .collect();
+                let q_dev = DeviceBuffer::alloc(q.len() * 4).unwrap();
+                q_dev.copy_from_host(&q).unwrap();
+
+                // Reference: the shipping per-head positions kernel.
+                let reference = DeviceBuffer::alloc(batch * heads * head_dim * 4).unwrap();
+                if let Some((ks, vs)) = &scales {
+                    crate::kernels::launch_tiled_paged_decode_attention_batched_positions_q8(
+                        &q_dev,
+                        &k_pages,
+                        &v_pages,
+                        ks,
+                        vs,
+                        &table_dev,
+                        &positions_dev,
+                        &reference,
+                        batch,
+                        page_size,
+                        page_table_len,
+                        heads,
+                        kv_heads,
+                        head_dim,
+                        head_dim,
+                        window,
+                        &stream,
+                    )
+                    .unwrap();
+                } else {
+                    crate::kernels::launch_tiled_paged_decode_attention_batched_positions(
+                        &q_dev,
+                        &k_pages,
+                        &v_pages,
+                        &table_dev,
+                        &positions_dev,
+                        &reference,
+                        batch,
+                        page_size,
+                        page_table_len,
+                        heads,
+                        kv_heads,
+                        head_dim,
+                        head_dim,
+                        window,
+                        &stream,
+                    )
+                    .unwrap();
+                }
+                stream.synchronize().unwrap();
+                let want = reference
+                    .copy_to_host::<f32>(batch * heads * head_dim)
+                    .unwrap();
+
+                for split in [1usize, 4] {
+                    let got_dev = DeviceBuffer::alloc(batch * heads * head_dim * 4).unwrap();
+                    let launched = if split == 1 {
+                        crate::kernels::launch_gqa_paged_decode_attention(
+                            q8,
+                            &q_dev,
+                            &k_pages,
+                            &v_pages,
+                            scales.as_ref().map(|(ks, _)| ks),
+                            scales.as_ref().map(|(_, vs)| vs),
+                            &table_dev,
+                            &got_dev,
+                            Some(&positions_dev),
+                            None,
+                            0,
+                            batch,
+                            1,
+                            page_size,
+                            page_table_len,
+                            heads,
+                            kv_heads,
+                            head_dim,
+                            head_dim,
+                            window,
+                            &stream,
+                        )
+                        .unwrap()
+                    } else {
+                        let partials =
+                            DeviceBuffer::alloc(batch * heads * split * (2 + head_dim) * 4)
+                                .unwrap();
+                        let ok = crate::kernels::launch_gqa_paged_decode_attention(
+                            q8,
+                            &q_dev,
+                            &k_pages,
+                            &v_pages,
+                            scales.as_ref().map(|(ks, _)| ks),
+                            scales.as_ref().map(|(_, vs)| vs),
+                            &table_dev,
+                            &partials,
+                            Some(&positions_dev),
+                            None,
+                            0,
+                            batch,
+                            split,
+                            page_size,
+                            page_table_len,
+                            heads,
+                            kv_heads,
+                            head_dim,
+                            head_dim,
+                            window,
+                            &stream,
+                        )
+                        .unwrap();
+                        if ok {
+                            crate::kernels::launch_gqa_split_decode_merge(
+                                &partials, &got_dev, batch, heads, split, head_dim, &stream,
+                            )
+                            .unwrap();
+                        }
+                        ok
+                    };
+                    assert!(
+                        launched,
+                        "GQA kernel rejected heads={heads} kv={kv_heads} dim={head_dim}"
+                    );
+                    stream.synchronize().unwrap();
+                    let got = got_dev
+                        .copy_to_host::<f32>(batch * heads * head_dim)
+                        .unwrap();
+                    for (idx, (&have, &expect)) in got.iter().zip(want.iter()).enumerate() {
+                        let tolerance = 2.0e-4f32.max(expect.abs() * 2.0e-4);
+                        assert!(
+                            (have - expect).abs() <= tolerance,
+                            "heads={heads} kv={kv_heads} dim={head_dim} page={page_size} window={window} q8={q8} split={split} idx={idx}: {have} vs {expect}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
     fn native_cuda_chunked_prefill_matches_whole_prompt() {
         use crate::gpu::CudaRowSampling;
         use hi_gguf::GgufFile;
