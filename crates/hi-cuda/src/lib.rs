@@ -11859,6 +11859,32 @@ mod tests {
             1e6 / graph_us,
             eager_us / graph_us,
         );
+
+        // End-to-end: the captured-graph generate must produce identical tokens to the
+        // eager paged generate, and should be faster on wall-clock.
+        let prompt: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let max_new = 64usize;
+        let t = std::time::Instant::now();
+        let eager_gen = model
+            .generate_greedy_tokens_paged(&prompt, max_new, None, 16)
+            .expect("eager paged generate should run");
+        let eager_gen_s = t.elapsed().as_secs_f64();
+        let t = std::time::Instant::now();
+        let graph_gen = model
+            .generate_greedy_tokens_paged_graph(&prompt, max_new, None, 16, &[])
+            .expect("graph paged generate should run");
+        let graph_gen_s = t.elapsed().as_secs_f64();
+        assert_eq!(
+            eager_gen, graph_gen,
+            "graph generate tokens diverged from eager generate"
+        );
+        eprintln!(
+            "end-to-end graph generate OK: {} tokens identical; eager {:.0} tok/s -> graph {:.0} tok/s ({:.2}x)",
+            eager_gen.len(),
+            eager_gen.len() as f64 / eager_gen_s,
+            graph_gen.len() as f64 / graph_gen_s,
+            eager_gen_s / graph_gen_s,
+        );
     }
 
     // Real-model speedup measurement for prompt-lookup speculative decode. Opt-in:

@@ -7560,6 +7560,176 @@ mod native {
             Ok((eager_us, graph_us))
         }
 
+        /// Greedy generation for a single sequence via a captured CUDA-graph decode.
+        ///
+        /// Prefills the prompt into the paged pool, then captures the per-token decode
+        /// forward (device-position + device-token) ONCE and replays it for every
+        /// generated token — eliminating ~700 kernel launches/token. Output is identical
+        /// to `generate_greedy_tokens_paged*` (bit-identical logits, same argmax). The full
+        /// page table is present at capture, so a single graph replays across page
+        /// boundaries (`d_position` drives KV-write offset and attention span); no
+        /// re-capture is needed. Text decoder layouts only; quantized weights (dp4a) so the
+        /// forward is stream-capturable (cuBLAS F16 paths are not captured here).
+        pub fn generate_greedy_tokens_paged_graph(
+            &self,
+            input_ids: &[u32],
+            max_tokens: usize,
+            eos_token_id: Option<u32>,
+            page_size: usize,
+            stop_token_sequences: &[Vec<u32>],
+        ) -> Result<Vec<u32>> {
+            let label = "CUDA paged graph greedy generation";
+            let dims = self.qwen_dims()?;
+            let max_tokens = validate_generation_max_tokens(label, max_tokens)?;
+            if input_ids.is_empty() {
+                bail!("{label} requires at least one input token");
+            }
+            if self.config.recurrent_ssm_tensor_layout {
+                bail!("{label} is not supported for recurrent SSM layouts");
+            }
+            if !self.supports_batched_text_generation() {
+                bail!("{label} currently supports loaded decoder model layouts only");
+            }
+            if input_ids.len() > dims.context {
+                bail!(
+                    "input length {} exceeds qwen context length {}",
+                    input_ids.len(),
+                    dims.context
+                );
+            }
+            validate_batched_generation_context_budget(
+                label,
+                input_ids.len(),
+                max_tokens,
+                dims.context,
+            )?;
+
+            let token_capacity = input_ids
+                .len()
+                .checked_add(max_tokens)
+                .context("CUDA paged graph greedy generation token capacity overflows usize")?
+                .min(dims.context);
+            let physical_page_count = token_capacity.div_ceil(page_size);
+            let page_table: Vec<usize> = (0..physical_page_count).collect();
+            let page_tables = vec![page_table];
+
+            // Prefill the prompt into the pool pages and pick the first generated token.
+            // The returned cache holds raw pointers into the pooled KV pages (which stay
+            // resident in `paged_batch_pool`), so it outlives the pool_slot borrow and is
+            // reused for the captured decode below.
+            let (mut cache, first_token) = {
+                let mut pool_slot = self.paged_batch_pool.borrow_mut();
+                if pool_slot
+                    .as_ref()
+                    .is_none_or(|pool| !pool.can_cover(&dims, page_size, physical_page_count))
+                {
+                    *pool_slot = Some(CudaPagedBatchDevicePool::new(
+                        self.config.block_count,
+                        &dims,
+                        page_size,
+                        physical_page_count,
+                        &self.stream,
+                    )?);
+                }
+                let pool = pool_slot
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("CUDA paged batch device pool was not initialized"))?;
+                let (cache, logits, _seq_len) = self
+                    .full_context_logits_device_batched_paged_cache_with_shared_prefix(
+                        std::slice::from_ref(&input_ids.to_vec()),
+                        page_size,
+                        token_capacity,
+                        &page_tables,
+                        pool,
+                    )?;
+                let first = self.argmax_batched_last_token(&logits, 1, 1)?[0];
+                (cache, first)
+            };
+
+            let mut generated = vec![first_token];
+            if is_stop_sequence(first_token, &generated, eos_token_id, stop_token_sequences)
+                || max_tokens == 1
+            {
+                return Ok(generated);
+            }
+
+            // Persistent device counters + argmax slot the captured graph reads/writes.
+            let d_position = DeviceBuffer::alloc(std::mem::size_of::<i32>())
+                .context("allocating CUDA graph decode position counter")?;
+            let d_token = DeviceBuffer::alloc(std::mem::size_of::<u32>())
+                .context("allocating CUDA graph decode token counter")?;
+            let d_argmax = DeviceBuffer::alloc(std::mem::size_of::<u32>())
+                .context("allocating CUDA graph decode argmax slot")?;
+
+            let first_decode_pos = input_ids.len();
+
+            // Warm the buffer pool for every allocation the decode forward makes, so the
+            // capture reuses pooled slots instead of cudaMalloc'ing mid-capture (illegal).
+            // KV written here at `first_decode_pos` is re-written idempotently by replay 1.
+            {
+                let logits =
+                    self.decode_batch_logits_paged_device(&[first_token], first_decode_pos, &mut cache)?;
+                crate::kernels::launch_argmax_batched_last_token(
+                    &logits.buffer,
+                    &d_argmax,
+                    1,
+                    1,
+                    logits.cols,
+                    &self.stream,
+                )?;
+                self.stream.synchronize()?;
+                drop(logits);
+            }
+
+            // Capture the decode forward + last-token argmax once.
+            crate::runtime::set_capture_active(true);
+            self.graph_capture_token.set(&d_token);
+            self.graph_capture_position.set(&d_position);
+            let captured = (|| -> Result<crate::runtime::CudaGraph> {
+                self.stream.begin_capture()?;
+                let logits =
+                    self.decode_batch_logits_paged_device(&[first_token], first_decode_pos, &mut cache)?;
+                crate::kernels::launch_argmax_batched_last_token(
+                    &logits.buffer,
+                    &d_argmax,
+                    1,
+                    1,
+                    logits.cols,
+                    &self.stream,
+                )?;
+                self.stream.end_capture()
+            })();
+            self.graph_capture_token.set(std::ptr::null());
+            self.graph_capture_position.set(std::ptr::null());
+            crate::runtime::set_capture_active(false);
+            let exec = captured?.instantiate()?;
+
+            // Replay: each step decodes `token` at `position`, yielding the next token.
+            let mut token = first_token;
+            let mut position = first_decode_pos;
+            for step in 1..max_tokens {
+                if position >= token_capacity {
+                    break;
+                }
+                d_position.copy_from_host(&[position as i32])?;
+                d_token.copy_from_host(&[token])?;
+                exec.launch(&self.stream)?;
+                self.stream.synchronize()?;
+                let next = d_argmax.copy_to_host::<u32>(1)?[0];
+                generated.push(next);
+                if is_stop_sequence(next, &generated, eos_token_id, stop_token_sequences) {
+                    break;
+                }
+                if step + 1 == max_tokens {
+                    break;
+                }
+                token = next;
+                position += 1;
+            }
+
+            Ok(generated)
+        }
+
         /// Append `token_ids` (one sequence) to the paged cache starting at `position` and
         /// return PER-POSITION logits `[token_ids.len(), vocab]`. This is one window of the
         /// chunked-prefill forward: each appended token attends causally to the already
