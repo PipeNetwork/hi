@@ -53,7 +53,7 @@ mod imp {
     use std::ffi::CStr;
     use std::os::raw::{c_char, c_int, c_ulonglong, c_void};
     use std::ptr;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::OnceLock;
 
     use anyhow::{Result, anyhow, bail};
 
@@ -202,6 +202,22 @@ mod imp {
     // temporaries (dequantized weights, seq*hidden activations) still return
     // their memory immediately and can't bloat the resident set on an 8GB card.
     // Opt out with HI_CUDA_NO_BUF_POOL (falls back to plain cudaMalloc/cudaFree).
+    //
+    // The pool is THREAD-LOCAL, which is what makes the single-stream argument
+    // hold: each model's ops are enqueued from one thread onto that model's
+    // stream, so recycling within a thread stays within one stream's ordering
+    // domain. A process-global pool broke this — with several models on separate
+    // threads (the test suite; any future multi-model server), thread B could
+    // recycle-and-write a buffer whose reads were still queued on thread A's
+    // independent stream. Streams have no cross-ordering, so B's memset/kernel
+    // writes raced A's in-flight work; with an otherwise-idle GPU the in-flight
+    // window is microseconds and the race almost never fired, but with any
+    // co-tenant GPU load our kernels queue for milliseconds and it fired
+    // constantly (nondeterministic wrong values across the parity suite).
+    // Residual caveat: a buffer whose last use was enqueued from thread A but
+    // that is dropped on thread B recycles into B's pool without ordering — no
+    // current code path moves buffers between threads mid-flight (models are
+    // built, used, and dropped on their owning thread).
     const POOL_MAX_BYTES: usize = 4 * 1024 * 1024;
 
     fn buffer_pool_enabled() -> bool {
@@ -227,9 +243,24 @@ mod imp {
         capture_flag().load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    fn buffer_pool() -> &'static Mutex<HashMap<usize, Vec<usize>>> {
-        static POOL: OnceLock<Mutex<HashMap<usize, Vec<usize>>>> = OnceLock::new();
-        POOL.get_or_init(|| Mutex::new(HashMap::new()))
+    // Frees every pooled pointer when its thread exits so short-lived threads
+    // (tests, one-off workers) return their device memory.
+    struct ThreadBufferPool(std::cell::RefCell<HashMap<usize, Vec<usize>>>);
+
+    impl Drop for ThreadBufferPool {
+        fn drop(&mut self) {
+            for (_, slots) in self.0.borrow_mut().drain() {
+                for addr in slots {
+                    // Ignore errors: at process exit the context may already be gone.
+                    let _ = unsafe { cudaFree(addr as *mut c_void) };
+                }
+            }
+        }
+    }
+
+    thread_local! {
+        static BUFFER_POOL: ThreadBufferPool =
+            ThreadBufferPool(std::cell::RefCell::new(HashMap::new()));
     }
 
     fn buffer_pool_take(bytes: usize) -> Option<*mut c_void> {
@@ -238,10 +269,16 @@ mod imp {
         if bytes == 0 || (bytes > POOL_MAX_BYTES && !capture_active()) || !buffer_pool_enabled() {
             return None;
         }
-        let mut pool = buffer_pool().lock().unwrap();
-        pool.get_mut(&bytes)
-            .and_then(|slots| slots.pop())
-            .map(|addr| addr as *mut c_void)
+        BUFFER_POOL
+            .try_with(|pool| {
+                pool.0
+                    .borrow_mut()
+                    .get_mut(&bytes)
+                    .and_then(|slots| slots.pop())
+                    .map(|addr| addr as *mut c_void)
+            })
+            .ok()
+            .flatten()
     }
 
     fn buffer_pool_return(ptr: *mut c_void, bytes: usize) -> bool {
@@ -249,9 +286,17 @@ mod imp {
         if bytes == 0 || (bytes > POOL_MAX_BYTES && !capture_active()) || !buffer_pool_enabled() {
             return false;
         }
-        let mut pool = buffer_pool().lock().unwrap();
-        pool.entry(bytes).or_default().push(ptr as usize);
-        true
+        // try_with: if this drop runs during the thread's TLS teardown the pool is
+        // gone — report un-pooled so the caller cudaFrees directly.
+        BUFFER_POOL
+            .try_with(|pool| {
+                pool.0
+                    .borrow_mut()
+                    .entry(bytes)
+                    .or_default()
+                    .push(ptr as usize);
+            })
+            .is_ok()
     }
 
     pub struct DeviceBuffer {
