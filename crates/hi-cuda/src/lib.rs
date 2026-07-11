@@ -4733,7 +4733,10 @@ fn process_continuous_decode_chunk(
             .max_tokens
             .saturating_sub(active[idx].generated_tokens.len());
         let draft_cap = max_draft.min(remaining.saturating_sub(1));
-        let extended = active[idx].context_len().saturating_add(draft_cap).saturating_add(1);
+        let extended = active[idx]
+            .context_len()
+            .saturating_add(draft_cap)
+            .saturating_add(1);
         let page_table = match active[idx].page_table_for_token_count(extended, state.kv_page_size)
         {
             Ok(pt) => pt,
@@ -4759,9 +4762,10 @@ fn process_continuous_decode_chunk(
                 stats
                     .decode_tokens
                     .fetch_add(usize_to_u64(tokens.len()), Ordering::Relaxed);
-                stats
-                    .decode_micros
-                    .fetch_add(usize_to_u64(elapsed.as_micros() as usize), Ordering::Relaxed);
+                stats.decode_micros.fetch_add(
+                    usize_to_u64(elapsed.as_micros() as usize),
+                    Ordering::Relaxed,
+                );
                 for token in tokens {
                     if retire[idx].is_some() {
                         break;
@@ -11947,13 +11951,20 @@ mod tests {
 
         // Every emitted token is the model's greedy token, so speculative decode must
         // reproduce plain greedy exactly, regardless of what the n-gram proposer guesses.
-        for input in [vec![0u32], vec![1, 0, 1, 0, 1], vec![0, 1, 2, 0, 1, 2, 0, 1]] {
+        for input in [
+            vec![0u32],
+            vec![1, 0, 1, 0, 1],
+            vec![0, 1, 2, 0, 1, 2, 0, 1],
+        ] {
             let max = 12usize;
             let greedy = model.generate_greedy_tokens(&input, max, None).unwrap();
             let spec = model
                 .generate_greedy_speculative_ngram(&input, max, None, 2, 4)
                 .unwrap();
-            assert_eq!(spec.tokens, greedy, "speculative output diverged from greedy");
+            assert_eq!(
+                spec.tokens, greedy,
+                "speculative output diverged from greedy"
+            );
             // One forward pass yields at least one token, never more tokens than passes*(draft+1).
             assert!(spec.forward_passes >= 1);
             assert!(spec.forward_passes <= spec.tokens.len().max(1));
