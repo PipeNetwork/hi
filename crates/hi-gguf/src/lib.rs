@@ -896,6 +896,28 @@ impl GgufTokenizer {
         }
     }
 
+    /// Incremental detokenizer: `push` one token at a time and receive only the
+    /// newly completed text, in O(token piece) per call instead of re-decoding the
+    /// whole sequence. The concatenation of all pushed deltas plus `finish()` equals
+    /// `decode(&all_ids)` byte-for-byte: multi-token UTF-8 sequences (byte-level BPE
+    /// and `<0xXX>` byte-fallback) are held until complete, and a trailing incomplete
+    /// character is dropped at `finish()` exactly like the batch decoder drops it.
+    pub fn streaming_decoder(&self, skip_special: bool) -> StreamingTokenDecoder {
+        let family = if self.is_sentencepiece_unigram() {
+            StreamingDecodeFamily::SentencePiece
+        } else if self.is_byte_level_bpe() {
+            StreamingDecodeFamily::ByteLevel
+        } else {
+            StreamingDecodeFamily::Plain
+        };
+        StreamingTokenDecoder {
+            skip_special,
+            family,
+            pending_bytes: Vec::new(),
+            carry: String::new(),
+        }
+    }
+
     fn is_byte_level_bpe(&self) -> bool {
         self.model
             .as_deref()
@@ -6394,6 +6416,178 @@ fn decode_tokenizer_bytes_lenient(bytes: &[u8]) -> String {
     out
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StreamingDecodeFamily {
+    ByteLevel,
+    SentencePiece,
+    Plain,
+}
+
+/// Incremental detokenizer state; see [`GgufTokenizer::streaming_decoder`]. Holds no
+/// reference to the tokenizer so it can live inside long-lived request state; every
+/// `push` must pass the same tokenizer the decoder was created from. Semantics match
+/// the batch decoder exactly:
+/// - Byte-level BPE: every token piece maps to raw bytes; the longest valid UTF-8
+///   prefix is emitted and the incomplete tail is held for the next push
+///   (`decode_tokenizer_bytes_lenient` is left-to-right prefix-stable, so incremental
+///   emission with a held tail reproduces the batch output byte-for-byte).
+/// - SentencePiece: `<0xXX>` byte-fallback runs accumulate bytes (across token
+///   boundaries) and drain incrementally like the above; a regular character flushes
+///   the run, dropping any incomplete tail — the same drop the batch decoder performs.
+///   A piece suffix that could be a split byte-fallback marker is carried to the next
+///   push so marker parsing never depends on token boundaries. `▁` becomes a space.
+/// - Plain: pieces are emitted directly with `▁` replaced by a space.
+pub struct StreamingTokenDecoder {
+    skip_special: bool,
+    family: StreamingDecodeFamily,
+    // Bytes reconstructed from byte-level/byte-fallback tokens that do not yet end on
+    // a UTF-8 character boundary.
+    pending_bytes: Vec<u8>,
+    // SentencePiece only: trailing piece characters that could be the prefix of a
+    // `<0xXX>` marker split across token pieces.
+    carry: String,
+}
+
+impl StreamingTokenDecoder {
+    /// Feed one token; returns the newly completed text (possibly empty).
+    /// `tokenizer` must be the tokenizer this decoder was created from.
+    pub fn push(&mut self, tokenizer: &GgufTokenizer, token_id: u32) -> Result<String> {
+        ensure_token_id_in_range(token_id, tokenizer.tokens.len(), "token id")?;
+        if self.skip_special && tokenizer.special_ids.contains(&token_id) {
+            return Ok(String::new());
+        }
+        let piece = tokenizer.tokens[token_id as usize].as_str();
+        match self.family {
+            StreamingDecodeFamily::Plain => Ok(piece.replace('\u{2581}', " ")),
+            StreamingDecodeFamily::ByteLevel => {
+                let decoder = byte_decoder();
+                for ch in piece.chars() {
+                    if let Some(byte) = decoder.get(&ch) {
+                        self.pending_bytes.push(*byte);
+                    } else {
+                        let mut buffer = [0; 4];
+                        self.pending_bytes
+                            .extend_from_slice(ch.encode_utf8(&mut buffer).as_bytes());
+                    }
+                }
+                Ok(self.drain_pending_valid_prefix())
+            }
+            StreamingDecodeFamily::SentencePiece => {
+                let mut text = std::mem::take(&mut self.carry);
+                text.push_str(piece);
+                let mut out = String::new();
+                let mut offset = 0usize;
+                while offset < text.len() {
+                    let remaining = &text[offset..];
+                    if let Some(byte) = remaining.get(..6).and_then(byte_fallback_value) {
+                        self.pending_bytes.push(byte);
+                        out.push_str(&self.drain_pending_valid_prefix());
+                        offset += 6;
+                        continue;
+                    }
+                    // A short tail that is a strict prefix of "<0xXX>" may be completed
+                    // by the next piece (the batch decoder parses the concatenation, so
+                    // markers are boundary-blind); hold it instead of emitting.
+                    if remaining.len() < 6 && could_prefix_byte_fallback(remaining) {
+                        self.carry = remaining.to_string();
+                        break;
+                    }
+                    // Regular character: terminates any byte-fallback run, dropping an
+                    // incomplete tail exactly like the batch decoder's flush.
+                    self.pending_bytes.clear();
+                    let ch = remaining
+                        .chars()
+                        .next()
+                        .expect("remaining string is non-empty");
+                    out.push(if ch == '\u{2581}' { ' ' } else { ch });
+                    offset += ch.len_utf8();
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    /// End of stream: emit whatever remains. An incomplete UTF-8 tail is dropped
+    /// (matching the batch decoder's behavior for output truncated mid-character);
+    /// a held SentencePiece carry that never became a byte-fallback marker is
+    /// emitted as regular text.
+    pub fn finish(mut self) -> String {
+        self.pending_bytes.clear();
+        let carry = std::mem::take(&mut self.carry);
+        if carry.is_empty() {
+            String::new()
+        } else {
+            carry.replace('\u{2581}', " ")
+        }
+    }
+
+    // Emit the longest valid UTF-8 prefix of `pending_bytes` (with U+FFFD for
+    // definitively invalid sequences), holding an incomplete trailing sequence.
+    fn drain_pending_valid_prefix(&mut self) -> String {
+        let mut out = String::new();
+        let mut consumed = 0usize;
+        loop {
+            let rest = &self.pending_bytes[consumed..];
+            match std::str::from_utf8(rest) {
+                Ok(valid) => {
+                    if self.family == StreamingDecodeFamily::SentencePiece {
+                        for ch in valid.chars() {
+                            out.push(if ch == '\u{2581}' { ' ' } else { ch });
+                        }
+                    } else {
+                        out.push_str(valid);
+                    }
+                    consumed = self.pending_bytes.len();
+                    break;
+                }
+                Err(error) => {
+                    let valid_up_to = error.valid_up_to();
+                    let valid = std::str::from_utf8(&rest[..valid_up_to])
+                        .expect("bytes up to valid_up_to are valid UTF-8");
+                    if self.family == StreamingDecodeFamily::SentencePiece {
+                        for ch in valid.chars() {
+                            out.push(if ch == '\u{2581}' { ' ' } else { ch });
+                        }
+                    } else {
+                        out.push_str(valid);
+                    }
+                    consumed += valid_up_to;
+                    match error.error_len() {
+                        Some(invalid_len) => {
+                            out.push('\u{FFFD}');
+                            consumed += invalid_len;
+                        }
+                        // Incomplete trailing sequence: hold for the next push.
+                        None => break,
+                    }
+                }
+            }
+        }
+        self.pending_bytes.drain(..consumed);
+        out
+    }
+}
+
+/// Is `text` a strict prefix of a `<0xXX>` byte-fallback marker (e.g. `<`, `<0`,
+/// `<0xA`)? Used to hold a piece-spanning marker candidate until the next token.
+fn could_prefix_byte_fallback(text: &str) -> bool {
+    if text.is_empty() || text.len() >= 6 {
+        return false;
+    }
+    let bytes = text.as_bytes();
+    let pattern: [fn(u8) -> bool; 5] = [
+        |b| b == b'<',
+        |b| b == b'0',
+        |b| b == b'x',
+        |b| b.is_ascii_hexdigit(),
+        |b| b.is_ascii_hexdigit(),
+    ];
+    bytes
+        .iter()
+        .zip(pattern.iter())
+        .all(|(byte, check)| check(*byte))
+}
+
 fn decode_byte_level_text(text: &str) -> Result<String> {
     let decoder = byte_decoder();
     let mut bytes = Vec::with_capacity(text.len());
@@ -7984,6 +8178,204 @@ mod tests {
         );
         assert_eq!(tokenizer.decode(&[1, 4, 2]).unwrap(), " hello");
         assert!(tokenizer.summary().has_scores);
+    }
+
+    // Deterministic LCG so the streaming-vs-batch property sweep is reproducible.
+    fn lcg_next(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        *state >> 33
+    }
+
+    fn assert_streaming_decode_matches_batch(tokenizer: &GgufTokenizer, seeds: u64) {
+        let vocab = tokenizer.summary().token_count as u64;
+        for skip_special in [true, false] {
+            for seed in 0..seeds {
+                let mut state = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
+                let len = (lcg_next(&mut state) % 40 + 1) as usize;
+                let ids = (0..len)
+                    .map(|_| (lcg_next(&mut state) % vocab) as u32)
+                    .collect::<Vec<_>>();
+                let batch = tokenizer.decode_with_options(&ids, skip_special).unwrap();
+                let mut decoder = tokenizer.streaming_decoder(skip_special);
+                let mut streamed = String::new();
+                for id in &ids {
+                    streamed.push_str(&decoder.push(tokenizer, *id).unwrap());
+                }
+                streamed.push_str(&decoder.finish());
+                assert_eq!(
+                    streamed, batch,
+                    "streamed decode diverged from batch decode for ids {ids:?} (skip_special={skip_special})"
+                );
+            }
+        }
+    }
+
+    fn write_streaming_bpe_tokenizer_fixture(path: &Path) {
+        // Byte-level BPE vocab with single-byte pieces that split multi-byte UTF-8
+        // (emoji F0 9F 98 80, é C3 A9) plus a stray continuation byte for the
+        // invalid/U+FFFD path.
+        let byte_pieces: Vec<String> = [
+            vec![0xF0u8],
+            vec![0x9F],
+            vec![0x98],
+            vec![0x80],
+            vec![0xF0, 0x9F],
+            vec![0xC3, 0xA9],
+        ]
+        .iter()
+        .map(|bytes| encode_byte_level_text(bytes))
+        .collect();
+        let mut tokens: Vec<&str> = vec!["h", "e", "hello", "\u{0120}world", "!", "<|endoftext|>"];
+        tokens.extend(byte_pieces.iter().map(String::as_str));
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        write_u32(&mut bytes, 3);
+        write_u64(&mut bytes, 0);
+        write_u64(&mut bytes, 4);
+        write_kv_u32(&mut bytes, "general.alignment", 32);
+        write_kv_string(&mut bytes, "tokenizer.ggml.model", "gpt2");
+        write_kv_string_array(&mut bytes, "tokenizer.ggml.tokens", &tokens);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.eos_token_id", 5);
+        pad_to_alignment(&mut bytes, 32);
+        fs::write(path, bytes).unwrap();
+    }
+
+    fn write_streaming_spm_tokenizer_fixture(path: &Path) {
+        // SentencePiece vocab with byte-fallback markers for a 3-byte char (我 =
+        // E6 88 91), plus adversarial regular pieces that only form a marker when
+        // concatenated ("<0x" + "AB>") to exercise the cross-piece carry.
+        let tokens = [
+            "<unk>",
+            "<s>",
+            "</s>",
+            "\u{2581}",
+            "\u{2581}hello",
+            "hello",
+            "<0x0A>",
+            "<0xE6>",
+            "<0x88>",
+            "<0x91>",
+            "<0x",
+            "AB>",
+            "<0xAB",
+            "!",
+            "a",
+        ];
+        let scores = [
+            -100.0, 0.0, 0.0, -5.0, -0.1, -1.0, -10.0, -10.0, -10.0, -10.0, -2.0, -2.0, -2.0, -0.1,
+            -0.1,
+        ];
+        let token_types = [2, 3, 3, 1, 1, 1, 6, 6, 6, 6, 1, 1, 1, 1, 1];
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        write_u32(&mut bytes, 3);
+        write_u64(&mut bytes, 0);
+        write_u64(&mut bytes, 7);
+        write_kv_u32(&mut bytes, "general.alignment", 32);
+        write_kv_string(&mut bytes, "tokenizer.ggml.model", "llama");
+        write_kv_string_array(&mut bytes, "tokenizer.ggml.tokens", &tokens);
+        write_kv_f32_array(&mut bytes, "tokenizer.ggml.scores", &scores);
+        write_kv_i32_array(&mut bytes, "tokenizer.ggml.token_type", &token_types);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.bos_token_id", 1);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.eos_token_id", 2);
+        pad_to_alignment(&mut bytes, 32);
+        fs::write(path, bytes).unwrap();
+    }
+
+    fn write_streaming_plain_tokenizer_fixture(path: &Path) {
+        let tokens = ["<unk>", "\u{2581}hi", "there", "\u{2581}", "!"];
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        write_u32(&mut bytes, 3);
+        write_u64(&mut bytes, 0);
+        write_u64(&mut bytes, 4);
+        write_kv_u32(&mut bytes, "general.alignment", 32);
+        write_kv_string(&mut bytes, "tokenizer.ggml.model", "wordpiece");
+        write_kv_string_array(&mut bytes, "tokenizer.ggml.tokens", &tokens);
+        write_kv_u32(&mut bytes, "tokenizer.ggml.unknown_token_id", 0);
+        pad_to_alignment(&mut bytes, 32);
+        fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn streaming_decoder_matches_batch_decode_byte_level_bpe() {
+        let path = tempfile_path("streaming-bpe-tokenizer");
+        write_streaming_bpe_tokenizer_fixture(&path);
+        let tokenizer = GgufFile::open(&path).unwrap().tokenizer().unwrap();
+
+        // Emoji split across four single-byte tokens: nothing emitted until the
+        // final byte completes the character.
+        let mut decoder = tokenizer.streaming_decoder(true);
+        assert_eq!(decoder.push(&tokenizer, 6).unwrap(), "");
+        assert_eq!(decoder.push(&tokenizer, 7).unwrap(), "");
+        assert_eq!(decoder.push(&tokenizer, 8).unwrap(), "");
+        assert_eq!(decoder.push(&tokenizer, 9).unwrap(), "\u{1F600}");
+        // Special token mid-stream is skipped without disturbing held bytes.
+        let mut decoder = tokenizer.streaming_decoder(true);
+        assert_eq!(decoder.push(&tokenizer, 10).unwrap(), ""); // F0 9F held
+        assert_eq!(decoder.push(&tokenizer, 5).unwrap(), ""); // <|endoftext|> skipped
+        assert_eq!(decoder.push(&tokenizer, 8).unwrap(), ""); // 98 held
+        assert_eq!(decoder.push(&tokenizer, 9).unwrap(), "\u{1F600}");
+        // A stray continuation byte is definitively invalid on arrival (it can never
+        // start a character), so U+FFFD is emitted immediately — same as batch.
+        let mut decoder = tokenizer.streaming_decoder(true);
+        assert_eq!(decoder.push(&tokenizer, 8).unwrap(), "\u{FFFD}");
+        assert_eq!(decoder.push(&tokenizer, 0).unwrap(), "h");
+        // Truncated mid-character: the held tail is dropped at finish.
+        let mut decoder = tokenizer.streaming_decoder(true);
+        assert_eq!(decoder.push(&tokenizer, 2).unwrap(), "hello");
+        assert_eq!(decoder.push(&tokenizer, 6).unwrap(), "");
+        assert_eq!(decoder.finish(), "");
+
+        assert_streaming_decode_matches_batch(&tokenizer, 500);
+    }
+
+    #[test]
+    fn streaming_decoder_matches_batch_decode_sentencepiece() {
+        let path = tempfile_path("streaming-spm-tokenizer");
+        write_streaming_spm_tokenizer_fixture(&path);
+        let tokenizer = GgufFile::open(&path).unwrap().tokenizer().unwrap();
+
+        // Byte-fallback run spanning three tokens completes a 3-byte character.
+        let mut decoder = tokenizer.streaming_decoder(true);
+        assert_eq!(decoder.push(&tokenizer, 7).unwrap(), "");
+        assert_eq!(decoder.push(&tokenizer, 8).unwrap(), "");
+        assert_eq!(decoder.push(&tokenizer, 9).unwrap(), "\u{6211}");
+        // A marker split across regular pieces ("<0x" + "AB>") is a byte-fallback
+        // in the batch decoder's concatenation, so it must be here too. Byte 0xAB is
+        // a continuation byte — definitively invalid alone — so U+FFFD, as in batch.
+        let mut decoder = tokenizer.streaming_decoder(true);
+        assert_eq!(decoder.push(&tokenizer, 10).unwrap(), "");
+        assert_eq!(decoder.push(&tokenizer, 11).unwrap(), "\u{FFFD}");
+        assert_eq!(decoder.push(&tokenizer, 13).unwrap(), "!");
+        // An incomplete byte run is dropped when a regular character flushes it.
+        let mut decoder = tokenizer.streaming_decoder(true);
+        assert_eq!(decoder.push(&tokenizer, 7).unwrap(), "");
+        assert_eq!(decoder.push(&tokenizer, 13).unwrap(), "!");
+        // A held would-be marker that never completes is emitted as text at finish.
+        let mut decoder = tokenizer.streaming_decoder(true);
+        assert_eq!(decoder.push(&tokenizer, 12).unwrap(), ""); // "<0xAB" carried
+        assert_eq!(decoder.finish(), "<0xAB");
+
+        assert_streaming_decode_matches_batch(&tokenizer, 500);
+    }
+
+    #[test]
+    fn streaming_decoder_matches_batch_decode_plain() {
+        let path = tempfile_path("streaming-plain-tokenizer");
+        write_streaming_plain_tokenizer_fixture(&path);
+        let tokenizer = GgufFile::open(&path).unwrap().tokenizer().unwrap();
+
+        let mut decoder = tokenizer.streaming_decoder(true);
+        assert_eq!(decoder.push(&tokenizer, 1).unwrap(), " hi");
+        assert_eq!(decoder.push(&tokenizer, 2).unwrap(), "there");
+        assert_eq!(decoder.finish(), "");
+
+        assert_streaming_decode_matches_batch(&tokenizer, 200);
     }
 
     #[test]

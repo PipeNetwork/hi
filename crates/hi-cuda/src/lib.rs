@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use futures_util::stream;
-use hi_gguf::{GgufFile, QwenGgufConfig, inspect_model};
+use hi_gguf::{GgufFile, QwenGgufConfig, StreamingTokenDecoder, inspect_model};
 use hi_local_core::backend::{
     BackendHealth, GenerationEvent, GenerationOutput, GenerationRequest, GenerationStream,
     ImageInput, ImageSource, ImageUrlKind, InferenceBackend, MultimodalInput, MultimodalSupport,
@@ -3854,6 +3854,12 @@ struct CudaContinuousTextRequest {
     prompt_tokens: Vec<u32>,
     generated_tokens: Vec<u32>,
     previous_text: String,
+    /// Incremental detokenizer (`HI_CUDA_INCREMENTAL_DETOK`, default on): each new
+    /// token is pushed in O(1) instead of re-decoding the whole generated sequence
+    /// per token. `None` = the full-re-decode fallback using `previous_text`.
+    stream_decoder: Option<StreamingTokenDecoder>,
+    /// How many of `generated_tokens` have been pushed through `stream_decoder`.
+    decoded_token_count: usize,
     max_tokens: usize,
     stop_token_sequences: Vec<Vec<u32>>,
     sampling_key: CudaSchedulerSamplingKey,
@@ -4323,12 +4329,27 @@ fn admit_continuous_text_job(
         prompt_tokens,
         generated_tokens: Vec::new(),
         previous_text: String::new(),
+        stream_decoder: incremental_detok_enabled()
+            .then(|| state.cpu_reference.tokenizer().streaming_decoder(true)),
+        decoded_token_count: 0,
         max_tokens,
         stop_token_sequences,
         sampling_key,
         rng,
         lease,
         prefix_reuse_tokens,
+    })
+}
+
+/// Incremental per-token detokenization (default on): stream deltas via
+/// `StreamingTokenDecoder::push` in O(token) instead of re-decoding the entire
+/// generated sequence every token. `HI_CUDA_INCREMENTAL_DETOK=0` restores the
+/// full-re-decode diffing path.
+fn incremental_detok_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("HI_CUDA_INCREMENTAL_DETOK").map_or(true, |value| value != "0")
     })
 }
 
@@ -5311,22 +5332,46 @@ fn send_continuous_token_delta(
     request: &mut CudaContinuousTextRequest,
     token: u32,
 ) -> std::result::Result<(), CudaContinuousRetireReason> {
-    let current_text = match state
-        .cpu_reference
-        .tokenizer()
-        .decode(&request.generated_tokens)
-    {
-        Ok(text) => text,
-        Err(err) => {
-            let _ = send_scheduler_error(&request.job.tx, err);
-            return Err(CudaContinuousRetireReason::Errored);
+    let delta = if request.stream_decoder.is_some() {
+        // Incremental path: push only the tokens generated since the last call
+        // (usually one; the speculative path can append several per pass).
+        let tokenizer = state.cpu_reference.tokenizer();
+        let mut delta = String::new();
+        while request.decoded_token_count < request.generated_tokens.len() {
+            let id = request.generated_tokens[request.decoded_token_count];
+            let decoder = request
+                .stream_decoder
+                .as_mut()
+                .expect("stream_decoder checked above");
+            match decoder.push(tokenizer, id) {
+                Ok(text) => delta.push_str(&text),
+                Err(err) => {
+                    let _ = send_scheduler_error(&request.job.tx, err);
+                    return Err(CudaContinuousRetireReason::Errored);
+                }
+            }
+            request.decoded_token_count += 1;
         }
+        delta
+    } else {
+        let current_text = match state
+            .cpu_reference
+            .tokenizer()
+            .decode(&request.generated_tokens)
+        {
+            Ok(text) => text,
+            Err(err) => {
+                let _ = send_scheduler_error(&request.job.tx, err);
+                return Err(CudaContinuousRetireReason::Errored);
+            }
+        };
+        let delta = current_text
+            .strip_prefix(&request.previous_text)
+            .unwrap_or(&current_text)
+            .to_string();
+        request.previous_text = current_text;
+        delta
     };
-    let delta = current_text
-        .strip_prefix(&request.previous_text)
-        .unwrap_or(&current_text)
-        .to_string();
-    request.previous_text = current_text;
     if delta.is_empty() {
         return Ok(());
     }
