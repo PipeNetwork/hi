@@ -3582,6 +3582,17 @@ mod native {
             matrix_name: &str,
             input: &GpuF32Tensor,
         ) -> Result<GpuF32Tensor> {
+            self.project_f32_device_shared_cast(matrix_name, input, &mut None)
+        }
+
+        /// [`Self::project_f32_device`] with a caller-held f16 input-cast slot,
+        /// shared across a group of projections over the same activation.
+        fn project_f32_device_shared_cast(
+            &self,
+            matrix_name: &str,
+            input: &GpuF32Tensor,
+            shared_cast: &mut Option<(DeviceBuffer, usize)>,
+        ) -> Result<GpuF32Tensor> {
             let matrix = self
                 .matrix(matrix_name)
                 .ok_or_else(|| anyhow!("CUDA matrix {matrix_name} is missing"))?;
@@ -3593,7 +3604,7 @@ mod native {
                 );
             }
             if matrix.is_quantized() {
-                return self.project_quantized_f32_device(matrix_name, matrix, input);
+                return self.project_quantized_f32_device(matrix_name, matrix, input, shared_cast);
             }
             let dtype = matrix.gemm_dtype()?;
             let output_elements = input
@@ -3769,6 +3780,7 @@ mod native {
             matrix_name: &str,
             matrix: &GpuMatrix,
             input: &GpuF32Tensor,
+            shared_cast: &mut Option<(DeviceBuffer, usize)>,
         ) -> Result<GpuF32Tensor> {
             // Single-token decode fast path for fp4 checkpoints: read the packed
             // MXFP4/NVFP4 blocks natively against the f32 activation (~0.53-0.56
@@ -4352,10 +4364,10 @@ mod native {
                 let weight_f16 = cache
                     .get(matrix_name)
                     .expect("cached f16 weight just inserted");
-                self.matmul_input_f16_weight(input, weight_f16, matrix)?
+                self.matmul_input_f16_weight(input, weight_f16, matrix, shared_cast)?
             } else {
                 let weight_f16 = self.dequantize_matrix_to_f16(matrix, weight_elements)?;
-                self.matmul_input_f16_weight(input, &weight_f16, matrix)?
+                self.matmul_input_f16_weight(input, &weight_f16, matrix, shared_cast)?
             };
             Ok(GpuF32Tensor {
                 rows: input.rows,
@@ -4408,25 +4420,41 @@ mod native {
         }
 
         /// Cast the input to f16 and run the tensor-core f16 GEMM against an already-f16
-        /// weight, returning the f32 output buffer.
+        /// weight, returning the f32 output buffer. `shared_cast` lets a group of
+        /// projections over the SAME activation (q/k/v, ffn gate/up) cast it once:
+        /// on first use the slot is filled, later calls reuse it — profiling showed
+        /// the per-projection cast repeated 6-7x per layer-chunk (5.5% of prefill
+        /// GPU time). Callers must only share a slot across an identical input.
         fn matmul_input_f16_weight(
             &self,
             input: &GpuF32Tensor,
             weight_f16: &DeviceBuffer,
             matrix: &GpuMatrix,
+            shared_cast: &mut Option<(DeviceBuffer, usize)>,
         ) -> Result<DeviceBuffer> {
             let input_elements = input
                 .rows
                 .checked_mul(input.cols)
                 .context("CUDA quantized projection input element count overflows usize")?;
-            let input_f16 = DeviceBuffer::alloc(input_elements * std::mem::size_of::<u16>())
-                .context("allocating CUDA f16 input scratch")?;
-            crate::kernels::launch_cast_f32_to_f16(
-                &input.buffer,
-                &input_f16,
-                input_elements,
-                &self.stream,
-            )?;
+            if let Some((_, cached_elements)) = shared_cast
+                && *cached_elements != input_elements
+            {
+                bail!(
+                    "CUDA shared f16 cast reused across different inputs ({cached_elements} vs {input_elements} elements)"
+                );
+            }
+            if shared_cast.is_none() {
+                let cast = DeviceBuffer::alloc(input_elements * std::mem::size_of::<u16>())
+                    .context("allocating CUDA f16 input scratch")?;
+                crate::kernels::launch_cast_f32_to_f16(
+                    &input.buffer,
+                    &cast,
+                    input_elements,
+                    &self.stream,
+                )?;
+                *shared_cast = Some((cast, input_elements));
+            }
+            let input_f16 = &shared_cast.as_ref().expect("just filled").0;
             let output_elements = input
                 .rows
                 .checked_mul(matrix.rows)
@@ -4434,7 +4462,7 @@ mod native {
             let output = DeviceBuffer::alloc(output_elements * std::mem::size_of::<f32>())
                 .context("allocating CUDA quantized projection output")?;
             self.cublas.matmul_mixed_rhs_transposed_row_major(
-                &input_f16,
+                input_f16,
                 weight_f16,
                 &output,
                 input.rows,
@@ -14776,8 +14804,13 @@ mod native {
                             rope,
                         )?
                     } else {
-                        let (q, gate) =
-                            self.dense_attention_q_f32_device(&prefix, &attn_input, &dims, eps)?;
+                        let (q, gate) = self.dense_attention_q_f32_device(
+                            &prefix,
+                            &attn_input,
+                            &dims,
+                            eps,
+                            &mut None,
+                        )?;
                         if let (Some(positions), Some(sections)) = (mrope_positions, mrope_sections)
                         {
                             self.apply_mrope_f32_device(
@@ -15196,8 +15229,13 @@ mod native {
                         rope,
                     )?
                 } else {
-                    let (q, gate) =
-                        self.dense_attention_q_f32_device(&prefix, &attn_input, &dims, eps)?;
+                    let (q, gate) = self.dense_attention_q_f32_device(
+                        &prefix,
+                        &attn_input,
+                        &dims,
+                        eps,
+                        &mut None,
+                    )?;
                     if let (Some(positions), Some(sections)) = (mrope_positions, mrope_sections) {
                         self.apply_mrope_f32_device(
                             &q,
@@ -16317,8 +16355,13 @@ mod native {
                         },
                     )?
                 } else {
-                    let (q, gate) =
-                        self.dense_attention_q_f32_device(&prefix, &attn_input, &dims, eps)?;
+                    let (q, gate) = self.dense_attention_q_f32_device(
+                        &prefix,
+                        &attn_input,
+                        &dims,
+                        eps,
+                        &mut None,
+                    )?;
                     self.apply_mrope_f32_device(
                         &q,
                         &mrope_positions,
@@ -16476,8 +16519,13 @@ mod native {
                         },
                     )?
                 } else {
-                    let (q, gate) =
-                        self.dense_attention_q_f32_device(&prefix, &attn_input, &dims, eps)?;
+                    let (q, gate) = self.dense_attention_q_f32_device(
+                        &prefix,
+                        &attn_input,
+                        &dims,
+                        eps,
+                        &mut None,
+                    )?;
                     self.apply_mrope_f32_device(
                         &q,
                         &mrope_positions,
@@ -16657,8 +16705,13 @@ mod native {
                         },
                     )?
                 } else {
-                    let (q, gate) =
-                        self.dense_attention_q_f32_device(&prefix, &attn_input, &dims, eps)?;
+                    let (q, gate) = self.dense_attention_q_f32_device(
+                        &prefix,
+                        &attn_input,
+                        &dims,
+                        eps,
+                        &mut None,
+                    )?;
                     self.apply_mrope_f32_device(
                         &q,
                         &mrope_positions,
@@ -17135,7 +17188,16 @@ mod native {
             // rope.freq_base); every other model keeps the single base passed in.
             let rope_base = self.layer_rope_base(prefix, rope_base);
             if !self.layer_uses_mla_attention(prefix) {
-                let (q, gate) = self.dense_attention_q_f32_device(prefix, attn_input, dims, eps)?;
+                // q/k/v (and the q-gate) all project from attn_input: cast it
+                // to f16 once and share it across the group.
+                let mut attn_input_cast: Option<(DeviceBuffer, usize)> = None;
+                let (q, gate) = self.dense_attention_q_f32_device(
+                    prefix,
+                    attn_input,
+                    dims,
+                    eps,
+                    &mut attn_input_cast,
+                )?;
                 match rope {
                     QwenRopeLayout::Single {
                         seq_len,
@@ -17196,7 +17258,11 @@ mod native {
                     )?,
                 }
 
-                let k = self.project_f32_device(&format!("{prefix}.attn_k.weight"), attn_input)?;
+                let k = self.project_f32_device_shared_cast(
+                    &format!("{prefix}.attn_k.weight"),
+                    attn_input,
+                    &mut attn_input_cast,
+                )?;
                 let k =
                     self.add_optional_rowwise_f32_device(k, &format!("{prefix}.attn_k.bias"))?;
                 let k = self.optional_head_rms_norm_f32_device(
@@ -17267,7 +17333,11 @@ mod native {
                     )?,
                 }
 
-                let v = self.project_f32_device(&format!("{prefix}.attn_v.weight"), attn_input)?;
+                let v = self.project_f32_device_shared_cast(
+                    &format!("{prefix}.attn_v.weight"),
+                    attn_input,
+                    &mut attn_input_cast,
+                )?;
                 let v =
                     self.add_optional_rowwise_f32_device(v, &format!("{prefix}.attn_v.bias"))?;
                 return Ok((q, k, v, gate));
@@ -17288,8 +17358,13 @@ mod native {
                 bail!("CUDA MLA attention requires expanded kv_heads to equal heads");
             }
 
-            let q_latent =
-                self.project_f32_device(&format!("{prefix}.attn_q_a.weight"), attn_input)?;
+            // Both MLA latent projections read attn_input: share one f16 cast.
+            let mut mla_input_cast: Option<(DeviceBuffer, usize)> = None;
+            let q_latent = self.project_f32_device_shared_cast(
+                &format!("{prefix}.attn_q_a.weight"),
+                attn_input,
+                &mut mla_input_cast,
+            )?;
             let q_latent = self.rms_norm_f32_device(
                 &format!("{prefix}.attn_q_a_norm.weight"),
                 &q_latent,
@@ -17317,8 +17392,11 @@ mod native {
             }
             let q = self.f32_tensor_from_host(&q_host, q.rows, q.cols, "CUDA MLA q compose")?;
 
-            let kv_a =
-                self.project_f32_device(&format!("{prefix}.attn_kv_a_mqa.weight"), attn_input)?;
+            let kv_a = self.project_f32_device_shared_cast(
+                &format!("{prefix}.attn_kv_a_mqa.weight"),
+                attn_input,
+                &mut mla_input_cast,
+            )?;
             let kv_a_host = kv_a.copy_to_host()?;
             let mut kv_latent_host = vec![0.0; attn_input.rows * mla.kv_lora_rank];
             let mut k_pe_host = vec![0.0; attn_input.rows * mla.qk_rope_head_dim];
@@ -17834,10 +17912,14 @@ mod native {
             attn_input: &GpuF32Tensor,
             dims: &QwenDims,
             eps: f32,
+            attn_input_cast: &mut Option<(DeviceBuffer, usize)>,
         ) -> Result<(GpuF32Tensor, Option<GpuF32Tensor>)> {
             let (q, gate) = if self.has_matrix(&format!("{prefix}.attn_q_gated.weight")) {
-                let q_gate =
-                    self.project_f32_device(&format!("{prefix}.attn_q_gated.weight"), attn_input)?;
+                let q_gate = self.project_f32_device_shared_cast(
+                    &format!("{prefix}.attn_q_gated.weight"),
+                    attn_input,
+                    attn_input_cast,
+                )?;
                 let q_gate = self.add_optional_rowwise_f32_device(
                     q_gate,
                     &format!("{prefix}.attn_q_gated.bias"),
@@ -17846,7 +17928,11 @@ mod native {
                     self.split_gated_q_projection_f32_device(&q_gate, dims.heads, dims.head_dim)?;
                 (q, Some(gate))
             } else {
-                let q = self.project_f32_device(&format!("{prefix}.attn_q.weight"), attn_input)?;
+                let q = self.project_f32_device_shared_cast(
+                    &format!("{prefix}.attn_q.weight"),
+                    attn_input,
+                    attn_input_cast,
+                )?;
                 let q =
                     self.add_optional_rowwise_f32_device(q, &format!("{prefix}.attn_q.bias"))?;
                 (q, None)
@@ -18103,10 +18189,20 @@ mod native {
             prefix: &str,
             input: &GpuF32Tensor,
         ) -> Result<GpuF32Tensor> {
-            let gate = self.project_f32_device(&format!("{prefix}.ffn_gate.weight"), input)?;
+            // gate and up both project from the same normed input: share one cast.
+            let mut ffn_input_cast: Option<(DeviceBuffer, usize)> = None;
+            let gate = self.project_f32_device_shared_cast(
+                &format!("{prefix}.ffn_gate.weight"),
+                input,
+                &mut ffn_input_cast,
+            )?;
             let gate =
                 self.add_optional_rowwise_f32_device(gate, &format!("{prefix}.ffn_gate.bias"))?;
-            let up = self.project_f32_device(&format!("{prefix}.ffn_up.weight"), input)?;
+            let up = self.project_f32_device_shared_cast(
+                &format!("{prefix}.ffn_up.weight"),
+                input,
+                &mut ffn_input_cast,
+            )?;
             let up = self.add_optional_rowwise_f32_device(up, &format!("{prefix}.ffn_up.bias"))?;
             // Gemma uses GeGLU (gelu(gate) * up); other dense models use SwiGLU.
             let activated = if self.config.is_gemma() {
