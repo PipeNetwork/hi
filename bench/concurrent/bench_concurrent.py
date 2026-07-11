@@ -50,6 +50,15 @@ def wait_for_server(port, timeout_s=600):
     raise RuntimeError(f"server on port {port} did not become healthy in {timeout_s}s")
 
 
+def served_model_id(port):
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/v1/models", timeout=10) as resp:
+        data = json.loads(resp.read())
+    models = data.get("data") or []
+    if not models:
+        raise RuntimeError("server reports no loaded models")
+    return models[0]["id"]
+
+
 def make_prompt(stream_idx):
     # Different lengths per stream so context lengths never align, and a corpus
     # that is not trivially n-gram-predictable (keeps speculative decode honest).
@@ -65,12 +74,12 @@ def make_prompt(stream_idx):
     )
 
 
-def run_stream(port, prompt, max_tokens, out, idx):
+def run_stream(port, model_id, prompt, max_tokens, out, idx):
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/v1/chat/completions",
         data=json.dumps(
             {
-                "model": "local",
+                "model": model_id,
                 "stream": True,
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": max_tokens,
@@ -129,12 +138,12 @@ def scheduler_counters(h):
     return sched if isinstance(sched, dict) else {}
 
 
-def run_k(port, k, max_tokens):
+def run_k(port, model_id, k, max_tokens):
     before = health(port)
     out = [None] * k
     threads = [
         threading.Thread(
-            target=run_stream, args=(port, make_prompt(i), max_tokens, out, i)
+            target=run_stream, args=(port, model_id, make_prompt(i), max_tokens, out, i)
         )
         for i in range(k)
     ]
@@ -195,16 +204,17 @@ def main():
                 stderr=subprocess.DEVNULL,
             )
         wait_for_server(args.port)
+        model_id = served_model_id(args.port)
 
         for _ in range(args.warmup):
             out = [None]
-            run_stream(args.port, make_prompt(0), 32, out, 0)
+            run_stream(args.port, model_id, make_prompt(0), 32, out, 0)
             if out[0] and "error" in out[0]:
                 raise RuntimeError(f"warmup stream failed: {out[0]['error']}")
 
         records = []
         for k in [int(v) for v in args.ks.split(",") if v]:
-            record = run_k(args.port, k, args.max_tokens)
+            record = run_k(args.port, model_id, k, args.max_tokens)
             record["label"] = args.label
             record["ts"] = time.strftime("%Y-%m-%dT%H:%M:%S")
             records.append(record)

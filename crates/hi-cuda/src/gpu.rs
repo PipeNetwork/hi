@@ -51,6 +51,19 @@ pub struct CudaVisionEncoderInfo {
     pub uses_window_attention: bool,
 }
 
+/// Per-row sampling config for heterogeneous batched decode: one forward can mix
+/// greedy and sampled requests, each row selecting its next token under its own
+/// parameters.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum CudaRowSampling {
+    Greedy,
+    Sampled {
+        temperature: f32,
+        top_p: f32,
+        top_k: Option<u32>,
+    },
+}
+
 #[cfg(feature = "native-cuda")]
 mod native {
     use std::cell::{Cell, RefCell, RefMut};
@@ -94,7 +107,9 @@ mod native {
 
     use crate::runtime::{Cublas, CublasLt, CudaRuntime, DeviceBuffer, GemmDType, Stream};
 
-    use super::{CudaMmprojProjectorInfo, CudaQwenGpuModelInfo, CudaVisionEncoderInfo};
+    use super::{
+        CudaMmprojProjectorInfo, CudaQwenGpuModelInfo, CudaRowSampling, CudaVisionEncoderInfo,
+    };
 
     const FLASH_ONLINE_MAX_HEAD_DIM: usize = 512;
     // Flash-attention (shared-memory K/V tiling) prefill path is used for causal
@@ -7192,6 +7207,123 @@ mod native {
             )
         }
 
+        /// Heterogeneous batched decode: ONE forward for N sequences at DIFFERENT
+        /// positions (one new token each), with per-row sampling configs — so the
+        /// weights are read once per step for the whole batch instead of once per
+        /// context-length group. Rows whose page tables are shorter than the longest
+        /// row's are padded by repeating their own last page: pad entries are never
+        /// dereferenced (the KV write touches only `positions[row]`'s page and the
+        /// attention span is bounded by `positions[row]`), they only satisfy the
+        /// uniform-page-table-length layout.
+        #[allow(clippy::too_many_arguments)]
+        pub fn decode_next_tokens_batch_paged_with_page_tables_and_positions(
+            &self,
+            token_ids: &[u32],
+            positions: &[usize],
+            row_sampling: &[CudaRowSampling],
+            samples: &[f32],
+            page_size: usize,
+            page_tables: &[Vec<usize>],
+            physical_page_count: usize,
+        ) -> Result<Vec<u32>> {
+            let label = "CUDA continuous paged heterogeneous append decode";
+            if token_ids.is_empty() {
+                bail!("{label} requires at least one request");
+            }
+            if self.config.recurrent_ssm_tensor_layout {
+                // The SSM state machine tracks a single shared position; callers keep
+                // the equal-position grouping for recurrent layouts.
+                bail!("{label} does not support recurrent SSM layouts");
+            }
+            if !self.supports_batched_text_generation() {
+                bail!("{label} currently supports loaded decoder model layouts only");
+            }
+            let batch_count = token_ids.len();
+            if positions.len() != batch_count
+                || row_sampling.len() != batch_count
+                || samples.len() != batch_count
+                || page_tables.len() != batch_count
+            {
+                bail!(
+                    "{label} got mismatched inputs: {} token(s), {} position(s), {} sampling row(s), {} sample(s), {} page table(s)",
+                    token_ids.len(),
+                    positions.len(),
+                    row_sampling.len(),
+                    samples.len(),
+                    page_tables.len()
+                );
+            }
+            if page_size == 0 {
+                bail!("{label} requires a non-zero page size");
+            }
+            let dims = self.qwen_dims()?;
+            let max_position = positions.iter().copied().max().unwrap_or(0);
+            if max_position >= dims.context {
+                bail!(
+                    "decode position {max_position} exceeds qwen context length {}",
+                    dims.context
+                );
+            }
+            let token_capacity = max_position
+                .checked_add(1)
+                .context("CUDA heterogeneous decode token capacity overflows usize")?;
+            let page_table_len = token_capacity.div_ceil(page_size);
+            let mut padded_tables = Vec::with_capacity(batch_count);
+            for (row, (pages, position)) in page_tables.iter().zip(positions).enumerate() {
+                // Each row must genuinely cover its OWN context; only the tail past
+                // its context may be padding.
+                let pages_needed = position
+                    .checked_add(1)
+                    .map(|tokens| tokens.div_ceil(page_size))
+                    .context("CUDA heterogeneous decode row page count overflows usize")?;
+                if pages.len() < pages_needed {
+                    bail!(
+                        "{label} row {row} has {} page(s), but position {position} requires {pages_needed}",
+                        pages.len()
+                    );
+                }
+                let last_page = *pages
+                    .last()
+                    .ok_or_else(|| anyhow!("{label} row {row} has an empty page table"))?;
+                let mut padded = pages.clone();
+                padded.resize(padded.len().max(page_table_len), last_page);
+                padded_tables.push(padded);
+            }
+            let mut cache = {
+                let mut pool_slot = self.paged_batch_pool.borrow_mut();
+                let recreate_pool = pool_slot
+                    .as_ref()
+                    .is_none_or(|pool| !pool.can_cover(&dims, page_size, physical_page_count));
+                if recreate_pool {
+                    *pool_slot = Some(CudaPagedBatchDevicePool::new(
+                        self.config.block_count,
+                        &dims,
+                        page_size,
+                        physical_page_count,
+                        &self.stream,
+                    )?);
+                }
+                let pool = pool_slot
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("CUDA paged batch device pool was not initialized"))?;
+                CudaPagedBatchKvCache::new_with_page_tables_from_pool(
+                    &dims,
+                    batch_count,
+                    page_size,
+                    token_capacity,
+                    &padded_tables,
+                    pool,
+                    &self.stream,
+                )?
+                // pool_slot borrow released here; the cache holds raw pointers into
+                // the pool, which stays alive in the RefCell.
+            };
+            let logits = self.decode_batch_logits_paged_device_with_positions(
+                token_ids, positions, &mut cache,
+            )?;
+            self.select_batched_last_token_per_row(&logits, batch_count, 1, row_sampling, samples)
+        }
+
         fn prefill_logits_batch_paged_with_page_tables(
             &self,
             inputs: &[Vec<u32>],
@@ -13352,6 +13484,151 @@ mod native {
             )?;
             self.op_barrier()?;
             tokens.copy_to_host(batch_count)
+        }
+
+        /// Token selection for a batch whose rows have DIFFERENT sampling configs.
+        /// Uniform batches short-circuit to the existing single-config paths (so
+        /// greedy-only batches bit-match `argmax_batched_last_token` and uniform
+        /// sampled batches bit-match `sample_batched_last_token`). Mixed batches run
+        /// the per-row kernel — greedy rows use the same block-argmax as the greedy
+        /// path — and ranked rows are then overwritten by the host ranked sampler,
+        /// exactly the router `sample_batched_last_token` uses for ranked configs.
+        fn select_batched_last_token_per_row(
+            &self,
+            logits: &GpuF32Tensor,
+            batch_count: usize,
+            seq_len: usize,
+            row_sampling: &[CudaRowSampling],
+            samples: &[f32],
+        ) -> Result<Vec<u32>> {
+            if row_sampling.len() != batch_count || samples.len() != batch_count {
+                bail!(
+                    "CUDA per-row token selection got {} sampling row(s) and {} sample(s) for batch {batch_count}",
+                    row_sampling.len(),
+                    samples.len()
+                );
+            }
+            if batch_count == 0 || seq_len == 0 || logits.cols == 0 {
+                bail!(
+                    "CUDA per-row token selection requires non-empty logits, got batch={batch_count}, seq_len={seq_len}, cols={}",
+                    logits.cols
+                );
+            }
+            if logits.rows != batch_count * seq_len {
+                bail!(
+                    "CUDA per-row token selection logits rows {} do not match batch {batch_count} x seq {seq_len}",
+                    logits.rows
+                );
+            }
+            if row_sampling
+                .iter()
+                .all(|row| matches!(row, CudaRowSampling::Greedy))
+            {
+                return self.argmax_batched_last_token(logits, batch_count, seq_len);
+            }
+            if let CudaRowSampling::Sampled {
+                temperature,
+                top_p,
+                top_k,
+            } = row_sampling[0]
+                && row_sampling.iter().all(|row| *row == row_sampling[0])
+            {
+                return self.sample_batched_last_token(
+                    logits,
+                    batch_count,
+                    seq_len,
+                    temperature,
+                    top_p,
+                    top_k,
+                    samples,
+                );
+            }
+            let mut temperatures = Vec::with_capacity(batch_count);
+            let mut top_ps = Vec::with_capacity(batch_count);
+            let mut top_ks = Vec::with_capacity(batch_count);
+            for row in row_sampling {
+                match row {
+                    CudaRowSampling::Greedy => {
+                        temperatures.push(0.0f32);
+                        top_ps.push(1.0f32);
+                        top_ks.push(0i32);
+                    }
+                    CudaRowSampling::Sampled {
+                        temperature,
+                        top_p,
+                        top_k,
+                    } => {
+                        temperatures.push(*temperature);
+                        top_ps.push(*top_p);
+                        top_ks.push(match top_k {
+                            Some(value) => i32::try_from(*value)
+                                .context("CUDA per-row top_k exceeds i32 range")?,
+                            None => 0,
+                        });
+                    }
+                }
+            }
+            let tokens = DeviceBuffer::alloc(batch_count * std::mem::size_of::<u32>())
+                .context("allocating CUDA per-row selected tokens")?;
+            let upload = |values: &[f32], what: &str| -> Result<DeviceBuffer> {
+                let buffer = DeviceBuffer::alloc(batch_count * std::mem::size_of::<f32>())
+                    .with_context(|| format!("allocating CUDA per-row {what}"))?;
+                buffer
+                    .copy_from_host(values)
+                    .with_context(|| format!("copying CUDA per-row {what}"))?;
+                Ok(buffer)
+            };
+            let sample_buffer = upload(samples, "samples")?;
+            let temperature_buffer = upload(&temperatures, "temperatures")?;
+            let top_p_buffer = upload(&top_ps, "top_p values")?;
+            let top_k_buffer = DeviceBuffer::alloc(batch_count * std::mem::size_of::<i32>())
+                .context("allocating CUDA per-row top_k values")?;
+            top_k_buffer
+                .copy_from_host(&top_ks)
+                .context("copying CUDA per-row top_k values")?;
+            crate::kernels::launch_select_batched_last_token_per_row(
+                &logits.buffer,
+                &tokens,
+                &sample_buffer,
+                &temperature_buffer,
+                &top_p_buffer,
+                &top_k_buffer,
+                batch_count,
+                seq_len,
+                logits.cols,
+                &self.stream,
+            )?;
+            self.op_barrier()?;
+            let mut tokens = tokens.copy_to_host::<u32>(batch_count)?;
+            // Ranked rows got an argmax placeholder from the kernel; resolve them with
+            // the host ranked sampler (the same one uniform ranked batches use).
+            for (batch, row) in row_sampling.iter().enumerate() {
+                let CudaRowSampling::Sampled {
+                    temperature,
+                    top_p,
+                    top_k,
+                } = row
+                else {
+                    continue;
+                };
+                if !sampled_selection_needs_host_rank(*temperature, *top_p, *top_k) {
+                    continue;
+                }
+                let row_idx = batch
+                    .checked_mul(seq_len)
+                    .and_then(|offset| offset.checked_add(seq_len - 1))
+                    .context("CUDA per-row token selection row index overflows usize")?;
+                let logits_row = self.copy_row_f32_device(logits, row_idx)?;
+                let logits_row = logits_row.copy_to_host()?;
+                tokens[batch] = sample_host_ranked_logits_with_uniform(
+                    &logits_row,
+                    *temperature,
+                    *top_p,
+                    *top_k,
+                    samples[batch],
+                )?;
+            }
+            Ok(tokens)
         }
 
         fn full_context_logits_device(&self, token_ids: &[u32]) -> Result<GpuF32Tensor> {
@@ -19533,7 +19810,11 @@ mod native {
                     self.page_table_len,
                     stream,
                 )?;
-                return stream.synchronize();
+                // No host sync: the attention that reads these pages is enqueued on the
+                // same stream, so stream ordering already guarantees the write lands
+                // first (same reasoning as the scalar write_batched above — a per-layer
+                // sync here drained the pipeline once per layer per token).
+                return Ok(());
             }
             crate::kernels::launch_write_paged_kv_cache_batched_positions(
                 &key.buffer,
@@ -19561,7 +19842,8 @@ mod native {
                 self.page_table_len,
                 stream,
             )?;
-            stream.synchronize()
+            // No host sync: same-stream ordering (see the Q8 branch above).
+            Ok(())
         }
 
         fn copy_prefix_from_first_batch(
@@ -24001,6 +24283,22 @@ mod non_native {
             _temperature: f32,
             _top_p: f32,
             _top_k: Option<u32>,
+            _samples: &[f32],
+            _page_size: usize,
+            _page_tables: &[Vec<usize>],
+            _physical_page_count: usize,
+        ) -> Result<Vec<u32>> {
+            bail!(
+                "hi-cuda was built without native-cuda support; GPU Qwen paged generation is unavailable"
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub fn decode_next_tokens_batch_paged_with_page_tables_and_positions(
+            &self,
+            _token_ids: &[u32],
+            _positions: &[usize],
+            _row_sampling: &[super::CudaRowSampling],
             _samples: &[f32],
             _page_size: usize,
             _page_tables: &[Vec<usize>],

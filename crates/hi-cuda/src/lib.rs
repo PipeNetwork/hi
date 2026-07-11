@@ -4641,6 +4641,12 @@ fn process_continuous_decode_iteration(
         }
     }
 
+    // With heterogeneous decode enabled, ALL decode-phase requests form one group
+    // regardless of context length or sampling config (per-row positions and
+    // sampling params); prefill and recurrent-SSM decode keep the exact-length
+    // grouping their entry points require.
+    let het_decode = het_decode_enabled() && !state.qwen.recurrent_ssm_tensor_layout;
+    let mut het_group: Vec<usize> = Vec::new();
     let mut groups: BTreeMap<
         (CudaContinuousStepPhase, usize, CudaSchedulerSamplingKey),
         Vec<usize>,
@@ -4652,12 +4658,31 @@ fn process_continuous_decode_iteration(
             } else {
                 CudaContinuousStepPhase::Decode
             };
+            if het_decode && phase == CudaContinuousStepPhase::Decode {
+                het_group.push(idx);
+                continue;
+            }
             let token_count = match phase {
                 CudaContinuousStepPhase::Prefill => request.prompt_tokens.len(),
                 CudaContinuousStepPhase::Decode => request.context_len(),
             };
             groups
                 .entry((phase, token_count, request.sampling_key))
+                .or_default()
+                .push(idx);
+        }
+    }
+    // Below the batching break-even, fold the het group back into the historical
+    // exact-length grouping (see het_decode_min_batch).
+    if !het_group.is_empty() && het_group.len() < het_decode_min_batch() {
+        for idx in het_group.drain(..) {
+            let request = &active[idx];
+            groups
+                .entry((
+                    CudaContinuousStepPhase::Decode,
+                    request.context_len(),
+                    request.sampling_key,
+                ))
                 .or_default()
                 .push(idx);
         }
@@ -4683,6 +4708,36 @@ fn process_continuous_decode_iteration(
                 sampling_key,
                 &chunk,
             );
+        }
+    }
+
+    for chunk in het_group.chunks(max_batch_size.max(1)) {
+        let chunk = chunk
+            .iter()
+            .copied()
+            .filter(|idx| retire[*idx].is_none())
+            .collect::<Vec<_>>();
+        if chunk.is_empty() {
+            continue;
+        }
+        if chunk.len() == 1 {
+            // Alone, a request keeps the per-request chunk path so the speculative
+            // and captured-graph fast paths (both single-request) still apply.
+            let idx = chunk[0];
+            let token_count = active[idx].context_len();
+            let sampling_key = active[idx].sampling_key;
+            process_continuous_decode_chunk(
+                state,
+                stats,
+                active,
+                &mut retire,
+                CudaContinuousStepPhase::Decode,
+                token_count,
+                sampling_key,
+                &chunk,
+            );
+        } else {
+            process_continuous_het_decode_chunk(state, stats, active, &mut retire, &chunk);
         }
     }
 
@@ -4768,6 +4823,35 @@ fn forget_retired_recurrent_state(
     }
 }
 
+/// Heterogeneous batched decode (`HI_CUDA_HET_DECODE`, opt-in): decode-phase requests at
+/// DIFFERENT context lengths and sampling configs batch into ONE forward with per-row
+/// positions, so the weights are read once per step for the whole batch instead of once
+/// per exact-context-length group (which real traffic never shares). Off = the historical
+/// grouping by (context length, sampling config).
+fn het_decode_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("HI_CUDA_HET_DECODE").is_ok_and(|value| value != "0"))
+}
+
+/// Minimum decode batch for the heterogeneous path (`HI_CUDA_HET_DECODE_MIN`, default 3).
+/// Below it, requests keep the historical grouping: while weights are cached f16, an
+/// M>1 matmul reads 2 bytes/param per step vs 0.57 per dp4a GEMV forward, so batching
+/// only pays once the batch amortizes that (measured on Qwen2.5-VL-3B: K=2 batched is
+/// ~14% SLOWER aggregate, K=4 is +63%, K=8 is +174%). A quantized M>1 GEMM will drop
+/// the break-even to 2.
+fn het_decode_min_batch() -> usize {
+    use std::sync::OnceLock;
+    static MIN: OnceLock<usize> = OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("HI_CUDA_HET_DECODE_MIN")
+            .ok()
+            .and_then(|value| value.trim().parse().ok())
+            .filter(|value| *value >= 2)
+            .unwrap_or(3)
+    })
+}
+
 /// Prompt-lookup speculative decode config `(ngram, max_draft)`, from `HI_CUDA_SPEC_DECODE`.
 /// Unset/`0` = off. Accepts `1` (defaults 2,8) or `ngram:draft` (e.g. `3:8`). Applies only to
 /// a single greedy text request decoding alone; other cases use the normal batched decode.
@@ -4788,6 +4872,193 @@ fn speculative_decode_config() -> Option<(usize, usize)> {
             }
         }
     })
+}
+
+/// One heterogeneous decode forward (`HI_CUDA_HET_DECODE`): every open request in
+/// `indexes` contributes one row at its OWN position with its OWN sampling config,
+/// so a mixed-length batch costs one weight read instead of one per length group.
+/// Single-request iterations never come here — they keep the per-request chunk
+/// path so the speculative and captured-graph fast paths still apply.
+fn process_continuous_het_decode_chunk(
+    state: &CudaSchedulerState,
+    stats: &CudaSchedulerStats,
+    active: &mut [CudaContinuousTextRequest],
+    retire: &mut [Option<CudaContinuousRetireReason>],
+    indexes: &[usize],
+) {
+    let model = match state.gpu_model.lock() {
+        Ok(model) => model,
+        Err(_) => {
+            for idx in indexes {
+                mark_continuous_error(
+                    state,
+                    active,
+                    retire,
+                    *idx,
+                    anyhow!("CUDA gpu model lock poisoned"),
+                );
+            }
+            return;
+        }
+    };
+    let indexes = retain_open_continuous_indexes(active, retire, indexes);
+    if indexes.is_empty() {
+        return;
+    }
+    let Some(kv_pages) = &state.kv_pages else {
+        for idx in &indexes {
+            mark_continuous_error(
+                state,
+                active,
+                retire,
+                *idx,
+                anyhow!("CUDA continuous decode requires paged KV leases"),
+            );
+        }
+        return;
+    };
+    let assembled = indexes
+        .iter()
+        .map(|idx| {
+            let request = &active[*idx];
+            let token = request.generated_tokens.last().copied().ok_or_else(|| {
+                anyhow!("CUDA continuous heterogeneous decode request has no generated token")
+            })?;
+            let position = request.context_len().checked_sub(1).ok_or_else(|| {
+                anyhow!("CUDA continuous heterogeneous decode requires a non-empty context")
+            })?;
+            let table = request.page_table_for_context(state.kv_page_size)?;
+            let row_sampling = match request.sampling_key {
+                CudaSchedulerSamplingKey::Greedy => gpu::CudaRowSampling::Greedy,
+                CudaSchedulerSamplingKey::Sampled {
+                    temperature_bits,
+                    top_p_bits,
+                    top_k,
+                } => gpu::CudaRowSampling::Sampled {
+                    temperature: f32::from_bits(temperature_bits),
+                    top_p: f32::from_bits(top_p_bits),
+                    top_k,
+                },
+            };
+            Ok((token, position, table, row_sampling))
+        })
+        .collect::<Result<Vec<_>>>();
+    let assembled = match assembled {
+        Ok(assembled) => assembled,
+        Err(err) => {
+            for idx in &indexes {
+                mark_continuous_error(state, active, retire, *idx, anyhow!("{err}"));
+            }
+            return;
+        }
+    };
+    let mut decode_tokens = Vec::with_capacity(assembled.len());
+    let mut positions = Vec::with_capacity(assembled.len());
+    let mut page_tables = Vec::with_capacity(assembled.len());
+    let mut row_sampling = Vec::with_capacity(assembled.len());
+    for (token, position, table, sampling) in assembled {
+        decode_tokens.push(token);
+        positions.push(position);
+        page_tables.push(table);
+        row_sampling.push(sampling);
+    }
+    // One uniform per row, drawn from each request's own RNG — exactly one draw per
+    // request per step, the same as any other grouping, so per-request sampled
+    // streams are independent of how requests get batched.
+    let samples = continuous_sampling_values(active, &indexes);
+    let started = Instant::now();
+    let result = model.decode_next_tokens_batch_paged_with_page_tables_and_positions(
+        &decode_tokens,
+        &positions,
+        &row_sampling,
+        &samples,
+        state.kv_page_size,
+        &page_tables,
+        kv_pages.pages_total,
+    );
+    let elapsed = started.elapsed();
+    let count = indexes.len();
+    let timing = scheduler_token_timing(0, usize_to_u64(count), elapsed);
+    stats
+        .decode_tokens
+        .fetch_add(timing.decode_tokens, Ordering::Relaxed);
+    stats
+        .decode_micros
+        .fetch_add(timing.decode_micros, Ordering::Relaxed);
+
+    match result {
+        Ok(tokens) if tokens.len() == indexes.len() => {
+            stats.gpu_batched_batches.fetch_add(1, Ordering::Relaxed);
+            stats
+                .gpu_batched_requests
+                .fetch_add(usize_to_u64(count), Ordering::Relaxed);
+            stats
+                .paged_lease_batched_requests
+                .fetch_add(usize_to_u64(count), Ordering::Relaxed);
+            stats
+                .continuous_append_decode_batches
+                .fetch_add(1, Ordering::Relaxed);
+            stats
+                .continuous_append_decode_requests
+                .fetch_add(usize_to_u64(count), Ordering::Relaxed);
+            update_atomic_max(&stats.max_observed_batch, count);
+            let greedy_rows = row_sampling
+                .iter()
+                .filter(|row| matches!(row, gpu::CudaRowSampling::Greedy))
+                .count();
+            if greedy_rows > 0 {
+                stats
+                    .greedy_batched_requests
+                    .fetch_add(usize_to_u64(greedy_rows), Ordering::Relaxed);
+            }
+            let sampled_rows = count.saturating_sub(greedy_rows);
+            if sampled_rows > 0 {
+                stats
+                    .sampled_batched_requests
+                    .fetch_add(usize_to_u64(sampled_rows), Ordering::Relaxed);
+            }
+            for (idx, token) in indexes.iter().copied().zip(tokens) {
+                if retire[idx].is_some() {
+                    continue;
+                }
+                if continuous_request_cancelled(&active[idx]) {
+                    retire[idx] = Some(CudaContinuousRetireReason::Cancelled);
+                    continue;
+                }
+                active[idx].generated_tokens.push(token);
+                match send_continuous_token_delta(state, &mut active[idx], token) {
+                    Ok(()) => {}
+                    Err(CudaContinuousRetireReason::Cancelled) => {
+                        retire[idx] = Some(CudaContinuousRetireReason::Cancelled);
+                        continue;
+                    }
+                    Err(CudaContinuousRetireReason::Errored) => {
+                        retire[idx] = Some(CudaContinuousRetireReason::Errored);
+                        continue;
+                    }
+                    Err(CudaContinuousRetireReason::Completed) => unreachable!(),
+                }
+                if continuous_request_finished(&state.qwen, &active[idx], token) {
+                    retire[idx] = Some(finish_continuous_request(state, &active[idx]));
+                }
+            }
+        }
+        Ok(tokens) => {
+            let err = anyhow!(
+                "CUDA continuous heterogeneous decode returned {} token(s) for {} request(s)",
+                tokens.len(),
+                indexes.len()
+            );
+            for idx in &indexes {
+                mark_continuous_error(state, active, retire, *idx, anyhow!("{err}"));
+            }
+        }
+        Err(err) => {
+            for idx in &indexes {
+                mark_continuous_error(state, active, retire, *idx, anyhow!("{err}"));
+            }
+        }
+    }
 }
 
 fn process_continuous_decode_chunk(
@@ -12301,6 +12572,206 @@ mod tests {
             assert!(spec.forward_passes >= 1);
             assert!(spec.forward_passes <= spec.tokens.len().max(1));
             assert!(spec.accepted_drafts <= spec.proposed_total);
+        }
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_het_batched_decode_matches_sequential() {
+        use crate::gpu::CudaRowSampling;
+        use hi_gguf::GgufFile;
+
+        let path = tempfile_path("gpu-qwen-het-decode");
+        write_reference_qwen(&path);
+        let gguf = GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+        assert!(model.supports_batched_text_generation());
+
+        // page_size 1 => every decode step crosses a page boundary, maximizing
+        // coverage of the padded-page-table layout.
+        let page_size = 1usize;
+        let physical_page_count = 36usize;
+        // Deliberately DIFFERENT context lengths per row — the case the scalar
+        // batched entry cannot express.
+        let prompts: Vec<Vec<u32>> = vec![vec![0], vec![1, 2], vec![2, 0, 1]];
+        let leases: Vec<Vec<usize>> = (0..prompts.len())
+            .map(|r| (r * 12..r * 12 + 12).collect())
+            .collect();
+        let table_for =
+            |row: usize, tokens: usize| -> Vec<usize> { leases[row][..tokens].to_vec() };
+
+        // Prefill each row alone; its first generated token must match the
+        // full-recompute greedy reference.
+        let mut ctxs = prompts.clone();
+        for (row, prompt) in prompts.iter().enumerate() {
+            let first = model
+                .prefill_greedy_next_tokens_batch_paged_with_page_tables(
+                    &[prompt.clone()],
+                    page_size,
+                    &[table_for(row, prompt.len())],
+                    physical_page_count,
+                )
+                .unwrap()[0];
+            assert_eq!(first, model.greedy_next_token(prompt).unwrap());
+            ctxs[row].push(first);
+        }
+
+        // Phase 1: all-greedy heterogeneous decode, 4 steps. Every step's tokens
+        // must match the full-recompute greedy reference for each row's context.
+        for step in 0..4 {
+            let tokens: Vec<u32> = ctxs.iter().map(|c| *c.last().unwrap()).collect();
+            let positions: Vec<usize> = ctxs.iter().map(|c| c.len() - 1).collect();
+            let tables: Vec<Vec<usize>> = ctxs
+                .iter()
+                .enumerate()
+                .map(|(row, c)| table_for(row, c.len()))
+                .collect();
+            let out = model
+                .decode_next_tokens_batch_paged_with_page_tables_and_positions(
+                    &tokens,
+                    &positions,
+                    &[CudaRowSampling::Greedy; 3],
+                    &[0.0; 3],
+                    page_size,
+                    &tables,
+                    physical_page_count,
+                )
+                .unwrap();
+            let expected: Vec<u32> = ctxs
+                .iter()
+                .map(|c| model.greedy_next_token(c).unwrap())
+                .collect();
+            assert_eq!(out, expected, "het greedy step {step} diverged");
+            for (c, t) in ctxs.iter_mut().zip(&out) {
+                c.push(*t);
+            }
+        }
+
+        // Phase 2: mixed per-row sampling (greedy + temp-only + ranked top_k) in one
+        // forward. References come from the scalar batch-of-1 entries at the same
+        // state — the KV writes are position-indexed and idempotent, so the scalar
+        // reference calls and the het call may share pages within a step.
+        let row_sampling = [
+            CudaRowSampling::Greedy,
+            CudaRowSampling::Sampled {
+                temperature: 1.0,
+                top_p: 1.0,
+                top_k: None,
+            },
+            CudaRowSampling::Sampled {
+                temperature: 1.0,
+                top_p: 1.0,
+                top_k: Some(2),
+            },
+        ];
+        let samples = [0.0f32, 0.7, 0.3];
+        for step in 0..3 {
+            let tokens: Vec<u32> = ctxs.iter().map(|c| *c.last().unwrap()).collect();
+            let positions: Vec<usize> = ctxs.iter().map(|c| c.len() - 1).collect();
+            let tables: Vec<Vec<usize>> = ctxs
+                .iter()
+                .enumerate()
+                .map(|(row, c)| table_for(row, c.len()))
+                .collect();
+            let mut expected = Vec::new();
+            for row in 0..ctxs.len() {
+                let reference = match row_sampling[row] {
+                    CudaRowSampling::Greedy => model
+                        .decode_greedy_next_tokens_batch_paged_with_page_tables(
+                            &[tokens[row]],
+                            positions[row],
+                            page_size,
+                            &[tables[row].clone()],
+                            physical_page_count,
+                        )
+                        .unwrap()[0],
+                    CudaRowSampling::Sampled {
+                        temperature,
+                        top_p,
+                        top_k,
+                    } => model
+                        .decode_sampled_next_tokens_batch_paged_with_page_tables(
+                            &[tokens[row]],
+                            positions[row],
+                            temperature,
+                            top_p,
+                            top_k,
+                            &[samples[row]],
+                            page_size,
+                            &[tables[row].clone()],
+                            physical_page_count,
+                        )
+                        .unwrap()[0],
+                };
+                expected.push(reference);
+            }
+            let out = model
+                .decode_next_tokens_batch_paged_with_page_tables_and_positions(
+                    &tokens,
+                    &positions,
+                    &row_sampling,
+                    &samples,
+                    page_size,
+                    &tables,
+                    physical_page_count,
+                )
+                .unwrap();
+            assert_eq!(out, expected, "het mixed-sampling step {step} diverged");
+            for (c, t) in ctxs.iter_mut().zip(&out) {
+                c.push(*t);
+            }
+        }
+
+        // Phase 3: uniform positions through the het entry must match the scalar
+        // batched entry (guards the routing equivalence).
+        let equal_prompts: Vec<Vec<u32>> = vec![vec![0, 1], vec![2, 1]];
+        let equal_leases: Vec<Vec<usize>> = vec![(0..8).collect(), (8..16).collect()];
+        let firsts = model
+            .prefill_greedy_next_tokens_batch_paged_with_page_tables(
+                &equal_prompts,
+                page_size,
+                &equal_leases
+                    .iter()
+                    .map(|lease| lease[..2].to_vec())
+                    .collect::<Vec<_>>(),
+                physical_page_count,
+            )
+            .unwrap();
+        let mut equal_ctxs = equal_prompts.clone();
+        for (c, t) in equal_ctxs.iter_mut().zip(&firsts) {
+            c.push(*t);
+        }
+        for step in 0..3 {
+            let tokens: Vec<u32> = equal_ctxs.iter().map(|c| *c.last().unwrap()).collect();
+            let position = equal_ctxs[0].len() - 1;
+            let tables: Vec<Vec<usize>> = equal_leases
+                .iter()
+                .map(|lease| lease[..position + 1].to_vec())
+                .collect();
+            let scalar = model
+                .decode_greedy_next_tokens_batch_paged_with_page_tables(
+                    &tokens,
+                    position,
+                    page_size,
+                    &tables,
+                    physical_page_count,
+                )
+                .unwrap();
+            let het = model
+                .decode_next_tokens_batch_paged_with_page_tables_and_positions(
+                    &tokens,
+                    &[position; 2],
+                    &[CudaRowSampling::Greedy; 2],
+                    &[0.0; 2],
+                    page_size,
+                    &tables,
+                    physical_page_count,
+                )
+                .unwrap();
+            assert_eq!(het, scalar, "uniform-position het step {step} diverged");
+            for (c, t) in equal_ctxs.iter_mut().zip(&het) {
+                c.push(*t);
+            }
         }
     }
 

@@ -4845,25 +4845,21 @@ __global__ void sample_last_row_kernel(
 // so the sequential tail is ~cols/blockDim, not cols. The ranked top_k/top_p path is
 // a serial scan-per-rank; it stays on thread 0 (far cheaper) but reuses the parallel
 // max. Launched with 256 threads; shared arrays are sized to match.
-__global__ void sample_batched_last_token_kernel(
-    const float* logits,
-    uint32_t* output_tokens,
-    const float* samples,
-    int batch_count,
-    int seq_len,
+// Block-cooperative token selection for one logits row: greedy argmax when
+// temperature <= 0, parallel inverse-CDF for temperature-only sampling, and a
+// single-thread serial scan for ranked top_k/top_p (slow — host-side ranking is
+// preferred for ranked configs; see sample_batched_last_token in gpu.rs).
+// Shared by the uniform-config batched kernel and the per-row-config kernel.
+__device__ void sample_last_token_row(
+    const float* row,
+    uint32_t* out,
+    float sample,
     int cols,
     float temperature,
     float top_p,
     int top_k) {
-  const int batch = blockIdx.x;
-  if (batch >= batch_count || seq_len <= 0 || cols <= 0) {
-    return;
-  }
   const int tid = threadIdx.x;
   const int nthreads = blockDim.x;
-  const float* row =
-      logits + (static_cast<size_t>(batch) * seq_len + (seq_len - 1)) * cols;
-  const float sample = samples != nullptr ? samples[batch] : 0.0f;
 
   __shared__ float s_max[256];
   __shared__ int s_argmax[256];
@@ -4897,14 +4893,14 @@ __global__ void sample_batched_last_token_kernel(
 
   if (!isfinite(temperature) || temperature <= 0.0f) {
     if (tid == 0) {
-      output_tokens[batch] = argmax;
+      *out = argmax;
     }
     return;
   }
   const float max_scaled = max_logit / temperature;
   if (!isfinite(max_scaled)) {
     if (tid == 0) {
-      output_tokens[batch] = argmax;
+      *out = argmax;
     }
     return;
   }
@@ -4937,7 +4933,7 @@ __global__ void sample_batched_last_token_kernel(
     const float total = s_total;
     if (total <= 0.0f || !isfinite(total)) {
       if (tid == 0) {
-        output_tokens[batch] = argmax;
+        *out = argmax;
       }
       return;
     }
@@ -4967,7 +4963,7 @@ __global__ void sample_batched_last_token_kernel(
     }
     __syncthreads();
     if (tid == 0) {
-      output_tokens[batch] = (s_token != 0xFFFFFFFFu) ? s_token : argmax;
+      *out = (s_token != 0xFFFFFFFFu) ? s_token : argmax;
     }
     return;
   }
@@ -4991,7 +4987,7 @@ __global__ void sample_batched_last_token_kernel(
     previous_id = token;
   }
   if (total <= 0.0f || !isfinite(total)) {
-    output_tokens[batch] = argmax_row_device(row, cols);
+    *out = argmax_row_device(row, cols);
     return;
   }
 
@@ -5021,7 +5017,7 @@ __global__ void sample_batched_last_token_kernel(
   }
   if (candidate_count <= 0 || candidate_weight_total <= 0.0f ||
       !isfinite(candidate_weight_total)) {
-    output_tokens[batch] = argmax_row_device(row, cols);
+    *out = argmax_row_device(row, cols);
     return;
   }
 
@@ -5045,7 +5041,7 @@ __global__ void sample_batched_last_token_kernel(
     ++emitted;
     cumulative += weight;
     if (target < cumulative || emitted == candidate_count) {
-      output_tokens[batch] = static_cast<uint32_t>(token);
+      *out = static_cast<uint32_t>(token);
       return;
     }
     if (emitted >= candidate_count) {
@@ -5053,7 +5049,66 @@ __global__ void sample_batched_last_token_kernel(
     }
   }
 
-  output_tokens[batch] = argmax_row_device(row, cols);
+  *out = argmax_row_device(row, cols);
+}
+
+__global__ void sample_batched_last_token_kernel(
+    const float* logits,
+    uint32_t* output_tokens,
+    const float* samples,
+    int batch_count,
+    int seq_len,
+    int cols,
+    float temperature,
+    float top_p,
+    int top_k) {
+  const int batch = blockIdx.x;
+  if (batch >= batch_count || seq_len <= 0 || cols <= 0) {
+    return;
+  }
+  const float* row =
+      logits + (static_cast<size_t>(batch) * seq_len + (seq_len - 1)) * cols;
+  const float sample = samples != nullptr ? samples[batch] : 0.0f;
+  sample_last_token_row(
+      row, output_tokens + batch, sample, cols, temperature, top_p, top_k);
+}
+
+// Per-row sampling configs: one heterogeneous decode batch can mix greedy and
+// sampled requests. Greedy rows (temperature <= 0) take block_argmax_last so they
+// stay BIT-identical to the argmax_batched_last_token path they'd take in a
+// greedy-only batch. Ranked rows (top_k / top_p < 1) also write the argmax as a
+// placeholder — the host overwrites them via its partial-sort ranked sampler,
+// which is ~60x faster than the serial in-kernel ranked scan. Only
+// temperature-only rows sample on the GPU (the parallel inverse-CDF path).
+__global__ void select_batched_last_token_per_row_kernel(
+    const float* logits,
+    uint32_t* output_tokens,
+    const float* samples,
+    const float* temperatures,
+    const float* top_ps,
+    const int* top_ks,
+    int batch_count,
+    int seq_len,
+    int cols) {
+  const int batch = blockIdx.x;
+  if (batch >= batch_count || seq_len <= 0 || cols <= 0) {
+    return;
+  }
+  const float* row =
+      logits + (static_cast<size_t>(batch) * seq_len + (seq_len - 1)) * cols;
+  const float temperature = temperatures[batch];
+  const float top_p = top_ps[batch];
+  const int top_k = top_ks[batch];
+  const bool greedy = !isfinite(temperature) || temperature <= 0.0f;
+  const float cutoff = isfinite(top_p) ? fminf(fmaxf(top_p, 0.0f), 1.0f) : 1.0f;
+  const int effective_top_k = top_k > 0 && top_k < cols ? top_k : cols;
+  const bool ranked = !greedy && !(effective_top_k == cols && cutoff >= 1.0f);
+  if (greedy || ranked) {
+    block_argmax_last(row, cols, output_tokens + batch);
+    return;
+  }
+  sample_last_token_row(
+      row, output_tokens + batch, samples[batch], cols, temperature, top_p, top_k);
 }
 
 int valid_common(void* ptr, int len) {
@@ -10236,5 +10291,35 @@ extern "C" int hi_cuda_launch_sample_batched_last_token(
       temperature,
       top_p,
       top_k);
+  return 0;
+}
+
+extern "C" int hi_cuda_launch_select_batched_last_token_per_row(
+    const void* logits,
+    void* output_tokens,
+    const void* samples,
+    const void* temperatures,
+    const void* top_ps,
+    const void* top_ks,
+    int batch_count,
+    int seq_len,
+    int cols,
+    void* stream) {
+  if (logits == nullptr || output_tokens == nullptr || samples == nullptr ||
+      temperatures == nullptr || top_ps == nullptr || top_ks == nullptr ||
+      batch_count <= 0 || seq_len <= 0 || cols <= 0 || stream == nullptr) {
+    return 1;
+  }
+  select_batched_last_token_per_row_kernel<<<batch_count, 256, 0,
+                                             static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const float*>(logits),
+      static_cast<uint32_t*>(output_tokens),
+      static_cast<const float*>(samples),
+      static_cast<const float*>(temperatures),
+      static_cast<const float*>(top_ps),
+      static_cast<const int*>(top_ks),
+      batch_count,
+      seq_len,
+      cols);
   return 0;
 }

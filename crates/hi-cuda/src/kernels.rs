@@ -1105,6 +1105,18 @@ mod native {
             top_k: c_int,
             stream: *mut c_void,
         ) -> c_int;
+        fn hi_cuda_launch_select_batched_last_token_per_row(
+            logits: *const c_void,
+            output_tokens: *mut c_void,
+            samples: *const c_void,
+            temperatures: *const c_void,
+            top_ps: *const c_void,
+            top_ks: *const c_void,
+            batch_count: c_int,
+            seq_len: c_int,
+            cols: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
     }
 
     pub fn launch_rms_norm(
@@ -4340,6 +4352,42 @@ mod native {
             )
         })?;
         check_last_error("hi_cuda_launch_sample_batched_last_token")
+    }
+
+    /// Per-row sampling configs for a heterogeneous decode batch: `temperatures`,
+    /// `top_ps`, `top_ks` (i32; 0 = unset), and `samples` are `[batch_count]` device
+    /// arrays. Greedy rows (temperature <= 0) bit-match the batched argmax kernel;
+    /// ranked rows write the argmax as a placeholder for the host ranked sampler.
+    pub fn launch_select_batched_last_token_per_row(
+        logits: &DeviceBuffer,
+        output_tokens: &DeviceBuffer,
+        samples: &DeviceBuffer,
+        temperatures: &DeviceBuffer,
+        top_ps: &DeviceBuffer,
+        top_ks: &DeviceBuffer,
+        batch_count: usize,
+        seq_len: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(batch_count, "select_batched_per_row batch_count")?;
+        ensure_len(seq_len, "select_batched_per_row seq_len")?;
+        ensure_len(cols, "select_batched_per_row cols")?;
+        launch_status(unsafe {
+            hi_cuda_launch_select_batched_last_token_per_row(
+                logits.as_ptr(),
+                output_tokens.as_mut_ptr(),
+                samples.as_ptr(),
+                temperatures.as_ptr(),
+                top_ps.as_ptr(),
+                top_ks.as_ptr(),
+                batch_count as c_int,
+                seq_len as c_int,
+                cols as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_select_batched_last_token_per_row")
     }
 
     fn ensure_len(value: usize, label: &str) -> Result<()> {
