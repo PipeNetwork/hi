@@ -912,7 +912,7 @@ impl GgufTokenizer {
             text.push_str(&self.tokens[*id as usize]);
         }
 
-        if self.is_sentencepiece_unigram() {
+        if self.is_sentencepiece_unigram() || self.is_gemma4_escaped_bpe() {
             decode_sentencepiece_text(&text)
         } else if self.is_byte_level_bpe() {
             decode_byte_level_text(&text)
@@ -928,7 +928,7 @@ impl GgufTokenizer {
     /// and `<0xXX>` byte-fallback) are held until complete, and a trailing incomplete
     /// character is dropped at `finish()` exactly like the batch decoder drops it.
     pub fn streaming_decoder(&self, skip_special: bool) -> StreamingTokenDecoder {
-        let family = if self.is_sentencepiece_unigram() {
+        let family = if self.is_sentencepiece_unigram() || self.is_gemma4_escaped_bpe() {
             StreamingDecodeFamily::SentencePiece
         } else if self.is_byte_level_bpe() {
             StreamingDecodeFamily::ByteLevel
@@ -997,11 +997,52 @@ impl GgufTokenizer {
         }
         if self.is_sentencepiece_unigram() {
             self.encode_sentencepiece_unigram(text)
+        } else if self.is_gemma4_escaped_bpe() {
+            self.encode_escaped_bpe(text)
         } else if self.is_byte_level_bpe() {
             self.encode_byte_level_bpe(text)
         } else {
             self.encode_greedy(text)
         }
+    }
+
+    /// Gemma-4's tokenizer (`tokenizer.ggml.model = "gemma4"`) is BPE over
+    /// whitespace-escaped text (llama.cpp LLAMA_VOCAB_TYPE_BPE with
+    /// `escape_whitespaces` and no space prefix), with sentencepiece-style
+    /// `<0xXX>` byte fallback for characters the merges never cover.
+    fn is_gemma4_escaped_bpe(&self) -> bool {
+        self.model.as_deref() == Some("gemma4")
+    }
+
+    fn encode_escaped_bpe(&self, text: &str) -> Result<Vec<u32>> {
+        let mut escaped = String::with_capacity(text.len() + 3);
+        for ch in text.chars() {
+            if ch == ' ' {
+                escaped.push('\u{2581}');
+            } else {
+                escaped.push(ch);
+            }
+        }
+        let mut ids = Vec::new();
+        for symbol in self.apply_bpe(&escaped) {
+            if let Some(id) = self.token_to_id.get(symbol).copied() {
+                ids.push(id);
+                continue;
+            }
+            for byte in symbol.bytes() {
+                let name = format!("<0x{byte:02X}>");
+                match self.token_to_id.get(&name).copied() {
+                    Some(id) => ids.push(id),
+                    None => match self.unknown_token_id {
+                        Some(id) => ids.push(id),
+                        None => bail!(
+                            "gemma4 BPE produced token {symbol:?} with no byte fallback in GGUF vocab"
+                        ),
+                    },
+                }
+            }
+        }
+        Ok(ids)
     }
 
     fn is_sentencepiece_unigram(&self) -> bool {
@@ -1328,9 +1369,30 @@ pub struct QwenGgufConfig {
     pub attention_head_count_kv: u32,
     pub attention_key_length: Option<u32>,
     pub attention_value_length: Option<u32>,
-    /// Sliding-window size for local attention layers (Gemma-2/3). Gemma-3
+    /// Sliding-window size for local attention layers (Gemma-2/3/4). Gemma-3
     /// interleaves local (windowed) and global (full) attention layers.
     pub attention_sliding_window: Option<u32>,
+    /// Gemma-4 per-layer local/global pattern (`attention.sliding_window_pattern`,
+    /// true = sliding). When absent, Gemma-3 falls back to the 5:1 pattern.
+    pub attention_sliding_window_pattern: Option<Vec<bool>>,
+    /// Gemma-4 per-layer KV head counts (`attention.head_count_kv` as an array;
+    /// SWA layers use GQA, global layers MQA).
+    pub attention_head_count_kv_per_layer: Option<Vec<u32>>,
+    /// Gemma-4 head dims for SLIDING layers (`attention.key/value_length_swa`);
+    /// `attention.key/value_length` then applies to global layers only.
+    pub attention_key_length_swa: Option<u32>,
+    pub attention_value_length_swa: Option<u32>,
+    /// Gemma-4 KV sharing: the last N layers reuse an earlier layer's KV and
+    /// carry no attn_k/attn_v projections.
+    pub attention_shared_kv_layers: Option<u32>,
+    /// Gemma-4 rope base/rot dims for SLIDING layers; the non-`_swa` keys then
+    /// apply to global layers only.
+    pub rope_freq_base_swa: Option<f32>,
+    pub rope_dimension_count_swa: Option<u32>,
+    /// Gemma-4 per-layer input embeddings width (gemma3n-style; 0/absent = none).
+    pub embedding_length_per_layer_input: Option<u32>,
+    /// Per-layer FFN widths (`feed_forward_length` as an array, gemma4 E-series).
+    pub feed_forward_length_per_layer: Option<Vec<u32>>,
     pub attention_q_lora_rank: Option<u32>,
     pub attention_kv_lora_rank: Option<u32>,
     pub attention_qk_rope_head_dim: Option<u32>,
@@ -1395,6 +1457,29 @@ impl QwenGgufConfig {
         let attention_value_length = gguf.metadata_u32(&format!("{prefix}.attention.value_length"));
         let attention_sliding_window =
             gguf.metadata_u32(&format!("{prefix}.attention.sliding_window"));
+        let attention_sliding_window_pattern = qwen_metadata_bool_array(
+            gguf,
+            &format!("{prefix}.attention.sliding_window_pattern"),
+            block_count,
+        )?;
+        let attention_head_count_kv_per_layer = qwen_metadata_u32_array(
+            gguf,
+            &format!("{prefix}.attention.head_count_kv"),
+            block_count,
+        )?;
+        let attention_key_length_swa =
+            gguf.metadata_u32(&format!("{prefix}.attention.key_length_swa"));
+        let attention_value_length_swa =
+            gguf.metadata_u32(&format!("{prefix}.attention.value_length_swa"));
+        let attention_shared_kv_layers =
+            gguf.metadata_u32(&format!("{prefix}.attention.shared_kv_layers"));
+        let rope_freq_base_swa = gguf.metadata_f32(&format!("{prefix}.rope.freq_base_swa"));
+        let rope_dimension_count_swa =
+            gguf.metadata_u32(&format!("{prefix}.rope.dimension_count_swa"));
+        let embedding_length_per_layer_input =
+            gguf.metadata_u32(&format!("{prefix}.embedding_length_per_layer_input"));
+        let feed_forward_length_per_layer =
+            qwen_metadata_u32_array(gguf, &format!("{prefix}.feed_forward_length"), block_count)?;
         let attention_q_lora_rank = gguf.metadata_u32(&format!("{prefix}.attention.q_lora_rank"));
         let attention_kv_lora_rank = gguf.metadata_u32(&format!("{prefix}.attention.kv_lora_rank"));
         let attention_qk_rope_head_dim =
@@ -1490,6 +1575,15 @@ impl QwenGgufConfig {
             attention_key_length,
             attention_value_length,
             attention_sliding_window,
+            attention_sliding_window_pattern,
+            attention_head_count_kv_per_layer,
+            attention_key_length_swa,
+            attention_value_length_swa,
+            attention_shared_kv_layers,
+            rope_freq_base_swa,
+            rope_dimension_count_swa,
+            embedding_length_per_layer_input,
+            feed_forward_length_per_layer,
             attention_q_lora_rank,
             attention_kv_lora_rank,
             attention_qk_rope_head_dim,
@@ -1541,6 +1635,66 @@ impl QwenGgufConfig {
     /// `rope.freq_base`), which the CUDA forward pass applies per layer.
     pub fn is_gemma3(&self) -> bool {
         self.architecture == "gemma3"
+    }
+
+    pub fn is_gemma4(&self) -> bool {
+        self.architecture == "gemma4"
+    }
+
+    /// Whether `layer` uses sliding-window (local) attention. Gemma-4 reads the
+    /// per-layer metadata pattern; Gemma-3 falls back to its fixed 5-local:1-global
+    /// interleave. Models without windowing return false.
+    pub fn layer_is_sliding(&self, layer: usize) -> bool {
+        if self.attention_sliding_window.is_none() {
+            return false;
+        }
+        if let Some(pattern) = &self.attention_sliding_window_pattern {
+            return pattern.get(layer).copied().unwrap_or(false);
+        }
+        if self.is_gemma3() {
+            return layer % 6 != 5;
+        }
+        false
+    }
+
+    /// Per-layer KV head count: gemma4 arrays override the scalar.
+    pub fn layer_head_count_kv(&self, layer: usize) -> u32 {
+        if let Some(per_layer) = &self.attention_head_count_kv_per_layer
+            && let Some(count) = per_layer.get(layer)
+        {
+            return *count;
+        }
+        self.attention_head_count_kv
+    }
+
+    /// Per-layer qk head dim: gemma4 sliding layers use `key_length_swa`,
+    /// global layers `key_length`.
+    pub fn layer_key_head_dim(&self, layer: usize) -> Option<u32> {
+        if self.layer_is_sliding(layer)
+            && let Some(swa) = self.attention_key_length_swa
+        {
+            return (swa != 0).then_some(swa);
+        }
+        self.attention_key_head_dim()
+    }
+
+    pub fn layer_value_head_dim(&self, layer: usize) -> Option<u32> {
+        if self.layer_is_sliding(layer)
+            && let Some(swa) = self.attention_value_length_swa
+        {
+            return (swa != 0).then_some(swa);
+        }
+        self.attention_value_head_dim()
+    }
+
+    /// Per-layer FFN width: per-layer arrays (gemma4 E-series) override the scalar.
+    pub fn layer_feed_forward_length(&self, layer: usize) -> Option<u32> {
+        if let Some(per_layer) = &self.feed_forward_length_per_layer
+            && let Some(width) = per_layer.get(layer)
+        {
+            return Some(*width);
+        }
+        self.feed_forward_length
     }
 
     pub fn quantization_label(&self) -> String {
@@ -3390,6 +3544,93 @@ fn qwen_attention_recurrent_layers(
         .map(Some)
 }
 
+/// Optional per-layer u32 array (e.g. gemma4's `attention.head_count_kv` /
+/// `feed_forward_length`, which are arrays when the value varies by layer).
+fn qwen_metadata_u32_array(
+    gguf: &GgufFile,
+    key: &str,
+    expected_len: u32,
+) -> Result<Option<Vec<u32>>> {
+    let Some(value) = gguf.metadata.get(key) else {
+        return Ok(None);
+    };
+    let MetadataValue::Array(values) = value else {
+        // Scalar form is handled by the metadata_u32 caller.
+        return Ok(None);
+    };
+    if values.len()
+        != usize::try_from(expected_len).context("qwen block_count does not fit usize")?
+    {
+        bail!(
+            "GGUF metadata {key} must contain {expected_len} entries, got {}",
+            values.len()
+        );
+    }
+    values
+        .iter()
+        .map(|value| match value {
+            MetadataValue::Uint8(value) => Ok((*value).into()),
+            MetadataValue::Int8(value) => {
+                u32::try_from(*value).map_err(|_| anyhow!("GGUF metadata {key} entry is negative"))
+            }
+            MetadataValue::Uint16(value) => Ok((*value).into()),
+            MetadataValue::Int16(value) => {
+                u32::try_from(*value).map_err(|_| anyhow!("GGUF metadata {key} entry is negative"))
+            }
+            MetadataValue::Uint32(value) => Ok(*value),
+            MetadataValue::Int32(value) => {
+                u32::try_from(*value).map_err(|_| anyhow!("GGUF metadata {key} entry is negative"))
+            }
+            MetadataValue::Uint64(value) => {
+                u32::try_from(*value).map_err(|_| anyhow!("GGUF metadata {key} entry exceeds u32"))
+            }
+            MetadataValue::Int64(value) => u32::try_from(*value)
+                .map_err(|_| anyhow!("GGUF metadata {key} entry out of u32 range")),
+            _ => bail!("GGUF metadata {key} must be an array of integers"),
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
+/// Optional per-layer bool array (e.g. gemma4's
+/// `attention.sliding_window_pattern`).
+fn qwen_metadata_bool_array(
+    gguf: &GgufFile,
+    key: &str,
+    expected_len: u32,
+) -> Result<Option<Vec<bool>>> {
+    let Some(value) = gguf.metadata.get(key) else {
+        return Ok(None);
+    };
+    let MetadataValue::Array(values) = value else {
+        bail!("GGUF metadata {key} must be an array of booleans or integers");
+    };
+    if values.len()
+        != usize::try_from(expected_len).context("qwen block_count does not fit usize")?
+    {
+        bail!(
+            "GGUF metadata {key} must contain {expected_len} entries, got {}",
+            values.len()
+        );
+    }
+    values
+        .iter()
+        .map(|value| match value {
+            MetadataValue::Bool(value) => Ok(*value),
+            MetadataValue::Uint8(value) => Ok(*value != 0),
+            MetadataValue::Int8(value) => Ok(*value != 0),
+            MetadataValue::Uint16(value) => Ok(*value != 0),
+            MetadataValue::Int16(value) => Ok(*value != 0),
+            MetadataValue::Uint32(value) => Ok(*value != 0),
+            MetadataValue::Int32(value) => Ok(*value != 0),
+            MetadataValue::Uint64(value) => Ok(*value != 0),
+            MetadataValue::Int64(value) => Ok(*value != 0),
+            _ => bail!("GGUF metadata {key} must be an array of booleans or integers"),
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
+}
+
 fn qwen_ssm_layer_tensors_present_with<F>(has_tensor: F, prefix: &str) -> bool
 where
     F: Fn(&str) -> bool,
@@ -3623,6 +3864,35 @@ fn validate_qwen_tensors(gguf: &GgufFile, config: &QwenGgufConfig) -> QwenTensor
         let prefix = format!("blk.{layer}");
         let uses_mla_attention = qwen_mla_attention_tensors_present_in(&validator.tensors, &prefix);
         let uses_recurrent_ssm = qwen_ssm_layer_tensors_present_in(&validator.tensors, &prefix);
+        // Gemma-4 varies attention geometry per layer: sliding layers use the
+        // `_swa` head dims with GQA, global layers the full dims with MQA and
+        // no attn_v (V reuses K). Shadow the model-wide dims accordingly.
+        let (qk_head_dim, _v_head_dim, q_dim, k_dim, v_dim, attention_output_dim, ff) =
+            if config.is_gemma4() {
+                let idx = layer as usize;
+                let layer_qk = config.layer_key_head_dim(idx).map(u64::from).unwrap_or(0);
+                let layer_v = config.layer_value_head_dim(idx).map(u64::from).unwrap_or(0);
+                let layer_kv = u64::from(config.layer_head_count_kv(idx));
+                (
+                    layer_qk,
+                    layer_v,
+                    layer_qk.saturating_mul(head_count),
+                    layer_qk.saturating_mul(layer_kv),
+                    layer_v.saturating_mul(layer_kv),
+                    layer_v.saturating_mul(head_count),
+                    config.layer_feed_forward_length(idx).map(u64::from),
+                )
+            } else {
+                (
+                    qk_head_dim,
+                    v_head_dim,
+                    q_dim,
+                    k_dim,
+                    v_dim,
+                    attention_output_dim,
+                    ff,
+                )
+            };
         validator.require_one_of(
             &qwen_dense_attention_norm_weight_names(&prefix),
             vec![ShapeRule::exact([embed])],
@@ -3662,16 +3932,39 @@ fn validate_qwen_tensors(gguf: &GgufFile, config: &QwenGgufConfig) -> QwenTensor
                     DTypePolicy::Matrix,
                 );
             }
-            validator.require_one_of(
-                &qwen_dense_attention_weight_names(&prefix, "k"),
-                matrix_rules(embed, k_dim),
-                DTypePolicy::Matrix,
-            );
-            validator.require_one_of(
-                &qwen_dense_attention_weight_names(&prefix, "v"),
-                matrix_rules(embed, v_dim),
-                DTypePolicy::Matrix,
-            );
+            // Gemma-4: global layers ship no attn_v (V reuses K); the last
+            // `shared_kv_layers` layers ship neither attn_k nor attn_v (they
+            // reuse an earlier layer's KV).
+            let gemma4_shared_kv = config.is_gemma4()
+                && config.attention_shared_kv_layers.is_some_and(|shared| {
+                    shared != 0 && layer >= block_count.saturating_sub(shared)
+                });
+            if gemma4_shared_kv {
+                validator.optional_one_of(
+                    &qwen_dense_attention_weight_names(&prefix, "k"),
+                    matrix_rules(embed, k_dim),
+                    DTypePolicy::Matrix,
+                );
+            } else {
+                validator.require_one_of(
+                    &qwen_dense_attention_weight_names(&prefix, "k"),
+                    matrix_rules(embed, k_dim),
+                    DTypePolicy::Matrix,
+                );
+            }
+            if config.is_gemma4() {
+                validator.optional_one_of(
+                    &qwen_dense_attention_weight_names(&prefix, "v"),
+                    matrix_rules(embed, v_dim),
+                    DTypePolicy::Matrix,
+                );
+            } else {
+                validator.require_one_of(
+                    &qwen_dense_attention_weight_names(&prefix, "v"),
+                    matrix_rules(embed, v_dim),
+                    DTypePolicy::Matrix,
+                );
+            }
         }
         if !uses_recurrent_ssm {
             validator.require_one_of(
