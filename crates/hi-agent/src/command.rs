@@ -1446,7 +1446,10 @@ mod tests {
             ConfigArg::Reasoning(Some(ReasoningEffort::Xhigh))
         );
         // Off spellings clear it.
-        assert_eq!(parse_config_arg("reasoning off"), ConfigArg::Reasoning(None));
+        assert_eq!(
+            parse_config_arg("reasoning off"),
+            ConfigArg::Reasoning(None)
+        );
         assert_eq!(
             parse_config_arg("reasoning none"),
             ConfigArg::Reasoning(None)
@@ -1465,14 +1468,20 @@ mod tests {
             parse_config_arg("temp 0.7"),
             ConfigArg::Temperature(Some(0.7))
         );
-        assert_eq!(parse_config_arg("temperature 0"), ConfigArg::Temperature(Some(0.0)));
+        assert_eq!(
+            parse_config_arg("temperature 0"),
+            ConfigArg::Temperature(Some(0.0))
+        );
         assert_eq!(parse_config_arg("temp off"), ConfigArg::Temperature(None));
         assert_eq!(
             parse_config_arg("temp default"),
             ConfigArg::Temperature(None)
         );
         assert!(matches!(parse_config_arg("temp 5"), ConfigArg::Invalid(_)));
-        assert!(matches!(parse_config_arg("temp hot"), ConfigArg::Invalid(_)));
+        assert!(matches!(
+            parse_config_arg("temp hot"),
+            ConfigArg::Invalid(_)
+        ));
         // Unknown option.
         assert!(matches!(parse_config_arg("bogus x"), ConfigArg::Invalid(_)));
         // Command parse wiring + aliases.
