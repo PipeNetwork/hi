@@ -23486,6 +23486,21 @@ mod non_native {
         }
 
         #[allow(clippy::too_many_arguments)]
+        pub fn speculative_greedy_next_tokens_paged_with_page_table(
+            &self,
+            _sequence: &[u32],
+            _page_size: usize,
+            _page_table: &[usize],
+            _physical_page_count: usize,
+            _ngram: usize,
+            _max_draft: usize,
+        ) -> Result<Vec<u32>> {
+            bail!(
+                "hi-cuda was built without native-cuda support; GPU Qwen paged generation is unavailable"
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
         pub fn decode_sampled_next_tokens_batch_paged_with_page_tables(
             &self,
             _token_ids: &[u32],
