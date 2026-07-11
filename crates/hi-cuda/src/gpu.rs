@@ -7373,6 +7373,103 @@ mod native {
             Ok((eager, replayed))
         }
 
+        /// Full multi-token CUDA-graph decode viability check: decode `tokens` (positions
+        /// 0..n) both eagerly and via a single captured graph replayed per token (device
+        /// position + token counters), returning per-token logits for each. The two must match
+        /// row-for-row — proving one captured graph correctly serves every position. Uses a
+        /// page table covering the whole run and f16 KV (graph path is gated off Q8).
+        #[doc(hidden)]
+        pub fn graph_decode_multitoken_smoke(
+            &self,
+            tokens: &[u32],
+            page_size: usize,
+            page_table: &[usize],
+            physical_page_count: usize,
+        ) -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
+            let dims = self.qwen_dims()?;
+            let n = tokens.len();
+            if n == 0 {
+                bail!("graph multitoken smoke needs at least one token");
+            }
+            let token_capacity = n.min(dims.context);
+            let build_cache = |slf: &Self| -> Result<CudaPagedBatchKvCache> {
+                let mut pool_slot = slf.paged_batch_pool.borrow_mut();
+                if pool_slot
+                    .as_ref()
+                    .is_none_or(|pool| !pool.can_cover(&dims, page_size, physical_page_count))
+                {
+                    *pool_slot = Some(CudaPagedBatchDevicePool::new(
+                        slf.config.block_count,
+                        &dims,
+                        page_size,
+                        physical_page_count,
+                        &slf.stream,
+                    )?);
+                }
+                let pool = pool_slot.as_ref().unwrap();
+                CudaPagedBatchKvCache::new_with_page_tables_from_pool(
+                    &dims,
+                    1,
+                    page_size,
+                    token_capacity,
+                    std::slice::from_ref(&page_table.to_vec()),
+                    pool,
+                    &slf.stream,
+                )
+            };
+
+            // Eager reference.
+            let mut eager = Vec::with_capacity(n);
+            {
+                let mut cache = build_cache(self)?;
+                for (i, &token) in tokens.iter().enumerate() {
+                    let logits = self.decode_batch_logits_paged_device(&[token], i, &mut cache)?;
+                    self.stream.synchronize()?;
+                    eager.push(logits.buffer.copy_to_host::<f32>(logits.rows * logits.cols)?);
+                }
+            }
+
+            // Graph: capture once at position 0, replay per token with device counters.
+            let mut cache = build_cache(self)?;
+            let d_position = DeviceBuffer::alloc(std::mem::size_of::<i32>())?;
+            let d_token = DeviceBuffer::alloc(std::mem::size_of::<u32>())?;
+            // Warm the pool (an eager step allocs every transient size).
+            {
+                let l = self.decode_batch_logits_paged_device(&[tokens[0]], 0, &mut cache)?;
+                self.stream.synchronize()?;
+                drop(l);
+            }
+            d_position.copy_from_host(&[0i32])?;
+            d_token.copy_from_host(&[tokens[0]])?;
+            self.stream.synchronize()?;
+
+            crate::runtime::set_capture_active(true);
+            self.graph_capture_token.set(&d_token);
+            self.graph_capture_position.set(&d_position);
+            let captured = (|| -> Result<(crate::runtime::CudaGraph, GpuF32Tensor)> {
+                self.stream.begin_capture()?;
+                let logits = self.decode_batch_logits_paged_device(&[tokens[0]], 0, &mut cache)?;
+                let graph = self.stream.end_capture()?;
+                Ok((graph, logits))
+            })();
+            self.graph_capture_token.set(std::ptr::null());
+            self.graph_capture_position.set(std::ptr::null());
+            crate::runtime::set_capture_active(false);
+            let (graph, logits) = captured?;
+            let exec = graph.instantiate()?;
+            let (rows, cols) = (logits.rows, logits.cols);
+
+            let mut graphed = Vec::with_capacity(n);
+            for (i, &token) in tokens.iter().enumerate() {
+                d_position.copy_from_host(&[i as i32])?;
+                d_token.copy_from_host(&[token])?;
+                exec.launch(&self.stream)?;
+                self.stream.synchronize()?;
+                graphed.push(logits.buffer.copy_to_host::<f32>(rows * cols)?);
+            }
+            Ok((eager, graphed))
+        }
+
         /// Append `token_ids` (one sequence) to the paged cache starting at `position` and
         /// return PER-POSITION logits `[token_ids.len(), vocab]`. This is one window of the
         /// chunked-prefill forward: each appended token attends causally to the already
@@ -14836,18 +14933,51 @@ mod native {
                         position_offset: position,
                     },
                 )?;
-                cache.write_layer_batched(
-                    layer_idx,
-                    &k,
-                    &v,
-                    batch_count,
-                    1,
-                    position,
-                    dims.kv_heads,
-                    dims.head_dim,
-                    dims.v_head_dim,
-                    &self.stream,
-                )?;
+                if let Some(d_pos) = self.active_graph_position() {
+                    // CUDA-graph capture: write K/V at the device-counter position (f16 KV
+                    // only; the graph path is gated off Q8). Done directly against the layer's
+                    // pool buffers so start_pos comes from the device counter.
+                    let layer = cache.layer(layer_idx)?;
+                    crate::kernels::launch_write_paged_kv_cache_batched_devpos(
+                        &k.buffer,
+                        layer.key_pages.as_buffer(),
+                        &layer.page_table,
+                        batch_count,
+                        1,
+                        dims.kv_heads,
+                        dims.head_dim,
+                        layer.page_size,
+                        layer.page_table_len,
+                        d_pos,
+                        &self.stream,
+                    )?;
+                    crate::kernels::launch_write_paged_kv_cache_batched_devpos(
+                        &v.buffer,
+                        layer.value_pages.as_buffer(),
+                        &layer.page_table,
+                        batch_count,
+                        1,
+                        dims.kv_heads,
+                        dims.v_head_dim,
+                        layer.page_size,
+                        layer.page_table_len,
+                        d_pos,
+                        &self.stream,
+                    )?;
+                } else {
+                    cache.write_layer_batched(
+                        layer_idx,
+                        &k,
+                        &v,
+                        batch_count,
+                        1,
+                        position,
+                        dims.kv_heads,
+                        dims.head_dim,
+                        dims.v_head_dim,
+                        &self.stream,
+                    )?;
+                }
                 let attn = self.paged_decode_attention_batched_f32_device(
                     &q,
                     cache.layer(layer_idx)?,
@@ -16424,18 +16554,33 @@ mod native {
                     heads * head_dim
                 );
             }
-            crate::kernels::launch_rope_batched_with_offset(
-                &input.buffer,
-                batch_count,
-                seq_len,
-                heads,
-                head_dim,
-                base,
-                scale,
-                position_offset,
-                split_half,
-                &self.stream,
-            )?;
+            if let Some(d_pos) = self.active_graph_position() {
+                crate::kernels::launch_rope_batched_with_offset_devpos(
+                    &input.buffer,
+                    batch_count,
+                    seq_len,
+                    heads,
+                    head_dim,
+                    base,
+                    scale,
+                    d_pos,
+                    split_half,
+                    &self.stream,
+                )?;
+            } else {
+                crate::kernels::launch_rope_batched_with_offset(
+                    &input.buffer,
+                    batch_count,
+                    seq_len,
+                    heads,
+                    head_dim,
+                    base,
+                    scale,
+                    position_offset,
+                    split_half,
+                    &self.stream,
+                )?;
+            }
             self.op_barrier()
         }
 
@@ -16937,23 +17082,43 @@ mod native {
                 });
             }
             if head_dim <= FLASH_ONLINE_MAX_HEAD_DIM {
-                crate::kernels::launch_tiled_paged_decode_attention_batched(
-                    &q.buffer,
-                    cache.key_pages.as_buffer(),
-                    cache.value_pages.as_buffer(),
-                    &cache.page_table,
-                    &output,
-                    batch_count,
-                    position,
-                    cache.page_size,
-                    cache.page_table_len,
-                    heads,
-                    kv_heads,
-                    head_dim,
-                    v_head_dim,
-                    window,
-                    &self.stream,
-                )?;
+                if let Some(d_pos) = self.active_graph_position() {
+                    crate::kernels::launch_tiled_paged_decode_attention_batched_devpos(
+                        &q.buffer,
+                        cache.key_pages.as_buffer(),
+                        cache.value_pages.as_buffer(),
+                        &cache.page_table,
+                        &output,
+                        batch_count,
+                        d_pos,
+                        cache.page_size,
+                        cache.page_table_len,
+                        heads,
+                        kv_heads,
+                        head_dim,
+                        v_head_dim,
+                        window,
+                        &self.stream,
+                    )?;
+                } else {
+                    crate::kernels::launch_tiled_paged_decode_attention_batched(
+                        &q.buffer,
+                        cache.key_pages.as_buffer(),
+                        cache.value_pages.as_buffer(),
+                        &cache.page_table,
+                        &output,
+                        batch_count,
+                        position,
+                        cache.page_size,
+                        cache.page_table_len,
+                        heads,
+                        kv_heads,
+                        head_dim,
+                        v_head_dim,
+                        window,
+                        &self.stream,
+                    )?;
+                }
             } else {
                 if window > 0 {
                     bail!(

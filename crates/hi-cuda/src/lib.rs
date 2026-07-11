@@ -11829,6 +11829,19 @@ mod tests {
             "graph capture OK: {} logits, replay bit-identical to eager",
             eager.len()
         );
+
+        // Multi-token: one captured graph replayed for positions 0..8 must match eager decode.
+        let (eager_seq, graphed_seq) = model
+            .graph_decode_multitoken_smoke(&[1, 2, 3, 4, 5, 6, 7, 8], 16, &[0], 1)
+            .expect("multi-token graph decode should succeed");
+        assert_eq!(eager_seq.len(), graphed_seq.len());
+        for (i, (e, g)) in eager_seq.iter().zip(&graphed_seq).enumerate() {
+            assert_eq!(e, g, "graph decode logits differ from eager at token {i}");
+        }
+        eprintln!(
+            "multi-token graph decode OK: {} tokens, all replays match eager",
+            eager_seq.len()
+        );
     }
 
     // Real-model speedup measurement for prompt-lookup speculative decode. Opt-in:
