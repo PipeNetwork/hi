@@ -25595,7 +25595,6 @@ mod tests {
             DeviceBuffer::alloc(norm_weight_values.len() * std::mem::size_of::<f32>()).unwrap();
         let conv_ring = DeviceBuffer::alloc(8 * std::mem::size_of::<f32>()).unwrap();
         let recurrent_state = DeviceBuffer::alloc(8 * std::mem::size_of::<f32>()).unwrap();
-        let ssm_scratch = DeviceBuffer::alloc(12 * std::mem::size_of::<f32>()).unwrap();
         let ssm_out = DeviceBuffer::alloc(4 * std::mem::size_of::<f32>()).unwrap();
         qkv.copy_from_host(&qkv_values).unwrap();
         gate.copy_from_host(&gate_values).unwrap();
@@ -25617,7 +25616,6 @@ mod tests {
             &norm_weight,
             &conv_ring,
             &recurrent_state,
-            &ssm_scratch,
             &ssm_out,
             0,
             0,

@@ -17764,16 +17764,6 @@ mod native {
                 );
             }
 
-            let scratch_elements = ssm
-                .conv_dim
-                .checked_add(
-                    ssm.key_dim
-                        .checked_mul(2)
-                        .context("CUDA recurrent SSM scratch key dimension overflows usize")?,
-                )
-                .context("CUDA recurrent SSM scratch element count overflows usize")?;
-            let scratch = DeviceBuffer::alloc(scratch_elements * std::mem::size_of::<f32>())
-                .context("allocating CUDA recurrent SSM step scratch")?;
             let normed_buffer = DeviceBuffer::alloc(ssm.value_dim * std::mem::size_of::<f32>())
                 .context("allocating CUDA recurrent SSM state gated RMSNorm")?;
             crate::kernels::launch_qwen_ssm_streaming_step(
@@ -17787,7 +17777,6 @@ mod native {
                 &norm_weight.buffer,
                 &state.conv_ring,
                 &state.recurrent,
-                &scratch,
                 &normed_buffer,
                 state.conv_next,
                 state.conv_len,

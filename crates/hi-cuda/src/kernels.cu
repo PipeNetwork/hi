@@ -223,6 +223,17 @@ __device__ float qwen_ssm_gate_value(
 // When null, `ba` is the fused per-group `[beta(repeat) | alpha(repeat)]`
 // layout (Qwen3-Next). `kv_group_round_robin`: value head `h` reads q/k group
 // `h % group_count` (Qwen3.5) instead of `h / repeat` (Qwen3-Next).
+//
+// One block per value head, `HI_CUDA_SSM_STEP_BLOCK` threads. Each block
+// writes only the conv-ring channels its head reads (q/k group channels are
+// written redundantly by the heads sharing a group -- identical values), so
+// blocks have no cross-block dependencies. Within the delta rule each thread
+// owns one value dim; its state walk keeps the exact accumulation order of
+// the previous single-thread kernel. Dynamic shared memory holds the
+// conv-activated q/k group vectors, the head's v slice, and a reduction
+// buffer: (2*state_size + head_v_dim + blockDim.x) floats.
+constexpr int HI_CUDA_SSM_STEP_BLOCK = 128;
+
 __global__ void qwen_ssm_streaming_step_kernel(
     const float* qkv,
     const float* gate,
@@ -234,7 +245,6 @@ __global__ void qwen_ssm_streaming_step_kernel(
     const float* norm_weight,
     float* conv_ring,
     float* recurrent_state,
-    float* scratch,
     float* output,
     int conv_next,
     int conv_len,
@@ -247,38 +257,52 @@ __global__ void qwen_ssm_streaming_step_kernel(
     int packed_qkvz,
     int kv_group_round_robin,
     float eps) {
-  if (blockIdx.x != 0 || threadIdx.x != 0) {
+  int head = blockIdx.x;
+  if (head >= time_step_rank) {
     return;
   }
+  int tid = threadIdx.x;
+  int threads = blockDim.x;
   int key_dim = group_count * state_size;
   int value_dim = time_step_rank * head_v_dim;
   int repeat = time_step_rank / group_count;
   int group_ba_dim = repeat * 2;
+  int group = kv_group_round_robin ? (head % group_count) : (head / repeat);
   int current_slot = conv_next;
   int new_conv_len = conv_len + 1;
   if (new_conv_len > conv_kernel) {
     new_conv_len = conv_kernel;
   }
 
-  float* conv = scratch;
-  float* query = scratch + conv_dim;
-  float* key = scratch + conv_dim + key_dim;
+  extern __shared__ float ssm_smem[];
+  float* q_sh = ssm_smem;                              // state_size
+  float* k_sh = ssm_smem + state_size;                 // state_size
+  float* v_sh = ssm_smem + 2 * state_size;             // head_v_dim
+  float* red = ssm_smem + 2 * state_size + head_v_dim; // blockDim.x
 
-  for (int channel = 0; channel < conv_dim; ++channel) {
-    conv_ring[current_slot * conv_dim + channel] =
-        qwen_ssm_mixed_qkv_value(
-            qkv,
-            channel,
-            packed_qkvz,
-            state_size,
-            time_step_rank,
-            group_count,
-            head_v_dim,
-            key_dim,
-            value_dim);
+  int q_base = group * state_size;
+  int k_base = key_dim + group * state_size;
+  int v_base = 2 * key_dim + head * head_v_dim;
+
+  for (int i = tid; i < state_size; i += threads) {
+    int channel = q_base + i;
+    conv_ring[current_slot * conv_dim + channel] = qwen_ssm_mixed_qkv_value(
+        qkv, channel, packed_qkvz, state_size, time_step_rank, group_count,
+        head_v_dim, key_dim, value_dim);
+    channel = k_base + i;
+    conv_ring[current_slot * conv_dim + channel] = qwen_ssm_mixed_qkv_value(
+        qkv, channel, packed_qkvz, state_size, time_step_rank, group_count,
+        head_v_dim, key_dim, value_dim);
   }
+  for (int i = tid; i < head_v_dim; i += threads) {
+    int channel = v_base + i;
+    conv_ring[current_slot * conv_dim + channel] = qwen_ssm_mixed_qkv_value(
+        qkv, channel, packed_qkvz, state_size, time_step_rank, group_count,
+        head_v_dim, key_dim, value_dim);
+  }
+  __syncthreads();
 
-  for (int channel = 0; channel < conv_dim; ++channel) {
+  auto conv_activated = [&](int channel) {
     float sum = 0.0f;
     for (int kernel = 0; kernel < conv_kernel; ++kernel) {
       int relative = conv_kernel - 1 - kernel;
@@ -289,99 +313,112 @@ __global__ void qwen_ssm_streaming_step_kernel(
       sum += conv_weight[channel * conv_kernel + kernel]
           * conv_ring[slot * conv_dim + channel];
     }
-    conv[channel] = hi_siluf(sum);
+    return hi_siluf(sum);
+  };
+  for (int i = tid; i < state_size; i += threads) {
+    q_sh[i] = conv_activated(q_base + i);
+    k_sh[i] = conv_activated(k_base + i);
   }
-
-  for (int group = 0; group < group_count; ++group) {
-    float query_norm = 0.0f;
-    float key_norm = 0.0f;
-    int start = group * state_size;
-    for (int state_dim = 0; state_dim < state_size; ++state_dim) {
-      float q = conv[start + state_dim];
-      float k = conv[key_dim + start + state_dim];
-      query_norm += q * q;
-      key_norm += k * k;
-    }
-    float inv_query = rsqrtf(query_norm + 1.0e-6f);
-    float inv_key = rsqrtf(key_norm + 1.0e-6f);
-    for (int state_dim = 0; state_dim < state_size; ++state_dim) {
-      query[start + state_dim] = conv[start + state_dim] * inv_query;
-      key[start + state_dim] = conv[key_dim + start + state_dim] * inv_key;
-    }
+  for (int i = tid; i < head_v_dim; i += threads) {
+    v_sh[i] = conv_activated(v_base + i);
   }
+  __syncthreads();
 
+  float query_sq = 0.0f;
+  for (int i = tid; i < state_size; i += threads) {
+    query_sq += q_sh[i] * q_sh[i];
+  }
+  red[tid] = query_sq;
+  __syncthreads();
+  for (int stride = threads / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      red[tid] += red[tid + stride];
+    }
+    __syncthreads();
+  }
+  float inv_query = rsqrtf(red[0] + 1.0e-6f);
+  __syncthreads();
+  float key_sq = 0.0f;
+  for (int i = tid; i < state_size; i += threads) {
+    key_sq += k_sh[i] * k_sh[i];
+  }
+  red[tid] = key_sq;
+  __syncthreads();
+  for (int stride = threads / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      red[tid] += red[tid + stride];
+    }
+    __syncthreads();
+  }
+  float inv_key = rsqrtf(red[0] + 1.0e-6f);
+  __syncthreads();
+  for (int i = tid; i < state_size; i += threads) {
+    q_sh[i] *= inv_query;
+    k_sh[i] *= inv_key;
+  }
+  __syncthreads();
+
+  float beta_raw;
+  float alpha;
+  if (ba_alpha != nullptr) {
+    beta_raw = ba[head];
+    alpha = ba_alpha[head];
+  } else {
+    // Fused layout stays keyed by the block group irrespective of the q/k
+    // pairing above.
+    int ba_group = (head / repeat) * group_ba_dim;
+    beta_raw = ba[ba_group + head % repeat];
+    alpha = ba[ba_group + repeat + head % repeat];
+  }
+  float beta = hi_sigmoidf(beta_raw);
+  float decay = expf(-expf(a_log[head]) * hi_softplusf(alpha + dt_bias[head]));
   float q_scale = rsqrtf(static_cast<float>(state_size));
-  for (int head = 0; head < time_step_rank; ++head) {
-    int group = kv_group_round_robin ? (head % group_count) : (head / repeat);
-    int q_start = group * state_size;
-    int k_start = group * state_size;
-    int v_start = head * head_v_dim;
-    float beta_raw;
-    float alpha;
-    if (ba_alpha != nullptr) {
-      beta_raw = ba[head];
-      alpha = ba_alpha[head];
-    } else {
-      // Fused layout stays keyed by the block group irrespective of the q/k
-      // pairing above.
-      int ba_group = (head / repeat) * group_ba_dim;
-      beta_raw = ba[ba_group + head % repeat];
-      alpha = ba[ba_group + repeat + head % repeat];
-    }
-    float beta = hi_sigmoidf(beta_raw);
-    float decay = expf(-expf(a_log[head]) * hi_softplusf(alpha + dt_bias[head]));
-    int state_start = head * state_size * head_v_dim;
+  int state_start = head * state_size * head_v_dim;
 
+  for (int value_dim_idx = tid; value_dim_idx < head_v_dim;
+       value_dim_idx += threads) {
+    float kv_mem = 0.0f;
     for (int state_dim = 0; state_dim < state_size; ++state_dim) {
-      for (int value_dim = 0; value_dim < head_v_dim; ++value_dim) {
-        recurrent_state[state_start + state_dim * head_v_dim + value_dim] *= decay;
-      }
+      int slot = state_start + state_dim * head_v_dim + value_dim_idx;
+      float decayed = recurrent_state[slot] * decay;
+      recurrent_state[slot] = decayed;
+      kv_mem += decayed * k_sh[state_dim];
     }
+    float delta = (v_sh[value_dim_idx] - kv_mem) * beta;
+    float core = 0.0f;
+    for (int state_dim = 0; state_dim < state_size; ++state_dim) {
+      int slot = state_start + state_dim * head_v_dim + value_dim_idx;
+      float updated = recurrent_state[slot] + k_sh[state_dim] * delta;
+      recurrent_state[slot] = updated;
+      core += updated * q_sh[state_dim] * q_scale;
+    }
+    output[head * head_v_dim + value_dim_idx] = core;
+  }
+  __syncthreads();
 
-    for (int value_dim = 0; value_dim < head_v_dim; ++value_dim) {
-      float kv_mem = 0.0f;
-      for (int state_dim = 0; state_dim < state_size; ++state_dim) {
-        kv_mem += recurrent_state[state_start + state_dim * head_v_dim + value_dim]
-            * key[k_start + state_dim];
-      }
-      float value = conv[2 * key_dim + v_start + value_dim];
-      float delta = (value - kv_mem) * beta;
-      for (int state_dim = 0; state_dim < state_size; ++state_dim) {
-        recurrent_state[state_start + state_dim * head_v_dim + value_dim] +=
-            key[k_start + state_dim] * delta;
-      }
-      float core = 0.0f;
-      for (int state_dim = 0; state_dim < state_size; ++state_dim) {
-        core += recurrent_state[state_start + state_dim * head_v_dim + value_dim]
-            * query[q_start + state_dim]
-            * q_scale;
-      }
-      output[v_start + value_dim] = core;
+  float variance = 0.0f;
+  for (int i = tid; i < head_v_dim; i += threads) {
+    float value = output[head * head_v_dim + i];
+    variance += value * value;
+  }
+  red[tid] = variance;
+  __syncthreads();
+  for (int stride = threads / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      red[tid] += red[tid + stride];
     }
-
-    float variance = 0.0f;
-    for (int value_dim = 0; value_dim < head_v_dim; ++value_dim) {
-      float value = output[v_start + value_dim];
-      variance += value * value;
-    }
-    float scale = rsqrtf(variance / static_cast<float>(head_v_dim) + eps);
-    for (int value_dim = 0; value_dim < head_v_dim; ++value_dim) {
-      int value_channel = v_start + value_dim;
-      float z = qwen_ssm_gate_value(
-          qkv,
-          gate,
-          value_channel,
-          packed_qkvz,
-          state_size,
-          time_step_rank,
-          group_count,
-          head_v_dim);
-      output[value_channel] =
-          output[value_channel] * scale * norm_weight[value_dim] * hi_siluf(z);
-    }
+    __syncthreads();
+  }
+  float scale = rsqrtf(red[0] / static_cast<float>(head_v_dim) + eps);
+  for (int i = tid; i < head_v_dim; i += threads) {
+    int value_channel = head * head_v_dim + i;
+    float z = qwen_ssm_gate_value(
+        qkv, gate, value_channel, packed_qkvz, state_size, time_step_rank,
+        group_count, head_v_dim);
+    output[value_channel] =
+        output[value_channel] * scale * norm_weight[i] * hi_siluf(z);
   }
 }
-
 __global__ void gelu_kernel(
     const float* input,
     float* output,
@@ -5269,7 +5306,20 @@ __device__ int next_ranked_token(
   return best_id;
 }
 
-__global__ void sample_last_row_kernel(
+__device__ void sample_last_token_row(
+    const float* row,
+    uint32_t* out,
+    float sample,
+    int cols,
+    float temperature,
+    float top_p,
+    int top_k,
+    int gpu_ranked);
+
+// Legacy single-thread sampler, kept verbatim for the ranked (top-k/top-p)
+// scalar path; greedy and temperature-only requests take the block-parallel
+// dispatch in sample_last_row_kernel below.
+__device__ void sample_last_row_serial(
     const float* logits,
     uint32_t* output_token,
     int rows,
@@ -5278,9 +5328,6 @@ __global__ void sample_last_row_kernel(
     float top_p,
     int top_k,
     float sample) {
-  if (threadIdx.x != 0 || blockIdx.x != 0 || rows <= 0 || cols <= 0) {
-    return;
-  }
   const float* row = logits + (rows - 1) * cols;
   if (!isfinite(temperature) || temperature <= 0.0f) {
     *output_token = argmax_row_device(row, cols);
@@ -5953,6 +6000,42 @@ __device__ void sample_last_token_row(
   *out = argmax_row_device(row, cols);
 }
 
+
+// Block-parallel scalar sampler: greedy -> block_argmax_last (bit-identical
+// to the batched greedy path), temperature-only -> the shared parallel
+// inverse-CDF helper, ranked -> the legacy serial walk on thread 0. Launched
+// with one 256-thread block (sample_last_token_row assumes blockDim == 256).
+__global__ void sample_last_row_kernel(
+    const float* logits,
+    uint32_t* output_token,
+    int rows,
+    int cols,
+    float temperature,
+    float top_p,
+    int top_k,
+    float sample) {
+  if (blockIdx.x != 0 || rows <= 0 || cols <= 0) {
+    return;
+  }
+  const float* row = logits + static_cast<size_t>(rows - 1) * cols;
+  const bool greedy = !isfinite(temperature) || temperature <= 0.0f;
+  const float cutoff = isfinite(top_p) ? fminf(fmaxf(top_p, 0.0f), 1.0f) : 1.0f;
+  const int effective_top_k = top_k > 0 && top_k < cols ? top_k : cols;
+  const bool ranked = !greedy && !(effective_top_k == cols && cutoff >= 1.0f);
+  if (greedy) {
+    block_argmax_last(row, cols, output_token);
+    return;
+  }
+  if (!ranked) {
+    sample_last_token_row(
+        row, output_token, sample, cols, temperature, top_p, top_k, 0);
+    return;
+  }
+  if (threadIdx.x == 0) {
+    sample_last_row_serial(
+        logits, output_token, rows, cols, temperature, top_p, top_k, sample);
+  }
+}
 __global__ void sample_batched_last_token_kernel(
     const float* logits,
     uint32_t* output_tokens,
@@ -6297,7 +6380,6 @@ extern "C" int hi_cuda_launch_qwen_ssm_streaming_step(
     const void* norm_weight,
     void* conv_ring,
     void* recurrent_state,
-    void* scratch,
     void* output,
     int conv_next,
     int conv_len,
@@ -6313,7 +6395,7 @@ extern "C" int hi_cuda_launch_qwen_ssm_streaming_step(
     void* stream) {
   if (qkv == nullptr || conv_weight == nullptr || ba == nullptr ||
       dt_bias == nullptr || a_log == nullptr || norm_weight == nullptr ||
-      conv_ring == nullptr || recurrent_state == nullptr || scratch == nullptr ||
+      conv_ring == nullptr || recurrent_state == nullptr ||
       output == nullptr || stream == nullptr) {
     return 1;
   }
@@ -6331,7 +6413,13 @@ extern "C" int hi_cuda_launch_qwen_ssm_streaming_step(
   if (conv_dim != 2 * key_dim + value_dim) {
     return 3;
   }
-  qwen_ssm_streaming_step_kernel<<<1, 1, 0, static_cast<cudaStream_t>(stream)>>>(
+  dim3 block(HI_CUDA_SSM_STEP_BLOCK);
+  dim3 grid(time_step_rank);
+  size_t shared_bytes =
+      static_cast<size_t>(2 * state_size + head_v_dim + HI_CUDA_SSM_STEP_BLOCK)
+      * sizeof(float);
+  qwen_ssm_streaming_step_kernel<<<grid, block, shared_bytes,
+                                   static_cast<cudaStream_t>(stream)>>>(
       static_cast<const float*>(qkv),
       static_cast<const float*>(gate),
       static_cast<const float*>(conv_weight),
@@ -6342,7 +6430,6 @@ extern "C" int hi_cuda_launch_qwen_ssm_streaming_step(
       static_cast<const float*>(norm_weight),
       static_cast<float*>(conv_ring),
       static_cast<float*>(recurrent_state),
-      static_cast<float*>(scratch),
       static_cast<float*>(output),
       conv_next,
       conv_len,
@@ -12247,7 +12334,7 @@ extern "C" int hi_cuda_launch_sample_last_row(
       top_k < 0 || stream == nullptr) {
     return 1;
   }
-  sample_last_row_kernel<<<1, 1, 0, static_cast<cudaStream_t>(stream)>>>(
+  sample_last_row_kernel<<<1, 256, 0, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const float*>(logits),
       static_cast<uint32_t*>(output_token),
       rows,
