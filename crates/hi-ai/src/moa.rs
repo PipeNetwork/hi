@@ -443,8 +443,12 @@ fn add_reference_usage(aggregate: &mut Usage, reference: Usage) {
     let aggregate_rate_limits = aggregate.rate_limits;
     let reference_rate_limits = reference.rate_limits;
 
-    aggregate.input_tokens = aggregate.input_tokens.saturating_add(reference.input_tokens);
-    aggregate.output_tokens = aggregate.output_tokens.saturating_add(reference.output_tokens);
+    aggregate.input_tokens = aggregate
+        .input_tokens
+        .saturating_add(reference.input_tokens);
+    aggregate.output_tokens = aggregate
+        .output_tokens
+        .saturating_add(reference.output_tokens);
     aggregate.cache_read_tokens = aggregate
         .cache_read_tokens
         .saturating_add(reference.cache_read_tokens);

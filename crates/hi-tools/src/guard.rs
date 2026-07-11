@@ -438,7 +438,8 @@ fn dangerous_target(target: &str) -> bool {
 fn is_system_top_level(first: &str) -> bool {
     matches!(
         first,
-        "etc" | "usr"
+        "etc"
+            | "usr"
             | "bin"
             | "sbin"
             | "lib"

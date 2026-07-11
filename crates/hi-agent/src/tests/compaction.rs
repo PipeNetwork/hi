@@ -439,7 +439,9 @@ async fn context_preflight_still_drops_when_real_window_exceeded() {
     cfg.context_window = Some(200_000);
     cfg.auto_compact = false;
     let mut agent = agent(vec![], cfg);
-    agent.messages_mut().push(Message::user("y".repeat(1_000_000))); // ~250k tokens
+    agent
+        .messages_mut()
+        .push(Message::user("y".repeat(1_000_000))); // ~250k tokens
     let pre = agent
         .ensure_request_fits_context("continue", 2, 100, 0, None, &mut NullUi)
         .expect("dropping history brings the request under the window");

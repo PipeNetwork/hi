@@ -311,7 +311,9 @@ impl Usage {
         // overflow-checked build or wrap session totals to garbage in release.
         self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
-        self.cache_read_tokens = self.cache_read_tokens.saturating_add(other.cache_read_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(other.cache_read_tokens);
         self.cache_creation_tokens = self
             .cache_creation_tokens
             .saturating_add(other.cache_creation_tokens);

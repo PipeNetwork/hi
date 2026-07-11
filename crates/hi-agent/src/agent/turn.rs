@@ -621,7 +621,9 @@ impl crate::Agent {
         // Y" — pattern-matching that as a mutating request would abort the child
         // before its first model call and return "(no answer)". The child simply
         // isn't advertised mutating tools, so it's safe to let it run and answer.
-        if read_only_intent.is_none() && !self.config.is_subagent && self.tools_unavailable_for(input)
+        if read_only_intent.is_none()
+            && !self.config.is_subagent
+            && self.tools_unavailable_for(input)
         {
             self.last_verify = None;
             self.last_changed_files.clear();

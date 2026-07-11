@@ -920,8 +920,8 @@ mod tests {
     #[tokio::test]
     async fn web_fetch_rejects_ipv4_mapped_metadata() {
         // The literal is refused before any network I/O.
-        let out = run_web_fetch(r#"{"url":"http://[::ffff:169.254.169.254]/latest/meta-data/"}"#)
-            .await;
+        let out =
+            run_web_fetch(r#"{"url":"http://[::ffff:169.254.169.254]/latest/meta-data/"}"#).await;
         assert!(out.is_err(), "ipv4-mapped metadata literal must be refused");
     }
 
