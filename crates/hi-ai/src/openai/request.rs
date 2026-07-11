@@ -239,6 +239,13 @@ pub(crate) fn build_body(
     if let Some(frequency_penalty) = request.frequency_penalty {
         body["frequency_penalty"] = json!(frequency_penalty);
     }
+    // Abstract reasoning level (GPT-5/o-series style). Endpoints that don't
+    // support it validate the value and 400 on an unknown one, so we only send
+    // it when explicitly requested. The Anthropic adapter ignores this field
+    // and uses `thinking_budget` instead.
+    if let Some(effort) = request.reasoning_effort {
+        body["reasoning_effort"] = json!(effort.as_str());
+    }
     body
 }
 
@@ -412,6 +419,7 @@ mod tests {
             top_p: None,
             frequency_penalty: None,
             thinking_budget: None,
+            reasoning_effort: None,
             profile: Default::default(),
         };
 
@@ -434,6 +442,7 @@ mod tests {
             top_p: None,
             frequency_penalty: None,
             thinking_budget: None,
+            reasoning_effort: None,
             profile: Default::default(),
         };
         let metadata = serde_json::json!({
@@ -459,6 +468,7 @@ mod tests {
             top_p: None,
             frequency_penalty: None,
             thinking_budget: None,
+            reasoning_effort: None,
             profile: Default::default(),
         };
         let plain = build_body(&req, request_attempts(&req)[0], None);
@@ -482,6 +492,34 @@ mod tests {
             "frequency_penalty: {}",
             hot["frequency_penalty"]
         );
+    }
+
+    #[test]
+    fn request_body_emits_reasoning_effort_only_when_set() {
+        let mut req = crate::types::ChatRequest {
+            model: "m".into(),
+            messages: vec![Message::user("hi")].into(),
+            tools: vec![].into(),
+            max_tokens: 16,
+            temperature: None,
+            top_p: None,
+            frequency_penalty: None,
+            thinking_budget: None,
+            reasoning_effort: None,
+            profile: Default::default(),
+        };
+        // Absent by default so the endpoint's own default applies.
+        let plain = build_body(&req, request_attempts(&req)[0], None);
+        assert!(plain.get("reasoning_effort").is_none());
+
+        // Each level reaches the wire as its lowercase string.
+        req.reasoning_effort = Some(crate::types::ReasoningEffort::High);
+        let body = build_body(&req, request_attempts(&req)[0], None);
+        assert_eq!(body["reasoning_effort"], "high");
+
+        req.reasoning_effort = Some(crate::types::ReasoningEffort::Minimal);
+        let body = build_body(&req, request_attempts(&req)[0], None);
+        assert_eq!(body["reasoning_effort"], "minimal");
     }
 
     #[test]

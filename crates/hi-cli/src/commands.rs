@@ -85,6 +85,45 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
                 Err(err) => eprintln!("\x1b[33mclear failed: {err}\x1b[0m"),
             }
         }
+        Command::Config(arg) => {
+            use hi_agent::command::{ConfigArg, parse_config_arg};
+            match parse_config_arg(&arg) {
+                ConfigArg::Show => {
+                    let r = agent
+                        .reasoning_effort()
+                        .map(|e| e.as_str().to_string())
+                        .unwrap_or_else(|| "off".into());
+                    let t = agent
+                        .temperature()
+                        .map(|t| t.to_string())
+                        .unwrap_or_else(|| "default".into());
+                    println!("\x1b[2mconfig — reasoning: {r} · temperature: {t}\x1b[0m");
+                    println!(
+                        "\x1b[2mset: /config reasoning <minimal|low|medium|high|xhigh|off> · /config temp <0.0-2.0|off>\x1b[0m"
+                    );
+                }
+                ConfigArg::Reasoning(effort) => {
+                    agent.set_reasoning_effort(effort);
+                    match effort {
+                        Some(e) => println!(
+                            "\x1b[2mreasoning effort → {} (applies next turn; OpenAI-compatible endpoints only)\x1b[0m",
+                            e.as_str()
+                        ),
+                        None => println!(
+                            "\x1b[2mreasoning effort → off (no reasoning_effort sent; endpoint default)\x1b[0m"
+                        ),
+                    }
+                }
+                ConfigArg::Temperature(temp) => {
+                    agent.set_temperature(temp);
+                    match temp {
+                        Some(t) => println!("\x1b[2mtemperature → {t}\x1b[0m"),
+                        None => println!("\x1b[2mtemperature → provider default (cleared)\x1b[0m"),
+                    }
+                }
+                ConfigArg::Invalid(m) => eprintln!("\x1b[33m{m}\x1b[0m"),
+            }
+        }
         Command::Verify(arg) => match arg.trim() {
             "" if agent.verify_is_on() => {
                 println!("\x1b[2mverify: {}\x1b[0m", agent.verify_summary())

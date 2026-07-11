@@ -1,5 +1,7 @@
 //! Slash-command parsing, shared by every frontend.
 
+use hi_ai::ReasoningEffort;
+
 /// A recognized in-session command. Frontends decide how to act on each.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
@@ -8,6 +10,10 @@ pub enum Command {
     Clear,
     /// Set the model for subsequent turns (empty = report current).
     Model(String),
+    /// Show or set per-session request config live: `reasoning <level|off>`
+    /// (OpenAI-compatible `reasoning_effort`) and `temp <value|off>` (sampling
+    /// temperature). Empty arg reports the current values.
+    Config(String),
     /// Run exactly one turn through the conservative MoA virtual route.
     Moa(String),
     /// Use a provider/profile for subsequent turns (empty = report current).
@@ -100,6 +106,7 @@ pub fn parse(line: &str) -> Option<Command> {
         "help" | "h" | "?" => Command::Help,
         "clear" | "new" => Command::Clear,
         "model" | "m" => Command::Model(arg),
+        "config" | "cfg" | "set" => Command::Config(arg),
         "moa" => Command::Moa(arg),
         "provider" | "prov" => Command::Provider(arg),
         "usage" | "cost" => Command::Removed("usage — removed; use /status".into()),
@@ -503,6 +510,73 @@ pub fn parse_goal_team(arg: &str) -> Option<GoalTeamArg> {
     })
 }
 
+/// The parsed form of a `/config` argument.
+#[derive(Clone, Debug, PartialEq)]
+pub enum ConfigArg {
+    /// `/config` — report the current reasoning effort and temperature.
+    Show,
+    /// `/config reasoning <level|off>` — set the reasoning effort (`None` = off,
+    /// i.e. send no `reasoning_effort` and take the endpoint default).
+    Reasoning(Option<ReasoningEffort>),
+    /// `/config temp <value|off>` — set the sampling temperature (`None` clears
+    /// it, leaving the provider default).
+    Temperature(Option<f32>),
+    /// Unrecognized option or bad value; carries a usage/error hint.
+    Invalid(String),
+}
+
+/// Parse a `/config` argument into a [`ConfigArg`]. Shared by every frontend so
+/// the plain REPL and the TUI accept exactly the same syntax.
+pub fn parse_config_arg(arg: &str) -> ConfigArg {
+    let a = arg.trim();
+    if a.is_empty() {
+        return ConfigArg::Show;
+    }
+    let (key, val) = match a.split_once(char::is_whitespace) {
+        Some((k, v)) => (k, v.trim()),
+        None => (a, ""),
+    };
+    let off = |v: &str| matches!(v.to_ascii_lowercase().as_str(), "off" | "none" | "clear");
+    match key.to_ascii_lowercase().as_str() {
+        "reasoning" | "reasoning-effort" | "reason" | "effort" | "r" => {
+            if val.is_empty() {
+                ConfigArg::Invalid(
+                    "usage: /config reasoning <minimal|low|medium|high|xhigh|off>".into(),
+                )
+            } else if off(val) || val.eq_ignore_ascii_case("disable") {
+                ConfigArg::Reasoning(None)
+            } else {
+                match ReasoningEffort::from_arg(val) {
+                    Some(e) => ConfigArg::Reasoning(Some(e)),
+                    None => ConfigArg::Invalid(format!(
+                        "unknown reasoning level '{val}' — use minimal, low, medium, high, xhigh, or off"
+                    )),
+                }
+            }
+        }
+        "temp" | "temperature" | "t" => {
+            if val.is_empty() {
+                ConfigArg::Invalid("usage: /config temp <0.0-2.0|off>".into())
+            } else if off(val) || val.eq_ignore_ascii_case("default") {
+                ConfigArg::Temperature(None)
+            } else {
+                match val.parse::<f32>() {
+                    Ok(t) if (0.0..=2.0).contains(&t) => ConfigArg::Temperature(Some(t)),
+                    Ok(_) => ConfigArg::Invalid(format!(
+                        "temperature '{val}' out of range — use 0.0 to 2.0, or off"
+                    )),
+                    Err(_) => ConfigArg::Invalid(format!(
+                        "bad temperature '{val}' — use a number from 0.0 to 2.0, or off"
+                    )),
+                }
+            }
+        }
+        other => ConfigArg::Invalid(format!(
+            "unknown /config option '{other}' — try: reasoning <level>, temp <value>"
+        )),
+    }
+}
+
 fn read_only_macro_prompt(kind: &str, topic: &str) -> String {
     let topic = topic.trim();
     let topic = if topic.is_empty() {
@@ -579,6 +653,18 @@ pub const COMMANDS: &[CommandSpec] = &[
         args: "[id]",
         help: "show or set the model (no id opens the selector)",
         arg_values: &[],
+    },
+    CommandSpec {
+        name: "config",
+        args: "[reasoning <level>|temp <value>]",
+        help: "show or set reasoning effort and sampling temperature for this session",
+        arg_values: &[
+            (
+                "reasoning",
+                "set reasoning_effort: minimal|low|medium|high|xhigh|off",
+            ),
+            ("temp", "set sampling temperature: 0.0-2.0, or off"),
+        ],
     },
     CommandSpec {
         name: "moa",
@@ -1337,6 +1423,72 @@ mod tests {
         // Not a limit subcommand → None (handled elsewhere).
         assert_eq!(parse_goal_limit("port to Rust"), None);
         assert_eq!(parse_goal_limit("limitless"), None);
+    }
+
+    #[test]
+    fn config_arg_parsing() {
+        use super::{ConfigArg, parse_config_arg};
+        use hi_ai::ReasoningEffort;
+        // Empty → show.
+        assert_eq!(parse_config_arg(""), ConfigArg::Show);
+        assert_eq!(parse_config_arg("   "), ConfigArg::Show);
+        // Reasoning levels + aliases.
+        assert_eq!(
+            parse_config_arg("reasoning high"),
+            ConfigArg::Reasoning(Some(ReasoningEffort::High))
+        );
+        assert_eq!(
+            parse_config_arg("effort MEDIUM"),
+            ConfigArg::Reasoning(Some(ReasoningEffort::Medium))
+        );
+        assert_eq!(
+            parse_config_arg("r xhigh"),
+            ConfigArg::Reasoning(Some(ReasoningEffort::Xhigh))
+        );
+        // Off spellings clear it.
+        assert_eq!(parse_config_arg("reasoning off"), ConfigArg::Reasoning(None));
+        assert_eq!(
+            parse_config_arg("reasoning none"),
+            ConfigArg::Reasoning(None)
+        );
+        // Bad level / missing value.
+        assert!(matches!(
+            parse_config_arg("reasoning turbo"),
+            ConfigArg::Invalid(_)
+        ));
+        assert!(matches!(
+            parse_config_arg("reasoning"),
+            ConfigArg::Invalid(_)
+        ));
+        // Temperature: in range, off, out of range, non-numeric.
+        assert_eq!(
+            parse_config_arg("temp 0.7"),
+            ConfigArg::Temperature(Some(0.7))
+        );
+        assert_eq!(parse_config_arg("temperature 0"), ConfigArg::Temperature(Some(0.0)));
+        assert_eq!(parse_config_arg("temp off"), ConfigArg::Temperature(None));
+        assert_eq!(
+            parse_config_arg("temp default"),
+            ConfigArg::Temperature(None)
+        );
+        assert!(matches!(parse_config_arg("temp 5"), ConfigArg::Invalid(_)));
+        assert!(matches!(parse_config_arg("temp hot"), ConfigArg::Invalid(_)));
+        // Unknown option.
+        assert!(matches!(parse_config_arg("bogus x"), ConfigArg::Invalid(_)));
+        // Command parse wiring + aliases.
+        assert_eq!(parse("/config"), Some(Command::Config(String::new())));
+        assert_eq!(
+            parse("/config reasoning high"),
+            Some(Command::Config("reasoning high".into()))
+        );
+        assert_eq!(
+            parse("/cfg temp 0.5"),
+            Some(Command::Config("temp 0.5".into()))
+        );
+        assert_eq!(
+            parse("/set reasoning off"),
+            Some(Command::Config("reasoning off".into()))
+        );
     }
 
     #[test]

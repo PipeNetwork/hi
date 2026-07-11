@@ -1009,6 +1009,7 @@ impl crate::Agent {
                     top_p,
                     frequency_penalty,
                     thinking_budget: self.config.thinking_budget,
+                    reasoning_effort: self.config.reasoning_effort,
                     profile: RequestProfile {
                         compat: self.config.compat,
                         tool_mode,
@@ -3218,6 +3219,7 @@ If the task is already complete, stop and give your final recap."
             top_p: None,
             frequency_penalty: None,
             thinking_budget: None,
+            reasoning_effort: None,
             profile: RequestProfile {
                 compat: self.config.compat,
                 tool_mode: ToolMode::ChatOnly,

@@ -312,6 +312,7 @@ fn reference_request(
         top_p: request.top_p,
         frequency_penalty: request.frequency_penalty,
         thinking_budget: None,
+        reasoning_effort: None,
         profile: RequestProfile {
             compat: request.profile.compat,
             tool_mode: ToolMode::ChatOnly,
@@ -538,6 +539,7 @@ mod tests {
             top_p: None,
             frequency_penalty: None,
             thinking_budget: Some(1024),
+            reasoning_effort: None,
             profile: RequestProfile::default(),
         }
     }

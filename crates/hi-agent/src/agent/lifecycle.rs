@@ -857,6 +857,30 @@ impl crate::Agent {
         self.config.verify = stages;
     }
 
+    /// The reasoning effort applied to main-turn requests (`None` = off, i.e. no
+    /// `reasoning_effort` sent and the endpoint's own default is used).
+    pub fn reasoning_effort(&self) -> Option<hi_ai::ReasoningEffort> {
+        self.config.reasoning_effort
+    }
+
+    /// Set (or clear, with `None`) the reasoning effort for subsequent turns.
+    /// Applies to main-turn requests on OpenAI-compatible endpoints that accept
+    /// `reasoning_effort`; the Anthropic adapter and non-supporting endpoints
+    /// ignore it. Safe to call between turns (like the other `/`-command setters).
+    pub fn set_reasoning_effort(&mut self, effort: Option<hi_ai::ReasoningEffort>) {
+        self.config.reasoning_effort = effort;
+    }
+
+    /// The sampling temperature applied to requests (`None` = provider default).
+    pub fn temperature(&self) -> Option<f32> {
+        self.config.temperature
+    }
+
+    /// Set (or clear, with `None`) the sampling temperature for subsequent turns.
+    pub fn set_temperature(&mut self, temperature: Option<f32>) {
+        self.config.temperature = temperature;
+    }
+
     pub(crate) fn persist(&mut self) -> Result<()> {
         if let Some(session) = self.session.as_mut() {
             // Clamp the cursor: transcript-shrinking ops (`strip_trailing_nudges`,

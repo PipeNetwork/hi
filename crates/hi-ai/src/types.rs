@@ -29,6 +29,60 @@ pub enum CompatMode {
     Strict,
 }
 
+/// How much internal reasoning to ask a reasoning-capable model to spend, for
+/// OpenAI-compatible endpoints that accept a `reasoning_effort` parameter
+/// (GPT-5 / o-series style, and several routed models such as pipenetwork's).
+///
+/// Unlike Anthropic's explicit [`ChatRequest::thinking_budget`] token count,
+/// this is an abstract level the provider maps to its own internal token
+/// target. `None` on a request omits the field entirely, leaving the endpoint's
+/// default (which, for some models, is no reasoning at all). Ignored by the
+/// Anthropic adapter, which uses `thinking_budget`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReasoningEffort {
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+}
+
+impl ReasoningEffort {
+    /// Levels from least to most effort — for menus, completion, and `/config`.
+    pub const ALL: [ReasoningEffort; 5] = [
+        Self::Minimal,
+        Self::Low,
+        Self::Medium,
+        Self::High,
+        Self::Xhigh,
+    ];
+
+    /// The wire value sent as the `reasoning_effort` request field.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+        }
+    }
+
+    /// Parse a user-supplied level (case-insensitive, with a few aliases).
+    /// Returns `None` for anything unrecognized so callers can report an error.
+    pub fn from_arg(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "minimal" | "min" => Some(Self::Minimal),
+            "low" => Some(Self::Low),
+            "medium" | "med" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" | "x-high" | "extra-high" => Some(Self::Xhigh),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RequestProfile {
     pub compat: CompatMode,
@@ -184,6 +238,11 @@ pub struct ChatRequest {
     /// When set, asks the provider to emit reasoning with this token budget
     /// (Anthropic extended thinking). Ignored by providers that don't support it.
     pub thinking_budget: Option<u32>,
+    /// Abstract reasoning level for OpenAI-compatible endpoints that accept a
+    /// `reasoning_effort` parameter (see [`ReasoningEffort`]). `None` omits the
+    /// field, leaving the endpoint default. Ignored by the Anthropic adapter,
+    /// which uses `thinking_budget` instead.
+    pub reasoning_effort: Option<ReasoningEffort>,
     pub profile: RequestProfile,
 }
 

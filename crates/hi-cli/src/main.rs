@@ -68,6 +68,13 @@ async fn main() -> Result<()> {
                         .map(|b| b.to_string())
                         .unwrap_or_else(|| "off".into())
                 );
+                println!(
+                    "reasoning:  {}",
+                    settings
+                        .reasoning_effort
+                        .map(|e| e.as_str().to_string())
+                        .unwrap_or_else(|| "off".into())
+                );
                 println!("tool_mode:  {:?}", settings.tool_mode);
                 println!("compat:     {:?}", settings.compat);
                 println!("api_key:    {}", config::mask_key(&settings.api_key));
@@ -182,6 +189,7 @@ async fn main() -> Result<()> {
         max_tokens_explicit: settings.max_tokens_explicit,
         temperature: cli.temperature,
         thinking_budget: settings.thinking_budget,
+        reasoning_effort: settings.reasoning_effort,
         tool_mode: settings.tool_mode,
         compat: settings.compat,
         minimal_tools: settings.minimal_tools || cli.minimal_tools,
@@ -1335,6 +1343,7 @@ mod tests {
             max_tokens: 4096,
             max_tokens_explicit: true,
             thinking_budget: None,
+            reasoning_effort: None,
             tool_mode: ToolMode::default(),
             compat: CompatMode::default(),
             minimal_tools: false,
@@ -1357,6 +1366,7 @@ mod tests {
             max_tokens,
             max_tokens_explicit: explicit,
             thinking_budget: None,
+            reasoning_effort: None,
             tool_mode: ToolMode::default(),
             compat: CompatMode::default(),
             minimal_tools: false,
