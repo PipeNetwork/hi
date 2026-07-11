@@ -7470,6 +7470,96 @@ mod native {
             Ok((eager, graphed))
         }
 
+        /// Time `n` decode steps eagerly vs via a captured-graph replay, returning
+        /// (eager_us_per_token, graph_us_per_token). Measures the raw launch-overhead win.
+        #[doc(hidden)]
+        pub fn graph_decode_bench(
+            &self,
+            n: usize,
+            page_size: usize,
+            page_table: &[usize],
+            physical_page_count: usize,
+        ) -> Result<(f64, f64)> {
+            let dims = self.qwen_dims()?;
+            let token_capacity = n.min(dims.context);
+            let build_cache = |slf: &Self| -> Result<CudaPagedBatchKvCache> {
+                let mut pool_slot = slf.paged_batch_pool.borrow_mut();
+                if pool_slot
+                    .as_ref()
+                    .is_none_or(|pool| !pool.can_cover(&dims, page_size, physical_page_count))
+                {
+                    *pool_slot = Some(CudaPagedBatchDevicePool::new(
+                        slf.config.block_count,
+                        &dims,
+                        page_size,
+                        physical_page_count,
+                        &slf.stream,
+                    )?);
+                }
+                let pool = pool_slot.as_ref().unwrap();
+                CudaPagedBatchKvCache::new_with_page_tables_from_pool(
+                    &dims,
+                    1,
+                    page_size,
+                    token_capacity,
+                    std::slice::from_ref(&page_table.to_vec()),
+                    pool,
+                    &slf.stream,
+                )
+            };
+
+            // Eager timing (warm the pool first, then time n forwards + sync).
+            let mut cache = build_cache(self)?;
+            for i in 0..8.min(n) {
+                let l = self.decode_batch_logits_paged_device(&[1], i, &mut cache)?;
+                self.stream.synchronize()?;
+                drop(l);
+            }
+            let t = Instant::now();
+            for i in 0..n {
+                let l = self.decode_batch_logits_paged_device(&[1], i % token_capacity, &mut cache)?;
+                self.stream.synchronize()?;
+                drop(l);
+            }
+            let eager_us = t.elapsed().as_secs_f64() * 1e6 / n as f64;
+
+            // Graph timing: capture once, replay n times.
+            let mut gcache = build_cache(self)?;
+            let d_position = DeviceBuffer::alloc(std::mem::size_of::<i32>())?;
+            let d_token = DeviceBuffer::alloc(std::mem::size_of::<u32>())?;
+            {
+                let l = self.decode_batch_logits_paged_device(&[1], 0, &mut gcache)?;
+                self.stream.synchronize()?;
+                drop(l);
+            }
+            d_position.copy_from_host(&[0i32])?;
+            d_token.copy_from_host(&[1u32])?;
+            self.stream.synchronize()?;
+            crate::runtime::set_capture_active(true);
+            self.graph_capture_token.set(&d_token);
+            self.graph_capture_position.set(&d_position);
+            let captured = (|| -> Result<(crate::runtime::CudaGraph, GpuF32Tensor)> {
+                self.stream.begin_capture()?;
+                let logits = self.decode_batch_logits_paged_device(&[1], 0, &mut gcache)?;
+                let graph = self.stream.end_capture()?;
+                Ok((graph, logits))
+            })();
+            self.graph_capture_token.set(std::ptr::null());
+            self.graph_capture_position.set(std::ptr::null());
+            crate::runtime::set_capture_active(false);
+            let (graph, _logits) = captured?;
+            let exec = graph.instantiate()?;
+            let t = Instant::now();
+            for i in 0..n {
+                d_position.copy_from_host(&[(i % token_capacity) as i32])?;
+                d_token.copy_from_host(&[1u32])?;
+                exec.launch(&self.stream)?;
+                self.stream.synchronize()?;
+            }
+            let graph_us = t.elapsed().as_secs_f64() * 1e6 / n as f64;
+            Ok((eager_us, graph_us))
+        }
+
         /// Append `token_ids` (one sequence) to the paged cache starting at `position` and
         /// return PER-POSITION logits `[token_ids.len(), vocab]`. This is one window of the
         /// chunked-prefill forward: each appended token attends causally to the already

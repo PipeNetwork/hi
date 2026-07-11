@@ -11842,6 +11842,19 @@ mod tests {
             "multi-token graph decode OK: {} tokens, all replays match eager",
             eager_seq.len()
         );
+
+        // Speedup: 128 decode steps eager vs graph replay.
+        let (eager_us, graph_us) = model
+            .graph_decode_bench(128, 16, &[0, 1, 2, 3, 4, 5, 6, 7], 8)
+            .expect("graph decode bench should run");
+        eprintln!(
+            "graph decode speedup: eager {:.1} us/tok ({:.0} tok/s) -> graph {:.1} us/tok ({:.0} tok/s), {:.2}x",
+            eager_us,
+            1e6 / eager_us,
+            graph_us,
+            1e6 / graph_us,
+            eager_us / graph_us,
+        );
     }
 
     // Real-model speedup measurement for prompt-lookup speculative decode. Opt-in:
