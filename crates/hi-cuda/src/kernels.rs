@@ -27,6 +27,14 @@ mod native {
             eps: c_float,
             stream: *mut c_void,
         ) -> c_int;
+        fn hi_cuda_launch_silu_mul_f32_f16(
+            gate: *const c_void,
+            up: *const c_void,
+            output: *mut c_void,
+            output_f16: *mut c_void,
+            len: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
         fn hi_cuda_launch_silu_mul(
             gate: *const c_void,
             up: *const c_void,
@@ -1320,6 +1328,30 @@ mod native {
             )
         })?;
         check_last_error("hi_cuda_launch_silu_mul")
+    }
+
+    /// SwiGLU with a fused f16 copy of the output (see the kernel comment):
+    /// `output` is f32 `[len]`, `output_f16` is half `[len]`.
+    pub fn launch_silu_mul_f32_f16(
+        gate: &DeviceBuffer,
+        up: &DeviceBuffer,
+        output: &DeviceBuffer,
+        output_f16: &DeviceBuffer,
+        len: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(len, "silu_mul_f32_f16 len")?;
+        launch_status(unsafe {
+            hi_cuda_launch_silu_mul_f32_f16(
+                gate.as_ptr(),
+                up.as_ptr(),
+                output.as_mut_ptr(),
+                output_f16.as_mut_ptr(),
+                len as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_silu_mul_f32_f16")
     }
 
     pub fn launch_gelu(

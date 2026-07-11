@@ -121,6 +121,26 @@ __global__ void silu_mul_kernel(
   output[idx] = hi_siluf(value) * up[idx];
 }
 
+// SwiGLU emitting BOTH f32 and f16 in one pass: the f16 copy feeds the down
+// projection's tensor-core GEMM directly, replacing a separate cast kernel
+// that re-read the freshly written f32 activation (~45MB per prefill
+// layer-chunk on a 3B). The f32 output stays authoritative for every other
+// consumer.
+__global__ void silu_mul_f32_f16_kernel(
+    const float* gate,
+    const float* up,
+    float* output,
+    __half* output_f16,
+    int len) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= len) {
+    return;
+  }
+  const float value = hi_siluf(gate[idx]) * up[idx];
+  output[idx] = value;
+  output_f16[idx] = __float2half(value);
+}
+
 __global__ void cast_f16_to_f32_kernel(
     const uint16_t* input,
     float* output,
@@ -6060,6 +6080,31 @@ extern "C" int hi_cuda_launch_silu_mul(
       static_cast<const float*>(gate),
       static_cast<const float*>(up),
       static_cast<float*>(output),
+      len);
+  return 0;
+}
+
+extern "C" int hi_cuda_launch_silu_mul_f32_f16(
+    const void* gate,
+    const void* up,
+    void* output,
+    void* output_f16,
+    int len,
+    void* stream) {
+  if (gate == nullptr || up == nullptr || output == nullptr || output_f16 == nullptr ||
+      !valid_common(output, len) || stream == nullptr) {
+    return 1;
+  }
+  if (len == 0) {
+    return 0;
+  }
+  dim3 block(256);
+  dim3 grid((len + block.x - 1) / block.x);
+  silu_mul_f32_f16_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const float*>(gate),
+      static_cast<const float*>(up),
+      static_cast<float*>(output),
+      static_cast<__half*>(output_f16),
       len);
   return 0;
 }

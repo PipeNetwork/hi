@@ -18205,12 +18205,25 @@ mod native {
             )?;
             let up = self.add_optional_rowwise_f32_device(up, &format!("{prefix}.ffn_up.bias"))?;
             // Gemma uses GeGLU (gelu(gate) * up); other dense models use SwiGLU.
+            // At prefill widths (rows beyond every M<=8 GEMV/MMQ fast path) the
+            // down projection is a tensor-core f16 GEMM, so SwiGLU emits the f16
+            // copy in the same pass and hands it over via the shared-cast slot —
+            // instead of a separate cast kernel re-reading the f32 activation.
+            let mut activated_cast: Option<(DeviceBuffer, usize)> = None;
             let activated = if self.config.is_gemma() {
                 self.gelu_mul_f32_device(&gate, &up)?
+            } else if input.rows > mmq_gemm_max_m() {
+                let (activated, activated_f16) = self.silu_mul_f32_and_f16_device(&gate, &up)?;
+                activated_cast = Some(activated_f16);
+                activated
             } else {
                 self.silu_mul_f32_device(&gate, &up)?
             };
-            let down = self.project_f32_device(&format!("{prefix}.ffn_down.weight"), &activated)?;
+            let down = self.project_f32_device_shared_cast(
+                &format!("{prefix}.ffn_down.weight"),
+                &activated,
+                &mut activated_cast,
+            )?;
             self.add_optional_rowwise_f32_device(down, &format!("{prefix}.ffn_down.bias"))
         }
 
@@ -19795,6 +19808,39 @@ mod native {
                 cols: heads * v_head_dim,
                 buffer: output,
             })
+        }
+
+        /// SwiGLU producing the f32 activation AND its f16 copy in one kernel
+        /// pass; the f16 buffer is sized/shaped for the shared-cast slot of the
+        /// following down projection.
+        fn silu_mul_f32_and_f16_device(
+            &self,
+            gate: &GpuF32Tensor,
+            up: &GpuF32Tensor,
+        ) -> Result<(GpuF32Tensor, (DeviceBuffer, usize))> {
+            gate.ensure_same_shape(up, "CUDA SwiGLU")?;
+            let elements = gate.element_count()?;
+            let output = DeviceBuffer::alloc(elements * std::mem::size_of::<f32>())
+                .context("allocating CUDA SwiGLU output")?;
+            let output_f16 = DeviceBuffer::alloc(elements * std::mem::size_of::<u16>())
+                .context("allocating CUDA SwiGLU f16 output")?;
+            crate::kernels::launch_silu_mul_f32_f16(
+                &gate.buffer,
+                &up.buffer,
+                &output,
+                &output_f16,
+                elements,
+                &self.stream,
+            )?;
+            self.op_barrier()?;
+            Ok((
+                GpuF32Tensor {
+                    rows: gate.rows,
+                    cols: gate.cols,
+                    buffer: output,
+                },
+                (output_f16, elements),
+            ))
         }
 
         fn silu_mul_f32_device(
