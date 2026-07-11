@@ -4808,16 +4808,35 @@ fn process_continuous_decode_chunk(
         return;
     }
 
-    // Captured-graph decode fast path: a single greedy text request decoding alone replays a
-    // captured per-token forward, cutting ~700 kernel launches/token (~+8-11% decode). Emits
-    // one token per step, identical to eager decode. Distinct from (and lower priority than)
-    // speculative decode above, which verifies multiple drafts per forward. Falls back to the
-    // eager batched path below if the model returns None (graphs unavailable for this layout).
+    // Captured-graph decode fast path: a single text request decoding alone replays a captured
+    // per-token forward (+ on-GPU argmax/sampler), cutting ~700 kernel launches/token (~+14%
+    // decode). Emits one token per step, identical to eager decode. Distinct from (and lower
+    // priority than) speculative decode above, which verifies multiple drafts per forward. Falls
+    // back to the eager batched path below if the model returns None (graphs unavailable). The
+    // readiness gate runs BEFORE drawing the sampling RNG so a fallback never double-advances it.
+    //
+    // Ranked sampling (top_k / top_p) is intentionally excluded: the eager path selects those on
+    // the host (a fast O(cols) partial sort), whereas the GPU sampler kernel's ranked path is
+    // single-threaded (~60x slower) and host selection is not stream-capturable. Only greedy and
+    // the parallel temp-only sampler are graphed.
+    let graph_eligible_sampling = match sampling_key {
+        CudaSchedulerSamplingKey::Greedy => true,
+        CudaSchedulerSamplingKey::Sampled {
+            temperature_bits,
+            top_p_bits,
+            top_k,
+        } => !gpu::sampled_selection_needs_host_rank(
+            f32::from_bits(temperature_bits),
+            f32::from_bits(top_p_bits),
+            top_k,
+        ),
+    };
     if gpu::decode_graph_enabled()
         && phase == CudaContinuousStepPhase::Decode
-        && matches!(sampling_key, CudaSchedulerSamplingKey::Greedy)
         && indexes.len() == 1
         && !state.qwen.recurrent_ssm_tensor_layout
+        && graph_eligible_sampling
+        && model.scheduler_graph_decode_ready()
     {
         let idx = indexes[0];
         let position = match active[idx].context_len().checked_sub(1) {
@@ -4844,12 +4863,38 @@ fn process_continuous_decode_chunk(
                 return;
             }
         };
+        // Draw this step's sampling inputs exactly as the eager path would (same request RNG),
+        // so graph-sampled tokens match eager-sampled tokens bit for bit.
+        let (graph_sampling, random_value) = match sampling_key {
+            CudaSchedulerSamplingKey::Greedy => (gpu::GraphSampling::Greedy, 0.0f32),
+            CudaSchedulerSamplingKey::Sampled {
+                temperature_bits,
+                top_p_bits,
+                top_k,
+            } => {
+                let random_value = active[idx]
+                    .rng
+                    .as_mut()
+                    .map(|rng| rng.gen_range(0.0f32..1.0f32))
+                    .unwrap_or(0.0);
+                (
+                    gpu::GraphSampling::Sampled {
+                        temperature: f32::from_bits(temperature_bits),
+                        top_p: f32::from_bits(top_p_bits),
+                        top_k,
+                    },
+                    random_value,
+                )
+            }
+        };
         match model.scheduler_graph_decode_step(
             last_token,
             position,
             state.kv_page_size,
             &active[idx].lease.pages,
             kv_pages.pages_total,
+            graph_sampling,
+            random_value,
         ) {
             Ok(Some(token)) => {
                 let elapsed = started.elapsed();
@@ -11974,9 +12019,9 @@ mod tests {
         );
 
         // Scheduler path: the stateful per-token scheduler_graph_decode_step loop (what the
-        // continuous scheduler's batch=1 greedy path runs) must produce the same tokens as eager.
+        // continuous scheduler's batch=1 path runs) must produce the same tokens as eager.
         let sched_gen = model
-            .scheduler_graph_decode_smoke(&prompt, max_new, 16)
+            .scheduler_graph_decode_smoke(&prompt, max_new, 16, None)
             .expect("scheduler graph decode smoke should run");
         assert_eq!(
             eager_gen, sched_gen,
@@ -11985,6 +12030,21 @@ mod tests {
         eprintln!(
             "scheduler graph decode OK: {} tokens identical to eager",
             sched_gen.len()
+        );
+
+        // Sampled capture path: the on-GPU sampler with top_k=1 forces the argmax, so a captured
+        // sampled graph must produce the same tokens as greedy. Exercises the sampler kernel
+        // inside the captured/replayed graph (device random + baked temperature/top_p/top_k).
+        let sampled_gen = model
+            .scheduler_graph_decode_smoke(&prompt, max_new, 16, Some(1))
+            .expect("sampled scheduler graph decode smoke should run");
+        assert_eq!(
+            eager_gen, sampled_gen,
+            "sampled (top_k=1) graph decode tokens diverged from greedy"
+        );
+        eprintln!(
+            "sampled graph decode OK (top_k=1 == greedy): {} tokens identical",
+            sampled_gen.len()
         );
     }
 

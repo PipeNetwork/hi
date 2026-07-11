@@ -122,7 +122,11 @@ mod native {
             .collect()
     }
 
-    fn sampled_selection_needs_host_rank(temperature: f32, top_p: f32, top_k: Option<u32>) -> bool {
+    pub(crate) fn sampled_selection_needs_host_rank(
+        temperature: f32,
+        top_p: f32,
+        top_k: Option<u32>,
+    ) -> bool {
         temperature.is_finite()
             && temperature > 0.0
             && ((top_p.is_finite() && top_p < 1.0) || top_k.is_some_and(|value| value > 0))
@@ -402,19 +406,38 @@ mod native {
         shared
     }
 
-    /// Persistent captured-graph decode state for the continuous scheduler's batch=1 greedy
-    /// path. Keyed by `(page_size, lease_pages, physical_page_count)`: the captured forward
-    /// reads/writes exactly those pool pages and is valid for ANY request leasing them (KV is
-    /// read fresh from the pages via `d_position` each replay), so a request that inherits the
-    /// same lease reuses the graph without a rebuild. Rebuilt when the key changes (new lease
-    /// shape or pool recreation, which would dangle the cache's raw page pointers).
+    /// Token-selection baked into a captured decode graph. Greedy captures an argmax kernel;
+    /// Sampled captures the on-GPU sampler with these (per-request-constant) parameters, reading
+    /// a fresh random value from a persistent device buffer each replay. Part of the graph key:
+    /// a request whose sampling differs from the captured graph forces a rebuild.
+    #[derive(Clone, Copy, PartialEq)]
+    pub(crate) enum GraphSampling {
+        Greedy,
+        Sampled {
+            temperature: f32,
+            top_p: f32,
+            top_k: Option<u32>,
+        },
+    }
+
+    /// Persistent captured-graph decode state for the continuous scheduler's batch=1 path. Keyed
+    /// by `(page_size, lease_pages, physical_page_count, sampling)`: the captured forward
+    /// reads/writes exactly those pool pages and is valid for ANY request leasing them with the
+    /// same sampling (KV is read fresh from the pages via `d_position` each replay, and only the
+    /// token id / position / random value change per step), so a request that inherits the same
+    /// lease + sampling reuses the graph without a rebuild. Rebuilt when the key changes (new
+    /// lease shape or pool recreation, which would dangle the cache's raw page pointers).
     struct SchedulerGraphDecodeState {
         exec: crate::runtime::GraphExec,
         // Holds raw pointers into the pooled KV pages (kept alive in `paged_batch_pool`).
         cache: CudaPagedBatchKvCache,
         d_position: DeviceBuffer,
         d_token: DeviceBuffer,
-        d_argmax: DeviceBuffer,
+        // Selected next-token id (argmax or sampled) written by the captured kernel.
+        d_output: DeviceBuffer,
+        // Per-step random value in [0,1) the sampler reads; unused for greedy.
+        d_random: DeviceBuffer,
+        sampling: GraphSampling,
         page_size: usize,
         lease_pages: Vec<usize>,
         physical_page_count: usize,
@@ -426,9 +449,11 @@ mod native {
             page_size: usize,
             lease_pages: &[usize],
             physical_page_count: usize,
+            sampling: GraphSampling,
         ) -> bool {
             self.page_size == page_size
                 && self.physical_page_count == physical_page_count
+                && self.sampling == sampling
                 && self.lease_pages == lease_pages
         }
     }
@@ -7841,6 +7866,17 @@ mod native {
             Ok(generated)
         }
 
+        /// Whether the captured-graph decode path can run (graphs not latched off by a prior
+        /// capture failure, and the layout is an eligible batched text decoder). The caller must
+        /// check this BEFORE consuming a request's sampling RNG so a fallback to eager decode
+        /// doesn't double-advance it. (A capture failure on the very first attempt still falls
+        /// back after one RNG draw, then latches off so later steps skip cleanly.)
+        pub fn scheduler_graph_decode_ready(&self) -> bool {
+            !self.scheduler_graph_disabled.get()
+                && !self.config.recurrent_ssm_tensor_layout
+                && self.supports_batched_text_generation()
+        }
+
         /// One captured-graph decode step for the continuous scheduler's batch=1 greedy path:
         /// decode `last_token` at `position` (its KV goes to `lease_pages[position/page_size]`)
         /// and return the next greedy token. The first call for a given
@@ -7853,13 +7889,16 @@ mod native {
         /// weights it touches, never their contents; each replay reads live KV from the pages
         /// via `d_position`. A new request that inherits an identical lease therefore replays
         /// correctly against its own (freshly prefilled) KV without a rebuild.
-        pub fn scheduler_graph_decode_step(
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn scheduler_graph_decode_step(
             &self,
             last_token: u32,
             position: usize,
             page_size: usize,
             lease_pages: &[usize],
             physical_page_count: usize,
+            sampling: GraphSampling,
+            random_value: f32,
         ) -> Result<Option<u32>> {
             if self.scheduler_graph_disabled.get()
                 || self.config.recurrent_ssm_tensor_layout
@@ -7876,16 +7915,21 @@ mod native {
                 .scheduler_graph_state
                 .borrow()
                 .as_ref()
-                .is_some_and(|state| state.matches(page_size, lease_pages, physical_page_count));
+                .is_some_and(|state| {
+                    state.matches(page_size, lease_pages, physical_page_count, sampling)
+                });
 
             if key_matches {
                 let state = self.scheduler_graph_state.borrow();
                 let state = state.as_ref().expect("checked matches");
                 state.d_position.copy_from_host(&[position as i32])?;
                 state.d_token.copy_from_host(&[last_token])?;
+                if matches!(state.sampling, GraphSampling::Sampled { .. }) {
+                    state.d_random.copy_from_host(&[random_value])?;
+                }
                 state.exec.launch(&self.stream)?;
                 self.stream.synchronize()?;
-                let next = state.d_argmax.copy_to_host::<u32>(1)?[0];
+                let next = state.d_output.copy_to_host::<u32>(1)?[0];
                 return Ok(Some(next));
             }
 
@@ -7898,6 +7942,8 @@ mod native {
                 lease_pages,
                 physical_page_count,
                 &dims,
+                sampling,
+                random_value,
             ) {
                 Ok((state, first_token)) => {
                     *self.scheduler_graph_state.borrow_mut() = Some(state);
@@ -7912,6 +7958,7 @@ mod native {
             }
         }
 
+        #[allow(clippy::too_many_arguments)]
         fn build_scheduler_graph_state(
             &self,
             last_token: u32,
@@ -7920,6 +7967,8 @@ mod native {
             lease_pages: &[usize],
             physical_page_count: usize,
             dims: &QwenDims,
+            sampling: GraphSampling,
+            random_value: f32,
         ) -> Result<(SchedulerGraphDecodeState, u32)> {
             let token_capacity = lease_pages
                 .len()
@@ -7962,8 +8011,46 @@ mod native {
                 .context("allocating CUDA scheduler graph position counter")?;
             let d_token = DeviceBuffer::alloc(std::mem::size_of::<u32>())
                 .context("allocating CUDA scheduler graph token counter")?;
-            let d_argmax = DeviceBuffer::alloc(std::mem::size_of::<u32>())
-                .context("allocating CUDA scheduler graph argmax slot")?;
+            let d_output = DeviceBuffer::alloc(std::mem::size_of::<u32>())
+                .context("allocating CUDA scheduler graph output-token slot")?;
+            let d_random = DeviceBuffer::alloc(std::mem::size_of::<f32>())
+                .context("allocating CUDA scheduler graph random slot")?;
+            // The sampler reads `random_value` for this first (warmup) decode; per-step replays
+            // overwrite d_random with each step's own value.
+            if matches!(sampling, GraphSampling::Sampled { .. }) {
+                d_random.copy_from_host(&[random_value])?;
+            }
+
+            // Launches the captured token-selection kernel (greedy argmax or the on-GPU sampler)
+            // reading `logits` -> writing `d_output`. Inlined at both the warmup and capture sites.
+            let select = |logits: &GpuF32Tensor| -> Result<()> {
+                match sampling {
+                    GraphSampling::Greedy => crate::kernels::launch_argmax_batched_last_token(
+                        &logits.buffer,
+                        &d_output,
+                        1,
+                        1,
+                        logits.cols,
+                        &self.stream,
+                    ),
+                    GraphSampling::Sampled {
+                        temperature,
+                        top_p,
+                        top_k,
+                    } => crate::kernels::launch_sample_batched_last_token(
+                        &logits.buffer,
+                        &d_output,
+                        &d_random,
+                        1,
+                        1,
+                        logits.cols,
+                        temperature,
+                        top_p,
+                        top_k,
+                        &self.stream,
+                    ),
+                }
+            };
 
             // Warm the pool for every decode-forward allocation (so capture never cudaMalloc's)
             // AND perform this step's real decode: writes `last_token` KV at `position` and
@@ -7971,16 +8058,9 @@ mod native {
             let first_token = {
                 let logits =
                     self.decode_batch_logits_paged_device(&[last_token], position, &mut cache)?;
-                crate::kernels::launch_argmax_batched_last_token(
-                    &logits.buffer,
-                    &d_argmax,
-                    1,
-                    1,
-                    logits.cols,
-                    &self.stream,
-                )?;
+                select(&logits)?;
                 self.stream.synchronize()?;
-                let token = d_argmax.copy_to_host::<u32>(1)?[0];
+                let token = d_output.copy_to_host::<u32>(1)?[0];
                 drop(logits);
                 token
             };
@@ -7992,14 +8072,7 @@ mod native {
                 self.stream.begin_capture()?;
                 let logits =
                     self.decode_batch_logits_paged_device(&[last_token], position, &mut cache)?;
-                crate::kernels::launch_argmax_batched_last_token(
-                    &logits.buffer,
-                    &d_argmax,
-                    1,
-                    1,
-                    logits.cols,
-                    &self.stream,
-                )?;
+                select(&logits)?;
                 self.stream.end_capture()
             })();
             self.graph_capture_token.set(std::ptr::null());
@@ -8013,7 +8086,9 @@ mod native {
                     cache,
                     d_position,
                     d_token,
-                    d_argmax,
+                    d_output,
+                    d_random,
+                    sampling,
                     page_size,
                     lease_pages: lease_pages.to_vec(),
                     physical_page_count,
@@ -8026,14 +8101,25 @@ mod native {
         /// prefill the prompt into the pool, then per-token capture-once/replay via the stateful
         /// scheduler entry. Returns the generated tokens (length `max_tokens`, no stop handling)
         /// so a test can assert they equal the eager paged generate. Resets any prior graph
-        /// state first so the capture path is exercised fresh.
+        /// state first so the capture path is exercised fresh. `sampled_top_k` selects the
+        /// captured token-selection: `None` = greedy argmax; `Some(k)` = the on-GPU sampler with
+        /// `top_k=k` (use `Some(1)` to force argmax and prove the sampled capture path is correct).
         #[doc(hidden)]
         pub fn scheduler_graph_decode_smoke(
             &self,
             input_ids: &[u32],
             max_tokens: usize,
             page_size: usize,
+            sampled_top_k: Option<u32>,
         ) -> Result<Vec<u32>> {
+            let sampling = match sampled_top_k {
+                None => GraphSampling::Greedy,
+                Some(k) => GraphSampling::Sampled {
+                    temperature: 1.0,
+                    top_p: 1.0,
+                    top_k: Some(k),
+                },
+            };
             let dims = self.qwen_dims()?;
             let token_capacity = input_ids
                 .len()
@@ -8089,6 +8175,8 @@ mod native {
                         page_size,
                         &lease_pages,
                         physical_page_count,
+                        sampling,
+                        0.5,
                     )?
                     .ok_or_else(|| anyhow!("scheduler graph decode returned None (unavailable)"))?;
                 generated.push(next);
@@ -23290,14 +23378,28 @@ mod native {
 }
 
 #[cfg(feature = "native-cuda")]
-pub(crate) use native::decode_graph_enabled;
-#[cfg(feature = "native-cuda")]
 pub use native::{
     CudaMmprojProjector, CudaQwenGpuModel, CudaVisionEncoder, GpuMatrix, GpuTensor, GpuVector,
 };
+#[cfg(feature = "native-cuda")]
+pub(crate) use native::{GraphSampling, decode_graph_enabled, sampled_selection_needs_host_rank};
 #[cfg(not(feature = "native-cuda"))]
 pub(crate) fn decode_graph_enabled() -> bool {
     false
+}
+#[cfg(not(feature = "native-cuda"))]
+pub(crate) fn sampled_selection_needs_host_rank(_t: f32, _p: f32, _k: Option<u32>) -> bool {
+    true
+}
+#[cfg(not(feature = "native-cuda"))]
+#[derive(Clone, Copy, PartialEq)]
+pub(crate) enum GraphSampling {
+    Greedy,
+    Sampled {
+        temperature: f32,
+        top_p: f32,
+        top_k: Option<u32>,
+    },
 }
 
 #[cfg(not(feature = "native-cuda"))]
@@ -23802,13 +23904,20 @@ mod non_native {
             )
         }
 
-        pub fn scheduler_graph_decode_step(
+        pub fn scheduler_graph_decode_ready(&self) -> bool {
+            false
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn scheduler_graph_decode_step(
             &self,
             _last_token: u32,
             _position: usize,
             _page_size: usize,
             _lease_pages: &[usize],
             _physical_page_count: usize,
+            _sampling: super::GraphSampling,
+            _random_value: f32,
         ) -> Result<Option<u32>> {
             // No native CUDA: graphs are unavailable, so the scheduler decodes eagerly.
             Ok(None)
