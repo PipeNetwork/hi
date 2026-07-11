@@ -20028,10 +20028,13 @@ mod native {
         /// bases: every 6th layer (index % 6 == 5) is global and uses the model's
         /// `rope.freq_base`; the other five-of-six local layers use base 10000. All
         /// other architectures use one base for every layer.
+        /// Rope base for the layer named by `prefix`. Gemma-3 local layers use
+        /// the fixed 10k base; Gemma-4 sliding layers use `rope.freq_base_swa`
+        /// (10k in practice) — both via `config.layer_is_sliding`, which reads
+        /// the gemma4 per-layer pattern metadata or gemma3's fixed 5:1 pattern.
         fn layer_rope_base(&self, prefix: &str, default_base: f32) -> f32 {
-            const GEMMA3_SLIDING_PATTERN: usize = 6;
-            const GEMMA3_LOCAL_ROPE_BASE: f32 = 10000.0;
-            if !self.config.is_gemma3() {
+            const GEMMA_LOCAL_ROPE_BASE: f32 = 10000.0;
+            if !self.config.is_gemma3() && !self.config.is_gemma4() {
                 return default_base;
             }
             let Some(layer) = prefix
@@ -20040,19 +20043,20 @@ mod native {
             else {
                 return default_base;
             };
-            if layer % GEMMA3_SLIDING_PATTERN != GEMMA3_SLIDING_PATTERN - 1 {
-                GEMMA3_LOCAL_ROPE_BASE
+            if self.config.layer_is_sliding(layer) {
+                self.config
+                    .rope_freq_base_swa
+                    .unwrap_or(GEMMA_LOCAL_ROPE_BASE)
             } else {
                 default_base
             }
         }
 
-        /// Sliding-window size for the layer named by `prefix`. Gemma-3 local
-        /// layers (index % 6 != 5) attend only to the last `attention.sliding_window`
-        /// tokens; global layers and every other architecture use 0 (unlimited).
+        /// Sliding-window size for the layer named by `prefix`. Gemma local
+        /// layers attend only to the last `attention.sliding_window` tokens;
+        /// global layers and every other architecture use 0 (unlimited).
         fn layer_attention_window(&self, prefix: &str) -> usize {
-            const GEMMA3_SLIDING_PATTERN: usize = 6;
-            if !self.config.is_gemma3() {
+            if !self.config.is_gemma3() && !self.config.is_gemma4() {
                 return 0;
             }
             let Some(window) = self.config.attention_sliding_window else {
@@ -20064,7 +20068,7 @@ mod native {
             else {
                 return 0;
             };
-            if layer % GEMMA3_SLIDING_PATTERN != GEMMA3_SLIDING_PATTERN - 1 {
+            if self.config.layer_is_sliding(layer) {
                 window as usize
             } else {
                 0
