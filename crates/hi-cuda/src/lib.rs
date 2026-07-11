@@ -10,7 +10,7 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::atomic::{AtomicU64 as StdAtomicU64, Ordering as StdOrdering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -806,6 +806,7 @@ impl CudaBackend {
                     multimodal_stats: multimodal_stats.clone(),
                     max_active_requests: config.max_active_requests,
                     prefix_cache: Mutex::new(None),
+                    sse_writer: None,
                 },
                 config.max_batch_size,
                 config.max_active_requests,
@@ -2812,6 +2813,10 @@ struct CudaSchedulerState {
     /// the divergent suffix. `None` until the first request retires (or when the
     /// feature is off).
     prefix_cache: Mutex<Option<RetainedPrefix>>,
+    /// SSE writer thread input (`HI_CUDA_SSE_WRITER`, default on): continuous
+    /// requests enqueue events here instead of blocking the scheduler thread.
+    /// `None` = direct blocking sends. Set by `CudaGenerationScheduler::start`.
+    sse_writer: Option<mpsc::Sender<CudaSseEmitJob>>,
 }
 
 /// A completed request's KV retained for cross-request prefix reuse. `pages`
@@ -2828,13 +2833,90 @@ struct CudaGenerationScheduler {
     tx: mpsc::Sender<CudaSchedulerJob>,
     stats: Arc<CudaSchedulerStats>,
     max_active_requests: usize,
+    // For encoding the prompt on the submitting (async) side instead of the GPU
+    // worker thread; long prompts otherwise stall every running decode.
+    cpu_reference: Arc<qwen_cpu::QwenCpuReference>,
 }
 
 struct CudaSchedulerJob {
     request: GenerationRequest,
     tx: tokio::sync::mpsc::Sender<Result<GenerationEvent>>,
     submitted_at: Instant,
+    /// Prompt tokens pre-encoded off the scheduler thread at submit. `None` means
+    /// the worker encodes (and reports failures) itself, as it always did.
+    prompt_tokens: Option<Vec<u32>>,
 }
+
+/// One event handed to the SSE writer thread (`HI_CUDA_SSE_WRITER`, default on):
+/// the scheduler thread enqueues instead of `blocking_send`ing, so a slow SSE
+/// consumer can no longer stall the GPU loop. The single writer thread preserves
+/// per-request event order; `try_send` never blocks, so one slow consumer cannot
+/// head-of-line-block other requests either — its channel just fills up, at which
+/// point the request is flagged cancelled via `cancelled`.
+struct CudaSseEmitJob {
+    tx: tokio::sync::mpsc::Sender<Result<GenerationEvent>>,
+    event: Result<GenerationEvent>,
+    cancelled: Arc<AtomicBool>,
+}
+
+fn sse_writer_loop(rx: mpsc::Receiver<CudaSseEmitJob>) {
+    while let Ok(job) = rx.recv() {
+        match job.tx.try_send(job.event) {
+            Ok(()) => {}
+            // Full: the consumer is a whole event buffer behind. Cancel the request
+            // rather than stall (the old behavior stalled the entire GPU loop).
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+            | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                job.cancelled.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// Emit an event for an active continuous request, via the SSE writer thread when
+/// enabled (never blocks the scheduler thread) or directly otherwise.
+fn emit_continuous_event(
+    state: &CudaSchedulerState,
+    request: &CudaContinuousTextRequest,
+    event: Result<GenerationEvent>,
+) -> std::result::Result<(), CudaContinuousRetireReason> {
+    if let Some(writer) = &state.sse_writer {
+        if continuous_request_cancelled(request) {
+            return Err(CudaContinuousRetireReason::Cancelled);
+        }
+        writer
+            .send(CudaSseEmitJob {
+                tx: request.job.tx.clone(),
+                event,
+                cancelled: request.writer_cancelled.clone(),
+            })
+            .map_err(|_| CudaContinuousRetireReason::Cancelled)
+    } else {
+        request
+            .job
+            .tx
+            .blocking_send(event)
+            .map_err(|_| CudaContinuousRetireReason::Cancelled)
+    }
+}
+
+fn continuous_request_cancelled(request: &CudaContinuousTextRequest) -> bool {
+    request.job.tx.is_closed() || request.writer_cancelled.load(Ordering::Relaxed)
+}
+
+/// Send SSE events through a dedicated writer thread instead of blocking the GPU
+/// scheduler thread on each delta (default on; `HI_CUDA_SSE_WRITER=0` restores
+/// in-thread blocking sends).
+fn sse_writer_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("HI_CUDA_SSE_WRITER").map_or(true, |value| value != "0"))
+}
+
+/// Per-request buffered event capacity. With the SSE writer this is the slack a
+/// slow consumer gets before being cancelled; without it, the depth at which the
+/// scheduler thread starts blocking.
+const CONTINUOUS_EVENT_BUFFER: usize = 256;
 
 #[derive(Debug)]
 struct CudaSchedulerStats {
@@ -3269,7 +3351,7 @@ fn new_cuda_scheduler_stats() -> CudaSchedulerStats {
 
 impl CudaGenerationScheduler {
     fn start(
-        state: CudaSchedulerState,
+        mut state: CudaSchedulerState,
         max_batch_size: usize,
         max_active_requests: usize,
         max_wait_us: u64,
@@ -3279,6 +3361,15 @@ impl CudaGenerationScheduler {
         let stats = Arc::new(new_cuda_scheduler_stats());
         let worker_stats = stats.clone();
         let max_batch_size = max_batch_size.max(1);
+        let cpu_reference = state.cpu_reference.clone();
+        if sse_writer_enabled() {
+            let (writer_tx, writer_rx) = mpsc::channel();
+            thread::Builder::new()
+                .name("hi-cuda-sse-writer".to_string())
+                .spawn(move || sse_writer_loop(writer_rx))
+                .map_err(|err| anyhow!("failed to spawn CUDA SSE writer: {err}"))?;
+            state.sse_writer = Some(writer_tx);
+        }
         thread::Builder::new()
             .name("hi-cuda-generation-scheduler".to_string())
             .spawn(move || {
@@ -3297,6 +3388,7 @@ impl CudaGenerationScheduler {
             tx,
             stats,
             max_active_requests: max_active_requests.max(1),
+            cpu_reference,
         })
     }
 
@@ -3324,7 +3416,20 @@ impl CudaGenerationScheduler {
             }
         };
         update_atomic_max(&self.stats.peak_inflight_requests, inflight);
-        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let (tx, rx) = tokio::sync::mpsc::channel(CONTINUOUS_EVENT_BUFFER);
+        // Encode the prompt here (off the GPU worker thread) so a long prompt's
+        // tokenization can't stall running decodes. Best-effort: on any failure the
+        // worker re-encodes and reports the error through the stream as before.
+        let prompt_tokens = if request.media_inputs.is_empty() {
+            let cpu_reference = self.cpu_reference.clone();
+            let prompt = request.prompt.clone();
+            tokio::task::spawn_blocking(move || cpu_reference.tokenizer().encode(&prompt).ok())
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
         let pending = self
             .stats
             .pending_requests
@@ -3335,6 +3440,7 @@ impl CudaGenerationScheduler {
             request,
             tx,
             submitted_at: Instant::now(),
+            prompt_tokens,
         }) {
             self.stats.pending_requests.fetch_sub(1, Ordering::Relaxed);
             release_scheduler_slots(&self.stats.inflight_requests, 1);
@@ -3860,6 +3966,9 @@ struct CudaContinuousTextRequest {
     stream_decoder: Option<StreamingTokenDecoder>,
     /// How many of `generated_tokens` have been pushed through `stream_decoder`.
     decoded_token_count: usize,
+    /// Set by the SSE writer thread when this request's event channel filled up
+    /// (slow consumer) or closed; the scheduler retires it as Cancelled.
+    writer_cancelled: Arc<AtomicBool>,
     max_tokens: usize,
     stop_token_sequences: Vec<Vec<u32>>,
     sampling_key: CudaSchedulerSamplingKey,
@@ -4209,7 +4318,7 @@ fn retain_prefix_from_request(state: &CudaSchedulerState, request: &mut CudaCont
 fn admit_continuous_text_job(
     state: &CudaSchedulerState,
     stats: &CudaSchedulerStats,
-    job: CudaSchedulerJob,
+    mut job: CudaSchedulerJob,
 ) -> Option<CudaContinuousTextRequest> {
     if job.tx.is_closed() {
         stats.cancelled_requests.fetch_add(1, Ordering::Relaxed);
@@ -4220,11 +4329,15 @@ fn admit_continuous_text_job(
         return None;
     }
 
+    let pre_encoded = job.prompt_tokens.take();
     let result = (|| -> Result<(Vec<u32>, usize, Vec<Vec<u32>>)> {
-        let prompt_tokens = state
-            .cpu_reference
-            .tokenizer()
-            .encode(&job.request.prompt)?;
+        let prompt_tokens = match pre_encoded {
+            Some(tokens) => tokens,
+            None => state
+                .cpu_reference
+                .tokenizer()
+                .encode(&job.request.prompt)?,
+        };
         if prompt_tokens.is_empty() {
             bail!("prompt encoded to zero tokens");
         }
@@ -4332,6 +4445,7 @@ fn admit_continuous_text_job(
         stream_decoder: incremental_detok_enabled()
             .then(|| state.cpu_reference.tokenizer().streaming_decoder(true)),
         decoded_token_count: 0,
+        writer_cancelled: Arc::new(AtomicBool::new(false)),
         max_tokens,
         stop_token_sequences,
         sampling_key,
@@ -4522,7 +4636,7 @@ fn process_continuous_decode_iteration(
 ) {
     let mut retire = vec![None; active.len()];
     for (idx, request) in active.iter().enumerate() {
-        if request.job.tx.is_closed() {
+        if continuous_request_cancelled(request) {
             retire[idx] = Some(CudaContinuousRetireReason::Cancelled);
         }
     }
@@ -4691,6 +4805,7 @@ fn process_continuous_decode_chunk(
         Err(_) => {
             for idx in indexes {
                 mark_continuous_error(
+                    state,
                     active,
                     retire,
                     *idx,
@@ -4707,6 +4822,7 @@ fn process_continuous_decode_chunk(
     let Some(kv_pages) = &state.kv_pages else {
         for idx in &indexes {
             mark_continuous_error(
+                state,
                 active,
                 retire,
                 *idx,
@@ -4730,7 +4846,7 @@ fn process_continuous_decode_chunk(
         Ok(page_tables) => page_tables,
         Err(err) => {
             for idx in &indexes {
-                mark_continuous_error(active, retire, *idx, anyhow!("{err}"));
+                mark_continuous_error(state, active, retire, *idx, anyhow!("{err}"));
             }
             return;
         }
@@ -4762,7 +4878,7 @@ fn process_continuous_decode_chunk(
         {
             Ok(pt) => pt,
             Err(err) => {
-                mark_continuous_error(active, retire, idx, anyhow!("{err}"));
+                mark_continuous_error(state, active, retire, idx, anyhow!("{err}"));
                 return;
             }
         };
@@ -4791,7 +4907,7 @@ fn process_continuous_decode_chunk(
                     if retire[idx].is_some() {
                         break;
                     }
-                    if active[idx].job.tx.is_closed() {
+                    if continuous_request_cancelled(&active[idx]) {
                         retire[idx] = Some(CudaContinuousRetireReason::Cancelled);
                         break;
                     }
@@ -4816,6 +4932,7 @@ fn process_continuous_decode_chunk(
             }
             Ok(_) => {
                 mark_continuous_error(
+                    state,
                     active,
                     retire,
                     idx,
@@ -4823,7 +4940,7 @@ fn process_continuous_decode_chunk(
                 );
             }
             Err(err) => {
-                mark_continuous_error(active, retire, idx, anyhow!("{err}"));
+                mark_continuous_error(state, active, retire, idx, anyhow!("{err}"));
             }
         }
         return;
@@ -4864,6 +4981,7 @@ fn process_continuous_decode_chunk(
             Some(position) => position,
             None => {
                 mark_continuous_error(
+                    state,
                     active,
                     retire,
                     idx,
@@ -4876,6 +4994,7 @@ fn process_continuous_decode_chunk(
             Some(token) => token,
             None => {
                 mark_continuous_error(
+                    state,
                     active,
                     retire,
                     idx,
@@ -4925,7 +5044,7 @@ fn process_continuous_decode_chunk(
                     usize_to_u64(elapsed.as_micros() as usize),
                     Ordering::Relaxed,
                 );
-                if active[idx].job.tx.is_closed() {
+                if continuous_request_cancelled(&active[idx]) {
                     retire[idx] = Some(CudaContinuousRetireReason::Cancelled);
                     return;
                 }
@@ -4951,7 +5070,7 @@ fn process_continuous_decode_chunk(
                 // Graphs unavailable for this layout; fall through to eager decode below.
             }
             Err(err) => {
-                mark_continuous_error(active, retire, idx, anyhow!("{err}"));
+                mark_continuous_error(state, active, retire, idx, anyhow!("{err}"));
                 return;
             }
         }
@@ -5031,6 +5150,7 @@ fn process_continuous_decode_chunk(
                     None => {
                         for idx in &indexes {
                             mark_continuous_error(
+                                state,
                                 active,
                                 retire,
                                 *idx,
@@ -5060,7 +5180,7 @@ fn process_continuous_decode_chunk(
                     Ok(tokens) => tokens,
                     Err(err) => {
                         for idx in &indexes {
-                            mark_continuous_error(active, retire, *idx, anyhow!("{err}"));
+                            mark_continuous_error(state, active, retire, *idx, anyhow!("{err}"));
                         }
                         return;
                     }
@@ -5099,6 +5219,7 @@ fn process_continuous_decode_chunk(
                     None => {
                         for idx in &indexes {
                             mark_continuous_error(
+                                state,
                                 active,
                                 retire,
                                 *idx,
@@ -5110,28 +5231,29 @@ fn process_continuous_decode_chunk(
                         return;
                     }
                 };
-                let decode_tokens =
-                    match indexes
-                        .iter()
-                        .map(|idx| {
-                            active[*idx]
-                        .generated_tokens
-                        .last()
-                        .copied()
-                        .ok_or_else(|| {
-                            anyhow!("CUDA continuous append decode request has no generated token")
-                        })
-                        })
-                        .collect::<Result<Vec<_>>>()
-                    {
-                        Ok(tokens) => tokens,
-                        Err(err) => {
-                            for idx in &indexes {
-                                mark_continuous_error(active, retire, *idx, anyhow!("{err}"));
-                            }
-                            return;
+                let decode_tokens = match indexes
+                    .iter()
+                    .map(|idx| {
+                        active[*idx]
+                            .generated_tokens
+                            .last()
+                            .copied()
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "CUDA continuous append decode request has no generated token"
+                                )
+                            })
+                    })
+                    .collect::<Result<Vec<_>>>()
+                {
+                    Ok(tokens) => tokens,
+                    Err(err) => {
+                        for idx in &indexes {
+                            mark_continuous_error(state, active, retire, *idx, anyhow!("{err}"));
                         }
-                    };
+                        return;
+                    }
+                };
                 match sampling_key {
                     CudaSchedulerSamplingKey::Greedy => model
                         .decode_greedy_next_tokens_batch_paged_with_page_tables(
@@ -5194,7 +5316,7 @@ fn process_continuous_decode_chunk(
                 if retire[idx].is_some() {
                     continue;
                 }
-                if active[idx].job.tx.is_closed() {
+                if continuous_request_cancelled(&active[idx]) {
                     retire[idx] = Some(CudaContinuousRetireReason::Cancelled);
                     continue;
                 }
@@ -5223,12 +5345,12 @@ fn process_continuous_decode_chunk(
                 indexes.len()
             );
             for idx in &indexes {
-                mark_continuous_error(active, retire, *idx, anyhow!("{err}"));
+                mark_continuous_error(state, active, retire, *idx, anyhow!("{err}"));
             }
         }
         Err(err) => {
             for idx in &indexes {
-                mark_continuous_error(active, retire, *idx, anyhow!("{err}"));
+                mark_continuous_error(state, active, retire, *idx, anyhow!("{err}"));
             }
         }
     }
@@ -5244,7 +5366,7 @@ fn retain_open_continuous_indexes(
         if retire[idx].is_some() {
             continue;
         }
-        if active[idx].job.tx.is_closed() {
+        if continuous_request_cancelled(&active[idx]) {
             retire[idx] = Some(CudaContinuousRetireReason::Cancelled);
         } else {
             open.push(idx);
@@ -5346,7 +5468,7 @@ fn send_continuous_token_delta(
             match decoder.push(tokenizer, id) {
                 Ok(text) => delta.push_str(&text),
                 Err(err) => {
-                    let _ = send_scheduler_error(&request.job.tx, err);
+                    let _ = emit_continuous_event(state, request, Err(err));
                     return Err(CudaContinuousRetireReason::Errored);
                 }
             }
@@ -5361,7 +5483,7 @@ fn send_continuous_token_delta(
         {
             Ok(text) => text,
             Err(err) => {
-                let _ = send_scheduler_error(&request.job.tx, err);
+                let _ = emit_continuous_event(state, request, Err(err));
                 return Err(CudaContinuousRetireReason::Errored);
             }
         };
@@ -5375,14 +5497,14 @@ fn send_continuous_token_delta(
     if delta.is_empty() {
         return Ok(());
     }
-    request
-        .job
-        .tx
-        .blocking_send(Ok(GenerationEvent::TokenDelta {
+    emit_continuous_event(
+        state,
+        request,
+        Ok(GenerationEvent::TokenDelta {
             token_id: token,
             text: delta,
-        }))
-        .map_err(|_| CudaContinuousRetireReason::Cancelled)
+        }),
+    )
 }
 
 fn continuous_request_finished(
@@ -5409,27 +5531,26 @@ fn finish_continuous_request(
         &request.job.request.stop_sequences,
     ) {
         Ok(generation) => {
-            if request
-                .job
-                .tx
-                .blocking_send(Ok(GenerationEvent::Finished {
+            match emit_continuous_event(
+                state,
+                request,
+                Ok(GenerationEvent::Finished {
                     output: generation.output,
-                }))
-                .is_ok()
-            {
-                CudaContinuousRetireReason::Completed
-            } else {
-                CudaContinuousRetireReason::Cancelled
+                }),
+            ) {
+                Ok(()) => CudaContinuousRetireReason::Completed,
+                Err(reason) => reason,
             }
         }
         Err(err) => {
-            let _ = send_scheduler_error(&request.job.tx, err);
+            let _ = emit_continuous_event(state, request, Err(err));
             CudaContinuousRetireReason::Errored
         }
     }
 }
 
 fn mark_continuous_error(
+    state: &CudaSchedulerState,
     active: &[CudaContinuousTextRequest],
     retire: &mut [Option<CudaContinuousRetireReason>],
     idx: usize,
@@ -5438,10 +5559,9 @@ fn mark_continuous_error(
     if retire[idx].is_some() {
         return;
     }
-    retire[idx] = if send_scheduler_error(&active[idx].job.tx, err).is_ok() {
-        Some(CudaContinuousRetireReason::Errored)
-    } else {
-        Some(CudaContinuousRetireReason::Cancelled)
+    retire[idx] = match emit_continuous_event(state, &active[idx], Err(err)) {
+        Ok(()) => Some(CudaContinuousRetireReason::Errored),
+        Err(_) => Some(CudaContinuousRetireReason::Cancelled),
     };
 }
 
@@ -8884,11 +9004,13 @@ mod tests {
                 request: request.clone(),
                 tx: open_tx,
                 submitted_at: std::time::Instant::now(),
+                prompt_tokens: None,
             },
             super::CudaSchedulerJob {
                 request,
                 tx: closed_tx,
                 submitted_at: std::time::Instant::now(),
+                prompt_tokens: None,
             },
         ]);
 
@@ -8922,11 +9044,13 @@ mod tests {
                 request: request.clone(),
                 tx: open_tx,
                 submitted_at: std::time::Instant::now(),
+                prompt_tokens: None,
             },
             super::CudaSchedulerJob {
                 request,
                 tx: closed_tx,
                 submitted_at: std::time::Instant::now(),
+                prompt_tokens: None,
             },
         ];
         let mut leases = vec![open_lease, closed_lease];
@@ -8984,16 +9108,19 @@ mod tests {
                 request: image_request,
                 tx: media_tx,
                 submitted_at: std::time::Instant::now(),
+                prompt_tokens: None,
             },
             super::CudaSchedulerJob {
                 request: text_request.clone(),
                 tx: open_tx,
                 submitted_at: std::time::Instant::now(),
+                prompt_tokens: None,
             },
             super::CudaSchedulerJob {
                 request: text_request,
                 tx: closed_tx,
                 submitted_at: std::time::Instant::now(),
+                prompt_tokens: None,
             },
         ];
         let mut leases = vec![open_lease, closed_lease];
@@ -9031,11 +9158,13 @@ mod tests {
                 request: request.clone(),
                 tx: tx_a,
                 submitted_at: observed_at - std::time::Duration::from_micros(7),
+                prompt_tokens: None,
             },
             super::CudaSchedulerJob {
                 request,
                 tx: tx_b,
                 submitted_at: observed_at - std::time::Duration::from_micros(13),
+                prompt_tokens: None,
             },
         ];
 
@@ -9195,6 +9324,7 @@ mod tests {
                 },
                 tx,
                 submitted_at: std::time::Instant::now(),
+                prompt_tokens: None,
             }
         }
 
@@ -16899,6 +17029,41 @@ mod tests {
         assert!(health.quantization.contains("sampling=batched"));
     }
 
+    #[test]
+    fn sse_writer_cancels_slow_consumer_without_blocking() {
+        let (writer_tx, writer_rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || super::sse_writer_loop(writer_rx));
+        // Consumer buffer of 2, never drained: the third event must not block the
+        // writer; it flags the request cancelled instead.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        for token_id in 0..3u32 {
+            writer_tx
+                .send(super::CudaSseEmitJob {
+                    tx: tx.clone(),
+                    event: Ok(super::GenerationEvent::TokenDelta {
+                        token_id,
+                        text: "x".to_string(),
+                    }),
+                    cancelled: cancelled.clone(),
+                })
+                .unwrap();
+        }
+        drop(writer_tx);
+        handle.join().unwrap();
+        assert!(cancelled.load(std::sync::atomic::Ordering::Relaxed));
+        // The buffered events were delivered, in order.
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Ok(super::GenerationEvent::TokenDelta { token_id: 0, .. }))
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Ok(super::GenerationEvent::TokenDelta { token_id: 1, .. }))
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+
     #[cfg(feature = "native-cuda")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cuda_gpu_scheduler_counts_cancelled_stream_before_dispatch() {
@@ -16983,6 +17148,7 @@ mod tests {
             multimodal_stats: backend.multimodal_stats.clone(),
             max_active_requests: 1,
             prefix_cache: super::Mutex::new(None),
+            sse_writer: None,
         };
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(rx);
@@ -17001,6 +17167,7 @@ mod tests {
                 },
                 tx,
                 submitted_at: std::time::Instant::now(),
+                prompt_tokens: None,
             }],
         );
 
