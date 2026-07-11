@@ -3440,15 +3440,13 @@ mod native {
             // (Q6_K ~0.66 vs f16 2 bytes/param) and wins outright. So in the hybrid plan
             // (which is chosen precisely when we're not VRAM-starved) skip the f16 cache
             // for the head and let the dp4a GEMV below handle it.
-            let cache_output_head = is_output_head
-                && !self.cache_layer_f16
-                && {
-                    let f16_bytes = weight_elements.saturating_mul(std::mem::size_of::<u16>());
-                    self.dequant_f16_cache.borrow().contains_key(matrix_name)
-                        || crate::runtime::free_memory_bytes()
-                            .map(|free| f16_bytes.saturating_mul(2) <= free)
-                            .unwrap_or(true)
-                };
+            let cache_output_head = is_output_head && !self.cache_layer_f16 && {
+                let f16_bytes = weight_elements.saturating_mul(std::mem::size_of::<u16>());
+                self.dequant_f16_cache.borrow().contains_key(matrix_name)
+                    || crate::runtime::free_memory_bytes()
+                        .map(|free| f16_bytes.saturating_mul(2) <= free)
+                        .unwrap_or(true)
+            };
             // Fused Q6_K GEMV (M=1 decode): read Q6_K directly instead of dequantizing the
             // whole matrix to f32 every token — the per-op dequant is ~12x slower for Q6_K
             // models kept quantized (f16 doesn't fit). Also handles the Q6_K output head in
@@ -7268,8 +7266,7 @@ mod native {
             if token_ids.is_empty() {
                 bail!("append_tokens_logits requires at least one token");
             }
-            if self.config.recurrent_ssm_tensor_layout || !self.supports_batched_text_generation()
-            {
+            if self.config.recurrent_ssm_tensor_layout || !self.supports_batched_text_generation() {
                 bail!("append_tokens_logits requires a text decoder layout");
             }
             let dims = self.qwen_dims()?;
