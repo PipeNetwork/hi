@@ -502,6 +502,43 @@ mod imp {
             )?;
             Ok(CudaGraph { raw: graph })
         }
+
+        /// Begin capture and return a guard that MUST be `end()`ed to obtain the graph. If the
+        /// guard is dropped without `end()` — e.g. an operation between begin and end returned an
+        /// error via `?` — its `Drop` calls `end_capture` so the stream leaves capture mode.
+        /// Otherwise a mid-capture failure (like the capture-safe pool refusing to grow) would
+        /// leave the stream capturing, and every later launch on it (including the eager fallback)
+        /// would be silently recorded instead of run.
+        pub fn begin_capture_scoped(&self) -> Result<CaptureGuard<'_>> {
+            self.begin_capture()?;
+            Ok(CaptureGuard {
+                stream: self,
+                armed: true,
+            })
+        }
+    }
+
+    /// RAII guard for a stream capture (see `Stream::begin_capture_scoped`).
+    pub struct CaptureGuard<'a> {
+        stream: &'a Stream,
+        armed: bool,
+    }
+
+    impl CaptureGuard<'_> {
+        /// Finish the capture and return the recorded graph.
+        pub fn end(mut self) -> Result<CudaGraph> {
+            self.armed = false;
+            self.stream.end_capture()
+        }
+    }
+
+    impl Drop for CaptureGuard<'_> {
+        fn drop(&mut self) {
+            if self.armed {
+                // Restore the stream to non-capturing on an early/error exit; discard the result.
+                let _ = self.stream.end_capture();
+            }
+        }
     }
 
     /// A recorded (but not yet executable) CUDA graph.

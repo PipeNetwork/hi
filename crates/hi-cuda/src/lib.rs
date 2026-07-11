@@ -22632,6 +22632,41 @@ mod tests {
         }
     }
 
+    // Regression: a CUDA-graph capture whose body fails partway (e.g. the capture-safe pool
+    // refuses to grow for an un-warmed weight scratch, as on a model with a non-dp4a output head)
+    // must still leave the stream in a non-capturing state, so the eager fallback can run. Before
+    // the CaptureGuard, `end_capture` was skipped on the error path and the stream stayed capturing
+    // — every later launch on it (including the fallback) was silently recorded, surfacing as a
+    // 500 ("copying CUDA paged batch KV page table") on the next request.
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_capture_guard_restores_stream_on_early_exit() {
+        use crate::runtime::{DeviceBuffer, Stream};
+
+        let stream = Stream::create().unwrap();
+        // A capture body that bails via `?` drops the guard without calling `end()`.
+        let result: anyhow::Result<()> = (|| {
+            let _guard = stream.begin_capture_scoped()?;
+            // A blocking host->device copy is illegal mid-capture and errors, dropping the guard.
+            let scratch = DeviceBuffer::alloc(std::mem::size_of::<u32>())?;
+            scratch.copy_from_host(&[7u32])?;
+            Ok(())
+        })();
+        assert!(
+            result.is_err(),
+            "a blocking copy during capture should have failed"
+        );
+        // If the guard had not ended the capture, this synchronize (and the copy below) would fail
+        // or record instead of run.
+        stream
+            .synchronize()
+            .expect("stream must be restored to non-capturing after the guard drops");
+        let buf = DeviceBuffer::alloc(std::mem::size_of::<u32>()).unwrap();
+        buf.copy_from_host(&[42u32]).unwrap();
+        stream.synchronize().unwrap();
+        assert_eq!(buf.copy_to_host::<u32>(1).unwrap()[0], 42);
+    }
+
     #[cfg(feature = "native-cuda")]
     #[test]
     fn native_cuda_kernels_run_on_device() {

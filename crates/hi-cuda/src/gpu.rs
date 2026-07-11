@@ -429,7 +429,9 @@ mod native {
     /// lease shape or pool recreation, which would dangle the cache's raw page pointers).
     struct SchedulerGraphDecodeState {
         exec: crate::runtime::GraphExec,
-        // Holds raw pointers into the pooled KV pages (kept alive in `paged_batch_pool`).
+        // Never read after capture — held so the cache's device buffers (page table, etc.), which
+        // the captured graph baked pointers into, stay alive for the exec's lifetime.
+        #[allow(dead_code)]
         cache: CudaPagedBatchKvCache,
         d_position: DeviceBuffer,
         d_token: DeviceBuffer,
@@ -7459,10 +7461,10 @@ mod native {
             crate::runtime::set_capture_active(true);
             self.graph_capture_token.set(&d_token);
             let captured = (|| -> Result<(crate::runtime::CudaGraph, GpuF32Tensor)> {
-                self.stream.begin_capture()?;
+                let guard = self.stream.begin_capture_scoped()?;
                 let logits =
                     self.decode_batch_logits_paged_device(&[token_id], position, &mut cache)?;
-                let graph = self.stream.end_capture()?;
+                let graph = guard.end()?;
                 Ok((graph, logits))
             })();
             self.graph_capture_token.set(std::ptr::null());
@@ -7554,9 +7556,9 @@ mod native {
             self.graph_capture_token.set(&d_token);
             self.graph_capture_position.set(&d_position);
             let captured = (|| -> Result<(crate::runtime::CudaGraph, GpuF32Tensor)> {
-                self.stream.begin_capture()?;
+                let guard = self.stream.begin_capture_scoped()?;
                 let logits = self.decode_batch_logits_paged_device(&[tokens[0]], 0, &mut cache)?;
-                let graph = self.stream.end_capture()?;
+                let graph = guard.end()?;
                 Ok((graph, logits))
             })();
             self.graph_capture_token.set(std::ptr::null());
@@ -7647,9 +7649,9 @@ mod native {
             self.graph_capture_token.set(&d_token);
             self.graph_capture_position.set(&d_position);
             let captured = (|| -> Result<(crate::runtime::CudaGraph, GpuF32Tensor)> {
-                self.stream.begin_capture()?;
+                let guard = self.stream.begin_capture_scoped()?;
                 let logits = self.decode_batch_logits_paged_device(&[1], 0, &mut gcache)?;
-                let graph = self.stream.end_capture()?;
+                let graph = guard.end()?;
                 Ok((graph, logits))
             })();
             self.graph_capture_token.set(std::ptr::null());
@@ -7819,7 +7821,7 @@ mod native {
             self.graph_capture_token.set(&d_token);
             self.graph_capture_position.set(&d_position);
             let captured = (|| -> Result<crate::runtime::CudaGraph> {
-                self.stream.begin_capture()?;
+                let guard = self.stream.begin_capture_scoped()?;
                 let logits = self.decode_batch_logits_paged_device(
                     &[first_token],
                     first_decode_pos,
@@ -7833,7 +7835,7 @@ mod native {
                     logits.cols,
                     &self.stream,
                 )?;
-                self.stream.end_capture()
+                guard.end()
             })();
             self.graph_capture_token.set(std::ptr::null());
             self.graph_capture_position.set(std::ptr::null());
@@ -8069,11 +8071,11 @@ mod native {
             self.graph_capture_token.set(&d_token);
             self.graph_capture_position.set(&d_position);
             let captured = (|| -> Result<crate::runtime::CudaGraph> {
-                self.stream.begin_capture()?;
+                let guard = self.stream.begin_capture_scoped()?;
                 let logits =
                     self.decode_batch_logits_paged_device(&[last_token], position, &mut cache)?;
                 select(&logits)?;
-                self.stream.end_capture()
+                guard.end()
             })();
             self.graph_capture_token.set(std::ptr::null());
             self.graph_capture_position.set(std::ptr::null());
