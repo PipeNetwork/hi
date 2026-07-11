@@ -1998,7 +1998,15 @@ __global__ void rope_batched_kernel(
     float base,
     float scale,
     int position_offset,
-    int split_half) {
+    int split_half,
+    const int* __restrict__ d_position_offset) {
+  // CUDA-graph decode replays one captured graph for every token; the per-token position
+  // is supplied through a device counter so the graph never bakes in a stale offset. When
+  // d_position_offset is null (all non-graph callers) the by-value position_offset is used
+  // and behavior is identical.
+  if (d_position_offset != nullptr) {
+    position_offset = *d_position_offset;
+  }
   int pair = blockIdx.x * blockDim.x + threadIdx.x;
   int pairs_per_token = heads * (head_dim / 2);
   int total_pairs = batch_count * seq_len * pairs_per_token;
@@ -2269,7 +2277,13 @@ __global__ void write_paged_kv_cache_batched_kernel(
     int head_dim,
     int page_size,
     int page_table_len,
-    int start_pos) {
+    int start_pos,
+    const int* __restrict__ d_start_pos) {
+  // CUDA-graph decode: start_pos from a device counter (see rope_batched_kernel). Null for
+  // all non-graph callers -> the by-value start_pos is used, behavior identical.
+  if (d_start_pos != nullptr) {
+    start_pos = *d_start_pos;
+  }
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   int total = batch_count * row_count * kv_heads * head_dim;
   if (idx >= total) {
@@ -4030,7 +4044,13 @@ __global__ void tiled_paged_decode_attention_batched_kernel(
     int kv_heads,
     int qk_head_dim,
     int v_head_dim,
-    int window) {
+    int window,
+    const int* __restrict__ d_position) {
+  // CUDA-graph decode: `position` (the last KV index to attend over) from a device counter
+  // (see rope_batched_kernel). Null for all non-graph callers -> by-value, identical.
+  if (d_position != nullptr) {
+    position = *d_position;
+  }
   // Split-K flash decode (batched). See tiled_paged_decode_attention_kernel.
   const int idx = blockIdx.x;
   const int total = batch_count * heads;
@@ -8880,7 +8900,43 @@ extern "C" int hi_cuda_launch_rope_batched_with_offset(
       base,
       scale,
       position_offset,
-      split_half);
+      split_half,
+      nullptr);
+  return 0;
+}
+
+// Device-position variant for CUDA-graph decode: position_offset comes from a device
+// counter (`d_position_offset`) so one captured graph replays for every token.
+extern "C" int hi_cuda_launch_rope_batched_with_offset_devpos(
+    void* values,
+    int batch_count,
+    int seq_len,
+    int heads,
+    int head_dim,
+    float base,
+    float scale,
+    const void* d_position_offset,
+    int split_half,
+    void* stream) {
+  if (values == nullptr || batch_count <= 0 || seq_len <= 0 || heads <= 0 ||
+      head_dim <= 0 || head_dim % 2 != 0 || base <= 0.0f ||
+      d_position_offset == nullptr || stream == nullptr) {
+    return 1;
+  }
+  int total_pairs = batch_count * seq_len * heads * (head_dim / 2);
+  dim3 block(256);
+  dim3 grid((total_pairs + block.x - 1) / block.x);
+  rope_batched_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<float*>(values),
+      batch_count,
+      seq_len,
+      heads,
+      head_dim,
+      base,
+      scale,
+      0,
+      split_half,
+      static_cast<const int*>(d_position_offset));
   return 0;
 }
 
@@ -9092,7 +9148,44 @@ extern "C" int hi_cuda_launch_write_paged_kv_cache_batched(
       head_dim,
       page_size,
       page_table_len,
-      start_pos);
+      start_pos,
+      nullptr);
+  return 0;
+}
+
+// Device-position variant for CUDA-graph decode: start_pos comes from a device counter.
+extern "C" int hi_cuda_launch_write_paged_kv_cache_batched_devpos(
+    const void* values,
+    void* pages,
+    const void* page_table,
+    int batch_count,
+    int row_count,
+    int kv_heads,
+    int head_dim,
+    int page_size,
+    int page_table_len,
+    const void* d_start_pos,
+    void* stream) {
+  if (values == nullptr || pages == nullptr || page_table == nullptr ||
+      batch_count <= 0 || row_count <= 0 || kv_heads <= 0 || head_dim <= 0 ||
+      page_size <= 0 || page_table_len <= 0 || d_start_pos == nullptr || stream == nullptr) {
+    return 1;
+  }
+  int total = batch_count * row_count * kv_heads * head_dim;
+  dim3 block(256);
+  dim3 grid((total + block.x - 1) / block.x);
+  write_paged_kv_cache_batched_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const float*>(values),
+      static_cast<kv_t*>(pages),
+      static_cast<const uint32_t*>(page_table),
+      batch_count,
+      row_count,
+      kv_heads,
+      head_dim,
+      page_size,
+      page_table_len,
+      0,
+      static_cast<const int*>(d_start_pos));
   return 0;
 }
 
@@ -9891,10 +9984,61 @@ extern "C" int hi_cuda_launch_tiled_paged_decode_attention_batched(
       heads,
       kv_heads,
       qk_head_dim,
-	      v_head_dim,
-      window);
-	  return 0;
-	}
+      v_head_dim,
+      window,
+      nullptr);
+  return 0;
+}
+
+// Device-position variant for CUDA-graph decode: `position` comes from a device counter.
+// `page_size * page_table_len` bounds the cache; the device position must stay within it.
+extern "C" int hi_cuda_launch_tiled_paged_decode_attention_batched_devpos(
+    const void* q,
+    const void* k_pages,
+    const void* v_pages,
+    const void* page_table,
+    void* output,
+    int batch_count,
+    const void* d_position,
+    int page_size,
+    int page_table_len,
+    int heads,
+    int kv_heads,
+    int qk_head_dim,
+    int v_head_dim,
+    int window,
+    void* stream) {
+  if (q == nullptr || k_pages == nullptr || v_pages == nullptr ||
+      page_table == nullptr || output == nullptr || batch_count <= 0 ||
+      d_position == nullptr || page_size <= 0 || page_table_len <= 0 ||
+      heads <= 0 || kv_heads <= 0 || qk_head_dim <= 0 || v_head_dim <= 0 ||
+      qk_head_dim > HI_CUDA_FLASH_MAX_HEAD_DIM ||
+      v_head_dim > HI_CUDA_FLASH_MAX_HEAD_DIM || heads % kv_heads != 0 ||
+      stream == nullptr) {
+    return 1;
+  }
+  dim3 block(HI_CUDA_DECODE_WARPS * 32);
+  dim3 grid(batch_count * heads);
+  size_t shared_bytes =
+      (2 * HI_CUDA_DECODE_WARPS + HI_CUDA_DECODE_WARPS * v_head_dim) * sizeof(float);
+  tiled_paged_decode_attention_batched_kernel<<<grid, block, shared_bytes, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const float*>(q),
+      static_cast<const kv_t*>(k_pages),
+      static_cast<const kv_t*>(v_pages),
+      static_cast<const uint32_t*>(page_table),
+      static_cast<float*>(output),
+      batch_count,
+      0,
+      page_size,
+      page_table_len,
+      heads,
+      kv_heads,
+      qk_head_dim,
+      v_head_dim,
+      window,
+      static_cast<const int*>(d_position));
+  return 0;
+}
 
 extern "C" int hi_cuda_launch_tiled_paged_decode_attention_batched_positions(
     const void* q,

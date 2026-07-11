@@ -13284,7 +13284,7 @@ mod native {
             token_capacity: usize,
             page_tables: &[Vec<usize>],
             pool: &'a CudaPagedBatchDevicePool,
-        ) -> Result<(CudaPagedBatchKvCache<'a>, GpuF32Tensor, usize)> {
+        ) -> Result<(CudaPagedBatchKvCache, GpuF32Tensor, usize)> {
             let dims = self.qwen_dims()?;
             let batch_count = inputs.len();
             if batch_count == 0 {
@@ -15227,7 +15227,7 @@ mod native {
             &self,
             input: &[u32],
             state: &mut RecurrentSsmRequestState,
-            mut cache: Option<&mut CudaPagedBatchKvCache<'_>>,
+            mut cache: Option<&mut CudaPagedBatchKvCache>,
             label: &str,
         ) -> Result<()> {
             if input.is_empty() {
@@ -15251,7 +15251,7 @@ mod native {
             &self,
             token_id: u32,
             state: &mut RecurrentSsmRequestState,
-            mut cache: Option<&mut CudaPagedBatchKvCache<'_>>,
+            mut cache: Option<&mut CudaPagedBatchKvCache>,
             label: &str,
         ) -> Result<GpuF32Tensor> {
             let dims = self.qwen_dims()?;
@@ -17730,11 +17730,11 @@ mod native {
         }
     }
 
-    struct CudaPagedBatchKvCache<'a> {
-        layers: Vec<CudaPagedBatchLayerKvCache<'a>>,
+    struct CudaPagedBatchKvCache {
+        layers: Vec<CudaPagedBatchLayerKvCache>,
     }
 
-    impl<'a> CudaPagedBatchKvCache<'a> {
+    impl CudaPagedBatchKvCache {
         fn new(
             layer_count: u32,
             dims: &QwenDims,
@@ -17836,7 +17836,7 @@ mod native {
             page_size: usize,
             token_capacity: usize,
             page_tables: &[Vec<usize>],
-            pool: &'a CudaPagedBatchDevicePool,
+            pool: &CudaPagedBatchDevicePool,
             stream: &Stream,
         ) -> Result<Self> {
             if batch_count == 0 {
@@ -17900,16 +17900,16 @@ mod native {
                     .copy_from_host(&page_table)
                     .context("copying CUDA paged batch KV page table")?;
                 layers.push(CudaPagedBatchLayerKvCache {
-                    key_pages: CudaPagedBatchBuffer::Borrowed(&pool_layer.key_pages),
-                    value_pages: CudaPagedBatchBuffer::Borrowed(&pool_layer.value_pages),
+                    key_pages: CudaPagedBatchBuffer::Shared(&pool_layer.key_pages),
+                    value_pages: CudaPagedBatchBuffer::Shared(&pool_layer.value_pages),
                     key_scales: pool_layer
                         .key_scales
                         .as_ref()
-                        .map(CudaPagedBatchBuffer::Borrowed),
+                        .map(|b| CudaPagedBatchBuffer::Shared(b)),
                     value_scales: pool_layer
                         .value_scales
                         .as_ref()
-                        .map(CudaPagedBatchBuffer::Borrowed),
+                        .map(|b| CudaPagedBatchBuffer::Shared(b)),
                     page_table: page_table_device,
                     batch_count,
                     page_size,
@@ -17921,7 +17921,7 @@ mod native {
             Ok(Self { layers })
         }
 
-        fn layer(&self, idx: usize) -> Result<&CudaPagedBatchLayerKvCache<'a>> {
+        fn layer(&self, idx: usize) -> Result<&CudaPagedBatchLayerKvCache> {
             self.layers
                 .get(idx)
                 .ok_or_else(|| anyhow!("CUDA paged batch KV cache layer {idx} is missing"))
@@ -18075,7 +18075,7 @@ mod native {
         }
     }
 
-    impl CudaBatchedKvCacheWrite for CudaPagedBatchKvCache<'_> {
+    impl CudaBatchedKvCacheWrite for CudaPagedBatchKvCache {
         fn write_layer_batched(
             &mut self,
             idx: usize,
@@ -18227,26 +18227,33 @@ mod native {
         }
     }
 
-    enum CudaPagedBatchBuffer<'a> {
+    enum CudaPagedBatchBuffer {
         Owned(DeviceBuffer),
-        Borrowed(&'a DeviceBuffer),
+        // A KV-page buffer living in the persistent `CudaPagedBatchDevicePool`. Held as a raw
+        // pointer rather than a borrow so the cache view carries no lifetime and can be kept
+        // alive across CUDA-graph replays (a borrow would make the view self-referential with
+        // the model that owns the pool). SAFETY: the pool outlives every cache built from it —
+        // it is stored in the model's `paged_batch_pool` and only recreated when no cache is
+        // live; the graph-decode path invalidates its captured graph if the pool is recreated.
+        Shared(*const DeviceBuffer),
     }
 
-    impl CudaPagedBatchBuffer<'_> {
+    impl CudaPagedBatchBuffer {
         fn as_buffer(&self) -> &DeviceBuffer {
             match self {
                 Self::Owned(buffer) => buffer,
-                Self::Borrowed(buffer) => buffer,
+                // SAFETY: see the `Shared` variant docs — the pointee outlives `self`.
+                Self::Shared(buffer) => unsafe { &**buffer },
             }
         }
     }
 
-    struct CudaPagedBatchLayerKvCache<'a> {
-        key_pages: CudaPagedBatchBuffer<'a>,
-        value_pages: CudaPagedBatchBuffer<'a>,
+    struct CudaPagedBatchLayerKvCache {
+        key_pages: CudaPagedBatchBuffer,
+        value_pages: CudaPagedBatchBuffer,
         // Present only for the int8/Q8 cache (pool path); None keeps the f16 path.
-        key_scales: Option<CudaPagedBatchBuffer<'a>>,
-        value_scales: Option<CudaPagedBatchBuffer<'a>>,
+        key_scales: Option<CudaPagedBatchBuffer>,
+        value_scales: Option<CudaPagedBatchBuffer>,
         page_table: DeviceBuffer,
         batch_count: usize,
         page_size: usize,
@@ -18254,7 +18261,7 @@ mod native {
         max_seq: usize,
     }
 
-    impl CudaPagedBatchLayerKvCache<'_> {
+    impl CudaPagedBatchLayerKvCache {
         fn write_batched(
             &mut self,
             key: &GpuF32Tensor,
