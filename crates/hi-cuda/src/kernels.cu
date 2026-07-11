@@ -9274,6 +9274,7 @@ extern "C" int hi_cuda_launch_paged_prefill_causal_attention_batched_q8(
 namespace wmma = nvcuda::wmma;
 constexpr int HI_CUDA_WMMA_TILE = 16;
 
+template <int HD_TILES>
 __global__ void wmma_causal_attention_batched_kernel(
     const half* __restrict__ q,
     const half* __restrict__ k,
@@ -9285,7 +9286,7 @@ __global__ void wmma_causal_attention_batched_kernel(
     int kv_heads,
     int head_dim) {
   const int T = HI_CUDA_WMMA_TILE;
-  const int hd_tiles = head_dim / T;   // <= 8 (head_dim <= 128)
+  constexpr int hd_tiles = HD_TILES;   // <= 8 (head_dim <= 128)
   // Flash-attention-v2 style: Q and the O accumulators live in registers/fragments
   // across the whole key loop, so shared holds only the current K/V tile + small
   // softmax scratch (~10 KB vs ~22 KB when O was a shared T*head_dim tile). Freeing
@@ -9315,11 +9316,13 @@ __global__ void wmma_causal_attention_batched_kernel(
                   : __float2half(0.0f);
   }
   __syncwarp();
-  wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> qf[8];
+  wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> qf[HD_TILES];
+#pragma unroll
   for (int h = 0; h < hd_tiles; ++h) {
     wmma::load_matrix_sync(qf[h], k_sh + h * T, head_dim);
   }
-  wmma::fragment<wmma::accumulator, 16, 16, 16, float> of[8];
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> of[HD_TILES];
+#pragma unroll
   for (int h = 0; h < hd_tiles; ++h) {
     wmma::fill_fragment(of[h], 0.0f);
   }
@@ -9350,7 +9353,8 @@ __global__ void wmma_causal_attention_batched_kernel(
     // S = Q @ K^T (tensor cores)
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> s_frag;
     wmma::fill_fragment(s_frag, 0.0f);
-    for (int h = 0; h < hd_tiles; ++h) {
+  #pragma unroll
+  for (int h = 0; h < hd_tiles; ++h) {
       wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> kf;
       wmma::load_matrix_sync(kf, k_sh + h * T, head_dim);
       wmma::mma_sync(s_frag, qf[h], kf, s_frag);
@@ -9424,7 +9428,8 @@ __global__ void wmma_causal_attention_batched_kernel(
     // identical across each 4-lane row group), then O += P @ V (tensor cores)
     wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pf;
     wmma::load_matrix_sync(pf, p_sh, T);
-    for (int h = 0; h < hd_tiles; ++h) {
+  #pragma unroll
+  for (int h = 0; h < hd_tiles; ++h) {
 #pragma unroll
       for (int i = 0; i < of[h].num_elements; ++i) {
         of[h].x[i] *= (((i >> 1) & 1) ? fac_hi : fac_lo);
@@ -9441,6 +9446,7 @@ __global__ void wmma_causal_attention_batched_kernel(
   const float inv_lo = (l_lo == 0.0f || !isfinite(l_lo)) ? 0.0f : 1.0f / l_lo;
   const float l_hi = l_sh[row_hi];
   const float inv_hi = (l_hi == 0.0f || !isfinite(l_hi)) ? 0.0f : 1.0f / l_hi;
+#pragma unroll
   for (int h = 0; h < hd_tiles; ++h) {
 #pragma unroll
     for (int i = 0; i < of[h].num_elements; ++i) {
@@ -9478,11 +9484,24 @@ extern "C" int hi_cuda_launch_wmma_causal_attention_batched(
   // as the O store tile) + m[T] l[T] factor[T] float. O accumulators live in fragments.
   size_t shared_bytes = (2 * T * head_dim + T * T) * sizeof(half) +
                         (T * T + 3 * T) * sizeof(float);
-  wmma_causal_attention_batched_kernel<<<grid, block, shared_bytes,
-                                         static_cast<cudaStream_t>(stream)>>>(
-      static_cast<const half*>(q), static_cast<const half*>(k),
-      static_cast<const half*>(v), static_cast<float*>(output), batch_count, seq_len,
-      heads, kv_heads, head_dim);
+#define HI_CUDA_WMMA_LAUNCH(HT)                                                              \
+  wmma_causal_attention_batched_kernel<HT>                                                     \
+      <<<grid, block, shared_bytes, static_cast<cudaStream_t>(stream)>>>(                      \
+          static_cast<const half*>(q), static_cast<const half*>(k),                           \
+          static_cast<const half*>(v), static_cast<float*>(output), batch_count, seq_len,     \
+          heads, kv_heads, head_dim)
+  switch (head_dim / T) {
+    case 1: HI_CUDA_WMMA_LAUNCH(1); break;
+    case 2: HI_CUDA_WMMA_LAUNCH(2); break;
+    case 3: HI_CUDA_WMMA_LAUNCH(3); break;
+    case 4: HI_CUDA_WMMA_LAUNCH(4); break;
+    case 5: HI_CUDA_WMMA_LAUNCH(5); break;
+    case 6: HI_CUDA_WMMA_LAUNCH(6); break;
+    case 7: HI_CUDA_WMMA_LAUNCH(7); break;
+    case 8: HI_CUDA_WMMA_LAUNCH(8); break;
+    default: return 1;
+  }
+#undef HI_CUDA_WMMA_LAUNCH
   return 0;
 }
 
@@ -9495,6 +9514,7 @@ extern "C" int hi_cuda_launch_wmma_causal_attention_batched(
 // path. Requires head_dim (== qk == v head dim) a multiple of 16, <= 128. f16
 // matmuls -> not bit-parity with the f32 flashtile paged kernel; validated by
 // parity-vs-reference + coherence.
+template <int HD_TILES>
 __global__ void wmma_paged_prefill_causal_attention_batched_kernel(
     const float* __restrict__ q,  // [batch][chunk_len][heads][head_dim] f32
     const kv_t* __restrict__ k_pages,
@@ -9510,7 +9530,7 @@ __global__ void wmma_paged_prefill_causal_attention_batched_kernel(
     int kv_heads,
     int head_dim) {
   const int T = HI_CUDA_WMMA_TILE;
-  const int hd_tiles = head_dim / T;
+  constexpr int hd_tiles = HD_TILES;
   extern __shared__ char smem_raw[];
   half* k_sh = reinterpret_cast<half*>(smem_raw);
   half* v_sh = k_sh + T * head_dim;
@@ -9535,11 +9555,13 @@ __global__ void wmma_paged_prefill_causal_attention_batched_kernel(
                   : __float2half(0.0f);
   }
   __syncwarp();
-  wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> qf[8];
+  wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> qf[HD_TILES];
+#pragma unroll
   for (int h = 0; h < hd_tiles; ++h) {
     wmma::load_matrix_sync(qf[h], k_sh + h * T, head_dim);
   }
-  wmma::fragment<wmma::accumulator, 16, 16, 16, float> of[8];
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> of[HD_TILES];
+#pragma unroll
   for (int h = 0; h < hd_tiles; ++h) {
     wmma::fill_fragment(of[h], 0.0f);
   }
@@ -9588,7 +9610,8 @@ __global__ void wmma_paged_prefill_causal_attention_batched_kernel(
     // S = Q @ K^T (tensor cores)
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> s_frag;
     wmma::fill_fragment(s_frag, 0.0f);
-    for (int h = 0; h < hd_tiles; ++h) {
+  #pragma unroll
+  for (int h = 0; h < hd_tiles; ++h) {
       wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> kf;
       wmma::load_matrix_sync(kf, k_sh + h * T, head_dim);
       wmma::mma_sync(s_frag, qf[h], kf, s_frag);
@@ -9662,7 +9685,8 @@ __global__ void wmma_paged_prefill_causal_attention_batched_kernel(
     // identical across each 4-lane row group), then O += P @ V (tensor cores)
     wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pf;
     wmma::load_matrix_sync(pf, p_sh, T);
-    for (int h = 0; h < hd_tiles; ++h) {
+  #pragma unroll
+  for (int h = 0; h < hd_tiles; ++h) {
 #pragma unroll
       for (int i = 0; i < of[h].num_elements; ++i) {
         of[h].x[i] *= (((i >> 1) & 1) ? fac_hi : fac_lo);
@@ -9678,6 +9702,7 @@ __global__ void wmma_paged_prefill_causal_attention_batched_kernel(
   const float inv_lo = (l_lo == 0.0f || !isfinite(l_lo)) ? 0.0f : 1.0f / l_lo;
   const float l_hi = l_sh[row_hi];
   const float inv_hi = (l_hi == 0.0f || !isfinite(l_hi)) ? 0.0f : 1.0f / l_hi;
+#pragma unroll
   for (int h = 0; h < hd_tiles; ++h) {
 #pragma unroll
     for (int i = 0; i < of[h].num_elements; ++i) {
@@ -9714,18 +9739,32 @@ extern "C" int hi_cuda_launch_wmma_paged_prefill_causal_attention_batched(
   dim3 block(32);
   size_t shared_bytes =
       (2 * T * head_dim + T * T) * sizeof(half) + (T * T + 3 * T) * sizeof(float);
-  wmma_paged_prefill_causal_attention_batched_kernel<<<grid, block, shared_bytes,
-                                                       static_cast<cudaStream_t>(stream)>>>(
-      static_cast<const float*>(q), static_cast<const kv_t*>(k_pages),
-      static_cast<const kv_t*>(v_pages), static_cast<const uint32_t*>(page_table),
-      static_cast<float*>(output), query_offset, batch_count, chunk_len, page_size, page_table_len,
-      heads, kv_heads, head_dim);
+#define HI_CUDA_WMMA_PAGED_LAUNCH(HT)                                                        \
+  wmma_paged_prefill_causal_attention_batched_kernel<HT>                                       \
+      <<<grid, block, shared_bytes, static_cast<cudaStream_t>(stream)>>>(                      \
+          static_cast<const float*>(q), static_cast<const kv_t*>(k_pages),                    \
+          static_cast<const kv_t*>(v_pages), static_cast<const uint32_t*>(page_table),        \
+          static_cast<float*>(output), query_offset, batch_count, chunk_len, page_size,       \
+          page_table_len, heads, kv_heads, head_dim)
+  switch (head_dim / T) {
+    case 1: HI_CUDA_WMMA_PAGED_LAUNCH(1); break;
+    case 2: HI_CUDA_WMMA_PAGED_LAUNCH(2); break;
+    case 3: HI_CUDA_WMMA_PAGED_LAUNCH(3); break;
+    case 4: HI_CUDA_WMMA_PAGED_LAUNCH(4); break;
+    case 5: HI_CUDA_WMMA_PAGED_LAUNCH(5); break;
+    case 6: HI_CUDA_WMMA_PAGED_LAUNCH(6); break;
+    case 7: HI_CUDA_WMMA_PAGED_LAUNCH(7); break;
+    case 8: HI_CUDA_WMMA_PAGED_LAUNCH(8); break;
+    default: return 1;
+  }
+#undef HI_CUDA_WMMA_PAGED_LAUNCH
   return 0;
 }
 
 // int8/Q8 variant of wmma_paged_prefill_causal_attention_batched: K/V pages are
 // int8, dequantized per-vector via the parallel scale buffers during the shared
 // tile gather; the tensor-core path downstream is identical.
+template <int HD_TILES>
 __global__ void wmma_paged_prefill_causal_attention_batched_q8_kernel(
     const float* __restrict__ q,
     const int8_t* __restrict__ k_pages,
@@ -9743,7 +9782,7 @@ __global__ void wmma_paged_prefill_causal_attention_batched_q8_kernel(
     int kv_heads,
     int head_dim) {
   const int T = HI_CUDA_WMMA_TILE;
-  const int hd_tiles = head_dim / T;
+  constexpr int hd_tiles = HD_TILES;
   extern __shared__ char smem_raw[];
   half* k_sh = reinterpret_cast<half*>(smem_raw);
   half* v_sh = k_sh + T * head_dim;
@@ -9767,11 +9806,13 @@ __global__ void wmma_paged_prefill_causal_attention_batched_q8_kernel(
                   : __float2half(0.0f);
   }
   __syncwarp();
-  wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> qf[8];
+  wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> qf[HD_TILES];
+#pragma unroll
   for (int h = 0; h < hd_tiles; ++h) {
     wmma::load_matrix_sync(qf[h], k_sh + h * T, head_dim);
   }
-  wmma::fragment<wmma::accumulator, 16, 16, 16, float> of[8];
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> of[HD_TILES];
+#pragma unroll
   for (int h = 0; h < hd_tiles; ++h) {
     wmma::fill_fragment(of[h], 0.0f);
   }
@@ -9833,7 +9874,8 @@ __global__ void wmma_paged_prefill_causal_attention_batched_q8_kernel(
     __syncwarp();
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> s_frag;
     wmma::fill_fragment(s_frag, 0.0f);
-    for (int h = 0; h < hd_tiles; ++h) {
+  #pragma unroll
+  for (int h = 0; h < hd_tiles; ++h) {
       wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> kf;
       wmma::load_matrix_sync(kf, k_sh + h * T, head_dim);
       wmma::mma_sync(s_frag, qf[h], kf, s_frag);
@@ -9907,7 +9949,8 @@ __global__ void wmma_paged_prefill_causal_attention_batched_q8_kernel(
     // identical across each 4-lane row group), then O += P @ V (tensor cores)
     wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> pf;
     wmma::load_matrix_sync(pf, p_sh, T);
-    for (int h = 0; h < hd_tiles; ++h) {
+  #pragma unroll
+  for (int h = 0; h < hd_tiles; ++h) {
 #pragma unroll
       for (int i = 0; i < of[h].num_elements; ++i) {
         of[h].x[i] *= (((i >> 1) & 1) ? fac_hi : fac_lo);
@@ -9923,6 +9966,7 @@ __global__ void wmma_paged_prefill_causal_attention_batched_q8_kernel(
   const float inv_lo = (l_lo == 0.0f || !isfinite(l_lo)) ? 0.0f : 1.0f / l_lo;
   const float l_hi = l_sh[row_hi];
   const float inv_hi = (l_hi == 0.0f || !isfinite(l_hi)) ? 0.0f : 1.0f / l_hi;
+#pragma unroll
   for (int h = 0; h < hd_tiles; ++h) {
 #pragma unroll
     for (int i = 0; i < of[h].num_elements; ++i) {
@@ -9961,13 +10005,26 @@ extern "C" int hi_cuda_launch_wmma_paged_prefill_causal_attention_batched_q8(
   dim3 block(32);
   size_t shared_bytes =
       (2 * T * head_dim + T * T) * sizeof(half) + (T * T + 3 * T) * sizeof(float);
-  wmma_paged_prefill_causal_attention_batched_q8_kernel<<<grid, block, shared_bytes,
-                                                          static_cast<cudaStream_t>(stream)>>>(
-      static_cast<const float*>(q), static_cast<const int8_t*>(k_pages),
-      static_cast<const int8_t*>(v_pages), static_cast<const float*>(k_scales),
-      static_cast<const float*>(v_scales), static_cast<const uint32_t*>(page_table),
-      static_cast<float*>(output), query_offset, batch_count, chunk_len, page_size, page_table_len,
-      heads, kv_heads, head_dim);
+#define HI_CUDA_WMMA_PAGED_Q8_LAUNCH(HT)                                                     \
+  wmma_paged_prefill_causal_attention_batched_q8_kernel<HT>                                    \
+      <<<grid, block, shared_bytes, static_cast<cudaStream_t>(stream)>>>(                      \
+          static_cast<const float*>(q), static_cast<const int8_t*>(k_pages),                  \
+          static_cast<const int8_t*>(v_pages), static_cast<const float*>(k_scales),           \
+          static_cast<const float*>(v_scales), static_cast<const uint32_t*>(page_table),      \
+          static_cast<float*>(output), query_offset, batch_count, chunk_len, page_size,       \
+          page_table_len, heads, kv_heads, head_dim)
+  switch (head_dim / T) {
+    case 1: HI_CUDA_WMMA_PAGED_Q8_LAUNCH(1); break;
+    case 2: HI_CUDA_WMMA_PAGED_Q8_LAUNCH(2); break;
+    case 3: HI_CUDA_WMMA_PAGED_Q8_LAUNCH(3); break;
+    case 4: HI_CUDA_WMMA_PAGED_Q8_LAUNCH(4); break;
+    case 5: HI_CUDA_WMMA_PAGED_Q8_LAUNCH(5); break;
+    case 6: HI_CUDA_WMMA_PAGED_Q8_LAUNCH(6); break;
+    case 7: HI_CUDA_WMMA_PAGED_Q8_LAUNCH(7); break;
+    case 8: HI_CUDA_WMMA_PAGED_Q8_LAUNCH(8); break;
+    default: return 1;
+  }
+#undef HI_CUDA_WMMA_PAGED_Q8_LAUNCH
   return 0;
 }
 
