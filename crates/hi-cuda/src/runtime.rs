@@ -535,8 +535,11 @@ mod imp {
     impl Drop for CaptureGuard<'_> {
         fn drop(&mut self) {
             if self.armed {
-                // Restore the stream to non-capturing on an early/error exit; discard the result.
+                // Restore the stream to non-capturing on an early/error exit, and consume any
+                // pending capture error (an illegal in-capture op invalidates the capture and
+                // leaves the error latched) so the eager fallback's next launch isn't poisoned.
                 let _ = self.stream.end_capture();
+                clear_last_error();
             }
         }
     }
@@ -974,5 +977,15 @@ mod imp {
 
     pub fn check_last_error(operation: &str) -> Result<()> {
         cuda_check(unsafe { cudaGetLastError() }, operation)
+    }
+
+    /// Consume and discard the pending CUDA error (`cudaGetLastError` clears it). Used after a
+    /// failed graph capture: an illegal in-capture op (e.g. a blocking device->host copy on a
+    /// model whose decode isn't fully device-side) leaves `cudaErrorStreamCaptureInvalidated`
+    /// pending, which would otherwise fail the very next launch on the eager fallback path.
+    pub fn clear_last_error() {
+        unsafe {
+            cudaGetLastError();
+        }
     }
 }
