@@ -964,6 +964,32 @@ __device__ __forceinline__ float ue4m3_to_float(uint8_t value) {
   return raw * 0.5f;
 }
 
+// fp4 (e2m1-scaled) value decode without memory: the 8 magnitudes {0,1,2,3,
+// 4,6,8,12} packed 4 bits each into one register constant (a per-lane variable
+// index into the __constant__ MXFP4_VALUES table serializes into replays when
+// lanes diverge).
+__device__ __forceinline__ float fp4_value(uint32_t q) {
+  constexpr uint32_t MAGS = 0xC8643210u;  // {12,8,6,4,3,2,1,0} in nibbles
+  const float mag = static_cast<float>((MAGS >> ((q & 7u) * 4u)) & 0xFu);
+  return (q & 8u) ? -mag : mag;
+}
+
+// ue4m3 scale decode as pure bit math (ue4m3_to_float uses ldexpf): value =
+// 0.5 * (1 + m/8) * 2^(e-7) for e>0, 0.5 * m * 2^-9 for e==0, 0 for 0/0x7f.
+__device__ __forceinline__ float ue4m3_to_float_fast(uint32_t value) {
+  if (value == 0u || value == 0x7fu) {
+    return 0.0f;
+  }
+  const uint32_t e = (value >> 3) & 0x0fu;
+  const uint32_t m = value & 0x07u;
+  if (e == 0u) {
+    return static_cast<float>(m) * 0x1p-10f;  // (m * 2^-9) * 0.5
+  }
+  // exponent field: (e - 7) + 127 - 1 (the trailing -1 is the 0.5 factor)
+  return __uint_as_float(((e + 119u) << 23) | (m << 20));
+}
+
+
 __global__ void dequantize_q8_0_kernel(const uint8_t* input, float* output, int elements) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= elements) {
@@ -1095,13 +1121,12 @@ __global__ void dequantize_nvfp4_kernel(const uint8_t* input, float* output, int
   output[idx] = d * static_cast<float>(MXFP4_VALUES[quant]);
 }
 
-// Fused fp4 (MXFP4 / NVFP4) GEMV for M=1 decode: y[row] = W[row] . x, reading
-// the packed fp4 blocks natively (MXFP4 17B/32 weights, NVFP4 36B/64) instead
-// of dequantizing the whole matrix to f32 per forward. f32 activations, f32
-// accumulate, one warp per output row; the nibble/scale decode is exactly the
-// dequantize kernels' above, so a dequant-then-dot reference matches to f32
-// accumulation order. At M=1 the row read is weight-bandwidth-bound, so native
-// fp4 reads ~7.5x fewer bytes than the dequantized-f32 matrix.
+// Both fp4 GEMVs iterate WARP-CONTIGUOUSLY: each warp step covers 128
+// consecutive elements of the row, each lane owning 4 consecutive elements --
+// so the activation reads are perfectly coalesced float4s and the weight
+// nibbles per step live in a tight 68/72-byte span. (A block-per-lane layout
+// scatters every instruction across 17-256B strides and measured ~9x off the
+// dp4a GEMV's effective bandwidth.)
 __global__ void mxfp4_gemv_kernel(
     const uint8_t* __restrict__ w,
     const float* __restrict__ x,
@@ -1116,7 +1141,34 @@ __global__ void mxfp4_gemv_kernel(
   const int nblocks = cols / 32;
   const uint8_t* wrow = w + static_cast<long>(row) * nblocks * 17;
   float acc = 0.0f;
-  for (int b = lane; b < nblocks; b += 32) {
+  // Warp step = 128 elements = 4 MXFP4 blocks; lane covers elements
+  // [lane*4, lane*4+4) of the step. Element j of a block: nibble of byte
+  // 1 + (j & 15), low half for j < 16.
+  const int block_in_step = lane >> 3;      // 0..3
+  const int s0 = (lane & 7) * 4;            // 0,4,..,28 within the block
+  const int qoff = 1 + (s0 & 15);           // first of 4 consecutive bytes
+  const bool hi = s0 >= 16;
+  for (int base_blk = 0; base_blk + 4 <= nblocks; base_blk += 4) {
+    const int blk_idx = base_blk + block_in_step;
+    const uint8_t* blk = wrow + blk_idx * 17;
+    const float d = e8m0_to_float_half(blk[0]);
+    const float4 xv = *reinterpret_cast<const float4*>(x + blk_idx * 32 + s0);
+    float bsum;
+    if (hi) {
+      bsum = fp4_value(static_cast<uint32_t>(blk[qoff] >> 4)) * xv.x +
+             fp4_value(static_cast<uint32_t>(blk[qoff + 1] >> 4)) * xv.y +
+             fp4_value(static_cast<uint32_t>(blk[qoff + 2] >> 4)) * xv.z +
+             fp4_value(static_cast<uint32_t>(blk[qoff + 3] >> 4)) * xv.w;
+    } else {
+      bsum = fp4_value(static_cast<uint32_t>(blk[qoff] & 0x0f)) * xv.x +
+             fp4_value(static_cast<uint32_t>(blk[qoff + 1] & 0x0f)) * xv.y +
+             fp4_value(static_cast<uint32_t>(blk[qoff + 2] & 0x0f)) * xv.z +
+             fp4_value(static_cast<uint32_t>(blk[qoff + 3] & 0x0f)) * xv.w;
+    }
+    acc += d * bsum;
+  }
+  // Tail: cols % 128 != 0 leaves up to 3 blocks; strided per lane (rare).
+  for (int b = (nblocks & ~3) + lane; b < nblocks; b += 32) {
     const uint8_t* blk = wrow + b * 17;
     const float d = e8m0_to_float_half(blk[0]);
     const float* xb = x + b * 32;
@@ -1124,8 +1176,8 @@ __global__ void mxfp4_gemv_kernel(
 #pragma unroll
     for (int j = 0; j < 16; ++j) {
       const uint8_t packed = blk[1 + j];
-      bsum += static_cast<float>(MXFP4_VALUES[packed & 0x0f]) * xb[j];
-      bsum += static_cast<float>(MXFP4_VALUES[packed >> 4]) * xb[16 + j];
+      bsum += fp4_value(static_cast<uint32_t>(packed & 0x0f)) * xb[j];
+      bsum += fp4_value(static_cast<uint32_t>(packed >> 4)) * xb[16 + j];
     }
     acc += d * bsum;
   }
@@ -1152,19 +1204,41 @@ __global__ void nvfp4_gemv_kernel(
   const int nblocks = cols / 64;
   const uint8_t* wrow = w + static_cast<long>(row) * nblocks * 36;
   float acc = 0.0f;
-  for (int b = lane; b < nblocks; b += 32) {
+  // Warp step = 128 elements = 2 NVFP4 blocks; lane covers 4 consecutive
+  // elements of one 16-element sub-block. Element j of a block: nibble of
+  // qs byte sub*8 + (j & 7), low half for (j % 16) < 8; a lane's 4 nibbles
+  // are the same half of 4 consecutive bytes = one aligned u32.
+  const int block_in_step = lane >> 4;      // 0..1
+  const int sub = (lane >> 2) & 3;          // 16-element sub-block
+  const int s0 = (lane & 3) * 4;            // 0,4,8,12 within the sub-block
+  const int qoff = 4 + sub * 8 + (s0 & 7);  // u32-aligned (36b+4+8s+{0,4})
+  const int shift = (s0 >= 8) ? 4 : 0;
+  for (int base_blk = 0; base_blk + 2 <= nblocks; base_blk += 2) {
+    const int blk_idx = base_blk + block_in_step;
+    const uint8_t* blk = wrow + blk_idx * 36;
+    const float d = ue4m3_to_float_fast(blk[sub]);
+    const uint32_t q = *reinterpret_cast<const uint32_t*>(blk + qoff);
+    const float4 xv = *reinterpret_cast<const float4*>(x + blk_idx * 64 + sub * 16 + s0);
+    const float bsum = fp4_value((q >> shift) & 0x0fu) * xv.x +
+                       fp4_value((q >> (8 + shift)) & 0x0fu) * xv.y +
+                       fp4_value((q >> (16 + shift)) & 0x0fu) * xv.z +
+                       fp4_value((q >> (24 + shift)) & 0x0fu) * xv.w;
+    acc += d * bsum;
+  }
+  // Tail: an odd block count leaves one block; strided per lane (rare).
+  for (int b = (nblocks & ~1) + lane; b < nblocks; b += 32) {
     const uint8_t* blk = wrow + b * 36;
     const uint8_t* qs = blk + 4;
 #pragma unroll
-    for (int sub = 0; sub < 4; ++sub) {
-      const float d = ue4m3_to_float(blk[sub]);
-      const float* xb = x + b * 64 + sub * 16;
+    for (int s = 0; s < 4; ++s) {
+      const float d = ue4m3_to_float_fast(blk[s]);
+      const float* xb = x + b * 64 + s * 16;
       float ssum = 0.0f;
 #pragma unroll
       for (int j = 0; j < 8; ++j) {
-        const uint8_t packed = qs[sub * 8 + j];
-        ssum += static_cast<float>(MXFP4_VALUES[packed & 0x0f]) * xb[j];
-        ssum += static_cast<float>(MXFP4_VALUES[packed >> 4]) * xb[8 + j];
+        const uint8_t packed = qs[s * 8 + j];
+        ssum += fp4_value(static_cast<uint32_t>(packed & 0x0f)) * xb[j];
+        ssum += fp4_value(static_cast<uint32_t>(packed >> 4)) * xb[8 + j];
       }
       acc += d * ssum;
     }

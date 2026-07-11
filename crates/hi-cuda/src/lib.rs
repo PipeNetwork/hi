@@ -24973,6 +24973,66 @@ mod tests {
         }
     }
 
+    /// Micro-bench (--ignored): fp4 GEMVs vs the Q4_K dp4a GEMV at 3B decode shapes.
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    #[ignore = "kernel A/B bench; run with --ignored on a quiet GPU"]
+    fn bench_fp4_gemv_vs_q4_k() {
+        use crate::runtime::{DeviceBuffer, Stream};
+
+        let stream = Stream::create().unwrap();
+        for (rows, cols) in [(2048usize, 2048usize), (11008, 2048), (2048, 11008)] {
+            let x = DeviceBuffer::alloc(cols * 4).unwrap();
+            x.memset_zero_async(&stream).unwrap();
+            let y = DeviceBuffer::alloc(rows * 4).unwrap();
+            let time = |bytes: usize, run: &dyn Fn()| -> (f64, f64) {
+                run();
+                stream.synchronize().unwrap();
+                let reps = 200;
+                let start = std::time::Instant::now();
+                for _ in 0..reps {
+                    run();
+                }
+                stream.synchronize().unwrap();
+                let us = start.elapsed().as_secs_f64() * 1e6 / reps as f64;
+                (us, bytes as f64 / us / 1e3)
+            };
+
+            let nv_bytes = rows * (cols / 64) * 36;
+            let nv_w = DeviceBuffer::alloc(nv_bytes).unwrap();
+            nv_w.memset_zero_async(&stream).unwrap();
+            let (nv_us, nv_bw) = time(nv_bytes, &|| {
+                crate::kernels::launch_nvfp4_gemv(&nv_w, &x, &y, rows, cols, &stream).unwrap()
+            });
+
+            let mx_bytes = rows * (cols / 32) * 17;
+            let mx_w = DeviceBuffer::alloc(mx_bytes).unwrap();
+            mx_w.memset_zero_async(&stream).unwrap();
+            let (mx_us, mx_bw) = time(mx_bytes, &|| {
+                crate::kernels::launch_mxfp4_gemv(&mx_w, &x, &y, rows, cols, &stream).unwrap()
+            });
+
+            let qk_bytes = rows * (cols / 256) * 144;
+            let qk_w = DeviceBuffer::alloc(qk_bytes).unwrap();
+            qk_w.memset_zero_async(&stream).unwrap();
+            let xq = DeviceBuffer::alloc(cols).unwrap();
+            let dx = DeviceBuffer::alloc((cols / 32) * 4).unwrap();
+            let xsum = DeviceBuffer::alloc((cols / 32) * 4).unwrap();
+            for b in [&xq, &dx, &xsum] {
+                b.memset_zero_async(&stream).unwrap();
+            }
+            let (qk_us, qk_bw) = time(qk_bytes, &|| {
+                crate::kernels::launch_q4_k_dp4a_gemv(
+                    &qk_w, &xq, &dx, &xsum, &y, rows, cols, &stream,
+                )
+                .unwrap()
+            });
+            println!(
+                "{rows}x{cols}: nvfp4 {nv_us:.0}us ({nv_bw:.0} GB/s) mxfp4 {mx_us:.0}us ({mx_bw:.0} GB/s) q4_k {qk_us:.0}us ({qk_bw:.0} GB/s)"
+            );
+        }
+    }
+
     /// W4A8 prefill GEMM (int8 tensor-core Q4_K x int8 activation) vs a host reference over the
     /// dequantized Q4_K weights + round-tripped int8 activations -- the same math as the
     /// validated q4_k dp4a GEMV, extended to M>1. M and N are deliberately NOT multiples of 16
