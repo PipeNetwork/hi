@@ -440,6 +440,14 @@ mod native {
         // Re-entrancy guard so only the OUTERMOST forward primitive records (many
         // forward methods delegate to one another; nested timers would double-count).
         forward_in_progress: Cell<bool>,
+        // CUDA-graph decode hooks. While a decode forward is being *captured*, these hold raw
+        // pointers to the persistent device buffers carrying the per-token input token id and
+        // position, so the embedding gather and the rope/KV-write/attention kernels read them
+        // from device memory (no host copy / by-value arg) and one captured graph replays for
+        // every token. Null outside capture -> the ordinary host-copy / by-value paths run,
+        // unchanged. The pointees outlive any capture; the model is accessed single-threaded.
+        graph_capture_token: Cell<*const DeviceBuffer>,
+        graph_capture_position: Cell<*const DeviceBuffer>,
     }
 
     /// RAII guard: on drop, attributes its lifetime to the model's per-generation
@@ -3000,6 +3008,22 @@ mod native {
             Ok(())
         }
 
+        /// During CUDA-graph decode capture, the device buffer holding the input token id for
+        /// the embedding gather; None means the ordinary host-copied ids are used.
+        fn active_graph_token(&self) -> Option<&DeviceBuffer> {
+            let ptr = self.graph_capture_token.get();
+            // SAFETY: the pointee is a field of the live graph-decode state and the model is
+            // accessed single-threaded (under the backend lock).
+            (!ptr.is_null()).then(|| unsafe { &*ptr })
+        }
+
+        /// During CUDA-graph decode capture, the device buffer holding the current token
+        /// position; None means the ordinary by-value position is used.
+        fn active_graph_position(&self) -> Option<&DeviceBuffer> {
+            let ptr = self.graph_capture_position.get();
+            (!ptr.is_null()).then(|| unsafe { &*ptr })
+        }
+
         /// Start a fresh per-generation prefill/decode timing window.
         pub(crate) fn reset_generation_timing(&self) {
             self.generation_timing.set((0, 0, 0));
@@ -3165,6 +3189,8 @@ mod native {
                 recurrent_page_states: RefCell::new(BTreeMap::new()),
                 generation_timing: Cell::new((0, 0, 0)),
                 forward_in_progress: Cell::new(false),
+                graph_capture_token: Cell::new(std::ptr::null()),
+                graph_capture_position: Cell::new(std::ptr::null()),
             })
         }
 
@@ -4185,10 +4211,22 @@ mod native {
                 }
             }
 
-            let ids = DeviceBuffer::alloc(std::mem::size_of_val(token_ids))
-                .context("allocating CUDA embedding token ids")?;
-            ids.copy_from_host(token_ids)
-                .context("copying CUDA embedding token ids")?;
+            // During CUDA-graph capture (single-token decode) the token id comes from the
+            // persistent device buffer that is rewritten before each replay, so the gather
+            // reads it from device memory — no host alloc/copy (a blocking cudaMemcpy would be
+            // illegal inside stream capture). Otherwise copy the host ids as usual.
+            let ids_owned;
+            let ids: &DeviceBuffer = match self.active_graph_token() {
+                Some(token) if token_ids.len() == 1 => token,
+                _ => {
+                    ids_owned = DeviceBuffer::alloc(std::mem::size_of_val(token_ids))
+                        .context("allocating CUDA embedding token ids")?;
+                    ids_owned
+                        .copy_from_host(token_ids)
+                        .context("copying CUDA embedding token ids")?;
+                    &ids_owned
+                }
+            };
             let output_elements = token_ids
                 .len()
                 .checked_mul(embeddings.cols)
@@ -7247,6 +7285,92 @@ mod native {
                 &self.stream,
             )?;
             self.decode_batch_logits_paged_device(token_ids, position, &mut cache)
+        }
+
+        /// Capture-viability check for CUDA-graph decode: run one paged decode forward
+        /// eagerly, then capture the same forward into a CUDA graph and replay it, returning
+        /// (eager_logits, replayed_logits). They must be bit-identical (same token/position).
+        /// Exercises the capture path — device-token embedding, no blocking copies/syncs, a
+        /// warm buffer pool — without the full per-token orchestration. Text decoder layouts.
+        #[doc(hidden)]
+        pub fn graph_capture_decode_smoke(
+            &self,
+            token_id: u32,
+            position: usize,
+            page_size: usize,
+            page_table: &[usize],
+            physical_page_count: usize,
+        ) -> Result<(Vec<f32>, Vec<f32>)> {
+            let dims = self.qwen_dims()?;
+            let token_capacity = position
+                .checked_add(1)
+                .context("graph smoke token capacity overflows usize")?;
+            let mut cache = {
+                let mut pool_slot = self.paged_batch_pool.borrow_mut();
+                if pool_slot
+                    .as_ref()
+                    .is_none_or(|pool| !pool.can_cover(&dims, page_size, physical_page_count))
+                {
+                    *pool_slot = Some(CudaPagedBatchDevicePool::new(
+                        self.config.block_count,
+                        &dims,
+                        page_size,
+                        physical_page_count,
+                        &self.stream,
+                    )?);
+                }
+                let pool = pool_slot
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("CUDA paged batch device pool was not initialized"))?;
+                CudaPagedBatchKvCache::new_with_page_tables_from_pool(
+                    &dims,
+                    1,
+                    page_size,
+                    token_capacity,
+                    std::slice::from_ref(&page_table.to_vec()),
+                    pool,
+                    &self.stream,
+                )?
+                // pool_slot borrow released here; `cache` holds raw pointers into the pooled
+                // KV pages, which stay alive in `paged_batch_pool` (not recreated below).
+            };
+
+            // Eager forward — also warms the buffer pool for every size the forward allocs.
+            // Copy the logits to host, then drop the tensor so its device buffer returns to the
+            // pool (the captured forward reuses that slot rather than cudaMalloc'ing mid-capture).
+            let (rows, cols, eager) = {
+                let logits =
+                    self.decode_batch_logits_paged_device(&[token_id], position, &mut cache)?;
+                self.stream.synchronize()?;
+                let host = logits.buffer.copy_to_host::<f32>(logits.rows * logits.cols)?;
+                (logits.rows, logits.cols, host)
+            };
+
+            // Persistent device token so the captured embedding gather reads it from device
+            // memory (a host copy would be an illegal cudaMemcpy inside capture).
+            let d_token = DeviceBuffer::alloc(std::mem::size_of::<u32>())
+                .context("allocating CUDA graph smoke token buffer")?;
+            d_token.copy_from_host(&[token_id])?;
+            self.stream.synchronize()?;
+
+            crate::runtime::set_capture_active(true);
+            self.graph_capture_token.set(&d_token);
+            let captured = (|| -> Result<(crate::runtime::CudaGraph, GpuF32Tensor)> {
+                self.stream.begin_capture()?;
+                let logits =
+                    self.decode_batch_logits_paged_device(&[token_id], position, &mut cache)?;
+                let graph = self.stream.end_capture()?;
+                Ok((graph, logits))
+            })();
+            self.graph_capture_token.set(std::ptr::null());
+            crate::runtime::set_capture_active(false);
+
+            let (graph, logits) = captured?;
+            let exec = graph.instantiate()?;
+            exec.launch(&self.stream)?;
+            self.stream.synchronize()?;
+            let replayed = logits.buffer.copy_to_host::<f32>(rows * cols)?;
+            Ok((eager, replayed))
         }
 
         /// Append `token_ids` (one sequence) to the paged cache starting at `position` and

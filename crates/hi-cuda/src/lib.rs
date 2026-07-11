@@ -11801,6 +11801,36 @@ mod tests {
         );
     }
 
+    // CUDA-graph capture viability check on a real model. Opt-in:
+    //   HI_CUDA_GRAPH_SMOKE_GGUF=/path/model.gguf cargo test --release -p hi-cuda \
+    //     --features native-cuda native_cuda_graph_capture_decode_smoke -- --nocapture
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_graph_capture_decode_smoke() {
+        use hi_gguf::GgufFile;
+        let Ok(path) = std::env::var("HI_CUDA_GRAPH_SMOKE_GGUF") else {
+            eprintln!("skipping; set HI_CUDA_GRAPH_SMOKE_GGUF=/path/model.gguf");
+            return;
+        };
+        // Force quantized weights so decode is all dp4a (cuBLAS may not be stream-capturable).
+        // SAFETY: single-threaded test setup.
+        unsafe { std::env::set_var("HI_CUDA_WEIGHTS_F16", "0") };
+        let gguf = GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+        let (eager, replayed) = model
+            .graph_capture_decode_smoke(1, 0, 16, &[0], 1)
+            .expect("capture + replay should succeed");
+        assert_eq!(eager.len(), replayed.len());
+        assert_eq!(
+            eager, replayed,
+            "replayed CUDA-graph logits differ from the eager forward"
+        );
+        eprintln!(
+            "graph capture OK: {} logits, replay bit-identical to eager",
+            eager.len()
+        );
+    }
+
     // Real-model speedup measurement for prompt-lookup speculative decode. Opt-in:
     //   HI_CUDA_SPEC_BENCH_GGUF=/path/model.gguf cargo test --release -p hi-cuda \
     //     --features native-cuda native_cuda_speculative_ngram_bench -- --nocapture
