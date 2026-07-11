@@ -2827,6 +2827,28 @@ mod native {
         *ENABLED.get_or_init(|| std::env::var("HI_CUDA_NO_Q4_GEMV").is_err())
     }
 
+    /// Capture the per-token decode forward into a CUDA graph and replay it, eliminating
+    /// ~700 kernel launches/token (~+8-11% decode throughput). Opt-in via
+    /// `HI_CUDA_DECODE_GRAPH`; single-sequence greedy text decode only, and it falls back
+    /// to eager decode on any capture/replay failure (e.g. a non-capturable cuBLAS path).
+    fn decode_graph_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("HI_CUDA_DECODE_GRAPH").is_ok())
+    }
+
+    /// Warn once (not per request) when HI_CUDA_DECODE_GRAPH is set but the captured decode
+    /// failed and we fell back to eager, so the fallback is visible without log spam.
+    fn warn_decode_graph_fallback_once(err: &anyhow::Error) {
+        use std::sync::Once;
+        static WARNED: Once = Once::new();
+        WARNED.call_once(|| {
+            eprintln!(
+                "HI_CUDA_DECODE_GRAPH: captured decode unavailable, falling back to eager decode ({err:#})"
+            );
+        });
+    }
+
     /// Store the paged KV cache as int8 (per-(token,kv_head)-vector symmetric quant, one
     /// f32 scale each) instead of f16, ~halving KV memory to roughly double the context
     /// ceiling. Off by default; enable with `HI_CUDA_KV_Q8`. Only the tiled paged decode
@@ -4763,6 +4785,23 @@ mod native {
                     stop_token_sequences,
                     is_cancelled,
                 );
+            }
+
+            // Opt-in CUDA-graph decode: capture the per-token forward once and replay it.
+            // Falls through to the eager path below on any capture/replay failure so the
+            // flag can never break generation (e.g. a non-capturable weight residency).
+            if decode_graph_enabled() && self.supports_batched_text_generation() {
+                match self.generate_greedy_tokens_paged_graph_with_cancellation(
+                    input_ids,
+                    max_tokens,
+                    eos_token_id,
+                    page_size,
+                    stop_token_sequences,
+                    &mut is_cancelled,
+                ) {
+                    Ok(tokens) => return Ok(tokens),
+                    Err(err) => warn_decode_graph_fallback_once(&err),
+                }
             }
 
             let token_capacity = input_ids
@@ -7578,6 +7617,28 @@ mod native {
             page_size: usize,
             stop_token_sequences: &[Vec<u32>],
         ) -> Result<Vec<u32>> {
+            self.generate_greedy_tokens_paged_graph_with_cancellation(
+                input_ids,
+                max_tokens,
+                eos_token_id,
+                page_size,
+                stop_token_sequences,
+                || false,
+            )
+        }
+
+        pub fn generate_greedy_tokens_paged_graph_with_cancellation<F>(
+            &self,
+            input_ids: &[u32],
+            max_tokens: usize,
+            eos_token_id: Option<u32>,
+            page_size: usize,
+            stop_token_sequences: &[Vec<u32>],
+            mut is_cancelled: F,
+        ) -> Result<Vec<u32>>
+        where
+            F: FnMut() -> bool,
+        {
             let label = "CUDA paged graph greedy generation";
             let dims = self.qwen_dims()?;
             let max_tokens = validate_generation_max_tokens(label, max_tokens)?;
@@ -7708,7 +7769,7 @@ mod native {
             let mut token = first_token;
             let mut position = first_decode_pos;
             for step in 1..max_tokens {
-                if position >= token_capacity {
+                if position >= token_capacity || is_cancelled() {
                     break;
                 }
                 d_position.copy_from_host(&[position as i32])?;
