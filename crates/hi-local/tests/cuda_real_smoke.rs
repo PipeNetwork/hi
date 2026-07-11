@@ -38,7 +38,10 @@ const FAMILY_FIXTURES: &[FixtureSpec] = &[
     FixtureSpec {
         label: "mistral",
         env_name: "HI_CUDA_SMOKE_MISTRAL_GGUF",
-        expected_family: ModelFamily::Mistral,
+        // llama.cpp converts Mistral-7B with architecture "llama" (it IS the
+        // llama layout), so family detection correctly reports Llama; a gguf
+        // declaring "mistral" would map to ModelFamily::Mistral instead.
+        expected_family: ModelFamily::Llama,
         relative_candidates: &["mistral/model.gguf", "mistral-7b-instruct/model.gguf"],
     },
     FixtureSpec {
@@ -56,20 +59,71 @@ const FAMILY_FIXTURES: &[FixtureSpec] = &[
     FixtureSpec {
         label: "mixtral",
         env_name: "HI_CUDA_SMOKE_MIXTRAL_GGUF",
-        expected_family: ModelFamily::Mixtral,
+        // llama.cpp's Mixtral conversions declare architecture "llama" (MoE-ness
+        // lives in the ffn_gate_inp/expert tensors, which the loader detects
+        // regardless); a gguf declaring "mixtral" would map to
+        // ModelFamily::Mixtral instead.
+        expected_family: ModelFamily::Llama,
         relative_candidates: &["mixtral/model.gguf", "mixtral-instruct/model.gguf"],
     },
     FixtureSpec {
         label: "deepseek-dense",
         env_name: "HI_CUDA_SMOKE_DEEPSEEK_DENSE_GGUF",
         expected_family: ModelFamily::DeepSeek,
+        // NOTE: DeepSeek-V2-Lite does NOT satisfy this fixture — its MLA
+        // variant (direct attn_q + kv_a_mqa/kv_b, no q_a/q_b low-rank split)
+        // is currently unsupported by the loader; a full-MLA (V2/V3-class)
+        // gguf is required here.
         relative_candidates: &["deepseek-dense/model.gguf", "deepseek/model.gguf"],
+    },
+    FixtureSpec {
+        label: "r1-distill-qwen-1.5b",
+        env_name: "HI_CUDA_SMOKE_R1_DISTILL_GGUF",
+        // DeepSeek's R1 distills onto Qwen2.5 bases keep the qwen2 layout.
+        expected_family: ModelFamily::Qwen2,
+        relative_candidates: &["r1-distill-qwen-1.5b/model.gguf"],
     },
     FixtureSpec {
         label: "glm-dense",
         env_name: "HI_CUDA_SMOKE_GLM_DENSE_GGUF",
         expected_family: ModelFamily::GlmFlash,
         relative_candidates: &["glm-dense/model.gguf", "glm4/model.gguf"],
+    },
+    // The shipping fleet: these are the models the backend is benchmarked and
+    // tuned on, so the matrix must exercise them, not just the third-party
+    // family samples above.
+    FixtureSpec {
+        label: "qwen25-vl-3b",
+        env_name: "HI_CUDA_SMOKE_QWEN25_VL_TEXT_GGUF",
+        expected_family: ModelFamily::Qwen2,
+        relative_candidates: &[
+            "qwen25-vl/model.gguf",
+            "qwen25-vl-3b-gguf/Qwen2.5-VL-3B-Instruct-Q4_K_M.gguf",
+        ],
+    },
+    FixtureSpec {
+        label: "qwen25-vl-3b-nvfp4",
+        env_name: "HI_CUDA_SMOKE_QWEN25_NVFP4_GGUF",
+        expected_family: ModelFamily::Qwen2,
+        relative_candidates: &["qwen25-vl-3b-gguf/Qwen2.5-VL-3B-Instruct-NVFP4.gguf"],
+    },
+    FixtureSpec {
+        label: "qwen3-32b",
+        env_name: "HI_CUDA_SMOKE_QWEN3_DENSE_GGUF",
+        expected_family: ModelFamily::Qwen3,
+        relative_candidates: &[
+            "qwen3-32b/model.gguf",
+            "qwen3-32b-gguf/Qwen3-32B-Q4_K_M.gguf",
+        ],
+    },
+    FixtureSpec {
+        label: "qwen3-30b-a3b-moe",
+        env_name: "HI_CUDA_SMOKE_QWEN3_MOE_GGUF",
+        expected_family: ModelFamily::Qwen3,
+        relative_candidates: &[
+            "qwen3-30b-a3b/model.gguf",
+            "qwen3-30b-a3b-gguf/Qwen3-30B-A3B-Q4_K_M.gguf",
+        ],
     },
 ];
 
@@ -90,7 +144,7 @@ fn cuda_real_text_http_smoke() -> Result<()> {
         return Ok(());
     };
 
-    let server = SmokeServer::start(&model, None, &[])?;
+    let mut server = SmokeServer::start(&model, None, &[])?;
     let health = server.wait_for_health(Duration::from_secs(180))?;
     assert_eq!(health["status"], "ok");
     assert_eq!(health["execution"]["status"], "gpu");
@@ -131,7 +185,7 @@ fn cuda_real_text_stress_http_smoke() -> Result<()> {
         return Ok(());
     };
 
-    let server = SmokeServer::start(&model, None, &[])?;
+    let mut server = SmokeServer::start(&model, None, &[])?;
     let health = server.wait_for_health(Duration::from_secs(180))?;
     assert_eq!(health["status"], "ok");
     assert_eq!(health["execution"]["status"], "gpu");
@@ -201,7 +255,7 @@ fn cuda_real_text_page_exhaustion_http_smoke() -> Result<()> {
         return Ok(());
     };
 
-    let server = SmokeServer::start(
+    let mut server = SmokeServer::start(
         &model,
         None,
         &["--max-batched-tokens", "16", "--kv-page-size", "16"],
@@ -271,7 +325,7 @@ fn cuda_real_qwen25_vl_image_http_smoke() -> Result<()> {
         return Ok(());
     };
 
-    let server = SmokeServer::start(&model, Some(&mmproj), &["--max-batched-tokens", "4096"])?;
+    let mut server = SmokeServer::start(&model, Some(&mmproj), &["--max-batched-tokens", "4096"])?;
     let health = server.wait_for_health(Duration::from_secs(240))?;
     assert_eq!(health["status"], "ok");
     assert_eq!(health["execution"]["status"], "gpu");
@@ -318,28 +372,42 @@ fn cuda_real_qwen25_vl_image_http_smoke() -> Result<()> {
 fn cuda_real_family_fixture_metadata_smoke() -> Result<()> {
     let mut checked = Vec::new();
     let mut missing = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
     for spec in FAMILY_FIXTURES {
         let Some(path) = optional_fixture_path(spec.env_name, spec.relative_candidates) else {
             missing.push(spec.label);
             continue;
         };
-        let gguf = GgufFile::open(&path)
-            .with_context(|| format!("opening {} fixture {}", spec.label, path.display()))?;
-        let config = gguf
-            .qwen_config()
-            .with_context(|| format!("parsing {} fixture {}", spec.label, path.display()))?;
-        if config.family != spec.expected_family {
-            bail!(
-                "{} fixture {} reported family {:?}, expected {:?}",
-                spec.label,
-                path.display(),
-                config.family,
-                spec.expected_family
-            );
+        let outcome = (|| -> Result<()> {
+            let gguf = GgufFile::open(&path)
+                .with_context(|| format!("opening {} fixture {}", spec.label, path.display()))?;
+            let config = gguf
+                .qwen_config()
+                .with_context(|| format!("parsing {} fixture {}", spec.label, path.display()))?;
+            if config.family != spec.expected_family {
+                bail!(
+                    "{} fixture {} reported family {:?}, expected {:?}",
+                    spec.label,
+                    path.display(),
+                    config.family,
+                    spec.expected_family
+                );
+            }
+            gguf.validate_qwen_tensors()
+                .with_context(|| format!("validating {} fixture {}", spec.label, path.display()))?;
+            Ok(())
+        })();
+        match outcome {
+            Ok(()) => checked.push(spec.label),
+            Err(err) => failures.push(format!("{}: {err:#}", spec.label)),
         }
-        gguf.validate_qwen_tensors()
-            .with_context(|| format!("validating {} fixture {}", spec.label, path.display()))?;
-        checked.push(spec.label);
+    }
+    if !failures.is_empty() {
+        bail!(
+            "CUDA family fixture metadata failure(s) (checked ok: {}):\n{}",
+            checked.join(", "),
+            failures.join("\n")
+        );
     }
 
     if env_flag("HI_CUDA_REQUIRE_REAL_FIXTURE_MATRIX") && !missing.is_empty() {
@@ -371,38 +439,56 @@ fn cuda_real_family_text_http_smoke() -> Result<()> {
     let _guard = smoke_gpu_lock();
     let mut checked = Vec::new();
     let mut missing = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
     for spec in FAMILY_FIXTURES {
         let Some(path) = optional_fixture_path(spec.env_name, spec.relative_candidates) else {
             missing.push(spec.label);
             continue;
         };
-        let server = SmokeServer::start(&path, None, &[])?;
-        let health = server.wait_for_health(Duration::from_secs(300))?;
-        assert_eq!(health["status"], "ok", "{health}");
-        assert_eq!(health["execution"]["status"], "gpu", "{health}");
-        assert_eq!(
-            health["scheduler"]["mode"], "continuous-iteration",
-            "{health}"
-        );
-        assert_eq!(health["kv_cache"]["status"], "paged", "{health}");
-        let attention_status = health["attention"]["status"]
-            .as_str()
-            .ok_or_else(|| anyhow!("family fixture health missing attention status: {health}"))?;
-        if !matches!(attention_status, "tiled-paged" | "paged-generic") {
-            bail!(
-                "{} fixture reported unsupported CUDA attention status {attention_status}: {health}",
-                spec.label
-            );
+        // One broken fixture must not hide the rest of the matrix: run every
+        // family, collect failures, and report them all at the end.
+        let outcome = (|| -> Result<()> {
+            let mut server = SmokeServer::start(&path, None, &[])?;
+            let health = server.wait_for_health(Duration::from_secs(300))?;
+            if health["status"] != "ok" {
+                bail!("health not ok: {health}");
+            }
+            if health["execution"]["status"] != "gpu" {
+                bail!("execution not gpu: {health}");
+            }
+            if health["scheduler"]["mode"] != "continuous-iteration" {
+                bail!("scheduler not continuous: {health}");
+            }
+            if health["kv_cache"]["status"] != "paged" {
+                bail!("kv cache not paged: {health}");
+            }
+            let attention_status = health["attention"]["status"].as_str().ok_or_else(|| {
+                anyhow!("family fixture health missing attention status: {health}")
+            })?;
+            if !matches!(attention_status, "tiled-paged" | "paged-generic") {
+                bail!("unsupported CUDA attention status {attention_status}: {health}");
+            }
+            let response = server.chat(json!({
+                "model": SMOKE_MODEL_ID,
+                "messages": [{"role": "user", "content": "Reply with one short word."}],
+                "max_tokens": 1,
+                "temperature": 0.0,
+                "stream": false
+            }))?;
+            assert_chat_completion(&response)?;
+            Ok(())
+        })();
+        match outcome {
+            Ok(()) => checked.push(spec.label),
+            Err(err) => failures.push(format!("{}: {err:#}", spec.label)),
         }
-        let response = server.chat(json!({
-            "model": SMOKE_MODEL_ID,
-            "messages": [{"role": "user", "content": "Reply with one short word."}],
-            "max_tokens": 1,
-            "temperature": 0.0,
-            "stream": false
-        }))?;
-        assert_chat_completion(&response)?;
-        checked.push(spec.label);
+    }
+    if !failures.is_empty() {
+        bail!(
+            "CUDA family matrix failure(s) (checked ok: {}):\n{}",
+            checked.join(", "),
+            failures.join("\n")
+        );
     }
 
     if env_flag("HI_CUDA_REQUIRE_REAL_FIXTURE_MATRIX") && !missing.is_empty() {
@@ -533,10 +619,19 @@ impl SmokeServer {
         })
     }
 
-    fn wait_for_health(&self, timeout: Duration) -> Result<Value> {
+    fn wait_for_health(&mut self, timeout: Duration) -> Result<Value> {
         let started = Instant::now();
         let mut last_err = None;
         while started.elapsed() < timeout {
+            // A dead child never becomes healthy: surface its exit and stderr
+            // immediately instead of burning the whole timeout (a broken
+            // fixture used to cost 300s of wall clock before reporting).
+            if let Ok(Some(status)) = self.child.try_wait() {
+                return Err(anyhow!(
+                    "smoke server exited ({status}) before becoming healthy; stderr:\n{}",
+                    self.stderr_tail()
+                ));
+            }
             match self.get_json("/health") {
                 Ok(health) if health["status"] == "ok" => return Ok(health),
                 Ok(health) => last_err = Some(anyhow!("health was not ready: {health}")),
