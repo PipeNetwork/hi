@@ -295,7 +295,7 @@ pub struct Usage {
 
 impl Usage {
     pub fn total(&self) -> u64 {
-        self.input_tokens + self.output_tokens
+        self.input_tokens.saturating_add(self.output_tokens)
     }
 
     pub fn is_zero(&self) -> bool {
@@ -306,10 +306,17 @@ impl Usage {
     }
 
     pub fn add(&mut self, other: Usage) {
-        self.input_tokens += other.input_tokens;
-        self.output_tokens += other.output_tokens;
-        self.cache_read_tokens += other.cache_read_tokens;
-        self.cache_creation_tokens += other.cache_creation_tokens;
+        // Saturating: token counts come straight off the wire (`as_u64()`), so a
+        // corrupt or hostile endpoint reporting near-`u64::MAX` must not panic an
+        // overflow-checked build or wrap session totals to garbage in release.
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(other.cache_read_tokens);
+        self.cache_creation_tokens = self
+            .cache_creation_tokens
+            .saturating_add(other.cache_creation_tokens);
         // "Latest observed": a booking that carries no rate-limit snapshot
         // (side-calls, error usage, estimates) must not wipe the last real one —
         // that made the rate-limit display blank out mid-session.

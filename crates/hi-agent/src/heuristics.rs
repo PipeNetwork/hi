@@ -312,7 +312,11 @@ pub(crate) fn emit_tool_output(ui: &mut dyn Ui, name: &str, output: &ToolOutput)
 /// - A mutating call (`write`/`edit`/`multi_edit`/`bash`/`apply_patch`) depends
 ///   on every earlier mutating call, so side effects apply in emission order.
 ///   (Two independent writes still serialize — file edits aren't commutative
-///   and a later write may depend on an earlier write's content.)
+///   and a later write may depend on an earlier write's content.) It also
+///   depends on any earlier *read* of the same path (write-after-read): "read
+///   a.rs, then write a.rs" must let the read observe the pre-write content, not
+///   a file being truncated/rewritten under it. A mutation with an unknown write
+///   path (`bash`) conservatively waits for every earlier read.
 /// - A read-only call depends on any earlier mutating call whose inferred
 ///   target path matches the read's target path — so "write a.rs, then read
 ///   a.rs" reads the post-write state even if a scheduler reorders independent
@@ -333,8 +337,12 @@ pub(crate) fn tool_deps(calls: &[(String, String, String)]) -> Vec<Vec<usize>> {
         let my_path = hi_tools::target_path(name, arguments);
         for (j, (was_mut, their_path)) in prior.iter().enumerate() {
             let must_wait = if mutating {
-                // Mutating calls serialize after all earlier mutations.
-                *was_mut
+                // Serialize after all earlier mutations (was_mut), and after an
+                // earlier read of the same path (write-after-read: the read must
+                // see the pre-write file). A mutation with an unknown write path
+                // (bash) conservatively waits for every earlier read, since
+                // paths_overlap treats an unknown path as overlapping.
+                *was_mut || paths_overlap(their_path.as_deref(), my_path.as_deref())
             } else {
                 // Reads wait for an earlier mutation on the same path. If
                 // either side has no parseable path, be safe and serialize
@@ -415,6 +423,31 @@ pub(crate) fn tool_mode_label(mode: ToolMode) -> &'static str {
         ToolMode::Required => "required",
         ToolMode::ChatOnly => "chat-only",
         ToolMode::ReadOnly => "read-only",
+    }
+}
+
+/// Whether the session `tool_mode` forbids *executing* `name`, returning the
+/// synthetic blocked-tool result to feed back to the model if so.
+///
+/// This enforces the mode at execution time, not just via tool advertisement —
+/// which is what closes the text-promoted tool-call hole: a local model can emit
+/// a tool call as prose (`{"name":"write",…}`) that never went through the
+/// advertised tool list, so a ChatOnly/ReadOnly session (including every
+/// `explore` subagent) would otherwise run it. `explore` launches only a
+/// read-only child, so it's allowed under ReadOnly (mirroring the advertisement
+/// rules and [`crate::steering::nudges::read_only_blocks_tool`]).
+pub(crate) fn mode_blocks_tool(mode: ToolMode, name: &str) -> Option<String> {
+    match mode {
+        ToolMode::Auto | ToolMode::Required => None,
+        ToolMode::ChatOnly => Some(format!(
+            "Tool `{name}` blocked: this is a discuss-only turn (tool mode chat-only). \
+             Answer in text without calling tools."
+        )),
+        ToolMode::ReadOnly if !hi_tools::is_read_only(name) && name != "explore" => Some(format!(
+            "Tool `{name}` blocked: this session is read-only (tool mode read-only). \
+             Use read-only inspection tools and do not modify files."
+        )),
+        ToolMode::ReadOnly => None,
     }
 }
 
@@ -694,6 +727,55 @@ pub(crate) fn recovery_telemetry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_deps_serializes_write_after_read_on_same_path() {
+        // read a.rs then write a.rs: the write must wait for the read so the read
+        // observes the pre-write file (previously they ran concurrently, so the
+        // read could see a torn/post-write file).
+        let calls = vec![
+            ("r".into(), "read".into(), r#"{"path":"a.rs"}"#.into()),
+            (
+                "w".into(),
+                "write".into(),
+                r#"{"path":"a.rs","content":"x"}"#.into(),
+            ),
+        ];
+        let deps = tool_deps(&calls);
+        assert!(deps[0].is_empty(), "the read has no deps");
+        assert_eq!(deps[1], vec![0], "the write waits for the same-path read");
+
+        // read a.rs then write b.rs: different files, still independent.
+        let calls = vec![
+            ("r".into(), "read".into(), r#"{"path":"a.rs"}"#.into()),
+            (
+                "w".into(),
+                "write".into(),
+                r#"{"path":"b.rs","content":"x"}"#.into(),
+            ),
+        ];
+        let deps = tool_deps(&calls);
+        assert!(
+            deps[1].is_empty(),
+            "a write to a different file is independent of the read"
+        );
+    }
+
+    #[test]
+    fn mode_blocks_tool_enforces_session_mode() {
+        // ChatOnly blocks every tool (nothing runs, not even reads).
+        assert!(mode_blocks_tool(ToolMode::ChatOnly, "read").is_some());
+        assert!(mode_blocks_tool(ToolMode::ChatOnly, "write").is_some());
+        // ReadOnly blocks mutating tools but allows inspection + `explore`.
+        assert!(mode_blocks_tool(ToolMode::ReadOnly, "write").is_some());
+        assert!(mode_blocks_tool(ToolMode::ReadOnly, "bash").is_some());
+        assert!(mode_blocks_tool(ToolMode::ReadOnly, "read").is_none());
+        assert!(mode_blocks_tool(ToolMode::ReadOnly, "grep").is_none());
+        assert!(mode_blocks_tool(ToolMode::ReadOnly, "explore").is_none());
+        // Auto/Required never block by mode.
+        assert!(mode_blocks_tool(ToolMode::Auto, "write").is_none());
+        assert!(mode_blocks_tool(ToolMode::Required, "bash").is_none());
+    }
 
     #[test]
     fn humanize_count_abbreviates_consistently() {

@@ -771,6 +771,7 @@ async fn manager(
                     .map(LoopSpec::name)
                     .unwrap_or_else(|| format!("#{id}"));
                 let fired_ms = now_ms();
+                let errored = result.is_err();
                 let (line, summary, quiet, tokens) = match result {
                     Ok(outcome) => {
                         let quiet = is_quiet(&outcome.summary);
@@ -786,6 +787,18 @@ async fn manager(
                         ((text, true), format!("firing failed: {err}"), false, None)
                     }
                 };
+                // A firing that failed to launch/run never established or advanced
+                // the baseline, so roll back the at-spawn `firings += 1`. Otherwise
+                // a failed FIRST firing leaves firings == 1, and the next firing
+                // (firings == 2) is told to "compare against previous checks, reply
+                // NOTHING NEW" against a session that has no baseline — silently
+                // suppressing the first genuine report.
+                if errored
+                    && let Some(l) = state.loops.iter_mut().find(|l| l.id == id)
+                {
+                    l.firings = l.firings.saturating_sub(1);
+                    save(loops_file.as_deref(), &state);
+                }
                 // Fold in the cost and enforce the budget: `total_tokens` is
                 // session-cumulative, so it *is* the loop's running spend.
                 let mut budget_line: Option<LoopLine> = None;

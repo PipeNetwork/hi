@@ -613,5 +613,11 @@ pub(crate) enum TurnState {
 /// range, the per-frame render clone, and memory on very long sessions.
 pub(crate) const MAX_TRANSCRIPT_LINES: usize = 10_000;
 
+/// Max debug-event log entries kept (one per streamed chunk / tool call /
+/// status). Read only by `/log`; without a cap it grows unbounded for the life
+/// of a long session (hours of streaming push millions of small entries) even
+/// though the visible transcript stays bounded. Trimmed oldest-first.
+pub(crate) const MAX_EVENT_LOG: usize = 20_000;
+
 #[cfg(test)]
 mod tests;

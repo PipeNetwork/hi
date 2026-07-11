@@ -75,12 +75,27 @@ impl Provider for AnthropicProvider {
         let mut blocks: Vec<Option<BlockBuilder>> = Vec::new();
         let mut completion = Completion::default();
         let mut stream_complete = false;
+        let mut progressed = false;
 
         loop {
             let Some(event) = stream.next().await else {
                 break;
             };
-            let event = event.context("error reading stream")?;
+            let event = match event {
+                Ok(event) => event,
+                // Mirror the OpenAI path: an unclean mid-stream close AFTER the
+                // answer finished or after content has already streamed must not
+                // discard a (near-)complete response and force a full re-bill —
+                // return what we have (the input tokens from `message_start` are
+                // already in `completion.usage`; output is estimated below). With
+                // no progress yet it's a genuine failure: propagate.
+                Err(err) => {
+                    if stream_complete || progressed {
+                        break;
+                    }
+                    return Err(err).context("error reading stream");
+                }
+            };
             let Ok(data) = serde_json::from_str::<Value>(&event.data) else {
                 continue;
             };
@@ -102,10 +117,13 @@ impl Provider for AnthropicProvider {
                     }
                     // Anthropic reports cache tokens separately from
                     // `input_tokens`, so the full context window occupancy is
-                    // the sum of all three.
-                    completion.usage.context_occupancy = completion.usage.input_tokens
-                        + completion.usage.cache_read_tokens
-                        + completion.usage.cache_creation_tokens;
+                    // the sum of all three. Saturating: the counts come straight
+                    // off the wire, so a corrupt frame can't overflow-panic here.
+                    completion.usage.context_occupancy = completion
+                        .usage
+                        .input_tokens
+                        .saturating_add(completion.usage.cache_read_tokens)
+                        .saturating_add(completion.usage.cache_creation_tokens);
                 }
                 "content_block_start" => {
                     let index = data["index"].as_u64().unwrap_or(0) as usize;
@@ -123,6 +141,7 @@ impl Provider for AnthropicProvider {
                     let index = data["index"].as_u64().unwrap_or(0) as usize;
                     if let Some(Some(builder)) = blocks.get_mut(index) {
                         builder.apply_delta(&data["delta"], sink);
+                        progressed = true;
                     }
                 }
                 "message_delta" => {

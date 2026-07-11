@@ -17,9 +17,9 @@ use crate::command;
 use crate::compaction;
 use crate::heuristics::{
     RECOVERY_SAMPLING, StallMode, emit_tool_output, humanize_count, looks_like_continue,
-    looks_like_unfinished_step, looks_mutating, parse_text_tool_calls, plan_has_pending_steps,
-    recovery_sampling, recovery_telemetry, respects_deps, textcall_id_offset, tool_deps,
-    tool_mode_label,
+    looks_like_unfinished_step, looks_mutating, mode_blocks_tool, parse_text_tool_calls,
+    plan_has_pending_steps, recovery_sampling, recovery_telemetry, respects_deps,
+    textcall_id_offset, tool_deps, tool_mode_label,
 };
 use crate::snapshot::changed_files_between;
 use crate::steering::{
@@ -613,7 +613,18 @@ impl crate::Agent {
         let input = turn_input.as_str();
         self.reset_last_turn_usage(user_prompt_tokens);
 
-        if read_only_intent.is_none() && self.tools_unavailable_for(input) {
+        // A top-level session the user restricted to ChatOnly/ReadOnly gets a
+        // clear early "your mode blocks edits" error when the prompt clearly asks
+        // for mutation. This must NOT fire for a subagent: an `explore` child
+        // runs ReadOnly as internal capability-scoping (not a user restriction),
+        // and its task text naturally contains verbs like "find where X creates
+        // Y" — pattern-matching that as a mutating request would abort the child
+        // before its first model call and return "(no answer)". The child simply
+        // isn't advertised mutating tools, so it's safe to let it run and answer.
+        if read_only_intent.is_none()
+            && !self.config.is_subagent
+            && self.tools_unavailable_for(input)
+        {
             self.last_verify = None;
             self.last_changed_files.clear();
             self.last_compat_fallbacks.clear();
@@ -2393,9 +2404,20 @@ If the task is already complete, stop and give your final recap."
                 // tree — so they now dispatch inside the dep-aware scheduler
                 // loop below.)
                 for (i, (id, name, arguments)) in calls.iter().enumerate() {
-                    if read_only_blocks_tool(read_only_intent, name) {
+                    // Block calls forbidden by the review intent (read-only
+                    // prompt) OR the session tool_mode. The tool_mode check is
+                    // essential for the text-promoted tool-call path above: a
+                    // local model can emit `{"name":"write",…}` as prose, which
+                    // bypasses tool *advertisement*, so without an execution-time
+                    // guard a ChatOnly/ReadOnly session — every `explore` subagent
+                    // included — could still run a mutating `write`/`bash`.
+                    let blocked = if read_only_blocks_tool(read_only_intent, name) {
+                        Some(read_only_blocked_tool_result(name))
+                    } else {
+                        mode_blocks_tool(self.config.tool_mode, name)
+                    };
+                    if let Some(content) = blocked {
                         ui.tool_call(name, arguments);
-                        let content = read_only_blocked_tool_result(name);
                         emit_tool_output(
                             &mut *ui,
                             name,
@@ -3215,7 +3237,9 @@ If the task is already complete, stop and give your final recap."
         let completion = match self.provider.stream(request, &mut sink).await {
             Ok(completion) => completion,
             Err(err) => {
-                self.add_error_usage(&err);
+                // Finalize is a side call — book its error usage without resetting
+                // the main conversation's `context_used` gauge.
+                self.add_side_error_usage(&err);
                 self.emit_usage(ui);
                 // Flush any partially-streamed recap text before the status
                 // line, so it isn't left dangling in the UI's pending buffer.

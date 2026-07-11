@@ -53,8 +53,24 @@ impl Provider for FallbackProvider {
             match backend.provider.stream(req, sink).await {
                 Ok(mut completion) if !completion.content.is_empty() || is_last => {
                     if !prior_usage.is_zero() {
-                        completion.usage.input_tokens += prior_usage.input_tokens;
-                        completion.usage.output_tokens += prior_usage.output_tokens;
+                        // Fold the failed/empty earlier attempts' token counts
+                        // into the winner. `Usage::add` sums only the token counts
+                        // + `estimated` and leaves `context_occupancy` /
+                        // `input_includes_cache` untouched (so the winner's stay),
+                        // but it would let a stale prior rate-limit snapshot
+                        // overwrite the winner's — so preserve the winner's
+                        // occupancy/cache/rate-limit scalars explicitly (these
+                        // drive the context gauge; taking them from a zeroed prior
+                        // attempt would mis-count cache tokens and trip early
+                        // auto-compaction).
+                        let winner_context = completion.usage.context_occupancy;
+                        let winner_includes_cache = completion.usage.input_includes_cache;
+                        let winner_rate_limits = completion.usage.rate_limits;
+                        let prior_rate_limits = prior_usage.rate_limits;
+                        completion.usage.add(prior_usage);
+                        completion.usage.context_occupancy = winner_context;
+                        completion.usage.input_includes_cache = winner_includes_cache;
+                        completion.usage.rate_limits = winner_rate_limits.or(prior_rate_limits);
                     }
                     return Ok(completion);
                 }

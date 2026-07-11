@@ -114,6 +114,10 @@ impl ProviderForm {
         if !base_url.is_empty() {
             form.fields[3].input.set(base_url);
         }
+        // Start focus past the API-key field when it's hidden (Ollama needs no
+        // key). Without this the form opens focused on an undrawn field, so the
+        // user's first keystrokes land invisibly in the API-key input.
+        form.skip_hidden();
         form
     }
 

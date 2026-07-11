@@ -91,7 +91,7 @@ impl crate::Agent {
         let completion = match self.provider.stream(request, &mut sink).await {
             Ok(completion) => completion,
             Err(err) => {
-                self.add_error_usage(&err);
+                self.add_side_error_usage(&err);
                 ui.status(&format!("(couldn't curate skill: {err})"));
                 return;
             }

@@ -140,6 +140,9 @@ fn run_blocking(
     let prompt = child_prompt(task, verify_cmd.as_deref());
     let mut cmd = Command::new(exe);
     cmd.current_dir(&worktree)
+        // Force the child to use the parent's resolved key (not a re-resolved
+        // default-profile literal). Env, not argv, so it isn't visible in `ps`.
+        .env("HI_FORCE_API_KEY", api_key)
         .env("HI_API_KEY", api_key)
         // No pipes: we gate on the ground-truth verify + the worktree diff, not the
         // child's stdout — and unread pipes would deadlock the timeout wait.
@@ -191,7 +194,25 @@ fn run_with_timeout(mut cmd: Command, secs: u64) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
         match child.try_wait() {
-            Ok(Some(_status)) => return Ok(()),
+            Ok(Some(status)) => {
+                // Only a clean exit means the task completed. A non-zero exit
+                // (provider error, step-cap kill, panic) means the child bailed
+                // mid-task — its worktree may hold a half-finished diff that must
+                // NOT reach the real tree, so surface it as a failure (the caller
+                // discards the worktree) rather than applying partial work.
+                if status.success() {
+                    return Ok(());
+                }
+                return Err(format!(
+                    "subagent exited unsuccessfully ({}); nothing applied. Its \
+                     partial changes were discarded — refine the task or \
+                     implement it directly.",
+                    status
+                        .code()
+                        .map(|c| format!("exit {c}"))
+                        .unwrap_or_else(|| "killed by signal".into())
+                ));
+            }
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();

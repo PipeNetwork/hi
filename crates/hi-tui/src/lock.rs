@@ -122,9 +122,29 @@ pub(crate) fn try_acquire(path: &Path) -> Option<FireLock> {
                 if live_holder(path).is_some() {
                     return None; // a live owner holds it
                 }
-                // Stale: reclaim and retry. hard_link's exclusivity means only one
-                // racer wins the re-link; the other loops and sees the new holder.
-                let _ = std::fs::remove_file(path);
+                // Stale: reclaim it. A blind `remove_file(path)` here is racy —
+                // between the `live_holder` check above (which shells out to
+                // `kill`/`ps`, a wide window) and the remove, a peer can reclaim
+                // and install its own *live* lock, which we'd then delete, leaving
+                // two holders that both double-fire every loop. Instead move the
+                // file aside atomically: `rename` of the current file succeeds for
+                // exactly one racer (the other gets ENOENT and re-observes the
+                // winner's lock on the next iteration). Then re-check the captured
+                // file's liveness — if it went live in the meantime, restore it
+                // and back off rather than steal a live lock.
+                let aside = path.with_extension(format!("lock.reclaim.{}", std::process::id()));
+                let _ = std::fs::remove_file(&aside);
+                if std::fs::rename(path, &aside).is_ok() {
+                    if live_holder(&aside).is_some() {
+                        // Became live between the check and the capture — put it
+                        // back and let that owner keep the lock.
+                        let _ = std::fs::rename(&aside, path);
+                        return None;
+                    }
+                    let _ = std::fs::remove_file(&aside);
+                }
+                // Whether we captured it or lost the rename race, loop and retry
+                // the exclusive hard-link.
             }
             Err(_) => {
                 let _ = std::fs::remove_file(&tmp);

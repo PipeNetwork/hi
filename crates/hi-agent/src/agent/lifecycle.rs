@@ -485,6 +485,18 @@ impl crate::Agent {
         self.add_usage(provider_error_usage(err));
     }
 
+    /// Like [`add_error_usage`] but for a *side* model call (skeptic, curate,
+    /// memory, goal planning, finalize, summarize). Books the error's usage
+    /// toward totals/turn spend without touching `context_used` — routing a
+    /// small side request's input size through `add_usage` would reset the main
+    /// conversation's occupancy gauge and silently disable the next
+    /// auto-compaction (see [`add_side_usage`]). Providers do attach nonzero
+    /// input usage to some errors (e.g. EmptyCompletion/MalformedStream), so
+    /// this matters in practice, not just in theory.
+    pub(crate) fn add_side_error_usage(&mut self, err: &anyhow::Error) {
+        self.add_side_usage(provider_error_usage(err));
+    }
+
     pub(crate) fn emit_usage(&self, ui: &mut dyn Ui) {
         ui.usage(
             self.last_user_prompt_tokens,
@@ -847,7 +859,14 @@ impl crate::Agent {
 
     pub(crate) fn persist(&mut self) -> Result<()> {
         if let Some(session) = self.session.as_mut() {
-            session.record(&self.messages.as_slice()[self.persisted..], self.totals)?;
+            // Clamp the cursor: transcript-shrinking ops (`strip_trailing_nudges`,
+            // `strip_finalize_pair`) pop messages without adjusting `persisted`,
+            // so after a mid-turn persist that already recorded up to a
+            // now-popped message, `persisted` can exceed the current length.
+            // Slicing `[persisted..]` would then panic; clamp so we simply record
+            // nothing new instead of crashing the session.
+            let start = self.persisted.min(self.messages.len());
+            session.record(&self.messages.as_slice()[start..], self.totals)?;
             self.persisted = self.messages.len();
         }
         Ok(())

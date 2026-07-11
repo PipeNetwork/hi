@@ -522,6 +522,7 @@ impl crate::App {
                 match agent.clear_history() {
                     Ok(()) => {
                         self.transcript.clear();
+                        self.event_log.clear();
                         self.pending = None;
                         self.code_lang = None;
                         self.current_assistant.clear();
