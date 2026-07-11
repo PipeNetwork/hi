@@ -5336,7 +5336,7 @@ fn process_continuous_het_decode_chunk(
                 temperature,
                 top_p,
                 top_k,
-            } => !gpu::sampled_selection_needs_host_rank(*temperature, *top_p, *top_k),
+            } => gpu::graph_capturable_sampling(*temperature, *top_p, *top_k),
         })
         && let Some(scratch_page) = {
             let mut slot = state
@@ -5628,17 +5628,17 @@ fn process_continuous_decode_chunk(
     // back to the eager batched path below if the model returns None (graphs unavailable). The
     // readiness gate runs BEFORE drawing the sampling RNG so a fallback never double-advances it.
     //
-    // Ranked sampling (top_k / top_p) is intentionally excluded: the eager path selects those on
-    // the host (a fast O(cols) partial sort), whereas the GPU sampler kernel's ranked path is
-    // single-threaded (~60x slower) and host selection is not stream-capturable. Only greedy and
-    // the parallel temp-only sampler are graphed.
+    // Greedy and temp-only sampling always capture. Ranked (top_k / top_p) configs capture
+    // only when the GPU ranked sampler is enabled (`HI_CUDA_GPU_RANKED_SAMPLER=1`) with a
+    // top_k that bounds the candidate set on-device — otherwise ranked selection happens on
+    // the host (a fast O(cols) partial sort), which is not stream-capturable.
     let graph_eligible_sampling = match sampling_key {
         CudaSchedulerSamplingKey::Greedy => true,
         CudaSchedulerSamplingKey::Sampled {
             temperature_bits,
             top_p_bits,
             top_k,
-        } => !gpu::sampled_selection_needs_host_rank(
+        } => gpu::graph_capturable_sampling(
             f32::from_bits(temperature_bits),
             f32::from_bits(top_p_bits),
             top_k,
@@ -24822,6 +24822,7 @@ mod tests {
             temperature,
             1.0,
             None,
+            false,
             &stream,
         )
         .unwrap();

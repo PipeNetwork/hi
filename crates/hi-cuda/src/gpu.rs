@@ -2988,6 +2988,38 @@ mod native {
         })
     }
 
+    /// GPU ranked sampler (`HI_CUDA_GPU_RANKED_SAMPLER=1`, opt-in): top_k/top_p
+    /// token selection runs on-device via a deterministic radix-select (no
+    /// per-token logits D2H + host partial sort), which also makes ranked
+    /// configs CUDA-graph capturable. Rows the kernel cannot cover (top-p
+    /// nucleus or top_k beyond the 1024-survivor buffer) come back as a
+    /// sentinel and are re-sampled on the host.
+    pub(crate) fn gpu_ranked_sampler_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("HI_CUDA_GPU_RANKED_SAMPLER").is_ok_and(|value| value != "0")
+        })
+    }
+
+    /// Whether a sampling config can be baked into a captured decode graph.
+    /// Greedy and temperature-only always can; ranked configs can when the GPU
+    /// ranked sampler is enabled AND top_k bounds the candidate set within the
+    /// kernel's survivor buffer (overflow is impossible, so replay never needs
+    /// a host fallback). Top-p-only stays eager: its nucleus size is dynamic.
+    pub(crate) fn graph_capturable_sampling(
+        temperature: f32,
+        top_p: f32,
+        top_k: Option<u32>,
+    ) -> bool {
+        if !sampled_selection_needs_host_rank(temperature, top_p, top_k) {
+            return true;
+        }
+        gpu_ranked_sampler_enabled()
+            && top_k
+                .is_some_and(|k| k > 0 && k as usize <= crate::kernels::RANKED_SAMPLER_SURVIVORS)
+    }
+
     /// GQA-grouped decode attention (`HI_CUDA_GQA_DECODE=1`, opt-in): one block
     /// serves all Q heads sharing a KV head, reading each K/V vector ONCE — decode
     /// attention's KV traffic drops by the GQA factor (4-8x on Qwen models) — and
@@ -8296,6 +8328,12 @@ mod native {
                 state.exec.launch(&self.stream)?;
                 self.stream.synchronize()?;
                 let next = state.d_output.copy_to_host::<u32>(1)?[0];
+                // Eligibility only admits ranked configs whose top_k bounds the
+                // sampler's survivor buffer, so overflow is impossible here;
+                // fail loudly rather than emit the sentinel as a token.
+                if next == crate::kernels::RANKED_SAMPLER_OVERFLOW {
+                    bail!("CUDA graph decode returned a ranked-sampler overflow sentinel");
+                }
                 return Ok(Some(next));
             }
 
@@ -8413,6 +8451,7 @@ mod native {
                         temperature,
                         top_p,
                         top_k,
+                        gpu_ranked_sampler_enabled(),
                         &self.stream,
                     ),
                 }
@@ -8562,6 +8601,15 @@ mod native {
                     .launch(&self.stream)?;
                 self.stream.synchronize()?;
                 let out = state.d_outputs.copy_to_host::<u32>(rows)?;
+                // Graph eligibility only admits ranked rows whose top_k bounds
+                // the survivor buffer, so the sampler can never overflow on
+                // replay; fail loudly rather than emit the sentinel as a token.
+                if out
+                    .iter()
+                    .any(|token| *token == crate::kernels::RANKED_SAMPLER_OVERFLOW)
+                {
+                    bail!("CUDA batched graph decode returned a ranked-sampler overflow sentinel");
+                }
                 return Ok(Some(out));
             }
 
@@ -8748,6 +8796,7 @@ mod native {
                     bucket,
                     1,
                     logits.cols,
+                    gpu_ranked_sampler_enabled(),
                     &slf.stream,
                 )
             };
@@ -14063,7 +14112,8 @@ mod native {
                     logits.cols
                 );
             }
-            if sampled_selection_needs_host_rank(temperature, top_p, top_k) {
+            let gpu_ranked = gpu_ranked_sampler_enabled();
+            if sampled_selection_needs_host_rank(temperature, top_p, top_k) && !gpu_ranked {
                 let mut tokens = Vec::with_capacity(batch_count);
                 for (batch, sample) in samples.iter().copied().enumerate() {
                     let row_idx = batch
@@ -14099,10 +14149,56 @@ mod native {
                 temperature,
                 top_p,
                 top_k,
+                gpu_ranked,
                 &self.stream,
             )?;
             self.op_barrier()?;
-            tokens.copy_to_host(batch_count)
+            let mut tokens = tokens.copy_to_host::<u32>(batch_count)?;
+            // Rows the ranked kernel could not cover (top-p nucleus or top_k
+            // beyond the survivor buffer) come back as the overflow sentinel;
+            // re-sample exactly those on the host.
+            self.resolve_ranked_sampler_overflows(
+                logits,
+                seq_len,
+                &mut tokens,
+                |_| (temperature, top_p, top_k),
+                samples,
+            )?;
+            Ok(tokens)
+        }
+
+        /// Host redo for rows the GPU ranked sampler marked as
+        /// [`crate::kernels::RANKED_SAMPLER_OVERFLOW`]: copies that row's logits
+        /// back and runs the host ranked sampler with the row's config — the
+        /// exact semantics the kernel's survivor buffer could not hold.
+        fn resolve_ranked_sampler_overflows(
+            &self,
+            logits: &GpuF32Tensor,
+            seq_len: usize,
+            tokens: &mut [u32],
+            row_config: impl Fn(usize) -> (f32, f32, Option<u32>),
+            samples: &[f32],
+        ) -> Result<()> {
+            for batch in 0..tokens.len() {
+                if tokens[batch] != crate::kernels::RANKED_SAMPLER_OVERFLOW {
+                    continue;
+                }
+                let (temperature, top_p, top_k) = row_config(batch);
+                let row_idx = batch
+                    .checked_mul(seq_len)
+                    .and_then(|offset| offset.checked_add(seq_len - 1))
+                    .context("CUDA ranked sampler overflow row index overflows usize")?;
+                let row = self.copy_row_f32_device(logits, row_idx)?;
+                let row = row.copy_to_host()?;
+                tokens[batch] = sample_host_ranked_logits_with_uniform(
+                    &row,
+                    temperature,
+                    top_p,
+                    top_k,
+                    samples[batch],
+                )?;
+            }
+            Ok(())
         }
 
         /// Token selection for a batch whose rows have DIFFERENT sampling configs.
@@ -14205,6 +14301,7 @@ mod native {
             top_k_buffer
                 .copy_from_host(&top_ks)
                 .context("copying CUDA per-row top_k values")?;
+            let gpu_ranked = gpu_ranked_sampler_enabled();
             crate::kernels::launch_select_batched_last_token_per_row(
                 &logits.buffer,
                 &tokens,
@@ -14215,10 +14312,30 @@ mod native {
                 batch_count,
                 seq_len,
                 logits.cols,
+                gpu_ranked,
                 &self.stream,
             )?;
             self.op_barrier()?;
             let mut tokens = tokens.copy_to_host::<u32>(batch_count)?;
+            if gpu_ranked {
+                // Ranked rows sampled on-device; only overflow-sentinel rows
+                // (survivor buffer exceeded) fall back to the host sampler.
+                self.resolve_ranked_sampler_overflows(
+                    logits,
+                    seq_len,
+                    &mut tokens,
+                    |batch| match row_sampling[batch] {
+                        CudaRowSampling::Greedy => (0.0, 1.0, None),
+                        CudaRowSampling::Sampled {
+                            temperature,
+                            top_p,
+                            top_k,
+                        } => (temperature, top_p, top_k),
+                    },
+                    samples,
+                )?;
+                return Ok(tokens);
+            }
             // Ranked rows got an argmax placeholder from the kernel; resolve them with
             // the host ranked sampler (the same one uniform ranked batches use).
             for (batch, row) in row_sampling.iter().enumerate() {
@@ -24797,6 +24914,131 @@ mod native {
             assert!(cases >= 1500, "expected a broad grid, ran {cases}");
         }
 
+        /// The GPU radix ranked sampler must pick the same token as the host
+        /// ranked sampler across a (vocab x temp x top_p x top_k x uniform)
+        /// grid, including exact-tie boundaries, and must be deterministic
+        /// across launches. Rows it cannot cover come back as the overflow
+        /// sentinel — allowed only where the survivor buffer genuinely cannot
+        /// hold the candidate set (top_k > 1024 or a top-p-only nucleus wider
+        /// than 1024) — and are then resolved on the host, which is exactly
+        /// what the dispatch layer does.
+        #[cfg(feature = "native-cuda")]
+        #[test]
+        fn native_cuda_gpu_ranked_sampler_matches_host() {
+            use crate::runtime::{DeviceBuffer, Stream};
+
+            fn make_logits(seed: u64, n: usize, spread: f32) -> Vec<f32> {
+                let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(1);
+                (0..n)
+                    .map(|_| {
+                        s = s
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
+                        let u = ((s >> 40) as f32) / ((1u64 << 24) as f32);
+                        (u - 0.5) * spread
+                    })
+                    .collect()
+            }
+
+            let stream = Stream::create().unwrap();
+            let samples = [0.0f32, 0.13, 0.5, 0.77, 0.999];
+            let batch = samples.len();
+            let samples_dev = DeviceBuffer::alloc(batch * 4).unwrap();
+            samples_dev.copy_from_host(&samples).unwrap();
+            let out_dev = DeviceBuffer::alloc(batch * std::mem::size_of::<u32>()).unwrap();
+
+            let launch = |logits: &[f32], n: usize, t: f32, tp: f32, tk: Option<u32>| -> Vec<u32> {
+                let mut batched = Vec::with_capacity(batch * n);
+                for _ in 0..batch {
+                    batched.extend_from_slice(logits);
+                }
+                let logits_dev = DeviceBuffer::alloc(batched.len() * 4).unwrap();
+                logits_dev.copy_from_host(&batched).unwrap();
+                let run = || {
+                    crate::kernels::launch_sample_batched_last_token(
+                        &logits_dev,
+                        &out_dev,
+                        &samples_dev,
+                        batch,
+                        1,
+                        n,
+                        t,
+                        tp,
+                        tk,
+                        true,
+                        &stream,
+                    )
+                    .unwrap();
+                    stream.synchronize().unwrap();
+                    out_dev.copy_to_host::<u32>(batch).unwrap()
+                };
+                let first = run();
+                assert_eq!(first, run(), "GPU ranked sampler must be deterministic");
+                first
+            };
+
+            // Random logits straddling the survivor buffer, plus an adversarial
+            // tie surface: only 3 distinct logit values, so top-k boundaries cut
+            // through wide equal-weight runs resolved purely by token index.
+            let vocabs = [200usize, 1500, 4096];
+            let temps = [0.7f32, 1.0];
+            let top_ps = [f32::INFINITY, 0.5, 0.9, 0.999];
+            let top_ks: [Option<u32>; 5] = [None, Some(1), Some(10), Some(40), Some(2000)];
+            let mut cases = 0u64;
+            let mut overflow_rows = 0u64;
+            for (vi, &n) in vocabs.iter().enumerate() {
+                let random = make_logits(0x8f21 + vi as u64, n, 4.0);
+                let ties: Vec<f32> = (0..n).map(|i| [1.5f32, 0.25, -2.0][i % 3]).collect();
+                for logits in [&random, &ties] {
+                    for &t in &temps {
+                        for &tp in &top_ps {
+                            for &tk in &top_ks {
+                                // The temp-only config routes to the inverse-CDF
+                                // path, not the ranked sampler; skip it here.
+                                if tk.is_none() && !(tp.is_finite() && tp < 1.0) {
+                                    continue;
+                                }
+                                let got = launch(logits, n, t, tp, tk);
+                                for (row, &token) in got.iter().enumerate() {
+                                    let want = sample_host_ranked_logits_with_uniform(
+                                        logits,
+                                        t,
+                                        tp,
+                                        tk,
+                                        samples[row],
+                                    )
+                                    .unwrap();
+                                    if token == crate::kernels::RANKED_SAMPLER_OVERFLOW {
+                                        let k_over = tk.is_some_and(|k| {
+                                            (k as usize).min(n)
+                                                > crate::kernels::RANKED_SAMPLER_SURVIVORS
+                                        });
+                                        let top_p_only = tk.is_none();
+                                        assert!(
+                                            k_over || top_p_only,
+                                            "unexpected overflow: vocab={n} temp={t} top_p={tp} top_k={tk:?}"
+                                        );
+                                        overflow_rows += 1;
+                                        continue;
+                                    }
+                                    assert_eq!(
+                                        token, want,
+                                        "mismatch: vocab={n} temp={t} top_p={tp} top_k={tk:?} sample={}",
+                                        samples[row]
+                                    );
+                                }
+                                cases += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(cases >= 200, "expected a broad grid, ran {cases}");
+            // The k=2000 configs on vocab 1500/4096 must overflow (survivor
+            // buffer holds 1024) — proving the sentinel path actually runs.
+            assert!(overflow_rows > 0, "expected some overflow-sentinel rows");
+        }
+
         #[test]
         fn qwen25_window_plan_reorders_merged_groups_then_reverses_merger_rows() {
             let plan = vision_window_plan([1, 4, 6], 1, 2, 4).unwrap();
@@ -24832,8 +25074,7 @@ pub use native::{
 };
 #[cfg(feature = "native-cuda")]
 pub(crate) use native::{
-    GraphSampling, decode_graph_batch_enabled, decode_graph_enabled,
-    sampled_selection_needs_host_rank,
+    GraphSampling, decode_graph_batch_enabled, decode_graph_enabled, graph_capturable_sampling,
 };
 #[cfg(not(feature = "native-cuda"))]
 pub(crate) fn decode_graph_enabled() -> bool {
@@ -24844,8 +25085,8 @@ pub(crate) fn decode_graph_batch_enabled() -> bool {
     false
 }
 #[cfg(not(feature = "native-cuda"))]
-pub(crate) fn sampled_selection_needs_host_rank(_t: f32, _p: f32, _k: Option<u32>) -> bool {
-    true
+pub(crate) fn graph_capturable_sampling(_t: f32, _p: f32, _k: Option<u32>) -> bool {
+    false
 }
 #[cfg(not(feature = "native-cuda"))]
 #[derive(Clone, Copy, PartialEq)]

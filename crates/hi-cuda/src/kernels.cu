@@ -5207,6 +5207,317 @@ __global__ void sample_last_row_kernel(
   *output_token = argmax_row_device(row, cols);
 }
 
+// GPU ranked (top_k / top_p) sampler (`HI_CUDA_GPU_RANKED_SAMPLER=1`):
+// deterministic radix-select of the top candidates, then a single-thread walk
+// over the sorted survivors that replicates the host sampler's float-summation
+// order exactly. One block (256 threads) per row; no host round-trips, so
+// ranked configs become CUDA-graph capturable.
+//
+// Selection ranks by (weight desc, token asc). The weight's IEEE bits are the
+// radix key (weights are non-negative, so unsigned integer order == float
+// order); an MSB-first 256-bin histogram descent finds the exact k-th key in 4
+// rounds, and weight TIES at the boundary (expf collapses nearby scaled logits,
+// especially deep in the tail) are resolved by a second ascending descent on
+// token index — the host's total order. All descents use integer counts (never
+// float atomics), so selection is reproducible run to run.
+//
+// Top-k configs (0 < k <= HI_CUDA_RANKED_SURVIVORS): the survivor set is
+// exactly the host sampler's kept set, and every later float accumulation
+// (kept total, nucleus walk, CDF walk) runs on one thread in host rank order —
+// the chosen token matches the host bit for bit up to expf-vs-libm rounding.
+// Top-p-only configs select a top-HI_CUDA_RANKED_SURVIVORS superset; if the
+// nucleus overflows it (cutoff unreached and the smallest survivor is still
+// positive) the kernel writes HI_CUDA_RANKED_OVERFLOW and the caller
+// re-samples that row on the host. The top-p-only normalizer is a
+// deterministic chunked reduction rather than the host's vocab-order fold, so
+// nucleus-boundary membership can differ from the host by ulps
+// (distribution-exact, documented).
+#define HI_CUDA_RANKED_SURVIVORS 1024
+#define HI_CUDA_RANKED_OVERFLOW 0xFFFFFFFFu
+
+__device__ void ranked_sample_row_radix(
+    const float* row,
+    uint32_t* out,
+    int cols,
+    float temperature,
+    float max_scaled,
+    unsigned int argmax,
+    float cutoff,
+    int top_k,
+    float uniform) {
+  const int tid = threadIdx.x;
+  const int nthreads = blockDim.x;
+
+  __shared__ float s_surv_w[HI_CUDA_RANKED_SURVIVORS];
+  __shared__ unsigned int s_surv_idx[HI_CUDA_RANKED_SURVIVORS];
+  __shared__ unsigned int s_hist[256];
+  __shared__ unsigned int s_prefix_key;
+  __shared__ int s_count_above;
+  __shared__ int s_tie_count;
+  __shared__ int s_nslot;
+  __shared__ float s_fulltotal;
+
+  const bool has_k = top_k > 0;
+  const int k_sel = has_k ? min(top_k, cols) : min(HI_CUDA_RANKED_SURVIVORS, cols);
+  if (k_sel > HI_CUDA_RANKED_SURVIVORS) {
+    // Dispatch keeps k <= HI_CUDA_RANKED_SURVIVORS; overflow = host redo.
+    if (tid == 0) {
+      *out = HI_CUDA_RANKED_OVERFLOW;
+    }
+    return;
+  }
+
+  // Top-p-only normalizer: the host sums the whole vocabulary in vocab order.
+  // Chunk-contiguous per-thread sums combined in thread order are deterministic
+  // (fixed block size) but not the host's exact fold — distribution-exact.
+  if (!has_k) {
+    const int chunk = (cols + nthreads - 1) / nthreads;
+    const int start = tid * chunk;
+    const int end = min(start + chunk, cols);
+    float csum = 0.0f;
+    for (int i = start; i < end; ++i) {
+      csum += sampling_weight(row, i, temperature, max_scaled);
+    }
+    s_surv_w[tid] = csum;  // scratch use before compaction
+    __syncthreads();
+    if (tid == 0) {
+      float acc = 0.0f;
+      for (int j = 0; j < nthreads; ++j) {
+        acc += s_surv_w[j];
+      }
+      s_fulltotal = acc;
+    }
+    __syncthreads();
+  }
+
+  // MSB-first radix descent on the weight key: after 4 rounds `prefix` is the
+  // exact 32-bit key of the k-th largest weight (counting ties), and
+  // `count_above` is how many keys are strictly greater.
+  unsigned int prefix = 0u;
+  int count_above = 0;
+  for (int round = 0; round < 4; ++round) {
+    const int shift = 24 - 8 * round;
+    const unsigned int high_mask =
+        (round == 0) ? 0u : (0xFFFFFFFFu << (shift + 8));
+    for (int b = tid; b < 256; b += nthreads) {
+      s_hist[b] = 0u;
+    }
+    __syncthreads();
+    for (int i = tid; i < cols; i += nthreads) {
+      const float w = sampling_weight(row, i, temperature, max_scaled);
+      const unsigned int key = __float_as_uint(w);
+      if (round == 0 || (key & high_mask) == prefix) {
+        atomicAdd(&s_hist[(key >> shift) & 0xFFu], 1u);
+      }
+    }
+    __syncthreads();
+    if (tid == 0) {
+      int cum = count_above;
+      int bin = 0;
+      for (int b = 255; b >= 0; --b) {
+        const int with_bin = cum + static_cast<int>(s_hist[b]);
+        if (with_bin >= k_sel) {
+          bin = b;
+          break;
+        }
+        cum = with_bin;
+      }
+      s_prefix_key = prefix | (static_cast<unsigned int>(bin) << shift);
+      s_count_above = cum;
+      s_tie_count = static_cast<int>(s_hist[bin]);
+    }
+    __syncthreads();
+    prefix = s_prefix_key;
+    count_above = s_count_above;
+  }
+  const unsigned int threshold_key = prefix;
+  const int ties_needed = k_sel - count_above;
+  const int tie_count = s_tie_count;
+
+  // Boundary ties beyond what k needs: keep the smallest token indexes, via an
+  // ascending radix descent over the (unique) indexes whose key == threshold.
+  unsigned int tie_index_max = 0xFFFFFFFFu;
+  if (tie_count > ties_needed) {
+    unsigned int ipfx = 0u;
+    int count_below = 0;
+    for (int round = 0; round < 4; ++round) {
+      const int shift = 24 - 8 * round;
+      const unsigned int high_mask =
+          (round == 0) ? 0u : (0xFFFFFFFFu << (shift + 8));
+      for (int b = tid; b < 256; b += nthreads) {
+        s_hist[b] = 0u;
+      }
+      __syncthreads();
+      for (int i = tid; i < cols; i += nthreads) {
+        const float w = sampling_weight(row, i, temperature, max_scaled);
+        if (__float_as_uint(w) != threshold_key) {
+          continue;
+        }
+        const unsigned int ik = static_cast<unsigned int>(i);
+        if (round == 0 || (ik & high_mask) == ipfx) {
+          atomicAdd(&s_hist[(ik >> shift) & 0xFFu], 1u);
+        }
+      }
+      __syncthreads();
+      if (tid == 0) {
+        int cum = count_below;
+        int bin = 255;
+        for (int b = 0; b < 256; ++b) {
+          const int with_bin = cum + static_cast<int>(s_hist[b]);
+          if (with_bin >= ties_needed) {
+            bin = b;
+            break;
+          }
+          cum = with_bin;
+        }
+        s_prefix_key = ipfx | (static_cast<unsigned int>(bin) << shift);
+        s_count_above = cum;
+      }
+      __syncthreads();
+      ipfx = s_prefix_key;
+      count_below = s_count_above;
+    }
+    // Indexes are unique, so the descent lands on the exact ties_needed-th
+    // smallest tie index; take ties with index <= it.
+    tie_index_max = ipfx;
+  }
+
+  // Compact the selected (weight, index) pairs into shared memory. Slot order
+  // is nondeterministic; the bitonic sort below restores the (unique) total
+  // order, so the sorted survivors are deterministic.
+  if (tid == 0) {
+    s_nslot = 0;
+  }
+  __syncthreads();
+  for (int i = tid; i < cols; i += nthreads) {
+    const float w = sampling_weight(row, i, temperature, max_scaled);
+    const unsigned int key = __float_as_uint(w);
+    bool take = key > threshold_key;
+    if (!take && key == threshold_key) {
+      take = static_cast<unsigned int>(i) <= tie_index_max;
+    }
+    if (take) {
+      const int slot = atomicAdd(&s_nslot, 1);
+      if (slot < HI_CUDA_RANKED_SURVIVORS) {
+        s_surv_w[slot] = w;
+        s_surv_idx[slot] = static_cast<unsigned int>(i);
+      }
+    }
+  }
+  __syncthreads();
+  const int n_surv = min(s_nslot, HI_CUDA_RANKED_SURVIVORS);
+  if (n_surv != k_sel) {
+    // Selection accounting failed (should not happen); never sample from a
+    // wrong set — fall back to the host.
+    if (tid == 0) {
+      *out = HI_CUDA_RANKED_OVERFLOW;
+    }
+    return;
+  }
+
+  // Bitonic sort by (weight desc, index asc); pad to a power of two with
+  // rank-last sentinels (weights are non-negative, so -1 sorts after all).
+  int n_sort = 1;
+  while (n_sort < n_surv) {
+    n_sort <<= 1;
+  }
+  for (int i = n_surv + tid; i < n_sort; i += nthreads) {
+    s_surv_w[i] = -1.0f;
+    s_surv_idx[i] = 0xFFFFFFFFu;
+  }
+  __syncthreads();
+  for (int span = 2; span <= n_sort; span <<= 1) {
+    for (int stride = span >> 1; stride > 0; stride >>= 1) {
+      for (int i = tid; i < n_sort; i += nthreads) {
+        const int j = i ^ stride;
+        if (j > i) {
+          const bool rank_order = (i & span) == 0;
+          const float wi = s_surv_w[i];
+          const float wj = s_surv_w[j];
+          const unsigned int ii = s_surv_idx[i];
+          const unsigned int ij = s_surv_idx[j];
+          const bool i_before_j = wi > wj || (wi == wj && ii < ij);
+          if (rank_order ? !i_before_j : i_before_j) {
+            s_surv_w[i] = wj;
+            s_surv_w[j] = wi;
+            s_surv_idx[i] = ij;
+            s_surv_idx[j] = ii;
+          }
+        }
+      }
+      __syncthreads();
+    }
+  }
+
+  // Single-thread walk in host rank order: normalizer, nucleus cut, CDF.
+  if (tid == 0) {
+    float total;
+    if (has_k) {
+      total = 0.0f;
+      for (int i = 0; i < n_surv; ++i) {
+        total += s_surv_w[i];
+      }
+    } else {
+      total = s_fulltotal;
+    }
+    if (total <= 0.0f || !isfinite(total)) {
+      *out = argmax;
+      return;
+    }
+
+    int candidate_count = 0;
+    int last_candidate = -1;
+    float candidate_total = 0.0f;
+    float cumulative_probability = 0.0f;
+    bool covered = has_k || k_sel >= cols;
+    for (int i = 0; i < n_surv; ++i) {
+      const float w = s_surv_w[i];
+      if (w <= 0.0f) {
+        continue;
+      }
+      ++candidate_count;
+      last_candidate = i;
+      candidate_total += w;
+      cumulative_probability += w / total;
+      if (cutoff < 1.0f && cumulative_probability >= cutoff) {
+        covered = true;
+        break;
+      }
+    }
+    if (!covered) {
+      // Top-p-only and the cutoff was not reached inside the survivor superset.
+      // If the smallest survivor is still positive the nucleus continues past
+      // it — the host must redo this row exactly. (If it is zero, every
+      // positive-weight token is already in the set and the walk was complete.)
+      if (s_surv_w[n_surv - 1] > 0.0f) {
+        *out = HI_CUDA_RANKED_OVERFLOW;
+        return;
+      }
+    }
+    if (candidate_count <= 0 || candidate_total <= 0.0f ||
+        !isfinite(candidate_total)) {
+      *out = argmax;
+      return;
+    }
+
+    const float target = uniform * candidate_total;
+    float cumulative = 0.0f;
+    for (int i = 0; i <= last_candidate; ++i) {
+      const float w = s_surv_w[i];
+      if (w <= 0.0f) {
+        continue;
+      }
+      cumulative += w;
+      if (target < cumulative) {
+        *out = s_surv_idx[i];
+        return;
+      }
+    }
+    *out = s_surv_idx[last_candidate];
+    return;
+  }
+}
+
 // One BLOCK per batch (was one thread): the old kernel scanned the whole vocab
 // ~3x sequentially on a single thread, adding ~31 ms/token to temperature sampling
 // (the default non-greedy path). Parallelize: block-reduce the max+argmax (reused by
@@ -5216,9 +5527,11 @@ __global__ void sample_last_row_kernel(
 // a serial scan-per-rank; it stays on thread 0 (far cheaper) but reuses the parallel
 // max. Launched with 256 threads; shared arrays are sized to match.
 // Block-cooperative token selection for one logits row: greedy argmax when
-// temperature <= 0, parallel inverse-CDF for temperature-only sampling, and a
-// single-thread serial scan for ranked top_k/top_p (slow — host-side ranking is
-// preferred for ranked configs; see sample_batched_last_token in gpu.rs).
+// temperature <= 0, parallel inverse-CDF for temperature-only sampling, and for
+// ranked top_k/top_p either the block-parallel radix sampler above
+// (gpu_ranked != 0, may emit HI_CUDA_RANKED_OVERFLOW) or the legacy
+// single-thread serial scan (slow — host-side ranking is preferred; see
+// sample_batched_last_token in gpu.rs).
 // Shared by the uniform-config batched kernel and the per-row-config kernel.
 __device__ void sample_last_token_row(
     const float* row,
@@ -5227,7 +5540,8 @@ __device__ void sample_last_token_row(
     int cols,
     float temperature,
     float top_p,
-    int top_k) {
+    int top_k,
+    int gpu_ranked) {
   const int tid = threadIdx.x;
   const int nthreads = blockDim.x;
 
@@ -5277,6 +5591,15 @@ __device__ void sample_last_token_row(
 
   const float cutoff = isfinite(top_p) ? fminf(fmaxf(top_p, 0.0f), 1.0f) : 1.0f;
   const float uniform = isfinite(sample) ? fminf(fmaxf(sample, 0.0f), 0.99999994f) : 0.0f;
+
+  // Ranked configs route to the radix sampler BEFORE the temp-only gate: the
+  // host treats top_k >= vocab as top-k mode (rank-order normalizer), which the
+  // radix path reproduces and the temp-only path does not.
+  if (gpu_ranked != 0 && (top_k > 0 || cutoff < 1.0f)) {
+    ranked_sample_row_radix(
+        row, out, cols, temperature, max_scaled, argmax, cutoff, top_k, uniform);
+    return;
+  }
   const int effective_top_k = top_k > 0 && top_k < cols ? top_k : cols;
 
   if (effective_top_k == cols && cutoff >= 1.0f) {
@@ -5431,7 +5754,8 @@ __global__ void sample_batched_last_token_kernel(
     int cols,
     float temperature,
     float top_p,
-    int top_k) {
+    int top_k,
+    int gpu_ranked) {
   const int batch = blockIdx.x;
   if (batch >= batch_count || seq_len <= 0 || cols <= 0) {
     return;
@@ -5440,16 +5764,19 @@ __global__ void sample_batched_last_token_kernel(
       logits + (static_cast<size_t>(batch) * seq_len + (seq_len - 1)) * cols;
   const float sample = samples != nullptr ? samples[batch] : 0.0f;
   sample_last_token_row(
-      row, output_tokens + batch, sample, cols, temperature, top_p, top_k);
+      row, output_tokens + batch, sample, cols, temperature, top_p, top_k,
+      gpu_ranked);
 }
 
 // Per-row sampling configs: one heterogeneous decode batch can mix greedy and
 // sampled requests. Greedy rows (temperature <= 0) take block_argmax_last so they
 // stay BIT-identical to the argmax_batched_last_token path they'd take in a
-// greedy-only batch. Ranked rows (top_k / top_p < 1) also write the argmax as a
-// placeholder — the host overwrites them via its partial-sort ranked sampler,
-// which is ~60x faster than the serial in-kernel ranked scan. Only
-// temperature-only rows sample on the GPU (the parallel inverse-CDF path).
+// greedy-only batch. Ranked rows (top_k / top_p < 1): with gpu_ranked they run
+// the block-parallel radix sampler (HI_CUDA_RANKED_OVERFLOW rows are host-redone
+// by the caller); otherwise they write the argmax as a placeholder — the host
+// overwrites them via its partial-sort ranked sampler, which is ~60x faster
+// than the serial in-kernel ranked scan. Temperature-only rows sample on the
+// GPU (the parallel inverse-CDF path) in both modes.
 __global__ void select_batched_last_token_per_row_kernel(
     const float* logits,
     uint32_t* output_tokens,
@@ -5459,7 +5786,8 @@ __global__ void select_batched_last_token_per_row_kernel(
     const int* top_ks,
     int batch_count,
     int seq_len,
-    int cols) {
+    int cols,
+    int gpu_ranked) {
   const int batch = blockIdx.x;
   if (batch >= batch_count || seq_len <= 0 || cols <= 0) {
     return;
@@ -5473,12 +5801,13 @@ __global__ void select_batched_last_token_per_row_kernel(
   const float cutoff = isfinite(top_p) ? fminf(fmaxf(top_p, 0.0f), 1.0f) : 1.0f;
   const int effective_top_k = top_k > 0 && top_k < cols ? top_k : cols;
   const bool ranked = !greedy && !(effective_top_k == cols && cutoff >= 1.0f);
-  if (greedy || ranked) {
+  if (greedy || (ranked && gpu_ranked == 0)) {
     block_argmax_last(row, cols, output_tokens + batch);
     return;
   }
   sample_last_token_row(
-      row, output_tokens + batch, samples[batch], cols, temperature, top_p, top_k);
+      row, output_tokens + batch, samples[batch], cols, temperature, top_p,
+      top_k, gpu_ranked);
 }
 
 int valid_common(void* ptr, int len) {
@@ -11123,6 +11452,7 @@ extern "C" int hi_cuda_launch_sample_batched_last_token(
     float temperature,
     float top_p,
     int top_k,
+    int gpu_ranked,
     void* stream) {
   if (logits == nullptr || output_tokens == nullptr || samples == nullptr ||
       batch_count <= 0 || seq_len <= 0 || cols <= 0 || top_k < 0 ||
@@ -11138,7 +11468,8 @@ extern "C" int hi_cuda_launch_sample_batched_last_token(
       cols,
       temperature,
       top_p,
-      top_k);
+      top_k,
+      gpu_ranked);
   return 0;
 }
 
@@ -11152,6 +11483,7 @@ extern "C" int hi_cuda_launch_select_batched_last_token_per_row(
     int batch_count,
     int seq_len,
     int cols,
+    int gpu_ranked,
     void* stream) {
   if (logits == nullptr || output_tokens == nullptr || samples == nullptr ||
       temperatures == nullptr || top_ps == nullptr || top_ks == nullptr ||
@@ -11168,6 +11500,7 @@ extern "C" int hi_cuda_launch_select_batched_last_token_per_row(
       static_cast<const int*>(top_ks),
       batch_count,
       seq_len,
-      cols);
+      cols,
+      gpu_ranked);
   return 0;
 }

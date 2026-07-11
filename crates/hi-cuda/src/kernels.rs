@@ -1179,6 +1179,7 @@ mod native {
             temperature: c_float,
             top_p: c_float,
             top_k: c_int,
+            gpu_ranked: c_int,
             stream: *mut c_void,
         ) -> c_int;
         fn hi_cuda_launch_select_batched_last_token_per_row(
@@ -1191,6 +1192,7 @@ mod native {
             batch_count: c_int,
             seq_len: c_int,
             cols: c_int,
+            gpu_ranked: c_int,
             stream: *mut c_void,
         ) -> c_int;
     }
@@ -4635,6 +4637,16 @@ mod native {
         check_last_error("hi_cuda_launch_sample_last_row")
     }
 
+    /// Token id emitted by the ranked GPU sampler when a row cannot be sampled
+    /// on-device (top-p nucleus larger than the survivor buffer, or a top_k
+    /// beyond it): the caller re-samples that row on the host.
+    pub const RANKED_SAMPLER_OVERFLOW: u32 = u32::MAX;
+
+    /// Capacity of the ranked GPU sampler's shared-memory survivor buffer
+    /// (must match `HI_CUDA_RANKED_SURVIVORS` in kernels.cu): top_k configs up
+    /// to this bound sample fully on-device and can be graph-captured.
+    pub const RANKED_SAMPLER_SURVIVORS: usize = 1024;
+
     pub fn launch_sample_batched_last_token(
         logits: &DeviceBuffer,
         output_tokens: &DeviceBuffer,
@@ -4645,6 +4657,7 @@ mod native {
         temperature: f32,
         top_p: f32,
         top_k: Option<u32>,
+        gpu_ranked: bool,
         stream: &Stream,
     ) -> Result<()> {
         ensure_len(batch_count, "sample_batched batch_count")?;
@@ -4670,6 +4683,7 @@ mod native {
                 temperature,
                 top_p,
                 top_k,
+                c_int::from(gpu_ranked),
                 stream.as_raw(),
             )
         })?;
@@ -4679,7 +4693,9 @@ mod native {
     /// Per-row sampling configs for a heterogeneous decode batch: `temperatures`,
     /// `top_ps`, `top_ks` (i32; 0 = unset), and `samples` are `[batch_count]` device
     /// arrays. Greedy rows (temperature <= 0) bit-match the batched argmax kernel;
-    /// ranked rows write the argmax as a placeholder for the host ranked sampler.
+    /// ranked rows either sample on-device via the radix sampler (`gpu_ranked`,
+    /// overflow rows come back as [`RANKED_SAMPLER_OVERFLOW`]) or write the argmax
+    /// as a placeholder for the host ranked sampler.
     pub fn launch_select_batched_last_token_per_row(
         logits: &DeviceBuffer,
         output_tokens: &DeviceBuffer,
@@ -4690,6 +4706,7 @@ mod native {
         batch_count: usize,
         seq_len: usize,
         cols: usize,
+        gpu_ranked: bool,
         stream: &Stream,
     ) -> Result<()> {
         ensure_len(batch_count, "select_batched_per_row batch_count")?;
@@ -4706,6 +4723,7 @@ mod native {
                 batch_count as c_int,
                 seq_len as c_int,
                 cols as c_int,
+                c_int::from(gpu_ranked),
                 stream.as_raw(),
             )
         })?;
