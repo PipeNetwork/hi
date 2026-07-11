@@ -231,17 +231,22 @@ mod imp {
     // instead — the pool must be pre-warmed) and never cudaFrees on drop (every freed
     // buffer is retained in the pool regardless of size). Set via `set_capture_active`
     // around a capture window.
-    fn capture_flag() -> &'static std::sync::atomic::AtomicBool {
-        static FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        &FLAG
+    //
+    // THREAD-LOCAL, matching the buffer pool itself: capture is a property of the
+    // capturing thread's stream (cudaStreamCaptureModeThreadLocal), and a process-
+    // global flag made every OTHER thread's pool refuse to cudaMalloc for the
+    // duration of a capture — concurrently-running work (parallel tests; any future
+    // second GPU thread) would spuriously fail its allocations.
+    thread_local! {
+        static CAPTURE_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
     pub fn set_capture_active(active: bool) {
-        capture_flag().store(active, std::sync::atomic::Ordering::SeqCst);
+        CAPTURE_ACTIVE.with(|flag| flag.set(active));
     }
 
     fn capture_active() -> bool {
-        capture_flag().load(std::sync::atomic::Ordering::SeqCst)
+        CAPTURE_ACTIVE.try_with(|flag| flag.get()).unwrap_or(false)
     }
 
     // Frees every pooled pointer when its thread exits so short-lived threads

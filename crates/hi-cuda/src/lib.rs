@@ -812,6 +812,7 @@ impl CudaBackend {
                     prefix_cache: Mutex::new(None),
                     sse_writer: None,
                     chunk_prefill_supported,
+                    graph_scratch: Mutex::new(None),
                 },
                 config.max_batch_size,
                 config.max_active_requests,
@@ -2825,6 +2826,14 @@ struct CudaSchedulerState {
     /// Whether the model supports the paged chunk-append forward that
     /// `HI_CUDA_CHUNK_PREFILL` uses (standard decoder layout, in-limit head dims).
     chunk_prefill_supported: bool,
+    /// One KV page lazily reserved for the batched CUDA-graph decode
+    /// (`HI_CUDA_DECODE_GRAPH_BATCH`): bucket rows beyond the live batch write
+    /// their padding KV here so they can never touch a live lease. Reserved on
+    /// first graph use so it never starves a small pool (tests, tiny configs);
+    /// if the pool is fully leased at that moment the step decodes eagerly and
+    /// reservation retries later. Held as a lease so the page returns to the
+    /// allocator with the scheduler.
+    graph_scratch: Mutex<Option<CudaPagedKvCacheLease>>,
 }
 
 /// A completed request's KV retained for cross-request prefix reuse. `pages`
@@ -5204,18 +5213,75 @@ fn process_continuous_het_decode_chunk(
     }
     // One uniform per row, drawn from each request's own RNG — exactly one draw per
     // request per step, the same as any other grouping, so per-request sampled
-    // streams are independent of how requests get batched.
+    // streams are independent of how requests get batched. The same values feed the
+    // captured-graph and eager paths, so a graph fallback never double-advances RNGs.
     let samples = continuous_sampling_values(active, &indexes);
     let started = Instant::now();
-    let result = model.decode_next_tokens_batch_paged_with_page_tables_and_positions(
-        &decode_tokens,
-        &positions,
-        &row_sampling,
-        &samples,
-        state.kv_page_size,
-        &page_tables,
-        kv_pages.pages_total,
-    );
+    // Captured-graph fast path: replay one pre-captured forward for the whole
+    // bucket. Only greedy/temp-only rows (ranked sampling selects on the host,
+    // which a graph cannot capture); padding/eligibility handled inside the step.
+    // Production-scale pools only (>= 64 pages): the scratch-page reservation must
+    // never eat a tiny test pool's last free page, and capture on sub-scale
+    // configs would only ever latch off anyway. Never inside this crate's parallel
+    // unit tests: a capture on a blocking stream makes every OTHER test thread's
+    // legacy-stream cudaMemcpy fail with error 906 ("would make the legacy stream
+    // depend on a capturing blocking stream") — a process-level CUDA constraint,
+    // irrelevant in production where one thread owns all GPU work. Real-model
+    // coverage: the opt-in native_cuda_batch_graph parity test (drives the step
+    // directly), the real smoke, and the server A/B.
+    let graph_tokens = if gpu::decode_graph_batch_enabled()
+        && !cfg!(test)
+        && kv_pages.pages_total >= 64
+        && row_sampling.iter().all(|row| match row {
+            gpu::CudaRowSampling::Greedy => true,
+            gpu::CudaRowSampling::Sampled {
+                temperature,
+                top_p,
+                top_k,
+            } => !gpu::sampled_selection_needs_host_rank(*temperature, *top_p, *top_k),
+        })
+        && let Some(scratch_page) = {
+            let mut slot = state
+                .graph_scratch
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if slot.is_none() {
+                *slot = kv_pages.allocate_for_tokens(1).ok();
+            }
+            slot.as_ref().and_then(|lease| lease.pages.first().copied())
+        } {
+        let lease_tables: Vec<Vec<usize>> = indexes
+            .iter()
+            .map(|idx| active[*idx].lease.pages.clone())
+            .collect();
+        model
+            .scheduler_batch_graph_decode_step(
+                &decode_tokens,
+                &positions,
+                &row_sampling,
+                &samples,
+                state.kv_page_size,
+                &lease_tables,
+                kv_pages.pages_total,
+                scratch_page,
+            )
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    let result = match graph_tokens {
+        Some(tokens) => Ok(tokens),
+        None => model.decode_next_tokens_batch_paged_with_page_tables_and_positions(
+            &decode_tokens,
+            &positions,
+            &row_sampling,
+            &samples,
+            state.kv_page_size,
+            &page_tables,
+            kv_pages.pages_total,
+        ),
+    };
     let elapsed = started.elapsed();
     let count = indexes.len();
     let timing = scheduler_token_timing(0, usize_to_u64(count), elapsed);
@@ -17867,6 +17933,7 @@ mod tests {
             prefix_cache: super::Mutex::new(None),
             sse_writer: None,
             chunk_prefill_supported: false,
+            graph_scratch: super::Mutex::new(None),
         };
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(rx);
@@ -23152,6 +23219,107 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Batched-graph decode parity vs eager heterogeneous decode. Opt-in (needs a
+    /// real quantized model so the M>1 forward is capturable via HI_CUDA_MMQ):
+    ///   HI_CUDA_GRAPH_SMOKE_GGUF=/path/model.gguf cargo test --release -p hi-cuda \
+    ///     --features native-cuda native_cuda_batch_graph -- --ignored --nocapture --test-threads=1
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    #[ignore = "needs a real quantized model; see doc comment"]
+    fn native_cuda_batch_graph_decode_matches_eager_het() {
+        use crate::gpu::CudaRowSampling;
+        use hi_gguf::GgufFile;
+        let Ok(path) = std::env::var("HI_CUDA_GRAPH_SMOKE_GGUF") else {
+            eprintln!("skipping; set HI_CUDA_GRAPH_SMOKE_GGUF=/path/model.gguf");
+            return;
+        };
+        // Quantized weights + the quantized M>1 GEMM so the batched forward is
+        // stream-capturable. SAFETY: single-threaded test setup (--test-threads=1).
+        unsafe { std::env::set_var("HI_CUDA_WEIGHTS_F16", "0") };
+        unsafe { std::env::set_var("HI_CUDA_MMQ", "1") };
+        let gguf = GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+
+        let page_size = 16usize;
+        let prompts: Vec<Vec<u32>> = vec![
+            (1..12).collect(),
+            (5..18).collect(),
+            (2..31).collect(), // crosses a page boundary early in the run
+        ];
+        let pages_per = 4usize; // 64-token capacity per row
+        let leases: Vec<Vec<usize>> = (0..prompts.len())
+            .map(|row| (row * pages_per..(row + 1) * pages_per).collect())
+            .collect();
+        let scratch_page = prompts.len() * pages_per;
+        let physical = scratch_page + 1;
+
+        let mut ctxs = prompts.clone();
+        for (row, prompt) in prompts.iter().enumerate() {
+            let first = model
+                .prefill_greedy_next_tokens_batch_paged_with_page_tables(
+                    &[prompt.clone()],
+                    page_size,
+                    &[leases[row][..prompt.len().div_ceil(page_size)].to_vec()],
+                    physical,
+                )
+                .unwrap()[0];
+            ctxs[row].push(first);
+        }
+
+        let run_steps = |ctxs: &mut Vec<Vec<u32>>, rows: usize, steps: usize| {
+            let row_sampling = vec![CudaRowSampling::Greedy; rows];
+            let samples = vec![0.0f32; rows];
+            let lease_tables: Vec<Vec<usize>> = (0..rows).map(|row| leases[row].clone()).collect();
+            for step in 0..steps {
+                let tokens: Vec<u32> = ctxs[..rows].iter().map(|c| *c.last().unwrap()).collect();
+                let positions: Vec<usize> = ctxs[..rows].iter().map(|c| c.len() - 1).collect();
+                let sliced: Vec<Vec<usize>> = ctxs[..rows]
+                    .iter()
+                    .enumerate()
+                    .map(|(row, c)| leases[row][..c.len().div_ceil(page_size)].to_vec())
+                    .collect();
+                // Eager reference first; the graph's forward then rewrites the same
+                // KV values idempotently (same tokens at the same positions).
+                let expected = model
+                    .decode_next_tokens_batch_paged_with_page_tables_and_positions(
+                        &tokens,
+                        &positions,
+                        &row_sampling,
+                        &samples,
+                        page_size,
+                        &sliced,
+                        physical,
+                    )
+                    .unwrap();
+                let got = model
+                    .scheduler_batch_graph_decode_step(
+                        &tokens,
+                        &positions,
+                        &row_sampling,
+                        &samples,
+                        page_size,
+                        &lease_tables,
+                        physical,
+                        scratch_page,
+                    )
+                    .unwrap()
+                    .expect("batched graph should capture and replay");
+                assert_eq!(got, expected, "rows={rows} step={step} diverged");
+                for (c, t) in ctxs[..rows].iter_mut().zip(&expected) {
+                    c.push(*t);
+                }
+            }
+        };
+
+        // 3 live rows -> bucket 4 (one scratch padding row), page boundaries crossed.
+        run_steps(&mut ctxs, 3, 24);
+        // Membership churn: down to 2 rows -> bucket 2 -> re-capture, still exact.
+        run_steps(&mut ctxs, 2, 6);
+        eprintln!(
+            "batched graph decode matched eager het for 30 steps incl. padding + bucket churn"
+        );
     }
 
     #[cfg(feature = "native-cuda")]

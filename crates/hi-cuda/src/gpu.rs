@@ -476,6 +476,32 @@ mod native {
         }
     }
 
+    /// Captured-graph decode for a fixed-size heterogeneous batch bucket (see
+    /// `scheduler_batch_graph_decode_step`). Everything per-step is replay-time
+    /// data in the persistent device buffers; the page table is PRIVATE (never
+    /// shared with the pool's content-keyed cache) so in-place updates are safe.
+    struct SchedulerBatchGraphDecodeState {
+        // Populated right after capture; Option only so the struct can exist
+        // during the warmup/capture sequence that produces the exec.
+        exec: Option<crate::runtime::GraphExec>,
+        // Held so the pooled KV pages / private table the graph baked pointers
+        // into stay alive for the exec's lifetime.
+        #[allow(dead_code)]
+        cache: CudaPagedBatchKvCache,
+        page_table: Rc<DeviceBuffer>,
+        table_host: Vec<u32>,
+        d_tokens: DeviceBuffer,
+        d_positions: DeviceBuffer,
+        d_outputs: DeviceBuffer,
+        d_samples: DeviceBuffer,
+        d_temperatures: DeviceBuffer,
+        d_top_ps: DeviceBuffer,
+        d_top_ks: DeviceBuffer,
+        bucket: usize,
+        page_size: usize,
+        physical_page_count: usize,
+    }
+
     pub struct CudaQwenGpuModel {
         info: CudaQwenGpuModelInfo,
         #[allow(dead_code)]
@@ -533,6 +559,9 @@ mod native {
         // `scheduler_graph_disabled` latches true if a capture ever fails (e.g. a non-capturable
         // weight residency) so the scheduler stops retrying and stays on eager decode.
         scheduler_graph_state: RefCell<Option<SchedulerGraphDecodeState>>,
+        // Batched (bucketed) counterpart for heterogeneous decode chunks
+        // (HI_CUDA_DECODE_GRAPH_BATCH); shares the disabled latch below.
+        scheduler_batch_graph_state: RefCell<Option<SchedulerBatchGraphDecodeState>>,
         scheduler_graph_disabled: Cell<bool>,
     }
 
@@ -2945,6 +2974,20 @@ mod native {
         *ENABLED.get_or_init(|| std::env::var("HI_CUDA_KV_Q8").is_ok())
     }
 
+    /// Batched (bucketed) CUDA-graph decode for heterogeneous decode chunks
+    /// (`HI_CUDA_DECODE_GRAPH_BATCH=1`, opt-in): capture the per-token forward once
+    /// per batch-size bucket and replay it, with leases/positions/tokens/sampling
+    /// as replay-time data. Needs the quantized M>1 GEMM (`HI_CUDA_MMQ`) for a
+    /// capturable forward — a cuBLAS fallback in the captured region fails capture
+    /// and latches graphs off (never breaks output).
+    pub(crate) fn decode_graph_batch_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("HI_CUDA_DECODE_GRAPH_BATCH").is_ok_and(|value| value != "0")
+        })
+    }
+
     /// GQA-grouped decode attention (`HI_CUDA_GQA_DECODE=1`, opt-in): one block
     /// serves all Q heads sharing a KV head, reading each K/V vector ONCE — decode
     /// attention's KV traffic drops by the GQA factor (4-8x on Qwen models) — and
@@ -3402,6 +3445,7 @@ mod native {
                 forward_in_progress: Cell::new(false),
                 graph_capture_token: Cell::new(std::ptr::null()),
                 graph_capture_position: Cell::new(std::ptr::null()),
+                scheduler_batch_graph_state: RefCell::new(None),
                 scheduler_graph_state: RefCell::new(None),
                 scheduler_graph_disabled: Cell::new(false),
             })
@@ -4498,13 +4542,15 @@ mod native {
                 }
             }
 
-            // During CUDA-graph capture (single-token decode) the token id comes from the
-            // persistent device buffer that is rewritten before each replay, so the gather
-            // reads it from device memory — no host alloc/copy (a blocking cudaMemcpy would be
-            // illegal inside stream capture). Otherwise copy the host ids as usual.
+            // During CUDA-graph capture the token id(s) come from the persistent device
+            // buffer that is rewritten before each replay, so the gather reads them from
+            // device memory — no host alloc/copy (a blocking cudaMemcpy would be illegal
+            // inside stream capture). The hook buffer always carries exactly the batch's
+            // ids (one for the single-sequence graph, `bucket` for the batched graph);
+            // the host `token_ids` then only size the launch. Otherwise copy as usual.
             let ids_owned;
             let ids: &DeviceBuffer = match self.active_graph_token() {
-                Some(token) if token_ids.len() == 1 => token,
+                Some(token) => token,
                 _ => {
                     ids_owned = DeviceBuffer::alloc(std::mem::size_of_val(token_ids))
                         .context("allocating CUDA embedding token ids")?;
@@ -8415,6 +8461,334 @@ mod native {
                 },
                 first_token,
             ))
+        }
+
+        /// One captured-graph decode step for a HETEROGENEOUS batch
+        /// (`HI_CUDA_DECODE_GRAPH_BATCH`): every live row decodes its token at its
+        /// own position under its own greedy/temp-only sampling config. Graphs are
+        /// captured per fixed-size BUCKET (2/4/8) keyed by
+        /// `(page_size, physical_page_count, bucket)` — batch membership, leases,
+        /// positions, tokens, and sampling params are all replay-time DATA written
+        /// into persistent device buffers, so admits/retires never re-capture. Rows
+        /// beyond the live count pad with the scheduler's reserved scratch page at
+        /// position 0 (harmless self-contained KV writes, outputs ignored). The
+        /// page-table buffer is PRIVATE to the graph (never shared with the pool's
+        /// content-keyed table cache) so in-place updates on membership change can't
+        /// poison cache hits. Returns Ok(None) when unavailable (latched off,
+        /// ineligible layout, rows > 8, or capture failed) — the caller decodes
+        /// eagerly; a failed capture latches graphs off for good.
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn scheduler_batch_graph_decode_step(
+            &self,
+            tokens: &[u32],
+            positions: &[usize],
+            row_sampling: &[CudaRowSampling],
+            samples: &[f32],
+            page_size: usize,
+            lease_tables: &[Vec<usize>],
+            physical_page_count: usize,
+            scratch_page: usize,
+        ) -> Result<Option<Vec<u32>>> {
+            if self.scheduler_graph_disabled.get()
+                || self.config.recurrent_ssm_tensor_layout
+                || !self.supports_batched_text_generation()
+            {
+                return Ok(None);
+            }
+            let rows = tokens.len();
+            if rows < 2
+                || rows > 8
+                || positions.len() != rows
+                || row_sampling.len() != rows
+                || samples.len() != rows
+                || lease_tables.len() != rows
+            {
+                return Ok(None);
+            }
+            let dims = self.qwen_dims()?;
+            if positions.iter().any(|position| *position >= dims.context) {
+                return Ok(None);
+            }
+            let bucket = rows.next_power_of_two().max(2);
+            let max_pages = dims.context.div_ceil(page_size);
+            if scratch_page >= physical_page_count
+                || lease_tables
+                    .iter()
+                    .any(|table| table.is_empty() || table.len() > max_pages)
+            {
+                return Ok(None);
+            }
+
+            // Desired flattened [bucket, max_pages] table: live rows = their full
+            // lease padded with its own last page, pad rows = the scratch page.
+            let mut desired = Vec::with_capacity(bucket * max_pages);
+            for table in lease_tables {
+                let last = *table.last().expect("checked non-empty");
+                for index in 0..max_pages {
+                    let page = table.get(index).copied().unwrap_or(last);
+                    desired.push(u32::try_from(page).context("page index does not fit u32")?);
+                }
+            }
+            for _ in rows..bucket {
+                for _ in 0..max_pages {
+                    desired.push(u32::try_from(scratch_page).context("scratch page too large")?);
+                }
+            }
+
+            let key_matches = self
+                .scheduler_batch_graph_state
+                .borrow()
+                .as_ref()
+                .is_some_and(|state| {
+                    state.page_size == page_size
+                        && state.physical_page_count == physical_page_count
+                        && state.bucket == bucket
+                });
+            if key_matches {
+                let mut state_slot = self.scheduler_batch_graph_state.borrow_mut();
+                let state = state_slot.as_mut().expect("checked matches");
+                if state.table_host != desired {
+                    state
+                        .page_table
+                        .copy_from_host(&desired)
+                        .context("updating CUDA batched graph page table")?;
+                    state.table_host = desired;
+                }
+                self.upload_batch_graph_inputs(state, tokens, positions, row_sampling, samples)?;
+                state
+                    .exec
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("CUDA batched graph exec missing"))?
+                    .launch(&self.stream)?;
+                self.stream.synchronize()?;
+                let out = state.d_outputs.copy_to_host::<u32>(rows)?;
+                return Ok(Some(out));
+            }
+
+            match self.build_scheduler_batch_graph_state(
+                &dims,
+                bucket,
+                max_pages,
+                page_size,
+                physical_page_count,
+                desired,
+                tokens,
+                positions,
+                row_sampling,
+                samples,
+            ) {
+                Ok((state, first_tokens)) => {
+                    *self.scheduler_batch_graph_state.borrow_mut() = Some(state);
+                    Ok(Some(first_tokens))
+                }
+                Err(err) => {
+                    self.scheduler_graph_disabled.set(true);
+                    *self.scheduler_batch_graph_state.borrow_mut() = None;
+                    warn_decode_graph_fallback_once(&err);
+                    Ok(None)
+                }
+            }
+        }
+
+        /// Write one step's per-row inputs into the batched graph's persistent
+        /// buffers. Pad rows decode token 0 at position 0 greedily into the scratch
+        /// page; their outputs are never read.
+        fn upload_batch_graph_inputs(
+            &self,
+            state: &SchedulerBatchGraphDecodeState,
+            tokens: &[u32],
+            positions: &[usize],
+            row_sampling: &[CudaRowSampling],
+            samples: &[f32],
+        ) -> Result<()> {
+            let bucket = state.bucket;
+            let mut token_values = vec![0u32; bucket];
+            token_values[..tokens.len()].copy_from_slice(tokens);
+            let mut position_values = vec![0u32; bucket];
+            for (slot, position) in position_values.iter_mut().zip(positions.iter()) {
+                *slot =
+                    u32::try_from(*position).context("graph decode position does not fit u32")?;
+            }
+            let mut sample_values = vec![0.0f32; bucket];
+            sample_values[..samples.len()].copy_from_slice(samples);
+            let mut temperatures = vec![0.0f32; bucket];
+            let mut top_ps = vec![1.0f32; bucket];
+            let mut top_ks = vec![0i32; bucket];
+            for (row, sampling) in row_sampling.iter().enumerate() {
+                if let CudaRowSampling::Sampled {
+                    temperature,
+                    top_p,
+                    top_k,
+                } = sampling
+                {
+                    temperatures[row] = *temperature;
+                    top_ps[row] = *top_p;
+                    top_ks[row] = match top_k {
+                        Some(value) => {
+                            i32::try_from(*value).context("graph decode top_k does not fit i32")?
+                        }
+                        None => 0,
+                    };
+                }
+            }
+            state.d_tokens.copy_from_host(&token_values)?;
+            state.d_positions.copy_from_host(&position_values)?;
+            state.d_samples.copy_from_host(&sample_values)?;
+            state.d_temperatures.copy_from_host(&temperatures)?;
+            state.d_top_ps.copy_from_host(&top_ps)?;
+            state.d_top_ks.copy_from_host(&top_ks)?;
+            Ok(())
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn build_scheduler_batch_graph_state(
+            &self,
+            dims: &QwenDims,
+            bucket: usize,
+            max_pages: usize,
+            page_size: usize,
+            physical_page_count: usize,
+            desired_table: Vec<u32>,
+            tokens: &[u32],
+            positions: &[usize],
+            row_sampling: &[CudaRowSampling],
+            samples: &[f32],
+        ) -> Result<(SchedulerBatchGraphDecodeState, Vec<u32>)> {
+            let rows = tokens.len();
+            let token_capacity = dims.context;
+            // Build the persistent cache over host tables reconstructed from the
+            // desired flattened layout, then give it a PRIVATE table buffer.
+            let host_tables: Vec<Vec<usize>> = (0..bucket)
+                .map(|row| {
+                    desired_table[row * max_pages..(row + 1) * max_pages]
+                        .iter()
+                        .map(|page| *page as usize)
+                        .collect()
+                })
+                .collect();
+            let mut cache = {
+                let mut pool_slot = self.paged_batch_pool.borrow_mut();
+                if pool_slot
+                    .as_ref()
+                    .is_none_or(|pool| !pool.can_cover(dims, page_size, physical_page_count))
+                {
+                    *pool_slot = Some(CudaPagedBatchDevicePool::new(
+                        self.config.block_count,
+                        dims,
+                        page_size,
+                        physical_page_count,
+                        &self.stream,
+                    )?);
+                }
+                let pool = pool_slot
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("CUDA paged batch device pool was not initialized"))?;
+                CudaPagedBatchKvCache::new_with_page_tables_from_pool(
+                    dims,
+                    bucket,
+                    page_size,
+                    token_capacity,
+                    &host_tables,
+                    pool,
+                    &self.stream,
+                )?
+            };
+            let private_table = Rc::new(
+                DeviceBuffer::alloc(desired_table.len() * std::mem::size_of::<u32>())
+                    .context("allocating CUDA batched graph private page table")?,
+            );
+            private_table
+                .copy_from_host(&desired_table)
+                .context("uploading CUDA batched graph private page table")?;
+            for layer in &mut cache.layers {
+                layer.page_table = Rc::clone(&private_table);
+            }
+
+            let alloc_u32 = |what: &str| -> Result<DeviceBuffer> {
+                DeviceBuffer::alloc(bucket * std::mem::size_of::<u32>())
+                    .with_context(|| format!("allocating CUDA batched graph {what}"))
+            };
+            let d_tokens = alloc_u32("token slots")?;
+            let d_positions = alloc_u32("position slots")?;
+            let d_outputs = alloc_u32("output slots")?;
+            let d_samples = alloc_u32("sample slots")?;
+            let d_temperatures = alloc_u32("temperature slots")?;
+            let d_top_ps = alloc_u32("top_p slots")?;
+            let d_top_ks = alloc_u32("top_k slots")?;
+            let state = SchedulerBatchGraphDecodeState {
+                exec: None,
+                cache,
+                page_table: private_table,
+                table_host: desired_table,
+                d_tokens,
+                d_positions,
+                d_outputs,
+                d_samples,
+                d_temperatures,
+                d_top_ps,
+                d_top_ks,
+                bucket,
+                page_size,
+                physical_page_count,
+            };
+            self.upload_batch_graph_inputs(&state, tokens, positions, row_sampling, samples)?;
+
+            let mut state = state;
+            let host_positions: Vec<usize> = (0..bucket)
+                .map(|row| positions.get(row).copied().unwrap_or(0))
+                .collect();
+            let select = |slf: &Self, logits: &GpuF32Tensor| -> Result<()> {
+                crate::kernels::launch_select_batched_last_token_per_row(
+                    &logits.buffer,
+                    &state.d_outputs,
+                    &state.d_samples,
+                    &state.d_temperatures,
+                    &state.d_top_ps,
+                    &state.d_top_ks,
+                    bucket,
+                    1,
+                    logits.cols,
+                    &slf.stream,
+                )
+            };
+
+            // Warmup: this step's REAL decode (writes every live row's KV, selects
+            // its token) and warms the buffer pool so capture never allocates.
+            let padded_tokens: Vec<u32> = (0..bucket)
+                .map(|row| tokens.get(row).copied().unwrap_or(0))
+                .collect();
+            let first_tokens = {
+                let logits = self.decode_batch_logits_paged_device_positions_buffer(
+                    &padded_tokens,
+                    &state.d_positions,
+                    &host_positions,
+                    &mut state.cache,
+                )?;
+                select(self, &logits)?;
+                self.stream.synchronize()?;
+                let out = state.d_outputs.copy_to_host::<u32>(rows)?;
+                drop(logits);
+                out
+            };
+
+            crate::runtime::set_capture_active(true);
+            self.graph_capture_token.set(&state.d_tokens);
+            let captured = (|| -> Result<crate::runtime::CudaGraph> {
+                let guard = self.stream.begin_capture_scoped()?;
+                let logits = self.decode_batch_logits_paged_device_positions_buffer(
+                    &padded_tokens,
+                    &state.d_positions,
+                    &host_positions,
+                    &mut state.cache,
+                )?;
+                select(self, &logits)?;
+                guard.end()
+            })();
+            self.graph_capture_token.set(std::ptr::null());
+            crate::runtime::set_capture_active(false);
+            state.exec = Some(captured?.instantiate()?);
+
+            Ok((state, first_tokens))
         }
 
         /// Drive `scheduler_graph_decode_step` in a loop the way the continuous scheduler does:
@@ -16301,6 +16675,30 @@ mod native {
             positions_device
                 .copy_from_host(&positions_u32)
                 .context("copying CUDA paged ragged decode positions")?;
+            self.decode_batch_logits_paged_device_positions_buffer(
+                token_ids,
+                &positions_device,
+                positions,
+                cache,
+            )
+        }
+
+        /// The per-row-position batched decode forward with a CALLER-owned device
+        /// positions buffer ([batch] u32). This is the shape the batched CUDA graph
+        /// captures: the buffer (and the embedding hook's token buffer) are
+        /// persistent and rewritten before each replay. `host_positions` are the
+        /// launch-time values — the GPU kernels never read them (they only feed the
+        /// host rope fallback of non-decoder layouts, which the graph never captures).
+        fn decode_batch_logits_paged_device_positions_buffer(
+            &self,
+            token_ids: &[u32],
+            positions_device: &DeviceBuffer,
+            positions: &[usize],
+            cache: &mut CudaPagedBatchKvCache,
+        ) -> Result<GpuF32Tensor> {
+            let _t = self.forward_timer();
+            let dims = self.qwen_dims()?;
+            let batch_count = token_ids.len();
 
             let mut hidden = self.embed_tokens_device(token_ids)?;
             let eps = self.config.rms_norm_eps.unwrap_or(1.0e-6);
@@ -24433,9 +24831,16 @@ pub use native::{
     CudaMmprojProjector, CudaQwenGpuModel, CudaVisionEncoder, GpuMatrix, GpuTensor, GpuVector,
 };
 #[cfg(feature = "native-cuda")]
-pub(crate) use native::{GraphSampling, decode_graph_enabled, sampled_selection_needs_host_rank};
+pub(crate) use native::{
+    GraphSampling, decode_graph_batch_enabled, decode_graph_enabled,
+    sampled_selection_needs_host_rank,
+};
 #[cfg(not(feature = "native-cuda"))]
 pub(crate) fn decode_graph_enabled() -> bool {
+    false
+}
+#[cfg(not(feature = "native-cuda"))]
+pub(crate) fn decode_graph_batch_enabled() -> bool {
     false
 }
 #[cfg(not(feature = "native-cuda"))]
@@ -25025,6 +25430,21 @@ mod non_native {
 
         pub fn supports_scheduler_chunked_prefill(&self) -> bool {
             false
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub(crate) fn scheduler_batch_graph_decode_step(
+            &self,
+            _tokens: &[u32],
+            _positions: &[usize],
+            _row_sampling: &[super::CudaRowSampling],
+            _samples: &[f32],
+            _page_size: usize,
+            _lease_tables: &[Vec<usize>],
+            _physical_page_count: usize,
+            _scratch_page: usize,
+        ) -> Result<Option<Vec<u32>>> {
+            Ok(None)
         }
 
         #[allow(clippy::too_many_arguments)]
