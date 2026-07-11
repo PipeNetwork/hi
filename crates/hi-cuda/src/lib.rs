@@ -11830,9 +11830,13 @@ mod tests {
             eager.len()
         );
 
-        // Multi-token: one captured graph replayed for positions 0..8 must match eager decode.
+        // Multi-token: one captured graph replayed for positions 0..20 must match eager decode.
+        // 20 tokens at page_size 16 crosses the page-0 -> page-1 boundary, proving a single
+        // capture replays across pages (d_position drives KV-write/attention into later pages,
+        // so no per-page re-capture is needed as long as the full page table is present).
+        let seq: Vec<u32> = (1u32..=20).collect();
         let (eager_seq, graphed_seq) = model
-            .graph_decode_multitoken_smoke(&[1, 2, 3, 4, 5, 6, 7, 8], 16, &[0], 1)
+            .graph_decode_multitoken_smoke(&seq, 16, &[0, 1], 2)
             .expect("multi-token graph decode should succeed");
         assert_eq!(eager_seq.len(), graphed_seq.len());
         for (i, (e, g)) in eager_seq.iter().zip(&graphed_seq).enumerate() {
