@@ -2448,6 +2448,7 @@ __global__ void write_paged_kv_cache_q8_batched_kernel(
     float* __restrict__ scales,
     const uint32_t* __restrict__ page_table,
     const uint32_t* __restrict__ positions,
+    const int* __restrict__ d_start_pos,
     int start_pos,
     int batch_count,
     int row_count,
@@ -2464,7 +2465,8 @@ __global__ void write_paged_kv_cache_q8_batched_kernel(
   int head = warp % kv_heads;
   int row = (warp / kv_heads) % row_count;
   int batch = warp / (kv_heads * row_count);
-  int base = positions ? static_cast<int>(positions[batch]) : start_pos;
+  int base = positions ? static_cast<int>(positions[batch])
+                       : (d_start_pos != nullptr ? *d_start_pos : start_pos);
   int logical_pos = base + row;
   int logical_page = logical_pos / page_size;
   int page_offset = logical_pos - logical_page * page_size;
@@ -2499,8 +2501,9 @@ __global__ void write_paged_kv_cache_q8_batched_kernel(
 
 extern "C" int hi_cuda_launch_write_paged_kv_cache_q8_batched(
     const void* values, void* pages, void* scales, const void* page_table,
-    const void* positions, int start_pos, int batch_count, int row_count, int kv_heads,
-    int head_dim, int page_size, int page_table_len, void* stream) {
+    const void* positions, const void* d_start_pos, int start_pos, int batch_count,
+    int row_count, int kv_heads, int head_dim, int page_size, int page_table_len,
+    void* stream) {
   if (values == nullptr || pages == nullptr || scales == nullptr || page_table == nullptr ||
       batch_count <= 0 || row_count <= 0 || kv_heads <= 0 || head_dim <= 0 || page_size <= 0 ||
       page_table_len <= 0 || stream == nullptr) {
@@ -2514,8 +2517,8 @@ extern "C" int hi_cuda_launch_write_paged_kv_cache_q8_batched(
                                            static_cast<cudaStream_t>(stream)>>>(
       static_cast<const float*>(values), static_cast<int8_t*>(pages),
       static_cast<float*>(scales), static_cast<const uint32_t*>(page_table),
-      static_cast<const uint32_t*>(positions), start_pos, batch_count, row_count, kv_heads,
-      head_dim, page_size, page_table_len);
+      static_cast<const uint32_t*>(positions), static_cast<const int*>(d_start_pos), start_pos,
+      batch_count, row_count, kv_heads, head_dim, page_size, page_table_len);
   return 0;
 }
 
@@ -4167,6 +4170,9 @@ __global__ void tiled_paged_decode_attention_batched_kernel(
 // int8/Q8 variant of tiled_paged_decode_attention_batched_positions_kernel. K/V pages are
 // int8; each cache vector has one f32 scale in k_scales/v_scales (indexed by physical
 // page, so shared across batch rows), loaded once per source and applied to the int8 value.
+// Position resolution mirrors the f16 family: per-batch device `positions`
+// when present, else the scalar device counter `d_start_pos` (CUDA-graph
+// capture), else the host `start_pos` (plain eager — no positions upload).
 __global__ void tiled_paged_decode_attention_batched_positions_q8_kernel(
     const float* q,
     const int8_t* k_pages,
@@ -4175,6 +4181,8 @@ __global__ void tiled_paged_decode_attention_batched_positions_q8_kernel(
     const float* v_scales,
     const uint32_t* page_table,
     const uint32_t* positions,
+    const int* d_start_pos,
+    int start_pos,
     float* output,
     int batch_count,
     int page_size,
@@ -4194,7 +4202,9 @@ __global__ void tiled_paged_decode_attention_batched_positions_q8_kernel(
   const int lane = threadIdx.x & 31;
   const int head = idx % heads;
   const int batch = idx / heads;
-  const int position = static_cast<int>(positions[batch]);
+  const int position = positions != nullptr
+                           ? static_cast<int>(positions[batch])
+                           : (d_start_pos != nullptr ? *d_start_pos : start_pos);
   const int kv_repeats = heads / kv_heads;
   const int kv_head = head / kv_repeats;
   const float scale = rsqrtf(static_cast<float>(qk_head_dim));
@@ -4297,15 +4307,16 @@ __global__ void tiled_paged_decode_attention_batched_positions_q8_kernel(
 
 extern "C" int hi_cuda_launch_tiled_paged_decode_attention_batched_positions_q8(
     const void* q, const void* k_pages, const void* v_pages, const void* k_scales,
-    const void* v_scales, const void* page_table, const void* positions, void* output,
-    int batch_count, int page_size, int page_table_len, int heads, int kv_heads,
-    int qk_head_dim, int v_head_dim, int window, void* stream) {
+    const void* v_scales, const void* page_table, const void* positions,
+    const void* d_start_pos, int start_pos, void* output, int batch_count, int page_size,
+    int page_table_len, int heads, int kv_heads, int qk_head_dim, int v_head_dim, int window,
+    void* stream) {
   if (q == nullptr || k_pages == nullptr || v_pages == nullptr || k_scales == nullptr ||
-      v_scales == nullptr || page_table == nullptr || positions == nullptr || output == nullptr ||
-      batch_count <= 0 || page_size <= 0 || page_table_len <= 0 || heads <= 0 || kv_heads <= 0 ||
-      qk_head_dim <= 0 || v_head_dim <= 0 || heads % kv_heads != 0 ||
-      qk_head_dim > HI_CUDA_FLASH_MAX_HEAD_DIM || v_head_dim > HI_CUDA_FLASH_MAX_HEAD_DIM ||
-      stream == nullptr) {
+      v_scales == nullptr || page_table == nullptr || output == nullptr || batch_count <= 0 ||
+      page_size <= 0 || page_table_len <= 0 || heads <= 0 || kv_heads <= 0 || qk_head_dim <= 0 ||
+      v_head_dim <= 0 || heads % kv_heads != 0 || qk_head_dim > HI_CUDA_FLASH_MAX_HEAD_DIM ||
+      v_head_dim > HI_CUDA_FLASH_MAX_HEAD_DIM ||
+      (positions == nullptr && d_start_pos == nullptr && start_pos < 0) || stream == nullptr) {
     return 1;
   }
   dim3 grid(batch_count * heads);
@@ -4317,8 +4328,9 @@ extern "C" int hi_cuda_launch_tiled_paged_decode_attention_batched_positions_q8(
       static_cast<const float*>(q), static_cast<const int8_t*>(k_pages),
       static_cast<const int8_t*>(v_pages), static_cast<const float*>(k_scales),
       static_cast<const float*>(v_scales), static_cast<const uint32_t*>(page_table),
-      static_cast<const uint32_t*>(positions), static_cast<float*>(output), batch_count,
-      page_size, page_table_len, heads, kv_heads, qk_head_dim, v_head_dim, window);
+      static_cast<const uint32_t*>(positions), static_cast<const int*>(d_start_pos), start_pos,
+      static_cast<float*>(output), batch_count, page_size, page_table_len, heads, kv_heads,
+      qk_head_dim, v_head_dim, window);
   return 0;
 }
 

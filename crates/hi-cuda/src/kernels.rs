@@ -672,6 +672,7 @@ mod native {
             scales: *mut c_void,
             page_table: *const c_void,
             positions: *const c_void,
+            d_start_pos: *const c_void,
             start_pos: c_int,
             batch_count: c_int,
             row_count: c_int,
@@ -1098,6 +1099,8 @@ mod native {
             v_scales: *const c_void,
             page_table: *const c_void,
             positions: *const c_void,
+            d_start_pos: *const c_void,
+            start_pos: c_int,
             output: *mut c_void,
             batch_count: c_int,
             page_size: c_int,
@@ -3169,12 +3172,16 @@ mod native {
     /// int8 + one f32 scale. `positions` (per-batch base position) is used when `Some`
     /// (decode); otherwise `start_pos` is the base for all rows (prefill).
     #[allow(clippy::too_many_arguments)]
+    /// Position precedence matches the kernel: per-batch `positions`, else the
+    /// scalar `device_start_pos` counter (CUDA-graph capture), else `start_pos`.
+    #[allow(clippy::too_many_arguments)]
     pub fn launch_write_paged_kv_cache_q8_batched(
         values: &DeviceBuffer,
         pages: &DeviceBuffer,
         scales: &DeviceBuffer,
         page_table: &DeviceBuffer,
         positions: Option<&DeviceBuffer>,
+        device_start_pos: Option<&DeviceBuffer>,
         start_pos: usize,
         batch_count: usize,
         row_count: usize,
@@ -3193,6 +3200,9 @@ mod native {
         let positions_ptr = positions
             .map(|buffer| buffer.as_ptr())
             .unwrap_or(std::ptr::null());
+        let device_start_pos_ptr = device_start_pos
+            .map(|buffer| buffer.as_ptr())
+            .unwrap_or(std::ptr::null());
         launch_status(unsafe {
             hi_cuda_launch_write_paged_kv_cache_q8_batched(
                 values.as_ptr(),
@@ -3200,6 +3210,7 @@ mod native {
                 scales.as_mut_ptr(),
                 page_table.as_ptr(),
                 positions_ptr,
+                device_start_pos_ptr,
                 start_pos as c_int,
                 batch_count as c_int,
                 row_count as c_int,
@@ -4400,6 +4411,10 @@ mod native {
     /// int8/Q8 batched-positions tiled paged decode attention (dequantizes int8 K/V pages
     /// via the parallel scale buffers). Mirrors the f16 batched-positions variant.
     #[allow(clippy::too_many_arguments)]
+    /// Position precedence matches the kernel: per-batch `positions`, else the
+    /// scalar `device_start_pos` counter (CUDA-graph capture), else `start_pos`
+    /// (plain eager — no per-call positions upload).
+    #[allow(clippy::too_many_arguments)]
     pub fn launch_tiled_paged_decode_attention_batched_positions_q8(
         q: &DeviceBuffer,
         k_pages: &DeviceBuffer,
@@ -4407,7 +4422,9 @@ mod native {
         k_scales: &DeviceBuffer,
         v_scales: &DeviceBuffer,
         page_table: &DeviceBuffer,
-        positions: &DeviceBuffer,
+        positions: Option<&DeviceBuffer>,
+        device_start_pos: Option<&DeviceBuffer>,
+        start_pos: usize,
         output: &DeviceBuffer,
         batch_count: usize,
         page_size: usize,
@@ -4432,6 +4449,13 @@ mod native {
         ensure_len(kv_heads, "tiled_paged_attention_q8 positions kv_heads")?;
         ensure_len(head_dim, "tiled_paged_attention_q8 positions head_dim")?;
         ensure_len(v_head_dim, "tiled_paged_attention_q8 positions v_head_dim")?;
+        ensure_len(start_pos, "tiled_paged_attention_q8 start_pos")?;
+        let positions_ptr = positions
+            .map(|buffer| buffer.as_ptr())
+            .unwrap_or(std::ptr::null());
+        let device_start_pos_ptr = device_start_pos
+            .map(|buffer| buffer.as_ptr())
+            .unwrap_or(std::ptr::null());
         launch_status(unsafe {
             hi_cuda_launch_tiled_paged_decode_attention_batched_positions_q8(
                 q.as_ptr(),
@@ -4440,7 +4464,9 @@ mod native {
                 k_scales.as_ptr(),
                 v_scales.as_ptr(),
                 page_table.as_ptr(),
-                positions.as_ptr(),
+                positions_ptr,
+                device_start_pos_ptr,
+                start_pos as c_int,
                 output.as_mut_ptr(),
                 batch_count as c_int,
                 page_size as c_int,

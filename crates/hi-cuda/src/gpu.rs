@@ -16677,36 +16677,73 @@ mod native {
                     },
                 )?;
                 if let Some(d_pos) = self.active_graph_position() {
-                    // CUDA-graph capture: write K/V at the device-counter position (f16 KV
-                    // only; the graph path is gated off Q8). Done directly against the layer's
-                    // pool buffers so start_pos comes from the device counter.
+                    // CUDA-graph capture: write K/V at the device-counter position, straight
+                    // against the layer's pool buffers so start_pos comes from the device
+                    // counter. Q8 caches quantize through their own devpos-capable kernel.
                     let layer = cache.layer(layer_idx)?;
-                    crate::kernels::launch_write_paged_kv_cache_batched_devpos(
-                        &k.buffer,
-                        layer.key_pages.as_buffer(),
-                        &layer.page_table,
-                        batch_count,
-                        1,
-                        dims.kv_heads,
-                        dims.head_dim,
-                        layer.page_size,
-                        layer.page_table_len,
-                        d_pos,
-                        &self.stream,
-                    )?;
-                    crate::kernels::launch_write_paged_kv_cache_batched_devpos(
-                        &v.buffer,
-                        layer.value_pages.as_buffer(),
-                        &layer.page_table,
-                        batch_count,
-                        1,
-                        dims.kv_heads,
-                        dims.v_head_dim,
-                        layer.page_size,
-                        layer.page_table_len,
-                        d_pos,
-                        &self.stream,
-                    )?;
+                    if let (Some(key_scales), Some(value_scales)) =
+                        (&layer.key_scales, &layer.value_scales)
+                    {
+                        crate::kernels::launch_write_paged_kv_cache_q8_batched(
+                            &k.buffer,
+                            layer.key_pages.as_buffer(),
+                            key_scales.as_buffer(),
+                            &layer.page_table,
+                            None,
+                            Some(d_pos),
+                            0,
+                            batch_count,
+                            1,
+                            dims.kv_heads,
+                            dims.head_dim,
+                            layer.page_size,
+                            layer.page_table_len,
+                            &self.stream,
+                        )?;
+                        crate::kernels::launch_write_paged_kv_cache_q8_batched(
+                            &v.buffer,
+                            layer.value_pages.as_buffer(),
+                            value_scales.as_buffer(),
+                            &layer.page_table,
+                            None,
+                            Some(d_pos),
+                            0,
+                            batch_count,
+                            1,
+                            dims.kv_heads,
+                            dims.v_head_dim,
+                            layer.page_size,
+                            layer.page_table_len,
+                            &self.stream,
+                        )?;
+                    } else {
+                        crate::kernels::launch_write_paged_kv_cache_batched_devpos(
+                            &k.buffer,
+                            layer.key_pages.as_buffer(),
+                            &layer.page_table,
+                            batch_count,
+                            1,
+                            dims.kv_heads,
+                            dims.head_dim,
+                            layer.page_size,
+                            layer.page_table_len,
+                            d_pos,
+                            &self.stream,
+                        )?;
+                        crate::kernels::launch_write_paged_kv_cache_batched_devpos(
+                            &v.buffer,
+                            layer.value_pages.as_buffer(),
+                            &layer.page_table,
+                            batch_count,
+                            1,
+                            dims.kv_heads,
+                            dims.v_head_dim,
+                            layer.page_size,
+                            layer.page_table_len,
+                            d_pos,
+                            &self.stream,
+                        )?;
+                    }
                 } else {
                     cache.write_layer_batched(
                         layer_idx,
@@ -19251,16 +19288,10 @@ mod native {
                         "CUDA Q8 KV cache decode requires head_dim <= {FLASH_ONLINE_MAX_HEAD_DIM}, got {head_dim}"
                     );
                 }
-                // Reuse the positions Q8 kernel with a uniform per-batch position buffer.
-                let positions: Vec<u32> = vec![
-                    u32::try_from(position).context(
-                        "CUDA Q8 decode position does not fit u32"
-                    )?;
-                    batch_count
-                ];
-                let positions_dev = DeviceBuffer::alloc(batch_count * std::mem::size_of::<u32>())
-                    .context("allocating CUDA Q8 uniform positions")?;
-                positions_dev.copy_from_host(&positions)?;
+                // Uniform position: the kernel reads it from the graph's device
+                // counter during capture, else takes it by value — no per-call
+                // positions buffer (this alloc+upload ran once per LAYER per
+                // token and made Q8 KV impossible to graph-capture).
                 crate::kernels::launch_tiled_paged_decode_attention_batched_positions_q8(
                     &q.buffer,
                     cache.key_pages.as_buffer(),
@@ -19268,7 +19299,9 @@ mod native {
                     key_scales.as_buffer(),
                     value_scales.as_buffer(),
                     &cache.page_table,
-                    &positions_dev,
+                    None,
+                    self.active_graph_position(),
+                    position,
                     &output,
                     batch_count,
                     cache.page_size,
@@ -19280,7 +19313,10 @@ mod native {
                     window,
                     &self.stream,
                 )?;
-                self.stream.synchronize()?;
+                // Stream-ordered like the f16 branch (a hard sync here both
+                // drained the pipeline once per layer per token and broke
+                // graph capture).
+                self.op_barrier()?;
                 return Ok(GpuF32Tensor {
                     rows: batch_count,
                     cols: heads * v_head_dim,
@@ -19419,7 +19455,9 @@ mod native {
                     key_scales.as_buffer(),
                     value_scales.as_buffer(),
                     &cache.page_table,
-                    positions,
+                    Some(positions),
+                    None,
+                    0,
                     &output,
                     batch_count,
                     cache.page_size,
@@ -20736,6 +20774,7 @@ mod native {
                     key_scales,
                     &self.page_table,
                     None,
+                    None,
                     start_pos,
                     1,
                     key.rows,
@@ -20750,6 +20789,7 @@ mod native {
                     &self.value_pages,
                     value_scales,
                     &self.page_table,
+                    None,
                     None,
                     start_pos,
                     1,
@@ -20888,6 +20928,7 @@ mod native {
                     key_scales.as_buffer(),
                     &self.page_table,
                     None,
+                    None,
                     start_pos,
                     batch_count,
                     row_count,
@@ -20902,6 +20943,7 @@ mod native {
                     self.value_pages.as_buffer(),
                     value_scales.as_buffer(),
                     &self.page_table,
+                    None,
                     None,
                     start_pos,
                     batch_count,
@@ -21000,6 +21042,7 @@ mod native {
                     key_scales.as_buffer(),
                     &self.page_table,
                     Some(positions),
+                    None,
                     0,
                     batch_count,
                     row_count,
@@ -21015,6 +21058,7 @@ mod native {
                     value_scales.as_buffer(),
                     &self.page_table,
                     Some(positions),
+                    None,
                     0,
                     batch_count,
                     row_count,
