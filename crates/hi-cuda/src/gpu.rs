@@ -56,6 +56,7 @@ mod native {
     use std::cell::{Cell, RefCell, RefMut};
     use std::collections::{BTreeMap, BTreeSet};
     use std::fmt;
+    use std::rc::Rc;
     use std::time::Instant;
 
     use anyhow::{Context, Result, anyhow, bail};
@@ -2921,6 +2922,18 @@ mod native {
         use std::sync::OnceLock;
         static ENABLED: OnceLock<bool> = OnceLock::new();
         *ENABLED.get_or_init(|| std::env::var("HI_CUDA_KV_Q8").is_ok())
+    }
+
+    /// Reuse the device-resident batch page table across decode iterations when its
+    /// contents are unchanged (the common case: a stable decode batch re-sends the same
+    /// page tables every token). Exact-match keyed (full table compare, no hash), so a
+    /// hit can never alias a different mapping. `HI_CUDA_PAGE_TABLE_CACHE=0` disables.
+    fn page_table_cache_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("HI_CUDA_PAGE_TABLE_CACHE").map_or(true, |value| value != "0")
+        })
     }
 
     /// Row-chunk the dense-FFN activations during prefill so the transient
@@ -18553,14 +18566,20 @@ mod native {
                 .len()
                 .checked_mul(std::mem::size_of::<u32>())
                 .context("CUDA paged KV page table byte count overflows usize")?;
+            // One device page table shared by every layer (contents are layer-invariant).
+            let page_table_device = Rc::new(
+                DeviceBuffer::alloc(page_table_bytes)
+                    .context("allocating CUDA paged KV page table")?,
+            );
+            page_table_device
+                .copy_from_host(&page_table)
+                .context("copying CUDA paged KV page table")?;
             let mut layers = Vec::with_capacity(layer_count);
             for _ in 0..layer_count {
                 let key_pages =
                     DeviceBuffer::alloc(key_bytes).context("allocating CUDA paged key cache")?;
                 let value_pages = DeviceBuffer::alloc(value_bytes)
                     .context("allocating CUDA paged value cache")?;
-                let page_table_device = DeviceBuffer::alloc(page_table_bytes)
-                    .context("allocating CUDA paged KV page table")?;
                 key_pages.memset_zero_async(stream)?;
                 value_pages.memset_zero_async(stream)?;
                 let (key_scales, value_scales) = if q8 {
@@ -18574,15 +18593,12 @@ mod native {
                 } else {
                     (None, None)
                 };
-                page_table_device
-                    .copy_from_host(&page_table)
-                    .context("copying CUDA paged KV page table")?;
                 layers.push(CudaPagedLayerKvCache {
                     key_pages,
                     value_pages,
                     key_scales,
                     value_scales,
-                    page_table: page_table_device,
+                    page_table: Rc::clone(&page_table_device),
                     page_size,
                     page_table_len,
                     max_seq: token_capacity,
@@ -18627,6 +18643,19 @@ mod native {
         head_dim: usize,
         v_head_dim: usize,
         layers: Vec<CudaPagedBatchDevicePoolLayer>,
+        // Last uploaded batch page table, reused across decode iterations while the
+        // batch's page assignments are unchanged (leases are immutable for a request's
+        // lifetime, so a stable batch hits every token). Exact-match: a hit requires the
+        // full flattened table plus shape to be equal, so reuse can never alias a
+        // different page mapping. Lives in the pool so it dies with the pool.
+        page_table_cache: RefCell<Option<CachedBatchPageTable>>,
+    }
+
+    struct CachedBatchPageTable {
+        table: Vec<u32>,
+        batch_count: usize,
+        page_table_len: usize,
+        buffer: Rc<DeviceBuffer>,
     }
 
     struct CudaPagedBatchDevicePoolLayer {
@@ -18712,6 +18741,7 @@ mod native {
                 head_dim: dims.head_dim,
                 v_head_dim: dims.v_head_dim,
                 layers,
+                page_table_cache: RefCell::new(None),
             })
         }
 
@@ -18806,26 +18836,29 @@ mod native {
                 .len()
                 .checked_mul(std::mem::size_of::<u32>())
                 .context("CUDA paged batch KV page table byte count overflows usize")?;
+            // One device page table shared by every layer (contents are layer-invariant).
+            let page_table_device = Rc::new(
+                DeviceBuffer::alloc(page_table_bytes)
+                    .context("allocating CUDA paged batch KV page table")?,
+            );
+            page_table_device
+                .copy_from_host(&page_table)
+                .context("copying CUDA paged batch KV page table")?;
             let mut layers = Vec::with_capacity(layer_count);
             for _ in 0..layer_count {
                 let key_pages = DeviceBuffer::alloc(key_bytes)
                     .context("allocating CUDA paged batch key cache")?;
                 let value_pages = DeviceBuffer::alloc(value_bytes)
                     .context("allocating CUDA paged batch value cache")?;
-                let page_table_device = DeviceBuffer::alloc(page_table_bytes)
-                    .context("allocating CUDA paged batch KV page table")?;
                 key_pages.memset_zero_async(stream)?;
                 value_pages.memset_zero_async(stream)?;
-                page_table_device
-                    .copy_from_host(&page_table)
-                    .context("copying CUDA paged batch KV page table")?;
                 layers.push(CudaPagedBatchLayerKvCache {
                     key_pages: CudaPagedBatchBuffer::Owned(key_pages),
                     value_pages: CudaPagedBatchBuffer::Owned(value_pages),
                     // The owned batch cache stays f16; only the pool path serves Q8.
                     key_scales: None,
                     value_scales: None,
-                    page_table: page_table_device,
+                    page_table: Rc::clone(&page_table_device),
                     batch_count,
                     page_size,
                     page_table_len,
@@ -18843,7 +18876,7 @@ mod native {
             token_capacity: usize,
             page_tables: &[Vec<usize>],
             pool: &CudaPagedBatchDevicePool,
-            stream: &Stream,
+            _stream: &Stream,
         ) -> Result<Self> {
             if batch_count == 0 {
                 bail!("CUDA paged batch KV cache batch_count must be greater than zero");
@@ -18894,17 +18927,50 @@ mod native {
                     );
                 }
             }
-            let page_table_bytes = page_table
-                .len()
-                .checked_mul(std::mem::size_of::<u32>())
-                .context("CUDA paged batch KV page table byte count overflows usize")?;
+            // One device page table shared by every layer (contents are layer-invariant),
+            // reused across calls while the batch's page assignments are unchanged. The
+            // blocking host-to-device copy completes before returning, so subsequent
+            // kernel launches on any stream see the data without a stream sync.
+            let cached = page_table_cache_enabled()
+                .then(|| {
+                    pool.page_table_cache
+                        .borrow()
+                        .as_ref()
+                        .filter(|entry| {
+                            entry.batch_count == batch_count
+                                && entry.page_table_len == page_table_len
+                                && entry.table == page_table
+                        })
+                        .map(|entry| Rc::clone(&entry.buffer))
+                })
+                .flatten();
+            let page_table_device = match cached {
+                Some(buffer) => buffer,
+                None => {
+                    let page_table_bytes = page_table
+                        .len()
+                        .checked_mul(std::mem::size_of::<u32>())
+                        .context("CUDA paged batch KV page table byte count overflows usize")?;
+                    let buffer = Rc::new(
+                        DeviceBuffer::alloc(page_table_bytes)
+                            .context("allocating CUDA paged batch KV page table")?,
+                    );
+                    buffer
+                        .copy_from_host(&page_table)
+                        .context("copying CUDA paged batch KV page table")?;
+                    if page_table_cache_enabled() {
+                        *pool.page_table_cache.borrow_mut() = Some(CachedBatchPageTable {
+                            table: page_table,
+                            batch_count,
+                            page_table_len,
+                            buffer: Rc::clone(&buffer),
+                        });
+                    }
+                    buffer
+                }
+            };
             let mut layers = Vec::with_capacity(pool.layers.len());
             for pool_layer in &pool.layers {
-                let page_table_device = DeviceBuffer::alloc(page_table_bytes)
-                    .context("allocating CUDA paged batch KV page table")?;
-                page_table_device
-                    .copy_from_host(&page_table)
-                    .context("copying CUDA paged batch KV page table")?;
                 layers.push(CudaPagedBatchLayerKvCache {
                     key_pages: CudaPagedBatchBuffer::Shared(&pool_layer.key_pages),
                     value_pages: CudaPagedBatchBuffer::Shared(&pool_layer.value_pages),
@@ -18916,14 +18982,13 @@ mod native {
                         .value_scales
                         .as_ref()
                         .map(|b| CudaPagedBatchBuffer::Shared(b)),
-                    page_table: page_table_device,
+                    page_table: Rc::clone(&page_table_device),
                     batch_count,
                     page_size,
                     page_table_len,
                     max_seq: token_capacity,
                 });
             }
-            stream.synchronize()?;
             Ok(Self { layers })
         }
 
@@ -19118,7 +19183,8 @@ mod native {
         // [page_offset] vector. `None` means the f16 (kv_t) cache is in use.
         key_scales: Option<DeviceBuffer>,
         value_scales: Option<DeviceBuffer>,
-        page_table: DeviceBuffer,
+        // Shared across all layers (contents are layer-invariant: the identity mapping).
+        page_table: Rc<DeviceBuffer>,
         page_size: usize,
         page_table_len: usize,
         max_seq: usize,
@@ -19260,7 +19326,9 @@ mod native {
         // Present only for the int8/Q8 cache (pool path); None keeps the f16 path.
         key_scales: Option<CudaPagedBatchBuffer>,
         value_scales: Option<CudaPagedBatchBuffer>,
-        page_table: DeviceBuffer,
+        // Shared across all layers (contents are layer-invariant) and, via the pool's
+        // page-table cache, across decode iterations with unchanged page assignments.
+        page_table: Rc<DeviceBuffer>,
         batch_count: usize,
         page_size: usize,
         page_table_len: usize,
