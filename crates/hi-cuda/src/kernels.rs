@@ -348,6 +348,22 @@ mod native {
             cols: c_int,
             stream: *mut c_void,
         ) -> c_int;
+        fn hi_cuda_launch_mxfp4_gemv(
+            weight: *const c_void,
+            x: *const c_void,
+            y: *mut c_void,
+            rows: c_int,
+            cols: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_nvfp4_gemv(
+            weight: *const c_void,
+            x: *const c_void,
+            y: *mut c_void,
+            rows: c_int,
+            cols: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
         fn hi_cuda_launch_q4_k_dp4a_gemv(
             weights: *const c_void,
             xq: *const c_void,
@@ -2238,6 +2254,56 @@ mod native {
             )
         })?;
         check_last_error("hi_cuda_launch_q4_0_dp4a_gemv")
+    }
+
+    /// Fused MXFP4 GEMV (M=1 decode): reads the packed fp4 blocks natively against
+    /// f32 activations. Requires cols % 32 == 0.
+    pub fn launch_mxfp4_gemv(
+        weight: &DeviceBuffer,
+        x: &DeviceBuffer,
+        y: &DeviceBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(rows, "mxfp4 gemv rows")?;
+        ensure_len(cols, "mxfp4 gemv cols")?;
+        launch_status(unsafe {
+            hi_cuda_launch_mxfp4_gemv(
+                weight.as_ptr(),
+                x.as_ptr(),
+                y.as_mut_ptr(),
+                rows as c_int,
+                cols as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_mxfp4_gemv")
+    }
+
+    /// Fused NVFP4 GEMV (M=1 decode): reads the packed fp4 blocks natively against
+    /// f32 activations. Requires cols % 64 == 0.
+    pub fn launch_nvfp4_gemv(
+        weight: &DeviceBuffer,
+        x: &DeviceBuffer,
+        y: &DeviceBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(rows, "nvfp4 gemv rows")?;
+        ensure_len(cols, "nvfp4 gemv cols")?;
+        launch_status(unsafe {
+            hi_cuda_launch_nvfp4_gemv(
+                weight.as_ptr(),
+                x.as_ptr(),
+                y.as_mut_ptr(),
+                rows as c_int,
+                cols as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_nvfp4_gemv")
     }
 
     /// dp4a Q4_K GEMV (M=1 decode): reads Q4_K weights + int8-quantized activation

@@ -24903,6 +24903,76 @@ mod tests {
         }
     }
 
+    /// Fused MXFP4/NVFP4 GEMV (M=1 decode, f32 activations, native packed-block
+    /// reads) vs a host f64 dot over the matrix dequantized by the shipping
+    /// dequantize kernels — the exact bytes-to-values decode the GEMV must match.
+    /// Synthetic weights: random nibbles, scale bytes pinned to sane exponents.
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_fp4_gemv_matches_dequant_reference() {
+        use crate::runtime::{DeviceBuffer, Stream};
+        use rand::rngs::StdRng;
+        use rand::{Rng, RngCore, SeedableRng};
+
+        let stream = Stream::create().unwrap();
+        let rows = 6usize;
+        let cols = 512usize;
+        // (name, block_weights, block_bytes, dequant qtype id, scale byte offsets, pinned scale)
+        for (name, block_weights, block_bytes, qtype, scale_offsets, pinned) in [
+            ("MXFP4", 32usize, 17usize, 39i32, &[0usize][..], 127u8),
+            ("NVFP4", 64, 36, 40, &[0, 1, 2, 3][..], 0x40),
+        ] {
+            let mut rng = StdRng::seed_from_u64(0xf4_00 + qtype as u64);
+            let nblocks = cols / block_weights;
+            let wlen = rows * nblocks * block_bytes;
+            let mut wbytes = vec![0u8; wlen];
+            rng.fill_bytes(&mut wbytes);
+            for blk in 0..(rows * nblocks) {
+                for &off in scale_offsets {
+                    wbytes[blk * block_bytes + off] = pinned;
+                }
+            }
+            let x: Vec<f32> = (0..cols).map(|_| rng.gen_range(-1.5f32..1.5)).collect();
+
+            let w_dev = DeviceBuffer::alloc(wlen).unwrap();
+            w_dev.copy_from_host(&wbytes).unwrap();
+            let x_dev = DeviceBuffer::alloc(cols * std::mem::size_of::<f32>()).unwrap();
+            x_dev.copy_from_host(&x).unwrap();
+
+            let elements = rows * cols;
+            let wf32_dev = DeviceBuffer::alloc(elements * std::mem::size_of::<f32>()).unwrap();
+            crate::kernels::launch_dequantize_matrix(&w_dev, &wf32_dev, elements, qtype, &stream)
+                .unwrap();
+
+            let y_dev = DeviceBuffer::alloc(rows * std::mem::size_of::<f32>()).unwrap();
+            if name == "MXFP4" {
+                crate::kernels::launch_mxfp4_gemv(&w_dev, &x_dev, &y_dev, rows, cols, &stream)
+                    .unwrap();
+            } else {
+                crate::kernels::launch_nvfp4_gemv(&w_dev, &x_dev, &y_dev, rows, cols, &stream)
+                    .unwrap();
+            }
+            stream.synchronize().unwrap();
+
+            let wf32 = wf32_dev.copy_to_host::<f32>(elements).unwrap();
+            let y = y_dev.copy_to_host::<f32>(rows).unwrap();
+            for r in 0..rows {
+                let mut acc = 0.0f64;
+                for c in 0..cols {
+                    acc += f64::from(wf32[r * cols + c]) * f64::from(x[c]);
+                }
+                let reference = acc as f32;
+                let tol = 1.0e-3 + 1.0e-4 * reference.abs();
+                assert!(
+                    (y[r] - reference).abs() <= tol,
+                    "{name} row {r}: gemv {} vs reference {} (tol {tol})",
+                    y[r],
+                    reference,
+                );
+            }
+        }
+    }
+
     /// W4A8 prefill GEMM (int8 tensor-core Q4_K x int8 activation) vs a host reference over the
     /// dequantized Q4_K weights + round-tripped int8 activations -- the same math as the
     /// validated q4_k dp4a GEMV, extended to M>1. M and N are deliberately NOT multiples of 16

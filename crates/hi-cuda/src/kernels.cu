@@ -1095,6 +1095,89 @@ __global__ void dequantize_nvfp4_kernel(const uint8_t* input, float* output, int
   output[idx] = d * static_cast<float>(MXFP4_VALUES[quant]);
 }
 
+// Fused fp4 (MXFP4 / NVFP4) GEMV for M=1 decode: y[row] = W[row] . x, reading
+// the packed fp4 blocks natively (MXFP4 17B/32 weights, NVFP4 36B/64) instead
+// of dequantizing the whole matrix to f32 per forward. f32 activations, f32
+// accumulate, one warp per output row; the nibble/scale decode is exactly the
+// dequantize kernels' above, so a dequant-then-dot reference matches to f32
+// accumulation order. At M=1 the row read is weight-bandwidth-bound, so native
+// fp4 reads ~7.5x fewer bytes than the dequantized-f32 matrix.
+__global__ void mxfp4_gemv_kernel(
+    const uint8_t* __restrict__ w,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int rows,
+    int cols) {
+  const int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  const int lane = threadIdx.x & 31;
+  if (row >= rows) {
+    return;
+  }
+  const int nblocks = cols / 32;
+  const uint8_t* wrow = w + static_cast<long>(row) * nblocks * 17;
+  float acc = 0.0f;
+  for (int b = lane; b < nblocks; b += 32) {
+    const uint8_t* blk = wrow + b * 17;
+    const float d = e8m0_to_float_half(blk[0]);
+    const float* xb = x + b * 32;
+    float bsum = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+      const uint8_t packed = blk[1 + j];
+      bsum += static_cast<float>(MXFP4_VALUES[packed & 0x0f]) * xb[j];
+      bsum += static_cast<float>(MXFP4_VALUES[packed >> 4]) * xb[16 + j];
+    }
+    acc += d * bsum;
+  }
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    acc += __shfl_down_sync(0xffffffffu, acc, offset);
+  }
+  if (lane == 0) {
+    y[row] = acc;
+  }
+}
+
+__global__ void nvfp4_gemv_kernel(
+    const uint8_t* __restrict__ w,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int rows,
+    int cols) {
+  const int row = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
+  const int lane = threadIdx.x & 31;
+  if (row >= rows) {
+    return;
+  }
+  const int nblocks = cols / 64;
+  const uint8_t* wrow = w + static_cast<long>(row) * nblocks * 36;
+  float acc = 0.0f;
+  for (int b = lane; b < nblocks; b += 32) {
+    const uint8_t* blk = wrow + b * 36;
+    const uint8_t* qs = blk + 4;
+#pragma unroll
+    for (int sub = 0; sub < 4; ++sub) {
+      const float d = ue4m3_to_float(blk[sub]);
+      const float* xb = x + b * 64 + sub * 16;
+      float ssum = 0.0f;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const uint8_t packed = qs[sub * 8 + j];
+        ssum += static_cast<float>(MXFP4_VALUES[packed & 0x0f]) * xb[j];
+        ssum += static_cast<float>(MXFP4_VALUES[packed >> 4]) * xb[8 + j];
+      }
+      acc += d * ssum;
+    }
+  }
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    acc += __shfl_down_sync(0xffffffffu, acc, offset);
+  }
+  if (lane == 0) {
+    y[row] = acc;
+  }
+}
+
 __global__ void dequantize_iq4_nl_kernel(const uint8_t* input, float* output, int elements) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= elements) {
@@ -8566,6 +8649,34 @@ extern "C" int hi_cuda_launch_q4_0_dp4a_gemv(
                           static_cast<cudaStream_t>(stream)>>>(
       static_cast<const uint8_t*>(weight), static_cast<const int8_t*>(xq),
       static_cast<const float*>(dx), static_cast<const int*>(xsum),
+      static_cast<float*>(y), rows, cols);
+  return 0;
+}
+
+extern "C" int hi_cuda_launch_mxfp4_gemv(
+    const void* weight, const void* x, void* y, int rows, int cols, void* stream) {
+  if (weight == nullptr || x == nullptr || y == nullptr || rows <= 0 || cols <= 0 ||
+      cols % 32 != 0 || stream == nullptr) {
+    return 1;
+  }
+  const int warps_per_block = 4;
+  const int grid = (rows + warps_per_block - 1) / warps_per_block;
+  mxfp4_gemv_kernel<<<grid, warps_per_block * 32, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint8_t*>(weight), static_cast<const float*>(x),
+      static_cast<float*>(y), rows, cols);
+  return 0;
+}
+
+extern "C" int hi_cuda_launch_nvfp4_gemv(
+    const void* weight, const void* x, void* y, int rows, int cols, void* stream) {
+  if (weight == nullptr || x == nullptr || y == nullptr || rows <= 0 || cols <= 0 ||
+      cols % 64 != 0 || stream == nullptr) {
+    return 1;
+  }
+  const int warps_per_block = 4;
+  const int grid = (rows + warps_per_block - 1) / warps_per_block;
+  nvfp4_gemv_kernel<<<grid, warps_per_block * 32, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const uint8_t*>(weight), static_cast<const float*>(x),
       static_cast<float*>(y), rows, cols);
   return 0;
 }

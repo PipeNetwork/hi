@@ -2928,6 +2928,15 @@ mod native {
         *ENABLED.get_or_init(|| std::env::var("HI_CUDA_WMMA_ATTN").is_ok())
     }
 
+    /// Fused fp4 (MXFP4/NVFP4) GEMV for M=1 decode (default: yes; set
+    /// `HI_CUDA_NO_FP4_GEMV` to fall back to dequant-per-op). Only reached when
+    /// fp4 weights are kept quantized on the GPU.
+    fn fp4_gemv_enabled() -> bool {
+        use std::sync::OnceLock;
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("HI_CUDA_NO_FP4_GEMV").is_err())
+    }
+
     /// FA2 multi-warp paged prefill attention (`HI_CUDA_FA2_ATTN=1`, opt-in): four
     /// warps per 64-query block tile share one 32-key K/V staging tile (4x fewer
     /// paged-prefix gathers per query) with per-warp softmax/output ownership,
@@ -3758,6 +3767,44 @@ mod native {
             matrix: &GpuMatrix,
             input: &GpuF32Tensor,
         ) -> Result<GpuF32Tensor> {
+            // Single-token decode fast path for fp4 checkpoints: read the packed
+            // MXFP4/NVFP4 blocks natively against the f32 activation (~0.53-0.56
+            // bytes/weight) instead of dequantizing the whole matrix to f32 per
+            // forward. Default on; `HI_CUDA_NO_FP4_GEMV` reverts to dequant.
+            if fp4_gemv_enabled()
+                && input.rows == 1
+                && ((matches!(matrix.dtype, GgufTensorType::MXFP4) && matrix.cols % 32 == 0)
+                    || (matches!(matrix.dtype, GgufTensorType::NVFP4) && matrix.cols % 64 == 0))
+            {
+                let output = DeviceBuffer::alloc(matrix.rows * std::mem::size_of::<f32>())
+                    .context("allocating CUDA fp4 GEMV output")?;
+                match matrix.dtype {
+                    GgufTensorType::MXFP4 => crate::kernels::launch_mxfp4_gemv(
+                        &matrix.buffer,
+                        &input.buffer,
+                        &output,
+                        matrix.rows,
+                        matrix.cols,
+                        &self.stream,
+                    )
+                    .with_context(|| format!("CUDA MXFP4 GEMV for {matrix_name}"))?,
+                    _ => crate::kernels::launch_nvfp4_gemv(
+                        &matrix.buffer,
+                        &input.buffer,
+                        &output,
+                        matrix.rows,
+                        matrix.cols,
+                        &self.stream,
+                    )
+                    .with_context(|| format!("CUDA NVFP4 GEMV for {matrix_name}"))?,
+                }
+                self.op_barrier()?;
+                return Ok(GpuF32Tensor {
+                    rows: 1,
+                    cols: matrix.rows,
+                    buffer: output,
+                });
+            }
             // Single-token decode fast path: quantize the activation to int8 and run a
             // fused dp4a Q4_0 GEMV, reading 4-bit weights + int8 activation directly.
             if q4_0_gemv_enabled()
