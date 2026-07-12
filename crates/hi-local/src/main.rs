@@ -76,6 +76,10 @@ enum Command {
         seed: Option<u64>,
         #[arg(long)]
         include_logits: bool,
+        /// Run the GPU provider instead of the CPU reference (deepseek4 only;
+        /// requires a native-cuda build). Same flags and output contract.
+        #[arg(long)]
+        gpu: bool,
     },
 }
 
@@ -178,6 +182,7 @@ async fn run(cli: Cli) -> Result<()> {
             top_p,
             seed,
             include_logits,
+            gpu,
         } => qwen_cpu(
             model_path,
             tokens,
@@ -188,6 +193,7 @@ async fn run(cli: Cli) -> Result<()> {
             top_p,
             seed,
             include_logits,
+            gpu,
         ),
     }
 }
@@ -231,6 +237,7 @@ fn qwen_cpu(
     top_p: f32,
     seed: Option<u64>,
     include_logits: bool,
+    gpu: bool,
 ) -> Result<()> {
     if !is_gguf_path(&model_path) {
         bail!(
@@ -238,8 +245,6 @@ fn qwen_cpu(
             model_path.display()
         );
     }
-    let model = hi_cuda::qwen_cpu::QwenCpuReference::load(&model_path)
-        .with_context(|| format!("loading Qwen GGUF model from {}", model_path.display()))?;
     let options = hi_cuda::qwen_cpu::QwenCpuRunOptions {
         max_tokens,
         top_k,
@@ -248,20 +253,88 @@ fn qwen_cpu(
         seed,
         include_logits,
     };
-    let output = match (tokens, prompt) {
+    let input = match (tokens, prompt) {
         (Some(tokens), None) => {
             let tokens = parse_token_ids(&tokens)?;
             if tokens.is_empty() {
                 bail!("--tokens must include at least one token id");
             }
-            model.run_tokens(&tokens, options)?
+            CpuReferenceInput::Tokens(tokens)
         }
-        (None, Some(prompt)) => model.run_prompt(&prompt, options)?,
+        (None, Some(prompt)) => CpuReferenceInput::Prompt(prompt),
         (None, None) => bail!("provide either --tokens or --prompt"),
         (Some(_), Some(_)) => bail!("provide only one of --tokens or --prompt"),
     };
+    // deepseek4 uses its own CPU reference (hyper-connections, latent MQA,
+    // compressed KV) and, under --gpu, the host-orchestrated CUDA engine;
+    // everything else keeps the existing Qwen path.
+    let gguf = hi_gguf::GgufFile::open(&model_path)
+        .with_context(|| format!("loading GGUF model from {}", model_path.display()))?;
+    let is_deepseek4 = gguf.qwen_config()?.is_deepseek4();
+    if gpu && !is_deepseek4 {
+        bail!("--gpu is currently supported only for deepseek4 GGUFs (DeepSeek-V4-Flash)");
+    }
+    let output = if gpu {
+        run_dsv4_gpu(gguf, &model_path, &input, options)?
+    } else if is_deepseek4 {
+        let model =
+            hi_cuda::dsv4_cpu::DeepSeekV4CpuReference::from_gguf(gguf).with_context(|| {
+                format!(
+                    "loading DeepSeek-V4 GGUF model from {}",
+                    model_path.display()
+                )
+            })?;
+        match &input {
+            CpuReferenceInput::Tokens(tokens) => model.run_tokens(tokens, options)?,
+            CpuReferenceInput::Prompt(prompt) => model.run_prompt(prompt, options)?,
+        }
+    } else {
+        let model = hi_cuda::qwen_cpu::QwenCpuReference::from_gguf(&gguf)
+            .with_context(|| format!("loading Qwen GGUF model from {}", model_path.display()))?;
+        match &input {
+            CpuReferenceInput::Tokens(tokens) => model.run_tokens(tokens, options)?,
+            CpuReferenceInput::Prompt(prompt) => model.run_prompt(prompt, options)?,
+        }
+    };
     println!("{}", serde_json::to_string_pretty(&output)?);
     Ok(())
+}
+
+#[cfg(feature = "native-cuda")]
+fn run_dsv4_gpu(
+    gguf: hi_gguf::GgufFile,
+    model_path: &Path,
+    input: &CpuReferenceInput,
+    options: hi_cuda::qwen_cpu::QwenCpuRunOptions,
+) -> Result<hi_cuda::qwen_cpu::QwenCpuRunOutput> {
+    let model = hi_cuda::dsv4_gpu::DeepSeekV4GpuEngine::from_gguf(gguf).with_context(|| {
+        format!(
+            "loading DeepSeek-V4 GGUF model onto the GPU from {}",
+            model_path.display()
+        )
+    })?;
+    Ok(match input {
+        CpuReferenceInput::Tokens(tokens) => model.run_tokens(tokens, options)?,
+        CpuReferenceInput::Prompt(prompt) => model.run_prompt(prompt, options)?,
+    })
+}
+
+#[cfg(not(feature = "native-cuda"))]
+fn run_dsv4_gpu(
+    _gguf: hi_gguf::GgufFile,
+    _model_path: &Path,
+    _input: &CpuReferenceInput,
+    _options: hi_cuda::qwen_cpu::QwenCpuRunOptions,
+) -> Result<hi_cuda::qwen_cpu::QwenCpuRunOutput> {
+    bail!(
+        "--gpu requires a native-cuda build of hi-local; rebuild with \
+         --features native-cuda and a CUDA Toolkit installation"
+    )
+}
+
+enum CpuReferenceInput {
+    Tokens(Vec<u32>),
+    Prompt(String),
 }
 
 async fn serve(
