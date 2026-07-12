@@ -925,15 +925,19 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum",
  "cc",
  "futures-util",
  "hi-gguf",
  "hi-local-core",
  "image",
  "rand 0.8.6",
+ "rayon",
  "reqwest",
  "serde",
+ "serde_json",
  "tokio",
+ "tower",
 ]
 
 [[package]]

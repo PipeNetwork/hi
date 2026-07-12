@@ -12,9 +12,15 @@ hi-gguf = { path = "../hi-gguf" }
 hi-local-core.workspace = true
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 rand = "0.8"
+rayon = "1"
 reqwest = { workspace = true, features = ["blocking"] }
 serde.workspace = true
 tokio.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+serde_json.workspace = true
+tower = { version = "0.5", features = ["util"] }
 
 [build-dependencies]
 cc = "1"

@@ -30,6 +30,7 @@ use image::imageops::FilterType;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
+pub mod dsv4_cpu;
 #[cfg(feature = "native-cuda")]
 mod expert_pool;
 pub mod gpu;
