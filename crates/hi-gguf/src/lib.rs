@@ -25,6 +25,9 @@ pub struct GgufFile {
     version: u32,
     alignment: u64,
     data_start: u64,
+    /// Additional mmapped files of a split GGUF (`split.count > 1`); tensor
+    /// shard index n > 0 resolves to `extra_shards[n - 1]`.
+    extra_shards: Vec<GgufShard>,
     metadata: BTreeMap<String, MetadataValue>,
     tensors: Vec<TensorInfo>,
     // name -> index into `tensors`, so `tensor(name)` is O(1) instead of a linear scan.
@@ -33,13 +36,105 @@ pub struct GgufFile {
     tensor_index: std::collections::HashMap<String, usize>,
 }
 
+#[derive(Debug)]
+struct GgufShard {
+    mmap: Mmap,
+    data_start: u64,
+}
+
 impl GgufFile {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
         let mmap = unsafe { Mmap::map(&file) }
             .with_context(|| format!("memory-mapping {}", path.display()))?;
-        parse_mmap(path.to_path_buf(), mmap)
+        let mut gguf = parse_mmap(path.to_path_buf(), mmap)?;
+        gguf.absorb_split_shards()?;
+        Ok(gguf)
+    }
+
+    /// llama.cpp split GGUFs (`name-00001-of-000NN.gguf`) spread tensors over
+    /// N files; the first shard carries the model metadata (and possibly
+    /// tensors), later shards carry only their own tensor tables. Open and
+    /// absorb the siblings so the tensor map spans the whole model.
+    fn absorb_split_shards(&mut self) -> Result<()> {
+        let split_count = self
+            .metadata_u32("split.count")
+            .map(|value| value as usize)
+            .unwrap_or(1);
+        if split_count <= 1 {
+            return Ok(());
+        }
+        let split_no = self.metadata_u32("split.no").unwrap_or(0);
+        if split_no != 0 {
+            bail!(
+                "{} is shard {} of a {split_count}-file split GGUF; open the first shard (-00001-of-...)",
+                self.path.display(),
+                split_no + 1
+            );
+        }
+        let file_name = self
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow!("split GGUF path has no file name"))?;
+        let first_suffix = format!("-00001-of-{split_count:05}.gguf");
+        let Some(stem) = file_name.strip_suffix(first_suffix.as_str()) else {
+            bail!(
+                "split GGUF {} (split.count = {split_count}) must be named like <model>{first_suffix}",
+                self.path.display()
+            );
+        };
+        let expected_total = self
+            .metadata_u32("split.tensors.count")
+            .map(|value| value as usize);
+        for shard_no in 1..split_count {
+            let sibling = self.path.with_file_name(format!(
+                "{stem}-{:05}-of-{split_count:05}.gguf",
+                shard_no + 1
+            ));
+            let file = File::open(&sibling)
+                .with_context(|| format!("opening split GGUF shard {}", sibling.display()))?;
+            let mmap = unsafe { Mmap::map(&file) }
+                .with_context(|| format!("memory-mapping {}", sibling.display()))?;
+            let shard = parse_mmap(sibling.clone(), mmap)?;
+            let shard_split_no = shard.metadata_u32("split.no").unwrap_or(0) as usize;
+            if shard_split_no != shard_no {
+                bail!(
+                    "split GGUF shard {} reports split.no {shard_split_no}; expected {shard_no}",
+                    sibling.display()
+                );
+            }
+            let shard_index = self.extra_shards.len() + 1;
+            for mut info in shard.tensors {
+                info.shard = shard_index;
+                if self
+                    .tensor_index
+                    .insert(info.name.clone(), self.tensors.len())
+                    .is_some()
+                {
+                    bail!(
+                        "split GGUF shard {} duplicates tensor {}",
+                        sibling.display(),
+                        info.name
+                    );
+                }
+                self.tensors.push(info);
+            }
+            self.extra_shards.push(GgufShard {
+                mmap: shard.mmap,
+                data_start: shard.data_start,
+            });
+        }
+        if let Some(expected) = expected_total
+            && self.tensors.len() != expected
+        {
+            bail!(
+                "split GGUF has {} tensors across shards; split.tensors.count says {expected}",
+                self.tensors.len()
+            );
+        }
+        Ok(())
     }
 
     pub fn path(&self) -> &Path {
@@ -78,12 +173,23 @@ impl GgufFile {
 
     pub fn tensor_view<'a>(&'a self, info: &'a TensorInfo) -> Result<TensorView<'a>> {
         let byte_len = info.byte_len()?;
-        let start = checked_add(self.data_start, info.offset, "tensor data offset")?;
+        let (mmap, data_start) = if info.shard == 0 {
+            (&self.mmap, self.data_start)
+        } else {
+            let shard = self.extra_shards.get(info.shard - 1).ok_or_else(|| {
+                anyhow!(
+                    "tensor {} references missing GGUF shard {}",
+                    info.name,
+                    info.shard
+                )
+            })?;
+            (&shard.mmap, shard.data_start)
+        };
+        let start = checked_add(data_start, info.offset, "tensor data offset")?;
         let end = checked_add(start, byte_len, "tensor data length")?;
         let start = usize::try_from(start).context("tensor data offset does not fit usize")?;
         let end = usize::try_from(end).context("tensor data length does not fit usize")?;
-        let bytes = self
-            .mmap
+        let bytes = mmap
             .get(start..end)
             .ok_or_else(|| anyhow!("tensor {} points outside GGUF data section", info.name))?;
         Ok(TensorView { info, bytes })
@@ -222,6 +328,9 @@ pub struct TensorInfo {
     pub dimensions: Vec<u64>,
     pub dtype: GgufTensorType,
     pub offset: u64,
+    /// Which file of a split GGUF holds this tensor's data (0 = the primary
+    /// shard; single-file models are always 0).
+    pub shard: usize,
 }
 
 impl TensorInfo {
@@ -5404,6 +5513,7 @@ fn parse_mmap(path: PathBuf, mmap: Mmap) -> Result<GgufFile> {
             dimensions,
             dtype,
             offset,
+            shard: 0,
         });
     }
 
@@ -5438,6 +5548,7 @@ fn parse_mmap(path: PathBuf, mmap: Mmap) -> Result<GgufFile> {
         version,
         alignment,
         data_start,
+        extra_shards: Vec::new(),
         metadata,
         tensors,
         tensor_index,
@@ -13346,6 +13457,84 @@ mod tests {
         pad_to_alignment(&mut bytes, 32);
         bytes.extend(data);
         fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn opens_split_gguf_across_shards() {
+        fn shard_bytes(
+            split_no: u32,
+            tensors: &[(&str, &[f32], u64)],
+            with_model_metadata: bool,
+        ) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(b"GGUF");
+            write_u32(&mut bytes, 3);
+            write_u64(&mut bytes, tensors.len() as u64);
+            write_u64(&mut bytes, if with_model_metadata { 4 } else { 3 });
+            write_kv_u32(&mut bytes, "general.alignment", 32);
+            write_kv_u32(&mut bytes, "split.count", 2);
+            write_kv_u32(&mut bytes, "split.no", split_no);
+            if with_model_metadata {
+                write_kv_u32(&mut bytes, "split.tensors.count", 3);
+            }
+            for (name, values, offset) in tensors {
+                write_string(&mut bytes, name);
+                write_u32(&mut bytes, 1);
+                write_u64(&mut bytes, values.len() as u64);
+                write_u32(&mut bytes, 0); // f32
+                write_u64(&mut bytes, *offset);
+            }
+            while bytes.len() % 32 != 0 {
+                bytes.push(0);
+            }
+            let data_start = bytes.len();
+            for (_, values, offset) in tensors {
+                let target = data_start + *offset as usize;
+                assert!(bytes.len() <= target);
+                bytes.resize(target, 0);
+                for value in *values {
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+            bytes
+        }
+
+        let dir = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base = format!("hi-gguf-split-test-{nanos}");
+        let shard1 = dir.join(format!("{base}-00001-of-00002.gguf"));
+        let shard2 = dir.join(format!("{base}-00002-of-00002.gguf"));
+        std::fs::write(&shard1, shard_bytes(0, &[("a", &[1.0, 2.0], 0)], true)).unwrap();
+        std::fs::write(
+            &shard2,
+            shard_bytes(1, &[("b", &[3.0, 4.0], 0), ("c", &[5.0, 6.0], 32)], false),
+        )
+        .unwrap();
+
+        let gguf = GgufFile::open(&shard1).unwrap();
+        assert_eq!(gguf.tensors().len(), 3);
+        assert_eq!(gguf.tensor_info("a").unwrap().shard, 0);
+        assert_eq!(gguf.tensor_info("b").unwrap().shard, 1);
+        assert_eq!(gguf.tensor_info("c").unwrap().shard, 1);
+        let c = gguf.tensor("c").unwrap();
+        let values: Vec<f32> = c
+            .bytes
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+        assert_eq!(values, vec![5.0, 6.0]);
+        let a = gguf.tensor("a").unwrap();
+        assert_eq!(a.bytes.len(), 8);
+
+        // Opening a later shard directly is refused with a pointer at shard 1.
+        let err = GgufFile::open(&shard2).unwrap_err().to_string();
+        assert!(err.contains("open the first shard"), "{err}");
+
+        std::fs::remove_file(&shard1).unwrap();
+        std::fs::remove_file(&shard2).unwrap();
     }
 
     fn write_kv_string(bytes: &mut Vec<u8>, key: &str, value: &str) {
