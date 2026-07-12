@@ -1473,7 +1473,13 @@ pub struct QwenGgufConfig {
     pub embedding_length: u32,
     pub feed_forward_length: Option<u32>,
     pub expert_feed_forward_length: Option<u32>,
+    /// Trunk decoder layers only. GGUFs whose `block_count` INCLUDES trailing
+    /// NextN/MTP draft layers (`nextn_predict_layers` > 0, e.g. GLM-5.2) have
+    /// those subtracted here; the MTP block's tensors live at the excluded
+    /// indices and are ignored until speculative decoding consumes them.
     pub block_count: u32,
+    /// Trailing NextN/MTP draft layers excluded from `block_count`.
+    pub nextn_predict_layers: u32,
     pub attention_head_count: u32,
     pub attention_head_count_kv: u32,
     pub attention_key_length: Option<u32>,
@@ -1563,7 +1569,16 @@ impl QwenGgufConfig {
         let prefix = architecture.clone();
         let context_length = gguf.required_u32(&format!("{prefix}.context_length"))?;
         let embedding_length = gguf.required_u32(&format!("{prefix}.embedding_length"))?;
-        let block_count = gguf.required_u32(&format!("{prefix}.block_count"))?;
+        let raw_block_count = gguf.required_u32(&format!("{prefix}.block_count"))?;
+        let nextn_predict_layers = gguf
+            .metadata_u32(&format!("{prefix}.nextn_predict_layers"))
+            .unwrap_or(0);
+        if nextn_predict_layers >= raw_block_count {
+            bail!(
+                "{prefix}.nextn_predict_layers {nextn_predict_layers} must be less than block_count {raw_block_count}"
+            );
+        }
+        let block_count = raw_block_count - nextn_predict_layers;
         reject_unsupported_mla_layout(gguf, family, &prefix, block_count)?;
         reject_unsupported_qwen_ssm_layout(gguf, family, &prefix)?;
         let attention_head_count = gguf.required_u32(&format!("{prefix}.attention.head_count"))?;
@@ -1696,6 +1711,7 @@ impl QwenGgufConfig {
 
         Ok(Self {
             architecture,
+            nextn_predict_layers,
             family,
             context_length,
             embedding_length,
