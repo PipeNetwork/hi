@@ -30,6 +30,8 @@ use image::imageops::FilterType;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
+#[cfg(feature = "native-cuda")]
+pub mod dsv4_backend;
 pub mod dsv4_cpu;
 #[cfg(feature = "native-cuda")]
 pub mod dsv4_gpu;
@@ -373,6 +375,11 @@ pub struct CudaBackend {
     kv_pages: Option<Arc<CudaPagedKvCacheManager>>,
     mmproj: Option<CudaMmprojInfo>,
     multimodal_stats: Arc<CudaMultimodalStats>,
+    /// deepseek4 GGUFs are served by the dedicated single-request V4 engine
+    /// instead of the Qwen GPU model + scheduler; when set, generation and
+    /// health delegate to it wholesale.
+    #[cfg(feature = "native-cuda")]
+    dsv4: Option<Arc<dsv4_backend::DeepSeekV4Backend>>,
 }
 
 #[derive(Clone, Debug)]
@@ -889,6 +896,20 @@ impl CudaBackend {
         let gguf = GgufFile::open(path)?;
         let chat_template = gguf.chat_template().map(ToString::to_string);
         let qwen = gguf.qwen_config()?;
+        // deepseek4 dispatch: V4 is served by its dedicated single-request GPU
+        // engine (Stage 2 of the bring-up plan), not the Qwen GPU model +
+        // scheduler below.
+        if qwen.is_deepseek4() {
+            return Self::load_deepseek4(
+                gguf,
+                path,
+                model_id,
+                execution,
+                config,
+                chat_template,
+                qwen,
+            );
+        }
         // Tensor validation is deferred to the model constructors below (both
         // CudaQwenGpuModel::from_gguf and QwenCpuReference::from_gguf validate up front),
         // avoiding a redundant pass — it is ~5 s on a 30B MoE with tens of thousands of
@@ -976,7 +997,77 @@ impl CudaBackend {
             kv_pages,
             mmproj,
             multimodal_stats,
+            #[cfg(feature = "native-cuda")]
+            dsv4: None,
         })
+    }
+
+    /// deepseek4 branch of `load_with_config`: construct the dedicated V4
+    /// serving backend (GPU only) and a CudaBackend shell that delegates to it.
+    #[cfg(feature = "native-cuda")]
+    fn load_deepseek4(
+        gguf: GgufFile,
+        path: &Path,
+        model_id: Option<String>,
+        execution: CudaExecution,
+        config: CudaBackendConfig,
+        chat_template: Option<String>,
+        qwen: QwenGgufConfig,
+    ) -> Result<Self> {
+        if execution != CudaExecution::Gpu {
+            bail!(
+                "deepseek4 GGUFs are served by the dedicated V4 GPU engine; --execution {} is not \
+                 supported for serving (use the `hi-local qwen-cpu` CPU oracle for reference runs)",
+                execution.label()
+            );
+        }
+        if config.mmproj_path.is_some() {
+            bail!("deepseek4 has no multimodal projector support; remove --mmproj-path");
+        }
+        let runtime = runtime::CudaRuntime::probe()
+            .map(|runtime| runtime.info().clone())
+            .map_err(|err| err.to_string());
+        if let Err(err) = &runtime {
+            bail!("CUDA gpu execution is unavailable: {err}");
+        }
+        // Tokenizer-only reference (no weight dequant): keeps the struct's
+        // non-generation plumbing (tokenizer probes) alive; the V4 engine owns
+        // its own tokenizer for serving.
+        let cpu_reference = Arc::new(qwen_cpu::QwenCpuReference::from_gguf_tokenizer_only(&gguf)?);
+        let dsv4 = Arc::new(dsv4_backend::DeepSeekV4Backend::from_gguf(
+            gguf, path, model_id,
+        )?);
+        Ok(Self {
+            model: dsv4.model().clone(),
+            chat_template,
+            qwen,
+            execution,
+            config,
+            cpu_reference,
+            gpu_model: Err("deepseek4 is served by the dedicated V4 engine".to_string()),
+            runtime,
+            scheduler: None,
+            kv_pages: None,
+            mmproj: None,
+            multimodal_stats: Arc::new(CudaMultimodalStats::default()),
+            dsv4: Some(dsv4),
+        })
+    }
+
+    #[cfg(not(feature = "native-cuda"))]
+    fn load_deepseek4(
+        _gguf: GgufFile,
+        _path: &Path,
+        _model_id: Option<String>,
+        _execution: CudaExecution,
+        _config: CudaBackendConfig,
+        _chat_template: Option<String>,
+        _qwen: QwenGgufConfig,
+    ) -> Result<Self> {
+        bail!(
+            "deepseek4 GGUF serving requires a native-cuda build of hi-cuda; rebuild with \
+             --features native-cuda and a CUDA Toolkit installation"
+        )
     }
 
     pub fn qwen_config(&self) -> &QwenGgufConfig {
@@ -9429,6 +9520,12 @@ impl InferenceBackend for CudaBackend {
     }
 
     fn health(&self) -> BackendHealth {
+        // The V4 backend reports its own minimal-but-truthful payload; none of
+        // the qwen scheduler/kv/attention machinery below exists for it.
+        #[cfg(feature = "native-cuda")]
+        if let Some(dsv4) = &self.dsv4 {
+            return dsv4.health();
+        }
         let scheduler = self
             .scheduler
             .as_ref()
@@ -9584,6 +9681,10 @@ impl InferenceBackend for CudaBackend {
     }
 
     fn multimodal_support(&self) -> MultimodalSupport {
+        #[cfg(feature = "native-cuda")]
+        if let Some(dsv4) = &self.dsv4 {
+            return dsv4.multimodal_support();
+        }
         match &self.mmproj {
             Some(_) if self.supports_multimodal_generation() => {
                 MultimodalSupport::image_video_generation(self.multimodal_status())
@@ -9606,6 +9707,12 @@ impl InferenceBackend for CudaBackend {
     }
 
     async fn stream_generate(&self, request: GenerationRequest) -> Result<GenerationStream> {
+        // deepseek4: the dedicated single-request V4 engine owns generation
+        // (and runs the same request validation itself).
+        #[cfg(feature = "native-cuda")]
+        if let Some(dsv4) = &self.dsv4 {
+            return dsv4.stream_generate(request).await;
+        }
         validate_generation_sampling_parameters(&request)?;
         validate_generation_max_tokens(&request, self.model.max_output_tokens)?;
         if self.execution == CudaExecution::Gpu {
@@ -9659,6 +9766,64 @@ mod tests {
     #[test]
     fn kernel_module_reports_native_cuda_disabled() {
         assert!(!crate::kernels::native_cuda_kernels_enabled());
+    }
+
+    #[cfg(not(feature = "native-cuda"))]
+    #[test]
+    fn deepseek4_load_requires_native_cuda_build() {
+        let path = crate::dsv4_cpu::fixture::tempfile_path("backend-dispatch-nocuda");
+        crate::dsv4_cpu::fixture::write_deepseek4_gguf(&path);
+
+        let err = CudaBackend::load(&path, Some("dsv4".to_string()))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("requires a native-cuda build"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn deepseek4_load_rejects_cpu_reference_execution() {
+        let path = crate::dsv4_cpu::fixture::tempfile_path("backend-dispatch-cpu");
+        crate::dsv4_cpu::fixture::write_deepseek4_gguf(&path);
+
+        let err = CudaBackend::load_with_execution(&path, None, CudaExecution::CpuReference)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("dedicated V4 GPU engine"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// `CudaBackend::load` on a deepseek4 GGUF must dispatch to the V4 engine:
+    /// same public type, but V4 health/model/template semantics.
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn deepseek4_load_dispatches_to_v4_backend() {
+        let path = crate::dsv4_cpu::fixture::tempfile_path("backend-dispatch-gpu");
+        crate::dsv4_cpu::fixture::write_deepseek4_gguf(&path);
+
+        let backend = CudaBackend::load(&path, Some("dsv4-dispatch".to_string())).unwrap();
+        assert_eq!(backend.execution(), CudaExecution::Gpu);
+        assert_eq!(backend.model().id, "dsv4-dispatch");
+        assert_eq!(
+            backend.model().family,
+            hi_local_core::model::ModelFamily::DeepSeek
+        );
+
+        let health = backend.health();
+        assert_eq!(health.backend, "cuda");
+        assert_eq!(health.family, "deepseek");
+        assert!(
+            health
+                .quantization
+                .contains("dsv4=enabled(engine=cuda-dsv4")
+        );
+        assert!(health.quantization.contains("execution=gpu"));
+        assert!(!health.quantization.contains("total_batches"));
     }
 
     #[test]
