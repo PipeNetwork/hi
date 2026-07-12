@@ -531,6 +531,11 @@ mod native {
         // "this projection is unsupported" (mixed dtypes, biases) so unsupported
         // layers probe once and then always take the legacy per-expert loop.
         moe_expert_groups: RefCell<BTreeMap<String, Option<Rc<MoeExpertGroup>>>>,
+        /// Host-cached gemma4 per-layer output scalars (None = tensor absent).
+        gemma_layer_output_scales: RefCell<BTreeMap<String, Option<f32>>>,
+        /// Device unit vectors (all ones) for gemma4's weightless V RMS norm,
+        /// keyed by head dim.
+        unit_norm_weights: RefCell<BTreeMap<usize, Rc<DeviceBuffer>>>,
         // Hybrid weight residency (see `WeightResidency::HybridQuantF16`): weights are
         // kept quantized for the dp4a decode GEMV, and the M>1 prefill GEMM caches a
         // dequantized f16 copy of each layer weight in `dequant_f16_cache` (bounded by a
@@ -3498,6 +3503,8 @@ mod native {
                 paged_batch_pool: RefCell::new(None),
                 dequant_f16_cache: RefCell::new(BTreeMap::new()),
                 moe_expert_groups: RefCell::new(BTreeMap::new()),
+                gemma_layer_output_scales: RefCell::new(BTreeMap::new()),
+                unit_norm_weights: RefCell::new(BTreeMap::new()),
                 cache_layer_f16,
                 recurrent_page_states: RefCell::new(BTreeMap::new()),
                 generation_timing: Cell::new((0, 0, 0)),
@@ -9210,6 +9217,7 @@ mod native {
                     self.rms_norm_f32_device(&format!("{prefix}.ffn_norm.weight"), &hidden, eps)?;
                 let mlp_out = self.ffn_f32_device(&prefix, &mlp_input)?;
                 hidden = self.add_f32_device(&hidden, &mlp_out)?;
+                hidden = self.apply_gemma_layer_output_scale(&prefix, hidden)?;
             }
             self.rms_norm_f32_device("output_norm.weight", &hidden, eps)
         }
@@ -14842,6 +14850,7 @@ mod native {
                             .project_f32_device(&format!("{prefix}.attn_k.weight"), &attn_input)?;
                         let k = self
                             .add_optional_rowwise_f32_device(k, &format!("{prefix}.attn_k.bias"))?;
+                        let gemma4_v_source = self.gemma4_v_from_k_source(&prefix, &k)?;
                         let k = self.optional_head_rms_norm_f32_device(
                             k,
                             &format!("{prefix}.attn_k_norm.weight"),
@@ -14875,10 +14884,13 @@ mod native {
                             )?;
                         }
 
-                        let v = self
-                            .project_f32_device(&format!("{prefix}.attn_v.weight"), &attn_input)?;
-                        let v = self
-                            .add_optional_rowwise_f32_device(v, &format!("{prefix}.attn_v.bias"))?;
+                        let v = self.project_attention_v(
+                            &prefix,
+                            &attn_input,
+                            gemma4_v_source,
+                            &dims,
+                            eps,
+                        )?;
                         (q, k, v, gate)
                     };
                     if let Some(cache) = cache.as_deref_mut() {
@@ -14914,6 +14926,7 @@ mod native {
                     self.rms_norm_f32_device(&format!("{prefix}.ffn_norm.weight"), &hidden, eps)?;
                 let mlp_out = self.ffn_f32_device(&prefix, &mlp_input)?;
                 hidden = self.add_f32_device(&hidden, &mlp_out)?;
+                hidden = self.apply_gemma_layer_output_scale(&prefix, hidden)?;
             }
 
             let normed = self.rms_norm_f32_device("output_norm.weight", &hidden, eps)?;
@@ -15007,6 +15020,7 @@ mod native {
                     self.rms_norm_f32_device(&format!("{prefix}.ffn_norm.weight"), &hidden, eps)?;
                 let mlp_out = self.ffn_f32_device(&prefix, &mlp_input)?;
                 hidden = self.add_f32_device(&hidden, &mlp_out)?;
+                hidden = self.apply_gemma_layer_output_scale(&prefix, hidden)?;
             }
 
             let normed = self.rms_norm_f32_device("output_norm.weight", &hidden, eps)?;
@@ -15269,6 +15283,7 @@ mod native {
                         self.project_f32_device(&format!("{prefix}.attn_k.weight"), &attn_input)?;
                     let k =
                         self.add_optional_rowwise_f32_device(k, &format!("{prefix}.attn_k.bias"))?;
+                    let gemma4_v_source = self.gemma4_v_from_k_source(&prefix, &k)?;
                     let k = self.optional_head_rms_norm_f32_device(
                         k,
                         &format!("{prefix}.attn_k_norm.weight"),
@@ -15302,10 +15317,13 @@ mod native {
                         )?;
                     }
 
-                    let v =
-                        self.project_f32_device(&format!("{prefix}.attn_v.weight"), &attn_input)?;
-                    let v =
-                        self.add_optional_rowwise_f32_device(v, &format!("{prefix}.attn_v.bias"))?;
+                    let v = self.project_attention_v(
+                        &prefix,
+                        &attn_input,
+                        gemma4_v_source,
+                        &dims,
+                        eps,
+                    )?;
                     (q, k, v, gate)
                 };
                 if let Some(cache) = cache.as_deref_mut() {
@@ -15342,6 +15360,7 @@ mod native {
                     self.rms_norm_f32_device(&format!("{prefix}.ffn_norm.weight"), &hidden, eps)?;
                 let mlp_out = self.ffn_f32_device(&prefix, &mlp_input)?;
                 hidden = self.add_f32_device(&hidden, &mlp_out)?;
+                hidden = self.apply_gemma_layer_output_scale(&prefix, hidden)?;
             }
 
             let normed = self.rms_norm_f32_device("output_norm.weight", &hidden, eps)?;
@@ -15552,6 +15571,7 @@ mod native {
                     self.rms_norm_f32_device(&format!("{prefix}.ffn_norm.weight"), &hidden, eps)?;
                 let mlp_out = self.ffn_f32_device(&prefix, &mlp_input)?;
                 hidden = self.add_f32_device(&hidden, &mlp_out)?;
+                hidden = self.apply_gemma_layer_output_scale(&prefix, hidden)?;
             }
 
             let normed = self.rms_norm_f32_device("output_norm.weight", &hidden, eps)?;
@@ -15826,6 +15846,7 @@ mod native {
                     )?;
                     let mlp_out = self.ffn_f32_device(&prefix, &mlp_input)?;
                     hidden = self.add_f32_device(&hidden, &mlp_out)?;
+                    hidden = self.apply_gemma_layer_output_scale(&prefix, hidden)?;
                 }
                 if offset + chunk_len >= seq_len {
                     let normed = self.rms_norm_f32_device("output_norm.weight", &hidden, eps)?;
@@ -15922,6 +15943,7 @@ mod native {
                     self.rms_norm_f32_device(&format!("{prefix}.ffn_norm.weight"), &hidden, eps)?;
                 let mlp_out = self.ffn_f32_device(&prefix, &mlp_input)?;
                 hidden = self.add_f32_device(&hidden, &mlp_out)?;
+                hidden = self.apply_gemma_layer_output_scale(&prefix, hidden)?;
             }
 
             let normed = self.rms_norm_f32_device("output_norm.weight", &hidden, eps)?;
@@ -16009,6 +16031,7 @@ mod native {
                     self.rms_norm_f32_device(&format!("{prefix}.ffn_norm.weight"), &hidden, eps)?;
                 let mlp_out = self.ffn_f32_device(&prefix, &mlp_input)?;
                 hidden = self.add_f32_device(&hidden, &mlp_out)?;
+                hidden = self.apply_gemma_layer_output_scale(&prefix, hidden)?;
             }
 
             let normed = self.rms_norm_f32_device("output_norm.weight", &hidden, eps)?;
@@ -16102,6 +16125,7 @@ mod native {
                     self.rms_norm_f32_device(&format!("{prefix}.ffn_norm.weight"), &hidden, eps)?;
                 let mlp_out = self.ffn_f32_device(&prefix, &mlp_input)?;
                 hidden = self.add_f32_device(&hidden, &mlp_out)?;
+                hidden = self.apply_gemma_layer_output_scale(&prefix, hidden)?;
             }
 
             let normed = self.rms_norm_f32_device("output_norm.weight", &hidden, eps)?;
@@ -16198,6 +16222,7 @@ mod native {
                     self.rms_norm_f32_device(&format!("{prefix}.ffn_norm.weight"), &hidden, eps)?;
                 let mlp_out = self.ffn_f32_device(&prefix, &mlp_input)?;
                 hidden = self.add_f32_device(&hidden, &mlp_out)?;
+                hidden = self.apply_gemma_layer_output_scale(&prefix, hidden)?;
             }
 
             let normed = self.rms_norm_f32_device("output_norm.weight", &hidden, eps)?;
@@ -16282,6 +16307,7 @@ mod native {
                     self.rms_norm_f32_device(&format!("{prefix}.ffn_norm.weight"), &hidden, eps)?;
                 let mlp_out = self.ffn_f32_device(&prefix, &mlp_input)?;
                 hidden = self.add_f32_device(&hidden, &mlp_out)?;
+                hidden = self.apply_gemma_layer_output_scale(&prefix, hidden)?;
             }
 
             let normed = self.rms_norm_f32_device("output_norm.weight", &hidden, eps)?;
@@ -16390,6 +16416,7 @@ mod native {
                         self.project_f32_device(&format!("{prefix}.attn_k.weight"), &attn_input)?;
                     let k =
                         self.add_optional_rowwise_f32_device(k, &format!("{prefix}.attn_k.bias"))?;
+                    let gemma4_v_source = self.gemma4_v_from_k_source(&prefix, &k)?;
                     let k = self.optional_head_rms_norm_f32_device(
                         k,
                         &format!("{prefix}.attn_k_norm.weight"),
@@ -16409,10 +16436,13 @@ mod native {
                         true,
                     )?;
 
-                    let v =
-                        self.project_f32_device(&format!("{prefix}.attn_v.weight"), &attn_input)?;
-                    let v =
-                        self.add_optional_rowwise_f32_device(v, &format!("{prefix}.attn_v.bias"))?;
+                    let v = self.project_attention_v(
+                        &prefix,
+                        &attn_input,
+                        gemma4_v_source,
+                        &dims,
+                        eps,
+                    )?;
                     (q, k, v, gate)
                 };
                 cache.write_layer_batched(
@@ -16445,6 +16475,7 @@ mod native {
                     self.rms_norm_f32_device(&format!("{prefix}.ffn_norm.weight"), &hidden, eps)?;
                 let mlp_out = self.ffn_f32_device(&prefix, &mlp_input)?;
                 hidden = self.add_f32_device(&hidden, &mlp_out)?;
+                hidden = self.apply_gemma_layer_output_scale(&prefix, hidden)?;
             }
 
             let normed = self.rms_norm_f32_device("output_norm.weight", &hidden, eps)?;
@@ -16555,6 +16586,7 @@ mod native {
                         self.project_f32_device(&format!("{prefix}.attn_k.weight"), &attn_input)?;
                     let k =
                         self.add_optional_rowwise_f32_device(k, &format!("{prefix}.attn_k.bias"))?;
+                    let gemma4_v_source = self.gemma4_v_from_k_source(&prefix, &k)?;
                     let k = self.optional_head_rms_norm_f32_device(
                         k,
                         &format!("{prefix}.attn_k_norm.weight"),
@@ -16574,10 +16606,13 @@ mod native {
                         true,
                     )?;
 
-                    let v =
-                        self.project_f32_device(&format!("{prefix}.attn_v.weight"), &attn_input)?;
-                    let v =
-                        self.add_optional_rowwise_f32_device(v, &format!("{prefix}.attn_v.bias"))?;
+                    let v = self.project_attention_v(
+                        &prefix,
+                        &attn_input,
+                        gemma4_v_source,
+                        &dims,
+                        eps,
+                    )?;
                     (q, k, v, gate)
                 };
                 cache.write_layer_batched(
@@ -16611,6 +16646,7 @@ mod native {
                     self.rms_norm_f32_device(&format!("{prefix}.ffn_norm.weight"), &hidden, eps)?;
                 let mlp_out = self.ffn_f32_device(&prefix, &mlp_input)?;
                 hidden = self.add_f32_device(&hidden, &mlp_out)?;
+                hidden = self.apply_gemma_layer_output_scale(&prefix, hidden)?;
             }
 
             let normed = self.rms_norm_f32_device("output_norm.weight", &hidden, eps)?;
@@ -16742,6 +16778,7 @@ mod native {
                         self.project_f32_device(&format!("{prefix}.attn_k.weight"), &attn_input)?;
                     let k =
                         self.add_optional_rowwise_f32_device(k, &format!("{prefix}.attn_k.bias"))?;
+                    let gemma4_v_source = self.gemma4_v_from_k_source(&prefix, &k)?;
                     let k = self.optional_head_rms_norm_f32_device(
                         k,
                         &format!("{prefix}.attn_k_norm.weight"),
@@ -16761,10 +16798,13 @@ mod native {
                         true,
                     )?;
 
-                    let v =
-                        self.project_f32_device(&format!("{prefix}.attn_v.weight"), &attn_input)?;
-                    let v =
-                        self.add_optional_rowwise_f32_device(v, &format!("{prefix}.attn_v.bias"))?;
+                    let v = self.project_attention_v(
+                        &prefix,
+                        &attn_input,
+                        gemma4_v_source,
+                        &dims,
+                        eps,
+                    )?;
                     (q, k, v, gate)
                 };
                 cache.write_layer_batched_positions(
@@ -16798,6 +16838,7 @@ mod native {
                     self.rms_norm_f32_device(&format!("{prefix}.ffn_norm.weight"), &hidden, eps)?;
                 let mlp_out = self.ffn_f32_device(&prefix, &mlp_input)?;
                 hidden = self.add_f32_device(&hidden, &mlp_out)?;
+                hidden = self.apply_gemma_layer_output_scale(&prefix, hidden)?;
             }
 
             let normed = self.rms_norm_f32_device("output_norm.weight", &hidden, eps)?;
@@ -16953,6 +16994,7 @@ mod native {
                     self.rms_norm_f32_device(&format!("{prefix}.ffn_norm.weight"), &hidden, eps)?;
                 let mlp_out = self.ffn_f32_device(&prefix, &mlp_input)?;
                 hidden = self.add_f32_device(&hidden, &mlp_out)?;
+                hidden = self.apply_gemma_layer_output_scale(&prefix, hidden)?;
             }
 
             let normed = self.rms_norm_f32_device("output_norm.weight", &hidden, eps)?;
@@ -17092,6 +17134,7 @@ mod native {
                     self.rms_norm_f32_device(&format!("{prefix}.ffn_norm.weight"), &hidden, eps)?;
                 let mlp_out = self.ffn_f32_device(&prefix, &mlp_input)?;
                 hidden = self.add_f32_device(&hidden, &mlp_out)?;
+                hidden = self.apply_gemma_layer_output_scale(&prefix, hidden)?;
             }
 
             let normed = self.rms_norm_f32_device("output_norm.weight", &hidden, eps)?;
@@ -17322,6 +17365,7 @@ mod native {
                 )?;
                 let k =
                     self.add_optional_rowwise_f32_device(k, &format!("{prefix}.attn_k.bias"))?;
+                let gemma4_v_source = self.gemma4_v_from_k_source(&prefix, &k)?;
                 let k = self.optional_head_rms_norm_f32_device(
                     k,
                     &format!("{prefix}.attn_k_norm.weight"),
@@ -17390,13 +17434,27 @@ mod native {
                     )?,
                 }
 
-                let v = self.project_f32_device_shared_cast(
-                    &format!("{prefix}.attn_v.weight"),
-                    attn_input,
-                    &mut attn_input_cast,
-                )?;
-                let v =
-                    self.add_optional_rowwise_f32_device(v, &format!("{prefix}.attn_v.bias"))?;
+                let v = if let Some(v) = gemma4_v_source {
+                    v
+                } else {
+                    let v = self.project_f32_device_shared_cast(
+                        &format!("{prefix}.attn_v.weight"),
+                        attn_input,
+                        &mut attn_input_cast,
+                    )?;
+                    self.add_optional_rowwise_f32_device(v, &format!("{prefix}.attn_v.bias"))?
+                };
+                let v = if self.config.is_gemma4() {
+                    self.head_rms_norm_unit_f32_device(
+                        v,
+                        attn_input.rows,
+                        dims.kv_heads,
+                        dims.v_head_dim,
+                        eps,
+                    )?
+                } else {
+                    v
+                };
                 return Ok((q, k, v, gate));
             }
 
@@ -17645,6 +17703,7 @@ mod native {
                     self.rms_norm_f32_device(&format!("{prefix}.ffn_norm.weight"), &hidden, eps)?;
                 let mlp_out = self.ffn_f32_device(&prefix, &mlp_input)?;
                 hidden = self.add_f32_device(&hidden, &mlp_out)?;
+                hidden = self.apply_gemma_layer_output_scale(&prefix, hidden)?;
             }
 
             state.tokens.push(token_id);
@@ -18851,6 +18910,116 @@ mod native {
             }))
         }
 
+        /// Weightless per-head RMS norm (unit weight), used by gemma4's V norm
+        /// (llama.cpp gemma4.cpp:256 `ggml_rms_norm(Vcur, eps)`).
+        fn head_rms_norm_unit_f32_device(
+            &self,
+            input: GpuF32Tensor,
+            seq_len: usize,
+            heads: usize,
+            head_dim: usize,
+            eps: f32,
+        ) -> Result<GpuF32Tensor> {
+            if input.rows != seq_len || input.cols != heads * head_dim {
+                bail!(
+                    "CUDA unit head RMSNorm input shape {}x{} does not match expected {}x{}",
+                    input.rows,
+                    input.cols,
+                    seq_len,
+                    heads * head_dim
+                );
+            }
+            let weight = {
+                let mut cache = self.unit_norm_weights.borrow_mut();
+                match cache.get(&head_dim) {
+                    Some(weight) => Rc::clone(weight),
+                    None => {
+                        let buffer = DeviceBuffer::alloc(head_dim * std::mem::size_of::<f32>())
+                            .context("allocating CUDA unit RMSNorm weight")?;
+                        buffer.copy_from_host(&vec![1.0f32; head_dim])?;
+                        let weight = Rc::new(buffer);
+                        cache.insert(head_dim, Rc::clone(&weight));
+                        weight
+                    }
+                }
+            };
+            let output = DeviceBuffer::alloc(input.element_count()? * std::mem::size_of::<f32>())
+                .context("allocating CUDA unit head RMSNorm output")?;
+            crate::kernels::launch_rms_norm(
+                &input.buffer,
+                &weight,
+                &output,
+                seq_len * heads,
+                head_dim,
+                eps,
+                &self.stream,
+            )?;
+            self.op_barrier()?;
+            Ok(GpuF32Tensor {
+                rows: input.rows,
+                cols: input.cols,
+                buffer: output,
+            })
+        }
+
+        /// Gemma-4 layers without an attn_v projection reuse the RAW K
+        /// projection (pre-norm, pre-rope) as V (llama.cpp gemma4.cpp:247-249).
+        /// Returns a clone of `k_raw` when that applies, else None.
+        fn gemma4_v_from_k_source(
+            &self,
+            prefix: &str,
+            k_raw: &GpuF32Tensor,
+        ) -> Result<Option<GpuF32Tensor>> {
+            if self.config.is_gemma4() && !self.has_matrix(&format!("{prefix}.attn_v.weight")) {
+                Ok(Some(self.clone_f32_device(k_raw)?))
+            } else {
+                Ok(None)
+            }
+        }
+
+        /// Project V (or adopt the gemma4 V-from-K clone) and apply gemma4's
+        /// weightless per-head RMS norm. Non-gemma4 models get the plain
+        /// projection, unchanged.
+        fn project_attention_v(
+            &self,
+            prefix: &str,
+            attn_input: &GpuF32Tensor,
+            v_from_k: Option<GpuF32Tensor>,
+            dims: &QwenDims,
+            eps: f32,
+        ) -> Result<GpuF32Tensor> {
+            let v = if let Some(v) = v_from_k {
+                v
+            } else {
+                let v = self.project_f32_device(&format!("{prefix}.attn_v.weight"), attn_input)?;
+                self.add_optional_rowwise_f32_device(v, &format!("{prefix}.attn_v.bias"))?
+            };
+            if self.config.is_gemma4() {
+                self.head_rms_norm_unit_f32_device(
+                    v,
+                    attn_input.rows,
+                    dims.kv_heads,
+                    dims.v_head_dim,
+                    eps,
+                )
+            } else {
+                Ok(v)
+            }
+        }
+
+        /// Device-to-device copy of a whole f32 tensor.
+        fn clone_f32_device(&self, input: &GpuF32Tensor) -> Result<GpuF32Tensor> {
+            let bytes = input.element_count()? * std::mem::size_of::<f32>();
+            let buffer = DeviceBuffer::alloc(bytes).context("allocating CUDA f32 tensor clone")?;
+            buffer.copy_device_range(0, &input.buffer, 0, bytes, &self.stream)?;
+            self.op_barrier()?;
+            Ok(GpuF32Tensor {
+                rows: input.rows,
+                cols: input.cols,
+                buffer,
+            })
+        }
+
         fn optional_head_rms_norm_f32_device(
             &self,
             input: GpuF32Tensor,
@@ -20055,6 +20224,49 @@ mod native {
 
         /// Gemma-2 post-FFN norm, applied to the MLP sub-layer output before the
         /// residual add (`residual + post_norm(mlp(x))`).
+        /// Gemma-4 per-layer output scalar (`blk.N.layer_output_scale.weight`,
+        /// a single element): multiplies the layer's full output hidden state
+        /// after the FFN residual. Absent tensor or non-gemma4 model = no-op.
+        /// The scalar is read to host once per layer and cached.
+        fn apply_gemma_layer_output_scale(
+            &self,
+            prefix: &str,
+            hidden: GpuF32Tensor,
+        ) -> Result<GpuF32Tensor> {
+            if !self.config.is_gemma4() {
+                return Ok(hidden);
+            }
+            let name = format!("{prefix}.layer_output_scale.weight");
+            let scale = {
+                let mut cache = self.gemma_layer_output_scales.borrow_mut();
+                match cache.get(&name) {
+                    Some(cached) => *cached,
+                    None => {
+                        let value = match self.vector(&name) {
+                            Some(vector) if vector.len == 1 => Some(vector.copy_to_host_f32()?[0]),
+                            _ => None,
+                        };
+                        cache.insert(name.clone(), value);
+                        value
+                    }
+                }
+            };
+            let Some(scale) = scale else {
+                return Ok(hidden);
+            };
+            crate::kernels::launch_scale_in_place(
+                &hidden.buffer,
+                hidden
+                    .rows
+                    .checked_mul(hidden.cols)
+                    .context("CUDA gemma4 layer output scale element count overflows usize")?,
+                scale,
+                &self.stream,
+            )?;
+            self.op_barrier()?;
+            Ok(hidden)
+        }
+
         fn apply_gemma_post_ffn_norm(
             &self,
             prefix: &str,

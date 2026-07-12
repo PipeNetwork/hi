@@ -85,6 +85,12 @@ mod native {
             cols: c_int,
             stream: *mut c_void,
         ) -> c_int;
+        fn hi_cuda_launch_scale_in_place(
+            values: *mut c_void,
+            count: c_int,
+            scale: c_float,
+            stream: *mut c_void,
+        ) -> c_int;
         fn hi_cuda_launch_add_scaled_row_in_place(
             output: *mut c_void,
             row_values: *const c_void,
@@ -1483,6 +1489,24 @@ mod native {
             )
         })?;
         check_last_error("hi_cuda_launch_copy_row_f32")
+    }
+
+    pub fn launch_scale_in_place(
+        values: &DeviceBuffer,
+        count: usize,
+        scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(count, "scale_in_place count")?;
+        launch_status(unsafe {
+            hi_cuda_launch_scale_in_place(
+                values.as_mut_ptr(),
+                count as c_int,
+                scale,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_scale_in_place")
     }
 
     pub fn launch_add_scaled_row_in_place(

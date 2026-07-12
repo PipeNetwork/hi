@@ -507,6 +507,14 @@ __global__ void copy_row_f32_kernel(
   output[col] = input[row * cols + col];
 }
 
+__global__ void scale_in_place_kernel(float* values, int count, float scale) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= count) {
+    return;
+  }
+  values[idx] *= scale;
+}
+
 __global__ void add_scaled_row_in_place_kernel(
     float* output,
     const float* row_values,
@@ -6464,6 +6472,24 @@ extern "C" int hi_cuda_launch_copy_row_f32(
       row,
       rows,
       cols);
+  return 0;
+}
+
+extern "C" int hi_cuda_launch_scale_in_place(
+    void* values,
+    int count,
+    float scale,
+    void* stream) {
+  if (values == nullptr || count < 0 || stream == nullptr) {
+    return 1;
+  }
+  if (count == 0) {
+    return 0;
+  }
+  dim3 block(256);
+  dim3 grid((count + block.x - 1) / block.x);
+  scale_in_place_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<float*>(values), count, scale);
   return 0;
 }
 
