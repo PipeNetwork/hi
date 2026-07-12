@@ -14839,6 +14839,7 @@ mod native {
                                 seq_len,
                                 dims.heads,
                                 dims.head_dim,
+                                self.gemma4_rope_freq_factors(&prefix),
                                 rope_base,
                                 rope_scale,
                                 0,
@@ -14877,6 +14878,7 @@ mod native {
                                 seq_len,
                                 dims.kv_heads,
                                 dims.head_dim,
+                                self.gemma4_rope_freq_factors(&prefix),
                                 rope_base,
                                 rope_scale,
                                 0,
@@ -15272,6 +15274,7 @@ mod native {
                             seq_len,
                             dims.heads,
                             dims.head_dim,
+                            self.gemma4_rope_freq_factors(&prefix),
                             rope_base,
                             rope_scale,
                             0,
@@ -15310,6 +15313,7 @@ mod native {
                             seq_len,
                             dims.kv_heads,
                             dims.head_dim,
+                            self.gemma4_rope_freq_factors(&prefix),
                             rope_base,
                             rope_scale,
                             0,
@@ -15793,7 +15797,6 @@ mod native {
                     let layer_idx =
                         usize::try_from(layer).context("qwen layer index does not fit usize")?;
                     let prefix = format!("blk.{layer}");
-                    let dims = self.qwen_layer_dims(layer as usize)?;
                     let dims = self.qwen_layer_dims(layer as usize)?;
                     self.ensure_layer_runtime_supported(&prefix)?;
                     let window = self.layer_attention_window(&prefix);
@@ -17069,7 +17072,7 @@ mod native {
             cache: &mut CudaPagedBatchKvCache,
         ) -> Result<GpuF32Tensor> {
             let _t = self.forward_timer();
-            let dims = self.qwen_dims()?;
+
             let batch_count = token_ids.len();
 
             let mut hidden = self.embed_tokens_device(token_ids)?;
@@ -17307,6 +17310,7 @@ mod native {
                         seq_len,
                         dims.heads,
                         dims.head_dim,
+                        self.gemma4_rope_freq_factors(&prefix),
                         rope_base,
                         rope_scale,
                         position_offset,
@@ -17322,6 +17326,7 @@ mod native {
                         seq_len,
                         dims.heads,
                         dims.head_dim,
+                        self.gemma4_rope_freq_factors(&prefix),
                         rope_base,
                         rope_scale,
                         position_offset,
@@ -17339,6 +17344,7 @@ mod native {
                         seq_len,
                         dims.heads,
                         dims.head_dim,
+                        self.gemma4_rope_freq_factors(&prefix),
                         rope_base,
                         rope_scale,
                         true,
@@ -17383,6 +17389,7 @@ mod native {
                         seq_len,
                         dims.kv_heads,
                         dims.head_dim,
+                        self.gemma4_rope_freq_factors(&prefix),
                         rope_base,
                         rope_scale,
                         position_offset,
@@ -17398,6 +17405,7 @@ mod native {
                         seq_len,
                         dims.kv_heads,
                         dims.head_dim,
+                        self.gemma4_rope_freq_factors(&prefix),
                         rope_base,
                         rope_scale,
                         position_offset,
@@ -17415,6 +17423,7 @@ mod native {
                         seq_len,
                         dims.kv_heads,
                         dims.head_dim,
+                        self.gemma4_rope_freq_factors(&prefix),
                         rope_base,
                         rope_scale,
                         true,
@@ -17455,6 +17464,19 @@ mod native {
                 } else {
                     v
                 };
+                if self.config.is_gemma4() {
+                    // Gemma-4 uses attention scale 1.0 (the query pre-scale is
+                    // folded into q_norm). The attention kernels hardcode
+                    // 1/sqrt(head_dim), so pre-scale q by sqrt(head_dim): the
+                    // factors cancel exactly.
+                    crate::kernels::launch_scale_in_place(
+                        &q.buffer,
+                        q.element_count()?,
+                        (dims.head_dim as f32).sqrt(),
+                        &self.stream,
+                    )?;
+                    self.op_barrier()?;
+                }
                 return Ok((q, k, v, gate));
             }
 
@@ -19074,6 +19096,7 @@ mod native {
             seq_len: usize,
             heads: usize,
             head_dim: usize,
+            freq_factors: Option<&DeviceBuffer>,
             base: f32,
             scale: f32,
             position_offset: usize,
@@ -19095,6 +19118,7 @@ mod native {
                 heads,
                 head_dim,
                 rot_dim,
+                freq_factors,
                 base,
                 scale,
                 position_offset,
@@ -19148,6 +19172,7 @@ mod native {
             seq_len: usize,
             heads: usize,
             head_dim: usize,
+            freq_factors: Option<&DeviceBuffer>,
             base: f32,
             scale: f32,
             position_offset: usize,
@@ -19171,6 +19196,7 @@ mod native {
                     heads,
                     head_dim,
                     rot_dim,
+                    freq_factors,
                     base,
                     scale,
                     d_pos,
@@ -19185,6 +19211,7 @@ mod native {
                     heads,
                     head_dim,
                     rot_dim,
+                    freq_factors,
                     base,
                     scale,
                     position_offset,
@@ -19204,6 +19231,7 @@ mod native {
             seq_len: usize,
             heads: usize,
             head_dim: usize,
+            freq_factors: Option<&DeviceBuffer>,
             base: f32,
             scale: f32,
             split_half: bool,
@@ -19226,6 +19254,7 @@ mod native {
                 heads,
                 head_dim,
                 rot_dim,
+                freq_factors,
                 base,
                 scale,
                 split_half,
@@ -20298,6 +20327,24 @@ mod native {
         /// bases: every 6th layer (index % 6 == 5) is global and uses the model's
         /// `rope.freq_base`; the other five-of-six local layers use base 10000. All
         /// other architectures use one base for every layer.
+        /// Gemma-4 global (non-sliding) layers rope with per-pair frequency
+        /// divisors from the shared `rope_freqs.weight` tensor ("proportional
+        /// rope": unrotated pairs carry ~1e30 factors). Sliding layers and all
+        /// other models return None.
+        fn gemma4_rope_freq_factors(&self, prefix: &str) -> Option<&DeviceBuffer> {
+            if !self.config.is_gemma4() {
+                return None;
+            }
+            let layer = prefix
+                .strip_prefix("blk.")
+                .and_then(|index| index.parse::<usize>().ok())?;
+            if self.config.layer_is_sliding(layer) {
+                return None;
+            }
+            self.vector("rope_freqs.weight")
+                .map(|vector| &vector.buffer)
+        }
+
         /// Rope base for the layer named by `prefix`. Gemma-3 local layers use
         /// the fixed 10k base; Gemma-4 sliding layers use `rope.freq_base_swa`
         /// (10k in practice) — both via `config.layer_is_sliding`, which reads

@@ -2190,6 +2190,7 @@ __global__ void rope_kernel(
     int heads,
     int head_dim,
     int rot_dim,
+    const float* freq_factors,
     float base,
     float scale,
     int position_offset,
@@ -2219,6 +2220,9 @@ __global__ void rope_kernel(
 
   float freq = powf(base, -(static_cast<float>(pair_in_head) * 2.0f) /
                               static_cast<float>(rot_dim));
+  if (freq_factors != nullptr) {
+    freq /= freq_factors[pair_in_head];
+  }
   float angle = static_cast<float>(position) * scale * freq;
   float s = sinf(angle);
   float c = cosf(angle);
@@ -2235,6 +2239,7 @@ __global__ void rope_batched_kernel(
     int heads,
     int head_dim,
     int rot_dim,
+    const float* freq_factors,
     float base,
     float scale,
     int position_offset,
@@ -2272,6 +2277,9 @@ __global__ void rope_batched_kernel(
 
   float freq = powf(base, -(static_cast<float>(pair_in_head) * 2.0f) /
                               static_cast<float>(rot_dim));
+  if (freq_factors != nullptr) {
+    freq /= freq_factors[pair_in_head];
+  }
   float angle = static_cast<float>(position) * scale * freq;
   float s = sinf(angle);
   float c = cosf(angle);
@@ -2289,6 +2297,7 @@ __global__ void rope_batched_positions_kernel(
     int heads,
     int head_dim,
     int rot_dim,
+    const float* freq_factors,
     float base,
     float scale,
     int split_half) {
@@ -2318,6 +2327,9 @@ __global__ void rope_batched_positions_kernel(
 
   float freq = powf(base, -(static_cast<float>(pair_in_head) * 2.0f) /
                               static_cast<float>(rot_dim));
+  if (freq_factors != nullptr) {
+    freq /= freq_factors[pair_in_head];
+  }
   float angle = static_cast<float>(position) * scale * freq;
   float s = sinf(angle);
   float c = cosf(angle);
@@ -10961,6 +10973,7 @@ extern "C" int hi_cuda_launch_rope(
     int heads,
     int head_dim,
     int rot_dim,
+    const void* freq_factors,
     float base,
     float scale,
     int split_half,
@@ -10982,6 +10995,7 @@ extern "C" int hi_cuda_launch_rope(
       heads,
       head_dim,
       rot_dim,
+      static_cast<const float*>(freq_factors),
       base,
       scale,
       0,
@@ -10995,6 +11009,7 @@ extern "C" int hi_cuda_launch_rope_with_offset(
     int heads,
     int head_dim,
     int rot_dim,
+    const void* freq_factors,
     float base,
     float scale,
     int position_offset,
@@ -11018,6 +11033,7 @@ extern "C" int hi_cuda_launch_rope_with_offset(
       heads,
       head_dim,
       rot_dim,
+      static_cast<const float*>(freq_factors),
       base,
       scale,
       position_offset,
@@ -11032,6 +11048,7 @@ extern "C" int hi_cuda_launch_rope_batched_with_offset(
     int heads,
     int head_dim,
     int rot_dim,
+    const void* freq_factors,
     float base,
     float scale,
     int position_offset,
@@ -11053,6 +11070,7 @@ extern "C" int hi_cuda_launch_rope_batched_with_offset(
       heads,
       head_dim,
       rot_dim,
+      static_cast<const float*>(freq_factors),
       base,
       scale,
       position_offset,
@@ -11070,6 +11088,7 @@ extern "C" int hi_cuda_launch_rope_batched_with_offset_devpos(
     int heads,
     int head_dim,
     int rot_dim,
+    const void* freq_factors,
     float base,
     float scale,
     const void* d_position_offset,
@@ -11091,6 +11110,7 @@ extern "C" int hi_cuda_launch_rope_batched_with_offset_devpos(
       heads,
       head_dim,
       rot_dim,
+      static_cast<const float*>(freq_factors),
       base,
       scale,
       0,
@@ -11107,6 +11127,7 @@ extern "C" int hi_cuda_launch_rope_batched_positions(
     int heads,
     int head_dim,
     int rot_dim,
+    const void* freq_factors,
     float base,
     float scale,
     int split_half,
@@ -11128,6 +11149,7 @@ extern "C" int hi_cuda_launch_rope_batched_positions(
       heads,
       head_dim,
       rot_dim,
+      static_cast<const float*>(freq_factors),
       base,
       scale,
       split_half);

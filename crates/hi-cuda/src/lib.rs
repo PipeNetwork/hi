@@ -25677,7 +25677,7 @@ mod tests {
         let rope = DeviceBuffer::alloc(2 * std::mem::size_of::<f32>()).unwrap();
         rope.copy_from_host(&[1.0f32, 0.0]).unwrap();
         crate::kernels::launch_rope_with_offset(
-            &rope, 1, 1, 2, 2, 10_000.0, 1.0, 1, false, &stream,
+            &rope, 1, 1, 2, 2, None, 10_000.0, 1.0, 1, false, &stream,
         )
         .unwrap();
         stream.synchronize().unwrap();
@@ -25698,6 +25698,7 @@ mod tests {
             1,
             2,
             2,
+            None,
             10_000.0,
             1.0,
             false,
