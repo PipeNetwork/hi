@@ -9164,6 +9164,7 @@ mod native {
                 let layer_idx =
                     usize::try_from(layer).context("qwen layer index does not fit usize")?;
                 let prefix = format!("blk.{layer}");
+                let dims = self.qwen_layer_dims(layer as usize)?;
                 self.ensure_layer_runtime_supported(&prefix)?;
                 let window = self.layer_attention_window(&prefix);
                 let attn_input =
@@ -14775,6 +14776,7 @@ mod native {
 
             for layer in 0..self.config.block_count {
                 let prefix = format!("blk.{layer}");
+                let dims = self.qwen_layer_dims(layer as usize)?;
                 let attn_input =
                     self.rms_norm_f32_device(&format!("{prefix}.attn_norm.weight"), &hidden, eps)?;
 
@@ -14953,6 +14955,7 @@ mod native {
 
             for layer in 0..self.config.block_count {
                 let prefix = format!("blk.{layer}");
+                let dims = self.qwen_layer_dims(layer as usize)?;
                 self.ensure_layer_runtime_supported(&prefix)?;
                 let attn_input =
                     self.rms_norm_f32_device(&format!("{prefix}.attn_norm.weight"), &hidden, eps)?;
@@ -15203,6 +15206,7 @@ mod native {
 
             for layer in 0..self.config.block_count {
                 let prefix = format!("blk.{layer}");
+                let dims = self.qwen_layer_dims(layer as usize)?;
                 self.ensure_layer_runtime_supported(&prefix)?;
                 let attn_input =
                     self.rms_norm_f32_device(&format!("{prefix}.attn_norm.weight"), &hidden, eps)?;
@@ -15498,6 +15502,7 @@ mod native {
                 let layer_idx =
                     usize::try_from(layer).context("qwen layer index does not fit usize")?;
                 let prefix = format!("blk.{layer}");
+                let dims = self.qwen_layer_dims(layer as usize)?;
                 self.ensure_layer_runtime_supported(&prefix)?;
                 let attn_input =
                     self.rms_norm_f32_device(&format!("{prefix}.attn_norm.weight"), &hidden, eps)?;
@@ -15768,6 +15773,8 @@ mod native {
                     let layer_idx =
                         usize::try_from(layer).context("qwen layer index does not fit usize")?;
                     let prefix = format!("blk.{layer}");
+                    let dims = self.qwen_layer_dims(layer as usize)?;
+                    let dims = self.qwen_layer_dims(layer as usize)?;
                     self.ensure_layer_runtime_supported(&prefix)?;
                     let window = self.layer_attention_window(&prefix);
                     let attn_input = self.rms_norm_f32_device(
@@ -15861,6 +15868,7 @@ mod native {
 
             for layer in 0..self.config.block_count {
                 let prefix = format!("blk.{layer}");
+                let dims = self.qwen_layer_dims(layer as usize)?;
                 let attn_input =
                     self.rms_norm_f32_device(&format!("{prefix}.attn_norm.weight"), &hidden, eps)?;
 
@@ -15950,6 +15958,7 @@ mod native {
                 let layer_idx =
                     usize::try_from(layer).context("qwen layer index does not fit usize")?;
                 let prefix = format!("blk.{layer}");
+                let dims = self.qwen_layer_dims(layer as usize)?;
                 let attn_input =
                     self.rms_norm_f32_device(&format!("{prefix}.attn_norm.weight"), &hidden, eps)?;
 
@@ -16049,6 +16058,7 @@ mod native {
                 let layer_idx =
                     usize::try_from(layer).context("qwen layer index does not fit usize")?;
                 let prefix = format!("blk.{layer}");
+                let dims = self.qwen_layer_dims(layer as usize)?;
                 self.ensure_layer_runtime_supported(&prefix)?;
                 let attn_input =
                     self.rms_norm_f32_device(&format!("{prefix}.attn_norm.weight"), &hidden, eps)?;
@@ -16143,6 +16153,7 @@ mod native {
                 let layer_idx =
                     usize::try_from(layer).context("qwen layer index does not fit usize")?;
                 let prefix = format!("blk.{layer}");
+                let dims = self.qwen_layer_dims(layer as usize)?;
                 self.ensure_layer_runtime_supported(&prefix)?;
                 let attn_input =
                     self.rms_norm_f32_device(&format!("{prefix}.attn_norm.weight"), &hidden, eps)?;
@@ -16223,6 +16234,7 @@ mod native {
                 let layer_idx =
                     usize::try_from(layer).context("qwen layer index does not fit usize")?;
                 let prefix = format!("blk.{layer}");
+                let dims = self.qwen_layer_dims(layer as usize)?;
                 self.ensure_layer_runtime_supported(&prefix)?;
                 let attn_input =
                     self.rms_norm_f32_device(&format!("{prefix}.attn_norm.weight"), &hidden, eps)?;
@@ -16337,6 +16349,7 @@ mod native {
                 let layer_idx =
                     usize::try_from(layer).context("qwen layer index does not fit usize")?;
                 let prefix = format!("blk.{layer}");
+                let dims = self.qwen_layer_dims(layer as usize)?;
                 self.ensure_layer_runtime_supported(&prefix)?;
                 let attn_input =
                     self.rms_norm_f32_device(&format!("{prefix}.attn_norm.weight"), &hidden, eps)?;
@@ -16501,6 +16514,7 @@ mod native {
                 let layer_idx =
                     usize::try_from(layer).context("qwen layer index does not fit usize")?;
                 let prefix = format!("blk.{layer}");
+                let dims = self.qwen_layer_dims(layer as usize)?;
                 self.ensure_layer_runtime_supported(&prefix)?;
                 let attn_input =
                     self.rms_norm_f32_device(&format!("{prefix}.attn_norm.weight"), &hidden, eps)?;
@@ -16687,6 +16701,7 @@ mod native {
                 let layer_idx =
                     usize::try_from(layer).context("qwen layer index does not fit usize")?;
                 let prefix = format!("blk.{layer}");
+                let dims = self.qwen_layer_dims(layer as usize)?;
                 self.ensure_layer_runtime_supported(&prefix)?;
                 let attn_input =
                     self.rms_norm_f32_device(&format!("{prefix}.attn_norm.weight"), &hidden, eps)?;
@@ -16819,6 +16834,7 @@ mod native {
                 let layer_idx =
                     usize::try_from(layer).context("qwen layer index does not fit usize")?;
                 let prefix = format!("blk.{layer}");
+                let dims = self.qwen_layer_dims(layer as usize)?;
                 self.ensure_layer_runtime_supported(&prefix)?;
                 let attn_input =
                     self.rms_norm_f32_device(&format!("{prefix}.attn_norm.weight"), &hidden, eps)?;
@@ -17026,6 +17042,7 @@ mod native {
                 let layer_idx =
                     usize::try_from(layer).context("qwen layer index does not fit usize")?;
                 let prefix = format!("blk.{layer}");
+                let dims = self.qwen_layer_dims(layer as usize)?;
                 self.ensure_layer_runtime_supported(&prefix)?;
                 let attn_input =
                     self.rms_norm_f32_device(&format!("{prefix}.attn_norm.weight"), &hidden, eps)?;
@@ -17079,6 +17096,46 @@ mod native {
 
             let normed = self.rms_norm_f32_device("output_norm.weight", &hidden, eps)?;
             self.output_logits_f32_device(&normed)
+        }
+
+        /// Layer-adjusted attention geometry. Gemma-4 varies head dims and KV
+        /// head counts per layer (sliding layers: `_swa` dims with GQA; global
+        /// layers: full dims with MQA); every other architecture returns the
+        /// model-wide dims unchanged.
+        fn qwen_layer_dims(&self, layer: usize) -> Result<QwenDims> {
+            let mut dims = self.qwen_dims()?;
+            if !self.config.is_gemma4() {
+                return Ok(dims);
+            }
+            let kv_heads = usize::try_from(self.config.layer_head_count_kv(layer))
+                .context("gemma4 per-layer kv head count does not fit usize")?;
+            let head_dim = self
+                .config
+                .layer_key_head_dim(layer)
+                .map(usize::try_from)
+                .transpose()
+                .context("gemma4 per-layer key head dim does not fit usize")?
+                .ok_or_else(|| anyhow!("gemma4 layer {layer} key head dim missing"))?;
+            let v_head_dim = self
+                .config
+                .layer_value_head_dim(layer)
+                .map(usize::try_from)
+                .transpose()
+                .context("gemma4 per-layer value head dim does not fit usize")?
+                .ok_or_else(|| anyhow!("gemma4 layer {layer} value head dim missing"))?;
+            if kv_heads == 0 || head_dim == 0 || v_head_dim == 0 {
+                bail!("gemma4 layer {layer} attention geometry must be non-zero");
+            }
+            if dims.heads % kv_heads != 0 {
+                bail!(
+                    "gemma4 layer {layer} heads {} must be a multiple of kv heads {kv_heads}",
+                    dims.heads
+                );
+            }
+            dims.kv_heads = kv_heads;
+            dims.head_dim = head_dim;
+            dims.v_head_dim = v_head_dim;
+            Ok(dims)
         }
 
         fn qwen_dims(&self) -> Result<QwenDims> {
@@ -17519,6 +17576,7 @@ mod native {
                 let layer_idx =
                     usize::try_from(layer).context("qwen layer index does not fit usize")?;
                 let prefix = format!("blk.{layer}");
+                let dims = self.qwen_layer_dims(layer as usize)?;
                 let attn_input =
                     self.rms_norm_f32_device(&format!("{prefix}.attn_norm.weight"), &hidden, eps)?;
 
