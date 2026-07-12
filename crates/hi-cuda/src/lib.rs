@@ -32,6 +32,8 @@ use rand::{Rng, SeedableRng};
 
 pub mod dsv4_cpu;
 #[cfg(feature = "native-cuda")]
+pub mod dsv4_gpu;
+#[cfg(feature = "native-cuda")]
 mod expert_pool;
 pub mod gpu;
 pub mod kernels;

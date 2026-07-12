@@ -1,9 +1,9 @@
 #[cfg(feature = "native-cuda")]
 mod native {
     use std::ffi::c_void;
-    use std::os::raw::{c_float, c_int};
+    use std::os::raw::{c_float, c_int, c_long};
 
-    use anyhow::{Result, bail};
+    use anyhow::{Result, anyhow, bail};
 
     use crate::runtime::{DeviceBuffer, Stream, check_last_error};
 
@@ -372,6 +372,181 @@ mod native {
             y: *mut c_void,
             rows: c_int,
             cols: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_dsv4_moe_select(
+            logits: *const c_void,
+            bias: *const c_void,
+            tid2eid: *const c_void,
+            token_ids: *const c_void,
+            table_tokens: c_int,
+            out_ids: *mut c_void,
+            out_weights: *mut c_void,
+            tokens: c_int,
+            experts: c_int,
+            top_k: c_int,
+            norm: c_int,
+            scale: f32,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_dsv4_swiglu_clamp(
+            gate: *const c_void,
+            up: *const c_void,
+            out: *mut c_void,
+            n: c_int,
+            clamp: f32,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_dsv4_moe_accum(
+            expert_out: *const c_void,
+            weights: *const c_void,
+            shared_out: *const c_void,
+            ys: *mut c_void,
+            tokens: c_int,
+            top_k: c_int,
+            embed: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_dsv4_exact_math(
+            input: *const c_void,
+            output: *mut c_void,
+            n: c_int,
+            op: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_dsv4_embed_broadcast(
+            src: *const c_void,
+            dtype_code: c_int,
+            row_offset_elems: c_long,
+            embed: c_int,
+            hc: c_int,
+            streams: *mut c_void,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_dsv4_hc_pre(
+            streams: *const c_void,
+            func: *const c_void,
+            base: *const c_void,
+            scale: *const c_void,
+            norm: *const c_void,
+            n: c_int,
+            embed: c_int,
+            rows: c_int,
+            sinkhorn_iters: c_int,
+            rms_eps: f32,
+            hc_eps: f32,
+            y: *mut c_void,
+            post_out: *mut c_void,
+            comb_out: *mut c_void,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_dsv4_hc_post(
+            f: *const c_void,
+            res: *const c_void,
+            post: *const c_void,
+            comb: *const c_void,
+            n: c_int,
+            embed: c_int,
+            out: *mut c_void,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_dsv4_rms_exact(
+            x: *mut c_void,
+            weight: *const c_void,
+            n: c_int,
+            eps: f32,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_dsv4_q_prep(
+            q: *mut c_void,
+            heads: c_int,
+            head_dim: c_int,
+            rope_dims: c_int,
+            rope: *const c_void,
+            rms_eps: f32,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_dsv4_kv_prep(
+            kv_in: *const c_void,
+            norm: *const c_void,
+            head_dim: c_int,
+            rope_dims: c_int,
+            rope: *const c_void,
+            rms_eps: f32,
+            ring_row: *mut c_void,
+            arena_row: *mut c_void,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_dsv4_attention_decode(
+            q: *const c_void,
+            comp_k: *const c_void,
+            comp_v: *const c_void,
+            comp_stride: c_int,
+            sel: *const c_void,
+            n_comp: c_int,
+            ring: *const c_void,
+            ring_cap: c_int,
+            first_ring_pos: c_long,
+            n_ring: c_int,
+            sinks: *const c_void,
+            scale: f32,
+            heads: c_int,
+            head_dim: c_int,
+            rope_dims: c_int,
+            rope_inv: *const c_void,
+            out: *mut c_void,
+            w_scratch: *mut c_void,
+            wn_scratch: *mut c_void,
+            max_keys: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_dsv4_compressor_emit(
+            gates: *const c_void,
+            kvs: *const c_void,
+            row_stride: c_int,
+            ape: *const c_void,
+            norm: *const c_void,
+            ratio: c_int,
+            dim: c_int,
+            width: c_int,
+            rms_eps: f32,
+            key_out: *mut c_void,
+            val_out: *mut c_void,
+            arena_k: *mut c_void,
+            arena_v: *mut c_void,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_dsv4_indexer_score(
+            qi: *const c_void,
+            head_w: *const c_void,
+            keys: *const c_void,
+            key_stride: c_int,
+            n_blocks: c_int,
+            idx_heads: c_int,
+            idx_key: c_int,
+            head_scale: f32,
+            key_scale: f32,
+            scores: *mut c_void,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_dsv4_indexer_select(
+            scores: *const c_void,
+            n_blocks: c_int,
+            top_k: c_int,
+            marks: *mut c_void,
+            sel_out: *mut c_void,
+            stream: *mut c_void,
+        ) -> c_int;
+        fn hi_cuda_launch_dsv4_hyper_head(
+            streams: *const c_void,
+            func: *const c_void,
+            base: *const c_void,
+            scale0: f32,
+            n: c_int,
+            embed: c_int,
+            rms_eps: f32,
+            hc_eps: f32,
+            out: *mut c_void,
             stream: *mut c_void,
         ) -> c_int;
         fn hi_cuda_launch_nvfp4_gemv(
@@ -1648,11 +1823,42 @@ mod native {
         len: usize,
         stream: &Stream,
     ) -> Result<()> {
+        launch_cast_f32_to_f16_slice(input, 0, output, 0, len, stream)
+    }
+
+    /// [`launch_cast_f32_to_f16`] with BYTE offsets into the input and output
+    /// buffers (the DeepSeek-V4 device step casts activation slices that live
+    /// inside its per-step arena / padded row layouts).
+    pub fn launch_cast_f32_to_f16_slice(
+        input: &DeviceBuffer,
+        input_byte_offset: usize,
+        output: &DeviceBuffer,
+        output_byte_offset: usize,
+        len: usize,
+        stream: &Stream,
+    ) -> Result<()> {
         ensure_len(len, "cast_f32_to_f16 len")?;
+        let in_end = len
+            .checked_mul(4)
+            .and_then(|bytes| input_byte_offset.checked_add(bytes));
+        let out_end = len
+            .checked_mul(2)
+            .and_then(|bytes| output_byte_offset.checked_add(bytes));
+        match (in_end, out_end) {
+            (Some(in_end), Some(out_end))
+                if in_end <= input.bytes() && out_end <= output.bytes() => {}
+            _ => {
+                bail!("cast_f32_to_f16 slice [{input_byte_offset}..] x {len} exceeds buffer bounds")
+            }
+        }
         launch_status(unsafe {
             hi_cuda_launch_cast_f32_to_f16(
-                input.as_ptr(),
-                output.as_mut_ptr(),
+                input.as_ptr().cast::<u8>().add(input_byte_offset).cast(),
+                output
+                    .as_mut_ptr()
+                    .cast::<u8>()
+                    .add(output_byte_offset)
+                    .cast(),
                 len as c_int,
                 stream.as_raw(),
             )
@@ -1819,11 +2025,40 @@ mod native {
         len: usize,
         stream: &Stream,
     ) -> Result<()> {
+        launch_cast_f32_to_bf16_slice(input, 0, output, 0, len, stream)
+    }
+
+    /// [`launch_cast_f32_to_bf16`] with BYTE offsets (see the f16 variant).
+    pub fn launch_cast_f32_to_bf16_slice(
+        input: &DeviceBuffer,
+        input_byte_offset: usize,
+        output: &DeviceBuffer,
+        output_byte_offset: usize,
+        len: usize,
+        stream: &Stream,
+    ) -> Result<()> {
         ensure_len(len, "cast_f32_to_bf16 len")?;
+        let in_end = len
+            .checked_mul(4)
+            .and_then(|bytes| input_byte_offset.checked_add(bytes));
+        let out_end = len
+            .checked_mul(2)
+            .and_then(|bytes| output_byte_offset.checked_add(bytes));
+        match (in_end, out_end) {
+            (Some(in_end), Some(out_end))
+                if in_end <= input.bytes() && out_end <= output.bytes() => {}
+            _ => bail!(
+                "cast_f32_to_bf16 slice [{input_byte_offset}..] x {len} exceeds buffer bounds"
+            ),
+        }
         launch_status(unsafe {
             hi_cuda_launch_cast_f32_to_bf16(
-                input.as_ptr(),
-                output.as_mut_ptr(),
+                input.as_ptr().cast::<u8>().add(input_byte_offset).cast(),
+                output
+                    .as_mut_ptr()
+                    .cast::<u8>()
+                    .add(output_byte_offset)
+                    .cast(),
                 len as c_int,
                 stream.as_raw(),
             )
@@ -2348,11 +2583,43 @@ mod native {
         cols: usize,
         stream: &Stream,
     ) -> Result<()> {
+        launch_mxfp4_gemv_at(weight, 0, x, y, rows, cols, stream)
+    }
+
+    /// [`launch_mxfp4_gemv`] with the packed weights starting at a byte offset
+    /// into `weight`. The DeepSeek-V4 expert pool packs many ~4.25 MiB expert
+    /// slices into shared arena allocations (a cudaMalloc per slot rounds up to
+    /// 2 MiB granularity and wastes ~40% VRAM); the kernel reads weight bytes
+    /// individually, so the offset needs no alignment, only to keep the packed
+    /// slice inside the buffer.
+    pub fn launch_mxfp4_gemv_at(
+        weight: &DeviceBuffer,
+        weight_byte_offset: usize,
+        x: &DeviceBuffer,
+        y: &DeviceBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
         ensure_len(rows, "mxfp4 gemv rows")?;
         ensure_len(cols, "mxfp4 gemv cols")?;
+        if !cols.is_multiple_of(32) {
+            bail!("mxfp4 gemv cols {cols} must be a multiple of the 32-element block");
+        }
+        let end = rows
+            .checked_mul(cols / 32)
+            .and_then(|blocks| blocks.checked_mul(17))
+            .and_then(|len| weight_byte_offset.checked_add(len));
+        match end {
+            Some(end) if end <= weight.bytes() => {}
+            _ => bail!(
+                "mxfp4 gemv weight slice at byte {weight_byte_offset} for {rows}x{cols} exceeds the {}-byte buffer",
+                weight.bytes()
+            ),
+        }
         launch_status(unsafe {
             hi_cuda_launch_mxfp4_gemv(
-                weight.as_ptr(),
+                weight.as_ptr().cast::<u8>().add(weight_byte_offset).cast(),
                 x.as_ptr(),
                 y.as_mut_ptr(),
                 rows as c_int,
@@ -2361,6 +2628,756 @@ mod native {
             )
         })?;
         check_last_error("hi_cuda_launch_mxfp4_gemv")
+    }
+
+    /// [`launch_mxfp4_gemv_at`] with byte offsets into the activation and
+    /// output buffers as well: the DeepSeek-V4 device MoE block keeps a whole
+    /// batch of activations/outputs in single flat buffers and launches one
+    /// GEMV per (token, expert) slot with no intervening syncs. `x_byte_offset`
+    /// must be 16-byte aligned (the kernel reads the activation as float4s);
+    /// `y_byte_offset` must be 4-byte aligned.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_mxfp4_gemv_slice(
+        weight: &DeviceBuffer,
+        weight_byte_offset: usize,
+        x: &DeviceBuffer,
+        x_byte_offset: usize,
+        y: &DeviceBuffer,
+        y_byte_offset: usize,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(rows, "mxfp4 gemv rows")?;
+        ensure_len(cols, "mxfp4 gemv cols")?;
+        if !cols.is_multiple_of(32) {
+            bail!("mxfp4 gemv cols {cols} must be a multiple of the 32-element block");
+        }
+        if !x_byte_offset.is_multiple_of(16) {
+            bail!("mxfp4 gemv activation offset {x_byte_offset} must be 16-byte aligned");
+        }
+        if !y_byte_offset.is_multiple_of(4) {
+            bail!("mxfp4 gemv output offset {y_byte_offset} must be 4-byte aligned");
+        }
+        let weight_end = rows
+            .checked_mul(cols / 32)
+            .and_then(|blocks| blocks.checked_mul(17))
+            .and_then(|len| weight_byte_offset.checked_add(len));
+        match weight_end {
+            Some(end) if end <= weight.bytes() => {}
+            _ => bail!(
+                "mxfp4 gemv weight slice at byte {weight_byte_offset} for {rows}x{cols} exceeds the {}-byte buffer",
+                weight.bytes()
+            ),
+        }
+        let x_end = cols
+            .checked_mul(4)
+            .and_then(|len| x_byte_offset.checked_add(len));
+        match x_end {
+            Some(end) if end <= x.bytes() => {}
+            _ => bail!(
+                "mxfp4 gemv activation slice at byte {x_byte_offset} for {cols} floats exceeds the {}-byte buffer",
+                x.bytes()
+            ),
+        }
+        let y_end = rows
+            .checked_mul(4)
+            .and_then(|len| y_byte_offset.checked_add(len));
+        match y_end {
+            Some(end) if end <= y.bytes() => {}
+            _ => bail!(
+                "mxfp4 gemv output slice at byte {y_byte_offset} for {rows} floats exceeds the {}-byte buffer",
+                y.bytes()
+            ),
+        }
+        launch_status(unsafe {
+            hi_cuda_launch_mxfp4_gemv(
+                weight.as_ptr().cast::<u8>().add(weight_byte_offset).cast(),
+                x.as_ptr().cast::<u8>().add(x_byte_offset).cast(),
+                y.as_mut_ptr().cast::<u8>().add(y_byte_offset).cast(),
+                rows as c_int,
+                cols as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_mxfp4_gemv")
+    }
+
+    /// DeepSeek-V4 MoE scoring + selection (device routing): sqrt-softplus
+    /// scores from `logits` [tokens, experts], hash-table or biased top-k
+    /// selection with the host's lower-index tie-break, raw-score weights,
+    /// optional normalization, routed scale. `tid2eid` (with `token_ids` and
+    /// `table_tokens`) switches a hash layer to table gathers. Outputs
+    /// `out_ids` [tokens, top_k] I32 and `out_weights` [tokens, top_k] F32.
+    /// Bit-identical to the host `moe_route_math` on identical logits.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_dsv4_moe_select(
+        logits: &DeviceBuffer,
+        bias: Option<&DeviceBuffer>,
+        tid2eid: Option<(&DeviceBuffer, usize)>,
+        token_ids: Option<&DeviceBuffer>,
+        out_ids: &DeviceBuffer,
+        out_weights: &DeviceBuffer,
+        tokens: usize,
+        experts: usize,
+        top_k: usize,
+        norm: bool,
+        scale: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(tokens, "dsv4 moe select tokens")?;
+        ensure_len(experts, "dsv4 moe select experts")?;
+        ensure_len(top_k, "dsv4 moe select top_k")?;
+        require_f32_capacity(logits, tokens * experts, "dsv4 moe select logits")?;
+        require_f32_capacity(out_ids, tokens * top_k, "dsv4 moe select ids")?;
+        require_f32_capacity(out_weights, tokens * top_k, "dsv4 moe select weights")?;
+        if let Some(bias) = bias {
+            require_f32_capacity(bias, experts, "dsv4 moe select bias")?;
+        }
+        let mut table_tokens = 0usize;
+        if let Some((table, rows)) = tid2eid {
+            ensure_len(rows, "dsv4 moe select table tokens")?;
+            require_f32_capacity(table, rows * top_k, "dsv4 moe select tid2eid")?;
+            let ids = token_ids
+                .ok_or_else(|| anyhow!("dsv4 moe select requires token ids with a hash table"))?;
+            require_f32_capacity(ids, tokens, "dsv4 moe select token ids")?;
+            table_tokens = rows;
+        }
+        launch_status(unsafe {
+            hi_cuda_launch_dsv4_moe_select(
+                logits.as_ptr(),
+                bias.map_or(std::ptr::null(), DeviceBuffer::as_ptr),
+                tid2eid.map_or(std::ptr::null(), |(table, _)| table.as_ptr()),
+                token_ids.map_or(std::ptr::null(), DeviceBuffer::as_ptr),
+                table_tokens as c_int,
+                out_ids.as_mut_ptr(),
+                out_weights.as_mut_ptr(),
+                tokens as c_int,
+                experts as c_int,
+                top_k as c_int,
+                if norm { 1 } else { 0 },
+                scale,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_dsv4_moe_select")
+    }
+
+    /// DeepSeek-V4 SwiGLU with the per-layer clamp, elementwise over `n`
+    /// values: `out = silu(min(gate, clamp)) * clamp(up, ±clamp)` (clamp <= 0
+    /// disables the clamps — the shared expert path). `out` may be the same
+    /// buffer as `gate` (in-place). The silu uses the bit-exact glibc expf
+    /// port, matching the host `swiglu_hidden`/`silu` exactly.
+    pub fn launch_dsv4_swiglu_clamp(
+        gate: &DeviceBuffer,
+        up: &DeviceBuffer,
+        out: &DeviceBuffer,
+        n: usize,
+        clamp: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(n, "dsv4 swiglu n")?;
+        require_f32_capacity(gate, n, "dsv4 swiglu gate")?;
+        require_f32_capacity(up, n, "dsv4 swiglu up")?;
+        require_f32_capacity(out, n, "dsv4 swiglu out")?;
+        launch_status(unsafe {
+            hi_cuda_launch_dsv4_swiglu_clamp(
+                gate.as_ptr(),
+                up.as_ptr(),
+                out.as_mut_ptr(),
+                n as c_int,
+                clamp,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_dsv4_swiglu_clamp")
+    }
+
+    /// DeepSeek-V4 MoE weighted accumulation: `ys[t][i] = Σ_j weights[t][j] *
+    /// expert_out[t][j][i]` serially in selection order (the host order),
+    /// plus `shared_out[t][i]` when present.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_dsv4_moe_accum(
+        expert_out: &DeviceBuffer,
+        weights: &DeviceBuffer,
+        shared_out: Option<&DeviceBuffer>,
+        ys: &DeviceBuffer,
+        tokens: usize,
+        top_k: usize,
+        embed: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(tokens, "dsv4 moe accum tokens")?;
+        ensure_len(top_k, "dsv4 moe accum top_k")?;
+        ensure_len(embed, "dsv4 moe accum embed")?;
+        require_f32_capacity(expert_out, tokens * top_k * embed, "dsv4 moe accum experts")?;
+        require_f32_capacity(weights, tokens * top_k, "dsv4 moe accum weights")?;
+        require_f32_capacity(ys, tokens * embed, "dsv4 moe accum output")?;
+        if let Some(shared) = shared_out {
+            require_f32_capacity(shared, tokens * embed, "dsv4 moe accum shared")?;
+        }
+        launch_status(unsafe {
+            hi_cuda_launch_dsv4_moe_accum(
+                expert_out.as_ptr(),
+                weights.as_ptr(),
+                shared_out.map_or(std::ptr::null(), DeviceBuffer::as_ptr),
+                ys.as_mut_ptr(),
+                tokens as c_int,
+                top_k as c_int,
+                embed as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_dsv4_moe_accum")
+    }
+
+    /// Test support: run one of the bit-exact math ports elementwise
+    /// (op 0 = expf, 1 = logf, 2 = softplus, 3 = silu) so the parity suite
+    /// can sweep them against the host libm.
+    pub fn launch_dsv4_exact_math(
+        input: &DeviceBuffer,
+        output: &DeviceBuffer,
+        n: usize,
+        op: u32,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(n, "dsv4 exact math n")?;
+        require_f32_capacity(input, n, "dsv4 exact math input")?;
+        require_f32_capacity(output, n, "dsv4 exact math output")?;
+        launch_status(unsafe {
+            hi_cuda_launch_dsv4_exact_math(
+                input.as_ptr(),
+                output.as_mut_ptr(),
+                n as c_int,
+                op as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_dsv4_exact_math")
+    }
+
+    // ---- DeepSeek-V4 device decode step (Wave-2 Stage 2b) -----------------
+    //
+    // Launchers for the bit-exact device ports of the host decode-step math.
+    // Where an operand lives inside a larger arena, the wrapper takes an
+    // explicit BYTE offset and bounds-checks the full slice.
+
+    /// Bounds-check `elements` 4-byte values starting `byte_offset` into
+    /// `buffer`.
+    fn require_f32_capacity_at(
+        buffer: &DeviceBuffer,
+        byte_offset: usize,
+        elements: usize,
+        label: &str,
+    ) -> Result<()> {
+        let end = elements
+            .checked_mul(4)
+            .and_then(|bytes| byte_offset.checked_add(bytes))
+            .ok_or_else(|| anyhow!("{label} byte range overflows usize"))?;
+        if end > buffer.bytes() {
+            bail!(
+                "{label} needs bytes [{byte_offset}, {end}) but the buffer holds {}",
+                buffer.bytes()
+            );
+        }
+        Ok(())
+    }
+
+    /// Raw pointer `byte_offset` bytes into `buffer` (bounds already checked).
+    unsafe fn ptr_at(buffer: &DeviceBuffer, byte_offset: usize) -> *mut c_void {
+        unsafe { buffer.as_mut_ptr().cast::<u8>().add(byte_offset).cast() }
+    }
+
+    /// Gather one embedding row from PACKED token_embd bytes (bit-exact
+    /// hi-gguf dequant: dtype_code 0 = F32, 1 = F16, 2 = BF16, 3 = Q8_0) and
+    /// broadcast it into the `hc` residual streams.
+    pub fn launch_dsv4_embed_broadcast(
+        src: &DeviceBuffer,
+        dtype_code: u32,
+        row_offset_elems: usize,
+        embed: usize,
+        hc: usize,
+        streams: &DeviceBuffer,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(embed, "dsv4 embed broadcast embed")?;
+        ensure_len(hc, "dsv4 embed broadcast hc")?;
+        require_f32_capacity(streams, hc * embed, "dsv4 embed broadcast streams")?;
+        let offset = c_long::try_from(row_offset_elems)
+            .map_err(|_| anyhow!("dsv4 embed broadcast row offset overflows c_long"))?;
+        launch_status(unsafe {
+            hi_cuda_launch_dsv4_embed_broadcast(
+                src.as_ptr(),
+                dtype_code as c_int,
+                offset,
+                embed as c_int,
+                hc as c_int,
+                streams.as_mut_ptr(),
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_dsv4_embed_broadcast")
+    }
+
+    /// HyperConnection.pre for one token (+ optional fused pre-norm): collapse
+    /// the `n` streams into `y` (written at `y_byte_offset`), emit the post
+    /// gates and the sinkhorn-normalized comb matrix. Bit-exact port of the
+    /// host `hc_pre_math` (+ `rms_norm_in_place` when `norm` is given).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_dsv4_hc_pre(
+        streams: &DeviceBuffer,
+        func: &DeviceBuffer,
+        base: &DeviceBuffer,
+        scale: &DeviceBuffer,
+        norm: Option<&DeviceBuffer>,
+        n: usize,
+        embed: usize,
+        rows: usize,
+        sinkhorn_iters: usize,
+        rms_eps: f32,
+        hc_eps: f32,
+        y: &DeviceBuffer,
+        y_byte_offset: usize,
+        post_out: &DeviceBuffer,
+        comb_out: &DeviceBuffer,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(n, "dsv4 hc_pre n")?;
+        ensure_len(embed, "dsv4 hc_pre embed")?;
+        ensure_len(rows, "dsv4 hc_pre rows")?;
+        ensure_len(sinkhorn_iters, "dsv4 hc_pre sinkhorn iterations")?;
+        require_f32_capacity(streams, n * embed, "dsv4 hc_pre streams")?;
+        require_f32_capacity(func, rows * n * embed, "dsv4 hc_pre func")?;
+        require_f32_capacity(base, rows, "dsv4 hc_pre base")?;
+        require_f32_capacity_at(y, y_byte_offset, embed, "dsv4 hc_pre y")?;
+        require_f32_capacity(post_out, n, "dsv4 hc_pre post")?;
+        require_f32_capacity(comb_out, n * n, "dsv4 hc_pre comb")?;
+        if let Some(norm) = norm {
+            require_f32_capacity(norm, embed, "dsv4 hc_pre norm")?;
+        }
+        launch_status(unsafe {
+            hi_cuda_launch_dsv4_hc_pre(
+                streams.as_ptr(),
+                func.as_ptr(),
+                base.as_ptr(),
+                scale.as_ptr(),
+                norm.map_or(std::ptr::null(), DeviceBuffer::as_ptr),
+                n as c_int,
+                embed as c_int,
+                rows as c_int,
+                sinkhorn_iters as c_int,
+                rms_eps,
+                hc_eps,
+                ptr_at(y, y_byte_offset),
+                post_out.as_mut_ptr(),
+                comb_out.as_mut_ptr(),
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_dsv4_hc_pre")
+    }
+
+    /// HyperConnection.post for one token: out[i] = post[i]*f + comb[i]·res.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_dsv4_hc_post(
+        f: &DeviceBuffer,
+        res: &DeviceBuffer,
+        post: &DeviceBuffer,
+        comb: &DeviceBuffer,
+        n: usize,
+        embed: usize,
+        out: &DeviceBuffer,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(n, "dsv4 hc_post n")?;
+        ensure_len(embed, "dsv4 hc_post embed")?;
+        require_f32_capacity(f, embed, "dsv4 hc_post f")?;
+        require_f32_capacity(res, n * embed, "dsv4 hc_post res")?;
+        require_f32_capacity(post, n, "dsv4 hc_post post")?;
+        require_f32_capacity(comb, n * n, "dsv4 hc_post comb")?;
+        require_f32_capacity(out, n * embed, "dsv4 hc_post out")?;
+        launch_status(unsafe {
+            hi_cuda_launch_dsv4_hc_post(
+                f.as_ptr(),
+                res.as_ptr(),
+                post.as_ptr(),
+                comb.as_ptr(),
+                n as c_int,
+                embed as c_int,
+                out.as_mut_ptr(),
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_dsv4_hc_post")
+    }
+
+    /// `rms_norm_in_place` on one device vector, bit-exact.
+    pub fn launch_dsv4_rms_exact(
+        x: &DeviceBuffer,
+        weight: &DeviceBuffer,
+        n: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(n, "dsv4 rms n")?;
+        require_f32_capacity(x, n, "dsv4 rms x")?;
+        require_f32_capacity(weight, n, "dsv4 rms weight")?;
+        launch_status(unsafe {
+            hi_cuda_launch_dsv4_rms_exact(
+                x.as_mut_ptr(),
+                weight.as_ptr(),
+                n as c_int,
+                eps,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_dsv4_rms_exact")
+    }
+
+    /// Per-head unweighted q RMS + forward rope tail, in place. `rope` points
+    /// `rope_byte_offset` into the step's host-computed [cos | sin] table.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_dsv4_q_prep(
+        q: &DeviceBuffer,
+        heads: usize,
+        head_dim: usize,
+        rope_dims: usize,
+        rope: &DeviceBuffer,
+        rope_byte_offset: usize,
+        rms_eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(heads, "dsv4 q prep heads")?;
+        ensure_len(head_dim, "dsv4 q prep head_dim")?;
+        ensure_len(rope_dims, "dsv4 q prep rope_dims")?;
+        require_f32_capacity(q, heads * head_dim, "dsv4 q prep q")?;
+        require_f32_capacity_at(rope, rope_byte_offset, rope_dims, "dsv4 q prep rope")?;
+        launch_status(unsafe {
+            hi_cuda_launch_dsv4_q_prep(
+                q.as_mut_ptr(),
+                heads as c_int,
+                head_dim as c_int,
+                rope_dims as c_int,
+                ptr_at(rope, rope_byte_offset),
+                rms_eps,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_dsv4_q_prep")
+    }
+
+    /// Shared KV latent prep (rms_norm + rope), written to the ring slot and
+    /// the arena mirror slot.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_dsv4_kv_prep(
+        kv_in: &DeviceBuffer,
+        norm: &DeviceBuffer,
+        head_dim: usize,
+        rope_dims: usize,
+        rope: &DeviceBuffer,
+        rope_byte_offset: usize,
+        rms_eps: f32,
+        ring: &DeviceBuffer,
+        ring_byte_offset: usize,
+        arena: &DeviceBuffer,
+        arena_byte_offset: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(head_dim, "dsv4 kv prep head_dim")?;
+        ensure_len(rope_dims, "dsv4 kv prep rope_dims")?;
+        require_f32_capacity(kv_in, head_dim, "dsv4 kv prep input")?;
+        require_f32_capacity(norm, head_dim, "dsv4 kv prep norm")?;
+        require_f32_capacity_at(rope, rope_byte_offset, rope_dims, "dsv4 kv prep rope")?;
+        require_f32_capacity_at(ring, ring_byte_offset, head_dim, "dsv4 kv prep ring slot")?;
+        require_f32_capacity_at(
+            arena,
+            arena_byte_offset,
+            head_dim,
+            "dsv4 kv prep arena slot",
+        )?;
+        launch_status(unsafe {
+            hi_cuda_launch_dsv4_kv_prep(
+                kv_in.as_ptr(),
+                norm.as_ptr(),
+                head_dim as c_int,
+                rope_dims as c_int,
+                ptr_at(rope, rope_byte_offset),
+                rms_eps,
+                ptr_at(ring, ring_byte_offset),
+                ptr_at(arena, arena_byte_offset),
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_dsv4_kv_prep")
+    }
+
+    /// Latent-MQA decode attention over [compressed blocks ‖ ring window]
+    /// with per-head sinks, one block per head; bit-exact host port.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_dsv4_attention_decode(
+        q: &DeviceBuffer,
+        comp: Option<(&DeviceBuffer, &DeviceBuffer, usize)>,
+        sel: Option<&DeviceBuffer>,
+        n_comp: usize,
+        ring: &DeviceBuffer,
+        ring_cap: usize,
+        first_ring_pos: usize,
+        n_ring: usize,
+        sinks: Option<&DeviceBuffer>,
+        scale: f32,
+        heads: usize,
+        head_dim: usize,
+        rope_dims: usize,
+        rope_inv: &DeviceBuffer,
+        rope_inv_byte_offset: usize,
+        out: &DeviceBuffer,
+        w_scratch: &DeviceBuffer,
+        wn_scratch: &DeviceBuffer,
+        max_keys: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(heads, "dsv4 attention heads")?;
+        ensure_len(head_dim, "dsv4 attention head_dim")?;
+        ensure_len(ring_cap, "dsv4 attention ring cap")?;
+        ensure_len(n_comp, "dsv4 attention n_comp")?;
+        ensure_len(n_ring, "dsv4 attention n_ring")?;
+        ensure_len(max_keys, "dsv4 attention max_keys")?;
+        if n_comp + n_ring == 0 || n_comp + n_ring > max_keys {
+            bail!(
+                "dsv4 attention key count {} out of range (max {max_keys})",
+                n_comp + n_ring
+            );
+        }
+        require_f32_capacity(q, heads * head_dim, "dsv4 attention q")?;
+        require_f32_capacity(ring, ring_cap * head_dim, "dsv4 attention ring")?;
+        require_f32_capacity(out, heads * head_dim, "dsv4 attention out")?;
+        require_f32_capacity(w_scratch, heads * max_keys, "dsv4 attention w scratch")?;
+        require_f32_capacity(wn_scratch, heads * max_keys, "dsv4 attention wn scratch")?;
+        require_f32_capacity_at(
+            rope_inv,
+            rope_inv_byte_offset,
+            rope_dims,
+            "dsv4 attention rope",
+        )?;
+        let mut comp_stride = 0usize;
+        if let Some((keys, values, stride)) = comp {
+            ensure_len(stride, "dsv4 attention comp stride")?;
+            comp_stride = stride;
+            // With a selection list the kernel indexes rows by sel[k]; the
+            // caller sizes the buffers to its block count (>= any sel entry),
+            // so only the unselected direct-prefix case is checkable here.
+            if n_comp > 0 && sel.is_none() {
+                require_f32_capacity(keys, n_comp * stride, "dsv4 attention comp keys")?;
+                require_f32_capacity(values, n_comp * stride, "dsv4 attention comp values")?;
+            }
+        } else if n_comp > 0 {
+            bail!("dsv4 attention has {n_comp} compressed keys but no compressed buffers");
+        }
+        if let Some(sinks) = sinks {
+            require_f32_capacity(sinks, heads, "dsv4 attention sinks")?;
+        }
+        if let Some(sel) = sel {
+            require_f32_capacity(sel, n_comp, "dsv4 attention selection")?;
+        }
+        let first = c_long::try_from(first_ring_pos)
+            .map_err(|_| anyhow!("dsv4 attention ring position overflows c_long"))?;
+        launch_status(unsafe {
+            hi_cuda_launch_dsv4_attention_decode(
+                q.as_ptr(),
+                comp.map_or(std::ptr::null(), |(keys, _, _)| keys.as_ptr()),
+                comp.map_or(std::ptr::null(), |(_, values, _)| values.as_ptr()),
+                comp_stride as c_int,
+                sel.map_or(std::ptr::null(), DeviceBuffer::as_ptr),
+                n_comp as c_int,
+                ring.as_ptr(),
+                ring_cap as c_int,
+                first,
+                n_ring as c_int,
+                sinks.map_or(std::ptr::null(), DeviceBuffer::as_ptr),
+                scale,
+                heads as c_int,
+                head_dim as c_int,
+                rope_dims as c_int,
+                ptr_at(rope_inv, rope_inv_byte_offset),
+                out.as_mut_ptr(),
+                w_scratch.as_mut_ptr(),
+                wn_scratch.as_mut_ptr(),
+                max_keys as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_dsv4_attention_decode")
+    }
+
+    /// APE compressor block completion: gate softmax over the block's `ratio`
+    /// positions, weighted kv average, rms-normed halves appended to the
+    /// compressed cache row (`key/val` at byte offsets) and mirrored into the
+    /// arena delta slots.
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_dsv4_compressor_emit(
+        gates: &DeviceBuffer,
+        kvs: &DeviceBuffer,
+        row_stride: usize,
+        ape: &DeviceBuffer,
+        norm: &DeviceBuffer,
+        ratio: usize,
+        dim: usize,
+        width: usize,
+        rms_eps: f32,
+        keys: &DeviceBuffer,
+        key_byte_offset: usize,
+        values: &DeviceBuffer,
+        val_byte_offset: usize,
+        arena: &DeviceBuffer,
+        arena_k_byte_offset: usize,
+        arena_v_byte_offset: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(ratio, "dsv4 compressor ratio")?;
+        ensure_len(dim, "dsv4 compressor dim")?;
+        ensure_len(width, "dsv4 compressor width")?;
+        ensure_len(row_stride, "dsv4 compressor row stride")?;
+        if width != dim && width != 2 * dim {
+            bail!("dsv4 compressor width {width} must be dim {dim} or 2*dim");
+        }
+        if row_stride < width {
+            bail!("dsv4 compressor row stride {row_stride} narrower than width {width}");
+        }
+        require_f32_capacity(gates, ratio * row_stride, "dsv4 compressor gates")?;
+        require_f32_capacity(kvs, ratio * row_stride, "dsv4 compressor kvs")?;
+        require_f32_capacity(ape, ratio * width, "dsv4 compressor ape")?;
+        require_f32_capacity(norm, dim, "dsv4 compressor norm")?;
+        require_f32_capacity_at(keys, key_byte_offset, dim, "dsv4 compressor key row")?;
+        require_f32_capacity_at(values, val_byte_offset, dim, "dsv4 compressor value row")?;
+        require_f32_capacity_at(arena, arena_k_byte_offset, dim, "dsv4 compressor arena K")?;
+        require_f32_capacity_at(arena, arena_v_byte_offset, dim, "dsv4 compressor arena V")?;
+        launch_status(unsafe {
+            hi_cuda_launch_dsv4_compressor_emit(
+                gates.as_ptr(),
+                kvs.as_ptr(),
+                row_stride as c_int,
+                ape.as_ptr(),
+                norm.as_ptr(),
+                ratio as c_int,
+                dim as c_int,
+                width as c_int,
+                rms_eps,
+                ptr_at(keys, key_byte_offset),
+                ptr_at(values, val_byte_offset),
+                ptr_at(arena, arena_k_byte_offset),
+                ptr_at(arena, arena_v_byte_offset),
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_dsv4_compressor_emit")
+    }
+
+    /// Lightning-indexer block scoring (relu dot per head, weighted sum).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_dsv4_indexer_score(
+        qi: &DeviceBuffer,
+        head_w: &DeviceBuffer,
+        keys: &DeviceBuffer,
+        key_stride: usize,
+        n_blocks: usize,
+        idx_heads: usize,
+        idx_key: usize,
+        head_scale: f32,
+        key_scale: f32,
+        scores: &DeviceBuffer,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(n_blocks, "dsv4 indexer blocks")?;
+        ensure_len(idx_heads, "dsv4 indexer heads")?;
+        ensure_len(idx_key, "dsv4 indexer key dim")?;
+        ensure_len(key_stride, "dsv4 indexer key stride")?;
+        require_f32_capacity(qi, idx_heads * idx_key, "dsv4 indexer qi")?;
+        require_f32_capacity(head_w, idx_heads, "dsv4 indexer head weights")?;
+        require_f32_capacity(keys, n_blocks * key_stride, "dsv4 indexer keys")?;
+        require_f32_capacity(scores, n_blocks, "dsv4 indexer scores")?;
+        launch_status(unsafe {
+            hi_cuda_launch_dsv4_indexer_score(
+                qi.as_ptr(),
+                head_w.as_ptr(),
+                keys.as_ptr(),
+                key_stride as c_int,
+                n_blocks as c_int,
+                idx_heads as c_int,
+                idx_key as c_int,
+                head_scale,
+                key_scale,
+                scores.as_mut_ptr(),
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_dsv4_indexer_score")
+    }
+
+    /// Serial top-k block selection (host sort semantics: descending
+    /// total_cmp, lower index on ties, ascending output).
+    pub fn launch_dsv4_indexer_select(
+        scores: &DeviceBuffer,
+        n_blocks: usize,
+        top_k: usize,
+        marks: &DeviceBuffer,
+        sel_out: &DeviceBuffer,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(n_blocks, "dsv4 indexer select blocks")?;
+        ensure_len(top_k, "dsv4 indexer select top_k")?;
+        require_f32_capacity(scores, n_blocks, "dsv4 indexer select scores")?;
+        if marks.bytes() < n_blocks {
+            bail!("dsv4 indexer select marks scratch too small");
+        }
+        require_f32_capacity(sel_out, top_k.min(n_blocks), "dsv4 indexer select output")?;
+        launch_status(unsafe {
+            hi_cuda_launch_dsv4_indexer_select(
+                scores.as_ptr(),
+                n_blocks as c_int,
+                top_k as c_int,
+                marks.as_mut_ptr(),
+                sel_out.as_mut_ptr(),
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_dsv4_indexer_select")
+    }
+
+    /// HyperHead: collapse the hc streams with sigmoid gates (host verbatim).
+    #[allow(clippy::too_many_arguments)]
+    pub fn launch_dsv4_hyper_head(
+        streams: &DeviceBuffer,
+        func: &DeviceBuffer,
+        base: &DeviceBuffer,
+        scale0: f32,
+        n: usize,
+        embed: usize,
+        rms_eps: f32,
+        hc_eps: f32,
+        out: &DeviceBuffer,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(n, "dsv4 hyper head n")?;
+        ensure_len(embed, "dsv4 hyper head embed")?;
+        require_f32_capacity(streams, n * embed, "dsv4 hyper head streams")?;
+        require_f32_capacity(func, n * n * embed, "dsv4 hyper head func")?;
+        require_f32_capacity(base, n, "dsv4 hyper head base")?;
+        require_f32_capacity(out, embed, "dsv4 hyper head out")?;
+        launch_status(unsafe {
+            hi_cuda_launch_dsv4_hyper_head(
+                streams.as_ptr(),
+                func.as_ptr(),
+                base.as_ptr(),
+                scale0,
+                n as c_int,
+                embed as c_int,
+                rms_eps,
+                hc_eps,
+                out.as_mut_ptr(),
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_dsv4_hyper_head")
     }
 
     /// Fused NVFP4 GEMV (M=1 decode): reads the packed fp4 blocks natively against
@@ -2892,6 +3909,50 @@ mod native {
         launch_status(unsafe {
             hi_cuda_launch_dequantize_matrix(
                 input.as_ptr(),
+                output.as_mut_ptr(),
+                elements as c_int,
+                quant_type as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_dequantize_matrix")
+    }
+
+    /// [`launch_dequantize_matrix`] with the packed input starting at a byte
+    /// offset into `input`. The DeepSeek-V4 expert pool packs many expert
+    /// slices into shared arena chunks; its batched-prefill path dequantizes a
+    /// pooled slice in place instead of re-uploading it. The dequant kernels
+    /// read block bytes individually, so the offset needs no alignment beyond
+    /// keeping `input_bytes` packed bytes inside the buffer.
+    pub fn launch_dequantize_matrix_at(
+        input: &DeviceBuffer,
+        input_byte_offset: usize,
+        input_bytes: usize,
+        output: &DeviceBuffer,
+        elements: usize,
+        quant_type: i32,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(elements, "dequantize elements")?;
+        match input_byte_offset.checked_add(input_bytes) {
+            Some(end) if end <= input.bytes() => {}
+            _ => bail!(
+                "dequantize input slice at byte {input_byte_offset} (+{input_bytes}) exceeds the {}-byte buffer",
+                input.bytes()
+            ),
+        }
+        let Some(output_bytes) = elements.checked_mul(std::mem::size_of::<f32>()) else {
+            bail!("dequantize output byte length overflows usize");
+        };
+        if output_bytes > output.bytes() {
+            bail!(
+                "dequantize output of {elements} f32 elements exceeds the {}-byte buffer",
+                output.bytes()
+            );
+        }
+        launch_status(unsafe {
+            hi_cuda_launch_dequantize_matrix(
+                input.as_ptr().cast::<u8>().add(input_byte_offset).cast(),
                 output.as_mut_ptr(),
                 elements as c_int,
                 quant_type as c_int,
@@ -5069,6 +6130,22 @@ mod native {
     fn ensure_len(value: usize, label: &str) -> Result<()> {
         if value > c_int::MAX as usize {
             bail!("{label} {value} exceeds CUDA launch i32 limit");
+        }
+        Ok(())
+    }
+
+    /// Require `buffer` to hold at least `elements` 4-byte values (f32 or
+    /// i32); used by the DeepSeek-V4 MoE launchers, whose operands are all
+    /// 4-byte typed.
+    fn require_f32_capacity(buffer: &DeviceBuffer, elements: usize, label: &str) -> Result<()> {
+        let bytes = elements
+            .checked_mul(4)
+            .ok_or_else(|| anyhow!("{label} byte length overflows usize"))?;
+        if bytes > buffer.bytes() {
+            bail!(
+                "{label} needs {bytes} bytes but the buffer holds {}",
+                buffer.bytes()
+            );
         }
         Ok(())
     }

@@ -1399,6 +1399,1224 @@ __global__ void nvfp4_gemv_kernel(
   }
 }
 
+// ---------------------------------------------------------------------------
+// DeepSeek-V4 device MoE block (Wave-2 Stage 2a).
+//
+// The device MoE path must reproduce the HOST MoE path bit-for-bit so the
+// `HI_DSV4_NO_DEVICE_MOE=1` A/B produces identical greedy tokens (the Stage-2a
+// parity gate). The host math runs Rust f32 ops whose exp/ln lower to glibc
+// 2.39's expf/logf (the ARM optimized-routines table method, built with
+// -mfma so gcc contracts single-use multiplies into FMAs). The device ports
+// below replicate that implementation exactly — same tables (extracted from
+// the installed libm.so.6 and cross-checked against glibc source), same
+// double-precision op sequence with explicit __fma_rn at the contraction
+// sites, so no nvcc -fmad choice can perturb them. A host-side exhaustive
+// sweep over all 2^32 f32 bit patterns validates the op placement (see
+// dsv4_gpu_exact_math_matches_host, which re-runs a dense sweep on device).
+// NaN payloads may differ (host 0/0 yields the x86 default NaN) — NaN inputs
+// mean the run is already garbage.
+
+// glibc sysdeps/ieee754/flt-32 e_exp2f_data: tab, poly_scaled, shift,
+// invln2_scaled. Plain __device__ (not __constant__): the table index differs
+// per lane, and divergent __constant__ loads serialize into replays.
+__device__ const unsigned long long DSV4_EXP2F_TAB[32] = {
+    0x3ff0000000000000ull, 0x3fefd9b0d3158574ull, 0x3fefb5586cf9890full, 0x3fef9301d0125b51ull,
+    0x3fef72b83c7d517bull, 0x3fef54873168b9aaull, 0x3fef387a6e756238ull, 0x3fef1e9df51fdee1ull,
+    0x3fef06fe0a31b715ull, 0x3feef1a7373aa9cbull, 0x3feedea64c123422ull, 0x3feece086061892dull,
+    0x3feebfdad5362a27ull, 0x3feeb42b569d4f82ull, 0x3feeab07dd485429ull, 0x3feea47eb03a5585ull,
+    0x3feea09e667f3bcdull, 0x3fee9f75e8ec5f74ull, 0x3feea11473eb0187ull, 0x3feea589994cce13ull,
+    0x3feeace5422aa0dbull, 0x3feeb737b0cdc5e5ull, 0x3feec49182a3f090ull, 0x3feed503b23e255dull,
+    0x3feee89f995ad3adull, 0x3feeff76f2fb5e47ull, 0x3fef199bdd85529cull, 0x3fef3720dcef9069ull,
+    0x3fef5818dcfba487ull, 0x3fef7c97337b9b5full, 0x3fefa4afa2a490daull, 0x3fefd0765b6e4540ull,
+};
+
+// glibc 2.39 expf, bit-exact (validated exhaustively over all 2^32 inputs
+// against the host libm). InvLn2N = 0x1.71547652b82fep+0 * 32, SHIFT =
+// 0x1.8p52, C = poly_scaled. gcc -mfma fuses z = InvLn2N*x into BOTH its
+// uses (z + SHIFT, z - kd) and deletes the multiply — hence the two fmas.
+__device__ __noinline__ float dsv4_glibc_expf(float x) {
+  const unsigned int ix = __float_as_uint(x);
+  const unsigned int abstop = (ix >> 20) & 0x7ff;
+  if (abstop >= 0x42b) {  // |x| >= 88 or nan
+    if (ix == 0xff800000u) {
+      return 0.0f;  // exp(-inf)
+    }
+    if (abstop >= 0x7f8) {
+      return x + x;  // inf/nan
+    }
+    if (x > 0x1.62e42ep6f) {  // > log(0x1p128): overflow -> +inf
+      return __uint_as_float(0x7f800000u);
+    }
+    if (x < -0x1.9fe368p6f) {  // < log(0x1p-150): underflow -> +0
+      return 0.0f;
+    }
+    if (x < -0x1.9d1d9ep6f) {  // may_uflow: glibc returns 0x1.4p-75f^2
+      return __fmul_rn(0x1.4p-75f, 0x1.4p-75f);
+    }
+  }
+  const double xd = static_cast<double>(x);
+  const double inv_ln2n = __longlong_as_double(0x40471547652B82FEll);
+  const double shift = __longlong_as_double(0x4338000000000000ll);
+  const double kd_pre = __fma_rn(inv_ln2n, xd, shift);
+  const unsigned long long ki = static_cast<unsigned long long>(__double_as_longlong(kd_pre));
+  const double kd = __dsub_rn(kd_pre, shift);
+  const double r = __fma_rn(inv_ln2n, xd, -kd);
+  unsigned long long t = DSV4_EXP2F_TAB[ki & 31ull];
+  t += ki << (52 - 5);
+  const double s = __longlong_as_double(static_cast<long long>(t));
+  const double c0 = __longlong_as_double(0x3ebc6af84b912394ll);
+  const double c1 = __longlong_as_double(0x3f2ebfce50fac4f3ll);
+  const double c2 = __longlong_as_double(0x3f962e42ff0c52d6ll);
+  const double p = __fma_rn(c0, r, c1);
+  const double r2 = __dmul_rn(r, r);
+  double y = __fma_rn(c2, r, 1.0);
+  y = __fma_rn(p, r2, y);
+  return __double2float_rn(__dmul_rn(y, s));
+}
+
+// glibc sysdeps/ieee754/flt-32 e_logf_data: {invc, logc} pairs and poly.
+__device__ const unsigned long long DSV4_LOGF_TAB[32] = {
+    0x3ff661ec79f8f3beull, 0xbfd57bf7808caadeull, 0x3ff571ed4aaf883dull, 0xbfd2bef0a7c06ddbull,
+    0x3ff49539f0f010b0ull, 0xbfd01eae7f513a67ull, 0x3ff3c995b0b80385ull, 0xbfcb31d8a68224e9ull,
+    0x3ff30d190c8864a5ull, 0xbfc6574f0ac07758ull, 0x3ff25e227b0b8ea0ull, 0xbfc1aa2bc79c8100ull,
+    0x3ff1bb4a4a1a343full, 0xbfba4e76ce8c0e5eull, 0x3ff12358f08ae5baull, 0xbfb1973c5a611cccull,
+    0x3ff0953f419900a7ull, 0xbfa252f438e10c1eull, 0x3ff0000000000000ull, 0x0000000000000000ull,
+    0x3fee608cfd9a47acull, 0x3faaa5aa5df25984ull, 0x3feca4b31f026aa0ull, 0x3fbc5e53aa362eb4ull,
+    0x3feb2036576afce6ull, 0x3fc526e57720db08ull, 0x3fe9c2d163a1aa2dull, 0x3fcbc2860d224770ull,
+    0x3fe886e6037841edull, 0x3fd1058bc8a07ee1ull, 0x3fe767dcf5534862ull, 0x3fd4043057b6ee09ull,
+};
+
+// glibc 2.39 logf, bit-exact (validated exhaustively over all 2^32 inputs).
+__device__ __noinline__ float dsv4_glibc_logf(float x) {
+  unsigned int ix = __float_as_uint(x);
+  if (ix == 0x3f800000u) {
+    return 0.0f;  // log(1) with WANT_ROUNDING
+  }
+  if (ix - 0x00800000u >= 0x7f800000u - 0x00800000u) {
+    // x < 0x1p-126 or inf or nan.
+    if (ix * 2u == 0u) {
+      return __uint_as_float(0xff800000u);  // log(+-0) = -inf
+    }
+    if (ix == 0x7f800000u) {
+      return x;  // log(inf) = inf
+    }
+    if ((ix & 0x80000000u) || ix * 2u >= 0xff000000u) {
+      const float z = __fsub_rn(x, x);
+      return __fdiv_rn(z, z);  // invalid -> nan
+    }
+    // Subnormal: normalize.
+    ix = __float_as_uint(__fmul_rn(x, 0x1p23f));
+    ix -= 23u << 23;
+  }
+  const unsigned int tmp = ix - 0x3f330000u;
+  const int i = static_cast<int>((tmp >> (23 - 4)) & 15u);
+  const int k = static_cast<int>(tmp) >> 23;
+  const unsigned int iz = ix - (tmp & (0x1ffu << 23));
+  const double invc = __longlong_as_double(static_cast<long long>(DSV4_LOGF_TAB[2 * i]));
+  const double logc = __longlong_as_double(static_cast<long long>(DSV4_LOGF_TAB[2 * i + 1]));
+  const double z = static_cast<double>(__uint_as_float(iz));
+  const double r = __fma_rn(z, invc, -1.0);
+  const double ln2 = __longlong_as_double(0x3FE62E42FEFA39EFll);
+  const double y0 = __fma_rn(static_cast<double>(k), ln2, logc);
+  const double a0 = __longlong_as_double(0xbfd00ea348b88334ll);
+  const double a1 = __longlong_as_double(0x3fd5575b0be00b6all);
+  const double a2 = __longlong_as_double(0xbfdffffef20a4123ll);
+  const double r2 = __dmul_rn(r, r);
+  double y = __fma_rn(a1, r, a2);
+  y = __fma_rn(a0, r2, y);
+  y = __fma_rn(y, r2, __dadd_rn(y0, r));
+  return __double2float_rn(y);
+}
+
+// Rust qwen_cpu::softplus verbatim: x > 20 -> x; x < -20 -> exp(x); else
+// ln(1 + exp(x)). NaN falls through both compares into the ln path like Rust.
+__device__ __forceinline__ float dsv4_softplus(float x) {
+  if (x > 20.0f) {
+    return x;
+  }
+  if (x < -20.0f) {
+    return dsv4_glibc_expf(x);
+  }
+  return dsv4_glibc_logf(__fadd_rn(1.0f, dsv4_glibc_expf(x)));
+}
+
+// Rust qwen_cpu::silu verbatim: x / (1 + exp(-x)); explicit _rn ops so nvcc
+// cannot contract anything.
+__device__ __forceinline__ float dsv4_silu(float x) {
+  return __fdiv_rn(x, __fadd_rn(1.0f, dsv4_glibc_expf(-x)));
+}
+
+// Scoring + selection for one MoE layer, one block per token. Scores
+// (sqrt-softplus of the router logits) parallelize across the block into
+// shared memory — each score is elementwise, so parallel order cannot change
+// bits. Selection/weights then run SERIALLY on thread 0, mirroring the host
+// routing loop op for op: descending adjusted score (score + optional
+// selection bias) with the LOWER index winning ties, weights = raw scores at
+// the selected experts, one left-to-right sum for the optional normalization,
+// then the routed scale. Hash layers (tid2eid != null) gather the table row
+// (token id clamped into the table) instead of ranking, weights still from
+// the scores. B and top_k are tiny (decode B=1, top_k=6), so the serial pass
+// is noise next to the expert GEMVs it unblocks.
+__global__ void dsv4_moe_select_kernel(
+    const float* __restrict__ logits,     // [tokens, experts]
+    const float* __restrict__ bias,       // [experts] or null
+    const int* __restrict__ tid2eid,      // [table_tokens, top_k] or null
+    const int* __restrict__ token_ids,    // [tokens] (used only with tid2eid)
+    int table_tokens,
+    int* __restrict__ out_ids,            // [tokens, top_k]
+    float* __restrict__ out_weights,      // [tokens, top_k]
+    int experts,
+    int top_k,
+    int norm,
+    float scale) {
+  extern __shared__ float scores[];  // [experts]
+  const int token = blockIdx.x;
+  const float* row = logits + static_cast<long>(token) * experts;
+  for (int e = threadIdx.x; e < experts; e += blockDim.x) {
+    scores[e] = sqrtf(dsv4_softplus(row[e]));
+  }
+  __syncthreads();
+  if (threadIdx.x != 0) {
+    return;
+  }
+  int* ids = out_ids + static_cast<long>(token) * top_k;
+  float* weights = out_weights + static_cast<long>(token) * top_k;
+  if (tid2eid != nullptr) {
+    int tok = token_ids[token];
+    if (tok > table_tokens - 1) {
+      tok = table_tokens - 1;  // clamp into the table like the host
+    }
+    for (int j = 0; j < top_k; ++j) {
+      const int expert = tid2eid[static_cast<long>(tok) * top_k + j];
+      ids[j] = expert;
+      weights[j] = scores[expert];
+    }
+  } else {
+    // Serial top-k over adjusted = score (+ bias), the host sort's order:
+    // strictly descending in (key, -index) lex order via the prev-based
+    // eligibility walk (same pattern as moe_topk_router_kernel above).
+    float prev_key = 0.0f;
+    int prev_id = -1;
+    for (int rank = 0; rank < top_k; ++rank) {
+      int best_id = -1;
+      float best_key = 0.0f;
+      for (int e = 0; e < experts; ++e) {
+        const float key =
+            bias != nullptr ? __fadd_rn(scores[e], bias[e]) : scores[e];
+        if (prev_id >= 0 &&
+            !(key < prev_key || (key == prev_key && e > prev_id))) {
+          continue;
+        }
+        if (best_id < 0 || key > best_key || (key == best_key && e < best_id)) {
+          best_id = e;
+          best_key = key;
+        }
+      }
+      if (best_id < 0) {
+        best_id = rank < experts ? rank : experts - 1;  // unreachable guard
+        best_key = 0.0f;
+      }
+      ids[rank] = best_id;
+      weights[rank] = scores[best_id];
+      prev_id = best_id;
+      prev_key = best_key;
+    }
+  }
+  // Host weight postprocess verbatim: left-to-right sum, normalize when
+  // enabled and denom > f32::EPSILON, then scale — as two separate passes.
+  if (norm && top_k > 1) {
+    float denom = 0.0f;
+    for (int j = 0; j < top_k; ++j) {
+      denom = __fadd_rn(denom, weights[j]);
+    }
+    if (denom > __uint_as_float(0x34000000u) /* f32::EPSILON */) {
+      for (int j = 0; j < top_k; ++j) {
+        weights[j] = __fdiv_rn(weights[j], denom);
+      }
+    }
+  }
+  for (int j = 0; j < top_k; ++j) {
+    weights[j] = __fmul_rn(weights[j], scale);
+  }
+}
+
+extern "C" int hi_cuda_launch_dsv4_moe_select(
+    const void* logits, const void* bias, const void* tid2eid, const void* token_ids,
+    int table_tokens, void* out_ids, void* out_weights, int tokens, int experts,
+    int top_k, int norm, float scale, void* stream) {
+  if (logits == nullptr || out_ids == nullptr || out_weights == nullptr || tokens <= 0 ||
+      experts <= 0 || top_k <= 0 || stream == nullptr ||
+      (tid2eid != nullptr && (token_ids == nullptr || table_tokens <= 0))) {
+    return 1;
+  }
+  const int block = 256;
+  const size_t shmem = static_cast<size_t>(experts) * sizeof(float);
+  dsv4_moe_select_kernel<<<tokens, block, shmem, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const float*>(logits), static_cast<const float*>(bias),
+      static_cast<const int*>(tid2eid), static_cast<const int*>(token_ids), table_tokens,
+      static_cast<int*>(out_ids), static_cast<float*>(out_weights), experts, top_k, norm,
+      scale);
+  return 0;
+}
+
+// SwiGLU with the DeepSeek-V4 per-layer clamp, elementwise over a batch of
+// rows: gate ceiled at +clamp, up clamped to ±clamp (clamp <= 0 disables —
+// the shared expert passes 0), then silu(gate) * up with the bit-exact silu.
+// fminf/fmaxf match Rust f32::min/max NaN-free semantics. `out` may alias
+// `gate` (the provider runs it in place).
+__global__ void dsv4_swiglu_clamp_kernel(
+    const float* __restrict__ gate,
+    const float* __restrict__ up,
+    float* __restrict__ out,
+    int n,
+    float clamp) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= n) {
+    return;
+  }
+  float g = gate[idx];
+  float u = up[idx];
+  if (clamp > 0.0f) {
+    g = fminf(g, clamp);
+    u = fminf(fmaxf(u, -clamp), clamp);
+  }
+  out[idx] = __fmul_rn(dsv4_silu(g), u);
+}
+
+extern "C" int hi_cuda_launch_dsv4_swiglu_clamp(
+    const void* gate, const void* up, void* out, int n, float clamp, void* stream) {
+  if (gate == nullptr || up == nullptr || out == nullptr || n <= 0 || stream == nullptr) {
+    return 1;
+  }
+  dim3 block(256);
+  dim3 grid((n + block.x - 1) / block.x);
+  dsv4_swiglu_clamp_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const float*>(gate), static_cast<const float*>(up),
+      static_cast<float*>(out), n, clamp);
+  return 0;
+}
+
+// Weighted accumulation of the routed expert outputs plus the shared expert:
+// ys[t][i] = sum_j w[t][j] * expert_out[t][j][i] (+ shared_out[t][i]).
+// The j loop runs serially in selection order with explicit mul-then-add
+// roundings — the host accumulation order — so a rank permutation or fma
+// contraction cannot perturb bits. Hash routing may select one expert twice;
+// both rank slots hold bit-identical GEMV outputs, matching the host's
+// compute-once-add-twice.
+__global__ void dsv4_moe_accum_kernel(
+    const float* __restrict__ expert_out,  // [tokens, top_k, embed]
+    const float* __restrict__ weights,     // [tokens, top_k]
+    const float* __restrict__ shared_out,  // [tokens, embed] or null
+    float* __restrict__ ys,                // [tokens, embed]
+    int tokens,
+    int top_k,
+    int embed) {
+  const long idx = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= static_cast<long>(tokens) * embed) {
+    return;
+  }
+  const int t = static_cast<int>(idx / embed);
+  const int i = static_cast<int>(idx % embed);
+  float acc = 0.0f;
+  for (int j = 0; j < top_k; ++j) {
+    const float w = weights[t * top_k + j];
+    const float v = expert_out[(static_cast<long>(t) * top_k + j) * embed + i];
+    acc = __fadd_rn(acc, __fmul_rn(w, v));
+  }
+  if (shared_out != nullptr) {
+    acc = __fadd_rn(acc, shared_out[idx]);
+  }
+  ys[idx] = acc;
+}
+
+extern "C" int hi_cuda_launch_dsv4_moe_accum(
+    const void* expert_out, const void* weights, const void* shared_out, void* ys,
+    int tokens, int top_k, int embed, void* stream) {
+  if (expert_out == nullptr || weights == nullptr || ys == nullptr || tokens <= 0 ||
+      top_k <= 0 || embed <= 0 || stream == nullptr) {
+    return 1;
+  }
+  const long n = static_cast<long>(tokens) * embed;
+  dim3 block(256);
+  dim3 grid(static_cast<unsigned int>((n + block.x - 1) / block.x));
+  dsv4_moe_accum_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const float*>(expert_out), static_cast<const float*>(weights),
+      static_cast<const float*>(shared_out), static_cast<float*>(ys), tokens, top_k,
+      embed);
+  return 0;
+}
+
+// Test support: elementwise op dispatch so the parity suite can sweep the
+// bit-exact math ports against the host libm (op 0 = expf, 1 = logf,
+// 2 = softplus, 3 = silu).
+__global__ void dsv4_exact_math_kernel(
+    const float* __restrict__ input, float* __restrict__ output, int n, int op) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= n) {
+    return;
+  }
+  const float x = input[idx];
+  float y;
+  switch (op) {
+    case 0: y = dsv4_glibc_expf(x); break;
+    case 1: y = dsv4_glibc_logf(x); break;
+    case 2: y = dsv4_softplus(x); break;
+    default: y = dsv4_silu(x); break;
+  }
+  output[idx] = y;
+}
+
+extern "C" int hi_cuda_launch_dsv4_exact_math(
+    const void* input, void* output, int n, int op, void* stream) {
+  if (input == nullptr || output == nullptr || n <= 0 || stream == nullptr) {
+    return 1;
+  }
+  dim3 block(256);
+  dim3 grid((n + block.x - 1) / block.x);
+  dsv4_exact_math_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const float*>(input), static_cast<float*>(output), n, op);
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// DeepSeek-V4 device decode step (Wave-2 Stage 2b).
+//
+// These kernels move the remaining host-resident decode math (hyper
+// connections + sinkhorn, rms norms, rope, latent-MQA attention with sinks,
+// APE compressors, lightning indexer, embedding gather, hyper head) onto the
+// GPU. Every kernel is a bit-exact port of the corresponding host routine in
+// dsv4_cpu.rs / qwen_cpu.rs: the host folds are strictly SEQUENTIAL f32 ops
+// (Rust never contracts into FMAs), so every reduction here runs as a serial
+// __fadd_rn/__fmul_rn chain on one thread in the host's exact order, exp/log
+// go through the bit-exact glibc ports above, and elementwise work
+// parallelizes freely (per-element rounding is order-independent). Rope
+// sin/cos tables are computed on HOST with the same libm calls the host path
+// makes and uploaded per step, so no device sinf/cosf enters the math.
+
+// Rust `qwen_cpu::sigmoid` verbatim: 1 / (1 + exp(-x)).
+__device__ __forceinline__ float dsv4_sigmoid(float x) {
+  return __fdiv_rn(1.0f, __fadd_rn(1.0f, dsv4_glibc_expf(-x)));
+}
+
+// Rust `qwen_cpu::dot` verbatim: ((0 + a0*b0) + a1*b1) + ... — the leading
+// 0.0 add included (it canonicalizes -0.0 products exactly like the host).
+__device__ float dsv4_dot_serial(
+    const float* __restrict__ a, const float* __restrict__ b, int n) {
+  float acc = 0.0f;
+  for (int i = 0; i < n; ++i) {
+    acc = __fadd_rn(acc, __fmul_rn(a[i], b[i]));
+  }
+  return acc;
+}
+
+// Host `values.iter().map(|v| v*v).sum::<f32>()` verbatim.
+__device__ float dsv4_sumsq_serial(const float* __restrict__ x, int n) {
+  float acc = 0.0f;
+  for (int i = 0; i < n; ++i) {
+    acc = __fadd_rn(acc, __fmul_rn(x[i], x[i]));
+  }
+  return acc;
+}
+
+// Host `(sum / n + eps).sqrt().recip()` verbatim (each op singly rounded).
+__device__ __forceinline__ float dsv4_rms_inv(float sumsq, int n, float eps) {
+  const float mean = __fdiv_rn(sumsq, static_cast<float>(n));
+  return __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(mean, eps)));
+}
+
+// f32 bits mapped monotonically so unsigned compare == Rust total_cmp.
+__device__ __forceinline__ unsigned int dsv4_total_bits(float x) {
+  const unsigned int u = __float_as_uint(x);
+  return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+// Rope layout per (base, direction): [cos(half) | sin(half)], half =
+// rope_dims/2, values host-computed at the step's position. Rotates the
+// trailing rope_dims of a head in place, INTERLEAVED pairs, host expression
+// order: x0' = x0*cos - x1*sin; x1' = x0*sin + x1*cos.
+__device__ __forceinline__ void dsv4_rope_pair(
+    float* __restrict__ tail, const float* __restrict__ rope, int half, int pair) {
+  const float c = rope[pair];
+  const float s = rope[half + pair];
+  const float x0 = tail[2 * pair];
+  const float x1 = tail[2 * pair + 1];
+  tail[2 * pair] = __fsub_rn(__fmul_rn(x0, c), __fmul_rn(x1, s));
+  tail[2 * pair + 1] = __fadd_rn(__fmul_rn(x0, s), __fmul_rn(x1, c));
+}
+
+// Gather one embedding row from the PACKED token_embd bytes (bit-exact
+// hi-gguf dequant) and broadcast it into the hc residual streams.
+// dtype_code: 0 = F32, 1 = F16, 2 = BF16, 3 = Q8_0.
+__global__ void dsv4_embed_broadcast_kernel(
+    const unsigned char* __restrict__ src,
+    int dtype_code,
+    long row_offset_elems,  // token * embed
+    int embed,
+    int hc,
+    float* __restrict__ streams) {
+  const int e = blockIdx.x * blockDim.x + threadIdx.x;
+  if (e >= embed) {
+    return;
+  }
+  const long idx = row_offset_elems + e;
+  float v;
+  switch (dtype_code) {
+    case 0:
+      v = reinterpret_cast<const float*>(src)[idx];
+      break;
+    case 1:
+      v = __half2float(reinterpret_cast<const __half*>(src)[idx]);
+      break;
+    case 2: {
+      const unsigned int bits =
+          static_cast<unsigned int>(reinterpret_cast<const unsigned short*>(src)[idx]) << 16;
+      v = __uint_as_float(bits);
+      break;
+    }
+    default: {  // Q8_0: 34-byte blocks of f16 scale + 32 i8 quants
+      const long block = idx / 32;
+      const int within = static_cast<int>(idx % 32);
+      const unsigned char* base = src + block * 34;
+      const float d = __half2float(*reinterpret_cast<const __half*>(base));
+      const float q = static_cast<float>(*reinterpret_cast<const signed char*>(base + 2 + within));
+      v = __fmul_rn(d, q);
+      break;
+    }
+  }
+  for (int s = 0; s < hc; ++s) {
+    streams[static_cast<long>(s) * embed + e] = v;
+  }
+}
+
+extern "C" int hi_cuda_launch_dsv4_embed_broadcast(
+    const void* src, int dtype_code, long row_offset_elems, int embed, int hc,
+    void* streams, void* stream) {
+  if (src == nullptr || streams == nullptr || embed <= 0 || hc <= 0 || stream == nullptr) {
+    return 1;
+  }
+  dim3 block(256);
+  dim3 grid((embed + block.x - 1) / block.x);
+  dsv4_embed_broadcast_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const unsigned char*>(src), dtype_code, row_offset_elems, embed, hc,
+      static_cast<float*>(streams));
+  return 0;
+}
+
+// HyperConnection.pre (+ optional fused pre-norm), one token, ONE block.
+// Ports dsv4_cpu::hc_pre_math + rms_norm_in_place verbatim:
+//   inv   = rms over the flat [n*embed] streams (serial sum on thread 0)
+//   mixes = func[rows, n*embed] · flat (one serial dot per row, run on
+//           threads 32.. so the dot chains overlap the rms chain; the inv
+//           scaling happens AFTER, exactly like the host's separate loop)
+//   pre/post sigmoid gates, comb row-softmax + eps, sinkhorn column/row
+//   normalizations — all serial on thread 0 with the bit-exact expf
+//   y[e] = Σ_i pre[i] * streams[i][e] (serial over i per element)
+//   if norm: y = rms_norm(y, norm) (serial sum on thread 0, then scale).
+// Shared layout: [mixes(rows) | pre(n) | post(n) | comb(n*n) | inv | y_inv].
+__global__ void dsv4_hc_pre_kernel(
+    const float* __restrict__ streams,
+    const float* __restrict__ func,
+    const float* __restrict__ base,
+    const float* __restrict__ scale,
+    const float* __restrict__ norm,  // nullable: fused pre-norm weights
+    int n,
+    int embed,
+    int rows,
+    int sinkhorn_iters,
+    float rms_eps,
+    float hc_eps,
+    float* __restrict__ y,
+    float* __restrict__ post_out,
+    float* __restrict__ comb_out) {
+  extern __shared__ float shm[];
+  float* s_mixes = shm;
+  float* s_pre = s_mixes + rows;
+  float* s_post = s_pre + n;
+  float* s_comb = s_post + n;
+  float* s_inv = s_comb + n * n;
+  const int flat = n * embed;
+  if (threadIdx.x == 0) {
+    s_inv[0] = dsv4_rms_inv(dsv4_sumsq_serial(streams, flat), flat, rms_eps);
+  }
+  const int r = static_cast<int>(threadIdx.x) - 32;
+  if (r >= 0 && r < rows) {
+    s_mixes[r] = dsv4_dot_serial(func + static_cast<long>(r) * flat, streams, flat);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    const float inv = s_inv[0];
+    for (int i = 0; i < rows; ++i) {
+      s_mixes[i] = __fmul_rn(s_mixes[i], inv);
+    }
+    for (int i = 0; i < n; ++i) {
+      s_pre[i] = __fadd_rn(
+          dsv4_sigmoid(__fadd_rn(__fmul_rn(s_mixes[i], scale[0]), base[i])), hc_eps);
+      s_post[i] = __fmul_rn(
+          dsv4_sigmoid(__fadd_rn(__fmul_rn(s_mixes[n + i], scale[1]), base[n + i])), 2.0f);
+    }
+    // comb rows: logits, host softmax_in_place (serial max fold, serial
+    // exp-and-sum, conditional divide), then + eps.
+    for (int i = 0; i < n; ++i) {
+      float* row = s_comb + i * n;
+      for (int j = 0; j < n; ++j) {
+        row[j] = __fadd_rn(__fmul_rn(s_mixes[2 * n + i * n + j], scale[2]),
+                           base[2 * n + i * n + j]);
+      }
+      float mx = __uint_as_float(0xff800000u);  // NEG_INFINITY
+      for (int j = 0; j < n; ++j) {
+        mx = fmaxf(mx, row[j]);
+      }
+      float sum = 0.0f;
+      for (int j = 0; j < n; ++j) {
+        row[j] = dsv4_glibc_expf(__fsub_rn(row[j], mx));
+        sum = __fadd_rn(sum, row[j]);
+      }
+      if (sum != 0.0f) {
+        for (int j = 0; j < n; ++j) {
+          row[j] = __fdiv_rn(row[j], sum);
+        }
+      }
+      for (int j = 0; j < n; ++j) {
+        row[j] = __fadd_rn(row[j], hc_eps);
+      }
+    }
+    // Sinkhorn: one column normalization, then (iters-1) row/column pairs.
+    for (int iter = 0; iter < (sinkhorn_iters < 1 ? 1 : sinkhorn_iters); ++iter) {
+      if (iter > 0) {
+        for (int i = 0; i < n; ++i) {
+          float sum = 0.0f;
+          for (int j = 0; j < n; ++j) {
+            sum = __fadd_rn(sum, s_comb[i * n + j]);
+          }
+          const float denom = __fadd_rn(sum, hc_eps);
+          for (int j = 0; j < n; ++j) {
+            s_comb[i * n + j] = __fdiv_rn(s_comb[i * n + j], denom);
+          }
+        }
+      }
+      for (int j = 0; j < n; ++j) {
+        float sum = 0.0f;
+        for (int i = 0; i < n; ++i) {
+          sum = __fadd_rn(sum, s_comb[i * n + j]);
+        }
+        const float denom = __fadd_rn(sum, hc_eps);
+        for (int i = 0; i < n; ++i) {
+          s_comb[i * n + j] = __fdiv_rn(s_comb[i * n + j], denom);
+        }
+      }
+    }
+    for (int i = 0; i < n; ++i) {
+      post_out[i] = s_post[i];
+    }
+    for (int i = 0; i < n * n; ++i) {
+      comb_out[i] = s_comb[i];
+    }
+  }
+  __syncthreads();
+  for (int e = threadIdx.x; e < embed; e += blockDim.x) {
+    float acc = 0.0f;
+    for (int i = 0; i < n; ++i) {
+      acc = __fadd_rn(acc, __fmul_rn(s_pre[i], streams[static_cast<long>(i) * embed + e]));
+    }
+    y[e] = acc;
+  }
+  if (norm == nullptr) {
+    return;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    s_inv[1] = dsv4_rms_inv(dsv4_sumsq_serial(y, embed), embed, rms_eps);
+  }
+  __syncthreads();
+  const float y_inv = s_inv[1];
+  for (int e = threadIdx.x; e < embed; e += blockDim.x) {
+    y[e] = __fmul_rn(y[e], __fmul_rn(y_inv, norm[e]));
+  }
+}
+
+extern "C" int hi_cuda_launch_dsv4_hc_pre(
+    const void* streams, const void* func, const void* base, const void* scale,
+    const void* norm, int n, int embed, int rows, int sinkhorn_iters, float rms_eps,
+    float hc_eps, void* y, void* post_out, void* comb_out, void* stream) {
+  if (streams == nullptr || func == nullptr || base == nullptr || scale == nullptr ||
+      y == nullptr || post_out == nullptr || comb_out == nullptr || n <= 0 || embed <= 0 ||
+      rows <= 0 || stream == nullptr) {
+    return 1;
+  }
+  const int block = 32 + rows > 256 ? 1024 : 256;
+  if (32 + rows > block) {
+    return 1;
+  }
+  const size_t shmem = static_cast<size_t>(rows + 2 * n + n * n + 2) * sizeof(float);
+  dsv4_hc_pre_kernel<<<1, block, shmem, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const float*>(streams), static_cast<const float*>(func),
+      static_cast<const float*>(base), static_cast<const float*>(scale),
+      static_cast<const float*>(norm), n, embed, rows, sinkhorn_iters, rms_eps, hc_eps,
+      static_cast<float*>(y), static_cast<float*>(post_out), static_cast<float*>(comb_out));
+  return 0;
+}
+
+// HyperConnection.post: out[i][e] = post[i]*f[e] + Σ_j comb[i][j]*res[j][e]
+// (serial over j — the host accumulation order).
+__global__ void dsv4_hc_post_kernel(
+    const float* __restrict__ f,
+    const float* __restrict__ res,
+    const float* __restrict__ post,
+    const float* __restrict__ comb,
+    int n,
+    int embed,
+    float* __restrict__ out) {
+  const long idx = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx >= static_cast<long>(n) * embed) {
+    return;
+  }
+  const int i = static_cast<int>(idx / embed);
+  const int e = static_cast<int>(idx % embed);
+  float acc = __fmul_rn(post[i], f[e]);
+  for (int j = 0; j < n; ++j) {
+    acc = __fadd_rn(acc, __fmul_rn(comb[i * n + j], res[static_cast<long>(j) * embed + e]));
+  }
+  out[idx] = acc;
+}
+
+extern "C" int hi_cuda_launch_dsv4_hc_post(
+    const void* f, const void* res, const void* post, const void* comb, int n, int embed,
+    void* out, void* stream) {
+  if (f == nullptr || res == nullptr || post == nullptr || comb == nullptr || out == nullptr ||
+      n <= 0 || embed <= 0 || stream == nullptr) {
+    return 1;
+  }
+  const long total = static_cast<long>(n) * embed;
+  dim3 block(256);
+  dim3 grid(static_cast<unsigned int>((total + block.x - 1) / block.x));
+  dsv4_hc_post_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const float*>(f), static_cast<const float*>(res),
+      static_cast<const float*>(post), static_cast<const float*>(comb), n, embed,
+      static_cast<float*>(out));
+  return 0;
+}
+
+// rms_norm_in_place verbatim, one vector, ONE block: serial sum-of-squares on
+// thread 0, then x[i] *= inv * w[i] elementwise.
+__global__ void dsv4_rms_exact_kernel(
+    float* __restrict__ x, const float* __restrict__ weight, int n, float eps) {
+  __shared__ float s_inv;
+  if (threadIdx.x == 0) {
+    s_inv = dsv4_rms_inv(dsv4_sumsq_serial(x, n), n, eps);
+  }
+  __syncthreads();
+  const float inv = s_inv;
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    x[i] = __fmul_rn(x[i], __fmul_rn(inv, weight[i]));
+  }
+}
+
+extern "C" int hi_cuda_launch_dsv4_rms_exact(
+    void* x, const void* weight, int n, float eps, void* stream) {
+  if (x == nullptr || weight == nullptr || n <= 0 || stream == nullptr) {
+    return 1;
+  }
+  dsv4_rms_exact_kernel<<<1, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<float*>(x), static_cast<const float*>(weight), n, eps);
+  return 0;
+}
+
+// Per-head UNWEIGHTED q RMS (value *= inv, no learned weight) + forward rope
+// tail, one block per head, in place.
+__global__ void dsv4_q_prep_kernel(
+    float* __restrict__ q,
+    int head_dim,
+    int rope_dims,
+    const float* __restrict__ rope,  // [cos(half) | sin(half)] at this step's pos
+    float rms_eps) {
+  __shared__ float s_inv;
+  float* head = q + static_cast<long>(blockIdx.x) * head_dim;
+  if (threadIdx.x == 0) {
+    s_inv = dsv4_rms_inv(dsv4_sumsq_serial(head, head_dim), head_dim, rms_eps);
+  }
+  __syncthreads();
+  const float inv = s_inv;
+  for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+    head[i] = __fmul_rn(head[i], inv);
+  }
+  __syncthreads();
+  const int half = rope_dims / 2;
+  float* tail = head + (head_dim - rope_dims);
+  for (int pair = threadIdx.x; pair < half; pair += blockDim.x) {
+    dsv4_rope_pair(tail, rope, half, pair);
+  }
+}
+
+extern "C" int hi_cuda_launch_dsv4_q_prep(
+    void* q, int heads, int head_dim, int rope_dims, const void* rope, float rms_eps,
+    void* stream) {
+  if (q == nullptr || heads <= 0 || head_dim <= 0 || rope_dims < 0 || stream == nullptr ||
+      (rope_dims > 0 && rope == nullptr)) {
+    return 1;
+  }
+  dsv4_q_prep_kernel<<<heads, 128, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<float*>(q), head_dim, rope_dims, static_cast<const float*>(rope), rms_eps);
+  return 0;
+}
+
+// Shared KV latent prep: rms_norm(kv, kv_norm) + forward rope tail, written to
+// BOTH the ring slot (device cache) and the arena slot (host mirror delta).
+__global__ void dsv4_kv_prep_kernel(
+    const float* __restrict__ kv_in,
+    const float* __restrict__ norm,
+    int head_dim,
+    int rope_dims,
+    const float* __restrict__ rope,
+    float rms_eps,
+    float* __restrict__ ring_row,
+    float* __restrict__ arena_row) {
+  extern __shared__ float s_vals[];  // [head_dim] + inv
+  float* s_inv = s_vals + head_dim;
+  if (threadIdx.x == 0) {
+    s_inv[0] = dsv4_rms_inv(dsv4_sumsq_serial(kv_in, head_dim), head_dim, rms_eps);
+  }
+  __syncthreads();
+  const float inv = s_inv[0];
+  for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+    s_vals[i] = __fmul_rn(kv_in[i], __fmul_rn(inv, norm[i]));
+  }
+  __syncthreads();
+  const int half = rope_dims / 2;
+  float* tail = s_vals + (head_dim - rope_dims);
+  for (int pair = threadIdx.x; pair < half; pair += blockDim.x) {
+    dsv4_rope_pair(tail, rope, half, pair);
+  }
+  __syncthreads();
+  for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+    ring_row[i] = s_vals[i];
+    arena_row[i] = s_vals[i];
+  }
+}
+
+extern "C" int hi_cuda_launch_dsv4_kv_prep(
+    const void* kv_in, const void* norm, int head_dim, int rope_dims, const void* rope,
+    float rms_eps, void* ring_row, void* arena_row, void* stream) {
+  if (kv_in == nullptr || norm == nullptr || ring_row == nullptr || arena_row == nullptr ||
+      head_dim <= 0 || rope_dims < 0 || stream == nullptr ||
+      (rope_dims > 0 && rope == nullptr)) {
+    return 1;
+  }
+  const size_t shmem = static_cast<size_t>(head_dim + 1) * sizeof(float);
+  dsv4_kv_prep_kernel<<<1, 128, shmem, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const float*>(kv_in), static_cast<const float*>(norm), head_dim, rope_dims,
+      static_cast<const float*>(rope), rms_eps, static_cast<float*>(ring_row),
+      static_cast<float*>(arena_row));
+  return 0;
+}
+
+// Latent-MQA decode attention over [compressed blocks ‖ ring window], one
+// block per head. Ports the host per-head loop verbatim:
+//   w[k]   = dot(q_head, key_k) * scale       (serial 512-dot per key,
+//            keys parallel across threads — each dot is the host chain)
+//   max    = fold over [sink?, w...]           (serial on thread 0)
+//   e[k]   = exp(w[k] - max)                   (elementwise, bit-exact expf)
+//   denom  = sink_exp + Σ e[k]                 (serial on thread 0, key order)
+//   wn[k]  = e[k] / denom
+//   out[i] = Σ_k wn[k] * v_k[i]                (serial over k per element)
+//   inverse rope on the out tail.
+// Key order: compressed blocks first (selected subset ascending, or all),
+// then ring window oldest→newest — the host concatenation order.
+__global__ void dsv4_attention_decode_kernel(
+    const float* __restrict__ q,
+    const float* __restrict__ comp_k,   // [blocks, comp_stride] or null
+    const float* __restrict__ comp_v,
+    int comp_stride,
+    const int* __restrict__ sel,        // ascending block subset or null
+    int n_comp,
+    const float* __restrict__ ring,     // [ring_cap, head_dim]
+    int ring_cap,
+    long first_ring_pos,
+    int n_ring,
+    const float* __restrict__ sinks,    // [heads] or null
+    float scale,
+    int head_dim,
+    int rope_dims,
+    const float* __restrict__ rope_inv,
+    float* __restrict__ out,
+    float* __restrict__ w_scratch,      // [heads, max_keys]
+    float* __restrict__ wn_scratch,     // [heads, max_keys]
+    int max_keys) {
+  __shared__ float s_max;
+  __shared__ float s_denom;
+  const int head = blockIdx.x;
+  const int n_keys = n_comp + n_ring;
+  const float* q_head = q + static_cast<long>(head) * head_dim;
+  float* w = w_scratch + static_cast<long>(head) * max_keys;
+  float* wn = wn_scratch + static_cast<long>(head) * max_keys;
+
+  for (int k = threadIdx.x; k < n_keys; k += blockDim.x) {
+    const float* key;
+    if (k < n_comp) {
+      const int b = sel != nullptr ? sel[k] : k;
+      key = comp_k + static_cast<long>(b) * comp_stride;
+    } else {
+      const long p = first_ring_pos + (k - n_comp);
+      key = ring + (p % ring_cap) * head_dim;
+    }
+    w[k] = __fmul_rn(dsv4_dot_serial(q_head, key, head_dim), scale);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float mx = sinks != nullptr ? sinks[head] : __uint_as_float(0xff800000u);
+    for (int k = 0; k < n_keys; ++k) {
+      mx = fmaxf(mx, w[k]);
+    }
+    s_max = mx;
+  }
+  __syncthreads();
+  const float mx = s_max;
+  for (int k = threadIdx.x; k < n_keys; k += blockDim.x) {
+    wn[k] = dsv4_glibc_expf(__fsub_rn(w[k], mx));
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float denom =
+        sinks != nullptr ? dsv4_glibc_expf(__fsub_rn(sinks[head], mx)) : 0.0f;
+    for (int k = 0; k < n_keys; ++k) {
+      denom = __fadd_rn(denom, wn[k]);
+    }
+    s_denom = denom;
+  }
+  __syncthreads();
+  const float denom = s_denom;
+  for (int k = threadIdx.x; k < n_keys; k += blockDim.x) {
+    wn[k] = __fdiv_rn(wn[k], denom);
+  }
+  __syncthreads();
+  float* out_head = out + static_cast<long>(head) * head_dim;
+  for (int i = threadIdx.x; i < head_dim; i += blockDim.x) {
+    float acc = 0.0f;
+    for (int k = 0; k < n_keys; ++k) {
+      const float* val;
+      if (k < n_comp) {
+        const int b = sel != nullptr ? sel[k] : k;
+        val = comp_v + static_cast<long>(b) * comp_stride;
+      } else {
+        const long p = first_ring_pos + (k - n_comp);
+        val = ring + (p % ring_cap) * head_dim;
+      }
+      acc = __fadd_rn(acc, __fmul_rn(wn[k], val[i]));
+    }
+    out_head[i] = acc;
+  }
+  __syncthreads();
+  const int half = rope_dims / 2;
+  float* tail = out_head + (head_dim - rope_dims);
+  for (int pair = threadIdx.x; pair < half; pair += blockDim.x) {
+    dsv4_rope_pair(tail, rope_inv, half, pair);
+  }
+}
+
+extern "C" int hi_cuda_launch_dsv4_attention_decode(
+    const void* q, const void* comp_k, const void* comp_v, int comp_stride, const void* sel,
+    int n_comp, const void* ring, int ring_cap, long first_ring_pos, int n_ring,
+    const void* sinks, float scale, int heads, int head_dim, int rope_dims,
+    const void* rope_inv, void* out, void* w_scratch, void* wn_scratch, int max_keys,
+    void* stream) {
+  if (q == nullptr || ring == nullptr || out == nullptr || w_scratch == nullptr ||
+      wn_scratch == nullptr || heads <= 0 || head_dim <= 0 || rope_dims < 0 ||
+      ring_cap <= 0 || n_ring < 0 || n_comp < 0 || n_comp + n_ring <= 0 ||
+      n_comp + n_ring > max_keys || stream == nullptr ||
+      (n_comp > 0 && (comp_k == nullptr || comp_v == nullptr)) ||
+      (rope_dims > 0 && rope_inv == nullptr)) {
+    return 1;
+  }
+  dsv4_attention_decode_kernel<<<heads, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const float*>(q), static_cast<const float*>(comp_k),
+      static_cast<const float*>(comp_v), comp_stride, static_cast<const int*>(sel), n_comp,
+      static_cast<const float*>(ring), ring_cap, first_ring_pos, n_ring,
+      static_cast<const float*>(sinks), scale, head_dim, rope_dims,
+      static_cast<const float*>(rope_inv), static_cast<float*>(out),
+      static_cast<float*>(w_scratch), static_cast<float*>(wn_scratch), max_keys);
+  return 0;
+}
+
+// APE compressor block completion, ONE block. Ports compressor_emit_block:
+//   per channel c: g[r] = gates[r][c] + ape[r][c]; softmax over the ratio
+//   positions (serial max fold / exp / weighted sum in row order, recomputing
+//   the singly-rounded g identically in both passes); compressed[c] = Σ/denom
+//   then rms_norm halves with the shared norm weights; split (width == 2*dim)
+//   normalizes K|V independently, shared (width == dim) writes V = K.
+// Outputs land in the compressed cache rows AND the arena delta slots.
+__global__ void dsv4_compressor_emit_kernel(
+    const float* __restrict__ gates,  // [ratio, row_stride]
+    const float* __restrict__ kvs,
+    int row_stride,
+    const float* __restrict__ ape,    // [ratio, width] flat
+    const float* __restrict__ norm,   // [dim]
+    int ratio,
+    int dim,
+    int width,
+    float rms_eps,
+    float* __restrict__ key_out,
+    float* __restrict__ val_out,
+    float* __restrict__ arena_k,
+    float* __restrict__ arena_v) {
+  extern __shared__ float s_comp[];  // [width] + 2 inv slots
+  float* s_inv = s_comp + width;
+  for (int c = threadIdx.x; c < width; c += blockDim.x) {
+    float mx = __uint_as_float(0xff800000u);
+    for (int r = 0; r < ratio; ++r) {
+      const float g = __fadd_rn(gates[static_cast<long>(r) * row_stride + c], ape[r * width + c]);
+      mx = fmaxf(mx, g);
+    }
+    float denom = 0.0f;
+    float weighted = 0.0f;
+    for (int r = 0; r < ratio; ++r) {
+      const float g = __fadd_rn(gates[static_cast<long>(r) * row_stride + c], ape[r * width + c]);
+      const float wgt = dsv4_glibc_expf(__fsub_rn(g, mx));
+      denom = __fadd_rn(denom, wgt);
+      weighted = __fadd_rn(weighted, __fmul_rn(wgt, kvs[static_cast<long>(r) * row_stride + c]));
+    }
+    s_comp[c] = __fdiv_rn(weighted, denom);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    s_inv[0] = dsv4_rms_inv(dsv4_sumsq_serial(s_comp, dim), dim, rms_eps);
+    if (width != dim) {
+      s_inv[1] = dsv4_rms_inv(dsv4_sumsq_serial(s_comp + dim, dim), dim, rms_eps);
+    }
+  }
+  __syncthreads();
+  const float inv_k = s_inv[0];
+  for (int i = threadIdx.x; i < dim; i += blockDim.x) {
+    const float k = __fmul_rn(s_comp[i], __fmul_rn(inv_k, norm[i]));
+    key_out[i] = k;
+    arena_k[i] = k;
+    float v;
+    if (width == dim) {
+      v = k;  // shared K=V form: value is a clone of the normalized key
+    } else {
+      v = __fmul_rn(s_comp[dim + i], __fmul_rn(s_inv[1], norm[i]));
+    }
+    val_out[i] = v;
+    arena_v[i] = v;
+  }
+}
+
+extern "C" int hi_cuda_launch_dsv4_compressor_emit(
+    const void* gates, const void* kvs, int row_stride, const void* ape, const void* norm,
+    int ratio, int dim, int width, float rms_eps, void* key_out, void* val_out,
+    void* arena_k, void* arena_v, void* stream) {
+  if (gates == nullptr || kvs == nullptr || ape == nullptr || norm == nullptr ||
+      key_out == nullptr || val_out == nullptr || arena_k == nullptr || arena_v == nullptr ||
+      ratio <= 0 || dim <= 0 || width < dim || row_stride < width || stream == nullptr) {
+    return 1;
+  }
+  const size_t shmem = static_cast<size_t>(width + 2) * sizeof(float);
+  dsv4_compressor_emit_kernel<<<1, 256, shmem, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const float*>(gates), static_cast<const float*>(kvs), row_stride,
+      static_cast<const float*>(ape), static_cast<const float*>(norm), ratio, dim, width,
+      rms_eps, static_cast<float*>(key_out), static_cast<float*>(val_out),
+      static_cast<float*>(arena_k), static_cast<float*>(arena_v));
+  return 0;
+}
+
+// Lightning-indexer scoring: score[b] = Σ_h (w[h]*head_scale) *
+// relu(dot(q_h, key_b)) * key_scale, heads serial in ascending order (the
+// host accumulation order), one thread per block index.
+__global__ void dsv4_indexer_score_kernel(
+    const float* __restrict__ qi,       // [idx_heads, idx_key]
+    const float* __restrict__ head_w,   // [idx_heads]
+    const float* __restrict__ keys,     // [blocks, key_stride]
+    int key_stride,
+    int n_blocks,
+    int idx_heads,
+    int idx_key,
+    float head_scale,
+    float key_scale,
+    float* __restrict__ scores) {
+  const int b = blockIdx.x * blockDim.x + threadIdx.x;
+  if (b >= n_blocks) {
+    return;
+  }
+  const float* key = keys + static_cast<long>(b) * key_stride;
+  float acc = 0.0f;
+  for (int h = 0; h < idx_heads; ++h) {
+    const float w = __fmul_rn(head_w[h], head_scale);
+    const float d = dsv4_dot_serial(qi + static_cast<long>(h) * idx_key, key, idx_key);
+    const float relu = fmaxf(d, 0.0f);
+    acc = __fadd_rn(acc, __fmul_rn(__fmul_rn(w, relu), key_scale));
+  }
+  scores[b] = acc;
+}
+
+extern "C" int hi_cuda_launch_dsv4_indexer_score(
+    const void* qi, const void* head_w, const void* keys, int key_stride, int n_blocks,
+    int idx_heads, int idx_key, float head_scale, float key_scale, void* scores,
+    void* stream) {
+  if (qi == nullptr || head_w == nullptr || keys == nullptr || scores == nullptr ||
+      n_blocks <= 0 || idx_heads <= 0 || idx_key <= 0 || key_stride < idx_key ||
+      stream == nullptr) {
+    return 1;
+  }
+  dim3 block(128);
+  dim3 grid((n_blocks + block.x - 1) / block.x);
+  dsv4_indexer_score_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const float*>(qi), static_cast<const float*>(head_w),
+      static_cast<const float*>(keys), key_stride, n_blocks, idx_heads, idx_key, head_scale,
+      key_scale, static_cast<float*>(scores));
+  return 0;
+}
+
+// Top-k block selection, ONE block, parallel and EXACT. Reproduces the host
+// sort semantics precisely — descending score under Rust total_cmp
+// (monotonic-bits compare), LOWER index winning ties, selected indices
+// emitted in ascending order — via radix selection instead of the original
+// serial repeated-max (single thread, O(top_k * blocks): ~13 ms per launch
+// at 1162 blocks, stacking to ~275 ms per decoded token across the 21
+// indexer layers — the >2k-context serving regression):
+//   1. binary-search the take-th largest monotonic key T over its 32 bits
+//      (count(key >= candidate) via a block-wide reduction per bit);
+//   2. mark every key > T (parallel), then fill the remaining quota from
+//      keys == T in ascending index order (serial thread 0 — exactly the
+//      host's lower-index-wins tie-break);
+//   3. compact the marks ascending (serial thread 0, O(blocks)).
+// The selected SET equals the host's: sort-desc-take-k keeps all keys > T
+// plus the lowest-index keys == T, where T is the take-th largest key
+// (largest value with count(key >= T) >= take).
+__global__ void dsv4_indexer_select_kernel(
+    const float* __restrict__ scores,
+    int n_blocks,
+    int top_k,
+    unsigned char* __restrict__ marks,
+    int* __restrict__ sel_out) {
+  __shared__ int s_count;
+  __shared__ unsigned int s_prefix;
+  const int take = top_k < n_blocks ? top_k : n_blocks;
+  if (threadIdx.x == 0) {
+    s_prefix = 0u;
+  }
+  __syncthreads();
+  for (int bit = 31; bit >= 0; --bit) {
+    const unsigned int cand = s_prefix | (1u << bit);
+    if (threadIdx.x == 0) {
+      s_count = 0;
+    }
+    __syncthreads();
+    int local = 0;
+    for (int b = threadIdx.x; b < n_blocks; b += blockDim.x) {
+      if (dsv4_total_bits(scores[b]) >= cand) {
+        ++local;
+      }
+    }
+    if (local > 0) {
+      atomicAdd(&s_count, local);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0 && s_count >= take) {
+      s_prefix = cand;
+    }
+    __syncthreads();
+  }
+  const unsigned int thresh = s_prefix;
+  if (threadIdx.x == 0) {
+    s_count = 0;
+  }
+  __syncthreads();
+  int local = 0;
+  for (int b = threadIdx.x; b < n_blocks; b += blockDim.x) {
+    const unsigned int kb = dsv4_total_bits(scores[b]);
+    const unsigned char above = kb > thresh ? 1 : 0;
+    marks[b] = above;
+    local += above;
+  }
+  if (local > 0) {
+    atomicAdd(&s_count, local);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    // count(> T) < take by construction of T; fill the difference from the
+    // equal-key group in ascending index order, then emit ascending.
+    int quota = take - s_count;
+    for (int b = 0; b < n_blocks && quota > 0; ++b) {
+      if (marks[b] == 0 && dsv4_total_bits(scores[b]) == thresh) {
+        marks[b] = 1;
+        --quota;
+      }
+    }
+    int out = 0;
+    for (int b = 0; b < n_blocks; ++b) {
+      if (marks[b]) {
+        sel_out[out++] = b;
+      }
+    }
+  }
+}
+
+extern "C" int hi_cuda_launch_dsv4_indexer_select(
+    const void* scores, int n_blocks, int top_k, void* marks, void* sel_out, void* stream) {
+  if (scores == nullptr || marks == nullptr || sel_out == nullptr || n_blocks <= 0 ||
+      top_k <= 0 || stream == nullptr) {
+    return 1;
+  }
+  dsv4_indexer_select_kernel<<<1, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const float*>(scores), n_blocks, top_k,
+      static_cast<unsigned char*>(marks), static_cast<int*>(sel_out));
+  return 0;
+}
+
+// HyperHead: collapse the hc streams with sigmoid gates only (no comb), the
+// host's hyper_head verbatim: w_i = sigmoid(mix_i*inv*scale0 + base_i) + eps.
+__global__ void dsv4_hyper_head_kernel(
+    const float* __restrict__ streams,
+    const float* __restrict__ func,
+    const float* __restrict__ base,
+    float scale0,
+    int n,
+    int embed,
+    float rms_eps,
+    float hc_eps,
+    float* __restrict__ out) {
+  extern __shared__ float shm[];
+  float* s_w = shm;          // [n]
+  float* s_inv = s_w + n;    // [1]
+  const int flat = n * embed;
+  if (threadIdx.x == 0) {
+    s_inv[0] = dsv4_rms_inv(dsv4_sumsq_serial(streams, flat), flat, rms_eps);
+  }
+  const int r = static_cast<int>(threadIdx.x) - 32;
+  if (r >= 0 && r < n) {
+    s_w[r] = dsv4_dot_serial(func + static_cast<long>(r) * flat, streams, flat);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    const float inv = s_inv[0];
+    for (int i = 0; i < n; ++i) {
+      s_w[i] = __fadd_rn(
+          dsv4_sigmoid(__fadd_rn(__fmul_rn(__fmul_rn(s_w[i], inv), scale0), base[i])), hc_eps);
+    }
+  }
+  __syncthreads();
+  for (int e = threadIdx.x; e < embed; e += blockDim.x) {
+    float acc = 0.0f;
+    for (int i = 0; i < n; ++i) {
+      acc = __fadd_rn(acc, __fmul_rn(s_w[i], streams[static_cast<long>(i) * embed + e]));
+    }
+    out[e] = acc;
+  }
+}
+
+extern "C" int hi_cuda_launch_dsv4_hyper_head(
+    const void* streams, const void* func, const void* base, float scale0, int n, int embed,
+    float rms_eps, float hc_eps, void* out, void* stream) {
+  if (streams == nullptr || func == nullptr || base == nullptr || out == nullptr || n <= 0 ||
+      embed <= 0 || 32 + n > 256 || stream == nullptr) {
+    return 1;
+  }
+  const size_t shmem = static_cast<size_t>(n + 1) * sizeof(float);
+  dsv4_hyper_head_kernel<<<1, 256, shmem, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<const float*>(streams), static_cast<const float*>(func),
+      static_cast<const float*>(base), scale0, n, embed, rms_eps, hc_eps,
+      static_cast<float*>(out));
+  return 0;
+}
+
 __global__ void dequantize_iq4_nl_kernel(const uint8_t* input, float* output, int elements) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= elements) {
