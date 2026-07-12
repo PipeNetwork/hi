@@ -533,6 +533,8 @@ mod native {
         // "this projection is unsupported" (mixed dtypes, biases) so unsupported
         // layers probe once and then always take the legacy per-expert loop.
         moe_expert_groups: RefCell<BTreeMap<String, Option<Rc<MoeExpertGroup>>>>,
+        /// Expert streaming (giant MoE): pool + sources + per-step tables.
+        expert_streaming: Option<RefCell<ExpertStreamState>>,
         /// Host-cached gemma4 per-layer output scalars (None = tensor absent).
         gemma_layer_output_scales: RefCell<BTreeMap<String, Option<f32>>>,
         /// Device unit vectors (all ones) for gemma4's weightless V RMS norm,
@@ -2931,7 +2933,7 @@ mod native {
     /// env opts small models in too.
     fn wmma_attn_forced_on() -> bool {
         use std::sync::OnceLock;
-        static ENABLED: OnceLock<bool> = OnceLock::new();
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENABLED.get_or_init(|| std::env::var("HI_CUDA_WMMA_ATTN").is_ok())
     }
 
@@ -2940,7 +2942,7 @@ mod native {
     /// fp4 weights are kept quantized on the GPU.
     fn fp4_gemv_enabled() -> bool {
         use std::sync::OnceLock;
-        static ENABLED: OnceLock<bool> = OnceLock::new();
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENABLED.get_or_init(|| std::env::var("HI_CUDA_NO_FP4_GEMV").is_err())
     }
 
@@ -2953,7 +2955,7 @@ mod native {
     /// class, pinned by the f64-reference parity test.
     fn fa2_attn_enabled() -> bool {
         use std::sync::OnceLock;
-        static ENABLED: OnceLock<bool> = OnceLock::new();
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENABLED
             .get_or_init(|| std::env::var("HI_CUDA_FA2_ATTN").map_or(true, |value| value != "0"))
     }
@@ -2968,7 +2970,7 @@ mod native {
 
     fn q4_0_gemv_enabled() -> bool {
         use std::sync::OnceLock;
-        static ENABLED: OnceLock<bool> = OnceLock::new();
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENABLED.get_or_init(|| std::env::var("HI_CUDA_NO_Q4_GEMV").is_err())
     }
 
@@ -2978,7 +2980,7 @@ mod native {
     /// to eager decode on any capture/replay failure (e.g. a non-capturable cuBLAS path).
     pub(crate) fn decode_graph_enabled() -> bool {
         use std::sync::OnceLock;
-        static ENABLED: OnceLock<bool> = OnceLock::new();
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENABLED.get_or_init(|| std::env::var("HI_CUDA_DECODE_GRAPH").is_ok())
     }
 
@@ -3000,7 +3002,7 @@ mod native {
     /// path supports it (head_dim <= FLASH_ONLINE_MAX_HEAD_DIM).
     fn kv_q8_enabled() -> bool {
         use std::sync::OnceLock;
-        static ENABLED: OnceLock<bool> = OnceLock::new();
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENABLED.get_or_init(|| std::env::var("HI_CUDA_KV_Q8").is_ok())
     }
 
@@ -3012,7 +3014,7 @@ mod native {
     /// and latches graphs off (never breaks output).
     pub(crate) fn decode_graph_batch_enabled() -> bool {
         use std::sync::OnceLock;
-        static ENABLED: OnceLock<bool> = OnceLock::new();
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENABLED.get_or_init(|| {
             std::env::var("HI_CUDA_DECODE_GRAPH_BATCH").is_ok_and(|value| value != "0")
         })
@@ -3026,7 +3028,7 @@ mod native {
     /// sentinel and are re-sampled on the host.
     pub(crate) fn gpu_ranked_sampler_enabled() -> bool {
         use std::sync::OnceLock;
-        static ENABLED: OnceLock<bool> = OnceLock::new();
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENABLED.get_or_init(|| {
             std::env::var("HI_CUDA_GPU_RANKED_SAMPLER").is_ok_and(|value| value != "0")
         })
@@ -3056,7 +3058,7 @@ mod native {
     /// long contexts additionally grid-split across SMs with a flash merge.
     fn gqa_decode_enabled() -> bool {
         use std::sync::OnceLock;
-        static ENABLED: OnceLock<bool> = OnceLock::new();
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENABLED.get_or_init(|| std::env::var("HI_CUDA_GQA_DECODE").is_ok_and(|value| value != "0"))
     }
 
@@ -3100,7 +3102,7 @@ mod native {
     /// Qwen3-30B-A3B decode 34.9 -> 48.8 tok/s (55.6 with graphs).
     fn moe_grouped_enabled() -> bool {
         use std::sync::OnceLock;
-        static ENABLED: OnceLock<bool> = OnceLock::new();
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENABLED
             .get_or_init(|| std::env::var("HI_CUDA_MOE_GROUPED").map_or(true, |value| value != "0"))
     }
@@ -3108,6 +3110,107 @@ mod native {
     /// Device pointer table over one MoE projection's expert weights (see
     /// `CudaQwenGpuModel::moe_expert_groups`). The addresses point into the
     /// per-expert `GpuMatrix` buffers, which live as long as the model.
+    /// Expert-streaming state: pool + per-(layer, projection) disk sources and
+    /// the pointer-table groups whose device tables are rewritten per step.
+    pub(crate) struct ExpertStreamState {
+        pool: crate::expert_pool::ExpertPool,
+        sources: BTreeMap<(u32, u8), crate::expert_pool::ExpertSource>,
+        tables: BTreeMap<(u32, u8), (Vec<u64>, Rc<MoeExpertGroup>)>,
+    }
+
+    impl ExpertStreamState {
+        fn projection_index(projection: &str) -> Option<u8> {
+            match projection {
+                "gate" => Some(0),
+                "up" => Some(1),
+                "down" => Some(2),
+                _ => None,
+            }
+        }
+
+        fn layer_of_prefix(prefix: &str) -> Option<u32> {
+            prefix.strip_prefix("blk.")?.parse().ok()
+        }
+    }
+
+    /// Opt-in expert streaming for giant MoE models: routed experts stay on
+    /// disk and are paged into a fixed device pool per step.
+    fn expert_streaming_enabled() -> bool {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("HI_CUDA_EXPERT_STREAMING").is_ok_and(|value| value != "0")
+        })
+    }
+
+    fn expert_pool_budget_bytes() -> Option<usize> {
+        std::env::var("HI_CUDA_EXPERT_POOL_BYTES")
+            .ok()
+            .and_then(|value| value.parse().ok())
+    }
+
+    /// Disk sources for every streamable (layer, projection): the plain rank-3
+    /// `ffn_{gate,up,down}_exps` tensors. Streaming supports only this layout;
+    /// fused gate_up or per-expert tensor files bail with a clear error.
+    fn collect_expert_sources(
+        gguf: &GgufFile,
+        config: &QwenGgufConfig,
+    ) -> Result<BTreeMap<(u32, u8), crate::expert_pool::ExpertSource>> {
+        let mut sources = BTreeMap::new();
+        let Some(experts) = config.expert_count else {
+            return Ok(sources);
+        };
+        let experts_u64 = u64::from(experts);
+        for layer in 0..config.block_count {
+            let prefix = format!("blk.{layer}");
+            if !moe_router_tensor_present_gguf(gguf, &prefix) {
+                continue;
+            }
+            for (proj_idx, projection) in ["gate", "up", "down"].iter().enumerate() {
+                let Some((name, info)) = qwen_moe_packed_expert_weight_names(&prefix, projection)
+                    .into_iter()
+                    .find_map(|name| gguf.tensor_info(&name).cloned().map(|info| (name, info)))
+                else {
+                    bail!(
+                        "expert streaming requires packed rank-3 ffn_{projection}_exps tensors; layer {layer} has none"
+                    );
+                };
+                if info.dimensions.len() != 3 || info.dimensions[2] != experts_u64 {
+                    bail!(
+                        "expert streaming requires {name} shaped [in, out, {experts}]; got {:?}",
+                        info.dimensions
+                    );
+                }
+                let per_expert_elements = info.dimensions[0]
+                    .checked_mul(info.dimensions[1])
+                    .context("expert element count overflows u64")?;
+                let bytes_per_expert = usize::try_from(info.dtype.byte_len(per_expert_elements)?)
+                    .context("expert byte length does not fit usize")?;
+                let rows =
+                    usize::try_from(info.dimensions[1]).context("expert rows do not fit usize")?;
+                let cols =
+                    usize::try_from(info.dimensions[0]).context("expert cols do not fit usize")?;
+                sources.insert(
+                    (layer, proj_idx as u8),
+                    crate::expert_pool::ExpertSource {
+                        tensor_name: name,
+                        bytes_per_expert,
+                        rows,
+                        cols,
+                        dtype: info.dtype,
+                        expert_count: experts as usize,
+                    },
+                );
+            }
+        }
+        Ok(sources)
+    }
+
+    fn moe_router_tensor_present_gguf(gguf: &GgufFile, prefix: &str) -> bool {
+        qwen_moe_router_weight_names(prefix)
+            .iter()
+            .any(|name| gguf.tensor(name).is_some())
+    }
+
     struct MoeExpertGroup {
         ptrs: DeviceBuffer,
         rows: usize,
@@ -3121,7 +3224,7 @@ mod native {
     /// hit can never alias a different mapping. `HI_CUDA_PAGE_TABLE_CACHE=0` disables.
     fn page_table_cache_enabled() -> bool {
         use std::sync::OnceLock;
-        static ENABLED: OnceLock<bool> = OnceLock::new();
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENABLED.get_or_init(|| {
             std::env::var("HI_CUDA_PAGE_TABLE_CACHE").map_or(true, |value| value != "0")
         })
@@ -3165,7 +3268,7 @@ mod native {
     /// `HI_CUDA_NO_DEQUANT_F16` reverts to dequant -> f32 -> cast).
     fn dequant_f16_enabled() -> bool {
         use std::sync::OnceLock;
-        static ENABLED: OnceLock<bool> = OnceLock::new();
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENABLED.get_or_init(|| std::env::var("HI_CUDA_NO_DEQUANT_F16").is_err())
     }
 
@@ -3174,7 +3277,7 @@ mod native {
     /// `HI_CUDA_NO_KQUANT_DP4A` reverts to the float GEMVs.
     fn kquant_dp4a_enabled() -> bool {
         use std::sync::OnceLock;
-        static ENABLED: OnceLock<bool> = OnceLock::new();
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENABLED.get_or_init(|| std::env::var("HI_CUDA_NO_KQUANT_DP4A").is_err())
     }
 
@@ -3186,7 +3289,7 @@ mod native {
     /// (`native_cuda_kquant_dp4a_gemm_matches_gemv_rows`).
     fn mmq_gemm_enabled() -> bool {
         use std::sync::OnceLock;
-        static ENABLED: OnceLock<bool> = OnceLock::new();
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENABLED.get_or_init(|| std::env::var("HI_CUDA_MMQ").map_or(true, |value| value != "0"))
     }
 
@@ -3384,6 +3487,22 @@ mod native {
         }
 
         pub fn from_gguf(gguf: &GgufFile) -> Result<Self> {
+            let streaming_budget = if expert_streaming_enabled() {
+                Some(expert_pool_budget_bytes().unwrap_or(0))
+            } else {
+                None
+            };
+            Self::from_gguf_with_expert_streaming(gguf, streaming_budget)
+        }
+
+        /// `expert_streaming_budget`: None = experts load resident as usual;
+        /// Some(bytes) = routed experts stream through a pool of that many
+        /// bytes (0 = auto-size from free memory). Public entry reads the
+        /// HI_CUDA_EXPERT_STREAMING / HI_CUDA_EXPERT_POOL_BYTES env flags.
+        pub(crate) fn from_gguf_with_expert_streaming(
+            gguf: &GgufFile,
+            expert_streaming_budget: Option<usize>,
+        ) -> Result<Self> {
             let config = gguf.qwen_config()?;
             gguf.validate_qwen_tensors()?;
             let runtime = CudaRuntime::probe()?;
@@ -3418,7 +3537,13 @@ mod native {
             // cards fall back to all-f16 (fast prefill, 2 bytes/param decode); tiny
             // cards to quantized-only (dequant prefill per op). `HI_CUDA_WEIGHTS_F16`
             // forces the choice.
-            let matrix_specs = qwen_matrix_specs(gguf, &config)?;
+            let expert_sources = if expert_streaming_budget.is_some() {
+                collect_expert_sources(gguf, &config)?
+            } else {
+                BTreeMap::new()
+            };
+            let stream_experts = !expert_sources.is_empty();
+            let matrix_specs = qwen_matrix_specs(gguf, &config, stream_experts)?;
             let residency = weight_residency_plan(&matrix_specs);
             let weights_f16 = matches!(residency, WeightResidency::F16);
             // Hybrid: weights stay quantized (dp4a decode) but the prefill GEMM caches a
@@ -3444,6 +3569,30 @@ mod native {
                 matrices.insert(spec.name, matrix);
             }
             synthesize_mla_split_kv_b(gguf, &config, &mut matrices, &mut total_matrix_bytes)?;
+            let expert_streaming = if stream_experts {
+                let slot_bytes = expert_sources
+                    .values()
+                    .map(|source| source.bytes_per_expert)
+                    .max()
+                    .unwrap_or(0);
+                let budget = match expert_streaming_budget {
+                    Some(bytes) if bytes > 0 => bytes,
+                    _ => {
+                        // Auto: spend most of what's left after the trunk and
+                        // a KV/runtime reserve.
+                        let free = crate::runtime::free_memory_bytes().unwrap_or(0);
+                        free.saturating_sub(8 * 1024 * 1024 * 1024)
+                    }
+                };
+                let pool = crate::expert_pool::ExpertPool::new(gguf.path(), slot_bytes, budget)?;
+                Some(RefCell::new(ExpertStreamState {
+                    pool,
+                    sources: expert_sources,
+                    tables: BTreeMap::new(),
+                }))
+            } else {
+                None
+            };
 
             let mut vectors = BTreeMap::new();
             let mut total_vector_bytes = 0usize;
@@ -3506,6 +3655,7 @@ mod native {
                 paged_batch_pool: RefCell::new(None),
                 dequant_f16_cache: RefCell::new(BTreeMap::new()),
                 moe_expert_groups: RefCell::new(BTreeMap::new()),
+                expert_streaming,
                 gemma_layer_output_scales: RefCell::new(BTreeMap::new()),
                 unit_norm_weights: RefCell::new(BTreeMap::new()),
                 cache_layer_f16,
@@ -3530,6 +3680,13 @@ mod native {
 
         pub fn tensor(&self, name: &str) -> Option<&GpuTensor> {
             self.tensors.get(name)
+        }
+
+        /// Expert-streaming pool statistics (None when streaming is off).
+        pub(crate) fn expert_pool_stats(&self) -> Option<crate::expert_pool::ExpertPoolStats> {
+            self.expert_streaming
+                .as_ref()
+                .map(|state| state.borrow().pool.stats())
         }
 
         pub fn has_matrix(&self, name: &str) -> bool {
@@ -18465,6 +18622,11 @@ mod native {
             {
                 return Ok(output);
             }
+            if self.expert_streaming.is_some() {
+                bail!(
+                    "expert streaming requires the grouped MoE path (HI_CUDA_MOE_GROUPED, packed Q4_K/Q6_K experts); the per-expert fallback has no resident expert weights"
+                );
+            }
             let routes =
                 self.moe_routes_device(prefix, &router, top_k, self.config.expert_weights_norm)?;
 
@@ -18684,6 +18846,47 @@ mod native {
             experts: usize,
         ) -> Result<Option<Rc<MoeExpertGroup>>> {
             let key = format!("{prefix}.{projection}");
+            if let Some(streaming) = &self.expert_streaming {
+                let layer = ExpertStreamState::layer_of_prefix(prefix);
+                let proj = ExpertStreamState::projection_index(projection);
+                if let (Some(layer), Some(proj)) = (layer, proj) {
+                    let mut state = streaming.borrow_mut();
+                    if let Some(source) = state.sources.get(&(layer, proj)).cloned() {
+                        let dtype = match source.dtype {
+                            GgufTensorType::Q4_K => crate::kernels::MoeGroupedGemvDtype::Q4K,
+                            GgufTensorType::Q6_K => crate::kernels::MoeGroupedGemvDtype::Q6K,
+                            other => bail!(
+                                "expert streaming currently requires Q4_K/Q6_K experts; {} is {}",
+                                source.tensor_name,
+                                other.label()
+                            ),
+                        };
+                        if source.cols % 256 != 0 {
+                            bail!(
+                                "expert streaming requires expert cols % 256 == 0; {} has {}",
+                                source.tensor_name,
+                                source.cols
+                            );
+                        }
+                        if let Some((_, group)) = state.tables.get(&(layer, proj)) {
+                            return Ok(Some(group.clone()));
+                        }
+                        let table = DeviceBuffer::alloc(experts * std::mem::size_of::<u64>())
+                            .context("allocating streamed expert pointer table")?;
+                        table.copy_from_host(&vec![0u64; experts])?;
+                        let group = Rc::new(MoeExpertGroup {
+                            ptrs: table,
+                            rows: source.rows,
+                            cols: source.cols,
+                            dtype,
+                        });
+                        state
+                            .tables
+                            .insert((layer, proj), (vec![0u64; experts], group.clone()));
+                        return Ok(Some(group));
+                    }
+                }
+            }
             if let Some(cached) = self.moe_expert_groups.borrow().get(&key) {
                 return Ok(cached.clone());
             }
@@ -18794,6 +18997,51 @@ mod native {
                 top_k,
                 self.config.expert_weights_norm,
             )?;
+            if let Some(streaming) = &self.expert_streaming {
+                // Streamed experts: resolve this step's routed ids on the host,
+                // page misses into the pool, and rewrite the pointer tables the
+                // grouped GEMV kernels dereference.
+                self.op_barrier()?;
+                let ids_host = route_ids.copy_to_host::<u32>(pairs)?;
+                let mut unique = ids_host;
+                unique.sort_unstable();
+                unique.dedup();
+                let layer = ExpertStreamState::layer_of_prefix(prefix)
+                    .ok_or_else(|| anyhow!("streamed MoE prefix {prefix} has no layer index"))?;
+                let mut state = streaming.borrow_mut();
+                let state = &mut *state;
+                // ONE ensure pass covers all three projections: separate
+                // passes would let the up/down loads evict the gate experts
+                // pinned moments earlier in the same step, leaving the gate
+                // pointer table aimed at reused slots.
+                let proj_sources = (0..3u8)
+                    .filter_map(|proj| {
+                        state
+                            .sources
+                            .get(&(layer, proj))
+                            .cloned()
+                            .map(|source| (proj, source))
+                    })
+                    .collect::<Vec<_>>();
+                let mut requests = Vec::with_capacity(proj_sources.len() * unique.len());
+                for (proj, source) in &proj_sources {
+                    for &id in &unique {
+                        requests.push(((layer, *proj, id), source));
+                    }
+                }
+                let addrs = state.pool.ensure_resident(&requests)?;
+                for (chunk, (proj, _)) in proj_sources.iter().enumerate() {
+                    let (mirror, group) =
+                        state.tables.get_mut(&(layer, *proj)).ok_or_else(|| {
+                            anyhow!("streamed expert table missing for layer {layer}")
+                        })?;
+                    let base = chunk * unique.len();
+                    for (idx, &id) in unique.iter().enumerate() {
+                        mirror[id as usize] = addrs[base + idx];
+                    }
+                    group.ptrs.copy_from_host(mirror)?;
+                }
+            }
 
             let quantize_rows = |tensor: &GpuF32Tensor,
                                  m: usize,
@@ -23501,7 +23749,11 @@ mod native {
         Ok(())
     }
 
-    fn qwen_matrix_specs(gguf: &GgufFile, config: &QwenGgufConfig) -> Result<Vec<MatrixSpec>> {
+    fn qwen_matrix_specs(
+        gguf: &GgufFile,
+        config: &QwenGgufConfig,
+        stream_experts: bool,
+    ) -> Result<Vec<MatrixSpec>> {
         let embed = usize::try_from(config.embedding_length)
             .context("qwen embedding_length does not fit usize")?;
         let vocab = config
@@ -23851,6 +24103,12 @@ mod native {
                     embed,
                 ));
                 for expert in 0..experts {
+                    if stream_experts {
+                        // Routed experts stay on disk; the expert pool serves
+                        // them per step. Router/shared-expert tensors still
+                        // load below.
+                        break;
+                    }
                     if let Some(source) =
                         moe_packed_expert_gate_up_source(gguf, &prefix, expert_ff, embed, experts)?
                     {

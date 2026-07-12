@@ -340,6 +340,27 @@ mod imp {
             self.bytes
         }
 
+        /// Host-to-device copy landing at a byte offset into this buffer
+        /// (expert-pool slot uploads).
+        pub fn copy_from_host_at<T>(&self, dst_offset: usize, data: &[T]) -> Result<()> {
+            let bytes = checked_slice_bytes(data)?;
+            let end = dst_offset
+                .checked_add(bytes)
+                .ok_or_else(|| anyhow::anyhow!("device copy destination range overflows usize"))?;
+            self.require_capacity(end)?;
+            cuda_check(
+                unsafe {
+                    cudaMemcpy(
+                        self.ptr.add(dst_offset),
+                        data.as_ptr().cast(),
+                        bytes,
+                        CudaMemcpyKind::HostToDevice as c_int,
+                    )
+                },
+                "cudaMemcpy(host_to_device)",
+            )
+        }
+
         pub fn copy_from_host<T>(&self, data: &[T]) -> Result<()> {
             let bytes = checked_slice_bytes(data)?;
             self.require_capacity(bytes)?;

@@ -30,6 +30,8 @@ use image::imageops::FilterType;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
+#[cfg(feature = "native-cuda")]
+mod expert_pool;
 pub mod gpu;
 pub mod kernels;
 mod prefix_cache;
@@ -27956,6 +27958,226 @@ mod tests {
             split_model.generate_greedy_tokens(&[1], 3, None).unwrap(),
             fused_model.generate_greedy_tokens(&[1], 3, None).unwrap()
         );
+    }
+
+    /// Rank-3 Q4_K expert tensor with deterministic random bytes and pinned
+    /// (small) block scales so activations stay finite. The bytes only need to
+    /// be IDENTICAL between the resident and streamed loads.
+    #[cfg(feature = "native-cuda")]
+    fn tensor_q4k_experts(
+        name: &str,
+        in_dim: usize,
+        out_dim: usize,
+        experts: usize,
+        seed: u64,
+    ) -> TestTensor {
+        use rand::rngs::StdRng;
+        use rand::{RngCore, SeedableRng};
+        const BLOCK_BYTES: usize = 144;
+        let elements = in_dim * out_dim * experts;
+        assert_eq!(elements % 256, 0);
+        let blocks = elements / 256;
+        let mut bytes = vec![0u8; blocks * BLOCK_BYTES];
+        let mut rng = StdRng::seed_from_u64(seed);
+        rng.fill_bytes(&mut bytes);
+        for block in 0..blocks {
+            let base = block * BLOCK_BYTES;
+            // d = f16 0x1C00 (~0.0039), dmin = 0x1800 (~0.00098): small enough
+            // that random quants cannot blow up the forward.
+            bytes[base] = 0x00;
+            bytes[base + 1] = 0x1C;
+            bytes[base + 2] = 0x00;
+            bytes[base + 3] = 0x18;
+        }
+        TestTensor {
+            name: name.to_string(),
+            dims: vec![in_dim as u64, out_dim as u64, experts as u64],
+            dtype: 12,
+            offset: 0,
+            bytes,
+        }
+    }
+
+    /// Tiny qwen3moe-style model whose routed experts are Q4_K rank-3 tensors:
+    /// the shape the expert-streaming pool serves. embed = ff = 256 keeps every
+    /// projection's reduction dim at the grouped-GEMV 256-multiple.
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_moe_streaming_fixture(path: &Path) {
+        const EMBED: usize = 256;
+        const EXPERTS: usize = 4;
+        let mut tensors = vec![
+            tensor_f16_exact(
+                "token_embd.weight",
+                vec![EMBED as u64, 3],
+                &qwen35_fixture_values(EMBED * 3, 61),
+            ),
+            tensor_f32(
+                "output_norm.weight",
+                vec![EMBED as u64],
+                &qwen35_fixture_norm_values(EMBED, 62),
+            ),
+        ];
+        for layer in 0..2usize {
+            let p = format!("blk.{layer}");
+            let seed = 63 + (layer as u32) * 40;
+            tensors.extend([
+                tensor_f32(
+                    &format!("{p}.attn_norm.weight"),
+                    vec![EMBED as u64],
+                    &qwen35_fixture_norm_values(EMBED, seed),
+                ),
+                tensor_f32(
+                    &format!("{p}.ffn_norm.weight"),
+                    vec![EMBED as u64],
+                    &qwen35_fixture_norm_values(EMBED, seed + 1),
+                ),
+                tensor_f16_exact(
+                    &format!("{p}.attn_q.weight"),
+                    vec![EMBED as u64, EMBED as u64],
+                    &qwen35_fixture_values(EMBED * EMBED, seed + 2),
+                ),
+                tensor_f16_exact(
+                    &format!("{p}.attn_k.weight"),
+                    vec![EMBED as u64, EMBED as u64],
+                    &qwen35_fixture_values(EMBED * EMBED, seed + 3),
+                ),
+                tensor_f16_exact(
+                    &format!("{p}.attn_v.weight"),
+                    vec![EMBED as u64, EMBED as u64],
+                    &qwen35_fixture_values(EMBED * EMBED, seed + 4),
+                ),
+                tensor_f16_exact(
+                    &format!("{p}.attn_output.weight"),
+                    vec![EMBED as u64, EMBED as u64],
+                    &qwen35_fixture_values(EMBED * EMBED, seed + 5),
+                ),
+                tensor_f32(
+                    &format!("{p}.ffn_gate_inp.weight"),
+                    vec![EMBED as u64, EXPERTS as u64],
+                    &qwen35_fixture_values(EMBED * EXPERTS, seed + 6),
+                ),
+                tensor_q4k_experts(
+                    &format!("{p}.ffn_gate_exps.weight"),
+                    EMBED,
+                    EMBED,
+                    EXPERTS,
+                    u64::from(seed) + 7,
+                ),
+                tensor_q4k_experts(
+                    &format!("{p}.ffn_up_exps.weight"),
+                    EMBED,
+                    EMBED,
+                    EXPERTS,
+                    u64::from(seed) + 8,
+                ),
+                tensor_q4k_experts(
+                    &format!("{p}.ffn_down_exps.weight"),
+                    EMBED,
+                    EMBED,
+                    EXPERTS,
+                    u64::from(seed) + 9,
+                ),
+            ]);
+        }
+        write_moe_streaming_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_moe_streaming_gguf(path: &Path, tensors: Vec<TestTensor>) {
+        let mut data = Vec::new();
+        let tensors = tensors
+            .into_iter()
+            .map(|mut tensor| {
+                pad_to_alignment(&mut data, 32);
+                tensor.offset = data.len() as u64;
+                data.extend_from_slice(&tensor.bytes);
+                tensor
+            })
+            .collect::<Vec<_>>();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        write_u32(&mut bytes, 3);
+        write_u64(&mut bytes, tensors.len() as u64);
+        write_u64(&mut bytes, 15);
+
+        write_kv_string(&mut bytes, "general.architecture", "qwen3moe");
+        write_kv_string(&mut bytes, "general.name", "moe-streaming-fixture");
+        write_kv_u32(&mut bytes, "general.alignment", 32);
+        write_kv_u32(&mut bytes, "general.file_type", 15);
+        write_kv_u32(&mut bytes, "qwen3moe.context_length", 128);
+        write_kv_u32(&mut bytes, "qwen3moe.embedding_length", 256);
+        write_kv_u32(&mut bytes, "qwen3moe.feed_forward_length", 256);
+        write_kv_u32(&mut bytes, "qwen3moe.block_count", 2);
+        write_kv_u32(&mut bytes, "qwen3moe.attention.head_count", 2);
+        write_kv_u32(&mut bytes, "qwen3moe.attention.head_count_kv", 2);
+        write_kv_f32(
+            &mut bytes,
+            "qwen3moe.attention.layer_norm_rms_epsilon",
+            1.0e-6,
+        );
+        write_kv_f32(&mut bytes, "qwen3moe.rope.freq_base", 10_000.0);
+        write_kv_u32(&mut bytes, "qwen3moe.expert_count", 4);
+        write_kv_u32(&mut bytes, "qwen3moe.expert_used_count", 2);
+        write_kv_string_array(&mut bytes, "tokenizer.ggml.tokens", &["a", "b", "c"]);
+
+        for tensor in tensors {
+            write_string(&mut bytes, &tensor.name);
+            write_u32(&mut bytes, tensor.dims.len() as u32);
+            for dim in tensor.dims {
+                write_u64(&mut bytes, dim);
+            }
+            write_u32(&mut bytes, tensor.dtype);
+            write_u64(&mut bytes, tensor.offset);
+        }
+
+        pad_to_alignment(&mut bytes, 32);
+        bytes.extend(data);
+        fs::write(path, bytes).unwrap();
+    }
+
+    /// The expert-streaming pool must be invisible to the math: a tiny pool
+    /// (5 slots vs 24 distinct experts, forcing constant eviction) generates
+    /// BIT-identical logits and greedy tokens vs the fully-resident load of
+    /// the same file.
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_expert_streaming_matches_resident() {
+        use hi_gguf::GgufFile;
+
+        // Both loads must keep experts quantized (grouped dp4a path); the
+        // f16-residency conversion would otherwise route the tiny resident
+        // model through different math. Same precedent as the MMQ tests.
+        unsafe { std::env::set_var("HI_CUDA_WEIGHTS_F16", "0") };
+
+        let path = tempfile_path("gpu-moe-streaming");
+        write_reference_moe_streaming_fixture(&path);
+        let gguf = GgufFile::open(&path).unwrap();
+
+        let resident =
+            crate::gpu::CudaQwenGpuModel::from_gguf_with_expert_streaming(&gguf, None).unwrap();
+        // Per-expert bytes: 256x256 Q4_K = 256 blocks x 144 = 36,864.
+        let streamed =
+            crate::gpu::CudaQwenGpuModel::from_gguf_with_expert_streaming(&gguf, Some(14 * 36_864))
+                .unwrap();
+
+        assert!(resident.has_matrix("blk.0.ffn_gate_exps.0.weight"));
+        assert!(!streamed.has_matrix("blk.0.ffn_gate_exps.0.weight"));
+
+        let resident_logits = resident.full_context_logits_host(&[0, 1, 2]).unwrap();
+        let streamed_logits = streamed.full_context_logits_host(&[0, 1, 2]).unwrap();
+        assert_eq!(resident_logits, streamed_logits);
+        assert!(resident_logits.iter().all(|value| value.is_finite()));
+
+        assert_eq!(
+            resident.generate_greedy_tokens(&[1], 4, None).unwrap(),
+            streamed.generate_greedy_tokens(&[1], 4, None).unwrap()
+        );
+
+        let stats = streamed.expert_pool_stats().unwrap();
+        assert!(stats.misses > 0);
+        assert!(stats.evictions > 0, "pool never evicted; stats: {stats:?}");
+        assert!(stats.hits > 0);
     }
 
     #[cfg(feature = "native-cuda")]
