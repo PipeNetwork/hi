@@ -167,7 +167,135 @@ fn render_gguf_chat_template(template: &str, messages: &[ChatMessage]) -> Option
         return render_simple_loop_template(&template, messages)
             .or_else(|| Some(build_chatml_prompt(messages, &[], &Value::Null)));
     }
+    // DeepSeek-V4: V3-style `<｜User｜>`/`<｜Assistant｜>` markers plus `<think>` mode tokens and
+    // DSML tool tags. The `｜DSML｜` token is the V4 discriminator — V3/R1-era templates carry the
+    // same user/assistant/think markers but no DSML, and must keep falling through to the family
+    // prompt below (and V2-classic templates use plain-text `'User: '` roles, matched further
+    // down), so requiring all three markers cannot shadow either.
+    if template.contains("<｜User｜>")
+        && template.contains("</think>")
+        && template.contains("｜DSML｜")
+    {
+        return Some(render_deepseek_v4_template(messages));
+    }
+    // DeepSeek-V2(-Lite)-Chat classic format: `{system}\n\nUser: {q}\n\nAssistant: {a}{eos}` with an
+    // `Assistant:` generation prompt (plain-text roles — the V3 `<｜User｜>` special tokens don't
+    // exist in the V2 vocab). Its jinja (`{% set %}` + elif chain) exceeds the loop renderer, so
+    // match the distinctive quoted role literals and render directly. BOS comes from the tokenizer
+    // (add_bos_token=true), so it is not emitted as text.
+    if template.contains("'User: '") && template.contains("'Assistant: '") {
+        return Some(render_deepseek_v2_classic_template(messages));
+    }
     render_simple_loop_template(&template, messages)
+}
+
+// DeepSeek-V4-Flash (thinking OFF, the serving default). Mirrors the GGUF's 13k jinja for the
+// no-tools path: `bos` + concatenated system text + `<｜User｜>` blocks (consecutive user/tool
+// turns merge with `\n\n`, tool results wrapped in `<tool_result>`), assistant turns as
+// `<｜Assistant｜></think>{content}<｜end▁of▁sentence｜>` (the `<｜Assistant｜></think>` prefix is
+// emitted only after a user-like predecessor, exactly like the template's transition rule), and a
+// `<｜Assistant｜></think>` generation prompt — with thinking disabled the template emits the
+// closing think token immediately so the model answers directly. The GGUF sets
+// add_bos_token=false and the template prints `bos_token` as text, so the bos literal is emitted
+// here and the tokenizer maps it to the bos id.
+fn render_deepseek_v4_template(messages: &[ChatMessage]) -> String {
+    let mut out = String::from("<｜begin▁of▁sentence｜>");
+    let mut first_system = true;
+    for message in messages {
+        if message.role == "system" {
+            if !first_system {
+                out.push_str("\n\n");
+            }
+            out.push_str(&message.content_text());
+            first_system = false;
+        }
+    }
+    // Whether the current `<｜User｜>` block is still open (user/tool turns append to it) and
+    // whether the previous rendered turn was user-like (which owes the next assistant its
+    // `<｜Assistant｜></think>` transition prefix).
+    let mut in_user = false;
+    let mut prev_user_like = false;
+    for message in messages {
+        match message.role.as_str() {
+            "system" => {}
+            "assistant" | "model" => {
+                if prev_user_like {
+                    out.push_str("<｜Assistant｜></think>");
+                }
+                out.push_str(&message.content_text());
+                // The template renders tool calls as DSML blocks; tool-call turns only reach
+                // this renderer without tool schemas (tools route to the family prompt), so
+                // keep the family renderer's plain-JSON fallback for them.
+                if !message.tool_calls.is_empty() {
+                    if !message.content_text().is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str(&json!(message.tool_calls).to_string());
+                }
+                out.push_str("<｜end▁of▁sentence｜>");
+                in_user = false;
+                prev_user_like = false;
+            }
+            "tool" => {
+                if in_user {
+                    out.push_str("\n\n");
+                } else {
+                    out.push_str("<｜User｜>");
+                    in_user = true;
+                }
+                out.push_str("<tool_result>");
+                out.push_str(&message.content_text());
+                out.push_str("</tool_result>");
+                prev_user_like = true;
+            }
+            // The template gives developer turns their own `<｜User｜>` block (never merged
+            // into an open user block, and not merged over by the next user turn either).
+            "developer" => {
+                out.push_str("<｜User｜>");
+                out.push_str(&message.content_text());
+                in_user = false;
+                prev_user_like = true;
+            }
+            _ => {
+                if in_user {
+                    out.push_str("\n\n");
+                } else {
+                    out.push_str("<｜User｜>");
+                    in_user = true;
+                }
+                out.push_str(&message.content_text());
+                prev_user_like = true;
+            }
+        }
+    }
+    out.push_str("<｜Assistant｜></think>");
+    out
+}
+
+fn render_deepseek_v2_classic_template(messages: &[ChatMessage]) -> String {
+    let mut out = String::new();
+    for message in messages {
+        match message.role.as_str() {
+            "system" | "developer" => {
+                out.push_str(&message.content_text());
+                out.push_str("\n\n");
+            }
+            "assistant" | "model" => {
+                out.push_str("Assistant: ");
+                out.push_str(&message.content_text());
+                // Turn terminator; the tokenizer maps the literal to the eos id.
+                out.push_str("<｜end▁of▁sentence｜>");
+            }
+            // The template has no tool role; route tool results back as user turns.
+            _ => {
+                out.push_str("User: ");
+                out.push_str(&message.content_text());
+                out.push_str("\n\n");
+            }
+        }
+    }
+    out.push_str("Assistant:");
+    out
 }
 
 fn render_gemma_turn_template(messages: &[ChatMessage]) -> String {
@@ -1210,6 +1338,140 @@ mod tests {
 
         assert!(prompt.contains("<｜User｜>hi"));
         assert!(prompt.ends_with("<｜Assistant｜>"));
+    }
+
+    #[test]
+    fn deepseek_v2_classic_template_renders_plain_text_roles() {
+        // DeepSeek-V2-Lite-Chat ships this template; its `{% set %}` + elif chain
+        // exceed the loop renderer, so the dedicated classic renderer must catch it.
+        let template = "{% if not add_generation_prompt is defined %}{% set add_generation_prompt = false %}{% endif %}{{ bos_token }}{% for message in messages %}{% if message['role'] == 'user' %}{{ 'User: ' + message['content'] + '\\n\\n' }}{% elif message['role'] == 'assistant' %}{{ 'Assistant: ' + message['content'] + eos_token }}{% elif message['role'] == 'system' %}{{ message['content'] + '\\n\\n' }}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ 'Assistant:' }}{% endif %}";
+        let messages = vec![
+            ChatMessage {
+                role: "system".to_string(),
+                content: Some(json!("Be brief.")),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+            },
+            ChatMessage {
+                role: "user".to_string(),
+                content: Some(json!("hi")),
+                tool_call_id: None,
+                tool_calls: Vec::new(),
+            },
+        ];
+
+        let prompt = build_prompt_with_template(
+            ModelFamily::DeepSeek,
+            Some(template),
+            &messages,
+            &[],
+            &Value::Null,
+        );
+
+        assert_eq!(prompt, "Be brief.\n\nUser: hi\n\nAssistant:");
+    }
+
+    // Structural fragments of the real DeepSeek-V4-Flash GGUF template (13k chars, unsloth
+    // build): the marker set-up, the user/tool/assistant turn emission, and the generation
+    // prompt. Trimmed to the parts the discriminator and renderer contract depend on.
+    const DEEPSEEK_V4_TEMPLATE: &str = "{%- set dsml_token = '｜DSML｜' -%}\
+{%- set thinking_start_token = '<think>' -%}\
+{%- set thinking_end_token = '</think>' -%}\
+{{- bos_token -}}\
+{{- ns.system_prompt -}}\
+{%- for message in messages -%}\
+{%- if message['role'] == 'user' -%}\
+{%- if state.in_user -%}{{- '\\n\\n' -}}{%- else -%}{{- '<｜User｜>' -}}{%- endif -%}\
+{{- message['content'] or '' -}}\
+{%- elif message['role'] == 'tool' -%}\
+{{- '<tool_result>' + (message['content'] or '') + '</tool_result>' -}}\
+{%- elif message['role'] == 'assistant' -%}\
+{{- '<｜Assistant｜>' -}}\
+{%- if thinking -%}{{- thinking_start_token -}}{%- else -%}{{- thinking_end_token -}}{%- endif -%}\
+{{- message['content'] -}}{{- '<｜end▁of▁sentence｜>' -}}\
+{%- endif -%}\
+{%- endfor -%}\
+{%- if add_generation_prompt -%}\
+{{- '<｜Assistant｜>' -}}\
+{%- if thinking -%}{{- thinking_start_token -}}{%- else -%}{{- thinking_end_token -}}{%- endif -%}\
+{%- endif -%}";
+
+    fn message(role: &str, content: &str) -> ChatMessage {
+        ChatMessage {
+            role: role.to_string(),
+            content: Some(json!(content)),
+            tool_call_id: None,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn deepseek_v4_template_renders_system_user_with_think_off_generation_prompt() {
+        let messages = vec![message("system", "Be brief."), message("user", "hi")];
+
+        let prompt = build_prompt_with_template(
+            ModelFamily::DeepSeek,
+            Some(DEEPSEEK_V4_TEMPLATE),
+            &messages,
+            &[],
+            &Value::Null,
+        );
+
+        // bos literal (add_bos_token=false; the template prints bos_token as text), plain
+        // system text, one user block, and the thinking-OFF generation prompt: the template
+        // emits `</think>` immediately after `<｜Assistant｜>` when thinking is disabled.
+        assert_eq!(
+            prompt,
+            "<｜begin▁of▁sentence｜>Be brief.<｜User｜>hi<｜Assistant｜></think>"
+        );
+    }
+
+    #[test]
+    fn deepseek_v4_template_renders_history_and_merged_user_turns() {
+        let messages = vec![
+            message("system", "sys"),
+            message("user", "q1"),
+            message("assistant", "a1"),
+            message("user", "q2"),
+            message("user", "q3"),
+            message("tool", "result"),
+        ];
+
+        let prompt = build_prompt_with_template(
+            ModelFamily::DeepSeek,
+            Some(DEEPSEEK_V4_TEMPLATE),
+            &messages,
+            &[],
+            &Value::Null,
+        );
+
+        assert_eq!(
+            prompt,
+            "<｜begin▁of▁sentence｜>sys\
+             <｜User｜>q1\
+             <｜Assistant｜></think>a1<｜end▁of▁sentence｜>\
+             <｜User｜>q2\n\nq3\n\n<tool_result>result</tool_result>\
+             <｜Assistant｜></think>"
+        );
+    }
+
+    #[test]
+    fn deepseek_v4_discriminator_does_not_capture_r1_style_templates() {
+        // R1/V3.1-era templates carry `<｜User｜>` and `</think>` but no DSML token; they must
+        // keep the existing behavior (complex jinja -> family deepseek prompt), not the V4
+        // renderer.
+        let template = "{% for message in messages %}{% if message['role'] == 'user' %}{{ '<｜User｜>' + message['content'] }}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ '<｜Assistant｜><think>' }}{% endif %}{# reasoning content split on '</think>' #}";
+        let messages = vec![message("user", "hi")];
+
+        let prompt = build_prompt_with_template(
+            ModelFamily::DeepSeek,
+            Some(template),
+            &messages,
+            &[],
+            &Value::Null,
+        );
+
+        assert_eq!(prompt, "<｜User｜>hi\n<｜Assistant｜>");
     }
 
     #[test]

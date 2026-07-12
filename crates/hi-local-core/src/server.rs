@@ -74,6 +74,9 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
         "gpu_matrices": segment_status_health_details(&health.quantization, "gpu-matrices"),
         "gpu_vectors": segment_status_health_details(&health.quantization, "gpu-vectors"),
         "scheduler": scheduler_health_details(&health.quantization),
+        // Dedicated single-request engines (DeepSeek-V4) advertise themselves via a
+        // `dsv4=enabled(...)` quantization segment; other backends report "unavailable".
+        "dsv4": segment_status_health_details(&health.quantization, "dsv4"),
         "kv_cache": kv_cache_health_details(&health.quantization),
         "prefix_cache": segment_status_health_details(&health.quantization, "prefix-cache"),
         "attention": attention_health_details(&health.quantization),
@@ -797,7 +800,17 @@ fn streaming_response_from_stream_future(
     let events = futures_util::stream::unfold(state, |mut state| async move {
         state.next_event().await.map(|event| (event, state))
     });
-    Sse::new(events).into_response()
+    // SSE comment keepalives so long silent prefills (minutes on the dsv4
+    // backend's 284B single-request engine) don't trip client idle-read
+    // timeouts (hi's default is 360 s). Comment lines are ignored by SSE
+    // parsers, including hi's eventsource-stream client.
+    Sse::new(events)
+        .keep_alive(
+            axum::response::sse::KeepAlive::new()
+                .interval(std::time::Duration::from_secs(15))
+                .text("keepalive"),
+        )
+        .into_response()
 }
 
 struct OpenAiSseState {
