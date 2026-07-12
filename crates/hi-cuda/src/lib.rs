@@ -972,6 +972,7 @@ impl CudaBackend {
         }
     }
 
+    #[cfg(feature = "native-cuda")]
     fn expert_streaming_status(&self) -> String {
         let Ok(model) = &self.gpu_model else {
             return "off".to_string();
@@ -989,6 +990,11 @@ impl CudaBackend {
             ),
             None => "off".to_string(),
         }
+    }
+
+    #[cfg(not(feature = "native-cuda"))]
+    fn expert_streaming_status(&self) -> String {
+        "off".to_string()
     }
 
     fn kv_cache_status(&self) -> String {
