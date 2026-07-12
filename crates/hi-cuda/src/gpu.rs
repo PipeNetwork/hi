@@ -3430,6 +3430,94 @@ mod native {
             Ok(())
         }
 
+        /// Env-gated (`HI_MLA_DEBUG_DUMP`) activation dump for CPU-parity
+        /// bisection; see `crate::mla_debug`. Tags are scoped to the layer set
+        /// via `crate::mla_debug::set_layer`. No-op unless the env var is set.
+        fn mla_debug_dump_tensor(&self, tag: &str, tensor: &GpuF32Tensor) {
+            if !crate::mla_debug::enabled() {
+                return;
+            }
+            match tensor.copy_to_host() {
+                Ok(values) => crate::mla_debug::dump_scoped(tag, &values),
+                Err(err) => eprintln!("mla_debug: failed to copy `{tag}` to host: {err:#}"),
+            }
+        }
+
+        /// Unscoped variant of `mla_debug_dump_tensor` for tensors outside the
+        /// layer loop (embeddings, final logits).
+        fn mla_debug_dump_tensor_raw(&self, tag: &str, tensor: &GpuF32Tensor) {
+            if !crate::mla_debug::enabled() {
+                return;
+            }
+            match tensor.copy_to_host() {
+                Ok(values) => crate::mla_debug::dump(tag, &values),
+                Err(err) => eprintln!("mla_debug: failed to copy `{tag}` to host: {err:#}"),
+            }
+        }
+
+        /// Debug-only (`HI_MLA_DEBUG_DUMP`) host recomputation of causal
+        /// attention from the SAME device q/k/v the kernel consumed, dumped as
+        /// `attn_hostref`. Comparing it against the kernel's `attn` record in
+        /// one dump isolates attention-kernel defects from upstream activation
+        /// noise. No-op unless dumps are enabled.
+        #[allow(clippy::too_many_arguments)]
+        fn mla_debug_dump_host_attention(
+            &self,
+            q: &GpuF32Tensor,
+            k: &GpuF32Tensor,
+            v: &GpuF32Tensor,
+            seq_len: usize,
+            heads: usize,
+            kv_heads: usize,
+            head_dim: usize,
+            v_head_dim: usize,
+            window: usize,
+        ) {
+            if !crate::mla_debug::enabled() {
+                return;
+            }
+            let (Ok(q), Ok(k), Ok(v)) = (q.copy_to_host(), k.copy_to_host(), v.copy_to_host())
+            else {
+                return;
+            };
+            let kv_repeats = heads / kv_heads.max(1);
+            let scale = (head_dim as f32).powf(-0.5);
+            let mut output = vec![0.0f32; seq_len * heads * v_head_dim];
+            for target in 0..seq_len {
+                let source_start = if window > 0 && target >= window {
+                    target - window + 1
+                } else {
+                    0
+                };
+                for head in 0..heads {
+                    let kv_head = head / kv_repeats.max(1);
+                    let q_vec = &q[(target * heads + head) * head_dim..][..head_dim];
+                    let mut scores = Vec::with_capacity(target + 1 - source_start);
+                    for source in source_start..=target {
+                        let k_vec = &k[(source * kv_heads + kv_head) * head_dim..][..head_dim];
+                        let dot: f32 = q_vec.iter().zip(k_vec).map(|(a, b)| a * b).sum();
+                        scores.push(dot * scale);
+                    }
+                    let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let mut denom = 0.0f32;
+                    for score in &mut scores {
+                        *score = (*score - max).exp();
+                        denom += *score;
+                    }
+                    let out = &mut output[(target * heads + head) * v_head_dim..][..v_head_dim];
+                    for (offset, score) in scores.into_iter().enumerate() {
+                        let source = source_start + offset;
+                        let weight = score / denom;
+                        let v_vec = &v[(source * kv_heads + kv_head) * v_head_dim..][..v_head_dim];
+                        for (out, value) in out.iter_mut().zip(v_vec) {
+                            *out += weight * value;
+                        }
+                    }
+                }
+            }
+            crate::mla_debug::dump_scoped("attn_hostref", &output);
+        }
+
         /// During CUDA-graph decode capture, the device buffer holding the input token id for
         /// the embedding gather; None means the ordinary host-copied ids are used.
         fn active_graph_token(&self) -> Option<&DeviceBuffer> {
@@ -3942,6 +4030,23 @@ mod native {
             })
         }
 
+        /// False when this model's activations are too outlier-heavy for the
+        /// per-32 int8 activation quantization used by the dp4a GEMV/GEMM fast
+        /// paths (`quantize_q8_row` + `*_dp4a_*`).
+        ///
+        /// DeepSeek-V2 (deepseek2) MLA models carry "massive activations":
+        /// hidden-state L2 ~3e3 dominated by a few huge dims, so per-32 int8
+        /// quantization costs ~0.5% RMS per projection (measured on
+        /// DeepSeek-V2-Lite; the kernels themselves are bit-faithful to the
+        /// int8 algorithm). The model's attention then amplifies that noise
+        /// chaotically (35%+ divergence from the f32 CPU reference by layer 19)
+        /// and greedy decode goes incoherent. The float-activation GEMV /
+        /// f16-GEMM paths track the CPU reference to ~1e-4 and reproduce its
+        /// greedy output, so deepseek2 skips every int8-activation fast path.
+        fn int8_activation_paths_allowed(&self) -> bool {
+            self.config.architecture != "deepseek2"
+        }
+
         fn project_quantized_f32_device(
             &self,
             matrix_name: &str,
@@ -3949,6 +4054,11 @@ mod native {
             input: &GpuF32Tensor,
             shared_cast: &mut Option<(DeviceBuffer, usize)>,
         ) -> Result<GpuF32Tensor> {
+            // Massive-activation models (deepseek2) skip every fast path that
+            // int8-quantizes the activation; see int8_activation_paths_allowed.
+            // (The fp4 and float K-quant GEMVs read the f32 activation directly
+            // and stay enabled.)
+            let int8_activations = self.int8_activation_paths_allowed();
             // Single-token decode fast path for fp4 checkpoints: read the packed
             // MXFP4/NVFP4 blocks natively against the f32 activation (~0.53-0.56
             // bytes/weight) instead of dequantizing the whole matrix to f32 per
@@ -3990,6 +4100,7 @@ mod native {
             // Single-token decode fast path: quantize the activation to int8 and run a
             // fused dp4a Q4_0 GEMV, reading 4-bit weights + int8 activation directly.
             if q4_0_gemv_enabled()
+                && int8_activations
                 && input.rows == 1
                 && matches!(matrix.dtype, GgufTensorType::Q4_0)
                 && matrix.cols % 32 == 0
@@ -4071,7 +4182,7 @@ mod native {
                 && matches!(matrix.dtype, GgufTensorType::Q6_K)
                 && matrix.cols % 256 == 0
             {
-                if kquant_dp4a_enabled() {
+                if int8_activations && kquant_dp4a_enabled() {
                     return self.kquant_dp4a_gemv(
                         matrix_name,
                         matrix,
@@ -4107,7 +4218,7 @@ mod native {
             {
                 let output = DeviceBuffer::alloc(matrix.rows * std::mem::size_of::<f32>())
                     .context("allocating CUDA Q4_K GEMV output")?;
-                if kquant_dp4a_enabled() {
+                if int8_activations && kquant_dp4a_enabled() {
                     // dp4a path: quantize the activation to int8 (per-32, same as Q4_0)
                     // and run the __dp4a Q4_K GEMV — ~3-4x faster than the float
                     // q4_k_gemv, which re-reads block metadata per weight.
@@ -4162,7 +4273,7 @@ mod native {
                 && matches!(matrix.dtype, GgufTensorType::Q5_K)
                 && matrix.cols % 256 == 0
             {
-                if kquant_dp4a_enabled() {
+                if int8_activations && kquant_dp4a_enabled() {
                     return self.kquant_dp4a_gemv(
                         matrix_name,
                         matrix,
@@ -4194,7 +4305,7 @@ mod native {
                 && matches!(matrix.dtype, GgufTensorType::Q3_K)
                 && matrix.cols % 256 == 0
             {
-                if kquant_dp4a_enabled() {
+                if int8_activations && kquant_dp4a_enabled() {
                     return self.kquant_dp4a_gemv(
                         matrix_name,
                         matrix,
@@ -4226,7 +4337,7 @@ mod native {
                 && matches!(matrix.dtype, GgufTensorType::Q2_K)
                 && matrix.cols % 256 == 0
             {
-                if kquant_dp4a_enabled() {
+                if int8_activations && kquant_dp4a_enabled() {
                     return self.kquant_dp4a_gemv(
                         matrix_name,
                         matrix,
@@ -4484,6 +4595,7 @@ mod native {
             // that row through the M=1 dp4a GEMV. Prefill (M > 32) keeps the cuBLAS
             // f16 GEMM below, which wins once M amortizes the f16 read.
             if mmq_gemm_enabled()
+                && int8_activations
                 && kquant_dp4a_enabled()
                 && input.rows >= 2
                 && input.rows <= mmq_gemm_max_m()
@@ -5961,8 +6073,12 @@ mod native {
                 return true;
             }
             if self.config.expert_count.is_some() {
+                // DeepSeek-class MoE keeps the first `leading_dense_block_count`
+                // layers dense, so the router need not live at blk.0 — accept it
+                // at any layer.
                 self.config.expert_used_count.is_some()
-                    && self.has_matrix("blk.0.ffn_gate_inp.weight")
+                    && (0..self.config.block_count)
+                        .any(|layer| self.has_matrix(&format!("blk.{layer}.ffn_gate_inp.weight")))
             } else {
                 self.has_matrix("blk.0.ffn_gate.weight")
                     && self.has_matrix("blk.0.ffn_up.weight")
@@ -16043,6 +16159,7 @@ mod native {
             }
 
             let mut hidden = self.embed_tokens_device(token_ids)?;
+            self.mla_debug_dump_tensor_raw("embed", &hidden);
             let eps = self.config.rms_norm_eps.unwrap_or(1.0e-6);
             let rope_base = self
                 .config
@@ -16053,8 +16170,10 @@ mod native {
             for layer in 0..self.config.block_count {
                 let prefix = format!("blk.{layer}");
                 let dims = self.qwen_layer_dims(layer as usize)?;
+                crate::mla_debug::set_layer(layer as usize);
                 let attn_input =
                     self.rms_norm_f32_device(&format!("{prefix}.attn_norm.weight"), &hidden, eps)?;
+                self.mla_debug_dump_tensor("attn_in", &attn_input);
 
                 if self.layer_uses_recurrent_ssm(&prefix) {
                     let ssm_out = self.recurrent_ssm_f32_device(&prefix, &attn_input, eps)?;
@@ -16073,6 +16192,9 @@ mod native {
                             position_offset: 0,
                         },
                     )?;
+                    self.mla_debug_dump_tensor("q", &q);
+                    self.mla_debug_dump_tensor("k", &k);
+                    self.mla_debug_dump_tensor("v", &v);
                     if let Some(cache) = cache.as_deref_mut() {
                         cache.write_layer(
                             usize::try_from(layer)
@@ -16097,20 +16219,39 @@ mod native {
                         dims.v_head_dim,
                         self.layer_attention_window(&prefix),
                     )?;
+                    self.mla_debug_dump_tensor("attn", &attn);
+                    self.mla_debug_dump_host_attention(
+                        &q,
+                        &k,
+                        &v,
+                        token_ids.len(),
+                        dims.heads,
+                        dims.kv_heads,
+                        dims.head_dim,
+                        dims.v_head_dim,
+                        self.layer_attention_window(&prefix),
+                    );
                     let attn_out =
                         self.attention_output_projection_f32_device(&prefix, &attn, gate.as_ref())?;
+                    self.mla_debug_dump_tensor("attn_out", &attn_out);
                     hidden = self.add_f32_device(&hidden, &attn_out)?;
+                    self.mla_debug_dump_tensor("hidden_attn", &hidden);
                 }
 
                 let mlp_input =
                     self.rms_norm_f32_device(&format!("{prefix}.ffn_norm.weight"), &hidden, eps)?;
+                self.mla_debug_dump_tensor("ffn_in", &mlp_input);
                 let mlp_out = self.ffn_f32_device(&prefix, &mlp_input)?;
+                self.mla_debug_dump_tensor("ffn_out", &mlp_out);
                 hidden = self.add_f32_device(&hidden, &mlp_out)?;
                 hidden = self.apply_gemma_layer_output_scale(&prefix, hidden)?;
+                self.mla_debug_dump_tensor("hidden", &hidden);
             }
 
             let normed = self.rms_norm_f32_device("output_norm.weight", &hidden, eps)?;
-            self.output_logits_f32_device(&normed)
+            let logits = self.output_logits_f32_device(&normed)?;
+            self.mla_debug_dump_tensor_raw("logits", &logits);
+            Ok(logits)
         }
 
         fn full_context_logits_device_with_paged_cache(
@@ -17039,6 +17180,7 @@ mod native {
                     usize::try_from(layer).context("qwen layer index does not fit usize")?;
                 let prefix = format!("blk.{layer}");
                 let dims = self.qwen_layer_dims(layer as usize)?;
+                crate::mla_debug::set_layer(layer as usize);
                 self.ensure_layer_runtime_supported(&prefix)?;
                 let attn_input =
                     self.rms_norm_f32_device(&format!("{prefix}.attn_norm.weight"), &hidden, eps)?;
@@ -17056,6 +17198,9 @@ mod native {
                         position_offset: position,
                     },
                 )?;
+                self.mla_debug_dump_tensor(&format!("decode_pos{position}.q"), &q);
+                self.mla_debug_dump_tensor(&format!("decode_pos{position}.k"), &k);
+                self.mla_debug_dump_tensor(&format!("decode_pos{position}.v"), &v);
                 if let Some(d_pos) = self.active_graph_position() {
                     // CUDA-graph capture: write K/V at the device-counter position, straight
                     // against the layer's pool buffers so start_pos comes from the device
@@ -17149,6 +17294,7 @@ mod native {
                     dims.v_head_dim,
                     self.layer_attention_window(&prefix),
                 )?;
+                self.mla_debug_dump_tensor(&format!("decode_pos{position}.attn"), &attn);
                 let attn_out =
                     self.attention_output_projection_f32_device(&prefix, &attn, gate.as_ref())?;
                 hidden = self.add_f32_device(&hidden, &attn_out)?;
@@ -17158,6 +17304,7 @@ mod native {
                 let mlp_out = self.ffn_f32_device(&prefix, &mlp_input)?;
                 hidden = self.add_f32_device(&hidden, &mlp_out)?;
                 hidden = self.apply_gemma_layer_output_scale(&prefix, hidden)?;
+                self.mla_debug_dump_tensor(&format!("decode_pos{position}.hidden"), &hidden);
             }
 
             let normed = self.rms_norm_f32_device("output_norm.weight", &hidden, eps)?;
@@ -17406,7 +17553,15 @@ mod native {
 
         fn layer_uses_mla_attention(&self, prefix: &str) -> bool {
             self.config.attention_mla_tensor_layout
-                && self.has_matrix(&format!("{prefix}.attn_q_a.weight"))
+                && (self.has_matrix(&format!("{prefix}.attn_q_a.weight"))
+                    || self.has_matrix(&format!("{prefix}.attn_kv_a_mqa.weight")))
+        }
+
+        /// True when an MLA layer uses the Q-LoRA query decomposition
+        /// (q_a -> q_a_norm -> q_b). DeepSeek-V2-Lite-class models omit it and
+        /// project the query directly from a full `attn_q` instead.
+        fn layer_uses_mla_q_lora(&self, prefix: &str) -> bool {
+            self.has_matrix(&format!("{prefix}.attn_q_a.weight"))
         }
 
         fn layer_uses_recurrent_ssm(&self, prefix: &str) -> bool {
@@ -17657,18 +17812,48 @@ mod native {
 
             // Both MLA latent projections read attn_input: share one f16 cast.
             let mut mla_input_cast: Option<(DeviceBuffer, usize)> = None;
-            let q_latent = self.project_f32_device_shared_cast(
-                &format!("{prefix}.attn_q_a.weight"),
-                attn_input,
-                &mut mla_input_cast,
-            )?;
-            let q_latent = self.rms_norm_f32_device(
-                &format!("{prefix}.attn_q_a_norm.weight"),
-                &q_latent,
-                eps,
-            )?;
-            let q = self.project_f32_device(&format!("{prefix}.attn_q_b.weight"), &q_latent)?;
+            let q = if self.layer_uses_mla_q_lora(prefix) {
+                // Q-LoRA query decomposition: attn_q_a -> q_a_norm -> attn_q_b.
+                let q_latent = self.project_f32_device_shared_cast(
+                    &format!("{prefix}.attn_q_a.weight"),
+                    attn_input,
+                    &mut mla_input_cast,
+                )?;
+                let q_latent = self.rms_norm_f32_device(
+                    &format!("{prefix}.attn_q_a_norm.weight"),
+                    &q_latent,
+                    eps,
+                )?;
+                self.project_f32_device(&format!("{prefix}.attn_q_b.weight"), &q_latent)?
+            } else {
+                // Full-Q MLA (DeepSeek-V2-Lite class): no Q-LoRA, project the
+                // per-head query directly from the full attn_q projection.
+                self.project_f32_device_shared_cast(
+                    &format!("{prefix}.attn_q.weight"),
+                    attn_input,
+                    &mut mla_input_cast,
+                )?
+            };
+            // DeepSeek applies interleaved (GPT-J style) RoPE to the q_pe/k_pe
+            // slices, unlike the NEOX split-half rope used by Qwen and by GLM's
+            // MLA. (Fixtures use qk_rope=2, where the two styles coincide, so the
+            // distinction only shows up on real models with qk_rope>2.)
+            //
+            // deepseek2 ships YARN rope-scaling metadata (factor 40 from a 4k
+            // original context, yarn_log_multiplier 0.0707). When the `Ds2Yarn`
+            // package is active (yarn metadata + `HI_DS2_YARN=1` opt-in; its type
+            // docs record why it is not on by default: the faithful vLLM/HF
+            // mscale^2 score factor demotes the short-context oracle top-1 on
+            // both backends identically, independent of the int8-dp4a history),
+            // the pe dims get NTK-by-parts frequency interpolation and the score
+            // gains `mscale^2` (folded in by pre-scaling q, since the kernel
+            // hardcodes `qk_head_dim^-0.5`); the cos/sin table stays unscaled.
+            // The package is shared verbatim with the CPU reference so the two
+            // stay parity twins; `HI_DS2_NO_YARN=1` is a hard off for bisection.
+            let yarn = crate::qwen_cpu::Ds2Yarn::from_config(&self.config);
+            let mla_pe_rope_split_half = !self.config.architecture.contains("deepseek");
             let mut q_host = q.copy_to_host()?;
+            crate::mla_debug::dump_scoped("q_prerope", &q_host);
             for row in 0..attn_input.rows {
                 for head in 0..dims.heads {
                     let head_start = row
@@ -17677,14 +17862,31 @@ mod native {
                         .context("CUDA MLA q host offset overflows usize")?;
                     let rope_start = head_start + mla.qk_nope_head_dim;
                     let rope_end = rope_start + mla.qk_rope_head_dim;
-                    apply_rope_layout_host(
-                        &mut q_host[rope_start..rope_end],
-                        row,
-                        rope,
-                        rope_base,
-                        rope_scale,
-                        true,
-                    )?;
+                    if let Some(yarn) = &yarn {
+                        crate::qwen_cpu::apply_deepseek_yarn_rope(
+                            &mut q_host[rope_start..rope_end],
+                            rope.position_for_row(row),
+                            yarn.inv_freq(),
+                        )?;
+                    } else {
+                        apply_rope_layout_host(
+                            &mut q_host[rope_start..rope_end],
+                            row,
+                            rope,
+                            rope_base,
+                            rope_scale,
+                            mla_pe_rope_split_half,
+                        )?;
+                    }
+                }
+            }
+            // Fold the YARN attention `mscale^2` into the score by pre-scaling q
+            // (the causal-attention kernel hardcodes `qk_head_dim^-0.5`); the CPU
+            // reference pre-scales q identically.
+            if let Some(yarn) = &yarn {
+                let mscale_sq = yarn.mscale_sq();
+                for value in q_host.iter_mut() {
+                    *value *= mscale_sq;
                 }
             }
             let q = self.f32_tensor_from_host(&q_host, q.rows, q.cols, "CUDA MLA q compose")?;
@@ -17695,6 +17897,7 @@ mod native {
                 &mut mla_input_cast,
             )?;
             let kv_a_host = kv_a.copy_to_host()?;
+            crate::mla_debug::dump_scoped("kv_a", &kv_a_host);
             let mut kv_latent_host = vec![0.0; attn_input.rows * mla.kv_lora_rank];
             let mut k_pe_host = vec![0.0; attn_input.rows * mla.qk_rope_head_dim];
             for row in 0..attn_input.rows {
@@ -17719,9 +17922,11 @@ mod native {
                 &kv_latent,
                 eps,
             )?;
+            self.mla_debug_dump_tensor("kv_latent_norm", &kv_latent);
             let kv_b =
                 self.project_f32_device(&format!("{prefix}.attn_kv_b.weight"), &kv_latent)?;
             let kv_b_host = kv_b.copy_to_host()?;
+            crate::mla_debug::dump_scoped("kv_b", &kv_b_host);
             let mut k_host = vec![0.0; attn_input.rows * dims.heads * dims.head_dim];
             let mut v_host = vec![0.0; attn_input.rows * dims.heads * dims.v_head_dim];
             let kv_b_head_dim = mla
@@ -17732,7 +17937,22 @@ mod native {
                 let mut k_pe = k_pe_host
                     [row * mla.qk_rope_head_dim..(row + 1) * mla.qk_rope_head_dim]
                     .to_vec();
-                apply_rope_layout_host(&mut k_pe, row, rope, rope_base, rope_scale, true)?;
+                if let Some(yarn) = &yarn {
+                    crate::qwen_cpu::apply_deepseek_yarn_rope(
+                        &mut k_pe,
+                        rope.position_for_row(row),
+                        yarn.inv_freq(),
+                    )?;
+                } else {
+                    apply_rope_layout_host(
+                        &mut k_pe,
+                        row,
+                        rope,
+                        rope_base,
+                        rope_scale,
+                        mla_pe_rope_split_half,
+                    )?;
+                }
                 for head in 0..dims.heads {
                     let kv_b_start = row * kv_b.cols + head * kv_b_head_dim;
                     let k_start = row * dims.heads * dims.head_dim + head * dims.head_dim;
@@ -18616,7 +18836,13 @@ mod native {
                     "qwen MoE expert counts are invalid: expert_count={experts}, expert_used_count={top_k}"
                 );
             }
+            self.mla_debug_dump_tensor("moe_router", &router);
+            // The grouped path int8-quantizes the activation rows, which
+            // massive-activation models cannot afford (see
+            // int8_activation_paths_allowed); they take the legacy per-expert
+            // loop whose projections use float-activation GEMVs / f16 GEMMs.
             if moe_grouped_enabled()
+                && self.int8_activation_paths_allowed()
                 && let Some(output) =
                     self.moe_grouped_f32_device(prefix, input, &router, experts, top_k)?
             {
@@ -18629,6 +18855,16 @@ mod native {
             }
             let routes =
                 self.moe_routes_device(prefix, &router, top_k, self.config.expert_weights_norm)?;
+            if crate::mla_debug::enabled() {
+                let flat: Vec<f32> = routes
+                    .iter()
+                    .flat_map(|row| {
+                        row.iter()
+                            .flat_map(|(expert, weight)| [*expert as f32, *weight])
+                    })
+                    .collect();
+                crate::mla_debug::dump_scoped("moe_routes", &flat);
+            }
 
             let output = DeviceBuffer::alloc(input.element_count()? * std::mem::size_of::<f32>())
                 .context("allocating CUDA MoE output")?;
@@ -22883,12 +23119,14 @@ mod native {
         if !config.attention_mla_tensor_layout {
             return Ok(None);
         }
+        // Q-LoRA is optional: DeepSeek-V2-Lite-class MLA has no q_lora_rank and
+        // projects the query directly from a full attn_q (q_lora_rank stays 0).
         let q_lora_rank = config
             .attention_q_lora_rank
             .map(usize::try_from)
             .transpose()
             .context("qwen attention.q_lora_rank does not fit usize")?
-            .ok_or_else(|| anyhow!("MLA tensor layout requires attention.q_lora_rank"))?;
+            .unwrap_or(0);
         let kv_lora_rank = config
             .attention_kv_lora_rank
             .map(usize::try_from)
@@ -22916,9 +23154,9 @@ mod native {
             .transpose()
             .context("qwen attention value head dimension does not fit usize")?
             .ok_or_else(|| anyhow!("MLA tensor layout requires a value head dimension"))?;
-        if q_lora_rank == 0 || kv_lora_rank == 0 || qk_rope_head_dim == 0 || v_head_dim == 0 {
+        if kv_lora_rank == 0 || qk_rope_head_dim == 0 || v_head_dim == 0 {
             bail!(
-                "MLA tensor layout requires non-zero q_lora_rank, kv_lora_rank, qk_rope_head_dim, and value head dimension"
+                "MLA tensor layout requires non-zero kv_lora_rank, qk_rope_head_dim, and value head dimension"
             );
         }
         Ok(Some(QwenMlaDims {
@@ -23958,29 +24196,44 @@ mod native {
                             .context("MLA kv_b per-head dimension overflows usize")?,
                     )
                     .context("MLA kv_b dimension overflows usize")?;
-                specs.extend([
-                    dense_matrix_spec_with_aliases(
+                let has_q_lora = qwen_mla_q_a_weight_names(&prefix)
+                    .iter()
+                    .any(|name| gguf.tensor(name).is_some());
+                if has_q_lora {
+                    specs.extend([
+                        dense_matrix_spec_with_aliases(
+                            gguf,
+                            format!("{prefix}.attn_q_a.weight"),
+                            qwen_mla_q_a_weight_names(&prefix),
+                            mla.q_lora_rank,
+                            embed,
+                        ),
+                        dense_matrix_spec_with_aliases(
+                            gguf,
+                            format!("{prefix}.attn_q_b.weight"),
+                            qwen_mla_q_b_weight_names(&prefix),
+                            mla_q_dim,
+                            mla.q_lora_rank,
+                        ),
+                    ]);
+                } else {
+                    // Full-Q MLA (DeepSeek-V2-Lite): a single dense attn_q
+                    // projection [heads*qk_head_dim, embed] in place of q_a/q_b.
+                    specs.push(dense_matrix_spec_with_aliases(
                         gguf,
-                        format!("{prefix}.attn_q_a.weight"),
-                        qwen_mla_q_a_weight_names(&prefix),
-                        mla.q_lora_rank,
-                        embed,
-                    ),
-                    dense_matrix_spec_with_aliases(
-                        gguf,
-                        format!("{prefix}.attn_q_b.weight"),
-                        qwen_mla_q_b_weight_names(&prefix),
+                        format!("{prefix}.attn_q.weight"),
+                        qwen_dense_attention_weight_names(&prefix, "q"),
                         mla_q_dim,
-                        mla.q_lora_rank,
-                    ),
-                    dense_matrix_spec_with_aliases(
-                        gguf,
-                        format!("{prefix}.attn_kv_a_mqa.weight"),
-                        qwen_mla_kv_a_weight_names(&prefix),
-                        kv_a_dim,
                         embed,
-                    ),
-                ]);
+                    ));
+                }
+                specs.push(dense_matrix_spec_with_aliases(
+                    gguf,
+                    format!("{prefix}.attn_kv_a_mqa.weight"),
+                    qwen_mla_kv_a_weight_names(&prefix),
+                    kv_a_dim,
+                    embed,
+                ));
                 if qwen_mla_kv_b_weight_names(&prefix)
                     .iter()
                     .any(|name| gguf.tensor(name).is_some())
@@ -24191,6 +24444,14 @@ mod native {
                         use_per_expert_tensors,
                     ));
                 }
+                // DeepSeek-V2-Lite fuses `expert_shared_count` shared experts into
+                // one MLP whose intermediate is expert_ff * shared_count wide.
+                let shared_expert_ff = match config.expert_shared_count {
+                    Some(count) if count > 1 => expert_ff.saturating_mul(
+                        usize::try_from(count).context("expert_shared_count does not fit usize")?,
+                    ),
+                    _ => expert_ff,
+                };
                 if let Some(source) =
                     moe_shared_expert_packed_gate_up_source(gguf, &prefix, expert_ff, embed)?
                 {
@@ -24225,14 +24486,14 @@ mod native {
                         gguf,
                         format!("{prefix}.ffn_gate_shexp.weight"),
                         qwen_moe_shared_expert_weight_names(&prefix, "gate"),
-                        expert_ff,
+                        shared_expert_ff,
                         embed,
                     ));
                     specs.push(dense_matrix_spec_with_aliases(
                         gguf,
                         format!("{prefix}.ffn_up_shexp.weight"),
                         qwen_moe_shared_expert_weight_names(&prefix, "up"),
-                        expert_ff,
+                        shared_expert_ff,
                         embed,
                     ));
                     specs.push(dense_matrix_spec_with_aliases(
@@ -24240,7 +24501,7 @@ mod native {
                         format!("{prefix}.ffn_down_shexp.weight"),
                         qwen_moe_shared_expert_weight_names(&prefix, "down"),
                         embed,
-                        expert_ff,
+                        shared_expert_ff,
                     ));
                 }
                 if qwen_moe_shared_expert_gate_weight_names(&prefix)
@@ -25930,6 +26191,241 @@ mod native {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// Env-gated real-model GPU parity probe (skips unless
+        /// `HI_CUDA_PARITY_GGUF` points at a .gguf). Loads the model on the GPU,
+        /// runs the full-context forward for `HI_CUDA_PARITY_TOKENS`
+        /// (comma-separated ids; defaults to the DeepSeek-V2-Lite "The capital
+        /// of France is" prompt), and prints the greedy token plus top-5
+        /// logits. Combine with `HI_MLA_DEBUG_DUMP` to capture per-layer
+        /// activation dumps for diffing against the CPU reference
+        /// (`hi-local qwen-cpu`), which accepts the same dump env var.
+        #[cfg(feature = "native-cuda")]
+        #[test]
+        fn native_cuda_real_gguf_greedy_parity_probe() {
+            let Ok(path) = std::env::var("HI_CUDA_PARITY_GGUF") else {
+                eprintln!("skipping: HI_CUDA_PARITY_GGUF not set");
+                return;
+            };
+            let gguf = GgufFile::open(std::path::Path::new(&path)).expect("open parity gguf");
+            // HI_CUDA_PARITY_PROMPT tokenizes a raw prompt string (no chat
+            // template); HI_CUDA_PARITY_TOKENS supplies explicit ids.
+            let tokens: Vec<u32> = if let Ok(prompt) = std::env::var("HI_CUDA_PARITY_PROMPT") {
+                gguf.tokenizer()
+                    .expect("parity gguf tokenizer")
+                    .encode(&prompt)
+                    .expect("encode parity prompt")
+            } else {
+                std::env::var("HI_CUDA_PARITY_TOKENS")
+                    .unwrap_or_else(|_| "100000,549,6077,280,7239,317".to_string())
+                    .split(',')
+                    .map(|token| token.trim().parse().expect("token ids must be u32"))
+                    .collect()
+            };
+            let model = CudaQwenGpuModel::from_gguf(&gguf).expect("load parity gguf onto GPU");
+            let logits = model.last_logits_host(&tokens).expect("GPU forward");
+            if let Ok(out) = std::env::var("HI_CUDA_PARITY_LOGITS_OUT") {
+                let body: String = logits.iter().map(|v| format!("{v}\n")).collect::<String>();
+                std::fs::write(&out, body).expect("write full logits");
+            }
+            let mut ranked: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
+            ranked.sort_by(|(_, left), (_, right)| right.total_cmp(left));
+            println!("tokens: {tokens:?}");
+            println!("greedy next token: {}", ranked[0].0);
+            for (rank, (token, logit)) in ranked.iter().take(5).enumerate() {
+                println!("top{}: token {token} logit {logit:.4}", rank + 1);
+            }
+            // Optional greedy continuation (full-context re-forward per token),
+            // decoded to text — a quick coherence readout for real models.
+            let generate: usize = std::env::var("HI_CUDA_PARITY_GEN")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
+            if generate > 0 {
+                let mut sequence = tokens.clone();
+                for _ in 0..generate {
+                    let next = model.greedy_next_token(&sequence).expect("greedy step");
+                    sequence.push(next);
+                }
+                let text = gguf
+                    .tokenizer()
+                    .expect("parity gguf tokenizer")
+                    .decode(&sequence[tokens.len()..])
+                    .expect("decode continuation");
+                println!("greedy continuation: {text:?}");
+            }
+        }
+
+        /// Env-gated real-model paged-decode parity probe (skips unless
+        /// `HI_CUDA_PARITY_GGUF` points at a .gguf). Greedy-extends the
+        /// `HI_CUDA_PARITY_TOKENS` prompt twice — once with the full-context
+        /// forward (recomputes attention from scratch each step) and once with
+        /// the serve-scheduler paged prefill + append-decode path — and
+        /// requires identical token streams. Catches paged KV write/read and
+        /// paged decode-attention defects that per-step logits parity misses.
+        #[cfg(feature = "native-cuda")]
+        #[test]
+        fn native_cuda_real_gguf_paged_decode_parity_probe() {
+            let Ok(path) = std::env::var("HI_CUDA_PARITY_GGUF") else {
+                eprintln!("skipping: HI_CUDA_PARITY_GGUF not set");
+                return;
+            };
+            let base: Vec<u32> = std::env::var("HI_CUDA_PARITY_TOKENS")
+                .unwrap_or_else(|_| "100000,549,6077,280,7239,317".to_string())
+                .split(',')
+                .map(|token| token.trim().parse().expect("token ids must be u32"))
+                .collect();
+            let steps: usize = std::env::var("HI_CUDA_PARITY_DECODE_STEPS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(8);
+            let gguf = GgufFile::open(std::path::Path::new(&path)).expect("open parity gguf");
+            let model = CudaQwenGpuModel::from_gguf(&gguf).expect("load parity gguf onto GPU");
+
+            let mut reference = base.clone();
+            for _ in 0..steps {
+                let next = model
+                    .greedy_next_token(&reference)
+                    .expect("full-context step");
+                reference.push(next);
+            }
+
+            let page_size: usize = std::env::var("HI_CUDA_PARITY_PAGE_SIZE")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(16);
+            let physical_page_count = (base.len() + steps).div_ceil(page_size) + 1;
+            let page_table: Vec<usize> = (0..physical_page_count).collect();
+            let first = model
+                .prefill_greedy_next_tokens_batch_paged_with_page_tables(
+                    std::slice::from_ref(&base),
+                    page_size,
+                    std::slice::from_ref(&page_table),
+                    physical_page_count,
+                )
+                .expect("paged prefill")[0];
+            let mut paged = base.clone();
+            paged.push(first);
+            while paged.len() < base.len() + steps {
+                let position = paged.len() - 1;
+                let next = model
+                    .decode_greedy_next_tokens_batch_paged_with_page_tables(
+                        &[*paged.last().unwrap()],
+                        position,
+                        page_size,
+                        std::slice::from_ref(&page_table),
+                        physical_page_count,
+                    )
+                    .expect("paged append decode")[0];
+                paged.push(next);
+            }
+            println!("full-context greedy: {:?}", &reference[base.len()..]);
+            println!("paged serve greedy:  {:?}", &paged[base.len()..]);
+            // NOTE: paged decode (f16 KV) and the full-context forward (f32
+            // k/v) round differently, and DeepSeek-class MoE routing takes
+            // top-k over near-TIED router weights (observed |delta w| ~1e-4 on
+            // V2-Lite), so over a long horizon the two greedy paths WILL
+            // legitimately pick different-but-valid experts and diverge. The
+            // strict token-equality assert therefore covers only the first 8
+            // steps; the teacher-forced drift below is the structural check.
+            let strict = (base.len()..base.len() + steps.min(8)).collect::<Vec<_>>();
+            for idx in strict {
+                assert_eq!(
+                    paged[idx], reference[idx],
+                    "paged greedy diverged from full-context within the first 8 steps"
+                );
+            }
+
+            // Teacher-forced per-step logit drift: replay the FULL-CONTEXT
+            // continuation through the paged append-decode path so both
+            // implementations always see the identical prefix, and measure how
+            // far the paged logits drift from the full-context logits at every
+            // step. This separates benign knife-edge argmax flips (small drift,
+            // near-tied top-2) from structural paged-KV/attention defects
+            // (drift growing without bound).
+            let first = model
+                .prefill_greedy_next_tokens_batch_paged_with_page_tables(
+                    std::slice::from_ref(&base),
+                    page_size,
+                    std::slice::from_ref(&page_table),
+                    physical_page_count,
+                )
+                .expect("paged prefill (teacher-forced)")[0];
+            assert_eq!(
+                first,
+                reference[base.len()],
+                "paged prefill greedy token must match the full-context prefill"
+            );
+            let mut max_rel_drift = 0.0f64;
+            let mut early_max_rel_drift = 0.0f64;
+            let mut flips = 0usize;
+            for step in 1..steps {
+                let position = base.len() + step - 1;
+                let forced_token = reference[position];
+                let paged_logits = model
+                    .decode_logits_batch_paged_with_page_tables(
+                        &[forced_token],
+                        position,
+                        page_size,
+                        std::slice::from_ref(&page_table),
+                        physical_page_count,
+                        "parity probe teacher-forced decode",
+                    )
+                    .expect("paged teacher-forced decode")
+                    .copy_to_host()
+                    .expect("copy paged logits");
+                let full_logits = model
+                    .last_logits_host(&reference[..=position])
+                    .expect("full-context logits");
+                let mut diff_sq = 0.0f64;
+                let mut norm_sq = 0.0f64;
+                for (paged, full) in paged_logits.iter().zip(&full_logits) {
+                    let diff = f64::from(paged - full);
+                    diff_sq += diff * diff;
+                    norm_sq += f64::from(*full) * f64::from(*full);
+                }
+                let rel = (diff_sq / norm_sq.max(1e-30)).sqrt();
+                max_rel_drift = max_rel_drift.max(rel);
+                if step <= 8 {
+                    early_max_rel_drift = early_max_rel_drift.max(rel);
+                }
+                let argmax = |values: &[f32]| -> usize {
+                    values
+                        .iter()
+                        .enumerate()
+                        .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                        .map(|(idx, _)| idx)
+                        .unwrap()
+                };
+                let paged_top = argmax(&paged_logits);
+                let full_top = argmax(&full_logits);
+                if paged_top != full_top {
+                    flips += 1;
+                }
+                println!(
+                    "step {step:3} (pos {position:3}): rel_drift={rel:.3e} paged_top={paged_top} full_top={full_top}{}",
+                    if paged_top != full_top {
+                        "  <-- FLIP"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            println!(
+                "teacher-forced steps: {}, max rel logit drift: {max_rel_drift:.3e}, argmax flips: {flips}",
+                steps - 1
+            );
+            // Early steps run before any MoE-router tie can flip an expert
+            // between the two paths, so they bound the pure paged-KV/attention
+            // numeric error: measured ~3e-3 on V2-Lite (f16 KV rounding), vs
+            // ~3e-1 when a paged-path defect corrupts the cache. Later steps
+            // are report-only because a legitimate near-tied expert flip
+            // (weight delta ~1e-4) inflates drift without any runtime defect.
+            assert!(
+                early_max_rel_drift < 0.02,
+                "paged decode logits drifted {early_max_rel_drift:.3e} (rel L2) from the full-context forward within the first 8 steps"
+            );
+        }
 
         // Brute-force full-sort baseline for the host ranked sampler: it mirrors
         // `sample_host_ranked_logits_with_uniform` but always fully sorts the vocabulary,

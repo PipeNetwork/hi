@@ -229,7 +229,9 @@ impl QwenCpuReference {
         }
 
         let mut hidden = self.embeddings.forward(input_ids)?;
-        for layer in &self.layers {
+        crate::mla_debug::dump_rows("embed", &hidden);
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            crate::mla_debug::set_layer(layer_idx);
             hidden = layer.forward(hidden, self.rms_eps)?;
         }
         for token in &mut hidden {
@@ -247,6 +249,7 @@ impl QwenCpuReference {
             }
             logits.push(token_logits);
         }
+        crate::mla_debug::dump_rows("logits", &logits);
         Ok(logits)
     }
 
@@ -418,15 +421,21 @@ impl QwenLayer {
         for token in &mut attn_input {
             rms_norm_in_place(token, &self.attn_norm, rms_eps)?;
         }
+        crate::mla_debug::dump_scoped_rows("attn_in", &attn_input);
         let attn_output = self.attention.forward(&attn_input, rms_eps)?;
+        crate::mla_debug::dump_scoped_rows("attn_out", &attn_output);
         add_residual(&mut hidden, &attn_output)?;
+        crate::mla_debug::dump_scoped_rows("hidden_attn", &hidden);
 
         let mut mlp_input = hidden.clone();
         for token in &mut mlp_input {
             rms_norm_in_place(token, &self.ffn_norm, rms_eps)?;
         }
+        crate::mla_debug::dump_scoped_rows("ffn_in", &mlp_input);
         let mlp_output = self.ffn.forward(&mlp_input)?;
+        crate::mla_debug::dump_scoped_rows("ffn_out", &mlp_output);
         add_residual(&mut hidden, &mlp_output)?;
+        crate::mla_debug::dump_scoped_rows("hidden", &hidden);
         Ok(hidden)
     }
 }
@@ -934,6 +943,10 @@ struct QwenAttention {
     /// Rotary dims per head; less than `qk_head_dim` for partial rope
     /// (`rope.dimension_count`, e.g. Qwen3.5 rotates 64 of 256 dims).
     rope_rot_dim: usize,
+    /// DeepSeek-V2/V3 YARN rope package (NTK-by-parts freqs + `mscale^2`), or
+    /// `None` for every non-yarn / non-deepseek2 model. Applied to the MLA pe
+    /// dims only; the GPU MLA path mirrors this exactly.
+    yarn: Option<Ds2Yarn>,
 }
 
 #[derive(Debug)]
@@ -948,9 +961,12 @@ enum QwenAttentionProjection {
         k_norm: Option<Vec<f32>>,
     },
     Mla {
-        q_a: Matrix,
-        q_a_norm: Vec<f32>,
-        q_b: Matrix,
+        // Q-LoRA query decomposition (q_a -> q_a_norm -> q_b); None for the
+        // DeepSeek-V2-Lite full-Q variant, which uses `q_full` instead.
+        q_a: Option<Matrix>,
+        q_a_norm: Option<Vec<f32>>,
+        q_b: Option<Matrix>,
+        q_full: Option<Matrix>,
         kv_a: Matrix,
         kv_a_norm: Vec<f32>,
         kv_b: Matrix,
@@ -1024,12 +1040,15 @@ impl QwenAttention {
             .checked_mul(heads)
             .context("qwen attention output dimension overflows usize")?;
         let projection = if uses_mla {
+            // Q-LoRA is optional: DeepSeek-V2-Lite-class MLA projects the query
+            // directly from a full attn_q with no q_lora_rank.
             let q_lora_rank = config
                 .attention_q_lora_rank
                 .map(usize::try_from)
                 .transpose()
                 .context("qwen attention.q_lora_rank does not fit usize")?
-                .ok_or_else(|| anyhow!("MLA tensor layout requires attention.q_lora_rank"))?;
+                .filter(|value| *value != 0)
+                .unwrap_or(0);
             let kv_lora_rank = config
                 .attention_kv_lora_rank
                 .map(usize::try_from)
@@ -1048,10 +1067,8 @@ impl QwenAttention {
                 .transpose()
                 .context("qwen attention.qk_rope_head_dim does not fit usize")?
                 .ok_or_else(|| anyhow!("MLA tensor layout requires attention.qk_rope_head_dim"))?;
-            if q_lora_rank == 0 || kv_lora_rank == 0 || qk_rope_head_dim == 0 {
-                bail!(
-                    "MLA tensor layout requires non-zero q_lora_rank, kv_lora_rank, and qk_rope_head_dim"
-                );
+            if kv_lora_rank == 0 || qk_rope_head_dim == 0 {
+                bail!("MLA tensor layout requires non-zero kv_lora_rank and qk_rope_head_dim");
             }
             let expected_qk_head_dim = qk_nope_head_dim
                 .checked_add(qk_rope_head_dim)
@@ -1071,24 +1088,46 @@ impl QwenAttention {
                         .context("MLA kv_b per-head dimension overflows usize")?,
                 )
                 .context("MLA kv_b dimension overflows usize")?;
+            let (q_a, q_a_norm, q_b, q_full) = if q_lora_rank != 0 {
+                (
+                    Some(load_matrix_aliases(
+                        gguf,
+                        &qwen_mla_q_a_weight_names(prefix),
+                        q_lora_rank,
+                        embed,
+                    )?),
+                    Some(load_vector_aliases(
+                        gguf,
+                        &qwen_mla_q_a_norm_weight_names(prefix),
+                        q_lora_rank,
+                    )?),
+                    Some(load_matrix_aliases(
+                        gguf,
+                        &qwen_mla_q_b_weight_names(prefix),
+                        q_dim,
+                        q_lora_rank,
+                    )?),
+                    None,
+                )
+            } else {
+                // Full-Q MLA: a single dense attn_q projection [q_dim, embed].
+                (
+                    None,
+                    None,
+                    None,
+                    Some(load_matrix_aliases(
+                        gguf,
+                        &qwen_dense_attention_weight_names(prefix, "q"),
+                        q_dim,
+                        embed,
+                    )?),
+                )
+            };
             QwenAttentionProjection::Mla {
-                q_a: load_matrix_aliases(
-                    gguf,
-                    &qwen_mla_q_a_weight_names(prefix),
-                    q_lora_rank,
-                    embed,
-                )?,
-                q_a_norm: load_vector_aliases(
-                    gguf,
-                    &qwen_mla_q_a_norm_weight_names(prefix),
-                    q_lora_rank,
-                )?,
-                q_b: load_matrix_aliases(
-                    gguf,
-                    &qwen_mla_q_b_weight_names(prefix),
-                    q_dim,
-                    q_lora_rank,
-                )?,
+                q_a,
+                q_a_norm,
+                q_b,
+                q_full,
                 kv_a: load_matrix_aliases(
                     gguf,
                     &qwen_mla_kv_a_weight_names(prefix),
@@ -1152,8 +1191,10 @@ impl QwenAttention {
                 .rope_freq_base
                 .unwrap_or_else(|| config.default_rope_freq_base()),
             rope_scale: config.rope_freq_scale.unwrap_or(1.0),
-            split_half_rope: true,
+            // DeepSeek uses interleaved (GPT-J) RoPE on q_pe/k_pe; Qwen/GLM NEOX.
+            split_half_rope: !config.architecture.contains("deepseek"),
             rope_rot_dim: config.rope_rot_dim(qk_head_dim),
+            yarn: Ds2Yarn::from_config(config),
         })
     }
 
@@ -1231,6 +1272,7 @@ impl QwenAttention {
                     q_a,
                     q_a_norm,
                     q_b,
+                    q_full,
                     kv_a,
                     kv_a_norm,
                     kv_b,
@@ -1243,29 +1285,53 @@ impl QwenAttention {
                     let kv_lora_rank = *kv_lora_rank;
                     let qk_nope_head_dim = *qk_nope_head_dim;
                     let qk_rope_head_dim = *qk_rope_head_dim;
-                    let mut q_latent = q_a.mul_vec(token)?;
-                    if q_latent.len() != q_lora_rank {
-                        bail!(
-                            "MLA q latent length {} does not match q_lora_rank {}",
-                            q_latent.len(),
-                            q_lora_rank
-                        );
-                    }
-                    rms_norm_in_place(&mut q_latent, q_a_norm, rms_eps)?;
-                    let mut q_token = q_b.mul_vec(&q_latent)?;
+                    let mut q_token = if let Some(q_full) = q_full {
+                        // Full-Q MLA (DeepSeek-V2-Lite): direct query projection.
+                        q_full.mul_vec(token)?
+                    } else {
+                        let mut q_latent = q_a.as_ref().unwrap().mul_vec(token)?;
+                        if q_latent.len() != q_lora_rank {
+                            bail!(
+                                "MLA q latent length {} does not match q_lora_rank {}",
+                                q_latent.len(),
+                                q_lora_rank
+                            );
+                        }
+                        rms_norm_in_place(&mut q_latent, q_a_norm.as_ref().unwrap(), rms_eps)?;
+                        q_b.as_ref().unwrap().mul_vec(&q_latent)?
+                    };
+                    crate::mla_debug::dump_scoped("q_prerope", &q_token);
                     for head in 0..self.heads {
                         let rope_start = head * self.qk_head_dim + qk_nope_head_dim;
                         let rope_end = rope_start + qk_rope_head_dim;
-                        apply_rope(
-                            &mut q_token[rope_start..rope_end],
-                            position,
-                            self.rope_base,
-                            self.rope_scale,
-                            self.split_half_rope,
-                        )?;
+                        if let Some(yarn) = &self.yarn {
+                            apply_deepseek_yarn_rope(
+                                &mut q_token[rope_start..rope_end],
+                                position,
+                                yarn.inv_freq(),
+                            )?;
+                        } else {
+                            apply_rope(
+                                &mut q_token[rope_start..rope_end],
+                                position,
+                                self.rope_base,
+                                self.rope_scale,
+                                self.split_half_rope,
+                            )?;
+                        }
+                    }
+                    // Fold the YARN attention `mscale^2` into the score by
+                    // pre-scaling q (the score scale is otherwise `qk_head_dim^-0.5`);
+                    // the GPU MLA path pre-scales q identically.
+                    if let Some(yarn) = &self.yarn {
+                        let mscale_sq = yarn.mscale_sq();
+                        for value in q_token.iter_mut() {
+                            *value *= mscale_sq;
+                        }
                     }
 
                     let kv_projected = kv_a.mul_vec(token)?;
+                    crate::mla_debug::dump_scoped("kv_a", &kv_projected);
                     if kv_projected.len() != kv_lora_rank + qk_rope_head_dim {
                         bail!(
                             "MLA kv_a output length {} does not match kv_lora_rank {} + qk_rope_head_dim {}",
@@ -1277,7 +1343,9 @@ impl QwenAttention {
                     let mut kv_latent = kv_projected[..kv_lora_rank].to_vec();
                     let k_pe = kv_projected[kv_lora_rank..].to_vec();
                     rms_norm_in_place(&mut kv_latent, kv_a_norm, rms_eps)?;
+                    crate::mla_debug::dump_scoped("kv_latent_norm", &kv_latent);
                     let kv_token = kv_b.mul_vec(&kv_latent)?;
+                    crate::mla_debug::dump_scoped("kv_b", &kv_token);
                     let mut k_token = vec![0.0; self.heads * self.qk_head_dim];
                     let mut v_token = vec![0.0; self.heads * self.v_head_dim];
                     let kv_b_head_dim = qk_nope_head_dim
@@ -1290,13 +1358,17 @@ impl QwenAttention {
                         k_token[k_start..k_start + qk_nope_head_dim]
                             .copy_from_slice(&kv_token[kv_start..kv_start + qk_nope_head_dim]);
                         let mut k_rope = k_pe.clone();
-                        apply_rope(
-                            &mut k_rope,
-                            position,
-                            self.rope_base,
-                            self.rope_scale,
-                            self.split_half_rope,
-                        )?;
+                        if let Some(yarn) = &self.yarn {
+                            apply_deepseek_yarn_rope(&mut k_rope, position, yarn.inv_freq())?;
+                        } else {
+                            apply_rope(
+                                &mut k_rope,
+                                position,
+                                self.rope_base,
+                                self.rope_scale,
+                                self.split_half_rope,
+                            )?;
+                        }
                         k_token[k_start + qk_nope_head_dim
                             ..k_start + qk_nope_head_dim + qk_rope_head_dim]
                             .copy_from_slice(&k_rope);
@@ -1316,6 +1388,10 @@ impl QwenAttention {
             k.push(k_token);
             v.push(v_token);
         }
+        crate::mla_debug::dump_scoped_rows("q", &q);
+        crate::mla_debug::dump_scoped_rows("k", &k);
+        crate::mla_debug::dump_scoped_rows("v", &v);
+        let mut attn_debug_rows = crate::mla_debug::enabled().then(Vec::new);
 
         let mut output = vec![vec![0.0; embed]; seq_len];
         let kv_repeats = self.heads / self.kv_heads;
@@ -1358,7 +1434,13 @@ impl QwenAttention {
                     *value *= sigmoid(*gate);
                 }
             }
+            if let Some(rows) = attn_debug_rows.as_mut() {
+                rows.push(joined.clone());
+            }
             output[target] = self.o.mul_vec_with_bias(&joined, self.o_bias.as_deref())?;
+        }
+        if let Some(rows) = attn_debug_rows {
+            crate::mla_debug::dump_scoped_rows("attn", &rows);
         }
         Ok(output)
     }
@@ -1552,6 +1634,16 @@ impl QwenMoe {
         let shared_gate = qwen_moe_shared_expert_weight_names(prefix, "gate");
         let shared_up = qwen_moe_shared_expert_weight_names(prefix, "up");
         let shared_down = qwen_moe_shared_expert_weight_names(prefix, "down");
+        // DeepSeek-V2-Lite fuses `expert_shared_count` shared experts into one MLP
+        // whose intermediate is expert_ff * shared_count wide.
+        let shared_ff = match config.expert_shared_count {
+            Some(count) if count > 1 => ff
+                .checked_mul(
+                    usize::try_from(count).context("expert_shared_count does not fit usize")?,
+                )
+                .context("MoE shared expert ff overflows usize")?,
+            _ => ff,
+        };
         let shared = if let Some(source) =
             moe_shared_expert_packed_gate_up_source(gguf, prefix, ff, embed)?
         {
@@ -1583,19 +1675,19 @@ impl QwenMoe {
             })
         } else if shared_gate.iter().any(|name| gguf.tensor(name).is_some()) {
             Some(QwenMlp {
-                gate: load_matrix_aliases(gguf, &shared_gate, ff, embed)?,
+                gate: load_matrix_aliases(gguf, &shared_gate, shared_ff, embed)?,
                 gate_bias: optional_vector_aliases(
                     gguf,
                     &qwen_moe_shared_expert_bias_names(prefix, "gate"),
-                    ff,
+                    shared_ff,
                 )?,
-                up: load_matrix_aliases(gguf, &shared_up, ff, embed)?,
+                up: load_matrix_aliases(gguf, &shared_up, shared_ff, embed)?,
                 up_bias: optional_vector_aliases(
                     gguf,
                     &qwen_moe_shared_expert_bias_names(prefix, "up"),
-                    ff,
+                    shared_ff,
                 )?,
-                down: load_matrix_aliases(gguf, &shared_down, embed, ff)?,
+                down: load_matrix_aliases(gguf, &shared_down, embed, shared_ff)?,
                 down_bias: optional_vector_aliases(
                     gguf,
                     &qwen_moe_shared_expert_bias_names(prefix, "down"),
@@ -1774,15 +1866,29 @@ impl EmbeddingTable {
 }
 
 #[derive(Debug)]
-struct Matrix {
+pub(crate) struct Matrix {
     rows: usize,
     cols: usize,
     data: Vec<f32>,
 }
 
 impl Matrix {
-    fn mul_vec(&self, input: &[f32]) -> Result<Vec<f32>> {
+    pub(crate) fn mul_vec(&self, input: &[f32]) -> Result<Vec<f32>> {
         self.mul_vec_with_bias(input, None)
+    }
+
+    /// (rows, cols) of the materialized matrix. Read by the DeepSeek-V4
+    /// device-step provider, which uploads small host matrices (the
+    /// hyper-connection mixers) once at first use.
+    #[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
+    pub(crate) fn shape(&self) -> (usize, usize) {
+        (self.rows, self.cols)
+    }
+
+    /// Row-major f32 payload (see [`Self::shape`]).
+    #[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
+    pub(crate) fn data(&self) -> &[f32] {
+        &self.data
     }
 
     fn mul_vec_with_bias(&self, input: &[f32], bias: Option<&[f32]>) -> Result<Vec<f32>> {
@@ -1819,7 +1925,7 @@ struct TensorData {
     data: Vec<f32>,
 }
 
-fn load_matrix(gguf: &GgufFile, name: &str, rows: usize, cols: usize) -> Result<Matrix> {
+pub(crate) fn load_matrix(gguf: &GgufFile, name: &str, rows: usize, cols: usize) -> Result<Matrix> {
     let tensor = load_tensor(gguf, name)?;
     if tensor.dims.len() != 2 {
         bail!("tensor {name} must be rank 2, got {:?}", tensor.dims);
@@ -3024,7 +3130,7 @@ fn moe_per_expert_tensors_complete(gguf: &GgufFile, prefix: &str, experts: usize
     })
 }
 
-fn load_vector(gguf: &GgufFile, name: &str, len: usize) -> Result<Vec<f32>> {
+pub(crate) fn load_vector(gguf: &GgufFile, name: &str, len: usize) -> Result<Vec<f32>> {
     let tensor = load_tensor(gguf, name)?;
     if tensor.dims != [len] {
         bail!(
@@ -3035,7 +3141,7 @@ fn load_vector(gguf: &GgufFile, name: &str, len: usize) -> Result<Vec<f32>> {
     Ok(tensor.data)
 }
 
-fn optional_vector(gguf: &GgufFile, name: &str, len: usize) -> Result<Option<Vec<f32>>> {
+pub(crate) fn optional_vector(gguf: &GgufFile, name: &str, len: usize) -> Result<Option<Vec<f32>>> {
     if gguf.tensor(name).is_some() {
         Ok(Some(load_vector(gguf, name, len)?))
     } else {
@@ -3090,7 +3196,7 @@ fn f16_to_f32(raw: u16) -> f32 {
     f32::from_bits(bits)
 }
 
-fn rms_norm_in_place(values: &mut [f32], weight: &[f32], eps: f32) -> Result<()> {
+pub(crate) fn rms_norm_in_place(values: &mut [f32], weight: &[f32], eps: f32) -> Result<()> {
     if values.len() != weight.len() {
         bail!(
             "RMSNorm input length {} does not match weight length {}",
@@ -3102,6 +3208,172 @@ fn rms_norm_in_place(values: &mut [f32], weight: &[f32], eps: f32) -> Result<()>
     let inv = (mean_square + eps).sqrt().recip();
     for (value, weight) in values.iter_mut().zip(weight) {
         *value *= inv * weight;
+    }
+    Ok(())
+}
+
+/// DeepSeek-V2/V3 (deepseek2) YARN rope package: NTK-by-parts frequency
+/// interpolation on the rope pe dims plus the attention `mscale^2` score factor.
+///
+/// Built straight from the GGUF `rope.scaling.*` metadata following vLLM/HF
+/// `deepseek_yarn` semantics (`~/vllm/.../deepseek_scaling_rope.py`,
+/// `models/deepseek_v2.py`): the cos/sin table stays UNSCALED (the two mscales
+/// cancel to ratio 1.0 for V2-Lite) while the softmax scale becomes
+/// `qk_head_dim^-0.5 * mscale^2`, folded in by pre-scaling q.
+///
+/// Strictly gated to deepseek2 models carrying `rope.scaling.type == "yarn"` with
+/// `factor > 1` — and, for now, an explicit `HI_DS2_YARN=1` opt-in. On
+/// DeepSeek-V2-Lite-Chat Q4_K_M this faithfully-implemented package (verified
+/// numerically against vLLM: correction dims 10/23, mscale^2 = 1.58963, table
+/// unscaled) demotes the short-context oracle top-1 " Paris" (logit 23.03,
+/// margin +1.16) to rank 38 (17.72) on BOTH the CPU reference and the GPU MLA
+/// path identically (rel-L2 2.4e-3, identical top-5: " preparing"/" marking"/
+/// " known"/" considering"/" heading"). Component isolation shows the yarn
+/// *frequencies* are benign at short context (" Paris" stays rank 2) while the
+/// `mscale^2` score factor alone causes the collapse (rank 41) — reproducing
+/// the pre-dp4a-fix failures on clean code, so those were NOT the int8
+/// corruption. Until that divergence from upstream semantics is understood,
+/// yarn stays opt-in so short-context deepseek2 behavior is unchanged by
+/// default. `HI_DS2_NO_YARN=1` is a hard off that wins over the opt-in
+/// (bisection kill switch). Shared verbatim by the CPU reference and the GPU
+/// MLA host-rope path so the two stay parity twins.
+#[derive(Debug, Clone)]
+pub(crate) struct Ds2Yarn {
+    /// NTK-by-parts corrected inverse frequencies, one per interleaved rope pair
+    /// (length `rope_dim / 2`); replaces the plain `base^(-2i/rope_dim)`.
+    inv_freq: Vec<f32>,
+    /// `mscale^2`, folded into the attention score by pre-scaling q.
+    mscale_sq: f32,
+}
+
+impl Ds2Yarn {
+    /// Build the package from config, or `None` when the model carries no yarn
+    /// scaling / is not deepseek2 / the package is not enabled (see the type
+    /// docs: `HI_DS2_YARN=1` opts in; `HI_DS2_NO_YARN=1` is a hard off).
+    pub(crate) fn from_config(config: &QwenGgufConfig) -> Option<Self> {
+        if std::env::var_os("HI_DS2_NO_YARN").is_some() {
+            return None;
+        }
+        if std::env::var_os("HI_DS2_YARN").is_none() {
+            return None;
+        }
+        // Strictly gated to deepseek2 MLA models with yarn metadata.
+        if !config.architecture.contains("deepseek") {
+            return None;
+        }
+        if config.rope_scaling_type.as_deref() != Some("yarn") {
+            return None;
+        }
+        let factor = config.rope_scaling_factor?;
+        if !(factor > 1.0) {
+            return None;
+        }
+        let rope_dim = config.rope_dimension_count? as usize;
+        if rope_dim == 0 || !rope_dim.is_multiple_of(2) {
+            return None;
+        }
+        let base = config
+            .rope_freq_base
+            .unwrap_or_else(|| config.default_rope_freq_base());
+        let orig_ctx = config.rope_scaling_original_context_length? as f32;
+        let beta_fast = config.rope_scaling_yarn_beta_fast.unwrap_or(32.0);
+        let beta_slow = config.rope_scaling_yarn_beta_slow.unwrap_or(1.0);
+        let log_mul = config.rope_yarn_log_multiplier.unwrap_or(0.0);
+
+        let inv_freq =
+            yarn_ntk_by_parts_inv_freq(base, rope_dim, factor, orig_ctx, beta_fast, beta_slow);
+        // vLLM `yarn_get_mscale`: mscale = 0.1*mscale_all_dim*ln(factor)+1. GGUF
+        // stores `yarn_log_multiplier = 0.1*mscale_all_dim`, so the mscale is
+        // exactly `1 + log_mul*ln(factor)`. The score scale gets mscale^2.
+        let mscale = 1.0 + log_mul * factor.ln();
+        Some(Self {
+            inv_freq,
+            mscale_sq: mscale * mscale,
+        })
+    }
+
+    pub(crate) fn inv_freq(&self) -> &[f32] {
+        &self.inv_freq
+    }
+
+    pub(crate) fn mscale_sq(&self) -> f32 {
+        self.mscale_sq
+    }
+}
+
+/// vLLM `yarn_find_correction_dim`: the rope dim index whose wavelength matches
+/// `num_rotations` full rotations across the original context.
+fn yarn_correction_dim(num_rotations: f32, dim: usize, base: f32, orig_ctx: f32) -> f32 {
+    (dim as f32 * (orig_ctx / (num_rotations * 2.0 * std::f32::consts::PI)).ln())
+        / (2.0 * base.ln())
+}
+
+/// vLLM `_compute_inv_freq`: NTK-by-parts blend of extrapolation (original
+/// freqs, high-frequency dims) and interpolation (freqs / factor, low-frequency
+/// dims) with a linear ramp between the `beta_fast`/`beta_slow` correction dims.
+/// Returns one inverse frequency per interleaved rope pair (`dim / 2`).
+fn yarn_ntk_by_parts_inv_freq(
+    base: f32,
+    dim: usize,
+    factor: f32,
+    orig_ctx: f32,
+    beta_fast: f32,
+    beta_slow: f32,
+) -> Vec<f32> {
+    let half = dim / 2;
+    // yarn_find_correction_range: floor(low)/ceil(high), clamped to [0, dim-1].
+    let low = yarn_correction_dim(beta_fast, dim, base, orig_ctx)
+        .floor()
+        .max(0.0);
+    let high = yarn_correction_dim(beta_slow, dim, base, orig_ctx)
+        .ceil()
+        .min((dim - 1) as f32);
+    // yarn_linear_ramp_mask prevents a zero-width ramp singularity.
+    let span = if (high - low).abs() < f32::EPSILON {
+        0.001
+    } else {
+        high - low
+    };
+    let mut inv_freq = Vec::with_capacity(half);
+    for i in 0..half {
+        let pos_freq = base.powf((2 * i) as f32 / dim as f32);
+        let inv_extrapolation = 1.0 / pos_freq;
+        let inv_interpolation = 1.0 / (factor * pos_freq);
+        // Ramp in [0,1]: 0 at/below `low` (pure extrapolation), 1 at/above `high`
+        // (pure interpolation). extrapolation_factor is 1, so the blend is direct.
+        let ramp = ((i as f32 - low) / span).clamp(0.0, 1.0);
+        inv_freq.push(inv_interpolation * ramp + inv_extrapolation * (1.0 - ramp));
+    }
+    inv_freq
+}
+
+/// Interleaved (GPT-J) RoPE using externally-supplied YARN inverse frequencies.
+/// Used only for deepseek2 MLA pe dims when the yarn package is active. Position
+/// is applied raw: yarn scales exclusively through `inv_freq`, never through a
+/// position multiplier (deepseek2 ships no `rope.freq_scale`).
+pub(crate) fn apply_deepseek_yarn_rope(
+    values: &mut [f32],
+    position: usize,
+    inv_freq: &[f32],
+) -> Result<()> {
+    if !values.len().is_multiple_of(2) {
+        bail!("YARN RoPE head dimension {} must be even", values.len());
+    }
+    if inv_freq.len() != values.len() / 2 {
+        bail!(
+            "YARN inv_freq length {} does not match rope pairs {}",
+            inv_freq.len(),
+            values.len() / 2
+        );
+    }
+    let position = position as f32;
+    for idx in (0..values.len()).step_by(2) {
+        let angle = position * inv_freq[idx / 2];
+        let (sin, cos) = angle.sin_cos();
+        let left = values[idx];
+        let right = values[idx + 1];
+        values[idx] = left * cos - right * sin;
+        values[idx + 1] = right * cos + left * sin;
     }
     Ok(())
 }
@@ -3143,7 +3415,7 @@ fn apply_rope(
     Ok(())
 }
 
-fn softmax_in_place(values: &mut [f32]) {
+pub(crate) fn softmax_in_place(values: &mut [f32]) {
     let max = values
         .iter()
         .copied()
@@ -3197,15 +3469,15 @@ fn add_vector_bias(values: &mut [f32], bias: &[f32]) -> Result<()> {
     Ok(())
 }
 
-fn silu(value: f32) -> f32 {
+pub(crate) fn silu(value: f32) -> f32 {
     value / (1.0 + (-value).exp())
 }
 
-fn sigmoid(value: f32) -> f32 {
+pub(crate) fn sigmoid(value: f32) -> f32 {
     1.0 / (1.0 + (-value).exp())
 }
 
-fn softplus(value: f32) -> f32 {
+pub(crate) fn softplus(value: f32) -> f32 {
     if value > 20.0 {
         value
     } else if value < -20.0 {
@@ -3223,14 +3495,14 @@ fn l2_normalize(values: &mut [f32]) {
     }
 }
 
-fn dot(left: &[f32], right: &[f32]) -> f32 {
+pub(crate) fn dot(left: &[f32], right: &[f32]) -> f32 {
     left.iter()
         .zip(right)
         .map(|(left, right)| left * right)
         .sum()
 }
 
-fn argmax(values: &[f32]) -> Result<u32> {
+pub(crate) fn argmax(values: &[f32]) -> Result<u32> {
     if values.is_empty() {
         bail!("cannot sample from empty logits");
     }
@@ -3338,7 +3610,11 @@ pub fn sample_from_logits(
     }
 }
 
-fn top_logits(logits: &[f32], tokenizer: &GgufTokenizer, top_k: usize) -> Result<Vec<TopLogit>> {
+pub(crate) fn top_logits(
+    logits: &[f32],
+    tokenizer: &GgufTokenizer,
+    top_k: usize,
+) -> Result<Vec<TopLogit>> {
     let mut ranked = logits.iter().copied().enumerate().collect::<Vec<_>>();
     ranked.sort_by(|(left_id, left), (right_id, right)| {
         right.total_cmp(left).then_with(|| left_id.cmp(right_id))
@@ -3809,6 +4085,7 @@ mod tests {
             rope_scale: 1.0,
             split_half_rope: true,
             rope_rot_dim: 2,
+            yarn: None,
         };
 
         let output = attention

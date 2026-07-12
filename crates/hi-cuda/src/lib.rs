@@ -38,6 +38,122 @@ mod prefix_cache;
 pub mod qwen_cpu;
 pub mod runtime;
 
+/// Env-gated activation dumps for bisecting GPU-vs-CPU numerical divergence
+/// (used to debug the DeepSeek-V2-Lite MLA forward). Set
+/// `HI_MLA_DEBUG_DUMP=/path/file.jsonl` and run the CPU reference and the CUDA
+/// forward with the same tokens (separate processes / paths); each tagged
+/// tensor appends one JSON line with its element count, L2 norm, the first 8
+/// values, and 8 evenly-strided samples. Diff the two files record-by-record to
+/// find the first divergent tensor. Zero-cost when the env var is unset.
+pub(crate) mod mla_debug {
+    use std::fs::File;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    static LAYER: AtomicUsize = AtomicUsize::new(0);
+
+    fn sink() -> Option<&'static Mutex<File>> {
+        static SINK: OnceLock<Option<Mutex<File>>> = OnceLock::new();
+        SINK.get_or_init(|| {
+            let path = std::env::var("HI_MLA_DEBUG_DUMP").ok()?;
+            let file = File::options().create(true).append(true).open(path).ok()?;
+            Some(Mutex::new(file))
+        })
+        .as_ref()
+    }
+
+    pub(crate) fn enabled() -> bool {
+        sink().is_some()
+    }
+
+    /// Records the layer index that `dump_scoped` tags with (`L{n}.<tag>`).
+    pub(crate) fn set_layer(layer: usize) {
+        if enabled() {
+            LAYER.store(layer, Ordering::Relaxed);
+        }
+    }
+
+    /// Dumps a tensor scoped to the current layer (`L{n}.<tag>`).
+    pub(crate) fn dump_scoped(tag: &str, values: &[f32]) {
+        if enabled() {
+            let layer = LAYER.load(Ordering::Relaxed);
+            dump(&format!("L{layer}.{tag}"), values);
+        }
+    }
+
+    /// Dumps rows-of-values (the CPU reference's `Vec<Vec<f32>>` layout) scoped
+    /// to the current layer; rows are concatenated to match the GPU tensors.
+    pub(crate) fn dump_scoped_rows(tag: &str, rows: &[Vec<f32>]) {
+        if enabled() {
+            let flat: Vec<f32> = rows.iter().flatten().copied().collect();
+            dump_scoped(tag, &flat);
+        }
+    }
+
+    pub(crate) fn dump_rows(tag: &str, rows: &[Vec<f32>]) {
+        if enabled() {
+            let flat: Vec<f32> = rows.iter().flatten().copied().collect();
+            dump(tag, &flat);
+        }
+    }
+
+    pub(crate) fn dump(tag: &str, values: &[f32]) {
+        let Some(sink) = sink() else { return };
+        let l2 = values
+            .iter()
+            .map(|value| f64::from(*value) * f64::from(*value))
+            .sum::<f64>()
+            .sqrt();
+        let first: Vec<f32> = values.iter().take(8).copied().collect();
+        let stride = (values.len() / 8).max(1);
+        let sample: Vec<f32> = values.iter().step_by(stride).take(8).copied().collect();
+        if let Ok(mut file) = sink.lock() {
+            let _ = writeln!(
+                file,
+                "{{\"tag\":\"{tag}\",\"n\":{},\"l2\":{l2:.6e},\"first\":{first:?},\"sample\":{sample:?}}}",
+                values.len()
+            );
+        }
+        dump_full(tag, values);
+    }
+
+    /// With `HI_MLA_DEBUG_DUMP_FULL=<dir>` additionally appends the raw f32
+    /// little-endian values to `<dir>/<tag>.bin` (per-token records append to
+    /// the same file, matching the flattened GPU layout) for elementwise diffs.
+    fn dump_full(tag: &str, values: &[f32]) {
+        static DIR: OnceLock<Option<String>> = OnceLock::new();
+        let Some(dir) = DIR
+            .get_or_init(|| std::env::var("HI_MLA_DEBUG_DUMP_FULL").ok())
+            .as_ref()
+        else {
+            return;
+        };
+        let name: String = tag
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '.' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let Ok(mut file) = File::options()
+            .create(true)
+            .append(true)
+            .open(format!("{dir}/{name}.bin"))
+        else {
+            return;
+        };
+        let mut bytes = Vec::with_capacity(values.len() * 4);
+        for value in values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let _ = file.write_all(&bytes);
+    }
+}
+
 const CUDA_ATTENTION_FAST_HEAD_DIM_MAX: usize = 512;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
