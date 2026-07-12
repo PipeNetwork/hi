@@ -93,14 +93,15 @@ mod native {
         qwen_moe_per_expert_gate_up_bias_names, qwen_moe_per_expert_gate_up_weight_names,
         qwen_moe_per_expert_up_gate_bias_names, qwen_moe_per_expert_up_gate_weight_names,
         qwen_moe_per_expert_weight_names, qwen_moe_router_bias_names, qwen_moe_router_weight_names,
-        qwen_moe_shared_expert_bias_names, qwen_moe_shared_expert_gate_bias_names,
-        qwen_moe_shared_expert_gate_up_bias_names, qwen_moe_shared_expert_gate_up_weight_names,
-        qwen_moe_shared_expert_gate_weight_names, qwen_moe_shared_expert_up_gate_bias_names,
-        qwen_moe_shared_expert_up_gate_weight_names, qwen_moe_shared_expert_weight_names,
-        qwen_ssm_a_names, qwen_ssm_alpha_weight_names, qwen_ssm_ba_weight_names,
-        qwen_ssm_beta_weight_names, qwen_ssm_conv1d_weight_names, qwen_ssm_dt_bias_names,
-        qwen_ssm_gate_weight_names, qwen_ssm_in_weight_names, qwen_ssm_layer_tensors_present,
-        qwen_ssm_norm_weight_names, qwen_ssm_out_weight_names, qwen_ssm_qkv_weight_names,
+        qwen_moe_selection_bias_names, qwen_moe_shared_expert_bias_names,
+        qwen_moe_shared_expert_gate_bias_names, qwen_moe_shared_expert_gate_up_bias_names,
+        qwen_moe_shared_expert_gate_up_weight_names, qwen_moe_shared_expert_gate_weight_names,
+        qwen_moe_shared_expert_up_gate_bias_names, qwen_moe_shared_expert_up_gate_weight_names,
+        qwen_moe_shared_expert_weight_names, qwen_ssm_a_names, qwen_ssm_alpha_weight_names,
+        qwen_ssm_ba_weight_names, qwen_ssm_beta_weight_names, qwen_ssm_conv1d_weight_names,
+        qwen_ssm_dt_bias_names, qwen_ssm_gate_weight_names, qwen_ssm_in_weight_names,
+        qwen_ssm_layer_tensors_present, qwen_ssm_norm_weight_names, qwen_ssm_out_weight_names,
+        qwen_ssm_qkv_weight_names,
     };
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
@@ -18462,7 +18463,8 @@ mod native {
             {
                 return Ok(output);
             }
-            let routes = self.moe_routes_device(&router, top_k, self.config.expert_weights_norm)?;
+            let routes =
+                self.moe_routes_device(prefix, &router, top_k, self.config.expert_weights_norm)?;
 
             let output = DeviceBuffer::alloc(input.element_count()? * std::mem::size_of::<f32>())
                 .context("allocating CUDA MoE output")?;
@@ -18561,8 +18563,25 @@ mod native {
             })
         }
 
+        /// Per-layer expert-selection bias (DeepSeek/GLM `exp_probs_b`): ranks
+        /// the top-k choice only; routed weights stay bias-free.
+        fn moe_selection_bias(&self, prefix: &str) -> Option<&GpuVector> {
+            qwen_moe_selection_bias_names(prefix)
+                .into_iter()
+                .find_map(|name| self.vector(&name))
+        }
+
+        fn moe_gating_sigmoid(&self) -> bool {
+            self.config.expert_gating_func == Some(2)
+        }
+
+        fn moe_weights_scale(&self) -> f32 {
+            self.config.expert_weights_scale.unwrap_or(1.0)
+        }
+
         fn moe_routes_device(
             &self,
+            prefix: &str,
             router: &GpuF32Tensor,
             top_k: usize,
             norm_topk: bool,
@@ -18586,10 +18605,13 @@ mod native {
                 &router.buffer,
                 &ids,
                 &weights,
+                self.moe_selection_bias(prefix).map(|vector| &vector.buffer),
                 router.rows,
                 router.cols,
                 top_k,
                 norm_topk,
+                self.moe_gating_sigmoid(),
+                self.moe_weights_scale(),
                 &self.stream,
             )?;
             self.op_barrier()?;
@@ -18620,6 +18642,7 @@ mod native {
         /// per-layer blocking readback.
         fn moe_route_buffers_device(
             &self,
+            prefix: &str,
             router: &GpuF32Tensor,
             top_k: usize,
             norm_topk: bool,
@@ -18636,10 +18659,13 @@ mod native {
                 &router.buffer,
                 &ids,
                 &weights,
+                self.moe_selection_bias(prefix).map(|vector| &vector.buffer),
                 router.rows,
                 router.cols,
                 top_k,
                 norm_topk,
+                self.moe_gating_sigmoid(),
+                self.moe_weights_scale(),
                 &self.stream,
             )?;
             Ok((ids, weights))
@@ -18760,8 +18786,12 @@ mod native {
             {
                 return Ok(None);
             }
-            let (route_ids, route_weights) =
-                self.moe_route_buffers_device(router, top_k, self.config.expert_weights_norm)?;
+            let (route_ids, route_weights) = self.moe_route_buffers_device(
+                prefix,
+                router,
+                top_k,
+                self.config.expert_weights_norm,
+            )?;
 
             let quantize_rows = |tensor: &GpuF32Tensor,
                                  m: usize,

@@ -129,10 +129,13 @@ mod native {
             scores: *const c_void,
             output_ids: *mut c_void,
             output_weights: *mut c_void,
+            selection_bias: *const c_void,
             rows: c_int,
             experts: c_int,
             top_k: c_int,
             norm_topk: c_int,
+            gating_sigmoid: c_int,
+            weights_scale: c_float,
             stream: *mut c_void,
         ) -> c_int;
         fn hi_cuda_launch_cast_f32_to_f16(
@@ -1604,14 +1607,18 @@ mod native {
         check_last_error("hi_cuda_launch_qwen_ssm_streaming_step")
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn launch_moe_topk_router(
         scores: &DeviceBuffer,
         output_ids: &DeviceBuffer,
         output_weights: &DeviceBuffer,
+        selection_bias: Option<&DeviceBuffer>,
         rows: usize,
         experts: usize,
         top_k: usize,
         norm_topk: bool,
+        gating_sigmoid: bool,
+        weights_scale: f32,
         stream: &Stream,
     ) -> Result<()> {
         ensure_len(rows, "moe_topk rows")?;
@@ -1622,10 +1629,13 @@ mod native {
                 scores.as_ptr(),
                 output_ids.as_mut_ptr(),
                 output_weights.as_mut_ptr(),
+                selection_bias.map_or(std::ptr::null(), DeviceBuffer::as_ptr),
                 rows as c_int,
                 experts as c_int,
                 top_k as c_int,
                 if norm_topk { 1 } else { 0 },
+                if gating_sigmoid { 1 } else { 0 },
+                weights_scale,
                 stream.as_raw(),
             )
         })?;

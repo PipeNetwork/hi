@@ -529,14 +529,21 @@ __global__ void add_scaled_row_in_place_kernel(
   output[row * cols + col] += row_values[col] * scale;
 }
 
+// `gating_sigmoid`: DeepSeek-V3/GLM-5 routing — per-expert sigmoid scores,
+// top-k SELECTED on score + selection_bias[e] (correction bias ranks only),
+// routed weight = bias-free sigmoid score. `weights_scale` multiplies the
+// final weights in both modes (1.0 = neutral).
 __global__ void moe_topk_router_kernel(
     const float* scores,
     uint32_t* output_ids,
     float* output_weights,
+    const float* selection_bias,
     int rows,
     int experts,
     int top_k,
-    int norm_topk) {
+    int norm_topk,
+    int gating_sigmoid,
+    float weights_scale) {
   int row = blockIdx.x * blockDim.x + threadIdx.x;
   if (row >= rows) {
     return;
@@ -545,6 +552,60 @@ __global__ void moe_topk_router_kernel(
   const float* row_scores = scores + row * experts;
   uint32_t* row_ids = output_ids + row * top_k;
   float* row_weights = output_weights + row * top_k;
+
+  if (gating_sigmoid) {
+    float previous_key = INFINITY;
+    int previous_id = -1;
+    float selected_sum = 0.0f;
+    for (int rank = 0; rank < top_k; ++rank) {
+      int best_id = -1;
+      float best_key = -INFINITY;
+      float best_weight = 0.0f;
+      for (int expert = 0; expert < experts; ++expert) {
+        float score = 1.0f / (1.0f + expf(-row_scores[expert]));
+        if (!isfinite(score)) {
+          score = 0.0f;
+        }
+        float key = score;
+        if (selection_bias != nullptr) {
+          key += selection_bias[expert];
+        }
+        bool eligible = previous_id < 0 || key < previous_key ||
+                        (key == previous_key && expert > previous_id);
+        if (!eligible) {
+          continue;
+        }
+        if (best_id < 0 || key > best_key ||
+            (key == best_key && expert < best_id)) {
+          best_id = expert;
+          best_key = key;
+          best_weight = score;
+        }
+      }
+      if (best_id < 0) {
+        best_id = rank < experts ? rank : experts - 1;
+        best_key = -INFINITY;
+        best_weight = 0.0f;
+      }
+      row_ids[rank] = static_cast<uint32_t>(best_id);
+      row_weights[rank] = best_weight;
+      selected_sum += best_weight;
+      previous_id = best_id;
+      previous_key = best_key;
+    }
+    if (norm_topk && top_k > 1 && selected_sum > 1.0e-7f &&
+        isfinite(selected_sum)) {
+      for (int rank = 0; rank < top_k; ++rank) {
+        row_weights[rank] /= selected_sum;
+      }
+    }
+    if (weights_scale != 1.0f) {
+      for (int rank = 0; rank < top_k; ++rank) {
+        row_weights[rank] *= weights_scale;
+      }
+    }
+    return;
+  }
 
   float max_score = -INFINITY;
   for (int expert = 0; expert < experts; ++expert) {
@@ -617,6 +678,11 @@ __global__ void moe_topk_router_kernel(
       isfinite(selected_sum)) {
     for (int rank = 0; rank < top_k; ++rank) {
       row_weights[rank] /= selected_sum;
+    }
+  }
+  if (weights_scale != 1.0f) {
+    for (int rank = 0; rank < top_k; ++rank) {
+      row_weights[rank] *= weights_scale;
     }
   }
 }
@@ -6533,10 +6599,13 @@ extern "C" int hi_cuda_launch_moe_topk_router(
     const void* scores,
     void* output_ids,
     void* output_weights,
+    const void* selection_bias,
     int rows,
     int experts,
     int top_k,
     int norm_topk,
+    int gating_sigmoid,
+    float weights_scale,
     void* stream) {
   if (scores == nullptr || output_ids == nullptr || output_weights == nullptr ||
       rows <= 0 || experts <= 0 || top_k <= 0 || top_k > experts ||
@@ -6549,10 +6618,13 @@ extern "C" int hi_cuda_launch_moe_topk_router(
       static_cast<const float*>(scores),
       static_cast<uint32_t*>(output_ids),
       static_cast<float*>(output_weights),
+      static_cast<const float*>(selection_bias),
       rows,
       experts,
       top_k,
-      norm_topk);
+      norm_topk,
+      gating_sigmoid,
+      weights_scale);
   return 0;
 }
 

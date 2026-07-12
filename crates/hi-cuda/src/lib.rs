@@ -25488,10 +25488,13 @@ mod tests {
             &router,
             &route_ids,
             &route_weights,
+            None,
             2,
             3,
             2,
             false,
+            false,
+            1.0,
             &stream,
         )
         .unwrap();
@@ -25512,10 +25515,13 @@ mod tests {
             &router,
             &route_ids,
             &route_weights,
+            None,
             2,
             3,
             2,
             true,
+            false,
+            1.0,
             &stream,
         )
         .unwrap();
