@@ -49,3 +49,35 @@ model = "qwen2.5-coder-3b"               # must match hi-local's --model-id
 base_url = "http://127.0.0.1:8080/v1"
 max_tokens = 2048
 tool_mode = "auto"
+
+# Local Qwen2.5-Coder-7B (Q6_K, ~6.3 GB) on an RTX PRO 6000 Blackwell (96 GB VRAM,
+# sm_120). VRAM is not a constraint here, so serve with the paged KV cache and a
+# roomy batch. Serve with:
+#   HI_CUDA_PREFIX_CACHE=1 hi-local serve --backend cuda --execution gpu \
+#     --port 8080 --model-id qwen2.5-coder-7b --max-batch-size 4 \
+#     --max-batched-tokens 8192 --kv-cache-mode paged \
+#     ~/.hi/models/qwen2.5-coder-7b-instruct-q6_k.gguf
+#
+# Then:  hi -p coder-7b "your prompt"
+[profiles.coder-7b]
+provider = "ollama"
+model = "qwen2.5-coder-7b"               # must match hi-local's --model-id
+base_url = "http://127.0.0.1:8080/v1"
+max_tokens = 2048                        # the model advertises max_output_tokens 2048
+tool_mode = "auto"
+
+# DeepSeek-V4-Flash (284B MoE, 13B active) on the CUDA dsv4 backend: non-expert
+# weights resident on one RTX PRO 6000 (~13.5 GB), MXFP4 experts streamed from
+# the mmap'd GGUF in host RAM. Single-request FIFO serving (no batching yet).
+# Serve with (systemd unit hi-local-v4.service, or by hand):
+#   hi-local serve --backend cuda --execution gpu --port 8081 \
+#     --model-id deepseek-v4-flash \
+#     ~/.hi/models/deepseek-v4-flash/DeepSeek-V4-Flash-UD-Q4_K_XL-00001-of-00005.gguf
+#
+# Then:  hi -p v4-flash "your prompt"
+[profiles.v4-flash]
+provider = "ollama"
+model = "deepseek-v4-flash"              # must match hi-local's --model-id
+base_url = "http://127.0.0.1:8081/v1"
+max_tokens = 4096
+tool_mode = "auto"
