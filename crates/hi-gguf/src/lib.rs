@@ -1412,6 +1412,11 @@ pub struct QwenGgufConfig {
     pub expert_count: Option<u32>,
     pub expert_used_count: Option<u32>,
     pub expert_weights_norm: bool,
+    /// llama.cpp expert gating function enum: 1 = softmax (default), 2 =
+    /// sigmoid (DeepSeek-V3/GLM-5 class), 4 = sqrt-softplus (DeepSeek-V4).
+    pub expert_gating_func: Option<u32>,
+    /// Routed-expert weight multiplier (DeepSeek `routed_scaling_factor`).
+    pub expert_weights_scale: Option<f32>,
     pub rope_freq_base: Option<f32>,
     pub rope_freq_scale: Option<f32>,
     pub rope_dimension_sections: Option<[u32; 4]>,
@@ -1482,11 +1487,29 @@ impl QwenGgufConfig {
             qwen_metadata_u32_array(gguf, &format!("{prefix}.feed_forward_length"), block_count)?;
         let attention_q_lora_rank = gguf.metadata_u32(&format!("{prefix}.attention.q_lora_rank"));
         let attention_kv_lora_rank = gguf.metadata_u32(&format!("{prefix}.attention.kv_lora_rank"));
-        let attention_qk_rope_head_dim =
-            gguf.metadata_u32(&format!("{prefix}.attention.qk_rope_head_dim"));
-        let attention_qk_nope_head_dim =
-            gguf.metadata_u32(&format!("{prefix}.attention.qk_nope_head_dim"));
-        let attention_v_head_dim = gguf.metadata_u32(&format!("{prefix}.attention.v_head_dim"));
+        // glm-dsa/DeepSeek-V3.2-class ggufs carry attention.key_length_mla /
+        // value_length_mla + rope.dimension_count instead of the DeepSeek-2
+        // qk_rope/qk_nope/v_head keys; derive the classic dims from them.
+        let attention_key_length_mla =
+            gguf.metadata_u32(&format!("{prefix}.attention.key_length_mla"));
+        let attention_value_length_mla =
+            gguf.metadata_u32(&format!("{prefix}.attention.value_length_mla"));
+        let rope_dimension_count_for_mla =
+            gguf.metadata_u32(&format!("{prefix}.rope.dimension_count"));
+        let attention_qk_rope_head_dim = gguf
+            .metadata_u32(&format!("{prefix}.attention.qk_rope_head_dim"))
+            .or(attention_key_length_mla.and(rope_dimension_count_for_mla));
+        let attention_qk_nope_head_dim = gguf
+            .metadata_u32(&format!("{prefix}.attention.qk_nope_head_dim"))
+            .or(
+                match (attention_key_length_mla, rope_dimension_count_for_mla) {
+                    (Some(mla), Some(rope)) if mla > rope => Some(mla - rope),
+                    _ => None,
+                },
+            );
+        let attention_v_head_dim = gguf
+            .metadata_u32(&format!("{prefix}.attention.v_head_dim"))
+            .or(attention_value_length_mla);
         let attention_qk_head_dim = gguf.metadata_u32(&format!("{prefix}.attention.qk_head_dim"));
         let attention_mla_tensor_layout = qwen_mla_decoder_tensors_present(gguf, block_count);
         let recurrent_ssm_tensor_layout =
@@ -1606,6 +1629,8 @@ impl QwenGgufConfig {
             expert_weights_norm: gguf
                 .metadata_bool(&format!("{prefix}.expert_weights_norm"))
                 .unwrap_or(true),
+            expert_gating_func: gguf.metadata_u32(&format!("{prefix}.expert_gating_func")),
+            expert_weights_scale: gguf.metadata_f32(&format!("{prefix}.expert_weights_scale")),
             rope_freq_base: gguf.metadata_f32(&format!("{prefix}.rope.freq_base")),
             rope_freq_scale: gguf.metadata_f32(&format!("{prefix}.rope.freq_scale")),
             rope_dimension_sections,
@@ -2662,6 +2687,42 @@ pub fn qwen_mla_kv_b_weight_names(prefix: &str) -> Vec<String> {
     })
 }
 
+/// DeepSeek-V3.2/GLM-5-class MLA ships the kv_b projection split into
+/// per-head `attn_k_b` (stored transposed, for weight absorption) and
+/// `attn_v_b` rank-3 tensors instead of one fused `attn_kv_b`.
+pub fn qwen_mla_k_b_weight_names(prefix: &str) -> Vec<String> {
+    layer_prefix_aliases(prefix, |prefix| {
+        vec![
+            format!("{prefix}.attn_k_b.weight"),
+            format!("{prefix}.attn_k_b_proj.weight"),
+            format!("{prefix}.self_attn.k_b_proj.weight"),
+            format!("{prefix}.self_attention.k_b_proj.weight"),
+            format!("{prefix}.attention.k_b_proj.weight"),
+        ]
+    })
+}
+
+pub fn qwen_mla_v_b_weight_names(prefix: &str) -> Vec<String> {
+    layer_prefix_aliases(prefix, |prefix| {
+        vec![
+            format!("{prefix}.attn_v_b.weight"),
+            format!("{prefix}.attn_v_b_proj.weight"),
+            format!("{prefix}.self_attn.v_b_proj.weight"),
+            format!("{prefix}.self_attention.v_b_proj.weight"),
+            format!("{prefix}.attention.v_b_proj.weight"),
+        ]
+    })
+}
+
+fn qwen_mla_split_kv_b_present(gguf: &GgufFile, prefix: &str) -> bool {
+    qwen_mla_k_b_weight_names(prefix)
+        .iter()
+        .any(|name| gguf.tensor(name).is_some())
+        && qwen_mla_v_b_weight_names(prefix)
+            .iter()
+            .any(|name| gguf.tensor(name).is_some())
+}
+
 pub fn qwen_mla_attention_tensors_present(gguf: &GgufFile, prefix: &str) -> bool {
     qwen_mla_q_a_weight_names(prefix)
         .iter()
@@ -2678,9 +2739,10 @@ pub fn qwen_mla_attention_tensors_present(gguf: &GgufFile, prefix: &str) -> bool
         && qwen_mla_kv_a_norm_weight_names(prefix)
             .iter()
             .any(|name| gguf.tensor(name).is_some())
-        && qwen_mla_kv_b_weight_names(prefix)
+        && (qwen_mla_kv_b_weight_names(prefix)
             .iter()
             .any(|name| gguf.tensor(name).is_some())
+            || qwen_mla_split_kv_b_present(gguf, prefix))
 }
 
 pub fn qwen_ssm_in_weight_names(prefix: &str) -> Vec<String> {
@@ -3003,6 +3065,19 @@ pub fn qwen_moe_router_weight_names(prefix: &str) -> Vec<String> {
 
 pub fn qwen_moe_router_bias_names(prefix: &str) -> Vec<String> {
     weight_aliases_to_bias_names(qwen_moe_router_weight_names(prefix))
+}
+
+/// DeepSeek/GLM expert-selection correction bias (`e_score_correction_bias`):
+/// added to gating scores for TOP-K SELECTION ONLY — the routed weight uses
+/// the bias-free score. Distinct from the additive router bias above.
+pub fn qwen_moe_selection_bias_names(prefix: &str) -> Vec<String> {
+    layer_prefix_aliases(prefix, |prefix| {
+        vec![
+            format!("{prefix}.exp_probs_b.bias"),
+            format!("{prefix}.mlp.gate.e_score_correction_bias"),
+            format!("{prefix}.mlp.gate.e_score_correction.bias"),
+        ]
+    })
 }
 
 pub fn qwen_moe_packed_expert_weight_names(prefix: &str, kind: &str) -> Vec<String> {
@@ -4493,9 +4568,15 @@ fn qwen_mla_attention_tensors_present_in(
         && qwen_mla_kv_a_norm_weight_names(prefix)
             .iter()
             .any(|name| tensors.contains_key(name.as_str()))
-        && qwen_mla_kv_b_weight_names(prefix)
+        && (qwen_mla_kv_b_weight_names(prefix)
             .iter()
             .any(|name| tensors.contains_key(name.as_str()))
+            || (qwen_mla_k_b_weight_names(prefix)
+                .iter()
+                .any(|name| tensors.contains_key(name.as_str()))
+                && qwen_mla_v_b_weight_names(prefix)
+                    .iter()
+                    .any(|name| tensors.contains_key(name.as_str()))))
 }
 
 fn moe_router_tensor_present(tensors: &BTreeMap<&str, &TensorInfo>, prefix: &str) -> bool {
@@ -4784,11 +4865,32 @@ fn require_mla_attention_tensors(
         vec![ShapeRule::exact([kv_lora])],
         DTypePolicy::Any,
     );
-    validator.require_one_of(
-        &qwen_mla_kv_b_weight_names(prefix),
-        matrix_rules(kv_lora, kv_b_dim),
-        DTypePolicy::Matrix,
-    );
+    let split_kv_b_present = qwen_mla_k_b_weight_names(prefix)
+        .iter()
+        .any(|name| validator.tensors.contains_key(name.as_str()))
+        && qwen_mla_v_b_weight_names(prefix)
+            .iter()
+            .any(|name| validator.tensors.contains_key(name.as_str()));
+    if split_kv_b_present {
+        // glm-dsa/DeepSeek-V3.2 split: per-head rank-3 tensors, k_b stored
+        // transposed (nope x kv_lora x heads) for weight absorption.
+        validator.require_one_of(
+            &qwen_mla_k_b_weight_names(prefix),
+            vec![ShapeRule::exact([qk_nope, kv_lora, head_count])],
+            DTypePolicy::Matrix,
+        );
+        validator.require_one_of(
+            &qwen_mla_v_b_weight_names(prefix),
+            vec![ShapeRule::exact([kv_lora, v_head_dim, head_count])],
+            DTypePolicy::Matrix,
+        );
+    } else {
+        validator.require_one_of(
+            &qwen_mla_kv_b_weight_names(prefix),
+            matrix_rules(kv_lora, kv_b_dim),
+            DTypePolicy::Matrix,
+        );
+    }
 }
 
 fn require_ssm_layer_tensors(
