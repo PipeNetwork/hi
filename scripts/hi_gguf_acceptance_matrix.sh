@@ -48,10 +48,20 @@ fi
 MODELS=(
   "qwen2.5-0.5b|qwen2|Q4_K_M|1|https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf"  # qwen2 (GPT2-BPE tokenizer)
   "tinyllama-1.1b|llama|Q4_K_M|0|https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf"  # llama (SPM tokenizer); 1.1B too weak for retrieval
+  "llama-3.2-1b|llama|Q4_K_M|0|https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q4_K_M.gguf"  # llama3 (tiktoken-style BPE + llama3 chat template); 1B too weak for retrieval
   "phi-3-mini|phi|IQ4_NL|1|https://huggingface.co/SixOpen/Phi-3-mini-4k-instruct-IQ4_NL-imat.gguf/resolve/main/phi-3-mini-4k-instruct-iq4_nl-imat.gguf"  # phi3 (fused ffn_up gate+up)
   "qwen3-0.6b|qwen3|Q8_0|0|https://huggingface.co/Qwen/Qwen3-0.6B-GGUF/resolve/main/Qwen3-0.6B-Q8_0.gguf"  # qwen3 (QK-norm); thinking mode overruns the short retrieval budget
   "gemma-2-2b|gemma|Q4_K_M|1|https://huggingface.co/bartowski/gemma-2-2b-it-GGUF/resolve/main/gemma-2-2b-it-Q4_K_M.gguf"  # gemma2 (post-norms, GeGLU, softcap)
   "gemma-3-1b|gemma|Q4_K_M|1|https://huggingface.co/unsloth/gemma-3-1b-it-GGUF/resolve/main/gemma-3-1b-it-Q4_K_M.gguf"  # gemma3 (per-layer sliding-window + dual RoPE) — long_ctx probe exercises the fix
+  "mistral-7b|llama|Q4_K_M|1|https://huggingface.co/bartowski/Mistral-7B-Instruct-v0.3-GGUF/resolve/main/Mistral-7B-Instruct-v0.3-Q4_K_M.gguf"  # Mistral GGUFs carry the llama arch, so /health reports family "llama"
+)
+
+# Larger models (need more than an ~8 GB card) opt in via --large. These cover
+# real MoE expert routing that no small dense model exercises.
+LARGE_MODELS=(
+  "qwen3-30b-a3b|qwen3|Q4_K_M|1|https://huggingface.co/unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF/resolve/main/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf"  # qwen3moe (128-expert MoE, 8 active)
+  "mixtral-8x7b|llama|Q4_K_M|0|https://huggingface.co/MaziyarPanahi/Mixtral-8x7B-Instruct-v0.1-GGUF/resolve/main/Mixtral-8x7B-Instruct-v0.1.Q4_K_M.gguf"  # llama-arch MoE (rank-3 ffn_*_exps tensors); long-ctx retrieval currently degenerate — coherence-gated at short context only
+  "deepseek-v2-lite|deepseek|Q4_K_M|0|https://huggingface.co/gaianet/DeepSeek-V2-Lite-Chat-GGUF/resolve/main/DeepSeek-V2-Lite-Chat-Q4_K_M.gguf"  # deepseek2 full-Q MLA (kv latent 512 + rope 64, asymmetric qk 192 / v 128) + 64-expert MoE with fused shared experts; massive activations force the f32/f16-activation matmul paths (no int8 dp4a). long_ctx 0: plain-rope CPU-parity config, YARN >4k unverified
 )
 
 usage() {
@@ -68,6 +78,8 @@ Options:
   --skip-build        Do not build hi-local (--features native-cuda).
   --skip-unit         Do not run cargo test -p hi-gguf before the matrix.
   --skip-long-context Skip the long-context retrieval probe.
+  --large             Also run the LARGE_MODELS tier (MoE models needing more
+                      than an ~8 GB card: qwen3-30b-a3b, mixtral-8x7b).
   --tool              Also run a (forced) tool-call check (off by default; small
                       GGUF models are unreliable at tool calling).
   -h, --help          Show this help.
@@ -95,6 +107,7 @@ run_build=1
 run_unit=1
 run_long=1
 run_tool=0
+run_large=0
 selected=()
 
 while (($#)); do
@@ -103,6 +116,7 @@ while (($#)); do
     --skip-build) run_build=0 ;;
     --skip-unit) run_unit=0 ;;
     --skip-long-context) run_long=0 ;;
+    --large) run_large=1 ;;
     --tool) run_tool=1 ;;
     -h | --help) usage; exit 0 ;;
     -*) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
@@ -113,6 +127,9 @@ done
 
 if ((${#selected[@]})); then
   MODELS=("${selected[@]}")
+fi
+if ((run_large)); then
+  MODELS+=("${LARGE_MODELS[@]}")
 fi
 
 log() { printf '\n[%s] %s\n' "$(date +%H:%M:%S)" "$*"; }
