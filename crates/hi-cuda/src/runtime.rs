@@ -30,8 +30,8 @@ impl CudaRuntime {
 
 #[cfg(feature = "native-cuda")]
 pub use imp::{
-    Cublas, CublasLt, CudaGraph, DeviceBuffer, GemmDType, GraphExec, Stream, check_last_error,
-    free_memory_bytes, multiprocessor_count, set_capture_active,
+    Cublas, CublasLt, CudaGraph, DeviceBuffer, Event, GemmDType, GraphExec, PinnedBuffer, Stream,
+    check_last_error, free_memory_bytes, multiprocessor_count, set_capture_active,
 };
 
 #[cfg(not(feature = "native-cuda"))]
@@ -51,7 +51,7 @@ mod imp {
 mod imp {
     use std::collections::HashMap;
     use std::ffi::CStr;
-    use std::os::raw::{c_char, c_int, c_ulonglong, c_void};
+    use std::os::raw::{c_char, c_int, c_uint, c_ulonglong, c_void};
     use std::ptr;
     use std::sync::OnceLock;
 
@@ -62,6 +62,7 @@ mod imp {
     type CudaError = c_int;
     type CublasStatus = c_int;
     type CudaStream = *mut c_void;
+    type CudaEvent = *mut c_void;
     type CudaGraphRaw = *mut c_void;
     type CudaGraphExecRaw = *mut c_void;
     type CublasHandle = *mut c_void;
@@ -97,8 +98,16 @@ mod imp {
         ) -> CudaError;
         fn cudaGetLastError() -> CudaError;
         fn cudaStreamCreate(stream: *mut CudaStream) -> CudaError;
+        fn cudaStreamCreateWithFlags(stream: *mut CudaStream, flags: c_int) -> CudaError;
         fn cudaStreamDestroy(stream: CudaStream) -> CudaError;
         fn cudaStreamSynchronize(stream: CudaStream) -> CudaError;
+        fn cudaStreamWaitEvent(stream: CudaStream, event: CudaEvent, flags: c_int) -> CudaError;
+        fn cudaEventCreateWithFlags(event: *mut CudaEvent, flags: c_int) -> CudaError;
+        fn cudaEventRecord(event: CudaEvent, stream: CudaStream) -> CudaError;
+        fn cudaEventSynchronize(event: CudaEvent) -> CudaError;
+        fn cudaEventDestroy(event: CudaEvent) -> CudaError;
+        fn cudaHostAlloc(ptr: *mut *mut c_void, size: usize, flags: c_uint) -> CudaError;
+        fn cudaFreeHost(ptr: *mut c_void) -> CudaError;
         fn cudaStreamBeginCapture(stream: CudaStream, mode: c_int) -> CudaError;
         fn cudaStreamEndCapture(stream: CudaStream, graph: *mut CudaGraphRaw) -> CudaError;
         fn cudaGraphInstantiate(
@@ -377,6 +386,44 @@ mod imp {
             )
         }
 
+        /// Async host-to-device copy of `len` bytes from `src[src_offset..]`
+        /// (pinned host memory) landing at `dst_offset` into this buffer, on
+        /// `stream`. The source MUST be page-locked (a [`PinnedBuffer`]) for the
+        /// DMA to run truly asynchronously — an async copy out of pageable
+        /// memory silently degrades to a blocking staging copy. Used by the
+        /// DeepSeek-V4 expert-pool copy-stream prefetch.
+        pub fn copy_from_pinned_at_async(
+            &self,
+            dst_offset: usize,
+            src: &PinnedBuffer,
+            src_offset: usize,
+            len: usize,
+            stream: &Stream,
+        ) -> Result<()> {
+            if len == 0 {
+                return Ok(());
+            }
+            self.require_capacity(dst_offset.saturating_add(len))?;
+            if src_offset.saturating_add(len) > src.bytes {
+                bail!(
+                    "pinned source copy of {len} bytes at offset {src_offset} exceeds the {}-byte staging buffer",
+                    src.bytes
+                );
+            }
+            cuda_check(
+                unsafe {
+                    cudaMemcpyAsync(
+                        (self.ptr as *mut u8).add(dst_offset).cast(),
+                        (src.ptr as *const u8).add(src_offset).cast(),
+                        len,
+                        CudaMemcpyKind::HostToDevice as c_int,
+                        stream.raw,
+                    )
+                },
+                "cudaMemcpyAsync(pinned_host_to_device)",
+            )
+        }
+
         /// Async device-to-device copy of `len` bytes from `src[src_offset..]` into
         /// `self[dst_offset..]` on `stream`. Used to slice/scatter row ranges of an
         /// activation tensor for chunked processing.
@@ -541,10 +588,38 @@ mod imp {
             Ok(Self { raw })
         }
 
+        /// Create a non-blocking stream: unlike [`Stream::create`], it does NOT
+        /// implicitly synchronize with the legacy default (NULL) stream, so a
+        /// synchronous `cudaMemcpy` (which the demand paths still issue) does not
+        /// serialize with copies enqueued here. Cross-stream ordering is then
+        /// solely the caller's responsibility via [`Event`]s. Used for the
+        /// DeepSeek-V4 dedicated expert-prefetch copy stream.
+        pub fn create_non_blocking() -> Result<Self> {
+            const CUDA_STREAM_NON_BLOCKING: c_int = 1;
+            let mut raw = ptr::null_mut();
+            cuda_check(
+                unsafe { cudaStreamCreateWithFlags(&mut raw, CUDA_STREAM_NON_BLOCKING) },
+                "cudaStreamCreateWithFlags",
+            )?;
+            Ok(Self { raw })
+        }
+
         pub fn synchronize(&self) -> Result<()> {
             cuda_check(
                 unsafe { cudaStreamSynchronize(self.raw) },
                 "cudaStreamSynchronize",
+            )
+        }
+
+        /// Enqueue a wait on `event` into this stream: all work submitted to this
+        /// stream after this call defers until `event` is reached on its own
+        /// stream. Cheap and asynchronous (it enqueues a dependency, it does not
+        /// block the host). The cross-stream join half of the fork/join event
+        /// pattern.
+        pub fn wait_event(&self, event: &Event) -> Result<()> {
+            cuda_check(
+                unsafe { cudaStreamWaitEvent(self.raw, event.raw, 0) },
+                "cudaStreamWaitEvent",
             )
         }
 
@@ -668,6 +743,113 @@ mod imp {
         fn drop(&mut self) {
             if !self.raw.is_null() {
                 let _ = unsafe { cudaStreamDestroy(self.raw) };
+            }
+        }
+    }
+
+    /// A CUDA event for cross-stream ordering. Created with timing disabled
+    /// (ordering-only is cheaper). [`Event::record`] stamps a point in a
+    /// stream's timeline; [`Stream::wait_event`] makes another stream defer
+    /// until that point, and [`Event::synchronize`] blocks the host until it.
+    /// Records may be repeated (each overwrites the last).
+    pub struct Event {
+        raw: CudaEvent,
+    }
+
+    impl Event {
+        pub fn create() -> Result<Self> {
+            const CUDA_EVENT_DISABLE_TIMING: c_int = 2;
+            let mut raw = ptr::null_mut();
+            cuda_check(
+                unsafe { cudaEventCreateWithFlags(&mut raw, CUDA_EVENT_DISABLE_TIMING) },
+                "cudaEventCreateWithFlags",
+            )?;
+            Ok(Self { raw })
+        }
+
+        /// Record this event's completion into `stream` (the fork half of the
+        /// fork/join pattern, and the "copy done" marker on a copy stream).
+        pub fn record(&self, stream: &Stream) -> Result<()> {
+            cuda_check(
+                unsafe { cudaEventRecord(self.raw, stream.raw) },
+                "cudaEventRecord",
+            )
+        }
+
+        /// Block the host until this event's last recorded point is reached.
+        /// Used to gate reuse of a pinned staging buffer whose prior DMA must
+        /// finish before it is overwritten on the host.
+        pub fn synchronize(&self) -> Result<()> {
+            cuda_check(
+                unsafe { cudaEventSynchronize(self.raw) },
+                "cudaEventSynchronize",
+            )
+        }
+    }
+
+    impl Drop for Event {
+        fn drop(&mut self) {
+            if !self.raw.is_null() {
+                let _ = unsafe { cudaEventDestroy(self.raw) };
+            }
+        }
+    }
+
+    /// Page-locked (pinned) host memory. `cudaMemcpyAsync` runs a true async DMA
+    /// only from pinned source memory; a copy from ordinary pageable memory
+    /// silently blocks on an internal staging copy. The expert-pool prefetch
+    /// stages mmap'd GGUF bytes through one of these before the async H2D.
+    pub struct PinnedBuffer {
+        ptr: *mut c_void,
+        bytes: usize,
+    }
+
+    impl PinnedBuffer {
+        pub fn alloc(bytes: usize) -> Result<Self> {
+            const CUDA_HOST_ALLOC_DEFAULT: c_uint = 0;
+            if bytes == 0 {
+                bail!("pinned host allocation must be non-zero");
+            }
+            let mut ptr = ptr::null_mut();
+            cuda_check(
+                unsafe { cudaHostAlloc(&mut ptr, bytes, CUDA_HOST_ALLOC_DEFAULT) },
+                "cudaHostAlloc",
+            )?;
+            Ok(Self { ptr, bytes })
+        }
+
+        pub fn bytes(&self) -> usize {
+            self.bytes
+        }
+
+        /// Copy `data` into this pinned buffer starting at `offset` (a plain host
+        /// memcpy). The subsequent async H2D then DMAs it to device.
+        pub fn copy_in(&self, offset: usize, data: &[u8]) -> Result<()> {
+            let end = offset
+                .checked_add(data.len())
+                .ok_or_else(|| anyhow!("pinned staging write range overflows usize"))?;
+            if end > self.bytes {
+                bail!(
+                    "pinned staging write of {} bytes at offset {offset} exceeds the {}-byte buffer",
+                    data.len(),
+                    self.bytes
+                );
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    (self.ptr as *mut u8).add(offset),
+                    data.len(),
+                );
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for PinnedBuffer {
+        fn drop(&mut self) {
+            if !self.ptr.is_null() {
+                let _ = unsafe { cudaFreeHost(self.ptr) };
             }
         }
     }
@@ -834,6 +1016,33 @@ mod imp {
             lhs_dtype: GemmDType,
             rhs_dtype: GemmDType,
         ) -> Result<()> {
+            self.matmul_mixed_rhs_transposed_row_major_at(
+                lhs, 0, rhs, out, 0, rows, cols, inner, lhs_dtype, rhs_dtype,
+            )
+        }
+
+        /// [`Self::matmul_mixed_rhs_transposed_row_major`] with byte offsets
+        /// into the lhs and output buffers. The DeepSeek-V4 device MoE block
+        /// keeps a batch of activations in one flat buffer and issues one
+        /// M=1 GEMV per token at its row offset — the identical cuBLAS call
+        /// the per-token host path makes, so results stay bit-identical.
+        /// Offsets should preserve 256-byte alignment (all callers use
+        /// row-stride multiples) so cuBLAS heuristics see the same alignment
+        /// as a fresh allocation.
+        #[allow(clippy::too_many_arguments)]
+        pub fn matmul_mixed_rhs_transposed_row_major_at(
+            &self,
+            lhs: &DeviceBuffer,
+            lhs_byte_offset: usize,
+            rhs: &DeviceBuffer,
+            out: &DeviceBuffer,
+            out_byte_offset: usize,
+            rows: usize,
+            cols: usize,
+            inner: usize,
+            lhs_dtype: GemmDType,
+            rhs_dtype: GemmDType,
+        ) -> Result<()> {
             if rows == 0 || cols == 0 || inner == 0 {
                 bail!("cuBLAS matmul dimensions must be non-zero");
             }
@@ -842,9 +1051,11 @@ mod imp {
                     "cuBLAS projection GEMM currently requires matching lhs/rhs dtypes, got {lhs_dtype:?} and {rhs_dtype:?}"
                 );
             }
-            lhs.require_capacity(checked_matrix_bytes(rows, inner, lhs_dtype.element_size())?)?;
+            let lhs_bytes = checked_matrix_bytes(rows, inner, lhs_dtype.element_size())?;
+            lhs.require_capacity(checked_offset_end(lhs_byte_offset, lhs_bytes)?)?;
             rhs.require_capacity(checked_matrix_bytes(cols, inner, rhs_dtype.element_size())?)?;
-            out.require_capacity(checked_bytes::<f32>(rows, cols)?)?;
+            let out_bytes = checked_bytes::<f32>(rows, cols)?;
+            out.require_capacity(checked_offset_end(out_byte_offset, out_bytes)?)?;
             let rows = checked_cublas_dim(rows, "rows")?;
             let cols = checked_cublas_dim(cols, "cols")?;
             let inner = checked_cublas_dim(inner, "inner")?;
@@ -866,11 +1077,11 @@ mod imp {
                         rhs.as_ptr(),
                         rhs_dtype.cuda_data_type(),
                         inner,
-                        lhs.as_ptr(),
+                        lhs.as_ptr().cast::<u8>().add(lhs_byte_offset).cast(),
                         lhs_dtype.cuda_data_type(),
                         inner,
                         (&beta as *const f32).cast(),
-                        out.as_mut_ptr(),
+                        out.as_mut_ptr().cast::<u8>().add(out_byte_offset).cast(),
                         CudaDataTypeKind::R32F as CudaDataType,
                         cols,
                         CublasComputeTypeKind::F32 as CublasComputeType,
@@ -890,12 +1101,36 @@ mod imp {
             cols: usize,
             inner: usize,
         ) -> Result<()> {
+            self.matmul_f32_rhs_transposed_row_major_at(lhs, 0, rhs, out, 0, rows, cols, inner)
+        }
+
+        /// [`Self::matmul_f32_rhs_transposed_row_major`] with byte offsets
+        /// into the lhs and output buffers (see the mixed `_at` variant for
+        /// why the DeepSeek-V4 device MoE block needs them).
+        #[allow(clippy::too_many_arguments)]
+        pub fn matmul_f32_rhs_transposed_row_major_at(
+            &self,
+            lhs: &DeviceBuffer,
+            lhs_byte_offset: usize,
+            rhs: &DeviceBuffer,
+            out: &DeviceBuffer,
+            out_byte_offset: usize,
+            rows: usize,
+            cols: usize,
+            inner: usize,
+        ) -> Result<()> {
             if rows == 0 || cols == 0 || inner == 0 {
                 bail!("cuBLAS matmul dimensions must be non-zero");
             }
-            lhs.require_capacity(checked_bytes::<f32>(rows, inner)?)?;
+            lhs.require_capacity(checked_offset_end(
+                lhs_byte_offset,
+                checked_bytes::<f32>(rows, inner)?,
+            )?)?;
             rhs.require_capacity(checked_bytes::<f32>(cols, inner)?)?;
-            out.require_capacity(checked_bytes::<f32>(rows, cols)?)?;
+            out.require_capacity(checked_offset_end(
+                out_byte_offset,
+                checked_bytes::<f32>(rows, cols)?,
+            )?)?;
             let rows = checked_cublas_dim(rows, "rows")?;
             let cols = checked_cublas_dim(cols, "cols")?;
             let inner = checked_cublas_dim(inner, "inner")?;
@@ -915,10 +1150,10 @@ mod imp {
                         &alpha,
                         rhs.as_ptr().cast(),
                         inner,
-                        lhs.as_ptr().cast(),
+                        lhs.as_ptr().cast::<u8>().add(lhs_byte_offset).cast(),
                         inner,
                         &beta,
-                        out.as_mut_ptr().cast(),
+                        out.as_mut_ptr().cast::<u8>().add(out_byte_offset).cast(),
                         cols,
                     )
                 },
@@ -1058,6 +1293,12 @@ mod imp {
         rows.checked_mul(cols)
             .and_then(|elements| elements.checked_mul(element_size))
             .ok_or_else(|| anyhow!("matrix byte length overflows usize"))
+    }
+
+    fn checked_offset_end(offset: usize, bytes: usize) -> Result<usize> {
+        offset
+            .checked_add(bytes)
+            .ok_or_else(|| anyhow!("buffer offset range overflows usize"))
     }
 
     fn checked_cublas_dim(value: usize, label: &str) -> Result<c_int> {
