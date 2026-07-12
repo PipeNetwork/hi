@@ -63,7 +63,6 @@ pub(crate) struct ExpertPool {
     tick: u64,
     pass: u64,
     stats: ExpertPoolStats,
-    staging: Vec<u8>,
 }
 
 impl ExpertPool {
@@ -102,7 +101,6 @@ impl ExpertPool {
             tick: 0,
             pass: 0,
             stats: ExpertPoolStats::default(),
-            staging: Vec::new(),
         })
     }
 
@@ -124,14 +122,16 @@ impl ExpertPool {
 
     /// Make every (key, source) pair resident, returning each expert's device
     /// address in order. One "pass" pins all requested experts so a miss never
-    /// evicts another expert needed by the same forward step.
+    /// evicts another expert needed by the same forward step. Misses read from
+    /// disk CONCURRENTLY (scoped threads over the mmap slices — the page
+    /// faults are the expensive part, and parallel reads fill the NVMe queue),
+    /// then upload serially (host-to-device runs at memory speed).
     pub(crate) fn ensure_resident(
         &mut self,
         requests: &[(ExpertKey, &ExpertSource)],
     ) -> Result<Vec<u64>> {
         self.pass += 1;
         let pass = self.pass;
-        let mut addrs = Vec::with_capacity(requests.len());
         // First pass: mark hits so they cannot be evicted by this pass's misses.
         for (key, _) in requests {
             if let Some(&slot) = self.resident.get(key) {
@@ -140,22 +140,114 @@ impl ExpertPool {
                 self.slots[slot].pinned_pass = pass;
             }
         }
-        for (key, source) in requests {
+        // Assign slots for the misses (serial: eviction order stays
+        // deterministic), dedup within the request list.
+        let mut addrs = vec![0u64; requests.len()];
+        let mut misses: Vec<(usize, ExpertKey, &ExpertSource, usize)> = Vec::new();
+        for (idx, (key, source)) in requests.iter().enumerate() {
             if let Some(&slot) = self.resident.get(key) {
                 self.stats.hits += 1;
-                addrs.push(self.slot_device_addr(slot));
+                addrs[idx] = self.slot_device_addr(slot);
                 continue;
             }
             let slot = self.take_slot(pass)?;
-            self.load_into_slot(*key, source, slot)?;
             self.tick += 1;
             self.slots[slot].key = Some(*key);
             self.slots[slot].last_use = self.tick;
             self.slots[slot].pinned_pass = pass;
             self.resident.insert(*key, slot);
-            addrs.push(self.slot_device_addr(slot));
+            addrs[idx] = self.slot_device_addr(slot);
+            misses.push((idx, *key, source, slot));
+        }
+        if misses.is_empty() {
+            return Ok(addrs);
+        }
+        // Concurrent disk reads into per-miss staging buffers.
+        let gguf = &self.gguf;
+        let mut staged: Vec<Result<Vec<u8>>> = Vec::with_capacity(misses.len());
+        let workers = misses.len().min(6);
+        if workers <= 1 {
+            for (_, key, source, _) in &misses {
+                staged.push(Self::read_expert_bytes(gguf, *key, source));
+            }
+        } else {
+            let jobs = std::sync::Mutex::new(misses.iter().enumerate());
+            let results =
+                std::sync::Mutex::new((0..misses.len()).map(|_| None).collect::<Vec<_>>());
+            std::thread::scope(|scope| {
+                for _ in 0..workers {
+                    scope.spawn(|| {
+                        loop {
+                            let job = { jobs.lock().unwrap().next() };
+                            let Some((slot_idx, (_, key, source, _))) = job else {
+                                break;
+                            };
+                            let bytes = Self::read_expert_bytes(gguf, *key, source);
+                            results.lock().unwrap()[slot_idx] = Some(bytes);
+                        }
+                    });
+                }
+            });
+            staged = results
+                .into_inner()
+                .unwrap()
+                .into_iter()
+                .map(|entry| entry.expect("expert read job completed"))
+                .collect();
+        }
+        // Serial host-to-device uploads into the assigned slots.
+        for ((_, key, source, slot), bytes) in misses.iter().zip(staged) {
+            let bytes = bytes?;
+            if source.bytes_per_expert > self.slot_bytes {
+                bail!(
+                    "expert {} of {} needs {} bytes; pool slots are {} bytes",
+                    key.2,
+                    source.tensor_name,
+                    source.bytes_per_expert,
+                    self.slot_bytes
+                );
+            }
+            self.arena
+                .copy_from_host_at(slot * self.slot_bytes, &bytes)?;
+            self.stats.misses += 1;
+            self.stats.bytes_read += source.bytes_per_expert as u64;
         }
         Ok(addrs)
+    }
+
+    /// Copy one expert's contiguous byte range out of the (split) GGUF mmap.
+    fn read_expert_bytes(
+        gguf: &GgufFile,
+        key: ExpertKey,
+        source: &ExpertSource,
+    ) -> Result<Vec<u8>> {
+        let expert = key.2 as usize;
+        if expert >= source.expert_count {
+            bail!(
+                "expert {} out of range for {} ({} experts)",
+                expert,
+                source.tensor_name,
+                source.expert_count
+            );
+        }
+        let view = gguf
+            .tensor(&source.tensor_name)
+            .ok_or_else(|| anyhow!("expert tensor {} missing from GGUF", source.tensor_name))?;
+        let start = expert
+            .checked_mul(source.bytes_per_expert)
+            .context("expert byte offset overflows usize")?;
+        let end = start
+            .checked_add(source.bytes_per_expert)
+            .context("expert byte range overflows usize")?;
+        let bytes = view.bytes.get(start..end).ok_or_else(|| {
+            anyhow!(
+                "expert {} byte range {start}..{end} exceeds tensor {} ({} bytes)",
+                expert,
+                source.tensor_name,
+                view.bytes.len()
+            )
+        })?;
+        Ok(bytes.to_vec())
     }
 
     fn take_slot(&mut self, pass: u64) -> Result<usize> {
@@ -180,54 +272,5 @@ impl ExpertPool {
             self.stats.evictions += 1;
         }
         Ok(victim)
-    }
-
-    fn load_into_slot(&mut self, key: ExpertKey, source: &ExpertSource, slot: usize) -> Result<()> {
-        let expert = key.2 as usize;
-        if expert >= source.expert_count {
-            bail!(
-                "expert {} out of range for {} ({} experts)",
-                expert,
-                source.tensor_name,
-                source.expert_count
-            );
-        }
-        if source.bytes_per_expert > self.slot_bytes {
-            bail!(
-                "expert {} of {} needs {} bytes; pool slots are {} bytes",
-                expert,
-                source.tensor_name,
-                source.bytes_per_expert,
-                self.slot_bytes
-            );
-        }
-        let view = self
-            .gguf
-            .tensor(&source.tensor_name)
-            .ok_or_else(|| anyhow!("expert tensor {} missing from GGUF", source.tensor_name))?;
-        let start = expert
-            .checked_mul(source.bytes_per_expert)
-            .context("expert byte offset overflows usize")?;
-        let end = start
-            .checked_add(source.bytes_per_expert)
-            .context("expert byte range overflows usize")?;
-        let bytes = view.bytes.get(start..end).ok_or_else(|| {
-            anyhow!(
-                "expert {} byte range {start}..{end} exceeds tensor {} ({} bytes)",
-                expert,
-                source.tensor_name,
-                view.bytes.len()
-            )
-        })?;
-        // Stage through an owned buffer: the mmap'd slice is file-backed and
-        // cudaMemcpy from it directly can fault-stall; the copy also keeps
-        // this correct if a future async upload outlives the view.
-        self.staging.clear();
-        self.staging.extend_from_slice(bytes);
-        self.arena
-            .copy_from_host_at(slot * self.slot_bytes, &self.staging)?;
-        self.stats.misses += 1;
-        self.stats.bytes_read += source.bytes_per_expert as u64;
-        Ok(())
     }
 }

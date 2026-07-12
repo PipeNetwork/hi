@@ -972,6 +972,25 @@ impl CudaBackend {
         }
     }
 
+    fn expert_streaming_status(&self) -> String {
+        let Ok(model) = &self.gpu_model else {
+            return "off".to_string();
+        };
+        let Ok(model) = model.lock() else {
+            return "off".to_string();
+        };
+        match model.expert_pool_stats() {
+            Some(stats) => format!(
+                "pool(hits={},misses={},evictions={},read_mb={})",
+                stats.hits,
+                stats.misses,
+                stats.evictions,
+                stats.bytes_read / (1024 * 1024)
+            ),
+            None => "off".to_string(),
+        }
+    }
+
     fn kv_cache_status(&self) -> String {
         if self.execution != CudaExecution::Gpu {
             return "disabled".to_string();
@@ -9295,7 +9314,7 @@ impl InferenceBackend for CudaBackend {
             ready: true,
             family: self.qwen.family.label().to_string(),
             quantization: format!(
-                "{}; execution={}; {}; {}; kv-cache={}; gpu-features={}; prefix-cache={}; attention={}; attention-detail={}; sampling={}; batch=max_size={},max_active_requests={},max_batched_tokens={},max_wait_us={},max_wait_us_cap={}; scheduler={}; multimodal-batching={}; multimodal-metrics={}; multimodal={}",
+                "{}; execution={}; {}; {}; kv-cache={}; gpu-features={}; prefix-cache={}; expert-streaming={}; attention={}; attention-detail={}; sampling={}; batch=max_size={},max_active_requests={},max_batched_tokens={},max_wait_us={},max_wait_us_cap={}; scheduler={}; multimodal-batching={}; multimodal-metrics={}; multimodal={}",
                 self.qwen.quantization_label(),
                 self.execution.label(),
                 self.runtime_status(),
@@ -9303,6 +9322,7 @@ impl InferenceBackend for CudaBackend {
                 self.kv_cache_status(),
                 self.gpu_feature_status(),
                 self.prefix_cache_status(scheduler),
+                self.expert_streaming_status(),
                 attention.status,
                 attention.detail,
                 if self.execution == CudaExecution::Gpu {
