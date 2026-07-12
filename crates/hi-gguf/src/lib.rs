@@ -4249,21 +4249,15 @@ fn validate_qwen_tensors(gguf: &GgufFile, config: &QwenGgufConfig) -> QwenTensor
                 ));
             } else if shared_split_present == shared.len() {
                 let shared_ff = ff.or(expert_ff);
-                validator.optional_one_of(
-                    &shared[0],
-                    feed_forward_matrix_rules(embed, shared_ff),
-                    DTypePolicy::Matrix,
-                );
-                validator.optional_one_of(
-                    &shared[1],
-                    feed_forward_matrix_rules(embed, shared_ff),
-                    DTypePolicy::Matrix,
-                );
-                validator.optional_one_of(
-                    &shared[2],
-                    feed_forward_matrix_rules(embed, shared_ff),
-                    DTypePolicy::Matrix,
-                );
+                // GLM/DeepSeek shared experts are expert_ff wide, qwen2moe's
+                // are n_ff wide — accept either.
+                let mut shared_rules = feed_forward_matrix_rules(embed, shared_ff);
+                if expert_ff.is_some() && expert_ff != shared_ff {
+                    shared_rules.extend(feed_forward_matrix_rules(embed, expert_ff));
+                }
+                validator.optional_one_of(&shared[0], shared_rules.clone(), DTypePolicy::Matrix);
+                validator.optional_one_of(&shared[1], shared_rules.clone(), DTypePolicy::Matrix);
+                validator.optional_one_of(&shared[2], shared_rules, DTypePolicy::Matrix);
                 if let Some(shared_ff) = shared_ff {
                     validator.optional_one_of(
                         &qwen_moe_shared_expert_bias_names(&prefix, "gate"),

@@ -25532,6 +25532,43 @@ mod tests {
             &[3.0f32.exp() / selected0, 1.0f32.exp() / selected0, 0.5, 0.5],
         );
 
+        // Sigmoid gating (glm-dsa/DeepSeek-V3): top-k RANKED on sigmoid(score)
+        // + selection bias; routed weights are the bias-free sigmoid scores,
+        // top-k normalized, then scaled by expert_weights_scale.
+        let selection_bias = DeviceBuffer::alloc(3 * std::mem::size_of::<f32>()).unwrap();
+        selection_bias.copy_from_host(&[1.0f32, 0.0, -2.0]).unwrap();
+        crate::kernels::launch_moe_topk_router(
+            &router,
+            &route_ids,
+            &route_weights,
+            Some(&selection_bias),
+            2,
+            3,
+            2,
+            true,
+            true,
+            2.0,
+            &stream,
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+        // row0 logits [0,1,3]: keys sigmoid+bias = [1.5, 0.731, -1.047] -> ids
+        // [0,1] despite expert 2 having the best raw score; row1 [5,5,1]:
+        // keys [1.993, 0.993, -1.269] -> ids [0,1].
+        assert_eq!(route_ids.copy_to_host::<u32>(4).unwrap(), vec![0, 1, 0, 1]);
+        let sigmoid = |value: f32| 1.0 / (1.0 + (-value).exp());
+        let sum0 = sigmoid(0.0) + sigmoid(1.0);
+        let sum1 = sigmoid(5.0) + sigmoid(5.0);
+        assert_close_vec(
+            &route_weights.copy_to_host::<f32>(4).unwrap(),
+            &[
+                sigmoid(0.0) / sum0 * 2.0,
+                sigmoid(1.0) / sum0 * 2.0,
+                sigmoid(5.0) / sum1 * 2.0,
+                sigmoid(5.0) / sum1 * 2.0,
+            ],
+        );
+
         let cast_input = DeviceBuffer::alloc(4 * std::mem::size_of::<f32>()).unwrap();
         let cast_f16 = DeviceBuffer::alloc(4 * std::mem::size_of::<u16>()).unwrap();
         let cast_bf16 = DeviceBuffer::alloc(4 * std::mem::size_of::<u16>()).unwrap();
@@ -27649,6 +27686,276 @@ mod tests {
             ),
         ];
         write_qwen35_hybrid_gguf(path, tensors);
+    }
+
+    /// glm-dsa fixture pair: layer 0 = dense-FFN MLA block, layer 1 = sigmoid
+    /// MoE MLA block. `split_kv_b` picks whether the kv_b projection ships as
+    /// the per-head split `attn_k_b`/`attn_v_b` rank-3 tensors (k_b stored
+    /// transposed, glm-dsa style) or pre-fused `attn_kv_b` with IDENTICAL
+    /// values — the two fixtures must produce matching outputs, which pins the
+    /// load-time synthesis transpose exactly.
+    /// Dims: embed=4, heads=2, q_lora=3, kv_lora=3, nope=2, rope=2 (qk_mla=4),
+    /// v_head=2; experts=3 top-2, sigmoid gating (func 2), scale 2.5.
+    #[cfg(feature = "native-cuda")]
+    fn write_reference_glm_dsa(path: &Path, split_kv_b: bool) {
+        const HEADS: usize = 2;
+        const NOPE: usize = 2;
+        const V_HEAD: usize = 2;
+        const KV_LORA: usize = 3;
+        // Fused kv_b rows are per head [k_nope rows | v rows], each row holding
+        // kv_lora input weights. Values on the 1/64 grid (exact in f16).
+        let fused_kv_b = qwen35_fixture_values(HEADS * (NOPE + V_HEAD) * KV_LORA, 41);
+        let mut tensors = vec![
+            tensor_f16_exact(
+                "token_embd.weight",
+                vec![4, 3],
+                &qwen35_fixture_values(12, 31),
+            ),
+            tensor_f32(
+                "output_norm.weight",
+                vec![4],
+                &qwen35_fixture_norm_values(4, 32),
+            ),
+        ];
+        for layer in 0..2usize {
+            let p = format!("blk.{layer}");
+            let seed = (layer as u32) * 100;
+            tensors.extend([
+                tensor_f32(
+                    &format!("{p}.attn_norm.weight"),
+                    vec![4],
+                    &qwen35_fixture_norm_values(4, seed + 33),
+                ),
+                tensor_f32(
+                    &format!("{p}.ffn_norm.weight"),
+                    vec![4],
+                    &qwen35_fixture_norm_values(4, seed + 34),
+                ),
+                tensor_f16_exact(
+                    &format!("{p}.attn_q_a.weight"),
+                    vec![4, 3],
+                    &qwen35_fixture_values(12, seed + 35),
+                ),
+                tensor_f32(
+                    &format!("{p}.attn_q_a_norm.weight"),
+                    vec![3],
+                    &qwen35_fixture_norm_values(3, seed + 36),
+                ),
+                tensor_f16_exact(
+                    &format!("{p}.attn_q_b.weight"),
+                    vec![3, 8],
+                    &qwen35_fixture_values(24, seed + 37),
+                ),
+                tensor_f16_exact(
+                    &format!("{p}.attn_kv_a_mqa.weight"),
+                    vec![4, 5],
+                    &qwen35_fixture_values(20, seed + 38),
+                ),
+                tensor_f32(
+                    &format!("{p}.attn_kv_a_norm.weight"),
+                    vec![3],
+                    &qwen35_fixture_norm_values(3, seed + 39),
+                ),
+                tensor_f16_exact(
+                    &format!("{p}.attn_output.weight"),
+                    vec![4, 4],
+                    &qwen35_fixture_values(16, seed + 40),
+                ),
+            ]);
+            if split_kv_b {
+                // k_b[n, l, h] = fused[(h*(NOPE+V_HEAD) + n)*KV_LORA + l]
+                let mut k_b = vec![0.0f32; NOPE * KV_LORA * HEADS];
+                let mut v_b = vec![0.0f32; KV_LORA * V_HEAD * HEADS];
+                for h in 0..HEADS {
+                    for n in 0..NOPE {
+                        for l in 0..KV_LORA {
+                            k_b[h * NOPE * KV_LORA + l * NOPE + n] =
+                                fused_kv_b[(h * (NOPE + V_HEAD) + n) * KV_LORA + l];
+                        }
+                    }
+                    for vd in 0..V_HEAD {
+                        for l in 0..KV_LORA {
+                            v_b[h * KV_LORA * V_HEAD + vd * KV_LORA + l] =
+                                fused_kv_b[(h * (NOPE + V_HEAD) + NOPE + vd) * KV_LORA + l];
+                        }
+                    }
+                }
+                tensors.push(tensor_f16_exact(
+                    &format!("{p}.attn_k_b.weight"),
+                    vec![NOPE as u64, KV_LORA as u64, HEADS as u64],
+                    &k_b,
+                ));
+                tensors.push(tensor_f16_exact(
+                    &format!("{p}.attn_v_b.weight"),
+                    vec![KV_LORA as u64, V_HEAD as u64, HEADS as u64],
+                    &v_b,
+                ));
+            } else {
+                tensors.push(tensor_f16_exact(
+                    &format!("{p}.attn_kv_b.weight"),
+                    vec![KV_LORA as u64, (HEADS * (NOPE + V_HEAD)) as u64],
+                    &fused_kv_b,
+                ));
+            }
+            if layer == 0 {
+                tensors.extend([
+                    tensor_f16_exact(
+                        &format!("{p}.ffn_gate.weight"),
+                        vec![4, 4],
+                        &qwen35_fixture_values(16, seed + 44),
+                    ),
+                    tensor_f16_exact(
+                        &format!("{p}.ffn_up.weight"),
+                        vec![4, 4],
+                        &qwen35_fixture_values(16, seed + 45),
+                    ),
+                    tensor_f16_exact(
+                        &format!("{p}.ffn_down.weight"),
+                        vec![4, 4],
+                        &qwen35_fixture_values(16, seed + 46),
+                    ),
+                ]);
+            } else {
+                tensors.extend([
+                    tensor_f32(
+                        &format!("{p}.ffn_gate_inp.weight"),
+                        vec![4, 3],
+                        &qwen35_fixture_values(12, seed + 47),
+                    ),
+                    tensor_f32(
+                        &format!("{p}.exp_probs_b.bias"),
+                        vec![3],
+                        &qwen35_fixture_values(3, seed + 48),
+                    ),
+                    tensor_f16_exact(
+                        &format!("{p}.ffn_gate_exps.weight"),
+                        vec![4, 2, 3],
+                        &qwen35_fixture_values(24, seed + 49),
+                    ),
+                    tensor_f16_exact(
+                        &format!("{p}.ffn_up_exps.weight"),
+                        vec![4, 2, 3],
+                        &qwen35_fixture_values(24, seed + 50),
+                    ),
+                    tensor_f16_exact(
+                        &format!("{p}.ffn_down_exps.weight"),
+                        vec![2, 4, 3],
+                        &qwen35_fixture_values(24, seed + 51),
+                    ),
+                    tensor_f16_exact(
+                        &format!("{p}.ffn_gate_shexp.weight"),
+                        vec![4, 2],
+                        &qwen35_fixture_values(8, seed + 52),
+                    ),
+                    tensor_f16_exact(
+                        &format!("{p}.ffn_up_shexp.weight"),
+                        vec![4, 2],
+                        &qwen35_fixture_values(8, seed + 53),
+                    ),
+                    tensor_f16_exact(
+                        &format!("{p}.ffn_down_shexp.weight"),
+                        vec![2, 4],
+                        &qwen35_fixture_values(8, seed + 54),
+                    ),
+                ]);
+            }
+        }
+        write_glm_dsa_gguf(path, tensors);
+    }
+
+    #[cfg(feature = "native-cuda")]
+    fn write_glm_dsa_gguf(path: &Path, tensors: Vec<TestTensor>) {
+        let mut data = Vec::new();
+        let tensors = tensors
+            .into_iter()
+            .map(|mut tensor| {
+                pad_to_alignment(&mut data, 32);
+                tensor.offset = data.len() as u64;
+                data.extend_from_slice(&tensor.bytes);
+                tensor
+            })
+            .collect::<Vec<_>>();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"GGUF");
+        write_u32(&mut bytes, 3);
+        write_u64(&mut bytes, tensors.len() as u64);
+        write_u64(&mut bytes, 23);
+
+        write_kv_string(&mut bytes, "general.architecture", "glm-dsa");
+        write_kv_string(&mut bytes, "general.name", "cpu-reference-glm-dsa");
+        write_kv_u32(&mut bytes, "general.alignment", 32);
+        write_kv_u32(&mut bytes, "general.file_type", 1);
+        write_kv_u32(&mut bytes, "glm-dsa.context_length", 128);
+        write_kv_u32(&mut bytes, "glm-dsa.embedding_length", 4);
+        write_kv_u32(&mut bytes, "glm-dsa.feed_forward_length", 4);
+        write_kv_u32(&mut bytes, "glm-dsa.block_count", 2);
+        write_kv_u32(&mut bytes, "glm-dsa.attention.head_count", 2);
+        write_kv_u32(&mut bytes, "glm-dsa.attention.head_count_kv", 1);
+        write_kv_f32(
+            &mut bytes,
+            "glm-dsa.attention.layer_norm_rms_epsilon",
+            1.0e-6,
+        );
+        write_kv_f32(&mut bytes, "glm-dsa.rope.freq_base", 10_000.0);
+        write_kv_u32(&mut bytes, "glm-dsa.rope.dimension_count", 2);
+        write_kv_u32(&mut bytes, "glm-dsa.attention.q_lora_rank", 3);
+        write_kv_u32(&mut bytes, "glm-dsa.attention.kv_lora_rank", 3);
+        write_kv_u32(&mut bytes, "glm-dsa.attention.key_length_mla", 4);
+        write_kv_u32(&mut bytes, "glm-dsa.attention.value_length_mla", 2);
+        write_kv_u32(&mut bytes, "glm-dsa.expert_count", 3);
+        write_kv_u32(&mut bytes, "glm-dsa.expert_feed_forward_length", 2);
+        write_kv_u32(&mut bytes, "glm-dsa.expert_used_count", 2);
+        write_kv_u32(&mut bytes, "glm-dsa.expert_gating_func", 2);
+        write_kv_f32(&mut bytes, "glm-dsa.expert_weights_scale", 2.5);
+        write_kv_string_array(&mut bytes, "tokenizer.ggml.tokens", &["a", "b", "c"]);
+
+        for tensor in tensors {
+            write_string(&mut bytes, &tensor.name);
+            write_u32(&mut bytes, tensor.dims.len() as u32);
+            for dim in tensor.dims {
+                write_u64(&mut bytes, dim);
+            }
+            write_u32(&mut bytes, tensor.dtype);
+            write_u64(&mut bytes, tensor.offset);
+        }
+
+        pad_to_alignment(&mut bytes, 32);
+        bytes.extend(data);
+        fs::write(path, bytes).unwrap();
+    }
+
+    /// Split k_b/v_b and pre-fused kv_b fixtures with identical weights must
+    /// generate identical outputs: pins the load-time synthesis transpose and
+    /// the sigmoid + selection-bias + scale MoE routing end to end.
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_glm_dsa_split_kv_b_matches_fused() {
+        use hi_gguf::GgufFile;
+
+        let split_path = tempfile_path("gpu-glm-dsa-split");
+        let fused_path = tempfile_path("gpu-glm-dsa-fused");
+        write_reference_glm_dsa(&split_path, true);
+        write_reference_glm_dsa(&fused_path, false);
+
+        let split_gguf = GgufFile::open(&split_path).unwrap();
+        let fused_gguf = GgufFile::open(&fused_path).unwrap();
+        let split_model = crate::gpu::CudaQwenGpuModel::from_gguf(&split_gguf).unwrap();
+        let fused_model = crate::gpu::CudaQwenGpuModel::from_gguf(&fused_gguf).unwrap();
+
+        // The synthesized fused projection must exist on the split model.
+        assert!(split_model.has_matrix("blk.0.attn_kv_b.weight"));
+        assert!(split_model.has_matrix("blk.1.attn_kv_b.weight"));
+
+        let split_logits = split_model.full_context_logits_host(&[0, 1, 2]).unwrap();
+        let fused_logits = fused_model.full_context_logits_host(&[0, 1, 2]).unwrap();
+        assert_close_vec(&split_logits, &fused_logits);
+        assert!(split_logits.iter().all(|value| value.is_finite()));
+
+        assert_eq!(
+            split_model.generate_greedy_tokens(&[1], 3, None).unwrap(),
+            fused_model.generate_greedy_tokens(&[1], 3, None).unwrap()
+        );
     }
 
     #[cfg(feature = "native-cuda")]

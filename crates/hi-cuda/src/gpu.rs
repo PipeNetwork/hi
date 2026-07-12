@@ -84,9 +84,10 @@ mod native {
         qwen_dense_packed_ffn_gate_up_weight_names, qwen_dense_packed_ffn_up_gate_bias_names,
         qwen_dense_packed_ffn_up_gate_weight_names, qwen_dense_packed_qkv_bias_names,
         qwen_dense_packed_qkv_weight_names, qwen_dense_token_embd_weight_names,
-        qwen_mla_attention_tensors_present, qwen_mla_kv_a_norm_weight_names,
-        qwen_mla_kv_a_weight_names, qwen_mla_kv_b_weight_names, qwen_mla_q_a_norm_weight_names,
-        qwen_mla_q_a_weight_names, qwen_mla_q_b_weight_names, qwen_moe_packed_expert_bias_names,
+        qwen_mla_attention_tensors_present, qwen_mla_k_b_weight_names,
+        qwen_mla_kv_a_norm_weight_names, qwen_mla_kv_a_weight_names, qwen_mla_kv_b_weight_names,
+        qwen_mla_q_a_norm_weight_names, qwen_mla_q_a_weight_names, qwen_mla_q_b_weight_names,
+        qwen_mla_v_b_weight_names, qwen_moe_packed_expert_bias_names,
         qwen_moe_packed_expert_gate_up_bias_names, qwen_moe_packed_expert_gate_up_weight_names,
         qwen_moe_packed_expert_up_gate_bias_names, qwen_moe_packed_expert_up_gate_weight_names,
         qwen_moe_packed_expert_weight_names, qwen_moe_per_expert_bias_names,
@@ -3442,6 +3443,7 @@ mod native {
                     .context("CUDA normalized matrix byte total overflows usize")?;
                 matrices.insert(spec.name, matrix);
             }
+            synthesize_mla_split_kv_b(gguf, &config, &mut matrices, &mut total_matrix_bytes)?;
 
             let mut vectors = BTreeMap::new();
             let mut total_vector_bytes = 0usize;
@@ -23403,6 +23405,102 @@ mod native {
         }
     }
 
+    /// glm-dsa/DeepSeek-V3.2 ship the MLA kv_b projection split into per-head
+    /// rank-3 tensors: `attn_k_b` [qk_nope, kv_lora, heads] (stored transposed
+    /// for weight absorption) and `attn_v_b` [kv_lora, v_head, heads]. hi's MLA
+    /// forward consumes one fused `[kv_lora -> heads*(nope+v)]` projection, so
+    /// synthesize it in F32 at load; the split tensors themselves stay unloaded.
+    fn synthesize_mla_split_kv_b(
+        gguf: &GgufFile,
+        config: &QwenGgufConfig,
+        matrices: &mut BTreeMap<String, GpuMatrix>,
+        total_matrix_bytes: &mut usize,
+    ) -> Result<()> {
+        if !config.attention_mla_tensor_layout {
+            return Ok(());
+        }
+        let Some(mla) = qwen_mla_dims(config)? else {
+            return Ok(());
+        };
+        let heads = usize::try_from(config.attention_head_count)
+            .context("qwen attention_head_count does not fit usize")?;
+        let nope = mla.qk_nope_head_dim;
+        let v_head = mla.v_head_dim;
+        let kv_lora = mla.kv_lora_rank;
+        let head_dim = nope
+            .checked_add(v_head)
+            .context("MLA kv_b per-head dimension overflows usize")?;
+        for layer in 0..config.block_count {
+            let prefix = format!("blk.{layer}");
+            let fused_name = format!("{prefix}.attn_kv_b.weight");
+            if matrices.contains_key(&fused_name) {
+                continue;
+            }
+            let Some(k_view) = qwen_mla_k_b_weight_names(&prefix)
+                .into_iter()
+                .find_map(|name| gguf.tensor(&name))
+            else {
+                continue;
+            };
+            let Some(v_view) = qwen_mla_v_b_weight_names(&prefix)
+                .into_iter()
+                .find_map(|name| gguf.tensor(&name))
+            else {
+                continue;
+            };
+            let expected_k = [nope as u64, kv_lora as u64, heads as u64];
+            let expected_v = [kv_lora as u64, v_head as u64, heads as u64];
+            if k_view.info.dimensions != expected_k || v_view.info.dimensions != expected_v {
+                bail!(
+                    "MLA split kv_b tensors for {prefix} have shapes {:?}/{:?}; expected {expected_k:?}/{expected_v:?}",
+                    k_view.info.dimensions,
+                    v_view.info.dimensions
+                );
+            }
+            let k_elems = nope * kv_lora * heads;
+            let v_elems = kv_lora * v_head * heads;
+            let k = dequantize_tensor_as_f32(k_view.bytes, k_view.info.dtype, k_elems)
+                .with_context(|| format!("dequantizing {prefix} attn_k_b"))?;
+            let v = dequantize_tensor_as_f32(v_view.bytes, v_view.info.dtype, v_elems)
+                .with_context(|| format!("dequantizing {prefix} attn_v_b"))?;
+            let rows = heads * head_dim;
+            let mut fused = vec![0.0f32; rows * kv_lora];
+            for head in 0..heads {
+                let k_base = head * nope * kv_lora;
+                for n in 0..nope {
+                    let row = (head * head_dim + n) * kv_lora;
+                    for l in 0..kv_lora {
+                        fused[row + l] = k[k_base + l * nope + n];
+                    }
+                }
+                let v_base = head * kv_lora * v_head;
+                for vd in 0..v_head {
+                    let row = (head * head_dim + nope + vd) * kv_lora;
+                    let src = v_base + vd * kv_lora;
+                    fused[row..row + kv_lora].copy_from_slice(&v[src..src + kv_lora]);
+                }
+            }
+            let bytes = fused.len() * std::mem::size_of::<f32>();
+            let buffer = DeviceBuffer::alloc(bytes)
+                .with_context(|| format!("allocating synthesized {fused_name}"))?;
+            buffer.copy_from_host(&fused)?;
+            *total_matrix_bytes = total_matrix_bytes
+                .checked_add(bytes)
+                .context("CUDA synthesized kv_b byte total overflows usize")?;
+            matrices.insert(
+                fused_name,
+                GpuMatrix {
+                    rows,
+                    cols: kv_lora,
+                    dtype: GgufTensorType::F32,
+                    bytes,
+                    buffer,
+                },
+            );
+        }
+        Ok(())
+    }
+
     fn qwen_matrix_specs(gguf: &GgufFile, config: &QwenGgufConfig) -> Result<Vec<MatrixSpec>> {
         let embed = usize::try_from(config.embedding_length)
             .context("qwen embedding_length does not fit usize")?;
@@ -23624,14 +23722,21 @@ mod native {
                         kv_a_dim,
                         embed,
                     ),
-                    dense_matrix_spec_with_aliases(
+                ]);
+                if qwen_mla_kv_b_weight_names(&prefix)
+                    .iter()
+                    .any(|name| gguf.tensor(name).is_some())
+                {
+                    specs.push(dense_matrix_spec_with_aliases(
                         gguf,
                         format!("{prefix}.attn_kv_b.weight"),
                         qwen_mla_kv_b_weight_names(&prefix),
                         kv_b_dim,
                         mla.kv_lora_rank,
-                    ),
-                ]);
+                    ));
+                }
+                // Split attn_k_b/attn_v_b (glm-dsa / DeepSeek-V3.2): no spec —
+                // the fused projection is synthesized after the load loop.
             } else if !qkv_split_tensors_present(gguf, &prefix)
                 && let Some(source) = qwen_dense_packed_qkv_weight_names(&prefix)
                     .into_iter()
