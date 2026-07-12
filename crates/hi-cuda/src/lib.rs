@@ -24534,6 +24534,7 @@ mod tests {
             let (block_bytes, d_off, dmin_off): (usize, usize, i64) = match dtype {
                 MoeGroupedGemvDtype::Q4K => (144, 0, 2),
                 MoeGroupedGemvDtype::Q6K => (210, 208, -1),
+                other => panic!("bench covers Q4K/Q6K only, got {other:?}"),
             };
             let nblk = n * (k / 256);
             let wlen = nblk * block_bytes;
@@ -24555,6 +24556,7 @@ mod tests {
             let dequant = match dtype {
                 MoeGroupedGemvDtype::Q4K => crate::kernels::launch_dequantize_q4_k_to_f16,
                 MoeGroupedGemvDtype::Q6K => crate::kernels::launch_dequantize_q6_k_to_f16,
+                other => panic!("bench covers Q4K/Q6K only, got {other:?}"),
             };
             dequant(&w, &wf16, n * k, &stream).unwrap();
             println!("\n=== {label} ===");
@@ -24661,6 +24663,27 @@ mod tests {
                 208,
                 -1,
                 crate::kernels::launch_q6_k_dp4a_gemv,
+            ),
+            (
+                MoeGroupedGemvDtype::Q2K,
+                84,
+                80,
+                82,
+                crate::kernels::launch_q2_k_dp4a_gemv,
+            ),
+            (
+                MoeGroupedGemvDtype::Q3K,
+                110,
+                108,
+                -1,
+                crate::kernels::launch_q3_k_dp4a_gemv,
+            ),
+            (
+                MoeGroupedGemvDtype::Q5K,
+                176,
+                0,
+                2,
+                crate::kernels::launch_q5_k_dp4a_gemv,
             ),
         ];
 

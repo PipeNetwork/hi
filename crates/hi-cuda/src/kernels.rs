@@ -2024,6 +2024,9 @@ mod native {
     pub enum MoeGroupedGemvDtype {
         Q4K = 0,
         Q6K = 1,
+        Q2K = 2,
+        Q3K = 3,
+        Q5K = 4,
     }
 
     /// GQA-grouped (+ optional grid-split) paged decode attention. One block per

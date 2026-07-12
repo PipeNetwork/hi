@@ -7956,22 +7956,16 @@ extern "C" int hi_cuda_launch_q4_k_dp4a_gemv(
 // dp4a Q5_K GEMV — Q4_K path + the 5th (high) bit from qh. Q5_K block = 176 B/256,
 // per-32 sub-blocks (aligns with the per-32 int8 activation); q5 = low4 + 16*qh_bit.
 // w = d*sc*q5 - dmin*m, so acc += dx[sub]*(d*sc*dp4a(q5,xq) - dmin*m*xsum[sub]).
-__global__ void q5_k_dp4a_gemv_kernel(
-    const uint8_t* __restrict__ weights,
+// One weight-row dot for the dp4a Q5_K GEMV (see q4_k_dp4a_row_acc for the
+// pattern); shared by the plain and MoE-grouped kernels.
+__device__ __forceinline__ float q5_k_dp4a_row_acc(
+    const uint8_t* __restrict__ row_ptr,
     const int8_t* __restrict__ xq,
     const float* __restrict__ dx,
     const int* __restrict__ xsum,
-    float* __restrict__ y,
-    int rows,
-    int cols) {
-  const int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
-  if (row >= rows) {
-    return;
-  }
-  const int lane = threadIdx.x & 31;
+    int cols,
+    int lane) {
   const int nsub = cols / 32;
-  const size_t row_bytes = static_cast<size_t>(cols / 256) * 176;
-  const uint8_t* row_ptr = weights + static_cast<size_t>(row) * row_bytes;
   float acc = 0.0f;
   for (int sub = lane; sub < nsub; sub += 32) {
     const int kblock = sub >> 3;
@@ -8002,6 +7996,25 @@ __global__ void q5_k_dp4a_gemv_kernel(
     acc += dx[sub] * (d * static_cast<float>(scale) * static_cast<float>(dot) -
                       dmin * static_cast<float>(mn) * static_cast<float>(xsum[sub]));
   }
+  return acc;
+}
+
+__global__ void q5_k_dp4a_gemv_kernel(
+    const uint8_t* __restrict__ weights,
+    const int8_t* __restrict__ xq,
+    const float* __restrict__ dx,
+    const int* __restrict__ xsum,
+    float* __restrict__ y,
+    int rows,
+    int cols) {
+  const int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+  if (row >= rows) {
+    return;
+  }
+  const int lane = threadIdx.x & 31;
+  const size_t row_bytes = static_cast<size_t>(cols / 256) * 176;
+  const uint8_t* row_ptr = weights + static_cast<size_t>(row) * row_bytes;
+  float acc = q5_k_dp4a_row_acc(row_ptr, xq, dx, xsum, cols, lane);
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1) {
     acc += __shfl_down_sync(0xffffffffu, acc, off);
@@ -8313,8 +8326,139 @@ __global__ void q6_k_moe_grouped_dp4a_gemv_kernel(
   }
 }
 
+__device__ __forceinline__ float q2_k_dp4a_row_acc(
+    const uint8_t* __restrict__ row_ptr,
+    const int8_t* __restrict__ xq,
+    const float* __restrict__ dx,
+    int cols,
+    int lane);
+
+__device__ __forceinline__ float q3_k_dp4a_row_acc(
+    const uint8_t* __restrict__ row_ptr,
+    const int8_t* __restrict__ xq,
+    const float* __restrict__ dx,
+    int cols,
+    int lane);
+
+__global__ void q2_k_moe_grouped_dp4a_gemv_kernel(
+    const unsigned long long* __restrict__ expert_ptrs,
+    const uint32_t* __restrict__ route_ids,
+    const int8_t* __restrict__ xq,
+    const float* __restrict__ dx,
+    const int* __restrict__ xsum,
+    float* __restrict__ y,
+    int pairs,
+    int top_k,
+    int act_per_pair,
+    int rows,
+    int cols) {
+  const int pair = blockIdx.y;
+  const int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+  if (pair >= pairs || row >= rows) {
+    return;
+  }
+  const int lane = threadIdx.x & 31;
+  const uint8_t* weights =
+      reinterpret_cast<const uint8_t*>(expert_ptrs[route_ids[pair]]);
+  const int act_row = act_per_pair ? pair : pair / top_k;
+  const int nsub = cols / 32;
+  const int8_t* xq_row = xq + static_cast<size_t>(act_row) * cols;
+  const float* dx_row = dx + static_cast<size_t>(act_row) * nsub;
+  const int* xsum_row = xsum + static_cast<size_t>(act_row) * nsub;
+  (void)xsum_row;
+  const size_t row_bytes = static_cast<size_t>(cols / 256) * 84;
+  float acc = q2_k_dp4a_row_acc(
+      weights + static_cast<size_t>(row) * row_bytes, xq_row, dx_row, cols,
+      lane);
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    acc += __shfl_down_sync(0xffffffffu, acc, off);
+  }
+  if (lane == 0) {
+    y[static_cast<size_t>(pair) * rows + row] = acc;
+  }
+}
+
+__global__ void q3_k_moe_grouped_dp4a_gemv_kernel(
+    const unsigned long long* __restrict__ expert_ptrs,
+    const uint32_t* __restrict__ route_ids,
+    const int8_t* __restrict__ xq,
+    const float* __restrict__ dx,
+    const int* __restrict__ xsum,
+    float* __restrict__ y,
+    int pairs,
+    int top_k,
+    int act_per_pair,
+    int rows,
+    int cols) {
+  const int pair = blockIdx.y;
+  const int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+  if (pair >= pairs || row >= rows) {
+    return;
+  }
+  const int lane = threadIdx.x & 31;
+  const uint8_t* weights =
+      reinterpret_cast<const uint8_t*>(expert_ptrs[route_ids[pair]]);
+  const int act_row = act_per_pair ? pair : pair / top_k;
+  const int nsub = cols / 32;
+  const int8_t* xq_row = xq + static_cast<size_t>(act_row) * cols;
+  const float* dx_row = dx + static_cast<size_t>(act_row) * nsub;
+  const int* xsum_row = xsum + static_cast<size_t>(act_row) * nsub;
+  (void)xsum_row;
+  const size_t row_bytes = static_cast<size_t>(cols / 256) * 110;
+  float acc = q3_k_dp4a_row_acc(
+      weights + static_cast<size_t>(row) * row_bytes, xq_row, dx_row, cols,
+      lane);
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    acc += __shfl_down_sync(0xffffffffu, acc, off);
+  }
+  if (lane == 0) {
+    y[static_cast<size_t>(pair) * rows + row] = acc;
+  }
+}
+
+__global__ void q5_k_moe_grouped_dp4a_gemv_kernel(
+    const unsigned long long* __restrict__ expert_ptrs,
+    const uint32_t* __restrict__ route_ids,
+    const int8_t* __restrict__ xq,
+    const float* __restrict__ dx,
+    const int* __restrict__ xsum,
+    float* __restrict__ y,
+    int pairs,
+    int top_k,
+    int act_per_pair,
+    int rows,
+    int cols) {
+  const int pair = blockIdx.y;
+  const int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+  if (pair >= pairs || row >= rows) {
+    return;
+  }
+  const int lane = threadIdx.x & 31;
+  const uint8_t* weights =
+      reinterpret_cast<const uint8_t*>(expert_ptrs[route_ids[pair]]);
+  const int act_row = act_per_pair ? pair : pair / top_k;
+  const int nsub = cols / 32;
+  const int8_t* xq_row = xq + static_cast<size_t>(act_row) * cols;
+  const float* dx_row = dx + static_cast<size_t>(act_row) * nsub;
+  const int* xsum_row = xsum + static_cast<size_t>(act_row) * nsub;
+  (void)xsum_row;
+  const size_t row_bytes = static_cast<size_t>(cols / 256) * 176;
+  float acc = q5_k_dp4a_row_acc(
+      weights + static_cast<size_t>(row) * row_bytes, xq_row, dx_row, xsum_row, cols,
+      lane);
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) {
+    acc += __shfl_down_sync(0xffffffffu, acc, off);
+  }
+  if (lane == 0) {
+    y[static_cast<size_t>(pair) * rows + row] = acc;
+  }
+}
+
 extern "C" int hi_cuda_launch_moe_grouped_dp4a_gemv(
-    int dtype,  // 0 = Q4_K, 1 = Q6_K
+    int dtype,  // 0 = Q4_K, 1 = Q6_K, 2 = Q2_K, 3 = Q3_K, 4 = Q5_K
     const void* expert_ptrs,
     const void* route_ids,
     const void* xq,
@@ -8352,6 +8496,33 @@ extern "C" int hi_cuda_launch_moe_grouped_dp4a_gemv(
           static_cast<const uint32_t*>(route_ids),
           static_cast<const int8_t*>(xq), static_cast<const float*>(dx),
           static_cast<float*>(y), pairs, top_k, act_per_pair, rows, cols);
+      return 0;
+    case 2:
+      q2_k_moe_grouped_dp4a_gemv_kernel<<<grid, warps_per_block * 32, 0,
+                                          static_cast<cudaStream_t>(stream)>>>(
+          static_cast<const unsigned long long*>(expert_ptrs),
+          static_cast<const uint32_t*>(route_ids),
+          static_cast<const int8_t*>(xq), static_cast<const float*>(dx),
+          static_cast<const int*>(xsum), static_cast<float*>(y), pairs, top_k,
+          act_per_pair, rows, cols);
+      return 0;
+    case 3:
+      q3_k_moe_grouped_dp4a_gemv_kernel<<<grid, warps_per_block * 32, 0,
+                                          static_cast<cudaStream_t>(stream)>>>(
+          static_cast<const unsigned long long*>(expert_ptrs),
+          static_cast<const uint32_t*>(route_ids),
+          static_cast<const int8_t*>(xq), static_cast<const float*>(dx),
+          static_cast<const int*>(xsum), static_cast<float*>(y), pairs, top_k,
+          act_per_pair, rows, cols);
+      return 0;
+    case 4:
+      q5_k_moe_grouped_dp4a_gemv_kernel<<<grid, warps_per_block * 32, 0,
+                                          static_cast<cudaStream_t>(stream)>>>(
+          static_cast<const unsigned long long*>(expert_ptrs),
+          static_cast<const uint32_t*>(route_ids),
+          static_cast<const int8_t*>(xq), static_cast<const float*>(dx),
+          static_cast<const int*>(xsum), static_cast<float*>(y), pairs, top_k,
+          act_per_pair, rows, cols);
       return 0;
     default:
       return 1;
@@ -8547,7 +8718,7 @@ __global__ void q6_k_dp4a_gemm_kernel(
 }
 
 extern "C" int hi_cuda_launch_kquant_dp4a_gemm(
-    int dtype,  // 0 = Q4_K, 1 = Q6_K
+    int dtype,  // 0 = Q4_K, 1 = Q6_K, 2 = Q2_K, 3 = Q3_K, 4 = Q5_K
     const void* weights,
     const void* xq,
     const void* dx,
@@ -8685,23 +8856,15 @@ extern "C" int hi_cuda_launch_moe_add_rows_scaled_by_sigmoid(
 // dp4a Q2_K GEMV. Q2_K = 84 B/256 (4-aligned), per-16 sub-blocks; w = d*(sc&0xf)*q
 // - dmin*(sc>>4), q is 2-bit. Each per-32 activation block = two group16 sub-blocks
 // (gi=0/1). Per group16: d*scale4*dp4a(q,xq) - dmin*min4*xsum16, scaled by dx[sub].
-__global__ void q2_k_dp4a_gemv_kernel(
-    const uint8_t* __restrict__ weights,
+// One weight-row dot for the dp4a Q2_K GEMV (see q4_k_dp4a_row_acc for the
+// pattern); shared by the plain and MoE-grouped kernels.
+__device__ __forceinline__ float q2_k_dp4a_row_acc(
+    const uint8_t* __restrict__ row_ptr,
     const int8_t* __restrict__ xq,
     const float* __restrict__ dx,
-    const int* __restrict__ xsum,
-    float* __restrict__ y,
-    int rows,
-    int cols) {
-  (void)xsum;
-  const int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
-  if (row >= rows) {
-    return;
-  }
-  const int lane = threadIdx.x & 31;
+    int cols,
+    int lane) {
   const int nsub = cols / 32;
-  const size_t row_bytes = static_cast<size_t>(cols / 256) * 84;
-  const uint8_t* row_ptr = weights + static_cast<size_t>(row) * row_bytes;
   float acc = 0.0f;
   for (int sub = lane; sub < nsub; sub += 32) {
     const int kblock = sub >> 3;
@@ -8740,6 +8903,26 @@ __global__ void q2_k_dp4a_gemv_kernel(
     }
     acc += dx[sub] * contrib;
   }
+  return acc;
+}
+
+__global__ void q2_k_dp4a_gemv_kernel(
+    const uint8_t* __restrict__ weights,
+    const int8_t* __restrict__ xq,
+    const float* __restrict__ dx,
+    const int* __restrict__ xsum,
+    float* __restrict__ y,
+    int rows,
+    int cols) {
+  (void)xsum;
+  const int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+  if (row >= rows) {
+    return;
+  }
+  const int lane = threadIdx.x & 31;
+  const size_t row_bytes = static_cast<size_t>(cols / 256) * 84;
+  const uint8_t* row_ptr = weights + static_cast<size_t>(row) * row_bytes;
+  float acc = q2_k_dp4a_row_acc(row_ptr, xq, dx, cols, lane);
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1) {
     acc += __shfl_down_sync(0xffffffffu, acc, off);
@@ -8770,23 +8953,15 @@ extern "C" int hi_cuda_launch_q2_k_dp4a_gemv(
 // w = d*scale*q3, q3 = low2 - (hmask_bit ? 0 : 4) (signed, -4..3), scale = 6-bit-32.
 // sum(q3*xq) = dp4a(low,xq) - 4*dp4a(notbit,xq) (notbit=1 where hmask clear), which
 // avoids packed-subtraction borrows. acc += dx[sub]*d*sum_chunk(scale*dot).
-__global__ void q3_k_dp4a_gemv_kernel(
-    const uint8_t* __restrict__ weights,
+// One weight-row dot for the dp4a Q3_K GEMV (see q4_k_dp4a_row_acc for the
+// pattern); shared by the plain and MoE-grouped kernels.
+__device__ __forceinline__ float q3_k_dp4a_row_acc(
+    const uint8_t* __restrict__ row_ptr,
     const int8_t* __restrict__ xq,
     const float* __restrict__ dx,
-    const int* __restrict__ xsum,
-    float* __restrict__ y,
-    int rows,
-    int cols) {
-  (void)xsum;
-  const int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
-  if (row >= rows) {
-    return;
-  }
-  const int lane = threadIdx.x & 31;
+    int cols,
+    int lane) {
   const int nsub = cols / 32;
-  const size_t row_bytes = static_cast<size_t>(cols / 256) * 110;
-  const uint8_t* row_ptr = weights + static_cast<size_t>(row) * row_bytes;
   float acc = 0.0f;
   for (int sub = lane; sub < nsub; sub += 32) {
     const int kblock = sub >> 3;
@@ -8836,6 +9011,26 @@ __global__ void q3_k_dp4a_gemv_kernel(
     }
     acc += dx[sub] * d * contrib;
   }
+  return acc;
+}
+
+__global__ void q3_k_dp4a_gemv_kernel(
+    const uint8_t* __restrict__ weights,
+    const int8_t* __restrict__ xq,
+    const float* __restrict__ dx,
+    const int* __restrict__ xsum,
+    float* __restrict__ y,
+    int rows,
+    int cols) {
+  (void)xsum;
+  const int row = blockIdx.x * (blockDim.x / 32) + (threadIdx.x / 32);
+  if (row >= rows) {
+    return;
+  }
+  const int lane = threadIdx.x & 31;
+  const size_t row_bytes = static_cast<size_t>(cols / 256) * 110;
+  const uint8_t* row_ptr = weights + static_cast<size_t>(row) * row_bytes;
+  float acc = q3_k_dp4a_row_acc(row_ptr, xq, dx, cols, lane);
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1) {
     acc += __shfl_down_sync(0xffffffffu, acc, off);

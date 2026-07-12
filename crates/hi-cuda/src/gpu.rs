@@ -18855,6 +18855,9 @@ mod native {
                         let dtype = match source.dtype {
                             GgufTensorType::Q4_K => crate::kernels::MoeGroupedGemvDtype::Q4K,
                             GgufTensorType::Q6_K => crate::kernels::MoeGroupedGemvDtype::Q6K,
+                            GgufTensorType::Q2_K => crate::kernels::MoeGroupedGemvDtype::Q2K,
+                            GgufTensorType::Q3_K => crate::kernels::MoeGroupedGemvDtype::Q3K,
+                            GgufTensorType::Q5_K => crate::kernels::MoeGroupedGemvDtype::Q5K,
                             other => bail!(
                                 "expert streaming currently requires Q4_K/Q6_K experts; {} is {}",
                                 source.tensor_name,
@@ -18923,6 +18926,9 @@ mod native {
                 let dtype = match dtype {
                     GgufTensorType::Q4_K => Some(crate::kernels::MoeGroupedGemvDtype::Q4K),
                     GgufTensorType::Q6_K => Some(crate::kernels::MoeGroupedGemvDtype::Q6K),
+                    GgufTensorType::Q2_K => Some(crate::kernels::MoeGroupedGemvDtype::Q2K),
+                    GgufTensorType::Q3_K => Some(crate::kernels::MoeGroupedGemvDtype::Q3K),
+                    GgufTensorType::Q5_K => Some(crate::kernels::MoeGroupedGemvDtype::Q5K),
                     _ => None,
                 };
                 match dtype {
