@@ -146,6 +146,18 @@ const FAMILY_FIXTURES: &[FixtureSpec] = &[
             "qwen36-27b-gguf/Qwen3.6-27B-Q4_K_M.gguf",
         ],
     },
+    // Gemma-4: per-layer attention geometry (sliding 256-dim GQA / global
+    // 512-dim MQA with V=K), proportional rope via freq factors, scale 1.0,
+    // layer output scales, gemma4 escaped-BPE tokenizer.
+    FixtureSpec {
+        label: "gemma4-12b",
+        env_name: "HI_CUDA_SMOKE_GEMMA4_GGUF",
+        expected_family: ModelFamily::Gemma,
+        relative_candidates: &[
+            "gemma4-12b/model.gguf",
+            "gemma4-12b-gguf/gemma-4-12b-it-Q4_K_M.gguf",
+        ],
+    },
 ];
 
 #[test]

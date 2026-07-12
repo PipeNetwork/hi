@@ -23448,6 +23448,41 @@ mod native {
         }
         for layer in 0..config.block_count {
             let prefix = format!("blk.{layer}");
+            // Gemma-4 varies attention geometry per layer (sliding: _swa dims
+            // with GQA; global: full dims with MQA, no attn_v).
+            let (q_dim, k_dim, v_dim, attention_output_dim) = if config.is_gemma4() {
+                let idx = layer as usize;
+                let layer_hd = config
+                    .layer_key_head_dim(idx)
+                    .map(usize::try_from)
+                    .transpose()
+                    .context("gemma4 per-layer key head dim does not fit usize")?
+                    .ok_or_else(|| anyhow!("gemma4 layer {layer} key head dim missing"))?;
+                let layer_vd = config
+                    .layer_value_head_dim(idx)
+                    .map(usize::try_from)
+                    .transpose()
+                    .context("gemma4 per-layer value head dim does not fit usize")?
+                    .ok_or_else(|| anyhow!("gemma4 layer {layer} value head dim missing"))?;
+                let layer_kv = usize::try_from(config.layer_head_count_kv(idx))
+                    .context("gemma4 per-layer kv head count does not fit usize")?;
+                (
+                    layer_hd
+                        .checked_mul(heads)
+                        .context("gemma4 q dimension overflows usize")?,
+                    layer_hd
+                        .checked_mul(layer_kv)
+                        .context("gemma4 k dimension overflows usize")?,
+                    layer_vd
+                        .checked_mul(layer_kv)
+                        .context("gemma4 v dimension overflows usize")?,
+                    layer_vd
+                        .checked_mul(heads)
+                        .context("gemma4 attention output dimension overflows usize")?,
+                )
+            } else {
+                (q_dim, k_dim, v_dim, attention_output_dim)
+            };
             if qwen_ssm_layer_tensors_present(gguf, &prefix) {
                 let ssm = qwen_ssm_dims(config)?
                     .ok_or_else(|| anyhow!("complete SSM tensor layout missing SSM metadata"))?;
@@ -23626,22 +23661,33 @@ mod native {
                         embed,
                     ));
                 }
-                specs.extend([
-                    dense_matrix_spec_with_aliases(
+                let skip_missing_kv = config.is_gemma4();
+                if !skip_missing_kv
+                    || qwen_dense_attention_weight_names(&prefix, "k")
+                        .iter()
+                        .any(|name| gguf.tensor(name).is_some())
+                {
+                    specs.push(dense_matrix_spec_with_aliases(
                         gguf,
                         format!("{prefix}.attn_k.weight"),
                         qwen_dense_attention_weight_names(&prefix, "k"),
                         k_dim,
                         embed,
-                    ),
-                    dense_matrix_spec_with_aliases(
+                    ));
+                }
+                if !skip_missing_kv
+                    || qwen_dense_attention_weight_names(&prefix, "v")
+                        .iter()
+                        .any(|name| gguf.tensor(name).is_some())
+                {
+                    specs.push(dense_matrix_spec_with_aliases(
                         gguf,
                         format!("{prefix}.attn_v.weight"),
                         qwen_dense_attention_weight_names(&prefix, "v"),
                         v_dim,
                         embed,
-                    ),
-                ]);
+                    ));
+                }
             }
             if !qwen_ssm_layer_tensors_present(gguf, &prefix) {
                 specs.push(dense_matrix_spec_with_aliases(
