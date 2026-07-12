@@ -1515,6 +1515,34 @@ pub struct QwenGgufConfig {
     pub attention_v_head_dim: Option<u32>,
     pub attention_qk_head_dim: Option<u32>,
     pub attention_mla_tensor_layout: bool,
+    // --- DeepSeek-V4 (`deepseek4`) ---
+    /// Lightning-indexer geometry (`{arch}.attention.indexer.*`): head count,
+    /// per-head key length, and the top-k tokens each query keeps.
+    pub attention_indexer_head_count: Option<u32>,
+    pub attention_indexer_key_length: Option<u32>,
+    pub attention_indexer_top_k: Option<u32>,
+    /// Grouped attention output projection (`attention.output_group_count` /
+    /// `attention.output_lora_rank`): out = wo_b(concat_g wo_a[g](attn[g])).
+    pub attention_output_group_count: Option<u32>,
+    pub attention_output_lora_rank: Option<u32>,
+    /// Per-layer KV-compressor ratios (`attention.compress_ratios`; 0 = no
+    /// compressor). May carry one extra trailing entry for a stripped MTP layer.
+    pub attention_compress_ratios: Option<Vec<u32>>,
+    pub attention_compress_rope_freq_base: Option<f32>,
+    /// Hyper-connection residual streams (`hyper_connection.count`,
+    /// `.sinkhorn_iterations`, `.epsilon`).
+    pub hyper_connection_count: Option<u32>,
+    pub hyper_connection_sinkhorn_iterations: Option<u32>,
+    pub hyper_connection_epsilon: Option<f32>,
+    /// First N MoE layers route by token id via `ffn_gate_tid2eid` lookup
+    /// tables instead of the learned router (`hash_layer_count`).
+    pub hash_layer_count: Option<u32>,
+    /// Per-layer SwiGLU activation clamps for routed / shared experts.
+    pub swiglu_clamp_exp: Option<Vec<f32>>,
+    pub swiglu_clamp_shexp: Option<Vec<f32>>,
+    /// Explicit YARN correction betas (`rope.scaling.yarn_beta_fast`/`_slow`).
+    pub rope_scaling_yarn_beta_fast: Option<f32>,
+    pub rope_scaling_yarn_beta_slow: Option<f32>,
     pub recurrent_ssm_tensor_layout: bool,
     pub ssm_conv_kernel: Option<u32>,
     pub ssm_inner_size: Option<u32>,
@@ -1526,6 +1554,9 @@ pub struct QwenGgufConfig {
     pub attention_recurrent_layers: Option<Vec<bool>>,
     pub expert_count: Option<u32>,
     pub expert_used_count: Option<u32>,
+    /// Number of always-on shared experts (DeepSeek MoE `n_shared_experts`).
+    /// Their fused MLP intermediate width is `expert_ff * expert_shared_count`.
+    pub expert_shared_count: Option<u32>,
     pub expert_weights_norm: bool,
     /// llama.cpp expert gating function enum: 1 = softmax (default), 2 =
     /// sigmoid (DeepSeek-V3/GLM-5 class), 4 = sqrt-softplus (DeepSeek-V4).
@@ -1534,6 +1565,14 @@ pub struct QwenGgufConfig {
     pub expert_weights_scale: Option<f32>,
     pub rope_freq_base: Option<f32>,
     pub rope_freq_scale: Option<f32>,
+    /// YARN rope scaling (DeepSeek-V2/V3). `rope.scaling.type == "yarn"`; the
+    /// factor extends context by `rope_scaling_factor` from
+    /// `rope_scaling_original_context_length`, and `rope_yarn_log_multiplier`
+    /// (llama.cpp `rope_yarn_log_mul`) sets the attention mscale.
+    pub rope_scaling_type: Option<String>,
+    pub rope_scaling_factor: Option<f32>,
+    pub rope_scaling_original_context_length: Option<u32>,
+    pub rope_yarn_log_multiplier: Option<f32>,
     pub rope_dimension_sections: Option<[u32; 4]>,
     /// Rotary dimension count (`{arch}.rope.dimension_count`). When smaller
     /// than the attention head dim (e.g. Qwen3.5 rotates 64 of 256 dims), only
@@ -1556,6 +1595,14 @@ pub struct QwenGgufConfig {
 }
 
 impl QwenGgufConfig {
+    /// DeepSeek-V4 (`deepseek4` arch): latent-MQA attention (single shared KV
+    /// head, no kv_b), attention sinks, per-layer compressors + lightning
+    /// indexer, hyper-connection residual streams, grouped output projection,
+    /// hash-routed leading MoE layers, sqrt-softplus gating.
+    pub fn is_deepseek4(&self) -> bool {
+        self.architecture == "deepseek4"
+    }
+
     fn from_gguf(gguf: &GgufFile) -> Result<Self> {
         let architecture = gguf
             .metadata_string("general.architecture")
@@ -1620,9 +1667,17 @@ impl QwenGgufConfig {
             gguf.metadata_u32(&format!("{prefix}.attention.value_length_mla"));
         let rope_dimension_count_for_mla =
             gguf.metadata_u32(&format!("{prefix}.rope.dimension_count"));
+        // DeepSeek-V2/V2-Lite-class ggufs (no Q-LoRA) carry the classic
+        // attention.key_length / value_length + rope.dimension_count rather than
+        // the DeepSeek-V3.2/glm-dsa `_mla`-suffixed keys or the explicit
+        // qk_rope/qk_nope/v_head keys. When a kv_lora_rank marks the layer as MLA,
+        // derive qk_rope = rope.dimension_count, qk_nope = key_length - qk_rope,
+        // and v_head = value_length from those plain keys.
+        let mla_dims_from_plain_keys = attention_kv_lora_rank.is_some();
         let attention_qk_rope_head_dim = gguf
             .metadata_u32(&format!("{prefix}.attention.qk_rope_head_dim"))
-            .or(attention_key_length_mla.and(rope_dimension_count_for_mla));
+            .or(attention_key_length_mla.and(rope_dimension_count_for_mla))
+            .or(rope_dimension_count_for_mla.filter(|_| mla_dims_from_plain_keys));
         let attention_qk_nope_head_dim = gguf
             .metadata_u32(&format!("{prefix}.attention.qk_nope_head_dim"))
             .or(
@@ -1630,12 +1685,48 @@ impl QwenGgufConfig {
                     (Some(mla), Some(rope)) if mla > rope => Some(mla - rope),
                     _ => None,
                 },
+            )
+            .or_else(
+                || match (attention_key_length, rope_dimension_count_for_mla) {
+                    (Some(key), Some(rope)) if mla_dims_from_plain_keys && key > rope => {
+                        Some(key - rope)
+                    }
+                    _ => None,
+                },
             );
         let attention_v_head_dim = gguf
             .metadata_u32(&format!("{prefix}.attention.v_head_dim"))
-            .or(attention_value_length_mla);
+            .or(attention_value_length_mla)
+            .or(attention_value_length.filter(|_| mla_dims_from_plain_keys));
         let attention_qk_head_dim = gguf.metadata_u32(&format!("{prefix}.attention.qk_head_dim"));
         let attention_mla_tensor_layout = qwen_mla_decoder_tensors_present(gguf, block_count);
+        let attention_indexer_head_count =
+            gguf.metadata_u32(&format!("{prefix}.attention.indexer.head_count"));
+        let attention_indexer_key_length =
+            gguf.metadata_u32(&format!("{prefix}.attention.indexer.key_length"));
+        let attention_indexer_top_k =
+            gguf.metadata_u32(&format!("{prefix}.attention.indexer.top_k"));
+        let attention_output_group_count =
+            gguf.metadata_u32(&format!("{prefix}.attention.output_group_count"));
+        let attention_output_lora_rank =
+            gguf.metadata_u32(&format!("{prefix}.attention.output_lora_rank"));
+        let attention_compress_ratios =
+            qwen_metadata_u32_array_lenient(gguf, &format!("{prefix}.attention.compress_ratios"))?;
+        let attention_compress_rope_freq_base =
+            gguf.metadata_f32(&format!("{prefix}.attention.compress_rope_freq_base"));
+        let hyper_connection_count = gguf.metadata_u32(&format!("{prefix}.hyper_connection.count"));
+        let hyper_connection_sinkhorn_iterations =
+            gguf.metadata_u32(&format!("{prefix}.hyper_connection.sinkhorn_iterations"));
+        let hyper_connection_epsilon =
+            gguf.metadata_f32(&format!("{prefix}.hyper_connection.epsilon"));
+        let hash_layer_count = gguf.metadata_u32(&format!("{prefix}.hash_layer_count"));
+        let swiglu_clamp_exp = gguf.metadata_f32_array(&format!("{prefix}.swiglu_clamp_exp"))?;
+        let swiglu_clamp_shexp =
+            gguf.metadata_f32_array(&format!("{prefix}.swiglu_clamp_shexp"))?;
+        let rope_scaling_yarn_beta_fast =
+            gguf.metadata_f32(&format!("{prefix}.rope.scaling.yarn_beta_fast"));
+        let rope_scaling_yarn_beta_slow =
+            gguf.metadata_f32(&format!("{prefix}.rope.scaling.yarn_beta_slow"));
         let recurrent_ssm_tensor_layout =
             qwen_any_recurrent_ssm_layer_tensors_present(gguf, block_count);
         let attention_recurrent_layers =
@@ -1653,6 +1744,7 @@ impl QwenGgufConfig {
             .unwrap_or(attention_head_count);
         let expert_count = gguf.metadata_u32(&format!("{prefix}.expert_count"));
         let expert_used_count = gguf.metadata_u32(&format!("{prefix}.expert_used_count"));
+        let expert_shared_count = gguf.metadata_u32(&format!("{prefix}.expert_shared_count"));
         let vocab_size = gguf
             .metadata
             .get("tokenizer.ggml.tokens")
@@ -1739,6 +1831,21 @@ impl QwenGgufConfig {
             attention_v_head_dim,
             attention_qk_head_dim,
             attention_mla_tensor_layout,
+            attention_indexer_head_count,
+            attention_indexer_key_length,
+            attention_indexer_top_k,
+            attention_output_group_count,
+            attention_output_lora_rank,
+            attention_compress_ratios,
+            attention_compress_rope_freq_base,
+            hyper_connection_count,
+            hyper_connection_sinkhorn_iterations,
+            hyper_connection_epsilon,
+            hash_layer_count,
+            swiglu_clamp_exp,
+            swiglu_clamp_shexp,
+            rope_scaling_yarn_beta_fast,
+            rope_scaling_yarn_beta_slow,
             recurrent_ssm_tensor_layout,
             ssm_conv_kernel: gguf.metadata_u32(&format!("{prefix}.ssm.conv_kernel")),
             ssm_inner_size: gguf.metadata_u32(&format!("{prefix}.ssm.inner_size")),
@@ -1751,6 +1858,7 @@ impl QwenGgufConfig {
             attention_recurrent_layers,
             expert_count,
             expert_used_count,
+            expert_shared_count,
             expert_weights_norm: gguf
                 .metadata_bool(&format!("{prefix}.expert_weights_norm"))
                 .unwrap_or(true),
@@ -1758,6 +1866,14 @@ impl QwenGgufConfig {
             expert_weights_scale: gguf.metadata_f32(&format!("{prefix}.expert_weights_scale")),
             rope_freq_base: gguf.metadata_f32(&format!("{prefix}.rope.freq_base")),
             rope_freq_scale: gguf.metadata_f32(&format!("{prefix}.rope.freq_scale")),
+            rope_scaling_type: gguf
+                .metadata_string(&format!("{prefix}.rope.scaling.type"))
+                .map(str::to_string),
+            rope_scaling_factor: gguf.metadata_f32(&format!("{prefix}.rope.scaling.factor")),
+            rope_scaling_original_context_length: gguf
+                .metadata_u32(&format!("{prefix}.rope.scaling.original_context_length")),
+            rope_yarn_log_multiplier: gguf
+                .metadata_f32(&format!("{prefix}.rope.scaling.yarn_log_multiplier")),
             rope_dimension_sections,
             rope_dimension_count: gguf.metadata_u32(&format!("{prefix}.rope.dimension_count")),
             rms_norm_eps: gguf.metadata_f32(&format!("{prefix}.attention.layer_norm_rms_epsilon")),
@@ -2019,6 +2135,13 @@ fn reject_unsupported_mla_layout(
     block_count: u32,
 ) -> Result<()> {
     if family != ModelFamily::DeepSeek && family != ModelFamily::GlmFlash {
+        return Ok(());
+    }
+    // DeepSeek-V4 (`deepseek4`) attention is latent-MQA: attn_q_a/attn_q_b plus a
+    // single shared attn_kv latent and NO kv_b, which the V2/V3 MLA completeness
+    // rules below would misread as an incomplete MLA set. Its tensor layout is
+    // validated by the deepseek4 loader instead.
+    if prefix == "deepseek4" {
         return Ok(());
     }
     let family_label = cuda_model_family_label(family);
@@ -2849,7 +2972,21 @@ fn qwen_mla_split_kv_b_present(gguf: &GgufFile, prefix: &str) -> bool {
 }
 
 pub fn qwen_mla_attention_tensors_present(gguf: &GgufFile, prefix: &str) -> bool {
-    qwen_mla_q_a_weight_names(prefix)
+    let kv_latent_present = qwen_mla_kv_a_weight_names(prefix)
+        .iter()
+        .any(|name| gguf.tensor(name).is_some())
+        && qwen_mla_kv_a_norm_weight_names(prefix)
+            .iter()
+            .any(|name| gguf.tensor(name).is_some())
+        && (qwen_mla_kv_b_weight_names(prefix)
+            .iter()
+            .any(|name| gguf.tensor(name).is_some())
+            || qwen_mla_split_kv_b_present(gguf, prefix));
+    if !kv_latent_present {
+        return false;
+    }
+    // Q-LoRA query decomposition (DeepSeek-V2/V3, GLM): q_a -> q_a_norm -> q_b.
+    let q_lora_present = qwen_mla_q_a_weight_names(prefix)
         .iter()
         .any(|name| gguf.tensor(name).is_some())
         && qwen_mla_q_a_norm_weight_names(prefix)
@@ -2857,17 +2994,14 @@ pub fn qwen_mla_attention_tensors_present(gguf: &GgufFile, prefix: &str) -> bool
             .any(|name| gguf.tensor(name).is_some())
         && qwen_mla_q_b_weight_names(prefix)
             .iter()
-            .any(|name| gguf.tensor(name).is_some())
-        && qwen_mla_kv_a_weight_names(prefix)
-            .iter()
-            .any(|name| gguf.tensor(name).is_some())
-        && qwen_mla_kv_a_norm_weight_names(prefix)
-            .iter()
-            .any(|name| gguf.tensor(name).is_some())
-        && (qwen_mla_kv_b_weight_names(prefix)
-            .iter()
-            .any(|name| gguf.tensor(name).is_some())
-            || qwen_mla_split_kv_b_present(gguf, prefix))
+            .any(|name| gguf.tensor(name).is_some());
+    // Full-Q MLA (DeepSeek-V2-Lite class): a single dense attn_q projection with
+    // no Q-LoRA, still feeding the compressed KV latent above. The kv_latent
+    // guard keeps plain dense attention (attn_q + attn_k + attn_v, no kv_a) out.
+    let full_q_present = qwen_dense_attention_weight_names(prefix, "q")
+        .iter()
+        .any(|name| gguf.tensor(name).is_some());
+    q_lora_present || full_q_present
 }
 
 pub fn qwen_ssm_in_weight_names(prefix: &str) -> Vec<String> {
@@ -3751,11 +3885,7 @@ fn qwen_metadata_u32_array(
     key: &str,
     expected_len: u32,
 ) -> Result<Option<Vec<u32>>> {
-    let Some(value) = gguf.metadata.get(key) else {
-        return Ok(None);
-    };
-    let MetadataValue::Array(values) = value else {
-        // Scalar form is handled by the metadata_u32 caller.
+    let Some(values) = qwen_metadata_u32_array_lenient(gguf, key)? else {
         return Ok(None);
     };
     if values.len()
@@ -3766,6 +3896,20 @@ fn qwen_metadata_u32_array(
             values.len()
         );
     }
+    Ok(Some(values))
+}
+
+/// Like `qwen_metadata_u32_array` but without a length requirement — for
+/// per-layer arrays that may carry extra trailing entries (e.g. deepseek4's
+/// `attention.compress_ratios` includes a slot for the stripped MTP layer).
+fn qwen_metadata_u32_array_lenient(gguf: &GgufFile, key: &str) -> Result<Option<Vec<u32>>> {
+    let Some(value) = gguf.metadata.get(key) else {
+        return Ok(None);
+    };
+    let MetadataValue::Array(values) = value else {
+        // Scalar form is handled by the metadata_u32 caller.
+        return Ok(None);
+    };
     values
         .iter()
         .map(|value| match value {
@@ -4380,6 +4524,17 @@ fn validate_qwen_tensors(gguf: &GgufFile, config: &QwenGgufConfig) -> QwenTensor
                 if expert_ff.is_some() && expert_ff != shared_ff {
                     shared_rules.extend(feed_forward_matrix_rules(embed, expert_ff));
                 }
+                // DeepSeek-V2-Lite fuses `expert_shared_count` shared experts into
+                // one MLP, widening its intermediate to expert_ff * shared_count.
+                if let (Some(expert_ff), Some(shared_count)) =
+                    (expert_ff, config.expert_shared_count)
+                    && shared_count > 1
+                {
+                    shared_rules.extend(feed_forward_matrix_rules(
+                        embed,
+                        Some(expert_ff.saturating_mul(u64::from(shared_count))),
+                    ));
+                }
                 validator.optional_one_of(&shared[0], shared_rules.clone(), DTypePolicy::Matrix);
                 validator.optional_one_of(&shared[1], shared_rules.clone(), DTypePolicy::Matrix);
                 validator.optional_one_of(&shared[2], shared_rules, DTypePolicy::Matrix);
@@ -4672,18 +4827,9 @@ fn qwen_mla_attention_tensors_present_in(
     tensors: &BTreeMap<&str, &TensorInfo>,
     prefix: &str,
 ) -> bool {
-    qwen_mla_q_a_weight_names(prefix)
+    let kv_latent_present = qwen_mla_kv_a_weight_names(prefix)
         .iter()
         .any(|name| tensors.contains_key(name.as_str()))
-        && qwen_mla_q_a_norm_weight_names(prefix)
-            .iter()
-            .any(|name| tensors.contains_key(name.as_str()))
-        && qwen_mla_q_b_weight_names(prefix)
-            .iter()
-            .any(|name| tensors.contains_key(name.as_str()))
-        && qwen_mla_kv_a_weight_names(prefix)
-            .iter()
-            .any(|name| tensors.contains_key(name.as_str()))
         && qwen_mla_kv_a_norm_weight_names(prefix)
             .iter()
             .any(|name| tensors.contains_key(name.as_str()))
@@ -4695,7 +4841,25 @@ fn qwen_mla_attention_tensors_present_in(
                 .any(|name| tensors.contains_key(name.as_str()))
                 && qwen_mla_v_b_weight_names(prefix)
                     .iter()
-                    .any(|name| tensors.contains_key(name.as_str()))))
+                    .any(|name| tensors.contains_key(name.as_str()))));
+    if !kv_latent_present {
+        return false;
+    }
+    // Q-LoRA query decomposition (DeepSeek-V2/V3, GLM): q_a -> q_a_norm -> q_b.
+    let q_lora_present = qwen_mla_q_a_weight_names(prefix)
+        .iter()
+        .any(|name| tensors.contains_key(name.as_str()))
+        && qwen_mla_q_a_norm_weight_names(prefix)
+            .iter()
+            .any(|name| tensors.contains_key(name.as_str()))
+        && qwen_mla_q_b_weight_names(prefix)
+            .iter()
+            .any(|name| tensors.contains_key(name.as_str()));
+    // Full-Q MLA (DeepSeek-V2-Lite class): a single dense attn_q + KV latent.
+    let full_q_present = qwen_dense_attention_weight_names(prefix, "q")
+        .iter()
+        .any(|name| tensors.contains_key(name.as_str()));
+    q_lora_present || full_q_present
 }
 
 fn moe_router_tensor_present(tensors: &BTreeMap<&str, &TensorInfo>, prefix: &str) -> bool {
@@ -4900,16 +5064,12 @@ fn require_mla_attention_tensors(
     head_count: u64,
 ) {
     let metadata_prefix = &config.architecture;
-    let Some(q_lora) = config
+    // Q-LoRA is optional: DeepSeek-V2-Lite-class MLA has no q_lora_rank and uses
+    // a single full attn_q projection instead of the q_a -> q_a_norm -> q_b path.
+    let q_lora = config
         .attention_q_lora_rank
         .map(u64::from)
-        .filter(|value| *value != 0)
-    else {
-        validator.errors.push(format!(
-            "MLA tensor layout in {prefix} requires {metadata_prefix}.attention.q_lora_rank"
-        ));
-        return;
-    };
+        .filter(|value| *value != 0);
     let Some(kv_lora) = config
         .attention_kv_lora_rank
         .map(u64::from)
@@ -4959,21 +5119,33 @@ fn require_mla_attention_tensors(
     let kv_a_dim = kv_lora.saturating_add(qk_rope);
     let kv_b_dim = head_count.saturating_mul(qk_nope.saturating_add(v_head_dim));
 
-    validator.require_one_of(
-        &qwen_mla_q_a_weight_names(prefix),
-        matrix_rules(embed, q_lora),
-        DTypePolicy::Matrix,
-    );
-    validator.require_one_of(
-        &qwen_mla_q_a_norm_weight_names(prefix),
-        vec![ShapeRule::exact([q_lora])],
-        DTypePolicy::Any,
-    );
-    validator.require_one_of(
-        &qwen_mla_q_b_weight_names(prefix),
-        matrix_rules(q_lora, q_dim),
-        DTypePolicy::Matrix,
-    );
+    match q_lora {
+        Some(q_lora) => {
+            validator.require_one_of(
+                &qwen_mla_q_a_weight_names(prefix),
+                matrix_rules(embed, q_lora),
+                DTypePolicy::Matrix,
+            );
+            validator.require_one_of(
+                &qwen_mla_q_a_norm_weight_names(prefix),
+                vec![ShapeRule::exact([q_lora])],
+                DTypePolicy::Any,
+            );
+            validator.require_one_of(
+                &qwen_mla_q_b_weight_names(prefix),
+                matrix_rules(q_lora, q_dim),
+                DTypePolicy::Matrix,
+            );
+        }
+        None => {
+            // Full-Q MLA (DeepSeek-V2-Lite): one dense attn_q [embed -> q_dim].
+            validator.require_one_of(
+                &qwen_dense_attention_weight_names(prefix, "q"),
+                matrix_rules(embed, q_dim),
+                DTypePolicy::Matrix,
+            );
+        }
+    }
     validator.require_one_of(
         &qwen_mla_kv_a_weight_names(prefix),
         matrix_rules(embed, kv_a_dim),
