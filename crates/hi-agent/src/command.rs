@@ -10,9 +10,8 @@ pub enum Command {
     Clear,
     /// Set the model for subsequent turns (empty = report current).
     Model(String),
-    /// Show or set per-session request config live: `reasoning <level|off>`
-    /// (OpenAI-compatible `reasoning_effort`) and `temp <value|off>` (sampling
-    /// temperature). Empty arg reports the current values.
+    /// Show or set per-session request config live: reasoning, temperature,
+    /// and the per-turn model-call step limit. Empty arg reports current values.
     Config(String),
     /// Run exactly one turn through the conservative MoA virtual route.
     Moa(String),
@@ -545,7 +544,7 @@ pub fn parse_goal_team(arg: &str) -> Option<GoalTeamArg> {
 /// The parsed form of a `/config` argument.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConfigArg {
-    /// `/config` — report the current reasoning effort and temperature.
+    /// `/config` — report the current live settings.
     Show,
     /// `/config reasoning <level|off>` — set the reasoning effort (`None` = off,
     /// i.e. send no `reasoning_effort` and take the endpoint default).
@@ -553,6 +552,10 @@ pub enum ConfigArg {
     /// `/config temp <value|off>` — set the sampling temperature (`None` clears
     /// it, leaving the provider default).
     Temperature(Option<f32>),
+    /// `/config steps <n|off>` — set a fixed cap, or disable it (`None`).
+    MaxSteps(Option<u32>),
+    /// `/config steps auto` — restore intent-aware per-turn defaults.
+    MaxStepsAuto,
     /// Unrecognized option or bad value; carries a usage/error hint.
     Invalid(String),
 }
@@ -603,8 +606,30 @@ pub fn parse_config_arg(arg: &str) -> ConfigArg {
                 }
             }
         }
+        "steps" | "max-steps" | "step-limit" | "limit" => {
+            if val.is_empty() {
+                ConfigArg::Invalid("usage: /config steps <1+|auto|off>".into())
+            } else if matches!(
+                val.to_ascii_lowercase().as_str(),
+                "off" | "none" | "disable" | "disabled" | "unlimited"
+            ) {
+                ConfigArg::MaxSteps(None)
+            } else if matches!(val.to_ascii_lowercase().as_str(), "auto" | "default") {
+                ConfigArg::MaxStepsAuto
+            } else {
+                match val.parse::<u32>() {
+                    Ok(steps) if steps > 0 => ConfigArg::MaxSteps(Some(steps)),
+                    Ok(_) => {
+                        ConfigArg::Invalid("step limit must be at least 1, or use auto/off".into())
+                    }
+                    Err(_) => ConfigArg::Invalid(format!(
+                        "bad step limit '{val}' — use a positive integer, auto, or off"
+                    )),
+                }
+            }
+        }
         other => ConfigArg::Invalid(format!(
-            "unknown /config option '{other}' — try: reasoning <level>, temp <value>"
+            "unknown /config option '{other}' — try: reasoning <level>, temp <value>, steps <n|auto|off>"
         )),
     }
 }
@@ -688,14 +713,18 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "config",
-        args: "[reasoning <level>|temp <value>]",
-        help: "show or set reasoning effort and sampling temperature for this session",
+        args: "[reasoning <level>|temp <value>|steps <n|auto|off>]",
+        help: "show or set live reasoning, temperature, and step limit",
         arg_values: &[
             (
                 "reasoning",
                 "set reasoning_effort: minimal|low|medium|high|xhigh|off",
             ),
             ("temp", "set sampling temperature: 0.0-2.0, or off"),
+            (
+                "steps",
+                "set the turn step limit: positive integer, auto, or off",
+            ),
         ],
     },
     CommandSpec {
@@ -1545,6 +1574,22 @@ mod tests {
         assert!(matches!(parse_config_arg("temp 5"), ConfigArg::Invalid(_)));
         assert!(matches!(
             parse_config_arg("temp hot"),
+            ConfigArg::Invalid(_)
+        ));
+        // Step cap: fixed, disabled, automatic, and invalid.
+        assert_eq!(
+            parse_config_arg("steps 500"),
+            ConfigArg::MaxSteps(Some(500))
+        );
+        assert_eq!(parse_config_arg("max-steps off"), ConfigArg::MaxSteps(None));
+        assert_eq!(
+            parse_config_arg("step-limit unlimited"),
+            ConfigArg::MaxSteps(None)
+        );
+        assert_eq!(parse_config_arg("steps auto"), ConfigArg::MaxStepsAuto);
+        assert!(matches!(parse_config_arg("steps 0"), ConfigArg::Invalid(_)));
+        assert!(matches!(
+            parse_config_arg("steps many"),
             ConfigArg::Invalid(_)
         ));
         // Unknown option.

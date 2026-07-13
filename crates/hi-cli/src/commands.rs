@@ -97,9 +97,12 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
                         .temperature()
                         .map(|t| t.to_string())
                         .unwrap_or_else(|| "default".into());
-                    println!("\x1b[2mconfig — reasoning: {r} · temperature: {t}\x1b[0m");
+                    let steps = agent.max_steps_setting();
                     println!(
-                        "\x1b[2mset: /config reasoning <minimal|low|medium|high|xhigh|off> · /config temp <0.0-2.0|off>\x1b[0m"
+                        "\x1b[2mconfig — reasoning: {r} · temperature: {t} · steps: {steps}\x1b[0m"
+                    );
+                    println!(
+                        "\x1b[2mset: /config reasoning <minimal|low|medium|high|xhigh|off> · /config temp <0.0-2.0|off> · /config steps <1+|auto|off>\x1b[0m"
                     );
                 }
                 ConfigArg::Reasoning(effort) => {
@@ -120,6 +123,19 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
                         Some(t) => println!("\x1b[2mtemperature → {t}\x1b[0m"),
                         None => println!("\x1b[2mtemperature → provider default (cleared)\x1b[0m"),
                     }
+                }
+                ConfigArg::MaxSteps(limit) => {
+                    agent.set_max_steps_limit(limit);
+                    match limit {
+                        Some(limit) => {
+                            println!("\x1b[2mstep limit → {limit} (applies next turn)\x1b[0m")
+                        }
+                        None => println!("\x1b[2mstep limit → off (applies next turn)\x1b[0m"),
+                    }
+                }
+                ConfigArg::MaxStepsAuto => {
+                    agent.set_max_steps_auto();
+                    println!("\x1b[2mstep limit → auto (intent-aware; applies next turn)\x1b[0m");
                 }
                 ConfigArg::Invalid(m) => eprintln!("\x1b[33m{m}\x1b[0m"),
             }

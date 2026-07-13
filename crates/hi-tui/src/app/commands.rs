@@ -571,13 +571,14 @@ impl crate::App {
                             .temperature()
                             .map(|t| t.to_string())
                             .unwrap_or_else(|| "default".into());
+                        let steps = agent.max_steps_setting();
                         self.push(Line::styled(
-                            format!("config — reasoning: {r} · temperature: {t}"),
+                            format!("config — reasoning: {r} · temperature: {t} · steps: {steps}"),
                             dim(),
                         ));
                         self.push(Line::styled(
                             "set: /config reasoning <minimal|low|medium|high|xhigh|off> · \
-                             /config temp <0.0-2.0|off>"
+                             /config temp <0.0-2.0|off> · /config steps <1+|auto|off>"
                                 .to_string(),
                             dim(),
                         ));
@@ -601,6 +602,21 @@ impl crate::App {
                             None => "temperature → provider default (cleared)".to_string(),
                         };
                         self.push(Line::styled(msg, dim()));
+                    }
+                    ConfigArg::MaxSteps(limit) => {
+                        agent.set_max_steps_limit(limit);
+                        let msg = match limit {
+                            Some(limit) => format!("step limit → {limit} (applies next turn)"),
+                            None => "step limit → off (applies next turn)".to_string(),
+                        };
+                        self.push(Line::styled(msg, dim()));
+                    }
+                    ConfigArg::MaxStepsAuto => {
+                        agent.set_max_steps_auto();
+                        self.push(Line::styled(
+                            "step limit → auto (intent-aware; applies next turn)".to_string(),
+                            dim(),
+                        ));
                     }
                     ConfigArg::Invalid(m) => {
                         self.push(Line::styled(m, Style::default().fg(Color::Yellow)));

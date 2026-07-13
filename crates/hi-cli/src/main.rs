@@ -218,10 +218,10 @@ async fn main() -> Result<()> {
         project_context: load_project_context(),
         verify: resolve_verify(&cli),
         max_verify_iterations: cli.max_verify,
-        max_steps: cli
-            .max_steps
-            .unwrap_or_else(|| AgentConfig::default().max_steps),
-        max_steps_explicit: cli.max_steps.is_some(),
+        max_steps: cli.max_steps.unwrap_or(u32::MAX),
+        // Unlimited is the default. Intent-aware caps are an explicit live
+        // opt-in via `/config steps auto`; `--max-steps` remains a fixed cap.
+        max_steps_explicit: true,
         auto_compact: !cli.no_auto_compact,
         compaction: cli
             .compaction

@@ -942,6 +942,29 @@ impl crate::Agent {
         self.config.temperature = temperature;
     }
 
+    /// Human-readable live step-limit setting. `auto` uses the intent-aware
+    /// defaults; `off` uses no practical per-turn cap.
+    pub fn max_steps_setting(&self) -> String {
+        if !self.config.max_steps_explicit {
+            "auto".to_string()
+        } else if self.config.max_steps == u32::MAX {
+            "off".to_string()
+        } else {
+            self.config.max_steps.to_string()
+        }
+    }
+
+    /// Set a fixed per-turn step cap, or disable the cap with `None`.
+    pub fn set_max_steps_limit(&mut self, limit: Option<u32>) {
+        self.config.max_steps = limit.unwrap_or(u32::MAX).max(1);
+        self.config.max_steps_explicit = true;
+    }
+
+    /// Restore intent-aware automatic step limits for subsequent turns.
+    pub fn set_max_steps_auto(&mut self) {
+        self.config.max_steps_explicit = false;
+    }
+
     pub(crate) fn persist(&mut self) -> Result<()> {
         if let Some(session) = self.session.as_mut() {
             // Clamp the cursor: transcript-shrinking ops (`strip_trailing_nudges`,

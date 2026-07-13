@@ -1,5 +1,5 @@
 //! The agent loop: user message → model → tool calls → results → repeat
-//! until the model stops calling tools. No artificial step limit.
+//! until the model stops calling tools, with a configurable runaway-step guard.
 
 mod agent;
 pub mod command;

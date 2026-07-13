@@ -297,6 +297,30 @@ fn mouse_wheel_scrolls_and_repins_the_transcript() {
     assert!(app.following, "wheel-down at the bottom should re-pin");
 }
 
+#[tokio::test]
+async fn config_command_sets_disables_and_restores_automatic_step_limit() {
+    let provider = std::sync::Arc::new(hi_ai::OpenAiProvider::new(
+        "http://127.0.0.1:1/v1".into(),
+        "test".into(),
+    ));
+    let mut agent = hi_agent::Agent::new(provider, hi_agent::AgentConfig::default());
+    let mut app = test_app("openai", "gpt-4o");
+    assert_eq!(agent.max_steps_setting(), "off");
+
+    app.handle_command(&mut agent, hi_agent::Command::Config("steps 350".into()))
+        .await;
+    assert_eq!(agent.max_steps_setting(), "350");
+
+    app.handle_command(&mut agent, hi_agent::Command::Config("steps off".into()))
+        .await;
+    assert_eq!(agent.max_steps_setting(), "off");
+
+    app.handle_command(&mut agent, hi_agent::Command::Config("steps auto".into()))
+        .await;
+    assert_eq!(agent.max_steps_setting(), "auto");
+    assert!(app.transcript_text().contains("step limit → auto"));
+}
+
 #[test]
 fn transcript_is_capped_while_following_but_not_while_scrolled_up() {
     let mut app = test_app("openai", "gpt-4o");

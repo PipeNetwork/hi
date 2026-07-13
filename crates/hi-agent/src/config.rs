@@ -204,7 +204,7 @@ impl Default for AgentConfig {
             project_context: None,
             verify: Vec::new(),
             max_verify_iterations: 2,
-            max_steps: 500,
+            max_steps: u32::MAX,
             max_steps_explicit: true,
             auto_compact: true,
             compaction: CompactionKind::ElideThenSummarizeTail {
