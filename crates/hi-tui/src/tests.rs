@@ -630,6 +630,7 @@ fn usage_event_keeps_tokens_out_of_compact_working_line() {
         generated: 340,
         ctx_used: 64_000,
         ctx_window: Some(128_000),
+        estimated: false,
     });
     assert_eq!(app.usage, (12, 340));
     assert_eq!(app.context_pct(), Some(50));
@@ -1112,6 +1113,7 @@ fn ctrl_question_toggles_the_observability_panel() {
         generated: 340,
         ctx_used: 64_000,
         ctx_window: Some(128_000),
+        estimated: false,
     });
     let mut term = Terminal::new(TestBackend::new(96, 18)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
@@ -1129,7 +1131,7 @@ fn ctrl_question_toggles_the_observability_panel() {
         "tool-call count: {screen}"
     );
     assert!(
-        screen.contains("user prompt estimate 12 · model output 340 · ctx 50%"),
+        screen.contains("user prompt estimate 12 · output across all model calls 340 · ctx 50%"),
         "scoped token metrics: {screen}"
     );
     assert!(
@@ -1267,8 +1269,7 @@ fn turn_end_renders_the_steer_suffix_from_the_summary() {
     // The agent appends a "steer" suffix to the usage summary for noisy
     // turns; the TUI renders it in the one historical summary location.
     let mut app = test_app("openai", "gpt-4o");
-    let noisy =
-        "[user prompt estimate 10 · model output 2 · ctx 5% (500/10k) · steer: 2 verify · 1 retry]";
+    let noisy = "[user prompt estimate 10 · output across all model calls 2 · ctx 5% (500/10k) · steer: 2 verify · 1 retry]";
     app.apply(UiEvent::TurnEnd {
         summary: noisy.into(),
     });
@@ -1280,8 +1281,7 @@ fn turn_end_renders_the_steer_suffix_from_the_summary() {
 #[test]
 fn stalled_turn_end_is_marked_incomplete_not_done() {
     let mut app = test_app("openai", "gpt-4o");
-    let stalled =
-        "[user prompt estimate 10 · model output 2 · ctx 5% (500/10k) · steer: 2 repeat · stalled]";
+    let stalled = "[user prompt estimate 10 · output across all model calls 2 · ctx 5% (500/10k) · steer: 2 repeat · stalled]";
     app.apply(UiEvent::TurnEnd {
         summary: stalled.into(),
     });
@@ -2159,6 +2159,7 @@ fn uievent_serializes_and_deserializes_roundtrip() {
             generated: 50,
             ctx_used: 1000,
             ctx_window: Some(8000),
+            estimated: false,
         },
         UiEvent::RateLimits { rate_limits: None },
         UiEvent::TurnEnd {

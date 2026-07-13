@@ -71,6 +71,7 @@ pub trait Ui: Send {
         _generated_tokens: u64,
         _context_used: u64,
         _context_window: Option<u32>,
+        _usage_estimated: bool,
     ) {
     }
     /// Latest provider rate-limit buckets observed on a model response. Emitted
@@ -143,12 +144,14 @@ impl<U: Ui + ?Sized> Ui for Box<U> {
         generated_tokens: u64,
         context_used: u64,
         context_window: Option<u32>,
+        usage_estimated: bool,
     ) {
         (**self).usage(
             prompt_tokens,
             generated_tokens,
             context_used,
             context_window,
+            usage_estimated,
         );
     }
     fn rate_limits(&mut self, rate_limits: Option<hi_ai::RateLimitState>) {

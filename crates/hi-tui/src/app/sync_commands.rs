@@ -326,6 +326,7 @@ impl crate::App {
                 self.goal = agent.structured_goal().cloned();
                 self.goal_drive_stall = 0;
                 self.usage = (0, 0);
+                self.usage_estimated = false;
                 self.context_used = 0;
                 self.sync_session_id = Some(switched.id.clone());
                 // `/sync off` followed by `/sync on` owns a TUI-local event

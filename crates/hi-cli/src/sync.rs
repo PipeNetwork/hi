@@ -971,18 +971,21 @@ impl hi_agent::Ui for MultiplexUi {
         generated_tokens: u64,
         context_used: u64,
         context_window: Option<u32>,
+        usage_estimated: bool,
     ) {
         self.primary.usage(
             prompt_tokens,
             generated_tokens,
             context_used,
             context_window,
+            usage_estimated,
         );
         self.remote.push_event(hi_tui::event::UiEvent::Usage {
             prompt: prompt_tokens,
             generated: generated_tokens,
             ctx_used: context_used,
             ctx_window: context_window,
+            estimated: usage_estimated,
         });
     }
     fn rate_limits(&mut self, rate_limits: Option<hi_ai::RateLimitState>) {
@@ -1509,9 +1512,15 @@ fn render_live_event(event: &hi_tui::event::UiEvent) {
             eprintln!("\x1b[2m  plan: {} step(s)\x1b[0m", steps.len());
         }
         UiEvent::Usage {
-            prompt, generated, ..
+            prompt,
+            generated,
+            estimated,
+            ..
         } => {
-            eprintln!("\x1b[2m  [{prompt} in · {generated} out]\x1b[0m");
+            let approx = if *estimated { "~" } else { "" };
+            eprintln!(
+                "\x1b[2m  [user prompt estimate {prompt} · output across all model calls {approx}{generated}]\x1b[0m"
+            );
         }
         UiEvent::RateLimits { .. } => {}
         UiEvent::TurnEnd { summary } => {

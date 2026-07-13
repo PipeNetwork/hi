@@ -332,6 +332,7 @@ impl crate::App {
                 generated,
                 ctx_used,
                 ctx_window,
+                estimated,
             } => {
                 self.event_log
                     .push(format!("usage {prompt} prompt {generated} generated"));
@@ -339,6 +340,7 @@ impl crate::App {
                 self.usage = (prompt, generated);
                 self.context_used = ctx_used;
                 self.context_window = ctx_window;
+                self.usage_estimated = estimated;
             }
             UiEvent::RateLimits { rate_limits } => {
                 self.event_log.push("rate_limits".to_string());

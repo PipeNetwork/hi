@@ -3177,7 +3177,7 @@ If the task is already complete, stop and give your final recap."
             self.messages.strip_finalize_pair();
         }
 
-        // Report turn-local user prompt/generated output first; full request
+        // Report the user-prompt estimate and all turn-local model output; full request
         // context remains visible as the `ctx` gauge below.
         ui.turn_end(&self.usage_summary(&self.totals));
         // Strip any trailing synthetic nudge so it doesn't absorb the next
@@ -3288,8 +3288,13 @@ If the task is already complete, stop and give your final recap."
         // tool, and history context, so putting it first made a short question
         // like "what's your name?" appear to be a 1.5k-token user prompt.
         let mut summary = format!(
-            "[user prompt estimate {} · model output {}",
+            "[user prompt estimate {} · output across all model calls {}{}",
             humanize_count(self.last_user_prompt_tokens),
+            if self.last_turn_usage.estimated {
+                "~"
+            } else {
+                ""
+            },
             humanize_count(self.last_turn_usage.output_tokens),
         );
         if self.last_turn_usage.cache_read_tokens > 0 {
@@ -3306,12 +3311,25 @@ If the task is already complete, stop and give your final recap."
         {
             let pct = (self.context_used * 100 / u64::from(window)).min(100);
             summary.push_str(&format!(
-                " · ctx {pct}% ({}/{})",
+                " · ctx {}{pct}% ({}/{})",
+                if self.last_turn_usage.estimated {
+                    "~"
+                } else {
+                    ""
+                },
                 humanize_count(self.context_used),
                 humanize_count(u64::from(window)),
             ));
         } else if self.context_used > 0 {
-            summary.push_str(&format!(" · ctx {}", humanize_count(self.context_used)));
+            summary.push_str(&format!(
+                " · ctx {}{}",
+                if self.last_turn_usage.estimated {
+                    "~"
+                } else {
+                    ""
+                },
+                humanize_count(self.context_used)
+            ));
         }
         if let Some(limits) = usage.rate_limits.and_then(rate_limit_summary) {
             summary.push_str(&format!(" · {limits}"));

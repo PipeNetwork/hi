@@ -4,7 +4,7 @@ use super::*;
 #[tokio::test]
 async fn usage_line_separates_cumulative_tokens_from_context_fill() {
     // The regression guard: with a window set, the done line shows
-    // raw user prompt tokens and current-turn generated output first, with a
+    // raw user prompt estimate and output across all current-turn calls, with a
     // context gauge that is the *last request's* full size. This prevents a tiny
     // prompt from looking like a 20k-token user message.
     let mut cfg = config();
@@ -32,8 +32,8 @@ async fn usage_line_separates_cumulative_tokens_from_context_fill() {
         "raw user prompt estimate first: {line}"
     );
     assert!(
-        line.contains("model output 300"),
-        "current-turn generated output (100+200): {line}"
+        line.contains("output across all model calls 300"),
+        "current-turn output across all calls (100+200): {line}"
     );
     // The context gauge is the LAST request (12k) over the window — NOT the
     // cumulative input (20k), and abbreviated, not raw.
@@ -141,7 +141,7 @@ fn usage_summary_includes_rate_limit_buckets_when_reported() {
 #[tokio::test]
 async fn emits_running_prompt_and_generated_usage_each_round() {
     // Two rounds (tool call, then text). The UI should see the raw prompt
-    // estimate stay stable while generated output climbs during the turn.
+    // estimate stay stable while model output climbs during the turn.
     let responses = vec![
         completion(
             vec![Content::ToolCall {
@@ -179,6 +179,48 @@ async fn last_turn_usage_resets_each_turn() {
     assert_eq!(agent.totals().output_tokens, 5);
     assert_eq!(agent.last_turn_usage().input_tokens, 7);
     assert_eq!(agent.last_turn_usage().output_tokens, 3);
+}
+
+#[tokio::test]
+async fn context_gauge_prefers_provider_normalized_occupancy() {
+    let response = Completion {
+        content: vec![Content::Text("done".into())],
+        usage: Usage {
+            input_tokens: 100,
+            output_tokens: 2,
+            context_occupancy: 777,
+            ..Usage::default()
+        },
+        stop_reason: None,
+    };
+    let mut agent = agent(vec![response], config());
+
+    agent.run_turn("go", &mut NullUi).await.unwrap();
+
+    assert_eq!(agent.context_used(), 777);
+}
+
+#[tokio::test]
+async fn estimated_usage_is_visibly_approximate() {
+    let response = Completion {
+        content: vec![Content::Text("done".into())],
+        usage: Usage {
+            input_tokens: 100,
+            output_tokens: 2,
+            context_occupancy: 100,
+            estimated: true,
+            ..Usage::default()
+        },
+        stop_reason: None,
+    };
+    let mut agent = agent(vec![response], config());
+    let mut ui = RecUi::default();
+
+    agent.run_turn("go", &mut ui).await.unwrap();
+
+    let summary = ui.turn_end.expect("turn_end emitted");
+    assert!(summary.contains("all model calls ~2"), "{summary}");
+    assert!(agent.last_turn_usage().estimated);
 }
 
 #[tokio::test]

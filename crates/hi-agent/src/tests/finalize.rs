@@ -257,7 +257,7 @@ async fn turn_end_reports_prompt_and_generated_not_context_as_input() {
     // The primary input is the raw user prompt estimate, not the full request
     // context. Generated output remains the current-turn total.
     assert!(
-        summary.contains("user prompt estimate 1 · model output 3"),
+        summary.contains("user prompt estimate 1 · output across all model calls 3"),
         "turn-local prompt/output, got: {summary}"
     );
 }

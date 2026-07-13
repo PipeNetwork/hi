@@ -53,6 +53,8 @@ pub enum UiEvent {
         generated: u64,
         ctx_used: u64,
         ctx_window: Option<u32>,
+        #[serde(default)]
+        estimated: bool,
     },
     RateLimits {
         rate_limits: Option<hi_ai::RateLimitState>,
@@ -143,12 +145,14 @@ impl Ui for ChannelUi {
         generated_tokens: u64,
         context_used: u64,
         context_window: Option<u32>,
+        usage_estimated: bool,
     ) {
         self.send(UiEvent::Usage {
             prompt: prompt_tokens,
             generated: generated_tokens,
             ctx_used: context_used,
             ctx_window: context_window,
+            estimated: usage_estimated,
         });
     }
     fn turn_end(&mut self, summary: &str) {

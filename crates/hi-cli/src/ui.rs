@@ -200,6 +200,7 @@ impl Ui for PlainUi {
         _output_tokens: u64,
         context_used: u64,
         context_window: Option<u32>,
+        _usage_estimated: bool,
     ) {
         // Show a context-fill percentage when the window is known,
         // so the user can see when auto-compaction is approaching.

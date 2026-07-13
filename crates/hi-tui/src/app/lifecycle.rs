@@ -78,6 +78,7 @@ impl crate::App {
             fleet_next_id: 0,
             loops: None,
             usage: (0, 0),
+            usage_estimated: false,
             context_used: 0,
             context_window: None,
             rate_limits: None,

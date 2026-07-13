@@ -111,6 +111,7 @@ impl crate::App {
         let state = match &self.last_turn_state {
             TurnState::Idle => "idle".to_string(),
             TurnState::Running => "running".to_string(),
+            TurnState::Done(s) if s == "done" => "done".to_string(),
             TurnState::Done(s) => format!("done ({s})"),
             TurnState::Warning(s) => format!("warning ({s})"),
             TurnState::Failed(s) => format!("failed ({s})"),
@@ -118,7 +119,7 @@ impl crate::App {
         };
         let ctx = self
             .context_pct()
-            .map(|p| format!("{p}%"))
+            .map(|p| format!("{}{p}%", if self.usage_estimated { "~" } else { "" }))
             .unwrap_or_else(|| "unknown".to_string());
         let goal = agent.goal_summary();
         let verify = agent.verify_summary();
@@ -127,7 +128,10 @@ impl crate::App {
         for line in [
             format!("status: {state}"),
             format!("provider/model: {} · {}", self.provider, self.model),
-            format!("context: {ctx}; turn usage: {input} prompt · {output} generated"),
+            format!(
+                "context: {ctx}; user prompt estimate: {input}; turn output across all model calls: {}{output}",
+                if self.usage_estimated { "~" } else { "" }
+            ),
             format!("goal: {goal}"),
             format!("verify: {verify}"),
             format!(
@@ -915,17 +919,21 @@ impl crate::App {
                     dim(),
                 ));
                 // Context composition: occupancy vs. window, plus the current
-                // turn's raw prompt estimate and generated output.
+                // turn's raw prompt estimate and output across all model calls.
                 let (input, output) = self.usage;
                 let ctx = if let Some(pct) = self.context_pct() {
-                    format!(" · ctx {pct}%")
+                    format!(
+                        " · ctx {}{pct}%",
+                        if self.usage_estimated { "~" } else { "" }
+                    )
                 } else {
                     String::new()
                 };
                 ilines.push(Line::styled(
                     format!(
-                        "turn: user prompt estimate {} · model output {}{ctx}",
+                        "turn: user prompt estimate {} · output across all model calls {}{}{ctx}",
                         fmt_count(input),
+                        if self.usage_estimated { "~" } else { "" },
                         fmt_count(output)
                     ),
                     dim(),

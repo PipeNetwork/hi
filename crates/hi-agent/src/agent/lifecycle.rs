@@ -520,9 +520,13 @@ impl crate::Agent {
     /// and refreshes the context gauge with the request's occupancy.
     pub(crate) fn add_usage(&mut self, usage: Usage) {
         self.add_side_usage(usage);
-        let effective_input = usage.effective_input_tokens();
-        if effective_input > 0 {
-            self.context_used = effective_input;
+        let occupancy = if usage.context_occupancy > 0 {
+            usage.context_occupancy
+        } else {
+            usage.effective_input_tokens()
+        };
+        if occupancy > 0 {
+            self.context_used = occupancy;
         }
     }
 
@@ -564,6 +568,7 @@ impl crate::Agent {
             self.last_turn_usage.output_tokens,
             self.context_used,
             self.config.context_window,
+            self.last_turn_usage.estimated,
         );
         ui.rate_limits(self.totals.rate_limits);
     }

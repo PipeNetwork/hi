@@ -381,6 +381,7 @@ impl Ui for RecUi {
         output_tokens: u64,
         _ctx_used: u64,
         _ctx_win: Option<u32>,
+        _usage_estimated: bool,
     ) {
         self.usages.push((input_tokens, output_tokens));
     }
