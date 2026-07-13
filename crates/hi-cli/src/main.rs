@@ -8,6 +8,7 @@ mod repl;
 mod session;
 mod setup;
 mod sync;
+mod sync_store;
 mod ui;
 
 use std::io::IsTerminal;
@@ -285,14 +286,22 @@ async fn main() -> Result<()> {
     // Clone the path before it's moved into JsonlSession — the daemon fallback
     // below may need to create its own session sink.
     let daemon_session_path = session_path.clone();
-    // Sync auto-enables for pipenetwork users (their API key and base URL
-    // already point to ipop, so sync works with zero extra config). Also
-    // enables on explicit --sync, --sync-session-id, or [sync] enabled = true.
+    let sync_store = sync_store::SyncStore::open()?;
+    let legacy_enabled = file.sync.as_ref().is_some_and(|section| section.enabled);
+    let mut persisted_sync_mode = sync_store.initialize_mode(legacy_enabled)?;
+    if let Some(configured) = file.sync.as_ref().and_then(|section| section.mode) {
+        sync_store.set_mode(configured)?;
+        persisted_sync_mode = configured;
+    }
+    // CLI flags are process-only overrides and never rewrite the persisted
+    // global policy.
+    if cli.sync || cli.sync_session_id.is_some() {
+        sync_store::set_process_mode_override(sync_store::SyncMode::On);
+    }
     let sync_enabled = cli.sync
         || cli.sync_session_id.is_some()
-        || file.sync.as_ref().is_some_and(|s| s.enabled)
-        || settings.provider == ProviderName::Pipenetwork;
-    let (mut sync_handle, mut remote_ui) = if sync_enabled && !cli.no_save && !cli.subagent {
+        || persisted_sync_mode != sync_store::SyncMode::Off;
+    let (mut sync_handle, mut remote_ui) = if !cli.no_save && !cli.subagent {
         let sync_config = build_sync_config(&settings, &cli, &file);
         let session_id = cli
             .sync_session_id
@@ -304,9 +313,6 @@ async fn main() -> Result<()> {
         agent.set_session(Box::new(sync_session));
         let remote_ui = std::sync::Arc::new(sync::RemoteUi::new(sync_config, session_id));
         (Some(handle), Some(remote_ui))
-    } else if !cli.no_save && !cli.subagent {
-        agent.set_session(Box::new(JsonlSession::new(session_path)));
-        (None, None)
     } else {
         (None, None)
     };
@@ -680,7 +686,7 @@ async fn main() -> Result<()> {
         });
         // Build dynamic live-event and flush callbacks. Session switching swaps the
         // underlying handles, and these callbacks immediately follow them.
-        let remote_event_tap: Option<hi_tui::RemoteEventTap> = sync_enabled.then(|| {
+        let remote_event_tap: Option<hi_tui::RemoteEventTap> = remote_ui.as_ref().map(|_| {
             let state = tui_remote_ui.clone();
             std::sync::Arc::new(move |event: &hi_tui::event::UiEvent| {
                 if let Some(rui) = state.lock().unwrap().as_ref() {
@@ -689,7 +695,7 @@ async fn main() -> Result<()> {
             }) as hi_tui::RemoteEventTap
         });
         let tui_sync_flush_callback: Option<hi_tui::RemoteFlushCallback> =
-            sync_enabled.then(|| {
+            sync_handle.is_some().then(|| {
                 let handles = tui_sync_handle.clone();
                 let events = tui_remote_ui.clone();
                 std::sync::Arc::new(move || {
@@ -738,8 +744,7 @@ async fn main() -> Result<()> {
                 let handles = tui_sync_handle.clone();
                 let events = tui_remote_ui.clone();
                 let active_session_id = tui_active_session_id.clone();
-                let switch_sync_config =
-                    sync_enabled.then(|| build_sync_config(&settings, &cli, &file));
+                let switch_sync_config = Some(build_sync_config(&settings, &cli, &file));
                 let switcher: hi_tui::SessionSwitcher = Box::new(move |id, agent| {
                     let id = id.to_string();
                     let handles = handles.clone();
@@ -761,24 +766,13 @@ async fn main() -> Result<()> {
 
                         let previous_handle = handles.lock().unwrap().clone();
                         let previous_events = events.lock().unwrap().clone();
-                        let (activation_tx, activation_rx) =
-                            if previous_handle.is_some() || previous_events.is_some() {
-                                let (tx, rx) = tokio::sync::oneshot::channel();
-                                (Some(tx), Some(rx))
-                            } else {
-                                (None, None)
-                            };
-
                         let next_sync = if let Some(config) = &switch_sync_config {
-                            let remote = match activation_rx {
-                                Some(activation) => sync::RemoteSessionSink::new_after_drain(
-                                    config.clone(),
-                                    id.clone(),
-                                    activation,
-                                ),
-                                None => sync::RemoteSessionSink::new(config.clone(), id.clone()),
-                            };
+                            let remote = sync::RemoteSessionSink::new(config.clone(), id.clone());
                             remote.seed_snapshot(&loaded)?;
+                            // Stage the replacement completely, including the
+                            // automatic takeover lease, before touching the
+                            // live agent or persistence handles.
+                            remote.ensure_registered_now().await?;
                             let synced =
                                 sync::SyncSession::new(JsonlSession::new(path.clone()), remote);
                             let next_handle = synced.remote_handle();
@@ -808,11 +802,7 @@ async fn main() -> Result<()> {
                         }
                         *active_session_id.lock().unwrap() = id.clone();
 
-                        // Drain the previous portal session after the local
-                        // switch is complete. The replacement sink's activation
-                        // barrier preserves end-before-register ordering without
-                        // making the TUI wait on network timeouts.
-                        if let Some(activation_tx) = activation_tx {
+                        if previous_handle.is_some() || previous_events.is_some() {
                             tokio::spawn(async move {
                                 if let Some(remote_ui) = previous_events {
                                     let _ = remote_ui.flush().await;
@@ -820,7 +810,6 @@ async fn main() -> Result<()> {
                                 if let Some(handle) = previous_handle {
                                     handle.end_session().await;
                                 }
-                                let _ = activation_tx.send(());
                             });
                         }
 
@@ -844,6 +833,46 @@ async fn main() -> Result<()> {
                     Ok(name)
                 }) as hi_tui::SessionRenamer
             });
+        let sync_control = hi_tui::SyncControl {
+            set_mode: std::sync::Arc::new(|value| {
+                let mode = match value {
+                    "on" => sync_store::SyncMode::On,
+                    "paused" => sync_store::SyncMode::Paused,
+                    "off" => sync_store::SyncMode::Off,
+                    _ => anyhow::bail!("mode must be on, paused, or off"),
+                };
+                sync_store::SyncStore::open()?.set_mode(mode)
+            }),
+            status: std::sync::Arc::new(|session_id| {
+                let status = sync_store::SyncStore::open()?.status(session_id)?;
+                Ok(format!(
+                    "mode={} · queue={} rows/{} bytes · oldest={} · last success={} · error={} · next retry={} · quarantined={} · cursor={} · lease={} ({}) until {} · event drops={}",
+                    status.mode.as_str(),
+                    status.queue_rows,
+                    status.queue_bytes,
+                    status
+                        .oldest_item_unix
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "none".into()),
+                    status
+                        .last_success_unix
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "never".into()),
+                    status.last_error.as_deref().unwrap_or("none"),
+                    status
+                        .next_retry_unix
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "none".into()),
+                    status.quarantined_records,
+                    status.server_cursor,
+                    status.lease_generation,
+                    status.lease_owner.as_deref().unwrap_or("none"),
+                    status.lease_expiry_unix,
+                    status.event_drops,
+                ))
+            }),
+            purge: std::sync::Arc::new(|| sync_store::SyncStore::open()?.purge()),
+        };
         match hi_tui::run(
             &mut agent,
             provider_label(settings.provider),
@@ -869,6 +898,7 @@ async fn main() -> Result<()> {
             Some(session_lister),
             session_switcher,
             session_renamer,
+            Some(sync_control),
         )
         .await
         {

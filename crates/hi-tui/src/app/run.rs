@@ -61,6 +61,7 @@ pub async fn run(
     session_lister: Option<crate::SessionLister>,
     session_switcher: Option<crate::SessionSwitcher>,
     session_renamer: Option<crate::SessionRenamer>,
+    sync_control: Option<crate::SyncControl>,
 ) -> Result<()> {
     if !io::stdin().is_terminal() {
         anyhow::bail!("TUI requires an interactive stdin");
@@ -103,6 +104,7 @@ pub async fn run(
     app.session_lister = session_lister;
     app.session_switcher = session_switcher;
     app.session_renamer = session_renamer;
+    app.sync_control = sync_control;
     app.remote_event_tap = remote_event_tap;
     app.remote_flush_callback = remote_flush_callback;
     if app.sync_config.is_some() {
@@ -338,21 +340,131 @@ pub async fn run(
                     // While the model picker is open, keys drive it.
                     Event::Key(key) if key.kind == KeyEventKind::Press && app.picker.is_some() => {
                         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                        match key.code {
-                            KeyCode::Enter => app.pick_model(agent),
-                            KeyCode::Esc => app.picker = None,
-                            KeyCode::Char('c') if ctrl => app.picker = None,
-                            // Navigation/filter: a fresh borrow, no app-level action.
-                            code => {
-                                let picker = app.picker.as_mut().unwrap();
-                                match code {
-                                    KeyCode::Up => picker.up(),
-                                    KeyCode::Down => picker.down(),
-                                    KeyCode::PageUp => picker.page_up(),
-                                    KeyCode::PageDown => picker.page_down(),
-                                    KeyCode::Backspace => picker.backspace(),
-                                    KeyCode::Char(c) if !ctrl => picker.insert(c),
+                        if app.session_picker {
+                            let selected = app.picker.as_ref().and_then(|picker| {
+                                picker
+                                    .matches
+                                    .get(picker.selected)
+                                    .and_then(|index| picker.all.get(*index))
+                                    .cloned()
+                            });
+                            if app.session_picker_searching {
+                                match key.code {
+                                    KeyCode::Esc => app.session_picker_searching = false,
+                                    KeyCode::Up => app.picker.as_mut().unwrap().up(),
+                                    KeyCode::Down => app.picker.as_mut().unwrap().down(),
+                                    KeyCode::PageUp => app.picker.as_mut().unwrap().page_up(),
+                                    KeyCode::PageDown => app.picker.as_mut().unwrap().page_down(),
+                                    KeyCode::Backspace => app.picker.as_mut().unwrap().backspace(),
+                                    KeyCode::Enter => app.session_picker_searching = false,
+                                    KeyCode::Char(c) if !ctrl => {
+                                        app.picker.as_mut().unwrap().insert(c)
+                                    }
                                     _ => {}
+                                }
+                            } else {
+                                match key.code {
+                                    KeyCode::Enter => {
+                                        app.picker = None;
+                                        app.session_picker = false;
+                                        if let Some(id) = selected {
+                                            app.switch_session(agent, &id).await;
+                                        }
+                                    }
+                                    KeyCode::Esc => {
+                                        app.picker = None;
+                                        app.session_picker = false;
+                                    }
+                                    KeyCode::Char('c') if ctrl => {
+                                        app.picker = None;
+                                        app.session_picker = false;
+                                    }
+                                    KeyCode::Char('/') => {
+                                        app.session_picker_searching = true;
+                                    }
+                                    KeyCode::Char('r') => {
+                                        if let Some(id) = selected {
+                                            app.input.set(&format!("/sessions rename {id} "));
+                                            app.picker = None;
+                                            app.session_picker = false;
+                                        }
+                                    }
+                                    KeyCode::Char('f') => {
+                                        if let Some(id) = selected {
+                                            let flags = app
+                                                .session_catalog_flags
+                                                .get(&id)
+                                                .copied()
+                                                .unwrap_or_default();
+                                            let next = !flags.0;
+                                            app.patch_session(
+                                                &id,
+                                                serde_json::json!({"favorite": next}),
+                                            )
+                                            .await;
+                                            app.session_catalog_flags.insert(id, (next, flags.1));
+                                        }
+                                    }
+                                    KeyCode::Char('a') => {
+                                        if let Some(id) = selected {
+                                            let flags = app
+                                                .session_catalog_flags
+                                                .get(&id)
+                                                .copied()
+                                                .unwrap_or_default();
+                                            let next = !flags.1;
+                                            app.patch_session(
+                                                &id,
+                                                serde_json::json!({"archived": next}),
+                                            )
+                                            .await;
+                                            app.session_catalog_flags.insert(id, (flags.0, next));
+                                        }
+                                    }
+                                    KeyCode::Char('d') => {
+                                        if let Some(id) = selected {
+                                            if app.session_delete_pending.as_deref() == Some(&id) {
+                                                app.picker = None;
+                                                app.session_picker = false;
+                                                app.session_delete_pending = None;
+                                                app.delete_session(&id).await;
+                                            } else {
+                                                app.session_delete_pending = Some(id.clone());
+                                                app.push(Line::styled(
+                                                    format!("press d again to permanently delete session {id}"),
+                                                    Style::default().fg(Color::Yellow),
+                                                ));
+                                            }
+                                        }
+                                    }
+                                    code => {
+                                        let picker = app.picker.as_mut().unwrap();
+                                        match code {
+                                            KeyCode::Up => picker.up(),
+                                            KeyCode::Down => picker.down(),
+                                            KeyCode::PageUp => picker.page_up(),
+                                            KeyCode::PageDown => picker.page_down(),
+                                            _ => {}
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            match key.code {
+                                KeyCode::Enter => app.pick_model(agent),
+                                KeyCode::Esc => app.picker = None,
+                                KeyCode::Char('c') if ctrl => app.picker = None,
+                                code => {
+                                    let picker = app.picker.as_mut().unwrap();
+                                    match code {
+                                        KeyCode::Up => picker.up(),
+                                        KeyCode::Down => picker.down(),
+                                        KeyCode::PageUp => picker.page_up(),
+                                        KeyCode::PageDown => picker.page_down(),
+                                        KeyCode::Backspace => picker.backspace(),
+                                        KeyCode::Char(c) if !ctrl => picker.insert(c),
+                                        _ => {}
+                                    }
                                 }
                             }
                         }

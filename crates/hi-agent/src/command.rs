@@ -974,11 +974,15 @@ pub const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         name: "sessions",
-        args: "[switch|rename|attach|host|sync]",
-        help: "list, switch, rename, attach, host, or sync sessions",
+        args: "[switch|rename|favorite|archive|restore|delete|attach|host|sync]",
+        help: "browse, switch, and manage sessions",
         arg_values: &[
             ("switch", "switch to a session"),
             ("rename", "name or rename a session"),
+            ("favorite", "favorite a session"),
+            ("archive", "archive a session"),
+            ("restore", "restore an archived session"),
+            ("delete", "permanently delete a session"),
             ("attach", "attach to a running session"),
             ("host", "host this session for remote input"),
             ("sync", "configure portal synchronization"),

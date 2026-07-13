@@ -128,6 +128,13 @@ pub type SessionSwitcher = Box<
 /// Persists a display name for a session cached on this machine.
 pub type SessionRenamer = Box<dyn Fn(&str, &str) -> anyhow::Result<String> + Send + Sync>;
 
+#[derive(Clone)]
+pub struct SyncControl {
+    pub set_mode: std::sync::Arc<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync>,
+    pub status: std::sync::Arc<dyn Fn(Option<&str>) -> anyhow::Result<String> + Send + Sync>,
+    pub purge: std::sync::Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>,
+}
+
 #[derive(Clone, Debug)]
 pub struct SessionSwitchInfo {
     pub id: String,
@@ -512,6 +519,11 @@ pub(crate) struct App {
     pub(crate) last_turn_snapshot: Option<AgentStateSnapshot>,
     /// Active model picker (`/model` with no argument), if any.
     pub(crate) picker: Option<ModelPicker>,
+    /// The shared picker is browsing sessions rather than models.
+    pub(crate) session_picker: bool,
+    pub(crate) session_picker_searching: bool,
+    pub(crate) session_catalog_flags: HashMap<String, (bool, bool)>,
+    pub(crate) session_delete_pending: Option<String>,
     /// Active provider form (`/provider add` or `/provider edit`), if any.
     pub(crate) provider_form: Option<provider_form::ProviderForm>,
     /// Ctrl-R reverse-search over input history. When active, keystrokes go to
@@ -645,6 +657,7 @@ pub(crate) struct App {
     pub(crate) session_switcher: Option<crate::SessionSwitcher>,
     /// Persists names for `/sessions rename <id> <name>`.
     pub(crate) session_renamer: Option<crate::SessionRenamer>,
+    pub(crate) sync_control: Option<crate::SyncControl>,
     /// The remote event tap for live streaming. When set, the `drive` function
     /// calls this after each `UiEvent` is applied to `App`, forwarding events
     /// to the `RemoteUi` for ipop sync. Set at startup or by `/sync on`.

@@ -600,7 +600,11 @@ impl crate::App {
             let block = Block::bordered()
                 .border_type(BorderType::Rounded)
                 .border_style(Style::default().fg(Color::Cyan))
-                .title(" select a model ")
+                .title(if self.session_picker {
+                    " sessions "
+                } else {
+                    " select a model "
+                })
                 .title_top(
                     Line::from(format!(" {}/{} ", p.selected + 1, p.matches.len().max(1)))
                         .right_aligned(),
@@ -608,7 +612,11 @@ impl crate::App {
             let mut plines: Vec<Line> = vec![Line::from(vec![
                 Span::raw(format!("filter: {}", p.filter)),
                 Span::styled(
-                    "   ↑↓ move · type to filter · Enter select · Esc cancel",
+                    if self.session_picker {
+                        "   ↑↓/wheel move · type to search · Enter switch · r rename · f favorite · a archive · d delete · Esc cancel"
+                    } else {
+                        "   ↑↓ move · type to filter · Enter select · Esc cancel"
+                    },
                     dim(),
                 ),
             ])];
@@ -618,16 +626,38 @@ impl crate::App {
             }
             for row in visible {
                 let mut tag = String::new();
+                if self.session_picker
+                    && let Some((favorite, archived)) = self.session_catalog_flags.get(row.id)
+                {
+                    if *favorite {
+                        tag.push_str(" ★");
+                    }
+                    if *archived {
+                        tag.push_str(" [archived]");
+                    }
+                }
                 if row.id == p.current {
                     tag.push_str(" (current)");
                 }
-                let caps = display_capabilities(row.meta);
+                let caps = if self.session_picker {
+                    String::new()
+                } else {
+                    display_capabilities(row.meta)
+                };
                 if !caps.is_empty() {
                     tag.push_str(&format!(" {{{caps}}}"));
                 }
                 // Price + window columns, right-aligned after the id.
-                let price = display_price(row.meta);
-                let window = display_window(row.meta);
+                let price = if self.session_picker {
+                    String::new()
+                } else {
+                    display_price(row.meta)
+                };
+                let window = if self.session_picker {
+                    String::new()
+                } else {
+                    display_window(row.meta)
+                };
                 let meta_col = if price.is_empty() && window.is_empty() {
                     String::new()
                 } else {

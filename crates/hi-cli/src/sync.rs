@@ -8,12 +8,12 @@
 //! failed records are queued for the next flush.
 
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::{Context, Result, anyhow};
 use hi_agent::SessionSink;
-use hi_ai::{Content, Message, Role, Usage};
-use serde::{Deserialize, Serialize};
+use hi_ai::{Message, Role, Usage};
+use serde::Deserialize;
 
 /// Session IDs are used in URL paths and local token filenames. Keep them to
 /// one safe path segment so a caller cannot redirect either operation.
@@ -36,21 +36,11 @@ pub fn validate_session_id(id: &str) -> Result<()> {
 const RECORD_TYPE_MESSAGE: &str = "message";
 const RECORD_TYPE_USAGE: &str = "usage";
 const RECORD_TYPE_CHECKPOINTS: &str = "checkpoints";
-const RECORD_TYPE_COMPACTION: &str = "compaction";
-const RECORD_TYPE_GOAL: &str = "goal";
-const RECORD_TYPE_GOAL_CLEARED: &str = "goal_cleared";
-const RECORD_TYPE_DECISIONS: &str = "decisions";
 const RECORD_TYPE_STATE_REPLACEMENT: &str = "state_replacement";
 const MAX_RECORD_WIRE_BYTES: usize = 5_000_000;
-
-/// A pending record waiting to be flushed to ipop. `record_type` +
-/// `payload_json` mirror the JSONL line format.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct PendingRecord {
-    client_record_id: String,
-    record_type: String,
-    payload_json: String,
-}
+// Leave room for JSON escaping and chunk metadata so each encoded chunk_part
+// remains below the 1 MiB wire contract.
+const CHUNK_PART_BYTES: usize = 450 * 1024;
 
 /// Configuration for syncing a session to ipop.
 #[derive(Clone, Debug)]
@@ -83,11 +73,13 @@ pub struct RemoteSessionSink {
     /// Buffered records waiting for the next flush. Protected by a mutex so
     /// the flush task can run concurrently with record() calls (though in
     /// practice the agent is single-threaded for turn execution).
-    pending: Mutex<Vec<PendingRecord>>,
+    store: std::sync::Arc<crate::sync_store::SyncStore>,
     /// Whether the session has been registered with ipop yet.
     registered: Mutex<bool>,
     /// The per-session input token returned by ipop at registration.
     input_token: Mutex<Option<String>>,
+    lease_lost: AtomicBool,
+    heartbeat_started: AtomicBool,
     /// Display title discovered from a custom name or first user message.
     title: Mutex<Option<String>>,
     /// Last title confirmed by the server, used to avoid redundant renames.
@@ -99,7 +91,6 @@ pub struct RemoteSessionSink {
     /// replacement waits to register until the previous session has flushed
     /// and ended, but the interactive UI does not wait for that network work.
     activation: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
-    record_nonce: u128,
     next_record_id: AtomicU64,
 }
 
@@ -108,6 +99,7 @@ impl RemoteSessionSink {
         Self::with_activation(config, session_id, None)
     }
 
+    #[cfg(test)]
     pub fn new_after_drain(
         config: SyncConfig,
         session_id: String,
@@ -126,21 +118,31 @@ impl RemoteSessionSink {
             .http1_only()
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
+        let store = std::sync::Arc::new(
+            crate::sync_store::SyncStore::open().expect("opening durable portal sync database"),
+        );
+        #[cfg(test)]
+        {
+            store
+                .set_mode(crate::sync_store::SyncMode::On)
+                .expect("enabling sync test store");
+            store
+                .reset_test_records(&session_id)
+                .expect("resetting sync test records");
+        }
         Self {
             config,
             session_id,
             client,
-            pending: Mutex::new(Vec::new()),
+            store,
             registered: Mutex::new(false),
             input_token: Mutex::new(None),
+            lease_lost: AtomicBool::new(false),
+            heartbeat_started: AtomicBool::new(false),
             title: Mutex::new(None),
             registered_title: Mutex::new(None),
             flush_lock: tokio::sync::Mutex::new(()),
             activation: tokio::sync::Mutex::new(activation),
-            record_nonce: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|duration| duration.as_nanos())
-                .unwrap_or_default(),
             next_record_id: AtomicU64::new(0),
         }
     }
@@ -148,41 +150,154 @@ impl RemoteSessionSink {
     /// Push a record to the pending buffer. `&self` because it uses interior
     /// mutability — this lets `SyncSession` call it via an `Arc` handle.
     pub fn push(&self, record_type: &str, payload_json: &str) {
-        let safe_payload;
-        let payload_json = if serde_json::to_string(payload_json)
+        if self.lease_lost.load(Ordering::Acquire) {
+            return;
+        }
+        let wire_bytes = serde_json::to_string(payload_json)
             .map(|wire| wire.len())
-            .unwrap_or(usize::MAX)
-            > MAX_RECORD_WIRE_BYTES
-        {
-            if record_type != RECORD_TYPE_MESSAGE {
-                // State snapshots/compactions are optional accelerators. Do
-                // not let one oversized record block all subsequent sync.
-                return;
+            .unwrap_or(usize::MAX);
+        if wire_bytes <= MAX_RECORD_WIRE_BYTES {
+            let _ = self
+                .store
+                .enqueue_record(&self.session_id, record_type, payload_json);
+            return;
+        }
+
+        // Oversized logical records are never omitted. Parts remain valid JSON
+        // and are followed by a hash-bearing commit; readers apply only a
+        // complete, verified set.
+        use sha2::{Digest, Sha256};
+        let nonce = self.next_record_id.fetch_add(1, Ordering::Relaxed);
+        let logical_id = format!(
+            "{:x}",
+            Sha256::digest(format!(
+                "{}\0{}\0{}\0{}",
+                self.session_id, record_type, nonce, payload_json
+            ))
+        );
+        let mut parts = Vec::new();
+        let mut start = 0;
+        while start < payload_json.len() {
+            let mut end = (start + CHUNK_PART_BYTES).min(payload_json.len());
+            while !payload_json.is_char_boundary(end) {
+                end -= 1;
             }
-            let Ok(message) = serde_json::from_str::<Message>(payload_json) else {
-                return;
-            };
-            safe_payload = serde_json::to_string(&Message {
-                role: message.role,
-                content: vec![Content::Text(
-                    "(oversized session content omitted from portal copy)".to_string(),
-                )],
-            })
-            .unwrap_or_default();
-            safe_payload.as_str()
-        } else {
-            payload_json
-        };
-        self.pending.lock().unwrap().push(PendingRecord {
-            client_record_id: format!(
-                "{:x}-{}-{}",
-                self.record_nonce,
-                std::process::id(),
-                self.next_record_id.fetch_add(1, Ordering::Relaxed)
-            ),
-            record_type: record_type.to_string(),
-            payload_json: payload_json.to_string(),
+            parts.push(&payload_json[start..end]);
+            start = end;
+        }
+        for (index, data) in parts.iter().enumerate() {
+            let part = serde_json::json!({
+                "logical_id": logical_id,
+                "index": index,
+                "parts": parts.len(),
+                "data": data,
+            });
+            let _ = self
+                .store
+                .enqueue_record(&self.session_id, "chunk_part", &part.to_string());
+        }
+        let commit = serde_json::json!({
+            "logical_id": logical_id,
+            "record_type": record_type,
+            "parts": parts.len(),
+            "sha256": format!("{:x}", Sha256::digest(payload_json.as_bytes())),
+            "bytes": payload_json.len(),
         });
+        let _ = self
+            .store
+            .enqueue_record(&self.session_id, "chunk_commit", &commit.to_string());
+    }
+
+    /// Reconcile complete JSONL lines after the last committed local offset.
+    /// The offset-derived ids make replay deterministic across crashes.
+    pub fn reconcile_jsonl(&self, path: &std::path::Path) -> Result<()> {
+        use sha2::{Digest, Sha256};
+        use std::io::{Read, Seek, SeekFrom};
+        let mut offset = self.store.track_jsonl(&self.session_id, path)?;
+        let mut file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        file.seek(SeekFrom::Start(offset))?;
+        let mut remaining = Vec::new();
+        file.read_to_end(&mut remaining)?;
+        let mut consumed = 0usize;
+        for line in remaining.split_inclusive(|byte| *byte == b'\n') {
+            if !line.ends_with(b"\n") {
+                break;
+            }
+            let payload = std::str::from_utf8(&line[..line.len() - 1])?;
+            if payload.is_empty() {
+                consumed += line.len();
+                offset = offset.saturating_add(line.len() as u64);
+                continue;
+            }
+            let value: serde_json::Value = serde_json::from_str(payload)
+                .with_context(|| format!("invalid JSONL record at byte {offset}"))?;
+            let record_type = value
+                .get("type")
+                .and_then(|kind| kind.as_str())
+                .unwrap_or(RECORD_TYPE_MESSAGE);
+            if record_type != "name" {
+                let base_id = format!(
+                    "{:x}",
+                    Sha256::digest(
+                        format!("{}\0{}\0{}", self.session_id, path.display(), offset).as_bytes()
+                    )
+                );
+                self.enqueue_reconciled(&base_id, record_type, payload)?;
+            }
+            consumed += line.len();
+            offset = offset.saturating_add(line.len() as u64);
+        }
+        if consumed > 0 {
+            self.store.set_jsonl_offset(&self.session_id, offset)?;
+        }
+        Ok(())
+    }
+
+    fn enqueue_reconciled(&self, base_id: &str, record_type: &str, payload: &str) -> Result<()> {
+        use sha2::{Digest, Sha256};
+        if serde_json::to_string(payload)?.len() <= MAX_RECORD_WIRE_BYTES {
+            return self.store.enqueue_record_with_id(
+                &self.session_id,
+                base_id,
+                record_type,
+                payload,
+            );
+        }
+        let mut chunks = Vec::new();
+        let mut start = 0;
+        while start < payload.len() {
+            let mut end = (start + CHUNK_PART_BYTES).min(payload.len());
+            while !payload.is_char_boundary(end) {
+                end -= 1;
+            }
+            chunks.push(&payload[start..end]);
+            start = end;
+        }
+        for (index, data) in chunks.iter().enumerate() {
+            let part = serde_json::json!({
+                "logical_id": base_id, "index": index, "parts": chunks.len(), "data": data,
+            });
+            self.store.enqueue_record_with_id(
+                &self.session_id,
+                &format!("{base_id}.p{index}"),
+                "chunk_part",
+                &part.to_string(),
+            )?;
+        }
+        let commit = serde_json::json!({
+            "logical_id": base_id, "record_type": record_type, "parts": chunks.len(),
+            "sha256": format!("{:x}", Sha256::digest(payload.as_bytes())), "bytes": payload.len(),
+        });
+        self.store.enqueue_record_with_id(
+            &self.session_id,
+            &format!("{base_id}.commit"),
+            "chunk_commit",
+            &commit.to_string(),
+        )
     }
 
     fn set_title(&self, title: Option<String>) {
@@ -226,12 +341,7 @@ impl RemoteSessionSink {
             "goal": loaded.goal,
             "decisions": loaded.decisions.entries(),
         }))?;
-        // Stay below both the server's 6 MB record limit and this client's
-        // request budget. Very large sessions continue syncing future turns;
-        // their machine cache remains the full authoritative copy.
-        if payload.len() <= 5_500_000 {
-            self.push(RECORD_TYPE_STATE_REPLACEMENT, &payload);
-        }
+        self.push(RECORD_TYPE_STATE_REPLACEMENT, &payload);
         if !loaded.usage.is_zero() {
             self.push(
                 RECORD_TYPE_USAGE,
@@ -275,6 +385,12 @@ impl RemoteSessionSink {
     /// first flush. A failed registration is retried on the next flush; marking
     /// it successful after a network error permanently strands the session.
     async fn ensure_registered(&self) -> Result<()> {
+        if self.store.effective_mode()? != crate::sync_store::SyncMode::On {
+            return Ok(());
+        }
+        if self.lease_lost.load(Ordering::Acquire) {
+            anyhow::bail!("lease_lost: select another session before accepting new turns");
+        }
         let activation = self.activation.lock().await.take();
         if let Some(activation) = activation {
             // A dropped sender means the predecessor task was aborted; allow
@@ -290,6 +406,7 @@ impl RemoteSessionSink {
             "session_id": self.session_id,
             "machine_id": self.config.machine_id,
             "cwd_digest": self.config.cwd_digest,
+            "project_fingerprint": crate::session::project_fingerprint(),
             "title": title,
         });
         let response = self
@@ -311,8 +428,113 @@ impl RemoteSessionSink {
             *self.input_token.lock().unwrap() = Some(token.to_string());
         }
         *self.registered_title.lock().unwrap() = title;
+        self.acquire_lease(true).await?;
+        self.start_lease_heartbeat();
         *self.registered.lock().unwrap() = true;
         Ok(())
+    }
+
+    async fn acquire_lease(&self, takeover: bool) -> Result<()> {
+        let url = format!(
+            "{}/hi/sessions/{}/lease",
+            self.config.base_url, self.session_id
+        );
+        let machine_id = self
+            .config
+            .machine_id
+            .clone()
+            .unwrap_or_else(|| "unknown-machine".to_string());
+        let client_instance_id = format!("{}-{}", machine_id, std::process::id());
+        let response = self
+            .client
+            .post(&url)
+            .header("x-api-key", &self.config.api_key)
+            .json(&serde_json::json!({
+                "client_instance_id": client_instance_id,
+                "machine_id": machine_id,
+                "takeover": takeover,
+            }))
+            .send()
+            .await
+            .with_context(|| format!("acquiring session lease at {url}"))?;
+        if matches!(
+            response.status(),
+            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
+        ) {
+            // Client-first rollout: legacy servers remain usable until lease
+            // enforcement is deployed.
+            return Ok(());
+        }
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow!("session lease failed: {status} {body}"));
+        }
+        let body: serde_json::Value = response.json().await.context("parsing session lease")?;
+        let Some(token) = body.get("lease_token").and_then(|value| value.as_str()) else {
+            // Some legacy test/proxy deployments answer unknown POST routes
+            // with a generic success body. Absence of the capability field is
+            // treated the same as a missing lease endpoint during rollout.
+            return Ok(());
+        };
+        let generation = body
+            .get("generation")
+            .and_then(|value| value.as_u64())
+            .unwrap_or_default();
+        let expiry = body
+            .get("expires_at_unix")
+            .and_then(|value| value.as_u64())
+            .unwrap_or_default();
+        self.store.store_lease(
+            &self.session_id,
+            token,
+            generation,
+            &client_instance_id,
+            expiry,
+        )?;
+        Ok(())
+    }
+
+    pub fn lease_token(&self) -> Option<String> {
+        self.store.lease_token(&self.session_id).ok().flatten()
+    }
+
+    fn start_lease_heartbeat(&self) {
+        if self.heartbeat_started.swap(true, Ordering::AcqRel) || self.lease_token().is_none() {
+            return;
+        }
+        let client = self.client.clone();
+        let url = format!(
+            "{}/hi/sessions/{}/heartbeat",
+            self.config.base_url, self.session_id
+        );
+        let api_key = self.config.api_key.clone();
+        let session_id = self.session_id.clone();
+        let store = self.store.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                if store.effective_mode().ok() != Some(crate::sync_store::SyncMode::On) {
+                    continue;
+                }
+                let Some(token) = store.lease_token(&session_id).ok().flatten() else {
+                    break;
+                };
+                let response = client
+                    .post(&url)
+                    .header("x-api-key", &api_key)
+                    .header("x-hi-lease-token", token)
+                    .json(&serde_json::json!({}))
+                    .send()
+                    .await;
+                if response
+                    .as_ref()
+                    .is_ok_and(|response| response.status() == reqwest::StatusCode::CONFLICT)
+                {
+                    break;
+                }
+            }
+        });
     }
 
     async fn sync_title(&self) -> Result<()> {
@@ -341,38 +563,29 @@ impl RemoteSessionSink {
         Ok(())
     }
 
-    fn requeue_front(&self, mut records: Vec<PendingRecord>) {
-        let mut pending = self.pending.lock().unwrap();
-        records.append(&mut *pending);
-        *pending = records;
-    }
-
     /// Flush all pending records to ipop. Called after each turn. Best-effort:
     /// on failure, records stay buffered for the next attempt.
     pub async fn flush(&self) -> Result<()> {
         let _flush = self.flush_lock.lock().await;
+        if self.store.effective_mode()? != crate::sync_store::SyncMode::On {
+            return Ok(());
+        }
         self.ensure_registered().await?;
         loop {
-            let records: Vec<PendingRecord> = {
-                let mut pending = self.pending.lock().unwrap();
-                if pending.is_empty() {
-                    return Ok(());
-                }
-                let mut count = 0;
-                let mut bytes = 0usize;
-                for record in pending.iter().take(512) {
-                    let record_bytes = serde_json::to_vec(record)
-                        .map(|encoded| encoded.len())
-                        .unwrap_or(usize::MAX);
-                    let next = bytes.saturating_add(record_bytes);
-                    if count > 0 && next > 5_500_000 {
-                        break;
-                    }
-                    count += 1;
+            let mut records = self.store.ready_records(&self.session_id, 512)?;
+            if records.is_empty() {
+                return Ok(());
+            }
+            let mut bytes = 0usize;
+            records.retain(|record| {
+                let next = bytes.saturating_add(record.payload_json.len() + 256);
+                if bytes > 0 && next > 5_500_000 {
+                    false
+                } else {
                     bytes = next;
+                    true
                 }
-                pending.drain(..count).collect()
-            };
+            });
 
             let url = format!(
                 "{}/hi/sessions/{}/records",
@@ -388,28 +601,69 @@ impl RemoteSessionSink {
                 }).collect::<Vec<_>>(),
             });
 
-            let response = match self
+            let mut request = self
                 .client
                 .post(&url)
                 .header("x-api-key", &self.config.api_key)
-                .json(&append_request)
-                .send()
-                .await
-            {
+                .json(&append_request);
+            if let Some(token) = self.lease_token() {
+                request = request.header("x-hi-lease-token", token);
+            }
+            let response = match request.send().await {
                 Ok(response) => response,
                 Err(err) => {
-                    self.requeue_front(records);
+                    self.store.fail_records(
+                        &self.session_id,
+                        &records,
+                        &err.to_string(),
+                        None,
+                        false,
+                    )?;
                     return Err(err).with_context(|| format!("flushing session records to {url}"));
                 }
             };
 
             if !response.status().is_success() {
-                // Put the records back in the buffer for retry.
-                self.requeue_front(records);
                 let status = response.status();
+                let retry_after = response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok());
                 let body = response.text().await.unwrap_or_default();
+                if status == reqwest::StatusCode::CONFLICT && body.contains("lease_lost") {
+                    self.lease_lost.store(true, Ordering::Release);
+                }
+                let permanent = status.is_client_error()
+                    && !matches!(
+                        status,
+                        reqwest::StatusCode::REQUEST_TIMEOUT
+                            | reqwest::StatusCode::CONFLICT
+                            | reqwest::StatusCode::TOO_MANY_REQUESTS
+                    );
+                self.store.fail_records(
+                    &self.session_id,
+                    &records,
+                    &format!("HTTP {status}: {body}"),
+                    retry_after,
+                    permanent,
+                )?;
                 return Err(anyhow!("ipop sync flush failed: {status} {body}"));
             }
+            let cursor = response
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .and_then(|body| body.get("record_count").and_then(|value| value.as_u64()))
+                .unwrap_or_default();
+            self.store.acknowledge_records(
+                &self.session_id,
+                &records
+                    .iter()
+                    .map(|record| record.row_id)
+                    .collect::<Vec<_>>(),
+                cursor,
+            )?;
         }
     }
 
@@ -421,13 +675,15 @@ impl RemoteSessionSink {
             "{}/hi/sessions/{}/end",
             self.config.base_url, self.session_id
         );
-        let _ = self
+        let mut request = self
             .client
             .post(&url)
             .header("x-api-key", &self.config.api_key)
-            .json(&serde_json::json!({}))
-            .send()
-            .await;
+            .json(&serde_json::json!({}));
+        if let Some(token) = self.lease_token() {
+            request = request.header("x-hi-lease-token", token);
+        }
+        let _ = request.send().await;
     }
 }
 
@@ -446,6 +702,9 @@ pub struct SyncSession {
 
 impl SyncSession {
     pub fn new(local: crate::session::JsonlSession, remote: RemoteSessionSink) -> Self {
+        remote
+            .reconcile_jsonl(local.path())
+            .expect("reconciling durable portal outbox");
         Self {
             local,
             remote: std::sync::Arc::new(remote),
@@ -462,36 +721,13 @@ impl SyncSession {
 impl SessionSink for SyncSession {
     fn record(&mut self, messages: &[Message], usage: Usage) -> Result<()> {
         self.local.record(messages, usage)?;
-        if messages.is_empty() && usage.is_zero() {
-            return Ok(());
-        }
         self.remote.observe_messages(messages);
-        for message in messages {
-            let payload = serde_json::to_string(message)?;
-            self.remote.push(RECORD_TYPE_MESSAGE, &payload);
-        }
-        if !usage.is_zero() {
-            let payload = serde_json::to_string(&serde_json::json!({
-                "type": "usage",
-                "input_tokens": usage.input_tokens,
-                "output_tokens": usage.output_tokens,
-                "cache_read_tokens": usage.cache_read_tokens,
-                "cache_creation_tokens": usage.cache_creation_tokens,
-                "estimated": usage.estimated,
-            }))?;
-            self.remote.push(RECORD_TYPE_USAGE, &payload);
-        }
-        Ok(())
+        self.remote.reconcile_jsonl(self.local.path())
     }
 
     fn record_compaction(&mut self, messages: &[Message]) -> Result<()> {
         self.local.record_compaction(messages)?;
-        let payload = serde_json::to_string(&serde_json::json!({
-            "type": "compaction",
-            "messages": messages,
-        }))?;
-        self.remote.push(RECORD_TYPE_COMPACTION, &payload);
-        Ok(())
+        self.remote.reconcile_jsonl(self.local.path())
     }
 
     fn record_state_replacement(
@@ -502,53 +738,27 @@ impl SessionSink for SyncSession {
     ) -> Result<()> {
         self.local
             .record_state_replacement(messages, goal, decisions)?;
-        let payload = serde_json::to_string(&serde_json::json!({
-            "type": "state_replacement",
-            "messages": messages,
-            "goal": goal,
-            "decisions": decisions.entries(),
-        }))?;
-        self.remote.push(RECORD_TYPE_STATE_REPLACEMENT, &payload);
-        Ok(())
+        self.remote.reconcile_jsonl(self.local.path())
     }
 
     fn record_checkpoints(&mut self, refs: &[String]) -> Result<()> {
         self.local.record_checkpoints(refs)?;
-        let payload = serde_json::to_string(&serde_json::json!({
-            "type": "checkpoints",
-            "refs": refs,
-        }))?;
-        self.remote.push(RECORD_TYPE_CHECKPOINTS, &payload);
-        Ok(())
+        self.remote.reconcile_jsonl(self.local.path())
     }
 
     fn record_goal(&mut self, goal: &hi_agent::Goal) -> Result<()> {
         self.local.record_goal(goal)?;
-        let payload = serde_json::to_string(&serde_json::json!({
-            "type": "goal",
-            "goal": goal,
-        }))?;
-        self.remote.push(RECORD_TYPE_GOAL, &payload);
-        Ok(())
+        self.remote.reconcile_jsonl(self.local.path())
     }
 
     fn clear_goal(&mut self) -> Result<()> {
         self.local.clear_goal()?;
-        let payload = serde_json::to_string(&serde_json::json!({
-            "type": "goal_cleared",
-        }))?;
-        self.remote.push(RECORD_TYPE_GOAL_CLEARED, &payload);
-        Ok(())
+        self.remote.reconcile_jsonl(self.local.path())
     }
 
     fn record_decisions(&mut self, decisions: &hi_agent::DecisionLog) -> Result<()> {
         self.local.record_decisions(decisions)?;
-        let payload = serde_json::to_string(&serde_json::json!({
-            "type": "decisions",
-            "decisions": decisions.entries(),
-        }))?;
-        self.remote.push(RECORD_TYPE_DECISIONS, &payload);
-        Ok(())
+        self.remote.reconcile_jsonl(self.local.path())
     }
 }
 
@@ -565,8 +775,7 @@ pub struct RemoteUi {
     config: SyncConfig,
     session_id: String,
     client: reqwest::Client,
-    /// Buffered serialized UiEvents waiting for the next flush.
-    pending: Mutex<Vec<String>>,
+    store: std::sync::Arc<crate::sync_store::SyncStore>,
     /// Serializes flushes to preserve ordering and make the final shutdown
     /// flush wait for any in-flight background flush.
     flush_lock: tokio::sync::Mutex<()>,
@@ -579,11 +788,23 @@ impl RemoteUi {
             .http1_only()
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
+        let store = std::sync::Arc::new(
+            crate::sync_store::SyncStore::open().expect("opening durable portal event database"),
+        );
+        #[cfg(test)]
+        {
+            store
+                .set_mode(crate::sync_store::SyncMode::On)
+                .expect("enabling sync event test store");
+            store
+                .reset_test_events(&session_id)
+                .expect("resetting sync test events");
+        }
         Self {
             config,
             session_id,
             client,
-            pending: Mutex::new(Vec::new()),
+            store,
             flush_lock: tokio::sync::Mutex::new(()),
         }
     }
@@ -601,7 +822,7 @@ impl RemoteUi {
                 })
                 .unwrap_or_default()
             };
-            self.pending.lock().unwrap().push(json);
+            let _ = self.store.enqueue_event(&self.session_id, &json);
         }
     }
 
@@ -609,63 +830,58 @@ impl RemoteUi {
     /// on failure, events stay buffered for retry.
     pub async fn flush(&self) -> Result<()> {
         let _flush = self.flush_lock.lock().await;
+        if self.store.effective_mode()? != crate::sync_store::SyncMode::On {
+            return Ok(());
+        }
         loop {
-            let events: Vec<String> = {
-                let mut pending = self.pending.lock().unwrap();
-                if pending.is_empty() {
-                    return Ok(());
-                }
-                let mut count = 0;
-                let mut bytes = 0usize;
-                for event in pending.iter().take(256) {
-                    let next = bytes.saturating_add(event.len());
-                    if count > 0 && next > 1_800_000 {
-                        break;
-                    }
-                    count += 1;
+            let mut rows = self.store.ready_events(&self.session_id, 256)?;
+            if rows.is_empty() {
+                return Ok(());
+            }
+            let mut bytes = 0usize;
+            rows.retain(|(_, event)| {
+                let next = bytes.saturating_add(event.len());
+                if bytes > 0 && next > 1_800_000 {
+                    false
+                } else {
                     bytes = next;
+                    true
                 }
-                pending.drain(..count).collect()
-            };
+            });
 
             let url = format!(
                 "{}/hi/sessions/{}/events",
                 self.config.base_url, self.session_id
             );
             let body = serde_json::json!({
-                "events": events.iter().map(|e| {
+                "events": rows.iter().map(|(_, e)| {
                     serde_json::json!({ "event_json": e })
                 }).collect::<Vec<_>>(),
             });
 
-            let response = match self
+            let mut request = self
                 .client
                 .post(&url)
                 .header("x-api-key", &self.config.api_key)
-                .json(&body)
-                .send()
-                .await
-            {
+                .json(&body);
+            if let Some(token) = self.store.lease_token(&self.session_id)? {
+                request = request.header("x-hi-lease-token", token);
+            }
+            let response = match request.send().await {
                 Ok(response) => response,
                 Err(err) => {
-                    self.requeue_events_front(events);
                     return Err(err).with_context(|| format!("flushing live events to {url}"));
                 }
             };
 
             if !response.status().is_success() {
-                self.requeue_events_front(events);
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
                 return Err(anyhow!("live event flush failed: {status} {body}"));
             }
+            self.store
+                .acknowledge_events(&rows.iter().map(|(id, _)| *id).collect::<Vec<_>>())?;
         }
-    }
-
-    fn requeue_events_front(&self, mut events: Vec<String>) {
-        let mut pending = self.pending.lock().unwrap();
-        events.append(&mut *pending);
-        *pending = events;
     }
 }
 
@@ -860,30 +1076,37 @@ pub async fn run_daemon_loop(
                     eprintln!("\x1b[33mdaemon: couldn't save input token: {err:#}\x1b[0m");
                 }
             }
-            println!("  input token: {token}");
-            println!("  (attach with: hi --attach {session_id} --input-token {token})");
+            println!("  input token saved to the private local session token file");
         }
     }
+    let writer_lease = sync_handle.as_ref().and_then(|handle| handle.lease_token());
 
     // Spawn a periodic heartbeat task so ipop knows the daemon is alive.
     let hb_client = client.clone();
     let hb_url = heartbeat_url.clone();
     let hb_key = api_key.clone();
+    let hb_lease = writer_lease.clone();
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-            let _ = hb_client
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            let mut request = hb_client
                 .post(&hb_url)
                 .header("x-api-key", &hb_key)
-                .json(&serde_json::json!({}))
-                .send()
-                .await;
+                .json(&serde_json::json!({}));
+            if let Some(token) = &hb_lease {
+                request = request.header("x-hi-lease-token", token);
+            }
+            let _ = request.send().await;
         }
     });
 
     loop {
         // Long-poll for pending inputs, but also watch for shutdown.
-        let poll_future = client.get(&input_url).header("x-api-key", &api_key).send();
+        let mut poll_request = client.get(&input_url).header("x-api-key", &api_key);
+        if let Some(token) = &writer_lease {
+            poll_request = poll_request.header("x-hi-lease-token", token);
+        }
+        let poll_future = poll_request.send();
         let inputs: Vec<QueuedInput> = tokio::select! {
             result = poll_future => {
                 match result {
@@ -895,6 +1118,12 @@ pub async fn run_daemon_loop(
                     }
                     Ok(response) => {
                         let status = response.status();
+                        if status == reqwest::StatusCode::CONFLICT {
+                            let body = response.text().await.unwrap_or_default();
+                            if body.contains("lease_lost") {
+                                return Err(anyhow!("lease_lost: this daemon was replaced by another writer"));
+                            }
+                        }
                         eprintln!("\x1b[33mdaemon: input poll returned {status}\x1b[0m");
                         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                         continue;
@@ -972,12 +1201,14 @@ pub async fn run_daemon_loop(
         // Ack the highest processed input_seq so clients know their inputs
         // were received and processed.
         if let Some(last_seq) = max_input_seq {
-            let _ = client
+            let mut request = client
                 .post(&ack_url)
                 .header("x-api-key", &api_key)
-                .json(&serde_json::json!({ "input_seq": last_seq }))
-                .send()
-                .await;
+                .json(&serde_json::json!({ "input_seq": last_seq }));
+            if let Some(token) = &writer_lease {
+                request = request.header("x-hi-lease-token", token);
+            }
+            let _ = request.send().await;
         }
     }
 }
@@ -1362,6 +1593,10 @@ async fn hi_daemon_shutdown_signal() {
 #[derive(Deserialize)]
 struct RecordsResponse {
     records: Vec<RemoteRecordResponse>,
+    #[serde(default)]
+    has_more: bool,
+    #[serde(default)]
+    next_seq: Option<u64>,
 }
 
 /// One record in the records response.
@@ -1390,14 +1625,13 @@ pub async fn fetch_session_history(
         .unwrap_or_else(|_| reqwest::Client::new());
     let records_url = format!("{}/hi/sessions/{session_id}/records", sync_config.base_url);
     let mut all_records: Vec<RemoteRecordResponse> = Vec::new();
-    let mut from_seq: Option<u64> = None;
+    let mut from_seq: Option<u64> = Some(1);
+    let mut expected_seq = 1u64;
     loop {
         let mut request = client
             .get(&records_url)
             .header("x-api-key", &sync_config.api_key);
-        if let Some(seq) = from_seq {
-            request = request.query(&[("from_seq", seq)]);
-        }
+        request = request.query(&[("from_seq", from_seq.unwrap_or(1)), ("limit", 1000)]);
         let response = request
             .send()
             .await
@@ -1410,25 +1644,32 @@ pub async fn fetch_session_history(
 
         let batch: RecordsResponse = response.json().await.context("parsing session records")?;
         let batch_len = batch.records.len();
-        let last_seq = batch.records.last().and_then(|record| record.record_seq);
-        all_records.extend(batch.records);
-        if batch_len < 5_000 {
+        for record in batch.records {
+            if let Some(sequence) = record.record_seq {
+                if sequence < expected_seq {
+                    continue;
+                }
+                if sequence != expected_seq {
+                    anyhow::bail!(
+                        "session record gap: expected sequence {expected_seq}, received {sequence}"
+                    );
+                }
+                expected_seq = expected_seq.saturating_add(1);
+            } else {
+                expected_seq = expected_seq.saturating_add(1);
+            }
+            all_records.push(record);
+        }
+        if !batch.has_more && batch_len < 5_000 {
             break;
         }
-        from_seq = Some(
-            last_seq
-                .map(|seq| seq + 1)
-                .unwrap_or_else(|| from_seq.unwrap_or(1) + batch_len as u64),
-        );
+        from_seq = batch.next_seq.or(Some(expected_seq));
+        if batch_len == 0 {
+            anyhow::bail!("session record pagination stalled at sequence {expected_seq}");
+        }
     }
 
-    let records = all_records
-        .into_iter()
-        .map(|record| crate::session::RemoteRecord {
-            record_type: record.record_type,
-            payload_json: record.payload_json,
-        })
-        .collect::<Vec<_>>();
+    let records = reassemble_remote_records(all_records)?;
     let mut loaded = crate::session::load_history_from_records(&records)?;
     // The rename endpoint updates session metadata without appending a durable
     // record, so fetch the current title separately when restoring a session.
@@ -1446,6 +1687,88 @@ pub async fn fetch_session_history(
         loaded.name = Some(title.trim().to_string());
     }
     Ok(loaded)
+}
+
+fn reassemble_remote_records(
+    records: Vec<RemoteRecordResponse>,
+) -> Result<Vec<crate::session::RemoteRecord>> {
+    use sha2::{Digest, Sha256};
+    let mut parts: std::collections::HashMap<String, Vec<Option<String>>> =
+        std::collections::HashMap::new();
+    let mut output = Vec::new();
+    for record in records {
+        match record.record_type.as_str() {
+            "chunk_part" => {
+                let value: serde_json::Value = serde_json::from_str(&record.payload_json)
+                    .context("invalid chunk_part payload")?;
+                let id = value["logical_id"]
+                    .as_str()
+                    .context("chunk_part omitted logical_id")?
+                    .to_string();
+                let index = value["index"]
+                    .as_u64()
+                    .context("chunk_part omitted index")? as usize;
+                let count = value["parts"]
+                    .as_u64()
+                    .context("chunk_part omitted parts")? as usize;
+                let data = value["data"].as_str().context("chunk_part omitted data")?;
+                if count == 0 || count > 65_536 || index >= count {
+                    anyhow::bail!("invalid chunk_part bounds");
+                }
+                let entry = parts.entry(id).or_insert_with(|| vec![None; count]);
+                if entry.len() != count {
+                    anyhow::bail!("chunk_part count changed within logical record");
+                }
+                if entry[index]
+                    .as_deref()
+                    .is_some_and(|existing| existing != data)
+                {
+                    anyhow::bail!("conflicting duplicate chunk_part");
+                }
+                entry[index] = Some(data.to_string());
+            }
+            "chunk_commit" => {
+                let value: serde_json::Value = serde_json::from_str(&record.payload_json)
+                    .context("invalid chunk_commit payload")?;
+                let id = value["logical_id"]
+                    .as_str()
+                    .context("chunk_commit omitted logical_id")?;
+                let record_type = value["record_type"]
+                    .as_str()
+                    .context("chunk_commit omitted record_type")?;
+                let expected_hash = value["sha256"]
+                    .as_str()
+                    .context("chunk_commit omitted sha256")?;
+                let expected_parts = value["parts"]
+                    .as_u64()
+                    .context("chunk_commit omitted parts")?
+                    as usize;
+                let chunks = parts.remove(id).context("chunk_commit is incomplete")?;
+                if chunks.len() != expected_parts || chunks.iter().any(Option::is_none) {
+                    anyhow::bail!("chunk_commit is incomplete");
+                }
+                let payload_json = chunks.into_iter().flatten().collect::<String>();
+                let actual_hash = format!("{:x}", Sha256::digest(payload_json.as_bytes()));
+                if actual_hash != expected_hash {
+                    anyhow::bail!("chunk_commit hash mismatch");
+                }
+                serde_json::from_str::<serde_json::Value>(&payload_json)
+                    .context("reassembled logical record is not valid JSON")?;
+                output.push(crate::session::RemoteRecord {
+                    record_type: record_type.to_string(),
+                    payload_json,
+                });
+            }
+            _ => output.push(crate::session::RemoteRecord {
+                record_type: record.record_type,
+                payload_json: record.payload_json,
+            }),
+        }
+    }
+    if !parts.is_empty() {
+        anyhow::bail!("session history contains incomplete chunked records");
+    }
+    Ok(output)
 }
 
 /// Resume a remote session locally: fetch the durable record history from ipop,
@@ -1664,8 +1987,8 @@ mod tests {
             Some("Named portal session")
         );
         let record_types = sink
-            .pending
-            .lock()
+            .store
+            .ready_records("snapshot", 32)
             .unwrap()
             .iter()
             .map(|record| record.record_type.clone())
@@ -1692,15 +2015,25 @@ mod tests {
             &serde_json::to_string(&Message::user("next turn")).unwrap(),
         );
 
-        let pending = sink.pending.lock().unwrap();
-        assert_eq!(pending.len(), 2, "oversized snapshot should be dropped");
-        assert!(pending[0].payload_json.len() < 1_000);
+        let pending = sink.store.ready_records("oversized", 64).unwrap();
         assert!(
-            pending[0]
-                .payload_json
-                .contains("oversized session content")
+            pending
+                .iter()
+                .any(|record| record.record_type == "chunk_part")
         );
-        assert!(pending[1].payload_json.contains("next turn"));
+        assert_eq!(
+            pending
+                .iter()
+                .filter(|record| record.record_type == "chunk_commit")
+                .count(),
+            2,
+            "both oversized logical records must be committed"
+        );
+        assert!(
+            pending
+                .iter()
+                .any(|record| record.payload_json.contains("next turn"))
+        );
     }
 
     #[tokio::test]
@@ -1716,12 +2049,20 @@ mod tests {
             "title-sync".into(),
         );
         sink.ensure_registered_now().await.unwrap();
-        assert_eq!(server.post_count(), 1);
+        assert_eq!(
+            server.post_count(),
+            2,
+            "registration plus lease capability probe"
+        );
 
         sink.update_title("Portal work");
         sink.flush().await.unwrap();
 
-        assert_eq!(server.post_count(), 2, "registration plus title update");
+        assert_eq!(
+            server.post_count(),
+            3,
+            "registration, lease, and title update"
+        );
         assert_eq!(
             sink.registered_title.lock().unwrap().as_deref(),
             Some("Portal work")
@@ -1759,7 +2100,11 @@ mod tests {
 
         handoff_tx.send(()).unwrap();
         flushing.await.unwrap().unwrap();
-        assert_eq!(server.post_count(), 2, "registration plus record append");
+        assert_eq!(
+            server.post_count(),
+            3,
+            "registration, lease, and record append"
+        );
     }
 
     #[tokio::test]
@@ -1821,6 +2166,10 @@ mod tests {
     }
 
     fn unreachable_config() -> SyncConfig {
+        crate::sync_store::SyncStore::open()
+            .unwrap()
+            .set_mode(crate::sync_store::SyncMode::On)
+            .unwrap();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         drop(listener);
@@ -1838,7 +2187,7 @@ mod tests {
         sink.push(RECORD_TYPE_MESSAGE, r#"{"role":"user","content":[]}"#);
 
         assert!(sink.flush().await.is_err());
-        assert_eq!(sink.pending.lock().unwrap().len(), 1);
+        assert_eq!(sink.store.ready_records("safe-id", 10).unwrap().len(), 1);
         assert!(!*sink.registered.lock().unwrap());
     }
 
@@ -1850,7 +2199,7 @@ mod tests {
         });
 
         assert!(ui.flush().await.is_err());
-        assert_eq!(ui.pending.lock().unwrap().len(), 1);
+        assert_eq!(ui.store.ready_events("safe-id", 10).unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1867,8 +2216,8 @@ mod tests {
             records.push(RECORD_TYPE_MESSAGE, r#"{"role":"user","content":[]}"#);
         }
         records.flush().await.unwrap();
-        // Registration plus two record batches (512 + 1).
-        assert_eq!(server.post_count(), 3);
+        // Registration, lease capability probe, plus two record batches.
+        assert_eq!(server.post_count(), 4);
 
         let events = RemoteUi::new(config, "event-chunks".to_string());
         for _ in 0..257 {
@@ -1876,7 +2225,7 @@ mod tests {
         }
         events.flush().await.unwrap();
         // Two more event batches (256 + 1).
-        assert_eq!(server.post_count(), 5);
+        assert_eq!(server.post_count(), 6);
     }
 
     #[test]

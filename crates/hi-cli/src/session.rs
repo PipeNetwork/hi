@@ -78,6 +78,10 @@ impl JsonlSession {
         Self { path }
     }
 
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Append a fully-formatted payload (one or more `\n`-terminated JSONL
     /// lines) with a single `write_all` on the `O_APPEND` fd. A buffered
     /// writer would split records larger than its buffer across multiple
@@ -253,7 +257,7 @@ pub fn sessions_dir() -> Option<PathBuf> {
 }
 
 /// The shared data root (`$XDG_DATA_HOME/hi` or `~/.local/share/hi`).
-fn data_root() -> Option<PathBuf> {
+pub(crate) fn data_root() -> Option<PathBuf> {
     std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
@@ -315,6 +319,69 @@ pub fn cwd_digest() -> String {
         hash = hash.wrapping_mul(0x100000001b3);
     }
     format!("{hash:016x}")
+}
+
+/// Account-wide opaque project identity. Remote URLs are normalized locally
+/// and only their SHA-256 digest is sent to the portal. Repositories without a
+/// remote deliberately include the machine id and remain machine-specific.
+pub fn project_fingerprint() -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let cwd = std::env::current_dir().ok()?;
+    let top = std::process::Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(&cwd)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let top = PathBuf::from(String::from_utf8(top.stdout).ok()?.trim());
+    let relative = cwd
+        .strip_prefix(&top)
+        .unwrap_or(Path::new(""))
+        .to_string_lossy()
+        .replace('\\', "/");
+    let remote = std::process::Command::new("git")
+        .args(["config", "--get", "remote.origin.url"])
+        .current_dir(&top)
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let identity = if let Some(remote) = remote {
+        normalize_git_remote(&remote).unwrap_or(remote)
+    } else {
+        format!(
+            "local:{}/{}",
+            machine_id().unwrap_or_else(|| "unknown".to_string()),
+            std::fs::canonicalize(&top).unwrap_or(top).to_string_lossy()
+        )
+    };
+    Some(format!(
+        "{:x}",
+        Sha256::digest(format!("{}\0{}", identity, relative).as_bytes())
+    ))
+}
+
+fn normalize_git_remote(remote: &str) -> Option<String> {
+    let value = remote.trim().trim_end_matches('/').trim_end_matches(".git");
+    let host_path = if let Some(rest) = value.split_once("://").map(|(_, rest)| rest) {
+        let rest = rest.rsplit_once('@').map(|(_, rest)| rest).unwrap_or(rest);
+        rest.split_once('/').map(|(host, path)| (host, path))?
+    } else if let Some((user_host, path)) = value.split_once(':') {
+        let host = user_host
+            .rsplit_once('@')
+            .map(|(_, host)| host)
+            .unwrap_or(user_host);
+        (host, path)
+    } else {
+        return None;
+    };
+    Some(format!(
+        "{}/{}",
+        host_path.0.to_ascii_lowercase(),
+        host_path.1.trim_matches('/').to_ascii_lowercase()
+    ))
 }
 
 /// Path to the persistent REPL input-history file. Per-directory (lives inside

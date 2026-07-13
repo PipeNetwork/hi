@@ -22,6 +22,8 @@ toml.workspace = true
 rustyline.workspace = true
 reqwest = { workspace = true }
 futures-util = { workspace = true }
+rusqlite = { version = "0.32", features = ["bundled"] }
+sha2 = "0.10"
 
 [dev-dependencies]
 # The fake OpenAI server, for the end-to-end test that drives the real binary.

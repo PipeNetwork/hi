@@ -53,6 +53,10 @@ pub(crate) const PROVIDER_CMD: &str = "provider";
 pub(crate) const SESSIONS_CMD: &str = "sessions";
 pub(crate) const SESSIONS_SWITCH_CTX: &str = "sessions switch";
 pub(crate) const SESSIONS_RENAME_CTX: &str = "sessions rename";
+pub(crate) const SESSIONS_FAVORITE_CTX: &str = "sessions favorite";
+pub(crate) const SESSIONS_ARCHIVE_CTX: &str = "sessions archive";
+pub(crate) const SESSIONS_RESTORE_CTX: &str = "sessions restore";
+pub(crate) const SESSIONS_DELETE_CTX: &str = "sessions delete";
 
 pub(crate) fn completion_context(input: &str) -> Option<CompletionContext> {
     let rest = input.strip_prefix('/')?;
@@ -73,6 +77,10 @@ pub(crate) fn completion_context(input: &str) -> Option<CompletionContext> {
                 let cmd = match action {
                     "switch" => SESSIONS_SWITCH_CTX,
                     "rename" => SESSIONS_RENAME_CTX,
+                    "favorite" => SESSIONS_FAVORITE_CTX,
+                    "archive" => SESSIONS_ARCHIVE_CTX,
+                    "restore" => SESSIONS_RESTORE_CTX,
+                    "delete" => SESSIONS_DELETE_CTX,
                     _ => return None,
                 };
                 return Some(CompletionContext::Arg {
@@ -139,12 +147,20 @@ pub(crate) fn completion_items_for(ctx: &CompletionContext) -> Vec<CompletionIte
             .map(|(value, hint)| CompletionItem {
                 label: value.to_string(),
                 help: hint.to_string(),
-                insert: if *cmd == SESSIONS_CMD && matches!(value, "switch" | "rename") {
+                insert: if *cmd == SESSIONS_CMD
+                    && matches!(
+                        value,
+                        "switch" | "rename" | "favorite" | "archive" | "restore" | "delete"
+                    ) {
                     format!("/{cmd} {value} ")
                 } else {
                     format!("/{cmd} {value}")
                 },
-                submit_on_enter: !(*cmd == SESSIONS_CMD && matches!(value, "switch" | "rename")),
+                submit_on_enter: !(*cmd == SESSIONS_CMD
+                    && matches!(
+                        value,
+                        "switch" | "rename" | "favorite" | "archive" | "restore" | "delete"
+                    )),
             })
             .collect(),
     }

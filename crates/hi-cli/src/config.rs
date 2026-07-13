@@ -394,6 +394,9 @@ pub struct SyncSection {
     pub api_key_env: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub machine_id: Option<String>,
+    /// Persisted sync policy. Missing values migrate from legacy `enabled`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<crate::sync_store::SyncMode>,
     /// When true, sync is enabled by default (no need for `--sync` on the CLI).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub enabled: bool,

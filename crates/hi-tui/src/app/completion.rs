@@ -4,7 +4,8 @@ use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::completion::{
     CompletionContext, CompletionItem, CompletionState, MODEL_CMD, MODEL_COMPLETION_MAX,
-    PROVIDER_CMD, SESSIONS_RENAME_CTX, SESSIONS_SWITCH_CTX, completion_context,
+    PROVIDER_CMD, SESSIONS_ARCHIVE_CTX, SESSIONS_DELETE_CTX, SESSIONS_FAVORITE_CTX,
+    SESSIONS_RENAME_CTX, SESSIONS_RESTORE_CTX, SESSIONS_SWITCH_CTX, completion_context,
     completion_items_for,
 };
 
@@ -24,7 +25,15 @@ impl crate::App {
             return self.provider_completion_items(prefix);
         }
         if let CompletionContext::Arg { cmd, prefix } = ctx
-            && matches!(*cmd, SESSIONS_SWITCH_CTX | SESSIONS_RENAME_CTX)
+            && matches!(
+                *cmd,
+                SESSIONS_SWITCH_CTX
+                    | SESSIONS_RENAME_CTX
+                    | SESSIONS_FAVORITE_CTX
+                    | SESSIONS_ARCHIVE_CTX
+                    | SESSIONS_RESTORE_CTX
+                    | SESSIONS_DELETE_CTX
+            )
         {
             return self.session_completion_items(cmd, prefix);
         }
@@ -32,11 +41,7 @@ impl crate::App {
     }
 
     fn session_completion_items(&self, command: &str, prefix: &str) -> Vec<CompletionItem> {
-        let action = if command == SESSIONS_RENAME_CTX {
-            "rename"
-        } else {
-            "switch"
-        };
+        let action = command.strip_prefix("sessions ").unwrap_or("switch");
         self.session_completion_cache
             .iter()
             .filter(|session| {
@@ -50,9 +55,13 @@ impl crate::App {
                 insert: format!(
                     "/sessions {action} {}{}",
                     session.id,
-                    if action == "rename" { " " } else { "" }
+                    if matches!(action, "rename" | "delete") {
+                        " "
+                    } else {
+                        ""
+                    }
                 ),
-                submit_on_enter: action == "switch",
+                submit_on_enter: matches!(action, "switch" | "favorite" | "archive" | "restore"),
             })
             .collect()
     }

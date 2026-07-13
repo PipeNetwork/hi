@@ -4,6 +4,7 @@
 use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 
+use crate::model_picker::ModelPicker;
 use crate::render::dim;
 
 #[derive(Clone, Debug)]
@@ -12,6 +13,9 @@ struct SyncedSessionInfo {
     title: String,
     status: String,
     records: u64,
+    project: String,
+    favorite: bool,
+    archived: bool,
 }
 
 fn valid_session_id(id: &str) -> bool {
@@ -28,6 +32,13 @@ impl crate::App {
     pub(crate) async fn handle_sync_command(&mut self, arg: &str) {
         match arg.trim() {
             "on" => {
+                if let Some(control) = &self.sync_control
+                    && let Err(error) = (control.set_mode)("on")
+                {
+                    self.push(Line::styled(format!("sync mode update failed: {error:#}"), dim()));
+                    self.follow();
+                    return;
+                }
                 if self.sync_config.is_some() {
                     // Need a session ID to stream events to. If sync was enabled
                     // at startup, this is already set. If not, we can't stream
@@ -54,25 +65,25 @@ impl crate::App {
                     // If sync wasn't enabled at startup, we can only stream events
                     // (not durable records) from this point — a full sync requires
                     // restarting with --sync.
-                    let config = self.sync_config.clone().unwrap();
-                    let rui = std::sync::Arc::new(crate::sync_tui::RemoteUi::new(
-                        crate::sync_tui::SyncConfig {
-                            base_url: config.base_url,
-                            api_key: config.api_key,
-                        },
-                        session_id,
-                    ));
-                    let rui_clone = rui.clone();
-                    let tap: std::sync::Arc<dyn Fn(&crate::event::UiEvent) + Send + Sync> =
-                        std::sync::Arc::new(move |event: &crate::event::UiEvent| {
-                            rui_clone.push_event(event.clone());
-                        });
-                    self.remote_event_tap = Some(tap);
-                    // Store the RemoteUi on the app so it can be flushed after turns.
-                    self.sync_remote_ui = Some(rui);
+                    if self.remote_flush_callback.is_none() {
+                        let config = self.sync_config.clone().unwrap();
+                        let rui = std::sync::Arc::new(crate::sync_tui::RemoteUi::new(
+                            crate::sync_tui::SyncConfig {
+                                base_url: config.base_url,
+                                api_key: config.api_key,
+                            },
+                            session_id,
+                        ));
+                        let rui_clone = rui.clone();
+                        let tap: std::sync::Arc<dyn Fn(&crate::event::UiEvent) + Send + Sync> =
+                            std::sync::Arc::new(move |event: &crate::event::UiEvent| {
+                                rui_clone.push_event(event.clone());
+                            });
+                        self.remote_event_tap = Some(tap);
+                        self.sync_remote_ui = Some(rui);
+                    }
                     self.push(Line::styled(
-                        "✓ sync active — live events are streaming to ipop\n  \
-                         (durable record sync requires restart with --sync for full history)",
+                        "✓ sync on — retained records/events and future portal data will upload",
                         Style::default().fg(Color::Green),
                     ));
                 } else {
@@ -83,24 +94,57 @@ impl crate::App {
                     ));
                 }
             }
-            "off" => {
-                self.sync_active = false;
-                self.remote_event_tap = None;
-                // Flush any remaining events before stopping. Spawn as a
-                // background task so a slow ipop doesn't block the TUI.
-                if let Some(rui) = self.sync_remote_ui.take() {
-                    tokio::spawn(async move {
-                        let _ = rui.flush().await;
-                    });
+            "paused" => {
+                if let Some(control) = &self.sync_control {
+                    let _ = (control.set_mode)("paused");
                 }
-                let message = if self.remote_flush_callback.is_some() {
-                    "live event streaming paused; durable record sync remains active until exit"
-                } else {
-                    "sync paused (session continues)"
-                };
-                self.push(Line::styled(message, dim()));
+                self.sync_active = false;
+                if self.remote_flush_callback.is_none()
+                    && self.sync_remote_ui.is_none()
+                    && let (Some(config), Some(session_id)) =
+                        (self.sync_config.clone(), self.sync_session_id.clone())
+                {
+                    let remote = std::sync::Arc::new(crate::sync_tui::RemoteUi::new(
+                        crate::sync_tui::SyncConfig {
+                            base_url: config.base_url,
+                            api_key: config.api_key,
+                        },
+                        session_id,
+                    ));
+                    let tap_remote = remote.clone();
+                    self.remote_event_tap = Some(std::sync::Arc::new(move |event| {
+                        tap_remote.push_event(event.clone());
+                    }));
+                    self.sync_remote_ui = Some(remote);
+                }
+                self.push(Line::styled(
+                    "sync paused — records and bounded live events remain queued; network activity stopped",
+                    dim(),
+                ));
+            }
+            "off" => {
+                if let Some(control) = &self.sync_control {
+                    let _ = (control.set_mode)("off");
+                }
+                self.sync_active = false;
+                self.sync_remote_ui = None;
+                self.push(Line::styled(
+                    "sync off — no portal data will be enqueued or sent; the existing queue is retained",
+                    dim(),
+                ));
             }
             "" | "status" => {
+                if let Some(control) = &self.sync_control {
+                    match (control.status)(self.sync_session_id.as_deref()) {
+                        Ok(status) => self.push(Line::styled(format!("sync: {status}"), dim())),
+                        Err(error) => self.push(Line::styled(
+                            format!("sync status unavailable: {error:#}"),
+                            Style::default().fg(Color::Yellow),
+                        )),
+                    }
+                    self.follow();
+                    return;
+                }
                 if self.sync_config.is_some() {
                     let status = if self.sync_active {
                         "active"
@@ -124,9 +168,25 @@ impl crate::App {
                     ));
                 }
             }
+            "purge" => self.push(Line::styled(
+                "purge permanently removes the retained portal queue; run `/sessions sync purge confirm`",
+                Style::default().fg(Color::Yellow),
+            )),
+            "purge confirm" => {
+                match &self.sync_control {
+                    Some(control) => match (control.purge)() {
+                        Ok(()) => self.push(Line::styled("✓ portal sync queue purged", dim())),
+                        Err(error) => self.push(Line::styled(
+                            format!("sync purge failed: {error:#}"),
+                            Style::default().fg(Color::Yellow),
+                        )),
+                    },
+                    None => self.push(Line::styled("sync persistence is unavailable", dim())),
+                }
+            }
             other => {
                 self.push(Line::styled(
-                    format!("usage: /sync on|off|status (got '{other}')"),
+                    format!("usage: /sync on|paused|off|status|purge (got '{other}')"),
                     dim(),
                 ));
             }
@@ -167,10 +227,43 @@ impl crate::App {
                 };
                 self.rename_session(session_id, name.trim()).await;
             }
+            value if value.starts_with("favorite ") => {
+                self.patch_session(
+                    value.trim_start_matches("favorite ").trim(),
+                    serde_json::json!({"favorite": true}),
+                )
+                .await;
+            }
+            value if value.starts_with("archive ") => {
+                self.patch_session(
+                    value.trim_start_matches("archive ").trim(),
+                    serde_json::json!({"archived": true}),
+                )
+                .await;
+            }
+            value if value.starts_with("restore ") => {
+                self.patch_session(
+                    value.trim_start_matches("restore ").trim(),
+                    serde_json::json!({"archived": false}),
+                )
+                .await;
+            }
+            value if value.starts_with("delete ") => {
+                let rest = value.trim_start_matches("delete ").trim();
+                let Some(id) = rest.strip_suffix(" confirm").map(str::trim) else {
+                    self.push(Line::styled(
+                        format!("permanent deletion requires `/sessions delete {rest} confirm`"),
+                        Style::default().fg(Color::Yellow),
+                    ));
+                    self.follow();
+                    return;
+                };
+                self.delete_session(id).await;
+            }
             other => {
                 self.push(Line::styled(
                     format!(
-                        "usage: /sessions [switch <id>|rename <id> <name>|attach <id>|host|sync on|off|status] (got '{other}')"
+                        "usage: /sessions [switch <id>|rename <id> <name>|favorite <id>|archive <id>|restore <id>|delete <id> confirm|attach <id>|host|sync on|paused|off|status|purge] (got '{other}')"
                     ),
                     dim(),
                 ));
@@ -179,7 +272,7 @@ impl crate::App {
         self.follow();
     }
 
-    async fn switch_session(&mut self, agent: &mut hi_agent::Agent, session_id: &str) {
+    pub(crate) async fn switch_session(&mut self, agent: &mut hi_agent::Agent, session_id: &str) {
         if session_id.is_empty() {
             self.push(Line::styled("usage: /sessions switch <session-id>", dim()));
             self.follow();
@@ -380,6 +473,73 @@ impl crate::App {
         self.follow();
     }
 
+    pub(crate) async fn patch_session(&mut self, session_id: &str, body: serde_json::Value) {
+        if !valid_session_id(session_id) {
+            self.push(Line::styled(
+                "invalid session id",
+                Style::default().fg(Color::Yellow),
+            ));
+            return;
+        }
+        let (Some(config), Some(client)) = (&self.sync_config, &self.sync_http) else {
+            self.push(Line::styled("session catalog is unavailable", dim()));
+            return;
+        };
+        match client
+            .patch(format!("{}/hi/sessions/{session_id}", config.base_url))
+            .header("x-api-key", &config.api_key)
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => self.push(Line::styled(
+                format!("✓ updated session {session_id}"),
+                Style::default().fg(Color::Green),
+            )),
+            Ok(response) => self.push(Line::styled(
+                format!("session update failed with HTTP {}", response.status()),
+                Style::default().fg(Color::Yellow),
+            )),
+            Err(error) => self.push(Line::styled(
+                format!("session update failed: {error}"),
+                Style::default().fg(Color::Yellow),
+            )),
+        }
+    }
+
+    pub(crate) async fn delete_session(&mut self, session_id: &str) {
+        if !valid_session_id(session_id) {
+            self.push(Line::styled(
+                "invalid session id",
+                Style::default().fg(Color::Yellow),
+            ));
+            return;
+        }
+        let (Some(config), Some(client)) = (&self.sync_config, &self.sync_http) else {
+            self.push(Line::styled("session catalog is unavailable", dim()));
+            return;
+        };
+        match client
+            .delete(format!("{}/hi/sessions/{session_id}", config.base_url))
+            .header("x-api-key", &config.api_key)
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => self.push(Line::styled(
+                format!("✓ permanently deleted session {session_id}"),
+                Style::default().fg(Color::Green),
+            )),
+            Ok(response) => self.push(Line::styled(
+                format!("session delete failed with HTTP {}", response.status()),
+                Style::default().fg(Color::Yellow),
+            )),
+            Err(error) => self.push(Line::styled(
+                format!("session delete failed: {error}"),
+                Style::default().fg(Color::Yellow),
+            )),
+        }
+    }
+
     /// `/attach <session-id>` — attach to a running session as a viewer.
     ///
     /// In the TUI, this prints a notice that attach mode runs in a separate
@@ -473,7 +633,15 @@ impl crate::App {
             ));
             completion.push(crate::LocalSessionInfo { title, ..session });
         }
+        let mut last_project = None::<&str>;
         for session in synced.iter().filter(|session| !seen.contains(&session.id)) {
+            if last_project != Some(session.project.as_str()) {
+                self.push(Line::styled(
+                    format!("  project {}", session.project),
+                    dim(),
+                ));
+                last_project = Some(&session.project);
+            }
             let marker = if self.sync_session_id.as_deref() == Some(session.id.as_str()) {
                 "●"
             } else {
@@ -481,13 +649,15 @@ impl crate::App {
             };
             self.push(Line::styled(
                 format!(
-                    "  {marker} {}{}  · /sessions switch {}",
+                    "  {marker} {}{}{}{}  · /sessions switch {}",
                     session.id,
                     if session.title.is_empty() {
                         String::new()
                     } else {
                         format!(": {}", session.title)
                     },
+                    if session.favorite { " ★" } else { "" },
+                    if session.archived { " [archived]" } else { "" },
                     session.id
                 ),
                 dim(),
@@ -499,6 +669,23 @@ impl crate::App {
                 lines: session.records as usize,
             });
         }
+        self.session_catalog_flags = synced
+            .iter()
+            .map(|session| (session.id.clone(), (session.favorite, session.archived)))
+            .collect();
+        let ids = completion
+            .iter()
+            .map(|session| session.id.clone())
+            .collect::<Vec<_>>();
+        self.picker = Some(ModelPicker::new(
+            ids,
+            self.sync_session_id.as_deref().unwrap_or_default(),
+            std::collections::HashMap::new(),
+            &self.served,
+        ));
+        self.session_picker = true;
+        self.session_picker_searching = false;
+        self.session_delete_pending = None;
         self.session_completion_cache = completion;
 
         if let Err(err) = synced_result {
@@ -519,30 +706,57 @@ impl crate::App {
         };
 
         let url = format!("{}/hi/sessions", config.base_url);
-        let response = client
-            .get(&url)
-            .header("x-api-key", &config.api_key)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("fetch failed: {e}"))?;
-
-        if !response.status().is_success() {
-            anyhow::bail!("HTTP {}", response.status());
+        let mut cursor: Option<String> = None;
+        let mut sessions = Vec::new();
+        loop {
+            let mut request = client
+                .get(&url)
+                .header("x-api-key", &config.api_key)
+                .query(&[("limit", "100")]);
+            if let Some(value) = &cursor {
+                request = request.query(&[("cursor", value)]);
+            }
+            let response = request
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("fetch failed: {e}"))?;
+            if !response.status().is_success() {
+                anyhow::bail!("HTTP {}", response.status());
+            }
+            let body: serde_json::Value = response.json().await?;
+            sessions.extend(
+                body["sessions"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|session| {
+                        Some(SyncedSessionInfo {
+                            id: session["session_id"].as_str()?.to_string(),
+                            title: session["title"].as_str().unwrap_or("").to_string(),
+                            status: session["status"].as_str().unwrap_or("saved").to_string(),
+                            records: session["record_count"].as_u64().unwrap_or(0),
+                            project: session["project_fingerprint"]
+                                .as_str()
+                                .map(|value| value.chars().take(8).collect())
+                                .unwrap_or_else(|| "local".to_string()),
+                            favorite: session["favorite"].as_bool().unwrap_or(false),
+                            archived: !session["archived_at_unix"].is_null(),
+                        })
+                    }),
+            );
+            if !body["has_more"].as_bool().unwrap_or(false) {
+                break;
+            }
+            cursor = body["next_cursor"].as_str().map(str::to_string);
+            if cursor.is_none() {
+                break;
+            }
         }
-
-        let body: serde_json::Value = response.json().await?;
-        Ok(body["sessions"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|session| {
-                Some(SyncedSessionInfo {
-                    id: session["session_id"].as_str()?.to_string(),
-                    title: session["title"].as_str().unwrap_or("").to_string(),
-                    status: session["status"].as_str().unwrap_or("saved").to_string(),
-                    records: session["record_count"].as_u64().unwrap_or(0),
-                })
-            })
-            .collect())
+        sessions.sort_by(|a, b| {
+            a.project
+                .cmp(&b.project)
+                .then_with(|| b.favorite.cmp(&a.favorite))
+        });
+        Ok(sessions)
     }
 }
