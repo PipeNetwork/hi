@@ -457,6 +457,13 @@ mod native {
             eps: f32,
             stream: *mut c_void,
         ) -> c_int;
+        fn hi_cuda_launch_dsv4_add_broadcast(
+            dst: *mut c_void,
+            src: *const c_void,
+            n: c_int,
+            embed: c_int,
+            stream: *mut c_void,
+        ) -> c_int;
         fn hi_cuda_launch_dsv4_q_prep(
             q: *mut c_void,
             heads: c_int,
@@ -3032,6 +3039,32 @@ mod native {
             )
         })?;
         check_last_error("hi_cuda_launch_dsv4_rms_exact")
+    }
+
+    /// Broadcast add over `n` streams: `dst[s*embed + i] += src[i]` — the MTP
+    /// draft input combine's `h += e`, single-rounded per element like the
+    /// host loop. Grid-strided over all n*embed elements.
+    pub fn launch_dsv4_add_broadcast(
+        dst: &DeviceBuffer,
+        src: &DeviceBuffer,
+        n: usize,
+        embed: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        ensure_len(n, "dsv4 add broadcast n")?;
+        ensure_len(embed, "dsv4 add broadcast embed")?;
+        require_f32_capacity(dst, n * embed, "dsv4 add broadcast dst")?;
+        require_f32_capacity(src, embed, "dsv4 add broadcast src")?;
+        launch_status(unsafe {
+            hi_cuda_launch_dsv4_add_broadcast(
+                dst.as_mut_ptr(),
+                src.as_ptr(),
+                n as c_int,
+                embed as c_int,
+                stream.as_raw(),
+            )
+        })?;
+        check_last_error("hi_cuda_launch_dsv4_add_broadcast")
     }
 
     /// Per-head unweighted q RMS + forward rope tail, in place. `rope` points

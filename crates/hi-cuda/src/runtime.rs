@@ -105,6 +105,7 @@ mod imp {
         fn cudaEventCreateWithFlags(event: *mut CudaEvent, flags: c_int) -> CudaError;
         fn cudaEventRecord(event: CudaEvent, stream: CudaStream) -> CudaError;
         fn cudaEventSynchronize(event: CudaEvent) -> CudaError;
+        fn cudaEventElapsedTime(ms: *mut f32, start: CudaEvent, end: CudaEvent) -> CudaError;
         fn cudaEventDestroy(event: CudaEvent) -> CudaError;
         fn cudaHostAlloc(ptr: *mut *mut c_void, size: usize, flags: c_uint) -> CudaError;
         fn cudaFreeHost(ptr: *mut c_void) -> CudaError;
@@ -784,6 +785,30 @@ mod imp {
                 unsafe { cudaEventSynchronize(self.raw) },
                 "cudaEventSynchronize",
             )
+        }
+
+        /// A TIMING-capable event (the default [`Event::create`] disables
+        /// timing for cheaper cross-stream ordering). Only pairs of timing
+        /// events measure elapsed device time.
+        pub fn create_timing() -> Result<Self> {
+            let mut raw = ptr::null_mut();
+            cuda_check(
+                unsafe { cudaEventCreateWithFlags(&mut raw, 0) },
+                "cudaEventCreateWithFlags(timing)",
+            )?;
+            Ok(Self { raw })
+        }
+
+        /// Milliseconds of device time between this (start) event and `end`,
+        /// both recorded with timing enabled and already completed (the
+        /// caller synchronizes `end` first).
+        pub fn elapsed_ms(&self, end: &Event) -> Result<f32> {
+            let mut ms = 0.0f32;
+            cuda_check(
+                unsafe { cudaEventElapsedTime(&mut ms, self.raw, end.raw) },
+                "cudaEventElapsedTime",
+            )?;
+            Ok(ms)
         }
     }
 

@@ -171,7 +171,37 @@ pub(crate) trait DsV4Linear {
     {
         None
     }
+
+    /// Wave-3 hook: serve a whole verify/re-feed CHUNK of up to
+    /// [`DSV4_DEVICE_VERIFY_CAP`] tokens device-side — the S>1 analog of
+    /// [`DsV4Linear::try_device_step`], with the same contract per position:
+    /// `want_logits` returns one logits row per token (bit-exact with running
+    /// [`DsV4Engine::host_step`] over the same tokens — the speculative
+    /// losslessness requirement), `state` advances over every token exactly
+    /// as sequential host steps would, `taps` (when given) captures the same
+    /// rows a tapped host step would, and `state` is untouched on error.
+    /// `want_logits = false` is the rewind re-feed form (no output heads).
+    /// `None` declines to the host chunk path.
+    fn try_device_verify(
+        &self,
+        _engine: &DsV4Engine<Self>,
+        _state: &mut DsV4State,
+        _tokens: &[u32],
+        _taps: Option<&mut DsV4Taps>,
+        _want_logits: bool,
+    ) -> Option<Result<Vec<Vec<f32>>>>
+    where
+        Self: Sized,
+    {
+        None
+    }
 }
+
+/// Maximum tokens per [`DsV4Linear::try_device_verify`] chunk. Sized for the
+/// largest verify the spec loop issues (pending + K drafts, K <= 7 for
+/// DFlash/DSpark block drafters); the GPU provider's chunk arena carries this
+/// many per-position slots. Longer verifies loop chunks of this size.
+pub(crate) const DSV4_DEVICE_VERIFY_CAP: usize = 8;
 
 /// The CPU-oracle [`DsV4Linear`]: every matrix stays as raw GGUF bytes in the
 /// shared mmap and is dequantized transiently per use, in row chunks.
@@ -526,13 +556,18 @@ pub(crate) struct DsV4State {
     /// Wave-2 Stage 2b: identity of the GPU-resident copy of this state.
     /// 0 = never device-mirrored. A device decode step whose provider-side
     /// device state carries the same (tag, pos) continues device-resident
-    /// without re-uploading; any mismatch (host prefill advanced the state,
-    /// truncation rewound it, a different conversation's state) forces a full
-    /// host→device restore under a fresh tag. Host-side content is ALWAYS
-    /// authoritative — the device step downloads its per-step state delta and
-    /// replays it into these host vectors before returning, so cloning a
-    /// state (prefix-cache snapshots) is valid at any time. Clones carry the
-    /// tag; that is sound because equal (tag, pos) implies equal content.
+    /// without re-uploading; a forward host mutation (host_step /
+    /// step_chunk_heads, prefill, snapshot resume onto other content) zeroes
+    /// the tag and forces a full host→device restore under a fresh tag.
+    /// Host-side content is ALWAYS authoritative — the device step downloads
+    /// its per-step state delta and replays it into these host vectors before
+    /// returning, so cloning a state (prefix-cache snapshots) is valid at any
+    /// time. The lineage invariant: any state carrying tag T at position p is
+    /// bit-identical to the tag-T device trajectory's prefix at p. Clones
+    /// share the tag (equal content); truncation keeps it (exact prefix
+    /// reconstruction) and the provider then either ADOPTS the rewind
+    /// device-side — re-tagging both sides fresh, so a divergent sibling
+    /// clone at the old (tag, pos) can never false-match — or restores.
     #[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
     pub(crate) device_tag: u64,
 }
@@ -780,7 +815,7 @@ impl DsV4Taps {
         }
     }
 
-    fn wants_layer(&self, layer: usize) -> bool {
+    pub(crate) fn wants_layer(&self, layer: usize) -> bool {
         self.config.aux_layers.binary_search(&layer).is_ok()
     }
 
@@ -796,9 +831,26 @@ impl DsV4Taps {
         }
     }
 
+    /// [`Self::push_layer_row`] from an already-flat (hc*embed) row — the GPU
+    /// device-verify path captures rows as flat device copies, so it feeds
+    /// them back without a streams round-trip. Identical layout and order.
+    pub(crate) fn push_layer_row_flat(&mut self, layer: usize, flat: &[f32]) {
+        if let Ok(group) = self.config.aux_layers.binary_search(&layer) {
+            self.aux[group].push(flat.to_vec());
+        }
+    }
+
+    /// [`Self::push_pre_head_row`] from an already-flat row (see
+    /// [`Self::push_layer_row_flat`]).
+    pub(crate) fn push_pre_head_row_flat(&mut self, flat: &[f32]) {
+        if self.config.pre_hc_head {
+            self.pre_hc_head.push(flat.to_vec());
+        }
+    }
+
     /// Advance the captured-row counter after a forward pass captured `n` new
     /// positions into every enabled group.
-    fn note_positions(&mut self, n: usize) {
+    pub(crate) fn note_positions(&mut self, n: usize) {
         self.captured += n;
         debug_assert!(!self.config.pre_hc_head || self.pre_hc_head.len() == self.captured);
         debug_assert!(self.aux.iter().all(|group| group.len() == self.captured));
@@ -1296,9 +1348,32 @@ impl<L: DsV4Linear> DsV4Engine<L> {
             bail!("DeepSeek-V4 verify requires at least one token");
         }
         let _exact = ExactBatchingGuard::new(&self.linear);
-        let chunk = self.prefill_chunk.max(1);
         let mut rows = Vec::with_capacity(tokens.len());
-        for piece in tokens.chunks(chunk) {
+        // Wave-3 device-sequenced verify: serve the call in device chunks of
+        // up to DSV4_DEVICE_VERIFY_CAP tokens (bit-exact with the host path
+        // below by contract). Support is static per provider/env/tap-config,
+        // so the first decline routes the remainder through the host chunk
+        // path; chunking is semantically invisible either way (the state
+        // machine is sequential across chunk boundaries).
+        let mut offset = 0;
+        while offset < tokens.len() {
+            let take = (tokens.len() - offset).min(DSV4_DEVICE_VERIFY_CAP);
+            match self.linear.try_device_verify(
+                self,
+                state,
+                &tokens[offset..offset + take],
+                taps.as_deref_mut(),
+                true,
+            ) {
+                Some(result) => {
+                    rows.extend(result?);
+                    offset += take;
+                }
+                None => break,
+            }
+        }
+        let chunk = self.prefill_chunk.max(1);
+        for piece in tokens[offset..].chunks(chunk) {
             rows.extend(self.step_chunk_heads(
                 state,
                 piece,
@@ -1337,7 +1412,6 @@ impl<L: DsV4Linear> DsV4Engine<L> {
         // Re-fed suffixes must reproduce the sequential state exactly, so the
         // provider stays pinned to exact batching here too (see verify_tokens).
         let _exact = ExactBatchingGuard::new(&self.linear);
-        let chunk = self.prefill_chunk.max(1);
         if state.pos > target {
             match self.truncate_state_to_at_most(state, target) {
                 Some(position) if position == target => {}
@@ -1352,9 +1426,7 @@ impl<L: DsV4Linear> DsV4Engine<L> {
                             taps.truncate(position);
                         }
                     }
-                    for piece in tokens[position..target].chunks(chunk) {
-                        self.step_chunk_heads(state, piece, ChunkHeads::None, taps.as_deref_mut())?;
-                    }
+                    self.refeed_chunks(state, &tokens[position..target], taps.as_deref_mut())?;
                 }
                 None => {
                     *state = self.new_state_with_ring_slack(state.ring_slack);
@@ -1363,9 +1435,7 @@ impl<L: DsV4Linear> DsV4Engine<L> {
                         // buffer re-captures from 0 whatever its old base was.
                         taps.rebase(0);
                     }
-                    for piece in tokens[..target].chunks(chunk) {
-                        self.step_chunk_heads(state, piece, ChunkHeads::None, taps.as_deref_mut())?;
-                    }
+                    self.refeed_chunks(state, &tokens[..target], taps.as_deref_mut())?;
                 }
             }
         }
@@ -1373,6 +1443,41 @@ impl<L: DsV4Linear> DsV4Engine<L> {
             taps.truncate(target);
         }
         debug_assert_eq!(state.pos, target);
+        Ok(())
+    }
+
+    /// Feed a rewind's rounded-off suffix back through the exact chunk
+    /// machinery, headless. The device chunk path serves it when available
+    /// (keeping the whole rewind device-resident — no restore on the next
+    /// device step); the first decline falls to the host chunk path, exactly
+    /// the pre-Wave-3 behavior. The caller holds the exact-batching guard.
+    fn refeed_chunks(
+        &self,
+        state: &mut DsV4State,
+        tokens: &[u32],
+        mut taps: Option<&mut DsV4Taps>,
+    ) -> Result<()> {
+        let mut offset = 0;
+        while offset < tokens.len() {
+            let take = (tokens.len() - offset).min(DSV4_DEVICE_VERIFY_CAP);
+            match self.linear.try_device_verify(
+                self,
+                state,
+                &tokens[offset..offset + take],
+                taps.as_deref_mut(),
+                false,
+            ) {
+                Some(result) => {
+                    result?;
+                    offset += take;
+                }
+                None => break,
+            }
+        }
+        let chunk = self.prefill_chunk.max(1);
+        for piece in tokens[offset..].chunks(chunk) {
+            self.step_chunk_heads(state, piece, ChunkHeads::None, taps.as_deref_mut())?;
+        }
         Ok(())
     }
 
@@ -1894,8 +1999,15 @@ impl<L: DsV4Linear> DsV4Engine<L> {
             .map(|back| target - back)
             .find(|&candidate| candidate > 0 && self.truncation_feasible(state, candidate))?;
         let drop = state.pos - position;
-        // Host-side mutation: sever any device-state link (see host_step).
-        state.device_tag = 0;
+        // Truncation deliberately KEEPS the device tag: it reconstructs an
+        // exact PREFIX of the tag's trajectory (bit-exact contract), so the
+        // lineage invariant on `device_tag` still holds at the new position.
+        // The provider sees (tag, pos < dev.pos) and either adopts the rewind
+        // device-side under a FRESH tag (cheap — the spec loop's per-verify
+        // rollback) or falls back to a full restore; content can never go
+        // stale because adoption re-tags and every other state holding the
+        // old (tag, pos) pair mismatches afterwards. Forward host mutations
+        // (host_step / step_chunk_heads) still zero the tag.
         for (layer, layer_state) in self.layers.iter().zip(&mut state.layers) {
             let keep = layer_state.ring.len().saturating_sub(drop);
             layer_state.ring.truncate(keep);
@@ -3384,7 +3496,7 @@ pub(crate) mod fixture {
     /// head_dim 8 (nope 4 + rope 4), q_lora 4, grouped output 2x4, 4 experts
     /// top-2 (ff 4) + 1 shared, sliding window 4, indexer top_k 1, vocab 3.
     pub(crate) fn write_deepseek4_gguf(path: &Path) {
-        write_deepseek4_gguf_core(path, false);
+        write_deepseek4_gguf_core(path, false, 64);
     }
 
     /// Speculative-decoding fixture variant: vocab 4 (`a b c d`) with eos on
@@ -3396,10 +3508,20 @@ pub(crate) mod fixture {
     // Consumed by the native-cuda backend's oracle suites only.
     #[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
     pub(crate) fn write_deepseek4_spec_gguf(path: &Path) {
-        write_deepseek4_gguf_core(path, true);
+        write_deepseek4_gguf_core(path, true, 64);
     }
 
-    fn write_deepseek4_gguf_core(path: &Path, spec_decode: bool) {
+    /// [`write_deepseek4_gguf`] with an enlarged `deepseek4.context_length`,
+    /// so long-context regimes (positions past the real model's 2048-token
+    /// indexer-engagement boundary; hundreds of compressed blocks) run on
+    /// fixture-scale weights. Same tensors, same tiny dims.
+    // Consumed by the native-cuda device-verify long-context gate only.
+    #[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
+    pub(crate) fn write_deepseek4_gguf_with_context(path: &Path, context: u32) {
+        write_deepseek4_gguf_core(path, false, context);
+    }
+
+    fn write_deepseek4_gguf_core(path: &Path, spec_decode: bool, context: u32) {
         let vocab: usize = if spec_decode { 4 } else { 3 };
         let mut tensors = vec![
             tensor_f32(
@@ -3605,7 +3727,7 @@ pub(crate) mod fixture {
         meta.string("general.name", "cpu-reference-deepseek4");
         meta.u32("general.alignment", 32);
         meta.u32("general.file_type", 1);
-        meta.u32("deepseek4.context_length", 64);
+        meta.u32("deepseek4.context_length", context);
         meta.u32("deepseek4.embedding_length", 4);
         meta.u32("deepseek4.block_count", 3);
         meta.u32("deepseek4.attention.head_count", 2);

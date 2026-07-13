@@ -1818,6 +1818,99 @@ __device__ float dsv4_sumsq_serial(const float* __restrict__ x, int n) {
   return acc;
 }
 
+// Per-warp staging width for the warp-cooperative serial folds below (each
+// warp needs 2 * this many floats of shared memory, double-buffered).
+constexpr int DSV4_WARP_FOLD_CHUNK = 128;
+
+// `dsv4_dot_serial` with WARP-cooperative loads: the lanes stage a chunk of
+// products into shared memory with coalesced reads (and prefetch the next
+// chunk while folding the current one), then every lane folds the staged
+// chunk in element order — a pure dependent __fadd_rn chain (~4 cy/element)
+// over shared memory instead of a single thread's serial DRAM walk (~35
+// cy/element on the 64 KB hyper-connection mixer rows). The accumulation is
+// the IDENTICAL ((0 + p0) + p1) + ... chain of singly-rounded ops as the
+// host dot — only the load schedule changes, so the result is bit-exact.
+// All 32 lanes must be active/converged; every lane returns the same value.
+// `s_stage` is this warp's [2 * DSV4_WARP_FOLD_CHUNK] staging slice.
+__device__ float dsv4_dot_serial_warp(
+    const float* __restrict__ a, const float* __restrict__ b, int n,
+    float* __restrict__ s_stage) {
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  float acc = 0.0f;
+  const int chunks = n / DSV4_WARP_FOLD_CHUNK;
+  if (chunks > 0) {
+    for (int k = lane; k < DSV4_WARP_FOLD_CHUNK; k += 32) {
+      s_stage[k] = __fmul_rn(a[k], b[k]);
+    }
+  }
+  __syncwarp();
+  for (int c = 0; c < chunks; ++c) {
+    const int buf = (c & 1) * DSV4_WARP_FOLD_CHUNK;
+    if (c + 1 < chunks) {
+      const int nbuf = ((c + 1) & 1) * DSV4_WARP_FOLD_CHUNK;
+      const int next = (c + 1) * DSV4_WARP_FOLD_CHUNK;
+      for (int k = lane; k < DSV4_WARP_FOLD_CHUNK; k += 32) {
+        s_stage[nbuf + k] = __fmul_rn(a[next + k], b[next + k]);
+      }
+    }
+    // Fold the staged chunk in order. float4 reads (the stage slices are
+    // 16-byte aligned) let the compiler prefetch operands into registers,
+    // so the chain runs at fadd latency instead of shared-load latency.
+    #pragma unroll
+    for (int j = 0; j < DSV4_WARP_FOLD_CHUNK; j += 4) {
+      const float4 v = *reinterpret_cast<const float4*>(&s_stage[buf + j]);
+      acc = __fadd_rn(acc, v.x);
+      acc = __fadd_rn(acc, v.y);
+      acc = __fadd_rn(acc, v.z);
+      acc = __fadd_rn(acc, v.w);
+    }
+    __syncwarp();
+  }
+  for (int i = chunks * DSV4_WARP_FOLD_CHUNK; i < n; ++i) {
+    acc = __fadd_rn(acc, __fmul_rn(a[i], b[i]));
+  }
+  return acc;
+}
+
+// `dsv4_sumsq_serial` with warp-cooperative loads (see dsv4_dot_serial_warp).
+__device__ float dsv4_sumsq_serial_warp(
+    const float* __restrict__ x, int n, float* __restrict__ s_stage) {
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  float acc = 0.0f;
+  const int chunks = n / DSV4_WARP_FOLD_CHUNK;
+  if (chunks > 0) {
+    for (int k = lane; k < DSV4_WARP_FOLD_CHUNK; k += 32) {
+      const float v = x[k];
+      s_stage[k] = __fmul_rn(v, v);
+    }
+  }
+  __syncwarp();
+  for (int c = 0; c < chunks; ++c) {
+    const int buf = (c & 1) * DSV4_WARP_FOLD_CHUNK;
+    if (c + 1 < chunks) {
+      const int nbuf = ((c + 1) & 1) * DSV4_WARP_FOLD_CHUNK;
+      const int next = (c + 1) * DSV4_WARP_FOLD_CHUNK;
+      for (int k = lane; k < DSV4_WARP_FOLD_CHUNK; k += 32) {
+        const float v = x[next + k];
+        s_stage[nbuf + k] = __fmul_rn(v, v);
+      }
+    }
+    #pragma unroll
+    for (int j = 0; j < DSV4_WARP_FOLD_CHUNK; j += 4) {
+      const float4 v = *reinterpret_cast<const float4*>(&s_stage[buf + j]);
+      acc = __fadd_rn(acc, v.x);
+      acc = __fadd_rn(acc, v.y);
+      acc = __fadd_rn(acc, v.z);
+      acc = __fadd_rn(acc, v.w);
+    }
+    __syncwarp();
+  }
+  for (int i = chunks * DSV4_WARP_FOLD_CHUNK; i < n; ++i) {
+    acc = __fadd_rn(acc, __fmul_rn(x[i], x[i]));
+  }
+  return acc;
+}
+
 // Host `(sum / n + eps).sqrt().recip()` verbatim (each op singly rounded).
 __device__ __forceinline__ float dsv4_rms_inv(float sumsq, int n, float eps) {
   const float mean = __fdiv_rn(sumsq, static_cast<float>(n));
@@ -1935,12 +2028,27 @@ __global__ void dsv4_hc_pre_kernel(
   float* s_comb = s_post + n;
   float* s_inv = s_comb + n * n;
   const int flat = n * embed;
-  if (threadIdx.x == 0) {
-    s_inv[0] = dsv4_rms_inv(dsv4_sumsq_serial(streams, flat), flat, rms_eps);
+  // Warp 0: the flat-streams sum of squares; warps 1..: one mixer-row dot
+  // each (strided when rows exceed the warps). Every fold is the host chain
+  // in element order — only the loads are warp-parallel.
+  const int warp = static_cast<int>(threadIdx.x) >> 5;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warps = static_cast<int>(blockDim.x) >> 5;
+  // Per-warp fold staging, 16-byte aligned for the float4 fold reads.
+  const int stage_off = ((rows + 2 * n + n * n + 2) + 3) & ~3;
+  float* s_stage = shm + stage_off + warp * 2 * DSV4_WARP_FOLD_CHUNK;
+  if (warp == 0) {
+    const float ss = dsv4_sumsq_serial_warp(streams, flat, s_stage);
+    if (lane == 0) {
+      s_inv[0] = dsv4_rms_inv(ss, flat, rms_eps);
+    }
   }
-  const int r = static_cast<int>(threadIdx.x) - 32;
-  if (r >= 0 && r < rows) {
-    s_mixes[r] = dsv4_dot_serial(func + static_cast<long>(r) * flat, streams, flat);
+  for (int r = warp - 1; r >= 0 && r < rows; r += warps - 1) {
+    const float d =
+        dsv4_dot_serial_warp(func + static_cast<long>(r) * flat, streams, flat, s_stage);
+    if (lane == 0) {
+      s_mixes[r] = d;
+    }
   }
   __syncthreads();
   if (threadIdx.x == 0) {
@@ -2024,8 +2132,11 @@ __global__ void dsv4_hc_pre_kernel(
     return;
   }
   __syncthreads();
-  if (threadIdx.x == 0) {
-    s_inv[1] = dsv4_rms_inv(dsv4_sumsq_serial(y, embed), embed, rms_eps);
+  if (warp == 0) {
+    const float ss = dsv4_sumsq_serial_warp(y, embed, s_stage);
+    if (lane == 0) {
+      s_inv[1] = dsv4_rms_inv(ss, embed, rms_eps);
+    }
   }
   __syncthreads();
   const float y_inv = s_inv[1];
@@ -2043,11 +2154,19 @@ extern "C" int hi_cuda_launch_dsv4_hc_pre(
       rows <= 0 || stream == nullptr) {
     return 1;
   }
-  const int block = 32 + rows > 256 ? 1024 : 256;
-  if (32 + rows > block) {
-    return 1;
+  // One warp for the streams sumsq + one per mixer row (rows stride when
+  // they exceed 31), at least 8 warps so the y collapse keeps parallelism.
+  int warps = rows + 1;
+  if (warps < 8) {
+    warps = 8;
   }
-  const size_t shmem = static_cast<size_t>(rows + 2 * n + n * n + 2) * sizeof(float);
+  if (warps > 32) {
+    warps = 32;
+  }
+  const int block = warps * 32;
+  const size_t shmem = static_cast<size_t>((((rows + 2 * n + n * n + 2) + 3) & ~3) +
+                                           warps * 2 * DSV4_WARP_FOLD_CHUNK) *
+                       sizeof(float);
   dsv4_hc_pre_kernel<<<1, block, shmem, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const float*>(streams), static_cast<const float*>(func),
       static_cast<const float*>(base), static_cast<const float*>(scale),
@@ -2118,6 +2237,31 @@ extern "C" int hi_cuda_launch_dsv4_rms_exact(
   }
   dsv4_rms_exact_kernel<<<1, 256, 0, static_cast<cudaStream_t>(stream)>>>(
       static_cast<float*>(x), static_cast<const float*>(weight), n, eps);
+  return 0;
+}
+
+// Broadcast add for the MTP draft input combine: dst[s*embed + i] +=
+// src[i] for every hc stream s — the host path's single-rounded `h += e`
+// per element, grid-strided over all n*embed elements.
+__global__ void dsv4_add_broadcast_kernel(
+    float* __restrict__ dst, const float* __restrict__ src, int n, int embed) {
+  const long total = static_cast<long>(n) * embed;
+  for (long idx = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x; idx < total;
+       idx += static_cast<long>(gridDim.x) * blockDim.x) {
+    dst[idx] = __fadd_rn(dst[idx], src[idx % embed]);
+  }
+}
+
+extern "C" int hi_cuda_launch_dsv4_add_broadcast(
+    void* dst, const void* src, int n, int embed, void* stream) {
+  if (dst == nullptr || src == nullptr || n <= 0 || embed <= 0 || stream == nullptr) {
+    return 1;
+  }
+  const long total = static_cast<long>(n) * embed;
+  dim3 block(256);
+  dim3 grid(static_cast<unsigned int>((total + block.x - 1) / block.x));
+  dsv4_add_broadcast_kernel<<<grid, block, 0, static_cast<cudaStream_t>(stream)>>>(
+      static_cast<float*>(dst), static_cast<const float*>(src), n, embed);
   return 0;
 }
 
@@ -2577,12 +2721,26 @@ __global__ void dsv4_hyper_head_kernel(
   float* s_w = shm;          // [n]
   float* s_inv = s_w + n;    // [1]
   const int flat = n * embed;
-  if (threadIdx.x == 0) {
-    s_inv[0] = dsv4_rms_inv(dsv4_sumsq_serial(streams, flat), flat, rms_eps);
+  // Warp-cooperative folds (see dsv4_hc_pre_kernel): warp 0 the sumsq,
+  // warps 1.. the mixer-row dots — identical fold order, parallel loads.
+  const int warp = static_cast<int>(threadIdx.x) >> 5;
+  const int lane = static_cast<int>(threadIdx.x) & 31;
+  const int warps = static_cast<int>(blockDim.x) >> 5;
+  // Per-warp fold staging, 16-byte aligned for the float4 fold reads.
+  const int stage_off = ((n + 1) + 3) & ~3;
+  float* s_stage = shm + stage_off + warp * 2 * DSV4_WARP_FOLD_CHUNK;
+  if (warp == 0) {
+    const float ss = dsv4_sumsq_serial_warp(streams, flat, s_stage);
+    if (lane == 0) {
+      s_inv[0] = dsv4_rms_inv(ss, flat, rms_eps);
+    }
   }
-  const int r = static_cast<int>(threadIdx.x) - 32;
-  if (r >= 0 && r < n) {
-    s_w[r] = dsv4_dot_serial(func + static_cast<long>(r) * flat, streams, flat);
+  for (int r = warp - 1; r >= 0 && r < n; r += warps - 1) {
+    const float d =
+        dsv4_dot_serial_warp(func + static_cast<long>(r) * flat, streams, flat, s_stage);
+    if (lane == 0) {
+      s_w[r] = d;
+    }
   }
   __syncthreads();
   if (threadIdx.x == 0) {
@@ -2609,7 +2767,11 @@ extern "C" int hi_cuda_launch_dsv4_hyper_head(
       embed <= 0 || 32 + n > 256 || stream == nullptr) {
     return 1;
   }
-  const size_t shmem = static_cast<size_t>(n + 1) * sizeof(float);
+  // 8 warps: warp 0 the sumsq, warps 1..7 the n mixer rows (n <= 224 by the
+  // gate above; hc is tiny in practice so rows never stride).
+  const size_t shmem = static_cast<size_t>((((n + 1) + 3) & ~3) +
+                                           8 * 2 * DSV4_WARP_FOLD_CHUNK) *
+                       sizeof(float);
   dsv4_hyper_head_kernel<<<1, 256, shmem, static_cast<cudaStream_t>(stream)>>>(
       static_cast<const float*>(streams), static_cast<const float*>(func),
       static_cast<const float*>(base), scale0, n, embed, rms_eps, hc_eps,

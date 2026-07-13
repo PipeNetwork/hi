@@ -79,6 +79,32 @@
 //!   pre-Stage-2b host path stays selectable and bit-identical); unsupported
 //!   shapes decline automatically. Counters in [`DsV4StepStats`] via
 //!   [`DeepSeekV4GpuEngine::step_stats`].
+//! - Wave-3 device-sequenced VERIFY (`try_device_verify`): a speculative
+//!   verify / rewind re-feed chunk of up to [`DSV4_DEVICE_VERIFY_CAP`] tokens
+//!   runs the Stage-2b per-token pipeline back to back entirely on-device —
+//!   the identical kernels and GEMV shapes per token, KV-ring appends between
+//!   tokens (in-chunk causality exactly like sequential steps), compressor
+//!   completions and indexer engagement per position — with ONE end-of-chunk
+//!   download carrying every position's logits, host-mirror delta, and
+//!   drafter tap rows (the chunk arena holds one position block per token;
+//!   the S=1 decode step is block 0). Bit-exactness with the host chunk path
+//!   (itself bit-exact with sequential steps) is asserted with `assert_eq`
+//!   on f32 logits at short and >2048-token contexts. Rewinds after a verify
+//!   are ADOPTED in place when every value the resumed trajectory reads is
+//!   still resident (`device_rewind_ok`; truncation keeps the device tag and
+//!   adoption re-tags both sides fresh), so the spec loop's
+//!   verify→rollback→verify cycle stays device-resident with zero restore
+//!   uploads. `HI_DSV4_DEVICE_VERIFY=0` (or `HI_DSV4_HOST_STEP=1`) falls back
+//!   to the bit-identical host chunk path.
+//! - Wave-3 device MTP draft ([`MtpDeviceDraft`]): the drafter's single-layer
+//!   forward (e/h input combine, SWA-128 latent MQA + sinks, hc, MoE over the
+//!   pool-pinned draft-layer experts, hc_head + final norm + lm head) runs as
+//!   one enqueue-only pipeline per slot with DEVICE argmax; the only per-slot
+//!   downloads are the 4-byte drafted id (when requested) and the MoE topk
+//!   readback, and the K>1 recurrence recycles the flat residual on device.
+//!   Weights arrive per call via [`MtpDraftDesc`], so DSpark's chained draft
+//!   blocks (layers 44+) reuse the machinery unchanged. `HI_DSV4_MTP_HOST=1`
+//!   keeps the host-orchestrated per-op draft path.
 //! - Prefill keeps the host-orchestrated chunked path (rayon host math +
 //!   batched heavy linears): at chunk 64 it is ~2x faster than routing prompt
 //!   tokens through sequential device steps, so retiring host attention for
@@ -111,9 +137,10 @@ use anyhow::{Context, Result, anyhow, bail};
 use hi_gguf::{GgufFile, GgufTensorType, GgufTokenizer, QwenGgufConfig, TensorInfo, TensorView};
 
 use crate::dsv4_cpu::{
-    CompressorWeights, DsV4Engine, DsV4ExpertTensors, DsV4Linear, DsV4MoeBlockCtx, DsV4State,
-    DsV4StepMirror, RawExperts, RawMatrix, TensorKey, dequantize_elem_range, host_moe_block,
-    v4_rope_sincos,
+    CompressorWeights, DSV4_DEVICE_VERIFY_CAP, DsV4Engine, DsV4ExpertTensors, DsV4Geometry,
+    DsV4Layer, DsV4Linear, DsV4MoeBlockCtx, DsV4MoeShared, DsV4State, DsV4StepMirror, DsV4Taps,
+    HcWeights, RawExperts, RawMatrix, TensorKey, dequantize_elem_range, dsv4_embed_row,
+    host_moe_block, v4_rope_sincos,
 };
 use crate::qwen_cpu::{QwenCpuRunOptions, QwenCpuRunOutput};
 use crate::runtime::{Cublas, CudaRuntime, DeviceBuffer, Event, GemmDType, PinnedBuffer, Stream};
@@ -303,10 +330,13 @@ struct PoolSlot {
     /// (roadmap item 5b); cleared (and counted as a speculative hit) the first
     /// time its layer actually re-touches it.
     spec: bool,
-    /// Permanently resident (never an eviction victim): the MTP drafter's
-    /// layer-43 slices, touched every draft. Set only by
-    /// [`DsV4GpuLinearInner::register_host_experts`], which guarantees enough
-    /// unpinned slots remain for the trunk's working set.
+    /// Permanently resident (never an eviction victim): a DRAFT layer's
+    /// slices (the MTP module as layer 43; DSpark's chained blocks as 44+),
+    /// touched every draft. Set only by
+    /// [`DsV4GpuLinearInner::register_host_experts`] — parameterized by the
+    /// draft-layer index, so any number of extra layers can register with
+    /// the same pinning semantics — which guarantees enough unpinned slots
+    /// remain for the trunk's working set.
     permanent: bool,
 }
 
@@ -749,8 +779,19 @@ pub struct DsV4StepStats {
     /// Steps declined to the host path (`HI_DSV4_HOST_STEP=1` or an
     /// unsupported model shape).
     pub host_steps: u64,
+    /// Wave-3 verify/re-feed chunks served fully device-side, and the tokens
+    /// they carried.
+    pub device_verify_chunks: u64,
+    pub device_verify_tokens: u64,
+    /// Verify chunks declined to the host chunk path
+    /// (`HI_DSV4_DEVICE_VERIFY=0`, `HI_DSV4_HOST_STEP=1`, unsupported shape,
+    /// or an over-wide tap config).
+    pub host_verify_chunks: u64,
+    /// Rewinds adopted device-side (truncated state re-tagged in place — no
+    /// restore upload). The spec loop's per-verify rollback lands here.
+    pub rewind_adoptions: u64,
     /// Full host→device state restores (fresh conversation, prefill handoff,
-    /// truncation, snapshot resume).
+    /// non-adoptable truncation, snapshot resume).
     pub restores: u64,
     /// CUDA ops enqueued by device steps (kernels, GEMVs, async copies) —
     /// none of them synchronize the host.
@@ -858,6 +899,33 @@ fn host_step_forced_from_env() -> bool {
     std::env::var("HI_DSV4_HOST_STEP").ok().as_deref() == Some("1")
 }
 
+/// `HI_DSV4_DEVICE_VERIFY=0`: decline every device verify chunk so verify
+/// and rewind re-feeds run the pre-Wave-3 host chunk path (bit-identical by
+/// contract; bisection kill switch). Default ON.
+fn device_verify_disabled_from_env() -> bool {
+    std::env::var("HI_DSV4_DEVICE_VERIFY").ok().as_deref() == Some("0")
+}
+
+/// Extra circular-ring capacity beyond the attention window on the DEVICE
+/// rings, mirroring the host ring slack's purpose: a rewind of up to this
+/// many positions can be ADOPTED in place (dev.pos moved back; stale slots
+/// are rewritten before any read — see `device_rewind_ok`), so the spec
+/// loop's per-verify rollback (<= DSV4_DEVICE_VERIFY_CAP - 1 rejected
+/// positions) never forces a full restore. Costs
+/// layers * slack * head_dim * 4 bytes (~1.4 MB on the real model).
+const DSV4_DEV_RING_SLACK: usize = 2 * DSV4_DEVICE_VERIFY_CAP;
+
+/// Aux-layer tap slots reserved per arena position block. Wide enough for
+/// DFlash's 5 aux layers with headroom; a request tapping more aux layers
+/// declines the device verify (host chunk path captures instead).
+const DSV4_MAX_TAP_LAYERS: usize = 8;
+
+/// Deepest K the device MTP draft accepts: the K>1 recurrence slots pollute
+/// k-1 ring slots past the catch-up frontier, which the ring slack must
+/// absorb before the next catch-up rewrites them (see
+/// [`MtpDeviceDraft::speculative_mark`]).
+pub(crate) const DSV4_MTP_DRAFT_MAX_K: usize = DSV4_DEV_RING_SLACK;
+
 fn upload_f32(values: &[f32], what: &str) -> Result<DeviceBuffer> {
     let buffer = DeviceBuffer::alloc(std::mem::size_of_val(values).max(4))
         .with_context(|| format!("allocating {what}"))?;
@@ -935,29 +1003,57 @@ struct DevLayerConsts {
     idx: Option<DevCompConsts>,
 }
 
-/// Fixed step-arena layout (f32 element offsets, 256-byte aligned): logits
-/// first, then per-layer mirror slots (raw-KV latent, attn-normed activation,
-/// compressor/indexer block completions). One D2H copy per step downloads the
-/// whole arena.
+/// Fixed step-arena layout (f32 element offsets, 256-byte aligned), one
+/// POSITION BLOCK per token of a device chunk (capacity
+/// [`DSV4_DEVICE_VERIFY_CAP`]; the S=1 decode step is position block 0, whose
+/// interior layout matches the original single-step arena exactly). Within a
+/// block: logits first, then per-layer mirror slots (raw-KV latent,
+/// attn-normed activation, compressor/indexer block completions), then the
+/// optional tap slots (flat hc-stream rows). Offsets below are relative to a
+/// block; position `p`'s block starts at `p * pos_stride`. ONE D2H copy per
+/// step/chunk downloads every live block.
 struct ArenaLayout {
     kv_off: Vec<usize>,
     x_off: Vec<usize>,
     comp_off: Vec<Option<(usize, usize)>>,
     idx_off: Vec<Option<(usize, usize)>>,
-    total: usize,
+    /// End of the mirror-critical slots (the no-taps download length of the
+    /// last live block).
+    core: usize,
+    /// Flat pre-hc-head tap row (hc*embed), after `core`.
+    tap_pre_off: usize,
+    /// First aux tap slot; slot g at `tap_aux_off + g * tap_stride`,
+    /// g < [`DSV4_MAX_TAP_LAYERS`].
+    tap_aux_off: usize,
+    tap_stride: usize,
+    /// Element stride between position blocks (= end of the tap slots).
+    pos_stride: usize,
+    /// Position blocks allocated (DSV4_DEVICE_VERIFY_CAP).
+    cap: usize,
 }
 
 /// Per-conversation device state.
 struct DevState {
     tag: u64,
     pos: usize,
+    /// Position of the last full host→device restore. The restore uploads
+    /// only that position's CURRENT pending block per compressor, so rewind
+    /// adoption into an EARLIER block (below `restore_pos - restore_pos %
+    /// ratio`) would read pending rows that were never uploaded.
+    restore_pos: usize,
+    /// Oldest ring position resident after the last restore
+    /// (`restore_pos - min(host ring len, ring_cap)`); adoption never reads
+    /// below it.
+    ring_floor: usize,
     layers: Vec<DevLayerState>,
 }
 
 struct DevLayerState {
-    /// Circular raw-KV ring [window, head_dim] f32; position p in slot
-    /// p % window (only the trailing window is ever attention-visible, so
-    /// the device ring ignores host-side ring slack).
+    /// Circular raw-KV ring [window + DSV4_DEV_RING_SLACK, head_dim] f32;
+    /// position p in slot p % ring_cap. Only the trailing `window` entries
+    /// are ever attention-visible; the slack entries exist so a device-side
+    /// rewind (dev.pos moved back up to ~slack positions) still finds every
+    /// window entry it needs un-clobbered.
     ring: DeviceBuffer,
     comp: Option<DevCompState>,
     idx: Option<DevCompState>,
@@ -985,6 +1081,8 @@ struct DeviceStepRes {
     o_rank: usize,
     group_features: usize,
     window: usize,
+    /// Device circular-ring capacity: window + DSV4_DEV_RING_SLACK.
+    ring_cap: usize,
     hc: usize,
     sinkhorn: usize,
     idx_heads: usize,
@@ -1140,6 +1238,22 @@ impl DsV4Linear for DsV4GpuLinear {
         token: u32,
     ) -> Option<Result<Vec<f32>>> {
         self.inner.try_device_step_impl(engine, state, token)
+    }
+
+    /// Wave-3: run a whole verify/re-feed chunk device-side (the S>1 analog
+    /// of the device step — see [`DsV4GpuLinearInner::try_device_verify_impl`]).
+    /// Declines under `HI_DSV4_DEVICE_VERIFY=0` / `HI_DSV4_HOST_STEP=1` or
+    /// for unsupported shapes; the host chunk path is bit-identical.
+    fn try_device_verify(
+        &self,
+        engine: &DsV4Engine<Self>,
+        state: &mut DsV4State,
+        tokens: &[u32],
+        taps: Option<&mut crate::dsv4_cpu::DsV4Taps>,
+        want_logits: bool,
+    ) -> Option<Result<Vec<Vec<f32>>>> {
+        self.inner
+            .try_device_verify_impl(engine, state, tokens, taps, want_logits)
     }
 
     fn moe_block(
@@ -1298,6 +1412,10 @@ pub(crate) struct DsV4GpuLinearInner {
     /// every device step so the engine runs the exact pre-Stage-2b host step.
     /// `Cell` so tests can A/B on one loaded model.
     host_step_forced: Cell<bool>,
+    /// Wave-3 kill switch (`HI_DSV4_DEVICE_VERIFY=0`): true declines every
+    /// device verify/re-feed chunk to the host chunk path (bit-identical by
+    /// contract). `Cell` so tests can A/B on one loaded model.
+    device_verify_disabled: Cell<bool>,
     /// Device-step resources, built lazily on the first step (the engine's
     /// resident matrices must be uploaded first, which happens at load).
     device_step: RefCell<Option<DeviceStepBuild>>,
@@ -1337,6 +1455,7 @@ impl DsV4GpuLinearInner {
             moe_tid2eid_tables: RefCell::new(HashMap::new()),
             moe_stats: RefCell::new(DsV4MoeBlockStats::default()),
             host_step_forced: Cell::new(host_step_forced_from_env()),
+            device_verify_disabled: Cell::new(device_verify_disabled_from_env()),
             device_step: RefCell::new(None),
             step_stats: RefCell::new(DsV4StepStats::default()),
         })
@@ -1347,12 +1466,28 @@ impl DsV4GpuLinearInner {
         *self.step_stats.borrow()
     }
 
+    /// The provider's engine stream (drafter benches time it with CUDA
+    /// events; everything the provider enqueues shares this stream).
+    #[cfg(test)]
+    pub(crate) fn stream(&self) -> &Stream {
+        &self.stream
+    }
+
     /// Force the device decode step on/off (tests only; production reads
     /// `HI_DSV4_HOST_STEP` once at construction). Off runs the exact host
-    /// step — the Stage-2b parity gate's A/B side.
+    /// step — the Stage-2b parity gate's A/B side. Also declines the Wave-3
+    /// device verify (the env switch gates both, matching production).
     #[cfg(test)]
     pub(crate) fn set_device_step_enabled(&self, enabled: bool) {
         self.host_step_forced.set(!enabled);
+    }
+
+    /// Force the Wave-3 device verify/re-feed chunks on/off (tests only;
+    /// production reads `HI_DSV4_DEVICE_VERIFY` once at construction). Off is
+    /// the exact host chunk path — the device-verify parity gate's A/B side.
+    #[cfg(test)]
+    pub(crate) fn set_device_verify_enabled(&self, enabled: bool) {
+        self.device_verify_disabled.set(!enabled);
     }
 
     /// Device MoE-block counters (see [`DsV4MoeBlockStats`]).
@@ -3086,25 +3221,78 @@ impl DsV4GpuLinearInner {
         if state.pos >= engine.geometry().context {
             return None;
         }
-        {
-            let mut guard = self.device_step.borrow_mut();
-            if guard.is_none() {
-                *guard = Some(match self.build_device_step(engine) {
-                    Ok(build) => build,
-                    Err(err) => {
-                        eprintln!(
-                            "dsv4 device step disabled (resource build failed): {err:#}; decoding stays on the host step"
-                        );
-                        DeviceStepBuild::Unsupported
-                    }
-                });
-            }
-            if matches!(guard.as_ref(), Some(DeviceStepBuild::Unsupported)) {
-                self.step_stats.borrow_mut().host_steps += 1;
-                return None;
-            }
+        if !self.ensure_device_step_built(engine) {
+            self.step_stats.borrow_mut().host_steps += 1;
+            return None;
         }
         Some(self.device_decode_step(engine, state, token))
+    }
+
+    /// Lazily build the device-step/chunk resources once; `false` means the
+    /// model shape is unsupported (reason already logged) and the caller
+    /// declines to the host path.
+    fn ensure_device_step_built(&self, engine: &DsV4Engine<DsV4GpuLinear>) -> bool {
+        let mut guard = self.device_step.borrow_mut();
+        if guard.is_none() {
+            *guard = Some(match self.build_device_step(engine) {
+                Ok(build) => build,
+                Err(err) => {
+                    eprintln!(
+                        "dsv4 device step disabled (resource build failed): {err:#}; decoding stays on the host step"
+                    );
+                    DeviceStepBuild::Unsupported
+                }
+            });
+        }
+        matches!(guard.as_ref(), Some(DeviceStepBuild::Ready(_)))
+    }
+
+    /// The [`DsV4Linear::try_device_verify`] implementation (Wave-3
+    /// device-sequenced verify): decline to the host chunk path under the
+    /// kill switches (`HI_DSV4_DEVICE_VERIFY=0`, `HI_DSV4_HOST_STEP=1`), for
+    /// unsupported model shapes or over-wide tap configs, or when the chunk
+    /// would overflow context/vocab (the host path owns those errors);
+    /// otherwise run the S tokens' full per-token pipelines entirely
+    /// device-side with ONE end-of-chunk download.
+    fn try_device_verify_impl(
+        &self,
+        engine: &DsV4Engine<DsV4GpuLinear>,
+        state: &mut DsV4State,
+        tokens: &[u32],
+        taps: Option<&mut DsV4Taps>,
+        want_logits: bool,
+    ) -> Option<Result<Vec<Vec<f32>>>> {
+        if self.host_step_forced.get() || self.device_verify_disabled.get() {
+            self.step_stats.borrow_mut().host_verify_chunks += 1;
+            return None;
+        }
+        if tokens.is_empty() || tokens.len() > DSV4_DEVICE_VERIFY_CAP {
+            return None;
+        }
+        let g = engine.geometry();
+        if state.pos + tokens.len() > g.context
+            || tokens.iter().any(|&token| (token as usize) >= g.vocab)
+        {
+            // Decline so the host chunk path raises its canonical error.
+            return None;
+        }
+        if let Some(taps) = taps.as_ref()
+            && taps.config().aux_layers.len() > DSV4_MAX_TAP_LAYERS
+        {
+            self.step_stats.borrow_mut().host_verify_chunks += 1;
+            return None;
+        }
+        if !self.ensure_device_step_built(engine) {
+            self.step_stats.borrow_mut().host_verify_chunks += 1;
+            return None;
+        }
+        let result = self.device_chunk_guarded(engine, state, tokens, want_logits, taps);
+        if result.is_ok() {
+            let mut stats = self.step_stats.borrow_mut();
+            stats.device_verify_chunks += 1;
+            stats.device_verify_tokens += tokens.len() as u64;
+        }
+        Some(result)
     }
 
     /// Build every device-step resource once: uploaded small weights, fixed
@@ -3277,7 +3465,8 @@ impl DsV4GpuLinearInner {
             },
         };
 
-        // Fixed arena layout: logits, then per-layer mirror slots.
+        // Fixed arena layout: logits, then per-layer mirror slots, then tap
+        // slots — one such block per chunk position (block 0 = the S=1 step).
         let n_layers = layers.len();
         let mut next = align_elems(g.vocab);
         let mut kv_off = Vec::with_capacity(n_layers);
@@ -3304,12 +3493,23 @@ impl DsV4GpuLinearInner {
                 (k, v)
             }));
         }
+        let core = next;
+        let tap_stride = align_elems(g.hc * g.embed);
+        let tap_pre_off = next;
+        next += tap_stride;
+        let tap_aux_off = next;
+        next += DSV4_MAX_TAP_LAYERS * tap_stride;
         let arena_layout = ArenaLayout {
             kv_off,
             x_off,
             comp_off,
             idx_off,
-            total: next,
+            core,
+            tap_pre_off,
+            tap_aux_off,
+            tap_stride,
+            pos_stride: next,
+            cap: DSV4_DEVICE_VERIFY_CAP,
         };
 
         let half = g.rope_dims / 2;
@@ -3326,6 +3526,7 @@ impl DsV4GpuLinearInner {
             o_rank: g.o_rank,
             group_features,
             window,
+            ring_cap: window + DSV4_DEV_RING_SLACK,
             hc: g.hc,
             sinkhorn: g.sinkhorn_iterations,
             idx_heads: g.idx_heads,
@@ -3357,7 +3558,10 @@ impl DsV4GpuLinearInner {
             hyper_scale0: hyper_weights.scale[0],
             output_norm: upload_f32(engine.output_norm_weights(), "dsv4 output norm")?,
             embed_src,
-            arena: alloc_dev(arena_layout.total * 4, "dsv4 step arena")?,
+            arena: alloc_dev(
+                arena_layout.pos_stride * arena_layout.cap * 4,
+                "dsv4 step arena",
+            )?,
             arena_layout,
             streams_a: alloc_dev(g.hc * g.embed * 4, "dsv4 streams A")?,
             streams_b: alloc_dev(g.hc * g.embed * 4, "dsv4 streams B")?,
@@ -3392,8 +3596,12 @@ impl DsV4GpuLinearInner {
             hyper_hidden: alloc_dev(g.embed * 4, "dsv4 hyper hidden")?,
             hyper_cast: alloc_dev(g.embed * 2, "dsv4 hyper hidden cast")?,
             // One [fwd cos|sin, inv cos|sin] block of rope_dims/2 pairs per
-            // distinct rope base, refilled per step at the step's position.
-            rope_buf: alloc_dev(rope_base_count * 4 * half.max(1) * 4, "dsv4 rope table")?,
+            // distinct rope base PER CHUNK POSITION, refilled per step/chunk
+            // at the live positions (layout [position][base][fwd|inv]).
+            rope_buf: alloc_dev(
+                DSV4_DEVICE_VERIFY_CAP * rope_base_count * 4 * half.max(1) * 4,
+                "dsv4 rope table",
+            )?,
             restore_staging: None,
             state: None,
             tag_counter: 0,
@@ -3487,7 +3695,7 @@ impl DsV4GpuLinearInner {
                     })
                 };
                 dev_layers.push(DevLayerState {
-                    ring: alloc_dev(res.window * res.head_dim * 4, "dsv4 device ring")?,
+                    ring: alloc_dev(res.ring_cap * res.head_dim * 4, "dsv4 device ring")?,
                     comp: lc.comp.as_ref().map(&alloc_comp).transpose()?,
                     idx: lc.idx.as_ref().map(&alloc_comp).transpose()?,
                 });
@@ -3495,20 +3703,25 @@ impl DsV4GpuLinearInner {
             res.state = Some(DevState {
                 tag: 0,
                 pos: 0,
+                restore_pos: 0,
+                ring_floor: 0,
                 layers: dev_layers,
             });
         }
         let dev = res.state.as_mut().expect("device state was just built");
+        let mut ring_floor = 0usize;
         for (li, host_layer) in state.layers.iter().enumerate() {
             let lc = &res.layers[li];
             let dl = &mut dev.layers[li];
-            // Raw ring: trailing min(len, window) entries into circular slots.
+            // Raw ring: trailing min(len, ring_cap) entries into circular
+            // slots (the slack beyond the window feeds rewind adoption).
             let len = host_layer.ring.len();
-            let take = len.min(res.window);
+            let take = len.min(res.ring_cap);
+            ring_floor = ring_floor.max(state.pos - take);
             if take > 0 {
                 let start_pos = state.pos - take;
-                let s0 = start_pos % res.window;
-                let first_run = take.min(res.window - s0);
+                let s0 = start_pos % res.ring_cap;
+                let first_run = take.min(res.ring_cap - s0);
                 let mut flat = Vec::with_capacity(first_run * res.head_dim);
                 for entry in host_layer.ring.iter().skip(len - take).take(first_run) {
                     if entry.len() != res.head_dim {
@@ -3594,6 +3807,11 @@ impl DsV4GpuLinearInner {
             }
         }
         dev.pos = state.pos;
+        // Adoption floors: pending rows exist only for the restore position's
+        // CURRENT block per compressor, and ring entries only for the
+        // uploaded suffix — rewind adoption never reads below either.
+        dev.restore_pos = state.pos;
+        dev.ring_floor = ring_floor;
         Ok((copies, launches))
     }
 
@@ -3688,20 +3906,41 @@ impl DsV4GpuLinearInner {
         Ok(())
     }
 
-    /// Run one decode step device-side. Any error invalidates the device
-    /// state (partially-written ring slots / pending rows), forcing the next
-    /// step to restore from the untouched host mirror.
+    /// Run one decode step device-side: a 1-token device chunk (position
+    /// block 0 of the chunk arena — the identical kernel/GEMV sequence and
+    /// addresses as the original single-step path).
     fn device_decode_step(
         &self,
         engine: &DsV4Engine<DsV4GpuLinear>,
         state: &mut DsV4State,
         token: u32,
     ) -> Result<Vec<f32>> {
-        let result = self.device_decode_step_inner(engine, state, token);
+        let mut rows =
+            self.device_chunk_guarded(engine, state, std::slice::from_ref(&token), true, None)?;
+        let logits = rows
+            .pop()
+            .ok_or_else(|| anyhow!("device step produced no logits row"))?;
+        self.step_stats.borrow_mut().device_steps += 1;
+        Ok(logits)
+    }
+
+    /// Run a device chunk (decode step or Wave-3 verify/re-feed). Any error
+    /// invalidates the device state (partially-written ring slots / pending
+    /// rows), forcing the next device call to restore from the untouched
+    /// host mirror.
+    fn device_chunk_guarded(
+        &self,
+        engine: &DsV4Engine<DsV4GpuLinear>,
+        state: &mut DsV4State,
+        tokens: &[u32],
+        want_logits: bool,
+        taps: Option<&mut DsV4Taps>,
+    ) -> Result<Vec<Vec<f32>>> {
+        let result = self.device_chunk_inner(engine, state, tokens, want_logits, taps);
         if result.is_err() {
-            // A failed step may have partially mutated device buffers (ring
-            // slot, pending rows): drain the stream so nothing still reads
-            // them, then drop the device state so the next step restores from
+            // A failed chunk may have partially mutated device buffers (ring
+            // slots, pending rows): drain the stream so nothing still reads
+            // them, then drop the device state so the next call restores from
             // the untouched host mirror.
             let _ = self.stream.synchronize();
             if let Some(DeviceStepBuild::Ready(res)) = self.device_step.borrow_mut().as_mut() {
@@ -3712,62 +3951,122 @@ impl DsV4GpuLinearInner {
         result
     }
 
-    fn device_decode_step_inner(
+    /// The device-sequenced chunk: run `tokens`' full per-token step
+    /// pipelines back to back entirely on-device — the EXACT single-step
+    /// kernel/GEMV sequence per token, KV ring appends between tokens (token
+    /// i attends to in-chunk tokens < i through the ring, exactly like
+    /// sequential steps), compressor updates at ratio boundaries, indexer
+    /// engagement past its block budget — with NO host round-trip between
+    /// tokens (the per-layer MoE topk readback + expert-pool miss uploads of
+    /// the existing pool path are the only interior syncs, identical to the
+    /// S=1 step) and ONE final download carrying every position's logits,
+    /// host-mirror delta, and tap rows.
+    fn device_chunk_inner(
         &self,
         engine: &DsV4Engine<DsV4GpuLinear>,
         state: &mut DsV4State,
-        token: u32,
-    ) -> Result<Vec<f32>> {
+        tokens: &[u32],
+        want_logits: bool,
+        mut taps: Option<&mut DsV4Taps>,
+    ) -> Result<Vec<Vec<f32>>> {
         let mut build_guard = self.device_step.borrow_mut();
         let Some(DeviceStepBuild::Ready(res)) = build_guard.as_mut() else {
             bail!("device step resources are unavailable");
         };
         let res: &mut DeviceStepRes = res;
         let stream = &self.stream;
-        let pos = state.pos;
-        if (token as usize) >= res.vocab {
-            bail!("token id {token} is outside vocab size {}", res.vocab);
+        let pos0 = state.pos;
+        let s = tokens.len();
+        if s == 0 || s > res.arena_layout.cap {
+            bail!(
+                "device chunk of {s} tokens exceeds the arena capacity {}",
+                res.arena_layout.cap
+            );
+        }
+        for &token in tokens {
+            if (token as usize) >= res.vocab {
+                bail!("token id {token} is outside vocab size {}", res.vocab);
+            }
+        }
+        // Tap groups captured this chunk (the config is normalized: sorted,
+        // deduplicated, validated against the layer count by new_taps).
+        let tap_pre = taps.as_ref().is_some_and(|taps| taps.config().pre_hc_head);
+        let tap_aux: Vec<usize> = taps
+            .as_ref()
+            .map(|taps| taps.config().aux_layers.clone())
+            .unwrap_or_default();
+        if tap_aux.len() > DSV4_MAX_TAP_LAYERS {
+            bail!(
+                "device chunk supports at most {DSV4_MAX_TAP_LAYERS} aux tap layers, got {}",
+                tap_aux.len()
+            );
         }
         let mut launches = 0u64;
         let mut syncs = 0u64;
         let mut restore_syncs = 0u64;
         let mut restored = false;
+        let mut adopted = false;
 
         // ---- Device-state currency: (tag, pos) must match the host state.
+        // A tag-matching device state AHEAD of the host position is a rewind
+        // (the spec loop's post-verify rollback, host-truncated with the tag
+        // deliberately kept): when every value the resumed trajectory reads
+        // is still resident (see `device_rewind_ok`), adopt it in place by
+        // moving the device position back — under a FRESH tag on both sides,
+        // so any divergent sibling clone still holding the old (tag, pos)
+        // mismatches and restores instead of false-matching. Anything else
+        // is a full host→device restore.
         let current = matches!(
             &res.state,
-            Some(dev) if state.device_tag != 0 && dev.tag == state.device_tag && dev.pos == pos
+            Some(dev) if state.device_tag != 0 && dev.tag == state.device_tag && dev.pos == pos0
         );
         if !current {
-            let (copies, restore_launches) = self.restore_device_state(res, state)?;
-            restore_syncs += copies;
-            launches += restore_launches;
+            let rewindable = matches!(
+                &res.state,
+                Some(dev) if state.device_tag != 0
+                    && dev.tag == state.device_tag
+                    && dev.pos > pos0
+                    && device_rewind_ok(res.window, res.ring_cap, &res.layers, dev, pos0)
+            );
             res.tag_counter += 1;
-            let dev = res.state.as_mut().expect("restore built the device state");
-            dev.tag = res.tag_counter;
-            dev.pos = pos;
+            if rewindable {
+                let dev = res.state.as_mut().expect("rewindable device state exists");
+                dev.tag = res.tag_counter;
+                dev.pos = pos0;
+                adopted = true;
+            } else {
+                let (copies, restore_launches) = self.restore_device_state(res, state)?;
+                restore_syncs += copies;
+                launches += restore_launches;
+                let dev = res.state.as_mut().expect("restore built the device state");
+                dev.tag = res.tag_counter;
+                dev.pos = pos0;
+                restored = true;
+            }
             state.device_tag = res.tag_counter;
-            restored = true;
         }
 
-        // ---- Step-start scratch growth (the stream is idle here: the
-        // previous step ended in a full sync; restore copies are blocking).
+        // ---- Chunk-start scratch growth (the stream is idle here: the
+        // previous step/chunk ended in a full sync; restore copies are
+        // blocking). Sized for the chunk's LAST position — per-token key
+        // counts only grow within the chunk.
         let layer_defs = engine.layers();
-        let n_ring = res.window.min(pos + 1);
-        let mut max_keys = n_ring;
+        let pos_end = pos0 + s - 1;
+        let n_ring_end = res.window.min(pos_end + 1);
+        let mut max_keys = n_ring_end;
         let mut max_blocks = 0usize;
         for (layer, lc) in layer_defs.iter().zip(&res.layers) {
             if let Some(consts) = &lc.comp {
-                let blocks_after = (pos + 1) / consts.ratio;
+                let blocks_after = (pos_end + 1) / consts.ratio;
                 let n_comp = if layer.indexer.is_some() && blocks_after > res.idx_top_k {
                     res.idx_top_k
                 } else {
                     blocks_after
                 };
-                max_keys = max_keys.max(n_comp + n_ring);
+                max_keys = max_keys.max(n_comp + n_ring_end);
             }
             if let Some(consts) = &lc.idx {
-                max_blocks = max_blocks.max((pos + 1) / consts.ratio);
+                max_blocks = max_blocks.max((pos_end + 1) / consts.ratio);
             }
         }
         if max_keys > res.attn_max_keys {
@@ -3789,593 +4088,1514 @@ impl DsV4GpuLinearInner {
             ensure_scratch(&mut res.idx_marks, max_blocks, "dsv4 indexer marks")?;
         }
 
-        // ---- Per-step uploads (async on the engine stream; tiny).
+        // ---- Per-chunk uploads (async on the engine stream; tiny): every
+        // live position's rope tables, laid out [position][base][fwd | inv].
         let half = res.rope_dims / 2;
+        let rope_block = 4 * half * 4;
         if res.rope_dims > 0 {
-            let mut rope_host = Vec::with_capacity(res.rope_bases.len() * 4 * half);
-            for &base in &res.rope_bases {
-                for inverse in [false, true] {
-                    let table = v4_rope_sincos(res.rope_dims, pos, base, inverse);
-                    rope_host.extend(table.iter().map(|&(_, cos)| cos));
-                    rope_host.extend(table.iter().map(|&(sin, _)| sin));
+            let mut rope_host = Vec::with_capacity(s * res.rope_bases.len() * 4 * half);
+            for i in 0..s {
+                for &base in &res.rope_bases {
+                    for inverse in [false, true] {
+                        let table = v4_rope_sincos(res.rope_dims, pos0 + i, base, inverse);
+                        rope_host.extend(table.iter().map(|&(_, cos)| cos));
+                        rope_host.extend(table.iter().map(|&(sin, _)| sin));
+                    }
                 }
             }
             res.rope_buf.copy_from_host_async(&rope_host, stream)?;
             launches += 1;
         }
 
-        // ---- Embedding gather + broadcast into the hc streams.
-        match &res.embed_src {
-            EmbedSrc::Packed { buffer, code } => {
-                crate::kernels::launch_dsv4_embed_broadcast(
-                    buffer,
-                    *code,
-                    token as usize * res.embed,
-                    res.embed,
-                    res.hc,
-                    &res.streams_a,
-                    stream,
-                )?;
-            }
-            EmbedSrc::Host { staging } => {
-                let row = engine.embed_row(token)?;
-                staging.copy_from_host_async(&row, stream)?;
-                launches += 1;
-                crate::kernels::launch_dsv4_embed_broadcast(
-                    staging,
-                    0,
-                    0,
-                    res.embed,
-                    res.hc,
-                    &res.streams_a,
-                    stream,
-                )?;
-            }
-        }
-        launches += 1;
-
-        // ---- Layers. Stream ping-pong: attn half A->B, ffn half B->A.
+        // ---- Token loop: each position's FULL pipeline, no interior syncs
+        // beyond the per-layer MoE readbacks. All launches share the engine
+        // stream, so token i's ring/compressed appends are ordered before
+        // token i+1's attention reads them.
         let resident = self.resident.borrow();
-        let dev_state = res.state.as_mut().expect("device state is current");
-        for (li, layer) in layer_defs.iter().enumerate() {
-            let lc = &res.layers[li];
-            let lstate = &mut dev_state.layers[li];
-            let rope_fwd = lc.base_idx * 4 * half * 4;
-            let rope_inv = rope_fwd + 2 * half * 4;
-            let x_off_bytes = res.arena_layout.x_off[li] * 4;
+        for (i, &token) in tokens.iter().enumerate() {
+            let pos = pos0 + i;
+            let pos_base = i * res.arena_layout.pos_stride;
+            let n_ring = res.window.min(pos + 1);
 
-            // hc_attn.pre + attn_norm, x into the arena mirror slot.
-            crate::kernels::launch_dsv4_hc_pre(
-                &res.streams_a,
-                &lc.hc_attn.func,
-                &lc.hc_attn.base,
-                &lc.hc_attn.scale,
-                Some(&lc.attn_norm),
-                res.hc,
-                res.embed,
-                lc.hc_attn.rows,
-                res.sinkhorn,
-                res.rms_eps,
-                res.hc_eps,
-                &res.arena,
-                x_off_bytes,
-                &res.post,
-                &res.comb,
-                stream,
-            )?;
+            // Embedding gather + broadcast into the hc streams.
+            match &res.embed_src {
+                EmbedSrc::Packed { buffer, code } => {
+                    crate::kernels::launch_dsv4_embed_broadcast(
+                        buffer,
+                        *code,
+                        token as usize * res.embed,
+                        res.embed,
+                        res.hc,
+                        &res.streams_a,
+                        stream,
+                    )?;
+                }
+                EmbedSrc::Host { staging } => {
+                    let row = engine.embed_row(token)?;
+                    staging.copy_from_host_async(&row, stream)?;
+                    launches += 1;
+                    crate::kernels::launch_dsv4_embed_broadcast(
+                        staging,
+                        0,
+                        0,
+                        res.embed,
+                        res.hc,
+                        &res.streams_a,
+                        stream,
+                    )?;
+                }
+            }
             launches += 1;
 
-            let x_elem = gemm_element_size(lc.x_dtype);
-            let x_in: (&DeviceBuffer, usize) = if lc.x_dtype == GemmDType::F32 {
-                (&res.arena, x_off_bytes)
-            } else {
-                self.cast_slice(
-                    lc.x_dtype,
+            // ---- Layers. Stream ping-pong: attn half A->B, ffn half B->A.
+            let dev_state = res.state.as_mut().expect("device state is current");
+            for (li, layer) in layer_defs.iter().enumerate() {
+                let lc = &res.layers[li];
+                let lstate = &mut dev_state.layers[li];
+                let rope_fwd = (i * res.rope_bases.len() + lc.base_idx) * rope_block;
+                let rope_inv = rope_fwd + 2 * half * 4;
+                let x_off_bytes = (pos_base + res.arena_layout.x_off[li]) * 4;
+
+                // hc_attn.pre + attn_norm, x into the arena mirror slot.
+                crate::kernels::launch_dsv4_hc_pre(
+                    &res.streams_a,
+                    &lc.hc_attn.func,
+                    &lc.hc_attn.base,
+                    &lc.hc_attn.scale,
+                    Some(&lc.attn_norm),
+                    res.hc,
+                    res.embed,
+                    lc.hc_attn.rows,
+                    res.sinkhorn,
+                    res.rms_eps,
+                    res.hc_eps,
                     &res.arena,
                     x_off_bytes,
-                    &res.x_cast,
-                    0,
-                    res.embed,
-                    &mut launches,
+                    &res.post,
+                    &res.comb,
+                    stream,
                 )?;
-                (&res.x_cast, 0)
-            };
+                launches += 1;
 
-            // q latent -> per-head q (+ unweighted RMS + rope).
-            self.resident_gemv_at(
-                dense_entry(&resident, &layer.q_a)?,
-                x_in.0,
-                x_in.1,
-                &res.qr,
-                0,
-            )?;
-            launches += 1;
-            crate::kernels::launch_dsv4_rms_exact(
-                &res.qr,
-                &lc.q_a_norm,
-                res.q_lora,
-                res.rms_eps,
-                stream,
-            )?;
-            launches += 1;
-            let qr_in: (&DeviceBuffer, usize) = if lc.qr_dtype == GemmDType::F32 {
-                (&res.qr, 0)
-            } else {
-                self.cast_slice(
-                    lc.qr_dtype,
+                let x_elem = gemm_element_size(lc.x_dtype);
+                let x_in: (&DeviceBuffer, usize) = if lc.x_dtype == GemmDType::F32 {
+                    (&res.arena, x_off_bytes)
+                } else {
+                    self.cast_slice(
+                        lc.x_dtype,
+                        &res.arena,
+                        x_off_bytes,
+                        &res.x_cast,
+                        0,
+                        res.embed,
+                        &mut launches,
+                    )?;
+                    (&res.x_cast, 0)
+                };
+
+                // q latent -> per-head q (+ unweighted RMS + rope).
+                self.resident_gemv_at(
+                    dense_entry(&resident, &layer.q_a)?,
+                    x_in.0,
+                    x_in.1,
                     &res.qr,
                     0,
-                    &res.qr_cast,
-                    0,
+                )?;
+                launches += 1;
+                crate::kernels::launch_dsv4_rms_exact(
+                    &res.qr,
+                    &lc.q_a_norm,
                     res.q_lora,
-                    &mut launches,
-                )?;
-                (&res.qr_cast, 0)
-            };
-            self.resident_gemv_at(
-                dense_entry(&resident, &layer.q_b)?,
-                qr_in.0,
-                qr_in.1,
-                &res.q,
-                0,
-            )?;
-            launches += 1;
-            crate::kernels::launch_dsv4_q_prep(
-                &res.q,
-                res.heads,
-                res.head_dim,
-                res.rope_dims,
-                &res.rope_buf,
-                rope_fwd,
-                res.rms_eps,
-                stream,
-            )?;
-            launches += 1;
-
-            // Shared KV latent -> ring slot + arena mirror slot.
-            self.resident_gemv_at(
-                dense_entry(&resident, &layer.kv)?,
-                x_in.0,
-                x_in.1,
-                &res.kv_tmp,
-                0,
-            )?;
-            launches += 1;
-            crate::kernels::launch_dsv4_kv_prep(
-                &res.kv_tmp,
-                &lc.kv_norm,
-                res.head_dim,
-                res.rope_dims,
-                &res.rope_buf,
-                rope_fwd,
-                res.rms_eps,
-                &lstate.ring,
-                (pos % res.window) * res.head_dim * 4,
-                &res.arena,
-                res.arena_layout.kv_off[li] * 4,
-                stream,
-            )?;
-            launches += 1;
-
-            // Compressor + indexer-compressor pending/completion.
-            if let (Some(weights), Some(consts), Some(dev_comp)) =
-                (&layer.compressor, &lc.comp, &mut lstate.comp)
-            {
-                let pair = res.arena_layout.comp_off[li].expect("compressor arena slot");
-                self.step_compressor(
-                    weights,
-                    consts,
-                    dev_comp,
-                    &resident,
-                    x_in,
-                    x_elem,
-                    res.embed,
-                    pos,
                     res.rms_eps,
-                    &res.comp_gates,
-                    &res.comp_kvs,
-                    &res.arena,
-                    pair,
-                    &mut res.retired,
-                    &mut launches,
+                    stream,
                 )?;
-            }
-            if let (Some(indexer), Some(consts), Some(dev_idx)) =
-                (&layer.indexer, &lc.idx, &mut lstate.idx)
-            {
-                let pair = res.arena_layout.idx_off[li].expect("indexer arena slot");
-                self.step_compressor(
-                    &indexer.compressor,
-                    consts,
-                    dev_idx,
-                    &resident,
-                    x_in,
-                    x_elem,
-                    res.embed,
-                    pos,
+                launches += 1;
+                let qr_in: (&DeviceBuffer, usize) = if lc.qr_dtype == GemmDType::F32 {
+                    (&res.qr, 0)
+                } else {
+                    self.cast_slice(
+                        lc.qr_dtype,
+                        &res.qr,
+                        0,
+                        &res.qr_cast,
+                        0,
+                        res.q_lora,
+                        &mut launches,
+                    )?;
+                    (&res.qr_cast, 0)
+                };
+                self.resident_gemv_at(
+                    dense_entry(&resident, &layer.q_b)?,
+                    qr_in.0,
+                    qr_in.1,
+                    &res.q,
+                    0,
+                )?;
+                launches += 1;
+                crate::kernels::launch_dsv4_q_prep(
+                    &res.q,
+                    res.heads,
+                    res.head_dim,
+                    res.rope_dims,
+                    &res.rope_buf,
+                    rope_fwd,
                     res.rms_eps,
-                    &res.comp_gates,
-                    &res.comp_kvs,
-                    &res.arena,
-                    pair,
-                    &mut res.retired,
-                    &mut launches,
+                    stream,
                 )?;
-            }
+                launches += 1;
 
-            // Indexer top-k narrowing (blocks visible AFTER this token).
-            let mut n_comp = 0usize;
-            if let Some(consts) = &lc.comp {
-                n_comp = (pos + 1) / consts.ratio;
-            }
-            let mut sel_used = false;
-            if let (Some(indexer), Some(consts), Some(dev_idx)) =
-                (&layer.indexer, &lc.idx, &lstate.idx)
-            {
-                let blocks_after = (pos + 1) / consts.ratio;
-                if blocks_after > res.idx_top_k {
-                    self.resident_gemv_at(
-                        dense_entry(&resident, &indexer.q_b)?,
-                        qr_in.0,
-                        qr_in.1,
-                        &res.idx_qi,
-                        0,
+                // Shared KV latent -> ring slot + arena mirror slot.
+                self.resident_gemv_at(
+                    dense_entry(&resident, &layer.kv)?,
+                    x_in.0,
+                    x_in.1,
+                    &res.kv_tmp,
+                    0,
+                )?;
+                launches += 1;
+                crate::kernels::launch_dsv4_kv_prep(
+                    &res.kv_tmp,
+                    &lc.kv_norm,
+                    res.head_dim,
+                    res.rope_dims,
+                    &res.rope_buf,
+                    rope_fwd,
+                    res.rms_eps,
+                    &lstate.ring,
+                    (pos % res.ring_cap) * res.head_dim * 4,
+                    &res.arena,
+                    (pos_base + res.arena_layout.kv_off[li]) * 4,
+                    stream,
+                )?;
+                launches += 1;
+
+                // Compressor + indexer-compressor pending/completion.
+                if let (Some(weights), Some(consts), Some(dev_comp)) =
+                    (&layer.compressor, &lc.comp, &mut lstate.comp)
+                {
+                    let (k, v) = res.arena_layout.comp_off[li].expect("compressor arena slot");
+                    let pair = (pos_base + k, pos_base + v);
+                    self.step_compressor(
+                        weights,
+                        consts,
+                        dev_comp,
+                        &resident,
+                        x_in,
+                        x_elem,
+                        res.embed,
+                        pos,
+                        res.rms_eps,
+                        &res.comp_gates,
+                        &res.comp_kvs,
+                        &res.arena,
+                        pair,
+                        &mut res.retired,
+                        &mut launches,
                     )?;
-                    self.resident_gemv_at(
-                        dense_entry(&resident, &indexer.proj)?,
-                        x_in.0,
-                        x_in.1,
-                        &res.idx_w,
-                        0,
-                    )?;
-                    launches += 2;
-                    let scores = res.idx_scores.as_ref().expect("indexer scores scratch");
-                    let marks = res.idx_marks.as_ref().expect("indexer marks scratch");
-                    crate::kernels::launch_dsv4_indexer_score(
-                        &res.idx_qi,
-                        &res.idx_w,
-                        &dev_idx.keys,
-                        consts.dim,
-                        blocks_after,
-                        res.idx_heads,
-                        res.idx_key,
-                        res.idx_head_scale,
-                        res.idx_key_scale,
-                        scores,
-                        stream,
-                    )?;
-                    crate::kernels::launch_dsv4_indexer_select(
-                        scores,
-                        blocks_after,
-                        res.idx_top_k,
-                        marks,
-                        &res.idx_sel,
-                        stream,
-                    )?;
-                    launches += 2;
-                    sel_used = true;
-                    n_comp = res.idx_top_k;
                 }
-            }
-
-            // Attention proper over [compressed ‖ ring window].
-            let comp_arg = match (&lstate.comp, &lc.comp) {
-                (Some(dev_comp), Some(consts)) => {
-                    Some((&dev_comp.keys, &dev_comp.values, consts.dim))
+                if let (Some(indexer), Some(consts), Some(dev_idx)) =
+                    (&layer.indexer, &lc.idx, &mut lstate.idx)
+                {
+                    let (k, v) = res.arena_layout.idx_off[li].expect("indexer arena slot");
+                    let pair = (pos_base + k, pos_base + v);
+                    self.step_compressor(
+                        &indexer.compressor,
+                        consts,
+                        dev_idx,
+                        &resident,
+                        x_in,
+                        x_elem,
+                        res.embed,
+                        pos,
+                        res.rms_eps,
+                        &res.comp_gates,
+                        &res.comp_kvs,
+                        &res.arena,
+                        pair,
+                        &mut res.retired,
+                        &mut launches,
+                    )?;
                 }
-                _ => None,
-            };
-            crate::kernels::launch_dsv4_attention_decode(
-                &res.q,
-                comp_arg,
-                sel_used.then_some(&res.idx_sel),
-                n_comp,
-                &lstate.ring,
-                res.window,
-                pos + 1 - n_ring,
-                n_ring,
-                lc.sinks.as_ref(),
-                res.attn_scale,
-                res.heads,
-                res.head_dim,
-                res.rope_dims,
-                &res.rope_buf,
-                rope_inv,
-                &res.attn_out,
-                res.attn_w.as_ref().expect("attention weight scratch"),
-                res.attn_wn.as_ref().expect("attention weight scratch"),
-                res.attn_max_keys,
-                stream,
-            )?;
-            launches += 1;
 
-            // Grouped low-rank output projection.
-            let a_elem = gemm_element_size(lc.wo_a_dtype);
-            let wo_src: (&DeviceBuffer, usize) = if lc.wo_a_dtype == GemmDType::F32 {
-                (&res.attn_out, 4)
-            } else {
-                self.cast_slice(
-                    lc.wo_a_dtype,
+                // Indexer top-k narrowing (blocks visible AFTER this token).
+                let mut n_comp = 0usize;
+                if let Some(consts) = &lc.comp {
+                    n_comp = (pos + 1) / consts.ratio;
+                }
+                let mut sel_used = false;
+                if let (Some(indexer), Some(consts), Some(dev_idx)) =
+                    (&layer.indexer, &lc.idx, &lstate.idx)
+                {
+                    let blocks_after = (pos + 1) / consts.ratio;
+                    if blocks_after > res.idx_top_k {
+                        self.resident_gemv_at(
+                            dense_entry(&resident, &indexer.q_b)?,
+                            qr_in.0,
+                            qr_in.1,
+                            &res.idx_qi,
+                            0,
+                        )?;
+                        self.resident_gemv_at(
+                            dense_entry(&resident, &indexer.proj)?,
+                            x_in.0,
+                            x_in.1,
+                            &res.idx_w,
+                            0,
+                        )?;
+                        launches += 2;
+                        let scores = res.idx_scores.as_ref().expect("indexer scores scratch");
+                        let marks = res.idx_marks.as_ref().expect("indexer marks scratch");
+                        crate::kernels::launch_dsv4_indexer_score(
+                            &res.idx_qi,
+                            &res.idx_w,
+                            &dev_idx.keys,
+                            consts.dim,
+                            blocks_after,
+                            res.idx_heads,
+                            res.idx_key,
+                            res.idx_head_scale,
+                            res.idx_key_scale,
+                            scores,
+                            stream,
+                        )?;
+                        crate::kernels::launch_dsv4_indexer_select(
+                            scores,
+                            blocks_after,
+                            res.idx_top_k,
+                            marks,
+                            &res.idx_sel,
+                            stream,
+                        )?;
+                        launches += 2;
+                        sel_used = true;
+                        n_comp = res.idx_top_k;
+                    }
+                }
+
+                // Attention proper over [compressed ‖ ring window].
+                let comp_arg = match (&lstate.comp, &lc.comp) {
+                    (Some(dev_comp), Some(consts)) => {
+                        Some((&dev_comp.keys, &dev_comp.values, consts.dim))
+                    }
+                    _ => None,
+                };
+                crate::kernels::launch_dsv4_attention_decode(
+                    &res.q,
+                    comp_arg,
+                    sel_used.then_some(&res.idx_sel),
+                    n_comp,
+                    &lstate.ring,
+                    res.ring_cap,
+                    pos + 1 - n_ring,
+                    n_ring,
+                    lc.sinks.as_ref(),
+                    res.attn_scale,
+                    res.heads,
+                    res.head_dim,
+                    res.rope_dims,
+                    &res.rope_buf,
+                    rope_inv,
                     &res.attn_out,
-                    0,
-                    &res.attn_out_cast,
-                    0,
-                    res.heads * res.head_dim,
-                    &mut launches,
+                    res.attn_w.as_ref().expect("attention weight scratch"),
+                    res.attn_wn.as_ref().expect("attention weight scratch"),
+                    res.attn_max_keys,
+                    stream,
                 )?;
-                (&res.attn_out_cast, a_elem)
-            };
-            let groups = grouped_entry(&resident, &layer.out_a)?;
-            for (gidx, entry) in groups.iter().enumerate() {
-                let (input, in_off) = if lc.wo_direct {
-                    (wo_src.0, gidx * res.group_features * wo_src.1)
+                launches += 1;
+
+                // Grouped low-rank output projection.
+                let a_elem = gemm_element_size(lc.wo_a_dtype);
+                let wo_src: (&DeviceBuffer, usize) = if lc.wo_a_dtype == GemmDType::F32 {
+                    (&res.attn_out, 4)
                 } else {
-                    res.wo_pad_in.copy_device_range(
-                        gidx * res.wo_pad_in_stride,
-                        wo_src.0,
-                        gidx * res.group_features * wo_src.1,
-                        res.group_features * wo_src.1,
-                        stream,
+                    self.cast_slice(
+                        lc.wo_a_dtype,
+                        &res.attn_out,
+                        0,
+                        &res.attn_out_cast,
+                        0,
+                        res.heads * res.head_dim,
+                        &mut launches,
                     )?;
-                    launches += 1;
-                    (&res.wo_pad_in, gidx * res.wo_pad_in_stride)
+                    (&res.attn_out_cast, a_elem)
                 };
-                let (output, out_off) = if lc.wo_direct {
-                    (&res.proj_flat, gidx * res.o_rank * 4)
-                } else {
-                    (&res.proj_pad, gidx * res.proj_pad_stride)
-                };
-                self.resident_gemv_at(entry, input, in_off, output, out_off)?;
-            }
-            launches += res.o_groups as u64;
-            if !lc.wo_direct {
-                for gidx in 0..res.o_groups {
-                    res.proj_flat.copy_device_range(
-                        gidx * res.o_rank * 4,
-                        &res.proj_pad,
-                        gidx * res.proj_pad_stride,
-                        res.o_rank * 4,
-                        stream,
-                    )?;
-                }
-                launches += res.o_groups as u64;
-            }
-            let wo_b_in: (&DeviceBuffer, usize) = if lc.wo_b_dtype == GemmDType::F32 {
-                (&res.proj_flat, 0)
-            } else {
-                self.cast_slice(
-                    lc.wo_b_dtype,
-                    &res.proj_flat,
-                    0,
-                    &res.proj_cast,
-                    0,
-                    res.o_groups * res.o_rank,
-                    &mut launches,
-                )?;
-                (&res.proj_cast, 0)
-            };
-            self.resident_gemv_at(
-                dense_entry(&resident, &layer.out_b)?,
-                wo_b_in.0,
-                wo_b_in.1,
-                &res.attn_final,
-                0,
-            )?;
-            launches += 1;
-
-            // hc_attn.post: streams_a (residual) + attention -> streams_b.
-            crate::kernels::launch_dsv4_hc_post(
-                &res.attn_final,
-                &res.streams_a,
-                &res.post,
-                &res.comb,
-                res.hc,
-                res.embed,
-                &res.streams_b,
-                stream,
-            )?;
-            launches += 1;
-
-            // hc_ffn.pre + ffn_norm -> ffn_y.
-            crate::kernels::launch_dsv4_hc_pre(
-                &res.streams_b,
-                &lc.hc_ffn.func,
-                &lc.hc_ffn.base,
-                &lc.hc_ffn.scale,
-                Some(&lc.ffn_norm),
-                res.hc,
-                res.embed,
-                lc.hc_ffn.rows,
-                res.sinkhorn,
-                res.rms_eps,
-                res.hc_eps,
-                &res.ffn_y,
-                0,
-                &res.post,
-                &res.comb,
-                stream,
-            )?;
-            launches += 1;
-
-            // MoE block: inlined Stage-2a device core (per-layer ids readback
-            // stays — it services the expert-pool LRU); unsupported layers
-            // (F32 fixture experts, no pool) or a too-small pool fall back to
-            // the exact host block on the downloaded activation.
-            let ctx = engine.moe_ctx(layer);
-            let mut device_moe_done = false;
-            if !self.device_moe_disabled.get() && self.device_moe_supported(&ctx) {
-                let mut scratch_guard = self.moe_scratch.borrow_mut();
-                let scratch = &mut *scratch_guard;
-                scratch.xs_f16_valid = false;
-                scratch.xs_bf16_valid = false;
-                match self.device_moe_core(
-                    &ctx,
-                    &res.ffn_y,
-                    1,
-                    std::slice::from_ref(&token),
-                    scratch,
-                    &resident,
-                )? {
-                    MoeCoreOutcome::Done {
-                        launches: core_launches,
-                        syncs: core_syncs,
-                    } => {
-                        launches += core_launches;
-                        syncs += core_syncs;
-                        {
-                            let mut stats = self.moe_stats.borrow_mut();
-                            stats.device_blocks += 1;
-                            stats.launches += core_launches;
-                            stats.syncs += core_syncs;
-                        }
-                        let ys = scratch.ys.as_ref().expect("moe core populated ys");
-                        crate::kernels::launch_dsv4_hc_post(
-                            ys,
-                            &res.streams_b,
-                            &res.post,
-                            &res.comb,
-                            res.hc,
-                            res.embed,
-                            &res.streams_a,
+                let groups = grouped_entry(&resident, &layer.out_a)?;
+                for (gidx, entry) in groups.iter().enumerate() {
+                    let (input, in_off) = if lc.wo_direct {
+                        (wo_src.0, gidx * res.group_features * wo_src.1)
+                    } else {
+                        res.wo_pad_in.copy_device_range(
+                            gidx * res.wo_pad_in_stride,
+                            wo_src.0,
+                            gidx * res.group_features * wo_src.1,
+                            res.group_features * wo_src.1,
                             stream,
                         )?;
                         launches += 1;
-                        device_moe_done = true;
-                    }
-                    MoeCoreOutcome::PoolTooSmall {
-                        launches: core_launches,
-                        syncs: core_syncs,
-                    } => {
-                        launches += core_launches;
-                        syncs += core_syncs;
-                    }
+                        (&res.wo_pad_in, gidx * res.wo_pad_in_stride)
+                    };
+                    let (output, out_off) = if lc.wo_direct {
+                        (&res.proj_flat, gidx * res.o_rank * 4)
+                    } else {
+                        (&res.proj_pad, gidx * res.proj_pad_stride)
+                    };
+                    self.resident_gemv_at(entry, input, in_off, output, out_off)?;
                 }
-            }
-            if !device_moe_done {
-                // Exact host MoE block on the downloaded activation (the host
-                // step's own path given identical inputs).
-                let y_host: Vec<f32> = res.ffn_y.copy_to_host(res.embed)?;
-                syncs += 1;
-                let ys_rows = host_moe_block(self, &ctx, std::slice::from_ref(&y_host), &[token])?;
-                self.moe_stats.borrow_mut().host_blocks += 1;
-                res.ffn_out.copy_from_host_async(&ys_rows[0], stream)?;
+                launches += res.o_groups as u64;
+                if !lc.wo_direct {
+                    for gidx in 0..res.o_groups {
+                        res.proj_flat.copy_device_range(
+                            gidx * res.o_rank * 4,
+                            &res.proj_pad,
+                            gidx * res.proj_pad_stride,
+                            res.o_rank * 4,
+                            stream,
+                        )?;
+                    }
+                    launches += res.o_groups as u64;
+                }
+                let wo_b_in: (&DeviceBuffer, usize) = if lc.wo_b_dtype == GemmDType::F32 {
+                    (&res.proj_flat, 0)
+                } else {
+                    self.cast_slice(
+                        lc.wo_b_dtype,
+                        &res.proj_flat,
+                        0,
+                        &res.proj_cast,
+                        0,
+                        res.o_groups * res.o_rank,
+                        &mut launches,
+                    )?;
+                    (&res.proj_cast, 0)
+                };
+                self.resident_gemv_at(
+                    dense_entry(&resident, &layer.out_b)?,
+                    wo_b_in.0,
+                    wo_b_in.1,
+                    &res.attn_final,
+                    0,
+                )?;
                 launches += 1;
+
+                // hc_attn.post: streams_a (residual) + attention -> streams_b.
                 crate::kernels::launch_dsv4_hc_post(
-                    &res.ffn_out,
-                    &res.streams_b,
+                    &res.attn_final,
+                    &res.streams_a,
                     &res.post,
                     &res.comb,
                     res.hc,
                     res.embed,
+                    &res.streams_b,
+                    stream,
+                )?;
+                launches += 1;
+
+                // hc_ffn.pre + ffn_norm -> ffn_y.
+                crate::kernels::launch_dsv4_hc_pre(
+                    &res.streams_b,
+                    &lc.hc_ffn.func,
+                    &lc.hc_ffn.base,
+                    &lc.hc_ffn.scale,
+                    Some(&lc.ffn_norm),
+                    res.hc,
+                    res.embed,
+                    lc.hc_ffn.rows,
+                    res.sinkhorn,
+                    res.rms_eps,
+                    res.hc_eps,
+                    &res.ffn_y,
+                    0,
+                    &res.post,
+                    &res.comb,
+                    stream,
+                )?;
+                launches += 1;
+
+                // MoE block: inlined Stage-2a device core (per-layer ids readback
+                // stays — it services the expert-pool LRU); unsupported layers
+                // (F32 fixture experts, no pool) or a too-small pool fall back to
+                // the exact host block on the downloaded activation.
+                let ctx = engine.moe_ctx(layer);
+                let mut device_moe_done = false;
+                if !self.device_moe_disabled.get() && self.device_moe_supported(&ctx) {
+                    let mut scratch_guard = self.moe_scratch.borrow_mut();
+                    let scratch = &mut *scratch_guard;
+                    scratch.xs_f16_valid = false;
+                    scratch.xs_bf16_valid = false;
+                    match self.device_moe_core(
+                        &ctx,
+                        &res.ffn_y,
+                        1,
+                        std::slice::from_ref(&token),
+                        scratch,
+                        &resident,
+                    )? {
+                        MoeCoreOutcome::Done {
+                            launches: core_launches,
+                            syncs: core_syncs,
+                        } => {
+                            launches += core_launches;
+                            syncs += core_syncs;
+                            {
+                                let mut stats = self.moe_stats.borrow_mut();
+                                stats.device_blocks += 1;
+                                stats.launches += core_launches;
+                                stats.syncs += core_syncs;
+                            }
+                            let ys = scratch.ys.as_ref().expect("moe core populated ys");
+                            crate::kernels::launch_dsv4_hc_post(
+                                ys,
+                                &res.streams_b,
+                                &res.post,
+                                &res.comb,
+                                res.hc,
+                                res.embed,
+                                &res.streams_a,
+                                stream,
+                            )?;
+                            launches += 1;
+                            device_moe_done = true;
+                        }
+                        MoeCoreOutcome::PoolTooSmall {
+                            launches: core_launches,
+                            syncs: core_syncs,
+                        } => {
+                            launches += core_launches;
+                            syncs += core_syncs;
+                        }
+                    }
+                }
+                if !device_moe_done {
+                    // Exact host MoE block on the downloaded activation (the host
+                    // step's own path given identical inputs).
+                    let y_host: Vec<f32> = res.ffn_y.copy_to_host(res.embed)?;
+                    syncs += 1;
+                    let ys_rows =
+                        host_moe_block(self, &ctx, std::slice::from_ref(&y_host), &[token])?;
+                    self.moe_stats.borrow_mut().host_blocks += 1;
+                    res.ffn_out.copy_from_host_async(&ys_rows[0], stream)?;
+                    launches += 1;
+                    crate::kernels::launch_dsv4_hc_post(
+                        &res.ffn_out,
+                        &res.streams_b,
+                        &res.post,
+                        &res.comb,
+                        res.hc,
+                        res.embed,
+                        &res.streams_a,
+                        stream,
+                    )?;
+                    launches += 1;
+                }
+
+                // Aux-layer tap capture: the post-layer streams (back in
+                // streams_a) copied into this position's arena tap slot. Ordered
+                // on the engine stream, so the copy lands before the next
+                // layer/token overwrites streams_a.
+                if let Ok(group) = tap_aux.binary_search(&li) {
+                    res.arena.copy_device_range(
+                        (pos_base
+                            + res.arena_layout.tap_aux_off
+                            + group * res.arena_layout.tap_stride)
+                            * 4,
+                        &res.streams_a,
+                        0,
+                        res.hc * res.embed * 4,
+                        stream,
+                    )?;
+                    launches += 1;
+                }
+            }
+
+            // Pre-hc-head tap capture (the MTP drafter's recurrence input).
+            if tap_pre {
+                res.arena.copy_device_range(
+                    (pos_base + res.arena_layout.tap_pre_off) * 4,
                     &res.streams_a,
+                    0,
+                    res.hc * res.embed * 4,
                     stream,
                 )?;
                 launches += 1;
             }
-        }
 
-        // ---- Hyper head + final norm + lm head into the arena's logits row.
-        crate::kernels::launch_dsv4_hyper_head(
-            &res.streams_a,
-            &res.hyper.func,
-            &res.hyper.base,
-            res.hyper_scale0,
-            res.hc,
-            res.embed,
-            res.rms_eps,
-            res.hc_eps,
-            &res.hyper_hidden,
-            stream,
-        )?;
-        launches += 1;
-        crate::kernels::launch_dsv4_rms_exact(
-            &res.hyper_hidden,
-            &res.output_norm,
-            res.embed,
-            res.rms_eps,
-            stream,
-        )?;
-        launches += 1;
-        let head_in: (&DeviceBuffer, usize) = if res.head_dtype == GemmDType::F32 {
-            (&res.hyper_hidden, 0)
-        } else {
-            self.cast_slice(
-                res.head_dtype,
-                &res.hyper_hidden,
-                0,
-                &res.hyper_cast,
-                0,
-                res.embed,
-                &mut launches,
-            )?;
-            (&res.hyper_cast, 0)
-        };
-        self.resident_gemv_at(
-            dense_entry(&resident, engine.output_head_matrix())?,
-            head_in.0,
-            head_in.1,
-            &res.arena,
-            0,
-        )?;
-        launches += 1;
+            // ---- Hyper head + final norm + lm head into this position's
+            // arena logits row (every position for a verify chunk; skipped
+            // entirely for a headless rewind re-feed).
+            if want_logits {
+                crate::kernels::launch_dsv4_hyper_head(
+                    &res.streams_a,
+                    &res.hyper.func,
+                    &res.hyper.base,
+                    res.hyper_scale0,
+                    res.hc,
+                    res.embed,
+                    res.rms_eps,
+                    res.hc_eps,
+                    &res.hyper_hidden,
+                    stream,
+                )?;
+                launches += 1;
+                crate::kernels::launch_dsv4_rms_exact(
+                    &res.hyper_hidden,
+                    &res.output_norm,
+                    res.embed,
+                    res.rms_eps,
+                    stream,
+                )?;
+                launches += 1;
+                let head_in: (&DeviceBuffer, usize) = if res.head_dtype == GemmDType::F32 {
+                    (&res.hyper_hidden, 0)
+                } else {
+                    self.cast_slice(
+                        res.head_dtype,
+                        &res.hyper_hidden,
+                        0,
+                        &res.hyper_cast,
+                        0,
+                        res.embed,
+                        &mut launches,
+                    )?;
+                    (&res.hyper_cast, 0)
+                };
+                self.resident_gemv_at(
+                    dense_entry(&resident, engine.output_head_matrix())?,
+                    head_in.0,
+                    head_in.1,
+                    &res.arena,
+                    pos_base * 4,
+                )?;
+                launches += 1;
+            }
+        }
         drop(resident);
 
-        // ---- THE end-of-step sync: one download of logits + state delta.
-        let arena_host: Vec<f32> = res.arena.copy_to_host(res.arena_layout.total)?;
+        // ---- THE end-of-chunk sync: ONE download of every live position's
+        // logits + state delta (+ tap rows when captured).
+        let al = &res.arena_layout;
+        let last_used = if !tap_aux.is_empty() {
+            al.tap_aux_off + tap_aux.len() * al.tap_stride
+        } else if tap_pre {
+            al.tap_pre_off + al.tap_stride
+        } else {
+            al.core
+        };
+        let arena_host: Vec<f32> = res
+            .arena
+            .copy_to_host((s - 1) * al.pos_stride + last_used)?;
         syncs += 1;
         res.retired.clear();
+        res.state.as_mut().expect("device state is current").pos = pos0 + s;
 
-        // ---- Replay the delta into the host mirror (stays authoritative).
-        let al = &res.arena_layout;
-        let mut mirror = DsV4StepMirror {
-            kv: Vec::with_capacity(layer_defs.len()),
-            x: Vec::with_capacity(layer_defs.len()),
-            comp_block: Vec::with_capacity(layer_defs.len()),
-            idx_block: Vec::with_capacity(layer_defs.len()),
-        };
-        for (li, lc) in res.layers.iter().enumerate() {
-            mirror
-                .kv
-                .push(&arena_host[al.kv_off[li]..al.kv_off[li] + res.head_dim]);
-            mirror
-                .x
-                .push(Some(&arena_host[al.x_off[li]..al.x_off[li] + res.embed]));
-            let completed = |consts: &DevCompConsts, pair: Option<(usize, usize)>| {
-                if (pos + 1).is_multiple_of(consts.ratio) {
-                    pair.map(|(k, v)| {
-                        (
-                            &arena_host[k..k + consts.dim],
-                            &arena_host[v..v + consts.dim],
-                        )
-                    })
-                } else {
-                    None
-                }
+        // ---- Replay each position's delta into the host mirror (stays
+        // authoritative at every position — snapshots/truncation unchanged).
+        let mut rows = Vec::with_capacity(if want_logits { s } else { 0 });
+        for i in 0..s {
+            let pos = pos0 + i;
+            let base = i * al.pos_stride;
+            let mut mirror = DsV4StepMirror {
+                kv: Vec::with_capacity(res.layers.len()),
+                x: Vec::with_capacity(res.layers.len()),
+                comp_block: Vec::with_capacity(res.layers.len()),
+                idx_block: Vec::with_capacity(res.layers.len()),
             };
-            mirror.comp_block.push(
-                lc.comp
-                    .as_ref()
-                    .and_then(|consts| completed(consts, al.comp_off[li])),
-            );
-            mirror.idx_block.push(
-                lc.idx
-                    .as_ref()
-                    .and_then(|consts| completed(consts, al.idx_off[li])),
-            );
+            for (li, lc) in res.layers.iter().enumerate() {
+                let kv_off = base + al.kv_off[li];
+                mirror.kv.push(&arena_host[kv_off..kv_off + res.head_dim]);
+                let x_off = base + al.x_off[li];
+                mirror.x.push(Some(&arena_host[x_off..x_off + res.embed]));
+                let completed = |consts: &DevCompConsts, pair: Option<(usize, usize)>| {
+                    if (pos + 1).is_multiple_of(consts.ratio) {
+                        pair.map(|(k, v)| {
+                            (
+                                &arena_host[base + k..base + k + consts.dim],
+                                &arena_host[base + v..base + v + consts.dim],
+                            )
+                        })
+                    } else {
+                        None
+                    }
+                };
+                mirror.comp_block.push(
+                    lc.comp
+                        .as_ref()
+                        .and_then(|consts| completed(consts, al.comp_off[li])),
+                );
+                mirror.idx_block.push(
+                    lc.idx
+                        .as_ref()
+                        .and_then(|consts| completed(consts, al.idx_off[li])),
+                );
+            }
+            engine.apply_device_step_mirror(state, &mirror)?;
+            if want_logits {
+                rows.push(arena_host[base..base + res.vocab].to_vec());
+            }
         }
-        engine.apply_device_step_mirror(state, &mirror)?;
-        dev_state.pos = pos + 1;
 
-        let logits = arena_host[..res.vocab].to_vec();
+        // ---- Tap rows, in the host chunk path's exact capture order (per
+        // aux layer over ascending positions, then the pre-head rows, then
+        // the position counter — buffer state identical to step_chunk_heads).
+        if let Some(taps) = taps.as_deref_mut() {
+            let width = res.hc * res.embed;
+            for (group, &layer) in tap_aux.iter().enumerate() {
+                for i in 0..s {
+                    let off = i * al.pos_stride + al.tap_aux_off + group * al.tap_stride;
+                    taps.push_layer_row_flat(layer, &arena_host[off..off + width]);
+                }
+            }
+            if tap_pre {
+                for i in 0..s {
+                    let off = i * al.pos_stride + al.tap_pre_off;
+                    taps.push_pre_head_row_flat(&arena_host[off..off + width]);
+                }
+            }
+            taps.note_positions(s);
+        }
+
         let mut stats = self.step_stats.borrow_mut();
-        stats.device_steps += 1;
         stats.launches += launches;
         stats.syncs += syncs;
         stats.restore_syncs += restore_syncs;
         if restored {
             stats.restores += 1;
         }
-        Ok(logits)
+        if adopted {
+            stats.rewind_adoptions += 1;
+        }
+        Ok(rows)
+    }
+}
+
+/// May the device state at `dev.pos` be rewound to `target` purely by moving
+/// the device position back (no restore upload)? Sound iff every value the
+/// resumed trajectory reads before rewriting is still resident:
+/// - RING: the window entries needed at `target` (positions
+///   max(0, target+1-window) .. target-1) must not have been clobbered by the
+///   circular writes of positions target..dev_pos-1 — position q is resident
+///   while dev_pos <= q + ring_cap — and must lie within the suffix the last
+///   restore uploaded (`ring_floor`). Later positions rewrite their own slots
+///   before reading them (each step writes pos % cap before its attention),
+///   so only the entry condition matters.
+/// - COMPRESSOR PENDING (each compressor and indexer-compressor): pending row
+///   j must still hold position target - target%ratio + j. Those rows exist
+///   iff target's block starts no earlier than the last restore's block (the
+///   restore uploads only its CURRENT block), and survive iff dev_pos has not
+///   left target's block's row window: dev_pos <= (target/ratio + 1) * ratio.
+///   A block-boundary target needs no pending at all.
+/// - COMPRESSED BLOCKS need no check: blocks beyond target/ratio become
+///   invisible (visibility derives from the position alone) and are rewritten
+///   in place during the step that would first re-expose them; blocks at or
+///   below target/ratio were fully uploaded by the restore.
+fn device_rewind_ok(
+    window: usize,
+    ring_cap: usize,
+    layers: &[DevLayerConsts],
+    dev: &DevState,
+    target: usize,
+) -> bool {
+    let oldest_needed = (target + 1).saturating_sub(window);
+    if oldest_needed < dev.ring_floor || dev.pos > ring_cap + oldest_needed {
+        return false;
+    }
+    layers.iter().all(|lc| {
+        [lc.comp.as_ref(), lc.idx.as_ref()]
+            .into_iter()
+            .flatten()
+            .all(|consts| {
+                let ratio = consts.ratio;
+                target.is_multiple_of(ratio)
+                    || (target - target % ratio >= dev.restore_pos - dev.restore_pos % ratio
+                        && dev.pos <= (target / ratio + 1) * ratio)
+            })
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Device-resident MTP draft step (Wave-3, deliverable 3).
+//
+// One `feed_slot` call runs a WHOLE draft slot on the GPU — the exact
+// operation sequence of `dsv4_mtp::MtpModule::forward_slot` driven through
+// the same bit-exact kernels/GEMVs the trunk device step uses: the e/h input
+// combine (enorm/hnorm RMS + e_proj/h_proj GEMVs + broadcast add), the full
+// compress-ratio-1 decoder block (hc_pre/attention/hc_post, hc_pre/MoE via
+// the Stage-2a device core over the pool-pinned draft-layer experts/hc_post),
+// and — when a draft id is wanted — hc_head + final norm + the target lm head
+// with DEVICE argmax. The only per-slot downloads are the 4-byte drafted
+// token id (when requested) and the device-MoE topk readback; the recycled
+// flat residual stays device-resident between K>1 recurrence slots
+// (`MtpDraftPrev::Recycled`), and catch-up slots feed batches of taps rows
+// through the same machinery with no logits work at all.
+//
+// The machinery is deliberately generic over `MtpDraftDesc` (weights are
+// passed per call, the struct owns only device buffers), so a DSpark drafter
+// can run its three chained draft blocks by feeding each block's desc —
+// nothing here is specific to layer 43.
+
+/// Borrowed weight handles for one draft layer + its input/output shells.
+/// Matrix handles must already be GPU-resident on the same provider
+/// (`register_host_dense`/`register_host_grouped`), experts registered via
+/// `register_host_experts`.
+pub(crate) struct MtpDraftDesc<'a> {
+    pub(crate) geometry: &'a DsV4Geometry,
+    pub(crate) layer: &'a DsV4Layer,
+    pub(crate) e_proj: &'a RawMatrix,
+    pub(crate) h_proj: &'a RawMatrix,
+    pub(crate) enorm: &'a [f32],
+    pub(crate) hnorm: &'a [f32],
+    pub(crate) hc_head: &'a HcWeights,
+    pub(crate) norm: &'a [f32],
+    pub(crate) token_embd: &'a RawMatrix,
+    pub(crate) output_head: &'a RawMatrix,
+    pub(crate) rms_eps: f32,
+    pub(crate) hc_eps: f32,
+}
+
+/// The previous-hidden source for one draft slot.
+pub(crate) enum MtpDraftPrev<'a> {
+    /// Upload this flat (hc*embed) row — a target taps row (catch-up feeding).
+    Host(&'a [f32]),
+    /// Recycle the previous slot's device-resident flat output (the K>1
+    /// recurrence input) — no host transfer at all.
+    Recycled,
+}
+
+/// Device-resident state + scratch for the MTP draft layer. Built once per
+/// drafter; weights arrive per call via [`MtpDraftDesc`].
+pub(crate) struct MtpDeviceDraft {
+    linear: DsV4GpuLinear,
+    // Geometry snapshot + dtype/config resolved at build.
+    embed: usize,
+    hc: usize,
+    heads: usize,
+    head_dim: usize,
+    rope_dims: usize,
+    q_lora: usize,
+    o_groups: usize,
+    o_rank: usize,
+    group_features: usize,
+    window: usize,
+    ring_cap: usize,
+    sinkhorn: usize,
+    vocab: usize,
+    rms_eps: f32,
+    hc_eps: f32,
+    attn_scale: f32,
+    rope_base: f32,
+    hyper_scale0: f32,
+    x_dtype: GemmDType,
+    qr_dtype: GemmDType,
+    wo_a_dtype: GemmDType,
+    wo_b_dtype: GemmDType,
+    wo_direct: bool,
+    e_dtype: GemmDType,
+    h_dtype: GemmDType,
+    head_dtype: GemmDType,
+    // Uploaded small weights.
+    attn_norm: DeviceBuffer,
+    ffn_norm: DeviceBuffer,
+    q_a_norm: DeviceBuffer,
+    kv_norm: DeviceBuffer,
+    sinks: Option<DeviceBuffer>,
+    hc_attn: DevHc,
+    hc_ffn: DevHc,
+    hc_head: DevHc,
+    enorm: DeviceBuffer,
+    hnorm: DeviceBuffer,
+    out_norm: DeviceBuffer,
+    // Activation buffers (every GEMV output lands at offset 0 of a dedicated
+    // buffer — the identical alignment class as the host-orchestrated
+    // `mul_vec` path's fresh allocations, so cuBLAS picks the same algorithm
+    // and the slot is bit-identical to `forward_slot` on this provider).
+    emb: DeviceBuffer,
+    emb_cast: DeviceBuffer,
+    e_out: DeviceBuffer,
+    h_tmp: DeviceBuffer,
+    h_cast: DeviceBuffer,
+    h_out: DeviceBuffer,
+    prev_host: DeviceBuffer,
+    streams_a: DeviceBuffer,
+    streams_b: DeviceBuffer,
+    post: DeviceBuffer,
+    comb: DeviceBuffer,
+    x: DeviceBuffer,
+    x_cast: DeviceBuffer,
+    qr: DeviceBuffer,
+    qr_cast: DeviceBuffer,
+    q: DeviceBuffer,
+    kv_tmp: DeviceBuffer,
+    kv_mirror: DeviceBuffer,
+    attn_out: DeviceBuffer,
+    attn_out_cast: DeviceBuffer,
+    attn_final: DeviceBuffer,
+    wo_pad_in: DeviceBuffer,
+    wo_pad_in_stride: usize,
+    proj_pad: DeviceBuffer,
+    proj_pad_stride: usize,
+    proj_flat: DeviceBuffer,
+    proj_cast: DeviceBuffer,
+    ffn_y: DeviceBuffer,
+    ffn_out: DeviceBuffer,
+    attn_w: DeviceBuffer,
+    attn_wn: DeviceBuffer,
+    hyper_hidden: DeviceBuffer,
+    hyper_cast: DeviceBuffer,
+    logits: DeviceBuffer,
+    argmax: DeviceBuffer,
+    rope: DeviceBuffer,
+    // Draft-layer SWA ring (circular by pos % ring_cap, slack for the K>1
+    // recurrence slots — see `speculative_mark`).
+    ring: DeviceBuffer,
+    /// Slots fed since the last reset (ring fill = min(count, window)).
+    count: usize,
+    /// Next expected position (continuity check).
+    next_pos: usize,
+}
+
+impl MtpDeviceDraft {
+    /// Build the device draft over an already-registered draft layer. Errors
+    /// (unsupported dtype mixes, missing residency) leave the caller on the
+    /// host-orchestrated path.
+    pub(crate) fn new(linear: DsV4GpuLinear, desc: &MtpDraftDesc<'_>) -> Result<Self> {
+        let g = desc.geometry;
+        let window = g
+            .window
+            .ok_or_else(|| anyhow!("MTP device draft requires a sliding window"))?;
+        if g.hc == 0 || g.rope_dims > g.head_dim || !g.rope_dims.is_multiple_of(2) {
+            bail!("MTP device draft: unsupported geometry");
+        }
+        if g.o_groups == 0 || !(g.heads * g.head_dim).is_multiple_of(g.o_groups) {
+            bail!("MTP device draft: grouped output projection shape");
+        }
+        let layer = desc.layer;
+        let hc_rows = g.hc * g.hc + 2 * g.hc;
+        if layer.hc_attn.func.shape() != (hc_rows, g.hc * g.embed)
+            || layer.hc_ffn.func.shape() != (hc_rows, g.hc * g.embed)
+            || desc.hc_head.func.shape() != (g.hc, g.hc * g.embed)
+            || desc.hc_head.scale.is_empty()
+        {
+            bail!("MTP device draft: hyper-connection mixer shape");
+        }
+        let inner: &DsV4GpuLinearInner = &linear;
+        let resident = inner.resident.borrow();
+        let dense_dtype =
+            |matrix: &RawMatrix| -> Result<GemmDType> { Ok(dense_entry(&resident, matrix)?.dtype) };
+        let x_dtype = dense_dtype(&layer.q_a)?;
+        if dense_dtype(&layer.kv)? != x_dtype {
+            bail!("MTP device draft: mixed activation-consumer dtypes");
+        }
+        let qr_dtype = dense_dtype(&layer.q_b)?;
+        let wo_groups = grouped_entry(&resident, &layer.out_a)?;
+        if wo_groups.len() != g.o_groups {
+            bail!("MTP device draft: grouped output projection group count");
+        }
+        let wo_a_dtype = wo_groups[0].dtype;
+        let wo_b_dtype = dense_dtype(&layer.out_b)?;
+        let e_dtype = dense_dtype(desc.e_proj)?;
+        let h_dtype = dense_dtype(desc.h_proj)?;
+        let head_dtype = dense_dtype(desc.output_head)?;
+        drop(resident);
+
+        let group_features = (g.heads * g.head_dim) / g.o_groups;
+        let a_elem = gemm_element_size(wo_a_dtype);
+        let wo_direct =
+            (group_features * a_elem).is_multiple_of(256) && (g.o_rank * 4).is_multiple_of(256);
+        let wo_pad_in_stride = align256(group_features * 4);
+        let proj_pad_stride = align256(g.o_rank * 4);
+        let ring_cap = window + DSV4_DEV_RING_SLACK;
+        let half = g.rope_dims / 2;
+
+        let upload_hc = |hc: &HcWeights| -> Result<DevHc> {
+            Ok(DevHc {
+                func: upload_f32(hc.func.data(), "mtp hc mixer")?,
+                base: upload_f32(&hc.base, "mtp hc base")?,
+                scale: upload_f32(&hc.scale, "mtp hc scale")?,
+                rows: hc.func.shape().0,
+            })
+        };
+        Ok(Self {
+            embed: g.embed,
+            hc: g.hc,
+            heads: g.heads,
+            head_dim: g.head_dim,
+            rope_dims: g.rope_dims,
+            q_lora: g.q_lora,
+            o_groups: g.o_groups,
+            o_rank: g.o_rank,
+            group_features,
+            window,
+            ring_cap,
+            sinkhorn: g.sinkhorn_iterations,
+            vocab: g.vocab,
+            rms_eps: desc.rms_eps,
+            hc_eps: desc.hc_eps,
+            attn_scale: (g.head_dim as f32).powf(-0.5),
+            rope_base: layer.rope_base,
+            hyper_scale0: desc.hc_head.scale[0],
+            x_dtype,
+            qr_dtype,
+            wo_a_dtype,
+            wo_b_dtype,
+            wo_direct,
+            e_dtype,
+            h_dtype,
+            head_dtype,
+            attn_norm: upload_f32(&layer.attn_norm, "mtp attn norm")?,
+            ffn_norm: upload_f32(&layer.ffn_norm, "mtp ffn norm")?,
+            q_a_norm: upload_f32(&layer.q_a_norm, "mtp q_a norm")?,
+            kv_norm: upload_f32(&layer.kv_norm, "mtp kv norm")?,
+            sinks: layer
+                .sinks
+                .as_ref()
+                .map(|sinks| upload_f32(sinks, "mtp sinks"))
+                .transpose()?,
+            hc_attn: upload_hc(&layer.hc_attn)?,
+            hc_ffn: upload_hc(&layer.hc_ffn)?,
+            hc_head: upload_hc(desc.hc_head)?,
+            enorm: upload_f32(desc.enorm, "mtp enorm")?,
+            hnorm: upload_f32(desc.hnorm, "mtp hnorm")?,
+            out_norm: upload_f32(desc.norm, "mtp final norm")?,
+            emb: alloc_dev(g.embed * 4, "mtp emb")?,
+            emb_cast: alloc_dev(g.embed * 2, "mtp emb cast")?,
+            e_out: alloc_dev(g.embed * 4, "mtp e out")?,
+            h_tmp: alloc_dev(g.embed * 4, "mtp h tmp")?,
+            h_cast: alloc_dev(g.embed * 2, "mtp h cast")?,
+            h_out: alloc_dev(g.embed * 4, "mtp h out")?,
+            prev_host: alloc_dev(g.hc * g.embed * 4, "mtp prev staging")?,
+            streams_a: alloc_dev(g.hc * g.embed * 4, "mtp streams A")?,
+            streams_b: alloc_dev(g.hc * g.embed * 4, "mtp streams B")?,
+            post: alloc_dev(g.hc * 4, "mtp hc post gates")?,
+            comb: alloc_dev(g.hc * g.hc * 4, "mtp hc comb")?,
+            x: alloc_dev(g.embed * 4, "mtp x")?,
+            x_cast: alloc_dev(g.embed * 2, "mtp x cast")?,
+            qr: alloc_dev(g.q_lora * 4, "mtp q latent")?,
+            qr_cast: alloc_dev(g.q_lora * 2, "mtp q latent cast")?,
+            q: alloc_dev(g.heads * g.head_dim * 4, "mtp q")?,
+            kv_tmp: alloc_dev(g.head_dim * 4, "mtp kv scratch")?,
+            kv_mirror: alloc_dev(g.head_dim * 4, "mtp kv mirror scratch")?,
+            attn_out: alloc_dev(g.heads * g.head_dim * 4, "mtp attention out")?,
+            attn_out_cast: alloc_dev(g.heads * g.head_dim * 2, "mtp attention out cast")?,
+            attn_final: alloc_dev(g.embed * 4, "mtp attention block out")?,
+            wo_pad_in: alloc_dev(g.o_groups * wo_pad_in_stride, "mtp wo padded input")?,
+            wo_pad_in_stride,
+            proj_pad: alloc_dev(g.o_groups * proj_pad_stride, "mtp wo padded output")?,
+            proj_pad_stride,
+            proj_flat: alloc_dev(g.o_groups * g.o_rank * 4, "mtp wo projected")?,
+            proj_cast: alloc_dev(g.o_groups * g.o_rank * 2, "mtp wo projected cast")?,
+            ffn_y: alloc_dev(g.embed * 4, "mtp ffn input")?,
+            ffn_out: alloc_dev(g.embed * 4, "mtp ffn fallback output")?,
+            attn_w: alloc_dev(g.heads * window * 4, "mtp attention weights")?,
+            attn_wn: alloc_dev(g.heads * window * 4, "mtp attention normalized weights")?,
+            hyper_hidden: alloc_dev(g.embed * 4, "mtp hyper hidden")?,
+            hyper_cast: alloc_dev(g.embed * 2, "mtp hyper hidden cast")?,
+            logits: alloc_dev(g.vocab * 4, "mtp logits")?,
+            argmax: alloc_dev(4, "mtp argmax")?,
+            rope: alloc_dev(4 * half.max(1) * 4, "mtp rope table")?,
+            ring: alloc_dev(ring_cap * g.head_dim * 4, "mtp draft ring")?,
+            count: 0,
+            next_pos: 0,
+            linear,
+        })
+    }
+
+    /// Forget every fed slot (cold start / request switch).
+    pub(crate) fn reset(&mut self) {
+        self.count = 0;
+        self.next_pos = 0;
+    }
+
+    /// Slots fed since the last reset.
+    pub(crate) fn fed_slots(&self) -> usize {
+        self.count
+    }
+
+    /// Snapshot the ring counters before K>1 recurrence slots; restoring the
+    /// mark afterwards discards them logically. The polluted ring SLOTS
+    /// self-heal: the next catch-up rewrites each position's slot before any
+    /// attention reads it, provided the recurrence depth stays within
+    /// [`DSV4_DEV_RING_SLACK`] (checked in [`Self::feed_slot`]'s continuity
+    /// guard by the caller keeping K small — production caps K <= 3).
+    pub(crate) fn speculative_mark(&self) -> (usize, usize) {
+        (self.count, self.next_pos)
+    }
+
+    pub(crate) fn speculative_restore(&mut self, mark: (usize, usize)) {
+        self.count = mark.0;
+        self.next_pos = mark.1;
+    }
+
+    /// Run one draft slot at rope position `pos` (see the module comment).
+    /// Returns the device-argmax'd token id when `want_id`.
+    pub(crate) fn feed_slot(
+        &mut self,
+        desc: &MtpDraftDesc<'_>,
+        pos: usize,
+        token: u32,
+        prev: MtpDraftPrev<'_>,
+        want_id: bool,
+    ) -> Result<Option<u32>> {
+        let handle = self.linear.clone();
+        let inner: &DsV4GpuLinearInner = &handle;
+        let stream = &inner.stream;
+        let layer = desc.layer;
+        let embed = self.embed;
+        let hc = self.hc;
+        if self.count > 0 && pos != self.next_pos {
+            bail!(
+                "MTP device draft fed position {pos}; expected {}",
+                self.next_pos
+            );
+        }
+        let mut launches = 0u64;
+        let resident = inner.resident.borrow();
+
+        // ---- Rope table for this slot's position (fwd | inv).
+        let half = self.rope_dims / 2;
+        if self.rope_dims > 0 {
+            let mut rope_host = Vec::with_capacity(4 * half);
+            for inverse in [false, true] {
+                let table = v4_rope_sincos(self.rope_dims, pos, self.rope_base, inverse);
+                rope_host.extend(table.iter().map(|&(_, cos)| cos));
+                rope_host.extend(table.iter().map(|&(sin, _)| sin));
+            }
+            self.rope.copy_from_host_async(&rope_host, stream)?;
+        }
+        let rope_fwd = 0usize;
+        let rope_inv = 2 * half * 4;
+
+        // ---- Input combine: streams_a[s] = h_proj(hnorm(prev_s)) +
+        // e_proj(enorm(embed)), embedding zero-masked at rope position 0.
+        if pos == 0 {
+            self.emb.memset_zero_async(stream)?;
+        } else {
+            let row = dsv4_embed_row(&inner.gguf, desc.token_embd, self.vocab, token)?;
+            self.emb.copy_from_host_async(&row, stream)?;
+        }
+        crate::kernels::launch_dsv4_rms_exact(&self.emb, &self.enorm, embed, self.rms_eps, stream)?;
+        let e_in: (&DeviceBuffer, usize) = if self.e_dtype == GemmDType::F32 {
+            (&self.emb, 0)
+        } else {
+            inner.cast_slice(
+                self.e_dtype,
+                &self.emb,
+                0,
+                &self.emb_cast,
+                0,
+                embed,
+                &mut launches,
+            )?;
+            (&self.emb_cast, 0)
+        };
+        inner.resident_gemv_at(
+            dense_entry(&resident, desc.e_proj)?,
+            e_in.0,
+            e_in.1,
+            &self.e_out,
+            0,
+        )?;
+        let prev_src: (&DeviceBuffer, usize) = match prev {
+            MtpDraftPrev::Host(flat) => {
+                if flat.len() != hc * embed {
+                    bail!(
+                        "MTP device draft prev hidden has {} values; expected {}",
+                        flat.len(),
+                        hc * embed
+                    );
+                }
+                self.prev_host.copy_from_host_async(flat, stream)?;
+                (&self.prev_host, 0)
+            }
+            // The previous slot's flat output (streams_a): each stream is
+            // copied out to h_tmp BEFORE its slot is overwritten below, so
+            // in-place recycling is stream-ordered safe.
+            MtpDraftPrev::Recycled => (&self.streams_a, 0),
+        };
+        let h_entry = dense_entry(&resident, desc.h_proj)?;
+        for s in 0..hc {
+            self.h_tmp.copy_device_range(
+                0,
+                prev_src.0,
+                prev_src.1 + s * embed * 4,
+                embed * 4,
+                stream,
+            )?;
+            crate::kernels::launch_dsv4_rms_exact(
+                &self.h_tmp,
+                &self.hnorm,
+                embed,
+                self.rms_eps,
+                stream,
+            )?;
+            let h_in: (&DeviceBuffer, usize) = if self.h_dtype == GemmDType::F32 {
+                (&self.h_tmp, 0)
+            } else {
+                inner.cast_slice(
+                    self.h_dtype,
+                    &self.h_tmp,
+                    0,
+                    &self.h_cast,
+                    0,
+                    embed,
+                    &mut launches,
+                )?;
+                (&self.h_cast, 0)
+            };
+            inner.resident_gemv_at(h_entry, h_in.0, h_in.1, &self.h_out, 0)?;
+            self.streams_a
+                .copy_device_range(s * embed * 4, &self.h_out, 0, embed * 4, stream)?;
+        }
+        crate::kernels::launch_dsv4_add_broadcast(&self.streams_a, &self.e_out, hc, embed, stream)?;
+
+        // ---- Decoder block, attention half (hc ping-pong A -> B).
+        crate::kernels::launch_dsv4_hc_pre(
+            &self.streams_a,
+            &self.hc_attn.func,
+            &self.hc_attn.base,
+            &self.hc_attn.scale,
+            Some(&self.attn_norm),
+            hc,
+            embed,
+            self.hc_attn.rows,
+            self.sinkhorn,
+            self.rms_eps,
+            self.hc_eps,
+            &self.x,
+            0,
+            &self.post,
+            &self.comb,
+            stream,
+        )?;
+        let x_in: (&DeviceBuffer, usize) = if self.x_dtype == GemmDType::F32 {
+            (&self.x, 0)
+        } else {
+            inner.cast_slice(
+                self.x_dtype,
+                &self.x,
+                0,
+                &self.x_cast,
+                0,
+                embed,
+                &mut launches,
+            )?;
+            (&self.x_cast, 0)
+        };
+        inner.resident_gemv_at(
+            dense_entry(&resident, &layer.q_a)?,
+            x_in.0,
+            x_in.1,
+            &self.qr,
+            0,
+        )?;
+        crate::kernels::launch_dsv4_rms_exact(
+            &self.qr,
+            &self.q_a_norm,
+            self.q_lora,
+            self.rms_eps,
+            stream,
+        )?;
+        let qr_in: (&DeviceBuffer, usize) = if self.qr_dtype == GemmDType::F32 {
+            (&self.qr, 0)
+        } else {
+            inner.cast_slice(
+                self.qr_dtype,
+                &self.qr,
+                0,
+                &self.qr_cast,
+                0,
+                self.q_lora,
+                &mut launches,
+            )?;
+            (&self.qr_cast, 0)
+        };
+        inner.resident_gemv_at(
+            dense_entry(&resident, &layer.q_b)?,
+            qr_in.0,
+            qr_in.1,
+            &self.q,
+            0,
+        )?;
+        crate::kernels::launch_dsv4_q_prep(
+            &self.q,
+            self.heads,
+            self.head_dim,
+            self.rope_dims,
+            &self.rope,
+            rope_fwd,
+            self.rms_eps,
+            stream,
+        )?;
+        inner.resident_gemv_at(
+            dense_entry(&resident, &layer.kv)?,
+            x_in.0,
+            x_in.1,
+            &self.kv_tmp,
+            0,
+        )?;
+        crate::kernels::launch_dsv4_kv_prep(
+            &self.kv_tmp,
+            &self.kv_norm,
+            self.head_dim,
+            self.rope_dims,
+            &self.rope,
+            rope_fwd,
+            self.rms_eps,
+            &self.ring,
+            (pos % self.ring_cap) * self.head_dim * 4,
+            &self.kv_mirror,
+            0,
+            stream,
+        )?;
+        let n_ring = (self.count + 1).min(self.window);
+        crate::kernels::launch_dsv4_attention_decode(
+            &self.q,
+            None,
+            None,
+            0,
+            &self.ring,
+            self.ring_cap,
+            pos + 1 - n_ring,
+            n_ring,
+            self.sinks.as_ref(),
+            self.attn_scale,
+            self.heads,
+            self.head_dim,
+            self.rope_dims,
+            &self.rope,
+            rope_inv,
+            &self.attn_out,
+            &self.attn_w,
+            &self.attn_wn,
+            self.window,
+            stream,
+        )?;
+
+        // Grouped low-rank output projection (the trunk step's exact shape).
+        let a_elem = gemm_element_size(self.wo_a_dtype);
+        let wo_src: (&DeviceBuffer, usize) = if self.wo_a_dtype == GemmDType::F32 {
+            (&self.attn_out, 4)
+        } else {
+            inner.cast_slice(
+                self.wo_a_dtype,
+                &self.attn_out,
+                0,
+                &self.attn_out_cast,
+                0,
+                self.heads * self.head_dim,
+                &mut launches,
+            )?;
+            (&self.attn_out_cast, a_elem)
+        };
+        let groups = grouped_entry(&resident, &layer.out_a)?;
+        for (gidx, entry) in groups.iter().enumerate() {
+            let (input, in_off) = if self.wo_direct {
+                (wo_src.0, gidx * self.group_features * wo_src.1)
+            } else {
+                self.wo_pad_in.copy_device_range(
+                    gidx * self.wo_pad_in_stride,
+                    wo_src.0,
+                    gidx * self.group_features * wo_src.1,
+                    self.group_features * wo_src.1,
+                    stream,
+                )?;
+                (&self.wo_pad_in, gidx * self.wo_pad_in_stride)
+            };
+            let (output, out_off) = if self.wo_direct {
+                (&self.proj_flat, gidx * self.o_rank * 4)
+            } else {
+                (&self.proj_pad, gidx * self.proj_pad_stride)
+            };
+            inner.resident_gemv_at(entry, input, in_off, output, out_off)?;
+        }
+        if !self.wo_direct {
+            for gidx in 0..self.o_groups {
+                self.proj_flat.copy_device_range(
+                    gidx * self.o_rank * 4,
+                    &self.proj_pad,
+                    gidx * self.proj_pad_stride,
+                    self.o_rank * 4,
+                    stream,
+                )?;
+            }
+        }
+        let wo_b_in: (&DeviceBuffer, usize) = if self.wo_b_dtype == GemmDType::F32 {
+            (&self.proj_flat, 0)
+        } else {
+            inner.cast_slice(
+                self.wo_b_dtype,
+                &self.proj_flat,
+                0,
+                &self.proj_cast,
+                0,
+                self.o_groups * self.o_rank,
+                &mut launches,
+            )?;
+            (&self.proj_cast, 0)
+        };
+        inner.resident_gemv_at(
+            dense_entry(&resident, &layer.out_b)?,
+            wo_b_in.0,
+            wo_b_in.1,
+            &self.attn_final,
+            0,
+        )?;
+        crate::kernels::launch_dsv4_hc_post(
+            &self.attn_final,
+            &self.streams_a,
+            &self.post,
+            &self.comb,
+            hc,
+            embed,
+            &self.streams_b,
+            stream,
+        )?;
+
+        // ---- FFN half (B -> A): hc_pre + the Stage-2a device MoE core over
+        // the pool-registered draft-layer experts; unsupported shapes (the
+        // F32 fixture) fall back to the exact host block.
+        crate::kernels::launch_dsv4_hc_pre(
+            &self.streams_b,
+            &self.hc_ffn.func,
+            &self.hc_ffn.base,
+            &self.hc_ffn.scale,
+            Some(&self.ffn_norm),
+            hc,
+            embed,
+            self.hc_ffn.rows,
+            self.sinkhorn,
+            self.rms_eps,
+            self.hc_eps,
+            &self.ffn_y,
+            0,
+            &self.post,
+            &self.comb,
+            stream,
+        )?;
+        let ctx = DsV4MoeBlockCtx {
+            router: &layer.router,
+            probs_bias: layer.probs_bias.as_deref(),
+            tid2eid: layer.tid2eid.as_ref(),
+            gate: &layer.gate_exps,
+            up: &layer.up_exps,
+            down: &layer.down_exps,
+            shared: layer.shared.as_ref().map(|shared| DsV4MoeShared {
+                gate: &shared.gate,
+                up: &shared.up,
+                down: &shared.down,
+            }),
+            swiglu_clamp: layer.swiglu_clamp,
+            experts: desc.geometry.experts,
+            top_k: desc.geometry.moe_top_k,
+            weights_norm: desc.geometry.expert_weights_norm,
+            weights_scale: desc.geometry.expert_weights_scale,
+            embed,
+        };
+        let mut device_moe_done = false;
+        if !inner.device_moe_disabled.get() && inner.device_moe_supported(&ctx) {
+            let mut scratch_guard = inner.moe_scratch.borrow_mut();
+            let scratch = &mut *scratch_guard;
+            scratch.xs_f16_valid = false;
+            scratch.xs_bf16_valid = false;
+            if let MoeCoreOutcome::Done { .. } = inner.device_moe_core(
+                &ctx,
+                &self.ffn_y,
+                1,
+                std::slice::from_ref(&token),
+                scratch,
+                &resident,
+            )? {
+                let ys = scratch.ys.as_ref().expect("moe core populated ys");
+                crate::kernels::launch_dsv4_hc_post(
+                    ys,
+                    &self.streams_b,
+                    &self.post,
+                    &self.comb,
+                    hc,
+                    embed,
+                    &self.streams_a,
+                    stream,
+                )?;
+                inner.moe_stats.borrow_mut().device_blocks += 1;
+                device_moe_done = true;
+            }
+        }
+        if !device_moe_done {
+            let y_host: Vec<f32> = self.ffn_y.copy_to_host(embed)?;
+            let ys_rows = host_moe_block(inner, &ctx, std::slice::from_ref(&y_host), &[token])?;
+            inner.moe_stats.borrow_mut().host_blocks += 1;
+            self.ffn_out.copy_from_host_async(&ys_rows[0], stream)?;
+            crate::kernels::launch_dsv4_hc_post(
+                &self.ffn_out,
+                &self.streams_b,
+                &self.post,
+                &self.comb,
+                hc,
+                embed,
+                &self.streams_a,
+                stream,
+            )?;
+        }
+
+        // ---- Head + device argmax (only when a draft id is wanted): the
+        // module's own hc_head collapse + final norm, the TARGET's lm head,
+        // and a 4-byte id download — the slot's only host-visible output.
+        let drafted = if want_id {
+            crate::kernels::launch_dsv4_hyper_head(
+                &self.streams_a,
+                &self.hc_head.func,
+                &self.hc_head.base,
+                self.hyper_scale0,
+                hc,
+                embed,
+                self.rms_eps,
+                self.hc_eps,
+                &self.hyper_hidden,
+                stream,
+            )?;
+            crate::kernels::launch_dsv4_rms_exact(
+                &self.hyper_hidden,
+                &self.out_norm,
+                embed,
+                self.rms_eps,
+                stream,
+            )?;
+            let head_in: (&DeviceBuffer, usize) = if self.head_dtype == GemmDType::F32 {
+                (&self.hyper_hidden, 0)
+            } else {
+                inner.cast_slice(
+                    self.head_dtype,
+                    &self.hyper_hidden,
+                    0,
+                    &self.hyper_cast,
+                    0,
+                    embed,
+                    &mut launches,
+                )?;
+                (&self.hyper_cast, 0)
+            };
+            inner.resident_gemv_at(
+                dense_entry(&resident, desc.output_head)?,
+                head_in.0,
+                head_in.1,
+                &self.logits,
+                0,
+            )?;
+            crate::kernels::launch_argmax(&self.logits, &self.argmax, self.vocab, stream)?;
+            let id: Vec<u32> = self.argmax.copy_to_host(1)?;
+            Some(id[0])
+        } else {
+            None
+        };
+        let _ = launches;
+        self.count += 1;
+        self.next_pos = pos + 1;
+        Ok(drafted)
+    }
+
+    /// Download the last computed draft logits (parity tests only; the
+    /// production path never moves them off-device).
+    #[cfg(test)]
+    pub(crate) fn last_logits_host(&self) -> Result<Vec<f32>> {
+        self.logits.copy_to_host(self.vocab)
     }
 }
 
@@ -5148,6 +6368,108 @@ pub(crate) mod tests {
             .unwrap();
         let want = host_blob_reference(&bytes, 1, 32, 64, &x);
         assert_close_relative(&got, &want, "unpinned blob GEMV");
+    }
+
+    /// MULTIPLE extra draft layers registered through `register_host_experts`
+    /// — the DSpark pattern (three chained MoE blocks as layers 44/45/46
+    /// alongside the trunk, same pinning semantics as the MTP's single layer
+    /// 43). Slices of different layers must not collide in the pool (keys are
+    /// (layer, proj, expert)), every layer's slices stay permanently resident
+    /// under trunk eviction pressure, and each GEMV matches its own blob's
+    /// host reference.
+    #[test]
+    fn dsv4_gpu_expert_pool_multiple_draft_layers_register_and_pin() {
+        let path = tempfile_path("mxfp4-multi-draft");
+        // 120 trunk slices vs 148 slots, 36 of them pinned by 3 draft layers
+        // (112 unpinned < 120 trunk slices, so the sweep still evicts; the
+        // registration guard's 64-slot headroom stays satisfiable).
+        write_mxfp4_experts_gguf(&path, 40);
+        let (_gguf, linear) = pool_test_linear(&path);
+        let slot_stride = 1280;
+        linear
+            .init_expert_pool_with_budget(148 * slot_stride)
+            .unwrap();
+
+        // Register layers 44..=46, each with distinct gate/up/down payloads.
+        let mut payloads: Vec<(String, usize, usize, Vec<u8>)> = Vec::new();
+        for layer in 44u32..=46 {
+            for (proj, suffix, in_dim, out_dim) in [
+                (0u8, "gate", 32usize, 64usize),
+                (1, "up", 32, 64),
+                (2, "down", 64, 32),
+            ] {
+                let name = format!("blk.{layer}.ffn_{suffix}_exps.weight");
+                let bytes =
+                    host_expert_blob(in_dim, out_dim, 4, 0xd5 + layer as u64 * 16 + proj as u64);
+                let pinned = linear
+                    .register_host_experts(
+                        &raw_experts(&name, in_dim, out_dim),
+                        4,
+                        layer,
+                        proj,
+                        GgufTensorType::MXFP4,
+                        bytes.clone(),
+                        true,
+                    )
+                    .unwrap();
+                assert!(pinned, "{name} must pin");
+                payloads.push((name, in_dim, out_dim, bytes));
+            }
+        }
+        let stats = linear.pool_stats().unwrap();
+        assert_eq!(stats.prefilled, 36, "3 layers x 3 projections x 4 experts");
+
+        // Every layer's slices answer with their OWN payload (no cross-layer
+        // slot collisions) and hit their pinned slots.
+        let check_all = |what: &str| {
+            let before = linear.pool_stats().unwrap();
+            for (name, in_dim, out_dim, bytes) in &payloads {
+                for expert in 0..4usize {
+                    let x = test_activation(*in_dim, 71 + expert as u32);
+                    let got = linear
+                        .mul_vec(
+                            TensorKey::Expert {
+                                experts: &raw_experts(name, *in_dim, *out_dim),
+                                expert,
+                            },
+                            &x,
+                        )
+                        .unwrap();
+                    let want = host_blob_reference(bytes, expert, *in_dim, *out_dim, &x);
+                    assert_close_relative(&got, &want, &format!("{name}[{expert}] {what}"));
+                }
+            }
+            let after = linear.pool_stats().unwrap();
+            assert_eq!(after.hits - before.hits, 36, "{what}: pinned slices hit");
+            assert_eq!(after.misses, before.misses, "{what}: no reloads");
+        };
+        check_all("fresh");
+
+        // Trunk pressure: 120 slices through the 60 unpinned slots.
+        for (name, in_dim, out_dim) in [
+            ("blk.0.ffn_gate_exps.weight", 32usize, 64usize),
+            ("blk.0.ffn_up_exps.weight", 32, 64),
+            ("blk.0.ffn_down_exps.weight", 64, 32),
+        ] {
+            for expert in 0..40usize {
+                let x = test_activation(in_dim, 300 + expert as u32);
+                let experts = raw_experts(name, in_dim, out_dim);
+                linear
+                    .mul_vec(
+                        TensorKey::Expert {
+                            experts: &experts,
+                            expert,
+                        },
+                        &x,
+                    )
+                    .unwrap();
+            }
+        }
+        assert!(
+            linear.pool_stats().unwrap().evictions > 0,
+            "trunk sweep must overflow the unpinned slots"
+        );
+        check_all("post-pressure");
     }
 
     /// Parity gate (a) on the GPU provider: chunked prefill (B=4 and a whole-
@@ -6306,7 +7628,7 @@ pub(crate) mod tests {
             for &token in &continuation[..keep] {
                 engine.step(&mut reference, token).unwrap();
             }
-            let restores_before = gpu.step_stats().restores;
+            let stats_before = gpu.step_stats();
             for &token in &[2u32, 0, 1] {
                 // Device steps on both sides (the production decode path).
                 let a = engine.step(&mut state, token).unwrap();
@@ -6320,11 +7642,16 @@ pub(crate) mod tests {
                     assert!((x - y).abs() <= 1.0e-4, "keep {keep}: {x} vs {y}");
                 }
             }
-            // The rewind is a host-side mutation, so it severed the device
-            // link; the continuation above must have restored the mirror.
+            // Wave-3 protocol: the rewound state keeps its tag, so its own
+            // continuation is served by rewind ADOPTION or (when the rewind
+            // crosses a compressor block mid-block) a restore; the fresh
+            // `reference` state always pays exactly one restore. Either way
+            // the device mirror is re-validated — count both mechanisms.
+            let stats_after = gpu.step_stats();
             assert!(
-                gpu.step_stats().restores > restores_before,
-                "keep {keep}: rewound state must force a device restore"
+                stats_after.restores + stats_after.rewind_adoptions
+                    > stats_before.restores + stats_before.rewind_adoptions,
+                "keep {keep}: rewound continuation must restore or adopt"
             );
         }
     }
@@ -6382,6 +7709,411 @@ pub(crate) mod tests {
                 "aux row {position}"
             );
         }
+    }
+
+    /// Wave-3 device-sequenced verify: for every chunk size S = 1..=8 the
+    /// device path's per-position logits are BIT-IDENTICAL (assert_eq on f32)
+    /// to the host chunk path's, the advanced host-mirror states are
+    /// bit-identical too, and the step-stats ledger shows the device path
+    /// actually served the chunks. The base position is chosen so ring
+    /// eviction, both compressor forms, and the indexer are all engaged.
+    #[test]
+    fn dsv4_gpu_device_verify_matches_host_verify_bitwise() {
+        let path = tempfile_path("device-verify");
+        write_deepseek4_gguf(&path);
+        let gpu = DeepSeekV4GpuEngine::load(&path).unwrap();
+        let engine = gpu.engine();
+        let lin = engine.linear();
+
+        let prompt: Vec<u32> = (0..11).map(|idx| idx % 3).collect();
+        let mut base = engine.new_state();
+        engine.prefill_with_chunk(&mut base, &prompt, 4).unwrap();
+
+        for s in 1..=DSV4_DEVICE_VERIFY_CAP {
+            let continuation: Vec<u32> = (0..s).map(|idx| ((idx * 2) % 3) as u32).collect();
+
+            lin.set_device_verify_enabled(false);
+            let mut host_state = base.clone();
+            let host_rows = engine
+                .verify_tokens(&mut host_state, &continuation)
+                .unwrap();
+            lin.set_device_verify_enabled(true);
+
+            let stats_before = gpu.step_stats();
+            let mut dev_state = base.clone();
+            let dev_rows = engine.verify_tokens(&mut dev_state, &continuation).unwrap();
+            let stats_after = gpu.step_stats();
+            assert_eq!(
+                stats_after.device_verify_chunks - stats_before.device_verify_chunks,
+                1,
+                "S={s}: expected one device verify chunk"
+            );
+            assert_eq!(
+                stats_after.device_verify_tokens - stats_before.device_verify_tokens,
+                s as u64,
+                "S={s}: expected {s} device verify tokens"
+            );
+
+            assert_eq!(dev_rows, host_rows, "S={s}: device verify logits drifted");
+            assert_eq!(host_state.pos(), dev_state.pos(), "S={s}: position");
+            for (li, (h, d)) in host_state.layers.iter().zip(&dev_state.layers).enumerate() {
+                assert_eq!(h.ring, d.ring, "S={s} layer {li}: ring mirror drifted");
+                for (hc, dc) in [
+                    (h.compressor.as_ref(), d.compressor.as_ref()),
+                    (h.indexer.as_ref(), d.indexer.as_ref()),
+                ] {
+                    let (Some(hc), Some(dc)) = (hc, dc) else {
+                        assert!(hc.is_none() && dc.is_none());
+                        continue;
+                    };
+                    assert_eq!(hc.pending, dc.pending, "S={s} layer {li}: pending");
+                    assert_eq!(hc.keys, dc.keys, "S={s} layer {li}: compressed keys");
+                    assert_eq!(hc.values, dc.values, "S={s} layer {li}: compressed values");
+                }
+            }
+        }
+    }
+
+    /// Long-context launch-shape audit on fixture-scale weights: past
+    /// position 2048 (the real model's indexer-engagement boundary) with
+    /// hundreds of compressed blocks per compressor, a 12-token device verify
+    /// (device chunks 8 + 4) stays BIT-IDENTICAL to the host chunk path AND
+    /// to sequential host steps. The >2048 base state is built on the CPU
+    /// engine (states are provider-independent host vectors) so the test's
+    /// GPU work is the verify paths themselves.
+    #[test]
+    fn dsv4_gpu_device_verify_long_context_matches_host() {
+        use crate::dsv4_cpu::DsV4CpuLinear;
+        use crate::dsv4_cpu::fixture::write_deepseek4_gguf_with_context;
+
+        let path = tempfile_path("device-verify-long");
+        write_deepseek4_gguf_with_context(&path, 4096);
+        let gpu = DeepSeekV4GpuEngine::load(&path).unwrap();
+        let engine = gpu.engine();
+        let lin = engine.linear();
+
+        // Build the >2048 base once, on CPU (both verify paths start from the
+        // SAME state, so the base's provenance and numerics cancel).
+        let cpu_gguf = Arc::new(GgufFile::open(&path).unwrap());
+        let cpu_engine = DsV4Engine::new(
+            cpu_gguf.clone(),
+            DsV4CpuLinear::from_gguf(cpu_gguf),
+            "cpu-base",
+        )
+        .unwrap();
+        let prompt: Vec<u32> = (0..2100).map(|idx| (idx % 3) as u32).collect();
+        let mut base = cpu_engine.new_state();
+        cpu_engine
+            .prefill_with_chunk(&mut base, &prompt, 128)
+            .unwrap();
+        assert!(base.pos() > 2048);
+
+        let continuation: Vec<u32> = (0..12).map(|idx| ((idx * 2) % 3) as u32).collect();
+        lin.set_device_verify_enabled(false);
+        let mut host_state = base.clone();
+        let host_rows = engine
+            .verify_tokens(&mut host_state, &continuation)
+            .unwrap();
+        lin.set_device_verify_enabled(true);
+        let stats_before = gpu.step_stats();
+        let mut dev_state = base.clone();
+        let dev_rows = engine.verify_tokens(&mut dev_state, &continuation).unwrap();
+        let stats_after = gpu.step_stats();
+        assert_eq!(
+            stats_after.device_verify_chunks - stats_before.device_verify_chunks,
+            2,
+            "12 tokens must split into device chunks of 8 + 4"
+        );
+        assert_eq!(dev_rows, host_rows, "long-context device verify drifted");
+
+        // Sequential host-step cross-check at the same positions.
+        lin.set_device_step_enabled(false);
+        let mut seq_state = base.clone();
+        let seq_rows: Vec<Vec<f32>> = continuation
+            .iter()
+            .map(|&token| engine.step(&mut seq_state, token).unwrap())
+            .collect();
+        lin.set_device_step_enabled(true);
+        assert_eq!(dev_rows, seq_rows, "device verify vs sequential host steps");
+    }
+
+    /// The spec-loop rewind pattern stays device-resident: verify K+1, rewind
+    /// to the accepted end, verify again — after the initial restore the
+    /// rewinds are ADOPTED in place (no restore uploads), and every logits
+    /// row stays bit-identical to the host chunk path's. Also pins the
+    /// divergent-clone hazard: a sibling clone that rewinds and re-verifies
+    /// re-tags the device state, so the original clone's stale (tag, pos)
+    /// can never false-match — both trajectories reproduce host verify.
+    #[test]
+    fn dsv4_gpu_device_verify_rewind_adoption_stays_device_resident() {
+        let path = tempfile_path("device-verify-adopt");
+        write_deepseek4_gguf(&path);
+        let gpu = DeepSeekV4GpuEngine::load(&path).unwrap();
+        let engine = gpu.engine();
+        let lin = engine.linear();
+
+        let prompt: Vec<u32> = (0..9).map(|idx| idx % 3).collect();
+        let k = 3usize;
+        let slack = 4 + k + 1; // max_ratio + k + 1, the backend's formula
+        let mut state = engine.new_state_with_ring_slack(slack);
+        engine.prefill_with_chunk(&mut state, &prompt, 4).unwrap();
+        let mut fed = prompt.clone();
+
+        // Host-path reference trajectory (identical inputs, fresh states).
+        let verify_reference = |fed: &[u32], seq: &[u32]| -> Vec<Vec<f32>> {
+            lin.set_device_verify_enabled(false);
+            lin.set_device_step_enabled(false);
+            let mut reference = engine.new_state_with_ring_slack(slack);
+            engine.prefill_with_chunk(&mut reference, fed, 4).unwrap();
+            let rows = engine.verify_tokens(&mut reference, seq).unwrap();
+            lin.set_device_step_enabled(true);
+            lin.set_device_verify_enabled(true);
+            rows
+        };
+
+        // Everything after the first verify's initial restore — 3 more
+        // verifies and every rewind (including their rounded-suffix device
+        // re-feeds) — must be served without another restore upload.
+        let mut baseline: Option<DsV4StepStats> = None;
+        for (round, keep) in [1usize, 2, 0, 3].into_iter().enumerate() {
+            let verify_seq: Vec<u32> = (0..=k).map(|idx| ((round + idx * 2) % 3) as u32).collect();
+            let want = verify_reference(&fed, &verify_seq);
+            let rows = engine.verify_tokens(&mut state, &verify_seq).unwrap();
+            assert_eq!(rows, want, "round {round}: device verify drifted");
+            if round == 0 {
+                baseline = Some(gpu.step_stats());
+            }
+            fed.extend_from_slice(&verify_seq[..=keep.min(k - 1)]);
+            engine
+                .rewind_state_to(&mut state, &fed, fed.len(), None)
+                .unwrap();
+        }
+        let baseline = baseline.expect("round 0 ran");
+        let after_loop = gpu.step_stats();
+        assert_eq!(
+            after_loop.restores, baseline.restores,
+            "rewound verifies must stay device-resident (no restores)"
+        );
+        assert!(
+            after_loop.rewind_adoptions > baseline.rewind_adoptions,
+            "expected rewind adoptions, got {after_loop:?}"
+        );
+
+        // Divergent clones: two siblings fork at the same (tag, pos), verify
+        // DIFFERENT tokens, and then trajectory A continues AFTER B ran — the
+        // false-match trap. Without fresh-tag-on-adopt, A's continuation at
+        // B's (tag, pos) would silently reuse B's device rings. All three
+        // results must match their host references bit for bit.
+        let seq_a: Vec<u32> = vec![0, 1, 2, 0];
+        let seq_b: Vec<u32> = vec![2, 2, 0, 1];
+        let want_a = verify_reference(&fed, &seq_a);
+        let want_b = verify_reference(&fed, &seq_b);
+        let mut side_a = state.clone();
+        let mut side_b = state.clone();
+        let got_a = engine.verify_tokens(&mut side_a, &seq_a).unwrap();
+        let got_b = engine.verify_tokens(&mut side_b, &seq_b).unwrap();
+        assert_eq!(got_a, want_a, "clone A diverged");
+        assert_eq!(got_b, want_b, "clone B diverged");
+        let seq_a2: Vec<u32> = vec![1, 0];
+        let mut fed_a = fed.clone();
+        fed_a.extend_from_slice(&seq_a);
+        let want_a2 = verify_reference(&fed_a, &seq_a2);
+        let got_a2 = engine.verify_tokens(&mut side_a, &seq_a2).unwrap();
+        assert_eq!(
+            got_a2, want_a2,
+            "sibling A's continuation false-matched B's device trajectory"
+        );
+    }
+
+    /// `HI_DSV4_DEVICE_VERIFY=0` (driven via the test setter): verify routes
+    /// through the host chunk path (ledger shows zero device chunks), and the
+    /// rows match the device path bit for bit — the kill switch is a pure
+    /// A/B, exactly like `HI_DSV4_HOST_STEP`.
+    #[test]
+    fn dsv4_gpu_device_verify_kill_switch_is_pure_ab() {
+        let path = tempfile_path("device-verify-kill");
+        write_deepseek4_gguf(&path);
+        let gpu = DeepSeekV4GpuEngine::load(&path).unwrap();
+        let engine = gpu.engine();
+        let lin = engine.linear();
+
+        let prompt: Vec<u32> = (0..6).map(|idx| idx % 3).collect();
+        let continuation: Vec<u32> = vec![1, 2, 0, 1];
+        let mut base = engine.new_state();
+        engine.prefill_with_chunk(&mut base, &prompt, 4).unwrap();
+
+        let stats0 = gpu.step_stats();
+        let mut on_state = base.clone();
+        let on_rows = engine.verify_tokens(&mut on_state, &continuation).unwrap();
+        let stats1 = gpu.step_stats();
+        assert_eq!(stats1.device_verify_chunks - stats0.device_verify_chunks, 1);
+
+        lin.set_device_verify_enabled(false);
+        let mut off_state = base.clone();
+        let off_rows = engine.verify_tokens(&mut off_state, &continuation).unwrap();
+        lin.set_device_verify_enabled(true);
+        let stats2 = gpu.step_stats();
+        assert_eq!(
+            stats2.device_verify_chunks, stats1.device_verify_chunks,
+            "killed verify must not serve device chunks"
+        );
+        assert!(stats2.host_verify_chunks > stats1.host_verify_chunks);
+        assert_eq!(on_rows, off_rows, "kill switch changed verify logits");
+    }
+
+    /// CUDA-event-timed A/B of the verify paths over one loaded engine:
+    /// median ms per S-token verify for S = 1..=max_s, device vs host, using
+    /// rewind-adoption between reps so the device side stays resident (the
+    /// production spec-loop shape). Returns (s, device_ms, host_ms) rows.
+    fn bench_verify_paths(
+        gpu: &DeepSeekV4GpuEngine,
+        base: &DsV4State,
+        history: &[u32],
+        continuation: &[u32],
+        max_s: usize,
+        reps: usize,
+    ) -> Vec<(usize, f64, f64)> {
+        use crate::runtime::Event;
+        let engine = gpu.engine();
+        let lin = engine.linear();
+        let base_pos = base.pos();
+        let mut rows = Vec::new();
+        for s in 1..=max_s.min(continuation.len()) {
+            let mut medians = [0.0f64; 2];
+            for (which, device) in [true, false].into_iter().enumerate() {
+                lin.set_device_verify_enabled(device);
+                let mut state = base.clone();
+                // Unmeasured warmup rep: establishes the device tag (first
+                // device verify restores) and warms the expert pool set.
+                let mut samples = Vec::with_capacity(reps);
+                for rep in 0..=reps {
+                    let start = Event::create_timing().unwrap();
+                    let end = Event::create_timing().unwrap();
+                    start.record(&lin.stream).unwrap();
+                    engine
+                        .verify_tokens(&mut state, &continuation[..s])
+                        .unwrap();
+                    end.record(&lin.stream).unwrap();
+                    end.synchronize().unwrap();
+                    if rep > 0 {
+                        samples.push(start.elapsed_ms(&end).unwrap() as f64);
+                    }
+                    engine
+                        .rewind_state_to(&mut state, &history[..base_pos], base_pos, None)
+                        .unwrap();
+                }
+                samples.sort_by(f64::total_cmp);
+                medians[which] = samples[samples.len() / 2];
+            }
+            lin.set_device_verify_enabled(true);
+            rows.push((s, medians[0], medians[1]));
+        }
+        rows
+    }
+
+    fn print_verify_bench(rows: &[(usize, f64, f64)], label: &str) {
+        eprintln!("[{label}] S-token verify, median ms (device | host | host/device):");
+        let mut prev: Option<(f64, f64)> = None;
+        for &(s, dev, host) in rows {
+            let (m_dev, m_host) =
+                prev.map_or((f64::NAN, f64::NAN), |(pd, ph)| (dev - pd, host - ph));
+            eprintln!(
+                "  S={s}: {dev:8.2} | {host:8.2} | {:.2}x   marginal token: {m_dev:+7.2} | {m_host:+7.2}",
+                host / dev
+            );
+            prev = Some((dev, host));
+        }
+    }
+
+    /// hc_pre kernel at REAL-model dims (hc 4, embed 4096, 24 mixer rows)
+    /// over synthetic weights: per-launch microseconds. The kernel runs 86x
+    /// per device token (2 per layer), so its per-launch cost directly sets
+    /// the device verify/step floor; the warp-cooperative fold rework took it
+    /// from ~640 us (nsys, single-thread DRAM-latency-bound serial dots) to
+    /// tens of us with bit-identical results. Run explicitly:
+    /// `CUDA_VISIBLE_DEVICES=0 cargo test -p hi-cuda --release --features native-cuda \
+    ///  dsv4_gpu_hc_pre_kernel_real_dims_benchmark -- --ignored --nocapture`
+    #[test]
+    #[ignore = "timing-only; run explicitly on a quiet GPU"]
+    fn dsv4_gpu_hc_pre_kernel_real_dims_benchmark() {
+        use crate::runtime::Event;
+        CudaRuntime::probe().unwrap();
+        let stream = Stream::create().unwrap();
+        let (hc, embed) = (4usize, 4096usize);
+        let rows = hc * hc + 2 * hc;
+        let flat = hc * embed;
+        let streams_buf = upload_f32(&test_activation(flat, 3), "bench streams").unwrap();
+        let func = upload_f32(&test_activation(rows * flat, 4), "bench func").unwrap();
+        let base = upload_f32(&test_activation(rows, 5), "bench base").unwrap();
+        let scale = upload_f32(&[0.6, 0.4, 0.8], "bench scale").unwrap();
+        let norm = upload_f32(&vec![1.0f32; embed], "bench norm").unwrap();
+        let y = alloc_dev(embed * 4, "bench y").unwrap();
+        let post = alloc_dev(hc * 4, "bench post").unwrap();
+        let comb = alloc_dev(hc * hc * 4, "bench comb").unwrap();
+        let launch = || {
+            crate::kernels::launch_dsv4_hc_pre(
+                &streams_buf,
+                &func,
+                &base,
+                &scale,
+                Some(&norm),
+                hc,
+                embed,
+                rows,
+                3,
+                1.0e-6,
+                1.0e-5,
+                &y,
+                0,
+                &post,
+                &comb,
+                &stream,
+            )
+            .unwrap();
+        };
+        for _ in 0..16 {
+            launch(); // warmup (also faults func into L2/DRAM steady state)
+        }
+        stream.synchronize().unwrap();
+        let reps = 200;
+        let start = Event::create_timing().unwrap();
+        let end = Event::create_timing().unwrap();
+        start.record(&stream).unwrap();
+        for _ in 0..reps {
+            launch();
+        }
+        end.record(&stream).unwrap();
+        end.synchronize().unwrap();
+        let us = start.elapsed_ms(&end).unwrap() as f64 * 1000.0 / reps as f64;
+        eprintln!(
+            "[real dims] dsv4_hc_pre: {us:.1} us/launch ({} rows x {flat} flat); \
+             86 launches/token = {:.2} ms/token",
+            rows,
+            us * 86.0 / 1000.0
+        );
+    }
+
+    /// Fixture-scale device-verify timing (relative numbers only — fixture
+    /// dims are launch-bound, so this measures the ORCHESTRATION cost the
+    /// device path removes, not GEMV throughput). Run explicitly:
+    /// `CUDA_VISIBLE_DEVICES=0 cargo test -p hi-cuda --release --features native-cuda \
+    ///  dsv4_gpu_device_verify_fixture_benchmark -- --ignored --nocapture`
+    #[test]
+    #[ignore = "timing-only; run explicitly on a quiet GPU"]
+    fn dsv4_gpu_device_verify_fixture_benchmark() {
+        let path = tempfile_path("device-verify-bench");
+        write_deepseek4_gguf(&path);
+        let gpu = DeepSeekV4GpuEngine::load(&path).unwrap();
+        let engine = gpu.engine();
+        let prompt: Vec<u32> = (0..16).map(|idx| idx % 3).collect();
+        let continuation: Vec<u32> = (0..8).map(|idx| ((idx * 2) % 3) as u32).collect();
+        let slack = 4 + 8 + 1;
+        let mut base = engine.new_state_with_ring_slack(slack);
+        engine.prefill_with_chunk(&mut base, &prompt, 4).unwrap();
+        let mut history = prompt.clone();
+        history.extend(&continuation);
+        let rows = bench_verify_paths(&gpu, &base, &history, &continuation, 8, 5);
+        print_verify_bench(&rows, "fixture");
     }
 
     // ---- Real-model gates (ignored: need the checkpoint + exclusive GPU) ---
@@ -6536,6 +8268,67 @@ pub(crate) mod tests {
             "greedy choice diverged after rewind"
         );
         eprintln!("real-model verify: rewind to {target} resumed on the sequential trajectory");
+    }
+
+    /// Wave-3 measurement (deliverable 4a): marginal verify-token cost at
+    /// S = 1..8, device vs host, CUDA-event timed with rewind-adoption reps
+    /// (the spec-loop shape). Uses the model's own greedy continuation so
+    /// expert routing is realistic. Run explicitly on GPU 0 with a small
+    /// pool (it is SHARED with a training job):
+    /// `HI_DSV4_EXPERT_POOL_GB=12 CUDA_VISIBLE_DEVICES=0 cargo test -p hi-cuda --release \
+    ///  --features native-cuda dsv4_real_model_device_verify_benchmark -- --ignored --nocapture --test-threads=1`
+    #[test]
+    #[ignore = "needs the real DeepSeek-V4-Flash checkpoint; timing-only"]
+    fn dsv4_real_model_device_verify_benchmark() {
+        let Some(path) = real_model_path() else {
+            eprintln!("skipping: real model not found");
+            return;
+        };
+        let gpu = DeepSeekV4GpuEngine::load(&path).unwrap();
+        let engine = gpu.engine();
+        let tokens = engine.tokenizer().encode(&long_prompt(300)).unwrap();
+        let prompt = &tokens[..256];
+        let slack = 128 + 8 + 1;
+        let started = std::time::Instant::now();
+        let mut base = engine.new_state_with_ring_slack(slack);
+        let mut logits = engine.prefill(&mut base, prompt).unwrap();
+        eprintln!(
+            "prefill 256 tokens in {:.1}s",
+            started.elapsed().as_secs_f64()
+        );
+        // The model's own greedy continuation (device steps on a clone).
+        let mut probe = base.clone();
+        let mut continuation = Vec::with_capacity(8);
+        for _ in 0..8 {
+            let next = crate::qwen_cpu::argmax(&logits).unwrap();
+            continuation.push(next);
+            logits = engine.step(&mut probe, next).unwrap();
+        }
+        drop(probe);
+        let mut history = prompt.to_vec();
+        history.extend(&continuation);
+        let pool_before = gpu.pool_stats().unwrap_or_default();
+        let rows = bench_verify_paths(&gpu, &base, &history, &continuation, 8, 5);
+        let pool_after = gpu.pool_stats().unwrap_or_default();
+        print_verify_bench(&rows, "real model, 256-token context");
+        let served =
+            (pool_after.hits - pool_before.hits) + (pool_after.misses - pool_before.misses);
+        if served > 0 {
+            eprintln!(
+                "expert pool over the bench: {:.1}% hit ({} misses, {:.2} GiB uploaded)",
+                100.0 * (pool_after.hits - pool_before.hits) as f64 / served as f64,
+                pool_after.misses - pool_before.misses,
+                gib(pool_after.bytes_uploaded - pool_before.bytes_uploaded),
+            );
+        }
+        let stats = gpu.step_stats();
+        eprintln!(
+            "ledger: verify chunks device {} / host {}, rewind adoptions {}, restores {}",
+            stats.device_verify_chunks,
+            stats.host_verify_chunks,
+            stats.rewind_adoptions,
+            stats.restores,
+        );
     }
 
     /// Before/after timing on a ~1.5k-token prompt (the validation run the
@@ -6748,6 +8541,13 @@ pub(crate) mod tests {
             let delta = DsV4StepStats {
                 device_steps: steps_after.device_steps - steps_before.device_steps,
                 host_steps: steps_after.host_steps - steps_before.host_steps,
+                device_verify_chunks: steps_after.device_verify_chunks
+                    - steps_before.device_verify_chunks,
+                device_verify_tokens: steps_after.device_verify_tokens
+                    - steps_before.device_verify_tokens,
+                host_verify_chunks: steps_after.host_verify_chunks
+                    - steps_before.host_verify_chunks,
+                rewind_adoptions: steps_after.rewind_adoptions - steps_before.rewind_adoptions,
                 restores: steps_after.restores - steps_before.restores,
                 launches: steps_after.launches - steps_before.launches,
                 syncs: steps_after.syncs - steps_before.syncs,
