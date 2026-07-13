@@ -40,14 +40,19 @@ pub mod dsv4_gpu;
 pub(crate) mod dsv4_mtp;
 #[cfg(feature = "native-cuda")]
 mod expert_pool;
-/// io_uring batch reads for streamed experts: CUDA-free (plain files + raw
-/// buffers), so it compiles, unit-tests and benches without native-cuda. Its
-/// non-test consumer is the native-cuda expert pool, hence the scoped allow.
+/// io_uring batch reads for streamed experts and bulk model loads: CUDA-free
+/// (plain files + raw buffers), so it compiles, unit-tests and benches
+/// without native-cuda. Its non-test consumers are the native-cuda expert
+/// pool and loaders, hence the scoped allow.
 #[cfg(target_os = "linux")]
 #[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
 pub(crate) mod expert_uring;
 pub mod gpu;
 pub mod kernels;
+/// mmap-vs-io_uring byte source for resident-weight loads (gpu.rs qwen
+/// matrices, dsv4 resident uploads) plus the shared ring auto heuristics.
+#[cfg(feature = "native-cuda")]
+pub(crate) mod load_source;
 mod prefix_cache;
 pub mod qwen_cpu;
 pub mod runtime;

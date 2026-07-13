@@ -46,6 +46,12 @@ pub(crate) const URING_BLOCK: usize = 4096;
 /// `HI_CUDA_EXPERT_IOURING_QD` default.
 pub(crate) const DEFAULT_QD: u32 = 256;
 
+/// Sub-read size for bulk (whole-tensor) loads: large extents split into
+/// chunks this size so a single tensor keeps the device queue full. 8 MiB
+/// matches the measured knee — scattered 8 MiB O_DIRECT reads at QD >= 8 hit
+/// this NVMe's ceiling.
+pub(crate) const LOAD_CHUNK: usize = 8 << 20;
+
 /// Largest single registered-buffer iovec the kernel accepts (1 GiB), and the
 /// historical cap on the number of iovecs.
 const MAX_FIXED_CHUNK: usize = 1 << 30;
@@ -174,6 +180,77 @@ impl Drop for AlignedBuf {
 // SAFETY: AlignedBuf is a plain owned allocation (no thread affinity).
 unsafe impl Send for AlignedBuf {}
 
+/// Owned result of a bulk extent read: the block-aligned span with the
+/// payload `len` bytes starting at `head`. Holding the alignment padding
+/// instead of copying the payload out keeps whole-tensor loads zero-copy.
+pub(crate) struct BulkBytes {
+    buf: AlignedBuf,
+    head: usize,
+    len: usize,
+}
+
+impl BulkBytes {
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        &self.buf.as_slice()[self.head..self.head + self.len]
+    }
+}
+
+/// Sampled page-cache residency of `extents` (`(shard, offset, len)` over
+/// `paths`), via `mincore` on transient maps — queries only, faults nothing
+/// in. Samples up to `max_samples` extents evenly. `None` when nothing could
+/// be measured (unreadable paths, mmap failures).
+///
+/// Honest only for ranges this process has not itself faulted through an
+/// existing mapping (query before touching the tensors).
+pub(crate) fn sampled_extent_residency(
+    paths: &[PathBuf],
+    extents: &[(usize, u64, usize)],
+    max_samples: usize,
+) -> Option<f64> {
+    if extents.is_empty() || max_samples == 0 {
+        return None;
+    }
+    let files: Vec<Option<File>> = paths.iter().map(|path| File::open(path).ok()).collect();
+    let mut resident = 0usize;
+    let mut total = 0usize;
+    for &(shard, offset, len) in extents
+        .iter()
+        .step_by((extents.len() / max_samples).max(1))
+        .take(max_samples)
+    {
+        let Some(Some(file)) = files.get(shard) else {
+            continue;
+        };
+        if len == 0 {
+            continue;
+        }
+        let start = offset / URING_BLOCK as u64 * URING_BLOCK as u64;
+        let end = (offset + len as u64).div_ceil(URING_BLOCK as u64) * URING_BLOCK as u64;
+        let map_len = (end - start) as usize;
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                map_len,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                start as libc::off_t,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            continue;
+        }
+        let pages = map_len / URING_BLOCK;
+        let mut vec = vec![0u8; pages];
+        if unsafe { libc::mincore(ptr, map_len, vec.as_mut_ptr()) } == 0 {
+            resident += vec.iter().filter(|byte| **byte & 1 != 0).count();
+            total += pages;
+        }
+        unsafe { libc::munmap(ptr, map_len) };
+    }
+    (total > 0).then(|| resident as f64 / total as f64)
+}
+
 /// Per-job drive-loop state.
 struct JobState {
     shard: usize,
@@ -198,6 +275,8 @@ struct JobState {
 pub(crate) struct IoUringReader {
     ring: Mutex<IoUring>,
     files: Vec<File>,
+    /// Shard byte lengths, cached at open (EOF clamping for chunked reads).
+    file_lens: Vec<u64>,
     qd: u32,
     fixed_files: bool,
     registered: Option<RegisteredArena>,
@@ -244,9 +323,18 @@ impl IoUringReader {
                 false
             }
         };
+        let mut file_lens = Vec::with_capacity(files.len());
+        for (file, path) in files.iter().zip(paths) {
+            file_lens.push(
+                file.metadata()
+                    .with_context(|| format!("stat {}", path.display()))?
+                    .len(),
+            );
+        }
         let reader = Self {
             ring: Mutex::new(ring),
             files,
+            file_lens,
             qd,
             fixed_files,
             registered: None,
@@ -395,6 +483,104 @@ impl IoUringReader {
                     .map(|slot| slot.unwrap_or_else(|| Err(anyhow!("{msg}"))))
                     .collect()
             }
+        }
+    }
+
+    /// Plan the block-aligned sub-reads that cover `len` bytes at `offset` of
+    /// `shard`, writing into the `aligned_len`-byte region at `dest`. Splits
+    /// the aligned span (not the payload), so every sub-read stays
+    /// block-aligned with a zero head; the final sub-read clamps to EOF
+    /// (`read_batch` accepts the short fill because its target is the clamped
+    /// length). Returns the payload head within `dest` plus the jobs.
+    ///
+    /// # Safety contract (checked bounds, unchecked pointer)
+    ///
+    /// `dest` must be a live, 4 KiB-aligned region of at least
+    /// `aligned_span(offset, len).2` bytes for the duration of the batch that
+    /// runs these jobs.
+    pub(crate) fn plan_chunked_extent(
+        &self,
+        shard: usize,
+        offset: u64,
+        len: usize,
+        chunk: usize,
+        dest: *mut u8,
+    ) -> Result<(usize, Vec<UringJob>)> {
+        if chunk == 0 || !chunk.is_multiple_of(URING_BLOCK) {
+            bail!("bulk read chunk {chunk} is not a multiple of {URING_BLOCK}");
+        }
+        let file_len = *self
+            .file_lens
+            .get(shard)
+            .ok_or_else(|| anyhow!("bulk read references missing GGUF shard {shard}"))?;
+        let end = offset
+            .checked_add(len as u64)
+            .ok_or_else(|| anyhow!("bulk read range overflows u64"))?;
+        if end > file_len {
+            bail!("bulk read {offset}..{end} exceeds shard {shard} ({file_len} bytes)");
+        }
+        let (aligned_start, head, aligned_len) = aligned_span(offset, len);
+        if len == 0 {
+            return Ok((0, Vec::new()));
+        }
+        let mut jobs = Vec::with_capacity(aligned_len.div_ceil(chunk));
+        for sub in 0..aligned_len.div_ceil(chunk) {
+            let sub_offset = aligned_start + (sub * chunk) as u64;
+            let span = chunk.min(aligned_len - sub * chunk);
+            let sub_len = usize::try_from((file_len - sub_offset).min(span as u64))
+                .expect("chunk fits usize");
+            jobs.push(UringJob {
+                shard,
+                offset: sub_offset,
+                len: sub_len,
+                dest: Some(SlotDest {
+                    // SAFETY: disjoint chunk-strided pieces of the caller's
+                    // aligned_len-sized region (caller contract).
+                    ptr: unsafe { dest.add(sub * chunk) },
+                    cap: span,
+                }),
+            });
+        }
+        Ok((head, jobs))
+    }
+
+    /// Read one contiguous extent (`len` bytes at `offset` of `shard`) into a
+    /// single owned aligned allocation, split into `chunk`-sized block-aligned
+    /// sub-reads submitted together — a lone multi-hundred-MB tensor fills
+    /// the queue by itself. The payload sits at [`BulkBytes::as_slice`].
+    pub(crate) fn read_extent_chunked(
+        &self,
+        shard: usize,
+        offset: u64,
+        len: usize,
+        chunk: usize,
+    ) -> Result<BulkBytes> {
+        let (_, _, aligned_len) = aligned_span(offset, len);
+        let buf = AlignedBuf::new(aligned_len)?;
+        let (head, jobs) = self.plan_chunked_extent(shard, offset, len, chunk, buf.ptr)?;
+        if jobs.is_empty() {
+            return Ok(BulkBytes {
+                buf,
+                head: 0,
+                len: 0,
+            });
+        }
+        let mut first_err: Option<anyhow::Error> = None;
+        // SAFETY: destinations are 4 KiB-aligned (buf base + chunk multiples),
+        // disjoint, and each holds its sub-read's aligned span; `buf` outlives
+        // the batch.
+        unsafe {
+            self.read_batch(&jobs, |_, outcome| {
+                if let Err(err) = outcome
+                    && first_err.is_none()
+                {
+                    first_err = Some(err);
+                }
+            })
+        }?;
+        match first_err {
+            None => Ok(BulkBytes { buf, head, len }),
+            Some(err) => Err(err),
         }
     }
 
@@ -902,11 +1088,57 @@ mod tests {
 
     const GLM_FIRST_SHARD: &str =
         ".hi/models/glm-5.2-reap50/GLM-5.2-REAP50-Q3_K_M-00001-of-00005.gguf";
+    const V4_FIRST_SHARD: &str =
+        ".hi/models/deepseek-v4-flash/DeepSeek-V4-Flash-UD-Q4_K_XL-00001-of-00005.gguf";
+
+    fn model_path(first_shard: &str) -> Option<PathBuf> {
+        let home = std::env::var_os("HOME")?;
+        let path = PathBuf::from(home).join(first_shard);
+        path.exists().then_some(path)
+    }
 
     fn glm_model_path() -> Option<PathBuf> {
-        let home = std::env::var_os("HOME")?;
-        let path = PathBuf::from(home).join(GLM_FIRST_SHARD);
-        path.exists().then_some(path)
+        model_path(GLM_FIRST_SHARD)
+    }
+
+    /// Sequential 16 MiB O_DIRECT single-thread read rate in GiB/s (what
+    /// `dd iflag=direct bs=16M` measures) — the device ceiling reference.
+    fn device_ceiling_gibs(path: &Path) -> f64 {
+        use std::os::unix::fs::{FileExt, OpenOptionsExt};
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(path)
+            .unwrap();
+        let chunk = 16 << 20;
+        let buf = AlignedBuf::new(chunk).unwrap();
+        let started = std::time::Instant::now();
+        let mut read = 0u64;
+        for i in 0..256u64 {
+            // SAFETY: buf is an exclusive, live chunk-sized allocation.
+            let slice = unsafe { std::slice::from_raw_parts_mut(buf.ptr, buf.len) };
+            read += file.read_at(slice, i * chunk as u64).unwrap() as u64;
+        }
+        read as f64 / (1u64 << 30) as f64 / started.elapsed().as_secs_f64()
+    }
+
+    /// Every non-expert (trunk) tensor extent of the model, in file order —
+    /// what a resident-weight load reads.
+    fn trunk_extents(gguf: &hi_gguf::GgufFile) -> Vec<BenchJob> {
+        gguf.tensors()
+            .iter()
+            .filter(|info| !info.name.contains("_exps."))
+            .filter_map(|info| {
+                let range = gguf.tensor_file_range(&info.name).ok()?;
+                Some(BenchJob {
+                    tensor: info.name.clone(),
+                    rel: 0,
+                    shard: range.shard,
+                    abs: range.file_offset,
+                    len: usize::try_from(range.len).ok()?,
+                })
+            })
+            .collect()
     }
 
     /// One expert-projection slice of the real model.
@@ -1004,42 +1236,13 @@ mod tests {
         }
     }
 
-    /// Fraction of the jobs' pages resident in the page cache, sampled over
-    /// up to `sample` extents via `mincore` (a query: faults nothing in).
+    /// Bench shim over the production sampler.
     fn sampled_residency(paths: &[PathBuf], jobs: &[BenchJob], sample: usize) -> f64 {
-        let files: Vec<File> = paths.iter().map(|path| File::open(path).unwrap()).collect();
-        let mut resident = 0usize;
-        let mut total = 0usize;
-        for job in jobs.iter().step_by((jobs.len() / sample).max(1)) {
-            let start = job.abs / 4096 * 4096;
-            let end = (job.abs + job.len as u64).div_ceil(4096) * 4096;
-            let len = (end - start) as usize;
-            let ptr = unsafe {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    len,
-                    libc::PROT_READ,
-                    libc::MAP_SHARED,
-                    files[job.shard].as_raw_fd(),
-                    start as libc::off_t,
-                )
-            };
-            if ptr == libc::MAP_FAILED {
-                continue;
-            }
-            let pages = len / 4096;
-            let mut vec = vec![0u8; pages];
-            if unsafe { libc::mincore(ptr, len, vec.as_mut_ptr()) } == 0 {
-                resident += vec.iter().filter(|byte| **byte & 1 != 0).count();
-                total += pages;
-            }
-            unsafe { libc::munmap(ptr, len) };
-        }
-        if total == 0 {
-            0.0
-        } else {
-            resident as f64 / total as f64
-        }
+        let extents: Vec<(usize, u64, usize)> = jobs
+            .iter()
+            .map(|job| (job.shard, job.abs, job.len))
+            .collect();
+        sampled_extent_residency(paths, &extents, sample).unwrap_or(0.0)
     }
 
     /// Ignored real-shard spot check: io_uring reads must match the mmap view
@@ -1080,6 +1283,180 @@ mod tests {
         }
     }
 
+    /// Ignored real-shard spot check for the bulk (model-load) path: chunked
+    /// whole-tensor reads must match the mmap view byte for byte, including
+    /// the largest trunk tensors (many chunks) and a spread of small ones.
+    #[test]
+    #[ignore = "needs ~/.hi/models/glm-5.2-reap50/ (169 GB, 5 shards)"]
+    fn real_glm_bulk_chunked_reads_match_mmap_spot_check() {
+        let Some(model) = glm_model_path() else {
+            eprintln!("skipping: {GLM_FIRST_SHARD} not present");
+            return;
+        };
+        let gguf = hi_gguf::GgufFile::open(&model).unwrap();
+        let reader = IoUringReader::open(&shard_paths(&gguf), DEFAULT_QD).unwrap();
+        let mut jobs = trunk_extents(&gguf);
+        jobs.sort_by_key(|job| std::cmp::Reverse(job.len));
+        // 3 largest (multi-chunk) + every 97th of the rest (small/odd sizes).
+        let picks: Vec<BenchJob> = jobs
+            .iter()
+            .take(3)
+            .chain(jobs.iter().skip(3).step_by(97))
+            .take(16)
+            .cloned()
+            .collect();
+        for job in &picks {
+            let bytes = reader
+                .read_extent_chunked(job.shard, job.abs, job.len, LOAD_CHUNK)
+                .unwrap();
+            let view = gguf.tensor(&job.tensor).unwrap();
+            assert_eq!(
+                bytes.as_slice(),
+                view.bytes,
+                "bulk chunked read vs mmap for {} ({} bytes)",
+                job.tensor,
+                job.len
+            );
+        }
+        eprintln!(
+            "bulk spot check: {} tensors, largest {:.1} MiB",
+            picks.len(),
+            picks[0].len as f64 / (1 << 20) as f64
+        );
+    }
+
+    /// The cold model-load benchmark (no GPU): every non-expert (trunk)
+    /// tensor extent, buffered vs io_uring, residency-verified cold. Runs
+    /// against the GLM shard set and, when present, the V4-Flash set.
+    /// `cargo test -p hi-cuda --release bench_cold_trunk_load_backends -- --ignored --nocapture`
+    #[test]
+    #[ignore = "IO benchmark; needs the real GLM (and optionally V4-Flash) shards"]
+    fn bench_cold_trunk_load_backends() {
+        let models: Vec<(&str, Option<PathBuf>)> = vec![
+            ("GLM-5.2-REAP50 Q3_K_M", model_path(GLM_FIRST_SHARD)),
+            ("DeepSeek-V4-Flash Q4_K_XL", model_path(V4_FIRST_SHARD)),
+        ];
+        let threads = 6;
+        for (label, path) in models {
+            let Some(model) = path else {
+                eprintln!("skipping {label}: shards not present");
+                continue;
+            };
+            let (jobs, paths) = {
+                let gguf = hi_gguf::GgufFile::open(&model).unwrap();
+                (trunk_extents(&gguf), shard_paths(&gguf))
+            };
+            let payload: u64 = jobs.iter().map(|job| job.len as u64).sum();
+            println!(
+                "\n{label}: {} trunk tensors, {:.2} GiB payload; device ceiling {:.2} GiB/s",
+                jobs.len(),
+                payload as f64 / (1u64 << 30) as f64,
+                device_ceiling_gibs(&paths[0]),
+            );
+            let mut rows: Vec<(String, f64)> = Vec::new();
+            let gibs = |secs: f64| payload as f64 / (1u64 << 30) as f64 / secs;
+
+            // (a) Buffered mmap faults, per-tensor to_vec (the loader's
+            // staging copy), verified-cold page cache — once single-threaded
+            // (the ACTUAL loader: one GpuMatrix::load / upload_matrix at a
+            // time) and once with the 6-thread pool for context.
+            for workers in [1usize, threads] {
+                drop_job_ranges_from_page_cache(&paths, &jobs);
+                let residency = sampled_residency(&paths, &jobs, 64);
+                if workers == 1 {
+                    println!(
+                        "page-cache residency after per-range DONTNEED: {:.0}%",
+                        residency * 100.0
+                    );
+                }
+                let gguf = hi_gguf::GgufFile::open(&model).unwrap();
+                let queue = Mutex::new(jobs.iter());
+                let started = std::time::Instant::now();
+                std::thread::scope(|scope| {
+                    for _ in 0..workers {
+                        scope.spawn(|| {
+                            loop {
+                                let Some(job) = queue.lock().unwrap().next() else {
+                                    break;
+                                };
+                                let view = gguf.tensor(&job.tensor).unwrap();
+                                let bytes = view.bytes.to_vec();
+                                std::hint::black_box(&bytes);
+                                assert_eq!(bytes.len(), job.len);
+                            }
+                        });
+                    }
+                });
+                let secs = started.elapsed().as_secs_f64();
+                rows.push((
+                    format!(
+                        "mmap to_vec ({workers} thread{}, {})",
+                        if workers == 1 { "" } else { "s" },
+                        if residency < 0.05 {
+                            "cold".to_string()
+                        } else {
+                            format!("{:.0}% cached", residency * 100.0)
+                        }
+                    ),
+                    secs,
+                ));
+                drop(gguf);
+                drop_job_ranges_from_page_cache(&paths, &jobs);
+            }
+
+            // (b) io_uring per-tensor chunked, serial tensor order — exactly
+            // the loader pattern (`LoadByteSource::tensor_bytes` per matrix).
+            {
+                let reader = IoUringReader::open(&paths, DEFAULT_QD).unwrap();
+                let started = std::time::Instant::now();
+                for job in &jobs {
+                    let bytes = reader
+                        .read_extent_chunked(job.shard, job.abs, job.len, LOAD_CHUNK)
+                        .unwrap();
+                    std::hint::black_box(bytes.as_slice());
+                }
+                let secs = started.elapsed().as_secs_f64();
+                rows.push(("io_uring per-tensor chunked (loader)".to_string(), secs));
+            }
+
+            // (c) io_uring whole trunk as one batch (headroom reference: what
+            // a fully batched loader could reach).
+            {
+                let reader = IoUringReader::open(&paths, DEFAULT_QD).unwrap();
+                let bufs: Vec<AlignedBuf> = jobs
+                    .iter()
+                    .map(|job| AlignedBuf::new(aligned_span(job.abs, job.len).2).unwrap())
+                    .collect();
+                let mut ring_jobs = Vec::new();
+                for (job, buf) in jobs.iter().zip(&bufs) {
+                    let (_, mut subs) = reader
+                        .plan_chunked_extent(job.shard, job.abs, job.len, LOAD_CHUNK, buf.ptr)
+                        .unwrap();
+                    ring_jobs.append(&mut subs);
+                }
+                let started = std::time::Instant::now();
+                let mut completed = 0usize;
+                // SAFETY: chunk-strided disjoint pieces of per-tensor live
+                // aligned allocations (plan_chunked_extent contract).
+                unsafe {
+                    reader.read_batch(&ring_jobs, |_, outcome| {
+                        outcome.unwrap();
+                        completed += 1;
+                    })
+                }
+                .unwrap();
+                assert_eq!(completed, ring_jobs.len());
+                let secs = started.elapsed().as_secs_f64();
+                rows.push(("io_uring whole-trunk batch".to_string(), secs));
+            }
+
+            println!("{:<42} {:>8} {:>9}", "backend", "GiB/s", "wall");
+            for (row, secs) in &rows {
+                println!("{row:<42} {:>8.2} {:>8.1}s", gibs(*secs), secs);
+            }
+        }
+    }
+
     /// The IO benchmark (no GPU): a realistic cold ensure-pass worth of
     /// scattered expert extents through every backend. Run alone:
     /// `cargo test -p hi-cuda --release bench_glm_expert_read_backends -- --ignored --nocapture`
@@ -1116,31 +1493,10 @@ mod tests {
         let mut rows: Vec<(String, f64)> = Vec::new();
         let gibs = |secs: f64| payload as f64 / (1u64 << 30) as f64 / secs;
 
-        // Device ceiling reference: one thread, sequential 16 MiB O_DIRECT
-        // reads (what dd iflag=direct measures).
-        {
-            use std::os::unix::fs::{FileExt, OpenOptionsExt};
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_DIRECT)
-                .open(&paths[0])
-                .unwrap();
-            let chunk = 16 << 20;
-            let mut buf = AlignedBuf::new(chunk).unwrap();
-            let started = std::time::Instant::now();
-            let mut read = 0u64;
-            for i in 0..256u64 {
-                // SAFETY: buf is an exclusive, live chunk-sized allocation.
-                let slice = unsafe { std::slice::from_raw_parts_mut(buf.ptr, buf.len) };
-                read += file.read_at(slice, i * chunk as u64).unwrap() as u64;
-            }
-            let secs = started.elapsed().as_secs_f64();
-            println!(
-                "device ceiling reference (sequential 16 MiB O_DIRECT, 1 thread): {:.2} GiB/s",
-                read as f64 / (1u64 << 30) as f64 / secs
-            );
-            let _ = &mut buf;
-        }
+        println!(
+            "device ceiling reference (sequential 16 MiB O_DIRECT, 1 thread): {:.2} GiB/s",
+            device_ceiling_gibs(&paths[0])
+        );
 
         // (a) The mmap path as the pool runs it: MADV_RANDOM on the expert
         // tensors, per-extent WILLNEED, 6 copy threads, page cache dropped
@@ -1284,6 +1640,50 @@ mod tests {
         for (label, secs) in &rows {
             println!("{label:<38} {:>8.2} {:>8.1}s", gibs(*secs), secs);
         }
+    }
+
+    /// Chunked bulk extent reads (the model-load path) return exactly the
+    /// buffered bytes across odd geometry: extents spanning many chunks,
+    /// sub-chunk extents, unaligned starts, the unaligned EOF tail, zero
+    /// length, and out-of-bounds rejection.
+    #[test]
+    fn read_extent_chunked_matches_buffered_reads() {
+        let dir = scratch_dir("chunked");
+        let path = dir.join("shard.bin");
+        let file_len = 300 * 1024 + 777; // not block-aligned
+        let expected = write_pattern_file(&path, file_len);
+        let Some(reader) = open_or_skip(&[path], 8) else {
+            return;
+        };
+        let chunk = 16 * 4096; // 64 KiB: several sub-reads per big extent
+        let cases: [(u64, usize); 7] = [
+            (0, file_len),                  // whole file incl. EOF tail
+            (32, 200_000),                  // unaligned start, many chunks
+            (5000, 100),                    // sub-chunk extent
+            (4096, chunk),                  // exactly one chunk, aligned
+            ((file_len - 900) as u64, 900), // EOF tail only
+            (123_457, 54_321),              // arbitrary
+            (777, 0),                       // zero length
+        ];
+        for (offset, len) in cases {
+            let bytes = reader
+                .read_extent_chunked(0, offset, len, chunk)
+                .unwrap_or_else(|err| panic!("chunked read at {offset}+{len}: {err:#}"));
+            assert_eq!(
+                bytes.as_slice(),
+                &expected[offset as usize..offset as usize + len],
+                "chunked read at {offset}+{len}"
+            );
+        }
+        // Past-EOF extents are rejected up front.
+        assert!(
+            reader
+                .read_extent_chunked(0, file_len as u64 - 10, 20, chunk)
+                .is_err()
+        );
+        // Chunk must be a positive block multiple.
+        assert!(reader.read_extent_chunked(0, 0, 100, 1000).is_err());
+        assert!(reader.read_extent_chunked(0, 0, 100, 0).is_err());
     }
 
     /// A batch far larger than the queue depth completes correctly (the drive

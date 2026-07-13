@@ -100,10 +100,14 @@ pub(crate) struct TierEnvConfig {
     pub prewarm_frac: f64,
     /// `HI_CUDA_EXPERT_ODIRECT=1`: O_DIRECT twin-fd expert reads.
     pub odirect: bool,
-    /// `HI_CUDA_EXPERT_IOURING=1`: batch-submitted io_uring O_DIRECT reads
-    /// (Linux; opt-in). Probed at construction; on any failure the pool falls
-    /// back to the O_DIRECT thread path, then mmap — never a load failure.
-    pub iouring: bool,
+    /// `HI_CUDA_EXPERT_IOURING` tri-state: `Some(true)` (=1) forces the
+    /// batch-submitted io_uring O_DIRECT reads, `Some(false)` (=0) forces
+    /// them off, `None` (unset) = AUTO — ring when the streamable bytes
+    /// cannot be comfortably page-cache-resident and are not already warm
+    /// ([`crate::load_source::auto_for_expert_stream`]). Probed at
+    /// construction; on any failure the pool falls back to the O_DIRECT
+    /// thread path, then mmap — never a load failure.
+    pub iouring: Option<bool>,
     /// `HI_CUDA_EXPERT_IOURING_QD` (default 256): io_uring submission queue
     /// depth, clamped to a power of two in [8, 4096].
     pub iouring_qd: u32,
@@ -132,7 +136,7 @@ impl TierEnvConfig {
                 .unwrap_or(0.5)
                 .clamp(0.0, 1.0),
             odirect: flag_on("HI_CUDA_EXPERT_ODIRECT"),
-            iouring: flag_on("HI_CUDA_EXPERT_IOURING"),
+            iouring: crate::load_source::tri_state_env("HI_CUDA_EXPERT_IOURING"),
             iouring_qd: std::env::var("HI_CUDA_EXPERT_IOURING_QD")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -869,8 +873,13 @@ pub(crate) enum FetchBackend {
     Direct(GgufDirectReader),
     /// Batch-submitted io_uring O_DIRECT reads (whole miss batches at queue
     /// depth; zero-copy into pinned tier slots where the pool arranges it).
+    /// `mode` records how the ring was chosen ("forced" / "auto") for the
+    /// startup line and /health.
     #[cfg(target_os = "linux")]
-    Uring(crate::expert_uring::IoUringReader),
+    Uring {
+        reader: crate::expert_uring::IoUringReader,
+        mode: &'static str,
+    },
 }
 
 /// Reads one expert's contiguous byte extent through the chosen
@@ -889,7 +898,7 @@ impl ExpertFetcher {
     #[cfg(target_os = "linux")]
     pub(crate) fn uring(&self) -> Option<&crate::expert_uring::IoUringReader> {
         match &self.backend {
-            FetchBackend::Uring(reader) => Some(reader),
+            FetchBackend::Uring { reader, .. } => Some(reader),
             _ => None,
         }
     }
@@ -900,8 +909,8 @@ impl ExpertFetcher {
             FetchBackend::Mmap { .. } => "mmap".to_string(),
             FetchBackend::Direct(_) => "odirect".to_string(),
             #[cfg(target_os = "linux")]
-            FetchBackend::Uring(reader) => format!(
-                "iouring(qd={}{})",
+            FetchBackend::Uring { reader, mode } => format!(
+                "iouring({mode},qd={}{})",
                 reader.queue_depth(),
                 if reader.buffers_registered() {
                     ",regbuf"
@@ -963,7 +972,7 @@ impl ExpertFetcher {
                 return direct.read_range(shard, offset, len);
             }
             #[cfg(target_os = "linux")]
-            FetchBackend::Uring(reader) => {
+            FetchBackend::Uring { reader, .. } => {
                 let (shard, offset, len) = self.file_extent(key, source)?;
                 return reader
                     .read_owned(&[(shard, offset, len)])
@@ -1013,7 +1022,7 @@ impl ExpertFetcher {
     ) -> Option<Vec<Result<Vec<u8>>>> {
         #[cfg(target_os = "linux")]
         {
-            let FetchBackend::Uring(reader) = &self.backend else {
+            let FetchBackend::Uring { reader, .. } = &self.backend else {
                 return None;
             };
             let mut results: Vec<Option<Result<Vec<u8>>>> = (0..jobs.len()).map(|_| None).collect();

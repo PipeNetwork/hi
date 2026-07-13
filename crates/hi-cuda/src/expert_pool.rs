@@ -144,16 +144,53 @@ impl ExpertPool {
         let sources = ram_tier::discover_sources(&gguf);
         let total_expert_bytes = ram_tier::total_expert_bytes(&sources);
 
-        // Backend ladder: io_uring (opt-in) -> O_DIRECT threads -> mmap. The
-        // ring is probed with one real read at construction; any failure
-        // (kernel <5.6, io_uring_disabled sysctl, seccomp/container denial,
+        let mem_available = ram_tier::mem_available_bytes();
+
+        // Ring selection is tri-state (`HI_CUDA_EXPERT_IOURING`): `1` forces
+        // the ring, `0` forces it off, unset = AUTO — ring when the
+        // streamable experts cannot be comfortably page-cache-resident and
+        // are not already warm (see `load_source::auto_for_expert_stream`).
+        // Then the ladder: io_uring -> O_DIRECT threads -> mmap. The ring is
+        // probed with one real read at construction; any failure (kernel
+        // <5.6, io_uring_disabled sysctl, seccomp/container denial,
         // O_DIRECT-less filesystem) logs and falls through — a knob can never
         // fail the model load.
         #[cfg(target_os = "linux")]
-        let mut uring = if env.iouring {
-            let paths: Vec<std::path::PathBuf> = (0..gguf.shard_count())
-                .filter_map(|shard| gguf.shard_path(shard).map(std::path::Path::to_path_buf))
-                .collect();
+        let paths: Vec<std::path::PathBuf> = (0..gguf.shard_count())
+            .filter_map(|shard| gguf.shard_path(shard).map(std::path::Path::to_path_buf))
+            .collect();
+        #[cfg(target_os = "linux")]
+        let ring_mode: Option<&'static str> = match env.iouring {
+            Some(true) => Some("forced"),
+            Some(false) => None,
+            None if sources.is_empty() => None,
+            None => {
+                let sample = sample_expert_extents(&gguf, &sources);
+                let inputs = crate::load_source::AutoInputs {
+                    needed_bytes: total_expert_bytes,
+                    mem_available,
+                    residency: crate::expert_uring::sampled_extent_residency(&paths, &sample, 64),
+                };
+                let decision = crate::load_source::auto_for_expert_stream(&inputs);
+                eprintln!(
+                    "hi-cuda expert streaming: io_uring auto -> {} ({})",
+                    if decision.use_ring { "on" } else { "off" },
+                    decision.why
+                );
+                decision.use_ring.then_some("auto")
+            }
+        };
+        #[cfg(not(target_os = "linux"))]
+        let ring_mode: Option<&'static str> = {
+            if env.iouring == Some(true) {
+                eprintln!(
+                    "hi-cuda expert streaming: HI_CUDA_EXPERT_IOURING=1 is Linux-only; using the fallback ladder"
+                );
+            }
+            None
+        };
+        #[cfg(target_os = "linux")]
+        let mut uring = if ring_mode.is_some() {
             match crate::expert_uring::IoUringReader::open(&paths, env.iouring_qd) {
                 Ok(reader) => {
                     for note in reader.notes() {
@@ -163,7 +200,7 @@ impl ExpertPool {
                 }
                 Err(err) => {
                     eprintln!(
-                        "hi-cuda expert streaming: HI_CUDA_EXPERT_IOURING=1 but io_uring is unavailable ({err:#}); falling back to O_DIRECT thread reads"
+                        "hi-cuda expert streaming: io_uring is unavailable ({err:#}); falling back to O_DIRECT thread reads"
                     );
                     None
                 }
@@ -174,16 +211,9 @@ impl ExpertPool {
         #[cfg(target_os = "linux")]
         let ring_active = uring.is_some();
         #[cfg(not(target_os = "linux"))]
-        let ring_active = {
-            if env.iouring {
-                eprintln!(
-                    "hi-cuda expert streaming: HI_CUDA_EXPERT_IOURING=1 is Linux-only; using the fallback ladder"
-                );
-            }
-            false
-        };
+        let ring_active = false;
 
-        let direct = if !ring_active && (env.odirect || env.iouring) {
+        let direct = if !ring_active && (env.odirect || ring_mode.is_some()) {
             match gguf.direct_io_reader() {
                 Ok(reader) => Some(reader),
                 Err(err) => {
@@ -250,7 +280,7 @@ impl ExpertPool {
         };
         let plan = ram_tier::plan_tier_budget(
             env.explicit_ram_gb,
-            ram_tier::mem_available_bytes(),
+            mem_available,
             tier_stride,
             tier_cap_bytes,
             staging_bytes,
@@ -349,7 +379,10 @@ impl ExpertPool {
 
         #[cfg(target_os = "linux")]
         let backend = match uring {
-            Some(reader) => ram_tier::FetchBackend::Uring(reader),
+            Some(reader) => ram_tier::FetchBackend::Uring {
+                reader,
+                mode: ring_mode.expect("an open ring implies a selection mode"),
+            },
             None => match direct {
                 Some(direct) => ram_tier::FetchBackend::Direct(direct),
                 None => ram_tier::FetchBackend::Mmap {
@@ -1093,6 +1126,29 @@ impl Drop for ExpertPool {
     }
 }
 
+/// Up to one expert extent per (layer, projection) source, rotating the
+/// expert index, for the AUTO-mode page-cache residency sample (spread over
+/// layers and shards; the sampler sub-samples further).
+#[cfg(target_os = "linux")]
+fn sample_expert_extents(
+    gguf: &GgufFile,
+    sources: &BTreeMap<(u32, u8), ExpertSource>,
+) -> Vec<(usize, u64, usize)> {
+    let mut extents = Vec::with_capacity(sources.len());
+    for (index, source) in sources.values().enumerate() {
+        if source.expert_count == 0 {
+            continue;
+        }
+        let Ok(range) = gguf.tensor_file_range(&source.tensor_name) else {
+            continue;
+        };
+        let expert = (index * 7) % source.expert_count;
+        let offset = range.file_offset + (expert * source.bytes_per_expert) as u64;
+        extents.push((range.shard, offset, source.bytes_per_expert));
+    }
+    extents
+}
+
 /// Fetch a batch of expert byte extents (results in job order): the whole
 /// batch through the io_uring backend at queue depth when active, otherwise
 /// up to [`READ_WORKERS`] threads. Used by miss batches and pre-warm.
@@ -1135,7 +1191,7 @@ fn parallel_fetch(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::path::{Path, PathBuf};
 
     use super::*;
@@ -1190,7 +1246,7 @@ mod tests {
 
     /// Minimal qwen3moe GGUF whose routed experts are patterned rank-3 F16
     /// tensors: exactly the layout the streaming pool serves.
-    fn write_streaming_fixture(path: &Path) {
+    pub(crate) fn write_streaming_fixture(path: &Path) {
         let mut tensors = Vec::new();
         for layer in 0..FIXTURE_LAYERS {
             tensors.push(FixtureTensor {
@@ -1264,7 +1320,7 @@ mod tests {
 
     /// Unique model dir per test: the usage file lives next to the model, so
     /// sharing a directory would leak learning-cache state between tests.
-    fn fixture_dir(name: &str) -> PathBuf {
+    pub(crate) fn fixture_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "hi-expert-pool-{name}-{}",
             std::time::SystemTime::now()
@@ -1281,7 +1337,7 @@ mod tests {
             explicit_ram_gb: Some(ram_bytes as f64 / ram_tier::GIB as f64),
             prewarm_frac,
             odirect: false,
-            iouring: false,
+            iouring: Some(false),
             iouring_qd: ram_tier::DEFAULT_IOURING_QD,
             willneed: true,
             madvise_random: true,
@@ -1406,9 +1462,18 @@ mod tests {
                 return;
             }
         };
-        let uring_fetcher =
-            ram_tier::ExpertFetcher::new(Arc::clone(&gguf), ram_tier::FetchBackend::Uring(reader));
-        assert!(uring_fetcher.io_label().starts_with("iouring(qd=256"));
+        let uring_fetcher = ram_tier::ExpertFetcher::new(
+            Arc::clone(&gguf),
+            ram_tier::FetchBackend::Uring {
+                reader,
+                mode: "forced",
+            },
+        );
+        assert!(
+            uring_fetcher
+                .io_label()
+                .starts_with("iouring(forced,qd=256")
+        );
         let requests = all_requests(&sources);
         // Single fetches.
         for (key, source) in &requests {
@@ -1655,7 +1720,7 @@ mod tests {
 
         let stride = crate::expert_uring::tier_slot_stride(FIXTURE_EXPERT_BYTES);
         let mut env = test_env((24 * stride) as u64, 0.0, false);
-        env.iouring = true;
+        env.iouring = Some(true);
         env.iouring_qd = 64;
         let mut pool =
             ExpertPool::new_with_env(&model, FIXTURE_EXPERT_BYTES, 3 * FIXTURE_EXPERT_BYTES, env)
@@ -1738,7 +1803,7 @@ mod tests {
             assert!(tier.resident_count() <= tier.slot_count());
         }
         let segment = pool.stats_segment();
-        assert!(segment.contains("io=iouring(qd=64"), "{segment}");
+        assert!(segment.contains("io=iouring(forced,qd=64"), "{segment}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1764,7 +1829,7 @@ mod tests {
 
         let stride = crate::expert_uring::tier_slot_stride(FIXTURE_EXPERT_BYTES);
         let mut env = test_env((24 * stride) as u64, 1.0, false);
-        env.iouring = true;
+        env.iouring = Some(true);
         let mut pool =
             ExpertPool::new_with_env(&model, FIXTURE_EXPERT_BYTES, 4 * FIXTURE_EXPERT_BYTES, env)
                 .unwrap();

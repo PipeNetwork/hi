@@ -1548,14 +1548,22 @@ impl DsV4GpuLinearInner {
     /// Upload every listed matrix (skipping duplicates — the tied lm head
     /// aliases `token_embd.weight`). Called once right after engine load.
     pub(crate) fn upload_resident(&self, specs: &[(RawMatrix, Option<usize>)]) -> Result<()> {
+        // One byte-source decision for the whole resident set (mmap vs
+        // io_uring O_DIRECT bulk reads; HI_CUDA_LOAD_IOURING tri-state, auto
+        // by extent size + page-cache residency).
+        let source = crate::load_source::LoadByteSource::for_tensors(
+            &self.gguf,
+            "dsv4 resident",
+            specs.iter().map(|(matrix, _)| matrix.name.as_str()),
+        );
         let mut resident = self.resident.borrow_mut();
         for (matrix, grouped_rank) in specs {
             if resident.contains_key(&matrix.name) {
                 continue;
             }
             let entry = match grouped_rank {
-                None => ResidentEntry::Dense(self.upload_matrix(matrix)?),
-                Some(rank) => ResidentEntry::Grouped(self.upload_grouped(matrix, *rank)?),
+                None => ResidentEntry::Dense(self.upload_matrix(&source, matrix)?),
+                Some(rank) => ResidentEntry::Grouped(self.upload_grouped(&source, matrix, *rank)?),
             };
             resident.insert(matrix.name.clone(), entry);
         }
@@ -1924,22 +1932,30 @@ impl DsV4GpuLinearInner {
     /// quantized dtypes dequantize once on device to f32 and narrow to f16
     /// (same recipe as gpu.rs's `GpuMatrix::into_f16`); quant dtypes without a
     /// device kernel id fall back to a host dequant and stay f32-resident.
-    fn upload_matrix(&self, matrix: &RawMatrix) -> Result<ResidentMatrix> {
-        let view = self.tensor_view(&matrix.name)?;
+    fn upload_matrix(
+        &self,
+        source: &crate::load_source::LoadByteSource<'_>,
+        matrix: &RawMatrix,
+    ) -> Result<ResidentMatrix> {
+        // Byte source behind the helper: the mmap view or an io_uring bulk
+        // read (which also lands in anonymous RAM, so the H2D below DMAs at
+        // full speed instead of the slow file-backed-page path).
+        let (loaded, info) = source.tensor_bytes(&matrix.name)?;
+        let bytes = loaded.as_slice();
         let elements = matrix
             .rows
             .checked_mul(matrix.cols)
             .context("resident matrix element count overflows usize")?;
-        let native = match view.info.dtype {
+        let native = match info.dtype {
             GgufTensorType::F32 => Some(GemmDType::F32),
             GgufTensorType::F16 => Some(GemmDType::F16),
             GgufTensorType::BF16 => Some(GemmDType::BF16),
             _ => None,
         };
         if let Some(dtype) = native {
-            let buffer = DeviceBuffer::alloc(view.bytes.len())
+            let buffer = DeviceBuffer::alloc(bytes.len())
                 .with_context(|| format!("allocating resident buffer for {}", matrix.name))?;
-            buffer.copy_from_host(view.bytes)?;
+            buffer.copy_from_host(bytes)?;
             return Ok(ResidentMatrix {
                 buffer,
                 rows: matrix.rows,
@@ -1947,10 +1963,10 @@ impl DsV4GpuLinearInner {
                 dtype,
             });
         }
-        if let Some(quant_type) = quant_type_id(view.info.dtype) {
-            let packed = DeviceBuffer::alloc(view.bytes.len())
+        if let Some(quant_type) = quant_type_id(info.dtype) {
+            let packed = DeviceBuffer::alloc(bytes.len())
                 .with_context(|| format!("allocating packed upload for {}", matrix.name))?;
-            packed.copy_from_host(view.bytes)?;
+            packed.copy_from_host(bytes)?;
             let f32_scratch = DeviceBuffer::alloc(elements * std::mem::size_of::<f32>())
                 .with_context(|| format!("allocating f32 dequant scratch for {}", matrix.name))?;
             crate::kernels::launch_dequantize_matrix(
@@ -1976,6 +1992,7 @@ impl DsV4GpuLinearInner {
         // No device dequant id (exotic dtype): dequantize on host and keep the
         // f32 copy resident. Costs 2x the f16 VRAM but stays exact and only
         // triggers for dtypes the real checkpoint does not use.
+        let view = TensorView { info, bytes };
         let data = dequantize_elem_range(&view, 0, elements)?;
         let buffer = DeviceBuffer::alloc(elements * std::mem::size_of::<f32>())
             .with_context(|| format!("allocating resident f32 buffer for {}", matrix.name))?;
@@ -1991,7 +2008,12 @@ impl DsV4GpuLinearInner {
     /// Upload a block-diagonal matrix as per-group [rank, cols] buffers:
     /// upload/dequantize the whole tensor once, then carve out each group's
     /// contiguous row range with a device-to-device copy.
-    fn upload_grouped(&self, matrix: &RawMatrix, rank: usize) -> Result<Vec<ResidentMatrix>> {
+    fn upload_grouped(
+        &self,
+        source: &crate::load_source::LoadByteSource<'_>,
+        matrix: &RawMatrix,
+        rank: usize,
+    ) -> Result<Vec<ResidentMatrix>> {
         if rank == 0 || !matrix.rows.is_multiple_of(rank) {
             bail!(
                 "grouped tensor {} rows {} do not split into rank-{rank} groups",
@@ -1999,7 +2021,7 @@ impl DsV4GpuLinearInner {
                 matrix.rows
             );
         }
-        let whole = self.upload_matrix(matrix)?;
+        let whole = self.upload_matrix(source, matrix)?;
         let group_bytes = rank
             .checked_mul(matrix.cols)
             .and_then(|elements| elements.checked_mul(gemm_element_size(whole.dtype)))

@@ -978,8 +978,11 @@ mod native {
 
             let mut matrices = BTreeMap::new();
             let mut total_matrix_bytes = 0usize;
+            // Vision mmproj files are small side-files: keep the mmap source
+            // (io_uring bulk loads target the main model file's trunk).
+            let byte_source = crate::load_source::LoadByteSource::mmap_only(gguf);
             for spec in vision_matrix_specs(gguf, &config)? {
-                let matrix = GpuMatrix::load(gguf, &spec)
+                let matrix = GpuMatrix::load(&byte_source, &spec)
                     .with_context(|| format!("loading CUDA vision matrix {}", spec.name))?;
                 total_matrix_bytes = total_matrix_bytes
                     .checked_add(matrix.bytes)
@@ -3739,8 +3742,16 @@ mod native {
             let mut matrices = BTreeMap::new();
             let mut total_matrix_bytes = 0usize;
             let mut quantized_matrix_count = 0usize;
+            // One byte-source decision for the whole trunk (mmap vs io_uring
+            // O_DIRECT bulk reads; HI_CUDA_LOAD_IOURING tri-state, auto by
+            // extent size + page-cache residency).
+            let byte_source = crate::load_source::LoadByteSource::for_tensors(
+                gguf,
+                "qwen matrices",
+                matrix_specs.iter().map(|spec| spec.tensor_name.as_str()),
+            );
             for spec in matrix_specs {
-                let mut matrix = GpuMatrix::load(gguf, &spec)
+                let mut matrix = GpuMatrix::load(&byte_source, &spec)
                     .with_context(|| format!("loading CUDA matrix {}", spec.name))?;
                 if weights_f16 && matrix.is_quantized() {
                     matrix = matrix
@@ -22642,20 +22653,26 @@ mod native {
     }
 
     impl GpuMatrix {
-        fn load(gguf: &GgufFile, spec: &MatrixSpec) -> Result<Self> {
-            let tensor = gguf
-                .tensor(&spec.tensor_name)
-                .ok_or_else(|| anyhow!("GGUF tensor {} is missing", spec.tensor_name))?;
-            let dtype = tensor.info.dtype;
+        /// `source` decides where the tensor bytes come from: the GGUF mmap
+        /// (today's path) or io_uring O_DIRECT bulk reads for cold/oversized
+        /// loads — see [`crate::load_source::LoadByteSource`]. The rest of
+        /// the load (normalization, staging, H2D) is byte-source-agnostic.
+        fn load(
+            source: &crate::load_source::LoadByteSource<'_>,
+            spec: &MatrixSpec,
+        ) -> Result<Self> {
+            let gguf = source.gguf();
+            let (loaded, info) = source.tensor_bytes(&spec.tensor_name)?;
+            let tensor_bytes = loaded.as_slice();
+            let dtype = info.dtype;
             if let Some(row_slice) = spec.row_slice {
                 let matrix_bytes =
-                    matrix_source_bytes(tensor.bytes, &tensor.info.dimensions, dtype, spec)?;
-                let matrix_dims = matrix_source_dims(&tensor.info.dimensions, spec)?;
+                    matrix_source_bytes(tensor_bytes, &info.dimensions, dtype, spec)?;
+                let matrix_dims = matrix_source_dims(&info.dimensions, spec)?;
                 return Self::load_row_slice(matrix_bytes, &matrix_dims, dtype, spec, row_slice);
             }
-            let matrix_bytes =
-                matrix_source_bytes(tensor.bytes, &tensor.info.dimensions, dtype, spec)?;
-            let matrix_dims = matrix_source_dims(&tensor.info.dimensions, spec)?;
+            let matrix_bytes = matrix_source_bytes(tensor_bytes, &info.dimensions, dtype, spec)?;
+            let matrix_dims = matrix_source_dims(&info.dimensions, spec)?;
             if !dtype.is_quantized()
                 && !matches!(
                     dtype,
