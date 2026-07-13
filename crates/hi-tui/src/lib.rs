@@ -127,12 +127,16 @@ pub type SessionSwitcher = Box<
 
 /// Persists a display name for a session cached on this machine.
 pub type SessionRenamer = Box<dyn Fn(&str, &str) -> anyhow::Result<String> + Send + Sync>;
+pub type SyncModeSetter = std::sync::Arc<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync>;
+pub type SyncStatusReader =
+    std::sync::Arc<dyn Fn(Option<&str>) -> anyhow::Result<String> + Send + Sync>;
+pub type SyncPurger = std::sync::Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct SyncControl {
-    pub set_mode: std::sync::Arc<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync>,
-    pub status: std::sync::Arc<dyn Fn(Option<&str>) -> anyhow::Result<String> + Send + Sync>,
-    pub purge: std::sync::Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>,
+    pub set_mode: SyncModeSetter,
+    pub status: SyncStatusReader,
+    pub purge: SyncPurger,
 }
 
 #[derive(Clone, Debug)]

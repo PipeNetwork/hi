@@ -343,7 +343,7 @@ impl SyncStore {
         let connection = self.connection.lock().unwrap();
         for record in records {
             let exponential = 2u64.saturating_pow(record.attempts.min(10) + 1).min(900);
-            let jitter = (record.row_id.unsigned_abs() % (exponential / 4 + 1)) as u64;
+            let jitter = record.row_id.unsigned_abs() % (exponential / 4 + 1);
             let retry = retry_after_secs.unwrap_or(exponential + jitter);
             connection.execute(
                 "UPDATE record_outbox SET attempts=attempts+1,next_retry_unix=?1,last_error=?2,quarantined=?3 WHERE id=?4",

@@ -367,7 +367,7 @@ fn normalize_git_remote(remote: &str) -> Option<String> {
     let value = remote.trim().trim_end_matches('/').trim_end_matches(".git");
     let host_path = if let Some(rest) = value.split_once("://").map(|(_, rest)| rest) {
         let rest = rest.rsplit_once('@').map(|(_, rest)| rest).unwrap_or(rest);
-        rest.split_once('/').map(|(host, path)| (host, path))?
+        rest.split_once('/')?
     } else if let Some((user_host, path)) = value.split_once(':') {
         let host = user_host
             .rsplit_once('@')
