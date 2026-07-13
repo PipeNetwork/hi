@@ -33,6 +33,7 @@ use rand::{Rng, SeedableRng};
 #[cfg(feature = "native-cuda")]
 pub mod dsv4_backend;
 pub mod dsv4_cpu;
+pub(crate) mod dsv4_dflash;
 #[cfg(feature = "native-cuda")]
 pub mod dsv4_gpu;
 pub(crate) mod dsv4_mtp;
