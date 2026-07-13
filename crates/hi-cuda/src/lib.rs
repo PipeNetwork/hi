@@ -35,6 +35,7 @@ pub mod dsv4_backend;
 pub mod dsv4_cpu;
 #[cfg(feature = "native-cuda")]
 pub mod dsv4_gpu;
+pub(crate) mod dsv4_mtp;
 #[cfg(feature = "native-cuda")]
 mod expert_pool;
 pub mod gpu;
