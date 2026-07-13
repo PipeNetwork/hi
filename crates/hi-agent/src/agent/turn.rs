@@ -29,16 +29,17 @@ use crate::steering::{
     READ_AFTER_SEARCH_NUDGE, READ_ONLY_SAFE_CONTEXT_WINDOW, REPEAT_NUDGE, REREAD_NUDGE,
     ReviewIntent, ReviewRepairMode, SECURITY_BROAD_SEARCH_NUDGE, SECURITY_SCOPE_NUDGE,
     TOOL_PROTOCOL_RETRY_NUDGE, TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE, ToolLoopGuardrail,
-    active_read_only_inspection_cap, answer_says_insufficient_evidence, bash_no_progress_signature,
-    classify_bash_command, classify_implementation_intent, classify_read_only_intent,
-    concrete_review_answer_problem, deepen_review_nudge, evidence_kind_for_tool,
-    implementation_missing_validation_nudge, implementation_text_tool_nudge,
-    implementation_tool_call_mutates, implementation_tool_call_validates,
-    implementation_tool_result_landed_mutation, implementation_tool_result_landed_substantive_edit,
-    implementation_turn_prompt, inspected_paths_for_prompt, inspection_signature,
-    inspection_sprawl_exhausted, inspection_sprawl_nudge, no_evidence_review_nudge,
-    read_only_blocked_tool_result, read_only_blocks_tool, read_only_turn_prompt,
-    repair_nudge_with_required_next, should_bootstrap_gpu_training_estimator, should_deepen_review,
+    active_read_only_inspection_cap, answer_says_insufficient_evidence, bash_command,
+    bash_no_progress_signature, classify_bash_command, classify_implementation_intent,
+    classify_read_only_intent, concrete_review_answer_problem, deepen_review_nudge,
+    evidence_kind_for_tool, implementation_missing_validation_nudge,
+    implementation_text_tool_nudge, implementation_tool_call_mutates,
+    implementation_tool_call_validates, implementation_tool_result_landed_mutation,
+    implementation_tool_result_landed_substantive_edit, implementation_turn_prompt,
+    inspected_paths_for_prompt, inspection_signature, inspection_sprawl_exhausted,
+    inspection_sprawl_nudge, no_evidence_review_nudge, read_only_blocked_tool_result,
+    read_only_blocks_tool, read_only_turn_prompt, repair_nudge_with_required_next,
+    should_bootstrap_gpu_training_estimator, should_deepen_review,
     should_nudge_gap_search_overclaim, should_nudge_inspection_sprawl,
     should_nudge_no_evidence_review, should_nudge_read_after_repeated_search,
     should_nudge_read_after_search_final, should_nudge_security_broad_search,
@@ -48,10 +49,10 @@ use crate::steering::{
 use crate::transcript::{NudgeKind, repair_invalid_tool_call_arguments_in_messages};
 use crate::verify::{Snapshot, Verifier, VerifyOutcome, stage_guidance};
 use crate::{
-    AUTO_KEEP_RECENT, FINALIZE_PROMPT, MAX_TOOL_PROTOCOL_RETRIES, PLAN_CONTINUE_NUDGE,
-    ProgressEvent, SILENT_CONTINUE_NUDGE, TRUNCATED_TOOL_CALL_NUDGE, TRUNCATION_NUDGE,
-    ToolCallEntry, TurnAttribution, TurnTelemetry, Ui, apply_plan_to_goal,
-    partial_text_tool_call_start,
+    AUTO_KEEP_RECENT, ConfirmationRequest, ConfirmationResult, FINALIZE_PROMPT,
+    MAX_TOOL_PROTOCOL_RETRIES, PLAN_CONTINUE_NUDGE, ProgressEvent, SILENT_CONTINUE_NUDGE,
+    TRUNCATED_TOOL_CALL_NUDGE, TRUNCATION_NUDGE, ToolCallEntry, TurnAttribution, TurnTelemetry, Ui,
+    apply_plan_to_goal, partial_text_tool_call_start,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -106,6 +107,9 @@ fn build_turn_telemetry(
         review_repair_exhaustion_reason: review_repair.exhaustion_reason.clone(),
         review_repair_counts: review_repair.counts.clone(),
         review_repair_stopped_by_exhaustion: !review_repair.exhaustion_reason.is_empty(),
+        skeptic_unavailable_count: 0,
+        skeptic_last_status: None,
+        checkpoint_available: None,
     }
 }
 
@@ -538,13 +542,21 @@ impl crate::Agent {
         }
     }
 
-    async fn ensure_turn_checkpoint(&mut self, checkpoint_created: &mut bool, _ui: &mut dyn Ui) {
-        if *checkpoint_created {
-            return;
+    async fn ensure_turn_checkpoint(
+        &mut self,
+        checkpoint_allowed: &mut Option<bool>,
+        checkpoint_created: &mut bool,
+        _ui: &mut dyn Ui,
+    ) -> bool {
+        if let Some(allowed) = *checkpoint_allowed {
+            return allowed;
         }
-        *checkpoint_created = true;
         #[cfg(test)]
-        return;
+        {
+            *checkpoint_allowed = Some(true);
+            *checkpoint_created = true;
+            true
+        }
         #[cfg(not(test))]
         {
             // Snapshot lazily, immediately before the first approved mutating
@@ -552,18 +564,42 @@ impl crate::Agent {
             // untracked files so `/undo` does not delete pre-existing user
             // files. On large worktrees this is too expensive for read-only or
             // conversational turns.
-            if let Some(sha) = hi_tools::checkpoint::create(std::path::Path::new(".")).await {
-                self.checkpoints.push(sha);
-                if self.checkpoints.len() > crate::MAX_CHECKPOINTS {
-                    self.checkpoints
-                        .drain(0..self.checkpoints.len() - crate::MAX_CHECKPOINTS);
+            let reason = match hi_tools::checkpoint::create_detailed(std::path::Path::new("."))
+                .await
+            {
+                hi_tools::checkpoint::CreateResult::Created(sha) => {
+                    let mut next = self.checkpoints.clone();
+                    next.push(sha);
+                    if next.len() > crate::MAX_CHECKPOINTS {
+                        next.drain(0..next.len() - crate::MAX_CHECKPOINTS);
+                    }
+                    if let Some(session) = self.session.as_mut()
+                        && let Err(err) = session.record_checkpoints(&next)
+                    {
+                        format!(
+                            "checkpoint was created but its reference could not be persisted: {err:#}"
+                        )
+                    } else {
+                        self.checkpoints = next;
+                        *checkpoint_created = true;
+                        *checkpoint_allowed = Some(true);
+                        return true;
+                    }
                 }
-                if let Some(session) = self.session.as_mut()
-                    && let Err(err) = session.record_checkpoints(&self.checkpoints)
-                {
-                    _ui.status(&format!("(couldn't persist checkpoint refs: {err})"));
-                }
+                hi_tools::checkpoint::CreateResult::Unavailable(reason)
+                | hi_tools::checkpoint::CreateResult::Failed(reason) => reason,
+            };
+            let decision = _ui
+                .confirm(ConfirmationRequest::MissingCheckpoint { reason })
+                .await;
+            let allowed = decision == ConfirmationResult::Approved;
+            *checkpoint_allowed = Some(allowed);
+            if allowed {
+                _ui.checkpoint_warning("⚠ continuing this turn without a checkpoint — /undo will not cover its changes");
+            } else if decision == ConfirmationResult::Unavailable {
+                _ui.status("mutation skipped: no checkpoint is available and this frontend cannot authorize continuing without /undo");
             }
+            allowed
         }
     }
 
@@ -633,6 +669,9 @@ impl crate::Agent {
                 looks_like_continue(input) && plan_has_pending_steps(&self.last_plan);
             if !preserve_plan && !self.last_plan.is_empty() {
                 self.last_plan.clear();
+                if let Some(session) = self.session.as_mut() {
+                    session.clear_plan()?;
+                }
                 ui.plan(&[]);
             }
             self.messages.strip_trailing_nudges();
@@ -648,6 +687,7 @@ impl crate::Agent {
             );
             return Ok(());
         }
+        let mut turn_checkpoint_allowed = None;
         let mut turn_checkpoint_created = false;
 
         // If the context window is filling up, reclaim room before adding more,
@@ -698,6 +738,9 @@ impl crate::Agent {
         let preserve_plan = looks_like_continue(input) && plan_has_pending_steps(&self.last_plan);
         if !preserve_plan && !self.last_plan.is_empty() {
             self.last_plan.clear();
+            if let Some(session) = self.session.as_mut() {
+                session.clear_plan()?;
+            }
             ui.plan(&[]);
         }
         let mut compat_fallbacks = Vec::new();
@@ -833,16 +876,24 @@ impl crate::Agent {
             && should_bootstrap_gpu_training_estimator(intent)
         {
             self.ensure_turn_snapshot(&mut turn_snapshot).await;
-            self.ensure_turn_checkpoint(&mut turn_checkpoint_created, ui)
+            let checkpoint_ok = self
+                .ensure_turn_checkpoint(
+                    &mut turn_checkpoint_allowed,
+                    &mut turn_checkpoint_created,
+                    ui,
+                )
                 .await;
-            let bootstrap_calls = self
-                .run_gpu_training_estimator_bootstrap(
+            let bootstrap_calls = if checkpoint_ok {
+                self.run_gpu_training_estimator_bootstrap(
                     ui,
                     &mut implementation_tracker,
                     &mut tool_timeline,
                     intent,
                 )
-                .await;
+                .await
+            } else {
+                0
+            };
             if bootstrap_calls > 0 {
                 made_tool_call = true;
                 sched_tool_calls = sched_tool_calls.saturating_add(bootstrap_calls);
@@ -2523,13 +2574,59 @@ If the task is already complete, stop and give your final recap."
                     let bash_idx = ready.iter().copied().find(|&i| calls[i].1 == "bash");
                     if let Some(i) = bash_idx {
                         let (id, name, arguments) = &calls[i];
-                        // Bash can mutate the workspace in ways static shell
-                        // heuristics miss (redirection, scripts, build tools),
-                        // so capture the baseline/checkpoint before it runs.
-                        // The guard layer still blocks catastrophic commands.
+                        let bash_mutates = implementation_tool_call_mutates(name, arguments);
+                        if self.config.confirm_edits && bash_mutates {
+                            let command =
+                                bash_command(arguments).unwrap_or_else(|| arguments.clone());
+                            let cwd = std::env::current_dir()
+                                .map(|path| path.display().to_string())
+                                .unwrap_or_else(|_| ".".to_string());
+                            let decision = ui
+                                .confirm(ConfirmationRequest::ShellMutation { command, cwd })
+                                .await;
+                            if decision != ConfirmationResult::Approved {
+                                ui.tool_call(name, arguments);
+                                let msg = if decision == ConfirmationResult::Unavailable {
+                                    "Shell mutation skipped: confirmation required, but this frontend cannot answer it; rerun interactively or disable --confirm-edits."
+                                } else {
+                                    "Shell mutation skipped by user (not run)."
+                                }
+                                .to_string();
+                                ui.tool_result(name, &msg);
+                                results[i] = Some((id.clone(), msg));
+                                completed[i] = true;
+                                completion_order.push(i);
+                                done += 1;
+                                sched_tool_calls += 1;
+                                sched_serial_runs += 1;
+                                sched_max_concurrent = sched_max_concurrent.max(1);
+                                continue;
+                            }
+                        }
+                        // Bash is opaque enough that change detection still needs
+                        // a baseline even when the mutation classifier says no.
                         self.ensure_turn_snapshot(&mut turn_snapshot).await;
-                        self.ensure_turn_checkpoint(&mut turn_checkpoint_created, ui)
-                            .await;
+                        if bash_mutates
+                            && !self
+                                .ensure_turn_checkpoint(
+                                    &mut turn_checkpoint_allowed,
+                                    &mut turn_checkpoint_created,
+                                    ui,
+                                )
+                                .await
+                        {
+                            ui.tool_call(name, arguments);
+                            let msg = "Shell mutation skipped because no checkpoint was available and continuing without /undo was not approved.".to_string();
+                            ui.tool_result(name, &msg);
+                            results[i] = Some((id.clone(), msg));
+                            completed[i] = true;
+                            completion_order.push(i);
+                            done += 1;
+                            sched_tool_calls += 1;
+                            sched_serial_runs += 1;
+                            sched_max_concurrent = sched_max_concurrent.max(1);
+                            continue;
+                        }
                         ui.tool_started(name, arguments);
                         ui.tool_call(name, arguments);
                         let path = hi_tools::target_path(name, arguments).unwrap_or_default();
@@ -2601,6 +2698,41 @@ If the task is already complete, stop and give your final recap."
                     if let Some(i) = self_idx {
                         let (id, name, arguments) = &calls[i];
                         if name == "delegate" {
+                            if self.config.confirm_edits {
+                                let summary = serde_json::from_str::<serde_json::Value>(arguments)
+                                    .ok()
+                                    .and_then(|value| {
+                                        value
+                                            .get("task")
+                                            .and_then(|v| v.as_str())
+                                            .map(str::to_string)
+                                    })
+                                    .unwrap_or_else(|| arguments.clone());
+                                let decision = ui
+                                    .confirm(ConfirmationRequest::DelegateApply {
+                                        summary: format!("Allow a write-capable delegate to apply verified changes for:\n{summary}"),
+                                        diff: "The exact diff will be produced in an isolated worktree.".to_string(),
+                                    })
+                                    .await;
+                                if decision != ConfirmationResult::Approved {
+                                    ui.tool_call(name, arguments);
+                                    let msg = if decision == ConfirmationResult::Unavailable {
+                                        "Delegate skipped: confirmation required, but this frontend cannot answer it."
+                                    } else {
+                                        "Delegate skipped by user (no changes applied)."
+                                    }
+                                    .to_string();
+                                    ui.tool_result(name, &msg);
+                                    results[i] = Some((id.clone(), msg));
+                                    completed[i] = true;
+                                    completion_order.push(i);
+                                    done += 1;
+                                    sched_tool_calls += 1;
+                                    sched_serial_runs += 1;
+                                    sched_max_concurrent = sched_max_concurrent.max(1);
+                                    continue;
+                                }
+                            }
                             // Write-capable subagent: capture the turn baseline +
                             // checkpoint BEFORE it mutates the tree — otherwise the
                             // later lazy snapshot (verify gate) would record
@@ -2609,8 +2741,26 @@ If the task is already complete, stop and give your final recap."
                             // leaving no pre-delegate checkpoint for `/undo` to
                             // isolate this turn.
                             self.ensure_turn_snapshot(&mut turn_snapshot).await;
-                            self.ensure_turn_checkpoint(&mut turn_checkpoint_created, ui)
-                                .await;
+                            if !self
+                                .ensure_turn_checkpoint(
+                                    &mut turn_checkpoint_allowed,
+                                    &mut turn_checkpoint_created,
+                                    ui,
+                                )
+                                .await
+                            {
+                                ui.tool_call(name, arguments);
+                                let msg = "Delegate skipped because no checkpoint was available and continuing without /undo was not approved.".to_string();
+                                ui.tool_result(name, &msg);
+                                results[i] = Some((id.clone(), msg));
+                                completed[i] = true;
+                                completion_order.push(i);
+                                done += 1;
+                                sched_tool_calls += 1;
+                                sched_serial_runs += 1;
+                                sched_max_concurrent = sched_max_concurrent.max(1);
+                                continue;
+                            }
                         }
                         ui.tool_call(name, arguments);
                         let content = match name.as_str() {
@@ -2674,7 +2824,16 @@ If the task is already complete, stop and give your final recap."
                                 let preview = hi_tools::preview_edit(name, &calls[i].2)
                                     .await
                                     .unwrap_or_default();
-                                if !ui.confirm_edit(&path, &preview) {
+                                let decision = ui
+                                    .confirm(ConfirmationRequest::FileEdit {
+                                        path,
+                                        diff: preview,
+                                    })
+                                    .await;
+                                if decision != ConfirmationResult::Approved {
+                                    if decision == ConfirmationResult::Unavailable {
+                                        ui.status("confirmation required, but this frontend cannot answer it; rerun interactively or disable --confirm-edits");
+                                    }
                                     denied.push(i);
                                 }
                             }
@@ -2682,7 +2841,7 @@ If the task is already complete, stop and give your final recap."
                     }
                     let batch_started = std::time::Instant::now();
                     // Split ready into approved and denied; only execute approved.
-                    let approved: Vec<usize> = ready
+                    let mut approved: Vec<usize> = ready
                         .iter()
                         .copied()
                         .filter(|i| !denied.contains(i))
@@ -2692,8 +2851,24 @@ If the task is already complete, stop and give your final recap."
                         .any(|&i| implementation_tool_call_mutates(&calls[i].1, &calls[i].2))
                     {
                         self.ensure_turn_snapshot(&mut turn_snapshot).await;
-                        self.ensure_turn_checkpoint(&mut turn_checkpoint_created, ui)
-                            .await;
+                        if !self
+                            .ensure_turn_checkpoint(
+                                &mut turn_checkpoint_allowed,
+                                &mut turn_checkpoint_created,
+                                ui,
+                            )
+                            .await
+                        {
+                            let blocked: Vec<usize> = approved
+                                .iter()
+                                .copied()
+                                .filter(|&i| {
+                                    implementation_tool_call_mutates(&calls[i].1, &calls[i].2)
+                                })
+                                .collect();
+                            denied.extend(blocked.iter().copied());
+                            approved.retain(|i| !blocked.contains(i));
+                        }
                     }
                     let outputs: Vec<_> = futures_util::stream::iter(
                         approved.iter().map(|&i| execute(&calls[i].1, &calls[i].2)),
@@ -2803,6 +2978,15 @@ If the task is already complete, stop and give your final recap."
                             && let Some(plan) = output.plan.as_deref()
                         {
                             self.last_plan = plan.to_vec();
+                            if let Some(session) = self.session.as_mut() {
+                                if plan_has_pending_steps(plan) {
+                                    session.record_plan(plan)?;
+                                } else {
+                                    // Keep the completed checklist visible for this live
+                                    // turn, but do not resurrect it after a restart.
+                                    session.clear_plan()?;
+                                }
+                            }
                             // Long-horizon: the model's `update_plan` maps onto the
                             // structured goal's sub-goals (status by position, plus
                             // appended steps it discovered), so the agent advances in
@@ -3123,6 +3307,8 @@ If the task is already complete, stop and give your final recap."
             &evidence,
             &review_repair,
         );
+        self.last_turn_telemetry.checkpoint_available =
+            turn_checkpoint_allowed.map(|_| turn_checkpoint_created);
 
         // Long-horizon driver: when a structured goal is set and long_horizon
         // is on, advance or retry the active sub-goal based on this turn's

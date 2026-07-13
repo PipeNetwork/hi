@@ -409,6 +409,7 @@ impl crate::App {
             + help_h
             + stream_h
             + usize::from(self.startup_notice.is_some())
+            + usize::from(self.checkpoint_warning.is_some())
             + usize::from(self.quit_notice.is_some())
             + status_lines
             + completion_rows
@@ -447,7 +448,9 @@ impl crate::App {
         };
         let plan_block = self.plan_lines(max_steps);
         let plan_h = plan_block.len();
-        let input_h = if self.fetching.is_some() {
+        let input_h = if self.confirmation.is_some() {
+            area.height.saturating_sub(3).clamp(8, 24)
+        } else if self.fetching.is_some() {
             3
         } else if let Some(p) = &self.picker {
             // filter line + visible model rows + borders, bounded by the screen.
@@ -568,7 +571,40 @@ impl crate::App {
         frame.render_widget(para, rows[0]);
 
         // --- Bottom region: a fetch/plan spinner, the model picker, or the input bar. ---
-        if let Some(started) = self.fetching.or(self.planning) {
+        if let Some(request) = &self.confirmation {
+            let details = request.details();
+            let all = details.lines().collect::<Vec<_>>();
+            let visible = rows[1].height.saturating_sub(4) as usize;
+            let max_scroll = all.len().saturating_sub(visible);
+            let scroll = self.confirmation_scroll.min(max_scroll);
+            let mut body = vec![Line::styled(
+                "This action can change your workspace. Review it before approving.",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )];
+            body.extend(
+                all.iter()
+                    .skip(scroll)
+                    .take(visible)
+                    .map(|line| Line::raw((*line).to_string())),
+            );
+            let block = Block::bordered()
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(format!(" {} ", request.title()))
+                .title_bottom(
+                    Line::styled(
+                        " y approve · n/Esc reject · ↑↓/PgUp/PgDn scroll · Ctrl-C cancel turn ",
+                        dim(),
+                    )
+                    .right_aligned(),
+                );
+            frame.render_widget(
+                Paragraph::new(body).block(block).wrap(Wrap { trim: false }),
+                rows[1],
+            );
+        } else if let Some(started) = self.fetching.or(self.planning) {
             let frame_ch = SPINNER[self.spinner % SPINNER.len()];
             let elapsed = fmt_elapsed(started.elapsed().as_secs());
             let label = if self.planning.is_some() {
@@ -980,6 +1016,14 @@ impl crate::App {
                     Style::default().fg(Color::Yellow),
                 ));
             }
+            if let Some(warning) = &self.checkpoint_warning {
+                ilines.push(Line::styled(
+                    warning.clone(),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
             if self.quit_notice.is_some() {
                 ilines.push(Line::styled(
                     "Press Ctrl-C again to exit",
@@ -1110,6 +1154,7 @@ impl crate::App {
                 + help_h
                 + stream_h
                 + usize::from(self.startup_notice.is_some())
+                + usize::from(self.checkpoint_warning.is_some())
                 + usize::from(self.quit_notice.is_some())
                 + status_lines
                 + self.completion_items().len();

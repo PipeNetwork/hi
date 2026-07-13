@@ -340,6 +340,7 @@ impl RemoteSessionSink {
             "messages": loaded.messages,
             "goal": loaded.goal,
             "decisions": loaded.decisions.entries(),
+            "plan": loaded.plan,
         }))?;
         self.push(RECORD_TYPE_STATE_REPLACEMENT, &payload);
         if !loaded.usage.is_zero() {
@@ -735,9 +736,10 @@ impl SessionSink for SyncSession {
         messages: &[Message],
         goal: Option<&hi_agent::Goal>,
         decisions: &hi_agent::DecisionLog,
+        plan: &[hi_agent::PlanStep],
     ) -> Result<()> {
         self.local
-            .record_state_replacement(messages, goal, decisions)?;
+            .record_state_replacement(messages, goal, decisions, plan)?;
         self.remote.reconcile_jsonl(self.local.path())
     }
 
@@ -753,6 +755,16 @@ impl SessionSink for SyncSession {
 
     fn clear_goal(&mut self) -> Result<()> {
         self.local.clear_goal()?;
+        self.remote.reconcile_jsonl(self.local.path())
+    }
+
+    fn record_plan(&mut self, plan: &[hi_agent::PlanStep]) -> Result<()> {
+        self.local.record_plan(plan)?;
+        self.remote.reconcile_jsonl(self.local.path())
+    }
+
+    fn clear_plan(&mut self) -> Result<()> {
+        self.local.clear_plan()?;
         self.remote.reconcile_jsonl(self.local.path())
     }
 
@@ -929,9 +941,12 @@ impl hi_agent::Ui for MultiplexUi {
             line: line.to_string(),
         });
     }
-    fn confirm_edit(&mut self, path: &str, diff: &str) -> bool {
+    fn confirm(
+        &mut self,
+        request: hi_agent::ConfirmationRequest,
+    ) -> hi_agent::ConfirmationFuture<'_> {
         // Only the primary UI confirms edits; the remote viewer is read-only.
-        self.primary.confirm_edit(path, diff)
+        self.primary.confirm(request)
     }
     fn tool_call(&mut self, name: &str, arguments: &str) {
         self.primary.tool_call(name, arguments);
@@ -1508,6 +1523,9 @@ fn render_live_event(event: &hi_tui::event::UiEvent) {
         UiEvent::Status { text } => {
             eprintln!("\x1b[2m  {text}\x1b[0m");
         }
+        UiEvent::CheckpointWarning { text } => {
+            eprintln!("\x1b[33m  {text}\x1b[0m");
+        }
         UiEvent::Plan { steps } => {
             eprintln!("\x1b[2m  plan: {} step(s)\x1b[0m", steps.len());
         }
@@ -1828,6 +1846,7 @@ pub async fn run_resume_local(
         loaded.checkpoint_refs,
         loaded.goal,
         loaded.decisions,
+        loaded.plan,
     );
     let sync_session = SyncSession::new(local, remote);
     let sync_handle = sync_session.remote_handle();
@@ -1987,6 +2006,7 @@ mod tests {
             name: Some("Named portal session".into()),
             goal: None,
             decisions: hi_agent::DecisionLog::default(),
+            plan: Vec::new(),
         };
 
         sink.seed_snapshot(&loaded).unwrap();

@@ -543,6 +543,9 @@ pub(crate) struct App {
     /// as a live checklist. Empty until the model posts a plan; replaced wholesale
     /// on each update so it never drifts.
     pub(crate) plan: Vec<hi_agent::PlanStep>,
+    /// Local interactive mutation confirmation currently shown by the turn driver.
+    pub(crate) confirmation: Option<hi_agent::ConfirmationRequest>,
+    pub(crate) confirmation_scroll: usize,
     /// The active long-horizon goal, mirrored from the agent so the pinned plan
     /// block and header can show sub-goal progress. Refreshed when `/goal` sets it
     /// and after every turn (the driver may advance it). `None` when no goal is set.
@@ -628,6 +631,7 @@ pub(crate) struct App {
     pub(crate) event_log: Vec<String>,
     pub(crate) model_issues: HashMap<String, u32>,
     pub(crate) startup_notice: Option<String>,
+    pub(crate) checkpoint_warning: Option<String>,
     /// A transient "Press Ctrl-C again to exit" notice, shown after the first
     /// Ctrl-C when idle. Cleared after ~1.8s (see the deadline race in the idle
     /// input loop) or when any other key is pressed. A second Ctrl-C while this

@@ -6,7 +6,7 @@ use std::io;
 use crossterm::event::{DisableBracketedPaste, DisableFocusChange, DisableMouseCapture};
 use crossterm::execute;
 use crossterm::terminal::{LeaveAlternateScreen, disable_raw_mode};
-use hi_agent::{PlanStep, Ui};
+use hi_agent::{ConfirmationFuture, ConfirmationRequest, ConfirmationResult, PlanStep, Ui};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
@@ -45,6 +45,9 @@ pub enum UiEvent {
     Status {
         text: String,
     },
+    CheckpointWarning {
+        text: String,
+    },
     Plan {
         steps: Vec<PlanStep>,
     },
@@ -78,6 +81,14 @@ pub enum UiEvent {
 /// turn never borrows the live `App`.
 pub(crate) struct ChannelUi {
     pub tx: mpsc::UnboundedSender<UiEvent>,
+    pub confirmations: mpsc::UnboundedSender<ConfirmationControl>,
+}
+
+/// Local-only control message. Confirmation responses are deliberately not
+/// serialized as UiEvents or mirrored to remote viewers.
+pub(crate) struct ConfirmationControl {
+    pub request: ConfirmationRequest,
+    pub response: tokio::sync::oneshot::Sender<ConfirmationResult>,
 }
 
 impl ChannelUi {
@@ -124,13 +135,24 @@ impl Ui for ChannelUi {
             line: line.to_string(),
         });
     }
-    // confirm_edit: the TUI's ChannelUi is async-by-channel and can't
-    // synchronously wait for a user response. --confirm-edits is primarily
-    // a REPL/plain-mode feature. The TUI auto-approves (returns true via
-    // the default impl). A future improvement could add a confirmation
-    // overlay with a oneshot channel.
+    fn confirm(&mut self, request: ConfirmationRequest) -> ConfirmationFuture<'_> {
+        let (response, answer) = tokio::sync::oneshot::channel();
+        if self
+            .confirmations
+            .send(ConfirmationControl { request, response })
+            .is_err()
+        {
+            return Box::pin(async { ConfirmationResult::Unavailable });
+        }
+        Box::pin(async move { answer.await.unwrap_or(ConfirmationResult::Cancelled) })
+    }
     fn status(&mut self, text: &str) {
         self.send(UiEvent::Status {
+            text: text.to_string(),
+        });
+    }
+    fn checkpoint_warning(&mut self, text: &str) {
+        self.send(UiEvent::CheckpointWarning {
             text: text.to_string(),
         });
     }

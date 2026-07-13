@@ -72,6 +72,8 @@ impl crate::App {
             planning: None,
             status: String::new(),
             plan: Vec::new(),
+            confirmation: None,
+            confirmation_scroll: 0,
             goal: None,
             goal_drive_stall: 0,
             fleet: Vec::new(),
@@ -104,6 +106,7 @@ impl crate::App {
             event_log: Vec::new(),
             model_issues: HashMap::new(),
             startup_notice: None,
+            checkpoint_warning: None,
             quit_notice: None,
             completion: None,
             focused: true,
@@ -177,6 +180,7 @@ impl crate::App {
         self.pending_explore_label = None;
         self.explore_run = None;
         if working {
+            self.checkpoint_warning = None;
             self.last_turn_event = None;
             self.last_turn_had_file_edits = false;
             self.waiting_for = Some(Duration::ZERO);

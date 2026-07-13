@@ -525,9 +525,9 @@ impl Ui for DenyEditsUi {
     fn assistant_text(&mut self, _: &str) {}
     fn assistant_reasoning(&mut self, _: &str) {}
     fn assistant_end(&mut self) {}
-    fn confirm_edit(&mut self, _: &str, _: &str) -> bool {
+    fn confirm(&mut self, _: crate::ConfirmationRequest) -> crate::ConfirmationFuture<'_> {
         self.confirm_calls += 1;
-        false
+        Box::pin(async { crate::ConfirmationResult::Rejected })
     }
     fn tool_call(&mut self, _: &str, _: &str) {}
     fn tool_result(&mut self, name: &str, result: &str) {

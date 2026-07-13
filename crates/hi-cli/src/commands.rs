@@ -66,7 +66,7 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
         Command::Log => {
             let t = agent.totals();
             let body = format!(
-                "# hi debug log\n\nmodel: {}\nsession usage across all model calls: {} input · {} output · {} total{}\nlast turn: user prompt estimate {} · output across all model calls {}{}\ngoal: {}\nverify: {}\nlast_error: none\ncheckpoints: {}\n",
+                "# hi debug log (redacted; best-effort secret detection)\n\nmodel: {}\nsession usage across all model calls: {} input · {} output · {} total{}\nlast turn: user prompt estimate {} · output across all model calls {}{}\ngoal: {}\nverify: {}\nlast_error: none\ncheckpoints: {}\n",
                 agent.model(),
                 t.input_tokens,
                 t.output_tokens,
@@ -87,8 +87,11 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
                 agent.verify_summary(),
                 agent.checkpoint_count(),
             );
-            match std::fs::write(".hi-debug.log", body) {
-                Ok(()) => println!("\x1b[2mwrote debug log: .hi-debug.log\x1b[0m"),
+            match hi_agent::ui::write_private_debug_log(
+                std::path::Path::new(".hi-debug.log"),
+                &body,
+            ) {
+                Ok(()) => println!("\x1b[2mwrote redacted debug log: .hi-debug.log\x1b[0m"),
                 Err(err) => eprintln!("\x1b[33mlog failed: {err}\x1b[0m"),
             }
         }
@@ -523,8 +526,12 @@ fn handle_goal_team(agent: &mut hi_agent::Agent, team: hi_agent::command::GoalTe
     match team {
         GoalTeamArg::Show => match agent.structured_goal() {
             Some(g) if g.team => println!(
-                "\x1b[2mgoal team: on — a skeptic reviews each advance ({} objection(s) so far)\x1b[0m",
-                g.skeptic_objections
+                "\x1b[2mgoal team: on — skeptic reviews each advance ({} objection(s), {} unavailable; last: {})\x1b[0m",
+                g.skeptic_objections,
+                g.skeptic_unavailable,
+                g.last_skeptic_status
+                    .map(|s| format!("{s:?}"))
+                    .unwrap_or_else(|| "not run".into())
             ),
             Some(_) => println!("\x1b[2mgoal team: off — enable with /goal team on\x1b[0m"),
             None => println!("\x1b[2mno active goal — set one with /goal <text> first\x1b[0m"),

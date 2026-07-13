@@ -36,6 +36,8 @@ pub(crate) enum SkepticVerdict {
     /// Send it back to retry, carrying these concrete objections (fed into the
     /// sub-goal's notes so the next turn sees them).
     Object(Vec<String>),
+    /// Reviewer configuration, transport, or output could not yield a verdict.
+    Unavailable(String),
 }
 
 impl crate::Agent {
@@ -44,12 +46,9 @@ impl crate::Agent {
     /// Returns the joined objections if the skeptic wants the work retried, or
     /// `None` to let it stand (approve). Fail-open: no objection, a provider error,
     /// or an unparseable reply all return `None`. Books usage; records no history.
-    pub(crate) async fn skeptic_gate(&mut self, objective: &str, sub_goal: &str) -> Option<String> {
+    pub(crate) async fn skeptic_gate(&mut self, objective: &str, sub_goal: &str) -> SkepticVerdict {
         let context = self.skeptic_context(objective, sub_goal).await;
-        match self.skeptic_review(&context).await {
-            SkepticVerdict::Object(objs) if !objs.is_empty() => Some(objs.join("\n")),
-            _ => None,
-        }
+        self.skeptic_review(&context).await
     }
 
     /// Review an arbitrary `(objective, sub_goal, diff)` with the real skeptic —
@@ -83,6 +82,7 @@ impl crate::Agent {
         match self.skeptic_review(&context).await {
             SkepticVerdict::Object(objs) => (true, objs),
             SkepticVerdict::Approve => (false, Vec::new()),
+            SkepticVerdict::Unavailable(_) => (false, Vec::new()),
         }
     }
 
@@ -123,7 +123,7 @@ impl crate::Agent {
     /// [`SkepticVerdict::Approve`].
     async fn skeptic_review(&mut self, context: &str) -> SkepticVerdict {
         let Some(model) = self.config.skeptic_model.clone() else {
-            return SkepticVerdict::Approve;
+            return SkepticVerdict::Unavailable("no skeptic model is configured".into());
         };
         let request = ChatRequest {
             model,
@@ -155,7 +155,7 @@ impl crate::Agent {
             Ok(completion) => completion,
             Err(err) => {
                 self.add_side_error_usage(&err);
-                return SkepticVerdict::Approve; // fail-open on a provider error
+                return SkepticVerdict::Unavailable(format!("provider error: {err:#}"));
             }
         };
         self.add_side_usage(completion.usage);
@@ -202,13 +202,16 @@ fn parse_verdict(text: &str) -> SkepticVerdict {
         .filter(|l| !l.is_empty())
         .collect();
     let Some(first) = lines.first() else {
-        return SkepticVerdict::Approve;
+        return SkepticVerdict::Unavailable("reviewer returned empty output".into());
     };
     // Drop surrounding markdown emphasis/bullets on the verdict line.
     let first_clean = first.trim_matches(|c: char| matches!(c, '#' | '*' | '`' | '-' | '•' | ' '));
     let lower = first_clean.to_ascii_lowercase();
-    if !(lower.starts_with("object") || lower.starts_with("reject")) {
+    if lower.starts_with("approve") {
         return SkepticVerdict::Approve;
+    }
+    if !(lower.starts_with("object") || lower.starts_with("reject")) {
+        return SkepticVerdict::Unavailable("reviewer output did not contain a verdict".into());
     }
     // Objections: subsequent non-empty lines (bullets stripped) …
     let mut objs: Vec<String> = lines[1..]
@@ -228,7 +231,7 @@ fn parse_verdict(text: &str) -> SkepticVerdict {
         objs.insert(0, inline.to_string());
     }
     if objs.is_empty() {
-        SkepticVerdict::Approve // OBJECT with nothing actionable → fail-open
+        SkepticVerdict::Unavailable("reviewer objected without an actionable reason".into())
     } else {
         SkepticVerdict::Object(objs)
     }
@@ -255,9 +258,14 @@ mod tests {
             SkepticVerdict::Approve
         );
         assert_eq!(parse_verdict("**APPROVE**"), SkepticVerdict::Approve);
-        // Empty / garbage → fail-open approve.
-        assert_eq!(parse_verdict("   \n\n"), SkepticVerdict::Approve);
-        assert_eq!(parse_verdict("hmm, not sure"), SkepticVerdict::Approve);
+        assert!(matches!(
+            parse_verdict("   \n\n"),
+            SkepticVerdict::Unavailable(_)
+        ));
+        assert!(matches!(
+            parse_verdict("hmm, not sure"),
+            SkepticVerdict::Unavailable(_)
+        ));
     }
 
     #[test]
@@ -287,9 +295,14 @@ mod tests {
     }
 
     #[test]
-    fn object_without_anything_actionable_is_fail_open() {
-        // OBJECT with no objections to feed back → approve (nothing to retry on).
-        assert_eq!(parse_verdict("OBJECT"), SkepticVerdict::Approve);
-        assert_eq!(parse_verdict("OBJECT\n\n"), SkepticVerdict::Approve);
+    fn object_without_anything_actionable_is_unavailable() {
+        assert!(matches!(
+            parse_verdict("OBJECT"),
+            SkepticVerdict::Unavailable(_)
+        ));
+        assert!(matches!(
+            parse_verdict("OBJECT\n\n"),
+            SkepticVerdict::Unavailable(_)
+        ));
     }
 }

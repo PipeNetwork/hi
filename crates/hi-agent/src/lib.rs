@@ -38,7 +38,9 @@ pub use skills::{
     skill_roots,
 };
 pub use subagent::{DelegateOutcome, DelegateRunner};
-pub use ui::{Ui, classify_error, tool_label};
+pub use ui::{
+    ConfirmationFuture, ConfirmationRequest, ConfirmationResult, Ui, classify_error, tool_label,
+};
 
 use snapshot::SnapshotCache;
 use transcript::Transcript;
@@ -65,7 +67,7 @@ use {
 pub use decision::{Decision, DecisionLog};
 pub use goal::{
     DEFAULT_SUBGOAL_RETRIES, GOAL_CONTINUE_PROMPT, GOAL_DRIVE_STALL_LIMIT, Goal, GoalStatus,
-    SubGoal,
+    SkepticStatus, SubGoal,
 };
 
 /// Crate version (from Cargo.toml).
@@ -183,6 +185,11 @@ pub struct TurnTelemetry {
     /// local budget. Compare with `hit_step_cap` to distinguish repair
     /// exhaustion from the global model-call backstop.
     pub review_repair_stopped_by_exhaustion: bool,
+    pub skeptic_unavailable_count: u32,
+    pub skeptic_last_status: Option<SkepticStatus>,
+    /// `Some(true)` when persisted, `Some(false)` when the user continued without
+    /// `/undo`, and `None` when the turn never attempted a mutation.
+    pub checkpoint_available: Option<bool>,
 }
 
 impl Default for TurnTelemetry {
@@ -216,6 +223,9 @@ impl Default for TurnTelemetry {
             review_repair_exhaustion_reason: String::new(),
             review_repair_counts: BTreeMap::new(),
             review_repair_stopped_by_exhaustion: false,
+            skeptic_unavailable_count: 0,
+            skeptic_last_status: None,
+            checkpoint_available: None,
         }
     }
 }

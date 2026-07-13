@@ -169,7 +169,7 @@ impl crate::App {
     pub(crate) fn write_debug_log(&mut self) {
         let path = std::path::Path::new(".hi-debug.log");
         let mut body = String::new();
-        body.push_str("# hi debug log\n\n");
+        body.push_str("# hi debug log (redacted; best-effort secret detection)\n\n");
         body.push_str("## status\n");
         body.push_str(&format!(
             "provider: {}\nmodel: {}\n",
@@ -189,9 +189,23 @@ impl crate::App {
             body.push('\n');
         }
         body.push_str("\n## transcript\n");
-        body.push_str(&self.transcript_text());
-        match std::fs::write(path, body) {
-            Ok(()) => self.push(Line::styled("wrote debug log: .hi-debug.log", dim())),
+        for entry in &self.transcript {
+            match entry {
+                crate::TranscriptEntry::Line(_) => {
+                    body.push_str(&entry.text());
+                    body.push('\n');
+                }
+                crate::TranscriptEntry::Reasoning { .. } => {
+                    body.push_str("[reasoning omitted]\n");
+                }
+            }
+        }
+        let body = hi_agent::ui::redact_debug_text(&body, &[self.api_key.as_str()]);
+        match hi_agent::ui::write_private_debug_log(path, &body) {
+            Ok(()) => self.push(Line::styled(
+                "wrote redacted debug log: .hi-debug.log",
+                dim(),
+            )),
             Err(err) => self.push(Line::styled(
                 format!("log failed: {err}"),
                 Style::default().fg(Color::Yellow),
@@ -323,8 +337,12 @@ impl crate::App {
             GoalTeamArg::Show => match agent.structured_goal() {
                 Some(g) if g.team => (
                     format!(
-                        "goal team: on — a skeptic reviews each advance ({} objection(s) so far)",
-                        g.skeptic_objections
+                        "goal team: on — skeptic reviews each advance ({} objection(s), {} unavailable; last: {})",
+                        g.skeptic_objections,
+                        g.skeptic_unavailable,
+                        g.last_skeptic_status
+                            .map(|s| format!("{s:?}"))
+                            .unwrap_or_else(|| "not run".into())
                     ),
                     dim(),
                 ),

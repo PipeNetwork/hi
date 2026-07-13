@@ -322,7 +322,7 @@ impl crate::App {
                 self.last_turn_snapshot = None;
                 self.last_turn_start = agent.messages().len();
                 self.queue.clear();
-                self.plan.clear();
+                self.plan = agent.current_plan().to_vec();
                 self.goal = agent.structured_goal().cloned();
                 self.goal_drive_stall = 0;
                 self.usage = (0, 0);

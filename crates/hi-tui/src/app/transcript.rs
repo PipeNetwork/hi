@@ -320,6 +320,12 @@ impl crate::App {
                 self.flush_pending();
                 self.push(Line::styled(text, Style::default().fg(Color::Blue)));
             }
+            UiEvent::CheckpointWarning { text } => {
+                self.event_log.push("checkpoint unavailable".into());
+                self.checkpoint_warning = Some(text.clone());
+                self.flush_pending();
+                self.push(Line::styled(text, Style::default().fg(Color::Yellow)));
+            }
             // Plan updates replace the pinned checklist in place — no transcript
             // line, so progress reads as one updating block rather than a scroll.
             UiEvent::Plan { steps } => {

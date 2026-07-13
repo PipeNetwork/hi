@@ -31,6 +31,14 @@ pub enum GoalStatus {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkepticStatus {
+    Approved,
+    Objected,
+    Unavailable,
+}
+
 /// One step of a decomposed goal. The agent works sub-goals in order; a failed
 /// sub-goal is retried up to `attempts` before being marked `Failed`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +95,11 @@ pub struct Goal {
     /// `#[serde(default)]`.
     #[serde(default)]
     pub skeptic_objections: u32,
+    /// Reviewer failures are visible but do not block goal advancement.
+    #[serde(default)]
+    pub skeptic_unavailable: u32,
+    #[serde(default)]
+    pub last_skeptic_status: Option<SkepticStatus>,
 }
 
 /// Default per-sub-goal retry budget: how many times to retry a failing sub-goal
@@ -134,6 +147,8 @@ impl Goal {
             step_limit: None,
             team: false,
             skeptic_objections: 0,
+            skeptic_unavailable: 0,
+            last_skeptic_status: None,
         }
     }
 

@@ -4,6 +4,131 @@
 //! TUI) decides how to format them. This keeps the loop free of `print!` and
 //! terminal concerns.
 
+use std::future::Future;
+use std::pin::Pin;
+
+/// A mutation that requires an explicit user decision.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConfirmationRequest {
+    FileEdit { path: String, diff: String },
+    ShellMutation { command: String, cwd: String },
+    DelegateApply { summary: String, diff: String },
+    MissingCheckpoint { reason: String },
+}
+
+impl ConfirmationRequest {
+    pub fn title(&self) -> &'static str {
+        match self {
+            Self::FileEdit { .. } => "Confirm file edit",
+            Self::ShellMutation { .. } => "Confirm shell mutation",
+            Self::DelegateApply { .. } => "Confirm delegated changes",
+            Self::MissingCheckpoint { .. } => "Continue without /undo?",
+        }
+    }
+
+    pub fn details(&self) -> String {
+        match self {
+            Self::FileEdit { path, diff } => format!("file: {path}\n\n{diff}"),
+            Self::ShellMutation { command, cwd } => format!(
+                "working directory: {cwd}\nwarning: this command is likely to mutate the workspace\n\n$ {command}"
+            ),
+            Self::DelegateApply { summary, diff } => format!("{summary}\n\n{diff}"),
+            Self::MissingCheckpoint { reason } => format!(
+                "A checkpoint could not be created: {reason}\n\nChanges in this turn will not be available to /undo."
+            ),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfirmationResult {
+    Approved,
+    Rejected,
+    Cancelled,
+    /// The frontend cannot collect an interactive answer. Callers must fail closed.
+    Unavailable,
+}
+
+pub type ConfirmationFuture<'a> = Pin<Box<dyn Future<Output = ConfirmationResult> + Send + 'a>>;
+
+/// Best-effort redaction for diagnostic text. It deliberately does not claim
+/// perfect secret detection.
+pub fn redact_debug_text(text: &str, known_secrets: &[&str]) -> String {
+    let mut redacted = text.to_string();
+    for secret in known_secrets.iter().copied().filter(|s| !s.is_empty()) {
+        redacted = redacted.replace(secret, "[REDACTED]");
+    }
+    redacted
+        .lines()
+        .map(|line| {
+            let lower = line.to_ascii_lowercase();
+            if let Some(index) = lower.find("authorization:") {
+                return format!("{}authorization: [REDACTED]", &line[..index]);
+            }
+            if let Some(index) = lower.find("bearer ") {
+                let start = index + "bearer ".len();
+                let end = line[start..]
+                    .find(|c: char| c.is_whitespace() || matches!(c, ',' | '}' | ']'))
+                    .map(|n| start + n)
+                    .unwrap_or(line.len());
+                let mut out = line.to_string();
+                out.replace_range(start..end, "[REDACTED]");
+                return out;
+            }
+            for separator in ['=', ':'] {
+                if let Some(index) = line.find(separator) {
+                    let name = line[..index]
+                        .trim_end()
+                        .split(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | '{' | ','))
+                        .next_back()
+                        .unwrap_or("")
+                        .trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                        .to_ascii_lowercase();
+                    if ["key", "token", "secret", "password"]
+                        .iter()
+                        .any(|needle| name.contains(needle))
+                    {
+                        return format!("{}{} [REDACTED]", &line[..index], separator);
+                    }
+                }
+            }
+            line.to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Atomically replace a debug log with owner-only permissions.
+pub fn write_private_debug_log(path: &std::path::Path, body: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp = path.with_extension(format!("debug-{}-{id}.tmp", std::process::id()));
+    let mut options = std::fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| {
+        let mut file = options.open(&temp)?;
+        file.write_all(body.as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&temp, path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temp);
+    }
+    result
+}
+
 /// Receives streamed output and tool activity from a running turn.
 ///
 /// `Send` is required because the streaming callback is handed to the provider
@@ -30,12 +155,10 @@ pub trait Ui: Send {
     /// discard when the final result arrives. Defaults to no-op; only the
     /// live TUI needs it.
     fn tool_stream(&mut self, _name: &str, _line: &str) {}
-    /// Ask the user to confirm a file edit. `path` is the file being changed;
-    /// `diff` is a unified-diff preview. Returns `true` to approve, `false` to
-    /// skip. Defaults to auto-approve (non-interactive). Only interactive
-    /// frontends override this to actually prompt.
-    fn confirm_edit(&mut self, _path: &str, _diff: &str) -> bool {
-        true
+    /// Ask the frontend to authorize a mutation. The default fails closed so a
+    /// headless frontend can never silently approve an opt-in confirmation.
+    fn confirm(&mut self, _request: ConfirmationRequest) -> ConfirmationFuture<'_> {
+        Box::pin(async { ConfirmationResult::Unavailable })
     }
     /// Emit the transcript header for a tool call, immediately followed by the
     /// matching [`tool_result`]. In a concurrent batch these are emitted in
@@ -48,6 +171,10 @@ pub trait Ui: Send {
     fn tool_result(&mut self, name: &str, result: &str);
     /// A status note (e.g. verification progress).
     fn status(&mut self, text: &str);
+    /// Pin a warning for the rest of a turn that is proceeding without /undo.
+    fn checkpoint_warning(&mut self, text: &str) {
+        self.status(text);
+    }
     /// A prominent notice that the agent is delegating to (or finishing) a
     /// subagent — louder than an ordinary [`status`](Ui::status) so the user
     /// clearly sees a nested agent run. Defaults to a plain status; frontends
@@ -120,8 +247,8 @@ impl<U: Ui + ?Sized> Ui for Box<U> {
     fn tool_stream(&mut self, name: &str, line: &str) {
         (**self).tool_stream(name, line);
     }
-    fn confirm_edit(&mut self, path: &str, diff: &str) -> bool {
-        (**self).confirm_edit(path, diff)
+    fn confirm(&mut self, request: ConfirmationRequest) -> ConfirmationFuture<'_> {
+        (**self).confirm(request)
     }
     fn tool_call(&mut self, name: &str, arguments: &str) {
         (**self).tool_call(name, arguments);
@@ -131,6 +258,9 @@ impl<U: Ui + ?Sized> Ui for Box<U> {
     }
     fn status(&mut self, text: &str) {
         (**self).status(text);
+    }
+    fn checkpoint_warning(&mut self, text: &str) {
+        (**self).checkpoint_warning(text);
     }
     fn subagent_note(&mut self, text: &str) {
         (**self).subagent_note(text);
@@ -310,7 +440,10 @@ pub fn clip(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_error, error_counts_as_model_issue, tool_label};
+    use super::{
+        classify_error, error_counts_as_model_issue, redact_debug_text, tool_label,
+        write_private_debug_log,
+    };
     use hi_ai::{ProviderError, ProviderErrorKind};
 
     #[test]
@@ -421,5 +554,34 @@ mod tests {
             assert!(!guidance.is_empty());
             assert!(!error_counts_as_model_issue(&err));
         }
+    }
+
+    #[test]
+    fn debug_redaction_covers_known_and_structured_secrets() {
+        let raw = "Authorization: Bearer abc\napi_key=abc\nlease_token: lease-123\npassword = hunter2\nplain ok";
+        let clean = redact_debug_text(raw, &["abc", "lease-123"]);
+        assert!(!clean.contains("abc"));
+        assert!(!clean.contains("lease-123"));
+        assert!(!clean.contains("hunter2"));
+        assert!(clean.contains("plain ok"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_debug_log_is_atomic_and_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::temp_dir().join(format!(
+            "hi-debug-{}-{}.log",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        write_private_debug_log(&path, "first").unwrap();
+        write_private_debug_log(&path, "second").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let _ = std::fs::remove_file(path);
     }
 }

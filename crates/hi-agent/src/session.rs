@@ -24,13 +24,19 @@ pub trait SessionSink: Send {
         messages: &[Message],
         goal: Option<&crate::Goal>,
         decisions: &crate::DecisionLog,
+        plan: &[crate::PlanStep],
     ) -> Result<()> {
         self.record_compaction(messages)?;
         match goal {
             Some(goal) => self.record_goal(goal)?,
             None => self.clear_goal()?,
         }
-        self.record_decisions(decisions)
+        self.record_decisions(decisions)?;
+        if plan.is_empty() {
+            self.clear_plan()
+        } else {
+            self.record_plan(plan)
+        }
     }
 
     /// Persist the retained git checkpoint refs so `/undo` still has the same
@@ -49,6 +55,16 @@ pub trait SessionSink: Send {
     /// Persist that the long-horizon goal was cleared. Default no-op so
     /// existing mock sinks don't need to implement it.
     fn clear_goal(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Persist the current unfinished task plan. Last write wins.
+    fn record_plan(&mut self, _plan: &[crate::PlanStep]) -> Result<()> {
+        Ok(())
+    }
+
+    /// Persist that no task plan should be restored.
+    fn clear_plan(&mut self) -> Result<()> {
         Ok(())
     }
 

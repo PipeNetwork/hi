@@ -18,6 +18,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context, Result, bail};
 use tokio::process::Command;
 
+/// Explicit result of attempting to create a working-tree checkpoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CreateResult {
+    Created(String),
+    /// Checkpointing is not available in this workspace (normally non-Git).
+    Unavailable(String),
+    /// Git was available, but snapshot creation actually failed.
+    Failed(String),
+}
+
 async fn git(dir: &Path, args: &[&str]) -> Result<Output> {
     Command::new("git")
         .arg("-C")
@@ -59,37 +69,73 @@ async fn toplevel(dir: &Path) -> Option<std::path::PathBuf> {
 /// returning its SHA. `None` if `dir` isn't in a git work tree (so there's
 /// nothing to checkpoint against).
 pub async fn create(dir: &Path) -> Option<String> {
-    if !in_work_tree(dir).await {
-        return None;
+    match create_detailed(dir).await {
+        CreateResult::Created(sha) => Some(sha),
+        CreateResult::Unavailable(_) | CreateResult::Failed(_) => None,
+    }
+}
+
+/// Snapshot with a diagnostic outcome suitable for an interactive safety gate.
+pub async fn create_detailed(dir: &Path) -> CreateResult {
+    let probe = match git(dir, &["rev-parse", "--is-inside-work-tree"]).await {
+        Ok(output) => output,
+        Err(err) => return CreateResult::Unavailable(format!("Git is unavailable: {err:#}")),
+    };
+    if !probe.status.success() {
+        return CreateResult::Unavailable(
+            "the working directory is not inside a Git work tree".into(),
+        );
     }
     static N: AtomicU64 = AtomicU64::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
     let tmp = std::env::temp_dir().join(format!("hi-checkpoint-{}-{n}", std::process::id()));
-    let index = tmp.to_str()?;
+    let Some(index) = tmp.to_str() else {
+        return CreateResult::Failed("temporary checkpoint index path is not valid UTF-8".into());
+    };
 
     // Seed the throwaway index from HEAD so `add -A` is a fast incremental
     // (harmlessly fails in a repo with no commits yet).
     let _ = git_indexed(dir, index, &["read-tree", "HEAD"]).await;
-    let add = git_indexed(dir, index, &["add", "-A"]).await.ok()?;
+    let add = match git_indexed(dir, index, &["add", "-A"]).await {
+        Ok(output) => output,
+        Err(err) => return CreateResult::Failed(format!("git add failed: {err:#}")),
+    };
     if !add.status.success() {
         let _ = std::fs::remove_file(&tmp);
-        return None;
+        return CreateResult::Failed(format!(
+            "git add failed: {}",
+            String::from_utf8_lossy(&add.stderr).trim()
+        ));
     }
-    let tree_out = git_indexed(dir, index, &["write-tree"]).await.ok()?;
+    let tree_out = match git_indexed(dir, index, &["write-tree"]).await {
+        Ok(output) => output,
+        Err(err) => return CreateResult::Failed(format!("git write-tree failed: {err:#}")),
+    };
     let _ = std::fs::remove_file(&tmp);
     if !tree_out.status.success() {
-        return None;
+        return CreateResult::Failed(format!(
+            "git write-tree failed: {}",
+            String::from_utf8_lossy(&tree_out.stderr).trim()
+        ));
     }
     let tree = String::from_utf8_lossy(&tree_out.stdout).trim().to_string();
 
-    let commit = git(dir, &["commit-tree", &tree, "-m", "hi checkpoint"])
-        .await
-        .ok()?;
+    let commit = match git(dir, &["commit-tree", &tree, "-m", "hi checkpoint"]).await {
+        Ok(output) => output,
+        Err(err) => return CreateResult::Failed(format!("git commit-tree failed: {err:#}")),
+    };
     if !commit.status.success() {
-        return None;
+        return CreateResult::Failed(format!(
+            "git commit-tree failed: {}",
+            String::from_utf8_lossy(&commit.stderr).trim()
+        ));
     }
     let sha = String::from_utf8_lossy(&commit.stdout).trim().to_string();
-    (!sha.is_empty()).then_some(sha)
+    if sha.is_empty() {
+        CreateResult::Failed("git commit-tree returned an empty checkpoint id".into())
+    } else {
+        CreateResult::Created(sha)
+    }
 }
 
 /// A unified diff of the working tree (of the repo containing `dir`) against
@@ -282,5 +328,17 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn detailed_result_distinguishes_non_git_workspace() {
+        let dir = std::env::temp_dir().join(format!("hi-non-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(matches!(
+            create_detailed(&dir).await,
+            CreateResult::Unavailable(_)
+        ));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

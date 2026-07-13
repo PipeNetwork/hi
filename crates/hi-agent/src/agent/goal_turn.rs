@@ -3,8 +3,9 @@
 //! for the `record_decision` tool.
 
 use crate::Ui;
+use crate::agent::skeptic::SkepticVerdict;
 use crate::decision::Decision;
-use crate::goal::{DEFAULT_SUBGOAL_RETRIES, Goal, GoalStatus};
+use crate::goal::{DEFAULT_SUBGOAL_RETRIES, Goal, GoalStatus, SkepticStatus};
 
 impl crate::Agent {
     /// Long-horizon driver — called at turn end. When a structured goal is set
@@ -46,7 +47,6 @@ impl crate::Agent {
         // retry note; the edits stay on disk for the next turn to build on.
         // Fail-open — any reviewer error/timeout/unparseable reply approves.
         if clean_success
-            && self.has_skeptic()
             && let Some((objective, sub_goal)) = goal_before.as_ref().and_then(|g| {
                 if !g.team || g.paused || g.status != GoalStatus::Active {
                     return None;
@@ -56,11 +56,13 @@ impl crate::Agent {
             })
         {
             match self.skeptic_gate(&objective, &sub_goal).await {
-                Some(objections) => {
+                SkepticVerdict::Object(items) => {
+                    let objections = items.join("\n");
                     // Objection: revert the turn's goal progress and record it.
                     self.structured_goal = goal_before;
                     if let Some(goal) = self.structured_goal.as_mut() {
                         goal.skeptic_objections = goal.skeptic_objections.saturating_add(1);
+                        goal.last_skeptic_status = Some(SkepticStatus::Objected);
                         goal.record_failure(
                             format!("reviewer objected — address then continue:\n{objections}"),
                             max_retries,
@@ -70,12 +72,32 @@ impl crate::Agent {
                     ui.status(&format!("🔍 skeptic objected — retrying: {first}"));
                     self.refresh_system_message();
                     self.persist_goal(ui);
+                    self.last_turn_telemetry.skeptic_last_status = Some(SkepticStatus::Objected);
                     return;
                 }
-                // Approved (or a fail-open error): note it and let the advance
-                // stand — fall through to the normal advance/retry logic.
-                None => ui.status("🔍 skeptic reviewed — advancing"),
+                SkepticVerdict::Approve => {
+                    if let Some(goal) = self.structured_goal.as_mut() {
+                        goal.last_skeptic_status = Some(SkepticStatus::Approved);
+                    }
+                    self.last_turn_telemetry.skeptic_last_status = Some(SkepticStatus::Approved);
+                    ui.status("🔍 skeptic approved — advancing");
+                }
+                SkepticVerdict::Unavailable(reason) => {
+                    if let Some(goal) = self.structured_goal.as_mut() {
+                        goal.skeptic_unavailable = goal.skeptic_unavailable.saturating_add(1);
+                        goal.last_skeptic_status = Some(SkepticStatus::Unavailable);
+                    }
+                    self.last_turn_telemetry.skeptic_unavailable_count = self
+                        .last_turn_telemetry
+                        .skeptic_unavailable_count
+                        .saturating_add(1);
+                    self.last_turn_telemetry.skeptic_last_status = Some(SkepticStatus::Unavailable);
+                    ui.status(&format!(
+                        "⚠ skeptic unavailable — advancing without review: {reason}"
+                    ));
+                }
             }
+            self.persist_goal(ui);
         }
 
         // Normal advance/retry bookkeeping, on the CURRENT goal.

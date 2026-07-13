@@ -552,6 +552,14 @@ async fn skeptic_gate_fails_open_on_provider_error() {
         "fail-open advanced despite the skeptic error"
     );
     assert_eq!(goal.skeptic_objections, 0);
+    assert_eq!(goal.skeptic_unavailable, 1);
+    assert_eq!(goal.last_skeptic_status, Some(SkepticStatus::Unavailable));
+    assert_eq!(agent.last_turn_telemetry().skeptic_unavailable_count, 1);
+    assert!(
+        ui.statuses
+            .iter()
+            .any(|status| status.contains("skeptic unavailable"))
+    );
 }
 
 #[tokio::test]

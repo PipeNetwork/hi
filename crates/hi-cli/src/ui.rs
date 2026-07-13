@@ -4,8 +4,8 @@ use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use hi_agent::Ui;
 use hi_agent::tool_label;
+use hi_agent::{ConfirmationFuture, ConfirmationRequest, ConfirmationResult, Ui};
 
 pub struct PlainUi {
     /// Set true on the first real output; the REPL's spinner watches it and
@@ -76,20 +76,27 @@ impl Ui for PlainUi {
         println!("\x1b[2m  │ {line}\x1b[0m");
     }
 
-    fn confirm_edit(&mut self, path: &str, diff: &str) -> bool {
+    fn confirm(&mut self, request: ConfirmationRequest) -> ConfirmationFuture<'_> {
         use std::io::Write;
         self.begin_output();
-        println!("\x1b[33m⏺ edit {} — apply? [y/N]\x1b[0m", path);
-        if !diff.is_empty() {
-            for line in diff.lines().take(20) {
+        println!("\x1b[33m⏺ {} — approve? [y/N]\x1b[0m", request.title());
+        let details = request.details();
+        if !details.is_empty() {
+            for line in details.lines().take(24) {
                 println!("\x1b[2m  {line}\x1b[0m");
             }
         }
         print!("\x1b[33m  › \x1b[0m");
         let _ = std::io::stdout().flush();
-        let mut input = String::new();
-        let _ = std::io::stdin().read_line(&mut input);
-        input.trim().eq_ignore_ascii_case("y")
+        Box::pin(async {
+            let mut input = String::new();
+            match std::io::stdin().read_line(&mut input) {
+                Ok(0) => ConfirmationResult::Unavailable,
+                Ok(_) if input.trim().eq_ignore_ascii_case("y") => ConfirmationResult::Approved,
+                Ok(_) => ConfirmationResult::Rejected,
+                Err(_) => ConfirmationResult::Unavailable,
+            }
+        })
     }
 
     fn tool_result(&mut self, name: &str, result: &str) {

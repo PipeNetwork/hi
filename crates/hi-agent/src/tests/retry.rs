@@ -38,6 +38,7 @@ impl SessionSink for StateReplacementRecordingSession {
         messages: &[Message],
         goal: Option<&Goal>,
         decisions: &DecisionLog,
+        _plan: &[crate::PlanStep],
     ) -> anyhow::Result<()> {
         self.records.lock().unwrap().push((
             messages.to_vec(),

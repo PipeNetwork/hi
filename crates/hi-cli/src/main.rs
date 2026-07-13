@@ -243,6 +243,7 @@ async fn main() -> Result<()> {
         ..AgentConfig::default()
     };
     let resume_summary = loaded.as_ref().and_then(|l| l.resume_summary.clone());
+    let restored_plan = loaded.as_ref().map(|l| l.plan.clone()).unwrap_or_default();
     let mut agent = match loaded {
         Some(loaded) => Agent::resume(
             provider,
@@ -255,6 +256,7 @@ async fn main() -> Result<()> {
         ),
         None => Agent::new(provider, agent_config),
     };
+    agent.restore_plan(restored_plan);
     // Attach the write-`delegate` subagent runner for any top-level agent (a
     // subagent can't delegate), regardless of whether write subagents start on —
     // so `/delegate on` can enable it at runtime. The tool stays gated by the
@@ -791,6 +793,7 @@ async fn main() -> Result<()> {
                             loaded.checkpoint_refs,
                             loaded.goal,
                             loaded.decisions,
+                            loaded.plan,
                         );
 
                         if let Some((synced, next_handle, next_events)) = next_sync {
@@ -1217,6 +1220,7 @@ struct LoadedAgentSession {
     checkpoint_refs: Vec<String>,
     structured_goal: Option<hi_agent::Goal>,
     decisions: hi_agent::DecisionLog,
+    plan: Vec<hi_agent::PlanStep>,
     /// A one-line summary of the resumed session, shown to the user on startup.
     resume_summary: Option<String>,
 }
@@ -1235,6 +1239,7 @@ fn resolve_session(cli: &Cli) -> Result<(std::path::PathBuf, Option<LoadedAgentS
                     checkpoint_refs: loaded.checkpoint_refs,
                     structured_goal: loaded.goal,
                     decisions: loaded.decisions,
+                    plan: loaded.plan,
                     resume_summary: None,
                 }),
             ));
@@ -1253,6 +1258,7 @@ fn resolve_session(cli: &Cli) -> Result<(std::path::PathBuf, Option<LoadedAgentS
                 checkpoint_refs: loaded.checkpoint_refs,
                 structured_goal: loaded.goal,
                 decisions: loaded.decisions,
+                plan: loaded.plan,
                 resume_summary: Some(summary),
             }),
         ));
@@ -1269,6 +1275,7 @@ fn resolve_session(cli: &Cli) -> Result<(std::path::PathBuf, Option<LoadedAgentS
                     checkpoint_refs: loaded.checkpoint_refs,
                     structured_goal: loaded.goal,
                     decisions: loaded.decisions,
+                    plan: loaded.plan,
                     resume_summary: Some(summary),
                 }),
             ));
@@ -1517,6 +1524,9 @@ fn write_report(
             "total": g.sub_goals.len(),
             "status": format!("{:?}", g.status),
             "paused": g.paused,
+            "skeptic_objections": g.skeptic_objections,
+            "skeptic_unavailable": g.skeptic_unavailable,
+            "last_skeptic_status": g.last_skeptic_status,
         })
     });
     let telemetry = serde_json::json!({
@@ -1548,6 +1558,9 @@ fn write_report(
         "review_repair_exhaustion_reason": tel.review_repair_exhaustion_reason,
         "review_repair_counts": tel.review_repair_counts,
         "review_repair_stopped_by_exhaustion": tel.review_repair_stopped_by_exhaustion,
+        "skeptic_unavailable_count": tel.skeptic_unavailable_count,
+        "skeptic_last_status": tel.skeptic_last_status,
+        "checkpoint_available": tel.checkpoint_available,
         "stopped_by_step_cap": tel.hit_step_cap,
     });
     let report = serde_json::json!({

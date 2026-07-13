@@ -13,6 +13,43 @@ fn dump(term: &Terminal<TestBackend>) -> String {
     out
 }
 
+#[test]
+fn confirmation_modal_renders_mutation_details() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.confirmation = Some(hi_agent::ConfirmationRequest::ShellMutation {
+        command: "rm generated.txt".into(),
+        cwd: "/workspace".into(),
+    });
+    let mut term = Terminal::new(TestBackend::new(88, 20)).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let screen = dump(&term);
+    assert!(screen.contains("Confirm shell mutation"));
+    assert!(screen.contains("rm generated.txt"));
+    assert!(screen.contains("y approve"));
+}
+
+#[tokio::test]
+async fn channel_confirmation_uses_local_response_channel() {
+    use hi_agent::Ui;
+    let (tx, _events) = tokio::sync::mpsc::unbounded_channel();
+    let (confirmations, mut controls) = tokio::sync::mpsc::unbounded_channel();
+    let mut ui = crate::event::ChannelUi { tx, confirmations };
+    let answer = ui.confirm(hi_agent::ConfirmationRequest::FileEdit {
+        path: "src/lib.rs".into(),
+        diff: "+safe".into(),
+    });
+    let control = controls.recv().await.unwrap();
+    assert!(matches!(
+        control.request,
+        hi_agent::ConfirmationRequest::FileEdit { .. }
+    ));
+    control
+        .response
+        .send(hi_agent::ConfirmationResult::Approved)
+        .unwrap();
+    assert_eq!(answer.await, hi_agent::ConfirmationResult::Approved);
+}
+
 /// A no-op resolver for tests — `/provider` isn't exercised in unit tests.
 fn test_resolver() -> ProfileResolver {
     Box::new(|_name| anyhow::bail!("no profiles in tests"))
@@ -146,6 +183,7 @@ async fn sessions_switch_replaces_live_agent_and_ui_session() {
                 Vec::new(),
                 None,
                 hi_agent::DecisionLog::default(),
+                Vec::new(),
             );
             Ok(SessionSwitchInfo {
                 id: id.to_string(),
@@ -1114,6 +1152,9 @@ fn ctrl_question_toggles_the_observability_panel() {
         review_repair_exhaustion_reason: "review_listing_only_exhausted".to_string(),
         review_repair_counts: repair_counts,
         review_repair_stopped_by_exhaustion: true,
+        skeptic_unavailable_count: 0,
+        skeptic_last_status: None,
+        checkpoint_available: None,
     });
     app.turn_tool_calls = 7;
     app.apply(UiEvent::Usage {

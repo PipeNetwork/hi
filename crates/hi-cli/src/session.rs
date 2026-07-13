@@ -56,6 +56,10 @@ enum SessionMeta {
     Decisions {
         decisions: Vec<hi_agent::Decision>,
     },
+    Plan {
+        steps: Vec<hi_agent::PlanStep>,
+    },
+    PlanCleared,
     /// An explicit replacement of all retry-relevant state. This keeps
     /// transcript, structured goal, and decisions in sync when a turn is
     /// discarded by `/retry` or interrupt cleanup.
@@ -65,6 +69,8 @@ enum SessionMeta {
         goal: Option<hi_agent::Goal>,
         #[serde(default)]
         decisions: Vec<hi_agent::Decision>,
+        #[serde(default)]
+        plan: Vec<hi_agent::PlanStep>,
     },
 }
 
@@ -165,16 +171,28 @@ impl SessionSink for JsonlSession {
         })
     }
 
+    fn record_plan(&mut self, plan: &[hi_agent::PlanStep]) -> Result<()> {
+        self.append_meta(&SessionMeta::Plan {
+            steps: plan.to_vec(),
+        })
+    }
+
+    fn clear_plan(&mut self) -> Result<()> {
+        self.append_meta(&SessionMeta::PlanCleared)
+    }
+
     fn record_state_replacement(
         &mut self,
         messages: &[Message],
         goal: Option<&hi_agent::Goal>,
         decisions: &hi_agent::DecisionLog,
+        plan: &[hi_agent::PlanStep],
     ) -> Result<()> {
         self.append_meta(&SessionMeta::StateReplacement {
             messages: messages.to_vec(),
             goal: goal.cloned(),
             decisions: decisions.entries().to_vec(),
+            plan: plan.to_vec(),
         })
     }
 }
@@ -190,6 +208,8 @@ pub struct LoadedSession {
     pub goal: Option<hi_agent::Goal>,
     /// Intra-session decisions persisted across resume (last write wins).
     pub decisions: hi_agent::DecisionLog,
+    /// Unfinished task plan restored into the live plan box.
+    pub plan: Vec<hi_agent::PlanStep>,
 }
 
 /// Atomically cache reconstructed session state at `path`. A failed restore
@@ -208,6 +228,7 @@ pub fn cache_loaded_session(path: &Path, loaded: &LoadedSession) -> Result<()> {
             &loaded.messages,
             loaded.goal.as_ref(),
             &loaded.decisions,
+            &loaded.plan,
         )?;
         session.record(&[], loaded.usage)?;
         session.record_checkpoints(&loaded.checkpoint_refs)?;
@@ -733,6 +754,7 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
     let mut checkpoint_refs = Vec::new();
     let mut loaded_goal: Option<hi_agent::Goal> = None;
     let mut loaded_decisions = hi_agent::DecisionLog::default();
+    let mut loaded_plan = Vec::new();
     let mut loaded_name = None;
     for line in text.lines() {
         if line.trim().is_empty() {
@@ -779,14 +801,20 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
                 SessionMeta::Decisions { decisions } => {
                     loaded_decisions = hi_agent::DecisionLog::from_entries(decisions);
                 }
+                SessionMeta::Plan { steps } => {
+                    loaded_plan = steps;
+                }
+                SessionMeta::PlanCleared => loaded_plan.clear(),
                 SessionMeta::StateReplacement {
                     messages: replacement,
                     goal,
                     decisions,
+                    plan,
                 } => {
                     messages = replacement;
                     loaded_goal = goal;
                     loaded_decisions = hi_agent::DecisionLog::from_entries(decisions);
+                    loaded_plan = plan;
                 }
             }
             continue;
@@ -803,6 +831,12 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
         };
         messages.push(message);
     }
+    if loaded_plan
+        .iter()
+        .all(|step| step.status == hi_agent::PlanStatus::Done)
+    {
+        loaded_plan.clear();
+    }
     Ok(LoadedSession {
         messages,
         usage,
@@ -810,6 +844,7 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
         name: loaded_name,
         goal: loaded_goal,
         decisions: loaded_decisions,
+        plan: loaded_plan,
     })
 }
 
@@ -833,6 +868,7 @@ pub fn load_history_from_records(records: &[RemoteRecord]) -> Result<LoadedSessi
     let mut checkpoint_refs = Vec::new();
     let mut loaded_goal: Option<hi_agent::Goal> = None;
     let mut loaded_decisions = hi_agent::DecisionLog::default();
+    let mut loaded_plan = Vec::new();
     let mut loaded_name = None;
 
     for record in records {
@@ -883,19 +919,29 @@ pub fn load_history_from_records(records: &[RemoteRecord]) -> Result<LoadedSessi
                 SessionMeta::Decisions { decisions } => {
                     loaded_decisions = hi_agent::DecisionLog::from_entries(decisions);
                 }
+                SessionMeta::Plan { steps } => loaded_plan = steps,
+                SessionMeta::PlanCleared => loaded_plan.clear(),
                 SessionMeta::StateReplacement {
                     messages: replacement,
                     goal,
                     decisions,
+                    plan,
                 } => {
                     messages = replacement;
                     loaded_goal = goal;
                     loaded_decisions = hi_agent::DecisionLog::from_entries(decisions);
+                    loaded_plan = plan;
                 }
             }
         }
     }
 
+    if loaded_plan
+        .iter()
+        .all(|step| step.status == hi_agent::PlanStatus::Done)
+    {
+        loaded_plan.clear();
+    }
     Ok(LoadedSession {
         messages,
         usage,
@@ -903,6 +949,7 @@ pub fn load_history_from_records(records: &[RemoteRecord]) -> Result<LoadedSessi
         name: loaded_name,
         goal: loaded_goal,
         decisions: loaded_decisions,
+        plan: loaded_plan,
     })
 }
 ///
@@ -1058,6 +1105,7 @@ mod tests {
             name: Some("Restored session".into()),
             goal: None,
             decisions: hi_agent::DecisionLog::default(),
+            plan: Vec::new(),
         };
 
         cache_loaded_session(&path, &expected).expect("cache restored session");
@@ -1293,6 +1341,28 @@ mod tests {
     }
 
     #[test]
+    fn jsonl_session_restores_unfinished_plan_and_clear_wins() {
+        let path = std::env::temp_dir().join(format!(
+            "hi-session-plan-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut session = JsonlSession::new(path.clone());
+        let plan = vec![hi_agent::PlanStep {
+            title: "implement".into(),
+            status: hi_agent::PlanStatus::Active,
+        }];
+        session.record_plan(&plan).unwrap();
+        assert_eq!(load_history(&path).unwrap().plan, plan);
+        session.clear_plan().unwrap();
+        assert!(load_history(&path).unwrap().plan.is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn jsonl_state_replacement_overrides_prior_messages_goal_and_decisions() {
         let mut path = std::env::temp_dir();
         path.push(format!(
@@ -1327,7 +1397,7 @@ mod tests {
             files: vec!["src/lib.rs".into()],
         });
         session
-            .record_state_replacement(&[Message::system("new sys")], None, &kept_decisions)
+            .record_state_replacement(&[Message::system("new sys")], None, &kept_decisions, &[])
             .unwrap();
 
         let loaded = load_history(&path).unwrap();

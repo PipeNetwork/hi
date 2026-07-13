@@ -178,6 +178,7 @@ impl crate::Agent {
         checkpoint_refs: Vec<String>,
         structured_goal: Option<Goal>,
         decisions: DecisionLog,
+        plan: Vec<hi_tools::PlanStep>,
     ) {
         let mut messages = crate::Transcript::new(history);
         // Run the same repair pipeline as `with_messages` so a resumed session
@@ -209,7 +210,14 @@ impl crate::Agent {
         // Clear per-turn / transient state from the previous session, matching
         // what `with_messages` initializes to None/empty for a fresh agent.
         self.goal = None;
-        self.last_plan = Vec::new();
+        self.last_plan = if plan
+            .iter()
+            .any(|step| step.status != hi_tools::PlanStatus::Done)
+        {
+            plan
+        } else {
+            Vec::new()
+        };
         self.last_changed_files = Vec::new();
         self.last_turn_telemetry = TurnTelemetry::default();
         self.last_verify = None;
@@ -218,6 +226,22 @@ impl crate::Agent {
         // stale. Clear it so the next turn re-snapshots from scratch.
         self.invalidate_snapshot();
         hi_tools::clear_read_cache();
+    }
+
+    /// Install an unfinished plan reconstructed by session storage.
+    pub fn restore_plan(&mut self, plan: Vec<hi_tools::PlanStep>) {
+        self.last_plan = if plan
+            .iter()
+            .any(|step| step.status != hi_tools::PlanStatus::Done)
+        {
+            plan
+        } else {
+            Vec::new()
+        };
+    }
+
+    pub fn current_plan(&self) -> &[hi_tools::PlanStep] {
+        &self.last_plan
     }
 
     /// Attach the runner that executes write-capable `delegate` subagents. Without
@@ -337,6 +361,7 @@ impl crate::Agent {
                 &next,
                 structured_goal.as_ref(),
                 &snapshot.decisions,
+                &snapshot.last_plan,
             )?;
         }
         self.messages.replace_all(next);
@@ -825,8 +850,19 @@ impl crate::Agent {
                 .filter(|s| s.status == crate::GoalStatus::Done)
                 .count();
             let paused = if g.paused { " · paused" } else { "" };
+            let skeptic = if g.team {
+                format!(
+                    " · skeptic: {} unavailable, last {}",
+                    g.skeptic_unavailable,
+                    g.last_skeptic_status
+                        .map(|status| format!("{status:?}"))
+                        .unwrap_or_else(|| "not run".into())
+                )
+            } else {
+                String::new()
+            };
             return format!(
-                "{} — {}/{} sub-goals done{paused}",
+                "{} — {}/{} sub-goals done{paused}{skeptic}",
                 g.objective,
                 done,
                 g.sub_goals.len()

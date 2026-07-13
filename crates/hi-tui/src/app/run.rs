@@ -21,7 +21,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::Line;
 use tokio::sync::mpsc;
 
-use crate::event::{ChannelUi, Restore, UiEvent};
+use crate::event::{ChannelUi, ConfirmationControl, Restore, UiEvent};
 use crate::input::HistorySearch;
 use crate::model_picker::ModelPicker;
 use crate::provider_form;
@@ -97,6 +97,7 @@ pub async fn run(
         mcp_url,
         api_key,
     );
+    app.plan = agent.current_plan().to_vec();
     // Pass sync config into the app for /sync, /sessions, /attach commands.
     app.sync_active = sync_config.is_some();
     app.sync_config = sync_config;
@@ -672,7 +673,11 @@ pub async fn run(
                     app.set_working(true);
                     app.follow();
                     let (tx, rx) = mpsc::unbounded_channel();
-                    let mut sink = ChannelUi { tx };
+                    let (confirm_tx, confirm_rx) = mpsc::unbounded_channel();
+                    let mut sink = ChannelUi {
+                        tx,
+                        confirmations: confirm_tx,
+                    };
                     {
                         let fut = agent.compact_with(kind, &mut sink);
                         drive(
@@ -681,6 +686,7 @@ pub async fn run(
                             &mut ticker,
                             &mut app,
                             rx,
+                            confirm_rx,
                             fut,
                             false,
                         )
@@ -1807,7 +1813,11 @@ pub async fn run(
         // Grab the interrupt handle so Esc during a tool call can signal it.
         app.interrupt = Some(agent.interrupt_handle());
         let (tx, rx) = mpsc::unbounded_channel();
-        let mut sink = ChannelUi { tx };
+        let (confirm_tx, confirm_rx) = mpsc::unbounded_channel();
+        let mut sink = ChannelUi {
+            tx,
+            confirmations: confirm_tx,
+        };
         let background_before = hi_tools::background_process_ids();
         let cancelled = {
             let fut = agent.run_turn(&run_line, &mut sink);
@@ -1817,6 +1827,7 @@ pub async fn run(
                 &mut ticker,
                 &mut app,
                 rx,
+                confirm_rx,
                 fut,
                 true,
             )
@@ -1961,7 +1972,11 @@ pub async fn run(
         app.set_working(true);
         app.follow();
         let (tx, rx) = mpsc::unbounded_channel();
-        let mut sink = ChannelUi { tx };
+        let (confirm_tx, confirm_rx) = mpsc::unbounded_channel();
+        let mut sink = ChannelUi {
+            tx,
+            confirmations: confirm_tx,
+        };
         {
             let fut = async {
                 agent.update_memory(&mut sink).await;
@@ -1973,6 +1988,7 @@ pub async fn run(
                 &mut ticker,
                 &mut app,
                 rx,
+                confirm_rx,
                 fut,
                 false,
             )
@@ -2009,12 +2025,14 @@ pub async fn run(
 /// Drive a model future (a turn or a compaction) to completion while keeping
 /// the UI live: redraw + spin every tick, drain the agent's events, let the
 /// user scroll/queue/cancel. Returns whether the user cancelled with Ctrl-C.
+#[allow(clippy::too_many_arguments)]
 async fn drive(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     input: &mut mpsc::UnboundedReceiver<Event>,
     ticker: &mut tokio::time::Interval,
     app: &mut App,
     mut rx: mpsc::UnboundedReceiver<UiEvent>,
+    mut confirmations: mpsc::UnboundedReceiver<ConfirmationControl>,
     fut: impl std::future::Future<Output = Result<()>>,
     expect_turn_end: bool,
 ) -> Result<bool> {
@@ -2024,6 +2042,8 @@ async fn drive(
     let mut last_activity = Instant::now();
     let mut watchdog_stuck = false;
     let watchdog_timeout = watchdog_stuck_timeout();
+    let mut pending_confirmation: Option<ConfirmationControl> = None;
+    let mut confirmations_open = true;
     loop {
         terminal.draw(|f| app.render(f))?;
         tokio::select! {
@@ -2060,6 +2080,16 @@ async fn drive(
                 }
                 app.apply(event);
             }
+            request = confirmations.recv(), if pending_confirmation.is_none() && confirmations_open => {
+                match request {
+                    Some(request) => {
+                        app.confirmation = Some(request.request.clone());
+                        app.confirmation_scroll = 0;
+                        pending_confirmation = Some(request);
+                    }
+                    None => confirmations_open = false,
+                }
+            }
             _ = ticker.tick() => {
                 app.spinner = app.spinner.wrapping_add(1);
                 app.drain_loops();
@@ -2079,9 +2109,50 @@ async fn drive(
             maybe = input.recv() => {
                 match maybe {
                     Some(Event::Mouse(mouse)) => app.handle_mouse(mouse.kind),
-                    Some(Event::Paste(text)) => app.input.insert_str(&text),
+                    Some(Event::Paste(text)) if pending_confirmation.is_none() => app.input.insert_str(&text),
+                    Some(Event::Paste(_)) => {}
                     Some(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                        if let Some(request) = pending_confirmation.take() {
+                            match key.code {
+                                KeyCode::Char('y') if !ctrl => {
+                                    let _ = request.response.send(hi_agent::ConfirmationResult::Approved);
+                                    app.confirmation = None;
+                                }
+                                KeyCode::Char('n') if !ctrl => {
+                                    let _ = request.response.send(hi_agent::ConfirmationResult::Rejected);
+                                    app.confirmation = None;
+                                }
+                                KeyCode::Esc => {
+                                    let _ = request.response.send(hi_agent::ConfirmationResult::Rejected);
+                                    app.confirmation = None;
+                                }
+                                KeyCode::Char('c') if ctrl => {
+                                    let _ = request.response.send(hi_agent::ConfirmationResult::Cancelled);
+                                    app.confirmation = None;
+                                    cancelled = true;
+                                    break;
+                                }
+                                KeyCode::Up => {
+                                    app.confirmation_scroll = app.confirmation_scroll.saturating_sub(1);
+                                    pending_confirmation = Some(request);
+                                }
+                                KeyCode::Down => {
+                                    app.confirmation_scroll = app.confirmation_scroll.saturating_add(1);
+                                    pending_confirmation = Some(request);
+                                }
+                                KeyCode::PageUp => {
+                                    app.confirmation_scroll = app.confirmation_scroll.saturating_sub(10);
+                                    pending_confirmation = Some(request);
+                                }
+                                KeyCode::PageDown => {
+                                    app.confirmation_scroll = app.confirmation_scroll.saturating_add(10);
+                                    pending_confirmation = Some(request);
+                                }
+                                _ => pending_confirmation = Some(request),
+                            }
+                            continue;
+                        }
                         match key.code {
                             KeyCode::Char('c') if ctrl => { cancelled = true; break; }
                             // Esc clears a half-typed queued command, or — when the
@@ -2122,5 +2193,6 @@ async fn drive(
         }
     }
     app.waiting_for = None;
+    app.confirmation = None;
     Ok(cancelled)
 }
