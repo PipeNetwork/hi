@@ -629,8 +629,11 @@ impl crate::Agent {
             self.last_changed_files.clear();
             self.last_compat_fallbacks.clear();
             self.last_turn_telemetry = TurnTelemetry::default();
-            if !looks_like_continue(input) {
+            let preserve_plan =
+                looks_like_continue(input) && plan_has_pending_steps(&self.last_plan);
+            if !preserve_plan && !self.last_plan.is_empty() {
                 self.last_plan.clear();
+                ui.plan(&[]);
             }
             self.messages.strip_trailing_nudges();
             self.persisted = self.persisted.min(self.messages.len());
@@ -689,13 +692,13 @@ impl crate::Agent {
         self.last_verify = None;
         self.last_changed_files.clear();
         self.last_compat_fallbacks.clear();
-        // Clear the plan from the previous turn unless the user's input looks
-        // like a "continue" command. When the user types "continue" on an
-        // incomplete plan, the plan state should persist so the plan-aware
-        // continue logic can fire. For any other input, clear it so a stale
-        // plan from a previous task doesn't cause spurious nudges.
-        if !looks_like_continue(input) {
+        // Preserve only an unfinished plan that the user explicitly continues.
+        // Clearing must also be emitted: the TUI owns a pinned copy and cannot
+        // infer that the agent cleared its internal state.
+        let preserve_plan = looks_like_continue(input) && plan_has_pending_steps(&self.last_plan);
+        if !preserve_plan && !self.last_plan.is_empty() {
             self.last_plan.clear();
+            ui.plan(&[]);
         }
         let mut compat_fallbacks = Vec::new();
 

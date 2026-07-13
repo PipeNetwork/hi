@@ -355,6 +355,7 @@ pub(crate) struct RecUi {
     pub(crate) turn_end: Option<String>,
     pub(crate) assistant: String,
     pub(crate) tool_results: Vec<(String, String)>,
+    pub(crate) plans: Vec<Vec<PlanStep>>,
 }
 impl Ui for RecUi {
     fn assistant_text(&mut self, t: &str) {
@@ -369,6 +370,9 @@ impl Ui for RecUi {
     }
     fn status(&mut self, t: &str) {
         self.statuses.push(t.to_string());
+    }
+    fn plan(&mut self, steps: &[PlanStep]) {
+        self.plans.push(steps.to_vec());
     }
     fn nudge(&mut self, t: &str) {
         // Steering diagnostics share the status capture so tests can assert on

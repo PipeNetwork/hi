@@ -110,6 +110,49 @@ async fn plan_with_pending_steps_continues_past_recap() {
 }
 
 #[tokio::test]
+async fn new_task_emits_plan_clear_for_frontends() {
+    let mut agent = agent(
+        vec![completion(
+            vec![Content::Text("new task done".into())],
+            1,
+            1,
+        )],
+        config(),
+    );
+    agent.last_plan = vec![PlanStep {
+        title: "old unfinished step".into(),
+        status: PlanStatus::Pending,
+    }];
+    let mut ui = RecUi::default();
+
+    agent
+        .run_turn("do a different task", &mut ui)
+        .await
+        .unwrap();
+
+    assert!(agent.last_plan.is_empty());
+    assert_eq!(ui.plans, vec![Vec::<PlanStep>::new()]);
+}
+
+#[tokio::test]
+async fn continue_does_not_preserve_a_completed_plan_box() {
+    let mut agent = agent(
+        vec![completion(vec![Content::Text("done".into())], 1, 1)],
+        config(),
+    );
+    agent.last_plan = vec![PlanStep {
+        title: "old completed step".into(),
+        status: PlanStatus::Done,
+    }];
+    let mut ui = RecUi::default();
+
+    agent.run_turn("continue", &mut ui).await.unwrap();
+
+    assert!(agent.last_plan.is_empty());
+    assert_eq!(ui.plans, vec![Vec::<PlanStep>::new()]);
+}
+
+#[tokio::test]
 async fn complete_plan_ends_turn_without_spurious_continue() {
     // When the plan is fully done (all steps "done"), the model's recap
     // should end the turn cleanly — no plan-driven continue nudge.

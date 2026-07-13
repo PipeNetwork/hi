@@ -770,6 +770,14 @@ fn renders_pinned_plan_checklist() {
         app.transcript.is_empty(),
         "plan must not echo into the transcript"
     );
+
+    app.apply(UiEvent::Plan { steps: Vec::new() });
+    term.draw(|f| app.render(f)).unwrap();
+    let screen3 = dump(&term);
+    assert!(
+        !screen3.contains("plan ·"),
+        "empty update clears box:\n{screen3}"
+    );
 }
 
 #[test]
