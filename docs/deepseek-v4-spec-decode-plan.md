@@ -146,6 +146,32 @@ All three stages are implemented and green (default suite 119, native 361).
   **Next lever: batched device verify** (the S>1 analog of the
   device-resident decode step) to cut the marginal verify token to ~10-20 ms;
   at that point DFlash's 2.1+ emitted/step and MTP K=2-3 become wins.
+- **Device verify + device MTP draft (2026-07-13, Wave-3)**: implemented.
+  `verify_tokens`/rewind re-feeds now run as device chunks of ≤8 tokens
+  (`DsV4Linear::try_device_verify` → `dsv4_gpu::device_chunk_inner`): the
+  S=1 device step's exact per-token kernel pipeline looped on-device with
+  in-chunk KV-ring causality, ONE end-of-chunk download (logits + host-mirror
+  delta + drafter tap rows), per-position logits `assert_eq`-bit-exact with
+  the host chunk path at short and >2048 contexts. Post-verify rollbacks are
+  ADOPTED device-side (truncation keeps the device tag; adoption re-tags
+  fresh so divergent snapshot clones can never false-match), so the spec
+  loop's verify→rewind→verify cycle pays zero restore uploads. The MTP draft
+  step is device-resident too (`MtpDeviceDraft`, generic over draft layers
+  via `MtpDraftDesc` — DSpark's blocks 44+ reuse it): per slot only the
+  4-byte device-argmax'd id (and the MoE topk readback) crosses the bus;
+  the K>1 flat residual recycles on device. Kill switches:
+  `HI_DSV4_DEVICE_VERIFY=0`, `HI_DSV4_MTP_HOST=1` (both bit-identical
+  fallbacks); `register_host_experts` is layer-parameterized and multi-layer
+  pinning (44/45/46) is test-pinned. nsys on the first device-verify bench
+  caught `dsv4_hc_pre_kernel` at 640 us/launch (86 launches/token = 55
+  ms/token — HALF the production device step too): its 24 mixer-row dots ran
+  as single-thread serial DRAM walks. Reworked to warp-cooperative staged
+  folds (identical singly-rounded chain, parallel loads): 640 -> 144
+  us/launch (12.4 ms/token), `dsv4_hyper_head` same treatment, all exactness
+  gates bit-identical. GPU-0 measurement (12 GiB pool, shared/reaped box) was
+  miss-upload-bound; production re-measurement on GPU 1 (72 GiB pool) pending
+  a quiet window — expected device marginal verify token ~= (pre-fix 84 ms −
+  43 ms hc_pre) ≈ 40 ms at 12 GiB-pool conditions, better at 90%+ pool hit.
 - **DEPLOYED (2026-07-13): `HI_DSV4_SPEC=mtp` on hi-local-v4.service**
   (drafter: 318 MiB dense resident + 3.19 GiB experts pool-pinned, k_cap 1).
   First deployment exposed that taps disabled prefix-cache restores (fresh
@@ -241,3 +267,42 @@ tests green including real-artifact censuses.
 3. DFlash: same, `HI_DSV4_SPEC=dflash`; target ≥2× decode on real `hi` turns.
 4. Suites green (`cargo test -p hi-cuda` native + workspace), service runs with
    spec enabled for a full `hi` tool-mode session, /health exposes spec stats.
+
+## Wave-3 results (2026-07-13): the kernel fix beat the speculation
+
+The warp-cooperative hc_pre/hyper_head fold fix (640→144 us/launch,
+bit-identical) lifted SEQUENTIAL decode by ~47%: GPU 0 baseline 9.11-class →
+13.35 tok/s; GPU 1 (Max-Q, production) → ~11.2 tok/s. At that floor, every
+speculative variant measured slower end-to-end, even with device-sequenced
+verify and the device MTP draft step engaged:
+
+| GPU 0, 64 GiB pool, 91-93% hits | tok/s | acceptance | notes |
+|---|---|---|---|
+| baseline (spec off) | **13.35** | — | new floor |
+| mtp K=1 | 11.85 | 76.6% | 125 ms/verify-step vs 75 ms seq step |
+| mtp K=2 | 6.33 | 55.9% | |
+| dspark K=5 | 4.05 | 42.3% (2.02/block) | verify-6 miss-amplified |
+| dflash K=7 | 3.15 | 23.6% | |
+
+GPU-1 A/B (live service, wave-3 binary, same request): spec-off ~11.2 tok/s
+vs mtp K=1 7.35 tok/s at 100% acceptance — verify-2+draft ≈ 272 ms vs 89 ms
+sequential. DEPLOYED: spec off. All drafters remain implemented, lossless,
+env-gated (HI_DSV4_SPEC=mtp|dflash|dspark) and re-open when verify gets
+cheaper. Next verify levers (from the wave-3 nsys pass): dsv4_attention_decode
+(~5.7 ms/token), dsv4_moe_select (~2.3 ms/token), and the per-(token,layer)
+MoE topk readback serialization (device-side pool LRU would remove it);
+projected together they put mtp K=1 back ahead (~15-16 tok/s) and make
+DSpark's 2.9-of-5 blocks the end-game.
+
+Wave-3 machinery landed (all bit-exact-gated, suites 134 default / 388
+native): device-sequenced verify chunks S≤8 (one download; rewind adoption =
+zero restore uploads across spec cycles; HI_DSV4_DEVICE_VERIFY kill switch),
+device MTP draft step (device argmax, 4-byte id downloads, recycled residual
+K>1), layer-parameterized pinned host-blob expert registration (MTP=43,
+DSpark=44/45/46), and the DSpark drafter (62.5% acceptance / 2.92-of-5 in its
+bring-up run; 19.9 ms/propose; confidence head available as a future
+dynamic-length lever).
+
+Ops note: the recurring service SIGKILLs were attributed by bpftrace to a
+long-running interactive `hi` agent session (killer sh's parent comm=hi),
+kill -9ing both hi-local services every few minutes. Not a service defect.
