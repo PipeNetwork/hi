@@ -87,7 +87,9 @@ use crate::safetensors::SafetensorsFile;
 #[cfg(feature = "native-cuda")]
 use crate::dsv4_backend::{DraftContext, Drafter};
 #[cfg(feature = "native-cuda")]
-use crate::dsv4_gpu::{DeepSeekV4GpuEngine, DsV4GpuLinear, HostDenseData};
+use crate::dsv4_gpu::{
+    DeepSeekV4GpuEngine, DsV4GpuLinear, HostDenseData, MtpDeviceDraft, MtpDraftDesc, MtpDraftPrev,
+};
 
 /// Every dimension the loader validates shard shapes against and the module
 /// forwards with. Copied from the trunk engine (the MTP block shares the
@@ -693,6 +695,120 @@ impl MtpModule {
         Ok((flat, logits))
     }
 
+    /// Borrowed weight handles for the device-resident draft step
+    /// ([`MtpDeviceDraft`] in `dsv4_gpu`). The same desc shape serves any
+    /// extra draft layer (DSpark's chained blocks included) — nothing in it
+    /// is specific to this module beyond which weights it points at.
+    #[cfg(feature = "native-cuda")]
+    pub(crate) fn draft_desc(&self) -> MtpDraftDesc<'_> {
+        MtpDraftDesc {
+            geometry: &self.dims.geometry,
+            layer: &self.weights.layer,
+            e_proj: &self.weights.e_proj,
+            h_proj: &self.weights.h_proj,
+            enorm: &self.weights.enorm,
+            hnorm: &self.weights.hnorm,
+            hc_head: &self.weights.hc_head,
+            norm: &self.weights.norm,
+            token_embd: &self.token_embd,
+            output_head: &self.output_head,
+            rms_eps: self.dims.rms_eps,
+            hc_eps: self.dims.hc_eps,
+        }
+    }
+
+    /// [`Self::propose_tokens`] served by the device-resident draft step:
+    /// the identical pairing/warm-continuation logic, with every slot's
+    /// forward running as [`MtpDeviceDraft::feed_slot`] — catch-up pairs
+    /// batch through with no logits work, only the LAST pair and the K>1
+    /// recurrence slots compute logits, and each drafted id is the slot's
+    /// single 4-byte download (the flat recurrence residual never leaves the
+    /// device). The K>1 slots are discarded via the ring-slack counter mark
+    /// instead of the host path's ring snapshot.
+    #[cfg(feature = "native-cuda")]
+    pub(crate) fn propose_tokens_device(
+        &self,
+        draft: &mut MtpDeviceDraft,
+        state: &mut MtpDrafterState,
+        tokens: &[u32],
+        taps: &DsV4Taps,
+        k: usize,
+    ) -> Result<Vec<u32>> {
+        let n = tokens.len();
+        if n < 2 {
+            return Ok(Vec::new());
+        }
+        let pairs = n - 1;
+        if taps.positions() < pairs {
+            bail!(
+                "MTP drafter needs taps through position {pairs} but they end at {}",
+                taps.positions()
+            );
+        }
+        let base = taps.base();
+        if base >= pairs {
+            return Ok(Vec::new());
+        }
+        // The K>1 recurrence slots pollute up to k-1 ring slots past the
+        // catch-up frontier; the slack must absorb them (see
+        // `MtpDeviceDraft::speculative_mark`).
+        if k >= crate::dsv4_gpu::DSV4_MTP_DRAFT_MAX_K {
+            bail!(
+                "MTP device draft supports k < {}",
+                crate::dsv4_gpu::DSV4_MTP_DRAFT_MAX_K
+            );
+        }
+
+        // Warm continuation: same rule as the host path, plus the device
+        // ring's own counters must be in lockstep with the consumed pairs.
+        let end = state.start + state.fed.len();
+        let warm = end <= pairs
+            && end >= base
+            && state.fed[..] == tokens[1 + state.start..1 + end]
+            && draft.fed_slots() == state.fed.len();
+        if !warm {
+            state.reset();
+            state.start = base;
+            draft.reset();
+        }
+
+        let desc = self.draft_desc();
+        let mut first_draft: Option<u32> = None;
+        while state.start + state.fed.len() < pairs {
+            let i = state.start + state.fed.len();
+            let token = tokens[i + 1];
+            let prev = taps
+                .pre_hc_head(i)
+                .ok_or_else(|| anyhow!("taps buffer has no pre-hc-head row for position {i}"))?;
+            let want = i + 1 == pairs && k > 0;
+            let id = draft.feed_slot(&desc, i, token, MtpDraftPrev::Host(prev), want)?;
+            state.fed.push(token);
+            if want {
+                first_draft = id;
+            }
+        }
+        let Some(first) = first_draft else {
+            // k == 0 (budget-capped verify) — or an already-consumed context,
+            // which the strictly-growing verify loop never produces.
+            return Ok(Vec::new());
+        };
+
+        let mut drafts = Vec::with_capacity(k);
+        drafts.push(first);
+        if drafts.len() < k {
+            let mark = draft.speculative_mark();
+            for t in 1..k {
+                let token = *drafts.last().expect("drafts is non-empty");
+                let id = draft
+                    .feed_slot(&desc, pairs - 1 + t, token, MtpDraftPrev::Recycled, true)?
+                    .expect("want_id slot returns an id");
+                drafts.push(id);
+            }
+            draft.speculative_restore(mark);
+        }
+        Ok(drafts)
+    }
+
     /// The drafter core: catch up on every (token, hidden) pair the target
     /// has produced since the last call, then draft up to `k` tokens. See the
     /// module docs for the pairing; `tokens` and `taps` are the Stage-A
@@ -1004,6 +1120,13 @@ fn mtp_k_cap() -> usize {
     }
 }
 
+/// `HI_DSV4_MTP_HOST=1`: keep the host-orchestrated per-op draft path (the
+/// pre-device-draft behavior) instead of the device-resident draft step.
+#[cfg(feature = "native-cuda")]
+fn mtp_host_forced() -> bool {
+    std::env::var("HI_DSV4_MTP_HOST").ok().as_deref() == Some("1")
+}
+
 /// The `HI_DSV4_SPEC=mtp` drafter: the module + the trunk provider handle +
 /// its own catch-up state.
 #[cfg(feature = "native-cuda")]
@@ -1011,6 +1134,10 @@ pub(crate) struct MtpDrafter {
     module: MtpModule,
     linear: DsV4GpuLinear,
     state: MtpDrafterState,
+    /// Device-resident draft step (default); `None` keeps every slot on the
+    /// host-orchestrated path (`HI_DSV4_MTP_HOST=1`, or the device build
+    /// failed — logged at construction).
+    device: Option<MtpDeviceDraft>,
     k_cap: usize,
     warned: bool,
 }
@@ -1076,10 +1203,25 @@ impl MtpDrafter {
             inner.token_embd_matrix().clone(),
             inner.output_head_matrix().clone(),
         );
+        let device = if mtp_host_forced() {
+            eprintln!("dsv4 mtp drafter: HI_DSV4_MTP_HOST=1 — host-orchestrated draft steps");
+            None
+        } else {
+            match MtpDeviceDraft::new(linear.clone(), &module.draft_desc()) {
+                Ok(draft) => Some(draft),
+                Err(err) => {
+                    eprintln!(
+                        "dsv4 mtp drafter: device draft unavailable ({err:#}); drafting stays host-orchestrated"
+                    );
+                    None
+                }
+            }
+        };
         Ok(Self {
             module,
             linear,
             state: MtpDrafterState::new(),
+            device,
             k_cap,
             warned: false,
         })
@@ -1100,10 +1242,16 @@ impl Drafter for MtpDrafter {
             return Vec::new();
         };
         let k = ctx.k.min(self.k_cap);
-        match self
-            .module
-            .propose_tokens(&self.linear, &mut self.state, ctx.tokens, taps, k)
-        {
+        let result = match self.device.as_mut() {
+            Some(draft) => {
+                self.module
+                    .propose_tokens_device(draft, &mut self.state, ctx.tokens, taps, k)
+            }
+            None => self
+                .module
+                .propose_tokens(&self.linear, &mut self.state, ctx.tokens, taps, k),
+        };
+        match result {
             Ok(drafts) => drafts,
             Err(err) => {
                 if !self.warned {
@@ -1111,6 +1259,9 @@ impl Drafter for MtpDrafter {
                     self.warned = true;
                 }
                 self.state.reset();
+                if let Some(draft) = self.device.as_mut() {
+                    draft.reset();
+                }
                 Vec::new()
             }
         }
@@ -2115,6 +2266,117 @@ mod native_tests {
         }
     }
 
+    /// The device-resident draft step is BIT-IDENTICAL to the
+    /// host-orchestrated `forward_slot` on the same provider: per-slot logits
+    /// assert_eq (f32), device-argmax ids equal host argmax, at every
+    /// catch-up slot including position 0's embedding zero-mask.
+    #[test]
+    fn mtp_device_draft_slots_match_host_orchestrated_bitwise() {
+        let craft = Craft::random();
+        let rig = cpu_rig("dev-draft-slots", &craft);
+        let (_gpu, drafter) = gpu_drafter("dev-draft-slots", &craft, 4);
+        assert!(
+            drafter.device.is_some(),
+            "fixture drafter must build the device draft by default"
+        );
+
+        let tokens = [0u32, 1, 2, 0, 1, 2, 0, 1];
+        let taps = taps_for(&rig.engine, &tokens);
+        let desc = drafter.module.draft_desc();
+        let mut dev = MtpDeviceDraft::new(drafter.linear.clone(), &desc).unwrap();
+        let mut host_ring = MtpDrafterState::new();
+        for i in 0..tokens.len() - 1 {
+            let prev = taps.pre_hc_head(i).unwrap();
+            let (_, host_logits) = drafter
+                .module
+                .forward_slot(
+                    &drafter.linear,
+                    &mut host_ring.ring,
+                    i,
+                    tokens[i + 1],
+                    prev,
+                    true,
+                )
+                .unwrap();
+            let host_logits = host_logits.unwrap();
+            let id = dev
+                .feed_slot(&desc, i, tokens[i + 1], MtpDraftPrev::Host(prev), true)
+                .unwrap()
+                .expect("want_id slot returns an id");
+            let dev_logits = dev.last_logits_host().unwrap();
+            assert_eq!(dev_logits, host_logits, "slot {i}: logits drifted");
+            assert_eq!(id, argmax(&host_logits).unwrap(), "slot {i}: argmax");
+        }
+    }
+
+    /// Whole-proposal parity, device vs host-orchestrated, across the
+    /// production access pattern: initial catch-up + K>1 recurrence, a warm
+    /// incremental continuation, and a cold restart on a different context.
+    /// Proposals must be identical token for token.
+    #[test]
+    fn mtp_device_draft_proposals_match_host_path() {
+        let craft = Craft::random();
+        let (_gpu, mut drafter) = gpu_drafter("dev-draft-propose", &craft, 4);
+        assert!(drafter.device.is_some());
+        let rig = cpu_rig("dev-draft-propose", &craft);
+
+        let runs: [&[u32]; 3] = [
+            &[0u32, 1, 2, 0, 1, 2],
+            &[0u32, 1, 2, 0, 1, 2, 2, 1], // warm continuation of the first
+            &[2u32, 0, 0, 1],             // cold restart (different context)
+        ];
+        for (turn, tokens) in runs.into_iter().enumerate() {
+            let taps = taps_for(&rig.engine, tokens);
+            let ctx = DraftContext {
+                tokens,
+                taps: Some(&taps),
+                k: 3,
+            };
+            // Device-path proposal (the drafter's internal state stays warm
+            // across turns — run 2 continues run 1's ring, run 3 cold-resets).
+            let dev_drafts = drafter.propose(&ctx);
+            // Host-path reference from a fresh state: with base-0 taps a full
+            // catch-up reproduces the warm ring exactly, so fresh == warm.
+            let mut host_state = MtpDrafterState::new();
+            let host_drafts = drafter
+                .module
+                .propose_tokens(&drafter.linear, &mut host_state, tokens, &taps, 3)
+                .unwrap();
+            assert_eq!(dev_drafts, host_drafts, "turn {turn}: proposals diverged");
+            assert_eq!(dev_drafts.len(), 3, "turn {turn}");
+        }
+    }
+
+    /// Cold start at a non-zero taps base (the prefix-cache restore pattern):
+    /// device drafts equal host drafts when both cold-start their rings at
+    /// the same base.
+    #[test]
+    fn mtp_device_draft_cold_start_matches_host() {
+        use super::tests::taps_for_at;
+
+        let craft = Craft::random();
+        let (_gpu, mut drafter) = gpu_drafter("dev-draft-base", &craft, 2);
+        assert!(drafter.device.is_some());
+        let rig = cpu_rig("dev-draft-base", &craft);
+
+        let tokens = [0u32, 1, 2, 0, 1, 2, 0];
+        let base = 3usize;
+        let taps = taps_for_at(&rig.engine, &tokens, base);
+        let ctx = DraftContext {
+            tokens: &tokens,
+            taps: Some(&taps),
+            k: 2,
+        };
+        let dev_drafts = drafter.propose(&ctx);
+        let mut host_state = MtpDrafterState::new();
+        let host_drafts = drafter
+            .module
+            .propose_tokens(&drafter.linear, &mut host_state, &tokens, &taps, 2)
+            .unwrap();
+        assert_eq!(dev_drafts, host_drafts, "cold-start drafts diverged");
+        assert!(!dev_drafts.is_empty());
+    }
+
     fn generation_request(prompt: &str, max_tokens: u32) -> GenerationRequest {
         GenerationRequest {
             prompt: prompt.to_string(),
@@ -2235,6 +2497,134 @@ mod native_tests {
         assert!(
             health_counter(&backend, "spec_proposed") > proposed_cold,
             "the drafter must keep proposing after a restore"
+        );
+    }
+
+    /// CUDA-event-timed A/B of one draft slot: device `feed_slot` vs the
+    /// host-orchestrated `forward_slot`, same (token, prev, pos) inputs.
+    /// Median ms over `reps` after one warmup each.
+    fn bench_draft_slot(
+        drafter: &MtpDrafter,
+        taps: &DsV4Taps,
+        tokens: &[u32],
+        reps: usize,
+    ) -> (f64, f64) {
+        use crate::runtime::Event;
+        let desc = drafter.module.draft_desc();
+        let stream = drafter.linear.stream();
+        let pairs = tokens.len() - 1;
+        let time_one = |f: &mut dyn FnMut(usize)| -> f64 {
+            let mut samples = Vec::with_capacity(reps);
+            for rep in 0..=reps {
+                let start = Event::create_timing().unwrap();
+                let end = Event::create_timing().unwrap();
+                start.record(stream).unwrap();
+                f(rep);
+                end.record(stream).unwrap();
+                end.synchronize().unwrap();
+                if rep > 0 {
+                    samples.push(start.elapsed_ms(&end).unwrap() as f64);
+                }
+            }
+            samples.sort_by(f64::total_cmp);
+            samples[samples.len() / 2]
+        };
+
+        // Device: one full catch-up pass per rep (fresh ring each time), the
+        // per-slot cost is the pass divided by its slots.
+        let mut dev = MtpDeviceDraft::new(drafter.linear.clone(), &desc).unwrap();
+        let device_ms = time_one(&mut |_| {
+            dev.reset();
+            for i in 0..pairs {
+                let prev = taps.pre_hc_head(i).unwrap();
+                dev.feed_slot(
+                    &desc,
+                    i,
+                    tokens[i + 1],
+                    MtpDraftPrev::Host(prev),
+                    i + 1 == pairs,
+                )
+                .unwrap();
+            }
+        }) / pairs as f64;
+
+        // Host-orchestrated: the same pass through forward_slot.
+        let host_ms = time_one(&mut |_| {
+            let mut ring = MtpDrafterState::new();
+            for i in 0..pairs {
+                let prev = taps.pre_hc_head(i).unwrap();
+                drafter
+                    .module
+                    .forward_slot(
+                        &drafter.linear,
+                        &mut ring.ring,
+                        i,
+                        tokens[i + 1],
+                        prev,
+                        i + 1 == pairs,
+                    )
+                    .unwrap();
+            }
+        }) / pairs as f64;
+        (device_ms, host_ms)
+    }
+
+    /// Fixture-scale draft-step timing (relative; launch-bound dims). Run:
+    /// `CUDA_VISIBLE_DEVICES=0 cargo test -p hi-cuda --release --features native-cuda \
+    ///  mtp_device_draft_fixture_benchmark -- --ignored --nocapture`
+    #[test]
+    #[ignore = "timing-only; run explicitly on a quiet GPU"]
+    fn mtp_device_draft_fixture_benchmark() {
+        let craft = Craft::random();
+        let rig = cpu_rig("dev-draft-bench", &craft);
+        let (_gpu, drafter) = gpu_drafter("dev-draft-bench", &craft, 4);
+        let tokens: Vec<u32> = (0..9).map(|idx| idx % 3).collect();
+        let taps = taps_for(&rig.engine, &tokens);
+        let (device_ms, host_ms) = bench_draft_slot(&drafter, &taps, &tokens, 5);
+        eprintln!(
+            "[fixture] MTP draft slot: device {device_ms:.3} ms | host {host_ms:.3} ms | {:.2}x",
+            host_ms / device_ms
+        );
+    }
+
+    /// Wave-3 measurement (deliverable 4b): MTP draft-step ms, device vs
+    /// host-orchestrated, on the real checkpoint. Run explicitly:
+    /// `HI_DSV4_EXPERT_POOL_GB=12 CUDA_VISIBLE_DEVICES=0 cargo test -p hi-cuda --release \
+    ///  --features native-cuda mtp_real_model_device_draft_benchmark -- --ignored --nocapture --test-threads=1`
+    #[test]
+    #[ignore = "needs the real checkpoint + MTP shard; timing-only"]
+    fn mtp_real_model_device_draft_benchmark() {
+        let Some(gguf_path) = crate::dsv4_gpu::tests::real_model_path() else {
+            eprintln!("skipping: real model not found");
+            return;
+        };
+        let Some(shard_path) = super::tests::real_shard_path() else {
+            eprintln!("skipping: real MTP shard not found");
+            return;
+        };
+        let gpu = DeepSeekV4GpuEngine::load(&gguf_path).unwrap();
+        let drafter = MtpDrafter::from_shard(&gpu, &shard_path, 3).unwrap();
+        let engine = gpu.engine();
+        let tokens = engine
+            .tokenizer()
+            .encode(&crate::dsv4_gpu::tests::long_prompt(48))
+            .unwrap();
+        let tokens = &tokens[..33];
+        // Real taps rows from a tapped prefill (chunk 1 keeps host steps).
+        let mut taps = engine
+            .new_taps(crate::dsv4_cpu::DsV4TapConfig {
+                pre_hc_head: true,
+                aux_layers: Vec::new(),
+            })
+            .unwrap();
+        let mut state = engine.new_state();
+        engine
+            .prefill_with_chunk_taps(&mut state, tokens, 8, Some(&mut taps))
+            .unwrap();
+        let (device_ms, host_ms) = bench_draft_slot(&drafter, &taps, tokens, 3);
+        eprintln!(
+            "[real model] MTP draft slot: device {device_ms:.2} ms | host {host_ms:.2} ms | {:.2}x",
+            host_ms / device_ms
         );
     }
 
