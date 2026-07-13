@@ -30,12 +30,17 @@ Status: IMPLEMENTED + VALIDATED (2026-07-13). Highlights:
 - Full-page-cache smoke (251 GB box, GPU 0, 60 GiB pool): load ~40 s, decode
   0.31 cold → 0.49 warm tok/s at 61.7% pool hit after two requests; coherent.
 - Suites: 137 default / 408 native at the workstreams' close.
-- **io_uring fetch backend (2026-07-13)**: opt-in `HI_CUDA_EXPERT_IOURING=1`
-  third fetcher — whole miss batches at queue depth, O_DIRECT DMA straight
-  into pinned tier slots, completion-driven uploads. Measured: cold mmap
-  0.71 GiB/s → O_DIRECT-family 6.5 GiB/s (device ceiling) on this box; the
-  ring matches the thread pool on GLM-sized extents and removes the CPU copy
-  chain. Full section at the bottom of this file.
+- **io_uring fetch backend (2026-07-13)**: third fetcher — whole miss batches
+  at queue depth, O_DIRECT DMA straight into pinned tier slots,
+  completion-driven uploads. Measured: cold mmap 0.71 GiB/s → O_DIRECT-family
+  6.5 GiB/s (device ceiling) on this box; the ring matches the thread pool on
+  GLM-sized extents and removes the CPU copy chain. Follow-up the same day:
+  `HI_CUDA_EXPERT_IOURING` became tri-state with **AUTO as the default**
+  (ring when the expert set is too big to cache AND cold; mmap when warm or
+  cacheable), and the ring now also serves **general model loads** behind
+  `HI_CUDA_LOAD_IOURING` (gpu.rs qwen matrices + dsv4 resident uploads;
+  cold trunk disk phase 2.5 → 5.6-6.1 GiB/s at the loader's serial seam).
+  Full sections at the bottom of this file.
 
 Original plan follows. Goal: users with limited RAM (24–64 GB) + NVMe (+
 optionally a GPU) run GLM-5.2-class MoE through `hi -p glm-5.2` with honest
@@ -150,10 +155,23 @@ possible and reaps completions as they land.
 
 ### Env knobs
 
-- `HI_CUDA_EXPERT_IOURING=1` — opt-in this phase (default off; `0`/unset keeps
-  the existing behavior exactly).
+- `HI_CUDA_EXPERT_IOURING` — tri-state (since the default-on follow-up): `1`
+  forces the ring, `0` forces it off, **unset = AUTO**. Auto rings only when
+  the streamable expert bytes exceed 50% of `MemAvailable` AND a `mincore`
+  sample of the expert extents is under 50% resident — i.e. the set can
+  neither fit in nor already lives in the page cache. Warm or cacheable sets
+  stay on mmap (streaming re-reads forever, so the page cache is the implicit
+  tier and should be allowed to warm; this keeps the big-RAM warm-cache boxes
+  exactly as before). One log line states the choice and why
+  (`io_uring auto -> on/off (...)`); /health reports
+  `io=iouring(auto|forced,qd=N[,regbuf])`.
 - `HI_CUDA_EXPERT_IOURING_QD` — submission queue depth, default 256, clamped
   to a power of two in [8, 4096].
+- `HI_CUDA_LOAD_IOURING` — the same tri-state for **general model loads**
+  (see the subsection at the end of this file). Auto for loads is
+  deliberately more aggressive: loads are one-shot, so it rings when the
+  extents are cold (< 90% resident) OR exceed 50% of `MemAvailable`; mmap
+  only when warm or unmeasurable-and-fitting.
 
 ### How it reads
 
@@ -245,3 +263,60 @@ checks: `real_glm_shards_uring_matches_mmap_spot_check` and the bench above.
 Suites at this workstream's close: 145 default / 116 hi-gguf / 420 native
 (the pre-existing GPU-contention flake — a prefill tok/s health counter under
 a concurrent training job — reproduced once across runs and passed alone).
+
+## io_uring for general model loads (2026-07-13 follow-up)
+
+The same ring now serves resident-weight loads for ANY GGUF model, behind one
+seam: `load_source::LoadByteSource` decides mmap vs ring once per load set
+(tri-state `HI_CUDA_LOAD_IOURING`; auto terms above) and serves whole-tensor
+bytes either as the mmap view or as an O_DIRECT bulk read
+(`read_extent_chunked`: the tensor's block-aligned span split into 8 MiB
+sub-reads submitted together, so one multi-hundred-MB tensor fills the queue
+by itself). Wiring is deliberately narrow:
+
+- gpu.rs `GpuMatrix::load` byte sourcing (the qwen matrix loop builds one
+  `LoadByteSource` for all `matrix_specs`; the vision mmproj loop stays
+  mmap-only — small side-file).
+- dsv4_gpu.rs `upload_resident` → `upload_matrix`/`upload_grouped`. Bonus fix
+  there: dsv4 previously ran `cudaMemcpy` STRAIGHT from file-backed mmap
+  pages (the slow page-by-page path); ring bytes live in anonymous RAM, so
+  the H2D DMAs at full speed.
+- Ring read errors degrade per-tensor to the mmap view with a log line;
+  probe failures fall back to mmap — a knob never fails a load.
+- Out of scope, noted as follow-ups: safetensors side-loads (dsv4 MTP),
+  dsv4's own expert prefill/blob reads, `GpuVector` loads (tiny), the mla
+  split-kv synthesis reads, and a whole-set batched loader (headroom row
+  below; needs windowed memory bounds).
+
+### Measured (cold trunk = every non-expert tensor, DONTNEED + mincore = 0%)
+
+| backend | GLM trunk 9.17 GiB | V4-Flash trunk 7.38 GiB |
+|---|---:|---:|
+| mmap to_vec (1 thread — the actual loader) | 2.71 GiB/s | 2.50 GiB/s |
+| mmap to_vec (6 threads, context) | 5.92 | 5.80 |
+| io_uring per-tensor chunked (the new loader path) | 5.61 | 6.07 |
+| io_uring whole-trunk batch (headroom) | 6.49 | 6.50 |
+
+Device ceilings 6.4 / 5.5 GiB/s. So the disk phase of a cold load improves
+~2.1-2.4x at the loader's real (serial, per-tensor) seam. Two honest caveats
+from measurement: (1) trunk reads are sequential, so buffered readahead is
+far better here (2.5-2.7 GiB/s) than on the scattered expert extents (0.7);
+(2) an end-to-end A/B on a real 7B q6_k (`real_cold_load_wall_time_ab`,
+GPU 0) measured 3.01 s (mmap) vs 3.06 s (ring) — that load is bound by
+quantized-matrix normalization + upload, and mmap's page faults naturally
+overlap the CPU work while the ring serializes read-then-normalize. The ring
+therefore wins the disk phase without regressing CPU-bound loads (ties), and
+pays off most where normalization is light (dsv4's native-dtype uploads,
+which also gain the anonymous-memory DMA fix) or disks are faster than CPUs.
+
+### Follow-up validation
+
+`facade_ring_bytes_match_mmap_view_on_fixture` (byte equivalence through the
+facade), `read_extent_chunked_matches_buffered_reads` (chunk geometry incl.
+EOF tails), `real_glm_bulk_chunked_reads_match_mmap_spot_check` (ignored;
+744 MiB tensor byte-exact), auto truth tables for both heuristics,
+`bench_cold_trunk_load_backends` (ignored; table above), and the ignored
+`real_cold_load_wall_time_ab`. Suites at this follow-up's close: 146 default
+/ 116 hi-gguf / 425 native (one fully green run; the pre-listed CUDA 906
+stream-capture cross-test race hit individual dsv4_backend tests in two other
+runs and each passes alone).
