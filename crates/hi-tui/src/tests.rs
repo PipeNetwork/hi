@@ -622,7 +622,7 @@ fn non_diff_tool_output_is_not_colorized() {
 }
 
 #[test]
-fn usage_event_updates_live_counter_and_working_line() {
+fn usage_event_keeps_tokens_out_of_compact_working_line() {
     let mut app = test_app("openai", "gpt-4o");
     app.set_working(true);
     app.apply(UiEvent::Usage {
@@ -638,8 +638,14 @@ fn usage_event_updates_live_counter_and_working_line() {
     term.draw(|f| app.render(f)).unwrap();
     let screen = dump(&term);
     assert!(screen.contains(SPINNER[0]), "spinner shown: {screen}");
-    assert!(screen.contains("prompt↑12"), "live prompt tokens: {screen}");
-    assert!(screen.contains("gen↓340"), "live output tokens: {screen}");
+    assert!(
+        !screen.contains("prompt↑"),
+        "no duplicate prompt tokens: {screen}"
+    );
+    assert!(
+        !screen.contains("gen↓"),
+        "no duplicate output tokens: {screen}"
+    );
     assert!(screen.contains("50% ctx"), "live context fill: {screen}");
 }
 
@@ -1101,6 +1107,12 @@ fn ctrl_question_toggles_the_observability_panel() {
         review_repair_stopped_by_exhaustion: true,
     });
     app.turn_tool_calls = 7;
+    app.apply(UiEvent::Usage {
+        prompt: 12,
+        generated: 340,
+        ctx_used: 64_000,
+        ctx_window: Some(128_000),
+    });
     let mut term = Terminal::new(TestBackend::new(96, 18)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     let screen = dump(&term);
@@ -1115,6 +1127,10 @@ fn ctrl_question_toggles_the_observability_panel() {
     assert!(
         screen.contains("tool calls this turn: 7"),
         "tool-call count: {screen}"
+    );
+    assert!(
+        screen.contains("user prompt estimate 12 · model output 340 · ctx 50%"),
+        "scoped token metrics: {screen}"
     );
     assert!(
         screen.contains("review repair: total 5")
@@ -1235,29 +1251,28 @@ fn turn_end_sets_status_and_marks_transcript_done() {
     app.apply(UiEvent::TurnEnd {
         summary: "[10 in · 2 out · 12 total]".into(),
     });
-    // Usage in the title bar...
-    assert!(app.status.contains("12 total"));
-    // ...and a clear "done" marker in the transcript so the turn's end shows.
+    assert_eq!(app.status, "done");
+    // The detailed summary remains in the completed-turn transcript marker.
     assert_eq!(app.transcript.len(), 1);
     let line = app.transcript[0].text();
     assert!(line.contains("✓ done"), "got: {line}");
+    assert!(
+        line.contains("12 total"),
+        "historical usage retained: {line}"
+    );
 }
 
 #[test]
 fn turn_end_renders_the_steer_suffix_from_the_summary() {
     // The agent appends a "steer" suffix to the usage summary for noisy
-    // turns; the TUI renders that string verbatim, so the suffix surfaces
-    // in both the status bar and the done marker with no TUI-specific code.
+    // turns; the TUI renders it in the one historical summary location.
     let mut app = test_app("openai", "gpt-4o");
-    let noisy = "[prompt↑10 gen↓2 · ctx 5% (500/10k) · steer: 2 verify · 1 retry]";
+    let noisy =
+        "[user prompt estimate 10 · model output 2 · ctx 5% (500/10k) · steer: 2 verify · 1 retry]";
     app.apply(UiEvent::TurnEnd {
         summary: noisy.into(),
     });
-    assert!(
-        app.status.contains("steer: 2 verify"),
-        "steer in status bar: {}",
-        app.status
-    );
+    assert_eq!(app.status, "done");
     let line = app.transcript[0].text();
     assert!(line.contains("steer"), "steer in done marker: {line}");
 }
@@ -1265,7 +1280,8 @@ fn turn_end_renders_the_steer_suffix_from_the_summary() {
 #[test]
 fn stalled_turn_end_is_marked_incomplete_not_done() {
     let mut app = test_app("openai", "gpt-4o");
-    let stalled = "[prompt↑10 gen↓2 · ctx 5% (500/10k) · steer: 2 repeat · stalled]";
+    let stalled =
+        "[user prompt estimate 10 · model output 2 · ctx 5% (500/10k) · steer: 2 repeat · stalled]";
     app.apply(UiEvent::TurnEnd {
         summary: stalled.into(),
     });

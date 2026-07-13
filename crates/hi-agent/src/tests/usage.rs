@@ -28,11 +28,11 @@ async fn usage_line_separates_cumulative_tokens_from_context_fill() {
 
     // Primary usage is the raw user prompt, not the full request context.
     assert!(
-        line.contains("prompt↑1"),
+        line.contains("user prompt estimate 1"),
         "raw user prompt estimate first: {line}"
     );
     assert!(
-        line.contains("gen↓300"),
+        line.contains("model output 300"),
         "current-turn generated output (100+200): {line}"
     );
     // The context gauge is the LAST request (12k) over the window — NOT the

@@ -461,17 +461,9 @@ impl crate::App {
 
         // --- Transcript ---
         let title = format!(" hi · {} · {} ", self.provider, self.model);
-        // Right-aligned: persistent token totals, a context-fill gauge,
-        // then the last status — so usage is always visible without a command.
+        // Right-aligned: durable navigation and context signals only. Detailed
+        // token usage lives in the observability panel.
         let mut info_parts: Vec<String> = Vec::new();
-        let (input, output) = self.usage;
-        if input + output > 0 {
-            info_parts.push(format!(
-                "prompt↑{} gen↓{}",
-                fmt_count(input),
-                fmt_count(output)
-            ));
-        }
         if let Some(goal) = &self.goal {
             let total = goal.sub_goals.len();
             if total > 0 {
@@ -489,9 +481,6 @@ impl crate::App {
         }
         if let Some(pct) = self.context_pct() {
             info_parts.push(format!("{pct}% ctx"));
-        }
-        if !self.status.is_empty() {
-            info_parts.push(self.status.clone());
         }
         let info = if info_parts.is_empty() {
             String::new()
@@ -935,7 +924,7 @@ impl crate::App {
                 };
                 ilines.push(Line::styled(
                     format!(
-                        "turn: prompt↑{} gen↓{}{ctx}",
+                        "turn: user prompt estimate {} · model output {}{ctx}",
                         fmt_count(input),
                         fmt_count(output)
                     ),
@@ -991,16 +980,8 @@ impl crate::App {
             }
             if self.working {
                 let frame_ch = SPINNER[self.spinner % SPINNER.len()];
-                let (input, output) = self.usage;
-                // Show the running token total once the first round reports it.
+                // Detailed token usage lives in the observability panel.
                 let mut stats = String::new();
-                if input + output > 0 {
-                    stats.push_str(&format!(
-                        " · prompt↑{} gen↓{}",
-                        fmt_count(input),
-                        fmt_count(output)
-                    ));
-                }
                 if let Some(pct) = self.context_pct() {
                     stats.push_str(&format!(" · {pct}% ctx"));
                 }

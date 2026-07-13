@@ -348,21 +348,22 @@ impl crate::App {
                 self.event_log.push(format!("turn_end {summary}"));
                 self.last_turn_event = Some(TurnEventKind::TurnEnd);
                 self.flush_pending();
-                // Tokens go to the status bar; a dim marker in the transcript
-                // makes the end of a turn unmistakable (so a long run doesn't just
-                // trail off with no clear "done").
-                self.status = summary.trim_matches(['[', ']']).to_string();
-                if self.status.contains("stalled") {
+                // Keep detailed usage in exactly one historical location. The
+                // persistent status remains token-free for subsequent turns.
+                let summary = summary.trim_matches(['[', ']']);
+                if summary.contains("stalled") {
+                    self.status = "incomplete · stalled".to_string();
                     self.last_turn_state = TurnState::Warning("incomplete".to_string());
                     self.last_error = Some("turn ended incomplete".to_string());
                     self.push(Line::styled(
-                        format!("⚠ incomplete · {}", self.status),
+                        format!("⚠ incomplete · {summary}"),
                         Style::default().fg(Color::Yellow),
                     ));
                     self.record_model_issue();
                 } else {
+                    self.status = "done".to_string();
                     self.last_turn_state = TurnState::Done(self.status.clone());
-                    self.push(Line::styled(format!("✓ done · {}", self.status), dim()));
+                    self.push(Line::styled(format!("✓ done · {summary}"), dim()));
                 }
                 // No follow(): respect a reader who scrolled up — the "↓ N new"
                 // hint tells them the summary landed below.

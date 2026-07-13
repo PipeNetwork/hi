@@ -3282,15 +3282,13 @@ If the task is already complete, stop and give your final recap."
         self.messages.push_assistant(vec![Content::Text(recap)]);
     }
 
-    /// Format a usage line. The primary input number is the raw user prompt
-    /// estimate, not the full request context; the context gauge shows the full
-    /// prompt actually occupying the model window.
+    /// Format the completed-turn usage marker with explicitly scoped metrics.
     pub(crate) fn usage_summary(&self, usage: &hi_ai::Usage) -> String {
         // User-facing prompt size first. The full request can include system,
         // tool, and history context, so putting it first made a short question
         // like "what's your name?" appear to be a 1.5k-token user prompt.
         let mut summary = format!(
-            "[prompt↑{} gen↓{}",
+            "[user prompt estimate {} · model output {}",
             humanize_count(self.last_user_prompt_tokens),
             humanize_count(self.last_turn_usage.output_tokens),
         );
