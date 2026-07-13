@@ -283,10 +283,29 @@ by itself). Wiring is deliberately narrow:
   the H2D DMAs at full speed.
 - Ring read errors degrade per-tensor to the mmap view with a log line;
   probe failures fall back to mmap — a knob never fails a load.
-- Out of scope, noted as follow-ups: safetensors side-loads (dsv4 MTP),
-  dsv4's own expert prefill/blob reads, `GpuVector` loads (tiny), the mla
-  split-kv synthesis reads, and a whole-set batched loader (headroom row
-  below; needs windowed memory bounds).
+- safetensors side-loads — DONE 2026-07-13: `SafetensorsFile::open` runs the
+  same tri-state + auto over its data section and, when the ring wins,
+  bulk-reads the whole section into owned anonymous memory behind the
+  unchanged `bytes()` API (coverage justified whole-section reads: the MTP
+  shard and all three DSpark shards are 100% loader-read; DFlash reads 70.6%
+  at load and row-gathers the rest — `embed_tokens` — at proposal time from
+  the owned buffer). Cold byte-layer A/B (fadvise + mincore 0%, file-offset
+  order): MTP 4.58 -> 6.27 GiB/s, DSpark shards 4.4 -> 6.3 GiB/s, DFlash an
+  honest wash (4.54 vs 4.46 GiB/s — the ring reads its whole 3.36 GiB
+  section including the ~1 GiB runtime-only embed table that mmap skips at
+  load).
+- dsv4 expert prefill — DONE 2026-07-13: `prefill_expert_pool` computes the
+  exact per-tensor expert-prefix extents the pool will consume, runs the
+  load auto over just those bytes, and when the ring wins streams
+  expert-aligned 128 MiB windows off a reader thread so O_DIRECT reads
+  overlap the H2D copies (serial read-then-upload measured 4.1 GiB/s, LOSING
+  to mmap's readahead-overlapped 4.5 — the windows restore the pipeline).
+  Cold A/B on the real V4 GGUF (6 GiB pool, extent-targeted eviction,
+  0% residency): 1.31 s mmap (4.6 GiB/s) vs 1.02 s ring (5.7-6.1 GiB/s),
+  ~1.3x. Warm production boots keep mmap via the auto, as before.
+- Still open as follow-ups: `GpuVector` loads (tiny), the mla split-kv
+  synthesis reads, and a whole-set batched loader (headroom row below;
+  needs windowed memory bounds).
 
 ### Measured (cold trunk = every non-expert tensor, DONTNEED + mincore = 0%)
 
@@ -320,3 +339,14 @@ EOF tails), `real_glm_bulk_chunked_reads_match_mmap_spot_check` (ignored;
 / 116 hi-gguf / 425 native (one fully green run; the pre-listed CUDA 906
 stream-capture cross-test race hit individual dsv4_backend tests in two other
 runs and each passes alone).
+
+The 2026-07-13 drafter/prefill follow-up adds
+`safetensors_ring_backing_matches_mmap_backing` (bytes + every typed reader
+identical across backings), `dsv4_gpu_expert_pool_prefill_forced_ring_matches_mmap`
+(identical pool counters and GEMV parity vs the mmap prefill, including a
+partial-prefix pool), mid-tensor slice windows in the facade test, and the
+ignored `safetensors_real_cold_read_ab` / `dsv4_real_cold_expert_prefill_ab`
+benches. Suites at its close: 150 default (load_source's unit tests now
+compile CUDA-free) / 116 hi-gguf / 427 native (one fully green run under a
+~68 GB training job on GPU 0; contention flaked one unrelated backend test
+in other runs — clean main flaked the same way — and it passes alone).

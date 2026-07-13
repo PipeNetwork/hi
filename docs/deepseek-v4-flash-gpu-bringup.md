@@ -44,7 +44,10 @@ H2D worst case ≈ 5-10 tok/min. Correct, slow.
 Stage 1b (usable): GPU LRU expert pool (~75GB VRAM ≈ 55% of all expert slices
 resident; reuse the expert_streaming pointer-table pattern but keyed per
 (layer, proj, expert) with MXFP4 slices + per-slice fused GEMV calls). Target
->90% hit rate on real text → several tok/s.
+>90% hit rate on real text → several tok/s. The `HI_DSV4_EXPERT_PREFILL_POOL=1`
+warmup sources cold GGUF bytes through io_uring O_DIRECT windows overlapped
+with the H2D copies (`HI_CUDA_LOAD_IOURING` tri-state + load auto over the
+exact prefix extents; measured ~1.3x over cold mmap, warm boots keep mmap).
 
 ## Stage 2 — serving integration
 - `CudaBackend::load`: if `config.is_deepseek4()`, construct a dedicated
