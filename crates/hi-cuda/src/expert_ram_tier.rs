@@ -70,6 +70,20 @@ pub(crate) const STAGING_SLOTS: usize = 4;
 const USAGE_FILE_NAME: &str = ".hi_expert_usage";
 const USAGE_FILE_VERSION: u32 = 1;
 
+/// `HI_CUDA_EXPERT_IOURING_QD` default.
+#[cfg(target_os = "linux")]
+pub(crate) const DEFAULT_IOURING_QD: u32 = crate::expert_uring::DEFAULT_QD;
+#[cfg(not(target_os = "linux"))]
+pub(crate) const DEFAULT_IOURING_QD: u32 = 256;
+
+/// O_DIRECT block alignment required of ring-mode slot bases. `cudaHostAlloc`
+/// suballocates small pinned buffers without page alignment, so the pool
+/// over-allocates by one block and shifts the slot region to the next
+/// boundary (`RamTier::new_with_stride`'s `base_offset`).
+pub(crate) const SLOT_DMA_ALIGN: usize = 4096;
+#[cfg(target_os = "linux")]
+const _: () = assert!(SLOT_DMA_ALIGN == crate::expert_uring::URING_BLOCK);
+
 // ---------------------------------------------------------------------------
 // Env knobs
 // ---------------------------------------------------------------------------
@@ -86,6 +100,13 @@ pub(crate) struct TierEnvConfig {
     pub prewarm_frac: f64,
     /// `HI_CUDA_EXPERT_ODIRECT=1`: O_DIRECT twin-fd expert reads.
     pub odirect: bool,
+    /// `HI_CUDA_EXPERT_IOURING=1`: batch-submitted io_uring O_DIRECT reads
+    /// (Linux; opt-in). Probed at construction; on any failure the pool falls
+    /// back to the O_DIRECT thread path, then mmap — never a load failure.
+    pub iouring: bool,
+    /// `HI_CUDA_EXPERT_IOURING_QD` (default 256): io_uring submission queue
+    /// depth, clamped to a power of two in [8, 4096].
+    pub iouring_qd: u32,
     /// `HI_CUDA_EXPERT_WILLNEED=0` disables WILLNEED readahead (default on).
     pub willneed: bool,
     /// `HI_CUDA_EXPERT_MADVISE=0` disables MADV_RANDOM on expert extents
@@ -111,6 +132,11 @@ impl TierEnvConfig {
                 .unwrap_or(0.5)
                 .clamp(0.0, 1.0),
             odirect: flag_on("HI_CUDA_EXPERT_ODIRECT"),
+            iouring: flag_on("HI_CUDA_EXPERT_IOURING"),
+            iouring_qd: std::env::var("HI_CUDA_EXPERT_IOURING_QD")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_IOURING_QD),
             willneed: flag_default_on("HI_CUDA_EXPERT_WILLNEED"),
             madvise_random: flag_default_on("HI_CUDA_EXPERT_MADVISE"),
             sync_upload: flag_on("HI_CUDA_EXPERT_SYNC_UPLOAD"),
@@ -194,13 +220,14 @@ impl TierBudgetPlan {
 }
 
 /// Compute the pinned-tier budget. Pure so the accounting is unit-testable:
-/// pass `MemAvailable`, the pool slot size, the total streamable expert bytes
-/// on disk (never pin more than the model has), and the staging overhead.
+/// pass `MemAvailable`, the arena slot size (the stride, in ring mode), the
+/// arena bytes it would take to cache every streamable expert slice — never
+/// pin more than that — and the staging overhead.
 pub(crate) fn plan_tier_budget(
     explicit_ram_gb: Option<f64>,
     mem_available: Option<u64>,
     slot_bytes: usize,
-    total_expert_bytes: u64,
+    max_useful_bytes: u64,
     staging_bytes: u64,
 ) -> TierBudgetPlan {
     let mut plan = TierBudgetPlan {
@@ -237,8 +264,8 @@ pub(crate) fn plan_tier_budget(
             (available.saturating_sub(slack) as f64 * AUTO_FRACTION) as u64
         }
     };
-    // Never pin more than the routed experts occupy on disk.
-    let requested = requested.min(total_expert_bytes.max(0));
+    // Never pin more than it takes to cache every streamable slice.
+    let requested = requested.min(max_useful_bytes);
     let slots = usize::try_from(requested / slot_bytes as u64).unwrap_or(0);
     if slots < 2 {
         plan.source = "disabled (budget below 2 slots)";
@@ -324,13 +351,26 @@ struct TierSlot {
     /// Guards the slot from eviction while the current pass still needs it.
     pinned_pass: u64,
     len: usize,
+    /// Payload start within the slot region. 0 for CPU-written entries; the
+    /// sub-block head of the extent for io_uring O_DIRECT reads that DMA the
+    /// block-aligned span straight into the slot.
+    data_offset: usize,
 }
 
 /// Fixed-budget pinned-host expert cache with LRU recency tickets, keyed like
 /// the VRAM pool.
+///
+/// Slots are `slot_stride` bytes apart but hold at most `slot_bytes` of
+/// payload. The two differ only in io_uring mode, where the stride is rounded
+/// up so every slot base is a legal O_DIRECT destination with room for the
+/// block-aligned span of any payload ([`crate::expert_uring::tier_slot_stride`]).
 pub(crate) struct RamTier {
     arena: TierArena,
     slot_bytes: usize,
+    slot_stride: usize,
+    /// Arena byte offset of slot 0 (aligns ring-mode slot bases to
+    /// [`SLOT_DMA_ALIGN`] within an unaligned pinned allocation; 0 otherwise).
+    base_offset: usize,
     slots: Vec<TierSlot>,
     resident: HashMap<ExpertKey, usize>,
     tick: u64,
@@ -339,10 +379,19 @@ pub(crate) struct RamTier {
 }
 
 impl RamTier {
-    pub(crate) fn new(arena: TierArena, slot_bytes: usize, slot_count: usize) -> Self {
+    pub(crate) fn new_with_stride(
+        arena: TierArena,
+        slot_bytes: usize,
+        slot_stride: usize,
+        slot_count: usize,
+        base_offset: usize,
+    ) -> Self {
+        assert!(slot_stride >= slot_bytes, "stride must hold the payload");
         Self {
             arena,
             slot_bytes,
+            slot_stride,
+            base_offset,
             slots: (0..slot_count)
                 .map(|_| TierSlot {
                     key: None,
@@ -350,13 +399,27 @@ impl RamTier {
                     sticky: false,
                     pinned_pass: 0,
                     len: 0,
+                    data_offset: 0,
                 })
                 .collect(),
             resident: HashMap::new(),
             tick: 0,
             stats: RamTierStats::default(),
-            budget_bytes: slot_count as u64 * slot_bytes as u64,
+            budget_bytes: slot_count as u64 * slot_stride as u64,
         }
+    }
+
+    pub(crate) fn slot_stride(&self) -> usize {
+        self.slot_stride
+    }
+
+    pub(crate) fn base_offset(&self) -> usize {
+        self.base_offset
+    }
+
+    /// Arena byte offset of a slot's base.
+    fn slot_base(&self, slot: usize) -> usize {
+        self.base_offset + slot * self.slot_stride
     }
 
     pub(crate) fn arena(&self) -> &TierArena {
@@ -415,7 +478,10 @@ impl RamTier {
                 self.slots[slot].pinned_pass = pass;
                 self.stats.hits += 1;
                 self.stats.bytes_served += self.slots[slot].len as u64;
-                Some((slot * self.slot_bytes, self.slots[slot].len))
+                Some((
+                    self.slot_base(slot) + self.slots[slot].data_offset,
+                    self.slots[slot].len,
+                ))
             }
             None => {
                 self.stats.misses += 1;
@@ -443,10 +509,10 @@ impl RamTier {
             self.tick += 1;
             self.slots[slot].last_use = self.tick;
             self.slots[slot].pinned_pass = pass;
-            return Some(slot * self.slot_bytes);
+            return Some(self.slot_base(slot) + self.slots[slot].data_offset);
         }
         let slot = self.take_slot(pass)?;
-        let offset = slot * self.slot_bytes;
+        let offset = self.slot_base(slot);
         if self.arena.write(offset, bytes).is_err() {
             return None;
         }
@@ -457,12 +523,80 @@ impl RamTier {
         entry.sticky = sticky;
         entry.pinned_pass = pass;
         entry.len = bytes.len();
+        entry.data_offset = 0;
         self.resident.insert(key, slot);
         self.stats.inserts += 1;
         if sticky {
             self.stats.prewarmed += 1;
         }
         Some(offset)
+    }
+
+    /// Claim a slot for `key` so a DMA/O_DIRECT read can land directly in the
+    /// arena (no CPU write). Returns `(slot_index, slot_base_arena_offset)`;
+    /// the entry is provisional and MUST be finished with
+    /// [`RamTier::commit_reserved`] (payload at `data_offset` within the
+    /// slot, `len` bytes) or rolled back with [`RamTier::abort_reserved`]
+    /// before any other tier call for that key. Declines exactly like
+    /// [`RamTier::insert`]: payload too large or every slot pinned by the
+    /// current pass.
+    pub(crate) fn reserve(
+        &mut self,
+        key: ExpertKey,
+        len: usize,
+        sticky: bool,
+        pass: u64,
+    ) -> Option<(usize, usize)> {
+        if len > self.slot_bytes {
+            return None;
+        }
+        if let Some(&slot) = self.resident.get(&key) {
+            // Already cached: re-reading identical bytes into the same slot
+            // is harmless; refresh recency and let commit update the offsets.
+            self.tick += 1;
+            self.slots[slot].last_use = self.tick;
+            self.slots[slot].pinned_pass = pass;
+            return Some((slot, self.slot_base(slot)));
+        }
+        let slot = self.take_slot(pass)?;
+        self.tick += 1;
+        let entry = &mut self.slots[slot];
+        entry.key = Some(key);
+        entry.last_use = self.tick;
+        entry.sticky = sticky;
+        entry.pinned_pass = pass;
+        entry.len = len;
+        entry.data_offset = 0;
+        self.resident.insert(key, slot);
+        Some((slot, self.slot_base(slot)))
+    }
+
+    /// Publish a reserved slot's payload location once its read landed.
+    pub(crate) fn commit_reserved(&mut self, slot: usize, data_offset: usize) {
+        let entry = &mut self.slots[slot];
+        debug_assert!(entry.key.is_some(), "committing an unreserved slot");
+        debug_assert!(
+            data_offset + entry.len <= self.slot_stride,
+            "committed payload exceeds the slot stride"
+        );
+        entry.data_offset = data_offset;
+        self.stats.inserts += 1;
+        if entry.sticky {
+            self.stats.prewarmed += 1;
+        }
+    }
+
+    /// Roll back a reserved slot whose read failed: the key is forgotten and
+    /// the slot returns to the free pool.
+    pub(crate) fn abort_reserved(&mut self, slot: usize) {
+        if let Some(key) = self.slots[slot].key.take() {
+            self.resident.remove(&key);
+        }
+        let entry = &mut self.slots[slot];
+        entry.sticky = false;
+        entry.pinned_pass = 0;
+        entry.len = 0;
+        entry.data_offset = 0;
     }
 
     fn take_slot(&mut self, pass: u64) -> Option<usize> {
@@ -712,36 +846,70 @@ pub(crate) fn total_expert_bytes(sources: &BTreeMap<(u32, u8), ExpertSource>) ->
         .sum()
 }
 
+/// Total streamable expert slices (one per (layer, projection, expert)). In
+/// ring mode the tier budget caps at `slices x stride` rather than payload
+/// bytes, since every cached slice occupies a full stride-widened slot.
+pub(crate) fn total_expert_slices(sources: &BTreeMap<(u32, u8), ExpertSource>) -> u64 {
+    sources
+        .values()
+        .map(|source| source.expert_count as u64)
+        .sum()
+}
+
 // ---------------------------------------------------------------------------
 // Disk fetch path
 // ---------------------------------------------------------------------------
 
-/// Reads one expert's contiguous byte extent, via buffered mmap copies
-/// (optionally WILLNEED-hinted per extent, since MADV_RANDOM turns off the
-/// kernel's own readahead) or via O_DIRECT positioned reads that bypass the
-/// page cache. Thread-safe (`&self` only), so the pool's read workers share
-/// it without locking.
+/// How expert extents leave the disk.
+pub(crate) enum FetchBackend {
+    /// Buffered mmap copies, optionally WILLNEED-hinted per extent (since
+    /// MADV_RANDOM turns off the kernel's own readahead).
+    Mmap { willneed_inline: bool },
+    /// O_DIRECT positioned reads on twin fds (≤ READ_WORKERS threads deep).
+    Direct(GgufDirectReader),
+    /// Batch-submitted io_uring O_DIRECT reads (whole miss batches at queue
+    /// depth; zero-copy into pinned tier slots where the pool arranges it).
+    #[cfg(target_os = "linux")]
+    Uring(crate::expert_uring::IoUringReader),
+}
+
+/// Reads one expert's contiguous byte extent through the chosen
+/// [`FetchBackend`]. Thread-safe (`&self` only), so the pool's read workers
+/// share it without locking.
 pub(crate) struct ExpertFetcher {
     gguf: Arc<GgufFile>,
-    direct: Option<GgufDirectReader>,
-    willneed_inline: bool,
+    backend: FetchBackend,
 }
 
 impl ExpertFetcher {
-    pub(crate) fn new(
-        gguf: Arc<GgufFile>,
-        direct: Option<GgufDirectReader>,
-        willneed: bool,
-    ) -> Self {
-        Self {
-            gguf,
-            direct,
-            willneed_inline: willneed,
+    pub(crate) fn new(gguf: Arc<GgufFile>, backend: FetchBackend) -> Self {
+        Self { gguf, backend }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn uring(&self) -> Option<&crate::expert_uring::IoUringReader> {
+        match &self.backend {
+            FetchBackend::Uring(reader) => Some(reader),
+            _ => None,
         }
     }
 
-    pub(crate) fn is_odirect(&self) -> bool {
-        self.direct.is_some()
+    /// `io=` label for the startup line and the /health stats segment.
+    pub(crate) fn io_label(&self) -> String {
+        match &self.backend {
+            FetchBackend::Mmap { .. } => "mmap".to_string(),
+            FetchBackend::Direct(_) => "odirect".to_string(),
+            #[cfg(target_os = "linux")]
+            FetchBackend::Uring(reader) => format!(
+                "iouring(qd={}{})",
+                reader.queue_depth(),
+                if reader.buffers_registered() {
+                    ",regbuf"
+                } else {
+                    ""
+                }
+            ),
+        }
     }
 
     /// The expert's byte extent within its tensor: (tensor name, offset, len).
@@ -761,28 +929,51 @@ impl ExpertFetcher {
         Ok((start, source.bytes_per_expert as u64))
     }
 
-    pub(crate) fn fetch(&self, key: ExpertKey, source: &ExpertSource) -> Result<Vec<u8>> {
+    /// The expert's absolute on-disk extent: `(shard, file_offset, len)`,
+    /// bounds-checked against the tensor (the direct-I/O and io_uring paths).
+    pub(crate) fn file_extent(
+        &self,
+        key: ExpertKey,
+        source: &ExpertSource,
+    ) -> Result<(usize, u64, usize)> {
         let (start, len) = Self::extent(key, source)?;
-        if let Some(direct) = &self.direct {
-            let range = self.gguf.tensor_file_range(&source.tensor_name)?;
-            let end = start
-                .checked_add(len)
-                .ok_or_else(|| anyhow!("expert byte range overflows u64"))?;
-            if end > range.len {
-                bail!(
-                    "expert {} byte range {start}..{end} exceeds tensor {} ({} bytes)",
-                    key.2,
-                    source.tensor_name,
-                    range.len
-                );
-            }
-            return direct.read_range(
-                range.shard,
-                range.file_offset + start,
-                usize::try_from(len).context("expert byte length does not fit usize")?,
+        let range = self.gguf.tensor_file_range(&source.tensor_name)?;
+        let end = start
+            .checked_add(len)
+            .ok_or_else(|| anyhow!("expert byte range overflows u64"))?;
+        if end > range.len {
+            bail!(
+                "expert {} byte range {start}..{end} exceeds tensor {} ({} bytes)",
+                key.2,
+                source.tensor_name,
+                range.len
             );
         }
-        if self.willneed_inline {
+        Ok((
+            range.shard,
+            range.file_offset + start,
+            usize::try_from(len).context("expert byte length does not fit usize")?,
+        ))
+    }
+
+    pub(crate) fn fetch(&self, key: ExpertKey, source: &ExpertSource) -> Result<Vec<u8>> {
+        let willneed_inline = match &self.backend {
+            FetchBackend::Direct(direct) => {
+                let (shard, offset, len) = self.file_extent(key, source)?;
+                return direct.read_range(shard, offset, len);
+            }
+            #[cfg(target_os = "linux")]
+            FetchBackend::Uring(reader) => {
+                let (shard, offset, len) = self.file_extent(key, source)?;
+                return reader
+                    .read_owned(&[(shard, offset, len)])
+                    .pop()
+                    .expect("one job submitted");
+            }
+            FetchBackend::Mmap { willneed_inline } => *willneed_inline,
+        };
+        let (start, len) = Self::extent(key, source)?;
+        if willneed_inline {
             // MADV_RANDOM disabled the kernel's speculative readahead, so ask
             // for exactly this extent before faulting through it; issued from
             // the read worker, never the routing thread.
@@ -811,6 +1002,45 @@ impl ExpertFetcher {
             )
         })?;
         Ok(bytes.to_vec())
+    }
+
+    /// Batch fetch through the io_uring backend (owned buffers, whole batch
+    /// at queue depth in one drive loop); `None` when the backend is not
+    /// io_uring, in which case callers use the thread pool.
+    pub(crate) fn fetch_batch_uring(
+        &self,
+        jobs: &[(ExpertKey, &ExpertSource)],
+    ) -> Option<Vec<Result<Vec<u8>>>> {
+        #[cfg(target_os = "linux")]
+        {
+            let FetchBackend::Uring(reader) = &self.backend else {
+                return None;
+            };
+            let mut results: Vec<Option<Result<Vec<u8>>>> = (0..jobs.len()).map(|_| None).collect();
+            let mut ring_jobs: Vec<(usize, (usize, u64, usize))> = Vec::with_capacity(jobs.len());
+            for (idx, (key, source)) in jobs.iter().enumerate() {
+                match self.file_extent(*key, source) {
+                    Ok(extent) => ring_jobs.push((idx, extent)),
+                    Err(err) => results[idx] = Some(Err(err)),
+                }
+            }
+            let extents: Vec<(usize, u64, usize)> =
+                ring_jobs.iter().map(|(_, extent)| *extent).collect();
+            for ((idx, _), result) in ring_jobs.iter().zip(reader.read_owned(&extents)) {
+                results[*idx] = Some(result);
+            }
+            Some(
+                results
+                    .into_iter()
+                    .map(|slot| slot.expect("every job resolved or read"))
+                    .collect(),
+            )
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = jobs;
+            None
+        }
     }
 }
 
@@ -1055,10 +1285,12 @@ pub(crate) mod tests {
     }
 
     fn heap_tier(slot_bytes: usize, slots: usize) -> RamTier {
-        RamTier::new(
+        RamTier::new_with_stride(
             TierArena::Heap(vec![0u8; slot_bytes * slots]),
             slot_bytes,
+            slot_bytes,
             slots,
+            0,
         )
     }
 
@@ -1161,6 +1393,86 @@ pub(crate) mod tests {
         assert!(tier.insert(key(0, 0, 3), &[3u8; 8], false, 200).is_none());
         // Next pass, eviction works again.
         assert!(tier.insert(key(0, 0, 3), &[3u8; 8], false, 201).is_some());
+    }
+
+    #[test]
+    fn ram_tier_reserve_commit_abort_with_widened_stride() {
+        // Ring-mode geometry: stride wider than the payload cap, payloads
+        // landing at a non-zero data offset (the O_DIRECT head), slot 0
+        // shifted to an aligned base within the arena.
+        let (slot_bytes, stride, slots, base_offset) = (16, 24, 3, 8);
+        let mut tier = RamTier::new_with_stride(
+            TierArena::Heap(vec![0u8; base_offset + stride * slots]),
+            slot_bytes,
+            stride,
+            slots,
+            base_offset,
+        );
+        assert_eq!(tier.slot_stride(), stride);
+        assert_eq!(tier.base_offset(), base_offset);
+        assert_eq!(tier.budget_bytes(), (stride * slots) as u64);
+
+        // Reserve hands out slot-base offsets on stride boundaries past the
+        // aligned base.
+        let (slot_a, base_a) = tier.reserve(key(0, 0, 1), 10, false, 1).unwrap();
+        assert_eq!(base_a, base_offset + slot_a * stride);
+        // Oversized payloads are declined exactly like insert.
+        assert!(
+            tier.reserve(key(0, 0, 2), slot_bytes + 1, false, 1)
+                .is_none()
+        );
+
+        // Commit publishes the payload at its head offset; lookups serve it.
+        tier.commit_reserved(slot_a, 3);
+        let (offset, len) = tier.lookup(&key(0, 0, 1), 2).unwrap();
+        assert_eq!(offset, base_a + 3);
+        assert_eq!(len, 10);
+        assert_eq!(tier.stats().inserts, 1);
+
+        // Abort forgets the key and frees the slot.
+        let (slot_b, _) = tier.reserve(key(0, 0, 3), 8, false, 2).unwrap();
+        tier.abort_reserved(slot_b);
+        assert!(tier.lookup(&key(0, 0, 3), 3).is_none());
+        let (slot_c, _) = tier.reserve(key(0, 0, 4), 8, false, 3).unwrap();
+        assert_eq!(slot_b, slot_c, "aborted slot is reusable");
+
+        // Reserved entries pinned by the current pass are not evictable: with
+        // all slots reserved in one pass, another reserve declines.
+        let mut tier = RamTier::new_with_stride(
+            TierArena::Heap(vec![0u8; stride * slots]),
+            slot_bytes,
+            stride,
+            slots,
+            0,
+        );
+        for expert in 0..slots as u32 {
+            assert!(tier.reserve(key(1, 0, expert), 8, false, 7).is_some());
+        }
+        assert!(tier.reserve(key(1, 0, 99), 8, false, 7).is_none());
+        // Next pass evicts LRU reservations as usual.
+        assert!(tier.reserve(key(1, 0, 99), 8, false, 8).is_some());
+        assert_eq!(tier.resident_count(), slots);
+
+        // CPU inserts under a widened stride land on stride boundaries with
+        // data_offset 0 and stay bounded.
+        let mut tier = RamTier::new_with_stride(
+            TierArena::Heap(vec![0u8; stride * slots]),
+            slot_bytes,
+            stride,
+            slots,
+            0,
+        );
+        for round in 0..10u32 {
+            if let Some(offset) = tier.insert(
+                key(2, 0, round),
+                &[round as u8; 16],
+                false,
+                u64::from(round),
+            ) {
+                assert_eq!(offset % stride, 0);
+            }
+            assert!(tier.resident_bytes() <= tier.budget_bytes());
+        }
     }
 
     #[test]

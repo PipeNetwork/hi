@@ -91,6 +91,10 @@ pub(crate) struct ExpertPool {
     fetcher: ram_tier::ExpertFetcher,
     usage: Option<ram_tier::ExpertUsage>,
     willneed: Option<ram_tier::WillNeedThread>,
+    /// io_uring reads may DMA straight into pinned tier slots: requires the
+    /// ring backend, a pinned tier arena with a 4 KiB-aligned base, and the
+    /// async upload engine. Decided once at construction.
+    ring_slot_dma: bool,
     /// Cumulative wall time of disk-read phases, for the MB/s health stat.
     read_nanos: u64,
 }
@@ -140,11 +144,67 @@ impl ExpertPool {
         let sources = ram_tier::discover_sources(&gguf);
         let total_expert_bytes = ram_tier::total_expert_bytes(&sources);
 
+        // Backend ladder: io_uring (opt-in) -> O_DIRECT threads -> mmap. The
+        // ring is probed with one real read at construction; any failure
+        // (kernel <5.6, io_uring_disabled sysctl, seccomp/container denial,
+        // O_DIRECT-less filesystem) logs and falls through — a knob can never
+        // fail the model load.
+        #[cfg(target_os = "linux")]
+        let mut uring = if env.iouring {
+            let paths: Vec<std::path::PathBuf> = (0..gguf.shard_count())
+                .filter_map(|shard| gguf.shard_path(shard).map(std::path::Path::to_path_buf))
+                .collect();
+            match crate::expert_uring::IoUringReader::open(&paths, env.iouring_qd) {
+                Ok(reader) => {
+                    for note in reader.notes() {
+                        eprintln!("hi-cuda expert streaming: io_uring {note}");
+                    }
+                    Some(reader)
+                }
+                Err(err) => {
+                    eprintln!(
+                        "hi-cuda expert streaming: HI_CUDA_EXPERT_IOURING=1 but io_uring is unavailable ({err:#}); falling back to O_DIRECT thread reads"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        #[cfg(target_os = "linux")]
+        let ring_active = uring.is_some();
+        #[cfg(not(target_os = "linux"))]
+        let ring_active = {
+            if env.iouring {
+                eprintln!(
+                    "hi-cuda expert streaming: HI_CUDA_EXPERT_IOURING=1 is Linux-only; using the fallback ladder"
+                );
+            }
+            false
+        };
+
+        let direct = if !ring_active && (env.odirect || env.iouring) {
+            match gguf.direct_io_reader() {
+                Ok(reader) => Some(reader),
+                Err(err) => {
+                    eprintln!(
+                        "hi-cuda expert streaming: O_DIRECT is unavailable ({err:#}); using buffered mmap reads"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let odirect = direct.is_some();
+        let mmap_reads = !ring_active && !odirect;
+
         // Buffered expert faults should not drag neighboring experts into the
         // page cache: mark every expert tensor extent random-access, and rely
         // on explicit WILLNEED for exact readahead. Trunk tensors keep the
-        // default readahead. Irrelevant under O_DIRECT (no page cache at all).
-        if env.madvise_random && !env.odirect {
+        // default readahead. Irrelevant under O_DIRECT/io_uring (no page
+        // cache at all).
+        if env.madvise_random && mmap_reads {
             for source in sources.values() {
                 let _ = gguf.advise_tensor(&source.tensor_name, GgufMemoryAdvice::Random);
             }
@@ -169,18 +229,54 @@ impl ExpertPool {
             0
         };
 
+        // In ring mode every tier slot doubles as an O_DIRECT DMA destination:
+        // widen the stride so slot bases stay 4 KiB-aligned with room for the
+        // block-aligned span of a full payload (small waste, zero CPU copies).
+        #[cfg(target_os = "linux")]
+        let tier_stride = if ring_active {
+            crate::expert_uring::tier_slot_stride(slot_bytes)
+        } else {
+            slot_bytes
+        };
+        #[cfg(not(target_os = "linux"))]
+        let tier_stride = slot_bytes;
+
+        // With a widened ring stride the arena needs `slices x stride` to
+        // cache everything, not just the payload bytes on disk.
+        let tier_cap_bytes = if tier_stride == slot_bytes {
+            total_expert_bytes
+        } else {
+            ram_tier::total_expert_slices(&sources).saturating_mul(tier_stride as u64)
+        };
         let plan = ram_tier::plan_tier_budget(
             env.explicit_ram_gb,
             ram_tier::mem_available_bytes(),
-            slot_bytes,
-            total_expert_bytes,
+            tier_stride,
+            tier_cap_bytes,
             staging_bytes,
         );
         eprintln!("hi-cuda expert RAM tier: {}", plan.describe());
         let tier = if plan.enabled() {
+            // Ring mode DMAs O_DIRECT reads straight into slots, so slot 0
+            // must sit on a 4 KiB boundary: over-allocate by one block and
+            // shift (cudaHostAlloc suballocates small buffers unaligned).
+            let align_slack = if ring_active {
+                ram_tier::SLOT_DMA_ALIGN
+            } else {
+                0
+            };
             let arena = if engine.is_some() {
-                match crate::runtime::PinnedBuffer::alloc(plan.budget_bytes as usize) {
-                    Ok(pinned) => Some(ram_tier::TierArena::Pinned(pinned)),
+                match crate::runtime::PinnedBuffer::alloc(plan.budget_bytes as usize + align_slack)
+                {
+                    Ok(pinned) => {
+                        let base = pinned.as_mut_ptr() as usize;
+                        let base_offset = if ring_active {
+                            base.next_multiple_of(ram_tier::SLOT_DMA_ALIGN) - base
+                        } else {
+                            0
+                        };
+                        Some((ram_tier::TierArena::Pinned(pinned), base_offset))
+                    }
                     Err(err) => {
                         eprintln!(
                             "hi-cuda expert RAM tier: pinned allocation of {} bytes failed ({err:#}); using pageable memory (uploads will stage)",
@@ -192,42 +288,96 @@ impl ExpertPool {
             } else {
                 None
             };
-            let arena = arena.unwrap_or_else(|| {
-                ram_tier::TierArena::Heap(vec![0u8; plan.budget_bytes as usize])
+            let (arena, base_offset) = arena.unwrap_or_else(|| {
+                (
+                    ram_tier::TierArena::Heap(vec![0u8; plan.budget_bytes as usize]),
+                    0,
+                )
             });
-            Some(ram_tier::RamTier::new(arena, slot_bytes, plan.slots))
+            Some(ram_tier::RamTier::new_with_stride(
+                arena,
+                slot_bytes,
+                tier_stride,
+                plan.slots,
+                base_offset,
+            ))
         } else {
             None
         };
 
-        let direct = if env.odirect {
-            match gguf.direct_io_reader() {
-                Ok(reader) => Some(reader),
-                Err(err) => {
-                    eprintln!(
-                        "hi-cuda expert streaming: HI_CUDA_EXPERT_ODIRECT=1 but O_DIRECT is unavailable ({err:#}); using buffered mmap reads"
-                    );
-                    None
+        // Ring + pinned tier: reads can DMA straight into the slots. Register
+        // the slot region as fixed buffers while we are at it (best-effort:
+        // most of the win is queue depth, not fixed buffers).
+        #[cfg(target_os = "linux")]
+        let ring_slot_dma = {
+            let aligned_base = tier.as_ref().and_then(|tier| {
+                tier.arena()
+                    .pinned()
+                    .map(|pinned| pinned.as_mut_ptr() as usize + tier.base_offset())
+            });
+            match (&mut uring, aligned_base) {
+                (Some(reader), Some(base))
+                    if base % crate::expert_uring::URING_BLOCK == 0 && engine.is_some() =>
+                {
+                    if let Err(err) = reader.register_arena(
+                        base as *mut u8,
+                        plan.budget_bytes as usize,
+                        tier_stride,
+                    ) {
+                        eprintln!(
+                            "hi-cuda expert streaming: io_uring buffer registration unavailable ({err:#}); unregistered reads on the same ring"
+                        );
+                    }
+                    true
                 }
+                (Some(_), Some(_)) => {
+                    eprintln!(
+                        "hi-cuda expert streaming: ring slot DMA disabled ({}); ring reads stage through scratch",
+                        if engine.is_none() {
+                            "no async upload engine"
+                        } else {
+                            "pinned tier arena base did not align"
+                        }
+                    );
+                    false
+                }
+                _ => false,
             }
-        } else {
-            None
         };
-        let odirect = direct.is_some();
-        let fetcher =
-            ram_tier::ExpertFetcher::new(Arc::clone(&gguf), direct, env.willneed && !odirect);
+        #[cfg(not(target_os = "linux"))]
+        let ring_slot_dma = false;
+
+        #[cfg(target_os = "linux")]
+        let backend = match uring {
+            Some(reader) => ram_tier::FetchBackend::Uring(reader),
+            None => match direct {
+                Some(direct) => ram_tier::FetchBackend::Direct(direct),
+                None => ram_tier::FetchBackend::Mmap {
+                    willneed_inline: env.willneed,
+                },
+            },
+        };
+        #[cfg(not(target_os = "linux"))]
+        let backend = match direct {
+            Some(direct) => ram_tier::FetchBackend::Direct(direct),
+            None => ram_tier::FetchBackend::Mmap {
+                willneed_inline: env.willneed,
+            },
+        };
+        let fetcher = ram_tier::ExpertFetcher::new(Arc::clone(&gguf), backend);
 
         let usage = (env.usage_save_secs > 0)
             .then(|| ram_tier::ExpertUsage::load_or_new(model_path, env.usage_save_secs));
-        let willneed =
-            (env.willneed && !odirect).then(|| ram_tier::WillNeedThread::spawn(Arc::clone(&gguf)));
+        let willneed = (env.willneed && mmap_reads)
+            .then(|| ram_tier::WillNeedThread::spawn(Arc::clone(&gguf)));
 
         eprintln!(
-            "hi-cuda expert streaming: io={} upload={} madvise_random={} willneed={} usage={} prewarm_frac={:.2}",
-            if odirect { "odirect" } else { "mmap" },
+            "hi-cuda expert streaming: io={} slot_dma={} upload={} madvise_random={} willneed={} usage={} prewarm_frac={:.2}",
+            fetcher.io_label(),
+            ring_slot_dma,
             if engine.is_some() { "async" } else { "sync" },
-            env.madvise_random && !odirect,
-            env.willneed && !odirect,
+            env.madvise_random && mmap_reads,
+            env.willneed && mmap_reads,
             usage.is_some(),
             env.prewarm_frac,
         );
@@ -251,6 +401,7 @@ impl ExpertPool {
             fetcher,
             usage,
             willneed,
+            ring_slot_dma,
             read_nanos: 0,
         };
         pool.prewarm_from_usage(&sources, env.prewarm_frac);
@@ -300,11 +451,7 @@ impl ExpertPool {
                     tier.sticky_count(),
                     tier_stats.prewarmed,
                     tier.budget_bytes() / (1024 * 1024),
-                    if self.fetcher.is_odirect() {
-                        "odirect"
-                    } else {
-                        "mmap"
-                    },
+                    self.fetcher.io_label(),
                 ));
             }
             None => out.push_str("; ram(off)"),
@@ -348,6 +495,28 @@ impl ExpertPool {
             return;
         }
         let started = Instant::now();
+        #[cfg(target_os = "linux")]
+        let (warmed, warmed_bytes) = if self.ring_slot_dma {
+            self.prewarm_ring(&jobs)
+        } else {
+            self.prewarm_copy(&jobs)
+        };
+        #[cfg(not(target_os = "linux"))]
+        let (warmed, warmed_bytes) = self.prewarm_copy(&jobs);
+        self.read_nanos += started.elapsed().as_nanos() as u64;
+        self.stats.bytes_read += warmed_bytes;
+        eprintln!(
+            "hi-cuda expert RAM tier: pre-warmed {warmed} expert slices ({} MiB) from {} usage entries in {:.1}s",
+            warmed_bytes / (1024 * 1024),
+            self.usage.as_ref().map(|usage| usage.len()).unwrap_or(0),
+            started.elapsed().as_secs_f64(),
+        );
+    }
+
+    /// Chunked pre-warm reads through [`parallel_fetch`] (which itself uses
+    /// the ring for owned batches when active), CPU-copied into sticky tier
+    /// entries. Chunking keeps the transient pageable staging small.
+    fn prewarm_copy(&mut self, jobs: &[(ExpertKey, &ExpertSource)]) -> (usize, u64) {
         let mut warmed = 0usize;
         let mut warmed_bytes = 0u64;
         for chunk in jobs.chunks(PREWARM_CHUNK) {
@@ -361,14 +530,71 @@ impl ExpertPool {
                 }
             }
         }
-        self.read_nanos += started.elapsed().as_nanos() as u64;
-        self.stats.bytes_read += warmed_bytes;
-        eprintln!(
-            "hi-cuda expert RAM tier: pre-warmed {warmed} expert slices ({} MiB) from {} usage entries in {:.1}s",
-            warmed_bytes / (1024 * 1024),
-            self.usage.as_ref().map(|usage| usage.len()).unwrap_or(0),
-            started.elapsed().as_secs_f64(),
-        );
+        (warmed, warmed_bytes)
+    }
+
+    /// Ring pre-warm: reserve sticky tier slots and let the O_DIRECT reads
+    /// DMA straight into them — the whole warm set at queue depth with zero
+    /// CPU copies. Best-effort like [`ExpertPool::prewarm_copy`]: failed
+    /// slices roll back and are simply not warmed.
+    #[cfg(target_os = "linux")]
+    fn prewarm_ring(&mut self, jobs: &[(ExpertKey, &ExpertSource)]) -> (usize, u64) {
+        use crate::expert_uring::{SlotDest, UringJob, UringRead};
+
+        let (arena_base, stride) = {
+            let tier = self.tier.as_ref().expect("tier checked above");
+            let pinned = tier.arena().pinned().expect("ring_slot_dma implies pinned");
+            (pinned.as_mut_ptr() as usize, tier.slot_stride())
+        };
+        let mut ring_jobs: Vec<UringJob> = Vec::new();
+        let mut slots: Vec<usize> = Vec::new();
+        for (key, source) in jobs {
+            let Ok((shard, offset, len)) = self.fetcher.file_extent(*key, source) else {
+                continue;
+            };
+            let tier = self.tier.as_mut().expect("tier checked above");
+            let Some((slot, slot_base)) = tier.reserve(*key, len, true, 0) else {
+                continue;
+            };
+            slots.push(slot);
+            ring_jobs.push(UringJob {
+                shard,
+                offset,
+                len,
+                dest: Some(SlotDest {
+                    ptr: (arena_base + slot_base) as *mut u8,
+                    cap: stride,
+                }),
+            });
+        }
+        if ring_jobs.is_empty() {
+            return (0, 0);
+        }
+        let mut outcomes: Vec<Option<Result<UringRead>>> =
+            (0..ring_jobs.len()).map(|_| None).collect();
+        let reader = self.fetcher.uring().expect("ring_slot_dma implies uring");
+        // SAFETY: each dest is a distinct freshly-reserved tier slot (aligned
+        // base, stride-sized), untouched by anything else during the batch
+        // (pre-warm runs single-threaded at construction).
+        let batch =
+            unsafe { reader.read_batch(&ring_jobs, |idx, outcome| outcomes[idx] = Some(outcome)) };
+        if let Err(err) = batch {
+            eprintln!("hi-cuda expert RAM tier: ring pre-warm aborted ({err:#})");
+        }
+        let tier = self.tier.as_mut().expect("tier checked above");
+        let mut warmed = 0usize;
+        let mut warmed_bytes = 0u64;
+        for ((slot, job), outcome) in slots.iter().zip(&ring_jobs).zip(outcomes) {
+            match outcome {
+                Some(Ok(UringRead::InPlace { head })) => {
+                    tier.commit_reserved(*slot, head);
+                    warmed += 1;
+                    warmed_bytes += job.len as u64;
+                }
+                _ => tier.abort_reserved(*slot),
+            }
+        }
+        (warmed, warmed_bytes)
     }
 
     /// Make every (key, source) pair resident, returning each expert's device
@@ -485,6 +711,13 @@ impl ExpertPool {
                 .collect();
             willneed.hint(extents);
         }
+        // Ring fast path: the whole miss batch is submitted to io_uring at
+        // queue depth, O_DIRECT reads DMA straight into reserved pinned tier
+        // slots, and each slice's H2D is enqueued as its read completes.
+        #[cfg(target_os = "linux")]
+        if self.ring_slot_dma {
+            return self.ring_pass(addrs, &misses, &tier_hits, engine_stream, pass);
+        }
         // Concurrent disk reads for the tier misses.
         let fetched = if disk_jobs.is_empty() {
             Vec::new()
@@ -583,6 +816,242 @@ impl ExpertPool {
         Ok(addrs)
     }
 
+    /// The io_uring ensure pass (`ring_slot_dma`): reserve a pinned tier slot
+    /// per disk miss, submit the whole batch at queue depth, and enqueue each
+    /// slice's async H2D as its O_DIRECT read lands (completion-driven
+    /// uploads: the copy stream drains while later reads are still in
+    /// flight). Tier declines fall back to owned scratch reads staged through
+    /// the pinned staging rings, exactly like the legacy path. On any error
+    /// the reserved-but-unread slots are rolled back and the copy stream is
+    /// host-synced before returning, so no DMA dangles into the tier arena.
+    #[cfg(target_os = "linux")]
+    fn ring_pass(
+        &mut self,
+        addrs: Vec<u64>,
+        misses: &[(ExpertKey, &ExpertSource, usize)],
+        tier_hits: &[Option<(usize, usize)>],
+        engine_stream: Option<&Stream>,
+        pass: u64,
+    ) -> Result<Vec<u64>> {
+        use crate::expert_uring::{SlotDest, UringJob, UringRead};
+
+        enum Plan {
+            /// Reads straight into tier slot `slot` (arena offset `slot_base`).
+            Slot {
+                miss_idx: usize,
+                slot: usize,
+                slot_base: usize,
+            },
+            /// Tier declined (every slot pass-pinned): owned scratch + staging.
+            Owned { miss_idx: usize },
+        }
+
+        // Resolve every extent before mutating anything (fallible).
+        let mut extents: Vec<Option<(usize, u64, usize)>> = Vec::with_capacity(misses.len());
+        for ((key, source, _), hit) in misses.iter().zip(tier_hits) {
+            if hit.is_some() {
+                extents.push(None);
+            } else {
+                extents.push(Some(self.fetcher.file_extent(*key, source)?));
+            }
+        }
+
+        // The engine pass must open BEFORE any tier-arena write: when an
+        // engine stream is in play, the previous pass's uploads may still be
+        // reading the very slots the ring is about to overwrite.
+        self.engine
+            .as_mut()
+            .expect("ring_slot_dma implies the upload engine")
+            .begin_pass(engine_stream)?;
+
+        // Reserve destination slots (provisional entries, committed as reads
+        // land). Slots the tier declines read into owned scratch instead.
+        let (arena_base, stride) = {
+            let tier = self.tier.as_ref().expect("ring_slot_dma implies the tier");
+            let pinned = tier.arena().pinned().expect("ring_slot_dma implies pinned");
+            (pinned.as_mut_ptr() as usize, tier.slot_stride())
+        };
+        let mut jobs: Vec<UringJob> = Vec::new();
+        let mut plans: Vec<Plan> = Vec::new();
+        {
+            let tier = self.tier.as_mut().expect("checked above");
+            for (miss_idx, ((key, _, _), extent)) in misses.iter().zip(&extents).enumerate() {
+                let Some((shard, offset, len)) = *extent else {
+                    continue; // tier hit
+                };
+                let dest = match tier.reserve(*key, len, false, pass) {
+                    Some((slot, slot_base)) => {
+                        plans.push(Plan::Slot {
+                            miss_idx,
+                            slot,
+                            slot_base,
+                        });
+                        Some(SlotDest {
+                            ptr: (arena_base + slot_base) as *mut u8,
+                            cap: stride,
+                        })
+                    }
+                    None => {
+                        plans.push(Plan::Owned { miss_idx });
+                        None
+                    }
+                };
+                jobs.push(UringJob {
+                    shard,
+                    offset,
+                    len,
+                    dest,
+                });
+            }
+        }
+
+        let mut first_err: Option<anyhow::Error> = None;
+        {
+            let engine = self.engine.as_ref().expect("checked above");
+            let tier = self.tier.as_ref().expect("checked above");
+            let pinned = tier.arena().pinned().expect("checked above");
+            // Tier hits are ready immediately: enqueue their DMAs first so
+            // the copy stream works while the NVMe reads run.
+            for ((_, _, device_slot), hit) in misses.iter().zip(tier_hits) {
+                let Some((tier_offset, len)) = hit else {
+                    continue;
+                };
+                if let Err(err) = engine.upload_pinned(
+                    &self.arena,
+                    device_slot * self.slot_bytes,
+                    pinned,
+                    *tier_offset,
+                    *len,
+                ) {
+                    first_err = Some(err);
+                    break;
+                }
+            }
+            // Drive the ring; completion-driven uploads for slot-DMA reads.
+            let mut outcomes: Vec<Option<Result<UringRead>>> =
+                (0..jobs.len()).map(|_| None).collect();
+            if first_err.is_none() && !jobs.is_empty() {
+                let reader = self
+                    .fetcher
+                    .uring()
+                    .expect("ring_slot_dma implies the uring backend");
+                let device_arena = &self.arena;
+                let slot_bytes = self.slot_bytes;
+                let started = Instant::now();
+                // SAFETY: every Slot dest is a distinct reserved tier slot —
+                // 4 KiB-aligned base (arena base alignment checked at
+                // construction, stride is a 4 KiB multiple), stride-sized,
+                // eviction-protected for this pass, and written by nothing
+                // else until the batch returns.
+                let batch = unsafe {
+                    reader.read_batch(&jobs, |idx, outcome| {
+                        if let (
+                            Plan::Slot {
+                                miss_idx,
+                                slot_base,
+                                ..
+                            },
+                            Ok(UringRead::InPlace { head }),
+                        ) = (&plans[idx], &outcome)
+                            && first_err.is_none()
+                        {
+                            let device_slot = misses[*miss_idx].2;
+                            if let Err(err) = engine.upload_pinned(
+                                device_arena,
+                                device_slot * slot_bytes,
+                                pinned,
+                                slot_base + head,
+                                jobs[idx].len,
+                            ) {
+                                first_err = Some(err);
+                            }
+                        }
+                        outcomes[idx] = Some(outcome);
+                    })
+                };
+                self.read_nanos += started.elapsed().as_nanos() as u64;
+                if let Err(err) = batch
+                    && first_err.is_none()
+                {
+                    first_err = Some(err);
+                }
+            }
+
+            // Publish / roll back the reserved slots and collect owned bytes.
+            let mut owned_uploads: Vec<(usize, Vec<u8>)> = Vec::new();
+            {
+                let tier = self.tier.as_mut().expect("checked above");
+                for (idx, plan) in plans.iter().enumerate() {
+                    let outcome = outcomes[idx].take();
+                    match plan {
+                        Plan::Slot { slot, .. } => match outcome {
+                            Some(Ok(UringRead::InPlace { head })) => {
+                                tier.commit_reserved(*slot, head);
+                                self.stats.bytes_read += jobs[idx].len as u64;
+                            }
+                            Some(Ok(UringRead::Owned(_))) => {
+                                unreachable!("slot job returned owned bytes")
+                            }
+                            Some(Err(err)) => {
+                                tier.abort_reserved(*slot);
+                                if first_err.is_none() {
+                                    first_err = Some(err);
+                                }
+                            }
+                            // Ring-level failure before this job completed.
+                            None => tier.abort_reserved(*slot),
+                        },
+                        Plan::Owned { miss_idx } => match outcome {
+                            Some(Ok(UringRead::Owned(bytes))) => {
+                                owned_uploads.push((*miss_idx, bytes));
+                            }
+                            Some(Ok(UringRead::InPlace { .. })) => {
+                                unreachable!("owned job landed in place")
+                            }
+                            Some(Err(err)) => {
+                                if first_err.is_none() {
+                                    first_err = Some(err);
+                                }
+                            }
+                            None => {}
+                        },
+                    }
+                }
+            }
+            // Owned fallbacks stage through the pinned staging rings. The
+            // tier declined these this pass (all slots pass-pinned), so no
+            // insert attempt either.
+            let engine = self.engine.as_mut().expect("checked above");
+            if first_err.is_none() {
+                for (miss_idx, bytes) in &owned_uploads {
+                    let device_slot = misses[*miss_idx].2;
+                    if let Err(err) =
+                        engine.stage_upload(&self.arena, device_slot * self.slot_bytes, bytes)
+                    {
+                        first_err = Some(err);
+                        break;
+                    }
+                    self.stats.bytes_read += bytes.len() as u64;
+                }
+            }
+        }
+        self.stats.misses += misses.len() as u64;
+
+        let engine = self.engine.as_mut().expect("checked above");
+        match first_err {
+            None => {
+                engine.finish_pass(engine_stream)?;
+                Ok(addrs)
+            }
+            Some(err) => {
+                // Host-sync so no in-flight copy still reads tier slots or
+                // staging when the caller unwinds.
+                let _ = engine.finish_pass(None);
+                Err(err)
+            }
+        }
+    }
+
     fn take_slot(&mut self, pass: u64) -> Result<usize> {
         // Prefer a free slot; else evict the least-recently-used unpinned one.
         if let Some(free) = self.slots.iter().position(|slot| slot.key.is_none()) {
@@ -624,12 +1093,16 @@ impl Drop for ExpertPool {
     }
 }
 
-/// Fetch a batch of expert byte extents with up to [`READ_WORKERS`] threads
-/// (results in job order). Used by miss batches and pre-warm.
+/// Fetch a batch of expert byte extents (results in job order): the whole
+/// batch through the io_uring backend at queue depth when active, otherwise
+/// up to [`READ_WORKERS`] threads. Used by miss batches and pre-warm.
 fn parallel_fetch(
     fetcher: &ram_tier::ExpertFetcher,
     jobs: &[(ExpertKey, &ExpertSource)],
 ) -> Vec<Result<Vec<u8>>> {
+    if let Some(results) = fetcher.fetch_batch_uring(jobs) {
+        return results;
+    }
     let workers = jobs.len().min(READ_WORKERS);
     if workers <= 1 {
         return jobs
@@ -808,6 +1281,8 @@ mod tests {
             explicit_ram_gb: Some(ram_bytes as f64 / ram_tier::GIB as f64),
             prewarm_frac,
             odirect: false,
+            iouring: false,
+            iouring_qd: ram_tier::DEFAULT_IOURING_QD,
             willneed: true,
             madvise_random: true,
             sync_upload,
@@ -875,13 +1350,19 @@ mod tests {
         let gguf = Arc::new(GgufFile::open(&model).unwrap());
         let sources = ram_tier::discover_sources(&gguf);
 
-        let mmap_fetcher = ram_tier::ExpertFetcher::new(Arc::clone(&gguf), None, true);
+        let mmap_fetcher = ram_tier::ExpertFetcher::new(
+            Arc::clone(&gguf),
+            ram_tier::FetchBackend::Mmap {
+                willneed_inline: true,
+            },
+        );
         let direct = gguf.direct_io_reader().ok();
         if direct.is_none() {
             eprintln!("skipping O_DIRECT half: unsupported filesystem");
         }
-        let odirect_fetcher = direct
-            .map(|reader| ram_tier::ExpertFetcher::new(Arc::clone(&gguf), Some(reader), false));
+        let odirect_fetcher = direct.map(|reader| {
+            ram_tier::ExpertFetcher::new(Arc::clone(&gguf), ram_tier::FetchBackend::Direct(reader))
+        });
         for (key, source) in all_requests(&sources) {
             let expected = expected_expert_bytes(&gguf, key);
             let via_mmap = mmap_fetcher.fetch(key, source).unwrap();
@@ -895,6 +1376,59 @@ mod tests {
         let (&(layer, proj), source) = sources.iter().next().unwrap();
         assert!(
             mmap_fetcher
+                .fetch((layer, proj, FIXTURE_EXPERTS), source)
+                .is_err()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Byte equivalence io_uring == mmap on the synthetic fixture GGUF: the
+    /// ring backend must return exactly the mmap bytes for every expert
+    /// extent, one at a time and as a whole owned batch. Skips (loudly) where
+    /// io_uring or O_DIRECT is unavailable.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fetcher_uring_matches_mmap_on_fixture() {
+        let dir = fixture_dir("uring-fetch");
+        let model = dir.join("model.gguf");
+        write_streaming_fixture(&model);
+        let gguf = Arc::new(GgufFile::open(&model).unwrap());
+        let sources = ram_tier::discover_sources(&gguf);
+
+        let reader = match crate::expert_uring::IoUringReader::open(
+            &[model.clone()],
+            crate::expert_uring::DEFAULT_QD,
+        ) {
+            Ok(reader) => reader,
+            Err(err) => {
+                eprintln!("skipping io_uring fetcher test: {err:#}");
+                std::fs::remove_dir_all(&dir).unwrap();
+                return;
+            }
+        };
+        let uring_fetcher =
+            ram_tier::ExpertFetcher::new(Arc::clone(&gguf), ram_tier::FetchBackend::Uring(reader));
+        assert!(uring_fetcher.io_label().starts_with("iouring(qd=256"));
+        let requests = all_requests(&sources);
+        // Single fetches.
+        for (key, source) in &requests {
+            let expected = expected_expert_bytes(&gguf, *key);
+            let via_uring = uring_fetcher.fetch(*key, source).unwrap();
+            assert_eq!(via_uring, expected, "io_uring fetch of {key:?}");
+        }
+        // Whole batch through one drive loop.
+        let batch = uring_fetcher.fetch_batch_uring(&requests).unwrap();
+        for ((key, _), bytes) in requests.iter().zip(batch) {
+            assert_eq!(
+                bytes.unwrap(),
+                expected_expert_bytes(&gguf, *key),
+                "io_uring batch fetch of {key:?}"
+            );
+        }
+        // Out-of-range experts fail loudly.
+        let (&(layer, proj), source) = sources.iter().next().unwrap();
+        assert!(
+            uring_fetcher
                 .fetch((layer, proj, FIXTURE_EXPERTS), source)
                 .is_err()
         );
@@ -1065,6 +1599,18 @@ mod tests {
         .unwrap();
         let tier_stats = pool.tier.as_ref().unwrap().stats();
         assert_eq!(tier_stats.prewarmed, 6, "2 hot experts x 3 projections");
+        assert_prewarm_serves_without_disk(&mut pool, &gguf, &sources);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Shared tail of the prewarm tests: routing to the pre-warmed expert
+    /// hits the tier for all three projections with zero new disk bytes and
+    /// byte-exact device contents.
+    fn assert_prewarm_serves_without_disk(
+        pool: &mut ExpertPool,
+        gguf: &GgufFile,
+        sources: &BTreeMap<(u32, u8), ExpertSource>,
+    ) {
         assert_eq!(pool.tier.as_ref().unwrap().sticky_count(), 6);
         let disk_after_prewarm = pool.stats().bytes_read;
         assert_eq!(disk_after_prewarm, 6 * FIXTURE_EXPERT_BYTES as u64);
@@ -1086,10 +1632,154 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 bytes,
-                expected_expert_bytes(&gguf, *key),
+                expected_expert_bytes(gguf, *key),
                 "pre-warmed {key:?}"
             );
         }
+    }
+
+    /// The io_uring tier end to end on a CUDA device: ring-mode construction
+    /// (probe, widened stride, buffer registration), zero-copy DMA into
+    /// reserved tier slots, completion-driven uploads, device evictions, and
+    /// repeat passes served from the tier with zero extra disk bytes — all
+    /// byte-exact against the GGUF. Skips loudly where io_uring or O_DIRECT
+    /// is unavailable.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_cuda_uring_tier_end_to_end_bytes_and_bounds() {
+        let dir = fixture_dir("uring-tier");
+        let model = dir.join("model.gguf");
+        write_streaming_fixture(&model);
+        let gguf = GgufFile::open(&model).unwrap();
+        let sources = ram_tier::discover_sources(&gguf);
+
+        let stride = crate::expert_uring::tier_slot_stride(FIXTURE_EXPERT_BYTES);
+        let mut env = test_env((24 * stride) as u64, 0.0, false);
+        env.iouring = true;
+        env.iouring_qd = 64;
+        let mut pool =
+            ExpertPool::new_with_env(&model, FIXTURE_EXPERT_BYTES, 3 * FIXTURE_EXPERT_BYTES, env)
+                .unwrap();
+        if !pool.fetcher.io_label().starts_with("iouring") {
+            eprintln!("skipping: io_uring unavailable here (fell back cleanly)");
+            std::fs::remove_dir_all(&dir).unwrap();
+            return;
+        }
+        assert!(
+            pool.ring_slot_dma,
+            "ring + pinned tier + engine must enable slot DMA"
+        );
+        let tier = pool.tier.as_ref().unwrap();
+        assert_eq!(tier.slot_stride(), stride);
+        assert_eq!(tier.slot_count(), 24, "stride-aware budget cap");
+        let stream = Stream::create().unwrap();
+        let source_of = |layer: u32, proj: u8| sources.get(&(layer, proj)).unwrap();
+
+        // Pass 1: three misses -> O_DIRECT ring reads into tier slots.
+        let requests: Vec<(ExpertKey, &ExpertSource)> = (0..3)
+            .map(|expert| ((0u32, 0u8, expert), source_of(0, 0)))
+            .collect();
+        let addrs = pool.ensure_resident(&requests).unwrap();
+        let disk_after_first = pool.stats().bytes_read;
+        assert_eq!(disk_after_first, 3 * FIXTURE_EXPERT_BYTES as u64);
+        let base = pool.arena.as_ptr() as u64;
+        for (idx, (key, _)) in requests.iter().enumerate() {
+            let offset = usize::try_from(addrs[idx] - base).unwrap();
+            let bytes = pool
+                .arena
+                .copy_to_host_offset::<u8>(offset, FIXTURE_EXPERT_BYTES)
+                .unwrap();
+            assert_eq!(bytes, expected_expert_bytes(&gguf, *key), "ring {key:?}");
+        }
+
+        // Pass 2 (engine-stream variant): different experts evict the device
+        // slots; the tier keeps everything.
+        let requests: Vec<(ExpertKey, &ExpertSource)> = (0..3)
+            .map(|expert| ((1u32, 2u8, expert), source_of(1, 2)))
+            .collect();
+        pool.ensure_resident_on(&requests, Some(&stream)).unwrap();
+        stream.synchronize().unwrap();
+        assert!(pool.stats().evictions >= 3);
+
+        // Pass 3: the originals again -> tier hits, zero new disk bytes,
+        // byte-exact device contents.
+        let disk_before_repeat = pool.stats().bytes_read;
+        let requests: Vec<(ExpertKey, &ExpertSource)> = (0..3)
+            .map(|expert| ((0u32, 0u8, expert), source_of(0, 0)))
+            .collect();
+        let addrs = pool.ensure_resident(&requests).unwrap();
+        assert_eq!(
+            pool.stats().bytes_read,
+            disk_before_repeat,
+            "tier hits cost no disk I/O in ring mode"
+        );
+        assert_eq!(pool.tier.as_ref().unwrap().stats().hits, 3);
+        for (idx, (key, _)) in requests.iter().enumerate() {
+            let offset = usize::try_from(addrs[idx] - base).unwrap();
+            let bytes = pool
+                .arena
+                .copy_to_host_offset::<u8>(offset, FIXTURE_EXPERT_BYTES)
+                .unwrap();
+            assert_eq!(
+                bytes,
+                expected_expert_bytes(&gguf, *key),
+                "tier-served {key:?}"
+            );
+        }
+        // Tier stays bounded under pressure: hammer every expert through.
+        let all = all_requests(&sources);
+        pool.ensure_resident(&all).unwrap_err();
+        // (24 requests through a 3-slot device pool in ONE pass must fail:
+        // every slot is pass-pinned. Split per projection instead.)
+        for chunk in all.chunks(3) {
+            pool.ensure_resident(chunk).unwrap();
+            let tier = pool.tier.as_ref().unwrap();
+            assert!(tier.resident_bytes() <= tier.budget_bytes());
+            assert!(tier.resident_count() <= tier.slot_count());
+        }
+        let segment = pool.stats_segment();
+        assert!(segment.contains("io=iouring(qd=64"), "{segment}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Ring pre-warm: the usage history warms sticky tier entries via
+    /// zero-copy O_DIRECT DMA at construction, then serves them with no disk
+    /// reads. Requires a CUDA device; skips where io_uring is unavailable.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_cuda_uring_prewarm_dma_pins_hottest_experts() {
+        let dir = fixture_dir("uring-prewarm");
+        let model = dir.join("model.gguf");
+        write_streaming_fixture(&model);
+        let gguf = GgufFile::open(&model).unwrap();
+        let sources = ram_tier::discover_sources(&gguf);
+
+        // Seed a history: expert (0, 1) is hottest, then (1, 2).
+        let mut usage = ram_tier::ExpertUsage::load_or_new(&model, 3600);
+        for _ in 0..5 {
+            usage.record_pass([(0u32, 1u32)]);
+        }
+        usage.record_pass([(1u32, 2u32)]);
+        usage.save().unwrap();
+
+        let stride = crate::expert_uring::tier_slot_stride(FIXTURE_EXPERT_BYTES);
+        let mut env = test_env((24 * stride) as u64, 1.0, false);
+        env.iouring = true;
+        let mut pool =
+            ExpertPool::new_with_env(&model, FIXTURE_EXPERT_BYTES, 4 * FIXTURE_EXPERT_BYTES, env)
+                .unwrap();
+        if !pool.fetcher.io_label().starts_with("iouring") {
+            eprintln!("skipping: io_uring unavailable here (fell back cleanly)");
+            std::fs::remove_dir_all(&dir).unwrap();
+            return;
+        }
+        assert!(pool.ring_slot_dma);
+        let tier_stats = pool.tier.as_ref().unwrap().stats();
+        assert_eq!(
+            tier_stats.prewarmed, 6,
+            "2 hot experts x 3 projections, DMA'd sticky"
+        );
+        assert_prewarm_serves_without_disk(&mut pool, &gguf, &sources);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

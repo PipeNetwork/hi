@@ -40,6 +40,12 @@ pub mod dsv4_gpu;
 pub(crate) mod dsv4_mtp;
 #[cfg(feature = "native-cuda")]
 mod expert_pool;
+/// io_uring batch reads for streamed experts: CUDA-free (plain files + raw
+/// buffers), so it compiles, unit-tests and benches without native-cuda. Its
+/// non-test consumer is the native-cuda expert pool, hence the scoped allow.
+#[cfg(target_os = "linux")]
+#[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
+pub(crate) mod expert_uring;
 pub mod gpu;
 pub mod kernels;
 mod prefix_cache;

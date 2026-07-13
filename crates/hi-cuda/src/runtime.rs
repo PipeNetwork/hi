@@ -847,6 +847,14 @@ mod imp {
             self.bytes
         }
 
+        /// Raw base address of the pinned allocation. The expert-tier io_uring
+        /// fetcher hands slot addresses inside this buffer to the kernel so
+        /// O_DIRECT NVMe reads DMA straight into page-locked memory (and
+        /// registers the region as fixed buffers when permitted).
+        pub fn as_mut_ptr(&self) -> *mut c_void {
+            self.ptr
+        }
+
         /// Copy `data` into this pinned buffer starting at `offset` (a plain host
         /// memcpy). The subsequent async H2D then DMAs it to device.
         pub fn copy_in(&self, offset: usize, data: &[u8]) -> Result<()> {
