@@ -50,8 +50,12 @@ pub(crate) mod expert_uring;
 pub mod gpu;
 pub mod kernels;
 /// mmap-vs-io_uring byte source for resident-weight loads (gpu.rs qwen
-/// matrices, dsv4 resident uploads) plus the shared ring auto heuristics.
-#[cfg(feature = "native-cuda")]
+/// matrices, dsv4 resident uploads and expert prefill) plus the shared ring
+/// auto heuristics. Like expert_uring it is CUDA-free — the safetensors
+/// backing decision reuses the tri-state env and load auto on plain Linux
+/// builds — so it compiles wherever either consumer exists.
+#[cfg(any(target_os = "linux", feature = "native-cuda"))]
+#[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
 pub(crate) mod load_source;
 mod prefix_cache;
 pub mod qwen_cpu;

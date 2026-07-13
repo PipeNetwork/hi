@@ -136,6 +136,8 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow, bail};
 use hi_gguf::{GgufFile, GgufTensorType, GgufTokenizer, QwenGgufConfig, TensorInfo, TensorView};
 
+use crate::load_source::{LoadByteSource, LoadedBytes};
+
 use crate::dsv4_cpu::{
     CompressorWeights, DSV4_DEVICE_VERIFY_CAP, DsV4Engine, DsV4ExpertTensors, DsV4Geometry,
     DsV4Layer, DsV4Linear, DsV4MoeBlockCtx, DsV4MoeShared, DsV4State, DsV4StepMirror, DsV4Taps,
@@ -255,6 +257,12 @@ const DSV4_POOL_DEFAULT_MAX_BYTES: usize = 72 << 30;
 const DSV4_POOL_HEADROOM_BYTES: usize = 6 << 30;
 const DSV4_POOL_CHUNK_TARGET_BYTES: usize = 1 << 30;
 const DSV4_POOL_SLOT_ALIGN: usize = 256;
+/// Ring-read window for the expert-pool prefill (rounded down to whole expert
+/// slices): a reader thread stays up to two windows ahead of the H2D upload
+/// loop so O_DIRECT reads and cudaMemcpys overlap. Serial read-then-upload
+/// measured 4.1 GiB/s cold vs buffered mmap's 4.5 (kernel readahead gives
+/// the mmap path that overlap for free); windowing restores the pipeline.
+const DSV4_PREFILL_RING_WINDOW_BYTES: usize = 128 << 20;
 /// One stats line on stderr every this many pooled expert GEMVs (~1.5x per
 /// decoded token on the real model), plus a final line at provider drop.
 const DSV4_POOL_LOG_EVERY_CALLS: u64 = 512;
@@ -546,6 +554,12 @@ impl DsV4ExpertPool {
         }
         self.lru_tail = idx;
     }
+}
+
+/// Experts per prefill ring window: [`DSV4_PREFILL_RING_WINDOW_BYTES`]
+/// rounded down to whole slices, minimum one.
+fn prefill_window_experts(bytes_per_expert: usize) -> usize {
+    (DSV4_PREFILL_RING_WINDOW_BYTES / bytes_per_expert.max(1)).max(1)
 }
 
 /// Parse `blk.{layer}.ffn_{gate,up,down}_exps.weight` into pool metadata.
@@ -1551,7 +1565,7 @@ impl DsV4GpuLinearInner {
         // One byte-source decision for the whole resident set (mmap vs
         // io_uring O_DIRECT bulk reads; HI_CUDA_LOAD_IOURING tri-state, auto
         // by extent size + page-cache residency).
-        let source = crate::load_source::LoadByteSource::for_tensors(
+        let source = LoadByteSource::for_tensors(
             &self.gguf,
             "dsv4 resident",
             specs.iter().map(|(matrix, _)| matrix.name.as_str()),
@@ -1688,11 +1702,62 @@ impl DsV4GpuLinearInner {
     /// Fill the pool with experts in (layer, projection, expert) order until
     /// every slot is loaded, so early decode steps hit instead of paying the
     /// first-touch upload. Counted as `prefilled`, not misses.
+    ///
+    /// GGUF-backed tensor bytes come through a [`LoadByteSource`] over the
+    /// exact per-tensor expert prefixes the pool will consume (one-shot
+    /// startup load, so the `HI_CUDA_LOAD_IOURING` tri-state + load auto
+    /// apply: a cold boot bulk-reads O_DIRECT into anonymous memory — which
+    /// also skips the slow cudaMemcpy-from-file-backed-pages uploads — while
+    /// the usual production boot, GGUF warm, keeps buffered mmap). Host
+    /// blobs (drafter experts, already anonymous RAM) keep their direct path.
     fn prefill_expert_pool(&self) -> Result<()> {
-        let mut guard = self.expert_pool.borrow_mut();
-        let Some(pool) = guard.as_mut() else {
+        let Some((ordered, prefixes)) = self.prefill_plan() else {
             return Ok(());
         };
+        let blobs = self.host_expert_blobs.borrow();
+        let source = LoadByteSource::for_tensor_prefixes(
+            &self.gguf,
+            "dsv4 expert prefill",
+            ordered
+                .iter()
+                .zip(&prefixes)
+                .filter(|((name, _), _)| !blobs.contains_key(name.as_str()))
+                .map(|((name, meta), &prefix)| {
+                    (name.as_str(), (prefix * meta.bytes_per_expert) as u64)
+                }),
+        );
+        drop(blobs);
+        self.prefill_with_source(&source, &ordered, &prefixes)
+    }
+
+    /// [`Self::prefill_expert_pool`] with the ring FORCED (no env, no auto)
+    /// for the A/B tests; `Ok(false)` = skipped, io_uring unavailable.
+    #[cfg(test)]
+    fn prefill_expert_pool_forced_ring(&self) -> Result<bool> {
+        let Some((ordered, prefixes)) = self.prefill_plan() else {
+            return Ok(true);
+        };
+        let source = match LoadByteSource::forced_ring_for_tests(&self.gguf) {
+            Ok(source) => source,
+            Err(err) => {
+                eprintln!("skipping forced-ring prefill: {err:#}");
+                return Ok(false);
+            }
+        };
+        self.prefill_with_source(&source, &ordered, &prefixes)?;
+        Ok(true)
+    }
+
+    /// The prefill walk order and, per tensor, how many leading experts the
+    /// pool will touch before hitting capacity — the contiguous prefix a ring
+    /// read may bulk-load. Mirrors [`Self::prefill_with_source`]'s loop:
+    /// already-resident slices consume no capacity but stay inside the prefix
+    /// (their bytes go unused; after a fresh init the pool is empty, so the
+    /// prefix is exactly what uploads). `None` when the pool is disabled.
+    #[allow(clippy::type_complexity)]
+    fn prefill_plan(&self) -> Option<(Vec<(String, ExpertTensorMeta)>, Vec<usize>)> {
+        let guard = self.expert_pool.borrow();
+        let pool = guard.as_ref()?;
         let mut ordered: Vec<(String, ExpertTensorMeta)> = pool
             .tensors
             .iter()
@@ -1700,8 +1765,103 @@ impl DsV4GpuLinearInner {
             .collect();
         ordered.sort_by_key(|(_, meta)| (meta.layer, meta.proj));
         let capacity = pool.slots.len();
-        'tensors: for (name, meta) in &ordered {
-            let source = self.expert_source(name)?;
+        let mut projected = pool.resident.len();
+        let mut prefixes = Vec::with_capacity(ordered.len());
+        for (_, meta) in &ordered {
+            let mut prefix = 0;
+            for expert in 0..meta.expert_count {
+                if projected == capacity {
+                    break;
+                }
+                prefix = expert + 1;
+                if !pool
+                    .resident
+                    .contains_key(&(meta.layer, meta.proj, expert as u32))
+                {
+                    projected += 1;
+                }
+            }
+            prefixes.push(prefix);
+        }
+        Some((ordered, prefixes))
+    }
+
+    fn prefill_with_source(
+        &self,
+        source: &LoadByteSource<'_>,
+        ordered: &[(String, ExpertTensorMeta)],
+        prefixes: &[usize],
+    ) -> Result<()> {
+        // Per ordered tensor: how many leading experts to stream through the
+        // ring (0 = blob-backed, an mmap decision, or nothing to load).
+        let ring_experts: Vec<usize> = if source.is_ring() {
+            let blobs = self.host_expert_blobs.borrow();
+            ordered
+                .iter()
+                .zip(prefixes)
+                .map(|((name, _), &prefix)| {
+                    if blobs.contains_key(name.as_str()) {
+                        0
+                    } else {
+                        prefix
+                    }
+                })
+                .collect()
+        } else {
+            vec![0; ordered.len()]
+        };
+        // Ring reads stream off a dedicated reader thread in expert-aligned
+        // windows (bounded channel = bounded read-ahead) so the O_DIRECT
+        // reads overlap the H2D copies. The mmap path needs no thread:
+        // kernel readahead already overlaps its faults with the copies.
+        std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Result<LoadedBytes<'_>>>(2);
+            if ring_experts.iter().any(|&count| count > 0) {
+                let ring_experts = &ring_experts;
+                scope.spawn(move || {
+                    for ((name, meta), &count) in ordered.iter().zip(ring_experts) {
+                        let per_window = prefill_window_experts(meta.bytes_per_expert);
+                        for first in (0..count).step_by(per_window) {
+                            let experts = per_window.min(count - first);
+                            let read = source.tensor_slice_bytes(
+                                name,
+                                first * meta.bytes_per_expert,
+                                experts * meta.bytes_per_expert,
+                            );
+                            if tx.send(read).is_err() {
+                                return; // upload loop stopped early (capacity)
+                            }
+                        }
+                    }
+                });
+            }
+            self.prefill_upload_loop(&rx, ordered, &ring_experts)
+        })
+    }
+
+    /// The demand half of [`Self::prefill_with_source`]: acquires slots and
+    /// uploads slices, taking ring-managed tensors' bytes from the reader
+    /// thread's windows (which arrive in exactly this loop's order) and
+    /// everything else from the raw source view.
+    fn prefill_upload_loop<'g>(
+        &self,
+        windows: &std::sync::mpsc::Receiver<Result<LoadedBytes<'g>>>,
+        ordered: &[(String, ExpertTensorMeta)],
+        ring_experts: &[usize],
+    ) -> Result<()> {
+        let mut guard = self.expert_pool.borrow_mut();
+        let Some(pool) = guard.as_mut() else {
+            return Ok(());
+        };
+        let capacity = pool.slots.len();
+        'tensors: for ((name, meta), &ring_count) in ordered.iter().zip(ring_experts) {
+            let expert_source = self.expert_source(name)?;
+            let per_window = prefill_window_experts(meta.bytes_per_expert);
+            // First expert of the window most recently received, and its
+            // bytes (`None` = that window's read failed; its experts fall
+            // back to the raw view without disturbing window order).
+            let mut window_first: Option<usize> = None;
+            let mut window_bytes: Option<LoadedBytes<'g>> = None;
             for expert in 0..meta.expert_count {
                 if pool.resident.len() == capacity {
                     break 'tensors;
@@ -1709,10 +1869,36 @@ impl DsV4GpuLinearInner {
                 let start = expert
                     .checked_mul(meta.bytes_per_expert)
                     .context("expert byte offset overflows usize")?;
-                let bytes = source
-                    .bytes()
-                    .get(start..start + meta.bytes_per_expert)
-                    .ok_or_else(|| anyhow!("tensor {name} expert slice is out of range"))?;
+                let bytes = if expert < ring_count {
+                    let first = expert - expert % per_window;
+                    if window_first != Some(first) {
+                        window_first = Some(first);
+                        window_bytes = match windows.recv() {
+                            Ok(Ok(loaded)) => Some(loaded),
+                            Ok(Err(err)) => {
+                                eprintln!(
+                                    "dsv4 expert prefill: ring window of {name} failed ({err:#}); using the source view"
+                                );
+                                None
+                            }
+                            Err(_) => None, // reader thread gone; use the view
+                        };
+                    }
+                    match &window_bytes {
+                        Some(loaded) => loaded
+                            .as_slice()
+                            .get((expert - first) * meta.bytes_per_expert..)
+                            .and_then(|tail| tail.get(..meta.bytes_per_expert)),
+                        None => expert_source
+                            .bytes()
+                            .get(start..start + meta.bytes_per_expert),
+                    }
+                } else {
+                    expert_source
+                        .bytes()
+                        .get(start..start + meta.bytes_per_expert)
+                }
+                .ok_or_else(|| anyhow!("tensor {name} expert slice is out of range"))?;
                 let (slot, hit) = pool.acquire((meta.layer, meta.proj, expert as u32));
                 if hit {
                     continue; // repeated prefill call; already resident
@@ -1934,7 +2120,7 @@ impl DsV4GpuLinearInner {
     /// device kernel id fall back to a host dequant and stay f32-resident.
     fn upload_matrix(
         &self,
-        source: &crate::load_source::LoadByteSource<'_>,
+        source: &LoadByteSource<'_>,
         matrix: &RawMatrix,
     ) -> Result<ResidentMatrix> {
         // Byte source behind the helper: the mmap view or an io_uring bulk
@@ -2010,7 +2196,7 @@ impl DsV4GpuLinearInner {
     /// contiguous row range with a device-to-device copy.
     fn upload_grouped(
         &self,
-        source: &crate::load_source::LoadByteSource<'_>,
+        source: &LoadByteSource<'_>,
         matrix: &RawMatrix,
         rank: usize,
     ) -> Result<Vec<ResidentMatrix>> {
@@ -6180,6 +6366,191 @@ pub(crate) mod tests {
         let stats = linear.pool_stats().unwrap();
         assert_eq!((stats.hits, stats.misses), (1, 0));
         assert_eq!(stats.bytes_uploaded, 9 * TEST_EXPERT_SLICE_BYTES);
+    }
+
+    /// Prefill through a FORCED io_uring byte source must reproduce the mmap
+    /// prefill exactly: identical prefilled/bytes_uploaded counters and every
+    /// GEMV matching the host dequant reference — at full capacity (whole
+    /// tensors ring-read) and with a 5-slot pool (a PARTIAL expert prefix of
+    /// the middle tensor, the extent-clipping case). Skips gracefully where
+    /// io_uring/O_DIRECT is unavailable.
+    #[test]
+    fn dsv4_gpu_expert_pool_prefill_forced_ring_matches_mmap() {
+        let path = tempfile_path("mxfp4-prefill-ring");
+        write_mxfp4_experts_gguf(&path, 3);
+        let slot_stride = (TEST_EXPERT_SLICE_BYTES as usize).div_ceil(256) * 256;
+        // (budget, expected prefilled): 9 slices fit entirely; 5 slots load
+        // gate[0..3] + up[0..2] and leave down untouched.
+        for (budget, expected_prefilled) in [(64usize << 10, 9u64), (5 * slot_stride, 5)] {
+            let (gguf_mmap, linear_mmap) = pool_test_linear(&path);
+            linear_mmap.init_expert_pool_with_budget(budget).unwrap();
+            linear_mmap.prefill_expert_pool().unwrap();
+            let stats_mmap = linear_mmap.pool_stats().unwrap();
+            assert_eq!(stats_mmap.prefilled, expected_prefilled);
+
+            let (gguf_ring, linear_ring) = pool_test_linear(&path);
+            linear_ring.init_expert_pool_with_budget(budget).unwrap();
+            if !linear_ring.prefill_expert_pool_forced_ring().unwrap() {
+                return; // skip message already logged
+            }
+            let stats_ring = linear_ring.pool_stats().unwrap();
+            assert_eq!(stats_ring.prefilled, stats_mmap.prefilled);
+            assert_eq!(stats_ring.bytes_uploaded, stats_mmap.bytes_uploaded);
+            assert_eq!(
+                stats_ring.bytes_uploaded,
+                expected_prefilled * TEST_EXPERT_SLICE_BYTES
+            );
+            assert_eq!((stats_ring.hits, stats_ring.misses), (0, 0));
+
+            // Downstream math: every slice through BOTH pools matches the
+            // host oracle with the same inputs, so a single corrupted byte in
+            // the ring-loaded slots would surface as a GEMV mismatch. The
+            // 5-slot pool additionally exercises demand misses (down slices
+            // were never prefilled) on both providers.
+            let tensors: [(&str, usize, usize); 3] = [
+                ("blk.0.ffn_gate_exps.weight", 32, 64),
+                ("blk.0.ffn_up_exps.weight", 32, 64),
+                ("blk.0.ffn_down_exps.weight", 64, 32),
+            ];
+            for (name, in_dim, out_dim) in tensors {
+                for expert in 0..3usize {
+                    let seed = expert as u32 + 40;
+                    check_expert_matvec(
+                        &gguf_ring,
+                        &linear_ring,
+                        name,
+                        in_dim,
+                        out_dim,
+                        expert,
+                        seed,
+                    );
+                    check_expert_matvec(
+                        &gguf_mmap,
+                        &linear_mmap,
+                        name,
+                        in_dim,
+                        out_dim,
+                        expert,
+                        seed,
+                    );
+                }
+            }
+            let after_ring = linear_ring.pool_stats().unwrap();
+            let after_mmap = linear_mmap.pool_stats().unwrap();
+            assert_eq!(
+                (after_ring.hits, after_ring.misses),
+                (after_mmap.hits, after_mmap.misses),
+                "budget {budget}: ring and mmap prefills must leave identical demand behavior"
+            );
+        }
+    }
+
+    /// Real cold expert-pool PREFILL wall-time A/B on the production V4 GGUF:
+    /// builds the provider + a bounded pool directly (no trunk residency
+    /// needed), computes the exact prefix extents prefill will read, evicts
+    /// ONLY those byte ranges (the shards are production-warm; whole-file
+    /// eviction would hurt the live service), reports their sampled
+    /// residency, then times prefill once with the ring forced off and once
+    /// forced on. Pool budget via `HI_DSV4_PREFILL_AB_GB` (default 8 GiB,
+    /// clamped under free VRAM). Run alone:
+    ///   `CUDA_VISIBLE_DEVICES=0 cargo test -p hi-cuda --release \
+    ///      --features native-cuda dsv4_real_cold_expert_prefill_ab \
+    ///      -- --ignored --nocapture --test-threads=1`
+    #[test]
+    #[ignore = "cold-reads GiBs of the production GGUF and fills a VRAM pool twice; opt-in"]
+    fn dsv4_real_cold_expert_prefill_ab() {
+        let path = std::env::var("HI_DSV4_AB_GGUF").ok().or_else(|| {
+            let home = std::env::var_os("HOME")?;
+            let default = std::path::PathBuf::from(home).join(
+                ".hi/models/deepseek-v4-flash/DeepSeek-V4-Flash-UD-Q4_K_XL-00001-of-00005.gguf",
+            );
+            default
+                .exists()
+                .then(|| default.to_string_lossy().into_owned())
+        });
+        let Some(path) = path else {
+            eprintln!("skipping: set HI_DSV4_AB_GGUF=/path/model.gguf");
+            return;
+        };
+        CudaRuntime::probe().unwrap();
+        let budget_gb: usize = std::env::var("HI_DSV4_PREFILL_AB_GB")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8);
+        let free = crate::runtime::free_memory_bytes().unwrap();
+        let budget = (budget_gb << 30).min(free.saturating_sub(4 << 30));
+        assert!(
+            budget >= 1 << 30,
+            "free VRAM too tight for a meaningful pool ({free} bytes free)"
+        );
+        for (label, forced) in [
+            ("mmap (HI_CUDA_LOAD_IOURING=0)", "0"),
+            ("io_uring (=1)", "1"),
+        ] {
+            let gguf = Arc::new(GgufFile::open(&path).unwrap());
+            let linear = DsV4GpuLinear::new(gguf.clone()).unwrap();
+            linear.init_expert_pool_with_budget(budget).unwrap();
+            let (ordered, prefixes) = linear.prefill_plan().expect("pool must be enabled");
+            // The exact extents prefill will read (trunk tensors are all
+            // GGUF-backed here — no host blobs registered).
+            let extents: Vec<(usize, u64, usize)> = ordered
+                .iter()
+                .zip(&prefixes)
+                .filter(|&(_, &prefix)| prefix > 0)
+                .map(|((name, meta), &prefix)| {
+                    let range = gguf.tensor_file_range(name).unwrap();
+                    (
+                        range.shard,
+                        range.file_offset,
+                        prefix * meta.bytes_per_expert,
+                    )
+                })
+                .collect();
+            let paths: Vec<std::path::PathBuf> = (0..gguf.shard_count())
+                .filter_map(|shard| gguf.shard_path(shard).map(Path::to_path_buf))
+                .collect();
+            let planned: u64 = extents.iter().map(|&(_, _, len)| len as u64).sum();
+            for &(shard, offset, len) in &extents {
+                let file = std::fs::File::open(&paths[shard]).unwrap();
+                use std::os::fd::AsRawFd;
+                let ret = unsafe {
+                    libc::posix_fadvise(
+                        file.as_raw_fd(),
+                        offset as libc::off_t,
+                        len as libc::off_t,
+                        libc::POSIX_FADV_DONTNEED,
+                    )
+                };
+                assert_eq!(ret, 0);
+            }
+            let residency =
+                crate::expert_uring::sampled_extent_residency(&paths, &extents, 64).unwrap_or(1.0);
+            if residency >= 0.05 {
+                eprintln!(
+                    "WARNING: extents still {:.0}% resident after targeted fadvise (another \
+                     process maps them?); timings below reflect a partially-warm read",
+                    residency * 100.0
+                );
+            }
+            // SAFETY: --test-threads=1 per the doc comment (mirrors
+            // load_source's real_cold_load_wall_time_ab).
+            unsafe { std::env::set_var("HI_CUDA_LOAD_IOURING", forced) };
+            let started = std::time::Instant::now();
+            linear.prefill_expert_pool().unwrap();
+            let secs = started.elapsed().as_secs_f64();
+            let stats = linear.pool_stats().unwrap();
+            println!(
+                "cold prefill ({label}): {secs:.2}s, {} slices, {:.2} GiB uploaded = {:.2} GiB/s \
+                 (planned extents {:.2} GiB, pre-run residency {:.1}%)",
+                stats.prefilled,
+                gib(stats.bytes_uploaded),
+                gib(stats.bytes_uploaded) / secs,
+                gib(planned),
+                residency * 100.0
+            );
+            drop(linear); // release the pool VRAM before the other mode
+        }
+        unsafe { std::env::remove_var("HI_CUDA_LOAD_IOURING") };
     }
 
     /// Craft one packed MXFP4 host blob shaped like the test tensors (random

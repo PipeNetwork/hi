@@ -9,6 +9,10 @@
 //! (offsets relative to the first byte after the header) plus an optional
 //! `"__metadata__"` string map. Tensor data is raw row-major little-endian.
 //!
+//! Cold or oversized opens swap the data section to an io_uring O_DIRECT bulk
+//! read (see [`DataBacking`]); `bytes()` and every typed reader are agnostic
+//! to the backing.
+//!
 //! Dequant conventions verified byte-level against the real artifacts
 //! (2026-07-12):
 //! - FP8 weights are OCP E4M3FN (`F8_E4M3`) paired with a sibling `.scale`
@@ -37,6 +41,9 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
 use memmap2::Mmap;
+
+#[cfg(target_os = "linux")]
+use crate::expert_uring::{BulkBytes, DEFAULT_QD, IoUringReader, LOAD_CHUNK};
 
 /// Tensor element type as spelled in a safetensors header.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,14 +145,44 @@ impl SafetensorsTensor {
     }
 }
 
+/// Backing store for the data section behind [`SafetensorsFile::bytes`]: the
+/// file mmap (warm or small files fault their pages on demand), or one owned
+/// anonymous buffer holding the whole data section, bulk-read at open via
+/// io_uring O_DIRECT. Whole-section reads are justified by measured loader
+/// coverage of the real drafter checkpoints (2026-07-13): the MTP shard and
+/// all three DSpark shards are 100% loader-read; DFlash reads 70.6% at load
+/// and row-gathers the remaining 29.4% (`embed_tokens`) at proposal time —
+/// which the owned buffer then serves from RAM instead of cold page faults.
+enum DataBacking {
+    Mmap,
+    #[cfg(target_os = "linux")]
+    Owned(BulkBytes),
+}
+
+impl std::fmt::Debug for DataBacking {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Mmap => f.write_str("Mmap"),
+            #[cfg(target_os = "linux")]
+            Self::Owned(bytes) => write!(f, "Owned({} bytes)", bytes.as_slice().len()),
+        }
+    }
+}
+
 /// A memory-mapped safetensors file. Opening parses and validates the header
 /// (dtype/shape/offset consistency and gap-free coverage of the data
-/// section), so tensor byte access afterwards is infallible slicing.
+/// section), so tensor byte access afterwards is infallible slicing. When the
+/// data section is cold or too big to cache, open bulk-reads it through
+/// io_uring O_DIRECT into owned anonymous memory instead (`HI_CUDA_LOAD_IOURING`
+/// tri-state, auto by size + sampled page-cache residency; any ring failure
+/// keeps the mmap) — same truth table as the GGUF resident loads, and like
+/// them it also sidesteps the slow cudaMemcpy-from-file-backed-pages path.
 #[derive(Debug)]
 pub struct SafetensorsFile {
     path: PathBuf,
     mmap: Mmap,
     data_start: usize,
+    backing: DataBacking,
     metadata: Option<BTreeMap<String, String>>,
     /// Sorted by tensor name.
     tensors: Vec<SafetensorsTensor>,
@@ -158,8 +195,99 @@ impl SafetensorsFile {
         let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
         let mmap = unsafe { Mmap::map(&file) }
             .with_context(|| format!("memory-mapping {}", path.display()))?;
-        Self::parse(path.to_path_buf(), mmap)
-            .with_context(|| format!("parsing safetensors file {}", path.display()))
+        #[allow(unused_mut)]
+        let mut parsed = Self::parse(path.to_path_buf(), mmap)
+            .with_context(|| format!("parsing safetensors file {}", path.display()))?;
+        #[cfg(target_os = "linux")]
+        parsed.maybe_ring_data_section();
+        Ok(parsed)
+    }
+
+    /// Swap the data-section backing to an owned io_uring bulk read when the
+    /// load truth table says so ([`crate::load_source::auto_for_load`] over
+    /// the section's size and sampled residency, `HI_CUDA_LOAD_IOURING`
+    /// tri-state). Header parsing stays on the mmap either way. Never fails
+    /// the open: any probe/read error keeps the mmap with one log line, and
+    /// the decision log is gated to attempted rings or non-trivial files so
+    /// tiny warm fixtures stay silent.
+    #[cfg(target_os = "linux")]
+    fn maybe_ring_data_section(&mut self) {
+        use crate::load_source::{AutoInputs, LOAD_LOG_MIN_BYTES, auto_for_load, tri_state_env};
+
+        let data_len = self.mmap.len() - self.data_start;
+        if data_len == 0 {
+            return;
+        }
+        let label = format!(
+            "safetensors {}",
+            self.path
+                .file_name()
+                .map(|name| name.to_string_lossy())
+                .unwrap_or_default()
+        );
+        let forced = tri_state_env("HI_CUDA_LOAD_IOURING");
+        match forced {
+            Some(false) => return,
+            Some(true) => {
+                eprintln!("hi-cuda {label} load: io=iouring (HI_CUDA_LOAD_IOURING=1)");
+            }
+            None => {
+                let inputs = AutoInputs {
+                    needed_bytes: data_len as u64,
+                    mem_available: crate::load_source::mem_available_bytes(),
+                    residency: crate::expert_uring::sampled_extent_residency(
+                        std::slice::from_ref(&self.path),
+                        &[(0, self.data_start as u64, data_len)],
+                        64,
+                    ),
+                };
+                let decision = auto_for_load(&inputs);
+                if decision.use_ring || data_len as u64 >= LOAD_LOG_MIN_BYTES {
+                    eprintln!(
+                        "hi-cuda {label} load: io={} (auto: {})",
+                        if decision.use_ring { "iouring" } else { "mmap" },
+                        decision.why
+                    );
+                }
+                if !decision.use_ring {
+                    return;
+                }
+            }
+        }
+        match self.ring_read_data_section(&label) {
+            Ok(bytes) => self.backing = DataBacking::Owned(bytes),
+            Err(err) => eprintln!(
+                "hi-cuda {label} load: io_uring unavailable ({err:#}); using buffered mmap reads"
+            ),
+        }
+    }
+
+    /// Bulk-read the whole data section O_DIRECT into anonymous memory.
+    #[cfg(target_os = "linux")]
+    fn ring_read_data_section(&self, label: &str) -> Result<BulkBytes> {
+        let reader = IoUringReader::open(std::slice::from_ref(&self.path), DEFAULT_QD)?;
+        for note in reader.notes() {
+            eprintln!("hi-cuda {label} load: io_uring {note}");
+        }
+        let data_len = self.mmap.len() - self.data_start;
+        let bytes = reader.read_extent_chunked(0, self.data_start as u64, data_len, LOAD_CHUNK)?;
+        if bytes.as_slice().len() != data_len {
+            bail!(
+                "short data-section read: {} of {data_len} bytes",
+                bytes.as_slice().len()
+            );
+        }
+        Ok(bytes)
+    }
+
+    /// The data section from the active backing (all tensor `begin`/`end`
+    /// offsets are relative to this slice).
+    fn data_section(&self) -> &[u8] {
+        match &self.backing {
+            DataBacking::Mmap => &self.mmap[self.data_start..],
+            #[cfg(target_os = "linux")]
+            DataBacking::Owned(bytes) => bytes.as_slice(),
+        }
     }
 
     fn parse(path: PathBuf, mmap: Mmap) -> Result<Self> {
@@ -219,6 +347,7 @@ impl SafetensorsFile {
             path,
             mmap,
             data_start,
+            backing: DataBacking::Mmap,
             metadata,
             tensors,
             index,
@@ -253,10 +382,11 @@ impl SafetensorsFile {
             .ok_or_else(|| anyhow!("tensor {name:?} not found in {}", self.path.display()))
     }
 
-    /// Zero-copy view of a tensor's raw little-endian bytes.
+    /// Zero-copy view of a tensor's raw little-endian bytes (from whichever
+    /// backing the open chose).
     pub fn bytes(&self, name: &str) -> Result<&[u8]> {
         let info = self.require(name)?;
-        Ok(&self.mmap[self.data_start + info.begin..self.data_start + info.end])
+        Ok(&self.data_section()[info.begin..info.end])
     }
 
     /// Convert an F32 / F16 / BF16 tensor to f32 values. Block-scaled FP8 and
@@ -1074,6 +1204,221 @@ mod tests {
         assert_eq!(bf16_bytes_to_f16(&[0x80, 0x3f]).unwrap(), vec![0x3c00]);
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// Byte equivalence across data-section backings on a synthetic fixture:
+    /// every tensor's `bytes()` and the typed readers (f32, i64, fp8 dequant,
+    /// fp4 dequant + MXFP4 repack) must be identical whether the section is
+    /// the mmap or the ring-read owned buffer (forced directly, no env —
+    /// mirrors load_source's facade_ring_bytes_match_mmap_view_on_fixture).
+    /// Skips the ring half where io_uring/O_DIRECT is unavailable.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn safetensors_ring_backing_matches_mmap_backing() {
+        let path = tempfile_path("ring-backing");
+        let bf16: Vec<u8> = [0x3f80u16, 0xc020, 0x3f00, 0x4040]
+            .iter()
+            .flat_map(|bits| bits.to_le_bytes())
+            .collect();
+        let fp8 = vec![
+            0x38, 0x40, 0x3c, 0xc0, 0x00, 0x01, 0x7e, 0xbc, 0x38, 0x38, 0x30, 0x30, 0xb8, 0x50,
+            0x28, 0x40,
+        ];
+        let fp8_scales = vec![126u8, 128, 127, 129];
+        let mut fp4 = Vec::new();
+        for byte in 0..64u32 {
+            fp4.push((byte.wrapping_mul(0x9e37_79b9) >> 13) as u8);
+        }
+        let fp4_scales = vec![127u8, 121, 128, 125];
+        write_safetensors(
+            &path,
+            Some(&[("format", "test")]),
+            &[
+                ("norm.weight", "BF16", vec![4], bf16),
+                ("proj.weight", "F8_E4M3", vec![4, 4], fp8),
+                ("proj.scale", "F8_E8M0", vec![2, 2], fp8_scales),
+                ("experts.0.w1.weight", "I8", vec![2, 32], fp4),
+                ("experts.0.w1.scale", "F8_E8M0", vec![2, 2], fp4_scales),
+                (
+                    "ids",
+                    "I64",
+                    vec![2],
+                    9i64.to_le_bytes()
+                        .iter()
+                        .chain((-4i64).to_le_bytes().iter())
+                        .copied()
+                        .collect(),
+                ),
+            ],
+        );
+
+        // Reference instance pinned to the mmap backing (open() would pick
+        // mmap for a warm fixture anyway, but a forced env must not flip it).
+        let mut via_mmap = SafetensorsFile::open(&path).unwrap();
+        via_mmap.backing = DataBacking::Mmap;
+
+        let mut via_ring = SafetensorsFile::open(&path).unwrap();
+        via_ring.backing = DataBacking::Mmap;
+        match via_ring.ring_read_data_section("safetensors test fixture") {
+            Ok(bytes) => via_ring.backing = DataBacking::Owned(bytes),
+            Err(err) => {
+                eprintln!("skipping ring half: {err:#}");
+                std::fs::remove_file(&path).ok();
+                return;
+            }
+        }
+        assert!(matches!(via_ring.backing, DataBacking::Owned(_)));
+
+        for name in via_mmap.names().collect::<Vec<_>>() {
+            assert_eq!(
+                via_ring.bytes(name).unwrap(),
+                via_mmap.bytes(name).unwrap(),
+                "ring vs mmap bytes for {name}"
+            );
+        }
+        assert_eq!(
+            via_ring.tensor_f32("norm.weight").unwrap(),
+            via_mmap.tensor_f32("norm.weight").unwrap()
+        );
+        assert_eq!(
+            via_ring.tensor_i64("ids").unwrap(),
+            via_mmap.tensor_i64("ids").unwrap()
+        );
+        let ring_fp8 = via_ring.fp8_block_scaled_f32("proj.weight").unwrap();
+        assert_eq!(
+            ring_fp8,
+            via_mmap.fp8_block_scaled_f32("proj.weight").unwrap()
+        );
+        assert_eq!(ring_fp8.len(), 16);
+        let ring_fp4 = via_ring
+            .fp4_block_scaled_f32("experts.0.w1.weight")
+            .unwrap();
+        assert_eq!(
+            ring_fp4,
+            via_mmap
+                .fp4_block_scaled_f32("experts.0.w1.weight")
+                .unwrap()
+        );
+        assert_eq!(
+            via_ring.fp4_to_gguf_mxfp4("experts.0.w1.weight").unwrap(),
+            via_mmap.fp4_to_gguf_mxfp4("experts.0.w1.weight").unwrap()
+        );
+        assert!(via_ring.bytes("missing").is_err());
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// Cold byte-layer A/B over the REAL drafter checkpoints: per file,
+    /// fadvise-DONTNEED the whole file (safe: production serves with spec
+    /// decode off, nothing hot reads these), verify the data section sampled
+    /// <5% resident, then wall-time `open()` + reading exactly the tensor set
+    /// the real loader touches through the public `bytes()` API (one byte per
+    /// 4 KiB page, black_boxed — faults every page without a full memory
+    /// scan), mmap-forced vs ring-forced. Run alone:
+    ///   `cargo test -p hi-cuda --release safetensors_real_cold_read_ab \
+    ///      -- --ignored --nocapture --test-threads=1`
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "cold-reads multi-GiB real checkpoints twice each; opt-in"]
+    fn safetensors_real_cold_read_ab() {
+        // (relative path under ~/.hi/models/deepseek-v4-flash, tensors the
+        // loader does NOT read — dflash's embed table is row-gathered at
+        // runtime, t2d is never read; dspark's confidence head is unused.)
+        let files: [(&str, &[&str]); 5] = [
+            ("mtp/model-00046-of-00046.safetensors", &[]),
+            (
+                "dflash-redhat/model.safetensors",
+                &["embed_tokens.weight", "t2d"],
+            ),
+            ("dspark/model-00046-of-00048.safetensors", &[]),
+            ("dspark/model-00047-of-00048.safetensors", &[]),
+            (
+                "dspark/model-00048-of-00048.safetensors",
+                &["mtp.2.confidence_head.proj.weight"],
+            ),
+        ];
+        let Some(home) = std::env::var_os("HOME") else {
+            eprintln!("skipping: HOME is unset");
+            return;
+        };
+        let base = PathBuf::from(home).join(".hi/models/deepseek-v4-flash");
+        for (suffix, skip) in files {
+            let path = base.join(suffix);
+            if !path.exists() {
+                eprintln!("skipping {suffix}: not found");
+                continue;
+            }
+            // Data-section extent for the eviction + residency check, read
+            // once up front (header pages re-warm identically for both runs).
+            // Backing pinned to mmap so this pre-open reads no tensor bytes.
+            // SAFETY: --test-threads=1 per the doc comment (mirrors
+            // load_source's real_cold_load_wall_time_ab).
+            unsafe { std::env::set_var("HI_CUDA_LOAD_IOURING", "0") };
+            let (data_start, file_len) = {
+                let file = SafetensorsFile::open(&path).unwrap();
+                (file.data_start, file.mmap.len())
+            };
+            let data_len = file_len - data_start;
+            for (label, forced) in [("mmap", "0"), ("ring", "1")] {
+                let residency = {
+                    let file = File::open(&path).unwrap();
+                    use std::os::fd::AsRawFd;
+                    // Whole-file eviction (len 0 = to EOF).
+                    let ret = unsafe {
+                        libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED)
+                    };
+                    assert_eq!(ret, 0);
+                    crate::expert_uring::sampled_extent_residency(
+                        std::slice::from_ref(&path),
+                        &[(0, data_start as u64, data_len)],
+                        64,
+                    )
+                    .unwrap_or(1.0)
+                };
+                assert!(
+                    residency < 0.05,
+                    "{suffix}: data section still {:.1}% resident after fadvise",
+                    residency * 100.0
+                );
+                // SAFETY: as above.
+                unsafe { std::env::set_var("HI_CUDA_LOAD_IOURING", forced) };
+                let started = std::time::Instant::now();
+                let file = SafetensorsFile::open(&path).unwrap();
+                // File-offset order: the most readahead-friendly walk, i.e.
+                // the mmap side's best case (name order would scatter the
+                // MTP experts lexicographically), so the ring's margin here
+                // is conservative.
+                let mut names: Vec<(usize, &str)> = file
+                    .tensors()
+                    .iter()
+                    .map(|tensor| (tensor.begin, tensor.name.as_str()))
+                    .collect();
+                names.sort_unstable();
+                let mut touched = 0u64;
+                let mut checksum = 0u64;
+                for (_, name) in names {
+                    if skip.contains(&name) {
+                        continue;
+                    }
+                    let bytes = file.bytes(name).unwrap();
+                    for offset in (0..bytes.len()).step_by(4096) {
+                        checksum = checksum.wrapping_add(bytes[offset] as u64);
+                    }
+                    touched += bytes.len() as u64;
+                }
+                std::hint::black_box(checksum);
+                let secs = started.elapsed().as_secs_f64();
+                println!(
+                    "{suffix} ({label}): {secs:.2}s for {:.2} GiB loader tensors = {:.2} GiB/s \
+                     (data section {:.2} GiB, pre-run residency {:.1}%)",
+                    touched as f64 / (1u64 << 30) as f64,
+                    touched as f64 / (1u64 << 30) as f64 / secs,
+                    data_len as f64 / (1u64 << 30) as f64,
+                    residency * 100.0
+                );
+                drop(file);
+            }
+        }
+        unsafe { std::env::remove_var("HI_CUDA_LOAD_IOURING") };
     }
 
     #[test]

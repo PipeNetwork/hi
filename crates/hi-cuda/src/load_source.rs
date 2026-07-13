@@ -35,6 +35,11 @@ use crate::expert_uring::{BulkBytes, IoUringReader, LOAD_CHUNK};
 /// Fraction of `MemAvailable` beyond which a byte set is considered too big
 /// to be comfortably page-cache-resident.
 pub(crate) const AUTO_MEM_FRACTION: f64 = 0.5;
+/// Auto decision log floor: fixture-sized loads (unit tests) stay silent
+/// unless a ring is actually attempted; anything a human would wait on logs
+/// its io choice.
+#[cfg(target_os = "linux")]
+pub(crate) const LOAD_LOG_MIN_BYTES: u64 = 64 << 20;
 /// One-shot loads: mmap only when at least this fraction of the sampled
 /// extents is already resident (below it, even a partially-warm buffered read
 /// loses to a full-speed O_DIRECT pass).
@@ -53,6 +58,21 @@ pub(crate) fn tri_state_env(name: &str) -> Option<bool> {
 /// env mutation): any set non-`0` value forces on.
 pub(crate) fn tri_state_value(value: Option<&str>) -> Option<bool> {
     value.map(|value| value != "0")
+}
+
+/// `MemAvailable` from /proc/meminfo in bytes (Linux; None elsewhere or on
+/// parse failure, which disables the auto budget). Lives here rather than in
+/// the (native-cuda-only) expert tier so the CUDA-free safetensors backing
+/// can share the auto inputs.
+pub(crate) fn mem_available_bytes() -> Option<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    for line in meminfo.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kb: u64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
+            return Some(kb * 1024);
+        }
+    }
+    None
 }
 
 /// Inputs to the auto decision, all best-effort.
@@ -211,10 +231,6 @@ impl<'g> LoadByteSource<'g> {
     ) -> Self {
         #[cfg(target_os = "linux")]
         {
-            let forced = tri_state_env("HI_CUDA_LOAD_IOURING");
-            if forced == Some(false) {
-                return Self::mmap_only(gguf);
-            }
             let mut extents: Vec<(usize, u64, usize)> = Vec::new();
             let mut needed_bytes = 0u64;
             for name in names {
@@ -228,58 +244,128 @@ impl<'g> LoadByteSource<'g> {
                     usize::try_from(range.len).unwrap_or(usize::MAX),
                 ));
             }
-            let paths: Vec<std::path::PathBuf> = (0..gguf.shard_count())
-                .filter_map(|shard| gguf.shard_path(shard).map(std::path::Path::to_path_buf))
-                .collect();
-            let mode = match forced {
-                Some(true) => {
-                    eprintln!("hi-cuda {label} load: io=iouring (HI_CUDA_LOAD_IOURING=1)");
-                    "forced"
-                }
-                Some(false) => unreachable!("handled above"),
-                None => {
-                    let inputs = AutoInputs {
-                        needed_bytes,
-                        mem_available: crate::expert_pool::ram_tier::mem_available_bytes(),
-                        residency: crate::expert_uring::sampled_extent_residency(
-                            &paths, &extents, 64,
-                        ),
-                    };
-                    let decision = auto_for_load(&inputs);
-                    eprintln!(
-                        "hi-cuda {label} load: io={} (auto: {})",
-                        if decision.use_ring { "iouring" } else { "mmap" },
-                        decision.why
-                    );
-                    if !decision.use_ring {
-                        return Self::mmap_only(gguf);
-                    }
-                    "auto"
-                }
-            };
-            match IoUringReader::open(&paths, crate::expert_uring::DEFAULT_QD) {
-                Ok(reader) => {
-                    for note in reader.notes() {
-                        eprintln!("hi-cuda {label} load: io_uring {note}");
-                    }
-                    Self {
-                        gguf,
-                        ring: Some((reader, mode)),
-                    }
-                }
-                Err(err) => {
-                    eprintln!(
-                        "hi-cuda {label} load: io_uring unavailable ({err:#}); using buffered mmap reads"
-                    );
-                    Self::mmap_only(gguf)
-                }
-            }
+            Self::from_extents(gguf, label, extents, needed_bytes)
         }
         #[cfg(not(target_os = "linux"))]
         {
             let _ = (label, names);
             Self::mmap_only(gguf)
         }
+    }
+
+    /// [`Self::for_tensors`] over explicit per-tensor PREFIX extents (name +
+    /// byte length from the tensor's file start): the dsv4 expert prefill
+    /// reads only the contiguous expert prefix that will actually fit the
+    /// pool, so the auto's needed_bytes and sampled residency must cover
+    /// exactly those bytes, not whole tensors.
+    pub(crate) fn for_tensor_prefixes<'names>(
+        gguf: &'g GgufFile,
+        label: &str,
+        prefixes: impl Iterator<Item = (&'names str, u64)>,
+    ) -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            let mut extents: Vec<(usize, u64, usize)> = Vec::new();
+            let mut needed_bytes = 0u64;
+            for (name, prefix_len) in prefixes {
+                let Ok(range) = gguf.tensor_file_range(name) else {
+                    continue;
+                };
+                let len = prefix_len.min(range.len);
+                if len == 0 {
+                    continue;
+                }
+                needed_bytes += len;
+                extents.push((
+                    range.shard,
+                    range.file_offset,
+                    usize::try_from(len).unwrap_or(usize::MAX),
+                ));
+            }
+            Self::from_extents(gguf, label, extents, needed_bytes)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (label, prefixes);
+            Self::mmap_only(gguf)
+        }
+    }
+
+    /// Shared tri-state + auto + probe core behind the public constructors.
+    /// The auto decision log is gated to rings actually attempted or
+    /// non-trivial byte sets, so fixture-sized test loads stay silent.
+    #[cfg(target_os = "linux")]
+    fn from_extents(
+        gguf: &'g GgufFile,
+        label: &str,
+        extents: Vec<(usize, u64, usize)>,
+        needed_bytes: u64,
+    ) -> Self {
+        let forced = tri_state_env("HI_CUDA_LOAD_IOURING");
+        if forced == Some(false) || extents.is_empty() {
+            return Self::mmap_only(gguf);
+        }
+        let paths: Vec<std::path::PathBuf> = (0..gguf.shard_count())
+            .filter_map(|shard| gguf.shard_path(shard).map(std::path::Path::to_path_buf))
+            .collect();
+        let mode = match forced {
+            Some(true) => {
+                eprintln!("hi-cuda {label} load: io=iouring (HI_CUDA_LOAD_IOURING=1)");
+                "forced"
+            }
+            Some(false) => unreachable!("handled above"),
+            None => {
+                let inputs = AutoInputs {
+                    needed_bytes,
+                    mem_available: mem_available_bytes(),
+                    residency: crate::expert_uring::sampled_extent_residency(&paths, &extents, 64),
+                };
+                let decision = auto_for_load(&inputs);
+                if decision.use_ring || needed_bytes >= LOAD_LOG_MIN_BYTES {
+                    eprintln!(
+                        "hi-cuda {label} load: io={} (auto: {})",
+                        if decision.use_ring { "iouring" } else { "mmap" },
+                        decision.why
+                    );
+                }
+                if !decision.use_ring {
+                    return Self::mmap_only(gguf);
+                }
+                "auto"
+            }
+        };
+        match IoUringReader::open(&paths, crate::expert_uring::DEFAULT_QD) {
+            Ok(reader) => {
+                for note in reader.notes() {
+                    eprintln!("hi-cuda {label} load: io_uring {note}");
+                }
+                Self {
+                    gguf,
+                    ring: Some((reader, mode)),
+                }
+            }
+            Err(err) => {
+                eprintln!(
+                    "hi-cuda {label} load: io_uring unavailable ({err:#}); using buffered mmap reads"
+                );
+                Self::mmap_only(gguf)
+            }
+        }
+    }
+
+    /// Test-only source with the ring FORCED over `gguf`'s shards (no env, no
+    /// auto, no log); `Err` where io_uring/O_DIRECT is unavailable so callers
+    /// can skip gracefully.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn forced_ring_for_tests(gguf: &'g GgufFile) -> Result<Self> {
+        let paths: Vec<std::path::PathBuf> = (0..gguf.shard_count())
+            .filter_map(|shard| gguf.shard_path(shard).map(std::path::Path::to_path_buf))
+            .collect();
+        let reader = IoUringReader::open(&paths, crate::expert_uring::DEFAULT_QD)?;
+        Ok(Self {
+            gguf,
+            ring: Some((reader, "forced")),
+        })
     }
 
     pub(crate) fn gguf(&self) -> &'g GgufFile {
@@ -321,6 +407,42 @@ impl<'g> LoadByteSource<'g> {
         Ok((LoadedBytes::Mmap(view.bytes), info))
     }
 
+    /// `len` bytes at byte `offset` of one tensor from the chosen backend
+    /// (expert-prefix windows; `(0, whole length)` matches
+    /// [`Self::tensor_bytes`]). Ring failures degrade to the mmap view like
+    /// `tensor_bytes`; a span past the tensor's end is an error on both.
+    pub(crate) fn tensor_slice_bytes(
+        &self,
+        name: &str,
+        offset: usize,
+        len: usize,
+    ) -> Result<LoadedBytes<'g>> {
+        #[cfg(target_os = "linux")]
+        if let Some((reader, _)) = &self.ring {
+            match self.ring_tensor_slice_bytes(reader, name, offset, len) {
+                Ok(bytes) => return Ok(LoadedBytes::Ring(bytes)),
+                Err(err) => {
+                    eprintln!(
+                        "hi-cuda load: io_uring read of {name} failed ({err:#}); falling back to the mmap view"
+                    );
+                }
+            }
+        }
+        let info = self
+            .gguf
+            .tensor_info(name)
+            .ok_or_else(|| anyhow!("GGUF tensor {name} is missing"))?;
+        let view = self.gguf.tensor_view(info)?;
+        let bytes = view.bytes.get(offset..offset + len).ok_or_else(|| {
+            anyhow!(
+                "slice [{offset}, {}) exceeds tensor {name} ({} bytes)",
+                offset + len,
+                view.bytes.len()
+            )
+        })?;
+        Ok(LoadedBytes::Mmap(bytes))
+    }
+
     #[cfg(target_os = "linux")]
     fn ring_tensor_bytes(&self, reader: &IoUringReader, name: &str) -> Result<BulkBytes> {
         let range = self.gguf.tensor_file_range(name)?;
@@ -328,6 +450,30 @@ impl<'g> LoadByteSource<'g> {
             range.shard,
             range.file_offset,
             usize::try_from(range.len)?,
+            LOAD_CHUNK,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn ring_tensor_slice_bytes(
+        &self,
+        reader: &IoUringReader,
+        name: &str,
+        offset: usize,
+        len: usize,
+    ) -> Result<BulkBytes> {
+        let range = self.gguf.tensor_file_range(name)?;
+        if (offset + len) as u64 > range.len {
+            return Err(anyhow!(
+                "slice [{offset}, {}) exceeds tensor {name} ({} bytes)",
+                offset + len,
+                range.len
+            ));
+        }
+        reader.read_extent_chunked(
+            range.shard,
+            range.file_offset + offset as u64,
+            len,
             LOAD_CHUNK,
         )
     }
@@ -431,8 +577,9 @@ mod tests {
 
     /// Byte equivalence through the facade on the synthetic streaming fixture
     /// GGUF: the ring source must serve exactly the mmap view's bytes for
-    /// every tensor (constructed directly, no env). Skips the ring half where
-    /// io_uring/O_DIRECT is unavailable.
+    /// every tensor — whole and prefix reads (constructed directly, no env).
+    /// Skips the ring half where io_uring/O_DIRECT is unavailable.
+    #[cfg(feature = "native-cuda")]
     #[test]
     fn facade_ring_bytes_match_mmap_view_on_fixture() {
         let dir = crate::expert_pool::tests::fixture_dir("load-source");
@@ -449,12 +596,8 @@ mod tests {
             .collect();
         #[cfg(target_os = "linux")]
         {
-            match IoUringReader::open(&[model.clone()], crate::expert_uring::DEFAULT_QD) {
-                Ok(reader) => {
-                    let ring_source = LoadByteSource {
-                        gguf: &gguf,
-                        ring: Some((reader, "forced")),
-                    };
+            match LoadByteSource::forced_ring_for_tests(&gguf) {
+                Ok(ring_source) => {
                     assert!(ring_source.is_ring());
                     for name in &names {
                         let (via_mmap, info_a) = mmap_source.tensor_bytes(name).unwrap();
@@ -465,7 +608,25 @@ mod tests {
                             via_mmap.as_slice(),
                             "facade ring vs mmap bytes for {name}"
                         );
+                        // Slice reads: a leading window, a mid-tensor
+                        // window, and the whole tensor.
+                        let whole = via_mmap.as_slice().len();
+                        for (offset, len) in [(0, whole / 2), (whole / 4, whole / 2), (0, whole)] {
+                            let slice = ring_source.tensor_slice_bytes(name, offset, len).unwrap();
+                            assert_eq!(
+                                slice.as_slice(),
+                                &via_mmap.as_slice()[offset..offset + len],
+                                "facade ring slice [{offset}, {}) for {name}",
+                                offset + len
+                            );
+                        }
                     }
+                    assert!(
+                        ring_source
+                            .tensor_slice_bytes(&names[0], 0, usize::MAX)
+                            .is_err(),
+                        "an over-long slice must not silently truncate"
+                    );
                 }
                 Err(err) => eprintln!("skipping ring half: {err:#}"),
             }
@@ -473,8 +634,21 @@ mod tests {
         for name in &names {
             let (bytes, info) = mmap_source.tensor_bytes(name).unwrap();
             assert_eq!(bytes.as_slice().len() as u64, info.byte_len().unwrap());
+            let half = bytes.as_slice().len() / 2;
+            let slice = mmap_source
+                .tensor_slice_bytes(name, half / 2, half)
+                .unwrap();
+            assert_eq!(
+                slice.as_slice(),
+                &bytes.as_slice()[half / 2..half / 2 + half]
+            );
         }
         assert!(mmap_source.tensor_bytes("no.such.tensor").is_err());
+        assert!(
+            mmap_source
+                .tensor_slice_bytes(&names[0], 0, usize::MAX)
+                .is_err()
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -486,7 +660,7 @@ mod tests {
     ///      real_cold_load_wall_time_ab -- --ignored --nocapture --test-threads=1`
     /// Model via `HI_LOAD_AB_GGUF=/path/model.gguf`, defaulting to the local
     /// qwen2.5-coder-7b when present.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", feature = "native-cuda"))]
     #[test]
     #[ignore = "loads a real model on the GPU twice; opt-in"]
     fn real_cold_load_wall_time_ab() {

@@ -152,18 +152,10 @@ impl TierEnvConfig {
     }
 }
 
-/// `MemAvailable` from /proc/meminfo in bytes (Linux; None elsewhere or on
-/// parse failure, which disables the auto budget).
-pub(crate) fn mem_available_bytes() -> Option<u64> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-    for line in meminfo.lines() {
-        if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            let kb: u64 = rest.trim().trim_end_matches("kB").trim().parse().ok()?;
-            return Some(kb * 1024);
-        }
-    }
-    None
-}
+/// `MemAvailable` for the auto budget — the parser moved to the CUDA-free
+/// load_source module (the safetensors backing shares it); re-exported so
+/// tier call sites keep reading `ram_tier::mem_available_bytes()`.
+pub(crate) use crate::load_source::mem_available_bytes;
 
 // ---------------------------------------------------------------------------
 // Budget plan
