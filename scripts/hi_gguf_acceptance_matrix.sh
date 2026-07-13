@@ -62,6 +62,7 @@ LARGE_MODELS=(
   "qwen3-30b-a3b|qwen3|Q4_K_M|1|https://huggingface.co/unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF/resolve/main/Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf"  # qwen3moe (128-expert MoE, 8 active)
   "mixtral-8x7b|llama|Q4_K_M|0|https://huggingface.co/MaziyarPanahi/Mixtral-8x7B-Instruct-v0.1-GGUF/resolve/main/Mixtral-8x7B-Instruct-v0.1.Q4_K_M.gguf"  # llama-arch MoE (rank-3 ffn_*_exps tensors); long-ctx retrieval currently degenerate — coherence-gated at short context only
   "deepseek-v2-lite|deepseek|Q4_K_M|0|https://huggingface.co/gaianet/DeepSeek-V2-Lite-Chat-GGUF/resolve/main/DeepSeek-V2-Lite-Chat-Q4_K_M.gguf"  # deepseek2 full-Q MLA (kv latent 512 + rope 64, asymmetric qk 192 / v 128) + 64-expert MoE with fused shared experts; massive activations force the f32/f16-activation matmul paths (no int8 dp4a). long_ctx 0: plain-rope CPU-parity config, YARN >4k unverified
+  "glm-5.2-reap50|glm-flash|Q3_K_M|0|https://huggingface.co/pipenetwork/GLM-5.2-REAP50-Q3_K_M-GGUF/resolve/main/GLM-5.2-REAP50-Q3_K_M-00001-of-00005.gguf"  # glm_moe_dsa (394B REAP-pruned MoE, 128 experts/layer, MLA q+kv-LoRA, interleaved pe-rope, sigmoid noaux_tc router); 169 GB across 5 shards (split loading pulls siblings); serve with HI_CUDA_EXPERT_STREAMING=1 and a pool sized to the card
 )
 
 usage() {

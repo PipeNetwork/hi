@@ -1,0 +1,135 @@
+# GLM-5.2 limited-RAM MoE streaming (colibri-informed)
+
+Status: IMPLEMENTED + VALIDATED (2026-07-13). Highlights:
+- **Rope verdict: INTERLEAVED** for glm-dsa (real-checkpoint A/B: split-half
+  produced V2-Lite-grade incoherence; matches colibri's token-exact engine).
+  `mla_pe_rope_interleaved()` names the families; the fixture now runs
+  qk_rope=4 and pins a 6.3e-2 logit separation between the styles — a
+  both-sides flip fails loudly.
+- **int8 verdict: stays ON for glm-dsa** — layer-by-layer trunk divergence
+  1e-6..1.3e-3 across all 78 layers with no compounding (deepseek2's
+  pathology was 35% by layer 19); near-tie greedy flips only (colibri-#100
+  acceptable). No float/grouped split needed; streaming deadlock avoided.
+- **Loader bug fixed at the root**: glm-dsa carries the latent KV widths in
+  plain `attention.key/value_length` alongside the true per-head `*_mla`
+  dims; `attention_value_head_dim()` now prefers the MLA dim (mirroring the
+  key twin) — this also fixes 1.5x-oversized KV pages and health reporting.
+- **The bounded-RAM tier** (expert_pool.rs + expert_ram_tier.rs + hi-gguf IO
+  surface): pinned-host LRU with itemized budget accounting, `.hi_expert_usage`
+  learning cache with startup pre-warm, MADV_RANDOM/threaded-WILLNEED,
+  O_DIRECT twin-fd path, double-buffered pinned staged async uploads.
+- **Auto-enable**: when routed experts + trunk exceed free VRAM, expert
+  streaming turns on by itself with an auto-sized pool (log line explains;
+  `HI_CUDA_EXPERT_STREAMING=0` forces resident). `hi -p glm-5.2` needs no env.
+- **Bounded-RSS proof (the acceptance test)**: GLM-5.2 REAP50 Q3_K_M (394B,
+  169 GB on disk, 5 shards) served under `systemd-run MemoryMax=32G
+  MemorySwapMax=0` with pool 48 GiB / RAM tier 20 GiB / O_DIRECT: ready,
+  coherent 48-token greedy answer at 0.41 tok/s, **cgroup MemoryPeak 23.7 GiB,
+  zero OOM kills**; the learning cache pre-warmed 1,241 expert slices (7 GiB)
+  from prior-run usage history in 1.6 s.
+- Full-page-cache smoke (251 GB box, GPU 0, 60 GiB pool): load ~40 s, decode
+  0.31 cold → 0.49 warm tok/s at 61.7% pool hit after two requests; coherent.
+- Suites: 137 default / 408 native at the workstreams' close.
+
+Original plan follows. Goal: users with limited RAM (24–64 GB) + NVMe (+
+optionally a GPU) run GLM-5.2-class MoE through `hi -p glm-5.2` with honest
+memory budgets. Reference design: `~/colibri` (744B GLM-5.2 on ~25 GB RAM,
+pure C); its full internals and our gap analysis live in the session research
+(2026-07-13 agent reports); key facts inlined below.
+
+## What already exists on main (prior GLM phases 0–3a)
+
+glm_moe_dsa loads & computes through the qwen GPU path: MLA with q_lora 2048 +
+kv_lora 512 (fused kv_b synthesized from split k_b/v_b at load), sigmoid
+router (`expert_gating_func=2`) with selection-only noaux_tc bias +
+`expert_weights_norm` + `expert_weights_scale`, shared expert, dense-prefix
+layers by tensor presence, `nextn_predict_layers` excludes the blk.78 MTP
+head, split-GGUF shards, and VRAM expert streaming: `HI_CUDA_EXPERT_STREAMING=1`
++ `HI_CUDA_EXPERT_POOL_BYTES` (expert_pool.rs: single arena, HashMap LRU,
+per-pass pinning, K-quant grouped dp4a GEMV + scatter-reduce, mmap→Vec→sync
+H2D misses, ≤6 read threads), /health `expert-streaming=` stats. DSA indexer
+tensors are ignored by construction (dense-attention path; indexer optional).
+
+## Correctness gates before anything else (Workstream A)
+
+1. **pe-rope style**: gpu.rs:17854 `mla_pe_rope_split_half = !arch.contains("deepseek")`
+   gives GLM split-half; colibri's token-exact-validated engine says GLM-5.2 is
+   INTERLEAVED (glm.c:806, applied 1459/1466). The tiny-fixture tests use
+   qk_rope=2 where the styles coincide — the V2-Lite lesson. Decide on the
+   real checkpoint (teacher-forcing / coherence A/B / colibri tiny-oracle
+   ported into a fixture with qk_rope large enough to distinguish).
+2. **int8-activation numerics**: deepseek2 needed float activations
+   (`int8_activation_paths_allowed`, gpu.rs:4046); GLM-5.2 is the same
+   MLA/DSv3 lineage and colibri finds int4 GLM sits near argmax ties. BUT the
+   grouped MoE path (which expert streaming REQUIRES, bail at 18851) is gated
+   on the same predicate. Measure first (HI_MLA_DEBUG_DUMP / parity probes /
+   HI_CUDA_NO_KQUANT_DP4A); if int8 fails: split the gate per call-site
+   (float trunk GEMVs, int8 grouped MoE) or add a float-activation grouped
+   GEMV variant. Never gate glm into the deadlock blindly.
+3. **Group-limited routing guard**: `expert_group_count>1` is not implemented;
+   GLM-5.2 is n_group=1. Parse + bail if >1 (silent wrong routing otherwise).
+
+## The limited-RAM disk tier (Workstream B — the feature)
+
+Today the "RAM tier" is the unbounded OS page cache; a 32 GB box with a
+169–466 GB GGUF thrashes. Borrow colibri's discipline:
+
+1. **Bounded pinned-host expert cache** fronting `ExpertPool::read_expert_bytes`
+   (expert_pool.rs:219), keyed like the VRAM pool (layer, proj, expert):
+   - Budget: `HI_CUDA_EXPERT_RAM_GB` explicit, else auto = a fraction of
+     MemAvailable measured at load MINUS itemized slack incl. a **page-cache
+     reserve** (colibri measured buffered preads collapsing 800→180 MB/s when
+     the cache is starved; they reserve 2.5 GB) and the working-set slab.
+     Print the projected peak at startup (the "OOM-killer never fires" rule).
+   - Storage: pinned host memory (PinnedBuffer, runtime.rs:823) so hits
+     upload async without a staging copy; LRU with recency tickets;
+     frequency counters persisted to `<model_dir>/.hi_expert_usage` and used
+     to pre-pin the hottest experts at startup (colibri's "learning cache" —
+     their data: profile-ranked placement 0.94 tok/s vs heat-blind same
+     capacity 0.29).
+2. **Page-cache policy on the GGUF mmap**: `madvise(MADV_RANDOM)` on expert
+   tensor extents (kill readahead amplification), keep default readahead for
+   trunk/dense; `POSIX_FADV_WILLNEED` readahead of the NEXT routed expert
+   block while the current one computes (colibri glm.c:1817 — issued from a
+   thread, never inline on a saturated queue: +0.5 ms/call measured);
+   optional `HI_CUDA_EXPERT_ODIRECT=1` twin-fd path (their VHDX/ext4 data:
+   buffered 0.8 → O_DIRECT 2.3 GB/s).
+3. **Upload overlap (phase 3b)**: replace mmap→pageable Vec→sync memcpy with
+   the dsv4 CopyEngine pattern (~100 lines on runtime.rs primitives:
+   non-blocking copy stream + events + double-buffered pinned staging).
+4. **GGUF granularity caveat**: one expert = 3 disjoint extents (gate/up/down
+   rank-3 tensors) vs colibri's 1 contiguous ~19 MB pread. Start with 3-read
+   fetch + WILLNEED batching; if NVMe profiling shows extent scatter binding,
+   add an optional expert-major sidecar repack (one-time, derived file) — NOT
+   in scope initially.
+5. **Observability**: extend the /health expert-streaming segment with
+   ram_tier hits/misses/bytes, pinned count, budget, and disk-read MB/s.
+6. **The guarantee (colibri policy, adopted)**: placement/caching never
+   changes router semantics or precision — cache pressure affects speed,
+   never output. Any lossy knob (e.g. expert top-p, which colibri shows cuts
+   reads 30–40%) must be explicit and warn. Byte-exactness caveats mirror
+   their #100 finding: kernel-family changes can flip near-tie argmaxes —
+   keep A/Bs on fixed prompts and document.
+
+## Test/acceptance plan
+
+- Fixture tests for the RAM tier (bounded size, eviction, pinning, stats).
+- Real model: GLM-5.2-REAP50 Q3_K_M (~169 GB, 5 shards,
+  ~/.hi/models/glm-5.2-reap50/): teacher-forcing/coherence gates, then
+  **bounded-RSS proof**: run hi-local under `systemd-run --user -p
+  MemoryMax=32G` (and 24G) on this 251 GB box — decode must work (slowly,
+  honestly) with RSS+pinned under budget, zero OOM kills.
+- Acceptance matrix LARGE_MODELS row; cuda_real_smoke FixtureSpec entry.
+- hi client: `[profiles.glm-5.2]` in hi.toml, service unit example (GPU 0),
+  docs in this file updated with measured numbers.
+
+## Later levers (documented, not in scope)
+
+- PILOT-style cross-layer prefetch: L+1's router on L's residual = 71.6%
+  top-8 recall (colibri-measured) — feed the readahead queue.
+- Device-resident MLA step + latent (576/token) KV cache — dsv4 engine is the
+  blueprint; today's expanded-KV MLA path is correct but host-round-trip-bound.
+- MTP (blk.78) self-speculation — dsv4 spec-decode machinery is the blueprint;
+  note colibri's cold-cache finding (drafts amplify expert traffic ~1.7x) and
+  their S-scaling result (verify cost ~linear in S for MoE).
+- Expert-major sidecar repack for single-pread expert fetches.

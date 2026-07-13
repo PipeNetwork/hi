@@ -81,3 +81,23 @@ model = "deepseek-v4-flash"              # must match hi-local's --model-id
 base_url = "http://127.0.0.1:8081/v1"
 max_tokens = 4096
 tool_mode = "auto"
+
+# GLM-5.2 REAP50 (394B MoE, 128 experts/layer) with expert streaming: dense
+# trunk resident (~10 GB quantized), routed experts streamed through the VRAM
+# pool with the bounded-RAM disk tier underneath — built for limited-RAM boxes
+# (docs/glm52-limited-ram-streaming.md; validated under MemoryMax=32G).
+# Serve with (GPU 0 example; size the pool to the card):
+#   CUDA_VISIBLE_DEVICES=0 HI_CUDA_EXPERT_STREAMING=1 \
+#     HI_CUDA_EXPERT_POOL_BYTES=$((48*1024*1024*1024)) \
+#     HI_CUDA_EXPERT_RAM_GB=20 HI_CUDA_WEIGHTS_F16=0 \
+#     hi-local serve --backend cuda --execution gpu --port 8082 \
+#     --model-id glm-5.2 --max-batched-tokens 512 \
+#     ~/.hi/models/glm-5.2-reap50/GLM-5.2-REAP50-Q3_K_M-00001-of-00005.gguf
+#
+# Then:  hi -p glm-5.2 "your prompt"
+[profiles.glm-5.2]
+provider = "ollama"
+model = "glm-5.2"                        # must match hi-local's --model-id
+base_url = "http://127.0.0.1:8082/v1"
+max_tokens = 4096
+tool_mode = "auto"

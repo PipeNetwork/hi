@@ -89,6 +89,15 @@ const FAMILY_FIXTURES: &[FixtureSpec] = &[
         expected_family: ModelFamily::GlmFlash,
         relative_candidates: &["glm-dense/model.gguf", "glm4/model.gguf"],
     },
+    // glm_moe_dsa (GLM-5.2 class): MLA q+kv-LoRA with interleaved pe-rope,
+    // sigmoid noaux_tc router, rank-3 expert tensors. Experts exceed any
+    // single card, so the loader auto-enables expert streaming.
+    FixtureSpec {
+        label: "glm-moe-dsa",
+        env_name: "HI_CUDA_SMOKE_GLM_MOE_GGUF",
+        expected_family: ModelFamily::GlmFlash,
+        relative_candidates: &["glm-5.2-reap50/GLM-5.2-REAP50-Q3_K_M-00001-of-00005.gguf"],
+    },
     // The shipping fleet: these are the models the backend is benchmarked and
     // tuned on, so the matrix must exercise them, not just the third-party
     // family samples above.
