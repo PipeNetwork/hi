@@ -2932,7 +2932,6 @@ mod native {
     /// kernel), so it defaults on only for quantized models (see the dispatch); this
     /// env opts small models in too.
     fn wmma_attn_forced_on() -> bool {
-        use std::sync::OnceLock;
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENABLED.get_or_init(|| std::env::var("HI_CUDA_WMMA_ATTN").is_ok())
     }
@@ -3134,12 +3133,102 @@ mod native {
     }
 
     /// Opt-in expert streaming for giant MoE models: routed experts stay on
-    /// disk and are paged into a fixed device pool per step.
+    /// disk and are paged into a fixed device pool per step. Unset does not
+    /// mean off: models whose experts cannot fit free VRAM auto-enable
+    /// streaming at load (see `auto_expert_streaming_budget`).
     fn expert_streaming_enabled() -> bool {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *ENABLED.get_or_init(|| {
             std::env::var("HI_CUDA_EXPERT_STREAMING").is_ok_and(|value| value != "0")
         })
+    }
+
+    /// Explicit `HI_CUDA_EXPERT_STREAMING=0`: force resident expert loading
+    /// even when the auto heuristic would stream.
+    fn expert_streaming_hard_off() -> bool {
+        std::env::var("HI_CUDA_EXPERT_STREAMING").is_ok_and(|value| value == "0")
+    }
+
+    /// Auto-enable heuristic: `Some(0)` (auto-sized pool) when the routed
+    /// experts plus the non-expert trunk cannot fit in currently-free VRAM
+    /// with a working reserve, `None` when resident loading fits (small MoEs
+    /// keep the fast fully-resident path). Uses tensor-table byte sizes — the
+    /// same bytes the resident loader would upload.
+    fn auto_expert_streaming_budget(gguf: &GgufFile, config: &QwenGgufConfig) -> Option<usize> {
+        const VRAM_RESERVE_BYTES: u64 = 6 * 1024 * 1024 * 1024;
+        if config.expert_count.is_none() {
+            eprintln!("hi-cuda: expert-streaming auto-detect: no expert_count in config");
+            return None;
+        }
+        let mut expert_bytes = 0u64;
+        let mut total_bytes = 0u64;
+        for info in gguf.tensors() {
+            let bytes = match info.byte_len() {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    eprintln!(
+                        "hi-cuda: expert-streaming auto-detect skipped — tensor {} byte_len: {err:#}",
+                        info.name
+                    );
+                    return None;
+                }
+            };
+            total_bytes = total_bytes.saturating_add(bytes);
+            if info.name.ends_with("ffn_gate_exps.weight")
+                || info.name.ends_with("ffn_up_exps.weight")
+                || info.name.ends_with("ffn_down_exps.weight")
+            {
+                expert_bytes = expert_bytes.saturating_add(bytes);
+            }
+        }
+        if expert_bytes == 0 {
+            eprintln!("hi-cuda: expert-streaming auto-detect: no rank-3 expert tensors found");
+            return None;
+        }
+        let trunk_bytes = total_bytes.saturating_sub(expert_bytes);
+        let free = match crate::runtime::free_memory_bytes() {
+            Ok(free) => free as u64,
+            Err(err) => {
+                eprintln!(
+                    "hi-cuda: expert-streaming auto-detect skipped — free-VRAM query failed: {err:#}"
+                );
+                return None;
+            }
+        };
+        let need = trunk_bytes
+            .saturating_add(expert_bytes)
+            .saturating_add(VRAM_RESERVE_BYTES);
+        if need <= free {
+            return None;
+        }
+        // Size the pool here from the free-VRAM reading we already hold:
+        // what's left after the trunk uploads and a KV/runtime reserve.
+        let budget = free
+            .saturating_sub(trunk_bytes)
+            .saturating_sub(VRAM_RESERVE_BYTES);
+        let budget = usize::try_from(budget).ok()?;
+        if budget == 0 {
+            eprintln!(
+                "hi-cuda: expert streaming needed (experts {:.1} GiB + trunk {:.1} GiB exceed free \
+                 VRAM {:.1} GiB) but there is no room for a streaming pool after the trunk and \
+                 reserve — free more VRAM or set HI_CUDA_EXPERT_POOL_BYTES; resident loading will \
+                 likely fail",
+                expert_bytes as f64 / (1u64 << 30) as f64,
+                trunk_bytes as f64 / (1u64 << 30) as f64,
+                free as f64 / (1u64 << 30) as f64,
+            );
+            return None;
+        }
+        eprintln!(
+            "hi-cuda: expert streaming auto-enabled — routed experts {:.1} GiB + trunk {:.1} GiB \
+             exceed free VRAM {:.1} GiB; streaming through a {:.1} GiB pool \
+             (HI_CUDA_EXPERT_POOL_BYTES overrides, HI_CUDA_EXPERT_STREAMING=0 forces resident)",
+            expert_bytes as f64 / (1u64 << 30) as f64,
+            trunk_bytes as f64 / (1u64 << 30) as f64,
+            free as f64 / (1u64 << 30) as f64,
+            budget as f64 / (1u64 << 30) as f64,
+        );
+        Some(budget)
     }
 
     fn expert_pool_budget_bytes() -> Option<usize> {
@@ -3592,7 +3681,7 @@ mod native {
             expert_streaming_budget: Option<usize>,
         ) -> Result<Self> {
             let config = gguf.qwen_config()?;
-            gguf.validate_qwen_tensors()?;
+            crate::qwen_cpu::validate_qwen_tensors_mla_aware(gguf, &config)?;
             let runtime = CudaRuntime::probe()?;
             let stream = Stream::create()?;
             let cublas = Cublas::create()?;
@@ -3625,6 +3714,16 @@ mod native {
             // cards fall back to all-f16 (fast prefill, 2 bytes/param decode); tiny
             // cards to quantized-only (dequant prefill per op). `HI_CUDA_WEIGHTS_F16`
             // forces the choice.
+            let expert_streaming_budget = expert_streaming_budget.or_else(|| {
+                // Auto-enable for limited-VRAM boxes: when the routed experts
+                // plus the trunk cannot fit free VRAM, stream instead of
+                // OOMing at load. Explicit HI_CUDA_EXPERT_STREAMING=0 forces
+                // resident loading (and fails honestly if it doesn't fit).
+                if expert_streaming_hard_off() {
+                    return None;
+                }
+                auto_expert_streaming_budget(gguf, &config)
+            });
             let expert_sources = if expert_streaming_budget.is_some() {
                 collect_expert_sources(gguf, &config)?
             } else {
@@ -3667,9 +3766,18 @@ mod native {
                     Some(bytes) if bytes > 0 => bytes,
                     _ => {
                         // Auto: spend most of what's left after the trunk and
-                        // a KV/runtime reserve.
-                        let free = crate::runtime::free_memory_bytes().unwrap_or(0);
-                        free.saturating_sub(8 * 1024 * 1024 * 1024)
+                        // a KV/runtime reserve. Fail honestly rather than
+                        // handing the pool a zero budget.
+                        let free = crate::runtime::free_memory_bytes()
+                            .context("expert pool auto-sizing: querying free VRAM")?;
+                        let budget = free.saturating_sub(8 * 1024 * 1024 * 1024);
+                        if budget == 0 {
+                            bail!(
+                                "expert pool auto-sizing found only {free} bytes of free VRAM; \
+                                 set HI_CUDA_EXPERT_POOL_BYTES explicitly"
+                            );
+                        }
+                        budget
                     }
                 };
                 let pool = crate::expert_pool::ExpertPool::new(gguf.path(), slot_bytes, budget)?;
@@ -3775,6 +3883,14 @@ mod native {
             self.expert_streaming
                 .as_ref()
                 .map(|state| state.borrow().pool.stats())
+        }
+
+        /// Full expert-streaming health segment (VRAM pool + RAM tier + IO),
+        /// composed by the pool itself. None when streaming is off.
+        pub(crate) fn expert_stream_health(&self) -> Option<String> {
+            self.expert_streaming
+                .as_ref()
+                .map(|state| state.borrow().pool.stats_segment())
         }
 
         pub fn has_matrix(&self, name: &str) -> bool {
@@ -4043,7 +4159,20 @@ mod native {
         /// and greedy decode goes incoherent. The float-activation GEMV /
         /// f16-GEMM paths track the CPU reference to ~1e-4 and reproduce its
         /// greedy output, so deepseek2 skips every int8-activation fast path.
-        fn int8_activation_paths_allowed(&self) -> bool {
+        ///
+        /// GLM-5.2 (glm-dsa), despite sharing the DeepSeek-V3 MLA lineage,
+        /// measured CLEAN on the real GLM-5.2-REAP50 Q3_K_M checkpoint
+        /// (2026-07, HI_MLA_DEBUG_DUMP A/B of default int8 vs
+        /// HI_CUDA_NO_KQUANT_DP4A=1 float): per-layer rel-L2 divergence stays
+        /// in the 1e-6..1.3e-3 band through all 78 layers with no compounding
+        /// amplification, router logits within ~1e-3, and greedy decode is
+        /// coherent and factually grounded under BOTH configs with long
+        /// shared prefixes before near-tie token splits (the acceptable
+        /// kernel-family flips of colibri's #100 analysis). So glm-dsa keeps
+        /// every int8 fast path — including the grouped MoE path that expert
+        /// streaming requires (which int8-quantizes activation rows
+        /// unconditionally and is gated on this predicate).
+        pub(crate) fn int8_activation_paths_allowed(&self) -> bool {
             self.config.architecture != "deepseek2"
         }
 
@@ -9446,6 +9575,7 @@ mod native {
             for layer in 0..self.config.block_count {
                 let layer_idx =
                     usize::try_from(layer).context("qwen layer index does not fit usize")?;
+                crate::mla_debug::set_layer(layer_idx);
                 let prefix = format!("blk.{layer}");
                 let dims = self.qwen_layer_dims(layer as usize)?;
                 self.ensure_layer_runtime_supported(&prefix)?;
@@ -15059,6 +15189,7 @@ mod native {
             };
 
             for layer in 0..self.config.block_count {
+                crate::mla_debug::set_layer(layer as usize);
                 let prefix = format!("blk.{layer}");
                 let dims = self.qwen_layer_dims(layer as usize)?;
                 let attn_input =
@@ -15245,6 +15376,7 @@ mod native {
             let rope_scale = self.config.rope_freq_scale.unwrap_or(1.0);
 
             for layer in 0..self.config.block_count {
+                crate::mla_debug::set_layer(layer as usize);
                 let prefix = format!("blk.{layer}");
                 let dims = self.qwen_layer_dims(layer as usize)?;
                 self.ensure_layer_runtime_supported(&prefix)?;
@@ -15497,6 +15629,7 @@ mod native {
             };
 
             for layer in 0..self.config.block_count {
+                crate::mla_debug::set_layer(layer as usize);
                 let prefix = format!("blk.{layer}");
                 let dims = self.qwen_layer_dims(layer as usize)?;
                 self.ensure_layer_runtime_supported(&prefix)?;
@@ -15800,6 +15933,7 @@ mod native {
             for layer in 0..self.config.block_count {
                 let layer_idx =
                     usize::try_from(layer).context("qwen layer index does not fit usize")?;
+                crate::mla_debug::set_layer(layer_idx);
                 let prefix = format!("blk.{layer}");
                 let dims = self.qwen_layer_dims(layer as usize)?;
                 self.ensure_layer_runtime_supported(&prefix)?;
@@ -16283,6 +16417,7 @@ mod native {
             for layer in 0..self.config.block_count {
                 let layer_idx =
                     usize::try_from(layer).context("qwen layer index does not fit usize")?;
+                crate::mla_debug::set_layer(layer_idx);
                 let prefix = format!("blk.{layer}");
                 let dims = self.qwen_layer_dims(layer as usize)?;
                 let attn_input =
@@ -16384,6 +16519,7 @@ mod native {
             for layer in 0..self.config.block_count {
                 let layer_idx =
                     usize::try_from(layer).context("qwen layer index does not fit usize")?;
+                crate::mla_debug::set_layer(layer_idx);
                 let prefix = format!("blk.{layer}");
                 let dims = self.qwen_layer_dims(layer as usize)?;
                 self.ensure_layer_runtime_supported(&prefix)?;
@@ -16480,6 +16616,7 @@ mod native {
             for layer in 0..self.config.block_count {
                 let layer_idx =
                     usize::try_from(layer).context("qwen layer index does not fit usize")?;
+                crate::mla_debug::set_layer(layer_idx);
                 let prefix = format!("blk.{layer}");
                 let dims = self.qwen_layer_dims(layer as usize)?;
                 self.ensure_layer_runtime_supported(&prefix)?;
@@ -16562,6 +16699,7 @@ mod native {
             for layer in 0..self.config.block_count {
                 let layer_idx =
                     usize::try_from(layer).context("qwen layer index does not fit usize")?;
+                crate::mla_debug::set_layer(layer_idx);
                 let prefix = format!("blk.{layer}");
                 let dims = self.qwen_layer_dims(layer as usize)?;
                 self.ensure_layer_runtime_supported(&prefix)?;
@@ -16678,6 +16816,7 @@ mod native {
             for layer in 0..self.config.block_count {
                 let layer_idx =
                     usize::try_from(layer).context("qwen layer index does not fit usize")?;
+                crate::mla_debug::set_layer(layer_idx);
                 let prefix = format!("blk.{layer}");
                 let dims = self.qwen_layer_dims(layer as usize)?;
                 self.ensure_layer_runtime_supported(&prefix)?;
@@ -16848,6 +16987,7 @@ mod native {
             for layer in 0..self.config.block_count {
                 let layer_idx =
                     usize::try_from(layer).context("qwen layer index does not fit usize")?;
+                crate::mla_debug::set_layer(layer_idx);
                 let prefix = format!("blk.{layer}");
                 let dims = self.qwen_layer_dims(layer as usize)?;
                 self.ensure_layer_runtime_supported(&prefix)?;
@@ -17040,6 +17180,7 @@ mod native {
             for layer in 0..self.config.block_count {
                 let layer_idx =
                     usize::try_from(layer).context("qwen layer index does not fit usize")?;
+                crate::mla_debug::set_layer(layer_idx);
                 let prefix = format!("blk.{layer}");
                 let dims = self.qwen_layer_dims(layer as usize)?;
                 self.ensure_layer_runtime_supported(&prefix)?;
@@ -17393,6 +17534,7 @@ mod native {
             for layer in 0..self.config.block_count {
                 let layer_idx =
                     usize::try_from(layer).context("qwen layer index does not fit usize")?;
+                crate::mla_debug::set_layer(layer_idx);
                 let prefix = format!("blk.{layer}");
                 let dims = self.qwen_layer_dims(layer as usize)?;
                 self.ensure_layer_runtime_supported(&prefix)?;
@@ -17524,9 +17666,7 @@ mod native {
                         "qwen attention key length is incompatible with embedding length {embed} and attention heads {heads}"
                     )
                 })?;
-            let v_head_dim = self
-                .config
-                .attention_value_head_dim()
+            let v_head_dim = crate::qwen_cpu::mla_aware_value_head_dim(&self.config)
                 .map(usize::try_from)
                 .transpose()
                 .context("qwen attention value head dimension does not fit usize")?
@@ -17834,10 +17974,12 @@ mod native {
                     &mut mla_input_cast,
                 )?
             };
-            // DeepSeek applies interleaved (GPT-J style) RoPE to the q_pe/k_pe
-            // slices, unlike the NEOX split-half rope used by Qwen and by GLM's
-            // MLA. (Fixtures use qk_rope=2, where the two styles coincide, so the
-            // distinction only shows up on real models with qk_rope>2.)
+            // DeepSeek and GLM-5.2 (glm-dsa) apply interleaved (GPT-J style)
+            // RoPE to the q_pe/k_pe slices, unlike the NEOX split-half rope
+            // used by Qwen and by GLM-4-flash's MLA; the per-family evidence
+            // lives on qwen_cpu::mla_pe_rope_interleaved, and the glm-dsa
+            // fixtures pin the distinction with qk_rope=4 (at qk_rope=2 the
+            // two styles coincide — the DeepSeek-V2-Lite lesson).
             //
             // deepseek2 ships YARN rope-scaling metadata (factor 40 from a 4k
             // original context, yarn_log_multiplier 0.0707). When the `Ds2Yarn`
@@ -17851,7 +17993,8 @@ mod native {
             // The package is shared verbatim with the CPU reference so the two
             // stay parity twins; `HI_DS2_NO_YARN=1` is a hard off for bisection.
             let yarn = crate::qwen_cpu::Ds2Yarn::from_config(&self.config);
-            let mla_pe_rope_split_half = !self.config.architecture.contains("deepseek");
+            let mla_pe_rope_split_half =
+                !crate::qwen_cpu::mla_pe_rope_interleaved(&self.config.architecture);
             let mut q_host = q.copy_to_host()?;
             crate::mla_debug::dump_scoped("q_prerope", &q_host);
             for row in 0..attn_input.rows {
@@ -19271,6 +19414,10 @@ mod native {
                         requests.push(((layer, *proj, id), source));
                     }
                 }
+                // Sync by default: the async engine-stream overlap
+                // (ensure_resident_on with Some(&self.stream)) showed
+                // cross-test interference with concurrent CUDA engines in the
+                // suite; re-enable behind an env once root-caused.
                 let addrs = state.pool.ensure_resident(&requests)?;
                 for (chunk, (proj, _)) in proj_sources.iter().enumerate() {
                     let (mirror, group) =
@@ -23148,8 +23295,7 @@ mod native {
         let qk_head_dim = qk_nope_head_dim
             .checked_add(qk_rope_head_dim)
             .context("MLA qk head dimension overflows usize")?;
-        let v_head_dim = config
-            .attention_value_head_dim()
+        let v_head_dim = crate::qwen_cpu::mla_aware_value_head_dim(config)
             .map(usize::try_from)
             .transpose()
             .context("qwen attention value head dimension does not fit usize")?
@@ -24026,8 +24172,7 @@ mod native {
             .transpose()
             .context("qwen attention key head dimension does not fit usize")?
             .ok_or_else(|| anyhow!("invalid qwen head metadata for CUDA matrix specs"))?;
-        let v_head_dim = config
-            .attention_value_head_dim()
+        let v_head_dim = crate::qwen_cpu::mla_aware_value_head_dim(config)
             .map(usize::try_from)
             .transpose()
             .context("qwen attention value head dimension does not fit usize")?
@@ -24618,8 +24763,7 @@ mod native {
             .transpose()
             .context("qwen attention key head dimension does not fit usize")?
             .ok_or_else(|| anyhow!("invalid qwen head metadata for CUDA vector specs"))?;
-        let v_head_dim = config
-            .attention_value_head_dim()
+        let v_head_dim = crate::qwen_cpu::mla_aware_value_head_dim(config)
             .map(usize::try_from)
             .transpose()
             .context("qwen attention value head dimension does not fit usize")?

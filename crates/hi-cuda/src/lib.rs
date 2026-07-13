@@ -1194,16 +1194,9 @@ impl CudaBackend {
         let Ok(model) = model.lock() else {
             return "off".to_string();
         };
-        match model.expert_pool_stats() {
-            Some(stats) => format!(
-                "pool(hits={},misses={},evictions={},read_mb={})",
-                stats.hits,
-                stats.misses,
-                stats.evictions,
-                stats.bytes_read / (1024 * 1024)
-            ),
-            None => "off".to_string(),
-        }
+        model
+            .expert_stream_health()
+            .unwrap_or_else(|| "off".to_string())
     }
 
     #[cfg(not(feature = "native-cuda"))]
@@ -28033,12 +28026,19 @@ mod tests {
     /// transposed, glm-dsa style) or pre-fused `attn_kv_b` with IDENTICAL
     /// values — the two fixtures must produce matching outputs, which pins the
     /// load-time synthesis transpose exactly.
-    /// Dims: embed=4, heads=2, q_lora=3, kv_lora=3, nope=2, rope=2 (qk_mla=4),
+    /// Dims: embed=4, heads=2, q_lora=3, kv_lora=3, nope=2, rope=4 (qk_mla=6),
     /// v_head=2; experts=3 top-2, sigmoid gating (func 2), scale 2.5.
+    ///
+    /// rope=4 is load-bearing: the interleaved (glm-dsa/DeepSeek) and NEOX
+    /// split-half partial-rope styles coincide at rope=2 — DeepSeek-V2-Lite
+    /// shipped broken behind exactly that degenerate fixture — and only
+    /// diverge from rope=4 up, so this fixture distinguishes the styles (see
+    /// native_cuda_glm_dsa_matches_cpu_reference_and_pins_interleaved_pe_rope).
     #[cfg(feature = "native-cuda")]
     fn write_reference_glm_dsa(path: &Path, split_kv_b: bool) {
         const HEADS: usize = 2;
         const NOPE: usize = 2;
+        const ROPE: usize = 4;
         const V_HEAD: usize = 2;
         const KV_LORA: usize = 3;
         // Fused kv_b rows are per head [k_nope rows | v rows], each row holding
@@ -28082,13 +28082,13 @@ mod tests {
                 ),
                 tensor_f16_exact(
                     &format!("{p}.attn_q_b.weight"),
-                    vec![3, 8],
-                    &qwen35_fixture_values(24, seed + 37),
+                    vec![3, (HEADS * (NOPE + ROPE)) as u64],
+                    &qwen35_fixture_values(3 * HEADS * (NOPE + ROPE), seed + 37),
                 ),
                 tensor_f16_exact(
                     &format!("{p}.attn_kv_a_mqa.weight"),
-                    vec![4, 5],
-                    &qwen35_fixture_values(20, seed + 38),
+                    vec![4, (KV_LORA + ROPE) as u64],
+                    &qwen35_fixture_values(4 * (KV_LORA + ROPE), seed + 38),
                 ),
                 tensor_f32(
                     &format!("{p}.attn_kv_a_norm.weight"),
@@ -28219,7 +28219,7 @@ mod tests {
         bytes.extend_from_slice(b"GGUF");
         write_u32(&mut bytes, 3);
         write_u64(&mut bytes, tensors.len() as u64);
-        write_u64(&mut bytes, 23);
+        write_u64(&mut bytes, 25);
 
         write_kv_string(&mut bytes, "general.architecture", "glm-dsa");
         write_kv_string(&mut bytes, "general.name", "cpu-reference-glm-dsa");
@@ -28236,12 +28236,28 @@ mod tests {
             "glm-dsa.attention.layer_norm_rms_epsilon",
             1.0e-6,
         );
-        write_kv_f32(&mut bytes, "glm-dsa.rope.freq_base", 10_000.0);
-        write_kv_u32(&mut bytes, "glm-dsa.rope.dimension_count", 2);
+        // Base 10 (not the usual 1e4) so BOTH rope pairs rotate by O(1)
+        // radians within a 3-token context: at base 1e4 the second pair's
+        // frequency is 1e-2 and the interleaved-vs-split-half difference
+        // stays within ~1e-2 of the logits, too close to the parity
+        // tolerance to pin the style robustly.
+        write_kv_f32(&mut bytes, "glm-dsa.rope.freq_base", 10.0);
+        // rope=4 / key_mla=6 (nope 2 + rope 4): the minimum rope dim where the
+        // interleaved and split-half partial-rope styles diverge.
+        write_kv_u32(&mut bytes, "glm-dsa.rope.dimension_count", 4);
         write_kv_u32(&mut bytes, "glm-dsa.attention.q_lora_rank", 3);
         write_kv_u32(&mut bytes, "glm-dsa.attention.kv_lora_rank", 3);
-        write_kv_u32(&mut bytes, "glm-dsa.attention.key_length_mla", 4);
+        write_kv_u32(&mut bytes, "glm-dsa.attention.key_length_mla", 6);
         write_kv_u32(&mut bytes, "glm-dsa.attention.value_length_mla", 2);
+        // The real GLM-5.2 gguf ALSO carries the LATENT compressed-KV dims in
+        // the plain key/value_length keys (576/512 = kv_lora + qk_rope /
+        // kv_lora); mirror that (3+4 / 3) so the fixture exercises
+        // qwen_cpu::mla_aware_value_head_dim (the per-head v dim must come
+        // from value_length_mla, not the latent width) and the
+        // validate_qwen_tensors_mla_aware shim for the validator's
+        // latent-width attn_output false positive.
+        write_kv_u32(&mut bytes, "glm-dsa.attention.key_length", 7);
+        write_kv_u32(&mut bytes, "glm-dsa.attention.value_length", 3);
         write_kv_u32(&mut bytes, "glm-dsa.expert_count", 3);
         write_kv_u32(&mut bytes, "glm-dsa.expert_feed_forward_length", 2);
         write_kv_u32(&mut bytes, "glm-dsa.expert_used_count", 2);
@@ -28295,6 +28311,199 @@ mod tests {
             split_model.generate_greedy_tokens(&[1], 3, None).unwrap(),
             fused_model.generate_greedy_tokens(&[1], 3, None).unwrap()
         );
+    }
+
+    /// Full CPU==GPU parity on the glm-dsa fixture (MLA q_lora/kv_lora,
+    /// sigmoid noaux_tc routing, shared expert) at qk_rope=4 — where the
+    /// interleaved and split-half pe-rope styles genuinely diverge — plus a
+    /// golden-logits pin of the INTERLEAVED style itself. Both backends share
+    /// qwen_cpu::mla_pe_rope_interleaved, so parity alone cannot catch a
+    /// style flip applied to both sides at once (exactly how DeepSeek-V2-Lite
+    /// shipped broken); the goldens can. The split-half logits recorded below
+    /// were measured on this fixture and are asserted FAR, proving the
+    /// fixture distinguishes the styles.
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_glm_dsa_matches_cpu_reference_and_pins_interleaved_pe_rope() {
+        use hi_gguf::GgufFile;
+
+        let path = tempfile_path("gpu-glm-dsa-cpu-parity");
+        write_reference_glm_dsa(&path, false);
+        let gguf = GgufFile::open(&path).unwrap();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+        let cpu = crate::qwen_cpu::QwenCpuReference::load(&path).unwrap();
+        assert_eq!(cpu.config().architecture, "glm-dsa");
+
+        let tokens = [0u32, 1, 2, 2, 0, 1];
+        let cpu_logits = cpu
+            .forward(&tokens)
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        let gpu_logits = model.full_context_logits_host(&tokens).unwrap();
+        assert_close_vec(&gpu_logits, &cpu_logits);
+        assert!(gpu_logits.iter().all(|value| value.is_finite()));
+
+        assert_eq!(
+            model.generate_greedy_tokens(&[1], 4, None).unwrap(),
+            cpu.generate_greedy(&[1], 4).unwrap()
+        );
+
+        // Golden full-context logits (6 tokens x vocab 3) under interleaved
+        // pe-rope, generated from this fixture on GPU (CPU is within the
+        // parity tolerance above); regenerate by printing gpu_logits if the
+        // fixture weights ever change.
+        const INTERLEAVED_LOGITS: [f32; 18] = [
+            0.26534653,
+            -0.09555817,
+            -0.039089203,
+            -0.33926773,
+            1.0184975,
+            0.295372,
+            0.14318848,
+            0.18154907,
+            0.9362488,
+            0.15462494,
+            0.09391785,
+            0.90491486,
+            0.4603653,
+            -0.8052864,
+            -0.15103531,
+            -0.45850372,
+            0.9992676,
+            -0.11646271,
+        ];
+        // The same fixture forwarded with split-half pe-rope (measured via a
+        // temporary style override while bringing GLM-5.2 up) — kept as
+        // evidence that qk_rope=4 separates the styles: max |delta| vs the
+        // interleaved goldens is 6.3e-2, and the live logits must stay far
+        // from these. Position-0 logits coincide by construction (rope is the
+        // identity at position 0).
+        const SPLIT_HALF_LOGITS: [f32; 18] = [
+            0.26534653,
+            -0.09555817,
+            -0.039089203,
+            -0.33854866,
+            1.0210247,
+            0.2813568,
+            0.14783478,
+            0.17350006,
+            0.93655396,
+            0.15768433,
+            0.07234955,
+            0.9055557,
+            0.44625092,
+            -0.8392143,
+            -0.21441269,
+            -0.4487648,
+            1.0035286,
+            -0.10030365,
+        ];
+        // Slightly looser than assert_close_vec: the goldens were captured on
+        // one GPU generation and only need to pin the STYLE (6.3e-2 apart),
+        // not exact kernel rounding.
+        for (actual, expected) in gpu_logits.iter().zip(INTERLEAVED_LOGITS) {
+            assert!(
+                (actual - expected).abs() <= 2.0e-3,
+                "glm-dsa logits diverged from the interleaved pe-rope goldens: \
+                 actual {actual} expected {expected}"
+            );
+        }
+        let split_half_delta = gpu_logits
+            .iter()
+            .zip(SPLIT_HALF_LOGITS)
+            .map(|(actual, split)| (actual - split).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            split_half_delta > 2.0e-2,
+            "glm-dsa fixture no longer distinguishes the pe-rope styles \
+             (max logit delta vs split-half {split_half_delta:e}); raise qk_rope"
+        );
+    }
+
+    /// Pins the int8-activation verdicts per architecture: glm-dsa keeps
+    /// every dp4a fast path — measured clean on the real GLM-5.2-REAP50
+    /// checkpoint (per-layer rel-L2 vs float activations stays <= ~1.3e-3
+    /// through 78 layers; greedy decode coherent under both configs) and
+    /// required for the grouped MoE path that expert streaming depends on —
+    /// while deepseek2's massive activations keep it excluded. Gating glm
+    /// off here would deadlock expert streaming against the grouped-MoE
+    /// requirement (gpu.rs moe_f32_device bails).
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_int8_activation_paths_allowed_for_glm_dsa_not_deepseek2() {
+        use hi_gguf::GgufFile;
+
+        let glm_path = tempfile_path("gpu-glm-dsa-int8-predicate");
+        write_reference_glm_dsa(&glm_path, false);
+        let glm_gguf = GgufFile::open(&glm_path).unwrap();
+        let glm_model = crate::gpu::CudaQwenGpuModel::from_gguf(&glm_gguf).unwrap();
+        assert!(glm_model.int8_activation_paths_allowed());
+
+        let ds2_path = tempfile_path("gpu-deepseek2-int8-predicate");
+        write_reference_deepseek_true_mla(&ds2_path);
+        let ds2_gguf = GgufFile::open(&ds2_path).unwrap();
+        let ds2_model = crate::gpu::CudaQwenGpuModel::from_gguf(&ds2_gguf).unwrap();
+        assert!(!ds2_model.int8_activation_paths_allowed());
+    }
+
+    /// Real-checkpoint GLM-5.2 greedy probe (env-gated like the hi-local real
+    /// smokes; skips unless `HI_GLM_DSA_REAL_GGUF` points at shard 1 of a
+    /// glm-dsa split GGUF). Run with `HI_CUDA_EXPERT_STREAMING=1` and an
+    /// `HI_CUDA_EXPERT_POOL_BYTES` sized for the GPU; prints load time and
+    /// greedy continuations + decode rates for a few factual prompts so rope
+    /// style / int8 A/Bs can be judged by coherence.
+    #[cfg(feature = "native-cuda")]
+    #[test]
+    fn native_cuda_glm_dsa_real_model_greedy_probe() {
+        use hi_gguf::GgufFile;
+        use std::time::Instant;
+
+        let Ok(path) = std::env::var("HI_GLM_DSA_REAL_GGUF") else {
+            eprintln!("skipping glm-dsa real-model probe; set HI_GLM_DSA_REAL_GGUF");
+            return;
+        };
+        let max_new = std::env::var("HI_GLM_DSA_REAL_MAX_TOKENS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(32);
+        let started = Instant::now();
+        let gguf = GgufFile::open(Path::new(&path)).unwrap();
+        let eos = gguf.metadata_u32("tokenizer.ggml.eos_token_id");
+        let tokenizer_host =
+            crate::qwen_cpu::QwenCpuReference::from_gguf_tokenizer_only(&gguf).unwrap();
+        let tokenizer = tokenizer_host.tokenizer();
+        let model = crate::gpu::CudaQwenGpuModel::from_gguf(&gguf).unwrap();
+        eprintln!(
+            "glm-dsa real model loaded in {:.1}s",
+            started.elapsed().as_secs_f64()
+        );
+
+        let prompts = [
+            "The capital of France is",
+            "Water is made of two elements: hydrogen and",
+            "The first person to walk on the Moon was",
+            "Counting by twos: 2, 4, 6, 8,",
+        ];
+        for prompt in prompts {
+            let input_ids = tokenizer.encode(prompt).unwrap();
+            let step = Instant::now();
+            // Paged KV: the non-paged greedy path preallocates the KV cache
+            // for the FULL model context (1M tokens on GLM-5.2 — hundreds of
+            // GB); the paged path allocates by actual sequence need.
+            let output = model
+                .generate_greedy_tokens_paged(&input_ids, max_new, eos, 16)
+                .unwrap();
+            let elapsed = step.elapsed().as_secs_f64();
+            let text = tokenizer.decode(&output).unwrap();
+            eprintln!(
+                "[{} new tokens, {:.2} tok/s] {prompt:?} -> {text:?}",
+                output.len(),
+                output.len() as f64 / elapsed
+            );
+            assert!(!output.is_empty(), "no tokens generated for {prompt:?}");
+        }
     }
 
     /// Rank-3 Q4_K expert tensor with deterministic random bytes and pinned

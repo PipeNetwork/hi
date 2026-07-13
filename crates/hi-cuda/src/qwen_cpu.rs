@@ -21,14 +21,15 @@ use hi_gguf::{
     qwen_moe_per_expert_gate_up_bias_names, qwen_moe_per_expert_gate_up_weight_names,
     qwen_moe_per_expert_up_gate_bias_names, qwen_moe_per_expert_up_gate_weight_names,
     qwen_moe_per_expert_weight_names, qwen_moe_router_bias_names, qwen_moe_router_weight_names,
-    qwen_moe_shared_expert_bias_names, qwen_moe_shared_expert_gate_bias_names,
-    qwen_moe_shared_expert_gate_up_bias_names, qwen_moe_shared_expert_gate_up_weight_names,
-    qwen_moe_shared_expert_gate_weight_names, qwen_moe_shared_expert_up_gate_bias_names,
-    qwen_moe_shared_expert_up_gate_weight_names, qwen_moe_shared_expert_weight_names,
-    qwen_ssm_a_names, qwen_ssm_alpha_weight_names, qwen_ssm_ba_weight_names,
-    qwen_ssm_beta_weight_names, qwen_ssm_conv1d_weight_names, qwen_ssm_dt_bias_names,
-    qwen_ssm_gate_weight_names, qwen_ssm_in_weight_names, qwen_ssm_layer_tensors_present,
-    qwen_ssm_norm_weight_names, qwen_ssm_out_weight_names, qwen_ssm_qkv_weight_names,
+    qwen_moe_selection_bias_names, qwen_moe_shared_expert_bias_names,
+    qwen_moe_shared_expert_gate_bias_names, qwen_moe_shared_expert_gate_up_bias_names,
+    qwen_moe_shared_expert_gate_up_weight_names, qwen_moe_shared_expert_gate_weight_names,
+    qwen_moe_shared_expert_up_gate_bias_names, qwen_moe_shared_expert_up_gate_weight_names,
+    qwen_moe_shared_expert_weight_names, qwen_ssm_a_names, qwen_ssm_alpha_weight_names,
+    qwen_ssm_ba_weight_names, qwen_ssm_beta_weight_names, qwen_ssm_conv1d_weight_names,
+    qwen_ssm_dt_bias_names, qwen_ssm_gate_weight_names, qwen_ssm_in_weight_names,
+    qwen_ssm_layer_tensors_present, qwen_ssm_norm_weight_names, qwen_ssm_out_weight_names,
+    qwen_ssm_qkv_weight_names,
 };
 use rand::distributions::{Distribution, WeightedIndex};
 use rand::rngs::StdRng;
@@ -119,7 +120,7 @@ impl QwenCpuReference {
         // built alongside it validates, so a redundant ~5 s pass on a large MoE is avoided.
         // The weight-loading reference validates, since it dequantizes those tensors here.
         if load_weights {
-            gguf.validate_qwen_tensors()?;
+            validate_qwen_tensors_mla_aware(gguf, &config)?;
         }
         let tokenizer = gguf.tokenizer()?;
         let embedding_length = usize::try_from(config.embedding_length)
@@ -1017,8 +1018,7 @@ impl QwenAttention {
                     "qwen attention key length is incompatible with embedding length {embed} and attention heads {heads}"
                 )
             })?;
-        let v_head_dim = config
-            .attention_value_head_dim()
+        let v_head_dim = mla_aware_value_head_dim(config)
             .map(usize::try_from)
             .transpose()
             .context("qwen attention value head dimension does not fit usize")?
@@ -1191,8 +1191,10 @@ impl QwenAttention {
                 .rope_freq_base
                 .unwrap_or_else(|| config.default_rope_freq_base()),
             rope_scale: config.rope_freq_scale.unwrap_or(1.0),
-            // DeepSeek uses interleaved (GPT-J) RoPE on q_pe/k_pe; Qwen/GLM NEOX.
-            split_half_rope: !config.architecture.contains("deepseek"),
+            // DeepSeek and GLM-5.2 (glm-dsa) use interleaved (GPT-J) RoPE on
+            // q_pe/k_pe; Qwen and GLM-4-flash MLA use NEOX split-half. See
+            // mla_pe_rope_interleaved for the per-family evidence.
+            split_half_rope: !mla_pe_rope_interleaved(&config.architecture),
             rope_rot_dim: config.rope_rot_dim(qk_head_dim),
             yarn: Ds2Yarn::from_config(config),
         })
@@ -1537,6 +1539,14 @@ impl QwenFfn {
 struct QwenMoe {
     router: Matrix,
     router_bias: Option<Vec<f32>>,
+    /// Sigmoid gating (`expert_gating_func = 2`, glm-dsa/DeepSeek-V3 class):
+    /// rank the top-k on sigmoid scores instead of softmax probabilities.
+    gating_sigmoid: bool,
+    /// Per-layer expert-selection bias (`exp_probs_b`, the noaux_tc trick):
+    /// biases the top-k RANKING only; routed weights stay bias-free.
+    selection_bias: Option<Vec<f32>>,
+    /// `expert_weights_scale`: multiplies the final routed weights.
+    weights_scale: f32,
     experts: Vec<QwenMlp>,
     shared: Option<QwenMlp>,
     shared_gate: Option<Matrix>,
@@ -1724,6 +1734,13 @@ impl QwenMoe {
                 &qwen_moe_router_bias_names(prefix),
                 experts,
             )?,
+            gating_sigmoid: config.expert_gating_func == Some(2),
+            selection_bias: optional_vector_aliases(
+                gguf,
+                &qwen_moe_selection_bias_names(prefix),
+                experts,
+            )?,
+            weights_scale: config.expert_weights_scale.unwrap_or(1.0),
             experts: expert_mlps,
             shared,
             shared_gate,
@@ -1739,17 +1756,54 @@ impl QwenMoe {
             let logits = self
                 .router
                 .mul_vec_with_bias(token, self.router_bias.as_deref())?;
-            let mut scores = logits;
-            softmax_in_place(&mut scores);
-            let mut ranked = scores.iter().copied().enumerate().collect::<Vec<_>>();
-            ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-            ranked.truncate(self.top_k.min(ranked.len()));
+            // Parity twin of the GPU moe_topk_router_kernel: sigmoid gating
+            // (glm-dsa/DeepSeek-V3, expert_gating_func=2) ranks the top-k on
+            // sigmoid(score) plus the selection-only exp_probs_b bias while
+            // the routed weights stay bias-free; softmax gating ranks on the
+            // softmax probabilities directly. Both then optionally normalize
+            // over the selected weights and apply expert_weights_scale.
+            let mut ranked: Vec<(usize, f32)> = if self.gating_sigmoid {
+                let mut keyed = logits
+                    .iter()
+                    .enumerate()
+                    .map(|(expert, logit)| {
+                        let mut weight = sigmoid(*logit);
+                        if !weight.is_finite() {
+                            weight = 0.0;
+                        }
+                        let key = weight
+                            + self
+                                .selection_bias
+                                .as_ref()
+                                .map_or(0.0, |bias| bias[expert]);
+                        (expert, key, weight)
+                    })
+                    .collect::<Vec<_>>();
+                keyed.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                keyed.truncate(self.top_k.min(keyed.len()));
+                keyed
+                    .into_iter()
+                    .map(|(expert, _, weight)| (expert, weight))
+                    .collect()
+            } else {
+                let mut scores = logits;
+                softmax_in_place(&mut scores);
+                let mut ranked = scores.iter().copied().enumerate().collect::<Vec<_>>();
+                ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                ranked.truncate(self.top_k.min(ranked.len()));
+                ranked
+            };
             if self.norm_topk_prob && ranked.len() > 1 {
-                let denom = ranked.iter().map(|(_, score)| *score).sum::<f32>();
-                if denom > f32::EPSILON {
-                    for (_, score) in &mut ranked {
-                        *score /= denom;
+                let denom = ranked.iter().map(|(_, weight)| *weight).sum::<f32>();
+                if denom > 1.0e-7 && denom.is_finite() {
+                    for (_, weight) in &mut ranked {
+                        *weight /= denom;
                     }
+                }
+            }
+            if self.weights_scale != 1.0 {
+                for (_, weight) in &mut ranked {
+                    *weight *= self.weights_scale;
                 }
             }
             let mut acc = vec![0.0; token.len()];
@@ -2322,8 +2376,7 @@ fn dense_packed_qkv_dim(config: &QwenGgufConfig) -> Result<usize> {
         .transpose()
         .context("attention key head dimension does not fit usize")?
         .ok_or_else(|| anyhow!("invalid attention metadata for packed qkv"))?;
-    let v_head_dim = config
-        .attention_value_head_dim()
+    let v_head_dim = mla_aware_value_head_dim(config)
         .map(usize::try_from)
         .transpose()
         .context("attention value head dimension does not fit usize")?
@@ -3378,6 +3431,90 @@ pub(crate) fn apply_deepseek_yarn_rope(
     Ok(())
 }
 
+/// Per-head value dimension with the MLA-aware preference order: the
+/// `attention_v_head_dim` config field (populated from `v_head_dim`, the
+/// `*_mla` keys, or the plain keys on kv_lora models) wins over the raw
+/// `attention.value_length`.
+///
+/// glm-dsa/DeepSeek-V3.2-class ggufs carry BOTH: there
+/// `attention.value_length` is the LATENT single-head value width of the
+/// compressed KV cache (512 = kv_lora_rank on GLM-5.2, alongside
+/// `attention.key_length` 576 = kv_lora + qk_rope), while the true per-head
+/// v dim after the kv_b expansion is `attention.value_length_mla` (256).
+/// `QwenGgufConfig::attention_value_head_dim()` prefers `value_length` and
+/// returns the latent 512 — correct for dense models, wrong for these —
+/// while its key twin `attention_key_head_dim()` already prefers the
+/// MLA-derived qk dims; this helper mirrors that ordering for v. Dense
+/// models (`attention_v_head_dim` unset) are unaffected.
+pub(crate) fn mla_aware_value_head_dim(config: &QwenGgufConfig) -> Option<u32> {
+    config
+        .attention_v_head_dim
+        .filter(|value| *value != 0)
+        .or_else(|| config.attention_value_head_dim())
+}
+
+/// Validate the qwen tensor table, tolerating exactly the known
+/// glm-dsa/DeepSeek-V3.2 false positive: `validate_qwen_tensors` derives the
+/// expected `attn_output` width from `attention.value_length`, which on
+/// those MLA ggufs is the latent value width (see
+/// `mla_aware_value_head_dim`), so every MLA layer of a real GLM-5.2
+/// checkpoint reports "attn_output ... has shape [heads*256, embed];
+/// expected [heads*512, embed]". The CUDA/CPU loaders derive their dims from
+/// the `*_mla` keys and every matrix load still shape-checks against those
+/// corrected specs, so accepting ONLY this complaint loses no safety: any
+/// other validation error — including a genuinely wrong attn_output shape,
+/// which the per-matrix load would catch — still fails the load.
+///
+/// TODO(hi-gguf): prefer `attention_v_head_dim` inside
+/// `attention_value_head_dim()` (mirroring `attention_key_head_dim()`) and
+/// delete this shim.
+pub(crate) fn validate_qwen_tensors_mla_aware(
+    gguf: &GgufFile,
+    config: &QwenGgufConfig,
+) -> Result<()> {
+    let validation = gguf.qwen_tensor_validation()?;
+    if validation.valid {
+        return Ok(());
+    }
+    let latent_value_conflict = config.attention_mla_tensor_layout
+        && config
+            .attention_v_head_dim
+            .zip(config.attention_value_length)
+            .is_some_and(|(mla, plain)| mla != 0 && mla != plain);
+    if latent_value_conflict
+        && validation.errors.iter().all(|error| {
+            error.starts_with("tensor blk.") && error.contains(".attn_output.weight has shape")
+        })
+    {
+        return Ok(());
+    }
+    bail!(
+        "invalid Qwen GGUF tensor table: {}",
+        validation.errors.join("; ")
+    );
+}
+
+/// Architectures whose MLA partial rope (the per-head q_pe/k_pe slices) is
+/// interleaved (GPT-J style: pairs `(2i, 2i+1)`, frequency `base^(-2i/d)`)
+/// rather than NEOX split-half (pairs `(i, i + d/2)`, same frequencies).
+///
+/// * The DeepSeek family (`deepseek`/`deepseek2`/... lineages): measured on
+///   DeepSeek-V2-Lite — split-half decodes incoherently on the real
+///   checkpoint, interleaved reproduces the reference output.
+/// * GLM-5.2 (`glm-dsa`, the DeepSeek-V3.2-lineage arch with the DSA
+///   indexer): pinned by colibri's token-exact-validated engine
+///   (glm.c `rope_interleave`, applied to q_pe/k_pe) and confirmed by greedy
+///   coherence A/B on the real GLM-5.2-REAP50 checkpoint — split-half
+///   produces V2-Lite-grade incoherence.
+///
+/// Qwen MLA and GLM-4-flash MLA (`glm4`/`glm4moe`/`glm4flash`) stay NEOX
+/// split-half. Fixtures exercising this predicate MUST use qk_rope >= 4: at
+/// qk_rope = 2 the two styles coincide, which is exactly how the V2-Lite bug
+/// shipped undetected (see `write_reference_glm_dsa`).
+pub(crate) fn mla_pe_rope_interleaved(architecture: &str) -> bool {
+    architecture.starts_with("deepseek") || architecture == "glm-dsa"
+}
+
 fn apply_rope(
     values: &mut [f32],
     position: usize,
@@ -4119,6 +4256,9 @@ mod tests {
         let moe = QwenMoe {
             router: test_matrix(2, 2, &[4.0, 0.0, 0.0, 1.0]),
             router_bias: None,
+            gating_sigmoid: false,
+            selection_bias: None,
+            weights_scale: 1.0,
             experts: vec![expert0, expert1],
             shared: None,
             shared_gate: None,
@@ -4156,6 +4296,9 @@ mod tests {
         let moe = QwenMoe {
             router: test_matrix(2, 2, &[4.0, 0.0, 0.0, 1.0]),
             router_bias: Some(vec![1.0, 0.0]),
+            gating_sigmoid: false,
+            selection_bias: None,
+            weights_scale: 1.0,
             experts: vec![expert0, expert1],
             shared: None,
             shared_gate: None,
@@ -4193,6 +4336,9 @@ mod tests {
         let moe = QwenMoe {
             router: test_matrix(1, 2, &[0.0, 0.0]),
             router_bias: None,
+            gating_sigmoid: false,
+            selection_bias: None,
+            weights_scale: 1.0,
             experts: vec![routed],
             shared: Some(shared),
             shared_gate: Some(test_matrix(1, 2, &[4.0, 0.0])),
@@ -4207,6 +4353,101 @@ mod tests {
 
         assert_close(output[0][0], shared_scale * hidden);
         assert_close(output[0][1], shared_scale * hidden * 2.0);
+    }
+
+    /// Sigmoid gating (glm-dsa/DeepSeek-V3): the exp_probs_b selection bias
+    /// decides the top-k RANKING (expert 1 outranks the higher-logit expert 0
+    /// only because of its bias) while the routed weight stays the bias-free
+    /// sigmoid, then expert_weights_scale multiplies the result.
+    #[test]
+    fn qwen_moe_sigmoid_gating_ranks_with_selection_bias_and_scales_weights() {
+        let expert0 = QwenMlp {
+            gate: test_matrix(1, 2, &[1.0, 0.0]),
+            gate_bias: None,
+            up: test_matrix(1, 2, &[1.0, 0.0]),
+            up_bias: None,
+            down: test_matrix(2, 1, &[1.0, 0.0]),
+            down_bias: None,
+        };
+        let expert1 = QwenMlp {
+            gate: test_matrix(1, 2, &[2.0, 0.0]),
+            gate_bias: None,
+            up: test_matrix(1, 2, &[3.0, 0.0]),
+            up_bias: None,
+            down: test_matrix(2, 1, &[10.0, 20.0]),
+            down_bias: None,
+        };
+        let expert2 = QwenMlp {
+            gate: test_matrix(1, 2, &[0.0; 2]),
+            gate_bias: None,
+            up: test_matrix(1, 2, &[0.0; 2]),
+            up_bias: None,
+            down: test_matrix(2, 1, &[0.0; 2]),
+            down_bias: None,
+        };
+        let moe = QwenMoe {
+            router: test_matrix(3, 2, &[1.0, 0.0, 0.8, 0.0, -2.0, 0.0]),
+            router_bias: None,
+            gating_sigmoid: true,
+            selection_bias: Some(vec![0.0, 0.5, 0.0]),
+            weights_scale: 2.5,
+            experts: vec![expert0, expert1, expert2],
+            shared: None,
+            shared_gate: None,
+            shared_gate_bias: None,
+            top_k: 1,
+            norm_topk_prob: false,
+        };
+
+        // Keys: sigmoid(1.0) ~= 0.731 vs sigmoid(0.8) + 0.5 ~= 1.190 -> expert 1.
+        let output = moe.forward(&[vec![1.0, 0.0]]).unwrap();
+        let weight = 2.5 * sigmoid(0.8);
+        let hidden = silu(2.0) * 3.0;
+
+        assert_close(output[0][0], weight * hidden * 10.0);
+        assert_close(output[0][1], weight * hidden * 20.0);
+    }
+
+    /// The interleaved-rope family predicate: DeepSeek MLA and GLM-5.2
+    /// (glm-dsa) are interleaved; Qwen and GLM-4-flash MLA stay split-half.
+    #[test]
+    fn mla_pe_rope_interleaved_names_the_deepseek_and_glm_dsa_families() {
+        assert!(mla_pe_rope_interleaved("deepseek"));
+        assert!(mla_pe_rope_interleaved("deepseek2"));
+        assert!(mla_pe_rope_interleaved("glm-dsa"));
+        assert!(!mla_pe_rope_interleaved("glm4"));
+        assert!(!mla_pe_rope_interleaved("glm4moe"));
+        assert!(!mla_pe_rope_interleaved("glm4flash"));
+        assert!(!mla_pe_rope_interleaved("qwen3"));
+        assert!(!mla_pe_rope_interleaved("qwen35"));
+    }
+
+    /// The two partial-rope styles coincide at rope dim 2 (one pair, frequency
+    /// 1) and genuinely diverge at dim 4 — the reason glm-dsa/deepseek
+    /// fixtures must use qk_rope >= 4 (the DeepSeek-V2-Lite lesson).
+    #[test]
+    fn rope_styles_coincide_at_dim_2_and_diverge_at_dim_4() {
+        let mut interleaved = vec![1.0, 2.0];
+        let mut split_half = interleaved.clone();
+        apply_rope(&mut interleaved, 3, 10_000.0, 1.0, false).unwrap();
+        apply_rope(&mut split_half, 3, 10_000.0, 1.0, true).unwrap();
+        for (left, right) in interleaved.iter().zip(&split_half) {
+            assert_close(*left, *right);
+        }
+
+        let mut interleaved = vec![1.0, 2.0, 3.0, 4.0];
+        let mut split_half = interleaved.clone();
+        apply_rope(&mut interleaved, 3, 10_000.0, 1.0, false).unwrap();
+        apply_rope(&mut split_half, 3, 10_000.0, 1.0, true).unwrap();
+        let max_delta = interleaved
+            .iter()
+            .zip(&split_half)
+            .map(|(left, right)| (left - right).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_delta > 0.5,
+            "rope styles unexpectedly close at dim 4: {max_delta}"
+        );
     }
 
     #[test]
