@@ -44,9 +44,9 @@ use rand::{Rng, SeedableRng};
 use rayon::prelude::*;
 
 use crate::qwen_cpu::{
-    Matrix, QwenCpuRunOptions, QwenCpuRunOutput, argmax, dot, load_matrix, load_vector,
-    optional_vector, rms_norm_in_place, sample_from_logits_with_rng, sigmoid, silu,
-    softmax_in_place, softplus, top_logits,
+    QwenCpuRunOptions, QwenCpuRunOutput, argmax, dot, load_vector, optional_vector,
+    rms_norm_in_place, sample_from_logits_with_rng, sigmoid, silu, softmax_in_place, softplus,
+    top_logits,
 };
 
 /// Rows dequantized per chunk when streaming a matrix through the CPU matvec
@@ -142,6 +142,15 @@ pub(crate) trait DsV4Linear {
     ) -> Result<()> {
         Ok(())
     }
+
+    /// Scoped speculative-verify hint: while set, [`DsV4Linear::mul_mat`]
+    /// must be bit-identical to looping [`DsV4Linear::mul_vec`] over the rows.
+    /// The default is a no-op because the default `mul_mat` already loops (the
+    /// CPU oracle is always exact); the GPU provider uses it to suspend its
+    /// opt-in `HI_DSV4_PREFILL_GEMM=1` batching for the duration of a verify
+    /// chunk — greedy speculative acceptance is lossless only because verify
+    /// logits reproduce the sequential step path exactly.
+    fn set_exact_batching(&self, _exact: bool) {}
 
     /// Wave-2 Stage 2b hook: serve one WHOLE decode step (S=1) device-side.
     /// `None` declines — the engine then runs the host step, today's exact
@@ -258,8 +267,9 @@ pub(crate) struct DsV4Engine<L: DsV4Linear> {
 /// Model-wide dimensions resolved (and validated) from GGUF metadata once at
 /// load time so the forward pass never re-derives them. Fields are
 /// crate-visible for the GPU device-step provider (`dsv4_gpu`), which mirrors
-/// this exact geometry on device.
-#[derive(Debug)]
+/// this exact geometry on device. `Clone` lets the MTP drafter (`dsv4_mtp`)
+/// carry its own copy — the MTP block shares the trunk's geometry exactly.
+#[derive(Clone, Debug)]
 pub(crate) struct DsV4Geometry {
     pub(crate) embed: usize,
     pub(crate) heads: usize,
@@ -317,9 +327,69 @@ pub(crate) struct DsV4Layer {
 /// output head.
 #[derive(Debug)]
 pub(crate) struct HcWeights {
-    pub(crate) func: Matrix,
+    pub(crate) func: DsV4HcFunc,
     pub(crate) base: Vec<f32>,
     pub(crate) scale: Vec<f32>,
+}
+
+/// Materialized f32 mixer matrix for [`HcWeights`]. A local replacement for
+/// `qwen_cpu::Matrix` (same `mul_vec`/`shape`/`data` surface) so weights that
+/// do not live in a GGUF — the MTP module's safetensors-sourced mixers — can
+/// construct one from raw parts.
+#[derive(Debug)]
+pub(crate) struct DsV4HcFunc {
+    rows: usize,
+    cols: usize,
+    data: Vec<f32>,
+}
+
+impl DsV4HcFunc {
+    /// Build from a row-major `[rows, cols]` f32 payload.
+    pub(crate) fn from_parts(rows: usize, cols: usize, data: Vec<f32>) -> Result<Self> {
+        if data.len() != rows * cols {
+            bail!(
+                "hc mixer payload has {} values; expected {rows} x {cols}",
+                data.len()
+            );
+        }
+        Ok(Self { rows, cols, data })
+    }
+
+    fn load(gguf: &GgufFile, name: &str, rows: usize, cols: usize) -> Result<Self> {
+        let matrix = raw_matrix(gguf, name, rows, cols)?;
+        let view = gguf
+            .tensor(name)
+            .ok_or_else(|| anyhow!("GGUF tensor {name} is missing"))?;
+        let data = dequantize_elem_range(&view, 0, matrix.rows * matrix.cols)?;
+        Self::from_parts(rows, cols, data)
+    }
+
+    pub(crate) fn mul_vec(&self, input: &[f32]) -> Result<Vec<f32>> {
+        if input.len() != self.cols {
+            bail!(
+                "hc mixer input length {} does not match cols {}",
+                input.len(),
+                self.cols
+            );
+        }
+        Ok(self
+            .data
+            .chunks_exact(self.cols)
+            .map(|row| dot(row, input))
+            .collect())
+    }
+
+    /// (rows, cols) of the materialized matrix (GPU device-step upload).
+    #[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
+    pub(crate) fn shape(&self) -> (usize, usize) {
+        (self.rows, self.cols)
+    }
+
+    /// Row-major f32 payload (see [`Self::shape`]).
+    #[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
+    pub(crate) fn data(&self) -> &[f32] {
+        &self.data
+    }
 }
 
 /// APE block compressor: `gate`/`kv` project embed -> `width`, `ape` is a
@@ -535,6 +605,214 @@ pub(crate) struct DsV4StepMirror<'a> {
     pub(crate) comp_block: Vec<Option<(&'a [f32], &'a [f32])>>,
     /// Same for the indexer's private compressor.
     pub(crate) idx_block: Vec<Option<(&'a [f32], &'a [f32])>>,
+}
+
+/// Which positions of a chunked forward pass get the output head (hyper-head
+/// stream collapse + final norm + lm head) applied.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ChunkHeads {
+    /// No logits (interior prefill chunks).
+    None,
+    /// Last position only (the prefill tail).
+    Last,
+    /// Every position (speculative verify).
+    All,
+}
+
+/// RAII wrapper around [`DsV4Linear::set_exact_batching`] so an early `?`
+/// return inside a verify chunk cannot leave the provider pinned to exact
+/// batching.
+struct ExactBatchingGuard<'a, L: DsV4Linear>(&'a L);
+
+impl<'a, L: DsV4Linear> ExactBatchingGuard<'a, L> {
+    fn new(linear: &'a L) -> Self {
+        linear.set_exact_batching(true);
+        Self(linear)
+    }
+}
+
+impl<L: DsV4Linear> Drop for ExactBatchingGuard<'_, L> {
+    fn drop(&mut self) {
+        self.0.set_exact_batching(false);
+    }
+}
+
+/// Which hidden activations a [`DsV4Taps`] buffer captures per position. An
+/// empty config captures nothing; every forward entry point takes
+/// `Option<&mut DsV4Taps>` and `None` skips all capture work, so taps are
+/// zero-cost unless a drafter asks for them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
+pub(crate) struct DsV4TapConfig {
+    /// Capture the flat (hc*embed) residual immediately before the output
+    /// hyper-head + final norm + lm head are applied — the MTP drafter's
+    /// `prev_hidden` input (Stage B of the spec-decode plan).
+    pub(crate) pre_hc_head: bool,
+    /// Capture post-layer hc-stream hidden states at these layer indices —
+    /// the DFlash drafter's aux-hidden conditioning (Stage C). Normalized
+    /// (sorted, deduplicated, validated) by [`DsV4Engine::new_taps`].
+    pub(crate) aux_layers: Vec<usize>,
+}
+
+impl DsV4TapConfig {
+    #[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
+    pub(crate) fn is_empty(&self) -> bool {
+        !self.pre_hc_head && self.aux_layers.is_empty()
+    }
+}
+
+/// Per-request hidden-state capture buffer for speculative drafters. Rows are
+/// appended by every tapped forward path — prefill chunks, verify chunks, and
+/// single (host) steps — for consecutive ABSOLUTE positions starting at the
+/// buffer's `base` (the state position the buffer was attached at — a
+/// prefix-cache restore point skips the restored prefix, whose activations
+/// were never recomputed). Captured positions stay in lockstep with the
+/// state's processed tokens as long as the buffer is attached at the state's
+/// current position and truncated alongside every state rewind
+/// ([`DsV4Taps::truncate`] drops rejected-draft positions exactly like
+/// `truncate_state_to_at_most` drops their state). Every accessor takes
+/// absolute positions and returns `None` below `base` — never a misaligned
+/// row. Flat rows are the concatenated hc streams
+/// `[stream_0 | .. | stream_{hc-1}]` (hc*embed wide); the stream-averaged
+/// view is their arithmetic mean (embed wide).
+// Accessor surface is consumed by the tap tests today and the Stage B/C
+// drafters next; production code only drives capture + truncate.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct DsV4Taps {
+    config: DsV4TapConfig,
+    hc: usize,
+    embed: usize,
+    /// Absolute position of the first captured row (0 unless the request
+    /// resumed from a prefix-cache restore).
+    base: usize,
+    /// Rows captured so far (advances even for an empty config so the
+    /// lockstep invariant is checkable).
+    captured: usize,
+    /// One flat (hc*embed) row per position `base + i`, when
+    /// `config.pre_hc_head`.
+    pre_hc_head: Vec<Vec<f32>>,
+    /// `aux[g]` holds one flat row per position `base + i` for
+    /// `config.aux_layers[g]`.
+    aux: Vec<Vec<Vec<f32>>>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl DsV4Taps {
+    pub(crate) fn config(&self) -> &DsV4TapConfig {
+        &self.config
+    }
+
+    /// Absolute position of the first captured row; accessors return `None`
+    /// below it. 0 unless the request resumed from a prefix-cache restore.
+    pub(crate) fn base(&self) -> usize {
+        self.base
+    }
+
+    /// Absolute END of the captured range (`base + captured rows`); equals
+    /// the attached state's processed-token count when the buffer has been
+    /// attached (and truncated) consistently. Rows exist for positions
+    /// `base() .. positions()`.
+    pub(crate) fn positions(&self) -> usize {
+        self.base + self.captured
+    }
+
+    /// Width of every flat row (hc * embed).
+    pub(crate) fn flat_width(&self) -> usize {
+        self.hc * self.embed
+    }
+
+    /// The flat pre-hc-head residual captured at ABSOLUTE `position`
+    /// (`None` below the base).
+    pub(crate) fn pre_hc_head(&self, position: usize) -> Option<&[f32]> {
+        self.pre_hc_head
+            .get(position.checked_sub(self.base)?)
+            .map(Vec::as_slice)
+    }
+
+    /// The flat post-layer streams captured at ABSOLUTE `position` for
+    /// `layer` (`None` below the base).
+    pub(crate) fn aux_flat(&self, layer: usize, position: usize) -> Option<&[f32]> {
+        let group = self.config.aux_layers.binary_search(&layer).ok()?;
+        self.aux[group]
+            .get(position.checked_sub(self.base)?)
+            .map(Vec::as_slice)
+    }
+
+    /// Stream-averaged (embed-wide arithmetic mean over the hc streams) view
+    /// of [`Self::aux_flat`].
+    pub(crate) fn aux_averaged(&self, layer: usize, position: usize) -> Option<Vec<f32>> {
+        let flat = self.aux_flat(layer, position)?;
+        let mut avg = vec![0.0f32; self.embed];
+        for stream in flat.chunks(self.embed) {
+            for (out, value) in avg.iter_mut().zip(stream) {
+                *out += value;
+            }
+        }
+        let inv = (self.hc as f32).recip();
+        for value in &mut avg {
+            *value *= inv;
+        }
+        Some(avg)
+    }
+
+    /// Drop every captured row at or beyond ABSOLUTE `positions` (state-rewind
+    /// mirror). Truncating to the base (or below it) empties the buffer but
+    /// keeps the base — a rewind below the base must instead [`Self::rebase`]
+    /// so re-captured rows realign.
+    pub(crate) fn truncate(&mut self, positions: usize) {
+        let keep = positions.saturating_sub(self.base).min(self.captured);
+        self.captured = keep;
+        self.pre_hc_head.truncate(keep);
+        for group in &mut self.aux {
+            group.truncate(keep);
+        }
+    }
+
+    /// Empty the buffer and restart capture at ABSOLUTE `base` (a state
+    /// rewind that landed below the current base, or a full state rebuild
+    /// from position 0).
+    pub(crate) fn rebase(&mut self, base: usize) {
+        self.base = base;
+        self.captured = 0;
+        self.pre_hc_head.clear();
+        for group in &mut self.aux {
+            group.clear();
+        }
+    }
+
+    fn wants_layer(&self, layer: usize) -> bool {
+        self.config.aux_layers.binary_search(&layer).is_ok()
+    }
+
+    fn push_layer_row(&mut self, layer: usize, streams: &[Vec<f32>]) {
+        if let Ok(group) = self.config.aux_layers.binary_search(&layer) {
+            self.aux[group].push(flat_streams(streams));
+        }
+    }
+
+    fn push_pre_head_row(&mut self, streams: &[Vec<f32>]) {
+        if self.config.pre_hc_head {
+            self.pre_hc_head.push(flat_streams(streams));
+        }
+    }
+
+    /// Advance the captured-row counter after a forward pass captured `n` new
+    /// positions into every enabled group.
+    fn note_positions(&mut self, n: usize) {
+        self.captured += n;
+        debug_assert!(!self.config.pre_hc_head || self.pre_hc_head.len() == self.captured);
+        debug_assert!(self.aux.iter().all(|group| group.len() == self.captured));
+    }
+}
+
+/// Concatenate the hc streams into one flat row (the layout `hc_pre_math`
+/// flattens to, and the layout the MTP module consumes).
+fn flat_streams(streams: &[Vec<f32>]) -> Vec<f32> {
+    let mut flat = Vec::with_capacity(streams.iter().map(Vec::len).sum());
+    for stream in streams {
+        flat.extend_from_slice(stream);
+    }
+    flat
 }
 
 impl<L: DsV4Linear> DsV4Engine<L> {
@@ -916,6 +1194,18 @@ impl<L: DsV4Linear> DsV4Engine<L> {
         self.prefill_with_chunk(state, tokens, self.prefill_chunk)
     }
 
+    /// [`Self::prefill`] with optional hidden-state capture (a speculative
+    /// drafter's context; see [`DsV4Taps`]). `None` is exactly `prefill`.
+    #[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
+    pub(crate) fn prefill_with_taps(
+        &self,
+        state: &mut DsV4State,
+        tokens: &[u32],
+        taps: Option<&mut DsV4Taps>,
+    ) -> Result<Vec<f32>> {
+        self.prefill_with_chunk_taps(state, tokens, self.prefill_chunk, taps)
+    }
+
     /// Prefill `tokens` processing up to `chunk` tokens per pass. `chunk <= 1`
     /// is the legacy strictly-sequential path (one [`Self::step`] per token);
     /// larger chunks batch the heavy linears and parallelize the host math
@@ -929,13 +1219,26 @@ impl<L: DsV4Linear> DsV4Engine<L> {
         tokens: &[u32],
         chunk: usize,
     ) -> Result<Vec<f32>> {
+        self.prefill_with_chunk_taps(state, tokens, chunk, None)
+    }
+
+    /// [`Self::prefill_with_chunk`] with optional hidden-state capture. Tap
+    /// capture on the `chunk <= 1` path forces host steps (see
+    /// [`Self::step_with_taps`]); logits are identical either way.
+    pub(crate) fn prefill_with_chunk_taps(
+        &self,
+        state: &mut DsV4State,
+        tokens: &[u32],
+        chunk: usize,
+        mut taps: Option<&mut DsV4Taps>,
+    ) -> Result<Vec<f32>> {
         if tokens.is_empty() {
             bail!("DeepSeek-V4 engine requires at least one input token");
         }
         if chunk <= 1 {
             let mut logits = Vec::new();
             for &token in tokens {
-                logits = self.step(state, token)?;
+                logits = self.step_with_taps(state, token, taps.as_deref_mut())?;
             }
             return Ok(logits);
         }
@@ -943,11 +1246,176 @@ impl<L: DsV4Linear> DsV4Engine<L> {
         let mut offset = 0;
         while offset < tokens.len() {
             let take = chunk.min(tokens.len() - offset);
-            let last = offset + take == tokens.len();
-            logits = self.step_chunk(state, &tokens[offset..offset + take], last)?;
+            let heads = if offset + take == tokens.len() {
+                ChunkHeads::Last
+            } else {
+                ChunkHeads::None
+            };
+            logits = self
+                .step_chunk_heads(
+                    state,
+                    &tokens[offset..offset + take],
+                    heads,
+                    taps.as_deref_mut(),
+                )?
+                .pop();
             offset += take;
         }
         logits.ok_or_else(|| anyhow!("chunked prefill produced no logits"))
+    }
+
+    /// Forward a chunk of already-sampled/drafted tokens and return the vocab
+    /// logits at EVERY position — the speculative-decoding verify step
+    /// (`docs/deepseek-v4-spec-decode-plan.md` Stage A). Bit-exact with
+    /// running [`Self::host_step`] over the same tokens: the chunk machinery
+    /// is bit-exact with the sequential path by construction (including the
+    /// GPU provider's device MoE + prefill expert pool), the per-position
+    /// output head below runs the sequential step's exact math, and
+    /// [`DsV4Linear::set_exact_batching`] pins the provider's `mul_mat` to
+    /// per-token loops for the duration (suspending `HI_DSV4_PREFILL_GEMM=1`,
+    /// which stays prefill-only). Advances `state` over ALL `tokens` — the
+    /// caller rolls rejected positions back via [`Self::rewind_state_to`].
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn verify_tokens(
+        &self,
+        state: &mut DsV4State,
+        tokens: &[u32],
+    ) -> Result<Vec<Vec<f32>>> {
+        self.verify_tokens_with_taps(state, tokens, None)
+    }
+
+    /// [`Self::verify_tokens`] with optional hidden-state capture.
+    #[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
+    pub(crate) fn verify_tokens_with_taps(
+        &self,
+        state: &mut DsV4State,
+        tokens: &[u32],
+        mut taps: Option<&mut DsV4Taps>,
+    ) -> Result<Vec<Vec<f32>>> {
+        if tokens.is_empty() {
+            bail!("DeepSeek-V4 verify requires at least one token");
+        }
+        let _exact = ExactBatchingGuard::new(&self.linear);
+        let chunk = self.prefill_chunk.max(1);
+        let mut rows = Vec::with_capacity(tokens.len());
+        for piece in tokens.chunks(chunk) {
+            rows.extend(self.step_chunk_heads(
+                state,
+                piece,
+                ChunkHeads::All,
+                taps.as_deref_mut(),
+            )?);
+        }
+        Ok(rows)
+    }
+
+    /// Rewind `state` to exactly `target` processed tokens after a verify
+    /// overshoot, given `tokens` — the full token history the state was fed
+    /// (`tokens.len() >= target`). [`Self::truncate_state_to_at_most`] may
+    /// round down to a compressor block boundary (mid-block interiors are
+    /// unrecoverable once compressed); the rounded-off suffix is then re-fed
+    /// through the exact chunk path, which reproduces the sequential state
+    /// bit for bit. A state whose retention cannot reach any rewind point
+    /// (`None` — e.g. resumed from a snapshot taken without speculative ring
+    /// slack) rebuilds from scratch: rare, slow, never wrong. `taps` (when
+    /// attached from position 0) is truncated and re-captured in lockstep.
+    #[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
+    pub(crate) fn rewind_state_to(
+        &self,
+        state: &mut DsV4State,
+        tokens: &[u32],
+        target: usize,
+        mut taps: Option<&mut DsV4Taps>,
+    ) -> Result<()> {
+        if target == 0 || target > state.pos || target > tokens.len() {
+            bail!(
+                "cannot rewind a state at position {} over {} known tokens to {target}",
+                state.pos,
+                tokens.len()
+            );
+        }
+        // Re-fed suffixes must reproduce the sequential state exactly, so the
+        // provider stays pinned to exact batching here too (see verify_tokens).
+        let _exact = ExactBatchingGuard::new(&self.linear);
+        let chunk = self.prefill_chunk.max(1);
+        if state.pos > target {
+            match self.truncate_state_to_at_most(state, target) {
+                Some(position) if position == target => {}
+                Some(position) => {
+                    if let Some(taps) = taps.as_deref_mut() {
+                        // A round-down below the taps base restarts capture
+                        // there so the re-fed rows realign (rows can never
+                        // exist below a buffer's base).
+                        if position < taps.base() {
+                            taps.rebase(position);
+                        } else {
+                            taps.truncate(position);
+                        }
+                    }
+                    for piece in tokens[position..target].chunks(chunk) {
+                        self.step_chunk_heads(state, piece, ChunkHeads::None, taps.as_deref_mut())?;
+                    }
+                }
+                None => {
+                    *state = self.new_state_with_ring_slack(state.ring_slack);
+                    if let Some(taps) = taps.as_deref_mut() {
+                        // The rebuild recomputes every position from 0, so the
+                        // buffer re-captures from 0 whatever its old base was.
+                        taps.rebase(0);
+                    }
+                    for piece in tokens[..target].chunks(chunk) {
+                        self.step_chunk_heads(state, piece, ChunkHeads::None, taps.as_deref_mut())?;
+                    }
+                }
+            }
+        }
+        if let Some(taps) = taps {
+            taps.truncate(target);
+        }
+        debug_assert_eq!(state.pos, target);
+        Ok(())
+    }
+
+    /// Build a hidden-state capture buffer for this engine's geometry,
+    /// normalizing (sort + dedup) and validating the aux layer indices.
+    // Production attaches at a restore base via new_taps_at; the base-0 form
+    // serves the tap suites.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn new_taps(&self, config: DsV4TapConfig) -> Result<DsV4Taps> {
+        self.new_taps_at(config, 0)
+    }
+
+    /// [`Self::new_taps`] attached at ABSOLUTE position `base` — the state
+    /// position the buffer starts capturing from. A request resuming from a
+    /// prefix-cache restore passes the restore point: the restored prefix's
+    /// activations were never recomputed, so no rows exist below it and the
+    /// accessors return `None` there (drafters cold-start at the base).
+    #[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
+    pub(crate) fn new_taps_at(&self, config: DsV4TapConfig, base: usize) -> Result<DsV4Taps> {
+        let mut aux_layers = config.aux_layers;
+        aux_layers.sort_unstable();
+        aux_layers.dedup();
+        if let Some(&layer) = aux_layers.last()
+            && layer >= self.layers.len()
+        {
+            bail!(
+                "tap layer index {layer} is outside the model's {} layers",
+                self.layers.len()
+            );
+        }
+        let groups = aux_layers.len();
+        Ok(DsV4Taps {
+            config: DsV4TapConfig {
+                pre_hc_head: config.pre_hc_head,
+                aux_layers,
+            },
+            hc: self.geometry.hc,
+            embed: self.geometry.embed,
+            base,
+            captured: 0,
+            pre_hc_head: Vec::new(),
+            aux: vec![Vec::new(); groups],
+        })
     }
 
     fn generate_from_state<R: Rng + ?Sized>(
@@ -989,11 +1457,48 @@ impl<L: DsV4Linear> DsV4Engine<L> {
         self.host_step(state, token)
     }
 
+    /// [`Self::step`] with optional hidden-state capture. Capture forces the
+    /// host step (the hc streams live in host memory there; the device step
+    /// keeps them GPU-resident) — the two are bit-identical, so attaching
+    /// taps never changes logits, and `None` is exactly `step`.
+    #[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
+    pub(crate) fn step_with_taps(
+        &self,
+        state: &mut DsV4State,
+        token: u32,
+        taps: Option<&mut DsV4Taps>,
+    ) -> Result<Vec<f32>> {
+        match taps {
+            Some(taps) if !taps.config.is_empty() => {
+                self.host_step_tapped(state, token, Some(taps))
+            }
+            Some(taps) => {
+                // Empty config: nothing to capture, but keep the position
+                // counter in lockstep with the state like the chunk path does.
+                let logits = self.step(state, token)?;
+                taps.note_positions(1);
+                Ok(logits)
+            }
+            None => self.step(state, token),
+        }
+    }
+
     /// The host-orchestrated step (pre-Stage-2b behavior, unchanged): all
     /// hyper-connection/rope/attention/compressor/indexer math on host, heavy
     /// linears through the provider. Kept fully selectable as the device
     /// step's bisection fallback (`HI_DSV4_HOST_STEP=1`).
     pub(crate) fn host_step(&self, state: &mut DsV4State, token: u32) -> Result<Vec<f32>> {
+        self.host_step_tapped(state, token, None)
+    }
+
+    /// [`Self::host_step`] plus optional per-position hidden-state capture
+    /// (post-layer streams and the pre-hc-head residual; see [`DsV4Taps`]).
+    fn host_step_tapped(
+        &self,
+        state: &mut DsV4State,
+        token: u32,
+        mut taps: Option<&mut DsV4Taps>,
+    ) -> Result<Vec<f32>> {
         let pos = state.pos;
         if pos >= self.geometry.context {
             bail!(
@@ -1011,7 +1516,7 @@ impl<L: DsV4Linear> DsV4Engine<L> {
         let ring_slack = state.ring_slack;
         // Broadcast the embedding into the hc residual streams.
         let mut streams = vec![hidden; self.geometry.hc];
-        for (layer, layer_state) in self.layers.iter().zip(&mut state.layers) {
+        for (idx, (layer, layer_state)) in self.layers.iter().zip(&mut state.layers).enumerate() {
             let residual = streams.clone();
             let (mut y, post, comb) = self.hc_pre(&layer.hc_attn, &streams)?;
             rms_norm_in_place(&mut y, &layer.attn_norm, self.rms_eps)?;
@@ -1023,6 +1528,13 @@ impl<L: DsV4Linear> DsV4Engine<L> {
             rms_norm_in_place(&mut y, &layer.ffn_norm, self.rms_eps)?;
             let ffn = self.moe(layer, &y, token)?;
             streams = hc_post(&ffn, &residual, &post, &comb);
+            if let Some(taps) = taps.as_deref_mut() {
+                taps.push_layer_row(idx, &streams);
+            }
+        }
+        if let Some(taps) = taps.as_deref_mut() {
+            taps.push_pre_head_row(&streams);
+            taps.note_positions(1);
         }
         let mut hidden = self.hyper_head(&streams)?;
         rms_norm_in_place(&mut hidden, &self.output_norm, self.rms_eps)?;
@@ -1039,14 +1551,20 @@ impl<L: DsV4Linear> DsV4Engine<L> {
     /// the blocks a sequential run would, including one its own token just
     /// completed). Results are identical to feeding the tokens through
     /// [`Self::step`] one at a time — the batched-prefill parity tests gate
-    /// exactly that. Returns the last token's logits when `want_logits` is
-    /// set (interior chunks skip the lm head).
-    fn step_chunk(
+    /// exactly that. `heads` selects which positions get the output head:
+    /// none (interior prefill chunks), the last (prefill tail), or every
+    /// position (speculative verify) — the per-position head is the
+    /// sequential step's exact math (hyper-head collapse, final norm, one
+    /// lm-head row through `mul_mat`, which the exact-batching mode serves as
+    /// the sequential `mul_vec`). `taps` optionally captures per-position
+    /// hidden states; `None` skips all capture work.
+    fn step_chunk_heads(
         &self,
         state: &mut DsV4State,
         tokens: &[u32],
-        want_logits: bool,
-    ) -> Result<Option<Vec<f32>>> {
+        heads: ChunkHeads,
+        mut taps: Option<&mut DsV4Taps>,
+    ) -> Result<Vec<Vec<f32>>> {
         let g = &self.geometry;
         let b = tokens.len();
         let pos0 = state.pos;
@@ -1065,7 +1583,7 @@ impl<L: DsV4Linear> DsV4Engine<L> {
             streams.push(vec![self.embed_row(token)?; g.hc]);
         }
         let params = self.hc_params();
-        for (layer, layer_state) in self.layers.iter().zip(&mut state.layers) {
+        for (idx, (layer, layer_state)) in self.layers.iter().zip(&mut state.layers).enumerate() {
             let (ys, posts, combs) =
                 chunk_hc_pre(&layer.hc_attn, &streams, &layer.attn_norm, params)?;
             let attn = self.attention_chunk(layer, layer_state, &ys, pos0, ring_slack)?;
@@ -1075,14 +1593,39 @@ impl<L: DsV4Linear> DsV4Engine<L> {
                 chunk_hc_pre(&layer.hc_ffn, &streams, &layer.ffn_norm, params)?;
             let ffn = self.moe_chunk(layer, &ys, tokens)?;
             chunk_hc_post(&mut streams, &ffn, &posts, &combs);
+            if let Some(taps) = taps.as_deref_mut()
+                && taps.wants_layer(idx)
+            {
+                for token_streams in &streams {
+                    taps.push_layer_row(idx, token_streams);
+                }
+            }
         }
         state.pos += b;
-        if !want_logits {
-            return Ok(None);
+        if let Some(taps) = taps.as_deref_mut() {
+            for token_streams in &streams {
+                taps.push_pre_head_row(token_streams);
+            }
+            taps.note_positions(b);
         }
-        let mut hidden = self.hyper_head(&streams[b - 1])?;
-        rms_norm_in_place(&mut hidden, &self.output_norm, self.rms_eps)?;
-        Ok(Some(self.matvec(&self.output_head, &hidden)?))
+        match heads {
+            ChunkHeads::None => Ok(Vec::new()),
+            ChunkHeads::Last => {
+                let mut hidden = self.hyper_head(&streams[b - 1])?;
+                rms_norm_in_place(&mut hidden, &self.output_norm, self.rms_eps)?;
+                Ok(vec![self.matvec(&self.output_head, &hidden)?])
+            }
+            ChunkHeads::All => {
+                let mut hiddens = Vec::with_capacity(b);
+                for token_streams in &streams {
+                    let mut hidden = self.hyper_head(token_streams)?;
+                    rms_norm_in_place(&mut hidden, &self.output_norm, self.rms_eps)?;
+                    hiddens.push(hidden);
+                }
+                self.linear
+                    .mul_mat(TensorKey::Dense(&self.output_head), &hiddens)
+            }
+        }
     }
 
     /// Batched form of [`Self::attention`] over a chunk of queries: causal
@@ -1488,25 +2031,13 @@ impl<L: DsV4Linear> DsV4Engine<L> {
     /// HyperHead: like hc.pre but only the first hc mixes (pre gates), used to
     /// collapse the streams before the final norm + lm head.
     fn hyper_head(&self, streams: &[Vec<f32>]) -> Result<Vec<f32>> {
-        let n = self.geometry.hc;
-        let embed = self.geometry.embed;
-        let mut flat = Vec::with_capacity(n * embed);
-        for stream in streams {
-            flat.extend_from_slice(stream);
-        }
-        let mean_square = flat.iter().map(|value| value * value).sum::<f32>() / flat.len() as f32;
-        let inv = (mean_square + self.rms_eps).sqrt().recip();
-        let mixes = self.hyper_head.func.mul_vec(&flat)?;
-        let mut collapsed = vec![0.0f32; embed];
-        for (i, stream) in streams.iter().enumerate() {
-            let weight =
-                sigmoid(mixes[i] * inv * self.hyper_head.scale[0] + self.hyper_head.base[i])
-                    + self.hc_eps;
-            for (out, value) in collapsed.iter_mut().zip(stream) {
-                *out += weight * value;
-            }
-        }
-        Ok(collapsed)
+        hyper_head_math(
+            &self.hyper_head,
+            streams,
+            self.geometry.embed,
+            self.rms_eps,
+            self.hc_eps,
+        )
     }
 
     fn attention(
@@ -1517,138 +2048,19 @@ impl<L: DsV4Linear> DsV4Engine<L> {
         pos: usize,
         ring_slack: usize,
     ) -> Result<Vec<f32>> {
-        let g = &self.geometry;
-
-        let mut qr = self.matvec(&layer.q_a, x)?;
-        rms_norm_in_place(&mut qr, &layer.q_a_norm, self.rms_eps)?;
-        let mut q = self.matvec(&layer.q_b, &qr)?;
-        for head in q.chunks_mut(g.head_dim) {
-            // Unweighted per-head RMS scaling (no learned weight), then rope on
-            // the trailing rope_dims at the query position.
-            let mean_square =
-                head.iter().map(|value| value * value).sum::<f32>() / g.head_dim as f32;
-            let inv = (mean_square + self.rms_eps).sqrt().recip();
-            for value in head.iter_mut() {
-                *value *= inv;
-            }
-            v4_rope_tail(head, g.rope_dims, pos, layer.rope_base, false);
-        }
-
-        let mut kv = self.matvec(&layer.kv, x)?;
-        rms_norm_in_place(&mut kv, &layer.kv_norm, self.rms_eps)?;
-        v4_rope_tail(&mut kv, g.rope_dims, pos, layer.rope_base, false);
-        layer_state.ring.push_back(kv);
-        if let Some(window) = g.window
-            && layer_state.ring.len() > window + ring_slack
-        {
-            layer_state.ring.pop_front();
-        }
-
-        // Both the attention compressor and the indexer's private compressor
-        // consume every token; blocks appear once `ratio` tokens accumulate.
-        if let (Some(weights), Some(cstate)) = (&layer.compressor, &mut layer_state.compressor) {
-            self.compressor_update(weights, cstate, x)?;
-        }
-        if let (Some(indexer), Some(istate)) = (&layer.indexer, &mut layer_state.indexer) {
-            self.compressor_update(&indexer.compressor, istate, x)?;
-        }
-        // Decode-form block causality: every complete block ends at or before
-        // the current position, so all cached blocks are visible. The indexer
-        // narrows to its top_k blocks only once more than top_k exist.
-        let selected = match (&layer.indexer, &layer_state.indexer) {
-            (Some(indexer), Some(istate)) if istate.keys.len() > g.idx_top_k => {
-                Some(self.indexer_select(indexer, istate, &qr, x)?)
-            }
-            _ => None,
-        };
-
-        // K/V order: compressed blocks first, then the raw ring (order does not
-        // affect the softmax; kept to mirror the reference concatenation).
-        let mut keys: Vec<&[f32]> = Vec::new();
-        let mut values: Vec<&[f32]> = Vec::new();
-        if let Some(cstate) = &layer_state.compressor {
-            match &selected {
-                Some(blocks) => {
-                    for &block in blocks {
-                        keys.push(&cstate.keys[block]);
-                        values.push(&cstate.values[block]);
-                    }
-                }
-                None => {
-                    for (key, value) in cstate.keys.iter().zip(&cstate.values) {
-                        keys.push(key);
-                        values.push(value);
-                    }
-                }
-            }
-        }
-        // Only the trailing `window` ring entries are attention-visible; any
-        // slack-retained older entries exist purely for state truncation.
-        let raw_skip = g
-            .window
-            .map_or(0, |window| layer_state.ring.len().saturating_sub(window));
-        for entry in layer_state.ring.iter().skip(raw_skip) {
-            keys.push(entry);
-            values.push(entry);
-        }
-
-        let scale = (g.head_dim as f32).powf(-0.5);
-        let mut out = vec![0.0f32; g.heads * g.head_dim];
-        for (head, (q_head, out_head)) in q
-            .chunks(g.head_dim)
-            .zip(out.chunks_mut(g.head_dim))
-            .enumerate()
-        {
-            let mut weights: Vec<f32> = keys.iter().map(|key| dot(q_head, key) * scale).collect();
-            let sink = layer.sinks.as_ref().map(|sinks| sinks[head]);
-            // Stable softmax over [keys, sink]: the sink adds exp() mass to the
-            // denominator but contributes no value.
-            let mut max = sink.unwrap_or(f32::NEG_INFINITY);
-            for weight in &weights {
-                max = max.max(*weight);
-            }
-            let mut denom = sink.map(|sink| (sink - max).exp()).unwrap_or(0.0);
-            for weight in &mut weights {
-                *weight = (*weight - max).exp();
-                denom += *weight;
-            }
-            for (weight, value) in weights.iter().zip(&values) {
-                let weight = weight / denom;
-                for (out, value) in out_head.iter_mut().zip(*value) {
-                    *out += weight * value;
-                }
-            }
-            // Inverse rope (negated angle) on the output tail at the query pos.
-            v4_rope_tail(out_head, g.rope_dims, pos, layer.rope_base, true);
-        }
-
-        let projected = self.grouped_matvec(&layer.out_a, g.o_rank, &out)?;
-        self.matvec(&layer.out_b, &projected)
+        dsv4_attention_step(
+            &self.linear,
+            &self.geometry,
+            self.rms_eps,
+            layer,
+            layer_state,
+            x,
+            pos,
+            ring_slack,
+        )
     }
 
-    /// Buffer the token; once `ratio` tokens accumulate, emit one compressed
-    /// K/V block: gated (softmax over block positions, per channel) average of
-    /// the block's wkv projections, halves RMS-normed with the shared weight.
-    fn compressor_update(
-        &self,
-        weights: &CompressorWeights,
-        state: &mut CompressorState,
-        x: &[f32],
-    ) -> Result<()> {
-        state.pending.push(x.to_vec());
-        if state.pending.len() < weights.ratio {
-            return Ok(());
-        }
-        let mut gates = Vec::with_capacity(weights.ratio);
-        let mut kvs = Vec::with_capacity(weights.ratio);
-        for token in &state.pending {
-            gates.push(self.matvec(&weights.gate, token)?);
-            kvs.push(self.matvec(&weights.kv, token)?);
-        }
-        compressor_emit_block(weights, state, gates, kvs, self.rms_eps)
-    }
-
-    /// Chunked-prefill form of [`Self::compressor_update`]: feed the chunk's
+    /// Chunked-prefill form of [`dsv4_compressor_update`]: feed the chunk's
     /// tokens in order, batching the block projections through
     /// [`DsV4Linear::mul_mat`] whenever a block completes mid-chunk. Block
     /// completion order (and therefore the compressed cache contents) is
@@ -1675,30 +2087,6 @@ impl<L: DsV4Linear> DsV4Engine<L> {
         Ok(())
     }
 
-    /// Lightning-indexer top-k block selection (no rope anywhere in it):
-    /// score[b] = Σ_h w[h] · relu(q_h · ick_b) · idx_key^-0.5 with
-    /// w = proj(x) · idx_heads^-0.5. Returns ascending block indices (gather
-    /// order does not affect the attention softmax).
-    fn indexer_select(
-        &self,
-        indexer: &IndexerWeights,
-        istate: &CompressorState,
-        qr: &[f32],
-        x: &[f32],
-    ) -> Result<Vec<usize>> {
-        let g = &self.geometry;
-        let qi = self.matvec(&indexer.q_b, qr)?;
-        let head_weights = self.matvec(&indexer.proj, x)?;
-        Ok(indexer_select_math(
-            &qi,
-            head_weights,
-            &istate.keys,
-            g.idx_heads,
-            g.idx_key,
-            g.idx_top_k,
-        ))
-    }
-
     /// One token's MoE block, via the provider's [`DsV4Linear::moe_block`]
     /// (B=1). Bit-identical to the pre-seam per-token path: the host
     /// implementation issues the same router matvec, routing math, per-expert
@@ -1711,21 +2099,9 @@ impl<L: DsV4Linear> DsV4Engine<L> {
             .ok_or_else(|| anyhow!("moe_block returned no output rows"))
     }
 
-    fn tensor_view(&self, name: &str) -> Result<TensorView<'_>> {
-        self.gguf
-            .tensor(name)
-            .ok_or_else(|| anyhow!("GGUF tensor {name} is missing"))
-    }
-
     /// Dense matvec, routed through the provider.
     fn matvec(&self, matrix: &RawMatrix, x: &[f32]) -> Result<Vec<f32>> {
         self.linear.mul_vec(TensorKey::Dense(matrix), x)
-    }
-
-    /// Block-diagonal matvec (wo_a): output rows g*rank..(g+1)*rank read input
-    /// slice g of `matrix.cols` elements.
-    fn grouped_matvec(&self, matrix: &RawMatrix, rank: usize, x: &[f32]) -> Result<Vec<f32>> {
-        self.linear.mul_vec(TensorKey::Grouped { matrix, rank }, x)
     }
 
     /// Dequantize just the token's embedding row. Host-side for the host
@@ -1733,16 +2109,35 @@ impl<L: DsV4Linear> DsV4Engine<L> {
     /// (bit-identical dequant) and only falls back here for exotic embedding
     /// dtypes.
     pub(crate) fn embed_row(&self, token: u32) -> Result<Vec<f32>> {
-        let token = usize::try_from(token).context("token id does not fit usize")?;
-        if token >= self.geometry.vocab {
-            bail!(
-                "token id {token} is outside vocab size {}",
-                self.geometry.vocab
-            );
-        }
-        let view = self.tensor_view(&self.token_embd.name)?;
-        dequantize_elem_range(&view, token * self.token_embd.cols, self.token_embd.cols)
+        dsv4_embed_row(&self.gguf, &self.token_embd, self.geometry.vocab, token)
     }
+
+    /// The GGUF the engine reads its weights from. The MTP drafter clones the
+    /// `Arc` so it can serve the target-shared embedding and lm-head rows
+    /// without borrowing the engine.
+    #[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
+    pub(crate) fn gguf(&self) -> &Arc<GgufFile> {
+        &self.gguf
+    }
+}
+
+/// [`DsV4Engine::embed_row`]'s body as a free function: dequantize one
+/// embedding row straight out of the GGUF mmap (bit-identical for every
+/// caller — the engine, and the MTP drafter which holds its own `Arc`).
+pub(crate) fn dsv4_embed_row(
+    gguf: &GgufFile,
+    token_embd: &RawMatrix,
+    vocab: usize,
+    token: u32,
+) -> Result<Vec<f32>> {
+    let token = usize::try_from(token).context("token id does not fit usize")?;
+    if token >= vocab {
+        bail!("token id {token} is outside vocab size {vocab}");
+    }
+    let view = gguf
+        .tensor(&token_embd.name)
+        .ok_or_else(|| anyhow!("GGUF tensor {} is missing", token_embd.name))?;
+    dequantize_elem_range(&view, token * token_embd.cols, token_embd.cols)
 }
 
 impl DsV4Linear for DsV4CpuLinear {
@@ -1947,12 +2342,194 @@ pub(crate) fn moe_route_math(
     Ok((selected, weights))
 }
 
+/// One token's V4 attention (S=1), shared verbatim by [`DsV4Engine::step`]'s
+/// host path and the MTP draft layer (`dsv4_mtp`, whose block is a
+/// compress-ratio-1 layer: no compressor/indexer, raw SWA ring only). All
+/// heavy linears go through `linear`; everything else is host f32 math.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dsv4_attention_step<L: DsV4Linear + ?Sized>(
+    linear: &L,
+    g: &DsV4Geometry,
+    rms_eps: f32,
+    layer: &DsV4Layer,
+    layer_state: &mut DsV4LayerState,
+    x: &[f32],
+    pos: usize,
+    ring_slack: usize,
+) -> Result<Vec<f32>> {
+    let mut qr = linear.mul_vec(TensorKey::Dense(&layer.q_a), x)?;
+    rms_norm_in_place(&mut qr, &layer.q_a_norm, rms_eps)?;
+    let mut q = linear.mul_vec(TensorKey::Dense(&layer.q_b), &qr)?;
+    for head in q.chunks_mut(g.head_dim) {
+        // Unweighted per-head RMS scaling (no learned weight), then rope on
+        // the trailing rope_dims at the query position.
+        let mean_square = head.iter().map(|value| value * value).sum::<f32>() / g.head_dim as f32;
+        let inv = (mean_square + rms_eps).sqrt().recip();
+        for value in head.iter_mut() {
+            *value *= inv;
+        }
+        v4_rope_tail(head, g.rope_dims, pos, layer.rope_base, false);
+    }
+
+    let mut kv = linear.mul_vec(TensorKey::Dense(&layer.kv), x)?;
+    rms_norm_in_place(&mut kv, &layer.kv_norm, rms_eps)?;
+    v4_rope_tail(&mut kv, g.rope_dims, pos, layer.rope_base, false);
+    layer_state.ring.push_back(kv);
+    if let Some(window) = g.window
+        && layer_state.ring.len() > window + ring_slack
+    {
+        layer_state.ring.pop_front();
+    }
+
+    // Both the attention compressor and the indexer's private compressor
+    // consume every token; blocks appear once `ratio` tokens accumulate.
+    if let (Some(weights), Some(cstate)) = (&layer.compressor, &mut layer_state.compressor) {
+        dsv4_compressor_update(linear, rms_eps, weights, cstate, x)?;
+    }
+    if let (Some(indexer), Some(istate)) = (&layer.indexer, &mut layer_state.indexer) {
+        dsv4_compressor_update(linear, rms_eps, &indexer.compressor, istate, x)?;
+    }
+    // Decode-form block causality: every complete block ends at or before
+    // the current position, so all cached blocks are visible. The indexer
+    // narrows to its top_k blocks only once more than top_k exist.
+    let selected = match (&layer.indexer, &layer_state.indexer) {
+        (Some(indexer), Some(istate)) if istate.keys.len() > g.idx_top_k => {
+            Some(dsv4_indexer_select(linear, g, indexer, istate, &qr, x)?)
+        }
+        _ => None,
+    };
+
+    // K/V order: compressed blocks first, then the raw ring (order does not
+    // affect the softmax; kept to mirror the reference concatenation).
+    let mut keys: Vec<&[f32]> = Vec::new();
+    let mut values: Vec<&[f32]> = Vec::new();
+    if let Some(cstate) = &layer_state.compressor {
+        match &selected {
+            Some(blocks) => {
+                for &block in blocks {
+                    keys.push(&cstate.keys[block]);
+                    values.push(&cstate.values[block]);
+                }
+            }
+            None => {
+                for (key, value) in cstate.keys.iter().zip(&cstate.values) {
+                    keys.push(key);
+                    values.push(value);
+                }
+            }
+        }
+    }
+    // Only the trailing `window` ring entries are attention-visible; any
+    // slack-retained older entries exist purely for state truncation.
+    let raw_skip = g
+        .window
+        .map_or(0, |window| layer_state.ring.len().saturating_sub(window));
+    for entry in layer_state.ring.iter().skip(raw_skip) {
+        keys.push(entry);
+        values.push(entry);
+    }
+
+    let scale = (g.head_dim as f32).powf(-0.5);
+    let mut out = vec![0.0f32; g.heads * g.head_dim];
+    for (head, (q_head, out_head)) in q
+        .chunks(g.head_dim)
+        .zip(out.chunks_mut(g.head_dim))
+        .enumerate()
+    {
+        let mut weights: Vec<f32> = keys.iter().map(|key| dot(q_head, key) * scale).collect();
+        let sink = layer.sinks.as_ref().map(|sinks| sinks[head]);
+        // Stable softmax over [keys, sink]: the sink adds exp() mass to the
+        // denominator but contributes no value.
+        let mut max = sink.unwrap_or(f32::NEG_INFINITY);
+        for weight in &weights {
+            max = max.max(*weight);
+        }
+        let mut denom = sink.map(|sink| (sink - max).exp()).unwrap_or(0.0);
+        for weight in &mut weights {
+            *weight = (*weight - max).exp();
+            denom += *weight;
+        }
+        for (weight, value) in weights.iter().zip(&values) {
+            let weight = weight / denom;
+            for (out, value) in out_head.iter_mut().zip(*value) {
+                *out += weight * value;
+            }
+        }
+        // Inverse rope (negated angle) on the output tail at the query pos.
+        v4_rope_tail(out_head, g.rope_dims, pos, layer.rope_base, true);
+    }
+
+    let projected = linear.mul_vec(
+        TensorKey::Grouped {
+            matrix: &layer.out_a,
+            rank: g.o_rank,
+        },
+        &out,
+    )?;
+    linear.mul_vec(TensorKey::Dense(&layer.out_b), &projected)
+}
+
+/// Buffer the token; once `ratio` tokens accumulate, emit one compressed
+/// K/V block: gated (softmax over block positions, per channel) average of
+/// the block's wkv projections, halves RMS-normed with the shared weight.
+fn dsv4_compressor_update<L: DsV4Linear + ?Sized>(
+    linear: &L,
+    rms_eps: f32,
+    weights: &CompressorWeights,
+    state: &mut CompressorState,
+    x: &[f32],
+) -> Result<()> {
+    state.pending.push(x.to_vec());
+    if state.pending.len() < weights.ratio {
+        return Ok(());
+    }
+    let mut gates = Vec::with_capacity(weights.ratio);
+    let mut kvs = Vec::with_capacity(weights.ratio);
+    for token in &state.pending {
+        gates.push(linear.mul_vec(TensorKey::Dense(&weights.gate), token)?);
+        kvs.push(linear.mul_vec(TensorKey::Dense(&weights.kv), token)?);
+    }
+    compressor_emit_block(weights, state, gates, kvs, rms_eps)
+}
+
+/// Lightning-indexer top-k block selection (no rope anywhere in it):
+/// score[b] = Σ_h w[h] · relu(q_h · ick_b) · idx_key^-0.5 with
+/// w = proj(x) · idx_heads^-0.5. Returns ascending block indices (gather
+/// order does not affect the attention softmax).
+fn dsv4_indexer_select<L: DsV4Linear + ?Sized>(
+    linear: &L,
+    g: &DsV4Geometry,
+    indexer: &IndexerWeights,
+    istate: &CompressorState,
+    qr: &[f32],
+    x: &[f32],
+) -> Result<Vec<usize>> {
+    let qi = linear.mul_vec(TensorKey::Dense(&indexer.q_b), qr)?;
+    let head_weights = linear.mul_vec(TensorKey::Dense(&indexer.proj), x)?;
+    Ok(indexer_select_math(
+        &qi,
+        head_weights,
+        &istate.keys,
+        g.idx_heads,
+        g.idx_key,
+        g.idx_top_k,
+    ))
+}
+
 impl DsV4CpuLinear {
-    /// Test-only: the GPU MoE-block parity test builds a pure-CPU oracle over
-    /// the same GGUF to cross-check the device path against host f32 math.
+    /// Build a CPU provider over an already-open GGUF. The engine constructs
+    /// its own; this entry point serves providers that overlay extra host
+    /// weights on top of the GGUF (the MTP host reference in `dsv4_mtp`) and
+    /// the GPU MoE-block parity test's pure-CPU oracle.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn from_gguf(gguf: Arc<GgufFile>) -> Self {
+        Self { gguf }
+    }
+
+    /// Test-only alias of [`Self::from_gguf`] (kept for the existing suites).
     #[cfg(test)]
     pub(crate) fn new_for_tests(gguf: Arc<GgufFile>) -> Self {
-        Self { gguf }
+        Self::from_gguf(gguf)
     }
 
     fn tensor_view(&self, name: &str) -> Result<TensorView<'_>> {
@@ -2289,7 +2866,7 @@ impl HcWeights {
         scale_len: usize,
     ) -> Result<Self> {
         Ok(Self {
-            func: load_matrix(gguf, &format!("{base}_fn.weight"), rows, cols)?,
+            func: DsV4HcFunc::load(gguf, &format!("{base}_fn.weight"), rows, cols)?,
             base: load_vector(gguf, &format!("{base}_base.weight"), rows)?,
             scale: load_vector(gguf, &format!("{base}_scale.weight"), scale_len)?,
         })
@@ -2356,19 +2933,47 @@ impl CompressorState {
 
 /// Scalars threaded through the hyper-connection helpers so the chunked path
 /// can run them on rayon workers without borrowing the engine (the provider
-/// is deliberately not `Sync`).
+/// is deliberately not `Sync`). Fields are crate-visible so the MTP draft
+/// layer (`dsv4_mtp`) can build one from its copied trunk geometry.
 #[derive(Clone, Copy)]
-struct HcParams {
-    hc: usize,
+pub(crate) struct HcParams {
+    pub(crate) hc: usize,
+    pub(crate) embed: usize,
+    pub(crate) rms_eps: f32,
+    pub(crate) hc_eps: f32,
+    pub(crate) sinkhorn_iterations: usize,
+}
+
+/// The output hyper-head math (see [`DsV4Engine::hyper_head`]): RMS-scaled
+/// sigmoid pre gates only, collapsing the hc streams to one activation.
+/// Shared by the engine and the MTP module's own `hc_head_*` collapse.
+pub(crate) fn hyper_head_math(
+    hc: &HcWeights,
+    streams: &[Vec<f32>],
     embed: usize,
     rms_eps: f32,
     hc_eps: f32,
-    sinkhorn_iterations: usize,
+) -> Result<Vec<f32>> {
+    let mut flat = Vec::with_capacity(streams.iter().map(Vec::len).sum());
+    for stream in streams {
+        flat.extend_from_slice(stream);
+    }
+    let mean_square = flat.iter().map(|value| value * value).sum::<f32>() / flat.len() as f32;
+    let inv = (mean_square + rms_eps).sqrt().recip();
+    let mixes = hc.func.mul_vec(&flat)?;
+    let mut collapsed = vec![0.0f32; embed];
+    for (i, stream) in streams.iter().enumerate() {
+        let weight = sigmoid(mixes[i] * inv * hc.scale[0] + hc.base[i]) + hc_eps;
+        for (out, value) in collapsed.iter_mut().zip(stream) {
+            *out += weight * value;
+        }
+    }
+    Ok(collapsed)
 }
 
 /// HyperConnection.pre math (see [`DsV4Engine::hc_pre`]); shared verbatim by
-/// the sequential and chunked paths.
-fn hc_pre_math(
+/// the sequential and chunked paths (and the MTP draft layer).
+pub(crate) fn hc_pre_math(
     hc: &HcWeights,
     streams: &[Vec<f32>],
     params: HcParams,
@@ -2592,7 +3197,12 @@ fn truncate_compressor(state: &mut CompressorState, ratio: usize, position: usiz
 }
 
 /// HyperConnection.post: stream i gets post[i]*f plus the comb-mixed residual.
-fn hc_post(f_out: &[f32], residual: &[Vec<f32>], post: &[f32], comb: &[f32]) -> Vec<Vec<f32>> {
+pub(crate) fn hc_post(
+    f_out: &[f32],
+    residual: &[Vec<f32>],
+    post: &[f32],
+    comb: &[f32],
+) -> Vec<Vec<f32>> {
     let n = residual.len();
     let mut streams = Vec::with_capacity(n);
     for i in 0..n {
@@ -2774,9 +3384,30 @@ pub(crate) mod fixture {
     /// head_dim 8 (nope 4 + rope 4), q_lora 4, grouped output 2x4, 4 experts
     /// top-2 (ff 4) + 1 shared, sliding window 4, indexer top_k 1, vocab 3.
     pub(crate) fn write_deepseek4_gguf(path: &Path) {
+        write_deepseek4_gguf_core(path, false);
+    }
+
+    /// Speculative-decoding fixture variant: vocab 4 (`a b c d`) with eos on
+    /// the extra token `d` and NO unknown-token fallback. The standard
+    /// fixture's eos (`c`) and unknown (`a`) ids are delta-skipped by the
+    /// streaming decoder, so the oracle suites could not observe emitted
+    /// token ids through the event stream; here tokens 0..=2 all stream
+    /// visibly and greedy only stops if it genuinely reaches `d`.
+    // Consumed by the native-cuda backend's oracle suites only.
+    #[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
+    pub(crate) fn write_deepseek4_spec_gguf(path: &Path) {
+        write_deepseek4_gguf_core(path, true);
+    }
+
+    fn write_deepseek4_gguf_core(path: &Path, spec_decode: bool) {
+        let vocab: usize = if spec_decode { 4 } else { 3 };
         let mut tensors = vec![
-            tensor_f32("token_embd.weight", vec![4, 3], &vals(1, 12)),
-            tensor_f32("output.weight", vec![4, 3], &vals(2, 12)),
+            tensor_f32(
+                "token_embd.weight",
+                vec![4, vocab as u64],
+                &vals(1, 4 * vocab),
+            ),
+            tensor_f32("output.weight", vec![4, vocab as u64], &vals(2, 4 * vocab)),
             tensor_f32("output_norm.weight", vec![4], &[1.0; 4]),
             tensor_f32("output_hc_fn.weight", vec![8, 2], &vals(3, 16)),
             tensor_f32("output_hc_base.weight", vec![2], &vals(4, 2)),
@@ -3007,11 +3638,17 @@ pub(crate) mod fixture {
         meta.f32("deepseek4.expert_weights_scale", 1.5);
         meta.f32_array("deepseek4.swiglu_clamp_exp", &[10.0, 10.0, 10.0]);
         meta.f32_array("deepseek4.swiglu_clamp_shexp", &[10.0, 10.0, 10.0]);
-        meta.u32("tokenizer.ggml.eos_token_id", 2);
-        // Unknown fallback lets the serving smoke test encode arbitrary prompt
-        // text (chat-template markers included) against the 3-token vocab.
-        meta.u32("tokenizer.ggml.unknown_token_id", 0);
-        meta.string_array("tokenizer.ggml.tokens", &["a", "b", "c"]);
+        if spec_decode {
+            meta.u32("tokenizer.ggml.eos_token_id", 3);
+            meta.string_array("tokenizer.ggml.tokens", &["a", "b", "c", "d"]);
+        } else {
+            meta.u32("tokenizer.ggml.eos_token_id", 2);
+            // Unknown fallback lets the serving smoke test encode arbitrary
+            // prompt text (chat-template markers included) against the
+            // 3-token vocab.
+            meta.u32("tokenizer.ggml.unknown_token_id", 0);
+            meta.string_array("tokenizer.ggml.tokens", &["a", "b", "c"]);
+        }
         // Structural fragment of the real DeepSeek-V4-Flash chat template: just
         // enough for hi-local-core's V4 discriminator (`<｜User｜>` + `</think>`
         // + `｜DSML｜`) so the serving smoke test renders the V4 prompt shape.
@@ -3471,6 +4108,363 @@ mod tests {
             engine.truncate_state_to_at_most(&mut no_slack, 14),
             Some(14)
         );
+    }
+
+    /// Stage-A verify contract on the CPU provider
+    /// (`docs/deepseek-v4-spec-decode-plan.md`): `verify_tokens` returns
+    /// logits at EVERY position, bit-identical to stepping the same tokens
+    /// through `host_step` one at a time, and advances the state identically
+    /// (a continued decode agrees bit for bit).
+    #[test]
+    fn dsv4_verify_tokens_bit_exact_with_sequential_steps() {
+        let path = tempfile_path("verify");
+        write_deepseek4_gguf(&path);
+        let model = DeepSeekV4CpuReference::load(&path).unwrap();
+        let engine = &model.engine;
+
+        let prompt: Vec<u32> = (0..6).map(|idx| idx % 3).collect();
+        // The continuation crosses ratio-4 and ratio-2 block boundaries,
+        // evicts from the window-4 ring, and engages the indexer's top-k.
+        let continuation: Vec<u32> = (0..8).map(|idx| (idx * 2) % 3).collect();
+
+        let mut seq_state = engine.new_state();
+        engine
+            .prefill_with_chunk(&mut seq_state, &prompt, 1)
+            .unwrap();
+        let mut verify_state = seq_state.clone();
+
+        let seq_rows: Vec<Vec<f32>> = continuation
+            .iter()
+            .map(|&token| engine.host_step(&mut seq_state, token).unwrap())
+            .collect();
+        let verify_rows = engine
+            .verify_tokens(&mut verify_state, &continuation)
+            .unwrap();
+        assert_eq!(verify_rows.len(), continuation.len());
+        assert_eq!(
+            verify_rows, seq_rows,
+            "verify logits must be bit-exact with sequential host steps"
+        );
+
+        assert_eq!(verify_state.pos(), seq_state.pos());
+        for &token in &[0u32, 1, 2] {
+            assert_eq!(
+                engine.host_step(&mut verify_state, token).unwrap(),
+                engine.host_step(&mut seq_state, token).unwrap(),
+                "continued decode after verify must stay bit-exact"
+            );
+        }
+    }
+
+    /// Stage-A rollback: a verify overshoots the accepted prefix, then
+    /// [`DsV4Engine::rewind_state_to`] restores the accepted end exactly —
+    /// including compressor block-boundary round-down re-feeds and the
+    /// no-retention full-rebuild fallback — so a continued decode is
+    /// bit-identical to a state that only ever stepped the accepted tokens.
+    #[test]
+    fn dsv4_verify_rewind_round_trip_matches_accepted_only_state() {
+        let path = tempfile_path("rewind");
+        write_deepseek4_gguf(&path);
+        let model = DeepSeekV4CpuReference::load(&path).unwrap();
+        let engine = &model.engine;
+
+        let prompt: Vec<u32> = (0..6).map(|idx| idx % 3).collect();
+        let continuation: Vec<u32> = vec![1, 2, 0, 1, 2];
+        let mut history = prompt.clone();
+        history.extend(&continuation);
+        // The backend's speculative sizing: max compress ratio 4 + K + 1.
+        let slack = 4 + continuation.len() + 1;
+
+        for keep in 1..=continuation.len() {
+            let target = prompt.len() + keep;
+            let mut state = engine.new_state_with_ring_slack(slack);
+            engine.prefill_with_chunk(&mut state, &prompt, 4).unwrap();
+            let rows = engine.verify_tokens(&mut state, &continuation).unwrap();
+            assert_eq!(rows.len(), continuation.len());
+            engine
+                .rewind_state_to(&mut state, &history[..target], target, None)
+                .unwrap();
+            assert_eq!(state.pos(), target);
+
+            // Reference: a state that only ever processed the kept prefix.
+            let mut reference = engine.new_state_with_ring_slack(slack);
+            engine
+                .prefill_with_chunk(&mut reference, &prompt, 4)
+                .unwrap();
+            for &token in &continuation[..keep] {
+                engine.host_step(&mut reference, token).unwrap();
+            }
+            for &token in &[2u32, 0, 1] {
+                assert_eq!(
+                    engine.host_step(&mut state, token).unwrap(),
+                    engine.host_step(&mut reference, token).unwrap(),
+                    "keep {keep}: rewound state diverged from accepted-only state"
+                );
+            }
+        }
+
+        // No retention at all (slack 0, ring evicted past the rewind point):
+        // rewind falls back to the full rebuild and still matches.
+        let mut state = engine.new_state();
+        engine.prefill_with_chunk(&mut state, &prompt, 4).unwrap();
+        engine.verify_tokens(&mut state, &continuation).unwrap();
+        let target = prompt.len() + 1;
+        engine
+            .rewind_state_to(&mut state, &history[..target], target, None)
+            .unwrap();
+        assert_eq!(state.pos(), target);
+        let mut reference = engine.new_state();
+        engine
+            .prefill_with_chunk(&mut reference, &history[..target], 4)
+            .unwrap();
+        for &token in &[2u32, 0, 1] {
+            assert_eq!(
+                engine.host_step(&mut state, token).unwrap(),
+                engine.host_step(&mut reference, token).unwrap(),
+                "full-rebuild rewind diverged"
+            );
+        }
+    }
+
+    /// Stage-A hidden taps: chunked prefill, single steps, and verify chunks
+    /// capture bit-identical rows to a fully sequential tapped run; the
+    /// captured pre-hc-head residual reproduces its position's logits through
+    /// the output head (direct computation); averaged views are the stream
+    /// means; and disabled/empty configs capture nothing while never
+    /// perturbing logits.
+    #[test]
+    fn dsv4_taps_capture_matches_sequential_and_direct_computation() {
+        let path = tempfile_path("taps");
+        write_deepseek4_gguf(&path);
+        let model = DeepSeekV4CpuReference::load(&path).unwrap();
+        let engine = &model.engine;
+        let (hc, embed) = (engine.geometry.hc, engine.geometry.embed);
+
+        let config = DsV4TapConfig {
+            pre_hc_head: true,
+            aux_layers: vec![2, 0], // unsorted on purpose; new_taps normalizes
+        };
+        let mut taps = engine.new_taps(config.clone()).unwrap();
+        assert_eq!(taps.flat_width(), hc * embed);
+
+        // Mixed capture paths, the drafter-context pattern: chunked prefill,
+        // then single tapped steps, then a verify chunk.
+        let tokens: Vec<u32> = (0..12).map(|idx| idx % 3).collect();
+        let mut state = engine.new_state_with_ring_slack(9);
+        let mut step_logits = engine
+            .prefill_with_chunk_taps(&mut state, &tokens[..8], 4, Some(&mut taps))
+            .unwrap();
+        for &token in &tokens[8..10] {
+            step_logits = engine
+                .step_with_taps(&mut state, token, Some(&mut taps))
+                .unwrap();
+        }
+        let verify_rows = engine
+            .verify_tokens_with_taps(&mut state, &tokens[10..12], Some(&mut taps))
+            .unwrap();
+        assert_eq!(taps.positions(), tokens.len());
+
+        // Oracle: the same sequence stepped one token at a time with taps.
+        let mut seq_taps = engine.new_taps(config).unwrap();
+        let mut seq_state = engine.new_state_with_ring_slack(9);
+        let mut seq_logits = Vec::new();
+        for &token in &tokens {
+            seq_logits.push(
+                engine
+                    .step_with_taps(&mut seq_state, token, Some(&mut seq_taps))
+                    .unwrap(),
+            );
+        }
+        for position in 0..tokens.len() {
+            assert_eq!(
+                taps.pre_hc_head(position).unwrap(),
+                seq_taps.pre_hc_head(position).unwrap(),
+                "pre-hc-head row {position}"
+            );
+            for layer in [0usize, 2] {
+                assert_eq!(
+                    taps.aux_flat(layer, position).unwrap(),
+                    seq_taps.aux_flat(layer, position).unwrap(),
+                    "aux layer {layer} row {position}"
+                );
+            }
+        }
+        // Capture never perturbs logits, on any path.
+        assert_eq!(step_logits, seq_logits[9]);
+        assert_eq!(verify_rows[0], seq_logits[10]);
+        assert_eq!(verify_rows[1], seq_logits[11]);
+
+        // Direct computation: the captured pre-hc-head residual is the value
+        // immediately before the output head, so pushing it through
+        // hyper-head collapse + final norm + lm head reproduces the logits.
+        let flat = taps.pre_hc_head(11).unwrap();
+        let streams: Vec<Vec<f32>> = flat.chunks(embed).map(<[f32]>::to_vec).collect();
+        assert_eq!(streams.len(), hc);
+        let mut hidden = engine.hyper_head(&streams).unwrap();
+        rms_norm_in_place(&mut hidden, &engine.output_norm, engine.rms_eps).unwrap();
+        let expected = engine.matvec(&engine.output_head, &hidden).unwrap();
+        assert_eq!(verify_rows[1], expected);
+
+        // Averaged view = arithmetic mean over the hc streams.
+        let avg = taps.aux_averaged(2, 5).unwrap();
+        let flat = taps.aux_flat(2, 5).unwrap();
+        assert_eq!(avg.len(), embed);
+        for (channel, value) in avg.iter().enumerate() {
+            let want = (flat[channel] + flat[embed + channel]) / 2.0;
+            assert!((value - want).abs() < 1.0e-6, "avg channel {channel}");
+        }
+
+        // Unrequested layers yield nothing; truncation drops rows in lockstep
+        // with a state rewind.
+        assert!(taps.aux_flat(1, 0).is_none());
+        taps.truncate(7);
+        assert_eq!(taps.positions(), 7);
+        assert!(taps.pre_hc_head(7).is_none());
+        assert!(taps.aux_flat(0, 6).is_some());
+
+        // Empty config: nothing captured, logits identical to the untapped
+        // run; out-of-range aux layers are rejected at construction.
+        let mut empty = engine.new_taps(DsV4TapConfig::default()).unwrap();
+        let mut plain_state = engine.new_state();
+        let plain = engine
+            .prefill_with_chunk(&mut plain_state, &tokens, 4)
+            .unwrap();
+        let mut tapped_state = engine.new_state();
+        let tapped = engine
+            .prefill_with_chunk_taps(&mut tapped_state, &tokens, 4, Some(&mut empty))
+            .unwrap();
+        assert_eq!(plain, tapped);
+        assert_eq!(empty.positions(), tokens.len());
+        assert!(empty.pre_hc_head(0).is_none());
+        assert!(
+            engine
+                .new_taps(DsV4TapConfig {
+                    pre_hc_head: false,
+                    aux_layers: vec![3],
+                })
+                .is_err()
+        );
+    }
+
+    /// Base-offset taps (prefix-cache-restore view): a buffer attached at a
+    /// non-zero base captures rows for absolute positions `base..` that are
+    /// bit-identical to a full buffer's rows there, returns `None` below the
+    /// base (never a misaligned row), truncates/rebases in absolute terms,
+    /// and stays position-aligned through verify + rewind.
+    #[test]
+    fn dsv4_taps_base_offset_accessors_truncate_and_rewind_alignment() {
+        let path = tempfile_path("taps-base");
+        write_deepseek4_gguf(&path);
+        let model = DeepSeekV4CpuReference::load(&path).unwrap();
+        let engine = &model.engine;
+        let config = DsV4TapConfig {
+            pre_hc_head: true,
+            aux_layers: vec![1],
+        };
+        let tokens: Vec<u32> = (0..12).map(|idx| idx % 3).collect();
+        let base = 5usize;
+
+        // Full-history reference buffer.
+        let mut full = engine.new_taps(config.clone()).unwrap();
+        let mut full_state = engine.new_state();
+        engine
+            .prefill_with_chunk_taps(&mut full_state, &tokens, 4, Some(&mut full))
+            .unwrap();
+
+        // Restore-shaped buffer: positions 0..base forwarded untapped (the
+        // restored prefix), capture attached at `base`.
+        let mut taps = engine.new_taps_at(config.clone(), base).unwrap();
+        let mut state = engine.new_state_with_ring_slack(9);
+        engine
+            .prefill_with_chunk(&mut state, &tokens[..base], 4)
+            .unwrap();
+        engine
+            .prefill_with_chunk_taps(&mut state, &tokens[base..], 4, Some(&mut taps))
+            .unwrap();
+
+        assert_eq!(taps.base(), base);
+        assert_eq!(taps.positions(), tokens.len());
+        // Absolute accessors: None strictly below the base, bit-identical to
+        // the full buffer at and above it.
+        for position in 0..base {
+            assert!(taps.pre_hc_head(position).is_none(), "row {position}");
+            assert!(taps.aux_flat(1, position).is_none(), "aux row {position}");
+            assert!(taps.aux_averaged(1, position).is_none());
+        }
+        for position in base..tokens.len() {
+            assert_eq!(
+                taps.pre_hc_head(position).unwrap(),
+                full.pre_hc_head(position).unwrap(),
+                "pre-hc-head row {position}"
+            );
+            assert_eq!(
+                taps.aux_flat(1, position).unwrap(),
+                full.aux_flat(1, position).unwrap(),
+                "aux row {position}"
+            );
+        }
+        assert!(taps.pre_hc_head(tokens.len()).is_none());
+
+        // Absolute truncate: to mid-range, then to (and below) the base.
+        taps.truncate(8);
+        assert_eq!(taps.positions(), 8);
+        assert!(taps.pre_hc_head(8).is_none());
+        assert_eq!(
+            taps.pre_hc_head(7).unwrap(),
+            full.pre_hc_head(7).unwrap(),
+            "truncate must keep absolute alignment"
+        );
+        taps.truncate(2);
+        assert_eq!(taps.base(), base, "truncate never moves the base");
+        assert_eq!(taps.positions(), base, "emptied buffer ends at its base");
+        assert!(taps.pre_hc_head(base).is_none());
+
+        // Rebase restarts capture at a new absolute position.
+        taps.rebase(2);
+        assert_eq!((taps.base(), taps.positions()), (2, 2));
+
+        // Verify + rewind keep a based buffer aligned: rows for rejected
+        // positions drop, the survivors still match the full reference.
+        let mut taps = engine.new_taps_at(config, base).unwrap();
+        let mut state = engine.new_state_with_ring_slack(9);
+        engine
+            .prefill_with_chunk(&mut state, &tokens[..base], 4)
+            .unwrap();
+        engine
+            .prefill_with_chunk_taps(&mut state, &tokens[base..], 4, Some(&mut taps))
+            .unwrap();
+        let continuation = [1u32, 2, 0, 1];
+        engine
+            .verify_tokens_with_taps(&mut state, &continuation, Some(&mut taps))
+            .unwrap();
+        assert_eq!(taps.positions(), tokens.len() + continuation.len());
+        let mut history = tokens.clone();
+        history.extend(&continuation);
+        let target = tokens.len() + 2;
+        engine
+            .rewind_state_to(&mut state, &history, target, Some(&mut taps))
+            .unwrap();
+        assert_eq!(state.pos(), target);
+        assert_eq!(taps.positions(), target, "taps track the rewound state");
+        assert_eq!(taps.base(), base);
+        // The surviving verify rows equal a full-history recompute.
+        let mut full2 = engine
+            .new_taps(DsV4TapConfig {
+                pre_hc_head: true,
+                aux_layers: vec![1],
+            })
+            .unwrap();
+        let mut ref_state = engine.new_state();
+        engine
+            .prefill_with_chunk_taps(&mut ref_state, &history[..target], 4, Some(&mut full2))
+            .unwrap();
+        for position in base..target {
+            assert_eq!(
+                taps.pre_hc_head(position).unwrap(),
+                full2.pre_hc_head(position).unwrap(),
+                "post-rewind row {position}"
+            );
+        }
     }
 
     #[test]

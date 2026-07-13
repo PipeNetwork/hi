@@ -1877,16 +1877,16 @@ impl Matrix {
         self.mul_vec_with_bias(input, None)
     }
 
-    /// (rows, cols) of the materialized matrix. Read by the DeepSeek-V4
-    /// device-step provider, which uploads small host matrices (the
-    /// hyper-connection mixers) once at first use.
-    #[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
+    /// (rows, cols) of the materialized matrix. Kept as part of the Matrix
+    /// surface for engine providers (the DeepSeek-V4 hyper-connection mixers
+    /// moved to `DsV4HcFunc`, so no in-tree caller remains in every config).
+    #[allow(dead_code)]
     pub(crate) fn shape(&self) -> (usize, usize) {
         (self.rows, self.cols)
     }
 
     /// Row-major f32 payload (see [`Self::shape`]).
-    #[cfg_attr(not(feature = "native-cuda"), allow(dead_code))]
+    #[allow(dead_code)]
     pub(crate) fn data(&self) -> &[f32] {
         &self.data
     }

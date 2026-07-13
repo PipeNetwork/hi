@@ -303,6 +303,11 @@ struct PoolSlot {
     /// (roadmap item 5b); cleared (and counted as a speculative hit) the first
     /// time its layer actually re-touches it.
     spec: bool,
+    /// Permanently resident (never an eviction victim): the MTP drafter's
+    /// layer-43 slices, touched every draft. Set only by
+    /// [`DsV4GpuLinearInner::register_host_experts`], which guarantees enough
+    /// unpinned slots remain for the trunk's working set.
+    permanent: bool,
 }
 
 /// Outcome of [`DsV4ExpertPool::acquire_prefetch`].
@@ -368,11 +373,15 @@ impl DsV4ExpertPool {
             return (idx, true);
         }
         // Prefer an unpinned victim; a fully-pinned pool (pathological tiny
-        // pool) force-evicts the LRU head — safe because the engine stream has
-        // already waited on the copy-done event, so that slot's prefetch copy
-        // has completed and its GEMV, if any, was enqueued earlier on the same
-        // stream.
-        let idx = self.find_victim().unwrap_or(self.lru_head);
+        // pool) force-evicts the coldest non-permanent slot — safe because the
+        // engine stream has already waited on the copy-done event, so that
+        // slot's prefetch copy has completed and its GEMV, if any, was
+        // enqueued earlier on the same stream. Permanent (MTP) slots are never
+        // victims; registration guarantees non-permanent slots exist.
+        let idx = self
+            .find_victim()
+            .or_else(|| self.find_forced_victim())
+            .unwrap_or(self.lru_head);
         self.reassign(idx, key);
         self.slots[idx as usize].pinned = false;
         self.touch(idx);
@@ -440,15 +449,31 @@ impl DsV4ExpertPool {
         }
     }
 
-    /// The coldest unpinned slot (LRU head walking toward the tail), or `None`
-    /// when every slot is pinned by the current batch.
+    /// The coldest unpinned, non-permanent slot (LRU head walking toward the
+    /// tail), or `None` when every slot is pinned by the current batch or
+    /// permanently resident.
     fn find_victim(&self) -> Option<u32> {
         let mut idx = self.lru_head;
         while idx != POOL_NIL {
-            if !self.slots[idx as usize].pinned {
+            let slot = &self.slots[idx as usize];
+            if !slot.pinned && !slot.permanent {
                 return Some(idx);
             }
-            idx = self.slots[idx as usize].next;
+            idx = slot.next;
+        }
+        None
+    }
+
+    /// The coldest non-permanent slot, ignoring batch pins — the force-evict
+    /// fallback for a fully batch-pinned pool (see [`Self::acquire`]).
+    fn find_forced_victim(&self) -> Option<u32> {
+        let mut idx = self.lru_head;
+        while idx != POOL_NIL {
+            let slot = &self.slots[idx as usize];
+            if !slot.permanent {
+                return Some(idx);
+            }
+            idx = slot.next;
         }
         None
     }
@@ -1052,11 +1077,177 @@ fn grouped_entry<'r>(
 /// The CUDA [`DsV4Linear`]: resident non-expert weights + streamed expert
 /// slices. Single-threaded by design (RefCell state, thread-local buffer
 /// pool); build, use, and drop it on one thread like the other GPU models.
+///
+/// A thin `Rc` handle over [`DsV4GpuLinearInner`]: the engine owns one handle,
+/// and the MTP drafter (`dsv4_mtp`) clones another so its `'static`
+/// [`crate::dsv4_backend::Drafter`] box can share the SAME device resources —
+/// resident matrices, streams, and crucially the expert pool — without
+/// borrowing the engine. `Rc` (not `Arc`) keeps the single-thread discipline
+/// honest: the handle cannot leave the engine worker thread.
+#[derive(Clone)]
 pub(crate) struct DsV4GpuLinear {
+    inner: std::rc::Rc<DsV4GpuLinearInner>,
+}
+
+impl DsV4GpuLinear {
+    fn new(gguf: Arc<GgufFile>) -> Result<Self> {
+        Ok(Self {
+            inner: std::rc::Rc::new(DsV4GpuLinearInner::new(gguf)?),
+        })
+    }
+
+    /// Rebuild the copy engine (tests only). Requires the sole handle — call
+    /// before the provider is shared with an engine or drafter.
+    #[cfg(test)]
+    pub(crate) fn set_copy_stream_enabled(&mut self, enabled: bool) -> Result<()> {
+        std::rc::Rc::get_mut(&mut self.inner)
+            .expect("set_copy_stream_enabled needs the sole provider handle")
+            .set_copy_stream_enabled(enabled)
+    }
+}
+
+impl std::ops::Deref for DsV4GpuLinear {
+    type Target = DsV4GpuLinearInner;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl DsV4Linear for DsV4GpuLinear {
+    fn mul_vec(&self, key: TensorKey<'_>, x: &[f32]) -> Result<Vec<f32>> {
+        self.inner.mul_vec(key, x)
+    }
+
+    fn prefetch_experts(&self, tensors: DsV4ExpertTensors<'_>, expert_ids: &[usize]) -> Result<()> {
+        self.inner.prefetch_experts(tensors, expert_ids)
+    }
+
+    fn set_exact_batching(&self, exact: bool) {
+        self.inner.set_exact_batching(exact);
+    }
+
+    /// Wave-2 Stage 2b: run the WHOLE decode step device-side (embedding
+    /// gather, hyper connections, attention, compressors, indexer, inlined
+    /// MoE, hyper head + lm head; one end-of-step download of logits + state
+    /// delta). Declines to the host step under `HI_DSV4_HOST_STEP=1` or when
+    /// the model shape is unsupported. Lives on the handle (not the inner)
+    /// because the engine's type parameter is the handle.
+    fn try_device_step(
+        &self,
+        engine: &DsV4Engine<Self>,
+        state: &mut DsV4State,
+        token: u32,
+    ) -> Option<Result<Vec<f32>>> {
+        self.inner.try_device_step_impl(engine, state, token)
+    }
+
+    fn moe_block(
+        &self,
+        ctx: &DsV4MoeBlockCtx<'_>,
+        xs: &[Vec<f32>],
+        tokens: &[u32],
+    ) -> Result<Vec<Vec<f32>>> {
+        self.inner.moe_block(ctx, xs, tokens)
+    }
+
+    fn mul_mat(&self, key: TensorKey<'_>, xs: &[Vec<f32>]) -> Result<Vec<Vec<f32>>> {
+        self.inner.mul_mat(key, xs)
+    }
+}
+
+/// A host-side dense weight payload for [`DsV4GpuLinearInner::register_host_dense`]
+/// (the MTP module's safetensors-sourced matrices), row-major `[rows, cols]`.
+pub(crate) enum HostDenseData {
+    F32(Vec<f32>),
+    F16(Vec<u16>),
+    Bf16(Vec<u16>),
+}
+
+impl HostDenseData {
+    fn len(&self) -> usize {
+        match self {
+            Self::F32(values) => values.len(),
+            Self::F16(bits) | Self::Bf16(bits) => bits.len(),
+        }
+    }
+}
+
+fn check_host_payload(matrix: &RawMatrix, len: usize) -> Result<()> {
+    if len != matrix.rows * matrix.cols {
+        bail!(
+            "host payload for {} has {len} values; expected {} x {}",
+            matrix.name,
+            matrix.rows,
+            matrix.cols
+        );
+    }
+    Ok(())
+}
+
+/// One host-owned packed expert tensor registered by the MTP drafter
+/// (`dsv4_mtp`): the official shard's experts repacked into the exact GGUF
+/// layout (`fp4_to_gguf_mxfp4`), served through the SAME pool/streaming paths
+/// as the GGUF-mmap trunk tensors — the byte source is the only difference.
+pub(crate) struct HostExpertBlob {
+    dtype: GgufTensorType,
+    /// Rank-3 `[in, out, experts]` packed payload, expert-major like the GGUF.
+    bytes: Vec<u8>,
+}
+
+/// Byte source for one packed expert tensor: the GGUF mmap (trunk layers) or
+/// a registered host blob (the MTP module). Owning the `Rc` keeps the blob
+/// borrowable past the registry's `RefCell` guard.
+enum ExpertSource<'a> {
+    Gguf(TensorView<'a>),
+    Blob(std::rc::Rc<HostExpertBlob>),
+}
+
+impl ExpertSource<'_> {
+    fn dtype(&self) -> GgufTensorType {
+        match self {
+            Self::Gguf(view) => view.info.dtype,
+            Self::Blob(blob) => blob.dtype,
+        }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Gguf(view) => view.bytes,
+            Self::Blob(blob) => &blob.bytes,
+        }
+    }
+
+    /// Dequantize an element subrange (the [`dequantize_elem_range`] math over
+    /// either source).
+    fn dequant_range(&self, elem_offset: usize, elem_count: usize) -> Result<Vec<f32>> {
+        match self {
+            Self::Gguf(view) => dequantize_elem_range(view, elem_offset, elem_count),
+            Self::Blob(blob) => {
+                let dtype = blob.dtype;
+                let start = usize::try_from(dtype.byte_len(elem_offset as u64)?)
+                    .context("expert blob byte offset does not fit usize")?;
+                let len = usize::try_from(dtype.byte_len(elem_count as u64)?)
+                    .context("expert blob byte length does not fit usize")?;
+                let bytes = blob
+                    .bytes
+                    .get(start..start + len)
+                    .ok_or_else(|| anyhow!("expert blob slice is out of range"))?;
+                hi_gguf::dequantize_tensor_as_f32(bytes, dtype, elem_count)
+            }
+        }
+    }
+}
+
+/// The provider state behind [`DsV4GpuLinear`] (see there).
+pub(crate) struct DsV4GpuLinearInner {
     gguf: Arc<GgufFile>,
     stream: Stream,
     cublas: Cublas,
     resident: RefCell<HashMap<String, ResidentEntry>>,
+    /// Host-owned packed expert tensors (MTP shard), keyed like GGUF tensors;
+    /// [`Self::expert_source`] checks here before the mmap.
+    host_expert_blobs: RefCell<HashMap<String, std::rc::Rc<HostExpertBlob>>>,
     /// Stage-1b LRU pool for packed MXFP4 expert slices; `None` when disabled
     /// or the model has no such tensors (everything then streams per call).
     expert_pool: RefCell<Option<DsV4ExpertPool>>,
@@ -1084,6 +1275,12 @@ pub(crate) struct DsV4GpuLinear {
     /// (`HI_DSV4_PREFILL_GEMM=1`). `Cell` so tests can force a mode without
     /// process-global env races.
     gemm_batching: Cell<bool>,
+    /// Scoped [`DsV4Linear::set_exact_batching`] override: while set,
+    /// `mul_mat` ignores `gemm_batching` and serves per-token `mul_vec` loops.
+    /// The engine pins it around speculative verify chunks (and their rewind
+    /// re-feeds), whose logits must be bit-exact with the sequential step
+    /// path even under `HI_DSV4_PREFILL_GEMM=1` (which stays prefill-only).
+    exact_batching: Cell<bool>,
     /// Wave-2 Stage 2a kill switch (`HI_DSV4_NO_DEVICE_MOE=1`): true routes
     /// every `moe_block` through the host path for bisection. `Cell` so the
     /// real-model A/B parity test can flip it on one loaded model.
@@ -1107,7 +1304,7 @@ pub(crate) struct DsV4GpuLinear {
     step_stats: RefCell<DsV4StepStats>,
 }
 
-impl DsV4GpuLinear {
+impl DsV4GpuLinearInner {
     fn new(gguf: Arc<GgufFile>) -> Result<Self> {
         let stream = Stream::create()?;
         let cublas = Cublas::create()?;
@@ -1125,6 +1322,7 @@ impl DsV4GpuLinear {
             stream,
             cublas,
             resident: RefCell::new(HashMap::new()),
+            host_expert_blobs: RefCell::new(HashMap::new()),
             expert_pool: RefCell::new(None),
             copy,
             prefetch_enabled: Cell::new(true),
@@ -1132,6 +1330,7 @@ impl DsV4GpuLinear {
             expert_scratch: RefCell::new(None),
             expert_dequant_scratch: RefCell::new(None),
             gemm_batching: Cell::new(prefill_gemm_from_env()),
+            exact_batching: Cell::new(false),
             device_moe_disabled: Cell::new(device_moe_disabled_from_env()),
             moe_scratch: RefCell::new(DeviceMoeScratch::default()),
             moe_bias_tables: RefCell::new(HashMap::new()),
@@ -1309,6 +1508,7 @@ impl DsV4GpuLinear {
                 },
                 pinned: false,
                 spec: false,
+                permanent: false,
             })
             .collect();
         eprintln!(
@@ -1358,7 +1558,7 @@ impl DsV4GpuLinear {
         ordered.sort_by_key(|(_, meta)| (meta.layer, meta.proj));
         let capacity = pool.slots.len();
         'tensors: for (name, meta) in &ordered {
-            let view = self.tensor_view(name)?;
+            let source = self.expert_source(name)?;
             for expert in 0..meta.expert_count {
                 if pool.resident.len() == capacity {
                     break 'tensors;
@@ -1366,8 +1566,8 @@ impl DsV4GpuLinear {
                 let start = expert
                     .checked_mul(meta.bytes_per_expert)
                     .context("expert byte offset overflows usize")?;
-                let bytes = view
-                    .bytes
+                let bytes = source
+                    .bytes()
                     .get(start..start + meta.bytes_per_expert)
                     .ok_or_else(|| anyhow!("tensor {name} expert slice is out of range"))?;
                 let (slot, hit) = pool.acquire((meta.layer, meta.proj, expert as u32));
@@ -1397,6 +1597,192 @@ impl DsV4GpuLinear {
         self.gguf
             .tensor(name)
             .ok_or_else(|| anyhow!("GGUF tensor {name} is missing"))
+    }
+
+    /// Resolve a packed expert tensor's byte source: a registered host blob
+    /// (MTP shard) first, then the GGUF mmap (trunk layers).
+    fn expert_source(&self, name: &str) -> Result<ExpertSource<'_>> {
+        if let Some(blob) = self.host_expert_blobs.borrow().get(name) {
+            return Ok(ExpertSource::Blob(blob.clone()));
+        }
+        Ok(ExpertSource::Gguf(self.tensor_view(name)?))
+    }
+
+    /// Make one dense matrix GPU-resident from HOST data (the MTP module's
+    /// safetensors-sourced weights — there is no GGUF tensor to read). The
+    /// name must be new; the engine's own residents were uploaded at load.
+    pub(crate) fn register_host_dense(
+        &self,
+        matrix: &RawMatrix,
+        data: &HostDenseData,
+    ) -> Result<()> {
+        let entry = ResidentEntry::Dense(self.upload_host_matrix(matrix, data, None)?);
+        self.insert_resident(&matrix.name, entry)
+    }
+
+    /// [`Self::register_host_dense`] for the block-diagonal grouped output
+    /// projection: one [rank, cols] buffer per group, split host-side.
+    pub(crate) fn register_host_grouped(
+        &self,
+        matrix: &RawMatrix,
+        rank: usize,
+        data: &HostDenseData,
+    ) -> Result<()> {
+        if rank == 0 || !matrix.rows.is_multiple_of(rank) {
+            bail!(
+                "grouped tensor {} rows {} do not split into rank-{rank} groups",
+                matrix.name,
+                matrix.rows
+            );
+        }
+        let mut groups = Vec::with_capacity(matrix.rows / rank);
+        for group in 0..matrix.rows / rank {
+            let rows = group * rank..(group + 1) * rank;
+            groups.push(self.upload_host_matrix(matrix, data, Some(rows))?);
+        }
+        self.insert_resident(&matrix.name, ResidentEntry::Grouped(groups))
+    }
+
+    fn insert_resident(&self, name: &str, entry: ResidentEntry) -> Result<()> {
+        let mut resident = self.resident.borrow_mut();
+        if resident.contains_key(name) {
+            bail!("tensor {name} is already GPU-resident");
+        }
+        resident.insert(name.to_string(), entry);
+        Ok(())
+    }
+
+    /// Upload a host payload (or a row range of it) as a resident matrix in
+    /// its natural GEMM dtype: F32 verbatim (the exact-parity fixture path),
+    /// F16 bits verbatim (fp8-dequantized real-shard weights), BF16 bits
+    /// verbatim (the shard's bf16 router).
+    fn upload_host_matrix(
+        &self,
+        matrix: &RawMatrix,
+        data: &HostDenseData,
+        rows: Option<std::ops::Range<usize>>,
+    ) -> Result<ResidentMatrix> {
+        fn upload<T>(name: &str, values: &[T]) -> Result<DeviceBuffer> {
+            let buffer = DeviceBuffer::alloc(std::mem::size_of_val(values))
+                .with_context(|| format!("allocating resident buffer for {name}"))?;
+            buffer.copy_from_host(values)?;
+            Ok(buffer)
+        }
+        let rows = rows.unwrap_or(0..matrix.rows);
+        let row_count = rows.len();
+        let range = rows.start * matrix.cols..rows.end * matrix.cols;
+        check_host_payload(matrix, data.len())?;
+        let (dtype, buffer) = match data {
+            HostDenseData::F32(values) => (GemmDType::F32, upload(&matrix.name, &values[range])?),
+            HostDenseData::F16(bits) => (GemmDType::F16, upload(&matrix.name, &bits[range])?),
+            HostDenseData::Bf16(bits) => (GemmDType::BF16, upload(&matrix.name, &bits[range])?),
+        };
+        Ok(ResidentMatrix {
+            buffer,
+            rows: row_count,
+            cols: matrix.cols,
+            dtype,
+        })
+    }
+
+    /// Register a host-owned packed expert tensor so the pool and streaming
+    /// expert paths serve it exactly like a GGUF tensor of the same name and
+    /// layout. MXFP4 payloads with a live pool additionally enter the pool's
+    /// managed-tensor set under `layer`/`proj`; `pin_resident` preloads every
+    /// slice and marks its slots permanent (never evicted — the MTP drafter
+    /// touches them every draft). Returns whether the slices are pool-pinned.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn register_host_experts(
+        &self,
+        experts: &RawExperts,
+        expert_count: usize,
+        layer: u32,
+        proj: u8,
+        dtype: GgufTensorType,
+        bytes: Vec<u8>,
+        pin_resident: bool,
+    ) -> Result<bool> {
+        let per_expert = experts
+            .in_dim
+            .checked_mul(experts.out_dim)
+            .context("expert slice element count overflows usize")?;
+        let expected = usize::try_from(dtype.byte_len((per_expert * expert_count) as u64)?)
+            .context("expert blob byte length does not fit usize")?;
+        if bytes.len() != expected {
+            bail!(
+                "expert blob {} has {} bytes; expected {expected}",
+                experts.name,
+                bytes.len()
+            );
+        }
+        {
+            let mut blobs = self.host_expert_blobs.borrow_mut();
+            if blobs.contains_key(&experts.name) || self.gguf.tensor_info(&experts.name).is_some() {
+                bail!("expert tensor {} is already registered", experts.name);
+            }
+            blobs.insert(
+                experts.name.clone(),
+                std::rc::Rc::new(HostExpertBlob { dtype, bytes }),
+            );
+        }
+        if dtype != GgufTensorType::MXFP4 || !experts.in_dim.is_multiple_of(32) {
+            // Non-MXFP4 payloads (the F32 fixture) use the streaming path,
+            // exactly like trunk fixtures of the same dtype.
+            return Ok(false);
+        }
+        let bytes_per_expert = usize::try_from(dtype.byte_len(per_expert as u64)?)
+            .context("expert slice byte length does not fit usize")?;
+        let mut guard = self.expert_pool.borrow_mut();
+        let Some(pool) = guard.as_mut() else {
+            return Ok(false);
+        };
+        if bytes_per_expert > pool.slot_stride {
+            bail!(
+                "expert blob {} slice size {bytes_per_expert} exceeds the pool slot stride {}",
+                experts.name,
+                pool.slot_stride
+            );
+        }
+        pool.tensors.insert(
+            experts.name.clone(),
+            ExpertTensorMeta {
+                layer,
+                proj,
+                bytes_per_expert,
+                expert_count,
+            },
+        );
+        if !pin_resident {
+            return Ok(false);
+        }
+        // Pin only when enough unpinned slots remain for the trunk's working
+        // set (a decode layer touches <= 3 * top_k slices; 64 is generous).
+        let already_permanent = pool.slots.iter().filter(|slot| slot.permanent).count();
+        if pool.slots.len() < already_permanent + expert_count + 64 {
+            eprintln!(
+                "dsv4 expert pool: not pinning {} ({expert_count} slices; pool has {} slots, {already_permanent} already pinned) — slices stay LRU-managed",
+                experts.name,
+                pool.slots.len()
+            );
+            return Ok(false);
+        }
+        let blob_guard = self.host_expert_blobs.borrow();
+        let blob = blob_guard
+            .get(&experts.name)
+            .expect("blob was just inserted");
+        for expert in 0..expert_count {
+            let start = expert * bytes_per_expert;
+            let slice = &blob.bytes[start..start + bytes_per_expert];
+            let (slot, hit) = pool.acquire((layer, proj, expert as u32));
+            if !hit {
+                let (chunk, offset) = pool.slot_location(slot);
+                pool.chunks[chunk].copy_from_host_at(offset, slice)?;
+                pool.stats.prefilled += 1;
+                pool.stats.bytes_uploaded += bytes_per_expert as u64;
+            }
+            pool.slots[slot as usize].permanent = true;
+        }
+        Ok(true)
     }
 
     /// Make one dense matrix GPU-resident. Float dtypes upload verbatim;
@@ -1699,7 +2085,7 @@ impl DsV4GpuLinear {
                 experts.in_dim
             );
         }
-        let view = self.tensor_view(&experts.name)?;
+        let source = self.expert_source(&experts.name)?;
         let per_expert = experts
             .in_dim
             .checked_mul(experts.out_dim)
@@ -1711,14 +2097,14 @@ impl DsV4GpuLinear {
         let output = DeviceBuffer::alloc(experts.out_dim * std::mem::size_of::<f32>())
             .context("allocating expert GEMV output")?;
 
-        if view.info.dtype == GgufTensorType::MXFP4 && experts.in_dim.is_multiple_of(32) {
+        if source.dtype() == GgufTensorType::MXFP4 && experts.in_dim.is_multiple_of(32) {
             // Contiguous packed range of expert e: rank-3 [in, out, experts]
             // stores expert-major, so the byte stride is in*out/32*17.
-            let dtype = view.info.dtype;
+            let dtype = source.dtype();
             let offset = dtype.byte_len((expert * per_expert) as u64)? as usize;
             let len = dtype.byte_len(per_expert as u64)? as usize;
-            let bytes = view
-                .bytes
+            let bytes = source
+                .bytes()
                 .get(offset..offset + len)
                 .ok_or_else(|| anyhow!("tensor {} expert slice is out of range", experts.name))?;
             if !self.pool_expert_gemv(experts, expert, bytes, &input, &output)? {
@@ -1736,7 +2122,7 @@ impl DsV4GpuLinear {
                 })?;
             }
         } else {
-            let data = dequantize_elem_range(&view, expert * per_expert, per_expert)?;
+            let data = source.dequant_range(expert * per_expert, per_expert)?;
             self.with_expert_scratch(per_expert * std::mem::size_of::<f32>(), |weights| {
                 weights.copy_from_host(&data)?;
                 self.cublas.matmul_f32_rhs_transposed_row_major(
@@ -1764,9 +2150,9 @@ impl DsV4GpuLinear {
         expert: usize,
         xs: &[Vec<f32>],
     ) -> Result<Vec<Vec<f32>>> {
-        let view = self.tensor_view(&experts.name)?;
+        let source = self.expert_source(&experts.name)?;
         if xs.len() < DSV4_EXPERT_GEMM_MIN_TOKENS
-            || view.info.dtype != GgufTensorType::MXFP4
+            || source.dtype() != GgufTensorType::MXFP4
             || !experts.in_dim.is_multiple_of(32)
         {
             return xs
@@ -1780,11 +2166,11 @@ impl DsV4GpuLinear {
             .in_dim
             .checked_mul(experts.out_dim)
             .context("expert slice element count overflows usize")?;
-        let dtype = view.info.dtype;
+        let dtype = source.dtype();
         let byte_offset = dtype.byte_len((expert * per_expert) as u64)? as usize;
         let byte_len = dtype.byte_len(per_expert as u64)? as usize;
-        let bytes = view
-            .bytes
+        let bytes = source
+            .bytes()
             .get(byte_offset..byte_offset + byte_len)
             .ok_or_else(|| anyhow!("tensor {} expert slice is out of range", experts.name))?;
         let quant_type = quant_type_id(dtype).expect("MXFP4 has a device dequant kernel id");
@@ -2068,12 +2454,12 @@ impl DsV4GpuLinear {
             PrefetchAcquire::Full => return Ok(PrefetchStep::Full),
             PrefetchAcquire::Loaded(slot) => slot,
         };
-        let view = self.tensor_view(name)?;
+        let source = self.expert_source(name)?;
         let start = expert
             .checked_mul(meta.bytes_per_expert)
             .context("expert byte offset overflows usize")?;
-        let bytes = view
-            .bytes
+        let bytes = source
+            .bytes()
             .get(start..start + meta.bytes_per_expert)
             .ok_or_else(|| anyhow!("tensor {name} expert slice is out of range"))?;
         let (chunk, offset) = pool.slot_location(slot);
@@ -2459,7 +2845,7 @@ impl DsV4GpuLinear {
                 .tensors
                 .get(&tensor.name)
                 .ok_or_else(|| anyhow!("tensor {} left the expert pool", tensor.name))?;
-            let view = self.tensor_view(&tensor.name)?;
+            let source = self.expert_source(&tensor.name)?;
             for &expert in &unique {
                 let (slot, hit) = pool.acquire((meta.layer, meta.proj, expert as u32));
                 let location = pool.slot_location(slot);
@@ -2469,8 +2855,8 @@ impl DsV4GpuLinear {
                     let start = expert
                         .checked_mul(meta.bytes_per_expert)
                         .context("expert byte offset overflows usize")?;
-                    let bytes = view
-                        .bytes
+                    let bytes = source
+                        .bytes()
                         .get(start..start + meta.bytes_per_expert)
                         .ok_or_else(|| {
                             anyhow!("tensor {} expert slice is out of range", tensor.name)
@@ -2682,7 +3068,7 @@ impl DsV4GpuLinear {
 }
 
 // ---- Wave-2 Stage 2b: device decode step orchestration --------------------
-impl DsV4GpuLinear {
+impl DsV4GpuLinearInner {
     /// The [`DsV4Linear::try_device_step`] implementation: decline (host step)
     /// when killed via `HI_DSV4_HOST_STEP=1`, when the position would overflow
     /// the context (the host step owns that error), or when the model shape is
@@ -3993,7 +4379,7 @@ impl DsV4GpuLinear {
     }
 }
 
-impl Drop for DsV4GpuLinear {
+impl Drop for DsV4GpuLinearInner {
     fn drop(&mut self) {
         // Final pool summary (the periodic line only fires every
         // DSV4_POOL_LOG_EVERY_CALLS pooled GEMVs).
@@ -4006,7 +4392,7 @@ impl Drop for DsV4GpuLinear {
     }
 }
 
-impl DsV4Linear for DsV4GpuLinear {
+impl DsV4Linear for DsV4GpuLinearInner {
     fn mul_vec(&self, key: TensorKey<'_>, x: &[f32]) -> Result<Vec<f32>> {
         match key {
             TensorKey::Dense(matrix) => self.dense_mul_vec(matrix, x),
@@ -4019,19 +4405,16 @@ impl DsV4Linear for DsV4GpuLinear {
         self.prefetch_experts_impl(tensors, expert_ids)
     }
 
-    /// Wave-2 Stage 2b: run the WHOLE decode step device-side (embedding
-    /// gather, hyper connections, attention, compressors, indexer, inlined
-    /// MoE, hyper head + lm head; one end-of-step download of logits + state
-    /// delta). Declines to the host step under `HI_DSV4_HOST_STEP=1` or when
-    /// the model shape is unsupported.
-    fn try_device_step(
-        &self,
-        engine: &DsV4Engine<Self>,
-        state: &mut DsV4State,
-        token: u32,
-    ) -> Option<Result<Vec<f32>>> {
-        self.try_device_step_impl(engine, state, token)
+    /// Speculative-verify pin: force `mul_mat` onto its bit-exact per-token
+    /// loops regardless of `HI_DSV4_PREFILL_GEMM` (see the field docs).
+    fn set_exact_batching(&self, exact: bool) {
+        self.exact_batching.set(exact);
     }
+
+    // NOTE: `try_device_step` deliberately keeps its default (`None`) here —
+    // the engine is parameterized by the [`DsV4GpuLinear`] handle, whose
+    // trait impl forwards to [`Self::try_device_step_impl`]. Nothing drives
+    // an engine over the inner type directly.
 
     /// Wave-2 Stage 2a: the whole MoE block device-side (see
     /// [`Self::device_moe_block`]). `HI_DSV4_NO_DEVICE_MOE=1` or an
@@ -4065,8 +4448,9 @@ impl DsV4Linear for DsV4GpuLinear {
         // Default (bit-exact) mode: serve the batch as per-token mul_vec
         // calls — identical invocations to the sequential path, so chunked
         // prefill reproduces it exactly. `HI_DSV4_PREFILL_GEMM=1` enables the
-        // GEMM batching below.
-        if !self.gemm_batching.get() {
+        // GEMM batching below, except while the engine pins exact batching
+        // (speculative verify chunks — see `set_exact_batching`).
+        if !self.gemm_batching.get() || self.exact_batching.get() {
             return xs.iter().map(|x| self.mul_vec(key, x)).collect();
         }
         // Numerics-debug escape hatch inside GEMM mode:
@@ -4554,6 +4938,216 @@ pub(crate) mod tests {
         let stats = linear.pool_stats().unwrap();
         assert_eq!((stats.hits, stats.misses), (1, 0));
         assert_eq!(stats.bytes_uploaded, 9 * TEST_EXPERT_SLICE_BYTES);
+    }
+
+    /// Craft one packed MXFP4 host blob shaped like the test tensors (random
+    /// nibbles, every block scale 0.5), plus its expert count.
+    fn host_expert_blob(in_dim: usize, out_dim: usize, experts: usize, seed: u64) -> Vec<u8> {
+        use rand::RngCore;
+        use rand::SeedableRng;
+        use rand::rngs::StdRng;
+        let mut rng = StdRng::seed_from_u64(seed);
+        let blocks = in_dim * out_dim * experts / 32;
+        let mut bytes = vec![0u8; blocks * 17];
+        rng.fill_bytes(&mut bytes);
+        for block in 0..blocks {
+            bytes[block * 17] = 127;
+        }
+        bytes
+    }
+
+    /// Host oracle over a raw packed blob (the registered MTP source).
+    fn host_blob_reference(
+        bytes: &[u8],
+        expert: usize,
+        in_dim: usize,
+        out_dim: usize,
+        x: &[f32],
+    ) -> Vec<f32> {
+        let per_expert = in_dim * out_dim;
+        let slice_bytes = per_expert / 32 * 17;
+        let weights = hi_gguf::dequantize_tensor_as_f32(
+            &bytes[expert * slice_bytes..(expert + 1) * slice_bytes],
+            GgufTensorType::MXFP4,
+            per_expert,
+        )
+        .unwrap();
+        (0..out_dim)
+            .map(|row| {
+                weights[row * in_dim..(row + 1) * in_dim]
+                    .iter()
+                    .zip(x)
+                    .map(|(w, x)| w * x)
+                    .sum()
+            })
+            .collect()
+    }
+
+    /// Stage-B pool extension: host-blob expert tensors register alongside
+    /// the GGUF-mmap trunk tensors (here as layer 9, the MTP pattern), their
+    /// pinned slots survive arbitrary trunk-driven eviction pressure, and
+    /// every GEMV against them matches the host dequant reference.
+    #[test]
+    fn dsv4_gpu_expert_pool_host_blobs_register_and_stay_pinned() {
+        let path = tempfile_path("mxfp4-pinned");
+        // 120 trunk slices vs 80 slots (12 of them pinned): heavy eviction.
+        write_mxfp4_experts_gguf(&path, 40);
+        let (gguf, linear) = pool_test_linear(&path);
+        let slot_stride = 1280; // 1088-byte slices aligned up to 256
+        linear
+            .init_expert_pool_with_budget(80 * slot_stride)
+            .unwrap();
+
+        let blobs: [(&str, usize, usize, u8); 3] = [
+            ("blk.9.ffn_gate_exps.weight", 32, 64, 0),
+            ("blk.9.ffn_up_exps.weight", 32, 64, 1),
+            ("blk.9.ffn_down_exps.weight", 64, 32, 2),
+        ];
+        let mut payloads = Vec::new();
+        for (name, in_dim, out_dim, proj) in blobs {
+            let bytes = host_expert_blob(in_dim, out_dim, 4, 0x517 + proj as u64);
+            let pinned = linear
+                .register_host_experts(
+                    &raw_experts(name, in_dim, out_dim),
+                    4,
+                    9,
+                    proj,
+                    GgufTensorType::MXFP4,
+                    bytes.clone(),
+                    true,
+                )
+                .unwrap();
+            assert!(pinned, "{name} must pin (pool has ample headroom)");
+            payloads.push(bytes);
+        }
+        let stats = linear.pool_stats().unwrap();
+        assert_eq!(stats.prefilled, 12, "registration preloads every slice");
+
+        // Duplicate registration must fail loudly.
+        let err = linear
+            .register_host_experts(
+                &raw_experts("blk.9.ffn_gate_exps.weight", 32, 64),
+                4,
+                9,
+                0,
+                GgufTensorType::MXFP4,
+                payloads[0].clone(),
+                true,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already registered"), "{err}");
+
+        // Blob GEMVs match the host reference and hit their pinned slots.
+        let before = linear.pool_stats().unwrap();
+        for ((name, in_dim, out_dim, _), bytes) in blobs.iter().zip(&payloads) {
+            for expert in 0..4usize {
+                let x = test_activation(*in_dim, 31 + expert as u32);
+                let got = linear
+                    .mul_vec(
+                        TensorKey::Expert {
+                            experts: &raw_experts(name, *in_dim, *out_dim),
+                            expert,
+                        },
+                        &x,
+                    )
+                    .unwrap();
+                let want = host_blob_reference(bytes, expert, *in_dim, *out_dim, &x);
+                assert_close_relative(&got, &want, &format!("{name}[{expert}]"));
+            }
+        }
+        let after = linear.pool_stats().unwrap();
+        assert_eq!(after.hits - before.hits, 12, "pinned slices must hit");
+        assert_eq!(after.misses, before.misses);
+
+        // Trunk-driven eviction pressure: 120 slices through 68 free slots,
+        // twice. The pinned layer-9 slots must never be victims.
+        for sweep in 0..2 {
+            for (name, in_dim, out_dim) in [
+                ("blk.0.ffn_gate_exps.weight", 32usize, 64usize),
+                ("blk.0.ffn_up_exps.weight", 32, 64),
+                ("blk.0.ffn_down_exps.weight", 64, 32),
+            ] {
+                for expert in 0..40usize {
+                    let x = test_activation(in_dim, 100 + sweep + expert as u32);
+                    let experts = raw_experts(name, in_dim, out_dim);
+                    linear
+                        .mul_vec(
+                            TensorKey::Expert {
+                                experts: &experts,
+                                expert,
+                            },
+                            &x,
+                        )
+                        .unwrap();
+                }
+            }
+        }
+        let pressured = linear.pool_stats().unwrap();
+        assert!(
+            pressured.evictions > 0,
+            "the sweep must overflow the unpinned slots"
+        );
+
+        // After the storm: every blob slice is STILL resident (hits, no new
+        // misses) and still bit-faithful to the host reference.
+        let before = linear.pool_stats().unwrap();
+        for ((name, in_dim, out_dim, _), bytes) in blobs.iter().zip(&payloads) {
+            for expert in 0..4usize {
+                let x = test_activation(*in_dim, 31 + expert as u32);
+                let got = linear
+                    .mul_vec(
+                        TensorKey::Expert {
+                            experts: &raw_experts(name, *in_dim, *out_dim),
+                            expert,
+                        },
+                        &x,
+                    )
+                    .unwrap();
+                let want = host_blob_reference(bytes, expert, *in_dim, *out_dim, &x);
+                assert_close_relative(&got, &want, &format!("{name}[{expert}] post-pressure"));
+            }
+        }
+        let after = linear.pool_stats().unwrap();
+        assert_eq!(
+            after.hits - before.hits,
+            12,
+            "pinned slices must survive eviction pressure"
+        );
+        assert_eq!(after.misses, before.misses, "no pinned slice may reload");
+
+        // A pool without pinning headroom declines to pin but keeps serving.
+        let tiny_path = tempfile_path("mxfp4-pinned-tiny");
+        write_mxfp4_experts_gguf(&tiny_path, 3);
+        let (_tiny_gguf, tiny_linear) = pool_test_linear(&tiny_path);
+        tiny_linear
+            .init_expert_pool_with_budget(8 * slot_stride)
+            .unwrap();
+        let bytes = host_expert_blob(32, 64, 4, 0x99);
+        let pinned = tiny_linear
+            .register_host_experts(
+                &raw_experts("blk.9.ffn_gate_exps.weight", 32, 64),
+                4,
+                9,
+                0,
+                GgufTensorType::MXFP4,
+                bytes.clone(),
+                true,
+            )
+            .unwrap();
+        assert!(!pinned, "an 8-slot pool must refuse to pin 4 slices");
+        let x = test_activation(32, 5);
+        let got = tiny_linear
+            .mul_vec(
+                TensorKey::Expert {
+                    experts: &raw_experts("blk.9.ffn_gate_exps.weight", 32, 64),
+                    expert: 1,
+                },
+                &x,
+            )
+            .unwrap();
+        let want = host_blob_reference(&bytes, 1, 32, 64, &x);
+        assert_close_relative(&got, &want, "unpinned blob GEMV");
     }
 
     /// Parity gate (a) on the GPU provider: chunked prefill (B=4 and a whole-
@@ -5609,6 +6203,187 @@ pub(crate) mod tests {
         }
     }
 
+    /// Stage-A verify on the GPU provider: per-position logits are bit-exact
+    /// with the sequential HOST step path (the stated contract — the chunk
+    /// machinery issues the identical cuBLAS GEMVs), greedy-identical with
+    /// the production device-step path at every position, and unmoved by
+    /// `HI_DSV4_PREFILL_GEMM=1` (verify pins the exact batching mode, so the
+    /// GEMM opt-in stays prefill-only).
+    #[test]
+    fn dsv4_gpu_verify_tokens_matches_sequential_and_pins_exact_batching() {
+        let path = tempfile_path("gpu-verify");
+        write_deepseek4_gguf(&path);
+        let gpu = DeepSeekV4GpuEngine::load(&path).unwrap();
+        let engine = gpu.engine();
+        let lin = engine.linear();
+
+        let prompt: Vec<u32> = (0..6).map(|idx| idx % 3).collect();
+        let continuation: Vec<u32> = (0..8).map(|idx| (idx * 2) % 3).collect();
+
+        // Host-step sequential reference.
+        lin.set_device_step_enabled(false);
+        let mut host_state = engine.new_state();
+        engine
+            .prefill_with_chunk(&mut host_state, &prompt, 4)
+            .unwrap();
+        let verify_base = host_state.clone();
+        let host_rows: Vec<Vec<f32>> = continuation
+            .iter()
+            .map(|&token| engine.step(&mut host_state, token).unwrap())
+            .collect();
+        lin.set_device_step_enabled(true);
+
+        let mut verify_state = verify_base.clone();
+        let verify_rows = engine
+            .verify_tokens(&mut verify_state, &continuation)
+            .unwrap();
+        assert_eq!(
+            verify_rows, host_rows,
+            "verify must be bit-exact with sequential host steps"
+        );
+
+        // Production decode path (device-resident steps): identical greedy
+        // choice at every position, logits within the device-step tolerance.
+        let mut dev_state = verify_base.clone();
+        for (idx, &token) in continuation.iter().enumerate() {
+            let dev = engine.step(&mut dev_state, token).unwrap();
+            assert_eq!(
+                crate::qwen_cpu::argmax(&verify_rows[idx]).unwrap(),
+                crate::qwen_cpu::argmax(&dev).unwrap(),
+                "greedy choice at position {idx}"
+            );
+            for (v, d) in verify_rows[idx].iter().zip(&dev) {
+                assert!((v - d).abs() <= 1.0e-4, "position {idx}: {v} vs {d}");
+            }
+        }
+
+        // GEMM prefill mode must not leak into verify: with batching forced
+        // on, verify logits stay bit-exact with the host-step reference.
+        lin.set_gemm_batching(true);
+        let mut gemm_state = verify_base.clone();
+        let gemm_rows = engine
+            .verify_tokens(&mut gemm_state, &continuation)
+            .unwrap();
+        lin.set_gemm_batching(false);
+        assert_eq!(
+            gemm_rows, host_rows,
+            "verify under HI_DSV4_PREFILL_GEMM must pin the exact batching mode"
+        );
+    }
+
+    /// Stage-A rollback on the GPU provider across verify boundaries, with
+    /// the production device-step decode continuing from the rewound state:
+    /// the continuation matches a state that only ever processed the accepted
+    /// tokens, and the (tag, pos) mirror protocol survives the rewind (the
+    /// next device step restores from the authoritative host mirror).
+    #[test]
+    fn dsv4_gpu_verify_rewind_round_trip_with_device_steps() {
+        let path = tempfile_path("gpu-rewind");
+        write_deepseek4_gguf(&path);
+        let gpu = DeepSeekV4GpuEngine::load(&path).unwrap();
+        let engine = gpu.engine();
+
+        let prompt: Vec<u32> = (0..6).map(|idx| idx % 3).collect();
+        let continuation: Vec<u32> = vec![1, 2, 0, 1, 2];
+        let mut history = prompt.clone();
+        history.extend(&continuation);
+        let slack = 4 + continuation.len() + 1;
+
+        for keep in [1usize, 3, 5] {
+            let target = prompt.len() + keep;
+            let mut state = engine.new_state_with_ring_slack(slack);
+            engine.prefill_with_chunk(&mut state, &prompt, 4).unwrap();
+            engine.verify_tokens(&mut state, &continuation).unwrap();
+            engine
+                .rewind_state_to(&mut state, &history[..target], target, None)
+                .unwrap();
+            assert_eq!(state.pos(), target);
+
+            let mut reference = engine.new_state_with_ring_slack(slack);
+            engine
+                .prefill_with_chunk(&mut reference, &prompt, 4)
+                .unwrap();
+            for &token in &continuation[..keep] {
+                engine.step(&mut reference, token).unwrap();
+            }
+            let restores_before = gpu.step_stats().restores;
+            for &token in &[2u32, 0, 1] {
+                // Device steps on both sides (the production decode path).
+                let a = engine.step(&mut state, token).unwrap();
+                let b = engine.step(&mut reference, token).unwrap();
+                assert_eq!(
+                    crate::qwen_cpu::argmax(&a).unwrap(),
+                    crate::qwen_cpu::argmax(&b).unwrap(),
+                    "keep {keep}: greedy diverged after rewind"
+                );
+                for (x, y) in a.iter().zip(&b) {
+                    assert!((x - y).abs() <= 1.0e-4, "keep {keep}: {x} vs {y}");
+                }
+            }
+            // The rewind is a host-side mutation, so it severed the device
+            // link; the continuation above must have restored the mirror.
+            assert!(
+                gpu.step_stats().restores > restores_before,
+                "keep {keep}: rewound state must force a device restore"
+            );
+        }
+    }
+
+    /// Taps on the GPU provider: verify-chunk capture equals a tapped
+    /// (host-step) sequential run bit for bit, and capture never perturbs the
+    /// verify logits.
+    #[test]
+    fn dsv4_gpu_taps_match_host_step_capture() {
+        use crate::dsv4_cpu::DsV4TapConfig;
+
+        let path = tempfile_path("gpu-taps");
+        write_deepseek4_gguf(&path);
+        let gpu = DeepSeekV4GpuEngine::load(&path).unwrap();
+        let engine = gpu.engine();
+
+        let prompt: Vec<u32> = (0..6).map(|idx| idx % 3).collect();
+        let continuation: Vec<u32> = vec![2, 1, 0, 2];
+        let mut base = engine.new_state();
+        engine.prefill_with_chunk(&mut base, &prompt, 4).unwrap();
+        let config = DsV4TapConfig {
+            pre_hc_head: true,
+            aux_layers: vec![1],
+        };
+
+        let mut tapped_state = base.clone();
+        let mut taps = engine.new_taps(config.clone()).unwrap();
+        let tapped_rows = engine
+            .verify_tokens_with_taps(&mut tapped_state, &continuation, Some(&mut taps))
+            .unwrap();
+        let mut plain_state = base.clone();
+        let plain_rows = engine
+            .verify_tokens(&mut plain_state, &continuation)
+            .unwrap();
+        assert_eq!(tapped_rows, plain_rows, "capture must not perturb verify");
+
+        // Sequential capture oracle (step_with_taps forces the host step).
+        let mut seq_taps = engine.new_taps(config).unwrap();
+        let mut seq_state = base.clone();
+        for &token in &continuation {
+            engine
+                .step_with_taps(&mut seq_state, token, Some(&mut seq_taps))
+                .unwrap();
+        }
+        assert_eq!(taps.positions(), continuation.len());
+        for position in 0..continuation.len() {
+            assert_eq!(
+                taps.pre_hc_head(position).unwrap(),
+                seq_taps.pre_hc_head(position).unwrap(),
+                "pre-hc-head row {position}"
+            );
+            assert_eq!(
+                taps.aux_flat(1, position).unwrap(),
+                seq_taps.aux_flat(1, position).unwrap(),
+                "aux row {position}"
+            );
+        }
+    }
+
     // ---- Real-model gates (ignored: need the checkpoint + exclusive GPU) ---
 
     /// The local DeepSeek-V4-Flash checkpoint, when present.
@@ -5674,6 +6449,93 @@ pub(crate) mod tests {
         );
         assert_eq!(sequential_next, chunked_next, "greedy next token diverged");
         assert!(max_drift <= 0.05, "logit drift {max_drift} exceeds 0.05");
+    }
+
+    /// Stage-A verify gate on the real checkpoint: verify_tokens over the
+    /// model's own greedy continuation must pick the SAME greedy token at
+    /// every position as sequential decode steps (the speculative
+    /// losslessness requirement) with near-zero logit drift, and the rewind
+    /// round-trip must resume decode on the sequential trajectory. Run
+    /// explicitly (a small expert pool keeps the load polite on a shared GPU):
+    /// `HI_DSV4_EXPERT_POOL_GB=24 CUDA_VISIBLE_DEVICES=0 cargo test -p hi-cuda --release \
+    ///  --features native-cuda dsv4_real_model_verify_tokens_parity -- --ignored --nocapture`
+    #[test]
+    #[ignore = "needs the real DeepSeek-V4-Flash checkpoint and an otherwise-idle GPU"]
+    fn dsv4_real_model_verify_tokens_parity() {
+        let Some(path) = real_model_path() else {
+            eprintln!("skipping: real model not found");
+            return;
+        };
+        let gpu = DeepSeekV4GpuEngine::load(&path).unwrap();
+        let engine = gpu.engine();
+        let tokens = engine.tokenizer().encode(&long_prompt(300)).unwrap();
+        assert!(tokens.len() >= 256, "prompt too short: {}", tokens.len());
+        let prompt = &tokens[..256];
+        const VERIFY: usize = 6;
+
+        // Prefill once with speculative ring slack, then split into the
+        // sequential (device-step) and verify trajectories.
+        let slack = 128 + VERIFY + 1;
+        let started = std::time::Instant::now();
+        let mut sequential_state = engine.new_state_with_ring_slack(slack);
+        let mut logits = engine.prefill(&mut sequential_state, prompt).unwrap();
+        eprintln!(
+            "real-model verify: 256-token prefill in {:.1}s",
+            started.elapsed().as_secs_f64()
+        );
+        let mut verify_state = sequential_state.clone();
+
+        // The model's own greedy continuation via the production decode path.
+        let mut continuation = Vec::new();
+        let mut sequential_rows = Vec::new();
+        for _ in 0..VERIFY {
+            let next = crate::qwen_cpu::argmax(&logits).unwrap();
+            continuation.push(next);
+            logits = engine.step(&mut sequential_state, next).unwrap();
+            sequential_rows.push(logits.clone());
+        }
+
+        // Verify those tokens in one chunked forward; per-position greedy
+        // choices must match the sequential rows exactly.
+        let started = std::time::Instant::now();
+        let verify_rows = engine
+            .verify_tokens(&mut verify_state, &continuation)
+            .unwrap();
+        eprintln!(
+            "real-model verify: {VERIFY}-token verify chunk in {:.1}s",
+            started.elapsed().as_secs_f64()
+        );
+        let mut max_drift = 0.0f32;
+        for (position, (verify, sequential)) in verify_rows.iter().zip(&sequential_rows).enumerate()
+        {
+            assert_eq!(
+                crate::qwen_cpu::argmax(verify).unwrap(),
+                crate::qwen_cpu::argmax(sequential).unwrap(),
+                "greedy choice diverged at verify position {position}"
+            );
+            for (v, s) in verify.iter().zip(sequential) {
+                max_drift = max_drift.max((v - s).abs());
+            }
+        }
+        eprintln!("real-model verify: max |logit drift| over {VERIFY} positions = {max_drift:e}");
+        assert!(max_drift <= 1.0e-3, "verify drift {max_drift} exceeds 1e-3");
+
+        // Rewind round-trip: keep 3 of the 6 verified tokens, then decode must
+        // continue on the sequential trajectory.
+        let keep = 3;
+        let mut history = prompt.to_vec();
+        history.extend(&continuation);
+        let target = prompt.len() + keep;
+        engine
+            .rewind_state_to(&mut verify_state, &history[..target], target, None)
+            .unwrap();
+        let resumed = engine.step(&mut verify_state, continuation[keep]).unwrap();
+        assert_eq!(
+            crate::qwen_cpu::argmax(&resumed).unwrap(),
+            crate::qwen_cpu::argmax(&sequential_rows[keep]).unwrap(),
+            "greedy choice diverged after rewind"
+        );
+        eprintln!("real-model verify: rewind to {target} resumed on the sequential trajectory");
     }
 
     /// Before/after timing on a ~1.5k-token prompt (the validation run the
