@@ -182,15 +182,18 @@ pub(crate) trait Drafter {
 type DsV4DrafterFactory = Box<dyn FnOnce(&DeepSeekV4GpuEngine) -> Option<Box<dyn Drafter>> + Send>;
 
 /// `HI_DSV4_SPEC`: drafter selection, resolved on the engine worker thread so
-/// drafters can own device resources. Named drafters land in the follow-up
-/// commits; until then every selection logs and stays off.
+/// drafters can own device resources. `mtp` = self-speculation from the
+/// official MTP module (Stage B, [`crate::dsv4_mtp`]); `dflash` = the RedHat
+/// block-diffusion drafter (Stage C, [`crate::dsv4_dflash`]).
 fn drafter_from_env(engine: &DeepSeekV4GpuEngine) -> Option<Box<dyn Drafter>> {
     let raw = std::env::var("HI_DSV4_SPEC").ok()?;
     match raw.trim() {
         "" | "0" | "off" | "none" => None,
+        "mtp" => crate::dsv4_mtp::mtp_drafter_from_env(engine),
+        "dflash" => crate::dsv4_dflash::dflash_drafter_from_env(engine),
         other => {
             eprintln!(
-                "HI_DSV4_SPEC={other} is not available yet; speculative decoding stays off"
+                "HI_DSV4_SPEC={other} is not a known drafter (expected mtp, dflash, or off); speculative decoding stays off"
             );
             None
         }
