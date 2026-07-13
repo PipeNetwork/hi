@@ -38,6 +38,7 @@ pub struct GgufFile {
 
 #[derive(Debug)]
 struct GgufShard {
+    path: PathBuf,
     mmap: Mmap,
     data_start: u64,
 }
@@ -122,6 +123,7 @@ impl GgufFile {
                 self.tensors.push(info);
             }
             self.extra_shards.push(GgufShard {
+                path: sibling,
                 mmap: shard.mmap,
                 data_start: shard.data_start,
             });
@@ -195,6 +197,107 @@ impl GgufFile {
         Ok(TensorView { info, bytes })
     }
 
+    /// Number of files backing this GGUF (1 unless it is a split model).
+    pub fn shard_count(&self) -> usize {
+        1 + self.extra_shards.len()
+    }
+
+    /// Filesystem path of one shard (0 = the file passed to [`GgufFile::open`]).
+    pub fn shard_path(&self, shard: usize) -> Option<&Path> {
+        if shard == 0 {
+            Some(&self.path)
+        } else {
+            self.extra_shards
+                .get(shard - 1)
+                .map(|shard| shard.path.as_path())
+        }
+    }
+
+    /// Absolute byte extent of a tensor's data within its backing shard file.
+    /// This is the on-disk location (`shard file offset`, not mmap-relative),
+    /// for direct-I/O readers and readahead planning; sub-ranges of the tensor
+    /// are plain offsets from `file_offset`.
+    pub fn tensor_file_range(&self, name: &str) -> Result<TensorFileRange> {
+        let info = self
+            .tensor_info(name)
+            .ok_or_else(|| anyhow!("tensor {name} missing from GGUF"))?;
+        let data_start = if info.shard == 0 {
+            self.data_start
+        } else {
+            self.extra_shards
+                .get(info.shard - 1)
+                .ok_or_else(|| {
+                    anyhow!("tensor {name} references missing GGUF shard {}", info.shard)
+                })?
+                .data_start
+        };
+        Ok(TensorFileRange {
+            shard: info.shard,
+            file_offset: checked_add(data_start, info.offset, "tensor file offset")?,
+            len: info.byte_len()?,
+        })
+    }
+
+    /// Page-cache advice for one tensor's full mmap extent. See
+    /// [`GgufFile::advise_tensor_range`].
+    pub fn advise_tensor(&self, name: &str, advice: GgufMemoryAdvice) -> Result<()> {
+        let info = self
+            .tensor_info(name)
+            .ok_or_else(|| anyhow!("tensor {name} missing from GGUF"))?;
+        self.advise_tensor_range(name, 0, info.byte_len()?, advice)
+    }
+
+    /// `madvise` a byte sub-range of one tensor's data on the backing mmap.
+    /// `MADV_RANDOM` on streamed-expert extents kills readahead amplification
+    /// (a fault no longer drags in megabytes of neighboring experts);
+    /// `WillNeed` starts asynchronous readahead of exactly the extent about to
+    /// be copied. The advice is applied page-aligned (the range is widened to
+    /// page boundaries, never narrowed). No-op on non-unix platforms.
+    pub fn advise_tensor_range(
+        &self,
+        name: &str,
+        range_offset: u64,
+        range_len: u64,
+        advice: GgufMemoryAdvice,
+    ) -> Result<()> {
+        let info = self
+            .tensor_info(name)
+            .ok_or_else(|| anyhow!("tensor {name} missing from GGUF"))?;
+        let byte_len = info.byte_len()?;
+        let range_end = checked_add(range_offset, range_len, "tensor advice range")?;
+        if range_end > byte_len {
+            bail!(
+                "advice range {range_offset}..{range_end} exceeds tensor {name} ({byte_len} bytes)"
+            );
+        }
+        let (mmap, data_start) = if info.shard == 0 {
+            (&self.mmap, self.data_start)
+        } else {
+            let shard = self.extra_shards.get(info.shard - 1).ok_or_else(|| {
+                anyhow!("tensor {name} references missing GGUF shard {}", info.shard)
+            })?;
+            (&shard.mmap, shard.data_start)
+        };
+        let start = checked_add(
+            checked_add(data_start, info.offset, "tensor data offset")?,
+            range_offset,
+            "tensor advice offset",
+        )?;
+        let start = usize::try_from(start).context("tensor advice offset does not fit usize")?;
+        let len = usize::try_from(range_len).context("tensor advice length does not fit usize")?;
+        advise_mmap_range(mmap, start, len, advice)
+    }
+
+    /// Open every shard a second time for O_DIRECT positioned reads that
+    /// bypass the page cache entirely (the "twin fd" pattern: the mmap fds
+    /// stay buffered for the trunk, this reader serves streamed-expert
+    /// extents). Linux-only; fails with a clear error where the OS or the
+    /// filesystem (e.g. tmpfs) does not support O_DIRECT, in which case the
+    /// caller falls back to the buffered mmap path.
+    pub fn direct_io_reader(&self) -> Result<GgufDirectReader> {
+        GgufDirectReader::open(self)
+    }
+
     pub fn qwen_config(&self) -> Result<QwenGgufConfig> {
         QwenGgufConfig::from_gguf(self)
     }
@@ -253,6 +356,208 @@ impl GgufFile {
         })
     }
 }
+
+/// Absolute byte extent of one tensor's data within its backing shard file
+/// (on-disk offsets, not mmap-relative). See [`GgufFile::tensor_file_range`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TensorFileRange {
+    /// Index of the shard file holding the tensor (0 = primary file); resolve
+    /// to a path with [`GgufFile::shard_path`].
+    pub shard: usize,
+    /// Byte offset of the tensor's first data byte within the shard file.
+    pub file_offset: u64,
+    /// Tensor data length in bytes.
+    pub len: u64,
+}
+
+/// Page-cache policy for a tensor's mmap extent (a safe subset of `madvise`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GgufMemoryAdvice {
+    /// Default kernel readahead.
+    Normal,
+    /// Expect random access: disable readahead (use for streamed-expert
+    /// extents so one expert fault does not drag neighbors into the cache).
+    Random,
+    /// Expect sequential access: aggressive readahead.
+    Sequential,
+    /// Start asynchronous readahead of the range now.
+    WillNeed,
+}
+
+#[cfg(unix)]
+fn advise_mmap_range(
+    mmap: &Mmap,
+    start: usize,
+    len: usize,
+    advice: GgufMemoryAdvice,
+) -> Result<()> {
+    const PAGE: usize = 4096;
+    let advice = match advice {
+        GgufMemoryAdvice::Normal => memmap2::Advice::Normal,
+        GgufMemoryAdvice::Random => memmap2::Advice::Random,
+        GgufMemoryAdvice::Sequential => memmap2::Advice::Sequential,
+        GgufMemoryAdvice::WillNeed => memmap2::Advice::WillNeed,
+    };
+    // madvise requires a page-aligned address: widen the range down to the
+    // containing page (the mmap base itself is page-aligned).
+    let aligned_start = start & !(PAGE - 1);
+    let aligned_len = len + (start - aligned_start);
+    if aligned_len == 0 {
+        return Ok(());
+    }
+    mmap.advise_range(advice, aligned_start, aligned_len)
+        .context("madvise on GGUF mmap range")
+}
+
+#[cfg(not(unix))]
+fn advise_mmap_range(
+    _mmap: &Mmap,
+    _start: usize,
+    _len: usize,
+    _advice: GgufMemoryAdvice,
+) -> Result<()> {
+    Ok(())
+}
+
+/// O_DIRECT logical-block granularity: file offset, read length and buffer
+/// address must all be multiples of the device's logical block size. 4096
+/// covers every NVMe/ext4/xfs configuration in practice.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const DIRECT_IO_BLOCK: usize = 4096;
+
+/// Positioned O_DIRECT reads over every shard of a (split) GGUF, bypassing
+/// the page cache. Reads land in an internal block-aligned scratch allocation
+/// and the requested sub-range is copied out, so callers may ask for arbitrary
+/// (unaligned) extents. Thread-safe: `read_range` uses positioned reads on
+/// shared fds, so concurrent expert fetches need no locking.
+#[derive(Debug)]
+pub struct GgufDirectReader {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    shards: Vec<File>,
+}
+
+impl GgufDirectReader {
+    #[cfg(target_os = "linux")]
+    fn open(gguf: &GgufFile) -> Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut shards = Vec::with_capacity(gguf.shard_count());
+        for shard in 0..gguf.shard_count() {
+            let path = gguf
+                .shard_path(shard)
+                .ok_or_else(|| anyhow!("GGUF shard {shard} has no path"))?;
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECT)
+                .open(path)
+                .with_context(|| {
+                    format!(
+                        "opening {} with O_DIRECT (unsupported on this filesystem?)",
+                        path.display()
+                    )
+                })?;
+            shards.push(file);
+        }
+        Ok(Self { shards })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn open(_gguf: &GgufFile) -> Result<Self> {
+        bail!("O_DIRECT GGUF reads are only supported on Linux")
+    }
+
+    /// Read `len` bytes at absolute file offset `file_offset` of `shard`
+    /// (offsets from [`GgufFile::tensor_file_range`] plus any sub-range).
+    pub fn read_range(&self, shard: usize, file_offset: u64, len: usize) -> Result<Vec<u8>> {
+        let mut out = vec![0u8; len];
+        self.read_range_into(shard, file_offset, &mut out)?;
+        Ok(out)
+    }
+
+    /// Read exactly `out.len()` bytes at `file_offset` of `shard` into `out`.
+    #[cfg(target_os = "linux")]
+    pub fn read_range_into(&self, shard: usize, file_offset: u64, out: &mut [u8]) -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        if out.is_empty() {
+            return Ok(());
+        }
+        let file = self
+            .shards
+            .get(shard)
+            .ok_or_else(|| anyhow!("O_DIRECT read references missing GGUF shard {shard}"))?;
+        let block = DIRECT_IO_BLOCK as u64;
+        let aligned_start = file_offset / block * block;
+        let head = (file_offset - aligned_start) as usize;
+        let aligned_len = (head + out.len()).div_ceil(DIRECT_IO_BLOCK) * DIRECT_IO_BLOCK;
+        let mut scratch = AlignedBlockBuf::new(aligned_len)?;
+        let buf = scratch.as_mut_slice();
+        // O_DIRECT reads may come back short (and MUST stop short at EOF when
+        // the file length is not block-aligned); loop until the caller's range
+        // is covered.
+        let mut filled = 0usize;
+        while filled < head + out.len() {
+            let read = file
+                .read_at(&mut buf[filled..], aligned_start + filled as u64)
+                .with_context(|| {
+                    format!("O_DIRECT read of {aligned_len} bytes at {aligned_start}")
+                })?;
+            if read == 0 {
+                bail!(
+                    "O_DIRECT read hit EOF: wanted {} bytes at {file_offset} of shard {shard}",
+                    out.len()
+                );
+            }
+            filled += read;
+        }
+        out.copy_from_slice(&buf[head..head + out.len()]);
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn read_range_into(&self, _shard: usize, _file_offset: u64, _out: &mut [u8]) -> Result<()> {
+        bail!("O_DIRECT GGUF reads are only supported on Linux")
+    }
+}
+
+/// Heap allocation aligned to [`DIRECT_IO_BLOCK`], as O_DIRECT requires of the
+/// destination buffer.
+#[cfg(target_os = "linux")]
+struct AlignedBlockBuf {
+    ptr: *mut u8,
+    len: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl AlignedBlockBuf {
+    fn new(len: usize) -> Result<Self> {
+        let layout = std::alloc::Layout::from_size_align(len, DIRECT_IO_BLOCK)
+            .context("O_DIRECT scratch layout")?;
+        // SAFETY: layout has non-zero size (callers round up to >= one block).
+        let ptr = unsafe { std::alloc::alloc(layout) };
+        if ptr.is_null() {
+            bail!("allocating {len}-byte aligned O_DIRECT scratch failed");
+        }
+        Ok(Self { ptr, len })
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: ptr is a live allocation of exactly `len` bytes owned by self.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for AlignedBlockBuf {
+    fn drop(&mut self) {
+        let layout = std::alloc::Layout::from_size_align(self.len, DIRECT_IO_BLOCK)
+            .expect("layout validated at construction");
+        // SAFETY: allocated with the identical layout in `new`.
+        unsafe { std::alloc::dealloc(self.ptr, layout) };
+    }
+}
+
+// SAFETY: AlignedBlockBuf is a plain owned allocation (no thread affinity).
+#[cfg(target_os = "linux")]
+unsafe impl Send for AlignedBlockBuf {}
 
 pub fn inspect_model(path: impl AsRef<Path>, model_id: Option<String>) -> Result<ModelInfo> {
     let path = path.as_ref();
@@ -1554,6 +1859,13 @@ pub struct QwenGgufConfig {
     pub attention_recurrent_layers: Option<Vec<bool>>,
     pub expert_count: Option<u32>,
     pub expert_used_count: Option<u32>,
+    /// Group-limited routing (DeepSeek-V3 `n_group`/`topk_group`): experts are
+    /// partitioned into `expert_group_count` groups and only the top
+    /// `expert_group_used_count` groups are searched. `> 1` is rejected at
+    /// load (unimplemented in the qwen MoE paths; GLM-5.2 is n_group = 1 so
+    /// the metadata is either absent or 1 there).
+    pub expert_group_count: Option<u32>,
+    pub expert_group_used_count: Option<u32>,
     /// Number of always-on shared experts (DeepSeek MoE `n_shared_experts`).
     /// Their fused MLP intermediate width is `expert_ff * expert_shared_count`.
     pub expert_shared_count: Option<u32>,
@@ -1744,6 +2056,9 @@ impl QwenGgufConfig {
             .unwrap_or(attention_head_count);
         let expert_count = gguf.metadata_u32(&format!("{prefix}.expert_count"));
         let expert_used_count = gguf.metadata_u32(&format!("{prefix}.expert_used_count"));
+        let expert_group_count = gguf.metadata_u32(&format!("{prefix}.expert_group_count"));
+        let expert_group_used_count =
+            gguf.metadata_u32(&format!("{prefix}.expert_group_used_count"));
         let expert_shared_count = gguf.metadata_u32(&format!("{prefix}.expert_shared_count"));
         let vocab_size = gguf
             .metadata
@@ -1858,6 +2173,8 @@ impl QwenGgufConfig {
             attention_recurrent_layers,
             expert_count,
             expert_used_count,
+            expert_group_count,
+            expert_group_used_count,
             expert_shared_count,
             expert_weights_norm: gguf
                 .metadata_bool(&format!("{prefix}.expert_weights_norm"))
@@ -2037,11 +2354,16 @@ impl QwenGgufConfig {
     }
 
     pub fn attention_value_head_dim(&self) -> Option<u32> {
+        // MLA dim first, mirroring `attention_key_head_dim`: glm-dsa GGUFs carry
+        // the latent compressed-KV width in plain `attention.value_length` (512)
+        // alongside the true per-head dim in `value_length_mla` (256); preferring
+        // the plain key poisons every downstream v_head consumer (attn_output
+        // validation, KV page sizing, health reporting).
+        if let Some(v) = self.attention_v_head_dim {
+            return (v != 0).then_some(v);
+        }
         let dense = dense_attention_head_dim(self.embedding_length, self.attention_head_count);
-        let value = self
-            .attention_value_length
-            .or(self.attention_v_head_dim)
-            .or(dense)?;
+        let value = self.attention_value_length.or(dense)?;
         (value != 0).then_some(value)
     }
 }
@@ -4178,6 +4500,25 @@ fn validate_qwen_tensors(gguf: &GgufFile, config: &QwenGgufConfig) -> QwenTensor
     {
         validator.errors.push(format!(
             "qwen MoE expert_used_count {used} must be in 1..={total}"
+        ));
+    }
+    // Group-limited routing (DeepSeek-V3 n_group > 1) is unimplemented in the
+    // qwen MoE paths: running anyway would route experts silently wrong, so
+    // reject at load. GLM-5.2-class checkpoints are n_group = 1 and pass.
+    if let Some(groups) = config.expert_group_count
+        && groups > 1
+    {
+        validator.errors.push(format!(
+            "group-limited expert routing is unimplemented: {}.expert_group_count = {groups} (expert_group_used_count = {:?}); only expert_group_count <= 1 is supported",
+            config.architecture, config.expert_group_used_count
+        ));
+    }
+    if let (Some(used), Some(groups)) = (config.expert_group_used_count, config.expert_group_count)
+        && groups > 0
+        && used > groups
+    {
+        validator.errors.push(format!(
+            "qwen MoE expert_group_used_count {used} must be <= expert_group_count {groups}"
         ));
     }
 
@@ -8630,6 +8971,57 @@ mod tests {
         assert!(validation.valid, "{:?}", validation.errors);
     }
 
+    /// `expert_group_count = 1` (GLM-5.2's shape) parses and stays loadable;
+    /// the guard must only reject actual group-limited routing.
+    #[test]
+    fn accepts_single_expert_group_metadata() {
+        let path = tempfile_path("glm-moe-group1");
+        write_tiny_glm_moe_grouped(&path, 1, 1);
+
+        let gguf = GgufFile::open(&path).unwrap();
+        let config = gguf.qwen_config().unwrap();
+        assert_eq!(config.expert_group_count, Some(1));
+        assert_eq!(config.expert_group_used_count, Some(1));
+        let validation = gguf.validate_qwen_tensors().unwrap();
+        assert!(validation.valid, "{:?}", validation.errors);
+    }
+
+    /// Group-limited routing (DeepSeek-V3 n_group > 1) is unimplemented in
+    /// the qwen MoE paths; loading such a checkpoint must fail loudly rather
+    /// than route experts silently wrong.
+    #[test]
+    fn rejects_group_limited_expert_routing() {
+        let path = tempfile_path("glm-moe-group4");
+        write_tiny_glm_moe_grouped(&path, 4, 2);
+
+        let gguf = GgufFile::open(&path).unwrap();
+        let config = gguf.qwen_config().unwrap();
+        assert_eq!(config.expert_group_count, Some(4));
+        assert_eq!(config.expert_group_used_count, Some(2));
+
+        let validation = gguf.qwen_tensor_validation().unwrap();
+        assert!(!validation.valid);
+        let err = gguf.validate_qwen_tensors().unwrap_err().to_string();
+        assert!(
+            err.contains("group-limited expert routing is unimplemented"),
+            "{err}"
+        );
+        assert!(err.contains("expert_group_count = 4"), "{err}");
+    }
+
+    #[test]
+    fn rejects_expert_group_used_count_above_group_count() {
+        let path = tempfile_path("glm-moe-group-used");
+        write_tiny_glm_moe_grouped(&path, 1, 3);
+
+        let gguf = GgufFile::open(&path).unwrap();
+        let err = gguf.validate_qwen_tensors().unwrap_err().to_string();
+        assert!(
+            err.contains("expert_group_used_count 3 must be <= expert_group_count 1"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn parses_glm_flash_config_with_decoder_compatible_tensor_layout() {
         let path = tempfile_path("glm-flash");
@@ -12559,6 +12951,36 @@ mod tests {
         );
     }
 
+    fn write_tiny_glm_moe_grouped(path: &Path, groups: u32, used_groups: u32) {
+        write_tiny_glm_gguf(
+            path,
+            vec![
+                ("token_embd.weight", vec![4, 2]),
+                ("output_norm.weight", vec![4]),
+                ("blk.0.attn_norm.weight", vec![4]),
+                ("blk.0.ffn_norm.weight", vec![4]),
+                ("blk.0.attn_q.weight", vec![4, 4]),
+                ("blk.0.attn_k.weight", vec![4, 4]),
+                ("blk.0.attn_v.weight", vec![4, 4]),
+                ("blk.0.attn_output.weight", vec![4, 4]),
+                ("blk.0.ffn_gate_inp.weight", vec![4, 2]),
+                ("blk.0.ffn_gate_exps.weight", vec![4, 3, 2]),
+                ("blk.0.ffn_up_exps.weight", vec![4, 3, 2]),
+                ("blk.0.ffn_down_exps.weight", vec![3, 4, 2]),
+            ],
+            16,
+            |bytes| {
+                write_glm_base_metadata(bytes, "glm4moe", "tiny-glm-moe-grouped", Some(3));
+                write_kv_u32(bytes, "glm4moe.expert_count", 2);
+                write_kv_u32(bytes, "glm4moe.expert_used_count", 1);
+                write_kv_u32(bytes, "glm4moe.expert_group_count", groups);
+                write_kv_u32(bytes, "glm4moe.expert_group_used_count", used_groups);
+                write_kv_u32(bytes, "tokenizer.ggml.eos_token_id", 1);
+                write_kv_string_array(bytes, "tokenizer.ggml.tokens", &["hello", "world"]);
+            },
+        );
+    }
+
     fn write_tiny_glm_flash_dense(path: &Path) {
         write_tiny_glm_gguf(
             path,
@@ -13720,6 +14142,168 @@ mod tests {
         // Opening a later shard directly is refused with a pointer at shard 1.
         let err = GgufFile::open(&shard2).unwrap_err().to_string();
         assert!(err.contains("open the first shard"), "{err}");
+
+        std::fs::remove_file(&shard1).unwrap();
+        std::fs::remove_file(&shard2).unwrap();
+    }
+
+    /// Two-shard split GGUF with deterministic non-zero f32 payloads, for the
+    /// tensor-file-range / O_DIRECT / madvise tests (zero-filled fixtures
+    /// cannot catch offset arithmetic bugs). Tensor `big` spans multiple
+    /// 4096-byte direct-I/O blocks; `b` sits at a non-zero data offset.
+    fn write_pattern_split_gguf(dir: &Path, base: &str) -> (PathBuf, PathBuf) {
+        fn shard_bytes(split_no: u32, tensors: &[(&str, &[f32], u64)], with_meta: bool) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(b"GGUF");
+            write_u32(&mut bytes, 3);
+            write_u64(&mut bytes, tensors.len() as u64);
+            write_u64(&mut bytes, if with_meta { 4 } else { 3 });
+            write_kv_u32(&mut bytes, "general.alignment", 32);
+            write_kv_u32(&mut bytes, "split.count", 2);
+            write_kv_u32(&mut bytes, "split.no", split_no);
+            if with_meta {
+                write_kv_u32(&mut bytes, "split.tensors.count", 3);
+            }
+            for (name, values, offset) in tensors {
+                write_string(&mut bytes, name);
+                write_u32(&mut bytes, 1);
+                write_u64(&mut bytes, values.len() as u64);
+                write_u32(&mut bytes, 0); // f32
+                write_u64(&mut bytes, *offset);
+            }
+            pad_to_alignment(&mut bytes, 32);
+            let data_start = bytes.len();
+            for (_, values, offset) in tensors {
+                let target = data_start + *offset as usize;
+                assert!(bytes.len() <= target);
+                bytes.resize(target, 0);
+                for value in *values {
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
+            }
+            bytes
+        }
+
+        let pattern = |len: usize, seed: f32| -> Vec<f32> {
+            (0..len).map(|i| seed + i as f32 * 0.25).collect()
+        };
+        let shard1 = dir.join(format!("{base}-00001-of-00002.gguf"));
+        let shard2 = dir.join(format!("{base}-00002-of-00002.gguf"));
+        let big = pattern(3000, 1.0); // 12000 bytes: crosses two block boundaries
+        let b = pattern(64, 500.0);
+        let c = pattern(128, 900.0);
+        std::fs::write(&shard1, shard_bytes(0, &[("big", &big, 0)], true)).unwrap();
+        std::fs::write(
+            &shard2,
+            shard_bytes(1, &[("b", &b, 0), ("c", &c, 256)], false),
+        )
+        .unwrap();
+        (shard1, shard2)
+    }
+
+    #[test]
+    fn tensor_file_range_locates_bytes_across_shards() {
+        let dir = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let (shard1, shard2) = write_pattern_split_gguf(&dir, &format!("hi-gguf-range-{nanos}"));
+
+        let gguf = GgufFile::open(&shard1).unwrap();
+        assert_eq!(gguf.shard_count(), 2);
+        assert_eq!(gguf.shard_path(0), Some(shard1.as_path()));
+        assert_eq!(gguf.shard_path(1), Some(shard2.as_path()));
+        for name in ["big", "b", "c"] {
+            let range = gguf.tensor_file_range(name).unwrap();
+            let raw = std::fs::read(gguf.shard_path(range.shard).unwrap()).unwrap();
+            let start = usize::try_from(range.file_offset).unwrap();
+            let len = usize::try_from(range.len).unwrap();
+            let view = gguf.tensor(name).unwrap();
+            assert_eq!(len, view.bytes.len());
+            assert_eq!(&raw[start..start + len], view.bytes, "tensor {name}");
+        }
+        assert!(gguf.tensor_file_range("missing").is_err());
+
+        std::fs::remove_file(&shard1).unwrap();
+        std::fs::remove_file(&shard2).unwrap();
+    }
+
+    #[test]
+    fn advise_tensor_range_smoke() {
+        let dir = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let (shard1, shard2) = write_pattern_split_gguf(&dir, &format!("hi-gguf-advise-{nanos}"));
+
+        let gguf = GgufFile::open(&shard1).unwrap();
+        gguf.advise_tensor("big", GgufMemoryAdvice::Random).unwrap();
+        // Cross-shard, unaligned sub-range (widened to page boundaries).
+        gguf.advise_tensor_range("c", 3, 100, GgufMemoryAdvice::WillNeed)
+            .unwrap();
+        gguf.advise_tensor("b", GgufMemoryAdvice::Sequential)
+            .unwrap();
+        gguf.advise_tensor("b", GgufMemoryAdvice::Normal).unwrap();
+        // Advice must stay within the tensor's extent.
+        let err = gguf
+            .advise_tensor_range("b", 200, 100, GgufMemoryAdvice::WillNeed)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exceeds tensor"), "{err}");
+
+        std::fs::remove_file(&shard1).unwrap();
+        std::fs::remove_file(&shard2).unwrap();
+    }
+
+    /// O_DIRECT twin-fd reads must return byte-identical data to the mmap for
+    /// arbitrary (unaligned) sub-ranges. Skips when the filesystem hosting the
+    /// fixture does not support O_DIRECT (e.g. tmpfs) or on non-Linux.
+    #[test]
+    fn o_direct_reads_match_mmap() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir();
+        let (shard1, shard2) = write_pattern_split_gguf(&dir, &format!("hi-gguf-odirect-{nanos}"));
+
+        let gguf = GgufFile::open(&shard1).unwrap();
+        let reader = match gguf.direct_io_reader() {
+            Ok(reader) => reader,
+            Err(err) => {
+                eprintln!("skipping O_DIRECT equivalence test: {err:#}");
+                std::fs::remove_file(&shard1).unwrap();
+                std::fs::remove_file(&shard2).unwrap();
+                return;
+            }
+        };
+        for name in ["big", "b", "c"] {
+            let range = gguf.tensor_file_range(name).unwrap();
+            let view = gguf.tensor(name).unwrap();
+            let len = usize::try_from(range.len).unwrap();
+            // Full tensor.
+            let full = reader
+                .read_range(range.shard, range.file_offset, len)
+                .unwrap();
+            assert_eq!(full, view.bytes, "tensor {name} full read");
+            // Unaligned sub-ranges, including block-boundary crossings for `big`.
+            for (sub_off, sub_len) in [(0usize, 1usize), (3, 5), (7, len - 7), (len - 1, 1)] {
+                let got = reader
+                    .read_range(range.shard, range.file_offset + sub_off as u64, sub_len)
+                    .unwrap();
+                assert_eq!(
+                    got,
+                    &view.bytes[sub_off..sub_off + sub_len],
+                    "tensor {name} sub-range {sub_off}+{sub_len}"
+                );
+            }
+        }
+        // Reading past EOF of the shard must fail, not fabricate bytes.
+        let big = gguf.tensor_file_range("big").unwrap();
+        let file_len = std::fs::metadata(&shard1).unwrap().len();
+        assert!(reader.read_range(big.shard, file_len - 4, 64).is_err());
 
         std::fs::remove_file(&shard1).unwrap();
         std::fs::remove_file(&shard2).unwrap();
