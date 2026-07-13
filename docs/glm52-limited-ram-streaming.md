@@ -30,6 +30,12 @@ Status: IMPLEMENTED + VALIDATED (2026-07-13). Highlights:
 - Full-page-cache smoke (251 GB box, GPU 0, 60 GiB pool): load ~40 s, decode
   0.31 cold → 0.49 warm tok/s at 61.7% pool hit after two requests; coherent.
 - Suites: 137 default / 408 native at the workstreams' close.
+- **io_uring fetch backend (2026-07-13)**: opt-in `HI_CUDA_EXPERT_IOURING=1`
+  third fetcher — whole miss batches at queue depth, O_DIRECT DMA straight
+  into pinned tier slots, completion-driven uploads. Measured: cold mmap
+  0.71 GiB/s → O_DIRECT-family 6.5 GiB/s (device ceiling) on this box; the
+  ring matches the thread pool on GLM-sized extents and removes the CPU copy
+  chain. Full section at the bottom of this file.
 
 Original plan follows. Goal: users with limited RAM (24–64 GB) + NVMe (+
 optionally a GPU) run GLM-5.2-class MoE through `hi -p glm-5.2` with honest
@@ -133,3 +139,109 @@ Today the "RAM tier" is the unbounded OS page cache; a 32 GB box with a
   note colibri's cold-cache finding (drafts amplify expert traffic ~1.7x) and
   their S-scaling result (verify cost ~linear in S for MoE).
 - Expert-major sidecar repack for single-pread expert fetches.
+
+## io_uring fetch backend (2026-07-13)
+
+Third `ExpertFetcher` backend (Linux only, `io-uring = "0.7"`): the miss path
+was a ≤6-thread pread pool, so the effective submission concurrency was the
+worker count. The ring submits a whole ensure-pass's miss extents (a cold GLM
+token is ~1,800 extents ≈ 10 GB) in as few `io_uring_enter` syscalls as
+possible and reaps completions as they land.
+
+### Env knobs
+
+- `HI_CUDA_EXPERT_IOURING=1` — opt-in this phase (default off; `0`/unset keeps
+  the existing behavior exactly).
+- `HI_CUDA_EXPERT_IOURING_QD` — submission queue depth, default 256, clamped
+  to a power of two in [8, 4096].
+
+### How it reads
+
+- **O_DIRECT twin fds** per shard (same 4 KiB alignment rules as the
+  `GgufDirectReader` path: offset rounded down, length rounded up, payload at
+  the `head` fixup offset inside the destination).
+- **Zero-copy into the tier**: in ring mode the pinned RAM-tier slot stride is
+  widened to `round_up(slot_bytes, 4K) + 4K` and the slot region is shifted to
+  a 4 KiB boundary inside the pinned allocation (`cudaHostAlloc` suballocates
+  small buffers unaligned). Each miss reserves a tier slot and the NVMe DMAs
+  the aligned span straight into it; the tier records the payload's `head`
+  offset. End to end (disk → pinned host → device) there is no CPU memcpy —
+  the old path staged through `Vec` scratch plus a `copy_in` into the tier.
+- **Completion-driven uploads (phase 2)**: as each slice's read completes, its
+  async H2D is enqueued on the copy stream immediately, overlapping the
+  remaining NVMe reads. Tier-declined slices (all slots pass-pinned) fall back
+  to owned scratch staged after the batch, exactly like the legacy path. The
+  engine-stream overlap question is untouched: `ensure_resident_on`'s
+  `Some(&stream)` wiring in gpu.rs stays reverted to sync pending the
+  cross-test-flake root cause.
+- **Registered resources**: shard fds via IORING_REGISTER_FILES; the pinned
+  arena via IORING_REGISTER_BUFFERS in 1 GiB stride-multiple iovec chunks.
+  Both degrade with a one-line log to the unregistered forms (most of the win
+  is queue depth, not fixed buffers — confirmed by the bench).
+- **Pre-warm rides the ring**: sticky slots are reserved and DMA'd the same
+  way, so the startup warm set loads at device speed with zero copies.
+- The `WillNeedThread` and `MADV_RANDOM` machinery are not engaged in ring
+  mode (no page cache in play); `/health` reports `io=iouring(qd=N[,regbuf])`.
+
+### Probe + fallback ladder
+
+Construction probes the whole stack — ring setup, O_DIRECT opens, best-effort
+fd registration, then **one real read byte-compared against a buffered read**
+(buffer registration follows once the pinned tier arena exists) — and on any
+failure logs the reason and falls back: **io_uring → O_DIRECT threads →
+mmap**. A knob can never fail the model load. Failure modes caught
+at load, not decode: kernel < 5.6 (no IORING_OP_READ),
+`kernel.io_uring_disabled` sysctl (=2, common on hardened hosts),
+seccomp/container denial (Docker's default profile blocks `io_uring_setup`),
+O_DIRECT-less filesystems (tmpfs/overlay upper layers), and
+EINVAL/ENOMEM/RLIMIT_MEMLOCK on buffer registration (registration is skipped,
+the ring still runs; since kernel 5.12 registration charges memcg rather than
+RLIMIT_MEMLOCK).
+
+### Measured (this box: 251 GB RAM, ext4 on NVMe root, kernel 6.8)
+
+`cargo test -p hi-cuda --release bench_glm_expert_read_backends -- --ignored
+--nocapture` — no GPU needed. 600 random (layer, expert) triples × 3
+projections = 1,800 extents, 10.0 GiB payload, extents 4.6–8.25 MiB, page
+cache dropped per-range via `posix_fadvise(DONTNEED)` and verified 0% resident
+via `mincore` (never a global drop_caches). Device ceiling reference
+(sequential 16 MiB O_DIRECT, 1 thread): 6.30 GiB/s.
+
+| backend                          | GiB/s | wall  |
+|----------------------------------|------:|------:|
+| mmap+willneed (6 threads, cold)  |  0.71 | 14.0s |
+| O_DIRECT pread (6 threads)       |  6.49 |  1.5s |
+| io_uring qd=8 unregistered       |  6.50 |  1.5s |
+| io_uring qd=8 registered         |  6.47 |  1.5s |
+| io_uring qd=64 unregistered      |  6.50 |  1.5s |
+| io_uring qd=64 registered        |  6.47 |  1.5s |
+| io_uring qd=256 unregistered     |  6.51 |  1.5s |
+| io_uring qd=256 registered       |  6.46 |  1.5s |
+
+Reading of the numbers, honestly: the 9x is **buffered mmap → O_DIRECT
+family** (0.71 → 6.5 GiB/s, and 0.71 GiB/s reproduces the ~723 MB/s baseline
+measured for the mmap path earlier in this file). At GLM's 4.6–8.25 MiB
+extents the block layer splits every pread into ~64 device-level commands, so
+6 threads already saturate this drive and **queue depth beyond 8 buys nothing
+here**; registered buffers are neutral. The ring's wins over the O_DIRECT
+thread pool on this hardware are therefore CPU- and pipeline-side, not
+raw-bandwidth: no per-read scratch alloc + copy-out + tier `copy_in` (three
+trips over ~10 GB per cold token), no read-worker threads, and per-slice
+upload overlap. On drives/filesystems where extents fragment smaller (or a
+future expert-major repack changes the extent mix), the QD headroom is
+already in place — re-run the bench to re-evaluate.
+
+### Tests
+
+Default suite (no GPU, no model): alignment math, QD clamping, probe failure
+modes (missing shard, tmpfs O_DIRECT denial), registration geometry, byte
+equivalence ring == buffered on synthetic files (slots + owned, EOF tails),
+batches ≫ QD. Native suite adds: ring == mmap on the streaming fixture GGUF
+(`fetcher_uring_matches_mmap_on_fixture`), the ring tier end to end
+(`native_cuda_uring_tier_end_to_end_bytes_and_bounds`: byte-exact device
+contents, bounded tier, evictions, engine-stream pass) and ring pre-warm
+(`native_cuda_uring_prewarm_dma_pins_hottest_experts`). Ignored real-model
+checks: `real_glm_shards_uring_matches_mmap_spot_check` and the bench above.
+Suites at this workstream's close: 145 default / 116 hi-gguf / 420 native
+(the pre-existing GPU-contention flake — a prefill tok/s health counter under
+a concurrent training job — reproduced once across runs and passed alone).
