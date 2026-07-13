@@ -8,6 +8,7 @@ mod lifecycle;
 mod models;
 mod render;
 mod run;
+mod sync_commands;
 mod transcript;
 
 pub use run::run;

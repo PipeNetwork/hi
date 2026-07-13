@@ -4,7 +4,8 @@ use crossterm::event::{KeyCode, KeyEvent};
 
 use crate::completion::{
     CompletionContext, CompletionItem, CompletionState, MODEL_CMD, MODEL_COMPLETION_MAX,
-    PROVIDER_CMD, completion_context, completion_items_for,
+    PROVIDER_CMD, SESSIONS_RENAME_CTX, SESSIONS_SWITCH_CTX, completion_context,
+    completion_items_for,
 };
 
 impl crate::App {
@@ -22,7 +23,38 @@ impl crate::App {
         {
             return self.provider_completion_items(prefix);
         }
+        if let CompletionContext::Arg { cmd, prefix } = ctx
+            && matches!(*cmd, SESSIONS_SWITCH_CTX | SESSIONS_RENAME_CTX)
+        {
+            return self.session_completion_items(cmd, prefix);
+        }
         completion_items_for(ctx)
+    }
+
+    fn session_completion_items(&self, command: &str, prefix: &str) -> Vec<CompletionItem> {
+        let action = if command == SESSIONS_RENAME_CTX {
+            "rename"
+        } else {
+            "switch"
+        };
+        self.session_completion_cache
+            .iter()
+            .filter(|session| {
+                session.id.to_lowercase().starts_with(prefix)
+                    || session.title.to_lowercase().contains(prefix)
+            })
+            .take(8)
+            .map(|session| CompletionItem {
+                label: session.id.clone(),
+                help: session.title.clone(),
+                insert: format!(
+                    "/sessions {action} {}{}",
+                    session.id,
+                    if action == "rename" { " " } else { "" }
+                ),
+                submit_on_enter: action == "switch",
+            })
+            .collect()
     }
 
     /// Up to [`MODEL_COMPLETION_MAX`] catalog ids starting with `prefix` (already
@@ -95,10 +127,48 @@ impl crate::App {
     /// matches; otherwise close it. Called after every edit to the input line.
     pub(crate) fn sync_completion(&mut self) {
         match completion_context(&self.input.text()) {
-            Some(ctx) if !self.items_for_ctx(&ctx).is_empty() => {
+            Some(ctx) => {
+                let changed = self.completion.as_ref().map(|c| &c.ctx) != Some(&ctx);
+                let entering_session_completion = match (&ctx, self.completion.as_ref()) {
+                    (
+                        CompletionContext::Arg { cmd, .. },
+                        Some(CompletionState {
+                            ctx: CompletionContext::Arg { cmd: previous, .. },
+                            ..
+                        }),
+                    ) if matches!(*cmd, SESSIONS_SWITCH_CTX | SESSIONS_RENAME_CTX) => {
+                        cmd != previous
+                    }
+                    (CompletionContext::Arg { cmd, .. }, _)
+                        if matches!(*cmd, SESSIONS_SWITCH_CTX | SESSIONS_RENAME_CTX) =>
+                    {
+                        true
+                    }
+                    _ => false,
+                };
+                if entering_session_completion {
+                    let mut refreshed = self
+                        .session_lister
+                        .as_ref()
+                        .map(|lister| lister())
+                        .unwrap_or_default();
+                    // `/sessions` may have added synced-only entries. Preserve
+                    // those while refreshing the machine cache so completion
+                    // offers every session shown in the unified list.
+                    for session in std::mem::take(&mut self.session_completion_cache) {
+                        if !refreshed.iter().any(|item| item.id == session.id) {
+                            refreshed.push(session);
+                        }
+                    }
+                    self.session_completion_cache = refreshed;
+                }
+                if self.items_for_ctx(&ctx).is_empty() {
+                    self.completion = None;
+                    return;
+                }
                 // Reset the highlight only when the context actually changed, so
                 // navigation survives unrelated redraws.
-                if self.completion.as_ref().map(|c| &c.ctx) != Some(&ctx) {
+                if changed {
                     self.completion = Some(CompletionState { ctx, selected: 0 });
                 }
             }

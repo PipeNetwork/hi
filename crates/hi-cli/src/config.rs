@@ -98,6 +98,17 @@ pub struct Cli {
     #[arg(long)]
     pub no_save: bool,
 
+    /// Sync this session to an ipop API endpoint for cross-machine resume.
+    /// Reads `HI_SYNC_BASE_URL` and `HI_SYNC_API_KEY` (or uses the provider's
+    /// base_url/api_key if those aren't set). Implied by `--sync-session-id`.
+    #[arg(long)]
+    pub sync: bool,
+
+    /// Explicit session id for sync (otherwise derived from the local session
+    /// file stem). Useful when a daemon re-registers an existing session.
+    #[arg(long, value_name = "ID")]
+    pub sync_session_id: Option<String>,
+
     /// Run as a subagent (used internally by the `delegate` write-subagent): the
     /// agent won't be offered `explore`/`delegate` (depth ≤ 1) and never saves a
     /// session. Not intended for direct use.
@@ -125,6 +136,32 @@ pub struct Cli {
     /// auto-fixing) in the background, without the TUI, until Ctrl-C.
     #[arg(long)]
     pub loops_daemon: bool,
+
+    /// Run as a persistent session daemon: hold the agent resident and accept
+    /// input from remote clients via ipop. Requires `--sync`. The daemon
+    /// long-polls ipop for queued inputs, runs each as a turn, and streams
+    /// live events back. Runs until Ctrl-C or the session is ended.
+    #[arg(long)]
+    pub daemon: bool,
+
+    /// Attach to a running session as a read-only viewer + input sender. Fetches
+    /// the session history from ipop, subscribes to the live event stream, and
+    /// forwards typed prompts to the hosting daemon. Requires `--sync`.
+    #[arg(long, value_name = "SESSION_ID")]
+    pub attach: Option<String>,
+
+    /// When used with `--attach`, take over the session in this process instead of
+    /// just viewing it. Fetches the durable record history from ipop, reconstructs
+    /// the conversation, and boots a local agent that continues from there. Useful
+    /// when the daemon is down and you want to keep working.
+    #[arg(long)]
+    pub resume_local: bool,
+
+    /// The per-session input token for submitting prompts to a token-protected
+    /// session via `--attach`. Normally obtained from the daemon's output or a
+    /// local file the daemon writes.
+    #[arg(long, value_name = "TOKEN")]
+    pub input_token: Option<String>,
 
     /// Use the plain line-based REPL instead of the full-screen TUI.
     #[arg(long)]
@@ -340,6 +377,26 @@ pub struct Config {
     pub moa: hi_ai::MoaConfig,
     #[serde(default)]
     pub profiles: HashMap<String, Profile>,
+    #[serde(default)]
+    pub sync: Option<SyncSection>,
+}
+
+/// The `[sync]` section in `hi.toml` — configures cross-machine session sync.
+/// All fields optional; unset fields fall back to env vars or the provider's
+/// credentials.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SyncSection {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key_env: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
+    /// When true, sync is enabled by default (no need for `--sync` on the CLI).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub enabled: bool,
 }
 
 impl serde::Serialize for Config {
@@ -359,6 +416,9 @@ impl serde::Serialize for Config {
             // BTreeMap serializes as a sorted map → stable, alphabetical output.
             let sorted: BTreeMap<&String, &Profile> = self.profiles.iter().collect();
             s.serialize_field("profiles", &sorted)?;
+        }
+        if let Some(sync) = &self.sync {
+            s.serialize_field("sync", sync)?;
         }
         s.end()
     }

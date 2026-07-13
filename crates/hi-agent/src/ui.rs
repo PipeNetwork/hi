@@ -100,6 +100,74 @@ pub trait Ui: Send {
     fn nudge(&mut self, _text: &str) {}
 }
 
+/// Blanket impl so `Box<dyn Ui>` can be used where `Ui` is expected — this
+/// lets `MultiplexUi` hold a boxed primary UI (e.g. `PlainUi` or `QuietUi`)
+/// alongside the `Arc<RemoteUi>`.
+impl<U: Ui + ?Sized> Ui for Box<U> {
+    fn assistant_text(&mut self, text: &str) {
+        (**self).assistant_text(text);
+    }
+    fn assistant_reasoning(&mut self, text: &str) {
+        (**self).assistant_reasoning(text);
+    }
+    fn assistant_end(&mut self) {
+        (**self).assistant_end();
+    }
+    fn tool_started(&mut self, name: &str, arguments: &str) {
+        (**self).tool_started(name, arguments);
+    }
+    fn tool_stream(&mut self, name: &str, line: &str) {
+        (**self).tool_stream(name, line);
+    }
+    fn confirm_edit(&mut self, path: &str, diff: &str) -> bool {
+        (**self).confirm_edit(path, diff)
+    }
+    fn tool_call(&mut self, name: &str, arguments: &str) {
+        (**self).tool_call(name, arguments);
+    }
+    fn tool_result(&mut self, name: &str, result: &str) {
+        (**self).tool_result(name, result);
+    }
+    fn status(&mut self, text: &str) {
+        (**self).status(text);
+    }
+    fn subagent_note(&mut self, text: &str) {
+        (**self).subagent_note(text);
+    }
+    fn plan(&mut self, steps: &[crate::PlanStep]) {
+        (**self).plan(steps);
+    }
+    fn usage(
+        &mut self,
+        prompt_tokens: u64,
+        generated_tokens: u64,
+        context_used: u64,
+        context_window: Option<u32>,
+    ) {
+        (**self).usage(
+            prompt_tokens,
+            generated_tokens,
+            context_used,
+            context_window,
+        );
+    }
+    fn rate_limits(&mut self, rate_limits: Option<hi_ai::RateLimitState>) {
+        (**self).rate_limits(rate_limits);
+    }
+    fn turn_end(&mut self, summary: &str) {
+        (**self).turn_end(summary);
+    }
+    fn changed_files(&mut self, files: &[String]) {
+        (**self).changed_files(files);
+    }
+    fn turn_error(&mut self, kind: &str, message: &str, guidance: &str) {
+        (**self).turn_error(kind, message, guidance);
+    }
+    fn nudge(&mut self, text: &str) {
+        (**self).nudge(text);
+    }
+}
+
 /// Classify a provider/agent error into a user-facing kind slug and
 /// remediation guidance. Returns `(kind, guidance)` where `kind` is a
 /// short lowercase slug and `guidance` is a one-line hint. Falls back to

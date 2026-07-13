@@ -17,6 +17,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum SessionMeta {
+    /// User-defined display name. Last write wins; an empty name restores the
+    /// automatic first-prompt title.
+    Name {
+        name: String,
+    },
     Usage {
         input_tokens: u64,
         output_tokens: u64,
@@ -175,10 +180,44 @@ pub struct LoadedSession {
     pub messages: Vec<Message>,
     pub usage: Usage,
     pub checkpoint_refs: Vec<String>,
+    /// User-defined display name, if one has been assigned (last write wins).
+    pub name: Option<String>,
     /// A long-horizon goal persisted across sessions, if any (last write wins).
     pub goal: Option<hi_agent::Goal>,
     /// Intra-session decisions persisted across resume (last write wins).
     pub decisions: hi_agent::DecisionLog,
+}
+
+/// Atomically cache reconstructed session state at `path`. A failed restore
+/// never leaves a partial JSONL file that could later masquerade as a complete
+/// session.
+pub fn cache_loaded_session(path: &Path, loaded: &LoadedSession) -> Result<()> {
+    static RESTORE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let restore_id = RESTORE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let temp = path.with_extension(format!("restoring-{}-{restore_id}", std::process::id()));
+    let result = (|| {
+        let mut session = JsonlSession::new(temp.clone());
+        session.record_state_replacement(
+            &loaded.messages,
+            loaded.goal.as_ref(),
+            &loaded.decisions,
+        )?;
+        session.record(&[], loaded.usage)?;
+        session.record_checkpoints(&loaded.checkpoint_refs)?;
+        if let Some(name) = &loaded.name {
+            session.append_meta(&SessionMeta::Name { name: name.clone() })?;
+        }
+        fs::rename(&temp, path)
+            .with_context(|| format!("installing restored session {}", path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
 }
 
 /// One-line summary shown when a session is resumed: message count and
@@ -221,13 +260,53 @@ fn data_root() -> Option<PathBuf> {
         .map(|p| p.join("hi"))
 }
 
+/// A persistent per-install machine identifier. Stored at
+/// `$XDG_DATA_HOME/hi/machine-id` (generated on first run, reused thereafter).
+/// Used as the `machine_id` in sync config so a remote viewer knows which
+/// machine is hosting a session. Falls back to `HI_SYNC_MACHINE_ID` env var
+/// if set (for explicit override), or `None` if the data dir isn't writable.
+pub fn machine_id() -> Option<String> {
+    // Explicit env override takes precedence.
+    if let Some(id) = std::env::var_os("HI_SYNC_MACHINE_ID")
+        .map(|s| s.to_string_lossy().to_string())
+        .filter(|s| !s.trim().is_empty())
+    {
+        return Some(id);
+    }
+
+    let root = data_root()?;
+    let path = root.join("machine-id");
+
+    // Try to read the existing ID.
+    if let Ok(id) = std::fs::read_to_string(&path) {
+        let id = id.trim().to_string();
+        if !id.is_empty() {
+            return Some(id);
+        }
+    }
+
+    // Generate a new ID and persist it.
+    let id = format!(
+        "{:016x}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0)
+    );
+    if std::fs::create_dir_all(&root).is_ok() && std::fs::write(&path, &id).is_ok() {
+        Some(id)
+    } else {
+        None
+    }
+}
+
 /// A short, stable, filesystem-safe key for the current working directory.
 /// Uses FNV-1a over the canonicalized path (resolves symlinks, so a project
 /// reached via different paths still maps to one bucket). Falls back to the
 /// raw cwd if canonicalization fails. Sixteen hex chars is enough to avoid
 /// collisions across any realistic number of project dirs while keeping the
 /// directory listing readable.
-fn cwd_digest() -> String {
+pub fn cwd_digest() -> String {
     let cwd = std::env::current_dir().unwrap_or_default();
     let key = std::fs::canonicalize(&cwd).unwrap_or(cwd);
     let mut hash: u64 = 0xcbf29ce484222325;
@@ -244,14 +323,28 @@ pub fn history_path() -> Option<PathBuf> {
     sessions_dir().and_then(|d| d.parent().map(|p| p.join("history")))
 }
 
-/// Path for a brand-new session, named by creation time (sortable).
+/// Path for a brand-new session. The millisecond prefix keeps listings
+/// sortable; machine/process/counter suffixes prevent two concurrent clients
+/// from sharing a file or merging distinct portal sessions under one ID.
 pub fn new_session_path() -> Result<PathBuf> {
+    static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let dir = sessions_dir().context("could not determine session directory")?;
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    Ok(dir.join(format!("{millis:013}.jsonl")))
+    let machine = machine_id().unwrap_or_else(|| format!("{:x}", std::process::id()));
+    let mut machine_hash: u64 = 0xcbf29ce484222325;
+    for byte in machine.bytes() {
+        machine_hash ^= byte as u64;
+        machine_hash = machine_hash.wrapping_mul(0x100000001b3);
+    }
+    let suffix = format!("{:08x}", machine_hash as u32);
+    let process = std::process::id();
+    let sequence = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    Ok(dir.join(format!(
+        "{millis:013}-{suffix}-{process:x}-{sequence:x}.jsonl"
+    )))
 }
 
 /// A resumable fleet session (for the `/fleet status` view).
@@ -272,6 +365,54 @@ pub fn fleet_sessions() -> Vec<FleetSessionInfo> {
     sessions_dir()
         .map(|dir| fleet_sessions_in(&dir))
         .unwrap_or_default()
+}
+
+/// List all sessions cached for the current project (not just fleet sessions).
+/// The TUI merges these with the synced catalog for `/sessions`.
+pub fn local_sessions() -> Vec<FleetSessionInfo> {
+    let Some(dir) = sessions_dir() else {
+        return Vec::new();
+    };
+    let Ok(read) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut entries: Vec<(PathBuf, SystemTime)> = read
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "jsonl"))
+        .map(|p| {
+            let modified = fs::metadata(&p)
+                .and_then(|m| m.modified())
+                .unwrap_or(UNIX_EPOCH);
+            (p, modified)
+        })
+        .collect();
+    entries.sort_by_key(|e| std::cmp::Reverse(e.1));
+    let now = SystemTime::now();
+    entries
+        .into_iter()
+        .map(|(path, modified)| {
+            let id = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("?")
+                .to_string();
+            let title = session_display_name(&path);
+            let age = now
+                .duration_since(modified)
+                .map(|d| humanize(d.as_secs()))
+                .unwrap_or_else(|_| "?".into());
+            let lines = fs::read_to_string(&path)
+                .map(|t| t.lines().count())
+                .unwrap_or(0);
+            FleetSessionInfo {
+                id,
+                title,
+                age,
+                lines,
+            }
+        })
+        .collect()
 }
 
 fn fleet_sessions_in(dir: &Path) -> Vec<FleetSessionInfo> {
@@ -304,10 +445,7 @@ fn fleet_sessions_in(dir: &Path) -> Vec<FleetSessionInfo> {
                 .and_then(|s| s.to_str())
                 .unwrap_or("?")
                 .to_string();
-            let title = first_user_message(&path)
-                .map(|m| session_title(&m))
-                .filter(|t| !t.is_empty())
-                .unwrap_or_else(|| "(no prompt yet)".to_string());
+            let title = session_display_name(&path);
             let age = now
                 .duration_since(modified)
                 .map(|d| humanize(d.as_secs()))
@@ -456,6 +594,46 @@ pub fn session_path(id: &str) -> Result<PathBuf> {
     Ok(dir.join(name))
 }
 
+/// Persist a user-defined display name for a session. Appending metadata keeps
+/// the JSONL log backward-compatible and makes rename atomic with concurrent
+/// turn appends; readers use the last name record.
+pub fn rename_session(id: &str, name: &str) -> Result<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        anyhow::bail!("session name cannot be empty");
+    }
+    if name.chars().count() > 120 {
+        anyhow::bail!("session name must be at most 120 characters");
+    }
+    let path = session_path(id)?;
+    if !path.is_file() {
+        anyhow::bail!("no saved session '{id}'");
+    }
+    let session = JsonlSession::new(path);
+    session.append_meta(&SessionMeta::Name {
+        name: name.to_string(),
+    })?;
+    Ok(name.to_string())
+}
+
+fn session_display_name(path: &Path) -> String {
+    custom_session_name(path)
+        .or_else(|| first_user_message(path).map(|message| session_title(&message)))
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| "(no prompt yet)".to_string())
+}
+
+fn custom_session_name(path: &Path) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    let mut name = None;
+    for line in text.lines() {
+        if let Ok(SessionMeta::Name { name: next }) = serde_json::from_str::<SessionMeta>(line) {
+            name = (!next.trim().is_empty()).then(|| next.trim().to_string());
+        }
+    }
+    name
+}
+
 /// The most recently modified *user* session, if any. Fleet (`-f<n>`) and loop
 /// (`-loop<n>`) sessions are excluded so `hi -c` resumes the user's own last
 /// chat, not a background fleet child or a `/loop` firing — the latter rewrites
@@ -488,12 +666,16 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
     let mut checkpoint_refs = Vec::new();
     let mut loaded_goal: Option<hi_agent::Goal> = None;
     let mut loaded_decisions = hi_agent::DecisionLog::default();
+    let mut loaded_name = None;
     for line in text.lines() {
         if line.trim().is_empty() {
             continue;
         }
         if let Ok(meta) = serde_json::from_str::<SessionMeta>(line) {
             match meta {
+                SessionMeta::Name { name } => {
+                    loaded_name = (!name.trim().is_empty()).then(|| name.trim().to_string());
+                }
                 SessionMeta::Usage {
                     input_tokens,
                     output_tokens,
@@ -558,12 +740,104 @@ pub fn load_history(path: &Path) -> Result<LoadedSession> {
         messages,
         usage,
         checkpoint_refs,
+        name: loaded_name,
         goal: loaded_goal,
         decisions: loaded_decisions,
     })
 }
 
-/// Print a summary of saved sessions (id, age, first user message).
+/// A remote session record: `(record_type, payload_json)`, as fetched from
+/// ipop's `GET /v1/hi/sessions/{id}/records` endpoint.
+pub struct RemoteRecord {
+    pub record_type: String,
+    pub payload_json: String,
+}
+
+/// Load a session from remote records (fetched from ipop) instead of a local
+/// JSONL file. Applies the same parsing logic as [`load_history`]: bare
+/// `message` records are conversation history; tagged metadata records
+/// (`usage`, `compaction`, `goal`, etc.) update the session state.
+///
+/// This lets `hi --attach --resume-local` boot a local agent from the remote
+/// session history when the daemon is down.
+pub fn load_history_from_records(records: &[RemoteRecord]) -> Result<LoadedSession> {
+    let mut messages = Vec::new();
+    let mut usage = Usage::default();
+    let mut checkpoint_refs = Vec::new();
+    let mut loaded_goal: Option<hi_agent::Goal> = None;
+    let mut loaded_decisions = hi_agent::DecisionLog::default();
+    let mut loaded_name = None;
+
+    for record in records {
+        if record.record_type == "message" {
+            if let Ok(message) = serde_json::from_str::<Message>(&record.payload_json) {
+                messages.push(message);
+            }
+            continue;
+        }
+        // Metadata records: parse the payload as a SessionMeta.
+        if let Ok(meta) = serde_json::from_str::<SessionMeta>(&record.payload_json) {
+            match meta {
+                SessionMeta::Name { name } => {
+                    loaded_name = (!name.trim().is_empty()).then(|| name.trim().to_string());
+                }
+                SessionMeta::Usage {
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    cache_creation_tokens,
+                    estimated,
+                } => {
+                    usage = Usage {
+                        input_tokens,
+                        output_tokens,
+                        cache_read_tokens,
+                        cache_creation_tokens,
+                        input_includes_cache: false,
+                        context_occupancy: input_tokens,
+                        rate_limits: None,
+                        estimated,
+                    };
+                }
+                SessionMeta::Checkpoints { refs } => {
+                    checkpoint_refs = refs;
+                }
+                SessionMeta::Compaction {
+                    messages: compacted,
+                } => {
+                    messages = compacted;
+                }
+                SessionMeta::Goal { goal } => {
+                    loaded_goal = Some(goal);
+                }
+                SessionMeta::GoalCleared => {
+                    loaded_goal = None;
+                }
+                SessionMeta::Decisions { decisions } => {
+                    loaded_decisions = hi_agent::DecisionLog::from_entries(decisions);
+                }
+                SessionMeta::StateReplacement {
+                    messages: replacement,
+                    goal,
+                    decisions,
+                } => {
+                    messages = replacement;
+                    loaded_goal = goal;
+                    loaded_decisions = hi_agent::DecisionLog::from_entries(decisions);
+                }
+            }
+        }
+    }
+
+    Ok(LoadedSession {
+        messages,
+        usage,
+        checkpoint_refs,
+        name: loaded_name,
+        goal: loaded_goal,
+        decisions: loaded_decisions,
+    })
+}
 ///
 /// Walks every project bucket under the data root (sessions are namespaced
 /// per-directory) and lists them newest-first, annotating each with a short
@@ -609,10 +883,7 @@ pub fn list_sessions() -> Result<()> {
             .duration_since(modified)
             .map(|d| humanize(d.as_secs()))
             .unwrap_or_else(|_| "?".into());
-        let title = first_user_message(&path)
-            .map(|m| session_title(&m))
-            .filter(|t| !t.is_empty())
-            .unwrap_or_else(|| "(no prompt yet)".to_string());
+        let title = session_display_name(&path);
         // Short 8-char project prefix so the column stays narrow but remains
         // enough to disambiguate sessions from different directories.
         let proj = &digest[..digest.len().min(8)];
@@ -664,19 +935,103 @@ fn humanize(secs: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{JsonlSession, cwd_digest, load_history, session_title};
+    use super::{
+        JsonlSession, LoadedSession, SessionMeta, cache_loaded_session, cwd_digest, load_history,
+        machine_id, session_display_name, session_title,
+    };
     use hi_agent::SessionSink;
     use hi_ai::{Message, Usage};
 
     #[test]
     fn fleet_session_paths_are_unique_within_a_burst() {
-        // new_session_path is millis-only; dispatching several fleet agents in
-        // one millisecond must still yield distinct files (counter suffix).
+        // Dispatching several fleet agents in one millisecond must still yield
+        // distinct files (counter suffix).
         let paths: Vec<_> = (0..10)
             .map(|_| super::new_fleet_session_path().expect("path"))
             .collect();
         let unique: std::collections::HashSet<_> = paths.iter().collect();
         assert_eq!(unique.len(), paths.len(), "collision in {paths:?}");
+    }
+
+    #[test]
+    fn user_session_paths_are_unique_and_safe_within_a_burst() {
+        let paths = (0..10)
+            .map(|_| super::new_session_path().expect("path"))
+            .collect::<Vec<_>>();
+        let ids = paths
+            .iter()
+            .map(|path| path.file_stem().unwrap().to_string_lossy().to_string())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(ids.len(), paths.len(), "collision in {paths:?}");
+        assert!(
+            ids.iter().all(|id| id.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+            }))
+        );
+    }
+
+    #[test]
+    fn restored_session_cache_round_trips_complete_state() {
+        let path = std::env::temp_dir().join(format!(
+            "hi-session-restore-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let expected = LoadedSession {
+            messages: vec![Message::user("restored prompt")],
+            usage: Usage {
+                input_tokens: 12,
+                output_tokens: 4,
+                ..Usage::default()
+            },
+            checkpoint_refs: vec!["checkpoint-1".into()],
+            name: Some("Restored session".into()),
+            goal: None,
+            decisions: hi_agent::DecisionLog::default(),
+        };
+
+        cache_loaded_session(&path, &expected).expect("cache restored session");
+        let loaded = load_history(&path).expect("load restored cache");
+
+        assert_eq!(loaded.messages.len(), 1);
+        assert_eq!(loaded.messages[0].text(), "restored prompt");
+        assert_eq!(loaded.usage.input_tokens, expected.usage.input_tokens);
+        assert_eq!(loaded.usage.output_tokens, expected.usage.output_tokens);
+        assert_eq!(loaded.checkpoint_refs, expected.checkpoint_refs);
+        assert_eq!(loaded.name, expected.name);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn explicit_session_name_overrides_automatic_title_last_write_wins() {
+        let path = std::env::temp_dir().join(format!(
+            "hi-session-name-{}-{}.jsonl",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut session = JsonlSession::new(path.clone());
+        session
+            .record(&[Message::user("automatic title")], Usage::default())
+            .unwrap();
+        session
+            .append_meta(&SessionMeta::Name {
+                name: "First name".into(),
+            })
+            .unwrap();
+        session
+            .append_meta(&SessionMeta::Name {
+                name: "Renamed work".into(),
+            })
+            .unwrap();
+
+        assert_eq!(session_display_name(&path), "Renamed work");
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -1056,5 +1411,24 @@ mod tests {
             a.chars().all(|c| c.is_ascii_hexdigit()),
             "digest is filesystem-safe hex: {a}"
         );
+    }
+
+    /// `machine_id` returns a non-empty string and is stable across calls
+    /// (the same ID is persisted and reused).
+    #[test]
+    fn machine_id_is_stable() {
+        // Don't use the env override (which might be set in CI).
+        // Just verify the function returns something non-empty.
+        let id = machine_id();
+        // machine_id may return None if the data dir isn't writable, but in
+        // practice it should always succeed in a test environment.
+        if let Some(id) = id {
+            assert!(!id.is_empty(), "machine_id must not be empty");
+            // A second call should return the same ID (persisted).
+            let id2 = machine_id();
+            if let Some(id2) = id2 {
+                assert_eq!(id, id2, "machine_id must be stable across calls");
+            }
+        }
     }
 }

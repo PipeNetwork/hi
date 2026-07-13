@@ -50,6 +50,9 @@ pub(crate) const MODEL_COMPLETION_MAX: usize = 8;
 /// The command whose argument values are profile names (live state from the
 /// config, plus the `add`/`edit`/`remove` subcommands).
 pub(crate) const PROVIDER_CMD: &str = "provider";
+pub(crate) const SESSIONS_CMD: &str = "sessions";
+pub(crate) const SESSIONS_SWITCH_CTX: &str = "sessions switch";
+pub(crate) const SESSIONS_RENAME_CTX: &str = "sessions rename";
 
 pub(crate) fn completion_context(input: &str) -> Option<CompletionContext> {
     let rest = input.strip_prefix('/')?;
@@ -58,12 +61,28 @@ pub(crate) fn completion_context(input: &str) -> Option<CompletionContext> {
         None => Some(CompletionContext::Command(rest.to_lowercase())),
         // Past the name, on the first argument token.
         Some((name, arg)) => {
-            if arg.contains(char::is_whitespace) {
-                return None; // a second token — past the single argument
-            }
             let spec = command::COMMANDS
                 .iter()
                 .find(|c| c.name.eq_ignore_ascii_case(name))?;
+            if spec.name == SESSIONS_CMD
+                && let Some((action, remainder)) = arg.split_once(char::is_whitespace)
+            {
+                if remainder.contains(char::is_whitespace) {
+                    return None;
+                }
+                let cmd = match action {
+                    "switch" => SESSIONS_SWITCH_CTX,
+                    "rename" => SESSIONS_RENAME_CTX,
+                    _ => return None,
+                };
+                return Some(CompletionContext::Arg {
+                    cmd,
+                    prefix: remainder.to_lowercase(),
+                });
+            }
+            if arg.contains(char::is_whitespace) {
+                return None; // a second token — past the single argument
+            }
             let prefix = arg.to_lowercase();
             if !spec.arg_values.is_empty() {
                 // A static enumerable set (compact, copy, verify, goal).
@@ -120,8 +139,12 @@ pub(crate) fn completion_items_for(ctx: &CompletionContext) -> Vec<CompletionIte
             .map(|(value, hint)| CompletionItem {
                 label: value.to_string(),
                 help: hint.to_string(),
-                insert: format!("/{cmd} {value}"),
-                submit_on_enter: true,
+                insert: if *cmd == SESSIONS_CMD && matches!(value, "switch" | "rename") {
+                    format!("/{cmd} {value} ")
+                } else {
+                    format!("/{cmd} {value}")
+                },
+                submit_on_enter: !(*cmd == SESSIONS_CMD && matches!(value, "switch" | "rename")),
             })
             .collect(),
     }
@@ -196,6 +219,21 @@ mod tests {
         assert_eq!(completion_context("/diff "), None);
         // A second argument token is past the single arg → no menu.
         assert_eq!(completion_context("/compact hybrid x"), None);
+        assert_eq!(
+            completion_context("/sessions switch 1783"),
+            Some(Arg {
+                cmd: "sessions switch",
+                prefix: "1783".to_string()
+            })
+        );
+        assert_eq!(
+            completion_context("/sessions rename 1783"),
+            Some(Arg {
+                cmd: "sessions rename",
+                prefix: "1783".to_string()
+            })
+        );
+        assert_eq!(completion_context("/sessions rename 1783 new name"), None);
         // Not a slash command at all.
         assert_eq!(completion_context("hello"), None);
     }

@@ -112,6 +112,149 @@ fn test_app(provider: &str, model: &str) -> App {
     )
 }
 
+#[tokio::test]
+async fn sessions_switch_replaces_live_agent_and_ui_session() {
+    let provider = std::sync::Arc::new(hi_ai::OpenAiProvider::new(
+        "http://127.0.0.1:1/v1".into(),
+        "test".into(),
+    ));
+    let mut agent = hi_agent::Agent::new(provider, hi_agent::AgentConfig::default());
+    let mut app = test_app("openai", "gpt-4o");
+    app.sync_config = Some(SyncConfig {
+        base_url: "http://127.0.0.1:1/v1".into(),
+        api_key: "test".into(),
+        machine_id: None,
+        cwd_digest: None,
+    });
+    let previous_remote = std::sync::Arc::new(crate::sync_tui::RemoteUi::new(
+        crate::sync_tui::SyncConfig {
+            base_url: "http://127.0.0.1:1/v1".into(),
+            api_key: "test".into(),
+        },
+        "session-1".into(),
+    ));
+    app.sync_remote_ui = Some(previous_remote.clone());
+    app.push(Line::raw("old transcript"));
+    app.session_switcher = Some(Box::new(|id, agent| {
+        Box::pin(async move {
+            agent.apply_loaded_session(
+                vec![
+                    hi_ai::Message::system("system"),
+                    hi_ai::Message::user("resumed prompt"),
+                ],
+                hi_ai::Usage::default(),
+                Vec::new(),
+                None,
+                hi_agent::DecisionLog::default(),
+            );
+            Ok(SessionSwitchInfo {
+                id: id.to_string(),
+                summary: "1 prior message".into(),
+            })
+        })
+    }));
+
+    app.handle_sessions_command(&mut agent, "switch session-2")
+        .await;
+
+    assert_eq!(app.sync_session_id.as_deref(), Some("session-2"));
+    assert!(!std::sync::Arc::ptr_eq(
+        &previous_remote,
+        app.sync_remote_ui.as_ref().unwrap()
+    ));
+    assert!(
+        agent
+            .messages()
+            .iter()
+            .any(|m| m.text() == "resumed prompt")
+    );
+    let transcript = app.transcript_text();
+    assert!(transcript.contains("switched to session session-2"));
+    assert!(!transcript.contains("old transcript"));
+}
+
+#[tokio::test]
+async fn sessions_rename_uses_session_manager_callback() {
+    let provider = std::sync::Arc::new(hi_ai::OpenAiProvider::new(
+        "http://127.0.0.1:1/v1".into(),
+        "test".into(),
+    ));
+    let mut agent = hi_agent::Agent::new(provider, hi_agent::AgentConfig::default());
+    let renamed = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let observed = renamed.clone();
+    let mut app = test_app("openai", "gpt-4o");
+    app.session_lister = Some(Box::new(|| {
+        vec![LocalSessionInfo {
+            id: "session-2".into(),
+            title: "Portal work".into(),
+            age: "now".into(),
+            lines: 1,
+        }]
+    }));
+    app.session_renamer = Some(Box::new(move |id, name| {
+        *observed.lock().unwrap() = Some((id.to_string(), name.to_string()));
+        Ok(name.to_string())
+    }));
+
+    app.handle_sessions_command(&mut agent, "rename session-2 Portal work")
+        .await;
+
+    assert_eq!(
+        *renamed.lock().unwrap(),
+        Some(("session-2".into(), "Portal work".into()))
+    );
+    assert!(app.transcript_text().contains("session-2 → Portal work"));
+}
+
+#[tokio::test]
+async fn sessions_list_uses_one_unified_heading() {
+    let provider = std::sync::Arc::new(hi_ai::OpenAiProvider::new(
+        "http://127.0.0.1:1/v1".into(),
+        "test".into(),
+    ));
+    let mut agent = hi_agent::Agent::new(provider, hi_agent::AgentConfig::default());
+    let mut app = test_app("openai", "gpt-4o");
+    app.session_lister = Some(Box::new(|| {
+        vec![LocalSessionInfo {
+            id: "session-2".into(),
+            title: "Portal work".into(),
+            age: "now".into(),
+            lines: 4,
+        }]
+    }));
+
+    app.handle_sessions_command(&mut agent, "").await;
+
+    let transcript = app.transcript_text();
+    assert!(transcript.contains("sessions (1):"));
+    assert!(!transcript.contains("local sessions"));
+    assert!(!transcript.contains("remote sessions"));
+    assert!(transcript.contains("/sessions switch session-2"));
+}
+
+#[tokio::test]
+async fn sessions_reject_path_like_ids_before_callbacks_or_http() {
+    let provider = std::sync::Arc::new(hi_ai::OpenAiProvider::new(
+        "http://127.0.0.1:1/v1".into(),
+        "test".into(),
+    ));
+    let mut agent = hi_agent::Agent::new(provider, hi_agent::AgentConfig::default());
+    let mut app = test_app("openai", "gpt-4o");
+    app.session_switcher = Some(Box::new(|_, _| {
+        Box::pin(async { panic!("invalid id reached switch callback") })
+    }));
+
+    app.handle_sessions_command(&mut agent, "switch ../../escape")
+        .await;
+    app.handle_sessions_command(&mut agent, "rename ../../escape bad")
+        .await;
+
+    assert_eq!(
+        app.transcript_text().matches("invalid session id").count(),
+        2
+    );
+}
+
 #[test]
 fn sticky_scroll_unpins_on_scroll_up_and_repins_at_bottom() {
     let mut app = test_app("openai", "gpt-4o");
@@ -127,7 +270,9 @@ fn sticky_scroll_unpins_on_scroll_up_and_repins_at_bottom() {
     assert_eq!(app.total_when_unpinned, 120);
 
     // Streaming output below must NOT yank a scrolled-up reader back down.
-    app.apply(UiEvent::Text("a fresh streamed line\n".into()));
+    app.apply(UiEvent::Text {
+        text: "a fresh streamed line\n".into(),
+    });
     assert!(
         !app.following,
         "new output leaves the scrolled-up reader put"
@@ -136,6 +281,20 @@ fn sticky_scroll_unpins_on_scroll_up_and_repins_at_bottom() {
     // Scrolling back past the bottom re-pins so output follows again.
     app.scroll_down(1000);
     assert!(app.following, "reaching the bottom re-pins");
+}
+
+#[test]
+fn mouse_wheel_scrolls_and_repins_the_transcript() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.view_max_scroll = 30;
+    app.view_total = 50;
+
+    app.handle_mouse(crossterm::event::MouseEventKind::ScrollUp);
+    assert!(!app.following);
+    assert_eq!(app.scroll, 27);
+
+    app.handle_mouse(crossterm::event::MouseEventKind::ScrollDown);
+    assert!(app.following, "wheel-down at the bottom should re-pin");
 }
 
 #[test]
@@ -279,30 +438,35 @@ fn working_line_names_the_inflight_tool_and_model_phase() {
     let mut app = test_app("openai", "gpt-4o");
     app.set_working(true);
     // Model phase: reasoning then text stream distinctly.
-    app.apply(UiEvent::Reasoning("hmm".into()));
+    app.apply(UiEvent::Reasoning { text: "hmm".into() });
     assert!(
         app.activity_line().starts_with("thinking…"),
         "{}",
         app.activity_line()
     );
-    app.apply(UiEvent::Text("here".into()));
+    app.apply(UiEvent::Text {
+        text: "here".into(),
+    });
     assert!(
         app.activity_line().starts_with("responding…"),
         "{}",
         app.activity_line()
     );
     // A tool starts → the line names it (with its own timer)…
-    app.apply(UiEvent::ToolStarted(
-        "bash".into(),
-        "{\"command\":\"cargo test\"}".into(),
-    ));
+    app.apply(UiEvent::ToolStarted {
+        name: "bash".into(),
+        arguments: "{\"command\":\"cargo test\"}".into(),
+    });
     assert!(
         app.activity_line().starts_with("running bash cargo test"),
         "{}",
         app.activity_line()
     );
     // …and clears back to the model once the result lands.
-    app.apply(UiEvent::ToolResult("bash".into(), "ok".into()));
+    app.apply(UiEvent::ToolResult {
+        name: "bash".into(),
+        result: "ok".into(),
+    });
     assert!(
         app.activity_line().starts_with("Working"),
         "{}",
@@ -340,16 +504,18 @@ fn working_wave_sweeps_one_lit_letter_at_a_time() {
 #[test]
 fn renders_tool_call_diff_and_spinner() {
     let mut app = test_app("openai", "gpt-4o");
-    app.apply(UiEvent::ToolCall(
-        "edit".into(),
-        "{\"path\":\"src/cli.rs\",\"old_string\":\"a\",\"new_string\":\"b\"}".into(),
-    ));
+    app.apply(UiEvent::ToolCall {
+        name: "edit".into(),
+        arguments: "{\"path\":\"src/cli.rs\",\"old_string\":\"a\",\"new_string\":\"b\"}".into(),
+    });
     // ANSI-colored diff line (from the edit tool) must render as text.
-    app.apply(UiEvent::ToolResult(
-        "edit".into(),
-        "\u{1b}[32m+ pub json: bool\u{1b}[0m".into(),
-    ));
-    app.apply(UiEvent::TurnEnd("[1234 in · 56 out · 1290 total]".into()));
+    app.apply(UiEvent::ToolResult {
+        name: "edit".into(),
+        result: "\u{1b}[32m+ pub json: bool\u{1b}[0m".into(),
+    });
+    app.apply(UiEvent::TurnEnd {
+        summary: "[1234 in · 56 out · 1290 total]".into(),
+    });
     app.working = true;
     app.spinner = 2;
 
@@ -382,7 +548,10 @@ fn renders_tool_call_diff_and_spinner() {
 fn colorizes_plain_diff_tool_output() {
     let mut app = test_app("openai", "gpt-4o");
     let diff = "--- a/x.rs\n+++ b/x.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n ctx\n";
-    app.apply(UiEvent::ToolResult("bash".into(), diff.into()));
+    app.apply(UiEvent::ToolResult {
+        name: "bash".into(),
+        result: diff.into(),
+    });
     // The content span (after the "  " indent) carries the diff color.
     let colored: Vec<(String, Option<Color>)> = app
         .transcript
@@ -416,10 +585,10 @@ fn colorizes_plain_diff_tool_output() {
 #[test]
 fn non_diff_tool_output_is_not_colorized() {
     let mut app = test_app("openai", "gpt-4o");
-    app.apply(UiEvent::ToolResult(
-        "bash".into(),
-        "- item one\n- item two\n".into(),
-    ));
+    app.apply(UiEvent::ToolResult {
+        name: "bash".into(),
+        result: "- item one\n- item two\n".into(),
+    });
     let any_red = app
         .transcript
         .iter()
@@ -454,19 +623,21 @@ fn usage_event_updates_live_counter_and_working_line() {
 fn rate_limit_event_updates_working_line() {
     let mut app = test_app("openai", "gpt-4o");
     app.set_working(true);
-    app.apply(UiEvent::RateLimits(Some(hi_ai::RateLimitState {
-        requests_min: hi_ai::RateLimitBucket {
-            limit: 60,
-            remaining: 58,
-            reset_seconds: 12,
-        },
-        tokens_min: hi_ai::RateLimitBucket {
-            limit: 100_000,
-            remaining: 88_000,
-            reset_seconds: 42,
-        },
-        ..Default::default()
-    })));
+    app.apply(UiEvent::RateLimits {
+        rate_limits: Some(hi_ai::RateLimitState {
+            requests_min: hi_ai::RateLimitBucket {
+                limit: 60,
+                remaining: 58,
+                reset_seconds: 12,
+            },
+            tokens_min: hi_ai::RateLimitBucket {
+                limit: 100_000,
+                remaining: 88_000,
+                reset_seconds: 42,
+            },
+            ..Default::default()
+        }),
+    });
 
     let mut term = Terminal::new(TestBackend::new(100, 8)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
@@ -509,20 +680,22 @@ fn renders_queued_commands_while_working() {
 fn renders_pinned_plan_checklist() {
     use hi_agent::PlanStep;
     let mut app = test_app("openai", "gpt-4o");
-    app.apply(UiEvent::Plan(vec![
-        PlanStep {
-            title: "find leak".into(),
-            status: PlanStatus::Done,
-        },
-        PlanStep {
-            title: "fix walkers".into(),
-            status: PlanStatus::Active,
-        },
-        PlanStep {
-            title: "add tests".into(),
-            status: PlanStatus::Pending,
-        },
-    ]));
+    app.apply(UiEvent::Plan {
+        steps: vec![
+            PlanStep {
+                title: "find leak".into(),
+                status: PlanStatus::Done,
+            },
+            PlanStep {
+                title: "fix walkers".into(),
+                status: PlanStatus::Active,
+            },
+            PlanStep {
+                title: "add tests".into(),
+                status: PlanStatus::Pending,
+            },
+        ],
+    });
 
     let mut term = Terminal::new(TestBackend::new(60, 20)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
@@ -540,20 +713,22 @@ fn renders_pinned_plan_checklist() {
 
     // A later update replaces the plan in place — progress advances and the
     // checklist isn't duplicated into the transcript.
-    app.apply(UiEvent::Plan(vec![
-        PlanStep {
-            title: "find leak".into(),
-            status: PlanStatus::Done,
-        },
-        PlanStep {
-            title: "fix walkers".into(),
-            status: PlanStatus::Done,
-        },
-        PlanStep {
-            title: "add tests".into(),
-            status: PlanStatus::Active,
-        },
-    ]));
+    app.apply(UiEvent::Plan {
+        steps: vec![
+            PlanStep {
+                title: "find leak".into(),
+                status: PlanStatus::Done,
+            },
+            PlanStep {
+                title: "fix walkers".into(),
+                status: PlanStatus::Done,
+            },
+            PlanStep {
+                title: "add tests".into(),
+                status: PlanStatus::Active,
+            },
+        ],
+    });
     term.draw(|f| app.render(f)).unwrap();
     let screen2 = dump(&term);
     assert!(
@@ -575,8 +750,8 @@ fn long_plan_does_not_break_input_box_border() {
     // rendered outside the box. The box must stay closed and fit on screen.
     use hi_agent::PlanStep;
     let mut app = test_app("openai", "gpt-4o");
-    app.apply(UiEvent::Plan(
-        (0..8)
+    app.apply(UiEvent::Plan {
+        steps: (0..8)
             .map(|i| PlanStep {
                 title: format!("step {i} with a fairly long title to be realistic"),
                 status: if i < 3 {
@@ -588,7 +763,7 @@ fn long_plan_does_not_break_input_box_border() {
                 },
             })
             .collect(),
-    ));
+    });
     app.working = true;
     // Tiny height: the full plan (9 lines) + status + input + borders can't fit.
     let mut term = Terminal::new(TestBackend::new(80, 12)).unwrap();
@@ -636,14 +811,14 @@ fn long_plan_does_not_break_input_box_border() {
     // closed — the cap reserves a row for the transcript so Layout never
     // clamps the box rect.
     let mut app2 = test_app("openai", "gpt-4o");
-    app2.apply(UiEvent::Plan(
-        (0..20)
+    app2.apply(UiEvent::Plan {
+        steps: (0..20)
             .map(|i| PlanStep {
                 title: format!("step {i}"),
                 status: PlanStatus::Pending,
             })
             .collect(),
-    ));
+    });
     app2.working = true;
     let mut term3 = Terminal::new(TestBackend::new(60, 10)).unwrap();
     term3.draw(|f| app2.render(f)).unwrap();
@@ -971,7 +1146,9 @@ fn in_progress_line_is_styled_live() {
     // A heading still streaming (no trailing newline yet) renders styled with
     // its markers stripped — not literally as "## …" until the line commits.
     let mut app = test_app("openai", "gpt-4o");
-    app.apply(UiEvent::Text("## Hello world".into()));
+    app.apply(UiEvent::Text {
+        text: "## Hello world".into(),
+    });
     let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     let screen = dump(&term);
@@ -987,7 +1164,9 @@ fn in_progress_line_is_styled_live() {
     // Styling the preview must NOT advance the real fence state: a partial
     // opening fence leaves code_lang untouched until its line commits.
     let mut app2 = test_app("openai", "gpt-4o");
-    app2.apply(UiEvent::Text("```rust".into()));
+    app2.apply(UiEvent::Text {
+        text: "```rust".into(),
+    });
     term.draw(|f| app2.render(f)).unwrap();
     assert!(
         app2.code_lang.is_none(),
@@ -1010,7 +1189,9 @@ fn edit_key_submits_on_enter_and_clears() {
 fn renders_title_transcript_and_input() {
     let mut app = test_app("openai", "gpt-4o");
     app.push(Line::raw("› hello"));
-    app.apply(UiEvent::Text("hi there\n".into()));
+    app.apply(UiEvent::Text {
+        text: "hi there\n".into(),
+    });
     app.apply(UiEvent::AssistantEnd);
     app.input.set("next question");
 
@@ -1027,7 +1208,9 @@ fn renders_title_transcript_and_input() {
 #[test]
 fn turn_end_sets_status_and_marks_transcript_done() {
     let mut app = test_app("openai", "gpt-4o");
-    app.apply(UiEvent::TurnEnd("[10 in · 2 out · 12 total]".into()));
+    app.apply(UiEvent::TurnEnd {
+        summary: "[10 in · 2 out · 12 total]".into(),
+    });
     // Usage in the title bar...
     assert!(app.status.contains("12 total"));
     // ...and a clear "done" marker in the transcript so the turn's end shows.
@@ -1043,7 +1226,9 @@ fn turn_end_renders_the_steer_suffix_from_the_summary() {
     // in both the status bar and the done marker with no TUI-specific code.
     let mut app = test_app("openai", "gpt-4o");
     let noisy = "[prompt↑10 gen↓2 · ctx 5% (500/10k) · steer: 2 verify · 1 retry]";
-    app.apply(UiEvent::TurnEnd(noisy.into()));
+    app.apply(UiEvent::TurnEnd {
+        summary: noisy.into(),
+    });
     assert!(
         app.status.contains("steer: 2 verify"),
         "steer in status bar: {}",
@@ -1057,7 +1242,9 @@ fn turn_end_renders_the_steer_suffix_from_the_summary() {
 fn stalled_turn_end_is_marked_incomplete_not_done() {
     let mut app = test_app("openai", "gpt-4o");
     let stalled = "[prompt↑10 gen↓2 · ctx 5% (500/10k) · steer: 2 repeat · stalled]";
-    app.apply(UiEvent::TurnEnd(stalled.into()));
+    app.apply(UiEvent::TurnEnd {
+        summary: stalled.into(),
+    });
 
     assert!(app.status.contains("stalled"), "status: {}", app.status);
     let line = app.transcript[0].text();
@@ -1071,16 +1258,23 @@ fn stalled_turn_end_is_marked_incomplete_not_done() {
 #[test]
 fn assistant_text_becomes_copy_target() {
     let mut app = test_app("openai", "gpt-4o");
-    app.apply(UiEvent::Text("first ".into()));
-    app.apply(UiEvent::Text("answer\n".into()));
+    app.apply(UiEvent::Text {
+        text: "first ".into(),
+    });
+    app.apply(UiEvent::Text {
+        text: "answer\n".into(),
+    });
     app.apply(UiEvent::AssistantEnd);
     assert_eq!(app.last_assistant, "first answer");
 
-    app.apply(UiEvent::ToolCall(
-        "bash".into(),
-        r#"{"command":"echo noisy"}"#.into(),
-    ));
-    app.apply(UiEvent::ToolResult("bash".into(), "noisy output".into()));
+    app.apply(UiEvent::ToolCall {
+        name: "bash".into(),
+        arguments: "{\"command\":\"echo noisy\"}".into(),
+    });
+    app.apply(UiEvent::ToolResult {
+        name: "bash".into(),
+        result: "noisy output".into(),
+    });
     assert_eq!(
         app.last_assistant, "first answer",
         "tool logs are not copied as the assistant response"
@@ -1108,14 +1302,14 @@ fn completed_turn_without_summary_is_visible() {
 #[test]
 fn stopped_after_tool_output_without_turn_end_is_visible() {
     let mut app = test_app("openai", "gpt-4o");
-    app.apply(UiEvent::ToolCall(
-        "edit".into(),
-        r#"{"path":"src/main.rs"}"#.into(),
-    ));
-    app.apply(UiEvent::ToolResult(
-        "edit".into(),
-        "19 additions, 3 deletions".into(),
-    ));
+    app.apply(UiEvent::ToolCall {
+        name: "edit".into(),
+        arguments: "{\"path\":\"src/main.rs\"}".into(),
+    });
+    app.apply(UiEvent::ToolResult {
+        name: "edit".into(),
+        result: "19 additions, 3 deletions".into(),
+    });
     app.note_turn_completed_without_summary();
 
     let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
@@ -1212,11 +1406,14 @@ fn route_rejection_failure_does_not_mark_model_degraded() {
 #[test]
 fn empty_tool_result_is_visible() {
     let mut app = test_app("openai", "gpt-4o");
-    app.apply(UiEvent::ToolCall(
-        "bash".into(),
-        r#"{"command":"true"}"#.into(),
-    ));
-    app.apply(UiEvent::ToolResult("bash".into(), String::new()));
+    app.apply(UiEvent::ToolCall {
+        name: "bash".into(),
+        arguments: "{\"command\":\"true\"}".into(),
+    });
+    app.apply(UiEvent::ToolResult {
+        name: "bash".into(),
+        result: String::new(),
+    });
     let rendered: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
     assert!(
         rendered.iter().any(|line| line.contains("(no output)")),
@@ -1228,17 +1425,20 @@ fn empty_tool_result_is_visible() {
 fn explore_tools_collapse_header_and_line_count_into_one_line() {
     let mut app = test_app("openai", "gpt-4o");
     // A read call: header is deferred until the result, then both collapse.
-    app.apply(UiEvent::ToolCall(
-        "read".into(),
-        r#"{"path":"src/main.rs"}"#.into(),
-    ));
+    app.apply(UiEvent::ToolCall {
+        name: "read".into(),
+        arguments: "{\"path\":\"src/main.rs\"}".into(),
+    });
     let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
     // No header emitted yet — it waits for the result.
     assert!(
         !lines.iter().any(|l| l.contains("⏺ read")),
         "no deferred header before result: {lines:?}"
     );
-    app.apply(UiEvent::ToolResult("read".into(), "a\nb\nc\n".into()));
+    app.apply(UiEvent::ToolResult {
+        name: "read".into(),
+        result: "a\nb\nc\n".into(),
+    });
     let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
     // Exactly one line, combining the header and the count.
     assert!(
@@ -1252,11 +1452,14 @@ fn explore_tools_collapse_header_and_line_count_into_one_line() {
     );
 
     // grep with no matches shows "(no output)" in the same collapsed line.
-    app.apply(UiEvent::ToolCall(
-        "grep".into(),
-        r#"{"pattern":"foo"}"#.into(),
-    ));
-    app.apply(UiEvent::ToolResult("grep".into(), String::new()));
+    app.apply(UiEvent::ToolCall {
+        name: "grep".into(),
+        arguments: "{\"pattern\":\"foo\"}".into(),
+    });
+    app.apply(UiEvent::ToolResult {
+        name: "grep".into(),
+        result: String::new(),
+    });
     let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
     assert!(
         lines.iter().any(|l| l == "⏺ grep foo · (no output)"),
@@ -1268,21 +1471,30 @@ fn explore_tools_collapse_header_and_line_count_into_one_line() {
 fn consecutive_same_tool_explore_results_merge_into_one_line() {
     let mut app = test_app("openai", "gpt-4o");
     // Three reads in a row should collapse to one summary line.
-    app.apply(UiEvent::ToolCall(
-        "read".into(),
-        r#"{"path":"a.rs"}"#.into(),
-    ));
-    app.apply(UiEvent::ToolResult("read".into(), "a\nb\n".into()));
-    app.apply(UiEvent::ToolCall(
-        "read".into(),
-        r#"{"path":"b.rs"}"#.into(),
-    ));
-    app.apply(UiEvent::ToolResult("read".into(), "c\nd\ne\n".into()));
-    app.apply(UiEvent::ToolCall(
-        "read".into(),
-        r#"{"path":"c.rs"}"#.into(),
-    ));
-    app.apply(UiEvent::ToolResult("read".into(), "f\n".into()));
+    app.apply(UiEvent::ToolCall {
+        name: "read".into(),
+        arguments: "{\"path\":\"a.rs\"}".into(),
+    });
+    app.apply(UiEvent::ToolResult {
+        name: "read".into(),
+        result: "a\nb\n".into(),
+    });
+    app.apply(UiEvent::ToolCall {
+        name: "read".into(),
+        arguments: "{\"path\":\"b.rs\"}".into(),
+    });
+    app.apply(UiEvent::ToolResult {
+        name: "read".into(),
+        result: "c\nd\ne\n".into(),
+    });
+    app.apply(UiEvent::ToolCall {
+        name: "read".into(),
+        arguments: "{\"path\":\"c.rs\"}".into(),
+    });
+    app.apply(UiEvent::ToolResult {
+        name: "read".into(),
+        result: "f\n".into(),
+    });
     let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
     // Exactly one read line, summarizing all three.
     assert_eq!(
@@ -1296,16 +1508,22 @@ fn consecutive_same_tool_explore_results_merge_into_one_line() {
     );
 
     // A non-explore tool between reads breaks the run.
-    app.apply(UiEvent::ToolCall(
-        "edit".into(),
-        r#"{"path":"a.rs"}"#.into(),
-    ));
-    app.apply(UiEvent::ToolResult("edit".into(), "ok".into()));
-    app.apply(UiEvent::ToolCall(
-        "read".into(),
-        r#"{"path":"d.rs"}"#.into(),
-    ));
-    app.apply(UiEvent::ToolResult("read".into(), "x\ny\n".into()));
+    app.apply(UiEvent::ToolCall {
+        name: "edit".into(),
+        arguments: "{\"path\":\"a.rs\"}".into(),
+    });
+    app.apply(UiEvent::ToolResult {
+        name: "edit".into(),
+        result: "ok".into(),
+    });
+    app.apply(UiEvent::ToolCall {
+        name: "read".into(),
+        arguments: "{\"path\":\"d.rs\"}".into(),
+    });
+    app.apply(UiEvent::ToolResult {
+        name: "read".into(),
+        result: "x\ny\n".into(),
+    });
     let lines: Vec<String> = app.transcript.iter().map(TranscriptEntry::text).collect();
     // Now two read lines: the merged 3-file run and a fresh single read.
     assert_eq!(
@@ -1605,6 +1823,71 @@ fn completion_offers_live_model_ids() {
 }
 
 #[test]
+fn sessions_completion_offers_subcommands_then_live_ids() {
+    let mut app = test_app("openai", "gpt-4o");
+    app.session_lister = Some(Box::new(|| {
+        vec![
+            LocalSessionInfo {
+                id: "1783895144561".into(),
+                title: "portal work".into(),
+                age: "2m".into(),
+                lines: 12,
+            },
+            LocalSessionInfo {
+                id: "1783894593132".into(),
+                title: "other work".into(),
+                age: "8m".into(),
+                lines: 4,
+            },
+        ]
+    }));
+
+    app.input.set("/sessions sw");
+    app.sync_completion();
+    assert_eq!(app.completion_items()[0].label, "switch");
+    assert_eq!(app.accept_completion(true), None);
+    assert_eq!(app.input.text(), "/sessions switch ");
+
+    app.sync_completion();
+    assert_eq!(app.completion_items().len(), 2);
+    assert_eq!(
+        app.accept_completion(true).as_deref(),
+        Some("/sessions switch 1783895144561")
+    );
+
+    app.input.set("/sessions rename 1783894");
+    app.sync_completion();
+    assert_eq!(app.accept_completion(true), None);
+    assert_eq!(app.input.text(), "/sessions rename 1783894593132 ");
+}
+
+#[test]
+fn session_completion_does_not_rescan_files_for_each_prefix_or_render() {
+    let mut app = test_app("openai", "gpt-4o");
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = calls.clone();
+    app.session_lister = Some(Box::new(move || {
+        observed.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        vec![LocalSessionInfo {
+            id: "1783895144561".into(),
+            title: "portal work".into(),
+            age: "2m".into(),
+            lines: 12,
+        }]
+    }));
+
+    app.input.set("/sessions switch ");
+    app.sync_completion();
+    assert_eq!(app.completion_items().len(), 1);
+    app.input.set("/sessions switch 178");
+    app.sync_completion();
+    for _ in 0..5 {
+        assert_eq!(app.completion_items().len(), 1);
+    }
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+}
+
+#[test]
 fn completion_offers_then_fills_compact_kinds() {
     let mut app = test_app("openai", "gpt-4o");
     // The space that used to kill the menu now offers the kinds.
@@ -1783,5 +2066,111 @@ fn splash_shows_full_pipenetwork_wordmark_in_orange() {
     assert!(
         lines[7].spans.is_empty(),
         "last line should be the blank breathing-room line"
+    );
+}
+
+#[test]
+fn uievent_serializes_and_deserializes_roundtrip() {
+    use crate::event::UiEvent;
+    use hi_agent::{PlanStatus, PlanStep};
+
+    // Every variant must round-trip through serde JSON.
+    let cases = vec![
+        UiEvent::Text {
+            text: "hello".to_string(),
+        },
+        UiEvent::Reasoning {
+            text: "thinking...".to_string(),
+        },
+        UiEvent::AssistantEnd,
+        UiEvent::ToolStarted {
+            name: "bash".to_string(),
+            arguments: r#"{"command":"ls"}"#.to_string(),
+        },
+        UiEvent::ToolCall {
+            name: "edit".to_string(),
+            arguments: r#"{"path":"a.rs"}"#.to_string(),
+        },
+        UiEvent::ToolResult {
+            name: "bash".to_string(),
+            result: "ok".to_string(),
+        },
+        UiEvent::ToolStream {
+            name: "bash".to_string(),
+            line: "compiling...".to_string(),
+        },
+        UiEvent::Status {
+            text: "running".to_string(),
+        },
+        UiEvent::Plan {
+            steps: vec![
+                PlanStep {
+                    title: "step 1".to_string(),
+                    status: PlanStatus::Done,
+                },
+                PlanStep {
+                    title: "step 2".to_string(),
+                    status: PlanStatus::Active,
+                },
+            ],
+        },
+        UiEvent::Usage {
+            prompt: 100,
+            generated: 50,
+            ctx_used: 1000,
+            ctx_window: Some(8000),
+        },
+        UiEvent::RateLimits { rate_limits: None },
+        UiEvent::TurnEnd {
+            summary: "[100 in · 50 out]".to_string(),
+        },
+        UiEvent::TurnError {
+            error_kind: "rate_limit".to_string(),
+            message: "too many requests".to_string(),
+            guidance: "wait and retry".to_string(),
+        },
+        UiEvent::ChangedFiles {
+            files: vec!["a.rs".to_string(), "b.rs".to_string()],
+        },
+    ];
+
+    for original in &cases {
+        let json = serde_json::to_string(original).unwrap();
+        let decoded: UiEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            serde_json::to_string(&decoded).unwrap(),
+            json,
+            "round-trip mismatch for {json}"
+        );
+    }
+
+    // Verify the tagged format: each event has a "kind" field.
+    let text_json = serde_json::to_string(&UiEvent::Text {
+        text: "hi".to_string(),
+    })
+    .unwrap();
+    assert!(
+        text_json.contains(r#""kind":"text""#),
+        "text event should have kind tag: {text_json}"
+    );
+    assert!(
+        text_json.contains(r#""text":"hi""#),
+        "text event should have text field: {text_json}"
+    );
+
+    // Verify the TurnError uses error_kind (not kind, which conflicts with the tag).
+    let error_json = serde_json::to_string(&UiEvent::TurnError {
+        error_kind: "auth".to_string(),
+        message: "bad key".to_string(),
+        guidance: "check key".to_string(),
+    })
+    .unwrap();
+    assert!(
+        error_json.contains(r#""error_kind":"auth""#),
+        "turn_error should use error_kind field: {error_json}"
+    );
+    assert!(
+        !error_json.contains(r#""kind":"auth""#),
+        "turn_error must not use kind for the error type (conflicts with tag): {error_json}"
     );
 }

@@ -779,6 +779,10 @@ impl crate::App {
                     )),
                 }
             }
+            Command::Sync(arg) => self.handle_sync_command(&arg).await,
+            Command::Sessions(arg) => self.handle_sessions_command(agent, &arg).await,
+            Command::Attach(arg) => self.handle_attach_command(&arg).await,
+            Command::Daemon(arg) => self.handle_daemon_command(&arg).await,
             Command::Unknown(name) => {
                 self.push(Line::styled(
                     format!("unknown command /{name}; try /help"),

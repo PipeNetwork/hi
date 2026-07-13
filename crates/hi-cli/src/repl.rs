@@ -22,6 +22,7 @@ pub(crate) async fn repl(
     auto_memory: bool,
     mut active_profile: Option<String>,
     config_path: Option<PathBuf>,
+    after_turn: Option<Arc<dyn Fn() + Send + Sync>>,
 ) -> Result<()> {
     use hi_agent::Command;
     use hi_agent::CompactionKind;
@@ -117,6 +118,9 @@ pub(crate) async fn repl(
                             let _ =
                                 drive_with_spinner(agent.compact_with(kind, &mut plain), &progress)
                                     .await;
+                            if let Some(callback) = &after_turn {
+                                callback();
+                            }
                             continue;
                         }
                         Command::Retry => {
@@ -638,6 +642,9 @@ pub(crate) async fn repl(
                 }
                 if let Some(state) = restore_model_state.take() {
                     agent.restore_model_state(state);
+                }
+                if let Some(callback) = &after_turn {
+                    callback();
                 }
             }
             Err(ReadlineError::Interrupted) => continue, // Ctrl-C: discard the line

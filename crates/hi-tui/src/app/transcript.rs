@@ -106,6 +106,30 @@ impl crate::App {
         self.scroll_by(n as i32);
     }
 
+    pub(crate) fn handle_mouse(&mut self, kind: crossterm::event::MouseEventKind) {
+        match kind {
+            crossterm::event::MouseEventKind::ScrollUp => {
+                if let Some(picker) = self.picker.as_mut() {
+                    picker.up();
+                } else if self.completion.is_some() {
+                    self.completion_move(-1);
+                } else {
+                    self.scroll_up(3);
+                }
+            }
+            crossterm::event::MouseEventKind::ScrollDown => {
+                if let Some(picker) = self.picker.as_mut() {
+                    picker.down();
+                } else if self.completion.is_some() {
+                    self.completion_move(1);
+                } else {
+                    self.scroll_down(3);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Move the viewport by `delta` wrapped lines (negative = toward older
     /// output). Re-pins to the bottom when scrolled all the way down; snapshots
     /// the line count when first leaving the bottom (for the "↓ N new" hint).
@@ -200,18 +224,19 @@ impl crate::App {
             self.event_log.drain(..excess);
         }
         match event {
-            UiEvent::Text(t) => {
+            UiEvent::Text { text } => {
                 self.event_log
-                    .push(format!("assistant_text {} chars", t.len()));
+                    .push(format!("assistant_text {} chars", text.len()));
                 self.last_turn_event = Some(TurnEventKind::Assistant);
                 // If reasoning preceded this text, commit it as a collapsible
                 // block before the answer starts.
                 self.flush_reasoning();
-                self.current_assistant.push_str(&t);
-                self.stream(Style::default(), true, &t);
+                self.current_assistant.push_str(&text);
+                self.stream(Style::default(), true, &text);
             }
-            UiEvent::Reasoning(t) => {
-                self.event_log.push(format!("reasoning {} chars", t.len()));
+            UiEvent::Reasoning { text } => {
+                self.event_log
+                    .push(format!("reasoning {} chars", text.len()));
                 self.last_turn_event = Some(TurnEventKind::Reasoning);
                 // Buffer reasoning instead of streaming it inline — it's
                 // committed as a single collapsible "thought for Ns" entry when
@@ -219,7 +244,7 @@ impl crate::App {
                 if self.reasoning_started.is_none() {
                     self.reasoning_started = Some(Instant::now());
                 }
-                self.reasoning_buffer.push_str(&t);
+                self.reasoning_buffer.push_str(&text);
             }
             UiEvent::AssistantEnd => {
                 self.event_log.push("assistant_end".to_string());
@@ -235,8 +260,8 @@ impl crate::App {
                 // code styling into the next response.
                 self.code_lang = None;
             }
-            UiEvent::ToolStarted(name, args) => {
-                let label = tool_label(&name, &args);
+            UiEvent::ToolStarted { name, arguments } => {
+                let label = tool_label(&name, &arguments);
                 self.event_log.push(format!("tool_started {label}"));
                 // Mark this tool as the active party so the working line can
                 // name it with its own timer until the result lands. No
@@ -246,8 +271,8 @@ impl crate::App {
                 // Clear any previous stream tail when a new tool starts.
                 self.tool_stream_tail.clear();
             }
-            UiEvent::ToolCall(name, args) => {
-                let label = tool_label(&name, &args);
+            UiEvent::ToolCall { name, arguments } => {
+                let label = tool_label(&name, &arguments);
                 self.event_log.push(format!("tool_call {label}"));
                 self.last_turn_event = Some(TurnEventKind::ToolCall);
                 self.turn_tool_calls = self.turn_tool_calls.saturating_add(1);
@@ -270,7 +295,7 @@ impl crate::App {
                     ));
                 }
             }
-            UiEvent::ToolResult(name, result) => {
+            UiEvent::ToolResult { name, result } => {
                 self.event_log
                     .push(format!("tool_result {} chars", result.len()));
                 self.last_turn_event = Some(TurnEventKind::ToolResult);
@@ -281,7 +306,7 @@ impl crate::App {
                 self.flush_pending();
                 self.push_result(&name, &result);
             }
-            UiEvent::ToolStream(_name, line) => {
+            UiEvent::ToolStream { line, .. } => {
                 // Accumulate streamed lines for the live working-area display.
                 // Keep only the last few so the panel stays compact.
                 self.tool_stream_tail.push(line.to_string());
@@ -289,15 +314,15 @@ impl crate::App {
                     self.tool_stream_tail.remove(0);
                 }
             }
-            UiEvent::Status(s) => {
-                self.event_log.push(format!("status {s}"));
+            UiEvent::Status { text } => {
+                self.event_log.push(format!("status {text}"));
                 self.last_turn_event = Some(TurnEventKind::Status);
                 self.flush_pending();
-                self.push(Line::styled(s, Style::default().fg(Color::Blue)));
+                self.push(Line::styled(text, Style::default().fg(Color::Blue)));
             }
             // Plan updates replace the pinned checklist in place — no transcript
             // line, so progress reads as one updating block rather than a scroll.
-            UiEvent::Plan(steps) => {
+            UiEvent::Plan { steps } => {
                 self.event_log.push(format!("plan {} steps", steps.len()));
                 self.plan = steps;
             }
@@ -315,11 +340,11 @@ impl crate::App {
                 self.context_used = ctx_used;
                 self.context_window = ctx_window;
             }
-            UiEvent::RateLimits(rate_limits) => {
+            UiEvent::RateLimits { rate_limits } => {
                 self.event_log.push("rate_limits".to_string());
                 self.rate_limits = rate_limits;
             }
-            UiEvent::TurnEnd(summary) => {
+            UiEvent::TurnEnd { summary } => {
                 self.event_log.push(format!("turn_end {summary}"));
                 self.last_turn_event = Some(TurnEventKind::TurnEnd);
                 self.flush_pending();
@@ -342,13 +367,18 @@ impl crate::App {
                 // No follow(): respect a reader who scrolled up — the "↓ N new"
                 // hint tells them the summary landed below.
             }
-            UiEvent::TurnError(kind, message, guidance) => {
-                self.event_log.push(format!("turn_error {kind} {message}"));
+            UiEvent::TurnError {
+                error_kind,
+                message,
+                guidance,
+            } => {
+                self.event_log
+                    .push(format!("turn_error {error_kind} {message}"));
                 self.last_turn_event = Some(TurnEventKind::TurnEnd);
                 self.flush_pending();
-                self.note_turn_failed(&message, &kind, &guidance);
+                self.note_turn_failed(&message, &error_kind, &guidance);
             }
-            UiEvent::ChangedFiles(files) => {
+            UiEvent::ChangedFiles { files } => {
                 self.event_log
                     .push(format!("changed_files {}", files.len()));
                 self.flush_pending();

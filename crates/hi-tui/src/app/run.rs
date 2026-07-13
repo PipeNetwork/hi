@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use crossterm::event::{
-    EnableBracketedPaste, EnableFocusChange, Event, EventStream, KeyCode, KeyEventKind,
-    KeyModifiers,
+    EnableBracketedPaste, EnableFocusChange, EnableMouseCapture, Event, EventStream, KeyCode,
+    KeyEventKind, KeyModifiers,
 };
 use crossterm::execute;
 use crossterm::terminal::{EnterAlternateScreen, enable_raw_mode};
@@ -54,6 +54,13 @@ pub async fn run(
     mcp_url: Option<String>,
     api_key: String,
     fleet_launcher: crate::FleetLauncher,
+    remote_event_tap: Option<crate::RemoteEventTap>,
+    remote_flush_callback: Option<crate::RemoteFlushCallback>,
+    sync_config: Option<crate::SyncConfig>,
+    sync_session_id: Option<String>,
+    session_lister: Option<crate::SessionLister>,
+    session_switcher: Option<crate::SessionSwitcher>,
+    session_renamer: Option<crate::SessionRenamer>,
 ) -> Result<()> {
     if !io::stdin().is_terminal() {
         anyhow::bail!("TUI requires an interactive stdin");
@@ -70,10 +77,9 @@ pub async fn run(
     // Focus reporting: lets us tell when you've switched away, so a finished turn
     // can ping you only when you're not looking. Harmless if unsupported.
     let _ = execute!(io::stdout(), EnableFocusChange);
-    // Deliberately NOT capturing the mouse: capture would route wheel events to
-    // us (enabling in-app scroll) but the terminal would then stop doing native
-    // click-drag selection, breaking copy/paste. Native selection wins; scroll
-    // with PageUp/PageDown.
+    // Mouse capture enables wheel scrolling inside the transcript. Most
+    // terminals retain native text selection while Shift is held.
+    let _ = execute!(io::stdout(), EnableMouseCapture);
     let mut terminal =
         Terminal::new(CrosstermBackend::new(io::stdout())).context("creating terminal")?;
 
@@ -90,6 +96,28 @@ pub async fn run(
         mcp_url,
         api_key,
     );
+    // Pass sync config into the app for /sync, /sessions, /attach commands.
+    app.sync_active = sync_config.is_some();
+    app.sync_config = sync_config;
+    app.sync_session_id = sync_session_id;
+    app.session_lister = session_lister;
+    app.session_switcher = session_switcher;
+    app.session_renamer = session_renamer;
+    app.remote_event_tap = remote_event_tap;
+    app.remote_flush_callback = remote_flush_callback;
+    if app.sync_config.is_some() {
+        app.sync_http = Some(
+            reqwest::Client::builder()
+                // Session listing and renaming run on the TUI command loop;
+                // bound outages so the interface cannot appear frozen for
+                // half a minute when portal sync is unreachable.
+                .connect_timeout(std::time::Duration::from_secs(3))
+                .timeout(std::time::Duration::from_secs(8))
+                .http1_only()
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new()),
+        );
+    }
     // Seed the context-fill gauge with the model's window so it reads 0% before
     // the first turn (it refreshes from real usage after each round).
     app.context_window = None;
@@ -295,6 +323,7 @@ pub async fn run(
                     }
                 };
                 match event {
+                    Event::Mouse(mouse) => app.handle_mouse(mouse.kind),
                     // A paste arrives as one event. Route it to whichever input
                     // surface is active: the provider form (its current field),
                     // or the main input line. Without this, a paste while the
@@ -546,6 +575,16 @@ pub async fn run(
                         .await?;
                     }
                     app.set_working(false);
+                    // Flush live events after compact too (background, non-blocking).
+                    if let Some(rui) = &app.sync_remote_ui {
+                        let rui = rui.clone();
+                        tokio::spawn(async move {
+                            let _ = rui.flush().await;
+                        });
+                    }
+                    if let Some(cb) = &app.remote_flush_callback {
+                        cb();
+                    }
                     app.follow();
                     continue;
                 }
@@ -1784,6 +1823,21 @@ pub async fn run(
             app.maybe_queue_goal_drive(agent);
         }
         app.set_working(false);
+        // Flush any pending live events from the TUI's /sync on RemoteUi.
+        // Spawn as a background task so a slow/unreachable ipop doesn't block
+        // the TUI event loop (5s timeout). Errors are silent — events are
+        // re-buffered on failure and retried on the next flush.
+        if let Some(rui) = &app.sync_remote_ui {
+            let rui = rui.clone();
+            tokio::spawn(async move {
+                let _ = rui.flush().await;
+            });
+        }
+        // Flush the startup RemoteUi (created in main.rs) so live events are
+        // actually streamed during the session, not just buffered until exit.
+        if let Some(cb) = &app.remote_flush_callback {
+            cb();
+        }
         // No follow() at turn end: if the user scrolled up to read mid-turn, leave
         // them there (the "↓ N new" hint shows the summary is below). A new turn
         // re-pins to the bottom.
@@ -1811,6 +1865,18 @@ pub async fn run(
                 false,
             )
             .await;
+        }
+        // Flush any pending live events from the TUI's /sync on RemoteUi.
+        // Spawn as a background task so a slow/unreachable ipop doesn't block
+        // the TUI event loop.
+        if let Some(rui) = &app.sync_remote_ui {
+            let rui = rui.clone();
+            tokio::spawn(async move {
+                let _ = rui.flush().await;
+            });
+        }
+        if let Some(cb) = &app.remote_flush_callback {
+            cb();
         }
         app.set_working(false);
     }
@@ -1851,8 +1917,11 @@ async fn drive(
         tokio::select! {
             result = &mut fut => {
                 while let Ok(event) = rx.try_recv() {
-                    if matches!(event, UiEvent::TurnEnd(_) | UiEvent::TurnError(..)) {
+                    if matches!(event, UiEvent::TurnEnd { .. } | UiEvent::TurnError { .. }) {
                         saw_turn_end = true;
+                    }
+                    if let Some(tap) = &app.remote_event_tap {
+                        tap(&event);
                     }
                     app.apply(event);
                 }
@@ -1870,10 +1939,13 @@ async fn drive(
                 break;
             }
             Some(event) = rx.recv() => {
-                if matches!(event, UiEvent::TurnEnd(_) | UiEvent::TurnError(..)) {
+                if matches!(event, UiEvent::TurnEnd { .. } | UiEvent::TurnError { .. }) {
                     saw_turn_end = true;
                 }
                 last_activity = Instant::now();
+                if let Some(tap) = &app.remote_event_tap {
+                    tap(&event);
+                }
                 app.apply(event);
             }
             _ = ticker.tick() => {
@@ -1894,6 +1966,7 @@ async fn drive(
             },
             maybe = input.recv() => {
                 match maybe {
+                    Some(Event::Mouse(mouse)) => app.handle_mouse(mouse.kind),
                     Some(Event::Paste(text)) => app.input.insert_str(&text),
                     Some(Event::Key(key)) if key.kind == KeyEventKind::Press => {
                         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);

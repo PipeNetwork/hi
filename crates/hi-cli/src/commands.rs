@@ -263,6 +263,51 @@ pub(crate) fn handle_command(agent: &mut Agent, command: hi_agent::Command) -> b
                 Err(err) => eprintln!("\x1b[33mexport failed: {err}\x1b[0m"),
             }
         }
+        Command::Sync(arg) => match arg.trim() {
+            "status" | "" => {
+                println!("\x1b[2muse /sync in the TUI, or `hi --sync` on the CLI\x1b[0m");
+            }
+            _ => {
+                println!("\x1b[33m/sync is only available in the full-screen TUI\x1b[0m");
+            }
+        },
+        Command::Sessions(arg) => match arg.trim() {
+            "" => {
+                let sessions = crate::session::local_sessions();
+                if sessions.is_empty() {
+                    println!("\x1b[2mno saved sessions in this project\x1b[0m");
+                } else {
+                    println!("\x1b[2msessions:\x1b[0m");
+                    for s in sessions {
+                        println!("\x1b[2m  {} ({}, {} lines)\x1b[0m", s.id, s.age, s.lines);
+                    }
+                }
+            }
+            value if value == "sync" || value.starts_with("sync ") => {
+                println!("\x1b[2muse /sessions sync in the TUI, or start hi with --sync\x1b[0m");
+            }
+            value if value == "attach" || value.starts_with("attach ") => {
+                println!("\x1b[33mattaching requires the TUI or `hi --attach <id>`\x1b[0m");
+            }
+            value if value == "host" || value.starts_with("host ") => {
+                println!("\x1b[33mhosting requires the TUI or `hi --daemon --sync`\x1b[0m");
+            }
+            _ => {
+                println!(
+                    "\x1b[33msession switching and renaming require the TUI (run hi without --plain)\x1b[0m"
+                );
+            }
+        },
+        Command::Attach(_) => {
+            println!(
+                "\x1b[33m/attach is only available in the full-screen TUI; or run `hi --attach <id>`\x1b[0m"
+            );
+        }
+        Command::Daemon(_) => {
+            println!(
+                "\x1b[33m/daemon is only available in the full-screen TUI; or run `hi --daemon --sync`\x1b[0m"
+            );
+        }
         Command::Unknown(name) => {
             eprintln!("\x1b[33munknown command /{name}; try /help\x1b[0m");
         }

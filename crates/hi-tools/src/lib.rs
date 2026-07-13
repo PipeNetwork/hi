@@ -3,6 +3,8 @@
 //! Richer capabilities come from subprocess CLI tools the model invokes via
 //! `bash` — not a plugin runtime — so this set stays intentionally small.
 
+use serde::{Deserialize, Serialize};
+
 pub mod checkpoint;
 pub mod guard;
 mod lsp;
@@ -88,14 +90,14 @@ impl ToolOutput {
 /// One line of the task plan/checklist surfaced by the `update_plan` tool. The
 /// model resubmits the whole list (with updated statuses) on every call, so
 /// there is no per-step index or state to drift out of sync.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanStep {
     pub title: String,
     pub status: PlanStatus,
 }
 
 /// The progress state of a single [`PlanStep`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlanStatus {
     Pending,
     Active,

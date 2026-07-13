@@ -103,6 +103,17 @@ impl crate::App {
             completion: None,
             focused: true,
             focus_known: false,
+            sync_config: None,
+            sync_active: false,
+            sync_session_id: None,
+            sync_http: None,
+            session_lister: None,
+            session_completion_cache: Vec::new(),
+            session_switcher: None,
+            session_renamer: None,
+            remote_event_tap: None,
+            sync_remote_ui: None,
+            remote_flush_callback: None,
         }
     }
 

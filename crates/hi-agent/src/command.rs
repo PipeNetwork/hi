@@ -87,6 +87,20 @@ pub enum Command {
     /// Show the activity digest: what loops have noticed, grouped by loop, with
     /// what's new since you last looked (TUI only).
     Digest,
+    /// Toggle or query session sync to ipop. Arg: `on`, `off`, `status`, or
+    /// empty (status). When on, session records + live events are pushed to
+    /// the ipop API for cross-machine resume.
+    Sync(String),
+    /// List or manage sessions. Args: `switch <id>`, `rename <id> <name>`, or
+    /// empty (list).
+    Sessions(String),
+    /// Attach to a running session as a viewer + input sender. Arg: session id
+    /// (or empty to pick from a list). This opens its live event stream.
+    Attach(String),
+    /// Start this session as a persistent daemon: hold the agent resident and
+    /// accept input from remote clients via ipop. Arg: empty (use current
+    /// session) or a session id to resume.
+    Daemon(String),
     Quit,
     /// A `/word` that isn't recognized.
     Unknown(String),
@@ -142,6 +156,24 @@ pub fn parse(line: &str) -> Option<Command> {
         "loop" | "loops" => Command::Loop(arg),
         "watch" => Command::Watch,
         "digest" | "activity" => Command::Digest,
+        // Compatibility aliases remain accepted, but the public command
+        // surface is consolidated under `/sessions`.
+        "sync" => Command::Sessions(if arg.is_empty() {
+            "sync".to_string()
+        } else {
+            format!("sync {arg}")
+        }),
+        "sessions" => Command::Sessions(arg),
+        "attach" => Command::Sessions(if arg.is_empty() {
+            "attach".to_string()
+        } else {
+            format!("attach {arg}")
+        }),
+        "daemon" => Command::Sessions(if arg.is_empty() {
+            "host".to_string()
+        } else {
+            format!("host {arg}")
+        }),
         "exit" | "quit" | "q" => Command::Quit,
         other => Command::Unknown(other.to_string()),
     })
@@ -912,6 +944,18 @@ pub const COMMANDS: &[CommandSpec] = &[
         arg_values: &[],
     },
     CommandSpec {
+        name: "sessions",
+        args: "[switch|rename|attach|host|sync]",
+        help: "list, switch, rename, attach, host, or sync sessions",
+        arg_values: &[
+            ("switch", "switch to a session"),
+            ("rename", "name or rename a session"),
+            ("attach", "attach to a running session"),
+            ("host", "host this session for remote input"),
+            ("sync", "configure portal synchronization"),
+        ],
+    },
+    CommandSpec {
         name: "status",
         args: "[topic]",
         help: "show runtime status, or discuss codebase status with a topic",
@@ -1022,6 +1066,27 @@ mod tests {
                 Some(_) => {}
             }
         }
+    }
+
+    #[test]
+    fn portal_session_commands_share_one_public_surface() {
+        let names = COMMANDS
+            .iter()
+            .map(|command| command.name)
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"sessions"));
+        assert!(!names.contains(&"sync"));
+        assert!(!names.contains(&"attach"));
+        assert!(!names.contains(&"daemon"));
+        assert_eq!(
+            parse("/sync status"),
+            Some(Command::Sessions("sync status".into()))
+        );
+        assert_eq!(
+            parse("/attach abc"),
+            Some(Command::Sessions("attach abc".into()))
+        );
+        assert_eq!(parse("/daemon"), Some(Command::Sessions("host".into())));
     }
 
     #[test]

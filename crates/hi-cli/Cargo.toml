@@ -20,6 +20,8 @@ serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 rustyline.workspace = true
+reqwest = { workspace = true }
+futures-util = { workspace = true }
 
 [dev-dependencies]
 # The fake OpenAI server, for the end-to-end test that drives the real binary.

@@ -159,6 +159,67 @@ impl crate::Agent {
         self.session = Some(session);
     }
 
+    /// Detach the current session sink. Used by `--attach --resume-local` to
+    /// prevent the pre-existing session sink (pointing to the original local
+    /// session file and remote session ID) from recording turns that belong to
+    /// the resumed remote session.
+    pub fn detach_session(&mut self) {
+        self.session = None;
+    }
+
+    /// Apply a loaded session state (from remote records or a local JSONL file)
+    /// to an existing agent. This is the in-place equivalent of [`Agent::resume`]
+    /// — it replaces the transcript, usage, checkpoints, goal, and decisions
+    /// without reconstructing the agent.
+    pub fn apply_loaded_session(
+        &mut self,
+        history: Vec<Message>,
+        usage: Usage,
+        checkpoint_refs: Vec<String>,
+        structured_goal: Option<Goal>,
+        decisions: DecisionLog,
+    ) {
+        let mut messages = crate::Transcript::new(history);
+        // Run the same repair pipeline as `with_messages` so a resumed session
+        // is cleaned up identically regardless of whether it came from a local
+        // JSONL file or remote ipop records.
+        messages.strip_finalize_pair();
+        messages.strip_trailing_nudges();
+        messages.repair_tool_result_ordering();
+        messages.repair_invalid_tool_call_arguments();
+        messages.repair_provider_invisible_assistant_messages();
+        messages.repair_consecutive_assistant_messages();
+        messages.repair_consecutive_user_messages();
+        // Clamp persisted to the (possibly shorter) transcript length.
+        let persisted = messages.len();
+        self.messages = messages;
+        self.persisted = persisted;
+        self.totals = usage;
+        self.checkpoints = checkpoint_refs;
+        if self.checkpoints.len() > crate::MAX_CHECKPOINTS {
+            self.checkpoints
+                .drain(0..self.checkpoints.len() - crate::MAX_CHECKPOINTS);
+        }
+        self.decisions = decisions;
+        self.structured_goal = self
+            .config
+            .long_horizon
+            .then_some(structured_goal)
+            .flatten();
+        // Clear per-turn / transient state from the previous session, matching
+        // what `with_messages` initializes to None/empty for a fresh agent.
+        self.goal = None;
+        self.last_plan = Vec::new();
+        self.last_changed_files = Vec::new();
+        self.last_turn_telemetry = TurnTelemetry::default();
+        self.last_verify = None;
+        self.refresh_system_message();
+        // The transcript was replaced, so any cached working-tree snapshot is
+        // stale. Clear it so the next turn re-snapshots from scratch.
+        self.invalidate_snapshot();
+        hi_tools::clear_read_cache();
+    }
+
     /// Attach the runner that executes write-capable `delegate` subagents. Without
     /// one, the `delegate` tool reports itself unavailable.
     pub fn set_delegate_runner(&mut self, runner: std::sync::Arc<dyn crate::DelegateRunner>) {

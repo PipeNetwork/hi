@@ -7,6 +7,7 @@ mod feedback;
 mod repl;
 mod session;
 mod setup;
+mod sync;
 mod ui;
 
 use std::io::IsTerminal;
@@ -35,6 +36,18 @@ async fn main() -> Result<()> {
     }
 
     let cli = Cli::parse();
+    if let Some(id) = cli.sync_session_id.as_deref() {
+        sync::validate_session_id(id)?;
+    }
+    if let Some(id) = cli.attach.as_deref() {
+        sync::validate_session_id(id)?;
+    }
+    if cli.resume_local && cli.attach.is_none() {
+        anyhow::bail!("--resume-local requires --attach <SESSION_ID>");
+    }
+    if cli.attach.is_some() && cli.daemon {
+        anyhow::bail!("--attach and --daemon cannot be used together");
+    }
 
     if cli.show_config {
         let file = config::load_config(cli.config.as_deref())?;
@@ -149,7 +162,7 @@ async fn main() -> Result<()> {
 
     // Resolve which session file to use and any history to resume.
     let (session_path, loaded) = resolve_session(&cli)?;
-    let feedback_session_id = feedback::session_id_from_path(&session_path);
+    let mut feedback_session_id = feedback::session_id_from_path(&session_path);
 
     let fallbacks = config::resolve_fallbacks(&cli, &file);
     // Arc so the agent can share it with read-only `explore` subagents.
@@ -266,9 +279,37 @@ async fn main() -> Result<()> {
     if let Some(runner) = &delegate_runner {
         agent.set_delegate_runner(runner.clone());
     }
-    if !cli.no_save && !cli.subagent {
+    // Build the session sink: local JSONL always (unless --no-save/--subagent),
+    // optionally multiplexed with a remote ipop sync sink (--sync or [sync] enabled).
+    // When sync is on, also create a RemoteUi for live event streaming.
+    // Clone the path before it's moved into JsonlSession — the daemon fallback
+    // below may need to create its own session sink.
+    let daemon_session_path = session_path.clone();
+    // Sync auto-enables for pipenetwork users (their API key and base URL
+    // already point to ipop, so sync works with zero extra config). Also
+    // enables on explicit --sync, --sync-session-id, or [sync] enabled = true.
+    let sync_enabled = cli.sync
+        || cli.sync_session_id.is_some()
+        || file.sync.as_ref().is_some_and(|s| s.enabled)
+        || settings.provider == ProviderName::Pipenetwork;
+    let (mut sync_handle, mut remote_ui) = if sync_enabled && !cli.no_save && !cli.subagent {
+        let sync_config = build_sync_config(&settings, &cli, &file);
+        let session_id = cli
+            .sync_session_id
+            .clone()
+            .unwrap_or_else(|| feedback::session_id_from_path(&session_path));
+        let remote = sync::RemoteSessionSink::new(sync_config.clone(), session_id.clone());
+        let sync_session = sync::SyncSession::new(JsonlSession::new(session_path), remote);
+        let handle = sync_session.remote_handle();
+        agent.set_session(Box::new(sync_session));
+        let remote_ui = std::sync::Arc::new(sync::RemoteUi::new(sync_config, session_id));
+        (Some(handle), Some(remote_ui))
+    } else if !cli.no_save && !cli.subagent {
         agent.set_session(Box::new(JsonlSession::new(session_path)));
-    }
+        (None, None)
+    } else {
+        (None, None)
+    };
     // The fleet launcher: how `/dashboard` spawns worktree-isolated child `hi`
     // runs (one per row turn), each appending to a parent-owned session file.
     let fleet_launcher = hi_tui::FleetLauncher {
@@ -324,6 +365,57 @@ async fn main() -> Result<()> {
         return hi_tui::run_loops_daemon(fleet_launcher).await;
     }
 
+    // Attach mode: connect to a remote session as a viewer + input sender.
+    // This doesn't need a local agent — it just talks to ipop.
+    if let Some(attach_session_id) = cli.attach.clone() {
+        let sync_config = build_sync_config(&settings, &cli, &file);
+        if cli.resume_local {
+            // Resume-local: fetch records from ipop, reconstruct the session,
+            // and boot a local agent that continues from the remote history.
+            return sync::run_resume_local(
+                sync_config,
+                attach_session_id,
+                &settings,
+                &cli,
+                &mut agent,
+            )
+            .await;
+        }
+        return sync::run_attach_client(sync_config, attach_session_id, cli.input_token.clone())
+            .await;
+    }
+
+    // Daemon mode: hold the agent resident and accept input from remote clients.
+    // Requires sync to be enabled.
+    if cli.daemon {
+        let sync_config = build_sync_config(&settings, &cli, &file);
+        let session_id = cli
+            .sync_session_id
+            .clone()
+            .unwrap_or_else(|| feedback::session_id_from_path(&daemon_session_path));
+        // Ensure sync handles exist (daemon requires sync).
+        let (daemon_sync_handle, daemon_remote_ui) = if sync_handle.is_none() {
+            let remote = sync::RemoteSessionSink::new(sync_config.clone(), session_id.clone());
+            let sync_session =
+                sync::SyncSession::new(JsonlSession::new(daemon_session_path), remote);
+            let handle = sync_session.remote_handle();
+            agent.set_session(Box::new(sync_session));
+            let rui =
+                std::sync::Arc::new(sync::RemoteUi::new(sync_config.clone(), session_id.clone()));
+            (Some(handle), Some(rui))
+        } else {
+            (sync_handle.clone(), remote_ui.clone())
+        };
+        return sync::run_daemon_loop(
+            agent,
+            sync_config,
+            session_id,
+            daemon_sync_handle,
+            daemon_remote_ui,
+        )
+        .await;
+    }
+
     if let Some(mut prompt) = prompt_input {
         let mut restore_model_state: Option<hi_agent::AgentModelState> = None;
         let mut report_model = settings.model.clone();
@@ -367,10 +459,24 @@ async fn main() -> Result<()> {
                 );
             }
         }
-        let mut plain = PlainUi::new();
-        let mut quiet = ui::QuietUi;
-        let view: &mut dyn hi_agent::Ui = if cli.quiet { &mut quiet } else { &mut plain };
-        let result = agent.run_turn(&prompt, view).await;
+        let result = if let Some(ref rui) = remote_ui {
+            // Multiplex: local UI renders normally, remote UI buffers for sync.
+            let primary: Box<dyn hi_agent::Ui> = if cli.quiet {
+                Box::new(ui::QuietUi)
+            } else {
+                Box::new(PlainUi::new())
+            };
+            let mut multi = sync::MultiplexUi {
+                primary,
+                remote: rui.clone(),
+            };
+            agent.run_turn(&prompt, &mut multi).await
+        } else {
+            let mut plain = PlainUi::new();
+            let mut quiet = ui::QuietUi;
+            let view: &mut dyn hi_agent::Ui = if cli.quiet { &mut quiet } else { &mut plain };
+            agent.run_turn(&prompt, view).await
+        };
         if let Some(state) = restore_model_state {
             agent.restore_model_state(state);
         }
@@ -399,6 +505,18 @@ async fn main() -> Result<()> {
         }
         // A one-shot turn may have started background processes; don't leak them.
         hi_tools::kill_background_processes();
+        // Flush any pending sync records and live events to ipop before exiting.
+        if let Some(handle) = &sync_handle {
+            if let Err(err) = handle.flush().await {
+                eprintln!("\x1b[33msync: {err:#}\x1b[0m");
+            }
+            handle.end_session().await;
+        }
+        if let Some(rui) = &remote_ui
+            && let Err(err) = rui.flush().await
+        {
+            eprintln!("\x1b[33msync events: {err:#}\x1b[0m");
+        }
         if result.is_ok() {
             report_result?;
         }
@@ -415,9 +533,40 @@ async fn main() -> Result<()> {
     let use_tui = !cli.plain && stdout_is_tty && stdin_is_tty;
     let active_profile = cli.profile.clone().or_else(|| file.default_profile.clone());
 
+    // Flush durable records and live events after each interactive turn. The
+    // callback is synchronous because both frontends own their event loops;
+    // the async flush is serialized by the sinks and retried on failure.
+    let mut sync_flush_callback: Option<hi_tui::RemoteFlushCallback> =
+        if sync_handle.is_some() || remote_ui.is_some() {
+            let handle = sync_handle.clone();
+            let rui = remote_ui.clone();
+            Some(std::sync::Arc::new(move || {
+                let handle = handle.clone();
+                let rui = rui.clone();
+                tokio::spawn(async move {
+                    if let Some(handle) = handle {
+                        let _ = handle.flush().await;
+                    }
+                    if let Some(rui) = rui {
+                        let _ = rui.flush().await;
+                    }
+                });
+            }))
+        } else {
+            None
+        };
+
     // The full-screen TUI is the default interactive experience; fall back to
     // the plain REPL when not on a TTY, when --plain is set, or if it errors.
     if use_tui {
+        // TUI session switching replaces these handles at runtime. Keeping the
+        // indirection here makes live events, per-turn flushes, and shutdown
+        // flushing follow the newly selected session instead of the one that
+        // happened to be active at process startup.
+        let tui_sync_handle = std::sync::Arc::new(std::sync::Mutex::new(sync_handle.clone()));
+        let tui_remote_ui = std::sync::Arc::new(std::sync::Mutex::new(remote_ui.clone()));
+        let tui_active_session_id =
+            std::sync::Arc::new(std::sync::Mutex::new(feedback_session_id.clone()));
         // Build the profile list and resolver for `/provider` in the TUI.
         let profiles: Vec<hi_tui::ProfileInfo> = profile_infos(&file);
         let resolver: hi_tui::ProfileResolver = Box::new({
@@ -529,6 +678,172 @@ async fn main() -> Result<()> {
                 })
             }
         });
+        // Build dynamic live-event and flush callbacks. Session switching swaps the
+        // underlying handles, and these callbacks immediately follow them.
+        let remote_event_tap: Option<hi_tui::RemoteEventTap> = sync_enabled.then(|| {
+            let state = tui_remote_ui.clone();
+            std::sync::Arc::new(move |event: &hi_tui::event::UiEvent| {
+                if let Some(rui) = state.lock().unwrap().as_ref() {
+                    rui.push_event(event.clone());
+                }
+            }) as hi_tui::RemoteEventTap
+        });
+        let tui_sync_flush_callback: Option<hi_tui::RemoteFlushCallback> =
+            sync_enabled.then(|| {
+                let handles = tui_sync_handle.clone();
+                let events = tui_remote_ui.clone();
+                std::sync::Arc::new(move || {
+                    let handle = handles.lock().unwrap().clone();
+                    let rui = events.lock().unwrap().clone();
+                    tokio::spawn(async move {
+                        if let Some(handle) = handle {
+                            let _ = handle.flush().await;
+                        }
+                        if let Some(rui) = rui {
+                            let _ = rui.flush().await;
+                        }
+                    });
+                }) as hi_tui::RemoteFlushCallback
+            });
+        // Build the TUI sync config (for /sync, /sessions, /attach commands).
+        let tui_sync_config = if sync_handle.is_some() || sync_enabled {
+            let cfg = build_sync_config(&settings, &cli, &file);
+            Some(hi_tui::SyncConfig {
+                base_url: cfg.base_url,
+                api_key: cfg.api_key,
+                machine_id: cfg.machine_id,
+                cwd_digest: cfg.cwd_digest,
+            })
+        } else {
+            None
+        };
+        let tui_sync_session_id = cli
+            .sync_session_id
+            .clone()
+            .or_else(|| Some(feedback::session_id_from_path(&daemon_session_path)));
+        // Build the machine-cache side of the unified `/sessions` list.
+        let session_lister: hi_tui::SessionLister = Box::new(|| {
+            session::local_sessions()
+                .into_iter()
+                .map(|s| hi_tui::LocalSessionInfo {
+                    id: s.id,
+                    title: s.title,
+                    age: s.age,
+                    lines: s.lines,
+                })
+                .collect()
+        });
+        let session_switcher: Option<hi_tui::SessionSwitcher> = (!cli.no_save && !cli.subagent)
+            .then(|| {
+                let handles = tui_sync_handle.clone();
+                let events = tui_remote_ui.clone();
+                let active_session_id = tui_active_session_id.clone();
+                let switch_sync_config =
+                    sync_enabled.then(|| build_sync_config(&settings, &cli, &file));
+                let switcher: hi_tui::SessionSwitcher = Box::new(move |id, agent| {
+                    let id = id.to_string();
+                    let handles = handles.clone();
+                    let events = events.clone();
+                    let active_session_id = active_session_id.clone();
+                    let switch_sync_config = switch_sync_config.clone();
+                    Box::pin(async move {
+                        sync::validate_session_id(&id)?;
+                        let path = session::session_path(&id)?;
+                        if !path.is_file() {
+                            let config = switch_sync_config.as_ref().ok_or_else(|| {
+                                anyhow!("session '{id}' is unavailable while sync is disabled")
+                            })?;
+                            let restored = sync::fetch_session_history(config, &id).await?;
+                            session::cache_loaded_session(&path, &restored)?;
+                        }
+                        let loaded = session::load_history(&path)?;
+                        let summary = session::resume_summary(&loaded);
+
+                        let previous_handle = handles.lock().unwrap().clone();
+                        let previous_events = events.lock().unwrap().clone();
+                        let (activation_tx, activation_rx) =
+                            if previous_handle.is_some() || previous_events.is_some() {
+                                let (tx, rx) = tokio::sync::oneshot::channel();
+                                (Some(tx), Some(rx))
+                            } else {
+                                (None, None)
+                            };
+
+                        let next_sync = if let Some(config) = &switch_sync_config {
+                            let remote = match activation_rx {
+                                Some(activation) => sync::RemoteSessionSink::new_after_drain(
+                                    config.clone(),
+                                    id.clone(),
+                                    activation,
+                                ),
+                                None => sync::RemoteSessionSink::new(config.clone(), id.clone()),
+                            };
+                            remote.seed_snapshot(&loaded)?;
+                            let synced =
+                                sync::SyncSession::new(JsonlSession::new(path.clone()), remote);
+                            let next_handle = synced.remote_handle();
+                            let next_events = std::sync::Arc::new(sync::RemoteUi::new(
+                                config.clone(),
+                                id.clone(),
+                            ));
+                            Some((synced, next_handle, next_events))
+                        } else {
+                            None
+                        };
+
+                        agent.apply_loaded_session(
+                            loaded.messages,
+                            loaded.usage,
+                            loaded.checkpoint_refs,
+                            loaded.goal,
+                            loaded.decisions,
+                        );
+
+                        if let Some((synced, next_handle, next_events)) = next_sync {
+                            agent.set_session(Box::new(synced));
+                            handles.lock().unwrap().replace(next_handle);
+                            events.lock().unwrap().replace(next_events);
+                        } else {
+                            agent.set_session(Box::new(JsonlSession::new(path)));
+                        }
+                        *active_session_id.lock().unwrap() = id.clone();
+
+                        // Drain the previous portal session after the local
+                        // switch is complete. The replacement sink's activation
+                        // barrier preserves end-before-register ordering without
+                        // making the TUI wait on network timeouts.
+                        if let Some(activation_tx) = activation_tx {
+                            tokio::spawn(async move {
+                                if let Some(remote_ui) = previous_events {
+                                    let _ = remote_ui.flush().await;
+                                }
+                                if let Some(handle) = previous_handle {
+                                    handle.end_session().await;
+                                }
+                                let _ = activation_tx.send(());
+                            });
+                        }
+
+                        Ok(hi_tui::SessionSwitchInfo { id, summary })
+                    })
+                });
+                switcher
+            });
+        let session_renamer: Option<hi_tui::SessionRenamer> =
+            (!cli.no_save && !cli.subagent).then(|| {
+                let handles = tui_sync_handle.clone();
+                let active_session_id = tui_active_session_id.clone();
+                Box::new(move |id: &str, name: &str| {
+                    sync::validate_session_id(id)?;
+                    let name = session::rename_session(id, name)?;
+                    if *active_session_id.lock().unwrap() == id
+                        && let Some(handle) = handles.lock().unwrap().as_ref()
+                    {
+                        handle.update_title(&name);
+                    }
+                    Ok(name)
+                }) as hi_tui::SessionRenamer
+            });
         match hi_tui::run(
             &mut agent,
             provider_label(settings.provider),
@@ -547,15 +862,63 @@ async fn main() -> Result<()> {
             settings.mcp_url.clone(),
             settings.api_key.clone(),
             fleet_launcher,
+            remote_event_tap,
+            tui_sync_flush_callback,
+            tui_sync_config,
+            tui_sync_session_id,
+            Some(session_lister),
+            session_switcher,
+            session_renamer,
         )
         .await
         {
             Ok(()) => {
-                feedback::maybe_prompt_and_submit(&settings, &feedback_session_id).await;
+                let active_session_id = tui_active_session_id.lock().unwrap().clone();
+                feedback::maybe_prompt_and_submit(&settings, &active_session_id).await;
+                let active_handle = tui_sync_handle.lock().unwrap().clone();
+                if let Some(handle) = &active_handle {
+                    if let Err(err) = handle.flush().await {
+                        eprintln!("\x1b[33msync: {err:#}\x1b[0m");
+                    }
+                    handle.end_session().await;
+                }
+                let active_remote_ui = tui_remote_ui.lock().unwrap().clone();
+                if let Some(rui) = &active_remote_ui
+                    && let Err(err) = rui.flush().await
+                {
+                    eprintln!("\x1b[33msync events: {err:#}\x1b[0m");
+                }
                 hi_tools::kill_background_processes();
                 return Ok(());
             }
-            Err(err) => eprintln!("\x1b[33mTUI error ({err:#}); falling back to plain mode\x1b[0m"),
+            Err(err) => {
+                eprintln!("\x1b[33mTUI error ({err:#}); falling back to plain mode\x1b[0m");
+                // A session switch may have replaced every sync handle while
+                // the TUI was running. Carry the active handles into fallback
+                // mode so subsequent turns and shutdown cannot write to or end
+                // the session that was active only at startup.
+                sync_handle = tui_sync_handle.lock().unwrap().clone();
+                remote_ui = tui_remote_ui.lock().unwrap().clone();
+                feedback_session_id = tui_active_session_id.lock().unwrap().clone();
+                sync_flush_callback = if sync_handle.is_some() || remote_ui.is_some() {
+                    let handle = sync_handle.clone();
+                    let rui = remote_ui.clone();
+                    Some(std::sync::Arc::new(move || {
+                        let handle = handle.clone();
+                        let rui = rui.clone();
+                        tokio::spawn(async move {
+                            if let Some(handle) = handle {
+                                let _ = handle.flush().await;
+                            }
+                            if let Some(rui) = rui {
+                                let _ = rui.flush().await;
+                            }
+                        });
+                    }) as hi_tui::RemoteFlushCallback)
+                } else {
+                    None
+                };
+            }
         }
     }
 
@@ -577,10 +940,22 @@ async fn main() -> Result<()> {
         auto_memory,
         active_profile,
         cli.config.clone(),
+        sync_flush_callback,
     )
     .await;
     if repl_result.is_ok() {
         feedback::maybe_prompt_and_submit(&settings, &feedback_session_id).await;
+    }
+    if let Some(handle) = &sync_handle {
+        if let Err(err) = handle.flush().await {
+            eprintln!("\x1b[33msync: {err:#}\x1b[0m");
+        }
+        handle.end_session().await;
+    }
+    if let Some(rui) = &remote_ui
+        && let Err(err) = rui.flush().await
+    {
+        eprintln!("\x1b[33msync events: {err:#}\x1b[0m");
     }
     repl_result
 }
@@ -591,6 +966,51 @@ pub(crate) fn provider_label(provider: ProviderName) -> &'static str {
         ProviderName::Anthropic => "anthropic",
         ProviderName::Pipenetwork => "pipenetwork",
         ProviderName::Ollama => "ollama",
+    }
+}
+
+/// Build the sync config for pushing session records to ipop.
+/// Precedence: `HI_SYNC_BASE_URL` / `HI_SYNC_API_KEY` env vars → the
+/// provider's `base_url` / `api_key` (so pipenetwork users get sync for free
+/// with their existing key).
+fn build_sync_config(
+    settings: &Settings,
+    _cli: &config::Cli,
+    file: &config::Config,
+) -> sync::SyncConfig {
+    // Precedence: env vars → config [sync] section → provider credentials.
+    let sync_section = file.sync.as_ref();
+    let base_url = std::env::var("HI_SYNC_BASE_URL")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            sync_section
+                .and_then(|s| s.base_url.clone())
+                .map(|u| u.trim_end_matches('/').to_string())
+        })
+        .unwrap_or_else(|| settings.base_url.trim_end_matches('/').to_string());
+    let api_key = std::env::var("HI_SYNC_API_KEY")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            // Try [sync] api_key, then api_key_env.
+            sync_section
+                .and_then(|s| s.api_key.clone())
+                .filter(|k| !k.is_empty())
+                .or_else(|| {
+                    sync_section
+                        .and_then(|s| s.api_key_env.as_deref())
+                        .and_then(|env_var| std::env::var(env_var).ok())
+                })
+        })
+        .unwrap_or_else(|| settings.api_key.clone());
+    let machine_id = session::machine_id();
+    let cwd_digest = Some(session::cwd_digest());
+    sync::SyncConfig {
+        base_url,
+        api_key,
+        machine_id,
+        cwd_digest,
     }
 }
 

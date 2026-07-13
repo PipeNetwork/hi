@@ -16,11 +16,12 @@ mod notify;
 pub use app::run;
 pub use daemon::run_loops_daemon;
 mod completion;
-mod event;
+pub mod event;
 mod input;
 mod model_picker;
 mod provider_form;
 mod render;
+mod sync_tui;
 mod util;
 mod watch;
 
@@ -107,6 +108,46 @@ pub struct FleetLauncher {
 
 /// Resolves a fleet session id into re-adoption info (`/fleet resume`).
 pub type FleetResumeResolver = Box<dyn Fn(&str) -> Option<FleetResumeInfo> + Send + Sync>;
+
+/// Lists sessions cached on this machine. The TUI merges these with synced
+/// sessions before presenting the single `/sessions` view.
+pub type SessionLister = Box<dyn Fn() -> Vec<LocalSessionInfo> + Send + Sync>;
+
+/// Loads a session into the live agent and replaces its persistence sink,
+/// restoring it from sync first when it is not cached on this machine.
+pub type SessionSwitcher = Box<
+    dyn for<'a> Fn(
+            &'a str,
+            &'a mut hi_agent::Agent,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<SessionSwitchInfo>> + Send + 'a>,
+        > + Send
+        + Sync,
+>;
+
+/// Persists a display name for a session cached on this machine.
+pub type SessionRenamer = Box<dyn Fn(&str, &str) -> anyhow::Result<String> + Send + Sync>;
+
+#[derive(Clone, Debug)]
+pub struct SessionSwitchInfo {
+    pub id: String,
+    pub summary: String,
+}
+
+/// Receives a copy of each agent UI event for live portal streaming.
+pub type RemoteEventTap = std::sync::Arc<dyn Fn(&crate::event::UiEvent) + Send + Sync>;
+
+/// Starts a non-blocking flush of portal records and live events.
+pub type RemoteFlushCallback = std::sync::Arc<dyn Fn() + Send + Sync>;
+
+/// A session cached on this machine, merged into the `/sessions` list view.
+#[derive(Clone, Debug)]
+pub struct LocalSessionInfo {
+    pub id: String,
+    pub title: String,
+    pub age: String,
+    pub lines: usize,
+}
 
 /// A fleet session resolved for re-adoption as a dashboard row.
 pub struct FleetResumeInfo {
@@ -584,6 +625,50 @@ pub(crate) struct App {
     /// Set once we've seen any focus event — i.e. the terminal reports focus, so
     /// `focused` is trustworthy.
     pub(crate) focus_known: bool,
+    /// Sync configuration for cross-machine session resume. `None` when sync
+    /// is not configured (no base_url/api_key). Set from the `--sync` CLI flag
+    /// or the `[sync]` config section.
+    pub(crate) sync_config: Option<crate::SyncConfig>,
+    /// Whether sync is currently active (pushing records + events to ipop).
+    pub(crate) sync_active: bool,
+    /// The session id used for sync (derived from the local session file stem).
+    pub(crate) sync_session_id: Option<String>,
+    /// An HTTP client for sync API calls (session list, attach, etc.).
+    /// Reused across calls for connection pooling.
+    pub(crate) sync_http: Option<reqwest::Client>,
+    /// Lists sessions cached on this machine. Provided by hi-cli.
+    pub(crate) session_lister: Option<crate::SessionLister>,
+    /// Snapshot used while session-id completion is open. Avoids rescanning
+    /// and rereading every JSONL file on each render tick.
+    pub(crate) session_completion_cache: Vec<crate::LocalSessionInfo>,
+    /// Switches the live agent and persistence sink for `/sessions switch <id>`.
+    pub(crate) session_switcher: Option<crate::SessionSwitcher>,
+    /// Persists names for `/sessions rename <id> <name>`.
+    pub(crate) session_renamer: Option<crate::SessionRenamer>,
+    /// The remote event tap for live streaming. When set, the `drive` function
+    /// calls this after each `UiEvent` is applied to `App`, forwarding events
+    /// to the `RemoteUi` for ipop sync. Set at startup or by `/sync on`.
+    pub(crate) remote_event_tap: Option<crate::RemoteEventTap>,
+    /// A `RemoteUi` created by `/sync on` for mid-session live streaming.
+    /// Flushed after each turn and on `/sync off`.
+    pub(crate) sync_remote_ui: Option<std::sync::Arc<crate::sync_tui::RemoteUi>>,
+    /// A flush callback for the startup `RemoteUi` (created in main.rs). Called
+    /// after each turn so live events are actually streamed during the session,
+    /// not just buffered until exit. This is a `Box<dyn Fn + Send + Sync>` that
+    /// spawns an async flush task internally (since the TUI can't hold a
+    /// `hi-cli` type directly).
+    pub(crate) remote_flush_callback: Option<crate::RemoteFlushCallback>,
+}
+
+/// Sync configuration passed into the TUI for `/sync`, `/sessions`, `/attach`.
+/// Mirrors `hi_cli::sync::SyncConfig` but lives in `hi-tui` so the TUI can
+/// make sync API calls without depending on `hi-cli`.
+#[derive(Clone, Debug)]
+pub struct SyncConfig {
+    pub base_url: String,
+    pub api_key: String,
+    pub machine_id: Option<String>,
+    pub cwd_digest: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
