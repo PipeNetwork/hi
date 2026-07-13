@@ -56,7 +56,7 @@ use std::thread;
 use anyhow::{Context, Result, anyhow, bail};
 use async_trait::async_trait;
 use futures_util::stream;
-use hi_gguf::{GgufFile, inspect_model};
+use hi_gguf::{GgufFile, GgufTokenizer, StreamingTokenDecoder, inspect_model};
 use hi_local_core::backend::{
     BackendHealth, GenerationEvent, GenerationOutput, GenerationRequest, GenerationStream,
     InferenceBackend, SamplingDefaults,
@@ -65,9 +65,9 @@ use hi_local_core::model::ModelInfo;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
-use crate::dsv4_cpu::DsV4State;
-use crate::dsv4_gpu::DeepSeekV4GpuEngine;
-use crate::qwen_cpu::sample_from_logits_with_rng;
+use crate::dsv4_cpu::{DsV4Engine, DsV4State, DsV4TapConfig, DsV4Taps};
+use crate::dsv4_gpu::{DeepSeekV4GpuEngine, DsV4GpuLinear};
+use crate::qwen_cpu::{argmax, sample_from_logits_with_rng};
 
 /// Advertised context window. The GGUF declares 1M, but long-context behavior
 /// (YARN is deliberately ignored at bring-up, matching the MLX reference) is
@@ -102,6 +102,111 @@ type BlockHash = u64;
 /// Read per request so the switch works without reloading the model.
 fn prefix_reuse_disabled() -> bool {
     std::env::var("HI_DSV4_NO_PREFIX_REUSE").ok().as_deref() == Some("1")
+}
+
+/// Default draft length per verify step (`HI_DSV4_SPEC_K`) — the oracle-test
+/// cap; Stage B/C drafters may want other values.
+const DSV4_SPEC_K_DEFAULT: usize = 4;
+
+/// `HI_DSV4_SPEC_K`: draft tokens proposed per verify step. Read per request
+/// (like the prefix-reuse switch) so it can be tuned without a reload; 0 is
+/// legal and degrades the speculative loop to sequential decode through
+/// 1-token verify chunks.
+fn spec_k_from_env() -> usize {
+    let Ok(raw) = std::env::var("HI_DSV4_SPEC_K") else {
+        return DSV4_SPEC_K_DEFAULT;
+    };
+    match raw.trim().parse::<usize>() {
+        Ok(k) => k,
+        Err(_) => {
+            eprintln!(
+                "ignoring invalid HI_DSV4_SPEC_K '{raw}' (want an integer >= 0); using {DSV4_SPEC_K_DEFAULT}"
+            );
+            DSV4_SPEC_K_DEFAULT
+        }
+    }
+}
+
+/// Everything a [`Drafter`] sees at proposal time.
+pub(crate) struct DraftContext<'a> {
+    /// Prompt plus every emitted token so far, INCLUDING the pending token the
+    /// verify step is about to feed — drafts continue after the last entry.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) tokens: &'a [u32],
+    /// Hidden taps captured so far: absolute positions
+    /// `taps.base() .. tokens.len()-1` (the pending token has not been
+    /// forwarded yet, and nothing exists below the base — a prefix-cache
+    /// restore skips the restored prefix, so drafters cold-start their own
+    /// state at the base). `None` unless the drafter's
+    /// [`Drafter::tap_config`] requested capture.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) taps: Option<&'a DsV4Taps>,
+    /// Maximum drafts the loop will verify this step.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) k: usize,
+}
+
+/// A speculative-decoding draft source for the greedy verify loop (Stage A of
+/// `docs/deepseek-v4-spec-decode-plan.md`). Implementations live on the
+/// engine worker thread; `MtpDrafter` (Stage B) and `DFlashDrafter` (Stage C)
+/// implement this and get selected through `HI_DSV4_SPEC` in
+/// [`drafter_from_env`]. Stage A ships the machinery plus the test-only
+/// oracle implementation.
+pub(crate) trait Drafter {
+    /// Hidden-state capture this drafter needs (default: none). Read once per
+    /// request BEFORE prefill, and the capture buffer attaches at the
+    /// prefix-cache restore point ([`DsV4Taps::base`]): positions from the
+    /// base onward are gap-free, positions below it were restored — not
+    /// recomputed — so no taps exist there and drafters cold-start at the
+    /// base.
+    fn tap_config(&self) -> DsV4TapConfig {
+        DsV4TapConfig::default()
+    }
+
+    /// Propose up to `ctx.k` draft tokens continuing `ctx.tokens`. Returning
+    /// fewer (or none) is fine — the loop verifies whatever comes back and
+    /// truncates any excess.
+    fn propose(&mut self, ctx: &DraftContext<'_>) -> Vec<u32>;
+
+    /// Verify-outcome feedback: of `proposed` drafts, the first `accepted`
+    /// were accepted, and `emitted` is the correction-or-bonus token the loop
+    /// emitted right after them (the next iteration's pending token).
+    fn observe_accepted(&mut self, proposed: usize, accepted: usize, emitted: u32) {
+        let _ = (proposed, accepted, emitted);
+    }
+}
+
+/// Builds the worker's drafter after the engine has loaded ON the worker
+/// thread (Stage B/C drafters own device resources, so construction must
+/// happen there). `None` disables speculative decoding.
+type DsV4DrafterFactory = Box<dyn FnOnce(&DeepSeekV4GpuEngine) -> Option<Box<dyn Drafter>> + Send>;
+
+/// `HI_DSV4_SPEC`: drafter selection, resolved on the engine worker thread so
+/// drafters can own device resources. Named drafters land in the follow-up
+/// commits; until then every selection logs and stays off.
+fn drafter_from_env(engine: &DeepSeekV4GpuEngine) -> Option<Box<dyn Drafter>> {
+    let raw = std::env::var("HI_DSV4_SPEC").ok()?;
+    match raw.trim() {
+        "" | "0" | "off" | "none" => None,
+        other => {
+            eprintln!(
+                "HI_DSV4_SPEC={other} is not available yet; speculative decoding stays off"
+            );
+            None
+        }
+    }
+}
+
+/// Speculative-decoding counters surfaced through the `/health` dsv4 object.
+#[derive(Debug, Default)]
+struct DsV4SpecStats {
+    /// Draft tokens proposed by the drafter (verified but not necessarily
+    /// accepted).
+    proposed_tokens: AtomicU64,
+    /// Proposed tokens greedily accepted.
+    accepted_tokens: AtomicU64,
+    /// Verify forwards executed (each covers one proposal batch + 1).
+    verify_steps: AtomicU64,
 }
 
 /// Static prefix-cache configuration, resolved once at load from the
@@ -336,6 +441,41 @@ impl BlockTracker {
         self.parent_hash = Some(hash);
         self.blocks_done += 1;
     }
+
+    /// [`Self::on_feed`] for multi-token feeds (the speculative loop accepts
+    /// several tokens per verify): advance the hash chain over EVERY newly
+    /// completed boundary so later boundaries keep working, snapshotting the
+    /// state directly when a boundary lands exactly at `fed.len()` and
+    /// through a clone truncated back to the boundary otherwise (block sizes
+    /// are compressor-aligned in production, so the exact truncate normally
+    /// succeeds; when it cannot, only that boundary's snapshot is skipped).
+    fn on_feed_spanning(
+        &mut self,
+        cache: &mut DsV4PrefixCache,
+        engine: &DsV4Engine<DsV4GpuLinear>,
+        fed: &[u32],
+        state: &DsV4State,
+    ) {
+        debug_assert_eq!(state.pos(), fed.len());
+        loop {
+            let boundary = (self.blocks_done + 1) * self.block_size;
+            if boundary > fed.len() {
+                return;
+            }
+            let start = self.blocks_done * self.block_size;
+            let hash = DsV4PrefixCache::hash_block(self.parent_hash, &fed[start..boundary]);
+            if boundary == fed.len() {
+                cache.store(hash, state, boundary);
+            } else {
+                let mut clone = state.clone();
+                if engine.truncate_state_to_at_most(&mut clone, boundary) == Some(boundary) {
+                    cache.store(hash, &clone, boundary);
+                }
+            }
+            self.parent_hash = Some(hash);
+            self.blocks_done += 1;
+        }
+    }
 }
 
 /// One queued generation: the request plus the stream half its events feed.
@@ -359,6 +499,7 @@ pub struct DeepSeekV4Backend {
     engine_context_length: u32,
     advertised_context_length: u32,
     reuse: Arc<DsV4ReuseStats>,
+    spec: Arc<DsV4SpecStats>,
     prefix_config: PrefixCacheConfig,
     memory_estimate_bytes: u64,
     jobs: mpsc::Sender<DsV4Job>,
@@ -372,9 +513,16 @@ impl DeepSeekV4Backend {
 
     /// Takes ownership of the GGUF (expert weights stream from the mmap for the
     /// engine's lifetime) and moves it onto the dedicated engine thread. The
-    /// prefix cache is sized from the environment.
+    /// prefix cache is sized from the environment, and the speculative drafter
+    /// from `HI_DSV4_SPEC`.
     pub fn from_gguf(gguf: GgufFile, path: &Path, model_id: Option<String>) -> Result<Self> {
-        Self::from_gguf_with_prefix_config(gguf, path, model_id, PrefixCacheConfig::from_env())
+        Self::from_gguf_with_prefix_config(
+            gguf,
+            path,
+            model_id,
+            PrefixCacheConfig::from_env(),
+            Box::new(drafter_from_env),
+        )
     }
 
     /// Open `path` with an explicit prefix-cache configuration. Test-only entry
@@ -388,6 +536,19 @@ impl DeepSeekV4Backend {
         block_size: usize,
         budget_bytes: usize,
     ) -> Result<Self> {
+        Self::load_with_drafter(path, model_id, block_size, budget_bytes, Box::new(|_| None))
+    }
+
+    /// [`Self::load_with_prefix_config`] plus an injected drafter factory —
+    /// the oracle speculative-decoding suites' entry point.
+    #[cfg(test)]
+    pub(crate) fn load_with_drafter(
+        path: impl AsRef<Path>,
+        model_id: Option<String>,
+        block_size: usize,
+        budget_bytes: usize,
+        drafter: DsV4DrafterFactory,
+    ) -> Result<Self> {
         let path = path.as_ref();
         Self::from_gguf_with_prefix_config(
             GgufFile::open(path)?,
@@ -397,6 +558,7 @@ impl DeepSeekV4Backend {
                 block_size,
                 budget_bytes,
             },
+            drafter,
         )
     }
 
@@ -405,6 +567,7 @@ impl DeepSeekV4Backend {
         path: &Path,
         model_id: Option<String>,
         prefix_config: PrefixCacheConfig,
+        drafter: DsV4DrafterFactory,
     ) -> Result<Self> {
         let config = gguf.qwen_config()?;
         if !config.is_deepseek4() {
@@ -420,7 +583,8 @@ impl DeepSeekV4Backend {
         model.max_output_tokens = DSV4_ADVERTISED_MAX_OUTPUT_TOKENS.min(context_length);
         let memory_estimate_bytes = config.total_tensor_bytes;
         let reuse = Arc::new(DsV4ReuseStats::default());
-        let jobs = spawn_engine_worker(gguf, reuse.clone(), prefix_config)?;
+        let spec = Arc::new(DsV4SpecStats::default());
+        let jobs = spawn_engine_worker(gguf, reuse.clone(), spec.clone(), prefix_config, drafter)?;
         Ok(Self {
             model,
             chat_template,
@@ -428,6 +592,7 @@ impl DeepSeekV4Backend {
             engine_context_length: config.context_length,
             advertised_context_length: context_length,
             reuse,
+            spec,
             prefix_config,
             memory_estimate_bytes,
             jobs,
@@ -448,9 +613,12 @@ impl InferenceBackend for DeepSeekV4Backend {
     fn health(&self) -> BackendHealth {
         let reused_tokens = self.reuse.reused_tokens.load(Ordering::Relaxed);
         let prefilled_tokens = self.reuse.prefilled_tokens.load(Ordering::Relaxed);
+        let spec_proposed = self.spec.proposed_tokens.load(Ordering::Relaxed);
+        let spec_accepted = self.spec.accepted_tokens.load(Ordering::Relaxed);
+        let spec_verify_steps = self.spec.verify_steps.load(Ordering::Relaxed);
         let quantization = format!(
             "{}; execution=gpu; \
-             dsv4=enabled(engine=cuda-dsv4,scheduling=single-request-fifo,max_batch_size=1,engine_context_length={},advertised_context_length={},prefix_reuse={},prefix_block_size={},prefix_cache_mb={},reused_tokens={reused_tokens},prefilled_tokens={prefilled_tokens}); \
+             dsv4=enabled(engine=cuda-dsv4,scheduling=single-request-fifo,max_batch_size=1,engine_context_length={},advertised_context_length={},prefix_reuse={},prefix_block_size={},prefix_cache_mb={},reused_tokens={reused_tokens},prefilled_tokens={prefilled_tokens},spec_k={},spec_proposed={spec_proposed},spec_accepted={spec_accepted},spec_verify_steps={spec_verify_steps}); \
              scheduler=disabled; sampling=single",
             self.quantization_label,
             self.engine_context_length,
@@ -458,6 +626,7 @@ impl InferenceBackend for DeepSeekV4Backend {
             if prefix_reuse_disabled() { "off" } else { "on" },
             self.prefix_config.block_size,
             self.prefix_config.budget_bytes / (1024 * 1024),
+            spec_k_from_env(),
         );
         BackendHealth {
             backend: "cuda".to_string(),
@@ -503,7 +672,9 @@ impl InferenceBackend for DeepSeekV4Backend {
 fn spawn_engine_worker(
     gguf: GgufFile,
     reuse: Arc<DsV4ReuseStats>,
+    spec: Arc<DsV4SpecStats>,
     prefix_config: PrefixCacheConfig,
+    drafter_factory: DsV4DrafterFactory,
 ) -> Result<mpsc::Sender<DsV4Job>> {
     let (job_tx, job_rx) = mpsc::channel::<DsV4Job>();
     let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
@@ -511,7 +682,7 @@ fn spawn_engine_worker(
         .name("hi-cuda-dsv4-engine".to_string())
         .spawn(move || {
             // Engine construction allocates every CUDA resource on this
-            // thread; jobs and the final drop stay here too.
+            // thread; jobs, the drafter, and the final drop stay here too.
             let engine = match DeepSeekV4GpuEngine::from_gguf(gguf) {
                 Ok(engine) => {
                     let _ = ready_tx.send(Ok(()));
@@ -522,6 +693,7 @@ fn spawn_engine_worker(
                     return;
                 }
             };
+            let mut drafter = drafter_factory(&engine);
             // FIFO: one generation at a time, in submission order. The
             // block-hash prefix cache is shared across every conversation this
             // worker serves; snapshots are inserted incrementally as each
@@ -531,7 +703,15 @@ fn spawn_engine_worker(
             let mut cache = DsV4PrefixCache::new(prefix_config);
             while let Ok(job) = job_rx.recv() {
                 let DsV4Job { request, events } = job;
-                if let Err(err) = stream_tokens(&engine, &request, &events, &mut cache, &reuse) {
+                if let Err(err) = stream_tokens(
+                    &engine,
+                    &request,
+                    &events,
+                    &mut cache,
+                    &reuse,
+                    &spec,
+                    &mut drafter,
+                ) {
                     let _ = events.send(Err(err));
                 }
             }
@@ -555,12 +735,18 @@ fn next_block_boundary(position: usize, block_size: usize) -> usize {
 /// The shared prefix cache is read (deepest-prefix restore) and written
 /// (boundary snapshots) in place as the request progresses; nothing is
 /// restored or written under the `HI_DSV4_NO_PREFIX_REUSE=1` kill switch.
+/// A configured `drafter` engages the speculative verify loop
+/// ([`decode_speculative`]) for greedy requests; sampled requests fall back
+/// to the sequential loop below (greedy acceptance is the only mode whose
+/// output is provably identical — Stage A scope).
 fn stream_tokens(
     engine: &DeepSeekV4GpuEngine,
     request: &GenerationRequest,
     events: &tokio::sync::mpsc::UnboundedSender<Result<GenerationEvent>>,
     cache: &mut DsV4PrefixCache,
     stats: &DsV4ReuseStats,
+    spec: &DsV4SpecStats,
+    drafter: &mut Option<Box<dyn Drafter>>,
 ) -> Result<()> {
     let inner = engine.engine();
     let tokenizer = inner.tokenizer();
@@ -573,6 +759,13 @@ fn stream_tokens(
     let max_tokens =
         usize::try_from(request.max_tokens).context("max_tokens does not fit usize")?;
     validate_context_budget(config.context_length, prompt_tokens.len(), max_tokens)?;
+
+    // Speculative decode is greedy-only in Stage A; sampled requests decode
+    // sequentially.
+    let drafter = drafter
+        .as_deref_mut()
+        .filter(|_| request.temperature <= 0.0);
+    let spec_k = spec_k_from_env();
 
     // Restore the deepest cached block prefix of this prompt (shared across
     // conversations), then prefill only the remainder. `fed` tracks exactly the
@@ -597,6 +790,33 @@ fn stream_tokens(
             (inner.new_state(), Vec::new(), tracker)
         }
     };
+    // Drafter taps attach AT the restore point: the restored prefix's
+    // activations were never recomputed, so the buffer's base marks where
+    // capture (and the drafter's own context) begins — fresh-session restores
+    // stay as cheap with speculation on as off.
+    let tap_config = drafter
+        .as_ref()
+        .map(|drafter| drafter.tap_config())
+        .unwrap_or_default();
+    let mut taps = if tap_config.is_empty() {
+        None
+    } else {
+        Some(inner.new_taps_at(tap_config, fed.len())?)
+    };
+    if drafter.is_some() {
+        // Verify rollbacks rewind up to spec_k rejected positions, plus a
+        // compressor block-boundary round-down (see `rewind_state_to`), so
+        // the request's ring retention must cover that window. Restored
+        // snapshots may carry less slack; bumping the field only extends
+        // FUTURE retention (the first rewinds may re-feed more — correct,
+        // just slower), and severs any device-state link so the documented
+        // "equal (tag, pos) implies equal content" invariant keeps holding.
+        let slack = spec_ring_slack(inner, spec_k);
+        if state.ring_slack < slack {
+            state.ring_slack = slack;
+            state.device_tag = 0;
+        }
+    }
 
     // Prefill the (possibly suffix-only) prompt remainder in block-aligned
     // segments so each crossed boundary is snapshotted at its exact position;
@@ -609,7 +829,7 @@ fn stream_tokens(
         }
         let seg_end = next_block_boundary(fed.len(), block_size).min(prompt_tokens.len());
         let piece = &prompt_tokens[fed.len()..seg_end];
-        logits = inner.prefill(&mut state, piece)?;
+        logits = inner.prefill_with_taps(&mut state, piece, taps.as_mut())?;
         stats
             .prefilled_tokens
             .fetch_add(piece.len() as u64, Ordering::Relaxed);
@@ -620,6 +840,25 @@ fn stream_tokens(
     }
     if logits.is_empty() {
         bail!("DeepSeek-V4 prefill produced no logits");
+    }
+
+    if let Some(drafter) = drafter {
+        return decode_speculative(SpecDecodeArgs {
+            inner,
+            request,
+            events,
+            cache,
+            spec,
+            drafter,
+            state,
+            fed,
+            tracker,
+            taps,
+            logits,
+            prompt_len: prompt_tokens.len() as u64,
+            max_tokens,
+            k_cap: spec_k,
+        });
     }
 
     // Same sampling semantics as the engine's QwenCpuRunOptions path: the
@@ -694,6 +933,249 @@ fn stream_tokens(
     Ok(())
 }
 
+/// Ring slack for speculative-decode states: a verify overshoots by up to
+/// `k` rejected positions, and rewinding across a completed compressor block
+/// rounds down to that block's boundary — up to `max_ratio - 1` further —
+/// so retain `max_ratio + k + 1` extra ring entries (~12 MB on the real
+/// model; see `DsV4Engine::rewind_state_to`).
+fn spec_ring_slack(engine: &DsV4Engine<DsV4GpuLinear>, k: usize) -> usize {
+    let max_ratio = engine
+        .layers()
+        .iter()
+        .filter_map(|layer| layer.compressor.as_ref().map(|weights| weights.ratio))
+        .max()
+        .unwrap_or(0);
+    max_ratio + k + 1
+}
+
+/// Borrowed request context for [`decode_speculative`] (one bundle instead of
+/// a dozen loose parameters).
+struct SpecDecodeArgs<'a> {
+    inner: &'a DsV4Engine<DsV4GpuLinear>,
+    request: &'a GenerationRequest,
+    events: &'a tokio::sync::mpsc::UnboundedSender<Result<GenerationEvent>>,
+    cache: &'a mut DsV4PrefixCache,
+    spec: &'a DsV4SpecStats,
+    drafter: &'a mut dyn Drafter,
+    state: DsV4State,
+    /// Tokens the state validly contains (prompt so far; grows by the pending
+    /// token + accepted drafts after every verify rollback).
+    fed: Vec<u32>,
+    tracker: Option<BlockTracker>,
+    taps: Option<DsV4Taps>,
+    /// Logits after the last prefilled prompt token.
+    logits: Vec<f32>,
+    prompt_len: u64,
+    max_tokens: usize,
+    k_cap: usize,
+}
+
+/// What one emitted token means for the speculative loop.
+enum SpecEmit {
+    Continue,
+    /// eos, a stop sequence, or the max_tokens budget: send Finished.
+    Finish,
+    /// The client dropped the stream: abort silently.
+    ClientGone,
+}
+
+/// The greedy speculative decode loop (Stage A of
+/// `docs/deepseek-v4-spec-decode-plan.md`): per iteration, propose up to K
+/// drafts, verify the pending token + drafts in ONE chunked forward
+/// ([`DsV4Engine::verify_tokens_with_taps`], bit-exact with sequential
+/// steps), greedily accept the longest draft prefix whose token i equals the
+/// argmax of position i's logits, emit the accepted tokens plus the
+/// correction-or-bonus token, and rewind the state to the accepted end. The
+/// emitted stream is byte-identical to sequential greedy decode by
+/// construction — every emitted token IS a sequential argmax — which the
+/// oracle-drafter suites gate end to end.
+fn decode_speculative(args: SpecDecodeArgs<'_>) -> Result<()> {
+    let SpecDecodeArgs {
+        inner,
+        request,
+        events,
+        cache,
+        spec,
+        drafter,
+        mut state,
+        mut fed,
+        mut tracker,
+        mut taps,
+        logits,
+        prompt_len,
+        max_tokens,
+        k_cap,
+    } = args;
+    let tokenizer = inner.tokenizer();
+    let eos = inner.config().eos_token_id;
+    let mut decoder = tokenizer.streaming_decoder(true);
+    let mut text = String::new();
+    let mut completion_tokens = 0u64;
+    let finish = |text: String, completion_tokens: u64| {
+        let _ = events.send(Ok(GenerationEvent::Finished {
+            output: GenerationOutput {
+                text,
+                prompt_tokens: prompt_len,
+                completion_tokens,
+            },
+        }));
+        Ok(())
+    };
+
+    // The first token comes straight off the prompt logits; `argmax` is the
+    // sequential sampler at temperature <= 0 (the speculative gate).
+    let mut pending = argmax(&logits)?;
+    completion_tokens += 1;
+    match emit_spec_token(
+        tokenizer,
+        &mut decoder,
+        events,
+        &mut text,
+        pending,
+        eos,
+        &request.stop_sequences,
+        completion_tokens,
+        max_tokens,
+    )? {
+        SpecEmit::Continue => {}
+        SpecEmit::Finish => return finish(text, completion_tokens),
+        SpecEmit::ClientGone => return Ok(()),
+    }
+
+    while (completion_tokens as usize) < max_tokens {
+        if events.is_closed() {
+            return Ok(());
+        }
+        // The bonus/correction token takes one budget slot, so never propose
+        // more drafts than the budget can still emit after it.
+        let remaining = max_tokens - completion_tokens as usize;
+        let k = k_cap.min(remaining - 1);
+        let mut context_tokens = Vec::with_capacity(fed.len() + 1);
+        context_tokens.extend_from_slice(&fed);
+        context_tokens.push(pending);
+        let mut drafts = drafter.propose(&DraftContext {
+            tokens: &context_tokens,
+            taps: taps.as_ref(),
+            k,
+        });
+        drafts.truncate(k);
+        // An out-of-vocab draft would make the verify forward bail; clamp the
+        // proposal at the first invalid id instead (drafter bug, not fatal).
+        if let Some(bad) = drafts
+            .iter()
+            .position(|&token| token as usize >= tokenizer.token_count())
+        {
+            drafts.truncate(bad);
+        }
+
+        // Verify pending + drafts in one chunked forward: logits row i is the
+        // sequential-greedy distribution for the token AFTER verify_seq[..=i].
+        let mut verify_seq = Vec::with_capacity(drafts.len() + 1);
+        verify_seq.push(pending);
+        verify_seq.extend_from_slice(&drafts);
+        let rows = inner.verify_tokens_with_taps(&mut state, &verify_seq, taps.as_mut())?;
+        spec.verify_steps.fetch_add(1, Ordering::Relaxed);
+        spec.proposed_tokens
+            .fetch_add(drafts.len() as u64, Ordering::Relaxed);
+
+        let mut accepted = 0usize;
+        while accepted < drafts.len() && drafts[accepted] == argmax(&rows[accepted])? {
+            accepted += 1;
+        }
+        spec.accepted_tokens
+            .fetch_add(accepted as u64, Ordering::Relaxed);
+        // Correction (a rejected draft's true argmax) or bonus (all accepted).
+        let next = argmax(&rows[accepted])?;
+        drafter.observe_accepted(drafts.len(), accepted, next);
+
+        // Emit the accepted drafts then the correction/bonus token; any of
+        // them can end the request (eos / stop sequence / budget), exactly
+        // where the sequential loop would have stopped.
+        let mut finished = false;
+        let mut client_gone = false;
+        for &token in drafts[..accepted].iter().chain(std::iter::once(&next)) {
+            completion_tokens += 1;
+            match emit_spec_token(
+                tokenizer,
+                &mut decoder,
+                events,
+                &mut text,
+                token,
+                eos,
+                &request.stop_sequences,
+                completion_tokens,
+                max_tokens,
+            )? {
+                SpecEmit::Continue => {}
+                SpecEmit::Finish => {
+                    finished = true;
+                    break;
+                }
+                SpecEmit::ClientGone => {
+                    client_gone = true;
+                    break;
+                }
+            }
+        }
+        if client_gone {
+            return Ok(());
+        }
+        if finished {
+            return finish(text, completion_tokens);
+        }
+
+        // The verify advanced the state over every draft; rewind to the
+        // accepted end (`next` is NOT fed — it is the next pending token) and
+        // only then extend the prefix-cache chain, so snapshots never contain
+        // rejected positions.
+        fed.push(pending);
+        fed.extend_from_slice(&drafts[..accepted]);
+        inner.rewind_state_to(&mut state, &fed, fed.len(), taps.as_mut())?;
+        if let Some(tracker) = tracker.as_mut() {
+            tracker.on_feed_spanning(cache, inner, &fed, &state);
+        }
+        pending = next;
+    }
+    finish(text, completion_tokens)
+}
+
+/// Push one token of the speculative loop through the streaming decoder and
+/// the event channel, mirroring the sequential loop's emission semantics
+/// (delta only when non-empty; eos, then stop sequences, then the budget).
+#[allow(clippy::too_many_arguments)]
+fn emit_spec_token(
+    tokenizer: &GgufTokenizer,
+    decoder: &mut StreamingTokenDecoder,
+    events: &tokio::sync::mpsc::UnboundedSender<Result<GenerationEvent>>,
+    text: &mut String,
+    token: u32,
+    eos: Option<u32>,
+    stop_sequences: &[String],
+    completion_tokens: u64,
+    max_tokens: usize,
+) -> Result<SpecEmit> {
+    let delta = decoder.push(tokenizer, token)?;
+    if !delta.is_empty() {
+        text.push_str(&delta);
+        if events
+            .send(Ok(GenerationEvent::TokenDelta {
+                token_id: token,
+                text: delta,
+            }))
+            .is_err()
+        {
+            return Ok(SpecEmit::ClientGone);
+        }
+    }
+    if Some(token) == eos
+        || stop_sequence_hit(text, stop_sequences)
+        || completion_tokens as usize >= max_tokens
+    {
+        return Ok(SpecEmit::Finish);
+    }
+    Ok(SpecEmit::Continue)
+}
+
 /// Mirror of the qwen path's context budget check, against the ENGINE's true
 /// context length (the advertised window only caps what `/v1/models` reports).
 fn validate_context_budget(
@@ -736,7 +1218,14 @@ mod tests {
     use serde_json::{Value, json};
     use tower::ServiceExt;
 
-    use crate::dsv4_cpu::fixture::{tempfile_path, write_deepseek4_gguf};
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+
+    use crate::dsv4_cpu::DeepSeekV4CpuReference;
+    use crate::dsv4_cpu::fixture::{
+        tempfile_path, write_deepseek4_gguf, write_deepseek4_spec_gguf,
+    };
+    use crate::qwen_cpu::QwenCpuRunOptions;
 
     use super::*;
 
@@ -1298,6 +1787,548 @@ mod tests {
             warm_s < 60.0,
             "warm reuse session must be seconds-class, got {warm_s:.1}s"
         );
+    }
+
+    /// Test-only [`Drafter`] replaying a preloaded continuation (a known
+    /// prompt's true greedy continuation), optionally corrupting chosen
+    /// continuation indices to force rejections — a corrupted draft is
+    /// `(token + 1) % vocab`, guaranteed unequal to the true argmax. Every
+    /// `observe_accepted` call is logged through the shared handle so tests
+    /// can assert the feedback contract from outside the worker thread.
+    struct OracleDrafter {
+        prompt_len: usize,
+        continuation: Vec<u32>,
+        corrupt: HashSet<usize>,
+        vocab: u32,
+        observed: Arc<Mutex<Vec<(usize, usize, u32)>>>,
+        /// Capture request for the loop (default: none). When non-empty, every
+        /// propose logs the taps' coverage into `tap_log` and any coverage
+        /// violation into `tap_violations` — asserting inside the worker
+        /// thread would only kill the worker, so tests assert on the logs.
+        tap_config: DsV4TapConfig,
+        /// Per-propose (taps.base(), taps.positions(), ctx.tokens.len()).
+        tap_log: Arc<Mutex<Vec<(usize, usize, usize)>>>,
+        tap_violations: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl OracleDrafter {
+        fn new(
+            prompt_len: usize,
+            continuation: &[u32],
+            corrupt: &[usize],
+            vocab: u32,
+            observed: Arc<Mutex<Vec<(usize, usize, u32)>>>,
+        ) -> Self {
+            Self {
+                prompt_len,
+                continuation: continuation.to_vec(),
+                corrupt: corrupt.iter().copied().collect(),
+                vocab,
+                observed,
+                tap_config: DsV4TapConfig::default(),
+                tap_log: Arc::new(Mutex::new(Vec::new())),
+                tap_violations: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    impl Drafter for OracleDrafter {
+        fn tap_config(&self) -> DsV4TapConfig {
+            self.tap_config.clone()
+        }
+
+        fn propose(&mut self, ctx: &DraftContext<'_>) -> Vec<u32> {
+            if !self.tap_config.is_empty() {
+                let mut violations = self.tap_violations.lock().unwrap();
+                match ctx.taps {
+                    None => violations.push("tap-requesting drafter got no taps".to_string()),
+                    Some(taps) => {
+                        let (base, end) = (taps.base(), taps.positions());
+                        self.tap_log
+                            .lock()
+                            .unwrap()
+                            .push((base, end, ctx.tokens.len()));
+                        if end + 1 != ctx.tokens.len() {
+                            violations.push(format!(
+                                "taps end {end} does not cover tokens {} - 1",
+                                ctx.tokens.len()
+                            ));
+                        }
+                        // Coverage: rows exist exactly for base..end and
+                        // NEVER below the base (a misaligned row would poison
+                        // a real drafter silently).
+                        if base > 0 && taps.pre_hc_head(base - 1).is_some() {
+                            violations.push(format!("row exists below base {base}"));
+                        }
+                        for position in base..end {
+                            if self.tap_config.pre_hc_head && taps.pre_hc_head(position).is_none() {
+                                violations.push(format!("missing pre-hc-head row {position}"));
+                            }
+                            for &layer in &self.tap_config.aux_layers {
+                                if taps.aux_flat(layer, position).is_none() {
+                                    violations.push(format!("missing aux {layer} row {position}"));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // ctx.tokens = prompt + every emitted token (pending included), so
+            // the next tokens to draft start at continuation[generated].
+            let generated = ctx.tokens.len().saturating_sub(self.prompt_len);
+            (0..ctx.k)
+                .map_while(|offset| {
+                    let idx = generated + offset;
+                    let token = *self.continuation.get(idx)?;
+                    Some(if self.corrupt.contains(&idx) {
+                        (token + 1) % self.vocab
+                    } else {
+                        token
+                    })
+                })
+                .collect()
+        }
+
+        fn observe_accepted(&mut self, proposed: usize, accepted: usize, emitted: u32) {
+            self.observed
+                .lock()
+                .unwrap()
+                .push((proposed, accepted, emitted));
+        }
+    }
+
+    /// Drive one request to completion; returns (delta token ids, text,
+    /// completion count). Deltas carry every emitted token EXCEPT
+    /// special-skipped ids (the spec fixture's `a b c` are all visible; only
+    /// its never-emitted eos `d` would skip), and their concatenated text
+    /// must reassemble the final text.
+    async fn collect_generation(
+        backend: &DeepSeekV4Backend,
+        request: GenerationRequest,
+    ) -> (Vec<u32>, String, u64) {
+        let mut stream = backend.stream_generate(request).await.unwrap();
+        let mut ids = Vec::new();
+        let mut collected = String::new();
+        let mut finished = None;
+        while let Some(event) = stream.next().await {
+            match event.unwrap() {
+                GenerationEvent::TokenDelta { token_id, text } => {
+                    ids.push(token_id);
+                    collected.push_str(&text);
+                }
+                GenerationEvent::Finished { output } => finished = Some(output),
+            }
+        }
+        let finished = finished.expect("stream must end with Finished");
+        assert_eq!(collected, finished.text);
+        (ids, finished.text, finished.completion_tokens)
+    }
+
+    /// The greedy continuation the spec-fixture model produces after
+    /// `prompt`, from the CPU oracle (bit-exact with the GPU engine's greedy
+    /// tokens per the Stage-1 parity gate) — the OracleDrafter's replay
+    /// source and the token-exactness reference.
+    fn reference_continuation(path: &std::path::Path, prompt: &str, max_tokens: usize) -> Vec<u32> {
+        let cpu = DeepSeekV4CpuReference::load(path).unwrap();
+        let tokens = cpu.tokenizer().encode(prompt).unwrap();
+        let out = cpu
+            .run_tokens(
+                &tokens,
+                QwenCpuRunOptions {
+                    max_tokens,
+                    ..QwenCpuRunOptions::default()
+                },
+            )
+            .unwrap();
+        out.generated_tokens
+    }
+
+    /// Oracle backend over the spec fixture at `path` with the given
+    /// corruption set (continuation indices whose draft is deliberately
+    /// wrong).
+    fn oracle_backend(
+        path: &std::path::Path,
+        prompt_len: usize,
+        continuation: &[u32],
+        corrupt: &[usize],
+        observed: Arc<Mutex<Vec<(usize, usize, u32)>>>,
+    ) -> Arc<DeepSeekV4Backend> {
+        let drafter = OracleDrafter::new(prompt_len, continuation, corrupt, 4, observed);
+        oracle_backend_with(path, drafter)
+    }
+
+    fn oracle_backend_with(
+        path: &std::path::Path,
+        drafter: OracleDrafter,
+    ) -> Arc<DeepSeekV4Backend> {
+        Arc::new(
+            DeepSeekV4Backend::load_with_drafter(
+                path,
+                Some("dsv4-fixture".to_string()),
+                4,
+                BIG_PREFIX_BUDGET,
+                Box::new(move |_| Some(Box::new(drafter))),
+            )
+            .unwrap(),
+        )
+    }
+
+    /// The Stage-A speculative acceptance gate (oracle drafting): a perfect
+    /// draft accepts everything, an adversarial draft rejects everything, and
+    /// mixed corruption lands in between — with the emitted token stream
+    /// identical to sequential greedy decode in EVERY case (losslessness is
+    /// the whole point). The spec fixture streams every emitted token id and
+    /// greedy runs to the budget, so acceptance has real depth.
+    #[tokio::test]
+    async fn dsv4_backend_oracle_drafter_outputs_match_sequential_greedy() {
+        let prompt = "abcabcab";
+        let max_tokens = 8u32;
+
+        // Sequential baseline (no drafter) + CPU-oracle continuation over the
+        // same model file; the delta stream must carry exactly those tokens.
+        let baseline_path = tempfile_path("oracle-baseline");
+        write_deepseek4_spec_gguf(&baseline_path);
+        let continuation = reference_continuation(&baseline_path, prompt, max_tokens as usize);
+        assert_eq!(
+            continuation.len(),
+            max_tokens as usize,
+            "spec fixture greedy must run to the budget: {continuation:?}"
+        );
+        let baseline = Arc::new(
+            DeepSeekV4Backend::load_with_prefix_config(
+                &baseline_path,
+                Some("dsv4-fixture".to_string()),
+                4,
+                BIG_PREFIX_BUDGET,
+            )
+            .unwrap(),
+        );
+        let (base_ids, base_text, base_completion) =
+            collect_generation(&baseline, generation_request(prompt, max_tokens)).await;
+        assert_eq!(
+            base_ids, continuation,
+            "sequential backend must reproduce the CPU-oracle continuation"
+        );
+
+        let adversarial: Vec<usize> = (0..continuation.len()).collect();
+        for (name, corrupt) in [
+            ("oracle-perfect", Vec::new()),
+            ("oracle-adversarial", adversarial),
+            ("oracle-mixed", vec![1usize]),
+        ] {
+            let path = tempfile_path(name);
+            write_deepseek4_spec_gguf(&path);
+            let observed = Arc::new(Mutex::new(Vec::new()));
+            let backend = oracle_backend(
+                &path,
+                prompt.len(),
+                &continuation,
+                &corrupt,
+                observed.clone(),
+            );
+            let (ids, text, completion) =
+                collect_generation(&backend, generation_request(prompt, max_tokens)).await;
+            assert_eq!(ids, continuation, "{name}: tokens must match sequential");
+            assert_eq!(text, base_text, "{name}: text must match sequential");
+            assert_eq!(completion, base_completion, "{name}");
+
+            let verify_steps = health_counter(&backend, "spec_verify_steps");
+            let proposed = health_counter(&backend, "spec_proposed");
+            let accepted = health_counter(&backend, "spec_accepted");
+            assert!(verify_steps >= 1, "{name}: no verify steps ran");
+            assert!(proposed >= 1, "{name}: drafter never proposed");
+            let observations = observed.lock().unwrap();
+            assert_eq!(
+                observations.len() as u64,
+                verify_steps,
+                "{name}: observe_accepted must fire once per verify"
+            );
+            assert_eq!(
+                observations.iter().map(|(_, a, _)| *a as u64).sum::<u64>(),
+                accepted,
+                "{name}: observed accepted counts must match the health counter"
+            );
+            drop(observations);
+            match name {
+                "oracle-perfect" => {
+                    assert_eq!(accepted, proposed, "perfect drafts must all be accepted");
+                }
+                "oracle-adversarial" => {
+                    assert_eq!(accepted, 0, "adversarial drafts must all be rejected");
+                }
+                _ => {
+                    assert!(
+                        accepted > 0 && accepted < proposed,
+                        "mixed corruption must accept some and reject some \
+                         (accepted {accepted} of {proposed})"
+                    );
+                }
+            }
+
+            // Prefix-cache interaction: an identical rerun restores cached
+            // blocks (snapshots taken only at accepted boundaries, including
+            // interior boundaries crossed mid-verify) and still reproduces
+            // the sequential stream exactly.
+            let (rerun_ids, rerun_text, _) =
+                collect_generation(&backend, generation_request(prompt, max_tokens)).await;
+            assert_eq!(rerun_ids, continuation, "{name}: rerun after restore");
+            assert_eq!(rerun_text, base_text, "{name}");
+            assert!(
+                health_counter(&backend, "reused_tokens") > 0,
+                "{name}: rerun must restore a cached block"
+            );
+        }
+    }
+
+    /// Speculative decode across turns: turn 2 extends turn 1 (the chat
+    /// pattern), restoring boundary snapshots the speculative loop wrote —
+    /// including interior boundaries snapshotted via clone + exact truncate
+    /// mid-verify — and its output still matches a cold sequential backend.
+    /// The oracle's replay no longer lines up on turn 2, so its drafts are
+    /// effectively adversarial there.
+    #[tokio::test]
+    async fn dsv4_backend_oracle_drafter_turn_two_matches_cold_sequential() {
+        let prompt = "abcabcab";
+        let max_tokens = 8u32;
+        let baseline_path = tempfile_path("oracle-turn2-base");
+        write_deepseek4_spec_gguf(&baseline_path);
+        let continuation = reference_continuation(&baseline_path, prompt, max_tokens as usize);
+        let baseline = Arc::new(
+            DeepSeekV4Backend::load_with_prefix_config(
+                &baseline_path,
+                Some("dsv4-fixture".to_string()),
+                4,
+                BIG_PREFIX_BUDGET,
+            )
+            .unwrap(),
+        );
+        let (_, turn1_text, _) =
+            collect_generation(&baseline, generation_request(prompt, max_tokens)).await;
+
+        let path = tempfile_path("oracle-turn2");
+        write_deepseek4_spec_gguf(&path);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let backend = oracle_backend(&path, prompt.len(), &continuation, &[], observed);
+        let (_, spec_turn1_text, _) =
+            collect_generation(&backend, generation_request(prompt, max_tokens)).await;
+        assert_eq!(spec_turn1_text, turn1_text);
+
+        // Turn 2: previous prompt + reply + new user text.
+        let turn2 = format!("{prompt}{turn1_text}ba");
+        let reused_before = health_counter(&backend, "reused_tokens");
+        let (spec_ids, spec_text, _) =
+            collect_generation(&backend, generation_request(&turn2, max_tokens)).await;
+        assert!(
+            health_counter(&backend, "reused_tokens") > reused_before,
+            "turn 2 must restore turn 1's cached blocks"
+        );
+        let (cold_ids, cold_text, _) =
+            collect_generation(&baseline, generation_request(&turn2, max_tokens)).await;
+        assert_eq!(spec_ids, cold_ids, "turn 2 must match cold sequential");
+        assert_eq!(spec_text, cold_text);
+    }
+
+    /// Early stop INSIDE the accepted-draft emission: a stop sequence (and,
+    /// on the standard fixture, eos below) triggers mid-verify exactly where
+    /// sequential decode stops — the emitted stream is cut at the same token.
+    #[tokio::test]
+    async fn dsv4_backend_oracle_drafter_stops_mid_accepted_drafts() {
+        // Stop sequence on the spec fixture (visible text, token-exact).
+        let prompt = "abcabcab";
+        let max_tokens = 8u32;
+        let path = tempfile_path("oracle-stop-base");
+        write_deepseek4_spec_gguf(&path);
+        let continuation = reference_continuation(&path, prompt, max_tokens as usize);
+        let baseline = Arc::new(
+            DeepSeekV4Backend::load_with_prefix_config(
+                &path,
+                Some("dsv4-fixture".to_string()),
+                4,
+                BIG_PREFIX_BUDGET,
+            )
+            .unwrap(),
+        );
+        let stop_request = |prompt: &str| GenerationRequest {
+            stop_sequences: vec!["aca".to_string()],
+            ..generation_request(prompt, max_tokens)
+        };
+        let (base_ids, base_text, base_completion) =
+            collect_generation(&baseline, stop_request(prompt)).await;
+        assert!(
+            (base_completion as u32) < max_tokens,
+            "stop sequence must cut the baseline short: {base_ids:?}"
+        );
+
+        let oracle_path = tempfile_path("oracle-stop");
+        write_deepseek4_spec_gguf(&oracle_path);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let backend = oracle_backend(&oracle_path, prompt.len(), &continuation, &[], observed);
+        let (ids, text, completion) = collect_generation(&backend, stop_request(prompt)).await;
+        assert_eq!(ids, base_ids, "stop-sequence cut must be token-identical");
+        assert_eq!(text, base_text);
+        assert_eq!(completion, base_completion);
+
+        // eos inside an accepted draft, on the standard fixture (greedy
+        // reaches eos "c" within two tokens; ids are delta-invisible there,
+        // so the gate is text/completion equality + the observed log).
+        let eos_prompt = "abcab";
+        let eos_base_path = tempfile_path("oracle-eos-base");
+        write_deepseek4_gguf(&eos_base_path);
+        let eos_continuation = reference_continuation(&eos_base_path, eos_prompt, 6);
+        assert!(
+            eos_continuation.len() < 6,
+            "standard fixture must stop at eos before the budget"
+        );
+        let eos_baseline = Arc::new(
+            DeepSeekV4Backend::load_with_prefix_config(
+                &eos_base_path,
+                Some("dsv4-fixture".to_string()),
+                4,
+                BIG_PREFIX_BUDGET,
+            )
+            .unwrap(),
+        );
+        let (_, eos_base_text, eos_base_completion) =
+            collect_generation(&eos_baseline, generation_request(eos_prompt, 6)).await;
+
+        let eos_path = tempfile_path("oracle-eos");
+        write_deepseek4_gguf(&eos_path);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let drafter = OracleDrafter::new(
+            eos_prompt.len(),
+            &eos_continuation,
+            &[],
+            3,
+            observed.clone(),
+        );
+        let backend = oracle_backend_with(&eos_path, drafter);
+        let (_, text, completion) =
+            collect_generation(&backend, generation_request(eos_prompt, 6)).await;
+        assert_eq!(text, eos_base_text);
+        assert_eq!(completion, eos_base_completion);
+        let observations = observed.lock().unwrap();
+        assert_eq!(observations.len(), 1, "one verify covers the eos");
+        let (proposed, accepted, _) = observations[0];
+        assert_eq!(
+            (proposed, accepted),
+            (eos_continuation.len() - 1, eos_continuation.len() - 1),
+            "the accepted drafts must include the eos token"
+        );
+    }
+
+    /// The spec-decoding redeployment gate: a tap-requesting drafter no
+    /// longer disables prefix-cache restores. Request 2 with the same prefix
+    /// RESTORES (reused_tokens > 0) with taps attached at the restore point
+    /// (base == restored length; complete coverage above it, nothing below
+    /// it), the drafter keeps proposing, and every output stays byte-identical
+    /// to the sequential spec-off run — the 2-second fresh-session restore
+    /// survives with speculation on.
+    #[tokio::test]
+    async fn dsv4_backend_taps_coexist_with_prefix_restore() {
+        let prompt = "abcabcab";
+        let max_tokens = 8u32;
+        let baseline_path = tempfile_path("taps-restore-base");
+        write_deepseek4_spec_gguf(&baseline_path);
+        let continuation = reference_continuation(&baseline_path, prompt, max_tokens as usize);
+        let baseline = Arc::new(
+            DeepSeekV4Backend::load_with_prefix_config(
+                &baseline_path,
+                Some("dsv4-fixture".to_string()),
+                4,
+                BIG_PREFIX_BUDGET,
+            )
+            .unwrap(),
+        );
+        let (base_ids, base_text, _) =
+            collect_generation(&baseline, generation_request(prompt, max_tokens)).await;
+        assert_eq!(base_ids, continuation);
+
+        let path = tempfile_path("taps-restore");
+        write_deepseek4_spec_gguf(&path);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let mut drafter = OracleDrafter::new(prompt.len(), &continuation, &[], 4, observed);
+        drafter.tap_config = DsV4TapConfig {
+            pre_hc_head: true,
+            aux_layers: vec![0, 2],
+        };
+        let tap_log = drafter.tap_log.clone();
+        let violations = drafter.tap_violations.clone();
+        let backend = oracle_backend_with(&path, drafter);
+
+        // Request 1 (cold): taps attach at 0, spec active, output identical.
+        let (ids1, text1, _) =
+            collect_generation(&backend, generation_request(prompt, max_tokens)).await;
+        assert_eq!(ids1, continuation);
+        assert_eq!(text1, base_text);
+        assert_eq!(health_counter(&backend, "reused_tokens"), 0);
+        let proposed_cold = health_counter(&backend, "spec_proposed");
+        assert!(proposed_cold > 0, "the drafter never proposed cold");
+        assert!(
+            tap_log.lock().unwrap().iter().all(|&(base, ..)| base == 0),
+            "cold request taps must attach at 0"
+        );
+
+        // Request 2 (same prefix): restores AND speculates, identically.
+        tap_log.lock().unwrap().clear();
+        let (ids2, text2, _) =
+            collect_generation(&backend, generation_request(prompt, max_tokens)).await;
+        assert_eq!(ids2, continuation, "restored spec run must stay identical");
+        assert_eq!(text2, base_text);
+        let reused = health_counter(&backend, "reused_tokens");
+        assert!(reused > 0, "request 2 must restore a cached block");
+        assert!(
+            health_counter(&backend, "spec_proposed") > proposed_cold,
+            "the drafter must keep proposing after a restore"
+        );
+        {
+            let log = tap_log.lock().unwrap();
+            assert!(!log.is_empty(), "no tapped proposals after the restore");
+            assert!(
+                log.iter().all(|&(base, ..)| base as u64 == reused),
+                "taps must attach at the restore point: {log:?}"
+            );
+        }
+
+        // Turn 2 extends turn 1 (the chat pattern): restores deeper via the
+        // decode-time snapshots and still matches a cold sequential run.
+        let turn2 = format!("{prompt}{base_text}ba");
+        let reused_before = health_counter(&backend, "reused_tokens");
+        let (spec_ids, spec_text, _) =
+            collect_generation(&backend, generation_request(&turn2, max_tokens)).await;
+        assert!(
+            health_counter(&backend, "reused_tokens") > reused_before,
+            "turn 2 must restore turn 1's blocks"
+        );
+        let (cold_ids, cold_text, _) =
+            collect_generation(&baseline, generation_request(&turn2, max_tokens)).await;
+        assert_eq!(spec_ids, cold_ids, "turn 2 must match cold sequential");
+        assert_eq!(spec_text, cold_text);
+
+        let violations = violations.lock().unwrap();
+        assert!(
+            violations.is_empty(),
+            "tap coverage violated: {violations:?}"
+        );
+    }
+
+    /// Stage A is greedy-only: a sampled request on a drafter-configured
+    /// backend falls back to the sequential loop (no verify steps) and still
+    /// serves normally.
+    #[tokio::test]
+    async fn dsv4_backend_drafter_skipped_for_sampled_requests() {
+        let path = tempfile_path("oracle-sampled");
+        write_deepseek4_spec_gguf(&path);
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let backend = oracle_backend(&path, 5, &[0, 1, 2], &[], observed);
+        let request = GenerationRequest {
+            temperature: 0.8,
+            seed: Some(11),
+            ..generation_request("abcab", 4)
+        };
+        let output = backend.generate(request).await.unwrap();
+        assert!(output.completion_tokens >= 1);
+        assert_eq!(health_counter(&backend, "spec_verify_steps"), 0);
+        assert_eq!(health_counter(&backend, "spec_proposed"), 0);
     }
 
     /// The Stage-2 smoke test: the axum server (hi-local-core) over the V4
