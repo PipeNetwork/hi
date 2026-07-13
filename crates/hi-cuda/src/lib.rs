@@ -42,6 +42,7 @@ pub mod kernels;
 mod prefix_cache;
 pub mod qwen_cpu;
 pub mod runtime;
+pub mod safetensors;
 
 /// Env-gated activation dumps for bisecting GPU-vs-CPU numerical divergence
 /// (used to debug the DeepSeek-V2-Lite MLA forward). Set

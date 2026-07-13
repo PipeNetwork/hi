@@ -931,6 +931,7 @@ dependencies = [
  "hi-gguf",
  "hi-local-core",
  "image",
+ "memmap2",
  "rand 0.8.6",
  "rayon",
  "reqwest",
