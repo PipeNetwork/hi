@@ -683,13 +683,16 @@ mod tests {
 
         let pwd_one = crate::execute_in(&one, "bash", r#"{"command":"pwd"}"#).await;
         let pwd_two = crate::execute_in(&two, "bash", r#"{"command":"pwd"}"#).await;
+        // `pwd` reports the physical working directory, so compare against the
+        // canonical form — on macOS the temp dir is reached via the `/var` →
+        // `/private/var` symlink alias.
         assert_eq!(
             pwd_one.process.unwrap().stdout_summary,
-            one.to_string_lossy()
+            one.canonicalize().unwrap().to_string_lossy()
         );
         assert_eq!(
             pwd_two.process.unwrap().stdout_summary,
-            two.to_string_lossy()
+            two.canonicalize().unwrap().to_string_lossy()
         );
 
         let write =

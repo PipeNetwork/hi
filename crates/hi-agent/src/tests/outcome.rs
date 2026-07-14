@@ -157,6 +157,62 @@ async fn plain_answer_returns_completed_not_applicable_outcome() {
 }
 
 #[tokio::test]
+async fn ambiguous_question_answered_in_text_completes() {
+    let workspace = IsolatedWorkspace::new("outcome-question-answer");
+    let mut agent = agent(
+        vec![completion(
+            vec![Content::Text(
+                "It turns on automatically when the model does not fit in VRAM.".into(),
+            )],
+            1,
+            1,
+        )],
+        workspace.config(),
+    );
+
+    // "how …" is not a recognized read-only opener, so the contract intent
+    // defaults to mutation-capable. Answering it with text and no file
+    // changes must still complete rather than report "incomplete · stalled".
+    let outcome = agent
+        .run_turn(
+            "how do users use it? does that build hi-mlx or turn on automatically?",
+            &mut NullUi,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, TurnStatus::Completed);
+    assert_eq!(
+        outcome.stop_reason,
+        TurnStopReason::NoApplicableVerification
+    );
+    assert_eq!(outcome.verification, VerificationStatus::NotApplicable);
+}
+
+#[tokio::test]
+async fn explicit_mutation_request_without_changes_is_stalled() {
+    let workspace = IsolatedWorkspace::new("outcome-explicit-no-changes");
+    let mut agent = agent(
+        vec![completion(
+            vec![Content::Text(
+                "The bug is in parser.rs line 42; an edit there would resolve it.".into(),
+            )],
+            1,
+            1,
+        )],
+        workspace.config(),
+    );
+
+    let outcome = agent
+        .run_turn("fix the parser bug", &mut NullUi)
+        .await
+        .unwrap();
+
+    assert_eq!(outcome.status, TurnStatus::Incomplete);
+    assert_eq!(outcome.stop_reason, TurnStopReason::Stalled);
+}
+
+#[tokio::test]
 async fn unverified_mutation_is_incomplete_without_escape_hatch() {
     let workspace = IsolatedWorkspace::new("outcome-unverified-mutation");
     let path = "created.rs";

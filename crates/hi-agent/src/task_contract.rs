@@ -24,6 +24,14 @@ pub enum RiskLevel {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskContract {
     pub intent: TaskIntent,
+    /// True only when the prompt contains an explicit, imperative mutation
+    /// request ("fix the login bug"), not for the mutation-capable default
+    /// that ambiguous wording ("how do users use it?") or tool/artifact nouns
+    /// ("does cargo build build hi-mlx?") fall into. Completion gates that
+    /// demand file changes key on this; capability scoping (which tools are
+    /// advertised) keys on `intent`, which stays deliberately broad.
+    #[serde(default)]
+    pub explicit_mutation: bool,
     pub referenced_paths: Vec<String>,
     pub acceptance_text: Vec<String>,
     pub verification: VerificationMode,
@@ -32,8 +40,11 @@ pub struct TaskContract {
 
 impl TaskContract {
     pub fn derive(prompt: &str, verification: VerificationMode) -> Self {
+        let intent = classify_intent(prompt);
         Self {
-            intent: classify_intent(prompt),
+            intent,
+            explicit_mutation: intent == TaskIntent::Mutation
+                && explicit_mutation_request(&prompt.to_ascii_lowercase()),
             referenced_paths: referenced_paths(prompt),
             acceptance_text: acceptance_text(prompt),
             verification,
@@ -125,47 +136,159 @@ fn contains_mutation_request(lower: &str) -> bool {
     lower
         .split(|character: char| !character.is_ascii_alphanumeric())
         .filter(|word| !word.is_empty())
-        .any(|word| {
-            matches!(
-                word,
-                "add"
-                    | "adding"
-                    | "build"
-                    | "building"
-                    | "change"
-                    | "changing"
-                    | "create"
-                    | "creating"
-                    | "delete"
-                    | "deleting"
-                    | "edit"
-                    | "editing"
-                    | "finish"
-                    | "finishing"
-                    | "fix"
-                    | "fixing"
-                    | "implement"
-                    | "implementing"
-                    | "migrate"
-                    | "migrating"
-                    | "modify"
-                    | "modifying"
-                    | "patch"
-                    | "patching"
-                    | "refactor"
-                    | "refactoring"
-                    | "remove"
-                    | "removing"
-                    | "rename"
-                    | "renaming"
-                    | "replace"
-                    | "replacing"
-                    | "update"
-                    | "updating"
-                    | "write"
-                    | "writing"
+        .any(is_mutation_verb)
+}
+
+fn is_mutation_verb(word: &str) -> bool {
+    matches!(
+        word,
+        "add"
+            | "adding"
+            | "build"
+            | "building"
+            | "change"
+            | "changing"
+            | "create"
+            | "creating"
+            | "delete"
+            | "deleting"
+            | "edit"
+            | "editing"
+            | "finish"
+            | "finishing"
+            | "fix"
+            | "fixing"
+            | "implement"
+            | "implementing"
+            | "migrate"
+            | "migrating"
+            | "modify"
+            | "modifying"
+            | "patch"
+            | "patching"
+            | "refactor"
+            | "refactoring"
+            | "remove"
+            | "removing"
+            | "rename"
+            | "renaming"
+            | "replace"
+            | "replacing"
+            | "update"
+            | "updating"
+            | "write"
+            | "writing"
+    )
+}
+
+/// Whether the request uses a mutation verb as an actual instruction to change
+/// the workspace, as opposed to a tool/artifact noun ("cargo build", "the
+/// build") or a question about behavior ("does that build hi-mlx?"). This is
+/// deliberately stricter than [`contains_mutation_request`]: it decides
+/// whether a turn that ends with no file changes counts as stalled, not which
+/// tools are advertised, so a false negative merely relaxes a completion gate
+/// while a false positive brands a correct text-only answer "incomplete ·
+/// stalled".
+fn explicit_mutation_request(lower: &str) -> bool {
+    let mut clause = String::new();
+    let mut clauses: Vec<(String, bool)> = Vec::new();
+    for character in lower.chars() {
+        if matches!(character, '.' | '?' | '!' | ';' | '\n') {
+            clauses.push((std::mem::take(&mut clause), character == '?'));
+        } else {
+            clause.push(character);
+        }
+    }
+    if !clause.trim().is_empty() {
+        clauses.push((clause, false));
+    }
+    clauses
+        .iter()
+        .any(|(clause, question)| clause_requests_mutation(clause, *question))
+}
+
+fn clause_requests_mutation(clause: &str, question: bool) -> bool {
+    let words: Vec<&str> = clause
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .collect();
+    words.iter().enumerate().any(|(index, word)| {
+        if !is_mutation_verb(word) {
+            return false;
+        }
+        let previous = index.checked_sub(1).map(|position| words[position]);
+        if question {
+            // Inside a question, a mutation verb only counts as a request when
+            // it is directed at the agent ("can you fix …?"), never when it
+            // asks about behavior ("does that build hi-mlx?").
+            return matches!(previous, Some("you" | "please"));
+        }
+        // Outside questions, skip tool/artifact-noun usages ("cargo build",
+        // "apply the patch") and auxiliary/interrogative frames ("does it
+        // build", "will this delete data") that split across a filename dot.
+        !matches!(
+            previous,
+            Some(
+                "cargo"
+                    | "npm"
+                    | "pnpm"
+                    | "yarn"
+                    | "gradle"
+                    | "mvn"
+                    | "bazel"
+                    | "docker"
+                    | "make"
+                    | "cmake"
+                    | "go"
+                    | "rustc"
+                    | "the"
+                    | "a"
+                    | "an"
+                    | "this"
+                    | "that"
+                    | "these"
+                    | "those"
+                    | "it"
+                    | "its"
+                    | "my"
+                    | "your"
+                    | "our"
+                    | "their"
+                    | "release"
+                    | "debug"
+                    | "dev"
+                    | "ci"
+                    | "run"
+                    | "still"
+                    | "also"
+                    | "not"
+                    | "dont"
+                    | "doesnt"
+                    | "didnt"
+                    | "wont"
+                    | "cant"
+                    | "couldnt"
+                    | "wouldnt"
+                    | "shouldnt"
+                    | "never"
+                    | "does"
+                    | "do"
+                    | "did"
+                    | "is"
+                    | "are"
+                    | "was"
+                    | "were"
+                    | "can"
+                    | "could"
+                    | "will"
+                    | "would"
+                    | "should"
+                    | "might"
+                    | "may"
+                    | "must"
             )
-        })
+        )
+    })
 }
 
 fn referenced_paths(prompt: &str) -> Vec<String> {
@@ -360,6 +483,50 @@ mod tests {
             VerificationMode::Auto,
         );
         assert_eq!(contract.referenced_paths, vec!["plan.md"]);
+    }
+
+    #[test]
+    fn questions_stay_mutation_capable_but_do_not_expect_mutation() {
+        for prompt in [
+            "how do users use it? does it automatically turn on if theres not enough ram?",
+            "if we do cargo build --release on a mac. does that build hi-mlx?",
+            "does it build?",
+            "review now. does mlx still build?",
+            "will this delete my sessions?",
+        ] {
+            let contract = TaskContract::derive(prompt, VerificationMode::Auto);
+            assert_eq!(
+                contract.intent,
+                TaskIntent::Mutation,
+                "capability stays broad for {prompt:?}"
+            );
+            assert!(
+                !contract.explicit_mutation,
+                "a question must not expect file changes: {prompt:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_requests_expect_mutation() {
+        for prompt in [
+            "fix the login bug",
+            "please update the parser to handle unicode",
+            "can you fix the flaky test?",
+            "implement the parser",
+            "review plan.md and lets keep building this",
+        ] {
+            let contract = TaskContract::derive(prompt, VerificationMode::Auto);
+            assert_eq!(contract.intent, TaskIntent::Mutation, "{prompt:?}");
+            assert!(contract.explicit_mutation, "{prompt:?}");
+        }
+    }
+
+    #[test]
+    fn read_only_prefix_never_expects_mutation() {
+        let contract = TaskContract::derive("read-only fix report", VerificationMode::Auto);
+        assert_eq!(contract.intent, TaskIntent::ReadOnly);
+        assert!(!contract.explicit_mutation);
     }
 
     #[test]

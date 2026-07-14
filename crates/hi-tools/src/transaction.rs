@@ -688,6 +688,11 @@ fn canonical_root(root: &Path) -> Result<PathBuf> {
 }
 
 pub(crate) fn resolve_workspace_target(root: &Path, requested: &Path) -> Result<PathBuf> {
+    // Callers pass the workspace root in whatever form they hold (the agent
+    // runtime pre-canonicalizes; direct tool entry points like `execute_in`
+    // may not). Canonicalize here so the containment check and the returned
+    // target never depend on caller hygiene.
+    let root = &canonical_root(root)?;
     let joined = if requested.is_absolute() {
         requested.to_path_buf()
     } else {
@@ -701,7 +706,13 @@ pub(crate) fn resolve_workspace_target(root: &Path, requested: &Path) -> Result<
         requested.display(),
         root.display()
     );
-    Ok(lexical)
+    // Return the path that was actually validated. The lexical form can name
+    // the workspace through a symlink alias (macOS `/var` → `/private/var`,
+    // so any `$TMPDIR` path) — every later containment check compares against
+    // the canonical root and would reject it ("parent escaped workspace"),
+    // failing all mutations in such workspaces. It would also let the write
+    // land on a different file than the one the escape check resolved.
+    Ok(resolved)
 }
 
 fn lexical_normalize(path: &Path) -> PathBuf {

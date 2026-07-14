@@ -906,6 +906,7 @@ impl crate::Agent {
         // it can never satisfy and previously turned valid reads into denials.
         if structurally_read_only_subagent {
             task_contract.intent = TaskIntent::ReadOnly;
+            task_contract.explicit_mutation = false;
         }
         self.refresh_tools_for_task(&context_task, task_contract.intent);
         let repository_context_enabled =
@@ -948,9 +949,16 @@ impl crate::Agent {
         } else {
             None
         };
-        // Ordinary implementation wording is mutating even when it did not
-        // arrive through the legacy `/build`/benchmark wrapper.
-        let expected_mutation = task_contract.intent == TaskIntent::Mutation;
+        // A turn is *expected* to mutate — and ends "incomplete · stalled"
+        // when it changes no files — only for an explicit mutation request
+        // ("fix the login bug"), a structured implementation task, or a goal
+        // drive turn. The mutation-capable intent that ambiguous wording
+        // ("how do users use it?") and tool nouns ("does cargo build build
+        // hi-mlx?") default into still advertises mutating tools, but must
+        // not brand a correct text-only answer as a stall.
+        let expected_mutation = task_contract.explicit_mutation
+            || implementation_intent.is_some()
+            || (goal_drive_turn && task_contract.intent == TaskIntent::Mutation);
         // Keep the legacy read-only classifier responsible for review prompt
         // shaping. A plain repository question can still have a read-only task
         // contract, and an `explore` child is structurally read-only even when its
