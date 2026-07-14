@@ -16,10 +16,16 @@ impl ToolLoopGuardrail {
     pub(crate) fn record_tool_result(
         &mut self,
         name: &str,
-        _arguments: &str,
+        arguments: &str,
         output: &str,
     ) -> ToolResultProgress {
-        if !is_hashable_idempotent_tool(name) || output.starts_with("Error:") {
+        // Wait-polls ("sleep 300 && du -sh …") are exempt from the
+        // signature-based repeat guards, so their loop bound lives here: the
+        // same poll returning byte-identical output means the awaited state
+        // stopped changing.
+        let hashable = is_hashable_idempotent_tool(name)
+            || (name == "bash" && super::implementation::bash_call_waits(arguments));
+        if !hashable || output.starts_with("Error:") {
             return ToolResultProgress::default();
         }
         let key = format!("{name}:{}", stable_result_hash(output));
@@ -59,6 +65,32 @@ mod tests {
         assert!(!first.repeated_idempotent_result);
         assert!(second.hashable_idempotent);
         assert!(second.repeated_idempotent_result);
+    }
+
+    #[test]
+    fn wait_poll_bash_is_hash_guarded_but_plain_bash_is_not() {
+        let mut guard = ToolLoopGuardrail::default();
+        let wait_args = r#"{"command":"sleep 300 && du -sh models/"}"#;
+
+        let first = guard.record_tool_result("bash", wait_args, "90G\t18 shards");
+        assert!(first.hashable_idempotent);
+        assert!(!first.repeated_idempotent_result);
+
+        let progressed = guard.record_tool_result("bash", wait_args, "124G\t27 shards");
+        assert!(progressed.hashable_idempotent);
+        assert!(
+            !progressed.repeated_idempotent_result,
+            "changing output is progress"
+        );
+
+        let static_poll = guard.record_tool_result("bash", wait_args, "124G\t27 shards");
+        assert!(
+            static_poll.repeated_idempotent_result,
+            "identical output means the awaited state stopped changing"
+        );
+
+        let plain = guard.record_tool_result("bash", r#"{"command":"cargo test"}"#, "ok");
+        assert!(!plain.hashable_idempotent, "plain bash is not hash guarded");
     }
 
     #[test]

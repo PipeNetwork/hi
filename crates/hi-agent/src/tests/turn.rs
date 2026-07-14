@@ -418,6 +418,121 @@ async fn nudges_when_model_repeats_the_same_command() {
 }
 
 #[tokio::test]
+async fn wait_poll_with_changing_output_is_not_repeat_nudged() {
+    // The model watches a slow external process by re-running the exact same
+    // "sleep && check" command. Each poll returns different output (the
+    // process is progressing), so the repeat guard must let every poll
+    // execute instead of branding the turn "incomplete · stalled" mid-wait.
+    let workspace = IsolatedWorkspace::new("turn-wait-poll-progress");
+    let marker = std::env::temp_dir().join(format!("hi-wait-poll-{}.log", std::process::id()));
+    let _ = std::fs::remove_file(&marker);
+    let poll = || {
+        completion(
+            vec![Content::ToolCall {
+                id: "w".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({
+                    "command": format!(
+                        "sleep 0; echo tick >> {m}; wc -l < {m}",
+                        m = marker.display()
+                    )
+                })
+                .to_string(),
+            }],
+            1,
+            1,
+        )
+    };
+    let responses = vec![
+        poll(),
+        poll(), // exact repeat, but output differs → must execute
+        poll(), // again → must execute
+        completion(
+            vec![Content::Text("Download finished; proceeding.".into())],
+            1,
+            1,
+        ),
+    ];
+    let mut agent = agent(responses, workspace.config());
+    let mut ui = RecUi::default();
+    agent
+        .run_turn("wait for the download to finish", &mut ui)
+        .await
+        .unwrap();
+    let _ = std::fs::remove_file(&marker);
+    let executed = agent
+        .last_turn_telemetry()
+        .tool_timeline
+        .iter()
+        .filter(|entry| entry.tool == "bash")
+        .count();
+    assert_eq!(
+        executed, 3,
+        "every changing poll executes: {:?}",
+        ui.statuses
+    );
+    assert!(
+        !ui.statuses
+            .iter()
+            .any(|s| s.contains("re-ran the same command") || s.contains("wait-and-check poll")),
+        "no repeat nudges while the poll output changes: {:?}",
+        ui.statuses
+    );
+    assert!(!agent.last_turn_telemetry().stalled_repeating);
+    assert!(!agent.last_turn_telemetry().stalled_unfinished);
+}
+
+#[tokio::test]
+async fn wait_poll_with_static_output_gets_diagnose_nudge() {
+    // The same wait-poll returning byte-identical output means the awaited
+    // state stopped changing: the result-hash guard (not the signature guard)
+    // nudges the model to diagnose rather than blind-poll, and the turn still
+    // ends cleanly once the model reports.
+    let workspace = IsolatedWorkspace::new("turn-wait-poll-static");
+    let poll = || {
+        completion(
+            vec![Content::ToolCall {
+                id: "w".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({"command": "sleep 0; echo waiting"}).to_string(),
+            }],
+            1,
+            1,
+        )
+    };
+    let responses = vec![
+        poll(),
+        poll(), // identical output → static-state nudge
+        completion(
+            vec![Content::Text(
+                "The download is stuck at 45 of 76 shards; reported current state.".into(),
+            )],
+            1,
+            1,
+        ),
+    ];
+    let mut agent = agent(responses, workspace.config());
+    let mut ui = RecUi::default();
+    agent
+        .run_turn("wait for the download to finish", &mut ui)
+        .await
+        .unwrap();
+    assert_eq!(
+        ui.statuses
+            .iter()
+            .filter(|s| s.contains("wait-and-check poll returned the same output"))
+            .count(),
+        1,
+        "static poll output is nudged once: {:?}",
+        ui.statuses
+    );
+    assert!(
+        !agent.last_turn_telemetry().stalled_repeating,
+        "model moved on after the nudge, so the turn is not stalled"
+    );
+}
+
+#[tokio::test]
 async fn gives_up_with_notice_after_repeat_cap() {
     // The model re-issues the exact same command every round, through the
     // whole repeat-nudge budget: bounded nudges, then one chat-only final

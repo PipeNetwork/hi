@@ -36,22 +36,22 @@ use crate::steering::{
     MutationRecovery, POST_TOOL_EMPTY_RESPONSE_NUDGE, READ_AFTER_SEARCH_NUDGE,
     READ_ONLY_SAFE_CONTEXT_WINDOW, REPEAT_NUDGE, REREAD_NUDGE, ReviewIntent, ReviewRepairMode,
     SECURITY_BROAD_SEARCH_NUDGE, SECURITY_SCOPE_NUDGE, TOOL_PROTOCOL_RETRY_NUDGE,
-    TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE, ToolLoopGuardrail, active_read_only_inspection_cap,
-    answer_says_insufficient_evidence, bash_command, bash_no_progress_signature,
-    classify_bash_command, classify_implementation_intent, classify_read_only_intent,
-    concrete_review_answer_problem, deepen_review_nudge, evidence_kind_for_tool,
-    implementation_mentions_tui, implementation_missing_validation_nudge,
-    implementation_text_tool_nudge, implementation_tool_call_mutates,
-    implementation_tool_call_validates, implementation_tool_result_landed_mutation,
-    implementation_tool_result_landed_substantive_edit, implementation_turn_prompt,
-    inspected_paths_for_prompt, inspection_signature, inspection_sprawl_exhausted,
-    inspection_sprawl_nudge, no_evidence_review_nudge, read_only_blocked_tool_result,
-    read_only_blocks_tool, read_only_turn_prompt, repair_nudge_with_required_next,
-    should_deepen_review, should_nudge_gap_search_overclaim, should_nudge_inspection_sprawl,
-    should_nudge_no_evidence_review, should_nudge_read_after_repeated_search,
-    should_nudge_read_after_search_final, should_nudge_security_broad_search,
-    should_nudge_security_scope, should_reject_review_repair_template,
-    summarize_inspected_evidence_nudge,
+    TOOL_PROTOCOL_TEXT_FALLBACK_NUDGE, ToolLoopGuardrail, WAIT_POLL_STATIC_NUDGE,
+    active_read_only_inspection_cap, answer_says_insufficient_evidence, bash_call_waits,
+    bash_command, bash_no_progress_signature, classify_bash_command,
+    classify_implementation_intent, classify_read_only_intent, concrete_review_answer_problem,
+    deepen_review_nudge, evidence_kind_for_tool, implementation_mentions_tui,
+    implementation_missing_validation_nudge, implementation_text_tool_nudge,
+    implementation_tool_call_mutates, implementation_tool_call_validates,
+    implementation_tool_result_landed_mutation, implementation_tool_result_landed_substantive_edit,
+    implementation_turn_prompt, inspected_paths_for_prompt, inspection_signature,
+    inspection_sprawl_exhausted, inspection_sprawl_nudge, no_evidence_review_nudge,
+    read_only_blocked_tool_result, read_only_blocks_tool, read_only_turn_prompt,
+    repair_nudge_with_required_next, should_deepen_review, should_nudge_gap_search_overclaim,
+    should_nudge_inspection_sprawl, should_nudge_no_evidence_review,
+    should_nudge_read_after_repeated_search, should_nudge_read_after_search_final,
+    should_nudge_security_broad_search, should_nudge_security_scope,
+    should_reject_review_repair_template, summarize_inspected_evidence_nudge,
 };
 use crate::transcript::{NudgeKind, repair_invalid_tool_call_arguments_in_messages};
 use crate::verify::{
@@ -1936,8 +1936,22 @@ impl crate::Agent {
                 let has_no_progress_bash = calls.iter().any(|(_, name, args)| {
                     name == "bash" && bash_no_progress_signature(args).is_some()
                 });
+                // A bash command that deliberately waits before sampling state
+                // ("sleep 300 && du -sh models/") is time-dependent the same
+                // way a `bash_output` poll is: re-running it verbatim is how
+                // the model watches a slow external process (a download, a
+                // long build, a warming server), and each run can return new
+                // output. Exempt such rounds from the signature-based repeat
+                // guards; the result-hash guard below still catches the
+                // static case (the same poll returning byte-identical output),
+                // so a wait loop stays bounded without punishing legitimate
+                // progress-watching.
+                let has_wait_poll_bash = calls
+                    .iter()
+                    .any(|(_, name, args)| name == "bash" && bash_call_waits(args));
                 let exact_repeat = !calls.is_empty()
                     && !has_background_output_poll
+                    && !has_wait_poll_bash
                     && prev_call_sig.as_ref() == Some(&call_sig);
                 // No-new-evidence cycle guard: a round whose every call is a
                 // read-only inspection (read/list/grep/glob) or stale background
@@ -1965,8 +1979,12 @@ impl crate::Agent {
                 // long implementation harness in the middle of a later plan step.
                 let no_new_evidence = !calls.is_empty() && !evidence.round_adds_evidence(&calls);
                 let stale_background_handle_call = no_new_evidence && has_background_handle_call;
+                // A wait-poll round re-runs a seen inspection signature by
+                // design, so it must not trip the no-new-evidence cycle guard
+                // either — its staleness is judged by output, below.
                 let is_repeat = exact_repeat
                     || (no_new_evidence
+                        && !has_wait_poll_bash
                         && (prev_added_no_evidence || stale_background_handle_call));
                 let no_new_after_mutation = is_repeat
                     && no_new_evidence
@@ -2177,10 +2195,13 @@ If the task is already complete, stop and give your final recap."
                     break false;
                 }
                 // A different set of calls (or none) this round — the model moved
-                // on, so clear any pending repeat-stall state.
+                // on, so clear any pending repeat-stall state. A wait-poll
+                // round is not counted as the first wasted round of a cycle:
+                // waiting on external state is progress-neutral, not evidence
+                // of a loop.
                 stalled_repeating = false;
                 prev_call_sig = Some(call_sig);
-                prev_added_no_evidence = no_new_evidence;
+                prev_added_no_evidence = no_new_evidence && !has_wait_poll_bash;
 
                 // Inspection-sprawl guard: a read-only review turn that keeps
                 // reading *distinct* files (each a new inspection signature, so
@@ -2816,9 +2837,10 @@ If the task is already complete, stop and give your final recap."
                 // The model acted, so drop the forced-tool-choice we may have set
                 // after a nudge — the next round is free to narrate or finish.
                 force_tools_next = false;
-                let hash_guard_applies = calls
-                    .iter()
-                    .all(|(_, name, _)| matches!(name.as_str(), "read" | "list" | "grep" | "glob"));
+                let hash_guard_applies = calls.iter().all(|(_, name, args)| {
+                    matches!(name.as_str(), "read" | "list" | "grep" | "glob")
+                        || (name == "bash" && bash_call_waits(args))
+                });
                 let mut hashable_idempotent_results = 0usize;
                 let mut repeated_idempotent_results = 0usize;
                 let mut tool_progress_labels: Vec<ToolProgressLabel> = Vec::new();
@@ -3745,20 +3767,39 @@ If the task is already complete, stop and give your final recap."
                     if repeat_budget_available {
                         repeat_nudges += 1;
                         stalled_repeating = true;
+                        let waiting_round = calls
+                            .iter()
+                            .any(|(_, name, args)| name == "bash" && bash_call_waits(args));
                         let force_final_after_nudge = progress_tracker.record_no_progress_nudge(
-                            "repeated idempotent tool output",
+                            if waiting_round {
+                                "wait poll returned static output"
+                            } else {
+                                "repeated idempotent tool output"
+                            },
                             no_progress_signature_for_calls(&calls),
                         ) && implementation_intent.is_none();
-                        ui.nudge(&format!(
-                            "the model got the same inspection output again — nudging it to act on already-returned evidence ({repeat_nudges}/{})",
-                            self.config.max_repeat_nudges
-                        ));
+                        if waiting_round {
+                            ui.nudge(&format!(
+                                "the wait-and-check poll returned the same output — nudging the model to diagnose the stalled process ({repeat_nudges}/{})",
+                                self.config.max_repeat_nudges
+                            ));
+                        } else {
+                            ui.nudge(&format!(
+                                "the model got the same inspection output again — nudging it to act on already-returned evidence ({repeat_nudges}/{})",
+                                self.config.max_repeat_nudges
+                            ));
+                        }
+                        let base_nudge = if waiting_round {
+                            WAIT_POLL_STATIC_NUDGE
+                        } else {
+                            REREAD_NUDGE
+                        };
                         let nudge = if force_final_after_nudge {
                             force_no_progress_final_answer_next = true;
                             force_tools_next = false;
-                            format!("{REREAD_NUDGE}\n\n{NO_PROGRESS_FINAL_ANSWER_NUDGE}")
+                            format!("{base_nudge}\n\n{NO_PROGRESS_FINAL_ANSWER_NUDGE}")
                         } else {
-                            REREAD_NUDGE.to_string()
+                            base_nudge.to_string()
                         };
                         self.messages.push_nudge(NudgeKind::Repeat, nudge);
                         continue;

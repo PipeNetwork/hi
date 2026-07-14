@@ -76,6 +76,15 @@ pub(crate) const REREAD_NUDGE: &str = "You already read these files earlier this
 are already in the conversation above — reading them again will only repeat the same output. Act on \
 that output now: make the edit it points to, move to the next step, or if the task is already complete, \
 stop and give your final recap. Do not re-read files you have already inspected.";
+/// Sent when a wait-and-check poll ("sleep 300 && du …") returns byte-identical
+/// output to an earlier poll: whatever the model is waiting on has stopped
+/// changing, so blind re-polling is no longer progress. Points the model at
+/// diagnosing the stalled process instead of quitting or looping.
+pub(crate) const WAIT_POLL_STATIC_NUDGE: &str = "Your wait-and-check command returned exactly the same \
+output as before — whatever you are waiting on has not progressed since the last check. Do not simply \
+re-run the same poll. Check the underlying process directly (bash_output on its handle, its log file, or \
+the process list), fix what is stuck if you can, or if the wait is genuinely still in progress use a much \
+longer interval. If you cannot make progress now, stop and report the current state and what remains.";
 pub(crate) const SECURITY_BROAD_SEARCH_NUDGE: &str = "This security review searched and read some evidence, \
 but it has not covered all required pattern families yet. Do not use mutating tools. Search for \
 unsafe/unwrap/expect/panic, command execution/filesystem/env access, and secret/token/auth \

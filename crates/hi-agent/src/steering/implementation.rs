@@ -15,6 +15,23 @@ pub(crate) fn bash_no_progress_signature(arguments: &str) -> Option<&'static str
     shell_command_no_progress_signature(&command)
 }
 
+/// A shell command that deliberately waits before (or while) sampling state —
+/// "sleep 300 && du -sh models/" — the natural way an agent watches a slow
+/// external process (a download, a long build, a warming server). Re-issuing
+/// one verbatim is legitimate as long as its output keeps changing, so the
+/// exact-repeat guard exempts it and the result-hash guard catches the static
+/// case instead.
+pub(crate) fn shell_command_waits(command: &str) -> bool {
+    command
+        .split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .any(|word| matches!(word, "sleep" | "wait"))
+}
+
+/// Whether a `bash` tool call's command [waits](shell_command_waits).
+pub(crate) fn bash_call_waits(arguments: &str) -> bool {
+    bash_command(arguments).is_some_and(|command| shell_command_waits(&command))
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BashCommandKind {
     Inspection,
@@ -405,6 +422,31 @@ pub(crate) fn shell_command_likely_validates(command: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wait_polls_are_detected_by_sleep_or_wait_words() {
+        for command in [
+            "sleep 300 && du -sh models/GLM-5.2-MLX-mixed-3_6bit/",
+            "sleep 5",
+            "wait",
+            "cd /repo && sleep 60; ls checkpoints | wc -l",
+        ] {
+            assert!(shell_command_waits(command), "{command:?}");
+        }
+        for command in [
+            "du -sh models/",
+            "cargo build --release",
+            "echo done",
+            "ls -la",
+        ] {
+            assert!(!shell_command_waits(command), "{command:?}");
+        }
+        assert!(bash_call_waits(
+            r#"{"command":"sleep 300 && du -sh models/"}"#
+        ));
+        assert!(!bash_call_waits(r#"{"command":"du -sh models/"}"#));
+        assert!(!bash_call_waits(r#"{"path":"not-a-bash-call"}"#));
+    }
 
     #[test]
     fn landed_filesystem_edits_are_result_based() {
