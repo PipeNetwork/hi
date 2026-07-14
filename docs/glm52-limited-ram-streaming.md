@@ -350,3 +350,73 @@ benches. Suites at its close: 150 default (load_source's unit tests now
 compile CUDA-free) / 116 hi-gguf / 427 native (one fully green run under a
 ~68 GB training job on GPU 0; contention flaked one unrelated backend test
 in other runs — clean main flaked the same way — and it passes alone).
+
+## GPU-1 validation window + zero-env auto fixes (2026-07-14)
+
+With GPU 1 temporarily freed (production v4 service stopped, then redeployed
+on the current binary), the deferred VRAM-bound validations ran for real:
+
+- **Prefill A/B at production scale** (32 GiB pool, 7710 slots,
+  extent-targeted DONTNEED, 0.0% pre-run residency): mmap 7.81 s (4.10 GiB/s)
+  -> ring 5.33 s (6.00 GiB/s), 1.46x — the ring's edge grows with pool size
+  (1.3x at 6 GiB). The subsequent production restarts prefilled the real
+  72 GiB pool in ~11 s (~6.5 GiB/s) with the auto choosing the ring because
+  the GLM runs had evicted the V4 expert extents from page cache; the
+  warm-trunk resident load stayed on mmap. Both decisions from one boot log.
+- **MTP drafter init end-to-end** (serve with HI_DSV4_SPEC=mtp, drafter file
+  evicted): ~5.7 s mmap vs ~6.4 s ring at 1 s log granularity. The 3.4 GiB
+  read is only ~0.7 s of a phase dominated by CPU dequant/repack, and the
+  whole-section-at-open read serializes IO before that CPU work, giving up
+  the fault/compute overlap mmap gets for free. The auto made both correct
+  per-file calls (warm trunk mmap, cold drafter ring). Documented follow-up:
+  windowed safetensors section reads (the same reader-thread overlap that
+  fixed the prefill path) if drafter cold-start ever matters.
+- **Full native suite on a quiet GPU**: 434 passed / 0 failed in 2.93 s —
+  confirming every earlier flake was GPU-0 contention, not code.
+- **Whole-model GLM cold-load A/B** (`real_cold_load_wall_time_ab`,
+  HI_LOAD_AB_GGUF=GLM): 40.32 s vs 40.31 s — an honest tie. At whole-load
+  level the trunk-read delta is buried under CPU normalize, the f32 kv_b
+  synthesis, ~76 GiB of pool allocation, and the 37 GiB usage-cache prewarm
+  that both runs share. The per-seam benches above remain the IO story.
+
+### Zero-env serve: two real bugs found and fixed
+
+The first true zero-env GLM-5.2 serve (no HI_CUDA_* at all) loaded but died
+on its first request — twice, differently:
+
+1. `allocating CUDA paged batch value pool`: the flat 6 GiB reserve ignored
+   KV geometry. GLM at 1M context costs 81,788,928 bytes per 16-token KV
+   page (~5.1 MiB/token); load-time KV plus the first request's batched
+   value pool wanted more than the 1.75 GiB the 79.2 GiB auto pool had left.
+   The auto also under-counted the trunk itself: `synthesize_mla_split_kv_b`
+   materializes fused F32 kv_b matrices beyond the tensor table (+4.27/-0.52
+   GiB on GLM's 78 MLA layers), so "5.9 GiB left" was really 1.75.
+2. `allocating CUDA f16 weight scratch` (with 9 GiB free): the big-card
+   default hybrid weight residency caches dequantized f16 trunk copies —
+   tens of GiB a streaming-tight card does not have (why the profile pinned
+   HI_CUDA_WEIGHTS_F16=0).
+
+Fixes (gpu.rs `mod vram_plan`, pure and unit-tested): the reserve is now
+derived from the same formulas as the allocations it protects — kv-pool
+(pages for --max-batched-tokens, plumbed to load via `KvPoolBound`;
+bare `from_gguf` assumes the 8192-token config default, which on GLM means a
+conservative 39 GiB reserve where a 512-token serve reserves 2.44 GiB),
+weight-scratch (persistent f16 output head + largest transient f16 dequant),
+activations, and 1 GiB headroom, all itemized in the auto-enable line;
+trunk bytes are corrected for the f32 kv_b synthesis; expert streaming now
+defaults weight residency to quantized-only (HI_CUDA_WEIGHTS_F16 still
+wins); and HI_CUDA_EXPERT_POOL_BYTES alone now overrides the auto budget,
+as the message always claimed. The proven zero-env line and result:
+
+```
+hi-cuda: expert streaming auto-enabled — routed experts 160.1 GiB + trunk
+12.9 GiB (incl. 4.3 GiB f32 kv_b synthesis) exceed free VRAM 94.3 GiB;
+reserve[kv-pool=2.44GiB(512tok) weight-scratch=1.96GiB activations=0.19GiB
+headroom=1.00GiB]=5.58GiB; streaming through a 75.8 GiB pool
+```
+
+Zero-env serve on the 96 GB card: coherent greedy completion, 24 tokens in
+14.3 s wall, 55.7% pool hit on the first request, io_uring by auto
+throughout, 2.66 GiB VRAM still free after the request-time pools landed
+inside the reserve. Suites at this close: 157 default / 116 hi-gguf /
+434 native.
